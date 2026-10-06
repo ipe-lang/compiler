@@ -8,9 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use ipe_diagnostics::{DResult, Diagnostic, Span};
+use ipe_diagnostics::{DResult, Diagnostic, NameError, Span};
 use ipe_intern::{Interner, Symbol};
-use ipe_kernels::StdlibKernel;
+use ipe_kernels::{AppSurface, StdlibKernel};
 
 use crate::resolve::{ModuleOrigin, QualifierForm, import_qualifier_forms};
 use crate::scope::{ExprTarget, Identity, ModuleScope, Origin, Tier, ValueIdentity};
@@ -19,7 +19,7 @@ use crate::scope::{ExprTarget, Identity, ModuleScope, Origin, Tier, ValueIdentit
 /// qualifier short-name.
 ///
 /// The key is the module's segment list; the value is the short-name under which
-/// that module's members are registered in [`Env::qual_vars`] (see the
+/// that module's members are pooled in [`Env::kernel_members`] (see the
 /// `QUALIFIERS` table in [`Env::install_prelude_qualifiers`]).
 ///
 /// This is the single source of truth consulted by the canonicaliser when it
@@ -32,7 +32,7 @@ use crate::scope::{ExprTarget, Identity, ModuleScope, Origin, Tier, ValueIdentit
 /// registry, both enforced by unit tests:
 ///
 /// * **No dangling target** (`stdlib_module_paths_target_a_known_qualifier`):
-///   every `canonical` here is a key of a freshly-built `Env`'s `qual_vars`. A
+///   every `canonical` here is a key of a freshly-built `Env`'s `kernel_members`. A
 ///   path whose canonical were absent would resolve to `None` (fail-closed) —
 ///   the alias is simply not registered and the reference surfaces the usual
 ///   `UnknownModule` at its use site, never a silently-invented empty qualifier.
@@ -171,7 +171,7 @@ pub const STDLIB_MODULE_QUALIFIERS: &[(&[&str], &str)] = &[
 
 /// The canonical qualifier text a stdlib import path is registered under.
 ///
-/// The textual lookup behind [`Env::canonical_stdlib_qualifier`]: matches the
+/// The textual lookup behind [`Env::kernel_module`]: matches the
 /// dotted path segments against [`STDLIB_MODULE_QUALIFIERS`], so a consumer
 /// without an [`Env`] (a lint over the parse tree) derives the same qualifier
 /// the resolver registers. `None` for a path naming no kernel-qualified module.
@@ -239,7 +239,8 @@ impl ModuleCatalog {
 /// `true` when a bare `import module` registers `qualifier`.
 ///
 /// A kernel stdlib module (a [`STDLIB_MODULE_QUALIFIERS`] path) binds its
-/// canonical qualifier, plus its last segment when
+/// canonical qualifier, its exact dotted path when that path is a
+/// [`DOTTED_QUALIFIER_SPELLINGS`] row, and its last segment when
 /// [`kernel_import_binds_last_segment`] allows it. Any other module binds the
 /// forms of `import_qualifier_forms(false, len)`: the last segment, plus the
 /// dotted path when the path has more than one segment.
@@ -249,6 +250,7 @@ pub fn bare_import_binds(module: &str, qualifier: &str) -> bool {
     let last = segments.last().copied();
     if let Some(canonical) = stdlib_canonical_qualifier(&segments) {
         return qualifier == canonical
+            || (module == qualifier && is_dotted_qualifier_spelling(&segments))
             || last.is_some_and(|last| {
                 last == qualifier && kernel_import_binds_last_segment(last, canonical)
             });
@@ -337,6 +339,409 @@ pub fn is_kernel_stdlib_module(path: &[Symbol], interner: &Interner) -> bool {
             .any(|(candidate, _)| matches(candidate))
 }
 
+/// The exact dotted paths a bare kernel import is also reachable under.
+///
+/// A bare `import Ipe.Auth` installs `Ipe.Auth` as a qualifier beside `Auth`,
+/// so `Ipe.Auth.hashPassword` resolves; `import Ipe.Auth as A` installs `A`
+/// only. Each row is a [`STDLIB_MODULE_QUALIFIERS`] path (the `const` check
+/// below), whose canonical is looked up there, so the two tables cannot drift.
+/// An import installs only its own path, never a sibling path of the same
+/// canonical.
+pub const DOTTED_QUALIFIER_SPELLINGS: &[&[&str]] = &[
+    &["Ipe", "Html", "Events"],
+    &["Ipe", "Tea", "Web"],
+    &["Ipe", "Tea", "Tui"],
+    &["Ipe", "Tea", "Cli"],
+    &["Ipe", "Tea", "Worker"],
+    &["Ipe", "Auth"],
+    &["Ipe", "Http", "Server", "Stream"],
+    &["Ipe", "Http", "Stream"],
+    &["Ipe", "Http", "Server", "WebSocket"],
+    &["Ipe", "Server"],
+    &["Ipe", "Server", "Http"],
+    &["Ipe", "Server", "Middleware"],
+    &["Ipe", "Server", "RateLimit"],
+    &["Ipe", "Server", "Stream"],
+    &["Ipe", "Server", "WebSocket"],
+    &["Ipe", "Ui", "Input"],
+    &["Ipe", "Ui", "Lazy"],
+    &["Ipe", "Ui", "Keyed"],
+];
+
+/// `true` when a bare import of `path` also installs its exact dotted spelling.
+#[must_use]
+pub fn is_dotted_qualifier_spelling(path: &[&str]) -> bool {
+    DOTTED_QUALIFIER_SPELLINGS
+        .iter()
+        .any(|row| row.len() == path.len() && row.iter().zip(path).all(|(a, b)| a == b))
+}
+
+/// The TEA app shapes, each the kernel module `Ipe.Tea.<Shape>`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TeaShape {
+    /// `Ipe.Tea.Web`.
+    Web,
+    /// `Ipe.Tea.Tui`.
+    Tui,
+    /// `Ipe.Tea.Cli`.
+    Cli,
+    /// `Ipe.Tea.Worker`.
+    Worker,
+}
+
+impl TeaShape {
+    /// Every shape, once each.
+    pub const ALL: [Self; 4] = [Self::Web, Self::Tui, Self::Cli, Self::Worker];
+
+    /// The shape module's canonical qualifier, also its `Ipe.Tea.<segment>`.
+    #[must_use]
+    pub const fn canonical(self) -> &'static str {
+        match self {
+            Self::Web => "Web",
+            Self::Tui => "Tui",
+            Self::Cli => "Cli",
+            Self::Worker => "Worker",
+        }
+    }
+
+    /// The app surface this shape's entry builds.
+    #[must_use]
+    pub const fn surface(self) -> AppSurface {
+        match self {
+            Self::Web => AppSurface::Web,
+            Self::Tui => AppSurface::Tui,
+            Self::Cli => AppSurface::Cli,
+            Self::Worker => AppSurface::Worker,
+        }
+    }
+
+    /// The shape whose module has the canonical qualifier `canonical`.
+    #[must_use]
+    pub fn from_canonical(canonical: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.canonical() == canonical)
+    }
+
+    /// The canonical of this shape's own `Cmd` or `Sub` module.
+    #[must_use]
+    pub fn cmd_sub(self, family: CmdOrSub) -> Option<&'static str> {
+        CMD_SUB_MODULES
+            .iter()
+            .find(|(segment, _, _)| *segment == self.canonical())
+            .map(|&(_, cmd, sub)| family.pick(cmd, sub))
+    }
+
+    /// Whether a module importing this shape may reach `Ipe.Tea.<segment>.{Cmd,Sub}`.
+    ///
+    /// The shape's own row, plus the shared `Terminal` row for a terminal
+    /// shape; [`AppSurface::admits_cmd_sub_of`] is the one rule.
+    #[must_use]
+    pub fn admits_cmd_sub_of(self, segment: &str) -> bool {
+        self.surface().admits_cmd_sub_of(segment)
+    }
+}
+
+/// One of the two shape-scoped effect families.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CmdOrSub {
+    /// `Ipe.Tea.<Shape>.Cmd`.
+    Cmd,
+    /// `Ipe.Tea.<Shape>.Sub`.
+    Sub,
+}
+
+impl CmdOrSub {
+    /// Both families.
+    pub const ALL: [Self; 2] = [Self::Cmd, Self::Sub];
+
+    /// The qualifier a shape import installs this family under.
+    #[must_use]
+    pub const fn qualifier(self) -> &'static str {
+        match self {
+            Self::Cmd => "Cmd",
+            Self::Sub => "Sub",
+        }
+    }
+
+    /// `cmd` for [`Self::Cmd`], `sub` for [`Self::Sub`].
+    #[must_use]
+    pub const fn pick(self, cmd: &'static str, sub: &'static str) -> &'static str {
+        match self {
+            Self::Cmd => cmd,
+            Self::Sub => sub,
+        }
+    }
+
+    /// The family a qualifier spelling names, if it is `Cmd` or `Sub`.
+    #[must_use]
+    pub fn from_qualifier(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.qualifier() == text)
+    }
+}
+
+/// Every `Ipe.Tea.<segment>.{Cmd,Sub}` module as `(segment, Cmd canonical, Sub canonical)`.
+///
+/// One row per shape plus the shared `Terminal` row. Each module re-exports the
+/// whole canonical `Cmd` / `Sub` member set; which module a shape may import is
+/// [`TeaShape::admits_cmd_sub_of`].
+pub const CMD_SUB_MODULES: &[(&str, &str, &str)] = &[
+    ("Web", "TeaWebCmd", "TeaWebSub"),
+    ("Terminal", "TeaTerminalCmd", "TeaTerminalSub"),
+    ("Tui", "TeaTuiCmd", "TeaTuiSub"),
+    ("Cli", "TeaCliCmd", "TeaCliSub"),
+    ("Worker", "TeaWorkerCmd", "TeaWorkerSub"),
+];
+
+/// The `(segment, family)` of a shape-scoped `Cmd` / `Sub` canonical.
+#[must_use]
+pub fn cmd_sub_module(canonical: &str) -> Option<(&'static str, CmdOrSub)> {
+    CMD_SUB_MODULES.iter().find_map(|&(segment, cmd, sub)| {
+        if cmd == canonical {
+            Some((segment, CmdOrSub::Cmd))
+        } else if sub == canonical {
+            Some((segment, CmdOrSub::Sub))
+        } else {
+            None
+        }
+    })
+}
+
+/// `const`-context equality of two segment paths.
+#[allow(clippy::indexing_slicing)] // every index is guarded by `i < a.len() == b.len()`
+const fn const_path_eq(a: &[&str], b: &[&str]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !const_str_eq(a[i], b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `const`-context: `true` when `path` is a [`STDLIB_MODULE_QUALIFIERS`] path.
+#[allow(clippy::indexing_slicing)] // the index is guarded by `i < len`
+const fn is_stdlib_module_path(path: &[&str]) -> bool {
+    let mut i = 0;
+    while i < STDLIB_MODULE_QUALIFIERS.len() {
+        if const_path_eq(STDLIB_MODULE_QUALIFIERS[i].0, path) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `const`-context: `true` when `name` is a [`STDLIB_MODULE_QUALIFIERS`] canonical.
+#[allow(clippy::indexing_slicing)] // the index is guarded by `i < len`
+const fn is_stdlib_canonical_const(name: &str) -> bool {
+    let mut i = 0;
+    while i < STDLIB_MODULE_QUALIFIERS.len() {
+        if const_str_eq(STDLIB_MODULE_QUALIFIERS[i].1, name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Every [`DOTTED_QUALIFIER_SPELLINGS`] row is a [`STDLIB_MODULE_QUALIFIERS`] path.
+#[allow(clippy::indexing_slicing)] // every index is guarded by its `while` bound
+const fn dotted_spellings_are_paths() -> bool {
+    let mut i = 0;
+    while i < DOTTED_QUALIFIER_SPELLINGS.len() {
+        if !is_stdlib_module_path(DOTTED_QUALIFIER_SPELLINGS[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Every [`CMD_SUB_MODULES`] and [`TeaShape`] canonical is a
+/// [`STDLIB_MODULE_QUALIFIERS`] canonical.
+#[allow(clippy::indexing_slicing)] // every index is guarded by its `while` bound
+const fn shape_canonicals_exist() -> bool {
+    let mut j = 0;
+    while j < CMD_SUB_MODULES.len() {
+        let (_, cmd, sub) = CMD_SUB_MODULES[j];
+        if !(is_stdlib_canonical_const(cmd) && is_stdlib_canonical_const(sub)) {
+            return false;
+        }
+        j += 1;
+    }
+    let mut k = 0;
+    while k < TeaShape::ALL.len() {
+        if !is_stdlib_canonical_const(TeaShape::ALL[k].canonical()) {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a dotted qualifier spelling drifts from the stdlib module table [ledger #boundary]
+const _: () = assert!(
+    dotted_spellings_are_paths(),
+    "DOTTED_QUALIFIER_SPELLINGS lists a path that is not a STDLIB_MODULE_QUALIFIERS path",
+);
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a TEA shape or `Cmd`/`Sub` module names a canonical absent from the stdlib module table [ledger #boundary]
+const _: () = assert!(
+    shape_canonicals_exist(),
+    "a CMD_SUB_MODULES or TeaShape canonical is absent from STDLIB_MODULE_QUALIFIERS",
+);
+
+/// A kernel stdlib module, named by its canonical qualifier.
+///
+/// Only this module constructs one, from a [`STDLIB_MODULE_QUALIFIERS`]
+/// canonical that carries members in [`Env::kernel_members`], so holding one
+/// proves the module exists.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct KernelModule(Symbol);
+
+impl KernelModule {
+    /// The canonical qualifier symbol (`Auth`, `JsonDec`, `Db.Decode`).
+    #[must_use]
+    pub const fn symbol(self) -> Symbol {
+        self.0
+    }
+}
+
+impl std::borrow::Borrow<Symbol> for KernelModule {
+    fn borrow(&self) -> &Symbol {
+        &self.0
+    }
+}
+
+/// The module a qualifier spelling resolves into.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ModuleIdentity {
+    /// A kernel stdlib module.
+    Kernel(KernelModule),
+    /// A user or compiled-source module, by its path.
+    Source(Vec<Symbol>),
+}
+
+/// How an import spells a qualifier it installs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClaimForm {
+    /// An explicit `as Alias`.
+    Alias,
+    /// The module's own name: a kernel canonical, an exact dotted path, or the
+    /// `Cmd` / `Sub` a shape import brings.
+    Path,
+    /// A bare import's last-segment shorthand.
+    LastSegment,
+}
+
+/// One import's claim on a qualifier spelling.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct QualifierClaim {
+    /// The qualifier spelling.
+    pub spelling: Symbol,
+    /// The module the spelling resolves into.
+    pub owner: ModuleIdentity,
+    /// How the import spelled it.
+    pub form: ClaimForm,
+    /// The import's span.
+    pub span: Span,
+}
+
+/// Two imports' claims on one spelling where neither outranks the other.
+///
+/// The spelling holds no members; a use of it is refused naming both imports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AmbiguousQualifier {
+    /// The import earlier in the source.
+    pub first: Span,
+    /// The import later in the source.
+    pub second: Span,
+}
+
+/// The import-installed qualifier scope of one module.
+///
+/// Written only by [`Env::install_import`] and [`Env::set_cmd_sub_shape`].
+#[derive(Clone, Debug, Default)]
+pub struct ImportScope {
+    /// Every module this module imported.
+    pub imported_modules: BTreeSet<ModuleIdentity>,
+    /// The claim that owns each installed spelling.
+    pub qualifier_owner: BTreeMap<Symbol, QualifierClaim>,
+    /// Spellings two claims share with neither outranking the other.
+    pub ambiguous: BTreeMap<Symbol, AmbiguousQualifier>,
+    /// The TEA shape this module imports, with its import span.
+    pub cmd_sub_shape: Option<(TeaShape, Span)>,
+}
+
+/// Why a qualifier holds no members in this module.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AbsentQualifier {
+    /// Two imports claim the spelling; see [`AmbiguousQualifier`].
+    Ambiguous(AmbiguousQualifier),
+    /// The canonical of a kernel module this module did not import, with the
+    /// module's import path.
+    KnownStdlib(Vec<Symbol>),
+    /// `Cmd` / `Sub` with no shape import and no `Ipe.Tea.<Shape>.{Cmd,Sub}` import.
+    InternalCmdSub(CmdOrSub),
+    /// No kernel module is gated under the spelling.
+    Unknown,
+}
+
+/// How a new claim on an installed spelling relates to the claim already there.
+enum ClaimVerdict {
+    /// The same module (or the same `Cmd` / `Sub` family): merge.
+    Same,
+    /// The new claim outranks the installed one: replace it.
+    Replace,
+    /// The installed claim outranks the new one: drop the new one.
+    Keep,
+    /// Neither outranks the other and both are explicit: refuse now.
+    Refuse,
+    /// Neither outranks the other and at least one is a shorthand: refuse at use.
+    Ambiguous,
+}
+
+/// Decide how `new` relates to `installed` on one spelling.
+fn claim_verdict(
+    installed: &QualifierClaim,
+    new: &QualifierClaim,
+    interner: &Interner,
+) -> ClaimVerdict {
+    if installed.owner == new.owner || same_cmd_sub_family(&installed.owner, &new.owner, interner) {
+        return ClaimVerdict::Same;
+    }
+    match (installed.form, new.form) {
+        (ClaimForm::Alias | ClaimForm::Path, ClaimForm::Alias | ClaimForm::Path) => {
+            ClaimVerdict::Refuse
+        }
+        (ClaimForm::Alias, ClaimForm::LastSegment) => ClaimVerdict::Keep,
+        (ClaimForm::LastSegment, ClaimForm::Alias) => ClaimVerdict::Replace,
+        (ClaimForm::Path | ClaimForm::LastSegment, ClaimForm::LastSegment)
+        | (ClaimForm::LastSegment, ClaimForm::Path) => ClaimVerdict::Ambiguous,
+    }
+}
+
+/// `true` when both owners are shape-scoped modules of one `Cmd` / `Sub` family.
+///
+/// Every such module re-exports the same canonical member set, and which of
+/// them a shape may import is refused earlier (IPE-N0035), so two admitted
+/// ones under one spelling denote the same members.
+fn same_cmd_sub_family(a: &ModuleIdentity, b: &ModuleIdentity, interner: &Interner) -> bool {
+    let family = |owner: &ModuleIdentity| match owner {
+        ModuleIdentity::Kernel(module) => interner
+            .resolve(module.symbol())
+            .and_then(cmd_sub_module)
+            .map(|(_, family)| family),
+        ModuleIdentity::Source(_) => None,
+    };
+    family(a).is_some_and(|fa| family(b) == Some(fa))
+}
+
+/// The members one import installs under one spelling.
+pub type InstalledMembers = (BTreeMap<Symbol, VarHome>, BTreeMap<Symbol, CtorHome>);
+
 /// Where a (possibly qualified) variable resolves to.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum VarHome {
@@ -424,51 +829,45 @@ pub struct Env {
     ///
     /// Written only during module setup, through `Rc::make_mut`.
     pub module_scope: Rc<ModuleScope>,
-    /// Qualified variable bindings: qualifier → (name → home).
-    pub qual_vars: Rc<BTreeMap<Symbol, BTreeMap<Symbol, VarHome>>>,
-    /// Qualified constructor bindings: qualifier → (`ctor_name` → home).
+    /// Qualified variable bindings: qualifier spelling → (name → home).
     ///
-    /// Populated when `import Foo as Alias` (user-module import) registers
-    /// `dep.ctors` under the alias qualifier.  Lets `Alias.CtorName` resolve
-    /// to `VarCtor` — needed for compiled-source ADTs like `Ipe.Money`'s
-    /// `Currency` constructors accessed as `Money.USD`, `Money.EUR`, etc.
+    /// Empty in a fresh environment; written only by [`Self::install_import`],
+    /// so a spelling holds members only when an import of this module
+    /// installed it.
+    pub qual_vars: Rc<BTreeMap<Symbol, BTreeMap<Symbol, VarHome>>>,
+    /// Qualified constructor bindings: qualifier spelling → (`ctor_name` → home).
+    ///
+    /// Written only by [`Self::install_import`] beside [`Self::qual_vars`]:
+    /// a compiled-source ADT's constructors (`Money.USD`) and a kernel module's
+    /// built-in union constructors (`Http.Post`).
     pub qual_ctors: Rc<BTreeMap<Symbol, BTreeMap<Symbol, CtorHome>>>,
+    /// The kernel member pool: every kernel module's members, by module.
+    ///
+    /// Filled once by [`Env::initial`]. Qualified resolution never reads it; an
+    /// import copies a module's members out of it into [`Self::qual_vars`].
+    pub kernel_members: Rc<BTreeMap<KernelModule, BTreeMap<Symbol, VarHome>>>,
+    /// The kernel constructor pool, the constructor half of [`Self::kernel_members`].
+    pub kernel_ctors: Rc<BTreeMap<KernelModule, BTreeMap<Symbol, CtorHome>>>,
+    /// What this module's imports installed: the modules, the owner of each
+    /// spelling, the ambiguous spellings, and the TEA shape.
+    pub import_scope: Rc<ImportScope>,
     /// **Parse-once registry index.**  Maps `(qualifier_sym, name_sym)`
     /// to the typed [`StdlibKernel`] variant, built anti-drift from
     /// [`StdlibKernel::ALL`] in `install_prelude_qualifiers`.
     ///
     /// Threaded through `VarHome::Kernel`, and exposed here so the
     /// `canon_equals_registry` tripwire test can validate parity with
-    /// `qual_vars` without touching any downstream path.
+    /// `kernel_members` without touching any downstream path.
     pub stdlib_index: Rc<BTreeMap<(Symbol, Symbol), StdlibKernel>>,
-    /// **Tier-C import gate: the known stdlib qualifiers.**
+    /// The import path of every gated kernel canonical.
     ///
-    /// Every canonical stdlib qualifier that carries kernel members in
-    /// [`Self::qual_vars`] at initial build, MINUS the Tier-A `Basics`
-    /// qualifier — i.e. exactly the Tier-C qualifiers of ADR 0001 (`String`,
-    /// `List`, `Dict`, `Http`, `Json.Decode`, …). A qualifier in this set
-    /// resolves ONLY when the module was imported (recorded in
-    /// [`Self::imported_stdlib_quals`]); a use of one that was NOT imported is
-    /// the teachable must-import diagnostic (IPE-N0034), NOT a silent resolve.
-    ///
-    /// Built once at [`Env::initial`] time, before any `import` is processed, so
-    /// it names precisely the ambient catalog — user-module import aliases
-    /// (registered later) are never members and so are never gated.
+    /// Every canonical stdlib qualifier that carries members in
+    /// [`Self::kernel_members`], minus the Tier-A `Basics`, mapped to the
+    /// primary `Ipe.*` path a diagnostic tells the user to import. A use of
+    /// one with no installing import is IPE-N0034.
     ///
     /// `Rc` so the per-scope `env.clone()` is a refcount bump, not a deep copy.
     pub gated_stdlib_quals: Rc<BTreeMap<Symbol, Vec<Symbol>>>,
-    /// **Tier-C import gate: the qualifiers this module actually imported.**
-    ///
-    /// A qualifier (canonical short-name, its `as`-alias, or the last-segment
-    /// default) is inserted here by [`crate::resolve::register_stdlib_import_aliases`]
-    /// when its `Ipe.*` module is imported. A Tier-C qualifier resolves iff it is
-    /// present here; anything absent surfaces IPE-N0034. Non-gated qualifiers
-    /// (user modules, the Tier-A `Basics`) never consult this set.
-    pub imported_stdlib_quals: BTreeSet<Symbol>,
-    /// Ambient qualifiers that are neither gated nor Tier-A: compiler-internal
-    /// kernel qualifiers (`Host`, …) no user is meant to type. Usable only when
-    /// an import binds the same spelling.
-    pub internal_quals: Rc<BTreeSet<Symbol>>,
     /// Every module this module could import, for the unbound-qualifier verdict.
     pub module_catalog: ModuleCatalog,
     /// Each module this module imports under an `as` alias (dotted path), with
@@ -1070,7 +1469,7 @@ pub const PRELUDE_QUALIFIERS: &[(&str, &[&str])] = &[
         // `Sub` qualifiers only (never the canonical `Sub`), so `onKey` is
         // nameable solely through `Ipe.Tea.Tui.Sub` and `onLine` solely through
         // `Ipe.Tea.Cli.Sub`; the rest of each qualifier's members are the
-        // canonical `Sub` set cloned in by `SHAPE_SCOPED_CMD_SUB`.
+        // canonical `Sub` set cloned in by `CMD_SUB_MODULES`.
         ("TeaTuiSub", &["onKey"]),
         ("TeaCliSub", &["onLine"]),
         // `Ipe.Tea.Worker.tea` — view-less co-located worker app-entry
@@ -1302,42 +1701,50 @@ impl Env {
         env.install_prelude_qualifiers(interner)?;
         env.install_builtin_ctors(interner)?;
         env.install_builtin_vars(interner)?;
-        // Freeze the Tier-C import gate: every qualifier now in `qual_vars` is an
-        // ambient stdlib catalog entry. All of them EXCEPT Tier-A `Basics` require
-        // an explicit import to be used (ADR 0001), so record them (each with the
-        // canonical `Ipe.*` path a diagnostic tells the user to import) here, before
-        // any user import is processed.
+        // Move every installed kernel table into the member pool and record the
+        // import path of each gated canonical, before any import is processed.
         env.freeze_stdlib_import_gate(interner)?;
         Ok(env)
     }
 
-    /// Populate [`Self::gated_stdlib_quals`] — the Tier-C import-gate catalog.
+    /// Move the installed kernel members into the pool and freeze the gate catalog.
     ///
-    /// Runs after every ambient qualifier is installed and before any user import
-    /// is seen, so it captures exactly the stdlib qualifiers whose members are
-    /// pre-installed in [`Self::qual_vars`]. `Basics` (Tier A) is excluded — it is
-    /// auto-imported and needs no `import`. For each gated canonical qualifier the
-    /// value is the canonical `Ipe.*` import path (segment symbols), used verbatim
-    /// in the IPE-N0034 "must import `Ipe.X`" diagnostic.
+    /// Runs after every ambient qualifier is installed and before any import is
+    /// seen. Every qualifier table the installers built moves into
+    /// [`Self::kernel_members`] / [`Self::kernel_ctors`], leaving
+    /// [`Self::qual_vars`] and [`Self::qual_ctors`] empty: a spelling holds
+    /// members only once an import installs it. [`Self::gated_stdlib_quals`]
+    /// maps each kernel canonical to its primary import path, which a
+    /// diagnostic tells the user to import. `Basics` (Tier A) is never gated.
     ///
     /// # Errors
     /// [`ipe_diagnostics::Diagnostic::CompilerBug`] if interning `Basics` or a path
     /// segment exhausts the interner.
     fn freeze_stdlib_import_gate(&mut self, interner: &mut Interner) -> DResult<()> {
+        let qual_vars = std::mem::take(&mut self.qual_vars);
+        let qual_ctors = std::mem::take(&mut self.qual_ctors);
+        self.kernel_members = Rc::new(
+            Rc::unwrap_or_clone(qual_vars)
+                .into_iter()
+                .map(|(q, members)| (KernelModule(q), members))
+                .collect(),
+        );
+        self.kernel_ctors = Rc::new(
+            Rc::unwrap_or_clone(qual_ctors)
+                .into_iter()
+                .map(|(q, ctors)| (KernelModule(q), ctors))
+                .collect(),
+        );
         let basics = interner.intern("Basics")?;
-        // canonical short-name → its primary `Ipe.*` import path (the FIRST
-        // table entry naming it). The path is the gate's verdict only: the
-        // IPE-N0034 candidate list is every catalog module whose bare import
-        // binds the qualifier (`ModuleCatalog::modules_bound_by`), so a
-        // canonical with several paths lists them all.
+        // canonical → its primary `Ipe.*` import path (the FIRST table entry
+        // naming it). The IPE-N0034 candidate list is every catalog module whose
+        // bare import binds the qualifier (`ModuleCatalog::modules_bound_by`), so
+        // a canonical with several paths lists them all.
         let mut canon_to_path: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
         for (path, canonical) in STDLIB_MODULE_QUALIFIERS {
             let canon_sym = interner.intern(canonical)?;
-            if canon_sym == basics {
-                continue; // Tier A: no import required.
-            }
-            if !self.qual_vars.contains_key(&canon_sym) {
-                continue; // defensive: only gate qualifiers that carry members.
+            if canon_sym == basics || !self.kernel_members.contains_key(&canon_sym) {
+                continue;
             }
             let mut segs = Vec::with_capacity(path.len());
             for seg in *path {
@@ -1345,53 +1752,219 @@ impl Env {
             }
             canon_to_path.entry(canon_sym).or_insert(segs);
         }
-        self.internal_quals = Rc::new(
-            self.qual_vars
-                .keys()
-                .filter(|q| **q != basics && !canon_to_path.contains_key(q))
-                .copied()
-                .collect(),
-        );
         self.gated_stdlib_quals = Rc::new(canon_to_path);
         Ok(())
     }
 
     /// The qualifiers a use site may be pointed at by a did-you-mean.
     ///
-    /// A bound qualifier passes when the Tier-C gate lets it resolve
-    /// ([`Self::stdlib_import_required`] is `None`) and it is not an internal
-    /// qualifier the module never imported. A gated, unimported qualifier is
-    /// never offered: the filter is the gate predicate itself.
+    /// Exactly the spellings an import installed: an unimported module is never
+    /// offered.
     pub fn usable_qualifiers(&self) -> impl Iterator<Item = Symbol> + '_ {
-        self.qual_vars.keys().copied().filter(|q| {
-            self.stdlib_import_required(*q).is_none()
-                && (!self.internal_quals.contains(q) || self.imported_stdlib_quals.contains(q))
-        })
+        self.qual_vars.keys().copied()
     }
 
-    /// Record that a Tier-C stdlib qualifier `q` (a canonical short-name, its
-    /// `as`-alias, or last-segment default) has been brought into scope by an
-    /// `import`. Idempotent.
-    pub fn mark_stdlib_qualifier_imported(&mut self, q: Symbol) {
-        self.imported_stdlib_quals.insert(q);
-    }
-
-    /// The Tier-C import-gate verdict for a used qualifier.
-    ///
-    /// Returns `Some(import_path)` when `qualifier` names a known Tier-C stdlib
-    /// module that the current module did NOT import — the caller then raises the
-    /// teachable IPE-N0034 "must import `Ipe.X`" diagnostic naming that path.
-    /// Returns `None` when the qualifier is either not a gated stdlib module (a
-    /// user alias, or Tier-A `Basics`) or was imported — in both cases ordinary
-    /// resolution proceeds.
+    /// The kernel module registered under the canonical qualifier `canonical`.
     #[must_use]
-    pub fn stdlib_import_required(&self, qualifier: Symbol) -> Option<&[Symbol]> {
-        if self.imported_stdlib_quals.contains(&qualifier) {
-            return None;
+    pub fn kernel_module_of(&self, canonical: Symbol) -> Option<KernelModule> {
+        self.kernel_members
+            .get_key_value(&canonical)
+            .map(|(module, _)| *module)
+    }
+
+    /// The kernel module a stdlib import `path` names, parsed once from the table.
+    ///
+    /// Consults [`STDLIB_MODULE_QUALIFIERS`] (the single source of truth) and
+    /// yields the module only when its canonical carries members in
+    /// [`Self::kernel_members`]. A path naming no kernel module yields `None`,
+    /// so the caller installs nothing and a use fails closed at its site.
+    ///
+    /// # Errors
+    /// [`ipe_diagnostics::Diagnostic::CompilerBug`] if interning the canonical
+    /// name exhausts the interner's symbol table.
+    pub fn kernel_module(
+        &self,
+        path: &[Symbol],
+        interner: &mut Interner,
+    ) -> DResult<Option<KernelModule>> {
+        // The `&'static str` canonical is owned by the table, so it outlives the
+        // immutable interner borrow released at the end of the block.
+        let canonical: Option<&'static str> = {
+            let mut segs: Vec<&str> = Vec::with_capacity(path.len());
+            for &s in path {
+                match interner.resolve(s) {
+                    Some(seg) => segs.push(seg),
+                    // An un-interned path segment cannot name a known module.
+                    None => return Ok(None),
+                }
+            }
+            stdlib_canonical_qualifier(&segs)
+        };
+        match canonical {
+            None => Ok(None),
+            Some(canon) => {
+                let sym = interner.intern(canon)?;
+                Ok(self.kernel_module_of(sym))
+            }
         }
-        self.gated_stdlib_quals
-            .get(&qualifier)
-            .map(std::vec::Vec::as_slice)
+    }
+
+    /// The pooled members of a kernel module.
+    #[must_use]
+    pub fn kernel_module_members(&self, module: KernelModule) -> InstalledMembers {
+        (
+            self.kernel_members
+                .get(&module)
+                .cloned()
+                .unwrap_or_default(),
+            self.kernel_ctors.get(&module).cloned().unwrap_or_default(),
+        )
+    }
+
+    /// Install one import's claim on a qualifier spelling: the one writer of
+    /// [`Self::qual_vars`] and [`Self::qual_ctors`].
+    ///
+    /// The import is recorded in [`ImportScope::imported_modules`]. A spelling
+    /// already owned by the same module merges; one owned by another module is
+    /// decided by [`ClaimForm`]: an alias outranks a last-segment shorthand,
+    /// two explicit spellings (alias or path) of different modules are refused
+    /// now, and a shorthand against a non-alias claim leaves the spelling
+    /// ambiguous, refused at its first use. The entry is created even when
+    /// `members` is empty, so a type qualifier sees the spelling as installed.
+    ///
+    /// # Errors
+    /// [`NameError::DuplicateQualifier`] (IPE-N0027) for two
+    /// explicit spellings of different modules; [`Diagnostic::CompilerBug`] if
+    /// the spelling is not interned.
+    pub fn install_import(
+        &mut self,
+        claim: QualifierClaim,
+        members: InstalledMembers,
+        interner: &Interner,
+    ) -> DResult<()> {
+        let spelling = claim.spelling;
+        let scope = Rc::make_mut(&mut self.import_scope);
+        scope.imported_modules.insert(claim.owner.clone());
+        let installed_span = scope.qualifier_owner.get(&spelling).map(|c| c.span);
+        let verdict = if scope.ambiguous.contains_key(&spelling) {
+            if claim.form == ClaimForm::Alias {
+                scope.ambiguous.remove(&spelling);
+                ClaimVerdict::Replace
+            } else {
+                ClaimVerdict::Keep
+            }
+        } else {
+            scope
+                .qualifier_owner
+                .get(&spelling)
+                .map_or(ClaimVerdict::Replace, |installed| {
+                    claim_verdict(installed, &claim, interner)
+                })
+        };
+        let earlier = installed_span.map_or(claim.span, |s| s.min(claim.span));
+        let later = installed_span.map_or(claim.span, |s| s.max(claim.span));
+        match verdict {
+            ClaimVerdict::Same => {
+                if claim.form == ClaimForm::Alias
+                    && let Some(owner) = scope.qualifier_owner.get_mut(&spelling)
+                {
+                    owner.form = ClaimForm::Alias;
+                }
+                self.extend_spelling(spelling, members);
+            }
+            ClaimVerdict::Keep => {}
+            ClaimVerdict::Replace => {
+                scope.qualifier_owner.insert(spelling, claim);
+                Rc::make_mut(&mut self.qual_vars).remove(&spelling);
+                Rc::make_mut(&mut self.qual_ctors).remove(&spelling);
+                self.extend_spelling(spelling, members);
+            }
+            ClaimVerdict::Refuse => {
+                let qualifier = interner.resolve(spelling).ok_or(Diagnostic::CompilerBug {
+                    where_: "canon.install_import",
+                    detail: "an installed qualifier spelling is not interned".to_owned(),
+                })?;
+                return Err(Diagnostic::Name {
+                    span: later,
+                    msg: NameError::DuplicateQualifier {
+                        qualifier: qualifier.into(),
+                        first: earlier,
+                    },
+                });
+            }
+            ClaimVerdict::Ambiguous => {
+                scope.qualifier_owner.remove(&spelling);
+                scope.ambiguous.insert(
+                    spelling,
+                    AmbiguousQualifier {
+                        first: earlier,
+                        second: later,
+                    },
+                );
+                Rc::make_mut(&mut self.qual_vars).remove(&spelling);
+                Rc::make_mut(&mut self.qual_ctors).remove(&spelling);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add `members` under an installed `spelling`, creating its entry.
+    fn extend_spelling(&mut self, spelling: Symbol, (vars, ctors): InstalledMembers) {
+        Rc::make_mut(&mut self.qual_vars)
+            .entry(spelling)
+            .or_default()
+            .extend(vars);
+        if !ctors.is_empty() {
+            Rc::make_mut(&mut self.qual_ctors)
+                .entry(spelling)
+                .or_default()
+                .extend(ctors);
+        }
+    }
+
+    /// Install a kernel module's pooled members under one spelling.
+    ///
+    /// # Errors
+    /// As [`Self::install_import`].
+    pub fn install_kernel_import(
+        &mut self,
+        module: KernelModule,
+        form: ClaimForm,
+        spelling: Symbol,
+        span: Span,
+        interner: &Interner,
+    ) -> DResult<()> {
+        let members = self.kernel_module_members(module);
+        self.install_import(
+            QualifierClaim {
+                spelling,
+                owner: ModuleIdentity::Kernel(module),
+                form,
+                span,
+            },
+            members,
+            interner,
+        )
+    }
+
+    /// Record the TEA shape this module imports.
+    pub fn set_cmd_sub_shape(&mut self, shape: TeaShape, span: Span) {
+        Rc::make_mut(&mut self.import_scope).cmd_sub_shape = Some((shape, span));
+    }
+
+    /// Why `qualifier` holds no members in this module.
+    #[must_use]
+    pub fn classify_absent(&self, qualifier: Symbol, interner: &Interner) -> AbsentQualifier {
+        if let Some(ambiguous) = self.import_scope.ambiguous.get(&qualifier) {
+            return AbsentQualifier::Ambiguous(*ambiguous);
+        }
+        if let Some(path) = self.gated_stdlib_quals.get(&qualifier) {
+            return AbsentQualifier::KnownStdlib(path.clone());
+        }
+        interner
+            .resolve(qualifier)
+            .and_then(CmdOrSub::from_qualifier)
+            .map_or(AbsentQualifier::Unknown, AbsentQualifier::InternalCmdSub)
     }
 
     /// Register the ambient (Tier-B) built-in constructors so `Just` / `Nothing` /
@@ -1490,16 +2063,15 @@ impl Env {
 
     /// All `StdlibKernel` values that are catalog-reachable in this `Env`.
     ///
-    /// Iterates every entry in [`Self::qual_vars`] across all qualifier maps and
-    /// yields the kernel carried by each [`VarHome::Kernel`] home. Each yielded
-    /// kernel has at least one surface name that resolves through the catalog —
-    /// the inverse direction guarded by the anti-drift tripwire in `ipe_stdlib`.
+    /// Iterates every module in [`Self::kernel_members`] and yields the kernel
+    /// carried by each [`VarHome::Kernel`] home. Each yielded kernel has at
+    /// least one surface name an import can reach — the inverse direction
+    /// guarded by the anti-drift tripwire in `ipe_stdlib`.
     ///
-    /// Aliases and shape-scoped copies produce duplicate yields for the same
-    /// kernel; callers that need set membership collect into a `Vec` and use
-    /// `contains`, or deduplicate as needed.
+    /// Re-exports and shape-scoped copies yield one kernel more than once;
+    /// callers that need set membership deduplicate.
     pub fn kernel_homes(&self) -> impl Iterator<Item = StdlibKernel> + '_ {
-        self.qual_vars
+        self.kernel_members
             .values()
             .flat_map(|members| members.values())
             .filter_map(|home| {
@@ -1509,50 +2081,6 @@ impl Env {
                     None
                 }
             })
-    }
-
-    /// Resolve a stdlib module's full import `path` (segment symbols) to the
-    /// canonical qualifier symbol under which its kernel members are registered.
-    ///
-    /// Consults [`STDLIB_MODULE_QUALIFIERS`] (the single source of truth) and
-    /// returns the interned canonical qualifier **only when it actually carries
-    /// members** in [`Self::qual_vars`]. A path that names no known stdlib module
-    /// — or whose canonical is (defensively) absent from the registry — yields
-    /// `None`, so the caller registers nothing and the reference fails closed
-    /// with the ordinary `UnknownModule` diagnostic at its use site rather than
-    /// resolving to an invented, empty qualifier.
-    ///
-    /// # Errors
-    /// [`ipe_diagnostics::Diagnostic::CompilerBug`] if interning the canonical
-    /// name exhausts the interner's symbol table.
-    pub fn canonical_stdlib_qualifier(
-        &self,
-        path: &[Symbol],
-        interner: &mut Interner,
-    ) -> DResult<Option<Symbol>> {
-        // Resolve the path to string segments under an immutable interner borrow
-        // and match it against the table. The `&'static str` canonical is owned
-        // by the table, so it outlives the borrow released at the end of the
-        // block — leaving the interner free for the mutable `intern` below.
-        let canonical: Option<&'static str> = {
-            let mut segs: Vec<&str> = Vec::with_capacity(path.len());
-            for &s in path {
-                match interner.resolve(s) {
-                    Some(seg) => segs.push(seg),
-                    // An un-interned path segment cannot name a known module.
-                    None => return Ok(None),
-                }
-            }
-            stdlib_canonical_qualifier(&segs)
-        };
-        match canonical {
-            None => Ok(None),
-            Some(canon) => {
-                let sym = interner.intern(canon)?;
-                // Fail-closed: only report a qualifier that actually has members.
-                Ok(self.qual_vars.contains_key(&sym).then_some(sym))
-            }
-        }
     }
 
     /// Built-in unqualified variables (the Tier-A `Ipe.Basics` surface).
@@ -1642,8 +2170,8 @@ impl Env {
         // Declared here (before the first `for` statement) to satisfy
         // `clippy::items_after_statements`.
         //
-        // MUST be processed BEFORE QUALIFIER_ALIASES (installed below) so that
-        // alias entries are included in any qual-to-qual copy.
+        // MUST be processed BEFORE the `CMD_SUB_MODULES` copies (installed
+        // below) so that alias entries are included in any qual-to-qual copy.
         const FUNC_ALIASES: &[(&str, &str, &str)] = &[
             // ("qualifier", "alias_name", "canonical_kernel_name")
             // `Html`'s legacy pipeline-readable spellings (`htmlRender` /
@@ -1684,81 +2212,6 @@ impl Env {
             ("TeaWebPubSub", "publish", "Cmd", "publish"),
             ("TeaWebPubSub", "publishNoEcho", "Cmd", "publishNoEcho"),
             ("TeaWebPubSub", "subscribeTopic", "Sub", "subscribeTopic"),
-        ];
-
-        // ── Shape-scoped `Cmd` / `Sub` re-exports ─────────────────────────────
-        // Each TEA shape re-exports the whole canonical `Cmd` / `Sub` member set
-        // under its own qualifier. Cloning the canonical member map keeps every
-        // `VarHome::Kernel` carrying the CANONICAL module + name symbols, so the
-        // lowerer's `("Cmd", …)` / `("Sub", …)` match arms fire unchanged — only
-        // the resolution qualifier differs. Which shapes may reach which
-        // qualifier is enforced separately by the cross-shape admissibility gate
-        // (IPE-N0035); this table only makes the members resolvable.
-        const SHAPE_SCOPED_CMD_SUB: &[(&str, &str)] = &[
-            // (shape-scoped qualifier, canonical qualifier)
-            ("TeaWebCmd", "Cmd"),
-            ("TeaWebSub", "Sub"),
-            ("TeaTerminalCmd", "Cmd"),
-            ("TeaTerminalSub", "Sub"),
-            ("TeaTuiCmd", "Cmd"),
-            ("TeaTuiSub", "Sub"),
-            ("TeaCliCmd", "Cmd"),
-            ("TeaCliSub", "Sub"),
-            ("TeaWorkerCmd", "Cmd"),
-            ("TeaWorkerSub", "Sub"),
-        ];
-
-        // ── Qualifier module aliases (Ipe.X / Ipê.X → short canonical) ────────
-        // Clones every entry from the canonical qualifier's member map into the
-        // alias qualifier key. Because each entry already holds
-        // `VarHome::Kernel(canonical_sym, fn_sym)` (NOT the alias key's symbol),
-        // `resolve_qual_var` in `resolve.rs` produces a `VarKernel` whose
-        // `module` field is always the canonical short name ("Html", "Ui", …).
-        // lower.rs match arms therefore work unmodified.
-        //
-        // Declared here (before the first `for` statement) to satisfy
-        // `clippy::items_after_statements`.
-        const QUALIFIER_ALIASES: &[(&str, &str)] = &[
-            // (alias_qualifier, canonical_qualifier)
-            // `Ipe.Ui`, `Ipe.Html`, and `Ipe.Html.Attributes` are compiled-source
-            // (mirror `Ipe.Path` / `Ipe.Url`): no qualifier alias — members
-            // resolve through source-dep injection, their retained primitives +
-            // native serialiser via `Kernel.kernel "Ui_*"` / `"Html_*"` / `"Attr_*"`.
-            // The `Ipe.Ui.*` sub-module aliases stay below.
-            ("Ipe.Html.Events", "Event"),
-            // ── Ipe.Tea.<Shape> shape aliases (ADR 0005) ──────────────────────
-            ("Ipe.Tea.Web", "Web"),
-            // `Tui` / `Cli` carry their `tea` member from the QUALIFIERS catalog.
-            // `Ipe.Tea.Terminal` (the bare app surface) is retired in favour of
-            // these two; its `Cmd` / `Sub` re-exports remain (below).
-            ("Ipe.Tea.Tui", "Tui"),
-            ("Ipe.Tea.Cli", "Cli"),
-            // `Worker` carries its `tea` member from the QUALIFIERS catalog; the
-            // view-less worker app-entry surface.
-            ("Ipe.Tea.Worker", "Worker"),
-            ("Ipe.Log", "Log"),
-            // ── Effect stdlib module aliases ──────────────────────────────────────
-            ("Ipe.Auth", "Auth"),
-            ("Ipe.Http.Server.Stream", "Stream"),
-            ("Ipe.Http.Stream", "HttpStream"),
-            // Ipe.Http.Server.WebSocket alias.
-            ("Ipe.Http.Server.WebSocket", "Ws"),
-            // ── Ipe.Server.* aliases onto the existing server canonicals ──────
-            ("Ipe.Server", "Server"),
-            ("Ipe.Server.Http", "Server"),
-            ("Ipe.Server.Middleware", "Middleware"),
-            ("Ipe.Server.RateLimit", "RateLimit"),
-            ("Ipe.Server.Stream", "Stream"),
-            ("Ipe.Server.WebSocket", "Ws"),
-            // Ipe.Ui.Input sub-module.
-            ("Ipe.Ui.Input", "Input"),
-            // Ipe.Ui.Lazy sub-module.
-            ("Ipe.Ui.Lazy", "Lazy"),
-            // Ipe.Ui.Keyed sub-module.
-            ("Ipe.Ui.Keyed", "Keyed"),
-            // Ipe.Decimal — DELIBERATELY absent: migrated to compiled-source
-            // `Ipe/Decimal.ipe`. The `Kernel.kernel "Decimal_*"` aliases in that
-            // module reach every kernel directly; no qualifier alias is needed.
         ];
 
         // Build stdlib_index FIRST so every `kernel_home` call below can look
@@ -1848,32 +2301,21 @@ impl Env {
                 .insert(member_sym, home);
         }
 
-        for (shape_qual, canonical) in SHAPE_SCOPED_CMD_SUB {
-            let shape_qual_sym = interner.intern(shape_qual)?;
-            let canonical_sym = interner.intern(canonical)?;
-            // Clone the canonical `Cmd` / `Sub` member map wholesale. Each cloned
-            // `VarHome::Kernel` keeps the CANONICAL module + name, so a later
-            // `Alias.member` resolves to the same `VarKernel` a canonical
-            // reference would — the lowerer is unaffected. `.cloned()` releases
-            // the shared borrow before the mutable `entry` borrow.
-            if let Some(canonical_members) = self.qual_vars.get(&canonical_sym).cloned() {
-                Rc::make_mut(&mut self.qual_vars)
-                    .entry(shape_qual_sym)
-                    .or_default()
-                    .extend(canonical_members);
-            }
-        }
-
-        for (alias, canonical) in QUALIFIER_ALIASES {
-            let alias_sym = interner.intern(alias)?;
-            let canonical_sym = interner.intern(canonical)?;
-            // `.cloned()` releases the shared borrow before the mutable
-            // `entry(alias_sym)` borrow — required by the borrow checker.
-            if let Some(canonical_members) = self.qual_vars.get(&canonical_sym).cloned() {
-                Rc::make_mut(&mut self.qual_vars)
-                    .entry(alias_sym)
-                    .or_default()
-                    .extend(canonical_members);
+        // Each `Ipe.Tea.<segment>.{Cmd,Sub}` module re-exports the whole
+        // canonical `Cmd` / `Sub` member set. Each cloned `VarHome::Kernel` keeps
+        // the CANONICAL module + name, so the lowerer's `("Cmd", …)` /
+        // `("Sub", …)` arms fire unchanged; which shape may import which module
+        // is IPE-N0035.
+        for &(_, cmd, sub) in CMD_SUB_MODULES {
+            for family in CmdOrSub::ALL {
+                let module_sym = interner.intern(family.pick(cmd, sub))?;
+                let canonical_sym = interner.intern(family.qualifier())?;
+                if let Some(canonical_members) = self.qual_vars.get(&canonical_sym).cloned() {
+                    Rc::make_mut(&mut self.qual_vars)
+                        .entry(module_sym)
+                        .or_default()
+                        .extend(canonical_members);
+                }
             }
         }
 
@@ -1971,23 +2413,41 @@ mod builtin_ctor_registration_tests {
         }
     }
 
-    /// The `HttpMethod` verbs stay reachable qualified as `Http.<Verb>`.
+    /// The `HttpMethod` verbs are pooled under the `Http` kernel module, which
+    /// an import of `Ipe.Http` installs as `Http.<Verb>`.
     #[test]
     fn http_verbs_resolve_qualified() {
         let mut interner = Interner::new();
         let env = Env::initial(Vec::new(), &mut interner).expect("base env");
         let http = interner.intern("Http").expect("intern");
+        let module = env
+            .kernel_module_of(http)
+            .expect("`Http` is a kernel module");
         for verb in ["Get", "Post", "Put", "Delete", "Patch", "Head", "Options"] {
             let sym = interner.intern(verb).expect("intern");
             let members = env
-                .qual_ctors
-                .get(&http)
-                .expect("`Http` qualifier must carry ctors");
+                .kernel_ctors
+                .get(&module)
+                .expect("`Http` kernel module must carry ctors");
             assert!(
                 members.contains_key(&sym),
                 "`Http.{verb}` must resolve to the HttpMethod verb"
             );
         }
+    }
+
+    /// A fresh environment installs no qualifier: a spelling reaches a module
+    /// only through an import.
+    #[test]
+    fn fresh_env_installs_no_qualifier() {
+        let mut interner = Interner::new();
+        let env = Env::initial(Vec::new(), &mut interner).expect("base env");
+        assert!(env.qual_vars.is_empty(), "no qualifier before any import");
+        assert!(
+            env.qual_ctors.is_empty(),
+            "no qualified ctor before any import"
+        );
+        assert!(!env.kernel_members.is_empty(), "the kernel pool is filled");
     }
 
     /// The home-less prelude constructors stay ambient unqualified.
@@ -2014,7 +2474,7 @@ mod stdlib_module_qualifier_distinctness_tests {
     use super::STDLIB_MODULE_QUALIFIERS;
 
     /// Every path in `STDLIB_MODULE_QUALIFIERS` must be distinct — a duplicate
-    /// path silently shadows the earlier entry in `canonical_stdlib_qualifier`
+    /// path silently shadows the earlier entry in `Env::kernel_module`
     /// (linear scan, first-match wins), making the second entry unreachable.
     #[test]
     fn no_duplicate_paths() {
