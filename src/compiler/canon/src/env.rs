@@ -1898,10 +1898,13 @@ impl Env {
                 self.extend_spelling(spelling, members);
             }
             ClaimVerdict::Refuse => {
-                let qualifier = interner.resolve(spelling).ok_or(Diagnostic::CompilerBug {
-                    where_: "canon.install_import",
-                    detail: "an installed qualifier spelling is not interned".to_owned(),
-                })?;
+                let qualifier =
+                    interner
+                        .resolve(spelling)
+                        .ok_or_else(|| Diagnostic::CompilerBug {
+                            where_: "canon.install_import",
+                            detail: "an installed qualifier spelling is not interned".to_owned(),
+                        })?;
                 return Err(Diagnostic::Name {
                     span: later,
                     msg: NameError::DuplicateQualifier {
