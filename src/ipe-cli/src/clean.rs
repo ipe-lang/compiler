@@ -280,8 +280,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("make root");
         let real_root = std::fs::canonicalize(&root).expect("canonicalize root");
-        crate::output_dir::OwnedDir::claim(&real_root.join("out").join("rust"))
-            .expect("claim out/rust");
+        crate::output_dir::OwnedDir::claim(&real_root.join("out")).expect("claim out");
 
         let removed = remove_generated_dir(&real_root, OUT).expect("remove must succeed");
         assert_eq!(removed, ["out/"]);

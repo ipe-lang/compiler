@@ -13,8 +13,6 @@
 //! [`CappedReader`]: ipe_fs_open::CappedReader
 #![forbid(unsafe_code)]
 
-use std::path::Path;
-
 use syn::visit::{self, Visit};
 use syn::{Fields, ImplItem, Item, ItemImpl, ItemStruct, PathSegment, Type, Visibility};
 
@@ -174,7 +172,7 @@ fn scan_source(file: &str, src: &str) -> Scan {
 
 #[test]
 fn no_proof_type_hands_out_its_raw_handle() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = e2e_support::manifest_dir!().join("src");
     let mut refused = Vec::new();
     let mut methods = Vec::new();
     for entry in std::fs::read_dir(&src).expect("read src/") {
