@@ -781,7 +781,9 @@ fn probe_linker(name: &str) -> LinkerProbeResult {
     if let Some(result) = read_probe_cache(name, cache_key.as_deref()) {
         return result;
     }
-    let result = run_link_probe(name);
+    let Some(result) = run_link_probe(name) else {
+        return LinkerProbeResult::Rejected;
+    };
     write_probe_cache(name, cache_key.as_deref(), &result);
     result
 }
@@ -834,26 +836,29 @@ fn rustc_version_string() -> Option<String> {
 }
 
 /// Run the actual link probe: feed `fn main(){}` to `rustc` with
-/// `-Clink-arg=-fuse-ld=<name>` and return whether it exits 0.
-fn run_link_probe(name: &str) -> LinkerProbeResult {
+/// `-Clink-arg=-fuse-ld=<name>` and return whether it exits 0, or `None` when
+/// the probe never ran to an exit.
+fn run_link_probe(name: &str) -> Option<LinkerProbeResult> {
     run_link_probe_with(Command::new("rustc"), name, LINK_PROBE_LIMITS)
 }
 
 /// Run the link probe through `rustc` under `ceiling`.
 ///
 /// The artifact lands in a `ScratchDir` that is removed on drop, so no debris
-/// reaches the project tree or the shared target. A probe that fails to run,
-/// crosses `ceiling`, or exits non-zero is `Rejected`.
-fn run_link_probe_with(mut rustc: Command, name: &str, ceiling: LocalCeiling) -> LinkerProbeResult {
+/// reaches the project tree or the shared target. Only a probe that ran to an
+/// exit yields a verdict (`Accepted` on success, `Rejected` otherwise); one
+/// that fails to start or crosses `ceiling` yields `None`, which is no fact
+/// about the linker and so is never cached.
+fn run_link_probe_with(
+    mut rustc: Command,
+    name: &str,
+    ceiling: LocalCeiling,
+) -> Option<LinkerProbeResult> {
     // A ScratchDir gives us an unpredictably-named, exclusively-created, mode-
     // 0700 directory that is removed when the guard drops — no predictable path,
     // no race on the temp name, no leftover artifacts.
-    let Ok(scratch) = ScratchDir::new("ipe-linker-probe") else {
-        return LinkerProbeResult::Rejected;
-    };
-    let Ok(leaf) = LeafName::new("probe") else {
-        return LinkerProbeResult::Rejected;
-    };
+    let scratch = ScratchDir::new("ipe-linker-probe").ok()?;
+    let leaf = LeafName::new("probe").ok()?;
     let out_path = scratch.child(&leaf);
     rustc
         .args(["-", "--edition=2021"])
@@ -867,11 +872,12 @@ fn run_link_probe_with(mut rustc: Command, name: &str, ceiling: LocalCeiling) ->
         LocalSource::LinkProbe,
     );
     // `scratch` drops here, removing the directory and the probe artifact.
-    if run.is_ok_and(|captured| captured.status.success()) {
+    let captured = run.ok()?;
+    Some(if captured.status.success() {
         LinkerProbeResult::Accepted
     } else {
         LinkerProbeResult::Rejected
-    }
+    })
 }
 
 /// The path of the linker-probe cache file: `$IPE_HOME/linker-probe.toml`.
@@ -2191,7 +2197,7 @@ mod tests {
         // where it is actually reachable in production.
         let result = run_link_probe("__ipe_test_nonexistent_linker__");
         assert!(
-            matches!(result, LinkerProbeResult::Rejected),
+            matches!(result, Some(LinkerProbeResult::Rejected)),
             "a nonexistent linker must be rejected by the probe"
         );
     }
@@ -2258,13 +2264,23 @@ mod tests {
         let (rustc, _stub) = stub_rustc("probe_ok", "cat >/dev/null\nexit 0");
         assert!(matches!(
             run_link_probe_with(rustc, "mold", LINK_PROBE_LIMITS),
-            LinkerProbeResult::Accepted
+            Some(LinkerProbeResult::Accepted)
         ));
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_link_probe_past_its_wall_is_rejected() {
+    fn a_link_probe_that_exits_non_zero_is_rejected() {
+        let (rustc, _stub) = stub_rustc("probe_fail", "cat >/dev/null\nexit 1");
+        assert!(matches!(
+            run_link_probe_with(rustc, "mold", LINK_PROBE_LIMITS),
+            Some(LinkerProbeResult::Rejected)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_probe_past_its_wall_is_no_verdict() {
         use crate::remote_ingest::LocalWall;
         let (rustc, _stub) = stub_rustc("probe_slow", "cat >/dev/null\nsleep 30\nexit 0");
         let started = std::time::Instant::now();
@@ -2273,7 +2289,10 @@ mod tests {
             "mold",
             LINK_PROBE_LIMITS.with_wall(LocalWall::of_secs::<1>()),
         );
-        assert!(matches!(probe, LinkerProbeResult::Rejected));
+        assert!(
+            probe.is_none(),
+            "a probe past its wall is no linker verdict"
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 

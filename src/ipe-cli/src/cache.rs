@@ -796,12 +796,12 @@ fn compiler_revision_hash() -> Option<String> {
 /// `None` when the query is refused: `rustc` is missing, crosses its ceiling,
 /// exits non-zero, or prints a report [`RustcVersion::parse`] refuses.
 fn toolchain_fingerprint_hash() -> Option<String> {
-    toolchain_fingerprint_of(RustcVersion::active().ok())
+    RustcVersion::active().ok().map(toolchain_fingerprint_of)
 }
 
-/// The fingerprint of `version`'s exact report bytes, `None` without a version.
-fn toolchain_fingerprint_of(version: Option<&RustcVersion>) -> Option<String> {
-    version.map(|version| hex::encode(Sha256::digest(version.verbatim())))
+/// The fingerprint of `version`'s exact report bytes.
+fn toolchain_fingerprint_of(version: &RustcVersion) -> String {
+    hex::encode(Sha256::digest(version.verbatim()))
 }
 
 /// Derive the version-epoch directory name for this process, or `None` when
@@ -1313,10 +1313,9 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(report);
         assert_eq!(
-            toolchain_fingerprint_of(version.as_ref().ok()),
+            version.as_ref().ok().map(toolchain_fingerprint_of),
             Some(hex::encode(hasher.finalize()))
         );
-        assert_eq!(toolchain_fingerprint_of(None), None);
     }
 
     #[cfg(unix)]
@@ -1350,7 +1349,7 @@ mod tests {
             ),
             "{query:?}"
         );
-        assert_eq!(toolchain_fingerprint_of(query.as_ref().ok()), None);
+        assert_eq!(query.as_ref().ok().map(toolchain_fingerprint_of), None);
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
