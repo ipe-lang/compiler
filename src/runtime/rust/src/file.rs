@@ -451,7 +451,11 @@ mod beneath {
             if !crate::path::path_is_absolute(root.clone()) {
                 return Err(BeneathRefusal::RootNotAbsolute);
             }
-            let text = root.as_str();
+            Self::parse_text(root.as_str())
+        }
+
+        /// The final-component rule on text, held independently of the seal's cleaning.
+        pub(super) fn parse_text(text: &str) -> Result<Self, BeneathRefusal> {
             let named = text == "/" || text.rsplit('/').next().and_then(EntryName::parse).is_some();
             if named {
                 Ok(Self(text.to_owned()))
@@ -1954,25 +1958,21 @@ mod read_file_beneath_tests {
     /// A root whose text runs past its final name resolves through that name, so it is refused.
     #[test]
     fn a_root_not_ending_in_a_name_is_refused() {
-        let world = World::new();
-        world.put("f", b"ok");
-        let alias = world.base().join("alias");
-        symlink(world.root(), &alias).unwrap();
-        let alias = alias.to_string_lossy().into_owned();
-        for unnamed in [
-            format!("{alias}/"),
-            format!("{alias}/."),
-            format!("{alias}/sub/.."),
-        ] {
-            let root = crate::path::path_literal(unnamed);
-            assert_refused(
-                &read_paths(root, sealed("f"), 1024),
-                IpeErrorKind::InvalidInput,
-                "the root does not end in a name",
+        for unnamed in ["/r/alias/", "/r/alias/.", "/r/alias/sub/..", "/r/.."] {
+            assert!(
+                matches!(
+                    BeneathRoot::parse_text(unnamed),
+                    Err(BeneathRefusal::RootUnnamed)
+                ),
+                "{unnamed:?} must be refused"
             );
         }
-        let named = crate::path::path_literal(world.root().to_string_lossy().into_owned());
-        assert_read(&read_paths(named, sealed("f"), 1024), "ok");
+        for named in ["/", "/r", "/r/alias"] {
+            assert!(
+                BeneathRoot::parse_text(named).is_ok(),
+                "{named:?} must be accepted"
+            );
+        }
     }
 
     /// Plants a FIFO with no writer at `path`.
