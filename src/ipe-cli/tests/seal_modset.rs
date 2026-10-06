@@ -407,6 +407,106 @@ fn authed_principal_claims_vendored_builds() {
     );
 }
 
+/// A `Web.tea` app that makes an outbound `Http.get`: the shape that reaches
+/// both the `web` and the `http_client` features.
+const WEB_HTTP_CLIENT: &str = r#"module Main exposing (main)
+
+import Ipe.Http as Http
+import Ipe.Task as Task
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.String as String
+import Ipe.Ui as Ui
+import Ipe.Url as Url
+
+
+type alias Model =
+    { status : Int }
+
+
+type Msg
+    = Fetch
+    | Fetched (Result Error Int)
+    | NoOp
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { status = 0 }, Cmd.none )
+
+
+statusOf : { status : Int, body : String, headers : Dict String String } -> Int
+statusOf response =
+    response.status
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Fetch ->
+            case Url.fromString "https://example.com/" of
+                Ok url ->
+                    ( model, Task.attempt Fetched (Task.map statusOf (Http.get url)) )
+
+                Err _err ->
+                    ( model, Cmd.none )
+
+        Fetched result ->
+            case result of
+                Ok status ->
+                    ( { model | status = status }, Cmd.none )
+
+                Err _err ->
+                    ( model, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+view : Model -> Element Msg
+view model =
+    Ui.column []
+        [ Ui.button [] { onPress = Just Fetch, label = Ui.text "fetch" }
+        , Ui.text (String.fromInt model.status)
+        ]
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = NoOp
+        }
+"#;
+
+/// Under the vendored emit model a web app with an outbound HTTP client must
+/// cargo-build with the telemetry exporters, the console proxy and the exit
+/// flush compiled in.
+///
+/// The vendored `web/mod.rs` and `system.rs` gate that code on `web` plus
+/// `http_client`; the vendored manifest declares `http_client` and
+/// `http_client_cargo_toml` promotes it, so this shape is the one that turns
+/// the code on and proves it builds.
+#[test]
+fn web_http_client_vendored_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build_vendored("web_http_client_vendored", WEB_HTTP_CLIENT).expect(
+        "a Web.tea app with an outbound Http.get must cargo-build under the vendored \
+         emit model with the http_client exporters compiled in",
+    );
+}
+
 /// Minimal `Jwt.encodeHs256` program — no server/web surface, so no `server`/
 /// `web` feature to carry `uuid` transitively.
 ///

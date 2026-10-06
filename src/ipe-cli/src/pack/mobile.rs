@@ -1646,6 +1646,7 @@ mod tests {
         })
         .expect_err("a non-web app is refused");
         assert_eq!(err, MobileRefusal::NotWebShape);
+        assert!(err.to_string().contains("IPE-P0022"), "carries the code");
     }
 
     #[test]
@@ -1656,6 +1657,7 @@ mod tests {
         })
         .expect_err("a web app with wasm off is refused");
         assert_eq!(err, MobileRefusal::WasmDisabled);
+        assert!(err.to_string().contains("IPE-P0023"), "carries the code");
     }
 
     // ── SPA bundle collection ─────────────────────────────────────────────────
