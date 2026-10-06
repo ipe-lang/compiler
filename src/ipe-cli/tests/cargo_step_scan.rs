@@ -14,7 +14,7 @@
 //! (the subcommand), and the exact count. A new cargo site, a listed site
 //! gaining a `build` subcommand, and a site moved to another file are refused.
 //! A `Command::new` whose program expression names neither is held by
-//! `remote_spawn_scan`'s per-expression inventory instead. The subcommand is
+//! `child_runner_scan`'s per-site runner proof instead. The subcommand is
 //! read only from the call chain of the `Command::new` statement itself, so an
 //! argument added in a later statement is not seen. Sources are compared with
 //! all whitespace removed, so line breaks and spacing cannot split a match.
