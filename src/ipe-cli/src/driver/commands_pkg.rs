@@ -1112,29 +1112,6 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the
-/// source-graph pipeline reads. Same argument convention as `ipe dev build`:
-///
-/// 1. a directory → its `package.ipe`'s `src`-root `Main.ipe`;
-/// 2. a `.ipe` file → itself.
-///
-/// A project's entry module is always `Main` (`project` module doc), so the
-/// entry file is `<src_root>/Main.ipe`.
-///
-/// # Errors
-/// [`CliError::Usage`] for a directory with no `package.ipe`; the manifest's own
-/// parse errors otherwise.
-pub fn resolve_analysis_entry(path: &Path) -> Result<PathBuf, CliError> {
-    let manifest = discover_manifest(path)?;
-    match manifest {
-        Some(m) => {
-            let parsed = project::parse_manifest(&m)?;
-            analysis_root_of(&parsed)
-        }
-        None => Ok(path.to_path_buf()),
-    }
-}
-
 /// The source file `ipe type-check` uses as its analysis root for a manifest
 /// project.
 ///
@@ -1229,7 +1206,7 @@ pub enum AnalysisTarget {
 /// manifest's canonical `tests/` or `src/` root.
 ///
 /// # Errors
-/// Same as [`resolve_analysis_entry`] for a directory argument;
+/// A manifest's own parse errors for a directory argument;
 /// [`CliError::Io`] when the file (a named one, or a directory's entry) cannot
 /// be canonicalised (`NotFound` when it is missing), or a project, `src/`, or
 /// existing `tests/` root cannot be; a manifest's own parse errors for a file
@@ -3010,8 +2987,7 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// # Errors
 /// Returns [`CliError::Io`] on a filesystem failure.
 pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     let Some(diag) = pipeline_first_diagnostic(&source) else {
         writeln!(

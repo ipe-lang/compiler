@@ -93,10 +93,8 @@ pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, C
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let text = crate::io_bounded::read_to_string_capped(
-        manifest_path,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
+    let text =
+        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
     read_package_manifest(&text, &root, manifest_path)
 }
 
@@ -1720,10 +1718,8 @@ pub fn upsert_index_dependency(
     name: &str,
     req: &semver::VersionReq,
 ) -> Result<(), CliError> {
-    let text = crate::io_bounded::read_to_string_capped(
-        manifest_path,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
+    let text =
+        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
     let entry = format!("dep {} {}", quote(name), quote(&req.to_string()));
     let updated = edit_dependencies_list(&text, manifest_path, name, Some(&entry))?;
     write_manifest_file(manifest_path, &updated)
@@ -1739,10 +1735,8 @@ pub fn upsert_index_dependency(
 /// As [`upsert_index_dependency`], minus the escape-collision refusal (a remove
 /// legitimately drops any matching entry, escape or index).
 pub fn remove_manifest_dependency(manifest_path: &Path, name: &str) -> Result<(), CliError> {
-    let text = crate::io_bounded::read_to_string_capped(
-        manifest_path,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
+    let text =
+        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
     let updated = edit_dependencies_list(&text, manifest_path, name, None)?;
     write_manifest_file(manifest_path, &updated)
 }
@@ -2057,6 +2051,34 @@ mod tests {
     }
 
     const HEADER: &str = "module Package exposing (package)\n\n";
+
+    /// A project's `package.ipe` that is a link is refused, never followed to its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_package_ipe_is_refused() {
+        let root = fresh_project("symlinked_package_ipe");
+        let real = root.join("real-package.ipe");
+        std::fs::write(
+            &real,
+            format!("{HEADER}package =\n    {{ name = \"linked\" }}\n"),
+        )
+        .expect("write the link target");
+        let path = root.join(PACKAGE_IPE);
+        std::os::unix::fs::symlink(&real, &path).expect("plant the package.ipe link");
+        let result = parse_package_manifest(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                result,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a linked package.ipe must be refused: {:?}",
+            result.map(|m| m.name)
+        );
+    }
 
     /// A bare `package.ipe` filename (as `ipe dev build package.ipe` passes it from
     /// inside the project dir) has an EMPTY parent, not an absolute one. The
