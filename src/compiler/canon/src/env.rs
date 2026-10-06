@@ -828,6 +828,9 @@ pub struct CtorIdentity {
     pub type_name: Symbol,
 }
 
+/// Dotted module path to the `as` aliases it is imported under.
+pub type ImportAliases = Rc<BTreeMap<Box<str>, BTreeSet<Box<str>>>>;
+
 /// The name-resolution environment.
 #[derive(Clone, Debug, Default)]
 pub struct Env {
@@ -890,7 +893,7 @@ pub struct Env {
     /// Each module this module imports under an `as` alias (dotted path), with
     /// those aliases: an unbound qualifier spelling such a module's own name is
     /// pointed at its alias, never told to import a module already imported.
-    pub import_aliases: Rc<BTreeMap<Box<str>, BTreeSet<Box<str>>>>,
+    pub import_aliases: ImportAliases,
     /// The module's driver-vouched trust provenance. `Ffi.binding` bodies
     /// resolve ONLY under [`ModuleOrigin::FfiInterface`]; any other origin
     /// falls through to ordinary qualified-name resolution (and fails there —

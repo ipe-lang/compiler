@@ -17,8 +17,8 @@ use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
 use crate::env::{
-    AbsentQualifier, ClaimForm, CmdOrSub, CtorHome, CtorIdentity, Env, ModuleIdentity,
-    QualifierClaim, TeaShape, VarHome,
+    AbsentQualifier, ClaimForm, CmdOrSub, CtorHome, CtorIdentity, Env, ImportAliases,
+    ModuleIdentity, QualifierClaim, TeaShape, VarHome,
 };
 use crate::scope::{
     AliasBody, Clash, ExprTarget, Identity, ModuleScope, Origin, Resolved, Tier,
@@ -424,10 +424,7 @@ struct TypeCtx<'a> {
 ///
 /// # Errors
 /// [`Diagnostic::CompilerBug`] if an alias symbol is not interned.
-fn import_alias_table(
-    imports: &[src::Import],
-    interner: &Interner,
-) -> DResult<Rc<BTreeMap<Box<str>, BTreeSet<Box<str>>>>> {
+fn import_alias_table(imports: &[src::Import], interner: &Interner) -> DResult<ImportAliases> {
     let mut table: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
     for import in imports {
         if let Some(alias) = import.alias {
