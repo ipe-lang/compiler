@@ -164,6 +164,7 @@ impl Scan {
 }
 
 /// Scan one source text.
+#[allow(clippy::expect_used)] // a crate source or sample that does not parse is a broken test input
 fn scan_source(file: &str, src: &str) -> Scan {
     let parsed = syn::parse_file(src).expect("crate source parses");
     let mut scan = Scan::default();

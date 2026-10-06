@@ -635,12 +635,12 @@ impl HeldDir {
     /// Give back a directory this run just claimed: unlink its marker while it is still ours.
     ///
     /// For a claim whose caller refuses the directory after the claim
-    /// committed; the directory is left as an unmarked user directory.
+    /// committed; the directory is left as an unmarked user directory. The
+    /// proof is consumed, so a claim is given back at most once.
     ///
     /// # Errors
     /// [`CliError::Io`] on a filesystem failure.
-    pub fn unclaim(&self, claimed: Claimed) -> Result<(), CliError> {
-        let Claimed(()) = claimed;
+    pub fn unclaim(&self, _claimed: Claimed) -> Result<(), CliError> {
         let MarkerState::Genuine(marker) = self.genuine_marker()? else {
             return Ok(());
         };
@@ -1913,19 +1913,14 @@ mod tests {
         let locks = Rc::new(Cell::new(0_u32));
         let counted = Rc::clone(&locks);
         let at = claim.clone();
-        set_claim_hook(Some(Box::new(move |point, _path: &Path| match point {
-            ClaimPoint::AfterLock => {
+        set_claim_hook(Some(Box::new(move |point, _path: &Path| {
+            if point == ClaimPoint::AfterLock {
                 counted.set(counted.get().saturating_add(1));
                 if counted.get() == 1 {
                     std::fs::remove_file(&at).expect("unlink locked claim");
                     std::fs::write(&at, b"").expect("recreate claim");
                 }
             }
-            ClaimPoint::AfterPreCheck
-            | ClaimPoint::AfterPublish
-            | ClaimPoint::BeforeCommit
-            | ClaimPoint::Busy
-            | ClaimPoint::MarkerRead => {}
         })));
         let claimed = held_at(&dir).claim();
         set_claim_hook(None);
