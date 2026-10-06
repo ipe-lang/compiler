@@ -162,48 +162,36 @@ endsWith : String -> String -> Bool
 endsWith = Kernel.kernel "String_endsWith"
 
 
--- | Haystack-first companion to `contains` — built for pipelines.
---
---     "hello world" |> String.containsIn "world"   -- True
---
--- Equivalent to `\\haystack needle -> contains needle haystack`.
-{-| `containsIn needle haystack` — `True` when `needle` appears in `haystack`.
-Haystack-first for pipeline use.
+{-| `containsIn haystack needle` — `True` when `needle` appears in `haystack`: `contains` with the arguments swapped.
 
 ```ipe
-containsIn "world" "hello world" --> True
-containsIn "xyz" "hello" --> False
-"hello world" |> containsIn "world" --> True
+containsIn "hello world" "world" --> True
+containsIn "hello" "xyz" --> False
+"world" |> containsIn "hello world" --> True
 ```
 -}
 containsIn : String -> String -> Bool
 containsIn = Kernel.kernel "String_containsIn"
 
 
--- | Haystack-first companion to `startsWith`.
---
---     "/api/users" |> String.startsWithIn "/api"  -- True
-{-| `startsWithIn prefix haystack` — `True` when `haystack` starts with `prefix`.
+{-| `startsWithIn haystack prefix` — `True` when `haystack` starts with `prefix`: `startsWith` with the arguments swapped.
 
 ```ipe
-startsWithIn "/api" "/api/users" --> True
-startsWithIn "/v2" "/api/users" --> False
-"/api/users" |> startsWithIn "/api" --> True
+startsWithIn "/api/users" "/api" --> True
+startsWithIn "/api/users" "/v2" --> False
+"/api" |> startsWithIn "/api/users" --> True
 ```
 -}
 startsWithIn : String -> String -> Bool
 startsWithIn = Kernel.kernel "String_startsWithIn"
 
 
--- | Haystack-first companion to `endsWith`.
---
---     "image.png" |> String.endsWithIn ".png"  -- True
-{-| `endsWithIn suffix haystack` — `True` when `haystack` ends with `suffix`.
+{-| `endsWithIn haystack suffix` — `True` when `haystack` ends with `suffix`: `endsWith` with the arguments swapped.
 
 ```ipe
-endsWithIn ".png" "image.png" --> True
-endsWithIn ".jpg" "image.png" --> False
-"image.png" |> endsWithIn ".png" --> True
+endsWithIn "image.png" ".png" --> True
+endsWithIn "image.png" ".jpg" --> False
+".png" |> endsWithIn "image.png" --> True
 ```
 -}
 endsWithIn : String -> String -> Bool
