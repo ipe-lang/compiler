@@ -367,8 +367,7 @@ pub use jwt::*;
 // builds on `decimal.rs`'s `Decimal` newtype, so the two modules gate together.
 // A program that reaches no `Decimal.*`/`Money.*` kernel and no `Db` surface
 // (whose `SqlValue` numeric columns decode through `rust_decimal`) drops the
-// crate. The `stringify.rs` `IpeStringify for Decimal` impl carries the same
-// gate, so a program without the feature still compiles.
+// crate. `Decimal`'s show row lives in `decimal.rs`, so it gates with the type.
 #[cfg(feature = "decimal")]
 pub mod decimal;
 #[cfg(feature = "decimal")]

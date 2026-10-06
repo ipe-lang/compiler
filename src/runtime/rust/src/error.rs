@@ -49,6 +49,8 @@ pub enum IpeErrorKind {
     Unexpected = 10,
 }
 
+crate::stringify::show_row!("ErrorKind", Value, [] IpeErrorKind, |k| k.label().to_owned());
+
 impl IpeErrorKind {
     /// Renders the reference design's `"<Kind>: "` prefix (`Error.toString`,
     /// `"<Kind>: <message>"`).
@@ -78,6 +80,12 @@ pub struct IpePanicInfo {
     pub stack: Vec<String>,
 }
 
+crate::stringify::show_row!("PanicInfo", Value, [] IpePanicInfo, |p| format!(
+    "{{{} {}}}",
+    p.message,
+    crate::stringify::IpeStringify::ipe_show(&p.stack)
+));
+
 /// Ipê's `TypeInfo` — `TypeMismatch`'s payload: `{ expected : String, actual
 /// : String }`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -86,6 +94,11 @@ pub struct IpeTypeInfo {
     pub expected: String,
     pub actual: String,
 }
+
+crate::stringify::show_row!("TypeInfo", Value, [] IpeTypeInfo, |t| format!(
+    "{{{} {}}}",
+    t.expected, t.actual
+));
 
 /// Ipê's `ErrorDetails` — the 5-variant enrichment union. Constructor names
 /// match Ipê source verbatim
@@ -102,6 +115,16 @@ pub enum IpeErrorDetails {
     Custom(String),
 }
 
+crate::stringify::show_row!("ErrorDetails", Value, [] IpeErrorDetails, |d| match d {
+    IpeErrorDetails::FfiPanic(p) => format!("FfiPanic {}", crate::stringify::IpeStringify::ipe_show(p)),
+    IpeErrorDetails::TypeMismatch(t) => {
+        format!("TypeMismatch {}", crate::stringify::IpeStringify::ipe_show(t))
+    }
+    IpeErrorDetails::HttpStatus(n) => format!("HttpStatus {n}"),
+    IpeErrorDetails::JsonDecode(s) => format!("JsonDecode {s}"),
+    IpeErrorDetails::Custom(s) => format!("Custom {s}"),
+});
+
 /// Ipê's `ErrorInfo` — `{ message : String, details : Maybe ErrorDetails }`.
 ///
 /// No `#[derive(Eq)]`: `IpeMaybe<T>` (the `details` field's carrier) derives
@@ -114,6 +137,12 @@ pub struct IpeErrorInfo {
     pub message: String,
     pub details: IpeMaybe<IpeErrorDetails>,
 }
+
+crate::stringify::show_row!("ErrorInfo", Value, [] IpeErrorInfo, |i| format!(
+    "{{{} {}}}",
+    i.message,
+    crate::stringify::IpeStringify::ipe_show(&i.details)
+));
 
 /// Ipê's `Error` — `Error ErrorKind ErrorInfo`, a single tuple-variant enum
 /// (constructor name == type name, matching `ipe_lower`'s registration) so
@@ -326,17 +355,9 @@ pub fn ipe_error_kind_name(kind: IpeErrorKind) -> String {
     kind.label().to_owned()
 }
 
-// `Error.toString` routes through the shared Stringify-bounded mechanism
-// (any `Show`-obligated type, not an Error-specific kernel — see the
-// `Interpolate | ErrorToString` direct-build arm in `ipe_types`' constrain).
-// Without this impl the autoref-specialization fallback would render via
-// `#[derive(Debug)]` (`Error(Io, IpeErrorInfo { message: ".." })`)
-// instead of the reference design's `"<Kind>: <message>"` format.
-impl crate::stringify::IpeStringify for IpeError {
-    fn ipe_show(&self) -> String {
-        self.to_ipe_string()
-    }
-}
+// `Error.toString` routes through the shared Stringify-bounded mechanism (any
+// `Show`-obligated type, not an Error-specific kernel): `"<Kind>: <message>"`.
+crate::stringify::show_row!("Error", Value, [] IpeError, |e| e.to_ipe_string());
 
 /// Compatibility bridge: kernel call sites across the runtime that produce a
 /// bare `String` error keep compiling — `?`/`.into()` on a `String` yields an

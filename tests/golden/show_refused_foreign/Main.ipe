@@ -1,0 +1,17 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.Result as Result exposing (Result(..))
+import Rust.Handle_demo as H
+
+
+-- An opaque `Rust.*` handle has no show row, so showing it is refused at
+-- `ipe` time (IPE-T0014), never left to fail the Rust build. The harness
+-- seeds the `handle-demo` FFI interface this module imports.
+main =
+    case H.new_from_widget () of
+        Ok w ->
+            Io.println (errorToString w)
+
+        Err _ ->
+            Io.println "err"

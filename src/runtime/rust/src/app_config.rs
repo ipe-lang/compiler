@@ -99,6 +99,8 @@ pub enum Setting {
     ConsoleToken(ConsoleTokenKind, crate::secret::Secret),
 }
 
+crate::stringify::show_row!("Setting", Internals, [] Setting, |_| "<Ipe.App.Setting>".to_owned());
+
 /// Which console/telemetry endpoint a [`Setting::ConsoleToken`] authorises. A
 /// closed set — each variant is one previously-bare env token given a typed
 /// `Secret` carrier. Always available (not `secret`-gated) so the console

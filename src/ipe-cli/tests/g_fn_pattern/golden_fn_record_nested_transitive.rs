@@ -5,7 +5,7 @@
 //! that demotion. A shallow `is_derivable` would emit a `derive(PartialEq)` on
 //! the outer struct that fails to compile on the inner field; the fixpoint over
 //! the type graph prevents that. Both structs get a hand-written `impl Clone`
-//! (an `Arc::clone` refcount bump on the fn slot) and render a `<fn>`
+//! (an `Arc::clone` refcount bump on the fn slot) and render a `<function>`
 //! placeholder in `IpeStringify`.
 //!
 //! `run outer 5` = `o.inner.op 5 + dup.inner.op 5 + dup.inner.tag`

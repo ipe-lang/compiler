@@ -160,7 +160,7 @@ pub fn spans_json(limit: usize) -> String {
 ///
 /// Keeps a present-but-non-UTF-8 value distinct from an absent one, so a
 /// garbled explicit setting can never fall through to the unset default.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RawEnv<'a> {
     /// The variable is not set.
     Absent,
@@ -168,6 +168,18 @@ pub enum RawEnv<'a> {
     Value(&'a str),
     /// The variable is set but is not valid UTF-8.
     NotUnicode,
+}
+
+// The read's shape only: a set value renders the redaction marker, never the
+// variable's content.
+impl std::fmt::Debug for RawEnv<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Value(_) => write!(f, "Value({})", crate::redact::REDACTED),
+            Self::NotUnicode => f.write_str("NotUnicode"),
+        }
+    }
 }
 
 impl<'a> RawEnv<'a> {
@@ -1421,6 +1433,19 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeSet;
+
+    // A raw environment read's `{:?}` keeps its shape and hides the value.
+    #[test]
+    fn raw_env_debug_hides_the_value() {
+        let shown = format!(
+            "{:?} {:?} {:?}",
+            RawEnv::Value("S3CR3T"),
+            RawEnv::Absent,
+            RawEnv::NotUnicode
+        );
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert_eq!(shown, "Value(<redacted>) Absent NotUnicode");
+    }
 
     /// Every byte class with no `frame-ancestors` representation is refused,
     /// the empty value is no embedding, and a source list is kept as written.

@@ -16,6 +16,8 @@ pub struct WebReq {
     pub cookies: IpeDict<String>,
 }
 
+crate::stringify::show_row!("WebReq", Redacted, [] WebReq, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 // Every field but the method is client-supplied data that can carry a credential
 // (a session cookie, an `Authorization` header, a token in the path or query);
 // the Ipê record fixes the field types, so the masking lives in `Debug`.

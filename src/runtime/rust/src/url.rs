@@ -41,11 +41,44 @@ use url::{Url as UrlCrate, form_urlencoded};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Url(UrlCrate);
 
-impl super::stringify::IpeStringify for Url {
-    /// Backs Ipê's `toString` / interpolation on a `Url`: the serialized URL
-    /// string. Identical to [`url_to_string`].
-    fn ipe_show(&self) -> String {
-        self.0.as_str().to_string()
+// `Url.toString` keeps the full URL; an implicit rendering shows `shown`.
+crate::stringify::show_row!("Url", Redacted, [] Url, |u| u.shown());
+
+impl Url {
+    /// The URL reduced to scheme, host, port and path.
+    ///
+    /// Userinfo, query and fragment, where credentials and tokens travel, never
+    /// appear. The parser ends the authority at the first `/`, `?` or `#` (and,
+    /// under a special scheme, `\`), so a credential holding one of them
+    /// spills out of the userinfo: `user:pw@host` parses with scheme `user`,
+    /// no host and path `pw@host`, and `https://u:1/pw@host` with host `u`.
+    /// The `@` that ended the userinfo stays literal in the path, query or
+    /// fragment it spilled into. With no host, or an `@` or `\` past the
+    /// authority, only the scheme is shown. A scheme outside
+    /// [`NAMEABLE_SCHEMES`] may be a user name, so it is withheld.
+    fn shown(&self) -> String {
+        use crate::stringify::REDACTED_SHOW;
+        let scheme = match SchemeShown::of(self.0.scheme()) {
+            SchemeShown::Known(scheme) => Some(scheme),
+            SchemeShown::Withheld => None,
+        };
+        let spilled = [Some(self.0.path()), self.0.query(), self.0.fragment()]
+            .into_iter()
+            .flatten()
+            .any(|part| part.contains(['@', '\\']));
+        if self.0.host_str().is_none() || spilled {
+            return scheme.map_or_else(
+                || REDACTED_SHOW.to_owned(),
+                |scheme| format!("{scheme}:{REDACTED_SHOW}"),
+            );
+        }
+        let mut shown = self.0.clone();
+        let _ = shown.set_password(None);
+        let _ = shown.set_username("");
+        shown.set_query(None);
+        shown.set_fragment(None);
+        let after_scheme = shown.as_str().strip_prefix(shown.scheme()).unwrap_or(":");
+        format!("{}{after_scheme}", scheme.unwrap_or(REDACTED_SHOW))
     }
 }
 
@@ -243,14 +276,8 @@ pub struct UrlRelative {
     fragment: Option<String>,
 }
 
-impl super::stringify::IpeStringify for UrlRelative {
-    /// Backs Ipê's `toString` / interpolation on a `Relative`: the reference
-    /// string (`path` + `?query` + `#fragment`). Identical to
-    /// [`url_relative_to_string`].
-    fn ipe_show(&self) -> String {
-        self.render()
-    }
-}
+// The reference string, identical to [`url_relative_to_string`].
+crate::stringify::show_row!("UrlRelative", Value, [] UrlRelative, |r| r.render());
 
 impl UrlRelative {
     /// Re-serialise the path + optional query + optional fragment triple. The single place

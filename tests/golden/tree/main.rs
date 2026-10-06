@@ -42,9 +42,9 @@ impl IpeStringify for MainTree {
             MainTree::Leaf => "Leaf".to_string(),
             MainTree::Node(p0, p1, p2) => format!(
                 "Node {} {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p2)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1),
+                IpeStringify::ipe_show(p2)
             ),
         }
     }

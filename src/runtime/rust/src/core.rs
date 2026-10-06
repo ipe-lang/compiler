@@ -24,6 +24,8 @@ pub type IpeTask<E, A> = Pin<Box<dyn Future<Output = IpeResult<E, A>> + Send + '
 #[cfg(target_arch = "wasm32")]
 pub type IpeTask<E, A> = Pin<Box<dyn Future<Output = IpeResult<E, A>> + 'static>>;
 
+crate::stringify::show_row!("Task", Internals, [E, A] IpeTask<E, A>, |_| "<Ipe.Task.Task>".to_owned());
+
 /// Construct Ok with generic error type.  Use `ok_res::<IpeError>` to
 /// instantiate with the project's concrete error type.
 pub fn ok_res<E, A>(a: A) -> IpeResult<E, A> {

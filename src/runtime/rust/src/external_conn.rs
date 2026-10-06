@@ -48,6 +48,8 @@ pub enum ExternalConnection {
     Sqlite(sqlx::sqlite::SqlitePool),
 }
 
+crate::stringify::show_row!("Connection", Internals, [] ExternalConnection, |_| "<Ipe.Db.Connection>".to_owned());
+
 impl std::fmt::Debug for ExternalConnection {
     /// Redact to the dialect only — a pool's own `Debug` can surface the
     /// connection options (host, user), so the struct-level impl stays
