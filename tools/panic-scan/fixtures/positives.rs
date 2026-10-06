@@ -76,3 +76,13 @@ use std::process as proc_alias; //@HIT
 use std::process::{self as proc_self}; //@HIT
 use ::std as std_alias; //@HIT
 extern crate std as std_crate; //@HIT
+
+// A macro body binds names its expansion reads, so a rename there MUST be
+// flagged like a top-level one.
+macro_rules! renames_in_body {
+    () => {
+        use std::process as body_alias; //@HIT
+        use std::process::{exit as body_leave}; //@HIT
+        fn body_exit() { $p::exit(0); } //@HIT
+    };
+}

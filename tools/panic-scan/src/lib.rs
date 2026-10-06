@@ -383,6 +383,29 @@ fn renamed_root(name: &str, parent: Option<&Ident>) -> Option<&'static str> {
     }
 }
 
+/// Whether the flat declaration at `toks[at]` may be visible outside its module.
+///
+/// Only a declaration that a statement boundary, an attribute, or the start of
+/// the body directly precedes is private; a `pub`, a `pub(…)`, a `$vis`
+/// metavariable, or anything else is taken as exported.
+fn flat_exported(toks: &[TokenTree], at: usize) -> bool {
+    match at.checked_sub(1).and_then(|before| toks.get(before)) {
+        None => false,
+        Some(TokenTree::Punct(p)) => p.as_char() != ';',
+        Some(TokenTree::Group(g)) => {
+            !matches!(g.delimiter(), Delimiter::Brace | Delimiter::Bracket)
+        }
+        Some(TokenTree::Ident(_) | TokenTree::Literal(_)) => true,
+    }
+}
+
+/// Whether `toks[at]` directly follows a metavariable (`$p`), a path segment
+/// whose module only the macro's caller names.
+fn follows_metavariable(toks: &[TokenTree], at: usize) -> bool {
+    let before = |back: usize| at.checked_sub(back).and_then(|k| toks.get(k));
+    matches!(before(1), Some(TokenTree::Ident(_))) && before(2).is_some_and(|t| is_punct(t, '$'))
+}
+
 /// Visitor state for one file.
 #[derive(Default)]
 struct Scanner {
@@ -574,15 +597,21 @@ impl Scanner {
                             && opens_call(toks.get(next.saturating_add(2)))
                         {
                             self.hit(line_of(m), format!("::{name}()"));
+                        } else if PROCESS_FNS.contains(&name.as_str())
+                            && follows_metavariable(&toks, i)
+                        {
+                            // `$p::exit` reaches `process::exit` when the
+                            // caller binds `$p` to the `process` module.
+                            self.hit(line_of(m), format!("$…::{name}"));
                         }
                     }
                     next
                 }
                 TokenTree::Punct(_) | TokenTree::Literal(_) => next,
-                TokenTree::Ident(id) => {
+                TokenTree::Ident(id) => self.flat_declaration(id, &toks, i).unwrap_or_else(|| {
                     self.flat_ident(id, &toks, next);
                     next
-                }
+                }),
                 TokenTree::Group(g) => {
                     self.flat_scan(&g.stream());
                     next
@@ -618,6 +647,56 @@ impl Scanner {
             _ => self.flat_scan(body),
         }
         None
+    }
+
+    /// Judge a flat `use` or `extern crate` declaration starting at `toks[at]`;
+    /// returns the index just past it.
+    ///
+    /// A name it binds is read by the syntax-tree checks of the code that
+    /// expands it, so it is judged by the same rules as a parsed declaration: a
+    /// macro-body `use std::process as p;` is the same hit as a top-level one.
+    /// A declaration that does not parse (a metavariable in its path) binds a
+    /// name that cannot be judged here, so it is itself a hit and its tokens
+    /// are scanned flat.
+    fn flat_declaration(&mut self, id: &Ident, toks: &[TokenTree], at: usize) -> Option<usize> {
+        let next = at.saturating_add(1);
+        let is_use = id == "use" && !toks.get(next).is_some_and(|t| is_punct(t, '<'));
+        let is_extern =
+            id == "extern" && matches!(toks.get(next), Some(TokenTree::Ident(c)) if c == "crate");
+        if !is_use && !is_extern {
+            return None;
+        }
+        let rest = toks.get(at..)?;
+        let end = rest
+            .iter()
+            .position(|t| is_punct(t, ';'))
+            .map_or(toks.len(), |semi| at.saturating_add(semi).saturating_add(1));
+        let decl: TokenStream = toks.get(at..end)?.iter().cloned().collect();
+        if is_use {
+            let Ok(item) = syn::parse2::<ItemUse>(decl) else {
+                self.hit(line_of(id), format!("unparsed {id}"));
+                return None;
+            };
+            self.use_tree(&item.tree, None, flat_exported(toks, at));
+        } else {
+            let Ok(item) = syn::parse2::<ItemExternCrate>(decl) else {
+                self.hit(line_of(id), format!("unparsed {id} crate"));
+                return None;
+            };
+            self.extern_crate(&item);
+        }
+        Some(end)
+    }
+
+    /// Record an `extern crate` that renames the `std` root.
+    fn extern_crate(&mut self, item: &ItemExternCrate) {
+        let name = name_of(&item.ident);
+        if let (Some((_, rename)), Some(root)) = (&item.rename, renamed_root(&name, None)) {
+            self.hit(
+                line_of(&item.ident),
+                format!("{root} as {}", name_of(rename)),
+            );
+        }
     }
 
     /// Check one flat identifier against the banned and source-naming forms.
@@ -875,13 +954,7 @@ impl<'ast> Visit<'ast> for Scanner {
     }
 
     fn visit_item_extern_crate(&mut self, item: &'ast ItemExternCrate) {
-        let name = name_of(&item.ident);
-        if let (Some((_, rename)), Some(root)) = (&item.rename, renamed_root(&name, None)) {
-            self.hit(
-                line_of(&item.ident),
-                format!("{root} as {}", name_of(rename)),
-            );
-        }
+        self.extern_crate(item);
         visit::visit_item_extern_crate(self, item);
     }
 
@@ -1338,6 +1411,46 @@ fn f() {
                 "not a hidden root:\n{src}"
             );
         }
+    }
+
+    /// A macro-body `use` or `extern crate` binds a name the expanded code's
+    /// paths read, so a rename there is the same hit as a top-level one.
+    #[test]
+    fn macro_body_renames_are_hits() {
+        let body =
+            |decl: &str| format!("macro_rules! m {{\n    () => {{\n        {decl}\n    }};\n}}\n");
+        for decl in [
+            "use std::process as p;",
+            "use std::process::{self as p};",
+            "use std::{process as p};",
+            "use ::std as s;",
+            "extern crate std as s;",
+            "use std::process::{exit as leave};",
+            "use std::process::{exit};",
+            "use std::panic::panic_any as boom;",
+            "use $p as q;",
+            "fn f() { $p::exit(0); }",
+            "const F: fn() -> ! = $p::abort;",
+        ] {
+            assert_eq!(hit_lines(&body(decl)), vec![3], "missed:\n{decl}");
+        }
+        for decl in [
+            "use std::fs as f;",
+            "use super::*;",
+            "fn f() { $p::read(0); m::exit(0); }",
+            "fn f() -> impl Sized + use<> {}",
+            "extern \"C\" { fn g(); }",
+        ] {
+            assert_eq!(
+                hit_lines(&body(decl)),
+                Vec::<usize>::new(),
+                "not a hit:\n{decl}"
+            );
+        }
+        let private = body("use core::include;");
+        assert!(scan_source(&private).is_ok_and(|scan| scan.test_path_includes.is_empty()));
+        let exported = body("pub use core::include;");
+        assert!(scan_source(&exported).is_ok_and(|scan| scan.test_path_includes.len() == 1));
     }
 
     /// A macro-body `mod` named by a metavariable resolves to a file only at

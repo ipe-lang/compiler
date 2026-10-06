@@ -652,3 +652,19 @@ fn a_metavariable_module_declaration_fails_closed() {
     let out = scan_in(&root, &["lib.rs"]);
     assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
 }
+
+/// A rename inside a macro body binds the name its expansion reads, so it is
+/// a hit like a top-level one.
+#[test]
+fn a_macro_body_rename_is_a_hit() {
+    let root = scratch("macro_body_rename");
+    put(
+        &root,
+        "lib.rs",
+        "macro_rules! leave {\n    () => {\n        use std::process as p;\n    };\n}\nleave!();\npub fn f() {\n    p::exit(0);\n}\n",
+    );
+    let out = scan_in(&root, &["lib.rs"]);
+    assert_eq!(out.status.code(), Some(1), "{}", streams(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("lib.rs:3:"), "{}", streams(&out));
+}
