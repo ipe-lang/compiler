@@ -1590,6 +1590,8 @@ messages! {
     upgrade_installer_download_failed(detail) = "upgrade-installer-download-failed";
     /// `ipe upgrade`'s installer could not be waited on.
     upgrade_installer_wait_failed(detail) = "upgrade-installer-wait-failed";
+    /// `ipe upgrade`'s installer exited before reading its whole script.
+    upgrade_installer_short_feed(detail) = "upgrade-installer-short-feed";
     /// `ipe upgrade`'s installer exited non-zero.
     upgrade_installer_failed = "upgrade-installer-failed";
     /// An output path that is a symbolic link.

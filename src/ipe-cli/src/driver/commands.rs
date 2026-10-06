@@ -2034,6 +2034,9 @@ pub fn set_executable(path: &Path) -> Result<(), CliError> {
 /// without a terminator.
 pub const RELAY_CHUNK_CAP: usize = 64 * 1024;
 
+/// Consecutive interrupted reads [`read_progress_chunk`] retries before it refuses.
+pub const RELAY_INTERRUPT_RETRIES: u32 = 64;
+
 /// Read the next chunk of `cargo`'s stderr into `out`, stopping at either a
 /// newline (a completed message line) or a carriage return (the boundary of
 /// cargo's in-place progress bar, which carries no newline). Returns the number
@@ -2047,16 +2050,33 @@ pub const RELAY_CHUNK_CAP: usize = 64 * 1024;
 /// terminator ends at the first ASCII byte past it (a character boundary), and
 /// at twice the cap whatever the byte.
 ///
+/// A read interrupted by a signal is retried, keeping the bytes already read,
+/// up to [`RELAY_INTERRUPT_RETRIES`] times in a row.
+///
 /// # Errors
-/// Propagates the underlying read error from the `cargo` stderr pipe.
+/// Propagates the underlying read error from the `cargo` stderr pipe, and an
+/// [`std::io::ErrorKind::Interrupted`] read once it recurs past
+/// [`RELAY_INTERRUPT_RETRIES`] consecutive retries.
 pub fn read_progress_chunk<R: std::io::Read>(
     reader: &mut R,
     out: &mut String,
 ) -> std::io::Result<usize> {
     let mut bytes: Vec<u8> = Vec::new();
+    let mut interrupted: u32 = 0;
     loop {
         let mut byte = [0u8; 1];
-        let n = reader.read(&mut byte)?;
+        let n = match reader.read(&mut byte) {
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    && interrupted < RELAY_INTERRUPT_RETRIES =>
+            {
+                interrupted = interrupted.saturating_add(1);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        interrupted = 0;
         if n == 0 {
             break;
         }
@@ -2160,6 +2180,7 @@ const WASM_BINDGEN_VERSION: &str = "0.2.126";
 /// 2. `wasm-bindgen` CLI — emits the JS glue + `www/pkg/ipe_app_bg.wasm`
 /// 3. `wasm-opt -Oz` — optional; silently skipped when not on PATH
 ///
+/// Both tools run under [`crate::remote_ingest::WASM_TOOL_LIMITS`].
 /// Writes the final `www/pkg/` tree into `<crate_dir>/www/pkg/`. On success
 /// the directory at `<crate_dir>/www/` is a self-contained static SPA ready to
 /// serve.
@@ -2167,6 +2188,7 @@ const WASM_BINDGEN_VERSION: &str = "0.2.126";
 /// # Errors
 /// [`CliError::EmittedBuildFailed`] when the wasm `cargo build` fails;
 /// [`CliError::Usage`] when `wasm-bindgen` fails;
+/// [`CliError::LocalLimitExceeded`] when `wasm-bindgen` crosses its ceiling;
 /// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim.
 pub fn bundle_wasm(crate_dir: &OwnedDir) -> Result<(), CliError> {
     let out_dir = crate_dir.path();
@@ -2218,6 +2240,7 @@ pub fn bundle_wasm(crate_dir: &OwnedDir) -> Result<(), CliError> {
             bindgen: Path::new("wasm-bindgen"),
             opt: Path::new("wasm-opt"),
         },
+        crate::remote_ingest::WASM_TOOL_LIMITS,
     )
 }
 
@@ -2229,17 +2252,42 @@ struct WasmTools<'a> {
     opt: &'a Path,
 }
 
+/// The bundle `wasm-bindgen` writes into `www/pkg/`.
+const WASM_BUNDLE_FILE: &str = "ipe_app_bg.wasm";
+
+/// The sibling `wasm-opt` writes to; it replaces the bundle only once `wasm-opt` succeeds.
+const WASM_OPT_STAGED_FILE: &str = ".ipe_app_bg.wasm.opt-tmp";
+
+/// Why `wasm-opt` left the bundle unoptimised.
+enum WasmOptSkip {
+    /// The tool is not installed; optimisation is optional.
+    Missing,
+    /// The tool ran and exited unsuccessfully.
+    Exit(std::process::ExitStatus),
+    /// The tool exited successfully without writing its output.
+    NoOutput,
+    /// The tool could not be run to completion within its ceiling.
+    Run(CliError),
+}
+
 /// Bundle the linked `wasm_path` into the owned crate's `www/pkg/` with `tools`.
 ///
+/// Each tool runs under `ceiling`. `wasm-opt` writes a sibling of the bundle,
+/// which replaces it only when `wasm-opt` succeeds, so a failed, killed, or
+/// absent `wasm-opt` leaves the bundle exactly as `wasm-bindgen` wrote it.
+///
 /// # Errors
-/// [`CliError::Usage`] when `wasm-bindgen` fails; [`CliError::OutputRefused`]
-/// when `crate_dir` was replaced before or while either tool ran;
-/// [`CliError::Io`] on a filesystem or spawn failure.
+/// [`CliError::Usage`] when `wasm-bindgen` fails; [`CliError::LocalLimitExceeded`]
+/// when `wasm-bindgen` crosses `ceiling`; [`CliError::OutputRefused`] when
+/// `crate_dir` was replaced before or while either tool ran; [`CliError::Io`]
+/// on a filesystem or spawn failure.
 fn bundle_wasm_pkg(
     crate_dir: &OwnedDir,
     wasm_path: &Path,
     tools: &WasmTools<'_>,
+    ceiling: crate::remote_ingest::LocalCeiling,
 ) -> Result<(), CliError> {
+    use crate::remote_ingest::{LocalSource, RunError, run_local};
     let out_dir = crate_dir.path();
     // `wasm-bindgen` and `wasm-opt` write into `www/pkg/` by path, so it is
     // rebuilt empty under the owned crate: a symlink at any level is refused and
@@ -2255,22 +2303,23 @@ fn bundle_wasm_pkg(
         crate_dir.path_to(&pkg_rel).map(drop)
     };
 
-    let wb_status = std::process::Command::new(tools.bindgen)
-        .args([
-            wasm_path.to_string_lossy().as_ref(),
-            "--target",
-            "web",
-            "--no-typescript",
-            "--out-dir",
-            pkg_dir.to_string_lossy().as_ref(),
-        ])
-        .status()
-        .map_err(|e| CliError::Io {
-            path: wasm_path.to_path_buf(),
-            source: e,
-        })?;
-    if !wb_status.success() {
-        let code = wb_status.code().unwrap_or(1);
+    let mut bindgen = std::process::Command::new(tools.bindgen);
+    bindgen
+        .arg(wasm_path)
+        .args(["--target", "web", "--no-typescript", "--out-dir"])
+        .arg(&pkg_dir);
+    let bound = run_local(bindgen, ceiling, LocalSource::WasmTool)
+        .map_err(|e| crate::cargo_step::local_run_error(tools.bindgen, e))?;
+    if !bound.status.success() {
+        let stderr = bound.stderr.to_terminal();
+        if !stderr.as_str().is_empty() {
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Text,
+                stderr.as_str(),
+            );
+        }
+        let code = bound.status.code().unwrap_or(1);
         return Err(CliError::Usage(text::msg::wasm_bindgen_failed(
             &code,
             &WASM_BINDGEN_VERSION,
@@ -2278,30 +2327,53 @@ fn bundle_wasm_pkg(
     }
     prove_pkg()?;
 
-    // Step 3: wasm-opt -Oz — optional size pass; silently skip when absent
-    // (`Command::new` returns `Err` when the tool is missing).
-    let bg_wasm = pkg_dir.join("ipe_app_bg.wasm");
-    if bg_wasm.is_file()
-        && let Ok(status) = std::process::Command::new(tools.opt)
-            .args([
-                bg_wasm.to_string_lossy().as_ref(),
-                "-Oz",
-                "-o",
-                bg_wasm.to_string_lossy().as_ref(),
-            ])
-            .status()
-        && !status.success()
-    {
-        // wasm-opt found but failed — non-fatal; the unoptimised bundle
-        // is still correct. Log and continue.
-        crate::screen::chatter(
-            crate::screen::Stream::Stderr,
-            crate::screen::Tone::Text,
-            &format!(
-                "note: wasm-opt exited {}; bundle is unoptimised but functional",
-                status.code().unwrap_or(1)
-            ),
-        );
+    // Step 3: wasm-opt -Oz — optional size pass; silently skipped when absent
+    // (spawning a missing program through `Command::new` reports `NotFound`).
+    let bundle = crate_dir.path_to(pkg_rel.join(WASM_BUNDLE_FILE))?;
+    let bg_wasm = bundle.path();
+    if bg_wasm.is_file() {
+        let staged = crate_dir.path_to(pkg_rel.join(WASM_OPT_STAGED_FILE))?;
+        staged.remove()?;
+        let mut opt = std::process::Command::new(tools.opt);
+        opt.arg(&bg_wasm).args(["-Oz", "-o"]).arg(staged.path());
+        let skipped = match run_local(opt, ceiling, LocalSource::WasmTool) {
+            Ok(captured) if captured.status.success() => {
+                (!staged.path().is_file()).then_some(WasmOptSkip::NoOutput)
+            }
+            Ok(captured) => Some(WasmOptSkip::Exit(captured.status)),
+            Err(RunError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Some(WasmOptSkip::Missing)
+            }
+            Err(e) => Some(WasmOptSkip::Run(crate::cargo_step::local_run_error(
+                tools.opt, e,
+            ))),
+        };
+        // The staged file is removed on every outcome, after the crate is
+        // proven still owned: nothing `wasm-opt` wrote outlives this step.
+        let kept = prove_pkg().and_then(|()| {
+            if skipped.is_none() {
+                bundle.copy_from(&staged.path())
+            } else {
+                Ok(())
+            }
+        });
+        staged.remove()?;
+        kept?;
+        let reason = match skipped {
+            None | Some(WasmOptSkip::Missing) => None,
+            Some(WasmOptSkip::Exit(status)) => Some(status.to_string()),
+            Some(WasmOptSkip::NoOutput) => Some("no output written".to_owned()),
+            Some(WasmOptSkip::Run(err)) => Some(err.to_string()),
+        };
+        if let Some(reason) = reason {
+            // wasm-opt found but failed — non-fatal; the bundle is the
+            // untouched `wasm-bindgen` output.
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::Text,
+                &format!("note: wasm-opt failed ({reason}); bundle is unoptimised but functional"),
+            );
+        }
     }
 
     prove_pkg()?;
@@ -3038,11 +3110,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // no capabilities and runs no jail.
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(&bin_args);
         set_session_env(&mut cmd, &session_env);
-        let err = cmd.exec();
+        let err = ipe_runtime_rust::system::exec_naming(
+            cmd,
+            ipe_runtime_rust::system::NamedFds::default(),
+        );
         Err(CliError::Io {
             path: bin,
             source: err,
@@ -3053,9 +3127,14 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(&bin_args);
         set_session_env(&mut cmd, &session_env);
-        let status = cmd.status().map_err(|e| CliError::Io {
+        let status = crate::remote_ingest::run_inherited(
+            cmd,
+            crate::remote_ingest::InheritedRole::UserProgram,
+            crate::remote_ingest::InheritedInput::Terminal,
+        )
+        .map_err(|e| CliError::Io {
             path: bin,
-            source: e,
+            source: e.into(),
         })?;
         // Propagate the child's exit code.  `CliError` only models failure, so
         // a non-zero exit is surfaced as a usage-owned message; the caller
@@ -3205,8 +3284,12 @@ fn wrapper_argv(app_args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
 fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliError> {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
-        let err = std::process::Command::new(program).args(args).exec();
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        let err = ipe_runtime_rust::system::exec_naming(
+            cmd,
+            ipe_runtime_rust::system::NamedFds::default(),
+        );
         Err(CliError::Io {
             path: program.to_path_buf(),
             source: err,
@@ -3214,13 +3297,17 @@ fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliEr
     }
     #[cfg(not(unix))]
     {
-        let status = std::process::Command::new(program)
-            .args(args)
-            .status()
-            .map_err(|e| CliError::Io {
-                path: program.to_path_buf(),
-                source: e,
-            })?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        let status = crate::remote_ingest::run_inherited(
+            cmd,
+            crate::remote_ingest::InheritedRole::UserProgram,
+            crate::remote_ingest::InheritedInput::Terminal,
+        )
+        .map_err(|e| CliError::Io {
+            path: program.to_path_buf(),
+            source: e.into(),
+        })?;
         if !status.success() {
             return Err(CliError::Usage(text::msg::program_exited(
                 &program.display(),
@@ -4321,6 +4408,10 @@ mod held_crate_tests {
         CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
     };
     use crate::output_dir::{OutputRefusal, OwnedDir};
+    use crate::remote_ingest::{
+        ByteBudget, IngestLimit, LocalCeiling, LocalRefusal, LocalSource, LocalWall,
+        WASM_TOOL_LIMITS,
+    };
     use crate::toolchain::CargoBin;
 
     /// A fresh scratch base for `tag`, holding a claimed `crate/`.
@@ -4419,18 +4510,188 @@ mod held_crate_tests {
     ) -> Result<(), CliError> {
         let bindgen = stub(base, "wasm-bindgen", bindgen);
         let opt = stub(base, "wasm-opt", opt);
+        bundle_within(crate_dir, base, &bindgen, &opt, WASM_TOOL_LIMITS)
+    }
+
+    /// Run [`bundle_wasm_pkg`] over `crate_dir` with the tools at `bindgen` and `opt` under `ceiling`.
+    fn bundle_within(
+        crate_dir: &OwnedDir,
+        base: &Path,
+        bindgen: &Path,
+        opt: &Path,
+        ceiling: LocalCeiling,
+    ) -> Result<(), CliError> {
         bundle_wasm_pkg(
             crate_dir,
             &base.join("ipe_app.wasm"),
-            &WasmTools {
-                bindgen: &bindgen,
-                opt: &opt,
-            },
+            &WasmTools { bindgen, opt },
+            ceiling,
         )
     }
 
     /// The `wasm-bindgen` stub body that writes the bundle into its `--out-dir`.
     const WRITE_BUNDLE: &str = "touch \"$6/ipe_app_bg.wasm\"";
+
+    /// The `wasm-bindgen` stub body that writes a bundle holding [`ORIGINAL`].
+    const WRITE_ORIGINAL: &str = "printf original > \"$6/ipe_app_bg.wasm\"";
+
+    /// The bytes [`WRITE_ORIGINAL`] writes.
+    const ORIGINAL: &[u8] = b"original";
+
+    /// The bundle under `crate_dir`'s `www/pkg/`.
+    fn bundle_path(crate_dir: &OwnedDir) -> PathBuf {
+        crate_dir
+            .path()
+            .join("www")
+            .join("pkg")
+            .join(super::WASM_BUNDLE_FILE)
+    }
+
+    /// Whether the bundle holds exactly `contents` and no staged `wasm-opt` output remains.
+    fn bundle_holds(crate_dir: &OwnedDir, contents: &[u8]) -> bool {
+        let staged = crate_dir
+            .path()
+            .join("www")
+            .join("pkg")
+            .join(super::WASM_OPT_STAGED_FILE);
+        std::fs::read(bundle_path(crate_dir)).is_ok_and(|bytes| bytes == contents)
+            && std::fs::symlink_metadata(staged).is_err()
+    }
+
+    /// A `wasm-opt` that writes garbage to its output and fails leaves the bundle byte-identical.
+    #[test]
+    fn a_failed_wasm_opt_leaves_the_bundle_byte_identical() {
+        let (base, crate_dir) = scratch("opt-fail");
+        let bundled = bundle_with(
+            &base,
+            &crate_dir,
+            WRITE_ORIGINAL,
+            "printf garbage > \"$4\"; exit 1",
+        );
+        assert!(
+            bundled.is_ok(),
+            "a failed wasm-opt is non-fatal, got {bundled:?}"
+        );
+        assert!(
+            bundle_holds(&crate_dir, ORIGINAL),
+            "the bundle is the wasm-bindgen output and the staged file is gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `wasm-opt` killed at its wall after writing garbage leaves the bundle byte-identical.
+    #[test]
+    fn a_wasm_opt_past_its_wall_leaves_the_bundle_byte_identical() {
+        let (base, crate_dir) = scratch("opt-wall");
+        let bindgen = stub(&base, "wasm-bindgen", WRITE_ORIGINAL);
+        let opt = stub(&base, "wasm-opt", "printf garbage > \"$4\"; exec sleep 30");
+        let started = std::time::Instant::now();
+        let bundled = bundle_within(
+            &crate_dir,
+            &base,
+            &bindgen,
+            &opt,
+            WASM_TOOL_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            bundled.is_ok(),
+            "a killed wasm-opt is non-fatal, got {bundled:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            bundle_holds(&crate_dir, ORIGINAL),
+            "the bundle is the wasm-bindgen output and the staged file is gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An absent `wasm-opt` skips optimisation and leaves the bundle as written.
+    #[test]
+    fn a_missing_wasm_opt_skips_optimisation() {
+        let (base, crate_dir) = scratch("opt-missing");
+        let bindgen = stub(&base, "wasm-bindgen", WRITE_ORIGINAL);
+        let bundled = bundle_within(
+            &crate_dir,
+            &base,
+            &bindgen,
+            &base.join("no-such-wasm-opt"),
+            WASM_TOOL_LIMITS,
+        );
+        assert!(
+            bundled.is_ok(),
+            "an absent wasm-opt is skipped, got {bundled:?}"
+        );
+        assert!(
+            bundle_holds(&crate_dir, ORIGINAL),
+            "the bundle is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A succeeding `wasm-opt` replaces the bundle with its output.
+    #[test]
+    fn a_succeeding_wasm_opt_replaces_the_bundle() {
+        let (base, crate_dir) = scratch("opt-ok");
+        let bundled = bundle_with(
+            &base,
+            &crate_dir,
+            WRITE_ORIGINAL,
+            "printf optimised > \"$4\"",
+        );
+        assert!(bundled.is_ok(), "got {bundled:?}");
+        assert!(
+            bundle_holds(&crate_dir, b"optimised"),
+            "the bundle is the wasm-opt output and the staged file is gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A failing `wasm-bindgen` fails the bundle step.
+    #[test]
+    fn a_failed_wasm_bindgen_is_refused() {
+        let (base, crate_dir) = scratch("bindgen-fail");
+        let bundled = bundle_with(&base, &crate_dir, "echo boom >&2; exit 3", "exit 0");
+        assert!(
+            matches!(bundled, Err(CliError::Usage(_))),
+            "got {bundled:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `wasm-bindgen` writing past its stdout ceiling is killed before its wall.
+    #[test]
+    #[allow(clippy::expect_used)] // 16 is inside the byte budget's range; a refusal is a red test
+    fn a_flooding_wasm_bindgen_is_refused() {
+        let (base, crate_dir) = scratch("bindgen-flood");
+        let cap = ByteBudget::for_test(16).expect("in-range byte budget");
+        let bindgen = stub(
+            &base,
+            "wasm-bindgen",
+            "head -c 4096 /dev/zero; exec sleep 30",
+        );
+        let opt = stub(&base, "wasm-opt", "exit 0");
+        let started = std::time::Instant::now();
+        let bundled = bundle_within(
+            &crate_dir,
+            &base,
+            &bindgen,
+            &opt,
+            WASM_TOOL_LIMITS.with_stdout(cap),
+        );
+        assert!(
+            matches!(
+                bundled,
+                Err(CliError::LocalLimitExceeded(LocalRefusal {
+                    source: LocalSource::WasmTool,
+                    limit: IngestLimit::Bytes(16),
+                    ..
+                }))
+            ),
+            "got {bundled:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// A crate replaced while `wasm-bindgen` wrote the bundle is refused.
     #[test]
@@ -4955,5 +5216,99 @@ mod help_on_misuse_tests {
         let expected = os(&["--", "--show-profile", "a", "--", "b"]);
         assert_eq!(argv, expected);
         assert_eq!(wrapper_argv(&[]), vec![std::ffi::OsString::from("--")]);
+    }
+}
+
+#[cfg(test)]
+mod progress_chunk_tests {
+    //! A read interrupted by a signal is retried without losing the bytes
+    //! already read, and a reader interrupted without end is refused after a
+    //! bounded number of retries.
+
+    use super::{RELAY_INTERRUPT_RETRIES, read_progress_chunk};
+
+    /// One read a [`Scripted`] reader serves.
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        /// One byte.
+        Byte(u8),
+        /// A read interrupted by a signal.
+        Interrupted,
+        /// The end of the stream.
+        End,
+    }
+
+    /// A reader that serves `steps` in order, then `then` on every later read.
+    struct Scripted {
+        /// The remaining steps, front first.
+        steps: std::collections::VecDeque<Step>,
+        /// The step served once `steps` is exhausted.
+        then: Step,
+        /// Reads served, interrupted ones included.
+        reads: u32,
+    }
+
+    impl Scripted {
+        /// A reader serving `steps`, then `then` forever.
+        fn new(steps: impl IntoIterator<Item = Step>, then: Step) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                then,
+                reads: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads = self.reads.saturating_add(1);
+            match self.steps.pop_front().unwrap_or(self.then) {
+                Step::Byte(byte) => buf.first_mut().map_or(Ok(0), |slot| {
+                    *slot = byte;
+                    Ok(1)
+                }),
+                Step::Interrupted => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                Step::End => Ok(0),
+            }
+        }
+    }
+
+    /// Interrupted reads between bytes are retried and the chunk keeps every byte.
+    #[test]
+    fn an_interrupted_read_is_retried_without_losing_bytes() {
+        let mut reader = Scripted::new(
+            [
+                Step::Byte(b'a'),
+                Step::Byte(b'b'),
+                Step::Interrupted,
+                Step::Interrupted,
+                Step::Interrupted,
+                Step::Byte(b'c'),
+                Step::Byte(b'\n'),
+            ],
+            Step::End,
+        );
+        let mut out = String::new();
+        let read = read_progress_chunk(&mut reader, &mut out);
+        assert!(matches!(read, Ok(4)), "got {read:?}");
+        assert_eq!(out, "abc\n");
+    }
+
+    /// A reader interrupted on every read is refused once the retry bound is spent.
+    #[test]
+    fn a_reader_interrupted_past_the_retry_bound_is_refused() {
+        let mut reader = Scripted::new([Step::Byte(b'a')], Step::Interrupted);
+        let mut out = String::new();
+        let read = read_progress_chunk(&mut reader, &mut out);
+        assert!(
+            read.as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::Interrupted),
+            "got {read:?}"
+        );
+        assert_eq!(
+            reader.reads,
+            RELAY_INTERRUPT_RETRIES.saturating_add(2),
+            "one byte, the bounded retries, then the refused read"
+        );
     }
 }

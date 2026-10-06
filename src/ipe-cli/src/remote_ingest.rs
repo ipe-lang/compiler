@@ -634,20 +634,38 @@ pub enum InheritedRole {
     UserProgram,
 }
 
+impl InheritedRole {
+    /// Whether a child in this role must read every byte it is fed.
+    ///
+    /// An installer that stops reading its script early ran only part of it,
+    /// whatever its exit status says; a build or the user's program may stop
+    /// reading when it has what it needs.
+    const fn consumes_all_input(self) -> bool {
+        match self {
+            Self::InteractiveInstall => true,
+            Self::SelfBuild | Self::UserProgram => false,
+        }
+    }
+}
+
 /// What an inherited child reads on its stdin.
 #[derive(Debug)]
 pub enum InheritedInput {
     /// The CLI's own stdin, the user's terminal.
     Terminal,
+    /// The null device: the child reads the end of its input at once.
+    Null,
     /// These bytes, already held to a ceiling where they were read.
     Bytes(Zeroizing<Vec<u8>>),
 }
 
-/// Why an inherited child produced no exit status.
+/// Why an inherited child produced no exit status the caller may accept.
 #[derive(Debug)]
 pub enum InheritedError {
     /// The hardened spawner refused or failed to start the child.
     Spawn(ipe_runtime_rust::system::SpawnRefusal),
+    /// The child, in a role that must read all of its input, exited 0 with part of it unwritten.
+    Feed(std::io::ErrorKind),
     /// Waiting on the child failed.
     Wait(std::io::Error),
 }
@@ -656,6 +674,7 @@ impl std::fmt::Display for InheritedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spawn(refusal) => refusal.fmt(f),
+            Self::Feed(kind) => write!(f, "the child stopped reading its input early ({kind})"),
             Self::Wait(e) => e.fmt(f),
         }
     }
@@ -665,6 +684,7 @@ impl From<InheritedError> for std::io::Error {
     fn from(error: InheritedError) -> Self {
         match error {
             InheritedError::Spawn(refusal) => refusal.into(),
+            InheritedError::Feed(kind) => kind.into(),
             InheritedError::Wait(e) => e,
         }
     }
@@ -676,19 +696,33 @@ impl From<InheritedError> for std::io::Error {
 /// descriptor besides stdio and, on Linux, dies with the CLI. No ceiling holds
 /// it; `role` names why none is needed. Stdout and stderr keep whatever the
 /// caller set on `command` (the terminal's by default). `input` is its stdin:
-/// the terminal, or bytes written to a pipe and then closed.
+/// the terminal, the null device, or bytes fed to a pipe while the CLI waits on
+/// the child, the pipe closed once they are written or the child exits.
+///
+/// A fed child that closes its stdin or exits before the CLI wrote every byte
+/// has not read its whole input. In a role that must read all of it
+/// ([`InheritedRole::InteractiveInstall`]) that is refused on exit 0, which
+/// cannot then mean the whole input ran; a non-zero exit is already a failure
+/// and is returned as the status that names it. Another role is judged by its
+/// exit status alone. Bytes written into the pipe and never read by an exiting
+/// child are not seen.
 ///
 /// # Errors
 /// [`InheritedError::Spawn`] when the child cannot start;
-/// [`InheritedError::Wait`] when waiting on it fails.
+/// [`InheritedError::Feed`] when a child that must read all of its input
+/// exited 0 without reading it; [`InheritedError::Wait`] when waiting on it fails.
 pub fn run_inherited(
     mut command: Command,
-    _role: InheritedRole,
+    role: InheritedRole,
     input: InheritedInput,
 ) -> Result<ExitStatus, InheritedError> {
     let bytes = match input {
         InheritedInput::Terminal => {
             command.stdin(Stdio::inherit());
+            None
+        }
+        InheritedInput::Null => {
+            command.stdin(Stdio::null());
             None
         }
         InheritedInput::Bytes(bytes) => {
@@ -698,12 +732,52 @@ pub fn run_inherited(
     };
     let mut child =
         ipe_runtime_rust::system::spawn_hardened(command).map_err(InheritedError::Spawn)?;
-    if let (Some(bytes), Some(mut pipe)) = (bytes, child.stdin.take()) {
-        // A child that exits without reading its stdin is judged by its exit
-        // status, not by this write; the pipe closes when it drops.
-        let _ = std::io::Write::write_all(&mut pipe, &bytes);
+    let Some(bytes) = bytes else {
+        return child.wait().map_err(InheritedError::Wait);
+    };
+    let (status, shortfall) = feed_until_exit(&mut child, bytes)?;
+    match shortfall {
+        Some(kind) if role.consumes_all_input() && status.success() => {
+            Err(InheritedError::Feed(kind))
+        }
+        Some(_) | None => Ok(status),
     }
-    child.wait().map_err(InheritedError::Wait)
+}
+
+/// Feed `bytes` to `child`'s stdin while waiting for it, returning its status and how the feed fell short.
+///
+/// The write never blocks the wait: the feed is pumped between polls of the
+/// child, and once the child exits the pipe closes with whatever is left, so a
+/// child, or a descendant holding its stdin, that stops reading cannot hold
+/// the CLI past the child's own exit.
+fn feed_until_exit(
+    child: &mut Child,
+    bytes: Zeroizing<Vec<u8>>,
+) -> Result<(ExitStatus, Option<std::io::ErrorKind>), InheritedError> {
+    let feed = child
+        .stdin
+        .take()
+        .ok_or(std::io::ErrorKind::BrokenPipe)
+        .and_then(|pipe| pipes::Feed::new(pipe, bytes).map_err(|e| e.kind()));
+    let mut feed = match feed {
+        Ok(feed) => feed,
+        Err(kind) => {
+            let status = child.wait().map_err(InheritedError::Wait)?;
+            return Ok((status, Some(kind)));
+        }
+    };
+    let mut idle = IDLE_MIN;
+    let status = loop {
+        let moved = feed.pump();
+        if !feed.is_open() {
+            break child.wait().map_err(InheritedError::Wait)?;
+        }
+        if let Some(status) = child.try_wait().map_err(InheritedError::Wait)? {
+            break status;
+        }
+        idle = pause(moved, idle);
+    };
+    Ok((status, feed.shortfall()))
 }
 
 /// The declared ingest ceilings of one remote surface.
@@ -1286,7 +1360,7 @@ impl std::fmt::Display for LocalSource {
             Self::LinkProbe => "linker probe",
             Self::FfiInspect => "FFI inspector",
             Self::WasmTool => "wasm bundle tool",
-            Self::SelfRun => "`ipe dev run` of an example",
+            Self::SelfRun => "self-run of a snippet",
         })
     }
 }
@@ -2650,6 +2724,8 @@ mod pipes {
         bytes: Zeroizing<Vec<u8>>,
         /// How many of `bytes` were written.
         written: usize,
+        /// How the write failed, once it did.
+        failed: Option<ErrorKind>,
     }
 
     impl Feed {
@@ -2659,13 +2735,27 @@ mod pipes {
                 pipe: Some(nonblocking(pipe)?),
                 bytes,
                 written: 0,
+                failed: None,
             })
+        }
+
+        /// Whether the pipe is still open, the buffer neither written nor refused.
+        pub const fn is_open(&self) -> bool {
+            self.pipe.is_some()
+        }
+
+        /// How the feed fell short of the whole buffer, if it did.
+        ///
+        /// A buffer not wholly written with no failed write is a pipe the
+        /// child left before reading it: [`ErrorKind::BrokenPipe`].
+        pub fn shortfall(&self) -> Option<ErrorKind> {
+            (self.written < self.bytes.len())
+                .then_some(self.failed.unwrap_or(ErrorKind::BrokenPipe))
         }
 
         /// Write what the pipe takes, returning whether any byte was written.
         ///
-        /// A child that exits without reading its stdin is judged by its exit
-        /// status, so a failed write only closes the pipe.
+        /// A failed write closes the pipe and is kept for [`Self::shortfall`].
         pub fn pump(&mut self) -> bool {
             let Some(pipe) = self.pipe.as_mut() else {
                 return false;
@@ -2680,8 +2770,14 @@ mod pipes {
                 match pipe.write(rest) {
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
                         self.pipe = None;
+                        self.failed = Some(ErrorKind::WriteZero);
+                        break;
+                    }
+                    Err(e) => {
+                        self.pipe = None;
+                        self.failed = Some(e.kind());
                         break;
                     }
                     Ok(n) => {
@@ -2703,7 +2799,7 @@ mod pipes {
 
     use zeroize::Zeroizing;
 
-    use super::{ByteBudget, CaptureOutcome, capture};
+    use super::{ByteBudget, CaptureOutcome, POLL_INTERVAL, capture};
 
     /// One output pipe, read to its end on its own thread.
     pub struct Reader {
@@ -2792,8 +2888,10 @@ mod pipes {
 
     /// A stdin pipe fed from a buffer on its own thread.
     pub struct Feed {
-        /// Signalled once the write ended, until it is seen.
-        done: Option<mpsc::Receiver<()>>,
+        /// Signalled with the write's outcome once it ended, until it is seen.
+        done: Option<mpsc::Receiver<Result<(), ErrorKind>>>,
+        /// The write's outcome, once seen.
+        outcome: Option<Result<(), ErrorKind>>,
     }
 
     impl Feed {
@@ -2806,24 +2904,52 @@ mod pipes {
             std::thread::Builder::new()
                 .name("ipe-child-stdin".to_owned())
                 .spawn(move || {
-                    // A child that exits without reading its stdin is judged by
-                    // its exit status, not by this write.
-                    let _ = pipe.write_all(&bytes);
-                    let _ = tx.send(());
+                    // The outcome reaches the waiting thread, which judges a
+                    // short write by the child's role.
+                    let _ = tx.send(pipe.write_all(&bytes).map_err(|e| e.kind()));
                 })?;
-            Ok(Self { done: Some(rx) })
+            Ok(Self {
+                done: Some(rx),
+                outcome: None,
+            })
         }
 
         /// Whether the write ended since the last pump.
         pub fn pump(&mut self) -> bool {
-            let ended = self
-                .done
-                .as_ref()
-                .is_some_and(|done| !matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
-            if ended {
-                self.done = None;
+            let Some(done) = self.done.as_ref() else {
+                return false;
+            };
+            let outcome = match done.try_recv() {
+                Ok(outcome) => outcome,
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => Err(ErrorKind::BrokenPipe),
+            };
+            self.outcome = Some(outcome);
+            self.done = None;
+            true
+        }
+
+        /// Whether the write is still running.
+        pub const fn is_open(&self) -> bool {
+            self.done.is_some()
+        }
+
+        /// How the feed fell short of the whole buffer, if it did.
+        ///
+        /// A write still running is given [`POLL_INTERVAL`] to end, since the
+        /// child it feeds has exited; one that does not end by then fell short.
+        pub fn shortfall(&mut self) -> Option<ErrorKind> {
+            if let Some(done) = self.done.take() {
+                self.outcome = Some(
+                    done.recv_timeout(POLL_INTERVAL)
+                        .unwrap_or(Err(ErrorKind::BrokenPipe)),
+                );
             }
-            ended
+            match self.outcome {
+                Some(Ok(())) => None,
+                Some(Err(kind)) => Some(kind),
+                None => Some(ErrorKind::BrokenPipe),
+            }
         }
     }
 }
@@ -4245,6 +4371,106 @@ mod tests {
             "{status:?}"
         );
         drop(held);
+    }
+
+    /// A first line, then more bytes than one pipe buffer holds, so a child that stops reading leaves some unwritten.
+    #[cfg(unix)]
+    fn script_past_pipe_buffer() -> zeroize::Zeroizing<Vec<u8>> {
+        let mut bytes = b"first\n".to_vec();
+        bytes.resize(256 * 1024, b'x');
+        zeroize::Zeroizing::new(bytes)
+    }
+
+    /// An installer that closes its stdin and exits 0 before reading its whole script is refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_that_leaves_its_script_unread_is_refused() {
+        let outcome = run_inherited(
+            sh("read -r line; exec 0<&-; exit 0"),
+            InheritedRole::InteractiveInstall,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Err(super::InheritedError::Feed(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// An installer that fails before reading its whole script keeps the exit status naming the failure.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_that_fails_early_reports_its_exit_status() {
+        let outcome = run_inherited(
+            sh("read -r line; exec 0<&-; exit 2"),
+            InheritedRole::InteractiveInstall,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.code() == Some(2)),
+            "{outcome:?}"
+        );
+    }
+
+    /// An installer that reads its whole script is judged by its exit status.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_that_reads_its_whole_script_is_accepted() {
+        let outcome = run_inherited(
+            sh("cat >/dev/null; exit 0"),
+            InheritedRole::InteractiveInstall,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
+    }
+
+    /// A child outside the installer role may stop reading its input; its exit status decides.
+    #[cfg(unix)]
+    #[test]
+    fn a_user_program_may_leave_its_input_unread() {
+        let outcome = run_inherited(
+            sh("read -r line; exec 0<&-; exit 0"),
+            InheritedRole::UserProgram,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
+    }
+
+    /// A descendant that holds the fed pipe without reading it cannot hold the CLI past the child's exit.
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_the_fed_pipe_does_not_outlive_the_child() {
+        let started = Instant::now();
+        let outcome = run_inherited(
+            sh("exec 3<&0; sleep 20 <&3 >/dev/null 2>&1 & exit 0"),
+            InheritedRole::UserProgram,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
+    }
+
+    /// A child given the null device reads the end of its input at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_null_input_child_reads_end_of_input() {
+        let outcome = run_inherited(
+            sh("read -r line && exit 3; exit 0"),
+            InheritedRole::UserProgram,
+            InheritedInput::Null,
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
     }
 
     /// The isolated git reads no user or system configuration and runs no hook.

@@ -2140,6 +2140,10 @@ upgrade: the installer could not be downloaded — nothing was changed: {detail}
 
 upgrade: the installer could not be waited on: {detail}
 
+## upgrade-installer-short-feed
+
+upgrade: the installer exited before reading its whole script, so the upgrade cannot be confirmed: {detail}
+
 ## upgrade-installer-failed
 
 upgrade: the installer exited non-zero — nothing was changed
