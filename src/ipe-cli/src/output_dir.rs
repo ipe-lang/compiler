@@ -60,6 +60,8 @@ const CLAIM_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How many times a claim tries before refusing the directory as busy.
 const MAX_CLAIM_POLLS: u32 = 200;
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the claim wait bound drops to no try at all [ledger #boundary]
+const _: () = assert!(MAX_CLAIM_POLLS > 0);
 
 /// The per-project namespace directory ipe keeps its caches in.
 pub const CACHE_NAMESPACE_DIR: &str = ".ipe";

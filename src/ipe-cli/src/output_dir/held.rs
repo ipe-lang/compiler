@@ -890,8 +890,9 @@ impl HeldDir {
     /// temp file (`.<name>.ipe-tmp.<pid>.<n>`) that is renamed over `name`, so
     /// nothing is ever written through an existing entry.
     ///
-    /// The marker and claim names are refused: no product write forges or
-    /// clobbers either.
+    /// The marker and claim names are refused in any ASCII case: no product
+    /// write forges or clobbers either, a case-insensitive filesystem
+    /// included.
     ///
     /// # Errors
     /// [`OutputRefusal::UnsafeComponent`] for the marker or claim name;
@@ -902,7 +903,7 @@ impl HeldDir {
         permissions: Option<std::fs::Permissions>,
         fill: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
     ) -> Result<(), CliError> {
-        if name == OWNERSHIP_MARKER || name == CLAIM_FILE {
+        if Self::is_reserved(name) {
             return Err(OutputRefusal::UnsafeComponent(self.path.join(name)).into());
         }
         if self.kind_of(name)? == EntryKind::Symlink {
@@ -910,6 +911,14 @@ impl HeldDir {
         }
         let tmp = format!(".{}.ipe-tmp.{}", name.to_string_lossy(), temp_suffix());
         self.replace_file(name, OsStr::new(&tmp), permissions, fill)
+    }
+
+    /// Whether `name` spells the marker or the claim name, in any ASCII case.
+    fn is_reserved(name: &OsStr) -> bool {
+        let name = name.to_string_lossy();
+        [OWNERSHIP_MARKER, CLAIM_FILE]
+            .into_iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
     }
 
     /// Fill the new file `tmp`, then rename it over `name`; `tmp` is removed on failure.
@@ -2218,7 +2227,12 @@ mod tests {
     fn write_file_refuses_the_marker_and_claim_names() {
         let dir = scratch("write_reserved");
         let held = held_at(&dir);
-        for name in [OWNERSHIP_MARKER, CLAIM_FILE] {
+        for name in [
+            OWNERSHIP_MARKER,
+            CLAIM_FILE,
+            ".IPE-OUTPUT",
+            ".Ipe-Output.Claim",
+        ] {
             let written = held.write_file(OsStr::new(name), None, |file| {
                 file.write_all(MARKER_TEXT.as_bytes())
             });
