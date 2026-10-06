@@ -7264,6 +7264,28 @@ fn canonicalise_asserted_call(
     // surface spelling is the full `Rust.Ffi.call`.
     let ffi_qualifier = interner.intern("Ffi")?;
     let raw_path = path.as_str().to_owned();
+    // `Ffi` must denote the generated module itself: a spelling another import
+    // owns (`import App.Shim as Ffi`) would otherwise answer the forwarder's
+    // name with an ordinary definition of that module. Read by `lookup`, never
+    // `intern`, for the interning-sequence reason above.
+    let rust = interner.lookup("Rust");
+    let foreign_ffi = env
+        .import_scope
+        .qualifier_owner
+        .get(&ffi_qualifier)
+        .is_some_and(|claim| match (&claim.owner, rust) {
+            (ModuleIdentity::Source(owner), Some(rust)) => {
+                owner.as_slice() != [rust, ffi_qualifier].as_slice()
+            }
+            (ModuleIdentity::Source(_) | ModuleIdentity::Kernel(_), _) => true,
+        });
+    if foreign_ffi {
+        return Err(malformed(format!(
+            "`Ffi` names another module here, so `{raw_path}` has no asserted \
+             binding — a native binding resolves through the generated `Rust.Ffi` \
+             module, which no other import may spell `Ffi`"
+        )));
+    }
     let target = resolve_qual_var(ffi_qualifier, def_sym, span, env, interner).map_err(|_| {
         malformed(format!(
             "no asserted binding exists for `{raw_path}` — a native binding needs \

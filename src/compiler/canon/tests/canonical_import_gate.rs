@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use ipe_canon::asserted::AssertedPath;
 use ipe_canon::ast::{Def, Module, Type};
 use ipe_canon::{ModuleCatalog, ModuleExports, ModuleOrigin, canonicalise_module_in_project};
 use ipe_diagnostics::{DResult, Diagnostic, NameError};
@@ -28,11 +29,23 @@ fn run(sources: &[&str], catalog: &[&str]) -> DResult<()> {
 
 /// As [`run`], yielding the last module's canonical form and the interner.
 fn run_last(sources: &[&str], catalog: &[&str]) -> DResult<Option<(Module, Interner)>> {
+    let user: Vec<(&str, ModuleOrigin)> = sources
+        .iter()
+        .map(|src| (*src, ModuleOrigin::User))
+        .collect();
+    run_with_origins(&user, catalog)
+}
+
+/// As [`run_last`], each source canonicalised under its own origin.
+fn run_with_origins(
+    sources: &[(&str, ModuleOrigin)],
+    catalog: &[&str],
+) -> DResult<Option<(Module, Interner)>> {
     let catalog = ModuleCatalog::new(catalog.iter().map(|m| Box::<str>::from(*m)));
     let mut interner = Interner::new();
     let mut deps: BTreeMap<Vec<Symbol>, ModuleExports> = BTreeMap::new();
     let mut last = None;
-    for src in sources {
+    for &(src, origin) in sources {
         let parsed = ipe_parse::parse_module(src, &mut interner)?;
         let expected = parsed.name.value.clone();
         let borrowed: BTreeMap<Vec<Symbol>, &ModuleExports> =
@@ -42,7 +55,7 @@ fn run_last(sources: &[&str], catalog: &[&str]) -> DResult<Option<(Module, Inter
             &expected,
             &borrowed,
             &catalog,
-            ModuleOrigin::User,
+            origin,
             &mut interner,
         )?;
         deps.insert(exports.path.clone(), exports);
@@ -332,5 +345,46 @@ fn two_shapes_sub_modules_under_one_alias_are_n0027_without_a_shape() {
         "1",
     );
     let result = run(&[&admitted], &["Main"]);
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// A native binding resolves only through the generated `Rust.Ffi` module: a
+/// spelling another import owns never answers the forwarder's name with that
+/// module's own definition (IPE-N0038).
+#[test]
+fn native_binding_never_resolves_through_a_foreign_ffi_spelling() {
+    let def_name = AssertedPath::from_crate_and_path("tm", "shift");
+    let def_name = def_name.as_ref().map(AssertedPath::def_name);
+    assert!(def_name.is_ok(), "{def_name:?}");
+    let def_name = def_name.unwrap_or_default();
+    let definition = format!("{def_name} : Int -> Int\n{def_name} n =\n    n\n");
+    let shim = format!("module App.Shim exposing (..)\n\n{definition}");
+    let forwarder = format!("module Rust.Ffi exposing (..)\n\n{definition}");
+    let main = |imports: &str| {
+        format!(
+            "module Main exposing (y)\n\nimport Ipe.Ffi.Rust as Rust\n{imports}\n\
+             y : Int -> Int\ny =\n    Rust.fn \"tm\" \"shift\"\n"
+        )
+    };
+    let hijacked = main("import App.Shim as Ffi\n");
+    let result = run(&[&shim, &hijacked], &["Main", "App.Shim"]);
+    assert!(
+        matches!(
+            result,
+            Err(Diagnostic::Name {
+                msg: NameError::AssertedCallMalformed { .. },
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    let explicit = main("import Rust.Ffi\n");
+    let result = run_with_origins(
+        &[
+            (forwarder.as_str(), ModuleOrigin::FfiInterface),
+            (explicit.as_str(), ModuleOrigin::User),
+        ],
+        &["Main", "Rust.Ffi"],
+    );
     assert!(result.is_ok(), "{result:?}");
 }
