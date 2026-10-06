@@ -9922,6 +9922,38 @@ mod emitted_router_behavior_tests {
 }
 
 #[cfg(all(test, feature = "server"))]
+mod page_mount_base_tests {
+    use axum::http::{HeaderMap, StatusCode};
+
+    /// The page under the current `IPE_WEB_BASE_PATH`.
+    #[cfg(not(feature = "debugger"))]
+    fn page(headers: &HeaderMap) -> axum::response::Response {
+        super::page_response("sid", "<p>x</p>", "tok", headers)
+    }
+
+    /// The page under the current `IPE_WEB_BASE_PATH`.
+    #[cfg(feature = "debugger")]
+    fn page(headers: &HeaderMap) -> axum::response::Response {
+        super::page_response_with_overlay("sid", "<p>x</p>", "", "tok", headers)
+    }
+
+    /// A page asked for under a base outside the mount-base grammar answers the
+    /// fixed 503, never a page whose URLs and `ipe-base` meta carry that base; a
+    /// grammar base renders the page.
+    #[test]
+    fn a_non_mount_base_path_refuses_the_page() {
+        let headers = HeaderMap::new();
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/a\"b");
+        let refused = page(&headers).status();
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/app");
+        let admitted = page(&headers).status();
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(admitted, StatusCode::OK);
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
 mod route_entry_cmd_tests {
     //! Every server path that commits a routed page from a URL runs that
     //! page's entry Cmd: the first GET (after `init`'s Cmd), a reload of a live
