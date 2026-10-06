@@ -1697,21 +1697,19 @@ impl InspectorFailure {
             Self::Run(RunError::Measure(path, source)) => CliError::Io { path, source },
             Self::Run(RunError::PipeDrainTimeout(stream)) => CliError::ChildPipeHeld(stream),
             Self::Run(RunError::PipeRead(stream, kind)) => CliError::ChildPipeUnread(stream, kind),
-            Self::Exit { code, stderr } => inspector_refusal(&format!(
-                "inspector exited with {code:?}\n{}",
-                stderr.to_terminal()
+            Self::Exit {
+                code: Some(code),
+                stderr,
+            } => CliError::Usage(text::msg::ffi_inspector_exited(
+                &code,
+                &stderr.to_terminal(),
             )),
-            Self::NotUtf8 => inspector_refusal("inspector produced non-UTF-8 output"),
+            Self::Exit { code: None, stderr } => {
+                CliError::Usage(text::msg::ffi_inspector_signalled(&stderr.to_terminal()))
+            }
+            Self::NotUtf8 => CliError::Usage(text::msg::ffi_inspector_not_utf8()),
         }
     }
-}
-
-/// The `ipe add` refusal carrying `detail`, sanitised for the terminal.
-fn inspector_refusal(detail: &str) -> CliError {
-    CliError::Usage(text::msg::command_refusal(
-        &"add",
-        &crate::style::TerminalSafe::sanitize(detail),
-    ))
 }
 
 /// Run the inspector `program` with `args` outside the jail, held to `ceiling`.
