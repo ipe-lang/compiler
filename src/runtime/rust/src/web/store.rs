@@ -11,8 +11,11 @@ use super::SessionEntry;
 use crate::tea::IpeCmd;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::hash_map::Entry;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Hard ceiling on a decoded checkpoint body. A persisted blob's length is
 /// attacker-influenceable at the storage boundary (a corrupt / crafted at-rest
@@ -148,11 +151,13 @@ enum Decoded<Model, Seed> {
 }
 
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
-impl<Model, Msg> From<Decoded<Model, IpeCmd<Msg>>> for Rejoin<Model, Msg> {
-    fn from(decoded: Decoded<Model, IpeCmd<Msg>>) -> Self {
-        match decoded {
-            Decoded::Verbatim(model) => Self::Restored(model),
-            Decoded::Rebuilt { model, seed } => Self::Rebuilt {
+impl<Model, Msg> Decoded<Model, IpeCmd<Msg>> {
+    /// The rejoin this checkpoint seeds, held under `claim` until its driver is published.
+    fn into_rejoin(self, claim: SidClaim) -> Rejoin<Model, Msg> {
+        match self {
+            Self::Verbatim(model) => Rejoin::Restored { claim, model },
+            Self::Rebuilt { model, seed } => Rejoin::Rebuilt {
+                claim,
                 model,
                 init_cmd: seed,
             },
@@ -171,24 +176,207 @@ pub enum StoreHit<Model, Msg> {
     Cold(Model),
 }
 
-/// Result of a page-entry lookup that may rebuild a session across a Model change.
+/// Result of a claimed page-entry lookup that may rebuild a session across a Model change.
 ///
 /// `Live` = the in-process session. `Restored` = a checkpoint decoded verbatim
 /// (no `init`). `Rebuilt` = a checkpoint spliced onto a fresh `init` model;
 /// it carries that `init`'s Cmd, which the caller must run under the session's
-/// sid. A rebuilt model without its Cmd has no representation.
+/// sid. `Miss` = no usable session for the sid. A cold model (`Restored` or
+/// `Rebuilt`) exists only beside the [`SidClaim`] that admitted it, so no
+/// second request for the sid can seed a driver from it while the claim is
+/// held; a rebuilt model without its Cmd has no representation.
 pub enum Rejoin<Model, Msg> {
     Live(SessionHandle<Model, Msg>),
-    Restored(Model),
-    Rebuilt { model: Model, init_cmd: IpeCmd<Msg> },
+    Restored {
+        claim: SidClaim,
+        model: Model,
+    },
+    Rebuilt {
+        claim: SidClaim,
+        model: Model,
+        init_cmd: IpeCmd<Msg>,
+    },
+    Miss,
 }
 
-impl<Model, Msg> From<StoreHit<Model, Msg>> for Rejoin<Model, Msg> {
-    fn from(hit: StoreHit<Model, Msg>) -> Self {
-        match hit {
-            StoreHit::Web(handle) => Self::Live(handle),
-            StoreHit::Cold(model) => Self::Restored(model),
+// ─── Per-session single flight: one cold-to-live transition per sid at a time ───
+
+/// Length in bytes of a session id: lowercase hex digits only.
+pub const SESSION_ID_LEN: usize = 32;
+
+/// Longest a request waits behind another request's claim on the same session.
+pub const CLAIM_WAIT: Duration = Duration::from_secs(5);
+
+/// Requests that may wait behind one session's claim holder before the next is refused.
+pub const MAX_CLAIM_WAITERS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
+
+/// Distinct sessions whose claims one process holds or awaits at once.
+pub const MAX_CLAIMS_IN_FLIGHT: usize = 4096;
+
+/// A session id parsed from a cookie: exactly [`SESSION_ID_LEN`] lowercase hex digits.
+///
+/// The only key a [`SidAdmission`] admits, so a cookie of any other length
+/// or alphabet never reaches the claim table or a store lookup. Its `Debug`
+/// never prints the id.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey(String);
+
+impl SessionKey {
+    /// Parse `raw` as a session id.
+    ///
+    /// `None` unless it is exactly [`SESSION_ID_LEN`] lowercase hex digits.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        (raw.len() == SESSION_ID_LEN && raw.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .then(|| Self(raw.to_owned()))
+    }
+
+    /// The id as the stores key it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionKey(<redacted>)")
+    }
+}
+
+/// Why a [`SidAdmission::claim`] was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRefusal {
+    /// The holder kept the session's claim past [`CLAIM_WAIT`].
+    InFlight,
+    /// The session already has a holder and [`MAX_CLAIM_WAITERS`] waiters.
+    Crowded,
+    /// A new session's slot would push the table past [`MAX_CLAIMS_IN_FLIGHT`].
+    Saturated,
+}
+
+/// One session's entry in the claim table.
+struct Slot {
+    /// One permit: the claim itself.
+    sem: Arc<Semaphore>,
+    /// The holder plus every waiter; the slot is removed when the last one leaves.
+    users: usize,
+}
+
+/// Claim slots keyed by session id.
+type ClaimTable = Mutex<HashMap<SessionKey, Slot>>;
+
+/// A store's per-session claim table: at most one cold rejoin per sid at a time.
+///
+/// The table lock is a `std` mutex, never held across an await.
+#[derive(Default)]
+pub struct SidAdmission(Arc<ClaimTable>);
+
+impl SidAdmission {
+    /// An empty claim table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim session `key`, waiting at most [`CLAIM_WAIT`] behind a current holder.
+    ///
+    /// # Errors
+    ///
+    /// [`ClaimRefusal::Saturated`] when a new slot would exceed
+    /// [`MAX_CLAIMS_IN_FLIGHT`], [`ClaimRefusal::Crowded`] when the slot
+    /// already has a holder and [`MAX_CLAIM_WAITERS`] waiters, and
+    /// [`ClaimRefusal::InFlight`] when the wait runs out.
+    pub async fn claim(&self, key: SessionKey) -> Result<SidClaim, ClaimRefusal> {
+        let sem = {
+            let mut table = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let full = table.len() >= MAX_CLAIMS_IN_FLIGHT;
+            match table.entry(key.clone()) {
+                Entry::Occupied(mut held) => {
+                    let slot = held.get_mut();
+                    if slot.users > MAX_CLAIM_WAITERS.get() {
+                        return Err(ClaimRefusal::Crowded);
+                    }
+                    slot.users = slot.users.saturating_add(1);
+                    Arc::clone(&slot.sem)
+                }
+                Entry::Vacant(free) => {
+                    if full {
+                        return Err(ClaimRefusal::Saturated);
+                    }
+                    let sem = Arc::new(Semaphore::new(1));
+                    free.insert(Slot {
+                        sem: Arc::clone(&sem),
+                        users: 1,
+                    });
+                    sem
+                }
+            }
+        };
+        // Built before the wait, so a waiter cancelled mid-wait still leaves its slot.
+        let mut lease = SlotLease {
+            key,
+            table: Arc::clone(&self.0),
+            permit: None,
+        };
+        // The semaphore is never closed; an `AcquireError` is refused like a timeout.
+        match tokio::time::timeout(CLAIM_WAIT, sem.acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                lease.permit = Some(permit);
+                Ok(SidClaim { lease })
+            }
+            Ok(Err(_)) | Err(_) => Err(ClaimRefusal::InFlight),
         }
+    }
+
+    /// Whether this table issued `claim`; a claim from another store never unlocks this one.
+    #[must_use]
+    pub fn admits(&self, claim: &SidClaim) -> bool {
+        Arc::ptr_eq(&self.0, &claim.lease.table)
+    }
+}
+
+/// A holder's or waiter's place in one slot, given back on drop.
+struct SlotLease {
+    key: SessionKey,
+    table: Arc<ClaimTable>,
+    /// `Some` once the lease holds the claim; `None` while it waits.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+        drop(self.permit.take());
+        if let Some(slot) = table.get_mut(&self.key) {
+            slot.users = slot.users.saturating_sub(1);
+            if slot.users == 0 {
+                table.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// The exclusive right to turn session [`SidClaim::key`] from cold to live.
+///
+/// Released on drop on every exit: return, `?`, cancellation or unwind.
+pub struct SidClaim {
+    lease: SlotLease,
+}
+
+impl SidClaim {
+    /// The claimed session id.
+    #[must_use]
+    pub const fn key(&self) -> &SessionKey {
+        &self.lease.key
+    }
+}
+
+impl std::fmt::Debug for SidClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SidClaim")
+            .field("key", &self.lease.key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -200,8 +388,21 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// Look up a session by sid. `None` = unknown (caller creates a new one).
     async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>>;
 
-    /// Look up a session by sid, reconstructing across a purely-additive Model
-    /// change. Behaves exactly like [`get`](SessionStore::get) on a live-handle
+    /// This store's per-session claim table.
+    fn admission(&self) -> &SidAdmission;
+
+    /// Claim session `key` for a page entry; see [`SidAdmission::claim`].
+    ///
+    /// # Errors
+    ///
+    /// The [`ClaimRefusal`] the claim table returns.
+    async fn claim(&self, key: SessionKey) -> Result<SidClaim, ClaimRefusal> {
+        self.admission().claim(key).await
+    }
+
+    /// Look up the claimed session, reconstructing across a purely-additive Model change.
+    ///
+    /// Behaves exactly like [`get`](SessionStore::get) on a live-handle
     /// hit and on an exact-schema checkpoint. The one difference: when a
     /// PERSISTED checkpoint's schema tag no longer matches this binary's (the
     /// Model changed), instead of the flat miss `get` returns, it attempts an
@@ -210,7 +411,10 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// plus the Cmd `make_init` returned beside it) ONLY if the merge is a
     /// proven additive superset that decodes strictly (old state kept, new
     /// fields filled from `init`). Any non-additive change, corrupt / oversized
-    /// body, or pre-`v2` row → `None` (the caller re-inits cleanly).
+    /// body, or pre-`v2` row → `Miss` (the caller re-inits cleanly). A claim
+    /// this store's [`admission`](SessionStore::admission) did not issue is a
+    /// `Miss` too. A cold result carries `claim` back to the caller; a `Live`
+    /// or `Miss` result releases it.
     ///
     /// `make_init` is a live `init` producer, invoked LAZILY — only on a
     /// schema-mismatched cold row, never on a live hit or a matched restore —
@@ -222,14 +426,25 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// schema change is a plain miss there and `Rebuilt` is never returned.
     async fn get_reconstructing(
         &self,
-        sid: &str,
+        claim: SidClaim,
         make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
-    ) -> Option<Rejoin<Model, Msg>> {
+    ) -> Rejoin<Model, Msg> {
         let _ = make_init;
-        self.get(sid).await.map(Rejoin::from)
+        if !self.admission().admits(&claim) {
+            return Rejoin::Miss;
+        }
+        match self.get(claim.key().as_str()).await {
+            Some(StoreHit::Web(handle)) => Rejoin::Live(handle),
+            Some(StoreHit::Cold(model)) => Rejoin::Restored { claim, model },
+            None => Rejoin::Miss,
+        }
     }
     /// Insert/refresh the live handle (and, for persistent backends, checkpoint
     /// the model). Called on session create and write-through on every commit.
+    ///
+    /// The handle is visible to [`get`](SessionStore::get) before the
+    /// persistence I/O starts, so a claim released after `set` returns hands
+    /// the next request for the sid a `Live` session, never a cold one.
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>);
     /// Drop a session.
     async fn delete(&self, sid: &str);
@@ -263,6 +478,7 @@ type SessionMap<Model, Msg> = HashMap<String, (SessionHandle<Model, Msg>, Instan
 pub struct MemoryStore<Model, Msg> {
     sessions: RwLock<SessionMap<Model, Msg>>,
     ttl: Duration,
+    admission: SidAdmission,
 }
 
 impl<Model, Msg> MemoryStore<Model, Msg> {
@@ -270,6 +486,7 @@ impl<Model, Msg> MemoryStore<Model, Msg> {
         MemoryStore {
             sessions: RwLock::new(HashMap::new()),
             ttl,
+            admission: SidAdmission::new(),
         }
     }
 }
@@ -284,6 +501,9 @@ impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
             *seen = Instant::now(); // touch — keep active sessions alive
             StoreHit::Web(h.clone())
         })
+    }
+    fn admission(&self) -> &SidAdmission {
+        &self.admission
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         self.sessions
@@ -348,6 +568,7 @@ pub struct FileStore<Model, Msg> {
     schema_tag: [u8; 32],
     /// Whether the last map write failed, so a failure streak is logged once.
     persist_failing: std::sync::atomic::AtomicBool,
+    admission: SidAdmission,
 }
 
 /// Why a checkpoint-map persist attempt failed, one variant per step.
@@ -417,6 +638,7 @@ impl<Model, Msg> FileStore<Model, Msg> {
             ttl,
             schema_tag,
             persist_failing: std::sync::atomic::AtomicBool::new(false),
+            admission: SidAdmission::new(),
         }
     }
 
@@ -493,11 +715,18 @@ where
         let model: Model = decode_checkpoint(&self.schema_tag, &blob)?;
         Some(StoreHit::Cold(model))
     }
+    fn admission(&self) -> &SidAdmission {
+        &self.admission
+    }
     async fn get_reconstructing(
         &self,
-        sid: &str,
+        claim: SidClaim,
         make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
-    ) -> Option<Rejoin<Model, Msg>> {
+    ) -> Rejoin<Model, Msg> {
+        if !self.admission.admits(&claim) {
+            return Rejoin::Miss;
+        }
+        let sid = claim.key().as_str();
         // Live handle wins, exactly as `get` — no `init`, no reconstruction.
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
@@ -507,20 +736,17 @@ where
             })
         };
         if let Some(h) = cached {
-            return Some(Rejoin::Live(h));
+            return Rejoin::Live(h);
         }
         // Cold: on an exact tag the checkpoint decodes verbatim; on a
         // schema-changed tag it is spliced onto `init` iff additive-superset.
         let blob = {
             let disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
             disk.get(sid).map(|(b, _)| b.clone())
-        }?;
-        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
-            &self.schema_tag,
-            &blob,
-            make_init,
-        )?);
-        Some(rejoin)
+        };
+        let decoded = blob
+            .and_then(|blob| decode_or_reconstruct_checkpoint(&self.schema_tag, &blob, make_init));
+        decoded.map_or(Rejoin::Miss, |d| d.into_rejoin(claim))
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -725,6 +951,7 @@ pub struct SqliteStore<Model, Msg> {
     /// stored tag differs is rejected BEFORE deserialization — treated
     /// identically to "no row" (fail-soft to a fresh `init`).
     schema_tag: [u8; 32],
+    admission: SidAdmission,
 }
 
 #[cfg(feature = "db")]
@@ -764,6 +991,7 @@ impl<Model, Msg> SqliteStore<Model, Msg> {
             mem_cache: RwLock::new(HashMap::new()),
             ttl,
             schema_tag,
+            admission: SidAdmission::new(),
         })
     }
 }
@@ -812,11 +1040,18 @@ where
             .await;
         Some(StoreHit::Cold(model))
     }
+    fn admission(&self) -> &SidAdmission {
+        &self.admission
+    }
     async fn get_reconstructing(
         &self,
-        sid: &str,
+        claim: SidClaim,
         make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
-    ) -> Option<Rejoin<Model, Msg>> {
+    ) -> Rejoin<Model, Msg> {
+        if !self.admission.admits(&claim) {
+            return Rejoin::Miss;
+        }
+        let sid = claim.key().as_str();
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
             w.get_mut(sid).map(|(h, seen)| {
@@ -830,7 +1065,7 @@ where
                 .bind(sid)
                 .execute(&self.pool)
                 .await;
-            return Some(Rejoin::Live(h));
+            return Rejoin::Live(h);
         }
         let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = ?")
             .bind(sid)
@@ -838,17 +1073,17 @@ where
             .await
             .ok()
             .flatten();
-        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
-            &self.schema_tag,
-            &row?.0,
-            make_init,
-        )?);
+        let Some(decoded) = row.and_then(|(blob,)| {
+            decode_or_reconstruct_checkpoint(&self.schema_tag, &blob, make_init)
+        }) else {
+            return Rejoin::Miss;
+        };
         let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = ? WHERE sid = ?")
             .bind(now_secs())
             .bind(sid)
             .execute(&self.pool)
             .await;
-        Some(rejoin)
+        decoded.into_rejoin(claim)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -932,6 +1167,7 @@ pub struct PostgresStore<Model, Msg> {
     ttl: Duration,
     /// See [`SqliteStore::schema_tag`] — same H24 reject-before-deserialize gate.
     schema_tag: [u8; 32],
+    admission: SidAdmission,
 }
 
 #[cfg(feature = "db")]
@@ -967,6 +1203,7 @@ impl<Model, Msg> PostgresStore<Model, Msg> {
             mem_cache: RwLock::new(HashMap::new()),
             ttl,
             schema_tag,
+            admission: SidAdmission::new(),
         })
     }
 }
@@ -1010,11 +1247,18 @@ where
             .await;
         Some(StoreHit::Cold(model))
     }
+    fn admission(&self) -> &SidAdmission {
+        &self.admission
+    }
     async fn get_reconstructing(
         &self,
-        sid: &str,
+        claim: SidClaim,
         make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
-    ) -> Option<Rejoin<Model, Msg>> {
+    ) -> Rejoin<Model, Msg> {
+        if !self.admission.admits(&claim) {
+            return Rejoin::Miss;
+        }
+        let sid = claim.key().as_str();
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
             w.get_mut(sid).map(|(h, seen)| {
@@ -1028,7 +1272,7 @@ where
                 .bind(sid)
                 .execute(&self.pool)
                 .await;
-            return Some(Rejoin::Live(h));
+            return Rejoin::Live(h);
         }
         let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = $1")
             .bind(sid)
@@ -1036,17 +1280,17 @@ where
             .await
             .ok()
             .flatten();
-        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
-            &self.schema_tag,
-            &row?.0,
-            make_init,
-        )?);
+        let Some(decoded) = row.and_then(|(blob,)| {
+            decode_or_reconstruct_checkpoint(&self.schema_tag, &blob, make_init)
+        }) else {
+            return Rejoin::Miss;
+        };
         let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = $1 WHERE sid = $2")
             .bind(now_secs())
             .bind(sid)
             .execute(&self.pool)
             .await;
-        Some(rejoin)
+        decoded.into_rejoin(claim)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -1137,6 +1381,7 @@ pub struct RedisStore<Model, Msg> {
     ttl_secs: u64,
     /// See [`SqliteStore::schema_tag`] — same H24 reject-before-deserialize gate.
     schema_tag: [u8; 32],
+    admission: SidAdmission,
 }
 
 #[cfg(feature = "redis_store")]
@@ -1173,6 +1418,7 @@ impl<Model, Msg> RedisStore<Model, Msg> {
             mem_cache: RwLock::new(HashMap::new()),
             ttl_secs: ttl.as_secs().max(1),
             schema_tag,
+            admission: SidAdmission::new(),
         })
     }
 }
@@ -1213,11 +1459,18 @@ where
         let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
         Some(StoreHit::Cold(model))
     }
+    fn admission(&self) -> &SidAdmission {
+        &self.admission
+    }
     async fn get_reconstructing(
         &self,
-        sid: &str,
+        claim: SidClaim,
         make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
-    ) -> Option<Rejoin<Model, Msg>> {
+    ) -> Rejoin<Model, Msg> {
+        if !self.admission.admits(&claim) {
+            return Rejoin::Miss;
+        }
+        let sid = claim.key().as_str();
         use redis::AsyncCommands;
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
@@ -1229,21 +1482,22 @@ where
         let mut conn = self.conn.clone();
         if let Some(h) = cached {
             let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
-            return Some(Rejoin::Live(h));
+            return Rejoin::Live(h);
         }
         let blob: Option<String> = redis::cmd("HGET")
             .arg(redis_key(sid))
             .arg("blob")
             .query_async(&mut conn)
             .await
-            .ok()?;
-        let rejoin = Rejoin::from(decode_or_reconstruct_checkpoint(
-            &self.schema_tag,
-            &blob?,
-            make_init,
-        )?);
+            .ok()
+            .flatten();
+        let Some(decoded) = blob
+            .and_then(|blob| decode_or_reconstruct_checkpoint(&self.schema_tag, &blob, make_init))
+        else {
+            return Rejoin::Miss;
+        };
         let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
-        Some(rejoin)
+        decoded.into_rejoin(claim)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
         let model = handle
@@ -2674,6 +2928,20 @@ mod tests {
     #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
     use serde::{Deserialize, Serialize};
 
+    // The well-formed sid every claimed lookup below is keyed under.
+    const SID: &str = "0123456789abcdef0123456789abcdef";
+
+    // Claim `sid` on `s` and look it up, reconstructing across a Model change.
+    async fn reconstruct<M: Send + 'static, C: Send + 'static>(
+        s: &impl SessionStore<M, C>,
+        sid: &str,
+        init: &(dyn Fn() -> (M, IpeCmd<C>) + Sync),
+    ) -> Rejoin<M, C> {
+        let key = SessionKey::parse(sid).expect("a test sid is well formed");
+        let claim = s.claim(key).await.expect("an idle sid is claimed at once");
+        s.get_reconstructing(claim, init).await
+    }
+
     // The OLD Model: two fields. A checkpoint persists JSON of this under
     // `OLD_TAG`.
     #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
@@ -2771,7 +3039,7 @@ mod tests {
             // OLD binary: persist a two-field checkpoint under OLD_TAG.
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
             s.set(
-                "s1",
+                SID,
                 handle_model(OldModel {
                     count: 7,
                     name: "alice".to_string(),
@@ -2784,7 +3052,7 @@ mod tests {
             // gate) drops it; `get_reconstructing` splices it.
             let s: FileStore<NewModel, ()> = FileStore::new(p, Duration::from_secs(60), NEW_TAG);
             assert!(
-                s.get("s1").await.is_none(),
+                s.get(SID).await.is_none(),
                 "the exact-tag gate still drops a schema-changed row"
             );
             let init = || {
@@ -2797,12 +3065,15 @@ mod tests {
                     init_marker(),
                 )
             };
-            let rejoin = s.get_reconstructing("s1", &init).await;
+            let rejoin = reconstruct(&s, SID, &init).await;
             assert!(
-                matches!(rejoin, Some(Rejoin::Rebuilt { .. })),
+                matches!(rejoin, Rejoin::Rebuilt { .. }),
                 "expected a rebuilt model across the additive change"
             );
-            let Some(Rejoin::Rebuilt { model, init_cmd }) = rejoin else {
+            let Rejoin::Rebuilt {
+                model, init_cmd, ..
+            } = rejoin
+            else {
                 return;
             };
             assert_eq!(
@@ -2823,7 +3094,7 @@ mod tests {
     }
 
     /// File store: a NON-additive change (a retyped field) through
-    /// `get_reconstructing` falls back to a clean re-init (`None`), never a
+    /// `get_reconstructing` falls back to a clean re-init (`Miss`), never a
     /// coerced Model.
     #[cfg(feature = "web")]
     #[tokio::test]
@@ -2835,7 +3106,7 @@ mod tests {
         {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
             s.set(
-                "s1",
+                SID,
                 handle_model(OldModel {
                     count: 7,
                     name: "alice".to_string(),
@@ -2856,7 +3127,7 @@ mod tests {
                 )
             };
             assert!(
-                s.get_reconstructing("s1", &init).await.is_none(),
+                matches!(reconstruct(&s, SID, &init).await, Rejoin::Miss),
                 "a retyped field must re-init cleanly, never coerce the old value"
             );
         }
@@ -2875,7 +3146,7 @@ mod tests {
         {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
             s.set(
-                "s1",
+                SID,
                 handle_model(OldModel {
                     count: 7,
                     name: "alice".to_string(),
@@ -2888,7 +3159,7 @@ mod tests {
                 FileStore::new(p, Duration::from_secs(60), NEW_TAG);
             let init = || (RemovedModel { count: 0 }, init_marker());
             assert!(
-                s.get_reconstructing("s1", &init).await.is_none(),
+                matches!(reconstruct(&s, SID, &init).await, Rejoin::Miss),
                 "a removed field is not an additive superset — must re-init"
             );
         }
@@ -2908,7 +3179,7 @@ mod tests {
         {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
             s.set(
-                "s1",
+                SID,
                 handle_model(OldModel {
                     count: 7,
                     name: "alice".to_string(),
@@ -2929,12 +3200,12 @@ mod tests {
                     init_marker(),
                 )
             };
-            let rejoin = s.get_reconstructing("s1", &init).await;
+            let rejoin = reconstruct(&s, SID, &init).await;
             assert!(
-                matches!(rejoin, Some(Rejoin::Restored(_))),
+                matches!(rejoin, Rejoin::Restored { .. }),
                 "expected the checkpoint restored verbatim under the same tag, never rebuilt"
             );
-            let Some(Rejoin::Restored(m)) = rejoin else {
+            let Rejoin::Restored { model: m, .. } = rejoin else {
                 return;
             };
             assert_eq!(
@@ -2950,7 +3221,7 @@ mod tests {
     }
 
     /// File store: a CORRUPT persisted body (non-base64) re-inits cleanly
-    /// through `get_reconstructing` — `None`, never a panic.
+    /// through `get_reconstructing` — `Miss`, never a panic.
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_reconstructing_corrupt_body_falls_back_to_reinit() {
@@ -2960,7 +3231,7 @@ mod tests {
         let _ = std::fs::remove_file(p);
         // Seed a raw corrupt row directly in the on-disk map, bypassing `set`.
         let mut seed: HashMap<String, (String, i64)> = HashMap::new();
-        seed.insert("s1".to_string(), ("!! not base64 !!".to_string(), 0));
+        seed.insert(SID.to_string(), ("!! not base64 !!".to_string(), 0));
         std::fs::write(p, serde_json::to_string(&seed).unwrap()).unwrap();
         let s: FileStore<NewModel, ()> = FileStore::new(p, Duration::from_secs(60), NEW_TAG);
         let init = || {
@@ -2974,7 +3245,7 @@ mod tests {
             )
         };
         assert!(
-            s.get_reconstructing("s1", &init).await.is_none(),
+            matches!(reconstruct(&s, SID, &init).await, Rejoin::Miss),
             "a corrupt body must re-init cleanly, never panic"
         );
         let _ = std::fs::remove_file(p);
@@ -2996,7 +3267,7 @@ mod tests {
                     .await
                     .unwrap();
             s.set(
-                "s1",
+                SID,
                 handle_model(OldModel {
                     count: 7,
                     name: "alice".to_string(),
@@ -3010,7 +3281,7 @@ mod tests {
                     .await
                     .unwrap();
             assert!(
-                s.get("s1").await.is_none(),
+                s.get(SID).await.is_none(),
                 "the exact-tag gate still drops a schema-changed row"
             );
             let init = || {
@@ -3023,12 +3294,15 @@ mod tests {
                     init_marker(),
                 )
             };
-            let rejoin = s.get_reconstructing("s1", &init).await;
+            let rejoin = reconstruct(&s, SID, &init).await;
             assert!(
-                matches!(rejoin, Some(Rejoin::Rebuilt { .. })),
+                matches!(rejoin, Rejoin::Rebuilt { .. }),
                 "expected a rebuilt model across the additive change"
             );
-            let Some(Rejoin::Rebuilt { model, init_cmd }) = rejoin else {
+            let Rejoin::Rebuilt {
+                model, init_cmd, ..
+            } = rejoin
+            else {
                 return;
             };
             assert_eq!(
@@ -3058,7 +3332,7 @@ mod tests {
                 )
             };
             assert!(
-                s2.get_reconstructing("s1", &init2).await.is_none(),
+                matches!(reconstruct(&s2, SID, &init2).await, Rejoin::Miss),
                 "a retyped field on a durable row must re-init, never coerce"
             );
         }
@@ -3073,16 +3347,331 @@ mod tests {
         let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let init = || ((), IpeCmd::None);
         assert!(
-            s.get_reconstructing("absent", &init).await.is_none(),
+            matches!(reconstruct(&s, SID, &init).await, Rejoin::Miss),
             "a memory-store miss has nothing to reconstruct from"
         );
-        s.set("a", handle()).await;
+        s.set(SID, handle()).await;
         assert!(
-            matches!(
-                s.get_reconstructing("a", &init).await,
-                Some(Rejoin::Live(_))
-            ),
+            matches!(reconstruct(&s, SID, &init).await, Rejoin::Live(_)),
             "a live memory handle is returned unchanged, never rebuilt"
         );
+    }
+
+    // ── Per-session claims: one cold rejoin per sid at a time ───────────────
+
+    // The `i`-th well-formed sid.
+    fn key(i: usize) -> SessionKey {
+        SessionKey::parse(&format!("{i:032x}")).expect("a 32-hex sid parses")
+    }
+
+    // Slots a claim table holds (held or awaited sids).
+    fn slots(admission: &SidAdmission) -> usize {
+        admission
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    // Whether a claim future is still waiting after one poll.
+    fn waits<F: std::future::Future + Unpin>(claim: &mut F) -> bool {
+        futures_util::FutureExt::now_or_never(claim).is_none()
+    }
+
+    /// A second claim on a held sid waits, then joins the session the holder published.
+    #[tokio::test(start_paused = true)]
+    async fn claim_second_waits_then_joins_live() {
+        let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let first = s
+            .claim(key(1))
+            .await
+            .expect("an idle sid is claimed at once");
+        let mut second = s.claim(key(1));
+        assert!(waits(&mut second), "a held sid's second claim waits");
+        s.set(first.key().as_str(), handle()).await;
+        drop(first);
+        let second = second.await.expect("a released claim passes to its waiter");
+        let init = || ((), IpeCmd::<()>::None);
+        assert!(
+            matches!(s.get_reconstructing(second, &init).await, Rejoin::Live(_)),
+            "the waiter joins the published session live"
+        );
+        assert_eq!(
+            slots(s.admission()),
+            0,
+            "every released claim leaves the table"
+        );
+    }
+
+    /// A claim waiting past `CLAIM_WAIT` is refused `InFlight`; one tick short it still waits.
+    #[tokio::test(start_paused = true)]
+    async fn claim_wait_expires_in_flight() {
+        let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let _held = s
+            .claim(key(1))
+            .await
+            .expect("an idle sid is claimed at once");
+        let mut waiter = s.claim(key(1));
+        assert!(waits(&mut waiter), "a held sid's claim waits");
+        let tick = Duration::from_millis(1);
+        tokio::time::advance(CLAIM_WAIT.saturating_sub(tick)).await;
+        assert!(
+            waits(&mut waiter),
+            "a claim still inside the wait keeps waiting"
+        );
+        tokio::time::advance(tick.saturating_mul(2)).await;
+        assert_eq!(waiter.await.err(), Some(ClaimRefusal::InFlight));
+        assert_eq!(
+            slots(s.admission()),
+            1,
+            "the expired waiter leaves only the holder"
+        );
+    }
+
+    /// The waiter one past `MAX_CLAIM_WAITERS` is refused `Crowded` at once.
+    #[tokio::test(start_paused = true)]
+    async fn claim_crowded_past_waiters() {
+        let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let _held = s
+            .claim(key(1))
+            .await
+            .expect("an idle sid is claimed at once");
+        let mut waiters: Vec<_> = (0..MAX_CLAIM_WAITERS.get())
+            .map(|_| s.claim(key(1)))
+            .collect();
+        for waiter in &mut waiters {
+            assert!(waits(waiter), "a waiter up to the limit queues");
+        }
+        assert_eq!(
+            s.claim(key(1)).await.err(),
+            Some(ClaimRefusal::Crowded),
+            "the waiter past the limit is refused"
+        );
+    }
+
+    /// A new sid past `MAX_CLAIMS_IN_FLIGHT` is refused `Saturated`; a held sid still queues.
+    #[tokio::test(start_paused = true)]
+    async fn claim_saturated_past_table_cap() {
+        let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let mut held = Vec::with_capacity(MAX_CLAIMS_IN_FLIGHT);
+        for i in 0..MAX_CLAIMS_IN_FLIGHT {
+            held.push(
+                s.claim(key(i))
+                    .await
+                    .expect("a sid under the cap is claimed"),
+            );
+        }
+        assert_eq!(
+            s.claim(key(MAX_CLAIMS_IN_FLIGHT)).await.err(),
+            Some(ClaimRefusal::Saturated),
+            "a new sid past the cap is refused"
+        );
+        let mut joining = s.claim(key(0));
+        assert!(
+            waits(&mut joining),
+            "a held sid still queues its waiter at the cap"
+        );
+        drop(held);
+        assert!(joining.await.is_ok(), "the waiter takes the released claim");
+        assert!(
+            s.claim(key(MAX_CLAIMS_IN_FLIGHT)).await.is_ok(),
+            "a freed table admits a new sid again"
+        );
+    }
+
+    /// A claim future dropped while it waits gives its waiter place back.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_claim_future_releases_slot() {
+        let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let held = s
+            .claim(key(1))
+            .await
+            .expect("an idle sid is claimed at once");
+        for _ in 0..MAX_CLAIM_WAITERS.get().saturating_mul(2) {
+            let mut cancelled = s.claim(key(1));
+            assert!(waits(&mut cancelled), "a waiter under the limit queues");
+        }
+        let mut waiters: Vec<_> = (0..MAX_CLAIM_WAITERS.get())
+            .map(|_| s.claim(key(1)))
+            .collect();
+        for waiter in &mut waiters {
+            assert!(
+                waits(waiter),
+                "cancelled waiters never count against the limit"
+            );
+        }
+        drop(waiters);
+        drop(held);
+        assert_eq!(slots(s.admission()), 0, "no cancelled waiter pins the slot");
+    }
+
+    /// A holder's drop, on return or unwind, frees the sid and removes its slot.
+    #[tokio::test(start_paused = true)]
+    async fn holder_drop_releases_and_removes_slot() {
+        let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let held = s
+            .claim(key(1))
+            .await
+            .expect("an idle sid is claimed at once");
+        assert_eq!(slots(s.admission()), 1);
+        drop(held);
+        assert_eq!(slots(s.admission()), 0, "a dropped holder removes its slot");
+        let held = s
+            .claim(key(1))
+            .await
+            .expect("a freed sid is claimed at once");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = held;
+            let nothing: Option<()> = std::hint::black_box(None);
+            nothing.expect("unwinds while holding the claim");
+        }));
+        assert!(unwound.is_err(), "the holder unwound");
+        assert_eq!(
+            slots(s.admission()),
+            0,
+            "an unwound holder removes its slot"
+        );
+        assert!(
+            s.claim(key(1)).await.is_ok(),
+            "an unwound holder's sid is claimed at once"
+        );
+    }
+
+    /// Only exactly 32 lowercase hex digits parse as a session id.
+    #[test]
+    fn malformed_sid_never_parses() {
+        assert!(SessionKey::parse(&"a".repeat(SESSION_ID_LEN)).is_some());
+        let multibyte = format!("{}é", "a".repeat(SESSION_ID_LEN.saturating_sub(2)));
+        assert_eq!(multibyte.len(), SESSION_ID_LEN);
+        for bad in [
+            String::new(),
+            "a".repeat(SESSION_ID_LEN.saturating_sub(1)),
+            "a".repeat(SESSION_ID_LEN.saturating_add(1)),
+            "A".repeat(SESSION_ID_LEN),
+            "g".repeat(SESSION_ID_LEN),
+            "-".repeat(SESSION_ID_LEN),
+            multibyte,
+        ] {
+            assert!(SessionKey::parse(&bad).is_none(), "{bad:?} must not parse");
+        }
+    }
+
+    /// Neither a key's nor a claim's `Debug` prints the session id.
+    #[tokio::test(start_paused = true)]
+    async fn session_key_debug_redacts() {
+        let k = key(0xabc);
+        let sid = k.as_str().to_owned();
+        assert!(!format!("{k:?}").contains(&sid));
+        let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let claim = s.claim(k).await.expect("an idle sid is claimed at once");
+        assert!(!format!("{claim:?}").contains(&sid));
+    }
+
+    /// A claim another store issued looks up nothing, even for a live sid.
+    #[tokio::test(start_paused = true)]
+    async fn foreign_claim_is_miss() {
+        let owner: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        let other: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
+        owner.set(SID, handle()).await;
+        let foreign = other
+            .claim(key_of(SID))
+            .await
+            .expect("an idle sid is claimed");
+        let init = || ((), IpeCmd::<()>::None);
+        assert!(matches!(
+            owner.get_reconstructing(foreign, &init).await,
+            Rejoin::Miss
+        ));
+    }
+
+    // `sid` as a key.
+    fn key_of(sid: &str) -> SessionKey {
+        SessionKey::parse(sid).expect("a test sid is well formed")
+    }
+
+    /// File store: a foreign claim is a miss, and a set session rejoins live.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn set_then_rejoin_is_live_file() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_claimfile_{}.json", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
+        let other: MemoryStore<i32, ()> = MemoryStore::new(Duration::from_secs(60));
+        s.set(SID, handle_i32(7)).await;
+        let init = || (0, IpeCmd::<()>::None);
+        let foreign = other
+            .claim(key_of(SID))
+            .await
+            .expect("an idle sid is claimed");
+        assert!(matches!(
+            s.get_reconstructing(foreign, &init).await,
+            Rejoin::Miss
+        ));
+        assert!(matches!(reconstruct(&s, SID, &init).await, Rejoin::Live(_)));
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Sqlite store: a foreign claim is a miss, and a set session rejoins live.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn set_then_rejoin_is_live_sqlite() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_claimsql_{}.db", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(p);
+        let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
+            .await
+            .unwrap();
+        assert_rejoins_live(&s).await;
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Postgres store: a foreign claim is a miss, and a set session rejoins live.
+    /// Gated on `IPE_TEST_PG_URL`.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn set_then_rejoin_is_live_postgres() {
+        let Ok(url) = crate::system::read_env_var("IPE_TEST_PG_URL") else {
+            return;
+        };
+        let s: PostgresStore<i32, ()> = PostgresStore::new(&url, Duration::from_secs(60), TEST_TAG)
+            .await
+            .unwrap();
+        assert_rejoins_live(&s).await;
+        s.delete(SID).await;
+    }
+
+    /// Redis store: a foreign claim is a miss, and a set session rejoins live.
+    /// Gated on `IPE_TEST_REDIS_URL`.
+    #[cfg(feature = "redis_store")]
+    #[tokio::test]
+    async fn set_then_rejoin_is_live_redis() {
+        let Ok(url) = crate::system::read_env_var("IPE_TEST_REDIS_URL") else {
+            return;
+        };
+        let s: RedisStore<i32, ()> = RedisStore::new(&url, Duration::from_secs(60), TEST_TAG)
+            .await
+            .unwrap();
+        assert_rejoins_live(&s).await;
+        s.delete(SID).await;
+    }
+
+    // A foreign claim on `s` is a miss; once `SID` is set, a claimed lookup is live.
+    #[cfg(any(feature = "db", feature = "redis_store"))]
+    async fn assert_rejoins_live(s: &impl SessionStore<i32, ()>) {
+        let other: MemoryStore<i32, ()> = MemoryStore::new(Duration::from_secs(60));
+        let init = || (0, IpeCmd::<()>::None);
+        s.set(SID, handle_i32(7)).await;
+        let foreign = other
+            .claim(key_of(SID))
+            .await
+            .expect("an idle sid is claimed");
+        assert!(matches!(
+            s.get_reconstructing(foreign, &init).await,
+            Rejoin::Miss
+        ));
+        assert!(matches!(reconstruct(s, SID, &init).await, Rejoin::Live(_)));
     }
 }
