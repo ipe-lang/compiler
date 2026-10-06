@@ -4487,6 +4487,11 @@ fn tea_cargo_toml(base: &str) -> DResult<String> {
 /// stays unconditional (it backs the always-present `Ipe.Url` and `ssrf`
 /// surfaces), so only reqwest is gated here.
 ///
+/// The `http_client` feature is promoted into `default` alongside the dep: the
+/// vendored `web/mod.rs` compiles the telemetry exporters and the console proxy
+/// under it, and `system::exit_process` flushes those exporters only with it on,
+/// so a web program that leaves it undeclared or off silently drops all three.
+///
 /// The dependency line is inserted before the
 /// `[target.'cfg(unix)'.dependencies]` header so it lands in the cross-platform
 /// `[dependencies]` table — `reqwest` must compile on every target, not only
@@ -4520,7 +4525,55 @@ fn http_client_cargo_toml(base: &str) -> DResult<String> {
     result.push_str(base.get(..anchor_pos).unwrap_or(""));
     result.push_str(&reqwest_dep);
     result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    promote_default_feature(
+        &result,
+        "http_client",
+        "ipe_backend_rust::project::http_client_cargo_toml",
+    )
+}
+
+/// Add `feature` to the vendored manifest's `default = [...]` list.
+///
+/// Idempotent: a no-op when the list already names `feature`. Used by the
+/// augmenters whose runtime module the vendored source gates on a feature of
+/// the same name, so the emitted crate turns the gate on without a
+/// `--features` flag.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) when the
+/// `default = [` anchor or its closing `]` is absent — a golden-drift invariant
+/// violation, never a silent no-op.
+fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> DResult<String> {
+    const DEFAULT_PREFIX: &str = "default = [";
+    let pfx = base
+        .find(DEFAULT_PREFIX)
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_,
+            detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
+        })?;
+    let search_from = pfx + DEFAULT_PREFIX.len();
+    let close = base
+        .get(search_from..)
+        .and_then(|s| s.find(']'))
+        .map(|rel| search_from + rel)
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_,
+            detail: "default feature list has no closing ']' — golden drifted".to_owned(),
+        })?;
+    let quoted = format!("\"{feature}\"");
+    if base
+        .get(search_from..close)
+        .is_some_and(|list| list.contains(&quoted))
+    {
+        return Ok(base.to_owned());
+    }
+    let mut out = String::with_capacity(base.len() + quoted.len() + 2);
+    out.push_str(base.get(..close).unwrap_or(""));
+    out.push_str(", ");
+    out.push_str(&quoted);
+    out.push_str(base.get(close..).unwrap_or(""));
+    Ok(out)
 }
 
 /// Build the time-enabled `Cargo.toml` by promoting the `time` feature into the
@@ -4601,10 +4654,11 @@ fn chrono_tz_cargo_toml(base: &str) -> DResult<String> {
 /// SMTP transport; `reqwest` (which it reaches through `http_client`) is added
 /// by [`http_client_cargo_toml`] under the shared HTTP-client predicate, and
 /// every other crate it uses (`base64` / `hmac` / `sha2` / `serde_json` /
-/// `url`) is already an unconditional base-manifest dependency. No feature
-/// promotion is required — the emitted crate declares the
-/// `email` module unconditionally (via the `mod.rs` append), so the module is
-/// always compiled once its one extra dep is present. `lettre`'s feature list +
+/// `url`) is already an unconditional base-manifest dependency. The emitted
+/// crate declares the `email` module through the `mod.rs` append; the `email`
+/// feature is promoted as well, mirroring the runtime crate, because the
+/// vendored `ssrf.rs` gates the dial helpers `email.rs` reaches on it.
+/// `lettre`'s feature list +
 /// `default-features = false` mirror `runtime/Cargo.toml` (the vendored source
 /// was tested against exactly that shape). The version comes from the
 /// [`crate_specs`] SSOT (drift-guarded against `runtime/Cargo.toml`).
@@ -4631,7 +4685,11 @@ fn email_cargo_toml(base: &str) -> DResult<String> {
     result.push_str(base.get(..anchor_pos).unwrap_or(""));
     result.push_str(&lettre_dep);
     result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    promote_default_feature(
+        &result,
+        "email",
+        "ipe_backend_rust::project::email_cargo_toml",
+    )
 }
 
 /// Build the locale-enabled vendored `Cargo.toml`.
@@ -4800,7 +4858,11 @@ fn config_cargo_toml(base: &str) -> DResult<String> {
     result.push_str(base.get(..anchor_pos).unwrap_or(""));
     result.push_str(&deps);
     result.push_str(base.get(anchor_pos..).unwrap_or(""));
-    Ok(result)
+    promote_default_feature(
+        &result,
+        "config",
+        "ipe_backend_rust::project::config_cargo_toml",
+    )
 }
 
 /// Build the compression-enabled `Cargo.toml` by appending the `flate2` and
@@ -4905,8 +4967,7 @@ fn csv_cargo_toml(base: &str) -> DResult<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if neither the async (`default = ["tokio"`)
-/// nor the synchronous (`default = ["json"]`) default-list anchor is present, or
+/// Returns [`Diagnostic::CompilerBug`] if the `default = [` anchor is absent, or
 /// the `zeroize` dependency anchor is absent — a golden-drift invariant violation
 /// (fail-loud, never a silent no-op).
 fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
@@ -4914,11 +4975,11 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
     // slot (`["tokio", "crypto", "json"]`), keeping crypto-program manifests
     // byte-identical.
     const TOKIO_ANCHOR: &str = r#"default = ["tokio""#;
-    // The synchronous default-list anchors: a crypto-using program that reaches
+    // The synchronous default-list anchor: a crypto-using program that reaches
     // no async reactor kernel is emitted with no `"tokio"` in the default list,
-    // so `"crypto"` is inserted into the `["json"]` form instead.
-    const SYNC_DEFAULT: &str = r#"default = ["json"]"#;
-    const SYNC_DEFAULT_CRYPTO: &str = r#"default = ["crypto", "json"]"#;
+    // so `"crypto"` becomes its first element instead, whatever features an
+    // earlier augmenter already promoted after `"json"`.
+    const DEFAULT_PREFIX: &str = "default = [";
     // Anchor the `rsa` line to the `zeroize` base dep it originally followed, so
     // its slot in `[dependencies]` is unchanged for a crypto-using program.
     const ZEROIZE_ANCHOR: &str = "zeroize = \"1\"\n";
@@ -4930,8 +4991,9 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
 
     // Step 1 — insert `"crypto"` into the default feature list. Anchor on
     // `"tokio"` when present (keeping the `["tokio", "crypto", "json"]` order
-    // byte-identical for async programs) and fall back to the synchronous
-    // `["json"]` list otherwise.
+    // byte-identical for async programs) and otherwise make it the first
+    // element (`["json"]` → `["crypto", "json"]`), so an earlier promotion
+    // (`"time"`, `"locale"`, `"config"`) never hides the anchor.
     let step1 = if let Some(p) = base.find(TOKIO_ANCHOR) {
         let anchor_end = p + TOKIO_ANCHOR.len();
         let mut s = String::with_capacity(base.len() + rsa_dep.len() + 12);
@@ -4939,13 +5001,18 @@ fn crypto_core_heavy_cargo_toml(base: &str) -> DResult<String> {
         s.push_str(r#", "crypto""#);
         s.push_str(base.get(anchor_end..).unwrap_or(""));
         s
-    } else if base.contains(SYNC_DEFAULT) {
-        base.replacen(SYNC_DEFAULT, SYNC_DEFAULT_CRYPTO, 1)
+    } else if let Some(p) = base.find(DEFAULT_PREFIX) {
+        let anchor_end = p + DEFAULT_PREFIX.len();
+        let mut s = String::with_capacity(base.len() + rsa_dep.len() + 12);
+        s.push_str(base.get(..anchor_end).unwrap_or(""));
+        s.push_str(r#""crypto", "#);
+        s.push_str(base.get(anchor_end..).unwrap_or(""));
+        s
     } else {
         return Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::project::crypto_core_heavy_cargo_toml",
             detail: format!(
-                "Cargo.toml anchor {TOKIO_ANCHOR:?} or {SYNC_DEFAULT:?} not found — golden drifted"
+                "Cargo.toml anchor {TOKIO_ANCHOR:?} or {DEFAULT_PREFIX:?} not found — golden drifted"
             ),
         });
     };
@@ -5660,8 +5727,9 @@ mod tests {
         CARGO_DEP_TOML, CARGO_TOML, CARGO_WASM_DEP_TOML, RUNTIME_CONFIG_RS_DB_POSTGRES,
         RUNTIME_CONFIG_RS_DB_SQLITE, RUNTIME_MOD_RS_WEB_APPEND, RUNTIME_MOD_RS_WEB_CORE_APPEND,
         WASM_ABSENT_MODULE_PATHS, WASM_CARGO_TOML, WASM_PRESENT_OVERRIDES,
-        async_runtime_cargo_toml, crypto_core_heavy_cargo_toml, db_cargo_toml,
-        dev_posture_cargo_toml, insert_wasi_linker_config, jwt_cargo_toml, runtime_bindings,
+        async_runtime_cargo_toml, config_cargo_toml, crypto_core_heavy_cargo_toml, db_cargo_toml,
+        dev_posture_cargo_toml, email_cargo_toml, http_client_cargo_toml,
+        insert_wasi_linker_config, jwt_cargo_toml, promote_default_feature, runtime_bindings,
         server_cargo_toml, shake_ffi_by_fn_ident, ssrf_cargo_toml, wasm_present_modules,
         wasm_runtime_bindings, web_cargo_toml, wrapper_call_paths,
     };
@@ -6535,6 +6603,63 @@ mod tests {
         assert!(
             !cfg.contains("[]"),
             "an empty array would not override a host build.rustflags, got: {cfg}"
+        );
+    }
+
+    /// `http_client_cargo_toml` promotes the `http_client` feature the template
+    /// declares, so the vendored exporters, console proxy and exit flush compile.
+    #[test]
+    fn http_client_toml_promotes_its_feature() {
+        let base = async_runtime_cargo_toml(CARGO_TOML).expect("async base");
+        let out = http_client_cargo_toml(&base).expect("http_client_cargo_toml must succeed");
+        assert!(
+            default_line(&out).contains("\"http_client\""),
+            "http_client must be promoted, got: {}",
+            default_line(&out)
+        );
+        assert!(
+            out.lines().any(|l| l == "http_client = []"),
+            "the template must declare http_client"
+        );
+        assert!(out.contains("reqwest = {"), "reqwest must be added");
+    }
+
+    /// `email_cargo_toml` and `config_cargo_toml` promote their features, which
+    /// the vendored `ssrf.rs` and `config_decode.rs` gates name.
+    #[test]
+    fn email_and_config_toml_promote_their_features() {
+        let email = email_cargo_toml(CARGO_TOML).expect("email_cargo_toml must succeed");
+        assert_eq!(default_line(&email), r#"default = ["json", "email"]"#);
+        let config = config_cargo_toml(CARGO_TOML).expect("config_cargo_toml must succeed");
+        assert_eq!(default_line(&config), r#"default = ["json", "config"]"#);
+    }
+
+    /// Promotion is idempotent and refuses a manifest with no default list.
+    #[test]
+    fn promote_default_feature_is_idempotent_and_fails_closed() {
+        let once = promote_default_feature(CARGO_TOML, "config", "test").expect("promote");
+        let twice = promote_default_feature(&once, "config", "test").expect("promote again");
+        assert_eq!(once, twice);
+        assert!(
+            promote_default_feature("[features]\njson = []\n", "config", "test").is_err(),
+            "a manifest with no default list must be refused"
+        );
+        assert!(
+            promote_default_feature("[features]\ndefault = [\"json\"\n", "config", "test").is_err(),
+            "an unclosed default list must be refused"
+        );
+    }
+
+    /// A synchronous program whose default list an earlier augmenter already
+    /// extended still gets `"crypto"` from the heavy crypto step.
+    #[test]
+    fn crypto_core_heavy_after_config_promotion() {
+        let base = config_cargo_toml(CARGO_TOML).expect("config base");
+        let out = crypto_core_heavy_cargo_toml(&base)
+            .expect("crypto_core_heavy_cargo_toml must accept a promoted sync default list");
+        assert_eq!(
+            default_line(&out),
+            r#"default = ["crypto", "json", "config"]"#
         );
     }
 }
