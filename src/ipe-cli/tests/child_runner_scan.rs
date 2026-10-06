@@ -486,7 +486,7 @@ fn type_last(ty: &Type) -> Option<String> {
 /// The impl name an `impl` block's fns are keyed under.
 fn impl_name(item: &ItemImpl) -> String {
     let self_name = type_last(&item.self_ty).unwrap_or_else(|| "<type>".to_owned());
-    let Some((_, path, _)) = &item.trait_ else {
+    let Some((path, _)) = &item.trait_ else {
         return self_name;
     };
     let trait_name = path
