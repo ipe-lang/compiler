@@ -14,6 +14,11 @@
 #![allow(clippy::module_name_repetitions)] // KernelId / KernelClass / FfiKernelId all contain "Kernel"
 #![forbid(unsafe_code)]
 
+mod builtin_type;
+pub use builtin_type::{
+    BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinType, KernelHome, SealClass,
+};
+
 mod capability;
 pub use capability::{Capability, ElementCapability, UnknownCapability, WebCapability};
 
@@ -266,7 +271,7 @@ pub struct SchemeKey(pub StdlibKernel);
 /// arguments (`List a`, `Maybe a`) are named here; the arity is carried by the
 /// argument slice of the [`TyShape::Con`] that references the tag, not by the
 /// tag itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumCount)]
 pub enum BuiltinTag {
     /// `Int` — the signed-integer primitive.
     Int,

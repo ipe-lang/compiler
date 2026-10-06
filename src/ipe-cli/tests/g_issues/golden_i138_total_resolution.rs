@@ -2,7 +2,7 @@
 //!
 //! Calling `unwrap_or_default()` in `ipe_canon::canonicalise_type` for any
 //! unqualified type name absent from `type_home_map` would give it `home = []`.
-//! Genuine builtins (in `RESERVED_BUILTIN_TYPES` / `EXTRA_BUILTIN_TYPE_NAMES`)
+//! Genuine builtins (the empty-home rows of `ipe_kernels::BUILTIN_TYPES`)
 //! legitimately carry that empty-home sentinel; the lowerer resolves them by
 //! explicit name arm.  Unknown names (user ADTs referenced without importing
 //! their module) would also get `home = []`, falling through to the lowerer's
@@ -23,7 +23,7 @@
 //!      `ModA` and `ModB` but not imported as a type → IPE-N0002.
 //!   2. `optbridge` — same shape, different payload types → IPE-N0002.
 //!   3. `kernel_implicit_positive` — `Request` used without explicit import;
-//!      it is in `RESERVED_BUILTIN_TYPES`, so the fix must NOT reject it → exit 0.
+//!      it is a reserved builtin row, so the fix must NOT reject it → exit 0.
 //!
 //! Run:
 //! ```text
@@ -92,7 +92,7 @@ fn i138_optbridge_fails_n0002() {
 // Positive control — kernel-implicit builtin must still compile
 // ---------------------------------------------------------------------------
 
-/// `Request` is in `RESERVED_BUILTIN_TYPES` and receives the empty-home
+/// `Request` is a reserved builtin row and receives the empty-home
 /// sentinel regardless of whether the user explicitly imports
 /// `Ipe.Http.Server`.  The `TypeNotFound` gate must NOT reject it.
 #[test]
@@ -101,10 +101,9 @@ fn i138_kernel_implicit_positive_exits_zero() {
         .expect("kernel_implicit_positive must compile (Request is a kernel builtin)");
 }
 
-/// `Value` is a kernel-implicit Prelude type that was missing from all
-/// three builtin allowlists (`RESERVED_BUILTIN_TYPES`, `EXTRA_BUILTIN_TYPE_NAMES`,
-/// `KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES` — newly added by the fix).
-/// After the fix it must receive the empty-home sentinel and compile clean.
+/// `Value` is a kernel-implicit Prelude type: a `KernelImplicit` row of
+/// `ipe_kernels::BUILTIN_TYPES`, so it receives the empty-home sentinel and
+/// compiles clean.
 /// The lowerer handles `Value` via an explicit arm (`IrType::Json`) placed
 /// after the `enum_variants` guard.
 #[test]

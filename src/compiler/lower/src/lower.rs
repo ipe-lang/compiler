@@ -63,8 +63,6 @@ use ir_type_mentions::{
     ir_type_mentions_server, ir_type_mentions_sqlvalue, ir_type_mentions_url,
     program_type_mentions,
 };
-#[cfg(test)]
-use record_shapes::OPAQUE_NAMES_ABOVE_GUARD;
 use record_shapes::{
     CACHE_CFG_FIELDS, CACHE_STATS_FIELDS, is_all_int_canon_record_shape, is_all_int_record_shape,
     is_backoff_strategy_ty, is_csv_doc_canon_shape, is_csv_doc_shape,
@@ -16235,7 +16233,7 @@ impl<'a> Lowerer<'a> {
     /// A user union of the same name (`type Route = …`) is keyed in
     /// `enum_variants` under its own module home; guarding on the empty home lets
     /// it fall through to the program-enum path and win by its own identity —
-    /// the second, independent gate behind `RESERVED_BUILTIN_TYPES` (IPE-N0026),
+    /// the second, independent gate behind the reserved builtin rows (IPE-N0026),
     /// so no single missed check can silently map a user type to the opaque.
     fn is_server_opaque_con(&self, home: &[Symbol], name: Symbol) -> bool {
         home.is_empty()
@@ -16268,8 +16266,9 @@ impl<'a> Lowerer<'a> {
     /// Each is minted only by an `Ipe.Http.Server.Stream` / `…WebSocket` kernel
     /// with the empty home (`ipe_types::constrain` builds `sw()` / `wsh()` /
     /// `wscfg()` with `module: Vec::new()`), so the runtime-`IrType` mapping keys
-    /// on that empty home alone. These names are NOT reserved (they sit in
-    /// `EXTRA_BUILTIN_TYPE_NAMES`), so a user `type StreamWriter = …` is legal and
+    /// on that empty home alone. These names are NOT reserved (their
+    /// `ipe_kernels::BUILTIN_TYPES` rows are `LoweredBelowGuard`), so a user
+    /// `type StreamWriter = …` is legal and
     /// is keyed in `enum_variants` under its own home; the empty-home guard lets
     /// that user union fall through to the program-enum guard and win by its own
     /// identity, instead of being hijacked to the opaque runtime handle (an
@@ -17971,7 +17970,7 @@ impl<'a> Lowerer<'a> {
                 // `ipe_runtime::error::IpeErrorDetails`.
                 "ErrorDetails" => Ok(IrType::ErrorDetails),
                 // The NOMINAL error-payload types (SEAL fix) —
-                // annotatable via canon's `EXTRA_BUILTIN_TYPE_NAMES`. Backed
+                // annotatable via their `LoweredBelowGuard` builtin rows. Backed
                 // by `ipe_runtime::error::{IpeErrorInfo, IpePanicInfo,
                 // IpeTypeInfo}`.
                 "ErrorInfo" => Ok(IrType::ErrorInfo),
@@ -18077,7 +18076,7 @@ impl<'a> Lowerer<'a> {
                 // Home-guarded on the empty kernel home so a user `type Route = …`
                 // (keyed under its own home) falls through to the program-enum
                 // guard below and wins by its own identity — defence-in-depth
-                // behind the `RESERVED_BUILTIN_TYPES` canon gate.
+                // behind the reserved-builtin canon gate (IPE-N0026).
                 "Request" if self.is_server_opaque_con(home, *name) => Ok(IrType::ServerRequest),
                 "Response" if self.is_server_opaque_con(home, *name) => Ok(IrType::ServerResponse),
                 "Route" if self.is_server_opaque_con(home, *name) => Ok(IrType::ServerRoute),
@@ -18534,8 +18533,8 @@ impl<'a> Lowerer<'a> {
                 // on user functions (kernel-implicit Prelude type).
                 // `Claims` maps to the same opaque JSON accumulator.
                 // ── Kernel-implicit opaque server / Ipe.Web types ────────
-                // These names are registered in `KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES`
-                // in ipe_canon so they pass N0002 without an explicit import.
+                // These names are `KernelImplicit` rows of `ipe_kernels::BUILTIN_TYPES`,
+                // so they pass N0002 without an explicit import.
                 // They all carry zero type arguments at the annotation level.
                 // `Handler` / `Middleware` — Ipe.Http.Server function aliases.
                 // `Session` / `Store` — Ipe.Web session-management opaques.
@@ -19584,8 +19583,8 @@ impl<'a> Lowerer<'a> {
         match t {
             Ty::Unit => Ok(IrType::Unit),
             // Reserved builtin names are matched first. This precedence is sound
-            // because `ipe_canon`'s `RESERVED_BUILTIN_TYPES` gate (resolve.rs,
-            // IPE-N0026) rejects any user `type` / `type alias` whose name is one
+            // because `ipe_canon`'s reserved-builtin gate (the `Reserved` rows of
+            // `ipe_kernels::BUILTIN_TYPES`, IPE-N0026) rejects any user `type` / `type alias` whose name is one
             // of these builtin constructors, so those arms can never silently
             // override a user `type Int = …` / `type Html = …`.
             //
@@ -19597,7 +19596,7 @@ impl<'a> Lowerer<'a> {
             // wins by its `(home, name)` identity, and only a genuine opaque
             // builtin (no union entry) falls through to the `UiPlain` arm. This
             // matches `ir_type_from_canon`, so the inferred and annotated paths
-            // agree. See RESERVED_BUILTIN_TYPES for the per-name cite list.
+            // agree. See `ipe_kernels::BUILTIN_TYPES` for the per-name roles.
             Ty::Con { name, args, module } => match self.resolve(*name)? {
                 // The closed config-tag ADTs (`HostMode` / `LogLevel` / `CsrfMode` /
                 // `RevocationMode`) erase to the raw `Int` tag their constructor kernels
@@ -20332,7 +20331,7 @@ impl<'a> Lowerer<'a> {
                 // user-declared `type Value` still resolves as its own enum here.
                 // The parametric reserved builtins (`Decoder` / `Cmd` / `Html` /
                 // …) stay ABOVE the guard — they are name-reserved
-                // (`RESERVED_BUILTIN_TYPES`, IPE-N0026) and so can never collide
+                // (`Reserved` builtin rows, IPE-N0026) and so can never collide
                 // with a program union.
                 "Value" => Ok(IrType::Json),
                 // Name resolution guarantees every type constructor resolves to
@@ -35527,25 +35526,6 @@ mod tests {
             !super::row_value_escapes_direct_access(&body, &syms),
             "a symbol outside the row set flows freely"
         );
-    }
-
-    /// Structural invariant (canon-1 / canon-2): every name in
-    /// `OPAQUE_NAMES_ABOVE_GUARD` must also appear in canon's
-    /// `RESERVED_BUILTIN_TYPES`.  An above-guard arm with a fixed `IrType`
-    /// mapping that is NOT reserved means a user `type <Name>` is silently
-    /// mis-lowered — a direct SEAL break.  Adding an above-guard arm without
-    /// also adding the name to `RESERVED_BUILTIN_TYPES` now fails this test.
-    #[test]
-    fn reserved_opaque_names_above_guard_are_reserved_in_canon() {
-        for &name in super::OPAQUE_NAMES_ABOVE_GUARD {
-            assert!(
-                ipe_canon::RESERVED_BUILTIN_TYPES.contains(&name),
-                "OPAQUE_NAMES_ABOVE_GUARD contains `{name}` but \
-                 ipe_canon::RESERVED_BUILTIN_TYPES does not — \
-                 a user `type {name}` would be silently mis-lowered (SEAL break); \
-                 add `{name}` to RESERVED_BUILTIN_TYPES in resolve.rs",
-            );
-        }
     }
 
     /// Per-occurrence `any` freshening covers NESTED occurrences (lower-1):
