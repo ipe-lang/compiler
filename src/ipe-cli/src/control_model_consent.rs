@@ -114,6 +114,10 @@ mod tests {
             msg.contains("acceptsControl"),
             "names the remedy field: {msg}"
         );
+        assert!(
+            !msg.contains("[capabilities]"),
+            "package.ipe has no TOML section; the remedy names the record field: {msg}"
+        );
     }
 
     #[test]

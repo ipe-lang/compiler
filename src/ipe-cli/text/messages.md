@@ -2129,8 +2129,9 @@ note: the iOS shell project layout is written here, but a signed, runnable .ipa 
 ## web-consent-remedy
 
   = a web capability is granted ONLY by the top-level app's package.ipe; a dependency
-    discloses but cannot self-authorise. Grant it after review by adding the axis to
-    `accept = [ … ]` under [capabilities] in package.ipe, or drop the dependency.
+    discloses but cannot self-authorise. Grant it after review by adding the axis,
+    spelled `JsPort <Axis>`, to `accepts = [ … ]` in the `capabilities` record of
+    package.ipe, or drop the dependency.
 
 ## native-ffi-crossing
 
@@ -2145,8 +2146,8 @@ a native crossing the build could not attribute to a crate
   = a native crossing is granted ONLY by the top-level app's package.ipe; a dependency
     crosses but cannot self-authorise. Its true effects are opaque to Ipê and
     contained at run by the OS jail, but the crossing itself needs the consumer's
-    consent. Grant it after review by adding `native-ffi` to `declared = [ … ]` under
-    [capabilities] in package.ipe, or drop the dependency.
+    consent. Grant it after review by adding `NativeFfi` to `declares = [ … ]` in
+    the `capabilities` record of package.ipe, or drop the dependency.
 
 ## control-model-consent-refusal
 
@@ -2154,8 +2155,8 @@ a native crossing the build could not attribute to a crate
   = the package opted into control-model consent by declaring `acceptsControl`,
     so that set must cover the program's actual control model; it does not
     list `{model}`, so the declared acceptance is stale.
-  = cover it after review by adding `{ctor}` to `acceptsControl = [ … ]`
-    under [capabilities] in package.ipe, or switch the entry to a listed
+  = cover it after review by adding `{ctor}` to `acceptsControl = [ … ]` in
+    the `capabilities` record of package.ipe, or switch the entry to a listed
     control model.
 
 ## permission-consent-header

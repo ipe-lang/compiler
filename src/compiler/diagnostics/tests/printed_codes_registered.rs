@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::ALL_CODES;
 
-/// Wire-shaped strings that are deliberately not registered codes: the shape
-/// placeholder docs use to describe a code, and the fixtures tests feed through
-/// the renderer.
-const NOT_CODES: &[&str] = &["IPE-X0000", "IPE-T0099", "IPE-T9999"];
+/// Wire-shaped strings the production source prints that are deliberately not
+/// registered codes: the shape placeholder docs use to describe a code, and the
+/// example row in the `code!` table's own documentation. Each must still occur
+/// in the scanned text, so a stale entry cannot linger as a blind spot.
+const NOT_CODES: &[&str] = &["IPE-X0000", "IPE-P0099"];
 
 /// The CLI message catalog, relative to the `src/` tree.
 const MESSAGE_CATALOG: &str = "ipe-cli/text/messages.md";
@@ -22,8 +23,9 @@ const MESSAGE_CATALOG: &str = "ipe-cli/text/messages.md";
 const WIRE_LEN: usize = 9;
 
 fn source_root() -> PathBuf {
-    let manifest = ipe_env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| String::from("."));
-    PathBuf::from(manifest).join("..").join("..")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
 }
 
 /// Whether `bytes` is `IPE-` followed by an uppercase letter and four digits.
@@ -62,40 +64,86 @@ fn unregistered(text: &str) -> Vec<&str> {
 
 /// `source` without its `#[cfg(test)]` items.
 ///
-/// A test item is skipped up to the closing brace at its own indentation, or to
-/// its `;` for a one-line item. The source is `rustfmt`-formatted, so a block's
-/// closing brace is the only line equal to its opener's indentation plus `}`.
+/// Only lines provably inside a test item drop out (see [`skip_test_item`]);
+/// anything the reading cannot place stays in view, so a misread item can only
+/// fail this test, never hide a production string from it.
 fn without_test_items(source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let mut kept = String::new();
     let mut at = 0;
     while let Some(line) = lines.get(at) {
-        if line.trim() != "#[cfg(test)]" {
+        if line.trim() == "#[cfg(test)]" {
+            at = skip_test_item(&lines, at);
+        } else {
             kept.push_str(line);
             kept.push('\n');
-            at += 1;
-            continue;
-        }
-        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-        let closer = format!("{indent}}}");
-        at += 1;
-        while lines
-            .get(at)
-            .is_some_and(|next| next.trim_start().starts_with("#["))
-        {
-            at += 1;
-        }
-        let head = lines.get(at).map_or("", |next| next.trim_end());
-        if head.ends_with(';') || (head.ends_with('}') && head.contains('{')) {
-            at += 1;
-        } else {
-            while lines.get(at).is_some_and(|next| *next != closer) {
-                at += 1;
-            }
             at += 1;
         }
     }
     kept
+}
+
+/// Width of `line`'s leading whitespace.
+fn indent_of(line: &str) -> usize {
+    line.chars().take_while(|c| c.is_whitespace()).count()
+}
+
+/// Index of the first line past the test item whose `#[cfg(test)]` is at `attr`.
+///
+/// The item may be a module, a function, a `use`, a struct field, an enum
+/// variant, a match arm or a statement. Skipped, at the attribute's own
+/// indentation `base`: further attributes and comments (with their deeper
+/// continuation lines), then the head line. A head that ends its item (`;`, `,`,
+/// or a one-line `{ … }`) is the whole item. Otherwise the lines blank or deeper
+/// than `base` are its body, and one following line at `base` that starts with
+/// `}`, `)` or `]` is its closer. No other line at or left of `base` is skipped.
+fn skip_test_item(lines: &[&str], attr: usize) -> usize {
+    let base = lines.get(attr).map_or(0, |line| indent_of(line));
+    let mut at = attr + 1;
+    while let Some(line) = lines.get(at) {
+        let text = line.trim();
+        let indent = indent_of(line);
+        let continuation = !text.is_empty() && indent > base;
+        let preamble = !text.is_empty()
+            && indent == base
+            && (text.starts_with("#[")
+                || text.starts_with("//")
+                || text.starts_with(")]")
+                || text.starts_with(']'));
+        if continuation || preamble {
+            at += 1;
+        } else {
+            break;
+        }
+    }
+    let Some(head) = lines.get(at) else {
+        return at;
+    };
+    if head.trim().is_empty() || indent_of(head) != base {
+        return at;
+    }
+    at += 1;
+    let head = head.trim_end();
+    let complete =
+        head.ends_with(';') || head.ends_with(',') || (head.ends_with('}') && head.contains('{'));
+    if complete {
+        return at;
+    }
+    let opens = head.ends_with(['{', '(', '[']);
+    let body_start = at;
+    while lines
+        .get(at)
+        .is_some_and(|line| line.trim().is_empty() || indent_of(line) > base)
+    {
+        at += 1;
+    }
+    let closes = lines.get(at).is_some_and(|line| {
+        indent_of(line) == base && line.trim_start().starts_with(['}', ')', ']'])
+    });
+    if closes && (opens || at > body_start) {
+        at += 1;
+    }
+    at
 }
 
 /// Collect every production `.rs` file under `dir`: no `tests` directory, no
@@ -139,6 +187,20 @@ fn every_printed_code_is_registered() -> Result<(), Box<dyn std::error::Error>> 
         scanned > 0,
         "the scan found no wire string at all under {}; the walk is broken",
         root.display()
+    );
+
+    let stale: Vec<&str> = NOT_CODES
+        .iter()
+        .copied()
+        .filter(|not_code| {
+            texts
+                .iter()
+                .all(|(_, text)| !wire_strings(text).contains(not_code))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "NOT_CODES entries no scanned file prints; drop them: {stale:?}"
     );
 
     let mut offenders = Vec::new();
@@ -196,5 +258,72 @@ mod inner {
         unregistered(&production),
         ["IPE-S9998", "IPE-S9994"],
         "production strings stay in view, test items drop out"
+    );
+}
+
+#[test]
+fn a_test_field_variant_arm_or_statement_hides_only_itself() {
+    let source = "\
+pub struct Proxy {
+    #[cfg(test)]
+    pub probe: u8,
+    pub name: &'static str,
+}
+const A: &str = \"IPE-S9993\";
+enum Kind {
+    #[cfg(test)]
+    Probe,
+    Real,
+}
+const B: &str = \"IPE-S9992\";
+fn pick(k: Kind) -> &'static str {
+    match k {
+        #[cfg(test)]
+        Kind::Probe => {
+            \"IPE-S9991\"
+        }
+        Kind::Real => \"IPE-S9990\",
+    }
+}
+fn run() {
+    #[cfg(test)]
+    let seen = record(
+        \"IPE-S9989\",
+    );
+    emit(\"IPE-S9988\");
+}
+#[cfg(test)]
+#[allow(
+    dead_code
+)]
+const C: &str = \"IPE-S9987\";
+const D: &str = \"IPE-S9986\";
+";
+    let production = without_test_items(source);
+    assert_eq!(
+        unregistered(&production),
+        [
+            "IPE-S9993",
+            "IPE-S9992",
+            "IPE-S9990",
+            "IPE-S9988",
+            "IPE-S9986"
+        ],
+        "every production string after a test field, variant, arm, statement or \
+         multi-line attribute stays in view"
+    );
+}
+
+#[test]
+fn an_unreadable_test_item_keeps_its_text_in_view() {
+    let source = "\
+#[cfg(test)]
+
+const A: &str = \"IPE-S9985\";
+";
+    assert_eq!(
+        unregistered(&without_test_items(source)),
+        ["IPE-S9985"],
+        "a blank line where the head should be ends the item: nothing past it is skipped"
     );
 }

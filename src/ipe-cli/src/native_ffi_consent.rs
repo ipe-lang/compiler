@@ -234,6 +234,10 @@ mod tests {
         assert!(msg.contains("IPE-S0003"), "carries the code: {msg}");
         assert!(msg.contains("Rust.Csum"), "names the crate: {msg}");
         assert!(msg.contains("Dep.Widget"), "names the discloser: {msg}");
+        assert!(
+            msg.contains("`NativeFfi` to `declares = [ … ]` in"),
+            "the remedy names the manifest field the gate reads: {msg}"
+        );
     }
 
     #[test]
