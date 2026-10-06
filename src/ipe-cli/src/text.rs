@@ -1149,6 +1149,8 @@ messages! {
     fmt_stdin_unformatted = "fmt-stdin-unformatted";
     /// `ipe fmt` was given a missing path.
     fmt_no_such_path(root) = "fmt-no-such-path";
+    /// `ipe fmt` refused a file whose formatted output would pass its cap.
+    fmt_output_too_large(file, cap) = "fmt-output-too-large";
     /// `ipe health` could not locate the home directory.
     health_home_unknown = "health-home-unknown";
     /// An `ipe health` install command was empty (an internal invariant).

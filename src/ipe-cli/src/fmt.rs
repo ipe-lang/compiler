@@ -32,6 +32,9 @@
 //!   corruption. (The comparison ignores spans — only structure and values
 //!   matter.)
 //! * **Comment-preserving**: every comment in the input appears in the output.
+//! * **Bounded**: the output of one file may not pass
+//!   [`OutputCap::for_input`]; a file it would pass is refused and
+//!   left unchanged.
 //! * **Idempotent**: `format_source(format_source(x)) == format_source(x)`. The
 //!   `ipe fmt` fixtures assert this over records / lists / tuples / `case` /
 //!   `let` / `if` / comments, and the scaffolded `ipe init` template is a fixed
@@ -59,7 +62,7 @@ use ipe_diagnostics::Diagnostic;
 // The formatting engine lives in the `ipe_fmt` crate so both this CLI and the
 // LSP formatting provider can share it. Re-export its public surface so
 // `ipe::fmt::format_source` (used here and by the integration tests) resolves.
-pub use ipe_fmt::{FmtError, format_source};
+pub use ipe_fmt::{FmtError, FmtLimit, OutputCap, format_source};
 
 use crate::CliError;
 /// Run the `fmt` subcommand.
@@ -67,7 +70,8 @@ use crate::CliError;
 /// # Errors
 /// [`CliError::Usage`] on flag misuse; [`CliError::Io`] on a filesystem
 /// failure; [`CliError::Pipeline`] when a file cannot be parsed or the
-/// formatter's round-trip guard trips. Under `--check`, an unformatted file is
+/// formatter's round-trip guard trips; [`CliError::Usage`] when a file's
+/// formatted output would pass its cap. Under `--check`, an unformatted file is
 /// reported as a non-zero exit via [`CliError::Usage`] carrying the list.
 pub fn run_fmt(rest: &[String]) -> Result<(), CliError> {
     // `--help` / `-h` is a request for output, not an error — honour it before
@@ -202,11 +206,11 @@ fn report_check(
 
 /// Format stdin to stdout. When `check` is true, print a diff instead.
 fn run_fmt_stdin(check: bool) -> Result<(), CliError> {
-    let mut src = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut src).map_err(|e| CliError::Io {
-        path: PathBuf::from("<stdin>"),
-        source: e,
-    })?;
+    let src = crate::io_bounded::read_opened_capped(
+        std::io::stdin().lock(),
+        Path::new("<stdin>"),
+        crate::io_bounded::SOURCE_READ_CAP,
+    )?;
 
     let formatted =
         format_source(&src).map_err(|e| fmt_err_to_cli(&PathBuf::from("<stdin>"), e))?;
@@ -272,6 +276,9 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
                 detail,
             }),
         },
+        FmtError::Limit(FmtLimit::OutputBytes { cap }) => CliError::Usage(
+            crate::text::msg::fmt_output_too_large(&file.display(), &cap),
+        ),
     }
 }
 

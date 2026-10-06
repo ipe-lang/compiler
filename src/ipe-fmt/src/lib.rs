@@ -41,6 +41,68 @@ pub enum FmtError {
     /// The formatter's own output failed to re-parse or did not round-trip to
     /// the same AST — a formatter bug, surfaced rather than written to disk.
     RoundTrip { detail: String },
+    /// The formatted output would pass a ceiling; nothing is returned, so the
+    /// caller leaves the file as it was.
+    Limit(FmtLimit),
+}
+
+/// A ceiling the formatter refuses to pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmtLimit {
+    /// The formatted output would be longer than `cap`.
+    OutputBytes { cap: OutputCap },
+}
+
+/// The most bytes of formatted output one source may produce.
+///
+/// Eight times the input, never under 64 KiB and never over 16 MiB: real
+/// code formats to about its own size, while a crafted input whose layout
+/// multiplies its size (a long flat list at deep indent) is turned back
+/// before its output is written anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OutputCap(usize);
+
+impl OutputCap {
+    /// The output a small input may always produce.
+    pub const FLOOR: usize = 64 << 10;
+    /// The output no input may pass.
+    pub const CEILING: usize = 16 << 20;
+    /// How many output bytes one input byte may become.
+    pub const GROWTH: usize = 8;
+
+    /// The cap for a source of `input_len` bytes.
+    #[must_use]
+    pub const fn for_input(input_len: usize) -> Self {
+        let grown = input_len.saturating_mul(Self::GROWTH);
+        let floored = if grown < Self::FLOOR {
+            Self::FLOOR
+        } else {
+            grown
+        };
+        Self(if floored > Self::CEILING {
+            Self::CEILING
+        } else {
+            floored
+        })
+    }
+
+    /// The cap in bytes.
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        self.0
+    }
+
+    /// Whether `output` fits under the cap.
+    #[must_use]
+    pub const fn admits(self, output: &str) -> bool {
+        output.len() <= self.0
+    }
+}
+
+impl fmt::Display for OutputCap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 impl fmt::Display for FmtError {
@@ -49,6 +111,9 @@ impl fmt::Display for FmtError {
             Self::Parse { src, diag } => f.write_str(&render(diag, "<source>", src)),
             Self::RoundTrip { detail } => {
                 write!(f, "ipe fmt: internal error while formatting: {detail}")
+            }
+            Self::Limit(FmtLimit::OutputBytes { cap }) => {
+                write!(f, "ipe fmt: formatted output would exceed {cap} bytes")
             }
         }
     }
@@ -331,9 +396,17 @@ fn skip_block_comment_body(mut rest: &str) -> &str {
 /// # Errors
 /// [`FmtError::Parse`] if `src` does not parse; [`FmtError::RoundTrip`] if the
 /// formatted output loses, adds or alters a comment, or does not re-parse to
-/// the same AST (a formatter bug — caught rather than written).
+/// the same AST (a formatter bug — caught rather than written);
+/// [`FmtError::Limit`] if the output would pass [`OutputCap::for_input`].
 pub fn format_source(src: &str) -> Result<String, FmtError> {
-    format_guarded(src, render_module)
+    format_guarded(src, OutputCap::for_input(src.len()), render_module)
+}
+
+/// [`format_source`] under an explicit `cap`, so a test drives the refusal
+/// with a small input.
+#[cfg(test)]
+fn format_source_capped(src: &str, cap: OutputCap) -> Result<String, FmtError> {
+    format_guarded(src, cap, render_module)
 }
 
 /// The printer's rendering of a whole module: what [`format_source`] writes.
@@ -341,13 +414,14 @@ fn render_module(printer: &Printer<'_>, module: &Module) -> String {
     printer.module(module)
 }
 
-/// Print `src` with `render`, then refuse the output unless it carries the
-/// input's comments and re-parses to the input's AST.
+/// Print `src` with `render`, then refuse the output unless it fits `cap`,
+/// carries the input's comments and re-parses to the input's AST.
 ///
 /// [`format_source`] renders with [`Printer::module`]; a test passes a faulty
 /// renderer to drive each refusal through the same guards.
 fn format_guarded(
     src: &str,
+    cap: OutputCap,
     render: impl FnOnce(&Printer<'_>, &Module) -> String,
 ) -> Result<String, FmtError> {
     let mut interner = Interner::new();
@@ -359,6 +433,12 @@ fn format_guarded(
         detail: "source parsed but did not lex".to_owned(),
     })?;
     let out = render(&Printer::new(&interner, &input, Some(src)), &module);
+
+    // Output guard: the formatted text fits the cap. It fires first so an
+    // over-cap output is never lexed, re-parsed or returned.
+    if !cap.admits(&out) {
+        return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
+    }
 
     // Comment guard: the formatted output carries exactly the input's comments.
     // It fires BEFORE the AST equivalence check so a comment bug surfaces as a
@@ -3553,9 +3633,94 @@ mod tests {
         assert!(scan_comments("-- a\n").len() < input.len());
     }
 
+    /// A module whose one value is a list of `items` ones, written on one
+    /// line two lets deep: the formatter puts every item on its own line at
+    /// that depth, so each two-byte item grows to over twenty output bytes.
+    fn nested_long_list(items: usize) -> String {
+        let ones = vec!["1"; items].join(",");
+        format!(
+            "module M exposing (x)\n\n\nx =\n    let\n        y =\n            let\n                z =\n                    [ {ones}\n                    ]\n            in\n            z\n    in\n    y\n"
+        )
+    }
+
+    /// The output one more item of [`nested_long_list`] adds, measured on
+    /// inputs small enough to format under the floor.
+    fn nested_long_list_growth_per_item() -> usize {
+        let small = format_source(&nested_long_list(200)).expect("formats under the floor");
+        let large = format_source(&nested_long_list(400)).expect("formats under the floor");
+        large.len().saturating_sub(small.len()) / 200
+    }
+
+    /// An input whose rendering passes eight times its size is refused with
+    /// the cap for that input, while the same shape at a size under the floor
+    /// formats.
+    #[test]
+    fn output_cap_refuses_past_cap() {
+        let growth = nested_long_list_growth_per_item();
+        assert!(
+            growth > 2 * OutputCap::GROWTH,
+            "precondition: an item of two input bytes must grow past the cap, got {growth}"
+        );
+        let src = nested_long_list(10_000);
+        let cap = OutputCap::for_input(src.len());
+        assert_eq!(cap.bytes(), src.len() * OutputCap::GROWTH);
+        let refused = format_source(&src);
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap: c })) if c == cap),
+            "{refused:?}"
+        );
+    }
+
+    /// One byte under the output's length refuses; the output's length admits.
+    #[test]
+    fn output_cap_refuses_one_byte_past_the_output() {
+        let src = "module M exposing (x)\n\n\nx =\n    [ 1, 2, 3 ]\n";
+        let out = format_source(src).expect("formats");
+        let tight = OutputCap(out.len());
+        assert_eq!(
+            format_source_capped(src, tight).ok().as_deref(),
+            Some(out.as_str())
+        );
+        let short = OutputCap(out.len() - 1);
+        let refused = format_source_capped(src, short);
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap })) if cap == short),
+            "{refused:?}"
+        );
+    }
+
+    /// The cap stops at 16 MiB: a 3 MiB input may not grow to 24 MiB.
+    #[test]
+    fn output_cap_is_sixteen_mib_at_most() {
+        assert_eq!(OutputCap::for_input(3 << 20).bytes(), 16 << 20);
+        assert_eq!(OutputCap::for_input(2 << 20).bytes(), 16 << 20);
+        assert_eq!(OutputCap::for_input((2 << 20) - 1).bytes(), (16 << 20) - 8);
+        assert_eq!(OutputCap::for_input(usize::MAX).bytes(), 16 << 20);
+    }
+
+    /// A tiny input may still produce 64 KiB, so the cap never refuses a small
+    /// file or an empty one.
+    #[test]
+    fn output_cap_floor_admits_tiny_input() {
+        assert_eq!(OutputCap::for_input(7).bytes(), 64 << 10);
+        assert_eq!(OutputCap::for_input(0).bytes(), 64 << 10);
+        assert_eq!(OutputCap::for_input(8 << 10).bytes(), 64 << 10);
+        assert_eq!(OutputCap::for_input((8 << 10) + 1).bytes(), (64 << 10) + 8);
+        let src = "module M exposing (x)\n\n\nx =\n    1\n";
+        let blank_tail = "\n".repeat(src.len() * OutputCap::GROWTH);
+        let padded = format_guarded(src, OutputCap::for_input(src.len()), |p, m| {
+            format!("{}{blank_tail}", p.module(m))
+        });
+        assert!(
+            matches!(&padded, Ok(out) if out.len() > src.len() * OutputCap::GROWTH),
+            "the floor admits a tiny input's output past eight times its size: {padded:?}"
+        );
+        assert!(OutputCap::for_input(0).admits(""));
+    }
+
     /// The `RoundTrip` detail of formatting `src` with `render`.
     fn refusal(src: &str, render: impl FnOnce(&Printer<'_>, &Module) -> String) -> String {
-        match format_guarded(src, render) {
+        match format_guarded(src, OutputCap::for_input(src.len()), render) {
             Err(FmtError::RoundTrip { detail }) => detail,
             other => format!("not a refusal: {other:?}"),
         }
