@@ -904,6 +904,7 @@ impl<'a> Builder<'a> {
             wildcard_any_return_bindings: BTreeSet::new(),
             wildcard_any_use_results: Vec::new(),
             ctors: BTreeMap::new(),
+            sealed_ctors: BTreeSet::new(),
             typed_rigids: Vec::new(),
             scheme_apps: Vec::new(),
             super_vars: Vec::new(),

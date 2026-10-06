@@ -38,6 +38,7 @@ use ipe_sandbox::home::ToolHome;
 use ipe_sandbox::{
     CanonicalPath, Capabilities, HomeMasks, JailPathError, JailSpec, NetworkPolicy, ResourceLimits,
     SandboxDefect, missing_caps, probe, run_in_bwrap_jail, run_in_bwrap_jail_deny_subprocess,
+    run_jail::ProcCap,
 };
 
 /// Resource caps for one playground build+run.
@@ -56,7 +57,7 @@ pub struct RunCaps {
     /// Open-file-descriptor cap (`prlimit --nofile`).
     pub fd_cap: u64,
     /// Process-count cap (`prlimit --nproc`) — a fork bomb is killed here.
-    pub proc_cap: u64,
+    pub proc_cap: ProcCap,
     /// Maximum captured stdout/stderr bytes.
     pub out_cap_bytes: u64,
 }
@@ -79,7 +80,7 @@ impl RunCaps {
             cpu_secs: 900,
             wall_secs: 900,
             fd_cap: 512,
-            proc_cap: 256,
+            proc_cap: ProcCap::of::<256>(),
             out_cap_bytes: 512 * 1024 * 1024,
         }
     }
@@ -100,7 +101,7 @@ impl RunCaps {
             fd_cap: 64,
             // >1 so the tokio runtime's worker threads (same process, but nproc
             // counts threads) start; low enough that a fork bomb is killed.
-            proc_cap: 32,
+            proc_cap: ProcCap::of::<32>(),
             out_cap_bytes: 8 * 1024 * 1024,
         }
     }
@@ -540,7 +541,7 @@ mod tests {
         let l = RunCaps::run_defaults().to_limits();
         assert_eq!(l.cpu_secs, 5);
         assert_eq!(l.wall_secs, 10);
-        assert_eq!(l.proc_cap, 32);
+        assert_eq!(l.proc_cap, ProcCap::of::<32>());
         // The build phase is more generous but still bounded.
         let b = RunCaps::build_defaults().to_limits();
         assert!(b.wall_secs > l.wall_secs);

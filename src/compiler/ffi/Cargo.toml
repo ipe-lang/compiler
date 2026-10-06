@@ -29,12 +29,9 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 # package name before cargo ever sees it. Same `toml` version the CLI and the
 # runtime already pin, so no new crate enters the vetted dependency graph.
 toml = "0.8"
-
-# The wrapper manifest is opened with `O_NOFOLLOW | O_NONBLOCK`, so a symlinked
-# or FIFO `Cargo.toml` is refused rather than followed or blocked on. rustix is
-# already in the dependency graph (the CLI's `statvfs` and cache reads).
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "0.38", features = ["fs"] }
+# The wrapper manifest is opened relative to its held directory, never through
+# a link, never blocking, and read under a typed byte cap.
+ipe_fs_open = { path = "../fs_open" }
 
 [dev-dependencies]
 ipe-test-temp = { path = "../../../tools/test-temp" }

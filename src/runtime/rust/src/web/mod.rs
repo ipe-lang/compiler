@@ -1953,25 +1953,65 @@ fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefu
 }
 
 /// Best-effort bounded flush of all active telemetry exporters (push + hub).
-/// Waits at most 500 ms in total. Never panics, never blocks shutdown beyond
-/// the cap. This MUST be called before every `process::exit` because
-/// `process::exit` skips Drop, so the mpsc Sender never drops and the
-/// batchers' channel-close drain path never runs without this explicit flush.
+///
+/// The two flushes run concurrently, each bounded by its exporter's flush
+/// deadline (its connect timeout plus one send budget), so shutdown waits at
+/// most the larger deadline, never their sum, and never past
+/// `push_exporter::FLUSH_DEADLINE_CEILING_MS`. Never panics. `process::exit`
+/// skips Drop, so the mpsc Sender never drops and the batchers'
+/// channel-close drain path never runs without this explicit flush; every
+/// process exit reaches it through `system::exit_process`
+/// (`flush_exporters_before_exit`).
 ///
 /// No-op when `http_client` is absent: the push/hub exporters make outbound
 /// HTTP calls and are gated behind that feature; a web app with no outbound
 /// HTTP kernel has no exporters to flush.
 #[cfg(all(feature = "server", feature = "http_client"))]
 async fn flush_exporters() {
-    // 500 ms total cap (split across two exporters in sequence — each is capped
-    // independently so a slow/unavailable first target doesn't eat all of the
-    // second exporter's budget).
-    const CAP_MS: u64 = 250;
-    push_exporter::flush_now(CAP_MS).await;
-    hub_exporter::flush_now(CAP_MS).await;
+    tokio::join!(push_exporter::flush_now(), hub_exporter::flush_now());
 }
 #[cfg(all(feature = "server", not(feature = "http_client")))]
 async fn flush_exporters() {}
+
+/// Runs `flush_exporters` to completion from synchronous code, bounded by `push_exporter::EXIT_FLUSH_BOUND`.
+///
+/// The pre-exit stage of `system::exit_process`, callable from any thread: a
+/// runtime worker, the entry's `block_on` thread, or a thread outside any
+/// runtime. The flush runs on a fresh thread through the exporters' own
+/// runtime handle (`Handle::block_on` from a thread with no runtime context, so
+/// no runtime is nested inside another), and the caller waits for it at most
+/// the bound. On a multi-thread runtime worker the wait goes through
+/// `block_in_place`, which hands the worker's queued tasks, the batchers among
+/// them, to another thread first. No-op when no exporter was enabled or the
+/// flush thread cannot start. Never panics.
+#[cfg(all(
+    feature = "server",
+    feature = "http_client",
+    not(target_arch = "wasm32")
+))]
+pub(crate) fn flush_exporters_before_exit() {
+    let Some(handle) = push_exporter::exporter_runtime() else {
+        return;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let flush = crate::threads::spawn_named("ipe-exit-flush", move || {
+        handle.block_on(flush_exporters());
+        let _ = done_tx.send(());
+    });
+    if flush.is_err() {
+        return;
+    }
+    let wait = || {
+        let _ = done_rx.recv_timeout(push_exporter::EXIT_FLUSH_BOUND);
+    };
+    let on_multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if on_multi_thread {
+        tokio::task::block_in_place(wait);
+    } else {
+        wait();
+    }
+}
 
 /// Push a bounded `event: reload` frame to every session THIS PROCESS is
 /// currently serving over SSE, so a connected browser skips its own
@@ -2161,12 +2201,11 @@ async fn web_shutdown_signal<Model, Msg>(
 
     // Telemetry export pipelines (push/hub exporters) flush every ~2 s on a
     // tick. The channel-close drain ONLY runs when the mpsc Sender is dropped,
-    // which requires Drop — and `process::exit` skips Drop entirely. Without an
-    // explicit pre-exit flush the grace-timer and watchdog paths below would
-    // silently lose ≤1 batch-interval (~2 s default) of buffered telemetry.
-    // `flush_exporters` sends a Flush sentinel to each active exporter and waits
-    // a bounded 500 ms; it is best-effort (telemetry only, never user data) and
-    // never hangs shutdown.
+    // which requires Drop — and `process::exit` skips Drop entirely. The
+    // grace-timer and watchdog paths below end through `system::exit_process`,
+    // whose pre-exit stage sends a Flush sentinel to each active exporter and
+    // waits at most the larger exporter flush deadline; it is best-effort
+    // (telemetry only, never user data) and never hangs shutdown.
 
     // Grace timer: force a CLEAN exit-0 after the window so a never-idle SSE
     // connection can't hang the drain. Spawned (not awaited) so we still return
@@ -2179,9 +2218,8 @@ async fn web_shutdown_signal<Model, Msg>(
         // after the first teardown call (shutdown_console is idempotent).
         #[cfg(feature = "http_client")]
         console_proxy::shutdown_console();
-        flush_exporters().await;
-        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — Ipe.Web server shutdown boundary: the grace timer won the drain race, exit zero [ledger #boundary]
-        std::process::exit(0);
+        // The exit funnel flushes the exporters before the process ends.
+        crate::system::exit_process(0);
     });
 
     // Second press: a watchdog that force-exits 130 if the user hits Ctrl-C
@@ -2191,9 +2229,8 @@ async fn web_shutdown_signal<Model, Msg>(
         crate::system::write_stderr_line("Ipe.Web: forcing exit (second signal)");
         #[cfg(feature = "http_client")]
         console_proxy::shutdown_console();
-        flush_exporters().await;
-        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — Ipe.Web server shutdown boundary: a second interrupt forces exit 130 (128 + SIGINT) [ledger #boundary]
-        std::process::exit(130); // 128 + SIGINT(2)
+        // 128 + SIGINT(2); the exit funnel flushes the exporters first.
+        crate::system::exit_process(130);
     });
     // Return → axum drains in-flight connections → serve future resolves Ok
     // (fast path when nothing long-lived is open; otherwise the grace timer

@@ -4,6 +4,7 @@
 //! a reader auditing the profile model never needs the per-platform arms.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 use ipe_kernels::Capability;
 
@@ -71,6 +72,142 @@ pub enum FilesystemScope {
     WorkingTreeReadWrite,
 }
 
+// ── the process-count ceiling ───────────────────────────────────────────────
+
+/// A jail's process-count ceiling, from 1 to [`ProcCap::MAX`].
+///
+/// Every jail arm takes its cap from this one type: `prlimit --nproc` on
+/// Linux, the Job Object `ActiveProcessLimit` on Windows (through
+/// [`ProcCap::job_limit`]). Zero and any value past [`ProcCap::MAX`] have no
+/// representation, so no cap reads as "no process" or as "unbounded".
+///
+/// The unit differs per kernel: Linux charges tasks (threads included), while
+/// the Windows Job Object counts processes.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ProcCap(NonZeroU32);
+
+impl ProcCap {
+    /// The highest cap a profile or an operator override may ask for.
+    ///
+    /// Linux counts threads against it, so it leaves room for a threaded build
+    /// while still bounding a fork bomb far below a host's task table.
+    pub const MAX: Self = Self(NonZeroU32::MIN.saturating_add(4095));
+
+    /// The cap every jail runs under unless its caller asks for another.
+    pub const DEFAULT: Self = Self(NonZeroU32::MIN.saturating_add(511));
+
+    /// Parse a requested cap, refusing zero and every value past [`Self::MAX`].
+    ///
+    /// # Errors
+    ///
+    /// [`ProcCapError::Zero`] for `0`; [`ProcCapError::PastCeiling`] for a
+    /// value above [`Self::MAX`]. A value is never clamped into range.
+    pub fn parse(requested: u64) -> Result<Self, ProcCapError> {
+        let narrow = u32::try_from(requested).map_err(|_| ProcCapError::PastCeiling)?;
+        let cap = NonZeroU32::new(narrow).ok_or(ProcCapError::Zero)?;
+        if cap > Self::MAX.0 {
+            return Err(ProcCapError::PastCeiling);
+        }
+        Ok(Self(cap))
+    }
+
+    /// A cap known at compile time; a count outside `1..=MAX` fails the build.
+    #[must_use]
+    pub const fn of<const N: u32>() -> Self {
+        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a literal cap is zero or past the ceiling [ledger #boundary]
+        const { assert!(N >= 1 && N <= Self::MAX.get()) };
+        Self(NonZeroU32::MIN.saturating_add(N - 1))
+    }
+
+    /// The cap as a count.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The Win32 Job Object `ActiveProcessLimit` for a jail.
+    ///
+    /// With `subprocess` withheld only the payload itself may run, so the
+    /// limit is 1; with it granted the limit is the cap. Both are at most
+    /// [`Self::MAX`], so the job is never unbounded.
+    #[must_use]
+    pub const fn job_limit(self, subprocess: bool) -> u32 {
+        if subprocess { self.get() } else { 1 }
+    }
+}
+
+// The documented range and default are the constants themselves.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the process-cap ceiling or default drifts from its documented value [ledger #boundary]
+const _: () = assert!(ProcCap::MAX.get() == 4096 && ProcCap::DEFAULT.get() == 512);
+
+impl std::fmt::Display for ProcCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<u64> for ProcCap {
+    type Error = ProcCapError;
+
+    fn try_from(requested: u64) -> Result<Self, Self::Error> {
+        Self::parse(requested)
+    }
+}
+
+impl From<ProcCap> for u64 {
+    fn from(cap: ProcCap) -> Self {
+        Self::from(cap.get())
+    }
+}
+
+impl std::str::FromStr for ProcCap {
+    type Err = ProcCapError;
+
+    /// Parse decimal digits only: a sign, a space or an empty text refuses.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ProcCapError::NotANumber);
+        }
+        // Digits only, so the one way `u64` parsing fails is an overflow.
+        text.parse::<u64>()
+            .map_err(|_| ProcCapError::PastCeiling)
+            .and_then(Self::parse)
+    }
+}
+
+/// Why a requested process cap was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcCapError {
+    /// The text is not a whole decimal number.
+    NotANumber,
+    /// A cap of 0 admits no process at all.
+    Zero,
+    /// The cap is above [`ProcCap::MAX`].
+    PastCeiling,
+}
+
+impl std::fmt::Display for ProcCapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max = ProcCap::MAX;
+        match self {
+            Self::NotANumber => write!(f, "a process cap must be a whole number from 1 to {max}"),
+            Self::Zero => write!(
+                f,
+                "a process cap of 0 admits no process; it must be from 1 to {max}"
+            ),
+            Self::PastCeiling => write!(
+                f,
+                "a process cap above {max} is refused; it must be from 1 to {max}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProcCapError {}
+
 /// The resource caps for a run-jailed app.
 ///
 /// Distinct from the build jail's `ResourceLimits`, whose values (10 GiB AS,
@@ -92,7 +229,7 @@ pub struct RunResourceLimits {
     /// Open-file-descriptor cap.
     pub fd_cap: u64,
     /// Process-count cap.
-    pub proc_cap: u64,
+    pub proc_cap: ProcCap,
 }
 
 impl Default for RunResourceLimits {
@@ -105,7 +242,7 @@ impl Default for RunResourceLimits {
             cpu_secs: 86_400,
             wall_secs: None,
             fd_cap: 4096,
-            proc_cap: 512,
+            proc_cap: ProcCap::DEFAULT,
         }
     }
 }
@@ -783,7 +920,78 @@ pub fn scan_capfloor(bytes: &[u8]) -> Option<CapFloor> {
 
 #[cfg(test)]
 mod limit_mapping_tests {
-    use super::RunResourceLimits;
+    use super::{ProcCap, ProcCapError, RunResourceLimits};
+
+    #[test]
+    fn proc_cap_refuses_zero_and_past_ceiling() {
+        assert_eq!(ProcCap::parse(0), Err(ProcCapError::Zero));
+        let one_past = u64::from(ProcCap::MAX.get()) + 1;
+        assert_eq!(ProcCap::parse(one_past), Err(ProcCapError::PastCeiling));
+        assert_eq!(
+            ProcCap::parse(u64::from(u32::MAX) + 1),
+            Err(ProcCapError::PastCeiling)
+        );
+        assert_eq!(ProcCap::parse(u64::MAX), Err(ProcCapError::PastCeiling));
+        assert_eq!(ProcCap::try_from(0_u64), Err(ProcCapError::Zero));
+        // The text form refuses the same values, and anything but digits.
+        assert_eq!("0".parse::<ProcCap>(), Err(ProcCapError::Zero));
+        assert_eq!("4097".parse::<ProcCap>(), Err(ProcCapError::PastCeiling));
+        assert_eq!(
+            "99999999999999999999999".parse::<ProcCap>(),
+            Err(ProcCapError::PastCeiling)
+        );
+        for not_digits in ["", "+64", "-1", " 64", "64 ", "0x40", "6.4", "\u{663}"] {
+            assert_eq!(
+                not_digits.parse::<ProcCap>(),
+                Err(ProcCapError::NotANumber),
+                "{not_digits:?}"
+            );
+        }
+        // Controls: the default, the ceiling and the floor admit unchanged.
+        assert_eq!(ProcCap::parse(512).map(ProcCap::get), Ok(512));
+        assert_eq!(ProcCap::parse(512), Ok(ProcCap::DEFAULT));
+        assert_eq!(ProcCap::parse(4096), Ok(ProcCap::MAX));
+        assert_eq!(ProcCap::parse(1).map(ProcCap::get), Ok(1));
+        assert_eq!("4096".parse::<ProcCap>(), Ok(ProcCap::MAX));
+        // A leading zero is still a decimal number, as in the other overrides.
+        assert_eq!("0512".parse::<ProcCap>(), Ok(ProcCap::DEFAULT));
+        assert_eq!(u64::from(ProcCap::MAX), 4096);
+        assert_eq!(ProcCap::MAX.to_string(), "4096");
+        assert_eq!(RunResourceLimits::default().proc_cap, ProcCap::DEFAULT);
+    }
+
+    #[test]
+    fn a_deserialized_proc_cap_refuses_zero_and_past_ceiling() {
+        // Serde mints the cap through `ProcCap::parse`, so a profile read from
+        // text cannot carry a cap the type refuses.
+        let limits = |proc_cap: &str| {
+            toml::from_str::<RunResourceLimits>(&format!(
+                "as_bytes = 1\ncpu_secs = 1\nfd_cap = 1\nproc_cap = {proc_cap}\n"
+            ))
+        };
+        for refused in ["0", "4097", "-1", "4294967296"] {
+            assert!(limits(refused).is_err(), "proc_cap = {refused}");
+        }
+        // Controls: the floor and the ceiling deserialize unchanged.
+        assert_eq!(limits("1").ok().map(|l| l.proc_cap.get()), Some(1));
+        assert_eq!(limits("4096").ok().map(|l| l.proc_cap), Some(ProcCap::MAX));
+    }
+
+    #[test]
+    fn active_process_cap_never_exceeds_the_proc_cap_ceiling() {
+        // The Windows Job Object limit comes from the typed cap alone, so it is
+        // never past `ProcCap::MAX` and never 0, granted or withheld.
+        for cap in [ProcCap::parse(1), Ok(ProcCap::DEFAULT), Ok(ProcCap::MAX)] {
+            let cap = cap.expect("a cap in range");
+            assert_eq!(cap.job_limit(true), cap.get());
+            assert!(cap.job_limit(true) <= ProcCap::MAX.get());
+            assert_eq!(cap.job_limit(false), 1);
+        }
+        // Controls: a granted job runs under the cap it asked for.
+        let eight = ProcCap::parse(8).expect("8 is in range");
+        assert_eq!(eight.job_limit(true), 8);
+        assert_eq!(ProcCap::MAX.job_limit(true), 4096);
+    }
 
     #[test]
     fn cpu_seconds_map_to_hundred_nanosecond_ticks() {

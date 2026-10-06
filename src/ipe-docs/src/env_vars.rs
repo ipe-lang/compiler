@@ -672,7 +672,9 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_FFI_PROC_CAP",
         default: "unset (sandbox default)",
-        purpose: "Process-count limit for each sandboxed FFI inspector phase.",
+        purpose: "Process-count limit for each sandboxed FFI inspector phase: a whole \
+                  number from 1 to 4096. Zero, a larger value, or anything but digits \
+                  refuses the inspection.",
         subsystem: Subsystem::Ffi,
         class: Class::SecurityTunable,
     },

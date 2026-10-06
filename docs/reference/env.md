@@ -144,7 +144,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_FFI_INSPECTOR` | unset (auto-located beside test binary) | Explicit path to the `ipe-ffi-inspector` binary used in integration tests. Not needed in normal use. | `Tunable` |
 | `IPE_FFI_OUT_CAP_MB` | unset (sandbox default) | Output-size cap (MB) for each sandboxed FFI inspector phase. Prevents inspector stdout from exhausting memory. | `SecurityTunable` |
 | `IPE_FFI_PROBE_DIR` | unset (per-run temp dir) | Root directory for the FFI inspector's probe workspace. Setting a stable path allows Cargo to reuse dependency build artefacts across repeated `ipe add` invocations. | `Tunable` |
-| `IPE_FFI_PROC_CAP` | unset (sandbox default) | Process-count limit for each sandboxed FFI inspector phase. | `SecurityTunable` |
+| `IPE_FFI_PROC_CAP` | unset (sandbox default) | Process-count limit for each sandboxed FFI inspector phase: a whole number from 1 to 4096. Zero, a larger value, or anything but digits refuses the inspection. | `SecurityTunable` |
 | `IPE_FFI_RSS_MB` | unset (sandbox default) | RSS memory limit (MB) for each sandboxed FFI inspector phase. | `SecurityTunable` |
 | `IPE_FFI_WALL_SECS` | unset (sandbox default) | Wall-clock time limit (seconds) for each sandboxed FFI inspector phase. | `SecurityTunable` |
 | `IPE_FFI_XC_LOAD` | unset | Path to a pre-generated cross-compilation manifest to load instead of running the inspector. Developer / CI optimisation. | `Tunable` |
