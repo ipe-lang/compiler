@@ -21,7 +21,7 @@
 //! (oldest batch evicted when full). No `unwrap`/`expect`/indexing.
 
 use super::push_exporter::{
-    ExporterEnv, FlushDeadline, OutcomeLog, PushOutcome, drain_before_exit,
+    ExporterEnv, FlushDeadline, OutcomeLog, PushOutcome, drain_before_exit, record_exporter_runtime,
 };
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -136,6 +136,7 @@ pub async fn enable_from_env() {
             super::push_exporter::redacted_origin(&base)
         ),
     );
+    record_exporter_runtime();
     tokio::spawn(batcher(
         rx,
         HubTarget {
