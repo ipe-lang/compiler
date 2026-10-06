@@ -1,0 +1,98 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.Db
+import Ipe.Db.Unsafe
+import Ipe.Db.Sql
+import Ipe.Error as Error
+import Ipe.List
+import Ipe.String
+import Ipe.Task
+
+-- `Sql.startsWith` end to end: a literal prefix matches itself only.
+-- `%`, `_` and `\` in the prefix match literally, the match is
+-- case-sensitive, a NULL value never matches, a refused prefix (empty, or
+-- one byte past the 16384-byte ceiling) surfaces as a typed `Task` error,
+-- and the prefix's binds keep their order when composed with `Sql.and`.
+
+
+rows =
+    [ SqlString "Acme-1"
+    , SqlString "acme-2"
+    , SqlString "ACME"
+    , SqlString "50%off"
+    , SqlString "50 cents"
+    , SqlString "500"
+    , SqlString "a_b-x"
+    , SqlString "axb-y"
+    , SqlString "!bang"
+    , SqlString "!x"
+    , SqlString "a\\b"
+    , SqlString "ab"
+    , SqlNull (SqlString "")
+    ]
+
+
+insertRow conn value =
+    Db.exec conn "INSERT INTO names (name) VALUES (?)" [ value ]
+
+
+report conn label frag =
+    Db.findWhere conn "names" frag
+        |> Task.andThen
+            (\found ->
+                Io.println
+                    (label
+                        ++ ": "
+                        ++ String.join "," (List.map (\r -> Unsafe.unsafeGetString "name" r) found)
+                    )
+            )
+        |> Task.onError (\e -> Io.println (label ++ ": " ++ Error.toString e))
+
+
+prefix conn p =
+    report conn ("startsWith " ++ p) (Sql.startsWith (Sql.column "name") p)
+
+
+main =
+    Task.andThen
+        (\conn ->
+            Db.withTransaction conn
+                (\txconn ->
+                    Unsafe.unsafeExecRaw txconn
+                        "CREATE TABLE names (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)"
+                        |> Task.andThen (\_ -> Task.sequence (List.map (insertRow txconn) rows))
+                        |> Task.andThen
+                            (\_ ->
+                                Task.sequence
+                                    [ prefix txconn "acme"
+                                    , prefix txconn "ACME"
+                                    , prefix txconn "50%"
+                                    , prefix txconn "a_b"
+                                    , prefix txconn "!b"
+                                    , prefix txconn "a\\"
+                                    , prefix txconn "ab"
+                                    , report txconn
+                                        "startsWith and eq"
+                                        (Sql.and
+                                            (Sql.startsWith (Sql.column "name") "a")
+                                            (Sql.eq (Sql.column "name") (Sql.string "ab"))
+                                        )
+                                    , report txconn
+                                        "eq and startsWith"
+                                        (Sql.and
+                                            (Sql.eq (Sql.column "name") (Sql.string "a_b-x"))
+                                            (Sql.startsWith (Sql.column "name") "a_")
+                                        )
+                                    , report txconn "empty prefix" (Sql.startsWith (Sql.column "name") "")
+                                    , report txconn
+                                        "longest prefix"
+                                        (Sql.startsWith (Sql.column "name") (String.repeat 16384 "a"))
+                                    , report txconn
+                                        "too-long prefix"
+                                        (Sql.startsWith (Sql.column "name") (String.repeat 16385 "a"))
+                                    ]
+                            )
+                        |> Task.andThen (\_ -> Task.succeed ())
+                )
+        )
+        (Db.open "sqlite" "sqlite::memory:")

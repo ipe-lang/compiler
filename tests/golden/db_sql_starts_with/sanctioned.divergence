@@ -1,0 +1,1 @@
+sanctioned: `Sql.startsWith` is an Ipê-only combinator with no reference counterpart, so there is no other backend to diverge from. Ipê's output is recorded as the correct reference.
