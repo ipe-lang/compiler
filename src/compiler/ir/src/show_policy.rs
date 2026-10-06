@@ -358,9 +358,10 @@ pub enum NamedShow {
     Leaf(ShowLeaf),
 }
 
-/// The Prelude enums the backend emits as a type alias to the runtime's own
-/// definition, with the leaf each is shown through. The runtime owns the one
-/// nominal type and its `IpeStringify` row, so the emitted crate holds no impl.
+/// The Prelude enums the backend emits as a runtime type alias, with their leaf.
+///
+/// The runtime owns the one nominal type and its `IpeStringify` row, so the
+/// emitted crate holds no impl.
 pub const RUNTIME_ALIASED_ENUMS: [(&str, ShowLeaf); 3] = [
     ("ProjectionTerm", show_leaf::PROJECTION_TERM),
     ("ProjectionOperand", show_leaf::PROJECTION_OPERAND),
