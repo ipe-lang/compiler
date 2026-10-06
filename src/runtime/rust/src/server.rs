@@ -806,6 +806,8 @@ fn parse_response_header(
 /// The header enters the response only when its name is a `token` other than
 /// `Set-Cookie`, `Content-Length` and `Transfer-Encoding` and its value a
 /// visible-ASCII header value; any other header is an `InvalidInput` error.
+/// It replaces every header of the same name in any case, so the response
+/// holds one value per header name.
 #[must_use]
 pub fn server_with_header(
     k: String,
@@ -814,10 +816,205 @@ pub fn server_with_header(
 ) -> IpeResult<IpeError, ServerResponse> {
     match parse_response_header(&k, &v) {
         Ok(_) => {
-            r.headers.insert(k, v);
+            set_header_replacing(&mut r.headers, k, v);
             IpeResult::Ok(r)
         }
         Err(refusal) => IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned())),
+    }
+}
+
+/// Sets header `name` to `value` in a response's headers, replacing every
+/// header of the same name in any case, so the map holds one value per header
+/// name. Every runtime write of a response header by name goes through here.
+fn set_header_replacing(headers: &mut HashMap<String, String>, name: String, value: String) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case(&name));
+    headers.insert(name, value);
+}
+
+/// Every value of header `name` in any case, joined by `, ` in name order so
+/// the result does not depend on map iteration order; `None` when absent.
+fn header_values_ci(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    let mut found: Vec<(&String, &String)> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    found.sort();
+    Some(
+        found
+            .into_iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+pub use response_head::ServerResponseHead;
+use response_head::{ServerDelivery, assemble_response_head};
+
+/// The one assembly of a response's status and headers, for every delivery.
+///
+/// A [`ServerResponseHead`] has no constructor but [`assemble_response_head`],
+/// so a buffered and a streamed response carry the same parsed handler
+/// headers, `Set-Cookie` lines and security headers, and refuse alike.
+mod response_head {
+    use super::{ServerResponse, parse_response_header};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+
+    /// How a response body reaches the client.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ServerDelivery {
+        /// The whole body in one piece.
+        Buffered,
+        /// The body chunk by chunk over a held connection.
+        Streamed,
+    }
+
+    impl ServerDelivery {
+        /// The headers this delivery adds when the handler has not set them.
+        fn default_headers(self) -> [Option<(HeaderName, HeaderValue)>; 2] {
+            match self {
+                Self::Buffered => [None, None],
+                // A proxy forwards each chunk as it arrives, and a streamed
+                // body is never replayed from a cache.
+                Self::Streamed => [
+                    Some((
+                        const { HeaderName::from_static("x-accel-buffering") },
+                        const { HeaderValue::from_static("no") },
+                    )),
+                    Some((
+                        header::CACHE_CONTROL,
+                        const { HeaderValue::from_static("no-cache") },
+                    )),
+                ],
+            }
+        }
+    }
+
+    /// Why a response has no head to send; every refusal answers `500`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HeadRefusal {
+        /// A handler header has no representation (see `parse_response_header`),
+        /// or names a header another handler header names in another case.
+        Header,
+        /// The response content type is not a header value.
+        ContentType,
+        /// A cookie line is not a header value.
+        Cookie,
+        /// The framing policy (`IPE_WEB_FRAME_ANCESTORS`) was refused.
+        FramingPolicy,
+        /// A security header is not a header line.
+        SecurityHeader,
+        /// The head holds more header names than a header map can.
+        Oversize,
+    }
+
+    /// A response status and header set, built only by [`assemble_response_head`].
+    pub struct ServerResponseHead {
+        status: StatusCode,
+        headers: HeaderMap,
+    }
+
+    // Header values can carry a session id or a token: only the status is shown.
+    impl std::fmt::Debug for ServerResponseHead {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ServerResponseHead")
+                .field("status", &self.status)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ServerResponseHead {
+        /// Whether the head declares an HTML body.
+        #[must_use]
+        pub fn is_html(&self) -> bool {
+            self.headers
+                .get(header::CONTENT_TYPE)
+                .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
+        }
+
+        /// The response with this head over `body`.
+        #[must_use]
+        pub fn into_response(self, body: axum::body::Body) -> axum::response::Response {
+            let mut resp = axum::response::Response::new(body);
+            *resp.status_mut() = self.status;
+            *resp.headers_mut() = self.headers;
+            resp
+        }
+    }
+
+    /// Assemble the head of `r` for `delivery` under the read security headers.
+    ///
+    /// Every handler header is parsed again, whatever built it: a `Response`
+    /// record update can carry headers `Server.withHeader` never saw. A handler
+    /// `content-type` header wins over `r.contentType`. Each `Set-Cookie` line
+    /// is its own header, never comma-folded (RFC 6265 §4.1). A security or
+    /// delivery header is added only when the handler has not set it.
+    ///
+    /// # Errors
+    ///
+    /// A [`HeadRefusal`] for a handler header, content type, cookie line or
+    /// security header with no representation, for two handler headers of one
+    /// name, for more header names than a header map holds, or for a refused
+    /// framing policy: no response ships without its framing policy, with a
+    /// raw line, or with a header whose value depends on iteration order.
+    pub fn assemble_response_head(
+        r: &ServerResponse,
+        delivery: ServerDelivery,
+        security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+    ) -> Result<ServerResponseHead, HeadRefusal> {
+        let security = security.map_err(|_| HeadRefusal::FramingPolicy)?;
+        // An out-of-range Ipê status is clamped into the HTTP range first.
+        let status = u16::try_from(r.status.clamp(100, 599))
+            .ok()
+            .and_then(|s| StatusCode::from_u16(s).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut headers = HeaderMap::new();
+        // One value per handler header name: a second spelling of a name is
+        // refused, never appended in `HashMap` iteration order.
+        for (k, v) in &r.headers {
+            let (name, value) = parse_response_header(k, v).map_err(|_| HeadRefusal::Header)?;
+            if headers.contains_key(&name) {
+                return Err(HeadRefusal::Header);
+            }
+            headers
+                .try_insert(name, value)
+                .map_err(|_| HeadRefusal::Oversize)?;
+        }
+        if !r.contentType.is_empty() && !headers.contains_key(header::CONTENT_TYPE) {
+            let (_, value) = parse_response_header("content-type", &r.contentType)
+                .map_err(|_| HeadRefusal::ContentType)?;
+            headers
+                .try_insert(header::CONTENT_TYPE, value)
+                .map_err(|_| HeadRefusal::Oversize)?;
+        }
+        for cookie in &r.cookies {
+            let value = cookie.header_value().ok_or(HeadRefusal::Cookie)?;
+            headers
+                .try_append(header::SET_COOKIE, value)
+                .map_err(|_| HeadRefusal::Oversize)?;
+        }
+        for (name, value) in security {
+            let name =
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| HeadRefusal::SecurityHeader)?;
+            if !headers.contains_key(&name) {
+                let value =
+                    HeaderValue::from_str(&value).map_err(|_| HeadRefusal::SecurityHeader)?;
+                headers
+                    .try_insert(name, value)
+                    .map_err(|_| HeadRefusal::Oversize)?;
+            }
+        }
+        for (name, value) in delivery.default_headers().into_iter().flatten() {
+            if !headers.contains_key(&name) {
+                headers
+                    .try_insert(name, value)
+                    .map_err(|_| HeadRefusal::Oversize)?;
+            }
+        }
+        Ok(ServerResponseHead { status, headers })
     }
 }
 
@@ -845,8 +1042,9 @@ const LOCATION_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
 #[must_use]
 pub fn server_redirect(location: String) -> ServerResponse {
     let mut r = resp(302, String::new(), "text/plain");
-    r.headers.insert(
-        "Location".to_string(),
+    set_header_replacing(
+        &mut r.headers,
+        "Location".to_owned(),
         percent_encoding::utf8_percent_encode(&location, LOCATION_ESCAPE).to_string(),
     );
     r
@@ -1536,82 +1734,32 @@ fn to_axum_response_with(
     security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // Ipe.Http.Server.Stream: a streaming response carries a sentinel body the
-    // handler stashed via ServerStream.stream. Detect it + serve the chunked
-    // body before the buffered path runs.
-    if let Some(streamed) = serve_streaming_sentinel(&r) {
-        return streamed;
-    }
-    // Clamp to the valid HTTP status range before the u16 cast so an out-of-range
-    // Ipê integer (e.g. from a buggy handler returning status=99999) produces a
-    // defined 500 rather than a wrapping or panicking cast.
-    let status_u16 = r.status.clamp(100, 599) as u16;
-    let status = axum::http::StatusCode::from_u16(status_u16)
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let mut builder = axum::http::Response::builder().status(status);
-    // Emit the response's contentType UNLESS the handler already set a
-    // content-type via withHeader (case-insensitive). builder.header APPENDS, so
-    // emitting both would produce two `content-type` headers on the wire; an
-    // explicit handler override wins (parity with the security-headers `if-unset`
-    // policy below).
-    let has_ct_header = r
-        .headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("content-type"));
-    if !r.contentType.is_empty() && !has_ct_header {
-        builder = builder.header("content-type", r.contentType.clone());
-    }
-    // Every header is parsed again here, whatever built it: a `Response`
-    // record update can carry headers `Server.withHeader` never saw. A header
-    // with no representation (CR/LF, non-token name, `Set-Cookie`) answers 500.
-    for (k, v) in &r.headers {
-        let Ok((name, value)) = parse_response_header(k, v) else {
+    // A streaming response carries the sentinel body `stream` registered.
+    // Claiming it takes its handler, which runs only once the head is built.
+    let pending = match claim_streaming_sentinel(&r.body) {
+        ServerStreamClaim::Buffered => None,
+        ServerStreamClaim::Stream(pending) => Some(pending),
+        // This process's sentinel with no live handler: serving it as a
+        // buffered body would send the sentinel nonce to the client.
+        ServerStreamClaim::Abandoned => {
             return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
-        builder = builder.header(name, value);
-    }
-    // Multiple Set-Cookie response headers (RFC 6265 §4.1 forbids comma-folding
-    // them into one line) — kept in a dedicated Vec (see `ServerResponse.cookies`)
-    // so two cookie-setting code paths (e.g. a handler's `Server.withCookie` plus
-    // a wrapping `Middleware.withCsrf`) never clobber each other via the
-    // single-valued `headers` map. `builder.header` APPENDS, so repeated calls
-    // with the same key name produce separate header lines on the wire.
-    for cookie_v in &r.cookies {
-        let Some(value) = cookie_v.header_value() else {
-            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
-        builder = builder.header(axum::http::header::SET_COOKIE, value);
-    }
-    // Safe-by-default security headers — applied only when the handler hasn't
-    // already set them, so an explicit handler override wins. Values are
-    // env/static (no request-derived strings → no header-injection surface).
-    // A refused framing policy answers 500: `Server.listen` refuses to start on
-    // it, and this second check keeps a response from ever shipping without it.
-    let Ok(security) = security else {
+        }
+    };
+    let delivery = if pending.is_some() {
+        ServerDelivery::Streamed
+    } else {
+        ServerDelivery::Buffered
+    };
+    let Ok(head) = assemble_response_head(&r, delivery, security) else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    for (name, value) in security {
-        if !r.headers.keys().any(|k| k.eq_ignore_ascii_case(name)) {
-            builder = builder.header(name, value);
-        }
+    if let Some(pending) = pending {
+        return pending.serve(head);
     }
-    // Dev-only "🔍 Console" banner injection for every text/html response.
-    // Runs on the buffered body only; streaming responses returned above via
-    // serve_streaming_sentinel bypass this. Effective content-type = the
-    // handler's override header when present, else r.contentType.
-    let effective_ct: String = if has_ct_header {
-        r.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
-    } else {
-        r.contentType.clone()
-    };
-    // Prefix test matches  `strings.HasPrefix(ct, "text/html")` exactly:
-    // case-sensitive, no trimming — Ipê's html builder always sets a lowercase
-    // `text/html; charset=utf-8`, so this is the byte-parity comparison.
-    let banner = if effective_ct.starts_with("text/html") {
+    // Dev-only "🔍 Console" banner injection for every text/html buffered body.
+    // Prefix test matches `strings.HasPrefix(ct, "text/html")` exactly:
+    // case-sensitive, no trimming.
+    let banner = if head.is_html() {
         crate::telemetry::dev_console_banner("")
     } else {
         String::new()
@@ -1624,10 +1772,7 @@ fn to_axum_response_with(
     } else {
         crate::telemetry::inject_dev_banner(&r.body, &banner)
     };
-    match builder.body(axum::body::Body::from(body)) {
-        Ok(resp) => resp,
-        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    head.into_response(axum::body::Body::from(body))
 }
 
 fn method_router(method: &str, h: ErasedHandler) -> axum::routing::MethodRouter {
@@ -1811,6 +1956,14 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         if let Some(msg) = endpoint_conflict(&routes) {
             return IpeResult::Err(msg.into());
         }
+        // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
+        // (env) > the app's `Host.bind` setting > the posture fallback
+        // (loopback unless production). A present `IPE_HTTP_BIND` that is not
+        // an IP address refuses the listener.
+        let host = match crate::app_config::resolve_host_bind() {
+            Ok(host) => host,
+            Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
+        };
         let ceilings = match listen_ceilings() {
             Ok(ceilings) => ceilings,
             Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
@@ -1934,15 +2087,13 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             port,
         );
         let port = resolved.port;
-        // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
-        // (env) > the app's `Host.bind` setting > the build-profile fallback
-        // (loopback in debug, all interfaces in release). The conservative
-        // loopback default keeps a dev console off the LAN by construction.
-        let host = crate::app_config::resolve_host_bind();
+        let Ok(port) = u16::try_from(port) else {
+            return IpeResult::Err(format!("Server.listen: port {port} is not a TCP port").into());
+        };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
-        crate::telemetry::record_bind(&host);
-        let addr = format!("{}:{}", host, port);
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
+        crate::telemetry::record_bind(host);
+        let addr = std::net::SocketAddr::new(host, port);
+        let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return IpeResult::Err(resolved.addr_in_use_message().into());
@@ -2766,7 +2917,7 @@ fn header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a
 fn plain_resp(status: i64, body: &str, extra: &[(&str, &str)]) -> ServerResponse {
     let mut headers = HashMap::new();
     for (k, v) in extra {
-        headers.insert(k.to_string(), v.to_string());
+        set_header_replacing(&mut headers, (*k).to_owned(), (*v).to_owned());
     }
     ServerResponse {
         status,
@@ -2775,6 +2926,36 @@ fn plain_resp(status: i64, body: &str, extra: &[(&str, &str)]) -> ServerResponse
         contentType: "text/plain".to_string(),
         cookies: Vec::new(),
     }
+}
+
+/// Tags `resp` with the allowed origin `allow`, replacing any
+/// `Access-Control-Allow-Origin` the handler set in any case. A specific
+/// origin (not `*`) makes the response origin-dependent, so `Origin` joins the
+/// handler's `Vary` (merged in any case, never clobbered) and a shared cache
+/// cannot serve one origin's grant to another.
+fn tag_cors(resp: &mut ServerResponse, allow: Option<String>) {
+    let Some(a) = allow else {
+        return;
+    };
+    if a != "*" {
+        let vary = match header_values_ci(&resp.headers, "Vary") {
+            Some(prev)
+                if prev
+                    .split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
+            {
+                prev
+            }
+            Some(prev) => format!("{prev}, Origin"),
+            None => "Origin".to_owned(),
+        };
+        set_header_replacing(&mut resp.headers, "Vary".to_owned(), vary);
+    }
+    set_header_replacing(
+        &mut resp.headers,
+        "access-control-allow-origin".to_owned(),
+        a,
+    );
 }
 
 /// Middleware.withCors : List String -> Handler -> Handler. Echoes an allowed
@@ -2809,58 +2990,14 @@ where
                     ),
                 ],
             );
-            if let Some(a) = allow {
-                // A reflected SPECIFIC origin (not `*`) makes the response
-                // origin-dependent — emit `Vary: Origin` so a shared/intermediary
-                // cache can't serve one origin's ACAO to another (CORS cache
-                // poisoning). `*` is origin-independent, so no Vary needed.
-                if a != "*" {
-                    // MERGE, don't clobber: a handler may already have set Vary
-                    // (e.g. `Accept-Encoding`). Append `Origin` unless present.
-                    let vary = match resp.headers.get("Vary") {
-                        Some(prev)
-                            if !prev
-                                .split(',')
-                                .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
-                        {
-                            format!("{}, Origin", prev)
-                        }
-                        Some(prev) => prev.clone(),
-                        None => "Origin".to_string(),
-                    };
-                    resp.headers.insert("Vary".to_string(), vary);
-                }
-                resp.headers
-                    .insert("access-control-allow-origin".to_string(), a);
-            }
+            tag_cors(&mut resp, allow);
             return Box::pin(async move { ok_res(resp) });
         }
         let task = h(req);
         Box::pin(async move {
             match task.await {
                 IpeResult::Ok(mut resp) => {
-                    if let Some(a) = allow {
-                        // See preflight branch: a reflected specific origin needs
-                        // `Vary: Origin` to be cache-safe.
-                        if a != "*" {
-                            // MERGE, don't clobber: a handler may already have set Vary
-                            // (e.g. `Accept-Encoding`). Append `Origin` unless present.
-                            let vary = match resp.headers.get("Vary") {
-                                Some(prev)
-                                    if !prev
-                                        .split(',')
-                                        .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
-                                {
-                                    format!("{}, Origin", prev)
-                                }
-                                Some(prev) => prev.clone(),
-                                None => "Origin".to_string(),
-                            };
-                            resp.headers.insert("Vary".to_string(), vary);
-                        }
-                        resp.headers
-                            .insert("access-control-allow-origin".to_string(), a);
-                    }
+                    tag_cors(&mut resp, allow);
                     ok_res(resp)
                 }
                 other => other,
@@ -3464,6 +3601,26 @@ mod tests {
         println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
     }
 
+    /// A present `IPE_HTTP_BIND` that is not an IP address refuses the listener
+    /// before it binds.
+    #[tokio::test]
+    async fn listen_refuses_a_bind_that_is_not_an_ip_address() {
+        for raw in ["localhost", "127.0.0.1:8080", "[::1]", " 127.0.0.1"] {
+            crate::system::locked_set_var("IPE_HTTP_BIND", raw);
+            // A listener that got past the refusal would bind and serve forever;
+            // the timeout turns that regression into a failure instead of a hang.
+            let listened: Result<IpeResult<String, ()>, _> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(0, Vec::new()),
+            )
+            .await;
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+            let refused = matches!(&listened, Ok(IpeResult::Err(msg))
+                if msg.starts_with("Server.listen: IPE_HTTP_BIND must be an IP address"));
+            assert!(refused, "IPE_HTTP_BIND={raw:?} must refuse the listener");
+        }
+    }
+
     #[test]
     fn server_header_is_case_insensitive_go_parity() {
         let mut headers = HashMap::new();
@@ -4060,7 +4217,7 @@ mod tests {
     async fn dev_posture_pin_to_axum_response_injects_dev_banner_before_body_close() {
         crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let ipe = server_html("<html><body><h1>hi</h1></body></html>".to_string());
         let out = axum_body_string(to_axum_response(ipe)).await;
         assert!(
@@ -4083,7 +4240,7 @@ mod tests {
     #[tokio::test]
     async fn to_axum_response_omits_dev_banner_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let html = "<html><body><h1>hi</h1></body></html>";
         let out = axum_body_string(to_axum_response(server_html(html.to_string()))).await;
         crate::system::locked_remove_var("ENV");
@@ -4203,7 +4360,7 @@ mod tests {
         // back to the same-origin check; a release binary refuses outright.
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_ENV");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let cfg = ws_server_default_cfg::<String>();
         let req = mk_ws_req(&[
             ("origin", "https://evil.example"),
@@ -4231,7 +4388,7 @@ mod tests {
                 None => crate::system::locked_remove_var(key),
             }
         }
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -4992,6 +5149,366 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
         assert!(resp.headers().get("x-injected").is_none());
+    }
+
+    /// A `stream` response whose handler emits nothing.
+    async fn streamed(content_type: &str) -> ServerResponse {
+        let task = server_stream_stream::<IpeError, _>(content_type.to_owned(), |_w| {
+            Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+        });
+        let built = match task.await {
+            IpeResult::Ok(r) => Some(r),
+            IpeResult::Err(_) => None,
+        };
+        built.expect("`stream` must build a response")
+    }
+
+    /// The security headers `to_axum_response_with` is handed in these tests.
+    fn framed_security()
+    -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
+        Ok(vec![
+            ("x-content-type-options", "nosniff".to_owned()),
+            ("x-frame-options", "SAMEORIGIN".to_owned()),
+        ])
+    }
+
+    /// The one value of header `name` in `resp`, or `None` for none or several.
+    fn single_header<'a>(resp: &'a axum::response::Response, name: &str) -> Option<&'a str> {
+        let mut all = resp.headers().get_all(name).iter();
+        let first = all.next()?;
+        if all.next().is_some() {
+            return None;
+        }
+        first.to_str().ok()
+    }
+
+    /// A streamed response carries the framing and `nosniff` headers, its
+    /// content type and the streaming hints; a handler header overrides a hint.
+    #[tokio::test]
+    async fn streamed_response_carries_the_security_headers() {
+        let mut r = streamed("text/event-stream").await;
+        r.headers
+            .insert("Cache-Control".to_owned(), "no-store".to_owned());
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(single_header(&resp, "x-frame-options"), Some("SAMEORIGIN"));
+        assert_eq!(
+            single_header(&resp, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            single_header(&resp, "content-type"),
+            Some("text/event-stream")
+        );
+        assert_eq!(single_header(&resp, "x-accel-buffering"), Some("no"));
+        assert_eq!(single_header(&resp, "cache-control"), Some("no-store"));
+    }
+
+    /// A streamed response sends every `Set-Cookie` line of its `cookies`.
+    #[tokio::test]
+    async fn streamed_response_emits_its_set_cookie_lines() {
+        let mut r = streamed("text/event-stream").await;
+        r = server_with_cookie(cookie("a", "1"), r);
+        r = server_with_cookie(cookie("b", "2"), r);
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let lines: Vec<_> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("a=1")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("b=2")), "{lines:?}");
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500 on a streamed response.
+    #[tokio::test]
+    async fn streamed_response_refuses_a_refused_framing_policy() {
+        let r = streamed("text/event-stream").await;
+        let resp = to_axum_response_with(r, Err(crate::telemetry::FrameAncestorsRefusal::Blank));
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("x-frame-options").is_none());
+        assert!(resp.headers().get("x-accel-buffering").is_none());
+    }
+
+    /// A raw header with no representation is the same typed refusal on a
+    /// buffered and a streamed head, and answers 500 on a streamed response.
+    #[tokio::test]
+    async fn buffered_and_streamed_heads_refuse_raw_headers_alike() {
+        for (name, value) in [
+            ("Set-Cookie", "sid=forged; Path=/"),
+            ("set-cookie", "sid=forged"),
+            ("X-Ok", "a\r\nSet-Cookie: sid=forged"),
+            ("X-Ok", "a\nb"),
+            ("X Bad", "v"),
+            ("Content-Length", "0"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            let mut buffered = server_text("ok".to_owned());
+            buffered.headers.insert(name.to_owned(), value.to_owned());
+            for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+                assert!(
+                    matches!(
+                        assemble_response_head(&buffered, delivery, framed_security()),
+                        Err(response_head::HeadRefusal::Header)
+                    ),
+                    "{name:?}: {value:?} under {delivery:?}"
+                );
+            }
+            let mut r = streamed("text/event-stream").await;
+            r.headers.insert(name.to_owned(), value.to_owned());
+            let resp = to_axum_response_with(r, framed_security());
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{name:?}: {value:?}"
+            );
+            assert!(
+                resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+                "{name:?}: {value:?}"
+            );
+        }
+    }
+
+    /// Two handler headers naming one header in different cases are the same
+    /// typed refusal on a buffered and a streamed head, and answer 500 on
+    /// both deliveries: the head never depends on `HashMap` iteration order.
+    #[tokio::test]
+    async fn heads_refuse_two_spellings_of_one_header_name() {
+        for [(first, first_value), (second, second_value)] in [
+            [
+                ("Content-Type", "text/html"),
+                ("content-type", "text/plain"),
+            ],
+            [("X-Custom", "a"), ("x-CUSTOM", "b")],
+        ] {
+            let mut buffered = server_text("ok".to_owned());
+            buffered
+                .headers
+                .insert(first.to_owned(), first_value.to_owned());
+            buffered
+                .headers
+                .insert(second.to_owned(), second_value.to_owned());
+            for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+                assert!(
+                    matches!(
+                        assemble_response_head(&buffered, delivery, framed_security()),
+                        Err(response_head::HeadRefusal::Header)
+                    ),
+                    "{first:?}/{second:?} under {delivery:?}"
+                );
+            }
+            let resp = to_axum_response_with(buffered, framed_security());
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{first:?}/{second:?}"
+            );
+            let mut r = streamed("text/event-stream").await;
+            r.headers.insert(first.to_owned(), first_value.to_owned());
+            r.headers.insert(second.to_owned(), second_value.to_owned());
+            let resp = to_axum_response_with(r, framed_security());
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{first:?}/{second:?}"
+            );
+            assert!(resp.headers().get("x-accel-buffering").is_none());
+        }
+    }
+
+    /// `Server.withHeader` replaces a header of the same name in any case, so
+    /// a response it builds holds one value per header name.
+    #[test]
+    fn with_header_replaces_a_header_of_the_same_name_in_any_case() {
+        let set = |k: &str, v: &str, r: ServerResponse| {
+            let built = match server_with_header(k.to_owned(), v.to_owned(), r) {
+                IpeResult::Ok(r) => Some(r),
+                IpeResult::Err(_) => None,
+            };
+            built.expect("a token name and a visible-ASCII value are a header")
+        };
+        let r = set("Location", "/b", server_redirect("/a".to_owned()));
+        let r = set("X-Custom", "1", r);
+        let r = set("x-custom", "2", r);
+        assert_eq!(r.headers.len(), 2, "{:?}", r.headers);
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
+        assert_eq!(single_header(&resp, "location"), Some("/b"));
+        assert_eq!(single_header(&resp, "x-custom"), Some("2"));
+    }
+
+    /// The response `middleware_with_cors` allowing `origins` makes of a GET
+    /// from `https://a.example` whose handler set `headers`, as it is sent.
+    async fn cors_tagged(origins: &[&str], headers: &[(&str, &str)]) -> axum::response::Response {
+        let set: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let h = middleware_with_cors::<String, _>(
+            origins.iter().map(|o| (*o).to_owned()).collect(),
+            move |_req: ServerRequest| {
+                let mut r = server_text("ok".into());
+                for (k, v) in set.clone() {
+                    r = match server_with_header(k, v, r) {
+                        IpeResult::Ok(r) => r,
+                        IpeResult::Err(e) => panic!("handler header refused: {e:?}"),
+                    };
+                }
+                Box::pin(ready(ok_res::<String, _>(r))) as IpeTask<String, ServerResponse>
+            },
+        );
+        let mut req_headers = HashMap::new();
+        req_headers.insert("Origin".to_owned(), "https://a.example".to_owned());
+        let IpeResult::Ok(r) = h(mk_req("GET", HashMap::new(), req_headers)).await else {
+            panic!("the CORS middleware must pass the handler's response through");
+        };
+        to_axum_response_with(r, framed_security())
+    }
+
+    /// A handler's `Access-Control-Allow-Origin` in any case is replaced by
+    /// the middleware's grant: the sent head carries exactly one value.
+    #[tokio::test]
+    async fn cors_replaces_a_handler_allow_origin_in_any_case() {
+        for name in [
+            "Access-Control-Allow-Origin",
+            "ACCESS-CONTROL-ALLOW-ORIGIN",
+            "access-control-allow-origin",
+        ] {
+            for (origins, granted) in [
+                (&["https://a.example"][..], "https://a.example"),
+                (&["*"][..], "*"),
+            ] {
+                let resp = cors_tagged(origins, &[(name, "https://evil.example")]).await;
+                assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+                assert_eq!(
+                    single_header(&resp, "access-control-allow-origin"),
+                    Some(granted),
+                    "{name} / {origins:?}"
+                );
+            }
+        }
+    }
+
+    /// A handler's `Vary` in any case is merged with `Origin` into one value,
+    /// and a `Vary` already naming `Origin` is kept as is.
+    #[tokio::test]
+    async fn cors_merges_a_handler_vary_in_any_case_into_one_value() {
+        for name in ["Vary", "VARY", "vary"] {
+            let resp = cors_tagged(&["https://a.example"], &[(name, "Accept-Encoding")]).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+            assert_eq!(
+                single_header(&resp, "vary"),
+                Some("Accept-Encoding, Origin"),
+                "{name}"
+            );
+            let resp = cors_tagged(&["https://a.example"], &[(name, "origin")]).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+            assert_eq!(single_header(&resp, "vary"), Some("origin"), "{name}");
+        }
+        let resp = cors_tagged(&["https://a.example"], &[]).await;
+        assert_eq!(single_header(&resp, "vary"), Some("Origin"));
+    }
+
+    /// More handler header names than a header map holds is a typed refusal,
+    /// never a capacity panic.
+    #[test]
+    fn head_refuses_more_header_names_than_a_header_map_holds() {
+        let mut r = server_text("ok".to_owned());
+        for i in 0..=(1_usize << 15) {
+            r.headers.insert(format!("x-h{i}"), "v".to_owned());
+        }
+        for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+            assert!(
+                matches!(
+                    assemble_response_head(&r, delivery, framed_security()),
+                    Err(response_head::HeadRefusal::Oversize)
+                ),
+                "{delivery:?}"
+            );
+        }
+    }
+
+    /// A content type that is not a visible-ASCII header value answers 500 on
+    /// a buffered and a streamed response alike, as the same handler header.
+    #[tokio::test]
+    async fn heads_refuse_a_non_ascii_content_type() {
+        let mut buffered = server_text("ok".to_owned());
+        buffered.contentType = "text/\u{e9}".to_owned();
+        for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+            assert!(
+                matches!(
+                    assemble_response_head(&buffered, delivery, framed_security()),
+                    Err(response_head::HeadRefusal::ContentType)
+                ),
+                "{delivery:?}"
+            );
+        }
+        let resp = to_axum_response_with(buffered, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = to_axum_response_with(streamed("text/\u{e9}").await, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .is_none()
+        );
+    }
+
+    /// A refused head never runs the stream handler; an assembled head does.
+    #[tokio::test]
+    async fn refused_head_never_runs_the_stream_handler() {
+        let stream_with_flag = |ran: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            server_stream_stream::<IpeError, _>("text/event-stream".to_owned(), move |_w| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+            })
+        };
+        let built = |result: IpeResult<IpeError, ServerResponse>| {
+            let built = match result {
+                IpeResult::Ok(r) => Some(r),
+                IpeResult::Err(_) => None,
+            };
+            built.expect("`stream` must build a response")
+        };
+        let refused_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = built(stream_with_flag(refused_ran.clone()).await);
+        let resp = to_axum_response_with(r, Err(crate::telemetry::FrameAncestorsRefusal::Blank));
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!refused_ran.load(std::sync::atomic::Ordering::SeqCst));
+        let served_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = built(stream_with_flag(served_ran.clone()).await);
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        for _ in 0..1024 {
+            if served_ran.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(served_ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A stream sentinel served a second time has no live handler: it answers
+    /// 500, never a buffered body that sends the sentinel nonce.
+    #[tokio::test]
+    async fn abandoned_stream_sentinel_answers_500_without_the_sentinel() {
+        let r = streamed("text/event-stream").await;
+        let again = r.clone();
+        let first = to_axum_response_with(r, framed_security());
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let second = to_axum_response_with(again, framed_security());
+        assert_eq!(
+            second.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum_body_string(second).await;
+        assert!(!body.contains("__ipe_stream:"), "{body:?}");
     }
 
     /// `redirect` percent-encodes CTLs, space, non-ASCII and the characters

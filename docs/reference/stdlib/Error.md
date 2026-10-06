@@ -4,7 +4,7 @@
 
 [Back to stdlib index](../stdlib.md)
 
-Ipe.Error — the structured `Error` type (Layer-3 Ipe source).
+Ipe.Error — the structured `Error` type.
 
 `Error` is the implicit error channel of every `Task` and the payload of
 `Result Error a`.  Its constructors classify the kind of failure at

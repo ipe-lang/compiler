@@ -54,6 +54,7 @@ use zeroize::Zeroizing;
 
 use crate::CliError;
 use crate::package_name::PackageName;
+use crate::style::TerminalSafe;
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -227,6 +228,94 @@ impl WallBudget {
             .filter(|secs| secs.get() <= MAX_WALL_SECS)
             .map(Self)
     }
+
+    /// The ceiling as the wall a watcher enforces and a refusal names.
+    #[must_use]
+    pub const fn limit(self) -> WallSecs {
+        WallSecs(self.0)
+    }
+}
+
+/// Ceiling on every wall-time ceiling of a local child, in seconds.
+///
+/// No local child may run longer than one hour. The jailed FFI inspector
+/// allows 900 seconds and a self-run of `ipe dev run` contains a full cargo build,
+/// so a local wall may exceed [`MAX_WALL_SECS`]; this is the type's ceiling,
+/// not a default.
+pub const MAX_LOCAL_WALL_SECS: u64 = 3600;
+
+// Every remote wall fits a local one, so a remote wall reused as a local
+// ceiling is in range by construction.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the remote wall ceiling outgrows the local one [ledger #boundary]
+const _: () = assert!(MAX_WALL_SECS <= MAX_LOCAL_WALL_SECS);
+
+/// The wall a watched child was held to: whole seconds, never zero.
+///
+/// Built only from a [`WallBudget`] or a [`LocalWall`], so the watcher's
+/// deadline and the refusal that names it are the same value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WallSecs(NonZeroU64);
+
+impl WallSecs {
+    /// The wall in whole seconds, never zero.
+    #[must_use]
+    pub const fn secs(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The wall as a duration.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        Duration::from_secs(self.0.get())
+    }
+}
+
+/// A wall-time ceiling of one local child: whole seconds in `1..=MAX_LOCAL_WALL_SECS`.
+///
+/// Built only as [`WallBudget`] is, with the local ceiling as its bound.
+///
+/// ```compile_fail,E0080
+/// let _ = ipe::remote_ingest::LocalWall::of_secs::<0>();
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = ipe::remote_ingest::LocalWall::of_secs::<3601>();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalWall(NonZeroU64);
+
+impl LocalWall {
+    /// The ceiling of `S` seconds, which the build refuses outside `1..=MAX_LOCAL_WALL_SECS`.
+    #[must_use]
+    pub const fn of_secs<const S: u64>() -> Self {
+        let secs = const {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD when a named local wall is zero or above `MAX_LOCAL_WALL_SECS` [ledger #boundary]
+            assert!(S > 0 && S <= MAX_LOCAL_WALL_SECS);
+            match NonZeroU64::new(S) {
+                Some(secs) => secs,
+                None => NonZeroU64::MIN,
+            }
+        };
+        Self(secs)
+    }
+
+    /// The remote wall `wall` as a local one; every remote wall is in range.
+    #[must_use]
+    pub const fn of_remote(wall: WallBudget) -> Self {
+        Self(wall.0)
+    }
+
+    /// The ceiling in whole seconds, never zero.
+    #[must_use]
+    pub const fn secs(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The ceiling as the wall a watcher enforces and a refusal names.
+    #[must_use]
+    pub const fn limit(self) -> WallSecs {
+        WallSecs(self.0)
+    }
 }
 
 /// What a remote-ingest surface may leave on disk.
@@ -323,15 +412,299 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// CLI wait longer; the wait ends in [`RunError::PipeDrainTimeout`].
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// The ceilings of one local child: its stdout and its wall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalLimits {
+    stdout_bytes: ByteBudget,
+    wall: LocalWall,
+}
+
+/// The ceilings of a local child run through [`run_local`] or [`run_local_fed`].
+///
+/// Opaque: every production value is a named constant of this module, so a
+/// caller can neither build a ceiling nor widen one. A local child stages
+/// nothing on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalCeiling(LocalLimits);
+
+impl LocalCeiling {
+    /// Bytes the child's stdout may carry.
+    #[must_use]
+    pub const fn stdout_bytes(&self) -> ByteBudget {
+        self.0.stdout_bytes
+    }
+
+    /// Wall time the child may run.
+    #[must_use]
+    pub const fn wall(&self) -> LocalWall {
+        self.0.wall
+    }
+
+    /// This ceiling with its wall time set, for a test to drive the refusals.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_wall(self, wall: LocalWall) -> Self {
+        let Self(limits) = self;
+        Self(LocalLimits { wall, ..limits })
+    }
+
+    /// This ceiling with its stdout ceiling set, for a test to drive the refusals.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_stdout(self, stdout_bytes: ByteBudget) -> Self {
+        let Self(limits) = self;
+        Self(LocalLimits {
+            stdout_bytes,
+            ..limits
+        })
+    }
+
+    /// The ceilings the watcher enforces.
+    const fn limits(&self) -> RunLimits {
+        RunLimits {
+            staging: Staging::Nothing,
+            stdout_bytes: self.0.stdout_bytes,
+            wall: self.0.wall.limit(),
+        }
+    }
+}
+
 /// The ceilings of a local `git` query, which stages nothing on disk.
 ///
 /// Its stdout (a revision, a remote URL, a porcelain status) is held to 4 MiB
 /// and its run to one minute.
-const QUERY_LIMITS: Limits = Limits {
-    staging: Staging::Nothing,
+const QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     stdout_bytes: ByteBudget::of::<{ 4 * MIB }>(),
-    wall: WallBudget::of_secs::<60>(),
-};
+    wall: LocalWall::of_secs::<60>(),
+});
+
+/// The ceilings of an offline `cargo generate-lockfile`, which reads only the local registry cache.
+///
+/// Its stdout is held to 64 KiB and its run to two minutes, so a held
+/// `.package-cache` lock or a wedged resolve cannot hold the CLI.
+pub const LOCK_RESOLVE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<120>(),
+});
+
+/// The ceilings of a networked `cargo generate-lockfile`, which may fetch the registry index.
+///
+/// Its stdout is held to 64 KiB and its run to ten minutes, the wall of
+/// [`INDEX_CLONE`].
+pub const LOCK_FETCH_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_remote(INDEX_CLONE.wall),
+});
+
+/// The ceilings of `cargo metadata --no-deps`, which reads only the crate's manifests.
+///
+/// Its stdout (the metadata document) is held to 16 MiB and its run to two
+/// minutes, so a held cargo lock or a wedged config read cannot hold the CLI.
+pub const METADATA_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 16 * MIB }>(),
+    wall: LocalWall::of_secs::<120>(),
+});
+
+/// The ceilings of a toolchain query (`cargo-deny --version`, `rustup target list --installed`).
+///
+/// Its stdout (a version line, a target list) is held to 64 KiB and its run
+/// to one minute.
+pub const TOOL_QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<60>(),
+});
+
+/// The ceilings of a `cargo-deny check`, which may fetch the advisory database.
+///
+/// Its stdout is held to 1 MiB and its run to ten minutes, the wall of
+/// [`INDEX_CLONE`].
+pub const SUPPLY_CHAIN_SCAN_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<MIB>(),
+    wall: LocalWall::of_remote(INDEX_CLONE.wall),
+});
+
+/// The ceilings of a `rustc -vV` query.
+///
+/// Its stdout (a handful of `key: value` lines) is held to 64 KiB and its run
+/// to one minute.
+pub const RUSTC_QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<60>(),
+});
+
+/// The ceilings of the `ipe health` link probe, which compiles and links an empty program.
+///
+/// Its stdout is held to 64 KiB and its run to two minutes.
+pub const LINK_PROBE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<120>(),
+});
+
+/// The ceilings of the unsandboxed FFI inspector.
+///
+/// The jailed inspector's defaults: its stdout (the inspection report) is held
+/// to 256 MiB and its run to fifteen minutes.
+pub const FFI_INSPECT_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 256 * MIB }>(),
+    wall: LocalWall::of_secs::<900>(),
+});
+
+/// The ceilings of a wasm bundle tool (`wasm-bindgen`, `wasm-opt`).
+///
+/// Its stdout is held to 1 MiB and its run to ten minutes.
+pub const WASM_TOOL_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<MIB>(),
+    wall: LocalWall::of_secs::<600>(),
+});
+
+/// The ceilings of a self-run of this CLI (`ipe dev run <snippet>`), which contains a full cargo build.
+///
+/// Its stdout (the snippet's output) is held to 1 MiB and its run to
+/// [`MAX_LOCAL_WALL_SECS`].
+pub const SELF_RUN_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<MIB>(),
+    wall: LocalWall::of_secs::<MAX_LOCAL_WALL_SECS>(),
+});
+
+/// Run a local `command` detached in its own process group, held to `ceiling`.
+///
+/// Stdin is the null device; stdout is held to the ceiling and stderr
+/// truncated at [`CHILD_STDERR_MAX_BYTES`]. A crossed ceiling kills the
+/// child's group and is a [`LocalRefusal`] naming `source`.
+///
+/// # Errors
+/// See [`RunError`].
+pub fn run_local(
+    command: Command,
+    ceiling: LocalCeiling,
+    source: LocalSource,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    run_local_core(command, None, ceiling, source)
+}
+
+/// Run a local `command` as [`run_local`] does, with `stdin` fed to it as it reads.
+///
+/// # Errors
+/// See [`RunError`].
+pub fn run_local_fed(
+    command: Command,
+    stdin: Zeroizing<Vec<u8>>,
+    ceiling: LocalCeiling,
+    source: LocalSource,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    run_local_core(command, Some(stdin), ceiling, source)
+}
+
+/// The one body of [`run_local`] and [`run_local_fed`].
+fn run_local_core(
+    command: Command,
+    stdin: Option<Zeroizing<Vec<u8>>>,
+    ceiling: LocalCeiling,
+    source: LocalSource,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    run_core(
+        command,
+        stdin,
+        None,
+        &ceiling.limits(),
+        Instant::now(),
+        Mode::Detached,
+    )
+    .map_err(|e| {
+        e.map_refusal(|limit| LocalRefusal {
+            source,
+            limit,
+            name: None,
+        })
+    })
+}
+
+/// Why a child whose stdio is the terminal's needs no ceiling.
+///
+/// Its output never enters the CLI's memory (the bytes go straight to the
+/// terminal's descriptors), its input is the terminal or bytes already bounded
+/// upstream, and its duration is the user's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InheritedRole {
+    /// An install the user consented to and watches; a wall would kill a slow but legitimate one.
+    InteractiveInstall,
+    /// This CLI run again, which holds its own children to their ceilings.
+    SelfBuild,
+    /// The user's own program, which they asked to run and can interrupt.
+    UserProgram,
+}
+
+/// What an inherited child reads on its stdin.
+#[derive(Debug)]
+pub enum InheritedInput {
+    /// The CLI's own stdin, the user's terminal.
+    Terminal,
+    /// These bytes, already held to a ceiling where they were read.
+    Bytes(Zeroizing<Vec<u8>>),
+}
+
+/// Why an inherited child produced no exit status.
+#[derive(Debug)]
+pub enum InheritedError {
+    /// The hardened spawner refused or failed to start the child.
+    Spawn(ipe_runtime_rust::system::SpawnRefusal),
+    /// Waiting on the child failed.
+    Wait(std::io::Error),
+}
+
+impl std::fmt::Display for InheritedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(refusal) => refusal.fmt(f),
+            Self::Wait(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<InheritedError> for std::io::Error {
+    fn from(error: InheritedError) -> Self {
+        match error {
+            InheritedError::Spawn(refusal) => refusal.into(),
+            InheritedError::Wait(e) => e,
+        }
+    }
+}
+
+/// Run `command` with the terminal's stdout and stderr, in `role`, until it exits.
+///
+/// The child starts through the runtime's hardened spawner, so it inherits no
+/// descriptor besides stdio and, on Linux, dies with the CLI. No ceiling holds
+/// it; `role` names why none is needed. Stdout and stderr keep whatever the
+/// caller set on `command` (the terminal's by default). `input` is its stdin:
+/// the terminal, or bytes written to a pipe and then closed.
+///
+/// # Errors
+/// [`InheritedError::Spawn`] when the child cannot start;
+/// [`InheritedError::Wait`] when waiting on it fails.
+pub fn run_inherited(
+    mut command: Command,
+    _role: InheritedRole,
+    input: InheritedInput,
+) -> Result<ExitStatus, InheritedError> {
+    let bytes = match input {
+        InheritedInput::Terminal => {
+            command.stdin(Stdio::inherit());
+            None
+        }
+        InheritedInput::Bytes(bytes) => {
+            command.stdin(Stdio::piped());
+            Some(bytes)
+        }
+    };
+    let mut child =
+        ipe_runtime_rust::system::spawn_hardened(command).map_err(InheritedError::Spawn)?;
+    if let (Some(bytes), Some(mut pipe)) = (bytes, child.stdin.take()) {
+        // A child that exits without reading its stdin is judged by its exit
+        // status, not by this write; the pipe closes when it drops.
+        let _ = std::io::Write::write_all(&mut pipe, &bytes);
+    }
+    child.wait().map_err(InheritedError::Wait)
+}
 
 /// The declared ingest ceilings of one remote surface.
 ///
@@ -419,11 +792,11 @@ impl Budget {
     }
 
     /// The ceilings the watcher enforces, without the surface name.
-    const fn limits(&self) -> Limits {
-        Limits {
+    const fn limits(&self) -> RunLimits {
+        RunLimits {
             staging: self.staging,
             stdout_bytes: self.stdout_bytes,
-            wall: self.wall,
+            wall: self.wall.limit(),
         }
     }
 }
@@ -767,7 +1140,7 @@ pub enum IngestLimit {
     /// A directory-depth ceiling.
     Depth(u32),
     /// A wall-time ceiling.
-    Time(WallBudget),
+    Time(WallSecs),
     /// A file name that is not valid UTF-8, which the tree hash cannot name.
     NonUtf8Name,
     /// An entry that is neither a regular file, a directory nor a link.
@@ -877,6 +1250,26 @@ pub enum LocalSource {
     PackageTree,
     /// A `git` query on a local repository.
     GitQuery,
+    /// An offline `cargo generate-lockfile` resolving from the local registry cache.
+    LockResolve,
+    /// A networked `cargo generate-lockfile` resolving an emitted crate's graph.
+    LockFetch,
+    /// A `cargo metadata --no-deps` reading a crate's target directory.
+    CargoMetadata,
+    /// A toolchain query: a tool's version or its installed targets.
+    ToolQuery,
+    /// A `cargo-deny check` over an emitted crate's dependency graph.
+    SupplyChainScan,
+    /// A `rustc -vV` query of the active toolchain.
+    RustcQuery,
+    /// The `ipe health` probe that links an empty program.
+    LinkProbe,
+    /// The FFI inspector run without the jail.
+    FfiInspect,
+    /// A wasm bundle tool (`wasm-bindgen`, `wasm-opt`).
+    WasmTool,
+    /// This CLI run again on a snippet (`ipe dev run`).
+    SelfRun,
 }
 
 impl std::fmt::Display for LocalSource {
@@ -884,6 +1277,16 @@ impl std::fmt::Display for LocalSource {
         f.write_str(match self {
             Self::PackageTree => "package source tree",
             Self::GitQuery => "git query",
+            Self::LockResolve => "offline cargo lock resolve",
+            Self::LockFetch => "cargo lock resolve",
+            Self::CargoMetadata => "cargo metadata query",
+            Self::ToolQuery => "toolchain query",
+            Self::SupplyChainScan => "cargo-deny supply-chain scan",
+            Self::RustcQuery => "rustc version query",
+            Self::LinkProbe => "linker probe",
+            Self::FfiInspect => "FFI inspector",
+            Self::WasmTool => "wasm bundle tool",
+            Self::SelfRun => "`ipe dev run` of an example",
         })
     }
 }
@@ -981,10 +1384,10 @@ pub struct Usage {
 
 /// The ceilings the watcher enforces on one child.
 #[derive(Debug, Clone, Copy)]
-struct Limits {
+struct RunLimits {
     staging: Staging,
     stdout_bytes: ByteBudget,
-    wall: WallBudget,
+    wall: WallSecs,
 }
 
 /// Measure `root` without following links, stopping once either disk ceiling of `budget` is passed.
@@ -1002,8 +1405,8 @@ pub fn measure(root: &Path, budget: &Budget) -> Result<Usage, (PathBuf, std::io:
     measure_limits(root, &budget.limits())
 }
 
-/// [`measure`] against bare [`Limits`].
-fn measure_limits(root: &Path, limits: &Limits) -> Result<Usage, (PathBuf, std::io::Error)> {
+/// [`measure`] against bare [`RunLimits`].
+fn measure_limits(root: &Path, limits: &RunLimits) -> Result<Usage, (PathBuf, std::io::Error)> {
     let mut usage = Usage::default();
     let root_meta = match std::fs::symlink_metadata(root) {
         Ok(meta) => meta,
@@ -1050,7 +1453,7 @@ fn measure_limits(root: &Path, limits: &Limits) -> Result<Usage, (PathBuf, std::
 /// The first disk ceiling of `limits` that `usage` passes, if any.
 ///
 /// A surface that stages nothing refuses its first staged byte or entry.
-const fn exceeded(usage: Usage, limits: &Limits) -> Option<IngestLimit> {
+const fn exceeded(usage: Usage, limits: &RunLimits) -> Option<IngestLimit> {
     let (bytes, entries) = match limits.staging {
         Staging::Nothing => (0, 0),
         Staging::Disk { bytes, entries } => (bytes.get(), entries.get()),
@@ -1071,8 +1474,49 @@ pub struct Captured {
     pub status: ExitStatus,
     /// The child's stdout, within the budget's stdout ceiling.
     pub stdout: Vec<u8>,
-    /// The child's stderr, truncated at [`CHILD_STDERR_MAX_BYTES`].
-    pub stderr: Vec<u8>,
+    /// The child's stderr, truncated at [`CHILD_STDERR_MAX_BYTES`] with the cut marked.
+    pub stderr: ChildStderr,
+}
+
+/// A child's stderr as kept: whole, or cut at [`CHILD_STDERR_MAX_BYTES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildStderr {
+    /// Every byte the child wrote.
+    Whole(Vec<u8>),
+    /// The first [`CHILD_STDERR_MAX_BYTES`] bytes; the rest was read and dropped.
+    Truncated(Vec<u8>),
+}
+
+impl ChildStderr {
+    /// The bytes kept, without the truncation marker.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Whole(bytes) | Self::Truncated(bytes) => bytes,
+        }
+    }
+
+    /// Whether the child wrote more than was kept.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        matches!(self, Self::Truncated(_))
+    }
+
+    /// The kept text, trimmed and sanitised for the terminal, with the cut named when one was made.
+    #[must_use]
+    pub fn to_terminal(&self) -> TerminalSafe {
+        let text = String::from_utf8_lossy(self.bytes());
+        let text = text.trim();
+        match self {
+            Self::Whole(_) => TerminalSafe::sanitize(text),
+            Self::Truncated(_) => {
+                let marker = crate::text::cli_child_stderr_truncated(&IngestLimit::Bytes(
+                    CHILD_STDERR_MAX_BYTES.get(),
+                ));
+                TerminalSafe::sanitize(&format!("{text}\n{marker}"))
+            }
+        }
+    }
 }
 
 /// One of a child's two output pipes.
@@ -1109,6 +1553,8 @@ pub enum RunError<R = IngestRefusal> {
     Exceeded(R),
     /// The child finished, but a process it started held this pipe open past the grace.
     PipeDrainTimeout(Stream),
+    /// Reading this pipe failed, so what was read is not the child's whole output.
+    PipeRead(Stream, std::io::ErrorKind),
 }
 
 impl<R> RunError<R> {
@@ -1120,6 +1566,7 @@ impl<R> RunError<R> {
             Self::Measure(path, e) => RunError::Measure(path, e),
             Self::Exceeded(refusal) => RunError::Exceeded(f(refusal)),
             Self::PipeDrainTimeout(stream) => RunError::PipeDrainTimeout(stream),
+            Self::PipeRead(stream, kind) => RunError::PipeRead(stream, kind),
         }
     }
 }
@@ -1133,6 +1580,9 @@ impl<R: std::fmt::Display> std::fmt::Display for RunError<R> {
             Self::Exceeded(refusal) => refusal.fmt(f),
             Self::PipeDrainTimeout(stream) => {
                 f.write_str(&crate::text::cli_child_pipe_held(stream))
+            }
+            Self::PipeRead(stream, kind) => {
+                f.write_str(&crate::text::cli_child_pipe_unread(stream, kind))
             }
         }
     }
@@ -1264,7 +1714,7 @@ fn run_core(
     mut command: Command,
     stdin: Option<Zeroizing<Vec<u8>>>,
     watch: Option<&Path>,
-    limits: &Limits,
+    limits: &RunLimits,
     started: Instant,
     mode: Mode,
 ) -> Result<Captured, RunError<IngestLimit>> {
@@ -1296,6 +1746,9 @@ fn run_core(
         if io.stdout.is_over() {
             return Err(stdout_over());
         }
+        if let Some((stream, kind)) = io.read_failure() {
+            return Err(RunError::PipeRead(stream, kind));
+        }
         if running.exited().map_err(RunError::Wait)? {
             break running.finish().map_err(RunError::Wait)?;
         }
@@ -1322,6 +1775,9 @@ fn run_core(
         if io.stdout.is_over() {
             return Err(stdout_over());
         }
+        if let Some((stream, kind)) = io.read_failure() {
+            return Err(RunError::PipeRead(stream, kind));
+        }
         let Some(stream) = io.open_stream() else {
             break;
         };
@@ -1331,10 +1787,15 @@ fn run_core(
         idle = pause(moved, idle);
     }
     let ChildIo { stdout, stderr, .. } = io;
+    let stderr = if stderr.is_over() {
+        ChildStderr::Truncated(stderr.into_kept())
+    } else {
+        ChildStderr::Whole(stderr.into_kept())
+    };
     Ok(Captured {
         status,
         stdout: stdout.into_kept(),
-        stderr: stderr.into_kept(),
+        stderr,
     })
 }
 
@@ -1348,10 +1809,10 @@ pub(crate) fn run_probe(
     stdout_bytes: ByteBudget,
     wall: WallBudget,
 ) -> Option<Captured> {
-    let limits = Limits {
+    let limits = RunLimits {
         staging: Staging::Nothing,
         stdout_bytes,
-        wall,
+        wall: wall.limit(),
     };
     run_core(command, None, None, &limits, Instant::now(), Mode::Probe).ok()
 }
@@ -1967,6 +2428,36 @@ fn pause(moved: bool, idle: Duration) -> Duration {
     idle.saturating_mul(2).min(POLL_INTERVAL)
 }
 
+/// What one output pipe left once it was read to its end.
+#[cfg(any(not(unix), test))]
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureOutcome {
+    /// Every byte the pipe carried, within the cap.
+    Complete(Vec<u8>),
+    /// The first `cap` bytes; more arrived and was read and dropped.
+    Overflowed(Vec<u8>),
+    /// A read failed before the end, so the bytes read are not the whole output.
+    ReadFailed(std::io::ErrorKind),
+}
+
+/// Keep at most `cap` bytes of `pipe`, then read the rest into a sink.
+///
+/// The pipe is drained to its end so the child never blocks on a full pipe. A
+/// failed read, on the kept part or the drained rest, is
+/// [`CaptureOutcome::ReadFailed`], never bytes that look complete.
+#[cfg(any(not(unix), test))]
+fn capture(mut pipe: impl Read, cap: ByteBudget) -> CaptureOutcome {
+    let mut kept = Vec::new();
+    if let Err(e) = (&mut pipe).take(cap.get()).read_to_end(&mut kept) {
+        return CaptureOutcome::ReadFailed(e.kind());
+    }
+    match std::io::copy(&mut pipe, &mut std::io::sink()) {
+        Err(e) => CaptureOutcome::ReadFailed(e.kind()),
+        Ok(0) => CaptureOutcome::Complete(kept),
+        Ok(_) => CaptureOutcome::Overflowed(kept),
+    }
+}
+
 /// A watched child's pipes, read and written by the thread that waits on it.
 ///
 /// Stdout is held to its ceiling, stderr is truncated at
@@ -2009,6 +2500,17 @@ impl ChildIo {
     /// Stop feeding stdin and close its pipe.
     fn close_stdin(&mut self) {
         self.stdin = None;
+    }
+
+    /// The first output pipe whose read failed, stdout before stderr, with how it failed.
+    const fn read_failure(&self) -> Option<(Stream, std::io::ErrorKind)> {
+        if let Some(kind) = self.stdout.failure() {
+            Some((Stream::Stdout, kind))
+        } else if let Some(kind) = self.stderr.failure() {
+            Some((Stream::Stderr, kind))
+        } else {
+            None
+        }
     }
 
     /// The first output pipe not yet at its end, stdout before stderr.
@@ -2069,6 +2571,8 @@ mod pipes {
         /// The pipe, until it reaches its end or fails.
         pipe: Option<File>,
         kept: Kept,
+        /// How the read failed, once it did.
+        failed: Option<ErrorKind>,
     }
 
     impl Reader {
@@ -2081,12 +2585,15 @@ mod pipes {
                     cap,
                     over: false,
                 },
+                failed: None,
             })
         }
 
         /// Read what the pipe has ready, returning whether any byte arrived.
         ///
-        /// The end of the pipe, or a failed read, closes it.
+        /// The end of the pipe closes it; a failed read closes it and is kept
+        /// as [`Self::failure`], so the bytes read so far never pass as the
+        /// whole output.
         pub fn pump(&mut self) -> bool {
             let Some(pipe) = self.pipe.as_mut() else {
                 return false;
@@ -2097,8 +2604,13 @@ mod pipes {
                 match pipe.read(&mut chunk) {
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
                         self.pipe = None;
+                        break;
+                    }
+                    Err(e) => {
+                        self.pipe = None;
+                        self.failed = Some(e.kind());
                         break;
                     }
                     Ok(n) => {
@@ -2118,6 +2630,11 @@ mod pipes {
         /// Whether more than the cap arrived.
         pub const fn is_over(&self) -> bool {
             self.kept.over
+        }
+
+        /// How reading the pipe failed, if it did.
+        pub const fn failure(&self) -> Option<ErrorKind> {
+            self.failed
         }
 
         /// The bytes kept.
@@ -2181,19 +2698,21 @@ mod pipes {
 /// A child's pipes read and written on threads, where the platform has no non-blocking pipes.
 #[cfg(not(unix))]
 mod pipes {
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::sync::mpsc;
 
     use zeroize::Zeroizing;
 
-    use super::ByteBudget;
+    use super::{ByteBudget, CaptureOutcome, capture};
 
     /// One output pipe, read to its end on its own thread.
     pub struct Reader {
         /// The reading thread's result, until it arrives.
-        capture: Option<mpsc::Receiver<(Vec<u8>, bool)>>,
+        capture: Option<mpsc::Receiver<CaptureOutcome>>,
         kept: Vec<u8>,
         over: bool,
+        /// How the read failed, once it did.
+        failed: Option<ErrorKind>,
     }
 
     impl Reader {
@@ -2217,6 +2736,7 @@ mod pipes {
                 capture,
                 kept: Vec::new(),
                 over: false,
+                failed: None,
             })
         }
 
@@ -2226,15 +2746,24 @@ mod pipes {
                 return false;
             };
             match capture.try_recv() {
-                Ok((kept, over)) => {
-                    self.kept = kept;
-                    self.over = over;
+                Ok(outcome) => {
+                    match outcome {
+                        CaptureOutcome::Complete(kept) => self.kept = kept,
+                        CaptureOutcome::Overflowed(kept) => {
+                            self.kept = kept;
+                            self.over = true;
+                        }
+                        CaptureOutcome::ReadFailed(kind) => self.failed = Some(kind),
+                    }
                     self.capture = None;
                     true
                 }
                 Err(mpsc::TryRecvError::Empty) => false,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    // The reading thread ended without a result, so nothing
+                    // read stands for the whole output.
                     self.capture = None;
+                    self.failed = Some(ErrorKind::BrokenPipe);
                     false
                 }
             }
@@ -2250,21 +2779,15 @@ mod pipes {
             self.over
         }
 
+        /// How reading the pipe failed, if it did.
+        pub const fn failure(&self) -> Option<ErrorKind> {
+            self.failed
+        }
+
         /// The bytes kept.
         pub fn into_kept(self) -> Vec<u8> {
             self.kept
         }
-    }
-
-    /// Keep at most `cap` bytes of `pipe`, then read the rest into a sink.
-    ///
-    /// The flag reports whether anything past `cap` arrived. The pipe is drained to
-    /// its end so the child never blocks on a full pipe.
-    fn capture(mut pipe: impl Read, cap: ByteBudget) -> (Vec<u8>, bool) {
-        let mut kept = Vec::new();
-        let _ = (&mut pipe).take(cap.get()).read_to_end(&mut kept);
-        let over = std::io::copy(&mut pipe, &mut std::io::sink()).is_ok_and(|rest| rest > 0);
-        (kept, over)
     }
 
     /// A stdin pipe fed from a buffer on its own thread.
@@ -2499,21 +3022,7 @@ impl Git {
     /// # Errors
     /// See [`RunError`]; a crossed ceiling is a [`LocalRefusal`] naming `source`.
     pub fn query(self, source: LocalSource) -> Result<Captured, RunError<LocalRefusal>> {
-        run_core(
-            self.command,
-            None,
-            None,
-            &QUERY_LIMITS,
-            Instant::now(),
-            Mode::Detached,
-        )
-        .map_err(|e| {
-            e.map_refusal(|limit| LocalRefusal {
-                source,
-                limit,
-                name: None,
-            })
-        })
+        run_local(self.command, QUERY_LIMITS, source)
     }
 
     /// The arguments given so far.
@@ -2640,7 +3149,7 @@ pub fn curl_refusal(
 ) -> Option<IngestRefusal> {
     let limit = match status.code()? {
         CURL_FILESIZE_EXCEEDED => IngestLimit::Bytes(response_bytes.get()),
-        CURL_OPERATION_TIMEDOUT => IngestLimit::Time(budget.wall),
+        CURL_OPERATION_TIMEDOUT => IngestLimit::Time(budget.wall.limit()),
         _ => return None,
     };
     Some(IngestRefusal {
@@ -2654,12 +3163,14 @@ pub fn curl_refusal(
 mod tests {
     use super::{
         ALL_BUDGETS, Budget, BudgetPairing, ByteBudget, CHILD_STDERR_MAX_BYTES, CappedReadError,
-        Captured, EntryBudget, FetchBudget, GITHUB_API, Git, IngestLimit, IngestRefusal,
-        IngestSource, LocalRefusal, LocalSource, MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES,
-        MAX_WALL_SECS, Mode, PACKAGE_SOURCE, PackageName, RefsCeiling, RunError, Staging, Stream,
-        Transfer, TreeCeiling, Usage, WallBudget, curl_limit_args, curl_refusal, measure,
-        read_capped, run_core,
+        CaptureOutcome, Captured, ChildStderr, EntryBudget, FetchBudget, GITHUB_API, Git,
+        IngestLimit, IngestRefusal, IngestSource, InheritedInput, InheritedRole, LocalRefusal,
+        LocalSource, LocalWall, MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES, MAX_WALL_SECS, Mode,
+        PACKAGE_SOURCE, PackageName, RefsCeiling, RunError, Staging, Stream, TOOL_QUERY_LIMITS,
+        Transfer, TreeCeiling, Usage, WallBudget, capture, curl_limit_args, curl_refusal, measure,
+        read_capped, run_core, run_inherited, run_local_fed,
     };
+    use std::io::Read;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -2994,8 +3505,8 @@ mod tests {
             (IngestLimit::Bytes(7), "7-byte"),
             (IngestLimit::Entries(3), "3-entry"),
             (IngestLimit::Depth(64), "64-level depth"),
-            (IngestLimit::Time(wall(9)), "9 seconds"),
-            (IngestLimit::Time(wall(1)), "1 second"),
+            (IngestLimit::Time(wall(9).limit()), "9 seconds"),
+            (IngestLimit::Time(wall(1).limit()), "1 second"),
             (IngestLimit::NonUtf8Name, "not valid UTF-8"),
             (IngestLimit::SpecialFile, "special file"),
             (IngestLimit::Symlink, "symbolic link"),
@@ -3082,7 +3593,7 @@ mod tests {
     /// network; a local query past its wall time does not blame the network.
     #[test]
     fn a_timed_out_refusal_says_it_did_not_finish() {
-        let limit = IngestLimit::Time(wall(9));
+        let limit = IngestLimit::Time(wall(9).limit());
         let remote = IngestRefusal {
             source: IngestSource::PackageFetch,
             limit,
@@ -3341,7 +3852,7 @@ mod tests {
     #[test]
     fn a_second_step_is_held_to_the_first_steps_deadline() {
         let mut limits = unstaged().limits();
-        limits.wall = wall(2);
+        limits.wall = wall(2).limit();
         let started = Instant::now();
         let first = run_core(
             sh("sleep 1.2"),
@@ -3501,7 +4012,8 @@ mod tests {
         assert!(
             matches!(run, Ok(ref captured) if captured.status.success()
                 && captured.stdout.is_empty()
-                && u64::try_from(captured.stderr.len()).ok() == Some(cap)),
+                && captured.stderr.is_truncated()
+                && u64::try_from(captured.stderr.bytes().len()).ok() == Some(cap)),
             "{run:?}"
         );
     }
@@ -3518,6 +4030,221 @@ mod tests {
             "{run:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A live child writing exactly the stdout ceiling keeps running and exits on its own.
+    ///
+    /// The exit status is the discriminator: a kill at the cap instead of one
+    /// byte past it would leave a signal status, not success.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_of_exactly_the_cap_from_a_live_child_is_kept_without_a_kill() {
+        let budget = unstaged().with_wall(wall(10));
+        let run = run(
+            sh("head -c 16 /dev/zero; sleep 1; exit 0"),
+            None,
+            None,
+            &budget,
+        );
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()
+                && u64::try_from(captured.stdout.len()).ok() == Some(CAP)),
+            "{run:?}"
+        );
+    }
+
+    /// One byte past the stdout ceiling kills a still-running child well before its wall.
+    #[cfg(unix)]
+    #[test]
+    fn one_byte_past_the_cap_from_a_live_child_is_killed_early() {
+        let budget = unstaged().with_wall(wall(60));
+        let started = Instant::now();
+        let run = run(sh("head -c 17 /dev/zero; sleep 30"), None, None, &budget);
+        assert!(
+            matches!(run, Err(RunError::Exceeded(IngestLimit::Bytes(CAP)))),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A pipe that yields some bytes and then fails.
+    struct FailingPipe {
+        sent: bool,
+    }
+
+    impl Read for FailingPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                return Err(std::io::Error::other("pipe broke"));
+            }
+            self.sent = true;
+            let n = buf.len().min(8);
+            buf.iter_mut().take(n).for_each(|byte| *byte = b'x');
+            Ok(n)
+        }
+    }
+
+    /// A read error on an output pipe is a failed capture, never bytes that look complete.
+    #[test]
+    fn a_stdout_read_error_is_refused_not_truncated() {
+        let outcome = capture(FailingPipe { sent: false }, bytes(CAP));
+        assert_eq!(
+            outcome,
+            CaptureOutcome::ReadFailed(std::io::ErrorKind::Other)
+        );
+    }
+
+    /// A pipe read to its end within the cap is complete; past it, overflowed.
+    #[test]
+    fn a_capture_names_whether_the_pipe_overflowed() {
+        let within = capture([b'x'; 16].as_slice(), bytes(CAP));
+        assert_eq!(within, CaptureOutcome::Complete(vec![b'x'; 16]));
+        let past = capture([b'x'; 17].as_slice(), bytes(CAP));
+        assert_eq!(past, CaptureOutcome::Overflowed(vec![b'x'; 16]));
+    }
+
+    /// A failed read on a live output pipe is kept as a failure, never taken for the pipe's end.
+    ///
+    /// A read on a directory descriptor fails (`EISDIR`); the watcher then
+    /// names the pipe and how it failed, so the bytes read so far cannot pass
+    /// as the child's whole output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_pipe_read_is_a_failure_not_an_end() {
+        let dir = std::fs::File::open("/").expect("open the root directory");
+        let mut io = super::ChildIo {
+            stdout: super::pipes::Reader::new(Some(dir), bytes(CAP)).expect("stdout reader"),
+            stderr: super::pipes::Reader::new(None::<std::fs::File>, bytes(CAP))
+                .expect("stderr reader"),
+            stdin: None,
+        };
+        let _ = io.pump();
+        assert!(io.open_stream().is_none(), "a failed pipe is closed");
+        assert_eq!(
+            io.read_failure(),
+            Some((Stream::Stdout, std::io::ErrorKind::IsADirectory))
+        );
+    }
+
+    /// Stderr one byte past its ceiling is kept to the ceiling and marked truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_stderr_past_its_ceiling_is_marked_truncated() {
+        let cap = CHILD_STDERR_MAX_BYTES.get();
+        let script = format!("head -c {} /dev/zero >&2", cap.saturating_add(1));
+        let run = run(sh(&script), None, None, &unstaged());
+        assert!(
+            matches!(run, Ok(ref captured) if captured.stderr.is_truncated()
+                && u64::try_from(captured.stderr.bytes().len()).ok() == Some(cap)),
+            "{run:?}"
+        );
+    }
+
+    /// Stderr of exactly its ceiling is whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_stderr_within_its_ceiling_is_whole() {
+        let cap = CHILD_STDERR_MAX_BYTES.get();
+        let script = format!("head -c {cap} /dev/zero >&2");
+        let run = run(sh(&script), None, None, &unstaged());
+        assert!(
+            matches!(run, Ok(ref captured) if !captured.stderr.is_truncated()
+                && u64::try_from(captured.stderr.bytes().len()).ok() == Some(cap)),
+            "{run:?}"
+        );
+    }
+
+    /// The rendered cut names the stderr ceiling; a whole stderr carries no marker.
+    #[test]
+    fn the_truncation_marker_names_the_stderr_ceiling() {
+        let ceiling = IngestLimit::Bytes(CHILD_STDERR_MAX_BYTES.get()).to_string();
+        let cut = ChildStderr::Truncated(b"boom".to_vec()).to_terminal();
+        assert!(cut.as_str().starts_with("boom"), "{}", cut.as_str());
+        assert!(cut.as_str().contains(&ceiling), "{}", cut.as_str());
+        let whole = ChildStderr::Whole(b"boom".to_vec()).to_terminal();
+        assert_eq!(whole.as_str(), "boom");
+    }
+
+    /// The unsandboxed FFI inspector is held to the jailed inspector's default stdout and wall caps.
+    #[test]
+    fn the_ffi_inspect_ceiling_is_the_jails_default() {
+        let jail = ipe_sandbox::ResourceLimits::default();
+        assert_eq!(
+            super::FFI_INSPECT_LIMITS.stdout_bytes().get(),
+            jail.out_cap_bytes
+        );
+        assert_eq!(super::FFI_INSPECT_LIMITS.wall().secs(), jail.wall_secs);
+    }
+
+    /// A fed local child reads the bytes it is given on its stdin.
+    #[cfg(unix)]
+    #[test]
+    fn a_fed_local_child_reads_its_stdin() {
+        let run = run_local_fed(
+            sh("cat"),
+            zeroize::Zeroizing::new(b"hello".to_vec()),
+            TOOL_QUERY_LIMITS,
+            LocalSource::ToolQuery,
+        );
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()
+                && captured.stdout == b"hello"),
+            "{run:?}"
+        );
+    }
+
+    /// A fed local child still running at its wall is killed and refused on time.
+    #[cfg(unix)]
+    #[test]
+    fn a_fed_local_child_past_its_wall_is_killed() {
+        let started = Instant::now();
+        let run = run_local_fed(
+            sh("exec sleep 30"),
+            zeroize::Zeroizing::new(b"hello".to_vec()),
+            TOOL_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            LocalSource::ToolQuery,
+        );
+        assert!(
+            matches!(
+                run,
+                Err(RunError::Exceeded(LocalRefusal {
+                    source: LocalSource::ToolQuery,
+                    limit: IngestLimit::Time(_),
+                    ..
+                }))
+            ),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// An inherited child gets stdio and nothing else the CLI holds open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_inherited_child_inherits_no_extra_descriptor() {
+        use std::os::fd::AsRawFd as _;
+        let held = rustix::fs::open(
+            "/dev/null",
+            rustix::fs::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open /dev/null");
+        assert!(
+            rustix::io::fcntl_getfd(&held)
+                .is_ok_and(|flags| !flags.contains(rustix::io::FdFlags::CLOEXEC)),
+            "the probe descriptor must be inheritable"
+        );
+        let script = format!("[ -e /dev/fd/{} ] && exit 3; exit 0", held.as_raw_fd());
+        let status = run_inherited(
+            sh(&script),
+            InheritedRole::UserProgram,
+            InheritedInput::Bytes(zeroize::Zeroizing::new(Vec::new())),
+        );
+        assert!(
+            matches!(status, Ok(ref status) if status.success()),
+            "{status:?}"
+        );
+        drop(held);
     }
 
     /// The isolated git reads no user or system configuration and runs no hook.
@@ -3650,7 +4377,7 @@ mod tests {
             curl_refusal(exit(28), bytes(7), &GITHUB_API),
             Some(IngestRefusal {
                 source: IngestSource::GithubApi,
-                limit: IngestLimit::Time(GITHUB_API.wall),
+                limit: IngestLimit::Time(GITHUB_API.wall.limit()),
                 name: None,
             })
         );

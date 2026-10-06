@@ -120,6 +120,10 @@
     "integration_id": 15368
   },
   {
+    "context": "release-targets",
+    "integration_id": 15368
+  },
+  {
     "context": "requirements-docs-drift",
     "integration_id": 15368
   },

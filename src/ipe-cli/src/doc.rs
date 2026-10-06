@@ -2,7 +2,7 @@
 //!
 //! Generates reference documentation for an Ipê package from its own source: the
 //! public API a consumer sees, each entry carrying its checker-inferred type
-//! signature, its `-- |` doc-comment, and a stable source location.
+//! signature, its doc-comment, and a stable source location.
 //!
 //! ## Output layout
 //!
@@ -79,9 +79,10 @@
 //! Type signatures come from the type checker — this module reuses
 //! [`crate::api_surface::extract_tree`], the same projection `ipe diff` uses, so
 //! a documented type is exactly the checked type and is never re-parsed. Ipê's
-//! lexer discards every `--` comment before the AST exists, so the `-- |`
-//! doc-comments are recovered here at the driver boundary by a source scan
-//! ([`scan_doc_comments`]) that is joined to the checked surface by binding name.
+//! lexer discards every comment before the AST exists, so the `{-| … -}` and
+//! `-- |` doc-comments are recovered at the driver boundary by the shared
+//! extractor ([`scan_doc_comments`] over [`ipe_docs::stdlib_docs`]) and joined to
+//! the checked surface by binding name.
 //! Neither pass runs the emit tier — `ipe doc` needs types, not code.
 //!
 //! ## Stdlib coverage
@@ -1272,7 +1273,7 @@ pub struct ModuleDoc {
     pub name: String,
     /// Whether this is a project module or a bundled stdlib module.
     pub kind: ModuleKind,
-    /// The module's own `-- |` header doc-comment, empty when it has none.
+    /// The module's own header doc-comment, empty when it has none.
     pub comment: String,
     /// Exposed union types, in name order.
     pub unions: Vec<UnionDoc>,
@@ -1292,7 +1293,7 @@ pub struct ValueDoc {
     /// are computed from this — never from the flat string — so a link is a real
     /// resolved identity, not a text match.
     pub signature_ty: TyDoc,
-    /// Its `-- |` doc-comment, empty when it has none.
+    /// Its doc-comment, empty when it has none.
     pub comment: String,
 }
 
@@ -1305,7 +1306,7 @@ pub struct UnionDoc {
     pub params: usize,
     /// Constructor name → argument signatures, in declaration order.
     pub ctors: Vec<CtorDoc>,
-    /// The union's `-- |` doc-comment, empty when it has none.
+    /// The union's doc-comment, empty when it has none.
     pub comment: String,
 }
 
@@ -2048,11 +2049,10 @@ fn union_doc(name: &str, union: &UnionApi, comments: &DocComments) -> UnionDoc {
 /// comment and a per-binding-name map.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DocComments {
-    /// The `-- |` block immediately above the `module` header, empty when absent.
+    /// The doc-comment directly above the `module` header, empty when absent.
     module: String,
-    /// Binding name → its `-- |` block. A binding is a top-level value or a union
-    /// type; a doc-comment attaches to the name on the first non-comment line
-    /// below it.
+    /// Exported name → its doc-comment (`{-| … -}` or `-- |`). A name is a
+    /// top-level value or a type; its comment sits directly above it.
     bindings: BTreeMap<String, String>,
 }
 
@@ -2063,138 +2063,22 @@ impl DocComments {
     }
 }
 
-/// Scan one module's source for `-- |` doc-comments and attach each to the
-/// binding it precedes.
+/// Read one module's doc-comments through the shared extractor
+/// ([`ipe_docs::stdlib_docs::extract_module_doc`]), the one reader of both the
+/// `{-| … -}` and the `-- |` forms, so `ipe doc` and the generated reference
+/// show the same prose for the same declaration.
 ///
-/// A doc-comment is a `-- |` line optionally followed by plain `--` continuation
-/// lines; it attaches to the identifier that opens the next non-comment,
-/// non-blank line. This is the driver-boundary recovery of a convention the lexer
-/// erases — a value binding is recognised by `name :` or `name … =`, a union by
-/// `type Name`, and the module header by `module`.
+/// A doc-comment attaches to the declaration directly below it (no blank line
+/// between); the module header's comment sits directly above `module`.
 fn scan_doc_comments(src: &str) -> DocComments {
-    let mut result = DocComments::default();
-    let mut pending: Option<String> = None;
-
-    for line in src.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = doc_comment_text(trimmed) {
-            // Start of, or continuation of, a doc block.
-            match &mut pending {
-                Some(block) => {
-                    block.push('\n');
-                    block.push_str(rest);
-                }
-                None => pending = Some(rest.to_owned()),
-            }
-            continue;
-        }
-        if is_plain_comment(trimmed) {
-            // A plain `--` line continues an open doc block (the stdlib writes
-            // multi-line comments with only the first line marked `-- |`), and is
-            // otherwise ignored.
-            if let Some(block) = &mut pending {
-                block.push('\n');
-                block.push_str(plain_comment_text(trimmed));
-            }
-            continue;
-        }
-        if trimmed.is_empty() {
-            // A blank line does not break an open block; a doc-comment separated
-            // from its binding by blank lines still attaches to it.
-            continue;
-        }
-
-        // A code line: the pending block, if any, attaches to the binding it
-        // opens. A line with no recognised binding drops the block.
-        if let Some(block) = pending.take() {
-            let block = block.trim().to_owned();
-            if let Some(target) = binding_target(trimmed) {
-                match target {
-                    BindingTarget::Module => result.module = block,
-                    BindingTarget::Named(name) => {
-                        result.bindings.entry(name).or_insert(block);
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
-/// The text of a `-- |` doc-comment line (the marker stripped), or `None` when
-/// `line` is not a doc-comment opener.
-fn doc_comment_text(line: &str) -> Option<&str> {
-    line.strip_prefix("-- |")
-        .map(str::trim_start)
-        .or_else(|| line.strip_prefix("--|").map(str::trim_start))
-}
-
-/// Whether `line` is any `--` line comment (doc or plain).
-fn is_plain_comment(line: &str) -> bool {
-    line.starts_with("--")
-}
-
-/// The text of a plain `--` comment line, marker stripped.
-///
-/// Strips the `-- ` prefix (with a single space) so that any indentation
-/// following the space is preserved in the returned text — allowing indented
-/// code examples embedded in doc-comments to carry their leading spaces into
-/// the accumulated block and, from there, into the HTML code-block renderer.
-/// A bare `--` with no following space (a blank continuation line) strips only
-/// the `--`, returning an empty string.
-fn plain_comment_text(line: &str) -> &str {
-    line.strip_prefix("-- ")
-        .or_else(|| line.strip_prefix("--"))
-        .unwrap_or(line)
-}
-
-/// What binding a code line opens, for attaching a preceding doc-comment.
-enum BindingTarget {
-    /// The `module` header.
-    Module,
-    /// A named top-level value or union type.
-    Named(String),
-}
-
-/// Recognise the binding a code line opens: the `module` header, a `type Name`
-/// union, or a top-level `name` value (`name :` signature or `name … =`
-/// definition). Returns `None` for any other line (an `import`, an expression
-/// continuation, a `)` closing an exposing list), so a doc block above such a
-/// line is dropped rather than misattached.
-fn binding_target(line: &str) -> Option<BindingTarget> {
-    let mut words = line.split_whitespace();
-    let first = words.next()?;
-    if first == "module" {
-        return Some(BindingTarget::Module);
-    }
-    if first == "type" {
-        // `type Name …` or `type alias Name …`.
-        let name = match words.next() {
-            Some("alias") => words.next()?,
-            Some(other) => other,
-            None => return None,
-        };
-        return Some(BindingTarget::Named(name.to_owned()));
-    }
-    // A top-level value: an identifier that begins a signature (`name :`) or a
-    // definition (`name arg… =`). A binding name starts with a lowercase letter;
-    // this excludes keywords like `import`, `exposing`, and closing punctuation.
-    let name = first.trim_end_matches(':');
-    if is_value_name(name) {
-        return Some(BindingTarget::Named(name.to_owned()));
-    }
-    None
-}
-
-/// Whether `word` is a lowercase-initial identifier — a top-level value name, as
-/// distinct from a `Type`, a keyword, or punctuation.
-fn is_value_name(word: &str) -> bool {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() => {
-            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
-        }
-        _ => false,
+    let doc = ipe_docs::stdlib_docs::extract_module_doc("", src);
+    DocComments {
+        module: doc.module_doc.unwrap_or_default(),
+        bindings: doc
+            .exports
+            .into_iter()
+            .filter_map(|export| export.doc.map(|text| (export.name, text)))
+            .collect(),
     }
 }
 
@@ -2865,7 +2749,7 @@ fn build_stdlib_only_docs() -> DocsJson {
 /// Verify every exposed binding in the package at `path` carries a doc-comment.
 ///
 /// Writes nothing; exits non-zero (a [`CliError::DocCoverage`] carrying the
-/// report) when any exposed value or union type lacks a `-- |` comment.
+/// report) when any exposed value or union type lacks a doc-comment.
 /// Stdlib modules are exempt — their signatures are the contract, doc-comments
 /// are optional.
 ///
@@ -2916,9 +2800,8 @@ fn check(path: &Path) -> Result<(), CliError> {
     for gap in &gaps {
         let _ = writeln!(report, "  {}.{}", gap.module, gap.name);
     }
-    let _ = write!(
-        report,
-        "add a `-- |` comment above each, or hide it from the module's exposing list"
+    report.push_str(
+        "add a `{-| … -}` doc-comment above each, or hide it from the module's exposing list",
     );
     Err(CliError::DocCoverage(crate::style::TerminalSafe::sanitize(
         &report,
@@ -5731,6 +5614,52 @@ mod tests {
     #[test]
     fn rejects_second_positional() {
         assert!(parse_doc(&s(&["a", "b"])).is_err());
+    }
+
+    /// Every value a compiled-source stdlib module exposes reaches the `ipe doc`
+    /// surface with its checker signature and the doc-comment the shared
+    /// extractor reads — a kernel alias included, and either comment form.
+    #[test]
+    fn compiled_stdlib_values_carry_signature_and_shared_comment() {
+        let mut gaps = Vec::new();
+        for module in ipe_stdlib::COMPILED_STD_MODULES {
+            let segments: Vec<String> = module.dotted.split('.').map(str::to_owned).collect();
+            let doc = build_compiled_std_module_doc(&segments, module.source);
+            let shared = ipe_docs::stdlib_docs::extract_module_doc(module.dotted, module.source);
+            for export in &shared.exports {
+                if !export.name.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    continue;
+                }
+                let Some(value) = doc.values.iter().find(|v| v.name == export.name) else {
+                    gaps.push(format!("{}.{}: missing", module.dotted, export.name));
+                    continue;
+                };
+                if value.signature.is_empty() {
+                    gaps.push(format!("{}.{}: no signature", module.dotted, export.name));
+                }
+                if value.comment != export.doc.as_deref().unwrap_or_default() {
+                    gaps.push(format!(
+                        "{}.{}: comment differs",
+                        module.dotted, export.name
+                    ));
+                }
+            }
+        }
+        assert!(
+            gaps.is_empty(),
+            "stdlib values off the doc surface:\n{}",
+            gaps.join("\n")
+        );
+    }
+
+    #[test]
+    fn scans_block_doc_comments() {
+        let src = "module M exposing (foo)\n\n{-| The foo value.\n\n```ipe\nfoo --> 1\n```\n-}\nfoo : Int\nfoo = 1\n";
+        let comments = scan_doc_comments(src);
+        assert_eq!(
+            comments.get("foo").as_deref(),
+            Some("The foo value.\n\n```ipe\nfoo --> 1\n```")
+        );
     }
 
     #[test]

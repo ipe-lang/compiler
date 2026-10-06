@@ -2135,7 +2135,7 @@ pub fn emit_server_call(
         // `Arc::new(move |w| { let task = handler(w); .. })` and stores that
         // `Arc` in a process-global `pending_handlers()` registry, popped and
         // driven later by whichever axum worker thread services the
-        // eventual request (`server_stream.rs`'s `serve_streaming_sentinel`).
+        // eventual request (`server_stream.rs`'s `claim_streaming_sentinel`).
         // Unsizing `Arc<ConcreteClosure>` to the registry's
         // `Arc<dyn Fn(..) -> .. + Send + Sync>` slot requires the captured
         // `handler: H` to itself be `Sync` — the same "value must legitimately

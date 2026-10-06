@@ -4,7 +4,7 @@
 
 [Back to stdlib index](../stdlib.md)
 
-`Ipe.List` — transform, filter, and combine lists (compiled-source Layer-3).
+`Ipe.List` — transform, filter, and combine lists.
 
 A `List a` is an ordered sequence of values that all share the type `a`:
 `[ 1, 2, 3 ]` is a `List Int`, `[ "a", "b" ]` a `List String`. Lists are
@@ -35,10 +35,8 @@ Example:
 
 See also: `Ipe.Maybe`, `Ipe.Dict` (key-value lookup), `Ipe.Set`.
 
-Every member is a point-free `Kernel.kernel` alias resolved by
-`detect_kernel_alias` to a registered `List*` `StdlibKernel` variant
-(`ipe_runtime::list::*`). The type constraints (`comparable`, `number`)
-are enforced by the type-checker at the call site.
+The `comparable` and `number` constraints in the signatures are checked at
+each call site.
 
 ## `isEmpty`
 

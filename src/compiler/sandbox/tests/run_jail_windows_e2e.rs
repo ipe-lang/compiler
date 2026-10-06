@@ -243,11 +243,11 @@ fn a_non_allowlisted_env_var_is_absent_from_the_jailed_child_but_present_under_c
 /// The host values of the names the launcher may forward: the base set plus
 /// `extra`, read through the same allowlisted host-env reader the launcher uses.
 fn host_lookup(extra: &[&str]) -> Vec<(String, OsString)> {
-    let names: Vec<&str> = WindowsBaseEnv::ALL
+    let mut names: Vec<&str> = WindowsBaseEnv::ALL
         .into_iter()
         .map(WindowsBaseEnv::name)
-        .chain(extra.iter().copied())
         .collect();
+    names.extend(extra.iter().copied());
     ipe_sandbox::host_env::granted_env(&env_granted(&names))
 }
 

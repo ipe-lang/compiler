@@ -1,6 +1,7 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Cursor(..), DecidedPair, PendingRow, ProgressRow, QueuedChange, ShownSource, SourceView(..), StaleReason(..), Unit, UnitView, attest, attestedHash, attestedUid, candidateQuery, countPending, dbBytes, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadPendingPage, loadProgress, loadView, nameFor, pageSize, placeholders, probe, readConnection, rebuildReviewed, reverify, shortHash, shownHash, shownText, storedHash, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownLines, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
+import Ipe.Bytes as Bytes
 import Ipe.Crypto as Crypto
 import Ipe.Db
 import Ipe.Db.Decode
@@ -15,9 +16,11 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Highlight as Highlight
 import Lib.Links as Links
+import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (RootMap)
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (IndexSettings)
+import Lib.Uid as Uid exposing (Uid)
 
 
 -- One ipe-index unit's metadata, never its source: a queue page lists these
@@ -28,7 +31,7 @@ import Lib.Settings as Settings exposing (IndexSettings)
 -- unit's file, parsed for highlighting. `attested` is the stored body hash,
 -- parsed once.
 type alias Unit =
-    { uid : String
+    { uid : Uid
     , path : SafeText
     , name : SafeText
     , qualified : SafeText
@@ -54,9 +57,8 @@ type alias UnitView =
 
 
 -- The unit columns as they come off the DB, before the source is attached.
--- The unit page queries units directly, not via change_queue: a decided
--- unit has no queue row, but its page must still render, so it reads no
--- queued change.
+-- The unit page queries units directly, not via `open_units`: a decided
+-- unit is not open, but its page must still render, so it reads no change.
 unitByUidSql : String
 unitByUidSql =
     "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid = ?"
@@ -73,10 +75,10 @@ unitFiles =
 -- one file read and verified against its tag's root in `roots`, and its
 -- links resolved from the view when it is shown. Nothing when no such unit
 -- exists. The unit page and the selected queue card both load through it.
-loadView : Db.Db -> RootMap -> String -> Task.Task Error (Maybe UnitView)
+loadView : Db.Db -> RootMap -> Uid -> Task.Task Error (Maybe UnitView)
 loadView conn roots uid =
     do
-        rows <- Db.queryDecode conn unitByUidSql [ SqlString uid ] rowDecoder
+        rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql uid ] rowDecoder
         case List.head rows of
             Just row ->
                 do
@@ -124,12 +126,15 @@ linksOf conn row view =
         Unreadable _ ->
             Task.succeed Links.noLinks
 
+        TooLarge _ ->
+            Task.succeed Links.noLinks
+
 
 -- The callgraph edges ipe-index resolved out of `uid`, one past the link
 -- ceiling, so a full read shows that more edges may exist.
-edgeLinks : Db.Db -> String -> Task.Task Error (List ( String, String ))
+edgeLinks : Db.Db -> Uid -> Task.Task Error (List ( String, String ))
 edgeLinks conn uid =
-    Db.queryDecode conn edgeSql [ SqlString uid, SqlString uid, SqlInt (Links.linkCeiling + 1) ] edgeDecoder
+    Db.queryDecode conn edgeSql [ Uid.toSql uid, Uid.toSql uid, SqlInt (Links.linkCeiling + 1) ] edgeDecoder
 
 
 edgeSql : String
@@ -170,10 +175,10 @@ candidateRows conn row names =
 -- per name, the unit in `path` first, then the lowest uid — ipe-index's own
 -- `uid_for_qualified` tie-break. Every name is bound; only placeholders enter
 -- the SQL text.
-candidateQuery : String -> String -> List String -> ( String, List SqlValue )
+candidateQuery : String -> Uid -> List String -> ( String, List SqlValue )
 candidateQuery path uid names =
     ( "SELECT qualified, uid FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1"
-    , List.concat [ [ SqlString path ], List.map SqlString names, [ SqlString uid ] ]
+    , List.concat [ [ SqlString path ], List.map SqlString names, [ Uid.toSql uid ] ]
     )
 
 
@@ -191,7 +196,7 @@ qualifiedDecoder =
 
 
 type alias RowUnit =
-    { uid : String
+    { uid : Uid
     , path : String
     , name : String
     , qualified : String
@@ -209,7 +214,7 @@ type alias RowUnit =
 -- The queue row is decoded in two halves of at most ten columns each
 -- (`Db.Decode.succeed` lifts at most 10 parameters — IPE-L0121), then merged.
 type alias RowA =
-    { uid : String
+    { uid : Uid
     , path : String
     , name : String
     , qualified : String
@@ -228,7 +233,7 @@ type alias RowB =
     }
 
 
-makeRowA : String -> String -> String -> String -> RowA
+makeRowA : Uid -> String -> String -> String -> RowA
 makeRowA uid path name qualified =
     { uid = uid
     , path = path
@@ -277,7 +282,7 @@ rowDecoder =
 partADecoder : Db.Decode.Decoder RowA
 partADecoder =
     Db.Decode.succeed makeRowA
-        |> Db.Decode.required "uid" (Db.Decode.string "uid")
+        |> Db.Decode.required "uid" (Uid.decoder "uid")
         |> Db.Decode.required "path" (Db.Decode.string "path")
         |> Db.Decode.required "name" (Db.Decode.string "name")
         |> Db.Decode.required "qualified" (Db.Decode.string "qualified")
@@ -297,17 +302,18 @@ partBDecoder =
 
 
 -- The startup check of `IPE_INDEX_DB`: the index is opened read-only and
--- every column a queue page and the progress count read is selected, so a
--- missing file, a file that is not an ipe-index database, or one missing a
--- table or column (an index built before the `reviewed` table, or with no
--- `files` table to read a language from) stops the server before it
--- listens, naming the variable and the file.
+-- every column a queue page reads from the `open_units` view is selected,
+-- with the `reviewed` copy and its `reviewed_stamp`, so a missing file, a
+-- file that is not an ipe-index database, or one missing the view, a table
+-- or a column stops the server before it listens, naming the variable and
+-- the file.
 probe : IndexSettings -> Task.Task Error ()
 probe settings =
     (do
         conn <- readConnection settings
-        Db.queryDecode conn (pendingColumns ++ pendingFrom ++ " LIMIT 0") [] pendingRowDecoder
+        Db.queryDecode conn (openColumns ++ " LIMIT 0") [] pendingRowDecoder
         Db.queryDecode conn "SELECT uid, body_hash FROM reviewed LIMIT 0" [] reviewedPairDecoder
+        Db.queryDecode conn "SELECT head FROM reviewed_stamp LIMIT 0" [] stampDecoder
         Task.succeed ()
     )
         |> Task.mapError (Settings.openFailure "IPE_INDEX_DB" (SafeText.literal "build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at an existing index") settings.db)
@@ -320,61 +326,6 @@ reviewedPairDecoder =
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
 
 
--- Review progress over the whole index, as one aggregate row: `reviewed`
--- counts the units whose current (uid, body_hash) pair is in the `reviewed`
--- copy, `total` the units reviewed or still queued, and `mirrored` the
--- copy's own rows, which the caller compares with the review database.
-type alias ProgressRow =
-    { reviewed : Int
-    , total : Int
-    , mirrored : Int
-    }
-
-
--- The one test of "this unit is decided": its uid and its current body hash,
--- compared column by column against the `reviewed` copy, never as one
--- concatenated key.
-decidedPredicate : String
-decidedPredicate =
-    "EXISTS (SELECT 1 FROM reviewed r WHERE r.uid = u.uid AND r.body_hash = u.body_hash)"
-
-
-progressSql : String
-progressSql =
-    String.concat
-        [ "SELECT (SELECT COUNT(*) FROM units u WHERE "
-        , decidedPredicate
-        , ") AS reviewed, (SELECT COUNT(*) FROM units u WHERE "
-        , decidedPredicate
-        , " OR EXISTS (SELECT 1 FROM change_queue q WHERE q.uid = u.uid AND "
-        , pendingChange
-        , ")) AS total, (SELECT COUNT(*) FROM reviewed) AS mirrored"
-        ]
-
-
-progressDecoder : Db.Decode.Decoder ProgressRow
-progressDecoder =
-    Db.Decode.succeed (\reviewed total mirrored -> { reviewed = reviewed, total = total, mirrored = mirrored })
-        |> Db.Decode.required "reviewed" (Db.Decode.int "reviewed")
-        |> Db.Decode.required "total" (Db.Decode.int "total")
-        |> Db.Decode.required "mirrored" (Db.Decode.int "mirrored")
-
-
--- The progress row, counted by SQLite over the index; one row is decoded
--- whatever the index's size. A query that yields anything but one row is a
--- failed read, never a zero.
-loadProgress : Db.Db -> Task.Task Error ProgressRow
-loadProgress conn =
-    do
-        rows <- Db.queryDecode conn progressSql [] progressDecoder
-        case rows of
-            [ row ] ->
-                Task.succeed row
-
-            _ ->
-                Task.fail (Error.unexpected "the review progress query did not return exactly one row")
-
-
 -- The index database at `settings` opened read-only: the one read
 -- connection a page load or lookup opens and then passes to every query it
 -- runs, from settings the caller resolved once.
@@ -383,107 +334,131 @@ readConnection settings =
     Db.open "sqlite" (Settings.indexReadUrl settings.db)
 
 
--- The most queue rows one page load reads. An index can hold tens of
--- thousands of queued units, and each loaded unit costs two review-db
--- lookups, so a load is bounded by this constant rather than by the queue's
--- size. A page load reads no source file.
-pageSize : Int
-pageSize =
-    200
-
-
--- Where a page starts in the queue's `(enqueued_at, uid)` order: the head, or
--- strictly after the last row of the previous page. `uid` breaks ties on
--- `enqueued_at`, so the order is total and no row is skipped or repeated
--- across pages.
+-- Where a page starts in the `(enqueued_at, uid)` order of `open_units`: the
+-- head, or strictly after the last row of the previous page. `uid` breaks
+-- ties on `enqueued_at` (a unit with no queue row orders at 0), so the order
+-- is total and no row is skipped or repeated across pages.
 type Cursor
     = Start
-    | After { enqueuedAt : Int, uid : String }
+    | After { enqueuedAt : Int, uid : Uid }
 
 
--- A queued unit with the `enqueued_at` it is ordered by, so the caller can
+-- An open unit with the `enqueued_at` it is ordered by, so the caller can
 -- build the cursor for the following page.
 type alias PendingRow =
     { unit : Unit
-    , queued : QueuedChange
+    , change : Change
     , enqueuedAt : Int
     }
 
 
--- A unit's `change_queue` row: only a queued unit has one, so a unit read
--- from `units` alone (the unit page) carries none.
-type alias QueuedChange =
-    { change : String
-    , oldHash : Maybe String
-    , newHash : Maybe String
-    }
+-- What the index recorded about an open unit's current body: a new unit, a
+-- modified one with the hash it replaced, or no queue row for this body at
+-- all. Membership never depends on it: a unit is open because its current
+-- (uid, body_hash) pair is undecided, so a unit whose change event is
+-- missing is still listed, as `Unrecorded`.
+type Change
+    = New
+    | Modified { old : String }
+    | Unrecorded
 
 
--- The one JOIN/WHERE both the page and the count read, so the total always
--- counts exactly the rows a page can return.
-pendingFrom : String
-pendingFrom =
-    " FROM change_queue q JOIN units u ON u.uid = q.uid" ++ unitFiles ++ " WHERE " ++ pendingChange
+-- The `change`/`old_hash` columns of `open_units`, parsed once. A `modified`
+-- row without the hash it replaced, an `old_hash` with no change, and a
+-- change kind this reviewer does not know each fail the read rather than
+-- being shown as something they are not.
+changeDecoder : Db.Decode.Decoder Change
+changeDecoder =
+    Db.Decode.succeed (\change old -> ( change, old ))
+        |> Db.Decode.required "change" (Db.Decode.nullable (Db.Decode.string "change"))
+        |> Db.Decode.required "old_hash" (Db.Decode.nullable (Db.Decode.string "old_hash"))
+        |> Db.Decode.andThen (\( change, old ) -> changeOf change old)
 
 
--- The queue rows still to review; `deleted` rows are never listed.
-pendingChange : String
-pendingChange =
-    "q.change IN ('new','modified')"
+changeOf : Maybe String -> Maybe String -> Db.Decode.Decoder Change
+changeOf change old =
+    case change of
+        Nothing ->
+            case old of
+                Nothing ->
+                    Db.Decode.succeed Unrecorded
+
+                Just _ ->
+                    Db.Decode.fail "an open unit has an old_hash but no change"
+
+        Just kind ->
+            if kind == "new" then
+                Db.Decode.succeed New
+
+            else if kind == "modified" then
+                case old of
+                    Just hash ->
+                        Db.Decode.succeed (Modified { old = hash })
+
+                    Nothing ->
+                        Db.Decode.fail "a modified unit has no old_hash"
+
+            else
+                Db.Decode.fail "an open unit has a change kind this reviewer does not know"
 
 
-pendingColumns : String
-pendingColumns =
-    "SELECT q.uid, q.change, q.old_hash, q.new_hash, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang, q.enqueued_at"
+-- The one membership read: `open_units` is the index's current units whose
+-- (uid, body_hash) pair is not in the `reviewed` copy. The page and the
+-- count both read it, so the total always counts exactly the rows a page
+-- can return.
+openColumns : String
+openColumns =
+    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM open_units"
 
 
-pendingOrder : String
-pendingOrder =
-    " ORDER BY q.enqueued_at, q.uid LIMIT ?"
+openOrder : String
+openOrder =
+    " ORDER BY enqueued_at, uid LIMIT ?"
 
 
 -- The page query and its bound parameters for `cursor`. Every value is a
 -- bound parameter; the page bound is always the last one.
-pendingPageQuery : Cursor -> ( String, List SqlValue )
-pendingPageQuery cursor =
+pendingPageQuery : PageSize -> Cursor -> ( String, List SqlValue )
+pendingPageQuery size cursor =
     case cursor of
         Start ->
-            ( pendingColumns ++ pendingFrom ++ pendingOrder, [ SqlInt pageSize ] )
+            ( openColumns ++ openOrder, [ SqlInt (PageSize.toInt size) ] )
 
         After at ->
-            ( pendingColumns ++ pendingFrom ++ " AND (q.enqueued_at, q.uid) > (?, ?)" ++ pendingOrder
-            , [ SqlInt at.enqueuedAt, SqlString at.uid, SqlInt pageSize ]
+            ( openColumns ++ " WHERE (enqueued_at, uid) > (?, ?)" ++ openOrder
+            , [ SqlInt at.enqueuedAt, Uid.toSql at.uid, SqlInt (PageSize.toInt size) ]
             )
 
 
-pendingRowDecoder : Db.Decode.Decoder ( RowUnit, QueuedChange, Int )
+pendingRowDecoder : Db.Decode.Decoder ( RowUnit, Change, Int )
 pendingRowDecoder =
     Db.Decode.andThen
-        (\row -> Db.Decode.map (\( queued, at ) -> ( row, queued, at )) queueColumnsDecoder)
+        (\row -> Db.Decode.map (\( change, at ) -> ( row, change, at )) openColumnsDecoder)
         rowDecoder
 
 
-queueColumnsDecoder : Db.Decode.Decoder ( QueuedChange, Int )
-queueColumnsDecoder =
-    Db.Decode.succeed (\change oldHash newHash at -> ( { change = change, oldHash = oldHash, newHash = newHash }, at ))
-        |> Db.Decode.required "change" (Db.Decode.string "change")
-        |> Db.Decode.required "old_hash" (Db.Decode.nullable (Db.Decode.string "old_hash"))
-        |> Db.Decode.required "new_hash" (Db.Decode.nullable (Db.Decode.string "new_hash"))
-        |> Db.Decode.required "enqueued_at" (Db.Decode.int "enqueued_at")
+openColumnsDecoder : Db.Decode.Decoder ( Change, Int )
+openColumnsDecoder =
+    Db.Decode.andThen
+        (\change ->
+            Db.Decode.succeed (\at -> ( change, at ))
+                |> Db.Decode.required "enqueued_at" (Db.Decode.int "enqueued_at")
+        )
+        changeDecoder
 
 
--- One page of queue units (new + modified) at `cursor` read on `conn`, at
--- most `pageSize` rows of metadata. No source file is read: a unit's file is
--- read only by `loadView`, so a unit whose file is missing still lists, and
--- only a failed query fails the page.
-loadPendingPage : Db.Db -> Cursor -> Task.Task Error (List PendingRow)
-loadPendingPage conn cursor =
+-- One page of open units at `cursor` read on `conn`, at most `size` rows
+-- of metadata. No source file is read: a unit's file is read only by
+-- `loadView`, so a unit whose file is missing still lists, and only a failed
+-- query fails the page.
+loadPendingPage : Db.Db -> PageSize -> Cursor -> Task.Task Error (List PendingRow)
+loadPendingPage conn size cursor =
     let
         ( sql, params ) =
-            pendingPageQuery cursor
+            pendingPageQuery size cursor
     in
     Db.queryDecode conn sql params pendingRowDecoder
-        |> Task.map (List.map (\( row, queued, at ) -> { unit = withRow row, queued = queued, enqueuedAt = at }))
+        |> Task.map (List.map (\( row, change, at ) -> { unit = withRow row, change = change, enqueuedAt = at }))
 
 
 countDecoder : Db.Decode.Decoder Int
@@ -492,14 +467,21 @@ countDecoder =
         |> Db.Decode.required "total" (Db.Decode.int "total")
 
 
--- How many units the whole queue holds, counted over `pendingFrom` without
--- loading a row. A count query that yields no row is a failed read, never a
--- zero.
+-- How many units are open, counted over `open_units` without loading a
+-- row. A count query that yields no row is a failed read, never a zero.
 countPending : Db.Db -> Task.Task Error Int
 countPending conn =
     do
-        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total" ++ pendingFrom) [] countDecoder
-        singleInt "COUNT(*) over change_queue" rows
+        rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM open_units" [] countDecoder
+        singleInt "COUNT(*) over open_units" rows
+
+
+-- How many units the index holds, open or decided.
+countUnits : Db.Db -> Task.Task Error Int
+countUnits conn =
+    do
+        rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM units" [] countDecoder
+        singleInt "COUNT(*) over units" rows
 
 
 bytesDecoder : Db.Decode.Decoder Int
@@ -527,35 +509,161 @@ singleInt what rows =
             Task.fail (Error.unexpected (what ++ " did not return exactly one row"))
 
 
+-- Everything one queue page shows, read in one index transaction, so the
+-- page rows, the open count and the unit count describe the same index
+-- state and no write between two reads can make them disagree. The module
+-- exposes no other reader of the page, the counts or the size, so no
+-- caller can read one of them outside this transaction. `stamp` is
+-- the review-log head the `reviewed` copy was last brought up to, or
+-- Nothing when the copy has never been stamped or was marked stale; the
+-- caller compares it with the review database's head before trusting the
+-- rest.
+type alias Snapshot =
+    { stamp : Maybe String
+    , rows : List PendingRow
+    , open : Int
+    , units : Int
+    , bytes : Int
+    }
+
+
+readSnapshot : Db.Db -> Cursor -> Task.Task Error Snapshot
+readSnapshot conn cursor =
+    Db.withTransaction conn
+        (\tx ->
+            do
+                stamp <- readStamp tx
+                rows <- loadPendingPage tx PageSize.queue cursor
+                open <- countPending tx
+                units <- countUnits tx
+                bytes <- dbBytes tx
+                Task.succeed { stamp = stamp, rows = rows, open = open, units = units, bytes = bytes }
+        )
+
+
+stampDecoder : Db.Decode.Decoder String
+stampDecoder =
+    Db.Decode.succeed (\head -> head)
+        |> Db.Decode.required "head" (Db.Decode.string "head")
+
+
+-- The head stamped on the `reviewed` copy: Nothing when no stamp row
+-- exists. The table's key admits at most one row, so more than one is a
+-- failed read.
+readStamp : Db.Db -> Task.Task Error (Maybe String)
+readStamp conn =
+    do
+        rows <- Db.queryDecode conn "SELECT head FROM reviewed_stamp WHERE one = 1" [] stampDecoder
+        case rows of
+            [] ->
+                Task.succeed Nothing
+
+            [ head ] ->
+                Task.succeed (Just head)
+
+            _ ->
+                Task.fail (Error.unexpected "reviewed_stamp holds more than one row")
+
+
+-- The identity of the review log: the hash-chain head after its last
+-- decision. Opaque: minted only by `chainHeadDecoder` (a read of the review
+-- database's `review_head`) and `chainLink` (the next link over a decided
+-- pair), so a head is never built from a count or a bare string.
+type ChainHead
+    = ChainHead String
+
+
+chainHeadDecoder : Db.Decode.Decoder ChainHead
+chainHeadDecoder =
+    Db.Decode.succeed (\head -> ChainHead head)
+        |> Db.Decode.required "head" (Db.Decode.string "head")
+
+
+-- A head as it is stored and compared.
+chainHeadText : ChainHead -> String
+chainHeadText head =
+    case head of
+        ChainHead text ->
+            text
+
+
+-- The head after `prev` records the decision on (uid, body_hash): the
+-- SHA-256 of the three parts, each written as its decimal length, `:`, then
+-- the part, so no choice of uid or hash can make two different triples hash
+-- the same input.
+chainLink : ChainHead -> Uid -> String -> ChainHead
+chainLink prev uid hash =
+    ChainHead (Crypto.sha256 (lengthPrefixed [ chainHeadText prev, Uid.toString uid, hash ]))
+
+
+lengthPrefixed : List String -> String
+lengthPrefixed parts =
+    String.concat (List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part) parts)
+
+
+-- What recording a decision did to the review log: a new row moved the head
+-- from `prev` to `head`, or the pair was already decided and nothing moved.
+type Written
+    = Inserted { prev : ChainHead, head : ChainHead }
+    | AlreadyDecided
+
+
 -- The review app consumes and clears explicitly: after a unit is decided,
--- `drainPair` runs in one index transaction, so the pair enters the
--- `reviewed` copy and the unit's change_queue row leaves together, or
--- neither does. Returns the count of queue rows deleted. The index is the one
--- `settings` names, resolved once at startup.
-drainUnit : IndexSettings -> Attested -> Task.Task Error Int
-drainUnit settings attested =
+-- one index transaction adds the pair to the `reviewed` copy, deletes the
+-- unit's change_queue row for that hash, and moves the copy's stamp along
+-- the review log. A new decision moves the stamp from `prev` to `head` only
+-- if it still reads `prev`; any other stamp means the copy missed a
+-- decision, so the stamp row is deleted and the next load rebuilds the copy
+-- rather than vouch for it. An already-decided pair leaves the stamp alone.
+-- Returns the count of queue rows deleted. The index is the one `settings`
+-- names, resolved once at startup.
+drainUnit : IndexSettings -> Attested -> Written -> Task.Task Error Int
+drainUnit settings attested written =
     do
         conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
-        Db.withTransaction conn (\tx -> drainPair tx (attestedUid attested) (attestedHash attested))
+        Db.withTransaction conn
+            (\tx ->
+                do
+                    drained <- drainPair tx (attestedUid attested) (attestedHash attested)
+                    moveStamp tx written
+                    Task.succeed drained
+            )
+
+
+moveStamp : Db.Db -> Written -> Task.Task Error ()
+moveStamp conn written =
+    case written of
+        AlreadyDecided ->
+            Task.succeed ()
+
+        Inserted link ->
+            do
+                moved <- Db.exec conn "UPDATE reviewed_stamp SET head = ? WHERE one = 1 AND head = ?" [ SqlString (chainHeadText link.head), SqlString (chainHeadText link.prev) ]
+                if moved == 1 then
+                    Task.succeed ()
+
+                else
+                    Db.exec conn "DELETE FROM reviewed_stamp" []
+                        |> Task.map (\_ -> ())
 
 
 -- A decided (uid, body_hash) pair as the review table holds it. Opaque:
 -- built only by `decidedPairDecoder`, which `Lib.Db.decidedPairsAfter` runs
 -- over the review table, so a refill drains only pairs read back from it.
 type DecidedPair
-    = DecidedPair { uid : String, hash : String }
+    = DecidedPair { uid : Uid, hash : String }
 
 
 -- The one constructor of a `DecidedPair`: a row's `uid` and `body_hash`.
 decidedPairDecoder : Db.Decode.Decoder DecidedPair
 decidedPairDecoder =
     Db.Decode.succeed (\uid hash -> DecidedPair { uid = uid, hash = hash })
-        |> Db.Decode.required "uid" (Db.Decode.string "uid")
+        |> Db.Decode.required "uid" (Uid.decoder "uid")
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
 
 
 -- A decided pair's key, read-only: the (uid, body_hash) it was decoded from.
-decidedPairKey : DecidedPair -> ( String, String )
+decidedPairKey : DecidedPair -> ( Uid, String )
 decidedPairKey pair =
     case pair of
         DecidedPair p ->
@@ -576,34 +684,40 @@ drainDecided conn pair =
 -- kept, so the first review wins and a re-drain is a no-op), then the
 -- change_queue row queued for that hash is deleted. Only the row queued for
 -- the decided hash is deleted: a re-index that re-queued the unit under new
--- content keeps its row, so that change is still reviewed. Returns the count
--- of queue rows deleted. Atomic only inside a transaction the caller opens.
-drainPair : Db.Db -> String -> String -> Task.Task Error Int
+-- content keeps its row, so the index's own pending list still names that
+-- change. Whether a unit is open never reads this row: `open_units` compares
+-- the current pair with `reviewed`. Returns the count of queue rows
+-- deleted. Atomic only inside a transaction the caller opens.
+drainPair : Db.Db -> Uid -> String -> Task.Task Error Int
 drainPair conn uid hash =
     do
-        Db.exec conn "INSERT OR IGNORE INTO reviewed (uid, body_hash) VALUES (?, ?)" [ SqlString uid, SqlString hash ]
+        Db.exec conn "INSERT OR IGNORE INTO reviewed (uid, body_hash) VALUES (?, ?)" [ Uid.toSql uid, SqlString hash ]
         Db.deleteWhere conn
             "change_queue"
             (Sql.and
-                (Sql.eq (Sql.column "uid") (Sql.param (SqlString uid)))
+                (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql uid)))
                 (Sql.eq (Sql.column "new_hash") (Sql.param (SqlString hash)))
             )
 
 
 -- The `reviewed` copy rebuilt in one index transaction: every row is
--- deleted, then `refill` re-adds the decided pairs through `drainDecided` on the
--- transaction's connection it is given. A failed refill rolls the whole
--- rebuild back, leaving the copy as it was. The index is the one `settings`
--- names, resolved once at startup.
-rebuildReviewed : IndexSettings -> (Db.Db -> Task.Task Error a) -> Task.Task Error a
-rebuildReviewed settings refill =
+-- deleted, `refill` re-adds the decided pairs through `drainDecided` on the
+-- transaction's connection it is given, and the copy is stamped with `head`,
+-- the review-log head the caller read before the refill began. A failed
+-- refill rolls the whole rebuild back, leaving the copy and its stamp as
+-- they were. The index is the one `settings` names, resolved once at
+-- startup.
+rebuildReviewed : IndexSettings -> ChainHead -> (Db.Db -> Task.Task Error a) -> Task.Task Error a
+rebuildReviewed settings head refill =
     do
         conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
         Db.withTransaction conn
             (\tx ->
                 do
                     Db.exec tx "DELETE FROM reviewed" []
-                    refill tx
+                    refilled <- refill tx
+                    Db.exec tx "INSERT OR REPLACE INTO reviewed_stamp (one, head) VALUES (1, ?)" [ SqlString (chainHeadText head) ]
+                    Task.succeed refilled
             )
 
 
@@ -625,7 +739,7 @@ unitsStore =
 -- the unit still exists (a decided unit whose source was deleted leaves a
 -- review row but no name). The `uid` value is bound as a parameter by
 -- `Store.findBy`, never interpolated into SQL text.
-nameFor : Db.Db -> String -> Task.Task Error (Maybe SafeText)
+nameFor : Db.Db -> Uid -> Task.Task Error (Maybe SafeText)
 nameFor conn uid =
     case unitsStore of
         Err e ->
@@ -633,7 +747,7 @@ nameFor conn uid =
 
         Ok store ->
             do
-                rows <- Store.findBy conn store "uid" (SqlString uid)
+                rows <- Store.findBy conn store "uid" (Uid.toSql uid)
                 case List.head rows of
                     Just row ->
                         Task.succeed (Maybe.map SafeText.renderForeign (Result.toMaybe (Store.readText "qualified" row)))
@@ -644,9 +758,9 @@ nameFor conn uid =
 
 -- The one verification of a unit's source. The stored hash is parsed first,
 -- so an unknown scheme refuses before any read; then the stored path is
--- resolved, the file read, the line range checked and the view re-hashed.
--- Only a view whose attestation equals the stored one is `Shown`. Every
--- per-unit cause (refused path, unreadable file, bad range, drift) is a
+-- resolved, a span past the line ceiling is withheld before any read, the
+-- file is read and `classifyView` judges the view. Every per-unit cause
+-- (refused path, unreadable file, oversized view, bad range, drift) is a
 -- `SourceView` state, never a failed task.
 viewOf : RootMap -> RowUnit -> Task.Task Error SourceView
 viewOf roots row =
@@ -660,9 +774,14 @@ viewOf roots row =
                     Task.succeed (Unreadable (RepoPath.toError refusal))
 
                 Ok path ->
-                    File.readFileLimit path sourceCeiling
-                        |> Task.map (\text -> verifyView row.uid stored (viewText row.lineStart row.lineEnd text))
-                        |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
+                    case spanOversize row.lineStart row.lineEnd of
+                        Just over ->
+                            Task.succeed (TooLarge over)
+
+                        Nothing ->
+                            File.readFileLimit path sourceCeiling
+                                |> Task.map (classifyView row.uid stored row.lineStart row.lineEnd)
+                                |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
 
 
 -- A read error re-worded to name the stored path it came from.
@@ -681,18 +800,61 @@ readFailure stored e =
         e
 
 
-verifyView : String -> String -> Result StaleReason String -> SourceView
-verifyView uid stored sliced =
-    case sliced of
-        Err reason ->
-            Stale reason
+-- The one judgement of a unit's view, in precedence order: a span past the
+-- line ceiling, a range outside `text`, a view past the byte ceiling, then
+-- the attestation compare. `ShownSource` is built only here, so holding one
+-- proves the view is within both ceilings and re-hashes to `stored`. An
+-- oversized view is never hashed: re-indexing cannot make it shown.
+classifyView : Uid -> String -> Int -> Int -> String -> SourceView
+classifyView uid stored start end text =
+    case spanOversize start end of
+        Just over ->
+            TooLarge over
 
-        Ok view ->
-            if attest view == stored then
-                Shown (ShownSource { uid = uid, text = view, hash = stored })
+        Nothing ->
+            case viewText start end text of
+                Err reason ->
+                    Stale reason
 
-            else
-                Stale Drifted
+                Ok view ->
+                    let
+                        size =
+                            Bytes.length (Bytes.fromString view)
+                    in
+                    if size > ByteSize.toBytes viewByteCeiling then
+                        TooLarge (ViewBytes { size = ByteSize.bytes size })
+
+                    else if attest view == stored then
+                        Shown (ShownSource { uid = uid, text = view, hash = stored })
+
+                    else
+                        Stale Drifted
+
+
+-- A span of more than `viewLineCeiling` lines, judged on the indexed range
+-- alone. Only a valid range (`1 <= start <= end`) is judged, which keeps
+-- `end - start` and its `+ 1` inside `Int` for any stored integers; an invalid
+-- range is left to `viewText`, which refuses it.
+spanOversize : Int -> Int -> Maybe Oversize
+spanOversize start end =
+    if 1 <= start && start <= end && end - start >= viewLineCeiling then
+        Just (SpanLines { lines = end - start + 1 })
+
+    else
+        Nothing
+
+
+-- The most lines a shown view may have: each line is a drawn row.
+viewLineCeiling : Int
+viewLineCeiling =
+    5000
+
+
+-- The most UTF-8 bytes a shown view may hold: bytes bound the drawn tokens,
+-- which a single long line can multiply without adding rows.
+viewByteCeiling : ByteSize
+viewByteCeiling =
+    ByteSize.kib 256
 
 
 -- The largest source file a unit is sliced from; a bigger file under the root
@@ -779,10 +941,11 @@ hashDigits attested =
             other
 
 
--- Source text proved equal to its attestation. Opaque: built only by
--- `viewOf`, so holding one means the bytes were re-hashed.
+-- Source text proved within both view ceilings and equal to its attestation.
+-- Opaque: built only by `classifyView`, so holding one means the bytes were
+-- measured and re-hashed.
 type ShownSource
-    = ShownSource { uid : String, text : String, hash : String }
+    = ShownSource { uid : Uid, text : String, hash : String }
 
 
 shownText : ShownSource -> String
@@ -790,6 +953,16 @@ shownText shown =
     case shown of
         ShownSource s ->
             s.text
+
+
+-- The shown view's lines numbered from the unit's first line `start`: the
+-- exact lines `viewText` joined and the attestation hashed, so the drawn rows,
+-- the counted rows and the hashed rows are one list.
+shownLines : ShownSource -> Int -> List ( Int, String )
+shownLines shown start =
+    shownText shown
+        |> String.split "\n"
+        |> List.indexedMap (\i line -> ( start + i, line ))
 
 
 shownHash : ShownSource -> String
@@ -803,10 +976,10 @@ shownHash shown =
 -- were shown, re-proved against the current index row and file. Opaque:
 -- built only by `reverify`.
 type Attested
-    = Attested { uid : String, hash : String }
+    = Attested { uid : Uid, hash : String }
 
 
-attestedUid : Attested -> String
+attestedUid : Attested -> Uid
 attestedUid attested =
     case attested of
         Attested a ->
@@ -833,7 +1006,7 @@ reverify settings shown =
         ShownSource s ->
             do
                 conn <- readConnection settings
-                rows <- Db.queryDecode conn unitByUidSql [ SqlString s.uid ] rowDecoder
+                rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql s.uid ] rowDecoder
                 case List.head rows of
                     Just row ->
                         viewOf settings.roots row
@@ -843,7 +1016,7 @@ reverify settings shown =
                         Task.fail (Error.conflict "unit no longer indexed")
 
 
-confirmShown : String -> String -> SourceView -> Task.Task Error Attested
+confirmShown : Uid -> String -> SourceView -> Task.Task Error Attested
 confirmShown uid hash fresh =
     case fresh of
         Shown now ->
@@ -859,6 +1032,15 @@ confirmShown uid hash fresh =
         Unreadable _ ->
             Task.fail sourceChanged
 
+        TooLarge _ ->
+            Task.fail pastCeiling
+
+
+-- A shown unit that grew past a view ceiling before its decision.
+pastCeiling : Error
+pastCeiling =
+    Error.conflict "source is now past the review ceiling; it cannot be decided"
+
 
 sourceChanged : Error
 sourceChanged =
@@ -872,12 +1054,20 @@ type StaleReason
     | UnverifiableHash
 
 
+-- Which view ceiling a withheld view passed, with the measure taken.
+type Oversize
+    = SpanLines { lines : Int }
+    | ViewBytes { size : ByteSize }
+
+
 -- What the unit page may show of a unit's source: the verified view, a
--- reason it is withheld, or the error that kept it from being read.
+-- reason it is withheld, the error that kept it from being read, or the
+-- ceiling it passed. Only `Shown` holds source text.
 type SourceView
     = Shown ShownSource
     | Stale StaleReason
     | Unreadable Error
+    | TooLarge Oversize
 
 
 -- The scheme prefix of every attestation ipe-index stores in `body_hash`.

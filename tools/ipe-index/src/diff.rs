@@ -100,9 +100,9 @@ pub type FileHunks = (String, Vec<(i64, i64)>);
 /// units. Deletions (no new-side lines) attribute to the line the removal sits
 /// at, so a deleted body still surfaces its enclosing unit.
 ///
-/// `range` is validated the same way `walk::changed`'s since-ref is: no leading
-/// `-` (option smuggling) and only ref-safe bytes, so a crafted range can't
-/// inject git options.
+/// `range` is validated before it reaches git: no leading `-` (option
+/// smuggling) and only ref-safe bytes, so a crafted range can't inject git
+/// options.
 pub fn changed_line_ranges(repo: &str, range: &str) -> anyhow::Result<Vec<FileHunks>> {
     use anyhow::bail;
     if range.is_empty()

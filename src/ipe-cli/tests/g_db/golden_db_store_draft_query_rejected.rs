@@ -11,8 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ipe::CliError;
-
+use crate::golden_app_settings_front_door::{emitted_rust, judge_rejection};
 use crate::support::repo_root;
 
 fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
@@ -37,16 +36,18 @@ fn draft_query_without_classification_is_rejected() {
     // Pin the REASON, not just the failure: a `Draft` read is a type mismatch
     // (Store expected, Draft found) — IPE-T0001. Asserting only `is_err()` would
     // pass on any unrelated build failure, leaving the deny-by-default guarantee
-    // unproven.
-    let got = match &built {
-        Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
-        _ => None,
-    };
+    // unproven; the `Draft` fragment proves the mismatch is the unclassified
+    // table, not some other T0001 in the fixture.
     assert_eq!(
-        got,
-        Some(ipe_diagnostics::IPE_T0001),
+        judge_rejection(&built, ipe_diagnostics::IPE_T0001, Some("Draft")),
+        Ok(()),
         "querying an unclassified `Draft` with `Store.all` MUST be rejected with \
          IPE-T0001 (Store expected, Draft found) — a table is unqueryable until \
          classified with `Store.public` or `Store.secured` (deny-by-default); got: {built:?}"
+    );
+    assert_eq!(
+        emitted_rust(&out),
+        None,
+        "{GOLDEN}: a rejected build must emit no Rust"
     );
 }

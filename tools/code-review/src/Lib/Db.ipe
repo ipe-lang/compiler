@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredReason, countDecisions, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPageSize, historyPlan, insertDecision, openAt, pairPageSize, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
+module Lib.Db exposing (Decision(..), Reason, ReviewRow, StoredDecision(..), StoredReason, advanceHead, currentHead, decidedPairsAfter, findDecision, findLatestForUid, HistoryCursor(..), HistoryRows, historyPage, historyPlan, insertDecision, openAt, parseReason, probe, reasonMaxChars, reasonText, storedReasonText)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -15,8 +15,10 @@ import Ipe.Task as Task
 import Ipe.Time as Time
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
 import Lib.Index as Index exposing (Attested, DecidedPair)
+import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (DbLocation)
+import Lib.Uid as Uid exposing (Uid)
 import Migrations exposing (all)
 
 
@@ -55,9 +57,8 @@ parseReason raw =
 
 -- A refusal's reason as the review table holds it. A row written before the
 -- reason bound, or edited outside this tool, may hold a reason that is not a
--- `Reason`; it is read as `Overlong` or `Blank` with its text kept only for a
--- faithful re-encode, so no stored row fails a read and its text is never
--- shown. Opaque: built only by `storedReason`, the one classification of a
+-- `Reason`; it is read as `Overlong` or `Blank`, so no stored reason fails a
+-- read and its text is never shown. Opaque: built only by `storedReason`, the one classification of a
 -- reason's text, and shown only through `storedReasonText`.
 type StoredReason
     = Valid Reason
@@ -98,19 +99,6 @@ storedReasonText stored =
             SafeText.literal "reason not shown: it is blank"
 
 
-storedReasonString : StoredReason -> String
-storedReasonString stored =
-    case stored of
-        Valid reason ->
-            reasonString reason
-
-        Overlong text ->
-            text
-
-        Blank text ->
-            text
-
-
 -- A reason as it may be shown, with every control and bidi character escaped.
 reasonText : Reason -> SafeText
 reasonText reason =
@@ -124,25 +112,91 @@ reasonString reason =
             r
 
 
--- One row of the review table. `reviewedAt` is a typed instant — a moment in
--- time, not a bare count — so it can only be built from and read as a
--- `Timestamp`, never swapped for a plain `Int`. `reason` is `Just` exactly
--- for a refusal: a stored refusal's reason is classified by `storedReason`,
--- so a row breaking the bound still decodes, and an approval's reason column
--- is never read (the store's plain read returns SQL NULL as `""`, which must
--- not stand for a reason).
+-- A decision as the review table holds it. A refusal carries its stored
+-- reason; there is no third form, so a row whose decision column is neither
+-- `approve` nor `refuse` fails its read instead of standing for either.
+type StoredDecision
+    = StoredApproved
+    | StoredRefused StoredReason
+
+
+-- One row of the review table, parsed. `reviewedAt` is a typed instant — a
+-- moment in time, not a bare count — so it can only be built from and read
+-- as a `Timestamp`, never swapped for a plain `Int`. Built only by
+-- `fromRecord`.
 type alias ReviewRow =
-    { uid : String
+    { uid : Uid
     , bodyHash : String
-    , decision : String
-    , reason : Maybe StoredReason
+    , decision : StoredDecision
     , reviewedAt : Timestamp
     }
 
 
--- Codec for ReviewRow. Keys in `SRecord` and JSON object match the DB column
--- names so `Store.fromCodec` derives the correct column list from the shape.
-reviewCodec : Codec ReviewRow
+-- One row of the review table as its columns hold it: the store's codec
+-- shape, read only through `fromRecord`.
+type alias ReviewRecord =
+    { uid : String
+    , bodyHash : String
+    , decision : String
+    , reason : Maybe String
+    , reviewedAt : Timestamp
+    }
+
+
+makeRecord : String -> String -> String -> Maybe String -> Timestamp -> ReviewRecord
+makeRecord uid bodyHash decision reason reviewedAt =
+    { uid = uid
+    , bodyHash = bodyHash
+    , decision = decision
+    , reason = reason
+    , reviewedAt = reviewedAt
+    }
+
+
+-- The one parser of a stored row. The uid must be a unit id and the
+-- decision `approve` or `refuse`; any other row fails, naming the row by its
+-- uid and never echoing the column text. A refusal's reason is classified by
+-- `storedReason`, a NULL one as blank, so a row breaking the reason bound
+-- still reads; an approval's reason column is never read.
+fromRecord : ReviewRecord -> Result Error ReviewRow
+fromRecord record =
+    case Uid.parse record.uid of
+        Err _ ->
+            Err (Error.unexpected "a review row holds a uid that is not a unit id")
+
+        Ok uid ->
+            Result.map
+                (\decision -> { uid = uid, bodyHash = record.bodyHash, decision = decision, reviewedAt = record.reviewedAt })
+                (storedDecision uid record)
+
+
+storedDecision : Uid -> ReviewRecord -> Result Error StoredDecision
+storedDecision uid record =
+    if record.decision == "approve" then
+        Ok StoredApproved
+
+    else if record.decision == "refuse" then
+        Ok (StoredRefused (storedReason (Maybe.withDefault "" record.reason)))
+
+    else
+        Err (Error.unexpected ("review row " ++ Uid.toString uid ++ " holds a decision this reviewer does not know"))
+
+
+-- A store read's row, parsed.
+fromMaybeRecord : Maybe ReviewRecord -> Task.Task Error (Maybe ReviewRow)
+fromMaybeRecord found =
+    case found of
+        Nothing ->
+            Task.succeed Nothing
+
+        Just record ->
+            Task.fromResult (Result.map Just (fromRecord record))
+
+
+-- Codec for ReviewRecord. Keys in `SRecord` and JSON object match the DB
+-- column names so `Store.fromCodec` derives the correct column list from the
+-- shape.
+reviewCodec : Codec ReviewRecord
 reviewCodec =
     Codec
         { enc = \row ->
@@ -153,7 +207,7 @@ reviewCodec =
                 , ( "reason"
                 , case row.reason of
                     Just r ->
-                        Encode.string (storedReasonString r)
+                        Encode.string r
 
                     Nothing ->
                         Encode.null
@@ -161,13 +215,12 @@ reviewCodec =
                 , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
                 ]
         , mkDec = \_ ->
-            Config.map5 makeRow
+            Config.map5 makeRecord
                 (Config.field "uid" Config.string)
                 (Config.field "body_hash" Config.string)
                 (Config.field "decision" Config.string)
                 (Config.field "reason" (Config.nullable Config.string))
                 (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
-                |> Config.map rowFromStored
         , shp = SRecord
             [ ( "uid", CText )
             , ( "body_hash", CText )
@@ -178,64 +231,64 @@ reviewCodec =
         }
 
 
--- A stored row as read, before its reason is parsed.
-type alias StoredRow =
-    { uid : String
-    , bodyHash : String
-    , decision : String
-    , reason : Maybe String
-    , reviewedAt : Timestamp
-    }
-
-
-makeRow : String -> String -> String -> Maybe String -> Timestamp -> StoredRow
-makeRow uid bodyHash decision reason reviewedAt =
-    { uid = uid
-    , bodyHash = bodyHash
-    , decision = decision
-    , reason = reason
-    , reviewedAt = reviewedAt
-    }
-
-
--- A stored row with its reason classified. Total: every row the table can
--- hold decodes, so one legacy row never fails a page.
-rowFromStored : StoredRow -> ReviewRow
-rowFromStored stored =
-    { uid = stored.uid
-    , bodyHash = stored.bodyHash
-    , decision = stored.decision
-    , reason = if stored.decision == "refuse" then
-        Just (storedReason (Maybe.withDefault "" stored.reason))
-
-    else
-        Nothing
-    , reviewedAt = stored.reviewedAt
-    }
-
-
 -- The typed store for the review table. `fromCodec` validates every column
 -- identifier; the composite key records `PRIMARY KEY (uid, body_hash)`, so the
 -- by-key operations fail closed and every access names both key columns. The
 -- table itself comes from the hand-written migration, since `createSql` does
 -- not render a composite key.
-reviewStore : Result Error (Store ReviewRow)
+reviewStore : Result Error (Store ReviewRecord)
 reviewStore =
     Store.fromCodec "review" reviewCodec
         |> Result.map (\draft -> Store.public (Store.compositePrimaryKey2 .uid .bodyHash draft))
 
 
 -- The startup check of `IPE_REVIEW_DB`: the review database is opened
--- (created when absent) and migrated, so an unwritable location stops the
--- server before it listens, naming the variable and the file.
+-- (created when absent) and migrated, its append-only guards are found on
+-- the tables they guard, and its log head is read, so an unwritable
+-- location, a file whose guards are gone, or one whose head is missing stops
+-- the server before it listens, naming the variable and the file.
 probe : DbLocation -> Task.Task Error ()
 probe loc =
     (do
         db <- openAt loc
         migrate db
+        requireGuards db
+        currentHead db
         Task.succeed ()
     )
         |> Task.mapError (Settings.openFailure "IPE_REVIEW_DB" (SafeText.literal "point IPE_REVIEW_DB at a writable SQLite file") loc)
+
+
+-- The triggers that keep the review log append-only, each named with the
+-- table it guards. A migrated file can still lose one: a dropped trigger, or
+-- the log renamed away and recreated, which carries its triggers to the
+-- renamed table.
+appendOnlyGuards : List String
+appendOnlyGuards =
+    [ "review_head_no_delete on review_head"
+    , "review_no_delete on review"
+    , "review_no_replace on review"
+    , "review_no_update on review"
+    ]
+
+
+guardDecoder : Db.Decode.Decoder String
+guardDecoder =
+    Db.Decode.succeed (\entry -> entry)
+        |> Db.Decode.required "guard" (Db.Decode.string "guard")
+
+
+-- Every guard in `appendOnlyGuards` is present on its table; a file missing
+-- one is refused, since its review rows could be rewritten unseen.
+requireGuards : Db -> Task.Task Error ()
+requireGuards db =
+    do
+        present <- Db.queryDecode db "SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger'" [] guardDecoder
+        if List.all (\entry -> List.member entry present) appendOnlyGuards then
+            Task.succeed ()
+
+        else
+            Task.fail (Error.unexpected "the review log's append-only triggers are not all in place")
 
 
 -- The review database at a parsed location, opened through the one review URL
@@ -255,69 +308,91 @@ migrate db =
 -- A decision is recorded only against an `Attested` pair, the proof that
 -- the reviewer was shown exactly those bytes; a refusal's reason is already a
 -- parsed `Reason`, so every decision that reaches the store is well formed.
-insertDecision : Db -> Attested -> Decision -> Task.Task Error Int
+-- One review transaction inserts the row and moves the log's head. The
+-- insert runs first, so the write lock is held before the head is read, and
+-- the primary key decides a duplicate at commit: a pair already decided
+-- inserts nothing and is `AlreadyDecided`, the first review winning. A new
+-- row links the head from `prev` to the next head over the pair, through a
+-- compare-and-set that fails, rolling the row back, if the head moved after
+-- it was read.
+insertDecision : Db -> Attested -> Decision -> Task.Task Error Index.Written
 insertDecision db attested decision =
-    insertIfAbsent db (Index.attestedUid attested) (Index.attestedHash attested) decision
-
-
--- A duplicate (uid, body_hash) pair is a no-op: the first review wins and
--- re-reviewing the same pair never overwrites it. The insert runs first and
--- the primary key arbitrates, so two concurrent first reviews cannot both
--- pass a check and one then fail: an insert that fails where the pair's row
--- exists is the duplicate (0 rows), and one that fails with no row for the
--- pair keeps its own error. Review rows are never deleted, so a row seen
--- after a failed insert is the one that won.
-insertIfAbsent : Db -> String -> String -> Decision -> Task.Task Error Int
-insertIfAbsent db uid bodyHash decision =
-    insertNew db uid bodyHash decision
-        |> Task.onError (\insertError -> duplicateOr db uid bodyHash insertError)
-
-
-duplicateOr : Db -> String -> String -> Error -> Task.Task Error Int
-duplicateOr db uid bodyHash insertError =
     do
-        existing <- findDecision db uid bodyHash
-        case existing of
-            Just _ ->
-                Task.succeed 0
+        now <- Time.unixMillis ()
+        let
+            uid =
+                Index.attestedUid attested
 
-            Nothing ->
-                Task.fail insertError
+            bodyHash =
+                Index.attestedHash attested
+
+            ( decisionText, reason ) =
+                case decision of
+                    Approved ->
+                        ( "approve", SqlNull (SqlString "") )
+
+                    Refused r ->
+                        ( "refuse", SqlString (reasonString r) )
+        in
+        Db.withTransaction db
+            (\tx ->
+                do
+                    inserted <- Db.exec tx "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (uid, body_hash) DO NOTHING" [ Uid.toSql uid, SqlString bodyHash, SqlString decisionText, reason, SqlTime (Timestamp.toUnixMillis now) ]
+                    linkInserted tx uid bodyHash inserted
+            )
 
 
-insertNew : Db -> String -> String -> Decision -> Task.Task Error Int
-insertNew db uid bodyHash decision =
-    case reviewStore of
-        Err e ->
-            Task.fail e
+linkInserted : Db -> Uid -> String -> Int -> Task.Task Error Index.Written
+linkInserted tx uid bodyHash inserted =
+    if inserted == 0 then
+        Task.succeed Index.AlreadyDecided
 
-        Ok store ->
-            do
-                now <- Time.unixMillis ()
-                let
-                    ( decisionText, reason ) =
-                        case decision of
-                            Approved ->
-                                ( "approve", Nothing )
+    else if inserted == 1 then
+        do
+            prev <- currentHead tx
+            let
+                head =
+                    Index.chainLink prev uid bodyHash
+            in
+            advanceHead tx prev head
+                |> Task.map (\_ -> Index.Inserted { prev = prev, head = head })
 
-                            Refused r ->
-                                ( "refuse", Just (Valid r) )
+    else
+        Task.fail (Error.unexpected "a review insert wrote more than one row")
 
-                    row =
-                        { uid = uid
-                        , bodyHash = bodyHash
-                        , decision = decisionText
-                        , reason = reason
-                        , reviewedAt = now
-                        }
-                in
-                Store.insert db store row
+
+-- The review log's head: the one `review_head` row. A missing or extra row
+-- is a failed read, never a default head.
+currentHead : Db -> Task.Task Error Index.ChainHead
+currentHead db =
+    do
+        rows <- Db.queryDecode db "SELECT head FROM review_head WHERE one = 1" [] Index.chainHeadDecoder
+        case rows of
+            [ head ] ->
+                Task.succeed head
+
+            _ ->
+                Task.fail (Error.unexpected "review_head did not return exactly one row")
+
+
+-- The head moved from `prev` to `next` only if it still reads `prev`: a head
+-- another writer moved first fails the move, so two decisions can never
+-- both link from the same head.
+advanceHead : Db -> Index.ChainHead -> Index.ChainHead -> Task.Task Error ()
+advanceHead db prev next =
+    do
+        moved <- Db.exec db "UPDATE review_head SET head = ? WHERE one = 1 AND head = ?" [ SqlString (Index.chainHeadText next), SqlString (Index.chainHeadText prev) ]
+        if moved == 1 then
+            Task.succeed ()
+
+        else
+            Task.fail (Error.conflict "the review log's head moved while a decision was recorded; decide again")
 
 
 -- The review row recorded for one (uid, body_hash) key, if any. The
 -- condition names both key columns through typed accessors; values bind as
--- parameters. Every stored row decodes, so a legacy refusal never fails it.
-findDecision : Db -> String -> String -> Task.Task Error (Maybe ReviewRow)
+-- parameters. A legacy refusal reads; a row `fromRecord` refuses fails it.
+findDecision : Db -> Uid -> String -> Task.Task Error (Maybe ReviewRow)
 findDecision db uid bodyHash =
     case reviewStore of
         Err e ->
@@ -325,15 +400,16 @@ findDecision db uid bodyHash =
 
         Ok store ->
             Store.query store
-                |> Store.where (Store.and [ Store.eq .uid uid, Store.eq .bodyHash bodyHash ])
+                |> Store.where (Store.and [ Store.eq .uid (Uid.toString uid), Store.eq .bodyHash bodyHash ])
                 |> Store.toMaybe db
+                |> Task.andThen fromMaybeRecord
 
 
 -- The most recent review row for a uid across all hashes, if any. Filter uses
 -- `Store.eq .uid` (field name "uid" matches SRecord key "uid"); ordering uses
 -- the snake_case column names the store knows ("reviewed_at", "body_hash");
 -- in-Ipê sort + limit-1 via the query builder.
-findLatestForUid : Db -> String -> Task.Task Error (Maybe ReviewRow)
+findLatestForUid : Db -> Uid -> Task.Task Error (Maybe ReviewRow)
 findLatestForUid db uid =
     case reviewStore of
         Err e ->
@@ -341,55 +417,28 @@ findLatestForUid db uid =
 
         Ok store ->
             Store.query store
-                |> Store.where (Store.eq .uid uid)
+                |> Store.where (Store.eq .uid (Uid.toString uid))
                 |> Store.orderDesc "reviewed_at"
                 |> Store.orderAsc "body_hash"
                 |> Store.limit 1
                 |> Store.toMaybe db
-
-
-countDecoder : Db.Decode.Decoder Int
-countDecoder =
-    Db.Decode.succeed (\n -> n)
-        |> Db.Decode.required "total" (Db.Decode.int "total")
-
-
--- How many decisions the review table holds, counted by SQLite without
--- decoding a row, so a row whose stored reason no longer parses still
--- counts. A count query that yields anything but one row is a failed read,
--- never a zero.
-countDecisions : Db -> Task.Task Error Int
-countDecisions db =
-    do
-        rows <- Db.queryDecode db "SELECT COUNT(*) AS total FROM review" [] countDecoder
-        case rows of
-            [ n ] ->
-                Task.succeed n
-
-            _ ->
-                Task.fail (Error.unexpected "COUNT(*) over review did not return exactly one row")
-
-
--- The most decided pairs one page of a progress rebuild reads.
-pairPageSize : Int
-pairPageSize =
-    200
+                |> Task.andThen fromMaybeRecord
 
 
 -- One page of decided pairs in key order, strictly after
--- `cursor` (from the first pair when Nothing), at most `pageSize` of them.
+-- `cursor` (from the first pair when Nothing), at most `size` of them.
 -- Only the two key columns are read, so no reason is parsed; every value is
--- a bound parameter. The caller passes a positive `pageSize`.
-decidedPairsAfter : Db -> Int -> Maybe DecidedPair -> Task.Task Error (List DecidedPair)
-decidedPairsAfter db pageSize cursor =
+-- a bound parameter.
+decidedPairsAfter : Db -> PageSize -> Maybe DecidedPair -> Task.Task Error (List DecidedPair)
+decidedPairsAfter db size cursor =
     case Maybe.map Index.decidedPairKey cursor of
         Nothing ->
-            Db.queryDecode db (pairColumns ++ pairOrder) [ SqlInt pageSize ] Index.decidedPairDecoder
+            Db.queryDecode db (pairColumns ++ pairOrder) [ SqlInt (PageSize.toInt size) ] Index.decidedPairDecoder
 
         Just ( uid, bodyHash ) ->
             Db.queryDecode db
                 (pairColumns ++ " WHERE (uid, body_hash) > (?, ?)" ++ pairOrder)
-                [ SqlString uid, SqlString bodyHash, SqlInt pageSize ]
+                [ Uid.toSql uid, SqlString bodyHash, SqlInt (PageSize.toInt size) ]
                 Index.decidedPairDecoder
 
 
@@ -410,7 +459,7 @@ pairOrder =
 -- included.
 type HistoryCursor
     = HistoryStart
-    | HistoryAfter Timestamp String String
+    | HistoryAfter Timestamp Uid String
 
 
 -- One page of review rows in the page order, and the cursor of the page
@@ -421,24 +470,16 @@ type alias HistoryRows =
     }
 
 
--- The most review rows one History page reads.
-historyPageSize : Int
-historyPageSize =
-    100
-
-
--- One History page: at most `pageSize` rows from `cursor`, sorted and cut by
+-- One History page: at most `size` rows from `cursor`, sorted and cut by
 -- SQLite, so a page never reads more than its size whatever the table holds.
--- Every value is a bound parameter, and every row the table can hold decodes.
--- A page size below one row is refused.
-historyPage : Db -> Int -> HistoryCursor -> Task.Task Error HistoryRows
-historyPage db pageSize cursor =
-    if pageSize < 1 then
-        Task.fail (Error.invalidInput ("a History page holds at least one review; the page size is " ++ String.fromInt pageSize))
-
-    else
-        Db.queryDecode db (historySql cursor) (historyParams pageSize cursor) historyRowDecoder
-            |> Task.map (\rows -> { rows = rows, next = historyNext pageSize rows })
+-- Every value is a bound parameter; a row `fromRecord` refuses fails the
+-- page, naming the row.
+historyPage : Db -> PageSize -> HistoryCursor -> Task.Task Error HistoryRows
+historyPage db size cursor =
+    do
+        records <- Db.queryDecode db (historySql cursor) (historyParams size cursor) historyRowDecoder
+        rows <- Task.fromResult (Result.traverse fromRecord records)
+        Task.succeed { rows = rows, next = historyNext size rows }
 
 
 -- The query plan SQLite chooses for the History page from `cursor`, one
@@ -449,7 +490,7 @@ historyPlan : Db -> HistoryCursor -> Task.Task Error (List String)
 historyPlan db cursor =
     Db.queryDecode db
         ("EXPLAIN QUERY PLAN " ++ historySql cursor)
-        (historyParams historyPageSize cursor)
+        (historyParams PageSize.history cursor)
         (Db.Decode.succeed identity |> Db.Decode.required "detail" (Db.Decode.string "detail"))
 
 
@@ -463,14 +504,14 @@ historySql cursor =
             historyColumns ++ " WHERE reviewed_at <= ? AND (reviewed_at < ? OR (uid, body_hash) > (?, ?))" ++ historyOrder
 
 
-historyParams : Int -> HistoryCursor -> List SqlValue
-historyParams pageSize cursor =
+historyParams : PageSize -> HistoryCursor -> List SqlValue
+historyParams size cursor =
     case cursor of
         HistoryStart ->
-            [ SqlInt pageSize ]
+            [ SqlInt (PageSize.toInt size) ]
 
         HistoryAfter at uid bodyHash ->
-            [ SqlTime (Timestamp.toUnixMillis at), SqlTime (Timestamp.toUnixMillis at), SqlString uid, SqlString bodyHash, SqlInt pageSize ]
+            [ SqlTime (Timestamp.toUnixMillis at), SqlTime (Timestamp.toUnixMillis at), Uid.toSql uid, SqlString bodyHash, SqlInt (PageSize.toInt size) ]
 
 
 historyColumns : String
@@ -484,18 +525,18 @@ historyOrder =
 
 
 -- The cursor after a page: the last row's key when the page is full.
-historyNext : Int -> List ReviewRow -> Maybe HistoryCursor
-historyNext pageSize rows =
-    if List.length rows < pageSize then
+historyNext : PageSize -> List ReviewRow -> Maybe HistoryCursor
+historyNext size rows =
+    if List.length rows < PageSize.toInt size then
         Nothing
 
     else
         Maybe.map (\row -> HistoryAfter row.reviewedAt row.uid row.bodyHash) (List.head (List.reverse rows))
 
 
-historyRowDecoder : Db.Decode.Decoder ReviewRow
+historyRowDecoder : Db.Decode.Decoder ReviewRecord
 historyRowDecoder =
-    Db.Decode.succeed storedReviewRow
+    Db.Decode.succeed historyRecord
         |> Db.Decode.required "uid" (Db.Decode.string "uid")
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
         |> Db.Decode.required "decision" (Db.Decode.string "decision")
@@ -503,6 +544,6 @@ historyRowDecoder =
         |> Db.Decode.required "reviewed_at" (Db.Decode.int "reviewed_at")
 
 
-storedReviewRow : String -> String -> String -> Maybe String -> Int -> ReviewRow
-storedReviewRow uid bodyHash decision reason reviewedAt =
-    rowFromStored (makeRow uid bodyHash decision reason (Timestamp.fromUnixMillis reviewedAt))
+historyRecord : String -> String -> String -> Maybe String -> Int -> ReviewRecord
+historyRecord uid bodyHash decision reason reviewedAt =
+    makeRecord uid bodyHash decision reason (Timestamp.fromUnixMillis reviewedAt)

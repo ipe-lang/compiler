@@ -51,7 +51,7 @@
 //! `cfg`-gate promotion. Also deferred: run-time sandbox isolation hardening.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,6 +62,10 @@ use crate::cli_args::OutputFormat;
 use crate::project::{self, ProjectManifest};
 use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
+use crate::remote_ingest::{
+    Captured, LocalCeiling, LocalRefusal, LocalSource, RunError, SUPPLY_CHAIN_SCAN_LIMITS,
+    TOOL_QUERY_LIMITS, run_local,
+};
 use crate::scratch::ScratchDir;
 use crate::text;
 
@@ -1351,33 +1355,22 @@ fn stable_baseline<'a>(
 // 1d. Supply chain
 // ===========================================================================
 
-/// Run `cargo-deny` over the emitted project's dependency graph, and re-assert
-/// the content-hash integrity of any Ipê package dependencies against their index
-/// pins.
-///
-/// `cargo-deny check` applies the workspace's supply-chain posture (advisories,
-/// bans, licenses, sources — see `deny.toml`) to the emitted Cargo project; a
-/// non-zero exit is a reject. The Ipê-package hash re-assertion reuses the
-/// resolver's lockfile pins so a fetched dependency whose bytes drifted from the
-/// registered hash is caught here too (the resolver verifies at install; the gate
-/// re-verifies at publish).
-///
-/// When `cargo-deny` is not installed, the advisory/bans scan is skipped with a
-/// loud warning (a missing dev tool is not an unsafe package), while the
-/// hash-integrity half still runs. The authoritative index-CI gate always
-/// installs cargo-deny, so enforcement is never actually skipped there.
-///
-/// # Errors
-/// [`CliError::PackageAudit`] when `cargo-deny` reports a violation, fails to run
-/// for any reason other than not being installed, or a locked dependency's hash
-/// no longer verifies.
+/// The program the supply-chain scan runs: `cargo-deny` itself, never the
+/// `cargo deny` subcommand, so a machine without it yields a `NotFound` spawn
+/// error instead of cargo reporting "no such subcommand".
+const CARGO_DENY: &str = "cargo-deny";
+
 /// Detect the installed cargo-deny minor version by parsing `cargo-deny --version`.
 ///
-/// Returns the minor component of the version (e.g. `20` for `cargo-deny 0.20.2`).
-/// On any parse failure defaults to `20` — the current "latest" release — so
-/// absent or unreadable version output uses the newer global-flag placement.
-fn detect_cargo_deny_minor() -> u32 {
-    let Ok(out) = Command::new("cargo-deny").arg("--version").output() else {
+/// The probe runs under [`TOOL_QUERY_LIMITS`]. Returns the minor component of
+/// the version (e.g. `20` for `cargo-deny 0.20.2`). A probe that fails, crosses
+/// a ceiling, or prints no parsable version defaults to `20` — the current
+/// "latest" release — so it uses the newer global-flag placement; the scan
+/// itself then runs under its own ceilings.
+fn detect_cargo_deny_minor(cargo_deny: &OsStr, ceiling: LocalCeiling) -> u32 {
+    let mut probe = Command::new(cargo_deny);
+    probe.arg("--version");
+    let Ok(out) = run_local(probe, ceiling, LocalSource::ToolQuery) else {
         return 20;
     };
     // Output is `cargo-deny X.Y.Z\n`; split on whitespace, take last token.
@@ -1388,6 +1381,21 @@ fn detect_cargo_deny_minor() -> u32 {
         .and_then(|v| v.split('.').nth(1))
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(20)
+}
+
+/// Run `cargo-deny` with `args`, detached in its own process group and held to `ceiling`.
+///
+/// # Errors
+/// See [`RunError`]: a crossed ceiling kills the child's group and is a
+/// [`LocalRefusal`] naming [`LocalSource::SupplyChainScan`].
+fn run_cargo_deny(
+    cargo_deny: &OsStr,
+    args: &[OsString],
+    ceiling: LocalCeiling,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    let mut command = Command::new(cargo_deny);
+    command.args(args);
+    run_local(command, ceiling, LocalSource::SupplyChainScan)
 }
 
 /// Build the cargo-deny argument vector for `advisories bans sources`.
@@ -1423,6 +1431,32 @@ fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> V
     args
 }
 
+/// Run `cargo-deny` over the emitted project's dependency graph, and re-assert
+/// the content-hash integrity of any Ipê package dependencies against their index
+/// pins.
+///
+/// `cargo-deny check` applies the workspace's supply-chain posture (advisories,
+/// bans, licenses, sources — see `deny.toml`) to the emitted Cargo project; a
+/// non-zero exit is a reject. It may fetch the advisory database, so it runs
+/// under [`SUPPLY_CHAIN_SCAN_LIMITS`]. The Ipê-package hash re-assertion reuses
+/// the resolver's lockfile pins so a fetched dependency whose bytes drifted from
+/// the registered hash is caught here too (the resolver verifies at install; the
+/// gate re-verifies at publish).
+///
+/// When `cargo-deny` is not installed, the advisory/bans scan is skipped with a
+/// loud warning (a missing dev tool is not an unsafe package), while the
+/// hash-integrity half still runs. The authoritative index-CI gate always
+/// installs cargo-deny, so enforcement is never actually skipped there.
+///
+/// # Errors
+/// - [`CliError::PackageAudit`] when `cargo-deny` reports a violation, fails to
+///   run for any reason other than not being installed, or a locked
+///   dependency's hash no longer verifies.
+/// - [`CliError::LocalLimitExceeded`] when `cargo-deny` crosses a ceiling; its
+///   process group is killed.
+/// - [`CliError::ChildPipeHeld`] when a process `cargo-deny` started holds a
+///   pipe open.
+/// - [`CliError::ChildPipeUnread`] when reading one of its output pipes fails.
 fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     let manifest = prepared.emitted_dir.join("Cargo.toml");
     if !manifest.is_file() {
@@ -1431,11 +1465,6 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
         return verify_locked_dependency_hashes(prepared);
     }
 
-    // Spawn `cargo-deny` directly rather than the `cargo deny` subcommand, so
-    // that a machine without cargo-deny yields a `NotFound` spawn error (handled
-    // as a skip below) instead of `cargo` running and reporting "no such
-    // subcommand", which would masquerade as a supply-chain violation.
-    //
     // Apply the SAME advisory/bans/sources posture the workspace uses — its
     // `deny.toml` ledgers advisories the vendored runtime's dependency tree
     // legitimately carries. Without it the check would default-reject every
@@ -1445,26 +1474,24 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     // `--config` placement is version-dependent: global (before `check`) for
     // cargo-deny >= 0.20, on the `check` subcommand for < 0.20.
     let derived_config = derive_deny_config(&prepared.emitted_dir)?;
-    let minor = detect_cargo_deny_minor();
+    let cargo_deny = OsStr::new(CARGO_DENY);
+    let minor = detect_cargo_deny_minor(cargo_deny, TOOL_QUERY_LIMITS);
     let args = deny_args(minor, &manifest, derived_config.as_deref());
-    let mut command = Command::new("cargo-deny");
-    command.args(&args);
-    let output = command.output();
 
-    match output {
+    match run_cargo_deny(cargo_deny, &args, SUPPLY_CHAIN_SCAN_LIMITS) {
         Ok(out) if out.status.success() => verify_locked_dependency_hashes(prepared),
         Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = out.stderr.to_terminal();
             Err(reject(
                 Check::SupplyChain,
                 format!(
                     "cargo-deny reported a supply-chain violation over the package's Rust \
                      dependency graph:\n{}",
-                    stderr.trim()
+                    stderr.as_str().trim()
                 ),
             ))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(RunError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             // cargo-deny is not installed. This is a missing dev tool, not an
             // unsafe package: conflating the two would fail every audit run on a
             // machine without cargo-deny. The authoritative gate — the package
@@ -1480,7 +1507,10 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
             );
             verify_locked_dependency_hashes(prepared)
         }
-        Err(e) => Err(reject(
+        Err(RunError::Exceeded(refusal)) => Err(CliError::LocalLimitExceeded(refusal)),
+        Err(RunError::PipeDrainTimeout(stream)) => Err(CliError::ChildPipeHeld(stream)),
+        Err(RunError::PipeRead(stream, kind)) => Err(CliError::ChildPipeUnread(stream, kind)),
+        Err(RunError::Spawn(e) | RunError::Wait(e) | RunError::Measure(_, e)) => Err(reject(
             Check::SupplyChain,
             format!(
                 "could not run `cargo deny` ({e}) — install cargo-deny \
@@ -3040,6 +3070,124 @@ mod tests {
                 !args.iter().any(|a| a.to_str() == Some("--config")),
                 "minor {minor}: --config must not appear when config is None"
             );
+        }
+    }
+
+    /// A `cargo-deny` driven through a stub that runs a shell `body`.
+    #[cfg(unix)]
+    mod stubbed_cargo_deny {
+        use super::super::{
+            LocalRefusal, LocalSource, RunError, SUPPLY_CHAIN_SCAN_LIMITS, TOOL_QUERY_LIMITS,
+            detect_cargo_deny_minor, run_cargo_deny,
+        };
+        use crate::remote_ingest::{IngestLimit, LocalWall};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        /// A fresh scratch base for `tag` holding a stub `cargo-deny` that runs `body`.
+        fn stub(tag: &str, body: &str) -> PathBuf {
+            let base = ipe_test_temp::temp_root()
+                .join(format!("ipe-audit-deny-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("scratch base");
+            let path = base.join("cargo-deny");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("stub executable");
+            path
+        }
+
+        /// Remove the scratch base holding the stub at `path`.
+        fn clean(path: &std::path::Path) {
+            if let Some(base) = path.parent() {
+                let _ = std::fs::remove_dir_all(base);
+            }
+        }
+
+        #[test]
+        fn a_scan_past_its_wall_is_refused() {
+            let deny = stub("scan-wall", "exec sleep 30");
+            let started = Instant::now();
+            let ran = run_cargo_deny(
+                deny.as_os_str(),
+                &[],
+                SUPPLY_CHAIN_SCAN_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert!(
+                matches!(
+                    &ran,
+                    Err(RunError::Exceeded(LocalRefusal {
+                        source: LocalSource::SupplyChainScan,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }))
+                ),
+                "a scan past its wall is a typed refusal, got {ran:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the refusal lands at the wall, not at the child's exit"
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_scan_flooding_stdout_is_refused() {
+            let deny = stub("scan-flood", "head -c 2097152 /dev/zero");
+            let ran = run_cargo_deny(deny.as_os_str(), &[], SUPPLY_CHAIN_SCAN_LIMITS);
+            assert!(
+                matches!(
+                    &ran,
+                    Err(RunError::Exceeded(LocalRefusal {
+                        source: LocalSource::SupplyChainScan,
+                        limit: IngestLimit::Bytes(_),
+                        ..
+                    }))
+                ),
+                "a scan past its stdout ceiling is a typed refusal, got {ran:?}"
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_version_probe_reads_the_minor() {
+            let deny = stub("probe-ok", "echo 'cargo-deny 0.14.3'");
+            assert_eq!(
+                detect_cargo_deny_minor(deny.as_os_str(), TOOL_QUERY_LIMITS),
+                14
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_version_probe_past_its_wall_falls_back_to_the_latest_placement() {
+            let deny = stub("probe-wall", "echo 'cargo-deny 0.14.3'\nexec sleep 30");
+            let started = Instant::now();
+            let minor = detect_cargo_deny_minor(
+                deny.as_os_str(),
+                TOOL_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert_eq!(minor, 20, "a probe stopped at its wall reads no version");
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the probe is stopped at its wall, not at the child's exit"
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_version_probe_flooding_stdout_falls_back_to_the_latest_placement() {
+            let deny = stub(
+                "probe-flood",
+                "head -c 131072 /dev/zero | tr '\\0' ' '\necho 'cargo-deny 0.14.3'",
+            );
+            assert_eq!(
+                detect_cargo_deny_minor(deny.as_os_str(), TOOL_QUERY_LIMITS),
+                20,
+                "a probe past its stdout ceiling reads no version"
+            );
+            clean(&deny);
         }
     }
 }

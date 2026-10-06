@@ -10,12 +10,21 @@
 //! includes, and refuses when a value names such a path or cannot be proven
 //! not to.
 //!
-//! The scan fails closed. Every value is split into words, under every setting
-//! but the few [`NON_CODE`] lists as never naming code. A path-shaped word is
-//! resolved against the configuration file's directory and the working tree,
-//! `~` through the injected [`Home`]; an option's argument is judged as a word
-//! of its own and the option word whole besides; a program name, less any
-//! runner prefix (`!`, `=`), passes; any other word, a `--` or `-` ending a
+//! The scan fails closed. Every setting is judged as the one key table in
+//! [`vcs_keys`](crate::vcs_keys) says its tool consumes the value, and every
+//! value is split into words but where the table decides it never names code.
+//! A Git setting no row decides is judged under every reading at once, which
+//! admits only a boolean or a number. A Mercurial setting whose key names a
+//! program Mercurial runs ([`vcs_keys::hg_key_tool`]) has that name judged as
+//! a tool name first, whatever its value. A path-shaped word is resolved against
+//! the configuration file's directory and the working tree, `~` through the
+//! injected [`Home`]; an option's argument is judged as a word of its own and
+//! the option word whole besides; a program name passes, as the
+//! setting's tool composes it: less only the one runner prefix (`!`,
+//! `python:`) that tool consumes (anywhere else `!/x` is a relative path), and
+//! with the `git-` a Git alias, credential helper, or remote helper names a
+//! program by, and whole, `~` and spaces included, where the tool runs it
+//! without a shell; any other word, a `--` or `-` ending a
 //! program's options, a command substitution, an expansion, a glob or brace
 //! expansion, another user's home, an `ext::` transport, or a relative `..` is
 //! unprovable and refuses. Every path is judged twice: lexically against the
@@ -26,6 +35,7 @@
 //! is bounded by [`ConfigLimits`] or a declared constant, and every
 //! unreadable, oversized, or malformed file refuses.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
@@ -39,6 +49,7 @@ use ipe_fs_open::{
 
 use crate::covers::path_covers;
 use crate::mounts::CanonicalPath;
+use crate::vcs_keys::{self, Compose, Consume, Include, Load};
 use crate::vcs_metadata::VcsKind;
 
 /// The longest path-shaped word or link target, in bytes, the resolver takes.
@@ -236,200 +247,6 @@ impl ConfigRoots<'_> {
     }
 }
 
-/// Which subsections a [`NonCode`] pattern matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubsectionMatch {
-    /// Only a key with no subsection.
-    Absent,
-    /// Only a key under some subsection.
-    Present,
-    /// A key with or without a subsection.
-    Either,
-}
-
-/// Which keys a [`NonCode`] pattern matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyMatch {
-    /// Every key.
-    Any,
-    /// The one key, compared in the tool's own case.
-    Named(&'static str),
-    /// Every key whose part after its last `:` is this sub-option (Mercurial's `name:option`).
-    Suboption(&'static str),
-}
-
-/// A setting whose value never names code a tool runs, so it is not scanned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NonCode {
-    /// The tool the setting belongs to.
-    pub kind: VcsKind,
-    /// The section; for Jujutsu, the top-level table.
-    pub section: &'static str,
-    /// The subsections matched.
-    pub subsection: SubsectionMatch,
-    /// The keys matched.
-    pub key: KeyMatch,
-}
-
-impl NonCode {
-    /// A pattern over `kind`'s `section`.
-    const fn new(
-        kind: VcsKind,
-        section: &'static str,
-        subsection: SubsectionMatch,
-        key: KeyMatch,
-    ) -> Self {
-        Self {
-            kind,
-            section,
-            subsection,
-            key,
-        }
-    }
-
-    /// Whether this pattern matches the setting.
-    fn matches(&self, kind: VcsKind, setting: (&str, Option<&str>, &str)) -> bool {
-        let (section, subsection, key) = setting;
-        let subsection_ok = match self.subsection {
-            SubsectionMatch::Absent => subsection.is_none(),
-            SubsectionMatch::Present => subsection.is_some(),
-            SubsectionMatch::Either => true,
-        };
-        let key_ok = match self.key {
-            KeyMatch::Any => true,
-            KeyMatch::Named(name) => name == key,
-            KeyMatch::Suboption(name) => key.rsplit_once(':').is_some_and(|(_, sub)| sub == name),
-        };
-        self.kind == kind && self.section == section && subsection_ok && key_ok
-    }
-}
-
-/// Every setting exempt from the scan, the one list of them.
-///
-/// Git keys are lowercase, as Git compares them. Git's refspecs
-/// (`remote.*.fetch`, `remote.*.push`) are listed because every clone writes
-/// one shaped like a path, and a refspec names refs, never a file. A remote or
-/// submodule URL is never exempt: it is admitted only when it is a network URL
-/// or names a defined remote, and judged as a path otherwise.
-pub const NON_CODE: &[NonCode] = &[
-    NonCode::new(
-        VcsKind::Git,
-        "core",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("worktree"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "core",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("excludesfile"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "core",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("attributesfile"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "commit",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("template"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "blame",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("ignorerevsfile"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "branch",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(VcsKind::Git, "user", SubsectionMatch::Either, KeyMatch::Any),
-    NonCode::new(
-        VcsKind::Git,
-        "remote",
-        SubsectionMatch::Present,
-        KeyMatch::Named("fetch"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "remote",
-        SubsectionMatch::Present,
-        KeyMatch::Named("push"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "url",
-        SubsectionMatch::Present,
-        KeyMatch::Named("insteadof"),
-    ),
-    NonCode::new(
-        VcsKind::Git,
-        "url",
-        SubsectionMatch::Present,
-        KeyMatch::Named("pushinsteadof"),
-    ),
-    NonCode::new(
-        VcsKind::Mercurial,
-        "paths",
-        SubsectionMatch::Absent,
-        KeyMatch::Suboption("pushrev"),
-    ),
-    NonCode::new(
-        VcsKind::Mercurial,
-        "ui",
-        SubsectionMatch::Absent,
-        KeyMatch::Named("username"),
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "revset-aliases",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "templates",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "template-aliases",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "colors",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "user",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-    NonCode::new(
-        VcsKind::Jujutsu,
-        "--when",
-        SubsectionMatch::Either,
-        KeyMatch::Any,
-    ),
-];
-
-/// Whether [`NON_CODE`] exempts the setting.
-fn exempt(kind: VcsKind, setting: (&str, Option<&str>, &str)) -> bool {
-    NON_CODE
-        .iter()
-        .any(|pattern| pattern.matches(kind, setting))
-}
-
 /// The setting a refused value came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSetting {
@@ -514,6 +331,14 @@ pub enum Unprovable {
     /// helper run from any URL, turns such a URL into a program run on a
     /// path the jail writes.
     RemoteHelper,
+    /// The scan does not know how the tool consumes the setting, and the value is neither a boolean nor a number.
+    UnknownSetting,
+    /// A tool name holds a separator, `..`, `~`, or `:`, so the name the tool resolves inside its own directory may reach out of it.
+    ///
+    /// A name a Mercurial setting's key gives is also refused when it is
+    /// empty, expands a variable (`$`, `%`), or, on Windows, names an entry of
+    /// the working tree, where Windows finds a program not on `PATH`.
+    ToolPath,
 }
 
 impl fmt::Display for Unprovable {
@@ -572,6 +397,14 @@ impl fmt::Display for Unprovable {
             Self::RemoteHelper => f.write_str(
                 "it lets Git hand a URL the scan does not read, such as one in `.gitmodules`, to a \
                  remote helper or `ext::`, which runs a program",
+            ),
+            Self::UnknownSetting => f.write_str(
+                "it is a setting the scan does not know how the tool consumes, and its value is \
+                 not a boolean or a number",
+            ),
+            Self::ToolPath => f.write_str(
+                "it names a tool by a path: the tool resolves the name inside its own directory, \
+                 so a separator, `..`, `~`, or `:` may reach a file the jail writes",
             ),
         }
     }
@@ -1048,8 +881,8 @@ struct FileCtx {
 enum Role {
     /// Never names code: not judged.
     Exempt,
-    /// Every word is judged.
-    Words,
+    /// Every word is judged, after the runner prefix the tool consumes.
+    Words(Runner),
     /// The words of this text, and this text as one command path whatever its shape.
     ///
     /// The text is the part of the value the tool runs or loads: the whole
@@ -1065,6 +898,23 @@ enum Role {
         /// Whether Git's `host:path` form counts as a network URL.
         scp: bool,
     },
+    /// A tool name: one the tool resolves inside its own directory, judged as a program name.
+    ToolName,
+    /// A program name Mercurial takes from a setting's key and resolves through
+    /// `findexe` relative to the repository root, after expanding `~` and
+    /// variables: judged as [`Role::ToolName`], and refused besides when empty,
+    /// when it may expand, or when Windows may find it in the working tree.
+    KeyTool,
+    /// A setting no row decides: admitted only when no reading makes it a path.
+    ///
+    /// Read through a shell, the value's words name files; run without one, the
+    /// whole value is one path relative to the directory the tool runs in;
+    /// after a composed prefix, an absolute program word turns relative; loaded,
+    /// a bare word is a file in that directory. Every such directory is the
+    /// working tree, a directory under it, or the carved metadata directory, so
+    /// only an empty value, a boolean, or a number, which none of these readings
+    /// turns into a path, is admitted.
+    Unknown,
     /// A Mercurial `[paths]` value: the whole value, and each item of it as a list, judged as [`Role::Url`] without the `host:path` form.
     ///
     /// Mercurial reads the value as a list of URLs (`parselist`: commas and
@@ -1072,6 +922,104 @@ enum Role {
     /// any other, and as one URL otherwise. Both readings are judged; a quote,
     /// which the list parser groups and unescapes by, refuses.
     UrlList,
+}
+
+/// How a tool turns a setting's value into the command line it runs.
+///
+/// A tool strips a runner prefix once, from the first character of the value
+/// as written, and only for the settings that declare it. Everywhere else a
+/// runner-shaped word (`!/x`, `=/x`) is run as written: a relative path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runner {
+    /// The value is the command line.
+    None,
+    /// One leading `!` makes the rest a shell command: a Mercurial `[alias]`, a
+    /// Git `submodule.<name>.update`.
+    Bang,
+    /// A Git `alias.*`: one leading `!` makes the rest a shell command;
+    /// otherwise Git splits the value into words itself, expanding none, reads
+    /// its own options off the front, and the first word left names a Git
+    /// command, which Git runs as the program `git-<word>`
+    /// (`execv_dashed_external`), relative to its working directory once the
+    /// word holds a `/`.
+    GitAlias,
+    /// A Git `credential.helper`: one leading `!` makes the rest a shell
+    /// command, an absolute path runs as written, and anything else runs as
+    /// `git credential-<value>`, the program `git-credential-<word>`
+    /// (`credential.c`).
+    GitHelper,
+    /// One leading `python:` makes the rest a Python callable: a Mercurial `[hooks]` value.
+    Python,
+    /// The value is run without a shell (Git's `gpg.program`, `core.askPass`,
+    /// `core.gitProxy`, a tool's `<tool>.path`, `sendemail.smtpServer`), or split into words Git expands none of
+    /// (`gpg.ssh.defaultKeyCommand`): a `~`, a quote, or a space is part of
+    /// the program path, and a word's leading `~` is a relative path's.
+    Exec,
+    /// A Git `remote.<name>.vcs`: run without a shell as the program `git-remote-<value>`.
+    GitRemote,
+}
+
+/// The command line a tool runs for a value, as [`Runner::consume`] composes it.
+enum Line<'v> {
+    /// Text a shell splits into words and expands.
+    Shell(Cow<'v, str>),
+    /// Text the tool splits into words itself, quotes grouping, expanding no
+    /// `~`, and runs without a shell.
+    Split {
+        /// The text split into words.
+        text: Cow<'v, str>,
+        /// The program prefix the tool adds to the first word not shaped like an option.
+        command_prefix: &'static str,
+    },
+    /// Text the tool runs as one program, neither split nor expanded, or
+    /// split into words it expands none of.
+    Exec(Cow<'v, str>),
+}
+
+impl<'v> Line<'v> {
+    /// A command line a shell runs as written.
+    const fn of(text: Cow<'v, str>) -> Self {
+        Self::Shell(text)
+    }
+}
+
+impl Runner {
+    /// The command line the tool runs for `value`.
+    fn consume(self, value: &str) -> Line<'_> {
+        let strip = |prefix: &str| {
+            value
+                .strip_prefix(prefix)
+                .map(|rest| Line::of(Cow::Borrowed(rest)))
+        };
+        match self {
+            Self::None => Line::of(Cow::Borrowed(value)),
+            Self::Bang => strip("!").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
+            Self::Python => strip("python:").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
+            Self::GitHelper if is_git_absolute(value) => Line::of(Cow::Borrowed(value)),
+            Self::GitHelper => strip("!")
+                .unwrap_or_else(|| Line::of(Cow::Owned(format!("git-credential-{value}")))),
+            // Git splits an alias into words and reads its own options
+            // (`-p`, `-c <name>`) off the front before the word naming a
+            // command, so the prefix lands on a word, not on the value's text.
+            Self::GitAlias => strip("!").unwrap_or(Line::Split {
+                text: Cow::Borrowed(value),
+                command_prefix: "git-",
+            }),
+            Self::Exec => Line::Exec(Cow::Borrowed(value)),
+            Self::GitRemote => Line::Exec(Cow::Owned(format!("git-remote-{value}"))),
+        }
+    }
+}
+
+/// Git's `is_absolute_path`: a leading `/`, and on Windows a leading `\` or a drive prefix.
+fn is_git_absolute(value: &str) -> bool {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some('/'), _) => true,
+        (Some('\\'), _) => cfg!(windows),
+        (Some(letter), Some(':')) => cfg!(windows) && letter.is_ascii_alphabetic(),
+        (Some(_) | None, _) => false,
+    }
 }
 
 /// What becomes of a value.
@@ -2194,8 +2142,15 @@ impl Scan<'_> {
                     self.note_remote(ctx, &entry.setting, &entry.value);
                     git_route(&entry.setting, &entry.value)
                 }
-                Syntax::Hg => Route::Judge(hg_role(&entry.setting, &entry.value)),
-                Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words),
+                Syntax::Hg => {
+                    if let Setting::Key { section, key, .. } = &entry.setting
+                        && let Some(name) = vcs_keys::hg_key_tool(section, key)
+                    {
+                        self.judge(ctx, &Role::KeyTool, name).map_err(&refuse)?;
+                    }
+                    hg_route(&entry.setting, &entry.value)
+                }
+                Syntax::Toml | Syntax::Darcs => Route::Judge(Role::Words(Runner::None)),
                 Syntax::GitRemote => Route::Judge(Role::Url { scp: true }),
             };
             if let Some(rewrite) = rewrite_of(ctx, &entry.setting, &entry.value) {
@@ -2222,10 +2177,13 @@ impl Scan<'_> {
                 }
                 Route::Judge(
                     Role::Exempt
-                    | Role::Words
+                    | Role::Words(_)
                     | Role::Forced(_)
                     | Role::Include(_)
-                    | Role::HooksPath,
+                    | Role::HooksPath
+                    | Role::ToolName
+                    | Role::KeyTool
+                    | Role::Unknown,
                 ) => {}
             }
             if is_remote_url(ctx.syntax, &entry.setting) && is_network_url(&entry.value, true) {
@@ -2505,7 +2463,7 @@ impl Scan<'_> {
             match node {
                 TomlNode::Table(table) => {
                     for (key, value) in table {
-                        if top && exempt(VcsKind::Jujutsu, (key.as_str(), None, "")) {
+                        if top && vcs_keys::jj_exempt(key.as_str()) {
                             continue;
                         }
                         let index = labels.len();
@@ -2517,7 +2475,7 @@ impl Scan<'_> {
                 TomlNode::Value(value) => match value {
                     toml::Value::String(text) => {
                         let judged = match pos {
-                            TomlPos::Text => self.judge(ctx, &Role::Words, text),
+                            TomlPos::Text => self.judge(ctx, &Role::Words(Runner::None), text),
                             TomlPos::Word(position) => self.judge_word(ctx, text, position),
                         };
                         judged.map_err(|stop| {
@@ -2549,14 +2507,15 @@ impl Scan<'_> {
 
     /// Judge one value by its role.
     fn judge(&mut self, ctx: &FileCtx, role: &Role, value: &str) -> Result<(), Stop> {
-        if *role != Role::Exempt {
+        // A key's tool name is refused as a path before the checks would name a narrower reason.
+        if !matches!(role, Role::Exempt | Role::KeyTool) {
             value_checks(value).map_err(unproven)?;
         }
         match role {
             Role::Exempt => Ok(()),
-            Role::Words => self.judge_words(ctx, value),
+            Role::Words(runner) => self.judge_words(ctx, value, *runner),
             Role::Forced(path) => {
-                self.judge_words(ctx, path)?;
+                self.judge_words(ctx, path, Runner::None)?;
                 self.judge_forced(ctx, path, Reach::Command).map(drop)
             }
             Role::Include(include) => {
@@ -2581,7 +2540,7 @@ impl Scan<'_> {
                 Ok(())
             }
             Role::HooksPath => {
-                self.judge_words(ctx, value)?;
+                self.judge_words(ctx, value, Runner::None)?;
                 for (_, found) in self.judge_forced(ctx, value, Reach::Command)? {
                     if let End::Dir(dir) = found.end {
                         self.list_held(&dir, &found.path).map_err(Stop::Refused)?;
@@ -2593,8 +2552,33 @@ impl Scan<'_> {
                 if is_network_url(value, *scp) {
                     return Ok(());
                 }
-                self.judge_words(ctx, value)?;
+                self.judge_words(ctx, value, Runner::None)?;
                 self.judge_forced(ctx, value, Reach::Command).map(drop)
+            }
+            Role::ToolName => {
+                if value.contains(['/', '\\', ':', '~']) || value.contains("..") {
+                    return Err(unproven(Unprovable::ToolPath));
+                }
+                self.judge_words(ctx, value, Runner::None)
+            }
+            Role::KeyTool => {
+                let bare = !value.is_empty()
+                    && !value.contains("..")
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-')
+                    });
+                if !bare || (cfg!(windows) && self.worktree_runs(value).map_err(Stop::Refused)?) {
+                    return Err(unproven(Unprovable::ToolPath));
+                }
+                value_checks(value).map_err(unproven)?;
+                self.judge_words(ctx, value, Runner::None)
+            }
+            Role::Unknown => {
+                if is_scalar(ctx.syntax, value) {
+                    Ok(())
+                } else {
+                    Err(unproven(Unprovable::UnknownSetting))
+                }
             }
             Role::UrlList => {
                 let url = Role::Url { scp: false };
@@ -2609,16 +2593,65 @@ impl Scan<'_> {
         }
     }
 
-    /// Judge every word of the command line `value`.
-    fn judge_words(&mut self, ctx: &FileCtx, value: &str) -> Result<(), Stop> {
+    /// Whether the working tree holds an entry Windows may run for the bare program `name`: `name` itself or `name.<extension>`, ignoring case.
+    ///
+    /// Windows drops a name's trailing dots and spaces, and a name or entry
+    /// that is not ASCII is taken to match.
+    fn worktree_runs(&self, name: &str) -> Result<bool, ConfigRefusal> {
+        let stem = name.trim_end_matches(['.', ' ']);
+        if stem.is_empty() || !stem.is_ascii() {
+            return Ok(true);
+        }
+        let worktree = self.grants.worktree.as_path();
+        let dir = HeldDir::open_root(worktree)
+            .map_err(|refusal| self.unreadable(worktree, fault_of(refusal)))?;
+        let entries = dir
+            .entries_hinted(self.limits.listing)
+            .map_err(|refusal| self.unreadable(worktree, fault_of(refusal)))?;
+        Ok(entries.iter().any(|(entry, _)| {
+            entry
+                .as_os_str()
+                .to_str()
+                .is_none_or(|text| runs_as(text, stem))
+        }))
+    }
+
+    /// Judge every word of the command line `value`, once `runner` consumed its prefix.
+    ///
+    /// The prefix is stripped from the value as written, before it is split,
+    /// so only the first word loses it, and only when the tool sees it there:
+    /// a quoted `'!'/x` keeps it, and the shell then runs `!/x`.
+    fn judge_words(&mut self, ctx: &FileCtx, value: &str, runner: Runner) -> Result<(), Stop> {
         let tilde = match ctx.syntax {
             Syntax::Git | Syntax::Hg | Syntax::Darcs | Syntax::GitRemote => Tilde::Shell,
             Syntax::Toml => Tilde::Verbatim,
         };
         let mut words = Words::default();
-        words
-            .push_split(value, Position::Program, tilde)
-            .map_err(unproven)?;
+        match runner.consume(value) {
+            Line::Shell(text) => words
+                .push_split(&text, Position::Program, tilde)
+                .map_err(unproven)?,
+            // No word's leading `~` is expanded: each is judged both ways.
+            Line::Split {
+                text,
+                command_prefix,
+            } => {
+                words
+                    .push_split(&text, Position::Program, Tilde::Verbatim)
+                    .map_err(unproven)?;
+                words.prefix_command(command_prefix);
+            }
+            // The whole text is the program, and its words those of a tool
+            // splitting it without a shell; a leading `~` is judged both ways.
+            Line::Exec(text) => {
+                words
+                    .push_split(&text, Position::Program, Tilde::Verbatim)
+                    .map_err(unproven)?;
+                words
+                    .push_forms(text.into_owned(), Position::Program)
+                    .map_err(unproven)?;
+            }
+        }
         self.judge_queue(ctx, &mut words)
     }
 
@@ -2645,8 +2678,10 @@ impl Scan<'_> {
     /// only when it is path-shaped (and resolved), empty, a program name, or an
     /// option; any other word, a number included, may name a file relative to
     /// the directory the tool runs in, so it is unprovable, and `--` or `-`
-    /// lets a program read any later word as such a file. Runner prefixes are
-    /// stripped from a program word only ([`command_text`]).
+    /// lets a program read any later word as such a file. Every word is judged
+    /// as written: a runner prefix a tool consumes is gone before the value is
+    /// split ([`Runner`]), so a runner-shaped word left here (`!/x`, `=/x`) is
+    /// the relative path the shell runs.
     ///
     /// Every queued word is strictly shorter than the word that queued it,
     /// but an option word queued back once to be judged whole, and
@@ -2660,7 +2695,7 @@ impl Scan<'_> {
                 return Err(unproven(Unprovable::Glob));
             }
             if stage == Stage::Fresh
-                && let Some(argument) = option_argument(command_text(&word, position))
+                && let Some(argument) = option_argument(&word)
                     .filter(|argument| !argument.is_empty())
                     .map(str::to_owned)
             {
@@ -2672,7 +2707,7 @@ impl Scan<'_> {
                     .map_err(unproven)?;
                 continue;
             }
-            let text = command_text(&word, position);
+            let text = word.as_str();
             if text == "-" || text == "--" {
                 return Err(unproven(Unprovable::EndOfOptions));
             }
@@ -2684,12 +2719,6 @@ impl Scan<'_> {
             let shaped = is_path_shaped(text);
             if shaped {
                 self.judge_path(ctx, text, Reach::Command)?;
-            }
-            if text.len() != word.len() && is_path_shaped(&word) {
-                // A tool that consumes no runner prefix runs the word as
-                // written: `!/x` is then the path `!/x`, relative to the
-                // directory it runs in.
-                self.judge_path(ctx, &word, Reach::Command)?;
             }
             if text.contains(is_word_separator) {
                 words.push_pieces(text, position).map_err(unproven)?;
@@ -2830,6 +2859,21 @@ struct Words {
 }
 
 impl Words {
+    /// Prefix `prefix` to the first pushed word not shaped like an option, at the position it stands.
+    ///
+    /// A word after a leading option keeps its argument position: it may be
+    /// that option's argument (`-c <name>`), and the command then follows it.
+    fn prefix_command(&mut self, prefix: &str) {
+        if let Some((word, _, _)) = self
+            .stack
+            .iter_mut()
+            .rev()
+            .find(|(word, _, _)| !word.starts_with('-'))
+        {
+            word.insert_str(0, prefix);
+        }
+    }
+
     /// Push one word not yet looked at.
     fn push(&mut self, word: String, position: Position) -> Result<(), Unprovable> {
         self.push_staged(word, position, Stage::Fresh)
@@ -3093,32 +3137,6 @@ fn option_argument(word: &str) -> Option<&str> {
     Some(rest.strip_prefix('=').unwrap_or(rest))
 }
 
-/// The text of `word` judged at `position`: a program word without its runner prefixes.
-///
-/// Only a program word may carry a prefix a tool consumes before running what
-/// follows; an argument reaches its program verbatim, so `=/x` there is the
-/// relative path `=/x`, never `/x`.
-fn command_text(word: &str, position: Position) -> &str {
-    match position {
-        Position::Program => strip_runners(word),
-        Position::Argument => word,
-    }
-}
-
-/// `word` without the prefixes that make a tool run what follows (`=`, `!`, `ext::`, `python:`).
-fn strip_runners(word: &str) -> &str {
-    let mut rest = word;
-    while let Some(next) = rest
-        .strip_prefix('=')
-        .or_else(|| rest.strip_prefix('!'))
-        .or_else(|| rest.strip_prefix("ext::"))
-        .or_else(|| rest.strip_prefix("python:"))
-    {
-        rest = next;
-    }
-    rest
-}
-
 /// Whether `word` is shaped like a path: it holds a separator, starts with `~`, or is `.` or `..`.
 fn is_path_shaped(word: &str) -> bool {
     word.contains(is_separator) || word.starts_with('~') || word == "." || word == ".."
@@ -3298,6 +3316,36 @@ fn is_git_bool(value: &str) -> bool {
         .any(|word| value.eq_ignore_ascii_case(word))
 }
 
+/// Whether `value` is one no reading of an unknown Git setting makes a path: empty, a Git boolean, or a decimal integer with an optional `k`, `m`, or `g` unit.
+fn is_git_scalar(value: &str) -> bool {
+    let number = value.strip_prefix('-').unwrap_or(value);
+    let digits = number
+        .strip_suffix(['k', 'm', 'g', 'K', 'M', 'G'])
+        .unwrap_or(number);
+    is_git_bool(value) || (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether `value` is one no reading of an unknown `syntax` setting makes a path.
+fn is_scalar(syntax: Syntax, value: &str) -> bool {
+    match syntax {
+        Syntax::Git => is_git_scalar(value),
+        Syntax::Hg => is_hg_scalar(value),
+        // Every setting of these files has a decided route, so none is unknown.
+        Syntax::GitRemote | Syntax::Toml | Syntax::Darcs => false,
+    }
+}
+
+/// Whether `value` is empty, a Mercurial boolean, or a decimal integer.
+fn is_hg_scalar(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    [
+        "", "1", "yes", "true", "on", "always", "0", "no", "false", "off", "never",
+    ]
+    .iter()
+    .any(|word| value.eq_ignore_ascii_case(word))
+        || (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// What Git does with a value of `setting`.
 fn git_route(setting: &Setting, value: &str) -> Route {
     let Setting::Key {
@@ -3306,41 +3354,52 @@ fn git_route(setting: &Setting, value: &str) -> Route {
         key,
     } = setting
     else {
-        return Route::Judge(Role::Words);
+        return Route::Judge(Role::Unknown);
     };
-    let key = key.to_ascii_lowercase();
-    let subsection = subsection.as_deref();
-    let shape = (&**section, subsection.is_some(), key.as_str());
-    if shape == ("include", false, "path") {
-        return Route::Judge(Role::Include(Reading::Always));
-    }
-    if shape == ("includeif", true, "path") {
-        return Route::Judge(Role::Include(Reading::Conditional));
-    }
-    if shape == ("core", false, "hookspath") {
-        return Route::Judge(Role::HooksPath);
-    }
-    let forced = shape == ("init", false, "templatedir")
-        || (shape == ("core", false, "fsmonitor") && !is_git_bool(value));
-    if forced {
-        return Route::Judge(Role::Forced(value.to_owned()));
-    }
-    if matches!(
-        shape,
-        ("remote", true, "url" | "pushurl") | ("submodule", true, "url")
-    ) {
-        return Route::Judge(Role::Url { scp: true });
-    }
-    if matches!(
-        shape,
-        ("branch", true, "remote" | "pushremote") | ("remote", false, "pushdefault")
-    ) {
-        return Route::RemoteName;
-    }
-    if exempt(VcsKind::Git, (&**section, subsection, key.as_str())) {
-        Route::Judge(Role::Exempt)
-    } else {
-        Route::Judge(Role::Words)
+    vcs_keys::git(section, subsection.as_deref(), key)
+        .map_or(Route::Judge(Role::Unknown), |consume| {
+            route_of(consume, value)
+        })
+}
+
+/// What becomes of `value`, which its tool consumes as `consume`.
+fn route_of(consume: Consume, value: &str) -> Route {
+    let words = |runner: Runner| Route::Judge(Role::Words(runner));
+    let forced = |path: &str| Route::Judge(Role::Forced(path.to_owned()));
+    match consume {
+        Consume::Exempt => Route::Judge(Role::Exempt),
+        Consume::Inert | Consume::Shell => words(Runner::None),
+        Consume::Bang => words(Runner::Bang),
+        Consume::Exec => words(Runner::Exec),
+        Consume::Composed(Compose::Alias) => words(Runner::GitAlias),
+        Consume::Composed(Compose::CredentialHelper) => words(Runner::GitHelper),
+        Consume::Composed(Compose::RemoteHelper) => words(Runner::GitRemote),
+        Consume::ToolName => Route::Judge(Role::ToolName),
+        Consume::Load(Load::Include(Include::Always)) => {
+            Route::Judge(Role::Include(Reading::Always))
+        }
+        Consume::Load(Load::Include(Include::Conditional)) => {
+            Route::Judge(Role::Include(Reading::Conditional))
+        }
+        Consume::Load(Load::HooksPath) => Route::Judge(Role::HooksPath),
+        Consume::Load(Load::Forced) => forced(value),
+        Consume::Load(Load::ForcedUnlessBool) => {
+            if is_git_bool(value) {
+                words(Runner::None)
+            } else {
+                forced(value)
+            }
+        }
+        // A leading `!` disables the extension; the path after it is still judged.
+        Consume::Load(Load::ForcedUnbanged) => forced(value.strip_prefix('!').unwrap_or(value)),
+        Consume::Url { scp } => Route::Judge(Role::Url { scp }),
+        Consume::UrlList => Route::Judge(Role::UrlList),
+        Consume::RemoteName => Route::RemoteName,
+        // Mercurial calls `python:<file>:<fn>` as a Python callable it imports from the file.
+        Consume::PythonHook => value
+            .strip_prefix("python:")
+            .and_then(|rest| rest.rsplit_once(':'))
+            .map_or_else(|| words(Runner::Python), |(path, _)| forced(path)),
     }
 }
 
@@ -3393,37 +3452,26 @@ fn holds_nul(entry: &Entry) -> bool {
     name_holds || entry.value.contains('\0')
 }
 
-/// How Mercurial treats a value of `setting`.
-fn hg_role(setting: &Setting, value: &str) -> Role {
-    let (section, key) = match setting {
-        Setting::Key { section, key, .. } => (section, key),
-        Setting::Include => return Role::Include(Reading::Always),
-        Setting::Line(_) => return Role::Words,
+/// Whether Windows may run the directory entry `entry` for the ASCII program `stem`: `stem` or `stem.<extension>`, ignoring case.
+fn runs_as(entry: &str, stem: &str) -> bool {
+    if !entry.is_ascii() {
+        return true;
+    }
+    let Some((head, rest)) = entry.split_at_checked(stem.len()) else {
+        return false;
     };
-    if &**section == "extensions" {
-        // A leading `!` disables the extension; the path after it is still judged.
-        return Role::Forced(value.strip_prefix('!').unwrap_or(value).to_owned());
-    }
-    if &**section == "hooks"
-        && let Some((path, _)) = value
-            .strip_prefix("python:")
-            .and_then(|rest| rest.rsplit_once(':'))
-    {
-        return Role::Forced(path.to_owned());
-    }
-    if &**section == "paths" && (!key.contains(':') || key.ends_with(":pushurl")) {
-        return Role::UrlList;
-    }
-    // A `[schemes]` template or a `[subpaths]` replacement is the URL the
-    // tool reads in place of one it was given, `.hgsub` sources included; a
-    // template is also a URL the scheme chain rewrites again.
-    if &**section == "schemes" || &**section == "subpaths" {
-        return Role::Url { scp: false };
-    }
-    if exempt(VcsKind::Mercurial, (&**section, None, key.as_str())) {
-        Role::Exempt
-    } else {
-        Role::Words
+    head.eq_ignore_ascii_case(stem) && (rest.is_empty() || rest.starts_with('.'))
+}
+
+/// What Mercurial does with a value of `setting`.
+fn hg_route(setting: &Setting, value: &str) -> Route {
+    match setting {
+        Setting::Key { section, key, .. } => vcs_keys::hg(section, key)
+            .map_or(Route::Judge(Role::Unknown), |consume| {
+                route_of(consume, value)
+            }),
+        Setting::Include => Route::Judge(Role::Include(Reading::Always)),
+        Setting::Line(_) => Route::Judge(Role::Unknown),
     }
 }
 
@@ -4082,21 +4130,146 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_with_in_tree_path_refused() {
+    fn unknown_git_key_refused() {
         let f = fixture("unknownkey");
+        let (tree, out) = (f.tree.display(), f.out.display());
+        for text in [
+            "[frob]\n\tcmd = /usr/bin/true\n".to_owned(),
+            "[core]\n\tfrobnicate = ~/x\n".to_owned(),
+            format!("[frobnicate \"x\"]\n\trunner = sh {out}/run.sh\n"),
+            format!("[frobnicate \"x\"]\n\trunner = sh -c {tree}/run.sh\n"),
+            "[frob]\n\tn = 1x\n".to_owned(),
+            "[http \"https://h\"]\n\tfrobnicate = x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::UnknownSetting),
+                "{text:?}: {result:?}"
+            );
+        }
+        // Controls: a value no reading makes a path.
+        for text in [
+            "[frob]\n\tn = 1\n",
+            "[frob]\n\tn = -512k\n",
+            "[frob]\n\ton = true\n",
+            "[frob]\n\te =\n",
+            "[frob]\n\tbare\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_key_judged_as_unscoped() {
+        let f = fixture("unscoped");
         let tree = f.tree.display();
-        git_config(
-            &f,
-            &format!("[frobnicate \"x\"]\n\trunner = sh -c {tree}/run.sh\n"),
-        );
+        for text in [
+            format!("[sendemail \"work\"]\n\ttocmd = {tree}/evil\n"),
+            format!("[credential \"https://h\"]\n\thelper = {tree}/evil\n"),
+            format!("[http \"https://h\"]\n\tcookieFile = {tree}/evil\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{text:?}: {result:?}"
+            );
+        }
+        // The unscoped row judges `smtpServer` as an executed path, where `~` is not the home.
+        git_config(&f, "[sendemail \"work\"]\n\tsmtpServer = ~/evil\n");
         let result = scan_git(&f);
-        assert_eq!(in_grant(&result), Some(f.tree.join("run.sh").as_path()));
-        let out = f.out.display();
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        for text in [
+            "[credential \"https://h\"]\n\tusername = x\n",
+            "[sendemail \"work\"]\n\tsmtpServer = /usr/sbin/sendmail\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn tool_name_with_separator_refused() {
+        let f = fixture("toolname");
+        for text in [
+            "[merge]\n\ttool = a/b\n",
+            "[merge]\n\ttool = \"a\\\\b\"\n",
+            "[diff]\n\ttool = ../../../../tree/evilsrc\n",
+            "[diff]\n\tguitool = ..\n",
+            "[web]\n\tbrowser = ~x\n",
+            "[man]\n\tviewer = a:b\n",
+            "[lfs]\n\tstandalonetransferagent = ./agent\n",
+        ] {
+            git_config(&f, text);
+            let result = scan_git(&f);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::ToolPath),
+                "{text:?}: {result:?}"
+            );
+        }
+        for text in [
+            "[merge]\n\ttool = vimdiff\n",
+            "[diff]\n\tguitool = meld\n",
+            "[gitcvs]\n\tdbDriver = SQLite\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn third_party_rows() {
+        let f = fixture("thirdparty");
+        for text in [
+            "[remote \"origin\"]\n\tgh-resolved = base\n",
+            "[lfs]\n\trepositoryformatversion = 0\n",
+            "[lfs \"https://h/r.git/info/lfs\"]\n\taccess = basic\n",
+            "[filter \"lfs\"]\n\trequired = true\n",
+            "[gitflow \"branch\"]\n\tmaster = main\n",
+        ] {
+            git_config(&f, text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+        let tree = f.tree.display();
+        for text in [
+            "[lfs \"customtransfer.x\"]\n\tpath = ~/evil\n".to_owned(),
+            format!("[lfs \"customtransfer.x\"]\n\targs = {tree}/evil\n"),
+            format!("[lfs \"extension.x\"]\n\tsmudge = {tree}/evil\n"),
+            format!("[gitflow \"path\"]\n\thooks = {tree}/hooks\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_git_hook_command_has_a_row() {
+        let f = fixture("hookcommand");
         git_config(
             &f,
-            &format!("[frobnicate \"x\"]\n\trunner = sh {out}/run.sh\n"),
+            "[hook \"x\"]\n\tcommand = /usr/bin/true\n\tevent = pre-commit\n",
         );
         assert_eq!(scan_git(&f), Ok(()));
+        let tree = f.tree.display();
+        git_config(&f, &format!("[hook \"x\"]\n\tcommand = {tree}/evil\n"));
+        let result = scan_git(&f);
+        assert_eq!(
+            in_grant(&result),
+            Some(f.tree.join("evil").as_path()),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -4406,6 +4579,160 @@ mod tests {
         write(&dot_hg.join("hgrc"), "[ui]\nnot an item\n");
         let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
         assert_eq!(fault(&result), Some(ConfigFault::Malformed { line: 2 }));
+    }
+
+    fn scan_hg(f: &Fixture, text: &str) -> Result<(), ConfigRefusal> {
+        let dot_hg = f.tree.join(".hg");
+        write(&dot_hg.join("hgrc"), text);
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        scan_with(f, &roots, ConfigLimits::DEFAULT)
+    }
+
+    #[test]
+    fn unknown_hg_key_refused() {
+        let f = fixture("hgunknown");
+        let tree = f.tree.display();
+        for text in [
+            "[frob]\nx = /usr/bin/true\n".to_owned(),
+            "[ui]\nfrobnicate = ~/x\n".to_owned(),
+            "[frob]\nn = 1x\n".to_owned(),
+            format!("[defaults]\npull = --ssh {tree}/evil\n"),
+            "[ui]\ndebugger = evil\n".to_owned(),
+            "[acl.allow]\nfoo = alice\n".to_owned(),
+            "[merge-tools]\nkdiff3.regkey = SoftwareKDiff3\n".to_owned(),
+            "[hooks]\ncommit:frob = x\n".to_owned(),
+            "[pager]\nattend- = x\n".to_owned(),
+            "[merge-tools]\nkdiff3.regappend = \\..\\..\\evil.exe\n".to_owned(),
+        ] {
+            let result = scan_hg(&f, &text);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::UnknownSetting),
+                "{text:?}: {result:?}"
+            );
+        }
+        // Controls: a value no reading makes a path, and documented settings with a row.
+        for text in [
+            "[frob]\nn = 1\n",
+            "[frob]\nn = -3\n",
+            "[frob]\non = Never\n",
+            "[frob]\ne =\n",
+            "[phases]\npublish = False\n",
+            "[ui]\nmergemarkers = basic\n",
+            "[extensions]\nrebase =\nrebase:required = True\n",
+            "[paths]\ndefault = https://example.com/r\ndefault:bookmarks.mode = mirror\n",
+            "[hooks]\npriority.commit = 5\ncommit:run-with-plain = auto\n",
+            "[alias]\nst = status\nst:doc = status\n",
+        ] {
+            assert_eq!(scan_hg(&f, text), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hg_key_named_tool_refused() {
+        let f = fixture("hgkeytool");
+        for text in [
+            "[merge-tools]\nbin/evil.priority = 1\n",
+            "[merge-tools]\nbin/evil = 1\n",
+            "[partial-merge-tools]\nbin/evil.order = 1\n",
+            "[extdiff]\ncmd.bin/evil =\n",
+            "[extdiff]\nbin/evil =\n",
+            "[merge-tools]\n~/evil.gui = True\n",
+            "[merge-tools]\n$HOME.priority = 1\n",
+            "[merge-tools]\n..\\evil.priority = 1\n",
+            "[extdiff]\ncmd.a:b =\n",
+            "[partial-merge-tools]\nx/y.disable = False\n",
+            "[merge-tools]\n%USERPROFILE%.priority = 1\n",
+            "[merge-tools]\n.priority = 1\n",
+            "[partial-merge-tools]\nx\" & evil & \".order = 1\n",
+            "[extdiff]\ncmd.a b =\n",
+            "[merge-tools]\nx;y.priority = 1\n",
+        ] {
+            let result = scan_hg(&f, text);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::ToolPath),
+                "{text:?}: {result:?}"
+            );
+        }
+        for text in [
+            "[merge-tools]\nkdiff3.priority = 1\n",
+            "[extdiff]\ncmd.vd =\n",
+        ] {
+            assert_eq!(scan_hg(&f, text), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hg_key_tool_value_still_judged() {
+        let f = fixture("hgkeyvalue");
+        let text = format!("[merge-tools]\nkdiff3.args = {}/evil\n", f.tree.display());
+        let result = scan_hg(&f, &text);
+        assert_eq!(
+            in_grant(&result),
+            Some(f.tree.join("evil").as_path()),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn hg_key_tool_entry_matching() {
+        assert!(runs_as("evil", "evil"));
+        assert!(runs_as("EVIL.exe", "evil"));
+        assert!(runs_as("evil.cmd", "Evil"));
+        assert!(runs_as("évil", "vd"));
+        assert!(!runs_as("evildoer", "evil"));
+        assert!(!runs_as("evi", "evil"));
+        assert!(!runs_as(".hg", "evil"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hg_key_tool_in_worktree_refused_on_windows() {
+        let f = fixture("hgkeywin");
+        write(&f.tree.join("evil.exe"), "");
+        let result = scan_hg(&f, "[merge-tools]\nevil.priority = 1\n");
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::ToolPath),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn hg_tool_paths_judged() {
+        let f = fixture("hgtools");
+        let tree = f.tree.display();
+        for text in [
+            format!("[merge-tools]\nx.executable = {tree}/evil\n"),
+            "[merge-tools]\nx.executable = evil\n".to_owned(),
+            "[ui]\nmerge = evil\n".to_owned(),
+            format!("[merge-tools]\nx.args = {tree}/evil\n"),
+            format!("[extdiff]\nopts.vd = {tree}/evil\n"),
+            format!("[extdiff]\nvd = {tree}/evil\n"),
+            format!("[fix]\nblack:command = {tree}/evil\n"),
+            format!("[email]\nmethod = {tree}/evil\n"),
+        ] {
+            let result = scan_hg(&f, &text);
+            assert_eq!(
+                in_grant(&result),
+                Some(f.tree.join("evil").as_path()),
+                "{text:?}: {result:?}"
+            );
+        }
+        // Mercurial expands `~` in a tool's executable; a program run without a shell does not.
+        assert_eq!(
+            scan_hg(&f, "[merge-tools]\nx.executable = ~/evil\n"),
+            Ok(())
+        );
+        let result = scan_hg(&f, "[profiling]\npy-spy.exe = ~/evil\n");
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -4812,7 +5139,7 @@ mod tests {
                 "{value:?}"
             );
         }
-        git_config(&f, &format!("[alias]\n\tx = {out}/a\n"));
+        git_config(&f, &format!("[alias]\n\tx = !{out}/a\n"));
         assert_eq!(scan_git(&f), Ok(()));
 
         // An include path is a file name, never a command: `!` there is the
@@ -5448,7 +5775,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_prefixed_program_word_judged_as_written_too() {
+    fn runner_prefix_judged_as_written_where_no_tool_consumes_it() {
         let f = fixture("runnerwhole");
         let out = f.out.display();
         for text in [
@@ -5456,6 +5783,11 @@ mod tests {
             format!("[core]\n\tpager = ={out}/less\n"),
             format!("[core]\n\teditor = !{out}/e\n"),
             format!("[alias]\n\tx = !!{out}/x\n"),
+            format!("[alias]\n\tx = \"'!'{out}/x\"\n"),
+            format!("[credential]\n\thelper = !!{out}/helper\n"),
+            format!("[core]\n\tpager = \"less;!{out}/x\"\n"),
+            format!("[alias]\n\tx = !sh -c '!{out}/x'\n"),
+            format!("[alias]\n\tx = !sh -c '!{out}/x {out}/y'\n"),
         ] {
             git_config(&f, &text);
             let result = scan_git(&f);
@@ -5466,6 +5798,195 @@ mod tests {
         }
         git_config(&f, "[alias]\n\tst = !git\n");
         assert_eq!(scan_git(&f), Ok(()));
+    }
+
+    #[test]
+    fn runner_prefix_consumed_once_where_the_tool_declares_it() {
+        let f = fixture("runnerdeclared");
+        let out = f.out.display();
+        for text in [
+            format!("[alias]\n\tx = !{out}/a {out}/b\n"),
+            format!("[credential]\n\thelper = !{out}/helper\n"),
+            format!("[credential \"https://example.com\"]\n\thelper = !{out}/helper\n"),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+        // Under a key not declared to consume the prefix, the same values refuse.
+        for text in [
+            format!("[core]\n\tpager = !{out}/a {out}/b\n"),
+            format!("[credential]\n\tusername = !{out}/helper\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_command_word_judged_as_the_program_git_runs() {
+        let f = fixture("gitdashed");
+        let out = f.out.display();
+        for text in [
+            format!("[alias]\n\tx = {out}/x\n"),
+            format!("[alias]\n\tx = -p {out}/x\n"),
+            format!("[alias]\n\tx = \"'-p' {out}/x\"\n"),
+            format!("[alias]\n\tx = --paginate {out}/x\n"),
+            format!("[alias \"x\"]\n\tcommand = {out}/x\n"),
+            "[alias]\n\tx = ~/x\n".to_owned(),
+            "[alias]\n\tx = y ~/x\n".to_owned(),
+            "[credential]\n\thelper = ~/x\n".to_owned(),
+            "[credential \"https://example.com\"]\n\thelper = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        // An option's argument (`-c <name>`) may stand before the command word.
+        git_config(&f, &format!("[alias]\n\tx = -c a.b {out}/x\n"));
+        assert!(scan_git(&f).is_err());
+        for text in [
+            "[alias]\n\tco = checkout\n".to_owned(),
+            "[alias]\n\tlg = log --oneline\n".to_owned(),
+            format!("[alias \"x\"]\n\tcommand = !{out}/x\n"),
+            "[alias]\n\tx = !~/x\n".to_owned(),
+            "[credential]\n\thelper = store\n".to_owned(),
+            format!("[credential]\n\thelper = {out}/helper\n"),
+            "[credential]\n\thelper = !~/x\n".to_owned(),
+            "[core]\n\tpager = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn git_program_run_without_a_shell_judged_whole() {
+        let f = fixture("gitexec");
+        let out = f.out.display();
+        for text in [
+            "[gpg]\n\tprogram = ~/x\n".to_owned(),
+            format!("[gpg]\n\tprogram = \"a {out}/x\"\n"),
+            "[gpg \"ssh\"]\n\tprogram = ~/x\n".to_owned(),
+            "[gpg \"ssh\"]\n\tdefaultKeyCommand = ~/x\n".to_owned(),
+            format!("[gpg \"ssh\"]\n\tdefaultKeyCommand = {out}/sh ~/x\n"),
+            "[core]\n\taskPass = ~/x\n".to_owned(),
+            format!("[core]\n\taskPass = \"a {out}/x\"\n"),
+            "[core]\n\tgitProxy = ~/x\n".to_owned(),
+            "[remote \"o\"]\n\tvcs = ~/x\n".to_owned(),
+            format!("[remote \"o\"]\n\tvcs = {out}/x\n"),
+            format!("[remote \"o\"]\n\tvcs = \"a {out}/x\"\n"),
+        ] {
+            git_config(&f, &text);
+            let result = scan_git(&f);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
+        for text in [
+            "[gpg]\n\tprogram = gpg2\n".to_owned(),
+            format!("[gpg]\n\tprogram = {out}/gpg\n"),
+            format!("[core]\n\taskPass = {out}/askpass\n"),
+            "[remote \"o\"]\n\tvcs = hg\n".to_owned(),
+            "[core]\n\tsshCommand = ~/x\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn git_tool_path_runs_without_a_shell_refused() {
+        let f = fixture("gittoolpath");
+        let out = f.out.display();
+        for key in [
+            "[difftool \"t\"]\n\tpath",
+            "[mergetool \"t\"]\n\tpath",
+            "[browser \"t\"]\n\tpath",
+            "[man \"t\"]\n\tpath",
+            "[sendemail]\n\tsmtpServer",
+        ] {
+            for value in ["~/evil".to_owned(), format!("\"x {out}/y\"")] {
+                let text = format!("{key} = {value}\n");
+                git_config(&f, &text);
+                let result = scan_git(&f);
+                assert!(
+                    in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                    "{text:?}: {result:?}"
+                );
+            }
+            for value in [format!("{out}/tool"), "tool".to_owned()] {
+                let text = format!("{key} = {value}\n");
+                git_config(&f, &text);
+                assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn git_submodule_update_bang_strips_then_shell() {
+        let f = fixture("gitsubupdate");
+        let tree = f.tree.display();
+        let out = f.out.display();
+        let text = format!("[submodule \"s\"]\n\tupdate = !{tree}/evil\n");
+        git_config(&f, &text);
+        let result = scan_git(&f);
+        assert_eq!(
+            in_grant(&result),
+            Some(f.tree.join("evil").as_path()),
+            "{text:?}: {result:?}"
+        );
+        for text in [
+            format!("[submodule \"s\"]\n\tupdate = !{out}/x\n"),
+            "[submodule \"s\"]\n\tupdate = !~/x\n".to_owned(),
+            "[submodule \"s\"]\n\tupdate = rebase\n".to_owned(),
+        ] {
+            git_config(&f, &text);
+            assert_eq!(scan_git(&f), Ok(()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn hg_runner_prefix_consumed_only_by_alias_and_hooks() {
+        let f = fixture("hgrunner");
+        let dot_hg = f.tree.join(".hg");
+        let out = f.out.display();
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        for text in [
+            format!("[alias]\nx = !{out}/x\n"),
+            "[hooks]\nx = python:hgext.hook.run\n".to_owned(),
+            format!("[hooks]\nx = python:{out}/mod.run\n"),
+        ] {
+            write(&dot_hg.join("hgrc"), &text);
+            assert_eq!(
+                scan_with(&f, &roots, ConfigLimits::DEFAULT),
+                Ok(()),
+                "{text:?}"
+            );
+        }
+        for text in [
+            format!("[alias]\nx = !!{out}/x\n"),
+            format!("[alias]\nx = python:{out}/mod.run\n"),
+            format!("[hooks]\nx = !{out}/x\n"),
+            format!("[ui]\neditor = !{out}/x\n"),
+        ] {
+            write(&dot_hg.join("hgrc"), &text);
+            let result = scan_with(&f, &roots, ConfigLimits::DEFAULT);
+            assert!(
+                in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+                "{text:?}: {result:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -5515,6 +6036,22 @@ mod tests {
         git_config(&f, "[branch.main \"x\"]\n\tremote = evil\n");
         let result = scan_git(&f);
         assert_eq!(in_grant(&result), Some(f.tree.join("evil").as_path()));
+    }
+
+    #[test]
+    fn dotted_header_reaches_its_row() {
+        // `[remote.o "x"]` names `remote.o.x.vcs`: the remote helper row, which
+        // composes `git-remote-~/x`, a path relative to the working tree; read
+        // as a shell word, `~/x` would name the home outside every grant.
+        let f = fixture("dottedrow");
+        git_config(&f, "[remote.o \"x\"]\n\tvcs = ~/x\n");
+        let result = scan_git(&f);
+        assert!(
+            in_grant(&result).is_some_and(|path| path.starts_with(&f.tree)),
+            "{result:?}"
+        );
+        git_config(&f, "[remote.o \"x\"]\n\tvcs = hg\n");
+        assert_eq!(scan_git(&f), Ok(()));
     }
 
     #[test]

@@ -19,17 +19,19 @@ import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
-import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), StoredDecision(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
+import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
+import Lib.Uid as Uid exposing (Uid)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -40,9 +42,9 @@ removeReviewFiles dbPath =
         removeFileIfAny (dbPath ++ "-shm")
 
 
--- After `probe` the review database holds the review table and the
--- migrations table, nothing else: no write-only table outlives its last
--- reader. A second `probe` on the same file is a no-op. Red while the
+-- After `probe` the review database holds the review table, its log head
+-- and the migrations table, nothing else: no write-only table outlives its
+-- last reader. A second `probe` on the same file is a no-op. Red while the
 -- `drain_cursor` migration stands without the one dropping it.
 drainCursorGoneAfterMigrate : Task.Task Error Bool
 drainCursorGoneAfterMigrate =
@@ -62,7 +64,7 @@ drainCursorGoneAfterMigrateIn base =
         db <- LibDb.openAt loc
         tables <- tableNames db
         removeReviewFiles dbPath
-        Task.succeed (tables == [ "_ipe_migrations", "review" ])
+        Task.succeed (tables == [ "_ipe_migrations", "review", "review_head" ])
 
 
 -- `LibDb.openAt` never migrates: on a review file that `probe` never ran on,
@@ -82,7 +84,7 @@ openDoesNotMigrateIn base =
     in
     do
         db <- Settings.parseReviewDb dbPath |> Task.andThen LibDb.openAt
-        readFailed <- LibDb.findDecision db "u-a" "h"
+        readFailed <- LibDb.findDecision db (uid "u-a") "h"
             |> Task.map (\_ -> False)
             |> Task.onError (\_ -> Task.succeed True)
         created <- tableExists db "review"
@@ -90,21 +92,211 @@ openDoesNotMigrateIn base =
         Task.succeed (readFailed && not created)
 
 
--- A second decision on the same attested pair is a no-op: one row, the
--- first decision kept.
-duplicateInsertIsNoop : Task.Task Error Bool
-duplicateInsertIsNoop =
+-- A second decision on the same attested pair is `AlreadyDecided`: one
+-- row, the first decision kept, and the log's head where the first decision
+-- moved it. The first decision links the head from the one read before it
+-- to the one read after it. Red if a duplicate inserts a second row,
+-- replaces the first decision, is reported as `Inserted`, or moves the head.
+-- The two decisions run one after the other, so this does not tell a
+-- dedupe in the insert from a read before it.
+duplicateDecisionAlreadyDecided : Task.Task Error Bool
+duplicateDecisionAlreadyDecided =
     onFreshReview "ipe-review-duplicate"
         (\db ->
             do
-                attested <- attestedFor "ipe-review-duplicate-index" "u-a"
-                LibDb.insertDecision db attested Approved
+                attested <- attestedFor "ipe-review-duplicate-index" (uid "u-a")
+                genesis <- reviewHeadOf db
+                first <- LibDb.insertDecision db attested Approved
+                afterFirst <- reviewHeadOf db
                 changed <- refuse "changed"
                 second <- LibDb.insertDecision db attested changed
-                n <- countReviewRows db "u-a" (Index.attest viewA)
-                found <- LibDb.findDecision db "u-a" (Index.attest viewA)
-                Task.succeed (second == 0 && n == 1 && isApproved found)
+                afterSecond <- reviewHeadOf db
+                n <- countReviewRows db (uid "u-a") (Index.attest viewA)
+                found <- LibDb.findDecision db (uid "u-a") (Index.attest viewA)
+                Task.succeed
+                    (linksFrom genesis afterFirst first
+                        && isAlreadyDecided second
+                        && afterSecond
+                        == afterFirst
+                        && n
+                        == 1
+                        && isApproved found
+                    )
         )
+
+
+-- True when `written` is a new row that moved the head from `prev` to `head`.
+linksFrom : String -> String -> Index.Written -> Bool
+linksFrom prev head written =
+    case written of
+        Inserted link ->
+            Index.chainHeadText link.prev == prev && Index.chainHeadText link.head == head && prev /= head
+
+        AlreadyDecided ->
+            False
+
+
+isAlreadyDecided : Index.Written -> Bool
+isAlreadyDecided written =
+    case written of
+        Inserted _ ->
+            False
+
+        AlreadyDecided ->
+            True
+
+
+-- The review log is append-only: deleting or updating a review row, and
+-- deleting the head, are each refused by a trigger, and the row and the
+-- head are left as they were. Re-inserting a decided pair with a replacing
+-- conflict clause (SQLite's REPLACE deletes the old row without firing a
+-- delete trigger) or an upsert changes nothing: the first decision stays.
+-- A refusal counts only as a trigger's `RAISE(ABORT)`, so a statement that
+-- fails for another reason (a typo, a missing table) is red, and a rewrite
+-- either runs or is refused by a trigger. Red with any of the four
+-- triggers dropped.
+reviewLogAppendOnly : Db -> Task.Task Error Bool
+reviewLogAppendOnly db =
+    let
+        refused sql =
+            Db.exec db sql []
+                |> Task.map (\_ -> False)
+                |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
+
+        rewrite sql =
+            Db.exec db sql [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString "refuse", SqlString "rewritten", SqlInt 0 ]
+                |> Task.map (\_ -> True)
+                |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
+    in
+    do
+        attested <- attestedFor "ipe-review-append-only-index" (uid "u-a")
+        LibDb.insertDecision db attested Approved
+        head <- reviewHeadOf db
+        refusals <- Task.sequence
+            (List.map refused
+                [ "DELETE FROM review"
+                , "UPDATE review SET decision = 'approve', reason = NULL"
+                , "UPDATE review SET body_hash = 'other'"
+                , "DELETE FROM review_head"
+                ]
+            )
+        rewrites <- Task.sequence
+            (List.map rewrite
+                [ "INSERT OR REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+                , "REPLACE INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
+                , "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?) ON CONFLICT (uid, body_hash) DO UPDATE SET decision = excluded.decision, reason = excluded.reason"
+                ]
+            )
+        n <- countReviewRows db (uid "u-a") (Index.attest viewA)
+        kept <- LibDb.findDecision db (uid "u-a") (Index.attest viewA)
+        headAfter <- reviewHeadOf db
+        Task.succeed
+            (List.all (\ok -> ok) (refusals ++ rewrites)
+                && n
+                == 1
+                && isApproved kept
+                && headAfter
+                == head
+            )
+
+
+-- The error a trigger's `RAISE(ABORT, ...)` surfaces as: SQLite's extended
+-- code `SQLITE_CONSTRAINT_TRIGGER` (1811). The runtime keeps a database
+-- error's code and never its driver text, so the trigger's own message is
+-- not observable and the code is what tells its refusal from any other
+-- failure.
+triggerAbortError : String
+triggerAbortError =
+    "db: database error [1811]"
+
+
+-- The head moves only from the head it was read as: a compare-and-set from a
+-- head that is not current fails with a typed error, and the review row
+-- written in the same transaction is rolled back with it, so a decision can
+-- never be kept without its link. Red if `advanceHead` ignores a zero-row
+-- update.
+concurrentHeadCasRefuses : Db -> Task.Task Error Bool
+concurrentHeadCasRefuses db =
+    do
+        current <- LibDb.currentHead db
+        refusedAsConflict <- staleCasRefused db (Index.chainLink current (uid "stale-uid") "stale-hash")
+        n <- countReviewRows db (uid "cas-uid") "cas-hash"
+        headAfter <- reviewHeadOf db
+        Task.succeed (refusedAsConflict && n == 0 && headAfter == Index.chainHeadText current)
+
+
+-- One transaction that writes a review row, then moves the head from
+-- `stale`; True when it fails as a conflict.
+staleCasRefused : Db -> Index.ChainHead -> Task.Task Error Bool
+staleCasRefused db stale =
+    Db.withTransaction db
+        (\tx ->
+            do
+                Db.exec tx "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "cas-uid"), SqlString "cas-hash", SqlString "approve", SqlNull (SqlString ""), SqlInt 0 ]
+                LibDb.advanceHead tx stale (Index.chainLink stale (uid "cas-uid") "cas-hash")
+        )
+        |> Task.map (\_ -> False)
+        |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "")))
+
+
+-- A review file whose log head is gone fails the startup probe, naming the
+-- variable and the file. Red if the probe only migrates.
+probeRefusesReviewWithoutHead : Task.Task Error Bool
+probeRefusesReviewWithoutHead =
+    freshDir "ipe-review-probe-no-head" |> Task.andThen probeRefusesReviewWithoutHeadIn
+
+
+probeRefusesReviewWithoutHeadIn : String -> Task.Task Error Bool
+probeRefusesReviewWithoutHeadIn base =
+    let
+        dbPath =
+            base ++ "/review.db"
+    in
+    do
+        db <- migratedReviewAt dbPath
+        Db.exec db "DROP TABLE review_head" []
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        message <- probeMessage (LibDb.probe loc)
+        removeReviewFiles dbPath
+        Task.succeed (probeNames "IPE_REVIEW_DB" dbPath message)
+
+
+-- A review file whose append-only guards are gone fails the startup probe,
+-- naming the variable and the file: one trigger dropped, and the log renamed
+-- away and recreated bare (its triggers follow the renamed table). An intact
+-- file passes. Red if the probe does not check the guards on their table.
+probeRefusesReviewWithoutGuards : Task.Task Error Bool
+probeRefusesReviewWithoutGuards =
+    freshDir "ipe-review-probe-no-guards" |> Task.andThen probeRefusesReviewWithoutGuardsIn
+
+
+probeRefusesReviewWithoutGuardsIn : String -> Task.Task Error Bool
+probeRefusesReviewWithoutGuardsIn base =
+    let
+        dropped =
+            base ++ "/dropped.db"
+
+        renamed =
+            base ++ "/renamed.db"
+    in
+    do
+        intact <- probeAfterEdits (base ++ "/intact.db") []
+        droppedMessage <- probeAfterEdits dropped [ "DROP TRIGGER review_no_replace" ]
+        renamedMessage <- probeAfterEdits renamed [ "ALTER TABLE review RENAME TO review_old", "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" ]
+        Task.succeed (intact == Nothing && probeNames "IPE_REVIEW_DB" dropped droppedMessage && probeNames "IPE_REVIEW_DB" renamed renamedMessage)
+
+
+-- The probe's refusal message on a migrated review file at `dbPath` after
+-- `edits` ran on it; Nothing when the probe passes.
+probeAfterEdits : String -> List String -> Task.Task Error (Maybe String)
+probeAfterEdits dbPath edits =
+    do
+        db <- migratedReviewAt dbPath
+        Task.sequence (List.map (\sql -> Db.exec db sql []) edits)
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        message <- probeMessage (LibDb.probe loc)
+        removeReviewFiles dbPath
+        Task.succeed message
 
 
 -- Re-reviewing the same pair must succeed (any Err here fails
@@ -116,11 +308,11 @@ isApproved m =
             False
 
         Just row ->
-            case row.reason of
-                Nothing ->
-                    row.decision == "approve"
+            case row.decision of
+                StoredApproved ->
+                    True
 
-                Just _ ->
+                StoredRefused _ ->
                     False
 
 
@@ -152,9 +344,8 @@ reasonBounded db =
                     Error.kind e == Error.kind (Error.invalidInput "")
     in
     do
-        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "long-uid", SqlString "hL", SqlString "refuse", SqlString (atBound ++ "x"), SqlInt 0 ]
-        storedRefused <- LibDb.findDecision db "long-uid" "hL" |> Task.map (storedReasonShown "reason not shown: 501 characters, over the 500-character limit")
-        Db.exec db "DELETE FROM review WHERE uid = ?" [ SqlString "long-uid" ]
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "long-uid"), SqlString "hL", SqlString "refuse", SqlString (atBound ++ "x"), SqlInt 0 ]
+        storedRefused <- LibDb.findDecision db (uid "long-uid") "hL" |> Task.map (storedReasonShown "reason not shown: 501 characters, over the 500-character limit")
         Task.succeed
             (rejected ""
                 && rejected "   "
@@ -184,12 +375,12 @@ storedReasonShown expected found =
             False
 
         Just row ->
-            case row.reason of
-                Nothing ->
+            case row.decision of
+                StoredApproved ->
                     False
 
-                Just r ->
-                    row.decision == "refuse" && SafeText.toString (LibDb.storedReasonText r) == expected
+                StoredRefused r ->
+                    SafeText.toString (LibDb.storedReasonText r) == expected
 
 
 decisionRoundtrip : Task.Task Error Bool
@@ -199,8 +390,8 @@ decisionRoundtrip =
             do
                 insertBoth "ipe-review-roundtrip-index" db
                 Task.map2 checkPair
-                    (LibDb.findDecision db "u-a" (Index.attest viewA))
-                    (LibDb.findDecision db "u-b" (Index.attest viewB))
+                    (LibDb.findDecision db (uid "u-a") (Index.attest viewA))
+                    (LibDb.findDecision db (uid "u-b") (Index.attest viewB))
         )
 
 
@@ -217,10 +408,9 @@ storedOverlongReasonDecodes db =
             "reason not shown: 5000 characters, over the 500-character limit"
     in
     do
-        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "huge-uid", SqlString "hH", SqlString "refuse", SqlString (String.repeat 5000 "y"), SqlInt 0 ]
-        byPair <- LibDb.findDecision db "huge-uid" "hH"
-        byUid <- LibDb.findLatestForUid db "huge-uid"
-        Db.exec db "DELETE FROM review WHERE uid = ?" [ SqlString "huge-uid" ]
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "huge-uid"), SqlString "hH", SqlString "refuse", SqlString (String.repeat 5000 "y"), SqlInt 0 ]
+        byPair <- LibDb.findDecision db (uid "huge-uid") "hH"
+        byUid <- LibDb.findLatestForUid db (uid "huge-uid")
         Task.succeed (storedReasonShown expected byPair && storedReasonShown expected byUid)
 
 
@@ -229,9 +419,8 @@ storedOverlongReasonDecodes db =
 storedBlankReasonDecodes : Db -> Task.Task Error Bool
 storedBlankReasonDecodes db =
     do
-        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString "blank-uid", SqlString "hB", SqlString "refuse", SqlString "\n\t", SqlInt 0 ]
-        found <- LibDb.findDecision db "blank-uid" "hB"
-        Db.exec db "DELETE FROM review WHERE uid = ?" [ SqlString "blank-uid" ]
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "blank-uid"), SqlString "hB", SqlString "refuse", SqlString "\n\t", SqlInt 0 ]
+        found <- LibDb.findDecision db (uid "blank-uid") "hB"
         Task.succeed (storedReasonShown "reason not shown: it is blank" found)
 
 
@@ -245,11 +434,17 @@ historyWalkMatchesOrder db =
         seeded =
             [ ( "walk-b", "h1", 7 ), ( "walk-a", "h2", 7 ), ( "walk-a", "h1", 7 ), ( "walk-c", "h1", 3 ), ( "walk-c", "h2", 3 ), ( "walk-d", "h1", 9 ), ( "walk-e", "h1", 1 ) ]
 
-        seed ( uid, bodyHash, at ) =
-            Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ SqlString uid, SqlString bodyHash, SqlString "refuse", SqlString "r", SqlInt at ]
+        seed ( label, bodyHash, at ) =
+            Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid label), SqlString bodyHash, SqlString "refuse", SqlString "r", SqlInt at ]
+
+        walkKey ( label, bodyHash ) =
+            ( Uid.toString (uid label), bodyHash )
+
+        walkUids =
+            List.map (\( label, _, _ ) -> Uid.toString (uid label)) seeded
 
         keyDecoder =
-            Db.Decode.succeed (\uid bodyHash -> ( uid, bodyHash ))
+            Db.Decode.succeed (\unit bodyHash -> ( unit, bodyHash ))
                 |> Db.Decode.required "uid" (Db.Decode.string "uid")
                 |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
     in
@@ -257,14 +452,13 @@ historyWalkMatchesOrder db =
         Task.sequence (List.map seed seeded)
         walked <- Task.loop 1000 { cursor = HistoryStart, seen = [], pages = 0 } (historyWalkStep db)
         expected <- Db.queryDecode db "SELECT uid, body_hash FROM review ORDER BY reviewed_at DESC, uid, body_hash" [] keyDecoder
-        Db.exec db "DELETE FROM review WHERE uid LIKE ?" [ SqlString "walk-%" ]
         Task.succeed
             (walked.seen
                 == expected
                 && walked.pages
                 > 3
-                && List.filter (\( uid, _ ) -> String.startsWith "walk-" uid) walked.seen
-                == [ ( "walk-d", "h1" ), ( "walk-a", "h1" ), ( "walk-a", "h2" ), ( "walk-b", "h1" ), ( "walk-c", "h1" ), ( "walk-c", "h2" ), ( "walk-e", "h1" ) ]
+                && List.filter (\( unit, _ ) -> List.member unit walkUids) walked.seen
+                == List.map walkKey [ ( "walk-d", "h1" ), ( "walk-a", "h1" ), ( "walk-a", "h2" ), ( "walk-b", "h1" ), ( "walk-c", "h1" ), ( "walk-c", "h2" ), ( "walk-e", "h1" ) ]
             )
 
 
@@ -280,11 +474,12 @@ type alias HistoryWalk =
 historyWalkStep : Db -> HistoryWalk -> Task.Task Error (Task.Step HistoryWalk HistoryWalk)
 historyWalkStep db state =
     do
-        page <- LibDb.historyPage db 2 state.cursor
+        size <- pageOf 2
+        page <- LibDb.historyPage db size state.cursor
         let
             next =
                 { cursor = state.cursor
-                , seen = state.seen ++ List.map (\row -> ( row.uid, row.bodyHash )) page.rows
+                , seen = state.seen ++ List.map (\row -> ( Uid.toString row.uid, row.bodyHash )) page.rows
                 , pages = state.pages + 1
                 }
         in
@@ -306,21 +501,46 @@ isLastHistoryPage next =
             False
 
 
--- A History page of no rows, or fewer, is refused as invalid input before
--- any read.
+-- A page size is parsed before any read: none of no rows, fewer, or past
+-- the ceiling has a `PageSize`, so no page read can be asked for one. Both
+-- bounds parse, and a one-row page returns at most one row.
 historyPageSizeRefused : Db -> Task.Task Error Bool
 historyPageSizeRefused db =
     let
-        refused size =
-            LibDb.historyPage db size HistoryStart
-                |> Task.map (\_ -> False)
-                |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.invalidInput "")))
+        refused rows =
+            case PageSize.parse rows of
+                Ok _ ->
+                    False
+
+                Err e ->
+                    Error.kind e == Error.kind (Error.invalidInput "")
+
+        accepted rows =
+            case PageSize.parse rows of
+                Ok size ->
+                    PageSize.toInt size == rows
+
+                Err _ ->
+                    False
     in
     do
-        zero <- refused 0
-        negative <- refused (-1)
-        one <- LibDb.historyPage db 1 HistoryStart |> Task.map (\page -> List.length page.rows <= 1)
-        Task.succeed (zero && negative && one)
+        one <- pageOf 1
+        onePage <- LibDb.historyPage db one HistoryStart
+        Task.succeed
+            (refused 0
+                && refused (-1)
+                && refused (PageSize.maxRows + 1)
+                && accepted 1
+                && accepted PageSize.maxRows
+                && List.length onePage.rows
+                <= 1
+            )
+
+
+-- A page of `rows` rows; a size the parser refuses fails the task.
+pageOf : Int -> Task.Task Error PageSize
+pageOf rows =
+    Task.fromResult (PageSize.parse rows)
 
 
 -- Each History state has its own text: a load in flight or a failed load
@@ -333,10 +553,10 @@ historyStateTextsDistinct =
             Error.unexpected "boom"
 
         row =
-            { uid = "u-h", bodyHash = "h", decision = "approve", reason = Nothing, reviewedAt = Timestamp.fromUnixMillis 0, name = Nothing }
+            { uid = uid "u-h", bodyHash = "h", decision = StoredApproved, reviewedAt = Timestamp.fromUnixMillis 0, name = Nothing }
 
         later =
-            HistoryAfter (Timestamp.fromUnixMillis 0) "u-h" "h"
+            HistoryAfter (Timestamp.fromUnixMillis 0) (uid "u-h") "h"
     in
     List.all identity
         [ Queue.historyStatusText HistoryLoading == Just "Loading history…"
@@ -361,7 +581,7 @@ historyPagesUseIndex db =
     in
     do
         first <- LibDb.historyPlan db HistoryStart
-        later <- LibDb.historyPlan db (HistoryAfter (Timestamp.fromUnixMillis 5) "u" "h")
+        later <- LibDb.historyPlan db (HistoryAfter (Timestamp.fromUnixMillis 5) (uid "u") "h")
         Task.succeed (indexed first && indexed later && List.any (String.startsWith "SEARCH") later)
 
 
@@ -383,10 +603,11 @@ loadTicketsSettleLatest =
         && not (Queue.isCurrentLoad second first)
 
 
--- A write that fails for a reason other than the key keeps its own error, and
--- a failed insert whose pair already has a row is the duplicate no-op. A
--- read-only connection makes every insert fail without a key conflict, with
--- SQLite's read-only result code (`SQLITE_READONLY`, 8).
+-- A write that fails keeps its own error: a read-only connection makes every
+-- insert fail with SQLite's read-only result code (`SQLITE_READONLY`, 8),
+-- one whose pair already has a row included, since the duplicate is decided
+-- by the database at the write, never by a read beforehand. Nothing is
+-- recorded and the log's head does not move.
 failedWritesKeepTheirError : Task.Task Error Bool
 failedWritesKeepTheirError =
     freshDir "ipe-review-failed-writes" |> Task.andThen failedWritesKeepTheirErrorIn
@@ -407,16 +628,18 @@ failedWritesKeepTheirErrorIn base =
         dir <- Task.fromResult (Path.fromString base)
         File.mkdirAll dir
         removeReviewFiles dbPath
-        seen <- attestedFor "ipe-review-failed-writes-index" "u-a"
-        fresh <- attestedFor "ipe-review-failed-writes-index" "u-b"
+        seen <- attestedFor "ipe-review-failed-writes-index" (uid "u-a")
+        fresh <- attestedFor "ipe-review-failed-writes-index" (uid "u-b")
         rw <- migratedReviewAt dbPath
         LibDb.insertDecision rw seen Approved
+        head <- reviewHeadOf rw
         ro <- openReadOnlyAt dbPath
-        duplicate <- LibDb.insertDecision ro seen Approved
+        duplicate <- failedReadOnly (LibDb.insertDecision ro seen Approved)
         freshReview <- failedReadOnly (LibDb.insertDecision ro fresh Approved)
-        kept <- LibDb.findDecision rw "u-b" (Index.attest viewB)
+        kept <- LibDb.findDecision rw (uid "u-b") (Index.attest viewB)
+        headAfter <- reviewHeadOf rw
         removeReviewFiles dbPath
-        Task.succeed (duplicate == 0 && freshReview && not (hasDecision kept))
+        Task.succeed (duplicate && freshReview && not (hasDecision kept) && headAfter == head)
 
 
 readOnlyWriteError : String
@@ -460,7 +683,7 @@ historyRoundtripIn base =
             )
         |> Task.andThen
             (\db ->
-                LibDb.historyPage db LibDb.historyPageSize HistoryStart
+                LibDb.historyPage db PageSize.history HistoryStart
                     |> Task.map
                         (\page ->
                             let
@@ -470,9 +693,8 @@ historyRoundtripIn base =
                             isLastHistoryPage page.next
                                 && List.length rows
                                 == 2
-                                && List.member ( "u-a", "approve" ) (List.map (\r -> ( r.uid, r.decision )) rows)
-                                && List.member ( "u-b", "refuse" ) (List.map (\r -> ( r.uid, r.decision )) rows)
-                                && List.member (Just "too big") (List.map (\r -> Maybe.map (\s -> SafeText.toString (LibDb.storedReasonText s)) r.reason) rows)
+                                && List.member ( uid "u-a", Nothing ) (List.map historyKey rows)
+                                && List.member ( uid "u-b", Just "too big" ) (List.map historyKey rows)
                         )
             )
         |> Task.andThen
@@ -484,13 +706,24 @@ historyRoundtripIn base =
             )
 
 
+-- A History row's uid and, for a refusal, its shown reason.
+historyKey : LibDb.ReviewRow -> ( Uid, Maybe String )
+historyKey row =
+    case row.decision of
+        StoredApproved ->
+            ( row.uid, Nothing )
+
+        StoredRefused reason ->
+            ( row.uid, Just (SafeText.toString (LibDb.storedReasonText reason)) )
+
+
 -- Fixture unit u-a approved and u-b refused "too big", each against the
 -- `Attested` pair its seeded source re-verifies to.
-insertBoth : String -> Db -> Task.Task Error Int
+insertBoth : String -> Db -> Task.Task Error Index.Written
 insertBoth scratch db =
     do
-        a <- attestedFor scratch "u-a"
-        b <- attestedFor scratch "u-b"
+        a <- attestedFor scratch (uid "u-a")
+        b <- attestedFor scratch (uid "u-b")
         LibDb.insertDecision db a Approved
         tooBig <- refuse "too big"
         LibDb.insertDecision db b tooBig
@@ -501,7 +734,11 @@ checks =
     Task.sequence
         [ check "drain_cursor is gone after migrate" drainCursorGoneAfterMigrate
         , check "open does not migrate" openDoesNotMigrate
-        , check "a duplicate attested decision is a no-op" duplicateInsertIsNoop
+        , check "a duplicate attested decision is already decided" duplicateDecisionAlreadyDecided
+        , check "the review log is append-only" (onFreshReview "ipe-review-reviewLogAppendOnly" reviewLogAppendOnly)
+        , check "a head compare-and-set from a stale head is refused" (onFreshReview "ipe-review-concurrentHeadCasRefuses" concurrentHeadCasRefuses)
+        , check "a review file without its log head fails the probe" probeRefusesReviewWithoutHead
+        , check "a review file without its append-only guards fails the probe" probeRefusesReviewWithoutGuards
         , check "refusal reason is non-blank and bounded" (onFreshReview "ipe-review-reasonBounded" reasonBounded)
         , check "a stored over-long reason decodes and shows its length" (onFreshReview "ipe-review-storedOverlongReasonDecodes" storedOverlongReasonDecodes)
         , check "a stored blank reason decodes as blank" (onFreshReview "ipe-review-storedBlankReasonDecodes" storedBlankReasonDecodes)

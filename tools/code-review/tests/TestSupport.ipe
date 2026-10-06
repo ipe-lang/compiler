@@ -47,6 +47,12 @@ module TestSupport exposing
     , listSecond
     , isUnitA
     , isUnitB
+    , isNew
+    , isUnrecorded
+    , modifiedFrom
+    , mirroredCount
+    , stampOf
+    , reviewHeadOf
     , cleanupIndex
     , removeFileIfAny
     , codeText
@@ -66,9 +72,12 @@ module TestSupport exposing
     , probeMessage
     , probeNames
     , maybeContains
+    , uid
+    , resyncBoundOf
     )
 
 import Ipe.ByteSize as ByteSize
+import Ipe.Bytes as Bytes
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -89,15 +98,18 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Epoch as Epoch
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
+import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
+import Lib.Uid as Uid exposing (Uid)
 
 
 tableExists : Db -> String -> Task.Task Error Bool
@@ -111,12 +123,47 @@ tableExists db name =
         |> Task.map (\rows -> List.length rows == 1)
 
 
-countReviewRows : Db -> String -> String -> Task.Task Error Int
-countReviewRows db uid bodyHash =
+-- The fixture unit id named by `label`: the label's bytes in lowercase hex,
+-- right-padded with `0` to 64 digits, so fixture ids keep the order of their
+-- labels. A label past 32 bytes is named by the hash of the label instead,
+-- so two distinct long labels stay distinct ids. It goes through `Uid.parse`
+-- like any id.
+uid : String -> Uid
+uid label =
+    case Uid.parse (fixtureHex label) of
+        Ok parsed ->
+            parsed
+
+        Err _ ->
+            uid ""
+
+
+fixtureHex : String -> String
+fixtureHex label =
+    let
+        hex =
+            Bytes.toHex (Bytes.fromString label)
+    in
+    if String.length hex > 64 then
+        Crypto.sha256 label
+
+    else
+        String.padRight 64 '0' hex
+
+
+-- A rebuild bound of `pageCeiling` pages of `rows` pairs, parsed the one
+-- way the app parses it.
+resyncBoundOf : Int -> Int -> Task.Task Error Queue.ResyncBound
+resyncBoundOf rows pageCeiling =
+    Task.fromResult (PageSize.parse rows |> Result.andThen (\size -> Queue.makeResyncBound size pageCeiling))
+
+
+countReviewRows : Db -> Uid -> String -> Task.Task Error Int
+countReviewRows db unit bodyHash =
     Db.findWhere db
         "review"
         (Sql.and
-            (Sql.eq (Sql.column "uid") (Sql.string uid))
+            (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql unit)))
             (Sql.eq (Sql.column "body_hash") (Sql.string bodyHash))
         )
         |> Task.map List.length
@@ -199,6 +246,12 @@ viewTag view =
         Unreadable e ->
             "unreadable: " ++ Error.toString e
 
+        TooLarge (SpanLines o) ->
+            "too large lines " ++ String.fromInt o.lines
+
+        TooLarge (ViewBytes o) ->
+            "too large bytes " ++ String.fromInt (ByteSize.toBytes o.size)
+
 
 shownTextOf : Index.SourceView -> Maybe String
 shownTextOf view =
@@ -212,6 +265,9 @@ shownTextOf view =
         Unreadable _ ->
             Nothing
 
+        TooLarge _ ->
+            Nothing
+
 
 shownOf : Index.SourceView -> Maybe Index.ShownSource
 shownOf view =
@@ -223,6 +279,9 @@ shownOf view =
             Nothing
 
         Unreadable _ ->
+            Nothing
+
+        TooLarge _ ->
             Nothing
 
 
@@ -243,9 +302,9 @@ langName lang =
             "Unknown"
 
 
-unitViewTag : String -> List PageEntry -> String
-unitViewTag uid units =
-    case List.find (\u -> u.uid == uid) units of
+unitViewTag : Uid -> List PageEntry -> String
+unitViewTag unit units =
+    case List.find (\u -> u.uid == unit) units of
         Just u ->
             viewTag u.view
 
@@ -389,7 +448,7 @@ insertUnitRows : Db -> Task.Task Error Int
 insertUnitRows conn =
     Db.exec conn
         "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-        [ SqlString "u-a"
+        [ Uid.toSql (uid "u-a")
         , SqlString "ipe:src/Lib.rs"
         , SqlString "fn"
         , SqlString "answer"
@@ -405,7 +464,7 @@ insertUnitRows conn =
             (\_ ->
                 Db.exec conn
                     "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-                    [ SqlString "u-b"
+                    [ Uid.toSql (uid "u-b")
                     , SqlString "ipe:src/Main.ipe"
                     , SqlString "module"
                     , SqlString "Main"
@@ -421,37 +480,20 @@ insertUnitRows conn =
         |> Task.andThen
             (\_ ->
                 Db.exec conn
-                    "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-                    [ SqlString "u-del"
-                    , SqlString "ipe:src/Gone.ipe"
-                    , SqlString "module"
-                    , SqlString "Gone"
-                    , SqlString "Gone"
-                    , SqlInt 1
-                    , SqlInt 1
-                    , SqlString "user"
-                    , SqlNull (SqlString "")
-                    , SqlString "hashC"
-                    , SqlString "shaC"
-                    ]
+                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
+                    [ Uid.toSql (uid "u-a"), SqlString "new", SqlNull (SqlString ""), SqlString (Index.attest viewA), SqlString "shaA", SqlInt 1 ]
             )
         |> Task.andThen
             (\_ ->
                 Db.exec conn
                     "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
-                    [ SqlString "u-a", SqlString "new", SqlNull (SqlString ""), SqlNull (SqlString ""), SqlString "shaA", SqlInt 1 ]
+                    [ Uid.toSql (uid "u-b"), SqlString "modified", SqlString "oldB", SqlString (Index.attest viewB), SqlString "shaB", SqlInt 2 ]
             )
         |> Task.andThen
             (\_ ->
                 Db.exec conn
                     "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
-                    [ SqlString "u-b", SqlString "modified", SqlString "oldB", SqlString (Index.attest viewB), SqlString "shaB", SqlInt 2 ]
-            )
-        |> Task.andThen
-            (\_ ->
-                Db.exec conn
-                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
-                    [ SqlString "u-del", SqlString "deleted", SqlString "hashC", SqlNull (SqlString ""), SqlString "shaC", SqlInt 3 ]
+                    [ Uid.toSql (uid "u-del"), SqlString "deleted", SqlString "hashC", SqlNull (SqlString ""), SqlString "shaC", SqlInt 3 ]
             )
 
 
@@ -475,13 +517,14 @@ envReview =
 
 
 -- Every setting a server resolves once at startup, from the current
--- environment.
+-- environment, under a freshly minted epoch.
 envAppSettings : Task.Task Error Settings.AppSettings
 envAppSettings =
     do
         index <- envSettings
         review <- envReview
-        Task.succeed { index = index, review = review }
+        epoch <- Epoch.mint
+        Task.succeed { index = index, review = review, epoch = epoch }
 
 
 -- Each request-time function below, run on settings resolved from the current
@@ -496,24 +539,24 @@ loadHistoryPageNow cursor =
     envAppSettings |> Task.andThen (\settings -> Queue.loadHistoryPage settings cursor)
 
 
-drainThenLoadNow : Index.Attested -> Index.Cursor -> Task.Task Error Queue.QueuePage
-drainThenLoadNow attested cursor =
-    envAppSettings |> Task.andThen (\settings -> Queue.drainThenLoad settings attested cursor)
+drainThenLoadNow : Index.Attested -> Index.Written -> Index.Cursor -> Task.Task Error Queue.QueuePage
+drainThenLoadNow attested written cursor =
+    envAppSettings |> Task.andThen (\settings -> Queue.drainThenLoad settings attested written cursor)
 
 
-loadUnitViewNow : String -> Task.Task Error (Maybe Index.UnitView)
-loadUnitViewNow uid =
-    envSettings |> Task.andThen (\settings -> Queue.loadUnitView settings uid)
+loadUnitViewNow : Uid -> Task.Task Error (Maybe Index.UnitView)
+loadUnitViewNow unit =
+    envSettings |> Task.andThen (\settings -> Queue.loadUnitView settings unit)
 
 
-decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
+decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideShownNow db shown decision =
     envSettings |> Task.andThen (\settings -> Queue.decide settings db shown decision)
 
 
-drainUnitNow : Index.Attested -> Task.Task Error Int
-drainUnitNow attested =
-    envSettings |> Task.andThen (\settings -> Index.drainUnit settings attested)
+drainUnitNow : Index.Attested -> Index.Written -> Task.Task Error Int
+drainUnitNow attested written =
+    envSettings |> Task.andThen (\settings -> Index.drainUnit settings attested written)
 
 
 resyncReviewedNow : Db -> Task.Task Error Int
@@ -532,47 +575,46 @@ setIndexEnv indexDb repo =
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_ROOT" repo)
 
 
--- One first-page unit with its queue row's change and the view
--- `Index.loadView` reads for it.
+-- One first-page unit with the change the index recorded for its current
+-- body and the view `Index.loadView` reads for it.
 type alias PageEntry =
-    { uid : String
+    { uid : Uid
     , unit : Index.Unit
-    , queued : Index.QueuedChange
+    , change : Index.Change
     , view : Index.SourceView
     }
 
 
--- The first queue page's units, each with its view read afterwards the one
--- way the app reads a selected unit's source, and the whole queue's count,
--- all on one index connection.
+-- The first queue page's units and the whole queue's count, from one
+-- `Index.readSnapshot`, each unit with its view read afterwards the one way
+-- the app reads a selected unit's source, all on one index connection.
 loadFirstPage : Task.Task Error { units : List PageEntry, total : Int }
 loadFirstPage =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        rows <- Index.loadPendingPage conn Index.Start
-        entries <- Task.sequence (List.map (pageEntry conn settings.roots) rows)
-        total <- Index.countPending conn
-        Task.succeed { units = entries, total = total }
+        snap <- Index.readSnapshot conn Index.Start
+        entries <- Task.sequence (List.map (pageEntry conn settings.roots) snap.rows)
+        Task.succeed { units = entries, total = snap.open }
 
 
--- The queued change comes from the page's queue row, the one place it
+-- The change comes from the page's `open_units` row, the one place it
 -- exists; the unit and its view from `loadView`, as the selected card reads them.
 pageEntry : Db -> RootMap -> Index.PendingRow -> Task.Task Error PageEntry
 pageEntry conn roots row =
     let
-        uid =
+        unit =
             row.unit.uid
     in
-    Index.loadView conn roots uid
+    Index.loadView conn roots unit
         |> Task.andThen
             (\found ->
                 case found of
                     Just loaded ->
-                        Task.succeed { uid = uid, unit = loaded.unit, queued = row.queued, view = loaded.view }
+                        Task.succeed { uid = unit, unit = loaded.unit, change = row.change, view = loaded.view }
 
                     Nothing ->
-                        Task.fail (Error.conflict ("queued unit " ++ uid ++ " has no view"))
+                        Task.fail (Error.conflict ("queued unit " ++ Uid.toString unit ++ " has no view"))
             )
 
 
@@ -582,21 +624,21 @@ indexConn =
     envSettings |> Task.andThen Index.readConnection
 
 
--- The view of unit `uid` loaded from the index the current environment names.
-loadUnitNow : String -> Task.Task Error (Maybe Index.UnitView)
-loadUnitNow uid =
+-- The view of unit `unit` loaded from the index the current environment names.
+loadUnitNow : Uid -> Task.Task Error (Maybe Index.UnitView)
+loadUnitNow unit =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        Index.loadView conn settings.roots uid
+        Index.loadView conn settings.roots unit
 
 
--- A decision on unit `uid` made the one way the app makes it: through
+-- A decision on unit `unit` made the one way the app makes it: through
 -- `Queue.decide` on the unit's loaded, shown source. A unit not shown fails
 -- the run.
-decideNow : Db -> String -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
-decideNow db uid decision =
-    loadUnitNow uid
+decideNow : Db -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+decideNow db unit decision =
+    loadUnitNow unit
         |> Task.andThen
             (\found ->
                 case Maybe.andThen (\loaded -> shownOf loaded.view) found of
@@ -604,7 +646,7 @@ decideNow db uid decision =
                         decideShownNow db shown decision
 
                     Nothing ->
-                        Task.fail (Error.conflict ("unit " ++ uid ++ " is not shown"))
+                        Task.fail (Error.conflict ("unit " ++ Uid.toString unit ++ " is not shown"))
             )
 
 
@@ -637,6 +679,79 @@ listSecond items =
             Nothing
 
 
+isNew : Index.Change -> Bool
+isNew change =
+    case change of
+        New ->
+            True
+
+        Modified _ ->
+            False
+
+        Unrecorded ->
+            False
+
+
+isUnrecorded : Index.Change -> Bool
+isUnrecorded change =
+    case change of
+        New ->
+            False
+
+        Modified _ ->
+            False
+
+        Unrecorded ->
+            True
+
+
+-- The hash a `Modified` change replaced; Nothing for any other change.
+modifiedFrom : Index.Change -> Maybe String
+modifiedFrom change =
+    case change of
+        New ->
+            Nothing
+
+        Modified m ->
+            Just m.old
+
+        Unrecorded ->
+            Nothing
+
+
+-- How many decided pairs the index's `reviewed` copy holds.
+mirroredCount : String -> Task.Task Error Int
+mirroredCount indexDb =
+    do
+        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+        rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM reviewed" [] totalDecoder
+        case rows of
+            [ n ] ->
+                Task.succeed n
+
+            _ ->
+                Task.fail (Error.unexpected "COUNT(*) over reviewed did not return exactly one row")
+
+
+totalDecoder : Db.Decode.Decoder Int
+totalDecoder =
+    Db.Decode.succeed (\n -> n)
+        |> Db.Decode.required "total" (Db.Decode.int "total")
+
+
+-- The head stamped on the index's `reviewed` copy, Nothing when unstamped.
+stampOf : String -> Task.Task Error (Maybe String)
+stampOf indexDb =
+    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+        |> Task.andThen Index.readStamp
+
+
+-- The review log's head as text.
+reviewHeadOf : Db -> Task.Task Error String
+reviewHeadOf db =
+    LibDb.currentHead db |> Task.map Index.chainHeadText
+
+
 isUnitA : PageEntry -> Bool
 isUnitA entry =
     let
@@ -644,13 +759,8 @@ isUnitA entry =
             entry.unit
     in
     u.uid
-        == "u-a"
-        && entry.queued.change
-        == "new"
-        && entry.queued.oldHash
-        == Nothing
-        && entry.queued.newHash
-        == Nothing
+        == uid "u-a"
+        && isNew entry.change
         && SafeText.toString u.path
         == "ipe:src/Lib.rs"
         && SafeText.toString u.name
@@ -682,11 +792,9 @@ isUnitB entry =
             entry.unit
     in
     u.uid
-        == "u-b"
-        && entry.queued.change
-        == "modified"
-        && entry.queued.newHash
-        == Just (Index.attest viewB)
+        == uid "u-b"
+        && modifiedFrom entry.change
+        == Just "oldB"
         && SafeText.toString u.path
         == "ipe:src/Main.ipe"
         && SafeText.toString u.kind
@@ -791,27 +899,27 @@ tableRowCount db name =
         |> Task.map (\rows -> ( name, List.sum rows ))
 
 
--- The `Attested` proof for fixture unit `uid`, built the one way the app
+-- The `Attested` proof for fixture unit `unit`, built the one way the app
 -- builds it: the unit is loaded from a seeded scratch index, its shown
 -- source re-verified by `Index.reverify`, and the scratch index removed. A
 -- unit that is not shown fails the run.
-attestedFor : String -> String -> Task.Task Error Index.Attested
-attestedFor name uid =
-    freshScratch name |> Task.andThen (\at -> attestedIn at uid)
+attestedFor : String -> Uid -> Task.Task Error Index.Attested
+attestedFor name unit =
+    freshScratch name |> Task.andThen (\at -> attestedIn at unit)
 
 
-attestedIn : Scratch -> String -> Task.Task Error Index.Attested
-attestedIn at uid =
+attestedIn : Scratch -> Uid -> Task.Task Error Index.Attested
+attestedIn at unit =
     do
         seedIndex at.indexDb at.repo
-        found <- loadUnitNow uid
-        attested <- reverifyShown uid found
+        found <- loadUnitNow unit
+        attested <- reverifyShown unit found
         cleanupIndex at.indexDb at.repo
         Task.succeed attested
 
 
-reverifyShown : String -> Maybe Index.UnitView -> Task.Task Error Index.Attested
-reverifyShown uid found =
+reverifyShown : Uid -> Maybe Index.UnitView -> Task.Task Error Index.Attested
+reverifyShown unit found =
     case found of
         Just loaded ->
             case loaded.view of
@@ -819,13 +927,16 @@ reverifyShown uid found =
                     envSettings |> Task.andThen (\settings -> Index.reverify settings shown)
 
                 Stale _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is stale"))
+                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is stale"))
 
                 Unreadable _ ->
-                    Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is unreadable"))
+                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is unreadable"))
+
+                TooLarge _ ->
+                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is too large"))
 
         Nothing ->
-            Task.fail (Error.conflict ("fixture unit " ++ uid ++ " is not in the index"))
+            Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is not in the index"))
 
 
 -- A test file path opened read-only through the app's read URL builder, so

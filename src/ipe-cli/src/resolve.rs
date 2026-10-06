@@ -31,7 +31,8 @@ use crate::package_name::PackageName;
 use crate::project::IpeDep;
 use crate::published_version::PublishedVersion;
 use crate::remote_ingest::{
-    self, Captured, FetchBudget, Git, IngestLimit, RefsCeiling, RunError, Transfer, TreeCeiling,
+    self, Captured, ChildStderr, FetchBudget, Git, IngestLimit, RefsCeiling, RunError, Transfer,
+    TreeCeiling,
 };
 
 /// The environment variable overriding the index checkout root; tests point it
@@ -1035,12 +1036,14 @@ impl RefName {
 /// — may widen the fetch; every other failure ends it.
 #[derive(Debug)]
 enum GitStepError {
-    /// Git ran and exited non-zero, with this (truncated) stderr.
-    Exited { stderr: Vec<u8> },
+    /// Git ran and exited non-zero, with this stderr, its cut marked.
+    Exited { stderr: ChildStderr },
     /// The step crossed its budget.
     Refused(remote_ingest::IngestRefusal),
     /// A process git started held an output pipe past the grace.
     PipeHeld(remote_ingest::Stream),
+    /// Reading one of git's output pipes failed, so its output was not used.
+    PipeUnread(remote_ingest::Stream, std::io::ErrorKind),
     /// Git could not be started or waited on.
     Unavailable(std::io::Error),
     /// The staged path could not be measured.
@@ -1062,6 +1065,7 @@ impl GitStepError {
             RunError::Measure(path, e) => Self::Measure(path, e),
             RunError::Exceeded(refusal) => Self::Refused(refusal),
             RunError::PipeDrainTimeout(stream) => Self::PipeHeld(stream),
+            RunError::PipeRead(stream, kind) => Self::PipeUnread(stream, kind),
         }
     }
 
@@ -1071,6 +1075,7 @@ impl GitStepError {
             Self::Exited { .. } => true,
             Self::Refused(_)
             | Self::PipeHeld(_)
+            | Self::PipeUnread(..)
             | Self::Unavailable(_)
             | Self::Measure(..)
             | Self::Interrupted => false,
@@ -1080,16 +1085,14 @@ impl GitStepError {
     /// The CLI error for this failure of `git <args>` fetching `name`.
     fn into_cli(self, name: &PackageName, args: &[&str]) -> CliError {
         match self {
-            Self::Exited { stderr } => {
-                let stderr = String::from_utf8_lossy(&stderr);
-                CliError::Resolve(crate::text::msg::resolve_git_failed(
-                    name,
-                    &crate::style::TerminalSafe::sanitize(&args.join(" ")),
-                    &crate::style::TerminalSafe::sanitize(stderr.trim()),
-                ))
-            }
+            Self::Exited { stderr } => CliError::Resolve(crate::text::msg::resolve_git_failed(
+                name,
+                &crate::style::TerminalSafe::sanitize(&args.join(" ")),
+                &stderr.to_terminal(),
+            )),
             Self::Refused(refusal) => CliError::RemoteIngestExceeded(refusal),
             Self::PipeHeld(stream) => CliError::ChildPipeHeld(stream),
+            Self::PipeUnread(stream, kind) => CliError::ChildPipeUnread(stream, kind),
             Self::Unavailable(e) => {
                 CliError::Resolve(crate::text::msg::resolve_git_unavailable(name, &e))
             }
@@ -1261,8 +1264,8 @@ mod tests {
     use crate::project::IpeDep;
     use crate::published_version::PublishedVersion;
     use crate::remote_ingest::{
-        self, ByteBudget, FetchBudget, IngestLimit, IngestRefusal, IngestSource, LocalRefusal,
-        LocalSource, PACKAGE_FILE_MAX_BYTES, PACKAGE_SOURCE, PACKAGE_TREE_MAX_BYTES,
+        self, ByteBudget, ChildStderr, FetchBudget, IngestLimit, IngestRefusal, IngestSource,
+        LocalRefusal, LocalSource, PACKAGE_FILE_MAX_BYTES, PACKAGE_SOURCE, PACKAGE_TREE_MAX_BYTES,
         PACKAGE_TREE_MAX_DEPTH, PACKAGE_TREE_MAX_ENTRIES, REFS_MAX_BYTES, REFS_MAX_COUNT,
         RefsCeiling, RunError, Stream, Transfer, TreeCeiling,
     };
@@ -2260,10 +2263,16 @@ mod tests {
     fn only_an_exit_widens_a_fetch() {
         use std::io::{Error, ErrorKind};
 
-        assert!(GitStepError::Exited { stderr: Vec::new() }.widens());
+        assert!(
+            GitStepError::Exited {
+                stderr: ChildStderr::Whole(Vec::new())
+            }
+            .widens()
+        );
         let ending = [
             GitStepError::Refused(fetch_refused(IngestLimit::Bytes(1))),
             GitStepError::PipeHeld(Stream::Stdout),
+            GitStepError::PipeUnread(Stream::Stdout, ErrorKind::Other),
             GitStepError::Unavailable(Error::from(ErrorKind::NotFound)),
             GitStepError::Measure(PathBuf::from("stage"), Error::from(ErrorKind::NotFound)),
             GitStepError::Interrupted,
@@ -2299,6 +2308,10 @@ mod tests {
         assert!(matches!(
             run(RunError::PipeDrainTimeout(Stream::Stderr)),
             CliError::ChildPipeHeld(Stream::Stderr)
+        ));
+        assert!(matches!(
+            run(RunError::PipeRead(Stream::Stdout, ErrorKind::Other)),
+            CliError::ChildPipeUnread(Stream::Stdout, ErrorKind::Other)
         ));
     }
 

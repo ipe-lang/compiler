@@ -353,6 +353,98 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       and no `working-directory`.  A suite no required job runs is refused,
       so a refusal test cannot exist yet be advisory.  LIMIT: a suite
       outside `.github/ci/` is not inventoried.
+  22. Every cargo feature is compiled by a required job: each `[features]`
+      key of every workspace member is switched on by a cargo command of a
+      required `ci.yml` job (one a `gate` entry produced by it names or
+      aggregates; not behind a literal-false job `if:` or a job
+      `continue-on-error`) in a step with no `if:` and no
+      `continue-on-error`, at every local-action depth: check 11 governs job
+      conditions only, and a step `if:` can skip the step while the job
+      succeeds —
+      through `--features`/`-F` (plain or `pkg/feat`), `--all-features`, a
+      default feature, a feature another feature lists, or a
+      `features = [..]` edge from a compiled member (a dev-dependency edge
+      only when its crate's test targets are compiled; an optional edge
+      never).  A misspelled `--features` value switches nothing on, so its
+      feature stays uncovered and is refused; a command that names features
+      and cannot be read is refused.  `FEATURE_COVERAGE_EXEMPT` names the
+      members whose matrix another job owns (the runtime crate:
+      `runtime-feature-combos`), with a refusal for a stale entry.  LIMIT: a
+      `--workspace --exclude` run is not counted; `cfg(all(feature=a,
+      not(feature=b)))` combinations are not enumerated.
+  23. Release-target parity: ci.yml's `release-targets-run` and
+      `release-targets-freebsd` check exactly what release.yml's `build` and
+      `build-freebsd` build, and each of the four jobs is an allowlist, not
+      a scan.  The `(os, target)` pairs of the two matrices are equal (a
+      target missing from either side, or on another `os`, is refused); each
+      matrix leg holds exactly its keys (`os`, `target`, plus release.yml's
+      `artifact` and `ext`), every value a literal string of the runner-label
+      and target-triple grammar (`ext` empty or `.exe`).  A native job's
+      first three steps are exactly: its checkout (commit-pinned; on
+      release.yml's side `with: ref: ${{ needs.resolve-tag.outputs.tag }}`
+      and nothing else, in a job that needs `resolve-tag`); `uses:
+      ./.github/actions/release-target-toolchain` with `target: ${{
+      matrix.target }}`; and a `shell: bash` step whose `env` is exactly
+      `TARGET: ${{ matrix.target }}` and whose `run` is exactly the one
+      cargo line, `cargo <verb> --release --locked --features ipe/wasi_run
+      --target "$TARGET" -p ipe -p ipe-ffi-inspector` (`check` in ci.yml,
+      `build` in release.yml).  A FreeBSD job's first two steps are exactly
+      its checkout and the FreeBSD VM step (`usesh: true`, `prepare: pkg
+      install -y rust`), whose `run` is exactly the cargo line without
+      `--target` in ci.yml and opens with it in release.yml.  ci.yml's jobs
+      run nothing else.  Each pinned step is compared key for key both ways,
+      typed (`1` is not `true`, nor `'1'`), a `name` that is a literal string
+      the one key set aside; the shared loader refuses a plain scalar YAML
+      1.1 and 1.2 read differently (`yes`, `0x2`, `010`).  Both local
+      actions the shared step runs, it and `rust-toolchain-pinned`, are
+      pinned the same way: their inputs (descriptions aside) and their steps
+      (names aside) are exactly the toolchain channel read from
+      `rust-toolchain.toml`, the commit-pinned `dtolnay/rust-toolchain`,
+      `rustc --version`, the commit-pinned `Swatinem/rust-cache`, and the
+      musl install on a musl target; nothing else runs before a cargo
+      command.  The job keys are only `name`, `needs`, `if`,
+      `timeout-minutes`, `strategy` (native jobs only, a boolean `fail-fast`
+      and an `include` list) and `steps`, `runs-on` exactly `${{ matrix.os
+      }}` or `ubuntu-latest`; the workflow keys are only `name`, `run-name`,
+      `on`, `permissions`, `concurrency`, `jobs` and `env`, and each
+      workflow's `env` is exactly its entries in the closed, value-pinned
+      `ALLOWED_ENV_DIFFERENCES`, each named with its why.  The program a step
+      runs is never read, so no spelling (a glob, an alias, a function, a
+      `PATH` edit, a download) can reach the region: only the pinned text
+      can.  After release.yml's cargo command, as defence in depth: the first
+      step is each job's only checkout (`uses:` read with owner and repo
+      case-folded, as GitHub reads them, in the job and its local actions
+      alike), every `run` step names `shell: bash`, and a `cargo` or `rustc`
+      word (as written, continuations joined, or as the shell reads it:
+      `c""argo`, an `sh -c` body, `cargo-zigbuild`) is refused.
+      release.yml's completeness `expected` list is exactly the artifacts
+      its jobs publish.  Both release builds carry `--features
+      ipe/wasi_run`, so the shipped `ipe` has the embedded WASI run its
+      refusal text promises.
+      LIMIT: `cargo check` does not link, so a link-time failure of a target
+      is not seen; the FreeBSD toolchain is the VM's unpinned `pkg install
+      rust`.  LIMIT: the internals of the third-party actions (checkout,
+      rust-cache, the toolchain and VM actions) are not read: what they run,
+      write to `$GITHUB_ENV`/`$GITHUB_PATH` or restore, and whether the VM
+      shell stops on the cargo line's failure; rust-cache's `save-if` reads
+      `github.ref`, so the cache a run restores depends on the event; a build
+      script or proc-macro reading the environment or the runner is not
+      proven absent.  LIMIT: steps after the cargo step (packaging, release
+      VM lines after the cargo line) are unverified beyond the scans above
+      and can replace or rebuild the shipped artifact (`curl -o dist/ipe`, a
+      script, a compiler named at run time).  LIMIT: a job in release.yml
+      outside the pinned set, or the publish job, can upload or replace an
+      artifact under a shipped name.  LIMIT: a release run takes the local
+      actions from the tag's checked-out tree, so a tag off main carries
+      composite text that CI never verified.
+  LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
+  to reach its step's exit status — `cargo .. || true`, an `exit 0` before
+  it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
+  modelled — nor proven to run the toolchain's cargo — an earlier step's
+  `$GITHUB_PATH` or `$GITHUB_ENV` write, a `cargo` shell function or alias,
+  or a `shell:` that is not a shell.  Check 23 pins its cargo lines and
+  every step before them instead (the one-line bash step stops on cargo's
+  failure); its residue is the third-party LIMIT above.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 `git ls-files` locally to list tracked paths.
@@ -433,6 +525,17 @@ MOLD_INSTALL_WORD_RE = re.compile(r"(?:^|[|;&(]\s*|(?<![A-Za-z0-9_-])sudo\s+)(?:
 # `/` (a subpath), so `owner/repo/sub@ref` names the same action as
 # `owner/repo@ref`.
 USES_REPO_RE = re.compile(r"([^/@]+/[^/@]+)(?=[/@])")
+
+
+def uses_action(uses: object, owner_repo: str) -> bool:
+    """Whether a `uses:` value runs the remote action `owner_repo`, at any ref
+    or subpath. GitHub reads owner and repo case-insensitively, so
+    `Actions/Checkout@v4` is `actions/checkout`: every recogniser of a remote
+    action goes through this one comparison."""
+    if not isinstance(uses, str):
+        return False
+    m = USES_REPO_RE.match(uses.casefold())
+    return m is not None and m[1] == owner_repo.casefold()
 # No job wraps or replaces rustc. SSOT: every env-var name that hands rustc a
 # wrapper.
 RUSTC_WRAPPER_VAR = "RUSTC_WRAPPER"
@@ -666,9 +769,9 @@ LEGACY_COMMAND_RE = re.compile(r"::\s*(?:set-env|add-path|save-state|set-output)
 # Bound on YAML nesting walked for string scalars; deeper is refused.
 STRING_SCALAR_DEPTH_LIMIT = 64
 
-# Bound on local-action nesting; a chain deeper than this is refused, never
-# assumed closed.
-LOCAL_ACTION_DEPTH_LIMIT = 20
+# Bound on local-action nesting (a composite whose steps use another local
+# action); a chain deeper than this is refused, never assumed closed.
+LOCAL_ACTION_DEPTH_LIMIT = 4
 
 
 VALID_DISPOSITIONS = {"gate", "gate-external", "nightly-gate", "informational", "delete"}
@@ -936,10 +1039,6 @@ class Step:
     @property
     def uses(self) -> str | None:
         return self._str("uses")
-
-    @property
-    def uses_folded(self) -> str:
-        return (self.uses or "").casefold()
 
     @property
     def run(self) -> str | None:
@@ -1496,8 +1595,7 @@ def _downloads_archive(job: dict) -> bool:
         uses = st.get("uses")
         with_ = st.get("with")
         if (
-            isinstance(uses, str)
-            and uses.startswith("actions/download-artifact@")
+            uses_action(uses, "actions/download-artifact")
             and isinstance(with_, dict)
             and with_.get("name") == HEAVY_SHARD_ARTIFACT
         ):
@@ -2464,7 +2562,7 @@ WASM_RUNNERS: dict[str, tuple[str, str, str]] = {
     "wasm32-unknown-unknown": ("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER", "wasm-bindgen-test-runner", "wasm-bindgen"),
 }
 WASM_RUNNER_CRATES = frozenset({"wasm-bindgen-cli"})
-_TOOL_INSTALLER = "taiki-e/install-action@"
+_TOOL_INSTALLER = "taiki-e/install-action"
 # The one step `if:` a claim step may carry: the release-only trivial pass.
 _CLAIM_STEP_GUARDS = frozenset({"needs.changes.outputs.release_only != 'true'"})
 _TEST_RUNS = frozenset({"test", "nextest run", "bench"})
@@ -2583,7 +2681,7 @@ def _claim_config(repo: str, platform: str) -> str | None:
 def _tool_pins(step: dict) -> list[str]:
     """The `tool:` items of a `taiki-e/install-action` step, else none."""
     uses = step.get("uses")
-    if not isinstance(uses, str) or not uses.startswith(_TOOL_INSTALLER):
+    if not uses_action(uses, _TOOL_INSTALLER):
         return []
     with_ = step.get("with")
     tool = with_.get("tool") if isinstance(with_, dict) else None
@@ -2780,7 +2878,7 @@ def check_test_claims(errors: list[str], root: str = REPO_ROOT) -> None:
                 if inv.subcommand == "install" and any(c.split("@", 1)[0] in WASM_RUNNER_CRATES for c in inv.install_crates):
                     errors.append(
                         f"check 20: {loc_job} runs `{found.line}`; install the runner through the pinned "
-                        f"{_TOOL_INSTALLER.rstrip('@')} step instead; refused"
+                        f"{_TOOL_INSTALLER} step instead; refused"
                     )
                 if inv.subcommand not in _TEST_RUNS or inv.no_run or not (inv.target or "").startswith("wasm32"):
                     continue
@@ -2835,8 +2933,6 @@ IPE_PACKAGE = "ipe"
 IPE_PACKAGE_DIR = "src/ipe-cli"
 # Cargo subcommands that compile the selected package's binary.
 _CARGO_COMPILES = frozenset({"build", "run", "rustc", "install"})
-# Nesting bound for a composite action whose steps use another local action.
-LOCAL_ACTION_DEPTH_LIMIT = 4
 WORKFLOW_PATTERNS = ("*.yml", "*.yaml")
 
 
@@ -2866,14 +2962,19 @@ def _default_wd(container: dict) -> str | None:
 
 
 def _steps_cargo(
-    steps: object, repo: str, wd: str | None, depth: int = 0
+    steps: object, repo: str, wd: str | None, depth: int = 0, unconditional: bool = False
 ) -> list[cargo_invocation.Found]:
     """Every cargo invocation `steps` run, each with its directory: every
     `run:` (here-document bodies included) from its `working-directory` (else
-    `wd`), and the steps of each local composite action a step `uses`."""
+    `wd`), and the steps of each local composite action a step `uses`. With
+    `unconditional`, a step (at any action depth) that has an `if:` or a
+    masking `continue-on-error` is left out: it can be skipped or fail while
+    its job succeeds."""
     out: list[cargo_invocation.Found] = []
     for st in steps if isinstance(steps, list) else []:
         if not isinstance(st, dict):
+            continue
+        if unconditional and not _unconditional_step(st):
             continue
         uses = st.get("uses")
         if isinstance(uses, str) and uses.startswith("./"):
@@ -2892,7 +2993,7 @@ def _steps_cargo(
                 continue
             runs = action.get("runs") if isinstance(action, dict) else None
             if isinstance(runs, dict) and runs.get("using") == "composite":
-                out.extend(_steps_cargo(runs.get("steps"), repo, None, depth + 1))
+                out.extend(_steps_cargo(runs.get("steps"), repo, None, depth + 1, unconditional))
             continue
         run = st.get("run")
         if not isinstance(run, str):
@@ -2905,14 +3006,14 @@ def _steps_cargo(
     return out
 
 
-def _job_cargo(job: dict, repo: str, doc: object) -> list[cargo_invocation.Found]:
+def _job_cargo(job: dict, repo: str, doc: object, unconditional: bool = False) -> list[cargo_invocation.Found]:
     """Every cargo invocation of `job` (see `_steps_cargo`); its default
     directory is the job's `defaults.run.working-directory`, else the
     workflow's."""
     wd = _default_wd(job)
     if wd is None and isinstance(doc, dict):
         wd = _default_wd(doc)
-    return _steps_cargo(job.get("steps"), repo, wd)
+    return _steps_cargo(job.get("steps"), repo, wd, unconditional=unconditional)
 
 
 def _workspace_layout(repo: str, tracked: list[str] | None) -> cargo_invocation.Layout | str:
@@ -2990,7 +3091,7 @@ def _artifact_steps(job: dict, action: str) -> set[str]:
         if not isinstance(st, dict):
             continue
         uses, with_ = st.get("uses"), st.get("with")
-        if isinstance(uses, str) and uses.startswith(f"actions/{action}-artifact@"):
+        if uses_action(uses, f"actions/{action}-artifact"):
             name = with_.get("name") if isinstance(with_, dict) else None
             out.add(name if isinstance(name, str) else "")
     return out
@@ -4095,10 +4196,7 @@ def _uses_repo(st: Step, owner_repo: str) -> bool:
     """Whether `st` runs the remote action `owner_repo` (case-folded), at any
     ref or subpath. A name ban is hygiene, not a trust boundary: a fork under
     another owner passes it, and check 7's SHA pin is what bounds that."""
-    if st.uses is None:
-        return False
-    m = USES_REPO_RE.match(st.uses_folded)
-    return m is not None and m[1] == owner_repo.casefold()
+    return uses_action(st.uses, owner_repo)
 
 
 def _refuse_rust_cache_save(st: Step, loc: str, errors: list[str]) -> None:
@@ -5231,6 +5329,10 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
         template engine): legitimate tools take author-written `-c` text,
         so the verifier cannot tell the two apart; and interpreter
         variables (`PYTHON*`) that steer the canonical pip install;
+      - a `run:` that reads a runner variable (`$GITHUB_EVENT_NAME`,
+        `$GITHUB_REF`, ..) in the shell rather than through `${{ }}`: the
+        text scan here does not model it (check 23 refuses the literal names
+        in its region only);
       - shadowing a checked command by means other than a shell function or
         alias written in the same `run:` (a `PATH` entry, `BASH_ENV`, a
         sourced file);
@@ -5357,6 +5459,989 @@ def check_ci_suites_required(entries: list[dict], errors: list[str], root: str =
                 f"check 21: .github/ci/{suite} is run by no required job — add a step whose whole `run:` is "
                 f"`python3 .github/ci/{suite} -v` to an unconditional `gate` job (ci.yml `artifact-guard`)"
             )
+
+
+# Check 22: the workspace members whose feature matrix another check owns, each
+# with its reason. Every other member's `[features]` keys must be compiled by a
+# required ci.yml job.
+FEATURE_COVERAGE_EXEMPT = {
+    "src/runtime/rust": "its feature matrix is owned by the `runtime-feature-combos` job",
+}
+# Cargo's feature flags: a command naming one whose text cannot be read is refused.
+_FEATURE_FLAG_TEXT = re.compile(r"--features|--all-features|--no-default-features|(?<![\w-])-F\b")
+# Subcommands that compile a selected package's test targets.
+_TEST_COMPILING = frozenset({"test", "bench", "nextest run", "nextest archive", "nextest list"})
+
+
+@dataclass(frozen=True)
+class _DepEdge:
+    """A dependency of one workspace member on another."""
+
+    target: str
+    features: tuple[str, ...]
+    default: bool
+    optional: bool
+    dev: bool
+
+
+@dataclass
+class _FeatureMember:
+    name: str
+    features: dict[str, list[str]]
+    edges: list[_DepEdge]
+
+
+def _str_list(value: object) -> list[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _feature_members(repo: str, errors: list[str]) -> dict[str, _FeatureMember] | None:
+    """Each workspace member's package name, `[features]` table and
+    dependency edges onto other members, keyed by directory; None (with the
+    reason in `errors`) when the workspace cannot be read."""
+    top = _load_toml(os.path.join(repo, "Cargo.toml"))
+    if isinstance(top, str):
+        errors.append(f"check 22: the root Cargo.toml {top}; refused")
+        return None
+    ws = top.get("workspace")
+    dirs = ws.get("members") if isinstance(ws, dict) else None
+    if not isinstance(dirs, list) or not all(isinstance(d, str) for d in dirs):
+        errors.append("check 22: the root Cargo.toml needs a literal `[workspace] members` list; refused")
+        return None
+    ws_deps = ws.get("dependencies") if isinstance(ws, dict) else None
+    ws_deps = ws_deps if isinstance(ws_deps, dict) else {}
+    docs: dict[str, dict[str, object]] = {}
+    for d in dirs:
+        doc = _load_toml(os.path.join(repo, d, "Cargo.toml"))
+        if isinstance(doc, str):
+            errors.append(f"check 22: {d}/Cargo.toml {doc}; refused")
+            return None
+        docs[d] = doc
+    names: dict[str, str] = {}
+    dir_name: dict[str, str] = {}
+    for d, doc in docs.items():
+        pkg = doc.get("package")
+        name = pkg.get("name") if isinstance(pkg, dict) else None
+        if not isinstance(name, str):
+            errors.append(f"check 22: {d}/Cargo.toml names no package; refused")
+            return None
+        names[name] = d
+        dir_name[d] = name
+    members: dict[str, _FeatureMember] = {}
+    for d, doc in docs.items():
+        raw = doc.get("features")
+        table = {k: _str_list(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+        targets = doc.get("target")
+        scopes = [doc] + [t for t in (targets.values() if isinstance(targets, dict) else []) if isinstance(t, dict)]
+        edges: list[_DepEdge] = []
+        for scope in scopes:
+            for kind, dev in (("dependencies", False), ("build-dependencies", False), ("dev-dependencies", True)):
+                deps = scope.get(kind)
+                for key, spec in deps.items() if isinstance(deps, dict) else []:
+                    if not isinstance(spec, dict):
+                        continue
+                    base = ws_deps.get(key) if spec.get("workspace") is True else None
+                    base = base if isinstance(base, dict) else {}
+                    package = spec.get("package", base.get("package", key))
+                    target = names.get(package) if isinstance(package, str) else None
+                    if target is None:
+                        continue
+                    edges.append(
+                        _DepEdge(
+                            target,
+                            tuple(_str_list(base.get("features")) + _str_list(spec.get("features"))),
+                            spec.get("default-features", base.get("default-features", True)) is not False,
+                            spec.get("optional") is True,
+                            dev,
+                        )
+                    )
+        members[d] = _FeatureMember(dir_name[d], table, edges)
+    return members
+
+
+def _feature_closure(
+    members: dict[str, _FeatureMember], roots: set[str], seeds: set[tuple[str, str]], tests: bool
+) -> set[tuple[str, str]]:
+    """Every `(member directory, feature)` active when `roots` compile with
+    `seeds` switched on: the seeds, the `features = [..]` that the
+    (non-optional) edges of each compiled member name, all closed over the
+    members' feature tables. A root's dev-dependency edges count when `tests`
+    compiles its test targets; an optional edge, and a weak `x?/f` entry, is
+    never counted."""
+    by_name = {m.name: d for d, m in members.items()}
+    compiled: set[str] = set(roots)
+    active: set[tuple[str, str]] = set()
+    wanted: set[tuple[str, str]] = set(seeds)
+    changed = True
+    while changed:
+        before = (len(compiled), len(active), len(wanted))
+        for d in sorted(compiled):
+            for edge in members[d].edges:
+                if edge.optional or (edge.dev and not (tests and d in roots)):
+                    continue
+                compiled.add(edge.target)
+                wanted.update((edge.target, f) for f in edge.features)
+                if edge.default:
+                    wanted.add((edge.target, "default"))
+        for d, f in sorted(wanted):
+            if d not in compiled or (d, f) in active or f not in members[d].features:
+                continue
+            active.add((d, f))
+            for entry in members[d].features[f]:
+                # `dep:x` names no feature; `x?/f` switches `f` on only when
+                # the optional dependency `x` is already on, which an optional
+                # edge never is here.
+                if entry.startswith("dep:") or "?/" in entry:
+                    continue
+                if "/" in entry:
+                    pkg, feat = entry.split("/", 1)
+                    target = by_name.get(pkg)
+                    if target is not None:
+                        wanted.add((target, feat))
+                else:
+                    wanted.add((d, entry))
+        changed = before != (len(compiled), len(active), len(wanted))
+    return active
+
+
+def _required_ci_jobs(entries: list[dict], wf: Workflow) -> list[dict]:
+    """The jobs of `wf` whose outcome a required context reports: a `gate`
+    entry produced by it names the job, or aggregates it."""
+    gates = [e for e in entries if isinstance(e, dict) and e.get("disposition") == "gate" and e.get("producer") == wf.fname]
+    out: list[dict] = []
+    for wj in wf.jobs:
+        ctx = str(wj.raw.get("name", wj.job_id))
+        reported = any(
+            str(e.get("context")) == ctx
+            or any(a == wj.job_id or ctx == a or ctx.startswith(f"{a} (") for a in e.get("aggregates") or [])
+            for e in gates
+        )
+        if reported:
+            out.append(wj.raw)
+    return out
+
+
+def _always_runs(node: object) -> bool:
+    """Whether a job or step is neither dead nor masked: no literal-false
+    `if:` and no `continue-on-error` that could mask it."""
+    if not isinstance(node, dict):
+        return False
+    if "continue-on-error" in node and node["continue-on-error"] is not False:
+        return False
+    return str(node.get("if", "true")).strip().lower() not in ("false", "${{ false }}")
+
+
+def _unconditional_step(step: object) -> bool:
+    """Whether a step runs whenever its job does: no `if:` at all and no
+    masking `continue-on-error`. Check 11 governs job conditions only; a step
+    `if:` can skip the step while the job, and the phase verdict reading it,
+    succeeds — so a step with any `if:` proves nothing ran."""
+    return _always_runs(step) and isinstance(step, dict) and "if" not in step
+
+
+def _invocation_roots(
+    inv: cargo_invocation.CargoInvocation, sel: cargo_invocation.Selection, members: dict[str, _FeatureMember]
+) -> set[str]:
+    """The member directories `inv` compiles at the top; empty for a
+    `--workspace` run that excludes members (what stays is not read)."""
+    if sel.whole_workspace:
+        return set() if "--exclude" in inv.command else set(members)
+    by_name = {m.name: d for d, m in members.items()}
+    roots = set(sel.dirs)
+    for spec in sel.packages:
+        d = by_name.get(spec.rsplit("#", 1)[-1].split("@", 1)[0])
+        if d is not None:
+            roots.add(d)
+    return roots.intersection(members)
+
+
+def _invocation_seeds(
+    inv: cargo_invocation.CargoInvocation, roots: set[str], members: dict[str, _FeatureMember]
+) -> set[tuple[str, str]]:
+    """The `(member directory, feature)` pairs `inv`'s feature flags switch on."""
+    by_name = {m.name: d for d, m in members.items()}
+    seeds: set[tuple[str, str]] = set()
+    for d in roots:
+        if inv.all_features:
+            seeds.update((d, f) for f in members[d].features)
+        elif not inv.no_default_features:
+            seeds.add((d, "default"))
+        for flag in inv.features:
+            pkg, _, feat = flag.rpartition("/")
+            if not pkg:
+                seeds.add((d, feat))
+                continue
+            target = by_name.get(pkg.rstrip("?"))
+            if target is not None:
+                seeds.add((target, feat))
+    return seeds
+
+
+def check_feature_coverage(
+    entries: list[dict], errors: list[str], root: str = REPO_ROOT, tracked: list[str] | None = None
+) -> None:
+    """Check 22 (see the module docstring)."""
+    repo = os.path.dirname(root)
+    members = _feature_members(repo, errors)
+    layout = _workspace_layout(repo, tracked)
+    if isinstance(layout, str):
+        errors.append(f"check 22: {layout}; cannot tell what a cargo command compiles")
+        return
+    if members is None:
+        return
+    covered: set[tuple[str, str]] = set()
+    for wf in _load_workflows(root, errors):
+        if wf.fname != "ci.yml":
+            continue
+        for job in _required_ci_jobs(entries, wf):
+            if not _always_runs(job):
+                continue
+            for found in _job_cargo(job, repo, wf.doc, unconditional=True):
+                inv = found.invocation
+                if isinstance(inv, str):
+                    if _FEATURE_FLAG_TEXT.search(found.line):
+                        errors.append(f"check 22: `{found.line}` names features but cannot be read ({inv}); refused")
+                    continue
+                if inv.subcommand not in cargo_invocation.COMPILING or inv.subcommand == "install":
+                    continue
+                sel = cargo_invocation.select(inv, found.cwd, layout)
+                if isinstance(sel, str) or not sel.in_workspace:
+                    continue
+                roots = _invocation_roots(inv, sel, members)
+                tests = inv.subcommand in _TEST_COMPILING or (
+                    isinstance(inv.selection, cargo_invocation.ExplicitTargets)
+                    and (inv.selection.all_tests or bool(inv.selection.tests))
+                )
+                covered.update(_feature_closure(members, roots, _invocation_seeds(inv, roots, members), tests))
+    for d, m in sorted(members.items()):
+        if d in FEATURE_COVERAGE_EXEMPT:
+            continue
+        for feature in sorted(m.features):
+            if (d, feature) not in covered:
+                errors.append(
+                    f"check 22: feature {feature!r} of workspace member {d} ({m.name}) is enabled by no "
+                    "command of a required ci.yml job — add it to a `--features` list of a required job's "
+                    "cargo command (or a `features = [..]` dependency edge from a compiled member)"
+                )
+    for d in sorted(FEATURE_COVERAGE_EXEMPT):
+        if d not in members or not members[d].features:
+            errors.append(
+                f"check 22: FEATURE_COVERAGE_EXEMPT names {d!r}, which is not a workspace member "
+                "with features; drop it"
+            )
+
+
+# Check 23: the release workflow's jobs and the ci.yml jobs that check them.
+RELEASE_WORKFLOW = "release.yml"
+RELEASE_NATIVE_JOB = "build"
+RELEASE_FREEBSD_JOB = "build-freebsd"
+RELEASE_PUBLISH_JOB = "release"
+CI_RELEASE_NATIVE_JOB = "release-targets-run"
+CI_RELEASE_FREEBSD_JOB = "release-targets-freebsd"
+_TOOLCHAIN_ACTION = "./.github/actions/rust-toolchain-pinned"
+# The one step both native jobs run between their checkout and their cargo
+# command: the toolchain, the dependency cache and the musl tools.
+RELEASE_TARGET_ACTION = "./.github/actions/release-target-toolchain"
+_RELEASE_EXPECTED = re.compile(r'expected="([^"]*)"')
+# The feature release binaries ship: `ipe dev run --target wasi` needs it, and
+# its refusal text promises it "in release packaging".
+RELEASE_FEATURE = "ipe/wasi_run"
+# The cargo command's argv, the one copy every pinned cargo line is built
+# from; only the verb (`check` in ci.yml, `build` in release.yml) and the
+# native jobs' `--target` differ.
+_RELEASE_CARGO_FLAGS = f"--release --locked --features {RELEASE_FEATURE}"
+_RELEASE_PACKAGES = "-p ipe -p ipe-ffi-inspector"
+# The job that parses the release tag, and the one `ref` a release build
+# checks out: the tag it parsed. ci.yml checks the tree under test instead.
+RELEASE_TAG_JOB = "resolve-tag"
+RELEASE_CHECKOUT_REF = "${{ needs.resolve-tag.outputs.tag }}"
+_CHECKOUT_ACTION = "actions/checkout"
+_MATRIX_TARGET = "${{ matrix.target }}"
+# The one shell a release-target job's `run` steps name: a step left to the
+# runner's default runs PowerShell on Windows, and `cmd` continues a line
+# with `^`, which no scan below joins.
+_RELEASE_TARGET_SHELL = "bash"
+# Remote actions the pinned steps run, matched exactly (owner, repo and the
+# 40-hex commit, case included): a case variant is another spelling no pin
+# names, so it is refused rather than read.
+_VM_ACTION_RE = re.compile(r"vmactions/freebsd-vm@[0-9a-f]{40}")
+_RUST_CACHE_PIN_RE = re.compile(r"Swatinem/rust-cache@[0-9a-f]{40}")
+_DTOLNAY_PIN_RE = re.compile(r"dtolnay/rust-toolchain@[0-9a-f]{40}")
+# The FreeBSD VM step's inputs but `run`.
+_VM_PRELUDE = {"usesh": True, "prepare": "pkg install -y rust"}
+# A matrix `os` or `target`: a runner label or a target triple, nothing a
+# shell or an expression can read as syntax.
+_MATRIX_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_MATRIX_EXT_RE = re.compile(r"(?:\.exe)?")
+# The keys each side's matrix legs carry: release.yml's `artifact` and `ext`
+# are read only by its packaging steps, after the cargo command.
+_CI_LEG_KEYS = frozenset({"os", "target"})
+_RELEASE_LEG_KEYS = frozenset({"os", "target", "artifact", "ext"})
+# The job keys a release-target job may hold; every other key (`env`,
+# `defaults`, `container`, `services`, `permissions`, `continue-on-error`,
+# ..) is refused, since each changes what the cargo command runs or lets the
+# job succeed without it. `needs` and `if` place the job (check 11 governs
+# ci.yml's); `runs-on` is pinned below.
+_NATIVE_JOB_KEYS = frozenset({"name", "needs", "if", "timeout-minutes", "strategy", "runs-on", "steps"})
+_FREEBSD_JOB_KEYS = _NATIVE_JOB_KEYS - {"strategy"}
+_NATIVE_RUNS_ON = "${{ matrix.os }}"
+_FREEBSD_RUNS_ON = "ubuntu-latest"
+# The workflow keys that cannot reach a job's cargo command: the trigger,
+# the token scope and run grouping, the display names, and the jobs checked
+# one by one. `env` is held to `ALLOWED_ENV_DIFFERENCES`; any other key
+# (`defaults`, ..) is refused.
+_RELEASE_TARGET_WORKFLOW_KEYS = frozenset({"name", "run-name", "on", True, "permissions", "concurrency", "jobs", "env"})
+
+
+def _release_cargo_line(verb: str, native: bool) -> str:
+    """The one cargo line a release-target job runs, quotes as written: bash
+    splits and globs `$TARGET`, never `"$TARGET"`."""
+    target = ' --target "$TARGET"' if native else ""
+    return f"cargo {verb} {_RELEASE_CARGO_FLAGS}{target} {_RELEASE_PACKAGES}"
+
+
+# The body of `_TOOLCHAIN_ACTION`, which `RELEASE_TARGET_ACTION` runs first:
+# its `run` texts line for line, its remote action and its inputs.
+_TOOLCHAIN_CHANNEL_RUN = (
+    "set -euo pipefail",
+    'file="rust-toolchain.toml"',
+    'if [[ ! -f "$file" ]]; then',
+    '  echo "::error::${file} not found; cannot determine the pinned toolchain." >&2',
+    "  exit 1",
+    "fi",
+    "channel=\"$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/p' \"$file\" | head -n1)\"",
+    'if [[ -z "$channel" ]]; then',
+    "  echo \"::error::No 'channel = \\\"...\\\"' line in ${file}; cannot determine the pinned toolchain.\" >&2",
+    "  exit 1",
+    "fi",
+    'echo "Pinned toolchain channel: ${channel}"',
+    'echo "channel=${channel}" >> "$GITHUB_OUTPUT"',
+)
+_MUSL_INSTALL_RUN = ("sudo apt-get update && sudo apt-get install -y musl-tools",)
+
+
+class _Pin:
+    """A `uses:` value matched by an exact pattern, not by equality."""
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        self.pattern = pattern
+
+
+class _Lines:
+    """A `run:` text pinned line for line: exactly these lines, one trailing
+    newline aside, no line added, dropped or changed (a CR is a change)."""
+
+    def __init__(self, lines: tuple[str, ...]) -> None:
+        self.lines = lines
+
+
+def _run_lines(text: str) -> list[str]:
+    return text.removesuffix("\n").split("\n")
+
+
+def _pin_refusal(value: object, pin: object, at: str) -> str | None:
+    """Why `value` is not `pin` (a literal compared typed, a `_Pin`, a
+    `_Lines`, or a mapping of these, key for key both ways), or None."""
+    if isinstance(pin, _Pin):
+        if isinstance(value, str) and pin.pattern.fullmatch(value):
+            return None
+        return f"{at} is {value!r}, which is not `{pin.pattern.pattern}`"
+    if isinstance(pin, _Lines):
+        if isinstance(value, str) and tuple(_run_lines(value)) == pin.lines:
+            return None
+        return f"{at} is {value!r}, which is not exactly {list(pin.lines)!r}"
+    if isinstance(pin, dict):
+        if not isinstance(value, dict):
+            return f"{at} is {value!r}, which is not a mapping"
+        keys = {(type(k), k) for k in value}
+        want = {(type(k), k) for k in pin}
+        if keys != want:
+            extra = sorted(str(k) for _t, k in keys - want)
+            missing = sorted(str(k) for _t, k in want - keys)
+            return f"{at} has keys {sorted(map(str, value))!r} (extra {extra!r}, missing {missing!r})"
+        for k, sub in pin.items():
+            why = _pin_refusal(value[k], sub, f"{at}.{k}")
+            if why is not None:
+                return why
+        return None
+    if _same_value(value, pin):
+        return None
+    return f"{at} is {value!r}, which must be exactly {pin!r}"
+
+
+def _step_pin_refusal(step: object, pin: dict, at: str) -> str | None:
+    """`step` is `pin` but for a literal `name` holding no expression."""
+    if not isinstance(step, dict):
+        return f"{at} is {step!r}, which is not a step mapping"
+    name = step.get("name")
+    if "name" in step and not (isinstance(name, str) and "${{" not in name):
+        return f"{at}.name is {name!r}, which must be a literal string"
+    return _pin_refusal({k: v for k, v in step.items() if k != "name"}, pin, at)
+
+
+def _pinned_step(step: object, pin: dict, at: str, why: str, errors: list[str]) -> bool:
+    refusal = _step_pin_refusal(step, pin, at)
+    if refusal is not None:
+        errors.append(f"check 23: {refusal}: {why}; refused")
+    return refusal is None
+
+
+def _steps_of(job: dict) -> list[dict]:
+    steps = job.get("steps")
+    return [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+
+
+def _only(items: list, where: str, what: str, errors: list[str]) -> object | None:
+    """The one of `items`, else a refusal naming `what`."""
+    if len(items) != 1:
+        errors.append(f"check 23: {where} must have exactly one {what}, has {len(items)}")
+        return None
+    return items[0]
+
+
+def _same_value(a: object, b: object) -> bool:
+    """`a` and `b` are one value as GitHub reads it: the same type at every
+    level, then equal. Python's `==` holds `1 == True` and `1 == 1.0`, which
+    GitHub stringifies apart (`1`, `true`, `1.0`)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict) and isinstance(b, dict):
+        b_keys = {(type(k), k): v for k, v in b.items()}
+        return len(a) == len(b) and all(
+            (type(k), k) in b_keys and _same_value(v, b_keys[(type(k), k)]) for k, v in a.items()
+        )
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _compare(what: str, ci_value: object, release_value: object, errors: list[str]) -> None:
+    if not _same_value(ci_value, release_value):
+        errors.append(
+            f"check 23: ci.yml's {what} is {ci_value!r} but release.yml's is {release_value!r}; "
+            "they must be equal"
+        )
+
+
+def _is_checkout(step: dict) -> bool:
+    return uses_action(step.get("uses"), _CHECKOUT_ACTION)
+
+
+class _Side(enum.Enum):
+    """The workflow a value of a release-target pair comes from."""
+
+    CI = "ci.yml"
+    RELEASE = RELEASE_WORKFLOW
+
+
+@dataclass(frozen=True)
+class AllowedEnvDifference:
+    """A workflow-level variable only one side sets, with one value, and why
+    it cannot change what compiles."""
+
+    side: _Side
+    key: str
+    value: str
+    why: str
+
+
+# The closed list of workflow `env` entries a release-target workflow sets:
+# each side's workflow `env` is exactly its entries here, so a new variable
+# must be named with its why, and an entry no longer set is refused.
+ALLOWED_ENV_DIFFERENCES: tuple[AllowedEnvDifference, ...] = (
+    AllowedEnvDifference(
+        _Side.CI, "CARGO_TERM_COLOR", "always",
+        "colours cargo's terminal output; it selects no code and no profile",
+    ),
+    AllowedEnvDifference(
+        _Side.CI, "CARGO_INCREMENTAL", "0",
+        "turns off the incremental cache, which `--release` already leaves off; it changes the build "
+        "cache, never which code compiles or whether it does",
+    ),
+)
+
+
+def _check_workflow_scope(side: _Side, doc: dict, errors: list[str]) -> None:
+    """The workflow holds only the keys that cannot reach a job's cargo
+    command, and its `env` is exactly its `ALLOWED_ENV_DIFFERENCES` entries."""
+    for key in sorted(set(doc) - _RELEASE_TARGET_WORKFLOW_KEYS, key=str):
+        errors.append(
+            f"check 23: {side.value} has a workflow `{key}`, which reaches every release-target step; refused"
+        )
+    want = {a.key: a.value for a in ALLOWED_ENV_DIFFERENCES if a.side is side}
+    env = doc.get("env", {})
+    why = _pin_refusal(env, want, f"{side.value} workflow env")
+    if why is not None:
+        errors.append(
+            f"check 23: {why}: a release-target workflow's `env` is exactly its ALLOWED_ENV_DIFFERENCES "
+            "entries, each named with why it cannot change what compiles; refused"
+        )
+
+
+def _check_job_scope(job: dict, where: str, keys: frozenset[str], runs_on: str, errors: list[str]) -> None:
+    for key in sorted(set(job) - keys, key=str):
+        errors.append(
+            f"check 23: {where} has a job `{key}`, which changes what its cargo command runs or lets the job "
+            "succeed without it; refused"
+        )
+    if not _same_value(job.get("runs-on"), runs_on):
+        errors.append(f"check 23: {where} runs on {job.get('runs-on')!r}; it must be exactly {runs_on!r}")
+    steps = job.get("steps")
+    if not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+        errors.append(f"check 23: {where}'s `steps` must be a list of step mappings; refused")
+
+
+def _matrix_legs(job: dict, where: str, keys: frozenset[str], errors: list[str]) -> dict[str, dict] | None:
+    """`job`'s `strategy.matrix.include` legs keyed by target: each leg holds
+    exactly `keys`, every value a string of its grammar."""
+    strategy = job.get("strategy")
+    matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+    include = matrix.get("include") if isinstance(matrix, dict) else None
+    if (
+        not isinstance(strategy, dict)
+        or not set(strategy) <= {"fail-fast", "matrix"}
+        or not isinstance(strategy.get("fail-fast", False), bool)
+        or not isinstance(matrix, dict)
+        or set(matrix) != {"include"}
+        or not isinstance(include, list)
+        or not all(isinstance(leg, dict) for leg in include)
+    ):
+        errors.append(
+            f"check 23: {where} must have a `strategy` of a boolean `fail-fast` and a matrix of only an "
+            "`include` list of mappings; refused"
+        )
+        return None
+    legs: dict[str, dict] = {}
+    for leg in include:
+        if set(leg) != keys or not all(isinstance(v, str) for v in leg.values()):
+            errors.append(
+                f"check 23: {where}: a matrix leg must hold exactly {sorted(keys)!r}, each a literal string, "
+                f"and is {leg!r}; refused"
+            )
+            return None
+        bad = sorted(
+            k for k, v in leg.items() if not (_MATRIX_EXT_RE if k == "ext" else _MATRIX_WORD_RE).fullmatch(v)
+        )
+        if bad:
+            errors.append(
+                f"check 23: {where}: matrix leg {leg!r} has {bad!r} outside the runner-label and target-triple "
+                "grammar, which a step could read as shell or expression syntax; refused"
+            )
+            return None
+        target = leg["target"]
+        if target in legs:
+            errors.append(f"check 23: {where}: target {target!r} appears in more than one leg")
+            return None
+        legs[target] = leg
+    return legs
+
+
+def _checkout_pin(side: _Side) -> dict:
+    """The first step of every release-target job: a commit-pinned checkout,
+    of exactly the parsed tag on release.yml's side and of the tree under test
+    on ci.yml's."""
+    pin: dict = {"uses": _Pin(_CHECKOUT_PIN)}
+    if side is _Side.RELEASE:
+        pin["with"] = {"ref": RELEASE_CHECKOUT_REF}
+    return pin
+
+
+def _check_tag_need(job: dict, where: str, errors: list[str]) -> None:
+    """release.yml's checkout reads the tag `RELEASE_TAG_JOB` parsed; without
+    the `needs` the expression reads empty and the checkout falls back to the
+    event's ref, a branch on a dispatch."""
+    needs = job.get("needs")
+    if not (needs == RELEASE_TAG_JOB or (isinstance(needs, list) and RELEASE_TAG_JOB in needs)):
+        errors.append(f"check 23: {where} must need `{RELEASE_TAG_JOB}`, whose tag its checkout builds; refused")
+
+
+def _native_pins(side: _Side) -> tuple[dict, dict, dict]:
+    verb = "check" if side is _Side.CI else "build"
+    return (
+        _checkout_pin(side),
+        {"uses": RELEASE_TARGET_ACTION, "with": {"target": _MATRIX_TARGET}},
+        {
+            "shell": _RELEASE_TARGET_SHELL,
+            "env": {"TARGET": _MATRIX_TARGET},
+            "run": _Lines((_release_cargo_line(verb, native=True),)),
+        },
+    )
+
+
+def _check_native_job(side: _Side, job: dict, where: str, errors: list[str]) -> None:
+    """The job's first three steps are exactly its checkout, the shared
+    `RELEASE_TARGET_ACTION` and its one cargo line; ci.yml's job runs nothing
+    else."""
+    steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    pins = _native_pins(side)
+    whys = (
+        "a release-target job's first step is its one checkout, of the tag on release.yml's side",
+        f"the second step is exactly `uses: {RELEASE_TARGET_ACTION}` with `target: {_MATRIX_TARGET}`, so "
+        "nothing runs between the checkout and the shared step",
+        "the third step runs exactly the job's one cargo line under bash, so nothing runs between the shared "
+        "step and the cargo command",
+    )
+    for n, (pin, why) in enumerate(zip(pins, whys), start=1):
+        step = steps[n - 1] if len(steps) >= n else None
+        _pinned_step(step, pin, f"{where} step {n}", why, errors)
+    if side is _Side.CI and len(steps) != len(pins):
+        errors.append(
+            f"check 23: {where} has {len(steps)} steps; it runs exactly the checkout, the shared step and the "
+            "cargo line, and nothing after them; refused"
+        )
+
+
+def _vm_pin(side: _Side, run: object) -> dict:
+    return {"uses": _Pin(_VM_ACTION_RE), "with": {**_VM_PRELUDE, "run": run}}
+
+
+def _check_freebsd_job(side: _Side, job: dict, where: str, errors: list[str]) -> str | None:
+    """The job's first two steps are exactly its checkout and the FreeBSD VM
+    step, whose `run` is exactly the cargo line on ci.yml's side and opens
+    with it on release.yml's; ci.yml's job runs nothing else. The VM step's
+    `uses`, or None."""
+    steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+    first = steps[0] if steps else None
+    _pinned_step(first, _checkout_pin(side), f"{where} step 1", "a release-target job's first step is its one checkout, of the tag on release.yml's side", errors)
+    vm = steps[1] if len(steps) >= 2 else None
+    line = _release_cargo_line("check" if side is _Side.CI else "build", native=False)
+    run: object = _Lines((line,))
+    if side is _Side.RELEASE and isinstance(vm, dict) and isinstance(vm.get("with"), dict):
+        text = vm["with"].get("run")
+        if isinstance(text, str) and _run_lines(text)[:1] == [line]:
+            run = text
+    ok = _pinned_step(
+        vm,
+        _vm_pin(side, run),
+        f"{where} step 2",
+        f"the second step is exactly the FreeBSD VM step with {_VM_PRELUDE!r}, its `run` opening with "
+        f"`{line}` (and only that on ci.yml's side)",
+        errors,
+    )
+    if side is _Side.CI and len(steps) != 2:
+        errors.append(
+            f"check 23: {where} has {len(steps)} steps; it runs exactly the checkout and the VM step, and "
+            "nothing after them; refused"
+        )
+    return vm.get("uses") if ok and isinstance(vm, dict) else None
+
+
+def _local_composite(uses: str, repo: str, where: str, depth: int, errors: list[str]) -> tuple[dict, list[dict]] | None:
+    """The document and step mappings of the local composite action `uses`
+    names, or None (refused) when it nests past `LOCAL_ACTION_DEPTH_LIMIT`
+    levels or cannot be read as a composite of step mappings."""
+    rel = posixpath.normpath(uses.split("@", 1)[0][2:])
+    found = [os.path.join(repo, rel, n) for n in ("action.yml", "action.yaml") if os.path.isfile(os.path.join(repo, rel, n))]
+    if depth >= LOCAL_ACTION_DEPTH_LIMIT or len(found) != 1:
+        why = "nests local actions too deep" if found else "has no single action.yml/action.yaml"
+        _refuse_once(errors, f"check 23: {where}: local action {uses!r} {why}, so what it runs cannot be read; refused")
+        return None
+    try:
+        with open(found[0]) as f:
+            doc = strict_yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        _refuse_once(errors, f"check 23: {where}: local action {uses!r} is unreadable ({e}); refused")
+        return None
+    runs = doc.get("runs") if isinstance(doc, dict) else None
+    steps = runs.get("steps") if isinstance(runs, dict) and runs.get("using") == "composite" else None
+    if not isinstance(steps, list) or not all(isinstance(st, dict) for st in steps):
+        _refuse_once(errors, f"check 23: {where}: local action {uses!r} is not a composite of step mappings; refused")
+        return None
+    return doc, steps
+
+
+def _refuse_once(errors: list[str], message: str) -> None:
+    """Several scans read the same local action; its refusal is listed once."""
+    if message not in errors:
+        errors.append(message)
+
+
+# The pinned body of each local action the pinned steps run: its inputs
+# (descriptions aside) and its steps (names aside). An action outside this
+# table is never reached before a cargo command.
+_LOCAL_ACTION_PINS: dict[str, tuple[dict, list[dict]]] = {
+    RELEASE_TARGET_ACTION: (
+        {"target": {"required": True}},
+        [
+            {"uses": _TOOLCHAIN_ACTION, "with": {"targets": "${{ inputs.target }}"}},
+            {"uses": _Pin(_RUST_CACHE_PIN_RE), "with": {"save-if": RUST_CACHE_SAVE_IF}},
+            {"if": "contains(inputs.target, 'musl')", "shell": _RELEASE_TARGET_SHELL, "run": _Lines(_MUSL_INSTALL_RUN)},
+        ],
+    ),
+    _TOOLCHAIN_ACTION: (
+        {"components": {"required": False, "default": ""}, "targets": {"required": False, "default": ""}},
+        [
+            {"id": "channel", "shell": _RELEASE_TARGET_SHELL, "run": _Lines(_TOOLCHAIN_CHANNEL_RUN)},
+            {
+                "uses": _Pin(_DTOLNAY_PIN_RE),
+                "with": {
+                    "toolchain": "${{ steps.channel.outputs.channel }}",
+                    "components": "${{ inputs.components }}",
+                    "targets": "${{ inputs.targets }}",
+                },
+            },
+            {"shell": _RELEASE_TARGET_SHELL, "run": _Lines(("rustc --version",))},
+        ],
+    ),
+}
+_ACTION_TOP_KEYS = frozenset({"name", "description", "inputs", "runs"})
+
+
+def _check_local_action_pins(repo: str, errors: list[str]) -> None:
+    """Every local action a pinned step runs is exactly its
+    `_LOCAL_ACTION_PINS` body: the toolchain, cache and musl steps, and
+    nothing else, before any release-target cargo command."""
+    for uses, (inputs_pin, steps_pin) in _LOCAL_ACTION_PINS.items():
+        where = f"local action {uses!r}"
+        got = _local_composite(uses, repo, where, 0, errors)
+        if got is None:
+            continue
+        doc, steps = got
+        for key in sorted(set(doc) - _ACTION_TOP_KEYS, key=str):
+            errors.append(f"check 23: {where} has a top-level `{key}`, which no pin names; refused")
+        if not _same_value(doc.get("runs"), {"using": "composite", "steps": steps}):
+            errors.append(f"check 23: {where}'s `runs` must hold only `using: composite` and `steps`; refused")
+        inputs = doc.get("inputs")
+        bare = (
+            {k: {f: v for f, v in spec.items() if f != "description"} if isinstance(spec, dict) else spec for k, spec in inputs.items()}
+            if isinstance(inputs, dict)
+            else inputs
+        )
+        why = _pin_refusal(bare, inputs_pin, f"{where} inputs (descriptions aside)")
+        if why is not None:
+            errors.append(f"check 23: {why}; refused")
+        if len(steps) != len(steps_pin):
+            errors.append(
+                f"check 23: {where} has {len(steps)} steps where its pin has {len(steps_pin)}: a step no pin "
+                "names runs before the cargo command; refused"
+            )
+        for n, (step, pin) in enumerate(zip(steps, steps_pin), start=1):
+            _pinned_step(step, pin, f"{where} step {n}", "a pinned local action runs exactly its pinned steps", errors)
+
+
+@dataclass(frozen=True)
+class _JobStep:
+    """A step a job runs: one of its own (`top` is its 1-based number) or one
+    of a local composite action that step uses, at any depth (`top` is the
+    number of the job step that uses it)."""
+
+    top: int
+    where: str
+    step: dict
+    in_action: bool
+
+
+def _job_steps(job: dict, where: str, repo: str, errors: list[str]) -> list[_JobStep]:
+    """Every step `job` runs, its local actions' steps included."""
+    out: list[_JobStep] = []
+
+    def walk(uses: object, top: int, swhere: str, depth: int) -> None:
+        if not (isinstance(uses, str) and uses.startswith("./")):
+            return
+        got = _local_composite(uses, repo, swhere, depth, errors)
+        for n, st in enumerate(got[1] if got else [], start=1):
+            inner = f"{swhere} -> {uses} step {n}"
+            out.append(_JobStep(top, inner, st, True))
+            walk(st.get("uses"), top, inner, depth + 1)
+
+    for n, st in enumerate(_steps_of(job), start=1):
+        swhere = f"{where} step {n}"
+        out.append(_JobStep(n, swhere, st, False))
+        walk(st.get("uses"), n, swhere, 0)
+    return out
+
+
+def _check_checkouts(job: dict, where: str, repo: str, errors: list[str]) -> None:
+    """The first step is the job's only checkout: a second one, anywhere in
+    the job or in a local action it uses (`uses:` read with owner and repo
+    case-folded, as GitHub reads them), replaces the tree the job built or
+    ships."""
+    for js in _job_steps(job, where, repo, errors):
+        if (js.top != 1 or js.in_action) and _is_checkout(js.step):
+            errors.append(
+                f"check 23: {js.where} runs `{js.step.get('uses')}`, a second checkout: it can replace the tree "
+                "the job builds, and the first step is the job's only checkout; refused"
+            )
+
+
+def _check_shells(job: dict, where: str, repo: str, errors: list[str]) -> None:
+    """Every `run` step of `job`, its local actions' included, names `shell:
+    bash`, the shell the run-text scans read."""
+    for js in _job_steps(job, where, repo, errors):
+        if "run" in js.step and js.step.get("shell") != _RELEASE_TARGET_SHELL:
+            errors.append(
+                f"check 23: {js.where} runs under `shell: {js.step.get('shell')!r}`, which the run-text scans "
+                f"do not read as written; it must name `shell: {_RELEASE_TARGET_SHELL}`; refused"
+            )
+
+
+# A line continuation the shell removes before it reads a name: bash's
+# backslash-newline, pwsh's backtick-newline, either with a CR before the
+# newline. `car\` + newline + `go` is `cargo` to bash.
+_LINE_CONTINUATION_RE = re.compile(r"[\\`]\r?\n")
+_SHELL_WORD_TEXT_RE = re.compile(r"[ \t;&|()\n`]")
+_EXPRESSION_RE = re.compile(r"\$\{\{.*?\}\}", re.S)
+# A build run outside the one pinned cargo line: after it, either can
+# rebuild the artifact the job ships.
+_REBUILDERS = frozenset({"cargo", "rustc"})
+
+
+def _scanned_texts(text: str) -> tuple[str, ...]:
+    """`text` as the name scans read it: as written and, when it differs,
+    with every line continuation removed. Removing one where the shell would
+    not (inside single quotes) only adds a text to scan, never drops one."""
+    joined = _LINE_CONTINUATION_RE.sub("", text)
+    return (text,) if joined == text else (text, joined)
+
+
+def _word_re(names: frozenset[str]) -> re.Pattern[str]:
+    """`names` as words of a text (`.exe` allowed after one), never part of
+    a path component, a hyphenated or an underscored name: `~/.cargo/bin`
+    and `CARGO_HOME` name no `cargo`; `cargo-zigbuild` does."""
+    alt = "|".join(re.escape(n) for n in sorted(names))
+    return re.compile(rf"(?<![A-Za-z0-9_.-])(?:{alt})(?:\.exe)?(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _named_commands(text: str, names: frozenset[str], depth: int = 0) -> set[str]:
+    """Which of `names` `text` can run, read two ways: as words of the text
+    (as written and continuations joined) and as the shell reads it (quotes
+    removed, so `c""argo` is `cargo`), every word of every command, the text
+    of a quoted word that holds shell syntax (an `sh -c` body, an `echo .. |
+    sh` feed) and of a here-document read again as shell, to
+    `cargo_invocation.NESTING_LIMIT` levels. Past that limit every name is
+    reported, so the caller refuses."""
+    if depth > cargo_invocation.NESTING_LIMIT:
+        return set(names)
+    found = {m.group(0).casefold().removesuffix(".exe") for t in _scanned_texts(text) for m in _word_re(names).finditer(t)}
+    joined = _EXPRESSION_RE.sub("$GITHUB_EXPRESSION", _scanned_texts(text)[-1])
+    for body in (joined, *shell_lex.heredoc_bodies(joined)):
+        for cmd in shell_lex.split_commands(body):
+            for word in cmd.words:
+                base = posixpath.basename(word).casefold().removesuffix(".exe")
+                if base in names:
+                    found.add(base)
+                if _SHELL_WORD_TEXT_RE.search(word) and word != body:
+                    found |= _named_commands(word, names, depth + 1)
+    return {n for n in names if n.casefold() in found}
+
+
+def _check_tail(job: dict, where: str, first_tail: int, vm_tail: str | None, repo: str, errors: list[str]) -> None:
+    """Defence in depth over release.yml's steps after its cargo command
+    (from step `first_tail`, and `vm_tail`, the VM `run` lines after the
+    cargo line), which no pin holds: a `cargo` or `rustc` word, as written,
+    continuations joined or as the shell reads it, is refused there."""
+    texts: list[tuple[str, str]] = []
+    if vm_tail is not None:
+        texts.append((f"{where} step 2 with.run (after the cargo line)", vm_tail))
+    for js in _job_steps(job, where, repo, errors):
+        if js.top >= first_tail:
+            body = {k: v for k, v in js.step.items() if k != "name"}
+            texts.extend((f"{js.where} {label}", text) for label, text, _if in _string_scalars(body, js.where, errors))
+    for at, text in texts:
+        for name in sorted(_named_commands(text, _REBUILDERS)):
+            errors.append(
+                f"check 23: {at} runs `{name}` after the cargo command: a second build can rebuild what the job "
+                "ships; refused"
+            )
+
+
+def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 23 (see the module docstring)."""
+    repo = os.path.dirname(root)
+    by_file = {wf.fname: wf for wf in _load_workflows(root, errors)}
+    jobs: dict[str, dict[str, dict]] = {}
+    for fname, wanted in (
+        ("ci.yml", (CI_RELEASE_NATIVE_JOB, CI_RELEASE_FREEBSD_JOB)),
+        (RELEASE_WORKFLOW, (RELEASE_NATIVE_JOB, RELEASE_FREEBSD_JOB, RELEASE_PUBLISH_JOB)),
+    ):
+        wf = by_file.get(fname)
+        if wf is None:
+            errors.append(f"check 23: .github/workflows/{fname} is missing; refused")
+            return
+        have = {wj.job_id: wj.raw for wj in wf.jobs}
+        for job_id in wanted:
+            if job_id not in have:
+                errors.append(f"check 23: {fname} has no job {job_id!r}, which the release-target parity needs")
+                return
+        jobs[fname] = {job_id: have[job_id] for job_id in wanted}
+    ci, rel = jobs["ci.yml"], jobs[RELEASE_WORKFLOW]
+    for side in _Side:
+        _check_workflow_scope(side, by_file[side.value].doc, errors)
+    _check_local_action_pins(repo, errors)
+
+    ci_native, rel_native = ci[CI_RELEASE_NATIVE_JOB], rel[RELEASE_NATIVE_JOB]
+    ci_bsd, rel_bsd = ci[CI_RELEASE_FREEBSD_JOB], rel[RELEASE_FREEBSD_JOB]
+    for side, job, name, native in (
+        (_Side.CI, ci_native, CI_RELEASE_NATIVE_JOB, True),
+        (_Side.CI, ci_bsd, CI_RELEASE_FREEBSD_JOB, False),
+        (_Side.RELEASE, rel_native, RELEASE_NATIVE_JOB, True),
+        (_Side.RELEASE, rel_bsd, RELEASE_FREEBSD_JOB, False),
+    ):
+        where = f"{side.value} job {name!r}"
+        _check_job_scope(
+            job,
+            where,
+            _NATIVE_JOB_KEYS if native else _FREEBSD_JOB_KEYS,
+            _NATIVE_RUNS_ON if native else _FREEBSD_RUNS_ON,
+            errors,
+        )
+        if side is _Side.RELEASE:
+            _check_tag_need(job, where, errors)
+        _check_checkouts(job, where, repo, errors)
+        _check_shells(job, where, repo, errors)
+    for side, job, name in ((_Side.CI, ci_native, CI_RELEASE_NATIVE_JOB), (_Side.RELEASE, rel_native, RELEASE_NATIVE_JOB)):
+        _check_native_job(side, job, f"{side.value} job {name!r}", errors)
+    _check_tail(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", 4, None, repo, errors)
+    _compare("checkout action", (_steps_of(ci_native) or [{}])[0].get("uses"), (_steps_of(rel_native) or [{}])[0].get("uses"), errors)
+
+    vm_uses = {}
+    for side, job, name in ((_Side.CI, ci_bsd, CI_RELEASE_FREEBSD_JOB), (_Side.RELEASE, rel_bsd, RELEASE_FREEBSD_JOB)):
+        vm_uses[side] = _check_freebsd_job(side, job, f"{side.value} job {name!r}", errors)
+    if vm_uses[_Side.CI] is not None and vm_uses[_Side.RELEASE] is not None:
+        _compare("FreeBSD VM action", vm_uses[_Side.CI], vm_uses[_Side.RELEASE], errors)
+    rel_vm_run = next(iter(s.get("with", {}).get("run") for s in _steps_of(rel_bsd)[1:2] if isinstance(s.get("with"), dict)), None)
+    vm_tail = "\n".join(_run_lines(rel_vm_run)[1:]) if isinstance(rel_vm_run, str) else None
+    _check_tail(rel_bsd, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", 3, vm_tail, repo, errors)
+    _compare(
+        "checkout action (FreeBSD)",
+        (_steps_of(ci_bsd) or [{}])[0].get("uses"),
+        (_steps_of(rel_bsd) or [{}])[0].get("uses"),
+        errors,
+    )
+
+    ci_legs = _matrix_legs(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", _CI_LEG_KEYS, errors)
+    rel_legs = _matrix_legs(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", _RELEASE_LEG_KEYS, errors)
+    if ci_legs is None or rel_legs is None:
+        return
+    for target, leg in sorted(rel_legs.items()):
+        if target not in ci_legs:
+            errors.append(
+                f"check 23: {RELEASE_WORKFLOW} builds {target!r} but ci.yml's {CI_RELEASE_NATIVE_JOB} never checks it"
+            )
+        elif ci_legs[target]["os"] != leg["os"]:
+            errors.append(
+                f"check 23: target {target!r} runs on {ci_legs[target]['os']!r} in ci.yml but "
+                f"{leg['os']!r} in {RELEASE_WORKFLOW}; they must be equal"
+            )
+    for target in sorted(set(ci_legs) - set(rel_legs)):
+        errors.append(f"check 23: ci.yml checks {target!r}, which {RELEASE_WORKFLOW} does not build")
+
+    published = {leg.get("artifact") for leg in rel_legs.values()}
+    for step in _steps_of(rel_bsd):
+        with_ = step.get("with")
+        if uses_action(step.get("uses"), "actions/upload-artifact") and isinstance(with_, dict):
+            published.add(with_.get("name"))
+    expected_sets = [
+        set(m.group(1).split())
+        for step in _steps_of(rel[RELEASE_PUBLISH_JOB])
+        for m in _RELEASE_EXPECTED.finditer(str(step.get("run", "")))
+    ]
+    expected = _only(expected_sets, f"{RELEASE_WORKFLOW} job {RELEASE_PUBLISH_JOB!r}", "`expected=\"..\"` list", errors)
+    if isinstance(expected, set):
+        for name in sorted(str(n) for n in published - expected):
+            errors.append(f"check 23: {RELEASE_WORKFLOW} publishes {name!r} but its completeness gate does not expect it")
+        for name in sorted(expected - published):
+            errors.append(f"check 23: {RELEASE_WORKFLOW}'s completeness gate expects {name!r}, which no job publishes")
 
 
 def load_manifest() -> dict:
@@ -5508,6 +6593,12 @@ def main() -> int:
 
     # ---- 21. Every CI-tooling refusal suite runs in a required job ----
     check_ci_suites_required(entries, errors)
+
+    # ---- 22. Every cargo feature is compiled by a required job ----
+    check_feature_coverage(entries, errors)
+
+    # ---- 23. ci.yml checks exactly the targets release.yml builds ----
+    check_release_target_parity(errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:
