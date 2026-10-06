@@ -307,12 +307,21 @@ fn help_word_alone_and_help_of_unknown_both_succeed() {
 }
 
 #[test]
-fn dev_group_bare_refuses_and_its_help_flag_lists_the_verbs() {
-    // A bare group names no command: it exits non-zero with nothing on stdout.
-    // `ipe dev --help` is the request that teaches its verbs, exit 0.
+fn dev_group_bare_and_its_help_flag_print_the_same_verb_listing() {
+    // A bare `ipe dev` is the group's own usage page: exit 0, page on stdout,
+    // nothing on stderr. `ipe dev --help` prints the identical page.
     let bare = run(&["dev"]);
-    assert!(!bare.ok, "a bare `ipe dev` must exit non-zero");
-    assert!(bare.stdout.is_empty(), "a refusal must not write to stdout");
+    assert!(bare.ok, "a bare `ipe dev` must exit 0");
+    assert!(
+        bare.stderr.is_empty(),
+        "a bare `ipe dev` must not write to stderr, got:\n{}",
+        bare.stderr
+    );
+    assert_eq!(
+        bare.stdout,
+        run(&["dev", "--help"]).stdout,
+        "a bare `ipe dev` must print the page `ipe dev --help` prints"
+    );
 
     let r = run(&["dev", "--help"]);
     assert!(r.ok, "`ipe dev --help` must exit 0");

@@ -4,30 +4,28 @@
 //! A workspace file is found by convention, not named by the user, and a
 //! cloned repository is attacker-shaped: the name may be a symlink to a
 //! device or to a file outside the workspace, a FIFO, a directory, or a
-//! multi-GiB blob, swapped between any two path lookups. So the path is
-//! resolved exactly once — [`read_workspace_file`] opens it without
-//! following a final symlink, then proves the *opened handle* (never the
-//! path again) is a regular file, then reads at most `max + 1` bytes.
-//!
-//! On Unix the open is `O_RDONLY | O_NONBLOCK | O_NOCTTY | O_NOFOLLOW |
-//! O_CLOEXEC`: a FIFO with no writer returns at once, a terminal never
-//! becomes the controlling one, and a final symlink fails the open (`ELOOP`)
-//! before any device behind it is touched. On Windows the open carries
-//! `FILE_FLAG_OPEN_REPARSE_POINT`, so a final reparse point is opened itself
-//! and refused on the handle's attributes. This is the same open as the
-//! CLI's `io_bounded::open_regular(path, FinalLink::Refuse)`; the two must
-//! stay at parity.
+//! multi-GiB blob, swapped between any two path lookups. So
+//! [`read_workspace_file`] opens it through `ipe_fs_open`: once, relative to
+//! the held directory, never following a link at its name and never
+//! blocking; the opened handle is proven a regular file and read under a
+//! [`ByteCap`].
 
-use std::io::Read as _;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
+use ipe_fs_open::{ByteCap, EntryName, HeldDir, OpenRefusal};
+
 use crate::config::{ConfigError, LINT_CONFIG_FILE, LINT_CONFIG_MAX_BYTES, LintConfig};
+
+/// The read ceiling for `lint.ipe`.
+const LINT_CONFIG_CAP: ByteCap =
+    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(LINT_CONFIG_MAX_BYTES - 1));
 
 /// Why [`read_workspace_file`] yielded no text.
 #[derive(Debug)]
 pub enum WorkspaceReadError {
-    /// The opened handle is not a regular file (a directory, FIFO, socket, or
-    /// device).
+    /// The entry is a link, or the opened handle is not a regular file (a
+    /// directory, FIFO, socket, or device).
     NotAFile,
     /// The file could not be opened, inspected, or read.
     Unreadable(std::io::Error),
@@ -53,103 +51,46 @@ impl std::fmt::Display for WorkspaceReadError {
 
 impl std::error::Error for WorkspaceReadError {}
 
-/// Open `path` once and read it as text, bounded by `max` bytes.
+/// Read the entry `name` of `dir` as text, bounded by `max` bytes.
 ///
-/// `Ok(None)` when nothing exists at `path`. A final symlink is refused,
-/// never followed. The regular-file proof is taken on the opened handle, so
-/// no swap between check and read is possible; the read never buffers more
-/// than `max + 1` bytes. A file exactly at the cap is accepted; one byte
+/// `Ok(None)` when `dir` or its entry `name` does not exist. A link at
+/// `name` is refused, never followed. The regular-file proof is taken on the
+/// opened handle, so no swap between check and read is possible; at most one
+/// byte past `max` is read. A file exactly at the cap is accepted; one byte
 /// over is refused.
 ///
 /// # Errors
-/// [`WorkspaceReadError`] when the final component is a symlink or the
-/// handle is not a regular file, the open or read fails, the content is
-/// over `max`, or it is not UTF-8.
-pub fn read_workspace_file(path: &Path, max: u64) -> Result<Option<String>, WorkspaceReadError> {
-    let Some(file) = open_no_follow(path)? else {
-        return Ok(None);
+/// [`WorkspaceReadError`] when the entry is a link or not a regular file,
+/// the open or read fails, the content is over `max`, or it is not UTF-8.
+pub fn read_workspace_file(
+    dir: &Path,
+    name: &EntryName,
+    max: ByteCap,
+) -> Result<Option<String>, WorkspaceReadError> {
+    let held = match HeldDir::open_root(dir) {
+        Ok(held) => held,
+        Err(OpenRefusal::Absent) => return Ok(None),
+        Err(refusal) => return Err(WorkspaceReadError::Unreadable(refusal.into_io())),
     };
-    let meta = file.metadata().map_err(WorkspaceReadError::Unreadable)?;
-    if !meta.is_file() {
-        return Err(WorkspaceReadError::NotAFile);
-    }
-    let mut buf = Vec::new();
-    file.take(max.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(WorkspaceReadError::Unreadable)?;
-    if !u64::try_from(buf.len()).is_ok_and(|len| len <= max) {
-        return Err(WorkspaceReadError::TooLarge { max });
-    }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|_| WorkspaceReadError::NotUtf8)
+    held.open_regular(name)
+        .and_then(|file| file.read_utf8(max))
+        .map_or_else(refused_read, |text| Ok(Some(text)))
 }
 
-/// Open `path` read-only: no blocking, no controlling terminal, no final-symlink follow.
-///
-/// `Ok(None)` when nothing exists at `path`. `ELOOP` (a final symlink under
-/// `O_NOFOLLOW`, dangling or not) and `ENXIO` (a socket, or a device with
-/// nothing behind it) are [`WorkspaceReadError::NotAFile`].
-#[cfg(unix)]
-fn open_no_follow(path: &Path) -> Result<Option<std::fs::File>, WorkspaceReadError> {
-    use rustix::fs::{Mode, OFlags};
-    use rustix::io::Errno;
-    let flags =
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    match rustix::fs::open(path, flags, Mode::empty()) {
-        Ok(fd) => Ok(Some(std::fs::File::from(fd))),
-        Err(Errno::NOENT) => Ok(None),
-        Err(Errno::LOOP | Errno::NXIO) => Err(WorkspaceReadError::NotAFile),
-        // FreeBSD reports `O_NOFOLLOW` on a symlink as `EMLINK`, NetBSD as `EFTYPE`.
-        #[cfg(target_os = "freebsd")]
-        Err(Errno::MLINK) => Err(WorkspaceReadError::NotAFile),
-        #[cfg(target_os = "netbsd")]
-        Err(Errno::FTYPE) => Err(WorkspaceReadError::NotAFile),
-        Err(errno) => Err(WorkspaceReadError::Unreadable(errno.into())),
+/// The answer [`read_workspace_file`] gives for a refused open or read of the entry.
+fn refused_read(refusal: OpenRefusal) -> Result<Option<String>, WorkspaceReadError> {
+    match refusal {
+        OpenRefusal::Absent => Ok(None),
+        OpenRefusal::Link | OpenRefusal::NotRegular(_) | OpenRefusal::BadName => {
+            Err(WorkspaceReadError::NotAFile)
+        }
+        OpenRefusal::TooLarge(cap) => Err(WorkspaceReadError::TooLarge { max: cap.get() }),
+        OpenRefusal::NotUtf8 => Err(WorkspaceReadError::NotUtf8),
+        OpenRefusal::Denied
+        | OpenRefusal::InUse
+        | OpenRefusal::TooManyEntries(_)
+        | OpenRefusal::Io(_) => Err(WorkspaceReadError::Unreadable(refusal.into_io())),
     }
-}
-
-/// Open `path` read-only, refusing a final reparse point on the opened handle.
-///
-/// `Ok(None)` when nothing exists at `path`. The open carries
-/// `FILE_FLAG_OPEN_REPARSE_POINT`, so a final reparse point of any tag
-/// (symlink, junction, or other) is opened itself rather than its target,
-/// and its handle attributes refuse it. A workspace path cannot name a
-/// Windows named pipe (those live only under `\\.\pipe\`), so the open
-/// cannot block.
-#[cfg(windows)]
-fn open_no_follow(path: &Path) -> Result<Option<std::fs::File>, WorkspaceReadError> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    /// `FILE_FLAG_OPEN_REPARSE_POINT`: opens a reparse point itself, never its target.
-    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
-    const ATTR_REPARSE_POINT: u32 = 0x400;
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(OPEN_REPARSE_POINT)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(WorkspaceReadError::Unreadable(e)),
-    };
-    let attributes = file
-        .metadata()
-        .map_err(WorkspaceReadError::Unreadable)?
-        .file_attributes();
-    if attributes & ATTR_REPARSE_POINT != 0 {
-        return Err(WorkspaceReadError::NotAFile);
-    }
-    Ok(Some(file))
-}
-
-/// Refuse every workspace read where no final-link-refusing open exists.
-///
-/// Without `O_NOFOLLOW` or reparse-point handles a convention-found file
-/// cannot be opened without following a link, so none is read: fail closed.
-#[cfg(not(any(unix, windows)))]
-fn open_no_follow(_path: &Path) -> Result<Option<std::fs::File>, WorkspaceReadError> {
-    Err(WorkspaceReadError::NotAFile)
 }
 
 /// Why [`load_lint_config`] yielded no configuration.
@@ -196,7 +137,10 @@ pub fn lint_config_dir(anchor: &Path) -> PathBuf {
 /// not parse as a configuration.
 pub fn load_lint_config(dir: &Path) -> Result<LintConfig, LintConfigLoadError> {
     let path = dir.join(LINT_CONFIG_FILE);
-    read_workspace_file(&path, LINT_CONFIG_MAX_BYTES)
+    EntryName::parse(std::ffi::OsStr::new(LINT_CONFIG_FILE))
+        .map_or_else(refused_read, |name| {
+            read_workspace_file(dir, &name, LINT_CONFIG_CAP)
+        })
         .map_err(LintConfigLoadError::Read)?
         .map_or_else(
             || Ok(LintConfig::default()),
@@ -212,8 +156,20 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use ipe_fs_open::{ByteCap, EntryName};
+
     use super::{LintConfigLoadError, WorkspaceReadError, load_lint_config, read_workspace_file};
     use crate::config::{LINT_CONFIG_FILE, LINT_CONFIG_MAX_BYTES};
+
+    /// The entry name `name`.
+    fn entry(name: &str) -> EntryName {
+        EntryName::new(std::ffi::OsStr::new(name)).expect("a plain entry name")
+    }
+
+    /// A cap of `bytes`.
+    fn cap(bytes: u64) -> ByteCap {
+        ByteCap::new(bytes).expect("a nonzero cap")
+    }
 
     /// A fresh, empty scratch directory for one test.
     fn scratch(name: &str) -> PathBuf {
@@ -230,27 +186,31 @@ mod tests {
     fn an_absent_file_is_none_and_the_default_config() {
         let dir = scratch("absent");
         assert!(matches!(
-            read_workspace_file(&dir.join("nope"), 16),
+            read_workspace_file(&dir, &entry("nope"), cap(16)),
             Ok(None)
         ));
         assert!(load_lint_config(&dir).is_ok());
+        assert!(matches!(
+            read_workspace_file(&dir.join("no-dir"), &entry("f"), cap(16)),
+            Ok(None)
+        ));
     }
 
     #[test]
     fn a_file_exactly_at_the_cap_is_read() {
         let dir = scratch("at-cap");
-        let path = dir.join("f");
-        assert!(std::fs::write(&path, [b'a'; 16]).is_ok());
-        assert!(matches!(read_workspace_file(&path, 16), Ok(Some(t)) if t.len() == 16));
+        assert!(std::fs::write(dir.join("f"), [b'a'; 16]).is_ok());
+        assert!(
+            matches!(read_workspace_file(&dir, &entry("f"), cap(16)), Ok(Some(t)) if t.len() == 16)
+        );
     }
 
     #[test]
     fn a_file_one_byte_over_the_cap_is_refused() {
         let dir = scratch("over-cap");
-        let path = dir.join("f");
-        assert!(std::fs::write(&path, [b'a'; 17]).is_ok());
+        assert!(std::fs::write(dir.join("f"), [b'a'; 17]).is_ok());
         assert!(matches!(
-            read_workspace_file(&path, 16),
+            read_workspace_file(&dir, &entry("f"), cap(16)),
             Err(WorkspaceReadError::TooLarge { max: 16 })
         ));
     }
@@ -287,10 +247,9 @@ mod tests {
     #[test]
     fn non_utf8_is_refused() {
         let dir = scratch("non-utf8");
-        let path = dir.join("f");
-        assert!(std::fs::write(&path, [0xff, 0xfe]).is_ok());
+        assert!(std::fs::write(dir.join("f"), [0xff, 0xfe]).is_ok());
         assert!(matches!(
-            read_workspace_file(&path, 16),
+            read_workspace_file(&dir, &entry("f"), cap(16)),
             Err(WorkspaceReadError::NotUtf8)
         ));
     }
@@ -320,7 +279,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_fifo_is_refused_without_blocking() {
+    fn a_fifo_lint_ipe_is_refused_not_hung() {
         let dir = scratch("fifo");
         mkfifo(&dir.join(LINT_CONFIG_FILE));
         assert!(matches!(
@@ -370,7 +329,7 @@ mod tests {
     #[test]
     fn a_device_named_directly_is_refused() {
         assert!(matches!(
-            read_workspace_file(std::path::Path::new("/dev/null"), 16),
+            read_workspace_file(std::path::Path::new("/dev"), &entry("null"), cap(16)),
             Err(WorkspaceReadError::NotAFile)
         ));
     }
@@ -385,6 +344,28 @@ mod tests {
         assert!(matches!(
             load_promptly(dir),
             Some(Err(LintConfigLoadError::Read(WorkspaceReadError::NotAFile)))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_lint_ipe_is_refused() {
+        let dir = scratch("sock");
+        let bound = std::os::unix::net::UnixListener::bind(dir.join(LINT_CONFIG_FILE));
+        assert!(bound.is_ok(), "bind: {bound:?}");
+        assert!(matches!(
+            load_lint_config(&dir),
+            Err(LintConfigLoadError::Read(WorkspaceReadError::NotAFile))
+        ));
+    }
+
+    #[test]
+    fn a_file_where_the_directory_is_is_unreadable_not_absent() {
+        let dir = scratch("notdir");
+        assert!(std::fs::write(dir.join("d"), "").is_ok());
+        assert!(matches!(
+            read_workspace_file(&dir.join("d"), &entry("f"), cap(16)),
+            Err(WorkspaceReadError::Unreadable(_))
         ));
     }
 }
