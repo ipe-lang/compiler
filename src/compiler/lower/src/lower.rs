@@ -13713,27 +13713,33 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Lower `Store.like .field pattern` to `Like col pattern_string`. The
-    /// accessor must name a `String` field (pinned by the type scheme); the
-    /// pattern string is lowered as-is and binds as a parameter at SQL time.
-    fn lower_store_like(&self, args: &[canon::Expr]) -> DResult<Expr> {
-        let (Some(acc), Some(pattern)) = (args.first(), args.get(1)) else {
-            return Err(bug("ipe_lower::lower_store_like", "Store.like arity < 2"));
+    /// Lower a text leaf `Store.like .field pattern` / `Store.startsWith .field
+    /// prefix` to the named `Cond` constructor (`Like` / `StartsWith`) over the
+    /// validated column and the lowered text.
+    ///
+    /// The accessor must name a `String` field (pinned by the type scheme); the
+    /// text is lowered as-is and binds as a parameter at SQL time.
+    fn lower_store_text_leaf(&self, ctor: &'static str, args: &[canon::Expr]) -> DResult<Expr> {
+        let (Some(acc), Some(text)) = (args.first(), args.get(1)) else {
+            return Err(bug(
+                "ipe_lower::lower_store_text_leaf",
+                format!("Store text leaf `{ctor}` arity < 2"),
+            ));
         };
         let (column, _field_ty) = self.accessor_column(acc)?;
-        let lowered_pattern = self.lower_expr(pattern)?;
+        let lowered_text = self.lower_expr(text)?;
         let ids = self.store_cond_ids()?;
-        let like_variant = self.interner.lookup("Like").ok_or_else(|| {
+        let variant = self.interner.lookup(ctor).ok_or_else(|| {
             bug(
-                "ipe_lower::lower_store_like",
-                "Ipe.Db.Store `Like` constructor not interned",
+                "ipe_lower::lower_store_text_leaf",
+                format!("Ipe.Db.Store `{ctor}` constructor not interned"),
             )
         })?;
         Ok(Expr::Ctor {
             home: ids.home,
             ty: ids.cond_ty,
-            variant: like_variant,
-            args: vec![Expr::Str(column), lowered_pattern],
+            variant,
+            args: vec![Expr::Str(column), lowered_text],
         })
     }
 
@@ -22677,7 +22683,12 @@ impl<'a> Lowerer<'a> {
                     return Ok(Intercepted::Done(self.lower_store_compare(&peek, args)?));
                 }
                 Callee::Kernel(KernelFn::StoreLike) if args.len() == 2 => {
-                    return Ok(Intercepted::Done(self.lower_store_like(args)?));
+                    return Ok(Intercepted::Done(self.lower_store_text_leaf("Like", args)?));
+                }
+                Callee::Kernel(KernelFn::StoreStartsWith) if args.len() == 2 => {
+                    return Ok(Intercepted::Done(
+                        self.lower_store_text_leaf("StartsWith", args)?,
+                    ));
                 }
                 Callee::Kernel(KernelFn::StoreIsNull) if args.len() == 1 => {
                     return Ok(Intercepted::Done(self.lower_store_isnull(args)?));
@@ -25901,9 +25912,10 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::StringAny
                 | KernelFn::StringAll
                 // `Store.eq` / `Store.neq` / `Store.gt` / `Store.gte` / `Store.lt`
-                // / `Store.lte` / `Store.like` / `Store.inList` — arity 2, all
-                // intercepted at lowering. These arities are only defensive fallback
-                // counts; the intercept fires before the generic arity dispatch.
+                // / `Store.lte` / `Store.like` / `Store.startsWith` / `Store.inList`
+                // — arity 2, all intercepted at lowering. These arities are only
+                // defensive fallback counts; the intercept fires before the generic
+                // arity dispatch.
                 // `Store.coalesce` / `Store.add` / `Store.sub` / `Store.mul` —
                 // arity 2 (left projection + right projection). Intercepted inside
                 // the `Store.select` projection body.
@@ -25918,6 +25930,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::StoreLtCol
                 | KernelFn::StoreLteCol
                 | KernelFn::StoreLike
+                | KernelFn::StoreStartsWith
                 | KernelFn::StoreInListCol
                 // Correlated-subquery row-security (arity 2). `correlate` (two
                 // accessors) and `existsIn` (Secured + a two-binder lambda) are
@@ -28467,6 +28480,7 @@ impl<'a> Lowerer<'a> {
                     ("Store", "lte") => Ok(Callee::Kernel(KernelFn::StoreLteCol)),
                     ("Store", "lteBy") => Ok(Callee::Kernel(KernelFn::StoreLteBy)),
                     ("Store", "like") => Ok(Callee::Kernel(KernelFn::StoreLike)),
+                    ("Store", "startsWith") => Ok(Callee::Kernel(KernelFn::StoreStartsWith)),
                     ("Store", "isNull") => Ok(Callee::Kernel(KernelFn::StoreIsNull)),
                     ("Store", "notNull") => Ok(Callee::Kernel(KernelFn::StoreNotNull)),
                     ("Store", "inList") => Ok(Callee::Kernel(KernelFn::StoreInListCol)),

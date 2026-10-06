@@ -1175,6 +1175,7 @@ mod registry_phase_c_tests {
             K::StoreLteCol,
             K::StoreLteBy,
             K::StoreLike,
+            K::StoreStartsWith,
             K::StoreIsNull,
             K::StoreNotNull,
             K::StoreInListCol,

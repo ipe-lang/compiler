@@ -2437,6 +2437,15 @@ pub enum StdlibKernel {
     /// leaf. The accessor must name a `String` field; the pattern is a bound
     /// parameter (wildcards are data, never SQL text).
     StoreLike,
+    /// `Store.startsWith : (row -> String) -> String -> Cond` — accessor-typed
+    /// literal-prefix leaf.
+    ///
+    /// The accessor must name a `String` field. The prefix is literal: `%`,
+    /// `_` and `\` in it match themselves, and the match is case-sensitive on
+    /// every engine. It renders through `Sql.startsWith`, so an empty prefix,
+    /// one holding a NUL character, or one longer than 16384 bytes is refused
+    /// as a typed error before any SQL is sent.
+    StoreStartsWith,
     /// `Store.isNull : (row -> t) -> Cond` — accessor-typed IS NULL leaf.
     /// Arity 1: only the accessor (column name), no value.
     StoreIsNull,
@@ -5328,6 +5337,15 @@ impl StdlibKernel {
             Self::StoreLteBy => d("Store", "lteBy", 3, Pure, "store_lte_by", IpeOrder),
             // `Store.like` — arity 2 (accessor + pattern string).
             Self::StoreLike => d("Store", "like", 2, Pure, "store_like", IpeOrder),
+            // `Store.startsWith` — arity 2 (accessor + prefix string).
+            Self::StoreStartsWith => d(
+                "Store",
+                "startsWith",
+                2,
+                Pure,
+                "store_starts_with",
+                IpeOrder,
+            ),
             // `Store.isNull` / `Store.notNull` — arity 1 (accessor only).
             Self::StoreIsNull => d("Store", "isNull", 1, Pure, "store_is_null", IpeOrder),
             Self::StoreNotNull => d("Store", "notNull", 1, Pure, "store_not_null", IpeOrder),
@@ -8117,6 +8135,7 @@ impl StdlibKernel {
         Self::StoreLteCol,
         Self::StoreLteBy,
         Self::StoreLike,
+        Self::StoreStartsWith,
         Self::StoreIsNull,
         Self::StoreNotNull,
         Self::StoreInListCol,
@@ -11701,7 +11720,7 @@ impl StdlibKernel {
         const STORE_EQ_COL: TyShape = TyShape::Fun(&A_TO_B_GETTER, &B_TO_COND_A);
         // `*By : Codec t -> (row -> t) -> t -> Cond row`.
         const STORE_EQ_BY: TyShape = TyShape::Fun(&CODEC_B, &STORE_EQ_COL);
-        // `like : (row -> String) -> String -> Cond row`.
+        // `like / startsWith : (row -> String) -> String -> Cond row`.
         const A_TO_STRING_GETTER: TyShape = TyShape::Fun(&A, &STRING);
         const STRING_TO_COND_A: TyShape = TyShape::Fun(&STRING, &COND_A);
         const STORE_LIKE: TyShape = TyShape::Fun(&A_TO_STRING_GETTER, &STRING_TO_COND_A);
@@ -13002,7 +13021,7 @@ impl StdlibKernel {
             | Self::StoreGteBy
             | Self::StoreLtBy
             | Self::StoreLteBy => Some(&STORE_EQ_BY),
-            Self::StoreLike => Some(&STORE_LIKE),
+            Self::StoreLike | Self::StoreStartsWith => Some(&STORE_LIKE),
             Self::StoreIsNull | Self::StoreNotNull => Some(&STORE_IS_NULL),
             Self::StoreInListCol => Some(&STORE_IN_LIST_COL),
             Self::StoreInListBy => Some(&STORE_IN_LIST_BY),
@@ -13098,6 +13117,7 @@ impl StdlibKernel {
         Self::StoreLteCol,
         Self::StoreLteBy,
         Self::StoreLike,
+        Self::StoreStartsWith,
         Self::StoreIsNull,
         Self::StoreNotNull,
         Self::StoreInListCol,
@@ -13670,6 +13690,7 @@ impl StdlibKernel {
             | Self::StoreLteCol
             | Self::StoreLteBy
             | Self::StoreLike
+            | Self::StoreStartsWith
             | Self::StoreIsNull
             | Self::StoreNotNull
             | Self::StoreInListCol
