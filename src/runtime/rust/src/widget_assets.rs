@@ -459,21 +459,56 @@ pub fn page_scripts_for(assets: &[WidgetAsset], base: &str, transport: WidgetTra
     for asset in assets {
         let url = format!("{base}{}", widget_asset_path(&asset.content));
         let integrity = widget_asset_integrity(&asset.content);
+        out.push_str("<link rel=\"modulepreload\" href=\"");
+        url_attr(&mut out, &url);
         out.push_str(&format!(
-            "<link rel=\"modulepreload\" href=\"{url}\" integrity=\"{integrity}\" crossorigin=\"anonymous\">"
+            "\" integrity=\"{integrity}\" crossorigin=\"anonymous\">"
         ));
     }
     let glue_url = format!("{base}{}", glue_path_for(assets, base, transport));
     let glue_integrity = glue_integrity_for(assets, base, transport);
+    out.push_str("<script type=\"module\" src=\"");
+    url_attr(&mut out, &glue_url);
     out.push_str(&format!(
-        "<script type=\"module\" src=\"{glue_url}\" integrity=\"{glue_integrity}\" crossorigin=\"anonymous\"></script>"
+        "\" integrity=\"{glue_integrity}\" crossorigin=\"anonymous\"></script>"
     ));
     out
+}
+
+/// Append `url` as the body of a double-quoted HTML attribute.
+///
+/// Every `href`/`src` the shell writes passes through this one escaper, so no
+/// URL text, whatever base it was built from, can close the attribute.
+fn url_attr(out: &mut String, url: &str) {
+    crate::escape::html_attr_into(url, out);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A URL that would close its attribute is escaped by the one seam; a
+    /// URL with no attribute-special byte is written unchanged.
+    #[test]
+    fn page_scripts_attr_seam_escapes() {
+        let mut hostile = String::new();
+        url_attr(&mut hostile, "x\" onload=\"y");
+        assert!(!hostile.contains('"'), "{hostile}");
+        assert_eq!(hostile, "x&#34; onload=&#34;y");
+        let mut plain = String::new();
+        url_attr(&mut plain, "/_ipe/widget.abc.js");
+        assert_eq!(plain, "/_ipe/widget.abc.js");
+        let assets = [WidgetAsset {
+            tag: "ipe-ce-0123456789abcdef".to_owned(),
+            content: "export function mount(){}".to_owned(),
+        }];
+        let html = page_scripts_for(&assets, "/app\" onload=\"y", WidgetTransport::Server);
+        assert!(!html.contains("onload=\"y"), "{html}");
+        assert!(
+            html.contains("href=\"/app&#34; onload=&#34;y/_ipe/widget."),
+            "{html}"
+        );
+    }
 
     // A single global registry means these tests must not race a real
     // registration; they exercise the pure hashing/glue helpers directly with an
