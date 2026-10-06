@@ -3257,9 +3257,11 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let root = dir.clone();
         let resolved = contained.resolved().to_path_buf();
-        std::thread::spawn(move || {
-            let _ = sender.send(read_widget_hook(&root, &resolved));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = sender.send(read_widget_hook(&root, &resolved));
+            })
+            .expect("spawn the bounded reader thread");
         let result = receiver.recv_timeout(std::time::Duration::from_secs(10));
         if result.is_err() {
             // A writer releases a reader stuck on the FIFO, so the process can exit.

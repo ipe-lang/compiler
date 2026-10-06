@@ -957,9 +957,11 @@ mod tests {
         assert!(made.success(), "mkfifo creates the fixture");
         let (tx, rx) = std::sync::mpsc::channel();
         let reader_root = root.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(Lockfile::read(&reader_root));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(Lockfile::read(&reader_root));
+            })
+            .expect("spawn the bounded reader thread");
         let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&root);
         assert!(

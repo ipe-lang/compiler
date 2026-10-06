@@ -333,13 +333,12 @@ pub fn read_named_in(dir: &Path, names: &[&str], cap: ByteCap) -> Result<String,
 /// otherwise as [`read_in`].
 pub fn read_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<String, CliError> {
     let not_below = || refusal_error(path, OpenRefusal::BadName);
-    let (base, rel) = match path.strip_prefix(root) {
-        Ok(rel) => (root.to_path_buf(), rel),
-        Err(_) => {
-            let canonical = std::fs::canonicalize(root).map_err(|_| not_below())?;
-            let rel = path.strip_prefix(&canonical).map_err(|_| not_below())?;
-            (canonical, rel)
-        }
+    let (base, rel) = if let Ok(rel) = path.strip_prefix(root) {
+        (root.to_path_buf(), rel)
+    } else {
+        let canonical = std::fs::canonicalize(root).map_err(|_| not_below())?;
+        let rel = path.strip_prefix(&canonical).map_err(|_| not_below())?;
+        (canonical, rel)
     };
     let names = rel
         .components()
@@ -430,12 +429,12 @@ fn open_leaf(path: &Path) -> Result<RegularFile, CliError> {
 ///
 /// A `max` of zero admits only an empty file.
 fn read_handle_bytes(file: RegularFile, path: &Path, max: u64) -> Result<Vec<u8>, CliError> {
+    /// The smallest cap, read under a `max` of zero so one byte past it is still seen.
+    const ONE_BYTE: ByteCap = ByteCap::from_nonzero(NonZeroU64::MIN);
     let too_large = || CliError::FileTooLarge {
         path: path.to_path_buf(),
         max,
     };
-    /// The smallest cap, read under a `max` of zero so one byte past it is still seen.
-    const ONE_BYTE: ByteCap = ByteCap::from_nonzero(NonZeroU64::MIN);
     let cap = ByteCap::new(max).unwrap_or(ONE_BYTE);
     let bytes = file.read_bytes(cap).map_err(|refusal| match refusal {
         OpenRefusal::TooLarge(_) => too_large(),

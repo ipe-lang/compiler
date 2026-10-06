@@ -4451,7 +4451,7 @@ fn shown_trace_strips_every_control_character() {
                  \u{9b}2J\u{9d}0;title\u{9c}Add(\u{85}3\t\u{7f}\u{202e}) => 5\n\
                  \x1b[H\x1b[2J\n";
     assert!(fs::write(&trace, laced).is_ok(), "write planted trace");
-    let shown = load_session_trace(&TraceFile::Named(trace.clone()));
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         shown.is_ok(),
         "a UTF-8 trace under the cap must show: {shown:?}"
@@ -4542,7 +4542,7 @@ fn shown_trace_over_the_cap_is_refused() {
         fs::write(&trace, vec![b'a'; over]).is_ok(),
         "write big trace"
     );
-    let shown = load_session_trace(&TraceFile::Named(trace.clone()));
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         matches!(shown, Err(CliError::FileTooLarge { .. })),
         "an oversized trace must be refused: {shown:?}"
@@ -4559,7 +4559,7 @@ fn shown_trace_not_utf8_is_refused() {
         fs::write(&trace, [b'A', 0xff, 0xfe, b'\n']).is_ok(),
         "write binary trace"
     );
-    let shown = load_session_trace(&TraceFile::Named(trace.clone()));
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         matches!(&shown, Err(CliError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::InvalidData),
