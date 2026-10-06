@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ipe_sandbox::run_jail::{
-    FilesystemScope, RunResourceLimits, SandboxProfile, WindowsBaseEnv,
+    FilesystemScope, ProcCap, RunResourceLimits, SandboxProfile, WindowsBaseEnv,
     run_windows_jailed_for_test, windows_scrubbed_env,
 };
 
@@ -121,7 +121,7 @@ fn subprocess_granted() -> SandboxProfile {
     SandboxProfile {
         subprocess: true,
         limits: RunResourceLimits {
-            proc_cap: 16,
+            proc_cap: ProcCap::parse(16).expect("16 is in range"),
             ..RunResourceLimits::default()
         },
         ..SandboxProfile::maximally_isolated()
