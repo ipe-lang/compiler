@@ -44,6 +44,8 @@
 
 use std::sync::OnceLock;
 
+use crate::encoding::{BundlePath, HashedAsset, MountBase};
+
 /// Which transport the generated glue wires for one build target.
 ///
 /// One glue module, two adapters. The `HTMLElement` subclass, the
@@ -105,6 +107,12 @@ fn content_digest(content: &str) -> [u8; 32] {
 /// `base64full` (standard base64 of the full 32-byte digest) is the SRI value.
 /// Both derive from one digest — the page SRI and the served bytes can never
 /// disagree because they are computed from the same bytes.
+/// The first eight digest bytes: the cache-busting segment of an asset path.
+const fn digest_head(digest: &[u8; 32]) -> [u8; 8] {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, ..] = *digest;
+    [b0, b1, b2, b3, b4, b5, b6, b7]
+}
+
 fn content_hashes(content: &str) -> (String, String) {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let digest = content_digest(content);
@@ -158,13 +166,14 @@ pub fn has_widgets() -> bool {
     !registered().is_empty()
 }
 
-/// The content-addressed URL PATH (no base prefix) for one widget asset, e.g.
-/// `/_ipe/widget.a1b2c3d4e5f6a7b8.js`. Stable for given content; changes when
-/// the file changes — making `Cache-Control: immutable` safe.
+/// The content-addressed bundle path of one widget asset, e.g.
+/// `_ipe/widget.a1b2c3d4e5f6a7b8.js`.
+///
+/// Stable for given content; changes when the file changes, which makes
+/// `Cache-Control: immutable` safe. Its URL is [`MountBase::url_of`].
 #[must_use]
-pub fn widget_asset_path(content: &str) -> String {
-    let (hex16, _) = content_hashes(content);
-    format!("/_ipe/widget.{hex16}.js")
+pub fn widget_asset_path(content: &str) -> BundlePath {
+    BundlePath::hashed(HashedAsset::Widget, digest_head(&content_digest(content)))
 }
 
 /// The `sha256-<b64>` SRI value for one widget asset's content.
@@ -191,13 +200,12 @@ pub fn widget_asset_integrity(content: &str) -> String {
 /// If the author module lacks a `mount` export the element fails observably
 /// (console error) and stays inert — it is never `define`d in a broken state.
 ///
-/// `base` is the sub-app base path prefix (empty for a root-mounted app), so the
-/// author-module `import` URL reaches the same content-addressed route the page
-/// pins. `transport` selects the down/up adapter (§ [`WidgetTransport`]); the
+/// `base` is where the bundle is served, so the author-module `import` URL
+/// reaches the same content-addressed route the page pins. `transport` selects the down/up adapter (§ [`WidgetTransport`]); the
 /// element class, the author `mount` contract, and the `define`-only-on-`ipe-ce-*`
 /// rule are identical in both.
 #[must_use]
-pub fn glue_js(base: &str, transport: WidgetTransport) -> String {
+pub fn glue_js(base: &MountBase, transport: WidgetTransport) -> String {
     glue_js_for(registered(), base, transport)
 }
 
@@ -211,7 +219,7 @@ pub fn glue_js(base: &str, transport: WidgetTransport) -> String {
 /// that manifest directly. The server path keeps calling [`glue_js`] (registry-
 /// backed) — same code, one glue, no drift.
 #[must_use]
-pub fn glue_js_for(assets: &[WidgetAsset], base: &str, transport: WidgetTransport) -> String {
+pub fn glue_js_for(assets: &[WidgetAsset], base: &MountBase, transport: WidgetTransport) -> String {
     let mut out = String::new();
     out.push_str(match transport {
         WidgetTransport::Server => GLUE_PRELUDE_SERVER,
@@ -231,8 +239,8 @@ pub fn glue_js_for(assets: &[WidgetAsset], base: &str, transport: WidgetTranspor
 /// (`attributeChangedCallback` vs the `set state(v)` property setter) and the
 /// `emit` wiring (`__ipeEmitWidgetUp` POST vs a typed `CustomEvent`) differ, both
 /// routed through the shared prelude helpers so no decode logic is duplicated.
-fn glue_class(base: &str, transport: WidgetTransport, tag: &str, content: &str) -> String {
-    let asset_url = format!("{base}{}", widget_asset_path(content));
+fn glue_class(base: &MountBase, transport: WidgetTransport, tag: &str, content: &str) -> String {
+    let asset_url = base.url_of(&widget_asset_path(content));
     // `tag` is `ipe-ce-<hex16>` — every byte is `[a-z0-9-]` (see the lowerer's
     // `custom_element_tag`), so it is safe both as a JS string literal and as the
     // class-name suffix. It is NEVER derived from user input.
@@ -393,29 +401,33 @@ function __ipeEmitWidgetUpEvent(host, up) {
 }
 ";
 
-/// The content-addressed URL PATH for the whole-registry glue module, e.g.
-/// `/_ipe/widget-glue.<hex16>.js`. The hash is over the glue content (which
-/// folds in every registered asset URL), so the URL changes when any widget
-/// changes — `Cache-Control: immutable` stays safe.
+/// The content-addressed bundle path of the whole-registry glue module, e.g.
+/// `_ipe/widget-glue.<hex16>.js`.
 ///
-/// `base` threads the sub-app prefix into the glue body (the author-import URLs),
-/// so a sub-app's glue hashes distinctly from a root-mounted one; the returned
-/// PATH is base-relative (the caller prepends `base` for the page `<script src>`).
+/// The hash is over the glue content (which folds in every registered asset
+/// URL), so the path changes when any widget changes and `Cache-Control:
+/// immutable` stays safe. `base` reaches the glue body (the author-import
+/// URLs), so glue served under a prefix hashes distinctly from glue served at
+/// the root; the page `<script src>` is `base.url_of` of the returned path.
 #[must_use]
-pub fn glue_path(base: &str, transport: WidgetTransport) -> String {
+pub fn glue_path(base: &MountBase, transport: WidgetTransport) -> BundlePath {
     glue_path_for(registered(), base, transport)
 }
 
 /// Registry-free [`glue_path`] over an explicit asset slice (build-time bundler).
 #[must_use]
-pub fn glue_path_for(assets: &[WidgetAsset], base: &str, transport: WidgetTransport) -> String {
-    let (hex16, _) = content_hashes(&glue_js_for(assets, base, transport));
-    format!("/_ipe/widget-glue.{hex16}.js")
+pub fn glue_path_for(
+    assets: &[WidgetAsset],
+    base: &MountBase,
+    transport: WidgetTransport,
+) -> BundlePath {
+    let digest = content_digest(&glue_js_for(assets, base, transport));
+    BundlePath::hashed(HashedAsset::WidgetGlue, digest_head(&digest))
 }
 
 /// The `sha256-<b64>` SRI value for the whole-registry glue module.
 #[must_use]
-pub fn glue_integrity(base: &str, transport: WidgetTransport) -> String {
+pub fn glue_integrity(base: &MountBase, transport: WidgetTransport) -> String {
     glue_integrity_for(registered(), base, transport)
 }
 
@@ -423,7 +435,7 @@ pub fn glue_integrity(base: &str, transport: WidgetTransport) -> String {
 #[must_use]
 pub fn glue_integrity_for(
     assets: &[WidgetAsset],
-    base: &str,
+    base: &MountBase,
     transport: WidgetTransport,
 ) -> String {
     let (_, b64) = content_hashes(&glue_js_for(assets, base, transport));
@@ -439,7 +451,7 @@ pub fn glue_integrity_for(
 /// no CSP impact). Every reference is EXTERNAL + SRI + `crossorigin` — no inline
 /// script, so the page CSP (`script-src 'self'`) is unchanged.
 #[must_use]
-pub fn page_scripts(base: &str, transport: WidgetTransport) -> String {
+pub fn page_scripts(base: &MountBase, transport: WidgetTransport) -> String {
     page_scripts_for(registered(), base, transport)
 }
 
@@ -447,7 +459,11 @@ pub fn page_scripts(base: &str, transport: WidgetTransport) -> String {
 /// bundler entry. Emits the SAME external, SRI-pinned `<link modulepreload>` +
 /// glue `<script>` markup as [`page_scripts`], for a caller-supplied manifest.
 #[must_use]
-pub fn page_scripts_for(assets: &[WidgetAsset], base: &str, transport: WidgetTransport) -> String {
+pub fn page_scripts_for(
+    assets: &[WidgetAsset],
+    base: &MountBase,
+    transport: WidgetTransport,
+) -> String {
     if assets.is_empty() {
         return String::new();
     }
@@ -457,23 +473,85 @@ pub fn page_scripts_for(assets: &[WidgetAsset], base: &str, transport: WidgetTra
     // `integrity`, and the subsequent `import` in the glue reuses the cached,
     // already-verified response.
     for asset in assets {
-        let url = format!("{base}{}", widget_asset_path(&asset.content));
+        let url = base.url_of(&widget_asset_path(&asset.content));
         let integrity = widget_asset_integrity(&asset.content);
+        out.push_str("<link rel=\"modulepreload\" href=\"");
+        url_attr(&mut out, &url);
         out.push_str(&format!(
-            "<link rel=\"modulepreload\" href=\"{url}\" integrity=\"{integrity}\" crossorigin=\"anonymous\">"
+            "\" integrity=\"{integrity}\" crossorigin=\"anonymous\">"
         ));
     }
-    let glue_url = format!("{base}{}", glue_path_for(assets, base, transport));
+    let glue_url = base.url_of(&glue_path_for(assets, base, transport));
     let glue_integrity = glue_integrity_for(assets, base, transport);
+    out.push_str("<script type=\"module\" src=\"");
+    url_attr(&mut out, &glue_url);
     out.push_str(&format!(
-        "<script type=\"module\" src=\"{glue_url}\" integrity=\"{glue_integrity}\" crossorigin=\"anonymous\"></script>"
+        "\" integrity=\"{glue_integrity}\" crossorigin=\"anonymous\"></script>"
     ));
     out
+}
+
+/// Append `url` as the body of a double-quoted HTML attribute.
+///
+/// Every `href`/`src` the shell writes passes through this one escaper, so no
+/// URL text, whatever base it was built from, can close the attribute.
+fn url_attr(out: &mut String, url: &str) {
+    crate::escape::html_attr_into(url, out);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A URL that would close its attribute is escaped by the one seam; a
+    /// URL with no attribute-special byte is written unchanged.
+    #[test]
+    fn page_scripts_attr_seam_escapes() {
+        let mut hostile = String::new();
+        url_attr(&mut hostile, "x\" onload=\"y");
+        assert!(!hostile.contains('"'), "{hostile}");
+        assert_eq!(hostile, "x&#34; onload=&#34;y");
+        let mut plain = String::new();
+        url_attr(&mut plain, "/_ipe/widget.abc.js");
+        assert_eq!(plain, "/_ipe/widget.abc.js");
+        let assets = [WidgetAsset {
+            tag: "ipe-ce-0123456789abcdef".to_owned(),
+            content: "export function mount(){}".to_owned(),
+        }];
+        let Ok(app) = MountBase::parse("/app") else {
+            return;
+        };
+        let html = page_scripts_for(&assets, &app, WidgetTransport::Server);
+        assert!(html.contains("href=\"/app/_ipe/widget."), "{html}");
+    }
+
+    /// Every URL the glue imports and the page loads carries the mount base;
+    /// the root base yields the same paths at `/`.
+    #[test]
+    fn glue_imports_carry_the_base() {
+        let assets = [WidgetAsset {
+            tag: "ipe-ce-0123456789abcdef".to_owned(),
+            content: "export function mount(){}".to_owned(),
+        }];
+        let Ok(app) = MountBase::parse("/app") else {
+            return;
+        };
+        let root = MountBase::root();
+        for transport in [WidgetTransport::Server, WidgetTransport::WasmClient] {
+            let glue = glue_js_for(&assets, &app, transport);
+            assert!(glue.contains("from \"/app/_ipe/widget."), "{glue}");
+            let html = page_scripts_for(&assets, &app, transport);
+            assert!(html.contains("href=\"/app/_ipe/widget."), "{html}");
+            assert!(html.contains("src=\"/app/_ipe/widget-glue."), "{html}");
+            let root_glue = glue_js_for(&assets, &root, transport);
+            assert!(root_glue.contains("from \"/_ipe/widget."), "{root_glue}");
+            let root_html = page_scripts_for(&assets, &root, transport);
+            assert!(
+                root_html.contains("src=\"/_ipe/widget-glue."),
+                "{root_html}"
+            );
+        }
+    }
 
     // A single global registry means these tests must not race a real
     // registration; they exercise the pure hashing/glue helpers directly with an
@@ -500,8 +578,8 @@ mod tests {
         let content = "export function mount(host, emit){ return { onState(){} }; }";
         let (hex16, b64) = content_hashes(content);
         assert_eq!(
-            widget_asset_path(content),
-            format!("/_ipe/widget.{hex16}.js")
+            widget_asset_path(content).rel(),
+            format!("_ipe/widget.{hex16}.js")
         );
         assert_eq!(widget_asset_integrity(content), format!("sha256-{b64}"));
     }
@@ -515,7 +593,7 @@ mod tests {
         // `JSON.parse`d, never `eval`ed.
         let tag = "ipe-ce-cafef00dcafef00d";
         let content = "export function mount(host, emit){ return { onState(s){} }; }";
-        let asset_url = widget_asset_path(content);
+        let asset_url = MountBase::root().url_of(&widget_asset_path(content));
         let class_suffix = tag.replace('-', "_");
         // Reconstruct one class block exactly as `glue_js` would, to assert on it
         // without touching the global registry.
@@ -552,8 +630,8 @@ mod tests {
         );
         let hex16: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            widget_asset_path(content),
-            format!("/_ipe/widget.{hex16}.js")
+            widget_asset_path(content).rel(),
+            format!("_ipe/widget.{hex16}.js")
         );
     }
 
@@ -583,8 +661,9 @@ mod tests {
         // so the page CSP and byte output are unchanged for a widget-free app.
         // (The global registry is empty unless `register` ran.)
         if !has_widgets() {
-            assert_eq!(page_scripts("", WidgetTransport::Server), "");
-            assert_eq!(page_scripts("", WidgetTransport::WasmClient), "");
+            let root = MountBase::root();
+            assert_eq!(page_scripts(&root, WidgetTransport::Server), "");
+            assert_eq!(page_scripts(&root, WidgetTransport::WasmClient), "");
         }
     }
 
@@ -616,7 +695,12 @@ mod tests {
         // `define` only the `ipe-ce-*` tag.
         let tag = "ipe-ce-cafef00dcafef00d";
         let content = "export function mount(host, emit){ return { onState(s){} }; }";
-        let wasm_class = glue_class("", WidgetTransport::WasmClient, tag, content);
+        let wasm_class = glue_class(
+            &MountBase::root(),
+            WidgetTransport::WasmClient,
+            tag,
+            content,
+        );
         assert!(wasm_class.contains("set state(v)"));
         assert!(
             !wasm_class.contains("observedAttributes"),
@@ -629,7 +713,7 @@ mod tests {
 
         // The server class remains the attribute path — the two adapters are
         // distinct but share the one class shell + `define` rule.
-        let server_class = glue_class("", WidgetTransport::Server, tag, content);
+        let server_class = glue_class(&MountBase::root(), WidgetTransport::Server, tag, content);
         assert!(server_class.contains("attributeChangedCallback"));
         assert!(server_class.contains("customElements.define(\"ipe-ce-"));
         assert!(!server_class.contains("set state(v)"));
@@ -640,19 +724,20 @@ mod tests {
     /// never pin one transport's integrity and be served the other's bytes.
     #[test]
     fn wasm_and_server_glue_paths_diverge() {
+        let root = MountBase::root();
         assert_ne!(
-            glue_js("", WidgetTransport::Server),
-            glue_js("", WidgetTransport::WasmClient),
+            glue_js(&root, WidgetTransport::Server),
+            glue_js(&root, WidgetTransport::WasmClient),
             "the two transports must not produce byte-identical glue"
         );
         assert_ne!(
-            glue_path("", WidgetTransport::Server),
-            glue_path("", WidgetTransport::WasmClient),
+            glue_path(&root, WidgetTransport::Server),
+            glue_path(&root, WidgetTransport::WasmClient),
             "distinct glue bytes must yield distinct content-addressed URLs"
         );
         assert_ne!(
-            glue_integrity("", WidgetTransport::Server),
-            glue_integrity("", WidgetTransport::WasmClient),
+            glue_integrity(&root, WidgetTransport::Server),
+            glue_integrity(&root, WidgetTransport::WasmClient),
             "distinct glue bytes must yield distinct SRI pins"
         );
     }

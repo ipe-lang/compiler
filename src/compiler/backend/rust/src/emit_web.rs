@@ -1461,6 +1461,7 @@ mod schema_tag_tests {
             None,
             ipe_ir::Target::Native,
             Vec::new(),
+            crate::MountBase::root(),
             false,
             None,
             false,

@@ -1281,6 +1281,30 @@ package.ipe: program entry {entry} has a path segment {segment} that is not a va
 
 package.ipe: program entry {entry} names no module
 
+## manifest-base-path-too-long
+
+`delivery.browser.basePath` is {len} bytes, past the {max}-byte limit. Serve the bundle under a shorter path, e.g. `/app`.
+
+## manifest-base-path-no-leading-slash
+
+`delivery.browser.basePath` {base} does not start with `/`. Write `/` for the origin root, or an absolute path such as `/app`.
+
+## manifest-base-path-trailing-slash
+
+`delivery.browser.basePath` {base} ends with `/`, and only the root is `/`. Drop the trailing slash, e.g. `/app`.
+
+## manifest-base-path-empty-segment
+
+`delivery.browser.basePath` {base} has an empty segment (`//`). Join segments with a single `/`, e.g. `/apps/admin`.
+
+## manifest-base-path-dot-segment
+
+`delivery.browser.basePath` {base} has a `.` or `..` segment, which a browser resolves away. Name the path directly, e.g. `/app`.
+
+## manifest-base-path-reserved-byte
+
+`delivery.browser.basePath` {base} holds the byte {byte}. A segment holds only `A-Z a-z 0-9 - . _ ~`, and segments are joined by `/`, e.g. `/my-app`.
+
 ## manifest-not-package-ipe
 
 {path}: not a package.ipe manifest. {hint}

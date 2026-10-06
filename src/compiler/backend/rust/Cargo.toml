@@ -19,6 +19,9 @@ sha2 = "0.10"
 # baked `Float` template default byte-identical to the runtime's
 # `#[derive(Serialize)]` form — single source of truth for the float spelling.
 ryu = "1"
+# `MountBase`: the typed mount base every emitted shell URL is built from. Only
+# `encoding` is enabled, so the compiler pulls the codec crates and no server.
+ipe-runtime-rust = { path = "../../../runtime/rust", default-features = false, features = ["encoding"] }
 
 [dev-dependencies]
 ipe-test-temp = { path = "../../../../tools/test-temp" }

@@ -190,10 +190,15 @@ type Orientation
     | Any
 
 
--- | Configuration for the `web solo` browser host.
+-- | Configuration for the browser host.
 --
--- `basePath` is the URL base path the client is served from. Use `"/"` for the
--- root and `"/app"` when the client lives at a sub-path behind a reverse proxy.
+-- `basePath` is the URL path the client bundle is served at: the `web solo`
+-- host, static hosts, and mobile shells all serve the bundle under it. Use
+-- `"/"` (or `""`) for the root and `"/app"` when the client lives at a sub-path
+-- behind a reverse proxy. Any other value is one or more `/segment` parts, each
+-- made only of the bytes `A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty,
+-- `.`, or `..` segment, and at most 1024 bytes in all. The manifest refuses any
+-- other value.
 type alias BrowserConfig =
     { basePath : String
     }
