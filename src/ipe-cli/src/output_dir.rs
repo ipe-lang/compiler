@@ -29,7 +29,10 @@
 //!   down; the levels above the anchor are not ipe's and are opened following
 //!   links, so disjointness is proven again on the anchor's canonical path. The
 //!   root itself and the leaf area are always claimed (created and marked, or
-//!   adopted); the levels between them and above the root are passed through.
+//!   adopted). The anchor below the root, the levels above the root, and the
+//!   areas between root and leaf are entered: each passes the one claim
+//!   decision before anything is created inside it, unless it already holds
+//!   user entries, in which case it is passed through unmarked.
 //!
 //! A tree ipe hands over to the user (`ipe release eject`) goes through [`HandoverRoot`]
 //! and [`HandoverDir`] instead: it must lie outside every tree ipe owns or may
@@ -520,10 +523,11 @@ enum RootStep<'a> {
 
 /// The levels of an area claim below its held anchor, each with its ownership step.
 ///
-/// Levels above the root are entered (an ancestor holding user entries is never adopted), the
-/// root is always claimed, the areas above the leaf are entered, and the leaf
-/// area is claimed. With no areas the root is the leaf. The root's step is a
-/// field of its own, so no claim can reach an area without claiming the root.
+/// The anchor and the levels above the root are entered (an ancestor holding
+/// user entries is never adopted), the root is always claimed, the areas
+/// above the leaf are entered, and the leaf area is claimed. With no areas
+/// the root is the leaf. The root's step is a field of its own, so no claim
+/// can reach an area without claiming the root.
 #[derive(Debug)]
 struct ClaimPlan<'a> {
     /// The missing levels between the anchor and the root, outermost first.
@@ -555,17 +559,17 @@ impl<'a> ClaimPlan<'a> {
     /// territory at a claimed level; [`CliError::Io`] on a filesystem failure.
     fn run(&self, anchor: held::HeldDir) -> Result<held::HeldDir, CliError> {
         held::level_held(anchor.path());
-        let mut dir = anchor;
-        for name in self.above_root {
-            dir = enter_in(&dir, name)?;
-            held::level_held(dir.path());
-        }
-        dir = match self.root {
+        let mut dir = match self.root {
             RootStep::Anchor => {
-                let _: held::Claimed = dir.claim()?;
-                dir
+                let _: held::Claimed = anchor.claim()?;
+                anchor
             }
             RootStep::Named(name) => {
+                let mut dir = enter_held(anchor)?;
+                for level in self.above_root {
+                    dir = enter_in(&dir, level)?;
+                    held::level_held(dir.path());
+                }
                 let root = claim_in(&dir, name)?;
                 held::level_held(root.path());
                 root
@@ -584,19 +588,26 @@ impl<'a> ClaimPlan<'a> {
     }
 }
 
-/// Enter the intermediate level `name` of the held `parent`, claiming it unless it is user territory.
+/// Enter the intermediate level `name` of the held `parent`, created when absent, as [`enter_held`] enters it.
 ///
-/// A link or a non-directory is refused. An existing level already holding
-/// user entries is traversed unmarked, never adopted. Every other level, the
-/// one this call created and one a concurrent claim created or is claiming
-/// alike, goes through [`held::HeldDir::claim`] before anything is created
-/// inside it: no claimant fills a level whose claim is still checking it
-/// empty, so sibling claims under one missing parent never refuse each other.
-/// A level the claim finds filled by another program is user territory and
-/// is traversed unmarked.
+/// A link or a non-directory is refused.
 fn enter_in(parent: &held::HeldDir, name: &std::ffi::OsStr) -> Result<held::HeldDir, CliError> {
-    let (dir, created) = parent.create_child(name)?;
-    if !created && dir.ownership()? == held::Ownership::User {
+    let (dir, _created) = parent.create_child(name)?;
+    enter_held(dir)
+}
+
+/// Pass the held level `dir` through its one claim decision before anything is created inside it.
+///
+/// A level holding user entries is traversed unmarked, never adopted. Every
+/// other level (empty, being claimed, or marked; created by this claim, by a
+/// concurrent one, or found so) goes through [`held::HeldDir::claim`] first:
+/// no claimant fills a level whose claim is still checking it empty, whether
+/// the claimant entered the level or holds it as its anchor, so sibling
+/// claims under one shared level never refuse or unmark each other. A level
+/// the claim finds filled by another program is user territory and is
+/// traversed unmarked.
+fn enter_held(dir: held::HeldDir) -> Result<held::HeldDir, CliError> {
+    if dir.ownership()? == held::Ownership::User {
         return Ok(dir);
     }
     match dir.claim() {
@@ -1137,8 +1148,8 @@ impl OutputRoot {
     /// through the handle above it — a level swapped after the proof cannot
     /// redirect the claim into the project. The root and the leaf area are
     /// claimed — created or existing, and marked — through a `ClaimPlan`;
-    /// the levels above the root and the areas between root and leaf are
-    /// only passed through.
+    /// the anchor below the root, the levels above the root, and the areas
+    /// between root and leaf are entered as `enter_held` enters them.
     ///
     /// # Errors
     /// As [`OutputRoot::area_path`] and [`OutputRoot::resolve`];
@@ -2730,6 +2741,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// What a sibling claim thread reports first.
+    #[derive(Debug, PartialEq, Eq)]
+    enum SiblingSeen {
+        /// It met a claim lock held elsewhere.
+        Busy,
+        /// It finished its work.
+        Done,
+    }
+
+    /// Run `creator` here and, at its first held claim lock, start `sibling` on a thread.
+    ///
+    /// The creator stays at that lock until the sibling's first report
+    /// arrives. Returns the creator's result, that first report, and the
+    /// sibling's result.
+    fn race_at_first_lock<T>(
+        creator: impl FnOnce() -> T,
+        sibling: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> (T, Option<SiblingSeen>, Result<(), String>) {
+        let started = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorded = std::rc::Rc::clone(&started);
+        let mut sibling = Some(sibling);
+        held::set_claim_hook(Some(Box::new(move |point, _path: &Path| {
+            if point == held::ClaimPoint::AfterLock
+                && let Some(sibling) = sibling.take()
+            {
+                let (seen, met) = std::sync::mpsc::channel::<SiblingSeen>();
+                let thread = std::thread::Builder::new()
+                    .spawn(move || {
+                        let busy = seen.clone();
+                        held::set_claim_hook(Some(Box::new(move |point, _path: &Path| {
+                            if point == held::ClaimPoint::Busy {
+                                let _ = busy.send(SiblingSeen::Busy);
+                            }
+                        })));
+                        let result = sibling();
+                        let _ = seen.send(SiblingSeen::Done);
+                        result
+                    })
+                    .expect("spawn test thread");
+                let first = met.recv_timeout(std::time::Duration::from_secs(60)).ok();
+                *recorded.borrow_mut() = Some((first, thread));
+            }
+        })));
+        let created = creator();
+        held::set_claim_hook(None);
+        let (first, thread) = started
+            .borrow_mut()
+            .take()
+            .expect("the creator reached a claim lock");
+        let other = thread.join().expect("sibling thread");
+        (created, first, other)
+    }
+
     /// A sibling entering a level another claim created waits for that claim before filling the level.
     ///
     /// The creator holds the level's claim lock while the sibling enters the
@@ -2737,68 +2801,31 @@ mod tests {
     /// lock first, so the creator's emptiness check never sees the child.
     #[test]
     fn a_sibling_entering_a_created_level_waits_for_its_claim() {
-        /// What the sibling thread reports first.
-        #[derive(Debug, PartialEq, Eq)]
-        enum Seen {
-            /// It met the creator's held claim lock.
-            Busy,
-            /// It finished entering the level and creating its child.
-            Done,
-        }
         let base = scratch("sibling_enter_wait");
         let level = base.join("level");
         let parent = held::HeldDir::open(&base)
             .expect("open base")
             .expect("base exists");
-        let sibling = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let spawned = std::rc::Rc::clone(&sibling);
-        let first_seen = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let recorded = std::rc::Rc::clone(&first_seen);
         let other_base = base.clone();
-        let mut fired = false;
-        held::set_claim_hook(Some(Box::new(move |point, _path: &Path| {
-            if point == held::ClaimPoint::AfterLock && !fired {
-                fired = true;
-                let other_base = other_base.clone();
-                let (seen, met) = std::sync::mpsc::channel::<Seen>();
-                let thread = std::thread::Builder::new()
-                    .spawn(move || {
-                        let busy = seen.clone();
-                        held::set_claim_hook(Some(Box::new(move |point, _path: &Path| {
-                            if point == held::ClaimPoint::Busy {
-                                let _ = busy.send(Seen::Busy);
-                            }
-                        })));
-                        let entered = held::HeldDir::open(&other_base)
-                            .map_err(|e| format!("{e:?}"))
-                            .and_then(|dir| dir.ok_or_else(|| "base vanished".to_owned()))
-                            .and_then(|dir| {
-                                enter_in(&dir, std::ffi::OsStr::new("level"))
-                                    .map_err(|e| format!("{e:?}"))
-                            })
-                            .and_then(|dir| {
-                                dir.create_child(std::ffi::OsStr::new("child"))
-                                    .map(|_| ())
-                                    .map_err(|e| format!("{e:?}"))
-                            });
-                        let _ = seen.send(Seen::Done);
-                        entered
+        let (entered, first, other) = race_at_first_lock(
+            || enter_in(&parent, std::ffi::OsStr::new("level")),
+            move || {
+                held::HeldDir::open(&other_base)
+                    .map_err(|e| format!("{e:?}"))
+                    .and_then(|dir| dir.ok_or_else(|| "base vanished".to_owned()))
+                    .and_then(|dir| {
+                        enter_in(&dir, std::ffi::OsStr::new("level")).map_err(|e| format!("{e:?}"))
                     })
-                    .expect("spawn test thread");
-                let first = met
-                    .recv_timeout(std::time::Duration::from_secs(60))
-                    .expect("the sibling reports");
-                *recorded.borrow_mut() = Some(first);
-                *spawned.borrow_mut() = Some(thread);
-            }
-        })));
-        let entered = enter_in(&parent, std::ffi::OsStr::new("level"));
-        held::set_claim_hook(None);
-        let other = sibling.borrow_mut().take().expect("sibling spawned");
-        let other = other.join().expect("sibling thread");
+                    .and_then(|dir| {
+                        dir.create_child(std::ffi::OsStr::new("child"))
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:?}"))
+                    })
+            },
+        );
         assert_eq!(
-            first_seen.borrow_mut().take(),
-            Some(Seen::Busy),
+            first,
+            Some(SiblingSeen::Busy),
             "the sibling meets the held claim lock before it fills the level"
         );
         assert!(entered.is_ok(), "the creator enters, got {entered:?}");
@@ -2808,6 +2835,47 @@ mod tests {
             "the created level is ipe's"
         );
         assert!(level.join("child").is_dir(), "the sibling's child is kept");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A sibling whose claim is anchored at a level another claim is still claiming waits for that claim.
+    ///
+    /// The sibling resolves after the creator made the level, so the level
+    /// is the held anchor of the sibling's claim rather than a level it
+    /// enters. It must still meet the creator's held claim lock before it
+    /// creates its root inside, so the creator's emptiness check never sees
+    /// that root and the shared level ends marked.
+    #[test]
+    fn a_sibling_anchored_at_a_claiming_level_waits_for_its_claim() {
+        let base = scratch("sibling_anchor_wait");
+        let proj = project(&base);
+        let level = base.join("level");
+        let creator = OutputRoot::resolve(Some(&level.join("a").to_string_lossy()), &proj)
+            .expect("resolve the creator");
+        let (leaf, other_proj) = (level.join("b"), proj);
+        let (claimed, first, other) = race_at_first_lock(
+            || creator.claim(),
+            move || {
+                OutputRoot::resolve(Some(&leaf.to_string_lossy()), &other_proj)
+                    .and_then(|root| root.claim())
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}"))
+            },
+        );
+        assert_eq!(
+            first,
+            Some(SiblingSeen::Busy),
+            "the sibling meets the held claim lock before it fills the level"
+        );
+        assert!(claimed.is_ok(), "the creator claims, got {claimed:?}");
+        assert!(other.is_ok(), "the sibling claims, got {other:?}");
+        for owned in [&level, &level.join("a"), &level.join("b")] {
+            assert!(
+                owned_at(owned).expect("read ownership"),
+                "{} is ipe's",
+                owned.display()
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3279,25 +3347,20 @@ mod tests {
     fn an_ancestor_claimed_during_the_handover_claim_unwinds_it() {
         let base = scratch("ancestor_during_claim");
         let proj = project(&base);
-        let plants: [(&str, fn(&Path)); 2] = [
-            ("marked", |dir: &Path| {
-                std::fs::write(dir.join(OWNERSHIP_MARKER), MARKER_TEXT).expect("plant marker");
-            }),
-            ("claiming", |dir: &Path| {
-                std::fs::write(dir.join(CLAIM_FILE), b"").expect("plant claim file");
-            }),
-        ];
-        for (tag, plant) in plants {
+        for (tag, reserved, bytes) in [
+            ("marked", OWNERSHIP_MARKER, MARKER_TEXT.as_bytes()),
+            ("claiming", CLAIM_FILE, b"".as_slice()),
+        ] {
             let ancestor = base.join(tag);
             std::fs::create_dir(&ancestor).expect("make ancestor");
             let inside = ancestor.join("app");
             let fresh = OutputRoot::fresh(&inside.to_string_lossy(), &proj).expect("fresh target");
-            let mut plant_once = Some((plant, ancestor.clone()));
+            let mut plant_once = Some(ancestor.join(reserved));
             super::held::set_level_hook(Some(Box::new(move |held: &Path| {
                 if held.file_name() == Some(std::ffi::OsStr::new("app"))
-                    && let Some((plant, ancestor)) = plant_once.take()
+                    && let Some(planted) = plant_once.take()
                 {
-                    plant(&ancestor);
+                    std::fs::write(planted, bytes).expect("plant reserved file");
                 }
             })));
             let result = fresh.claim();
