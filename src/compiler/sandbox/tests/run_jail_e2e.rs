@@ -135,7 +135,7 @@ struct Outcome {
 fn run_jailed(tools: &RunJailTools, profile: &SandboxProfile, payload: &[OsString]) -> Option<i32> {
     // The assertions inherit stderr (a diagnostic when one fails); only the
     // canary captures it.
-    run_jailed_inner(tools, profile, None, payload, false).code
+    run_jailed_inner(tools, profile, None, payload, false, |_| {}).code
 }
 
 /// Like [`run_jailed`], with `tree` bound as the working tree instead of the
@@ -146,7 +146,7 @@ fn run_jailed_in_tree(
     tree: &Path,
     payload: &[OsString],
 ) -> Option<i32> {
-    run_jailed_inner(tools, profile, Some(tree), payload, false).code
+    run_jailed_inner(tools, profile, Some(tree), payload, false, |_| {}).code
 }
 
 /// Like [`run_jailed`], but captures `bwrap`'s stderr so an establishment
@@ -156,18 +156,21 @@ fn run_jailed_capturing(
     profile: &SandboxProfile,
     payload: &[OsString],
 ) -> Outcome {
-    run_jailed_inner(tools, profile, None, payload, true)
+    run_jailed_inner(tools, profile, None, payload, true, |_| {})
 }
 
 /// Shared spawn core. `capture_stderr` selects whether `bwrap`'s stderr is piped
 /// (canary) or inherited (assertions). The working tree is `tree`, else the
-/// scratch. Panics (fails the test) if the spawn itself could not be launched.
+/// scratch. `after` inspects the host side of the scoped scratch once the jail
+/// has exited, before it is removed. Panics (fails the test) if the spawn itself
+/// could not be launched.
 fn run_jailed_inner(
     tools: &RunJailTools,
     profile: &SandboxProfile,
     tree: Option<&Path>,
     payload: &[OsString],
     capture_stderr: bool,
+    after: impl FnOnce(&Path),
 ) -> Outcome {
     // Hold the global lock across the whole spawn — the memfd + cloexec-clear is
     // a process-wide fd-table mutation.
@@ -206,6 +209,7 @@ fn run_jailed_inner(
     let out = cmd.output().expect("spawn jailed process");
     // Reap the memfd.
     drop(seccomp);
+    after(scoped.as_path());
     let _ = std::fs::remove_dir_all(&scoped);
     Outcome {
         code: out.status.code(),
@@ -326,6 +330,33 @@ fn nested_carve_ancestor_rename_refused() {
             dir.display()
         );
     }
+}
+
+#[test]
+fn an_in_scratch_write_succeeds_under_the_run_jail() {
+    let Some(tools) = e2e_tools() else { return };
+    // A builtin `printf` with a redirect into the jail's `TMPDIR` (the scoped
+    // scratch): the shell writes without forking, so the isolated profile's
+    // subprocess denial is not in play.
+    let payload: Vec<OsString> = ["/bin/sh", "-c", "printf ok > \"$TMPDIR/ipe-e2e-write\""]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let mut written = None;
+    let code = run_jailed_inner(&tools, &isolated(), None, &payload, false, |scoped| {
+        written = std::fs::read_to_string(scoped.join("ipe-e2e-write")).ok();
+    })
+    .code;
+    assert_eq!(
+        code,
+        Some(0),
+        "a write into the scoped scratch succeeds under the isolated jail (no false-deny)"
+    );
+    assert_eq!(
+        written.as_deref(),
+        Some("ok"),
+        "the in-scratch write reached the host's scoped scratch"
+    );
 }
 
 fn isolated() -> SandboxProfile {

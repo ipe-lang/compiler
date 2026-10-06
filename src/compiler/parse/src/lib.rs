@@ -2592,6 +2592,41 @@ mod tests {
         );
     }
 
+    /// Every operator of the closed set parses into a one-operator chain that
+    /// records exactly its text, so the token map and the set cannot drift.
+    #[test]
+    fn every_closed_set_operator_records_its_text() {
+        for op in ipe_syntax::BinOp::ALL {
+            let mut i = Interner::new();
+            let text = op.text();
+            let src = format!("module Main exposing (v)\n\nv =\n    a {text} b\n");
+            let result = parse_module(&src, &mut i);
+            assert!(result.is_ok(), "`a {text} b` must parse: {result:?}");
+            let Ok(m) = result else { return };
+            let recorded = find_value(&m, &i, "v").and_then(|val| {
+                if let Expr_::Binops(ops, _) = &val.body.value
+                    && let [(_, only)] = ops.as_slice()
+                {
+                    i.resolve(only.value)
+                } else {
+                    None
+                }
+            });
+            assert_eq!(recorded, Some(text), "`a {text} b` records `{text}`");
+        }
+    }
+
+    /// A token run outside the closed operator set is refused by the parser,
+    /// so no operator without a fixity ever reaches canonicalisation.
+    #[test]
+    fn operator_outside_the_closed_set_is_a_parse_error() {
+        for text in ["%", "<?>", "&", "</>", "^", "==="] {
+            let src = format!("{HDR}\nv =\n    a {text} b\n");
+            assert_ne!(err_code(&src), "OK", "`a {text} b` must not parse");
+        }
+        assert_eq!(err_code(&format!("{HDR}\nv =\n    a + b\n")), "OK");
+    }
+
     #[test]
     fn space_between_minus_and_literal_is_not_a_negative_literal() {
         // A negative literal matches only when the `-` is immediately

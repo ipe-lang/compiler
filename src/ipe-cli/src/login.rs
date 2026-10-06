@@ -18,7 +18,6 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::CliError;
@@ -196,7 +195,7 @@ enum TokenReadRefusal {
     Unreadable,
 }
 
-/// Read the token file at `path` through a handle proven owner-only.
+/// Read the token file at `path` through a handle proven owner-only and regular.
 fn read_stored_token(path: &std::path::Path) -> Result<String, TokenReadRefusal> {
     let file = crate::secret_file::open_existing(HOST_SECRET_STORE, path).map_err(|e| match e {
         SecretFileError::NotOwnerOnly(_) => TokenReadRefusal::Exposed,
@@ -206,7 +205,8 @@ fn read_stored_token(path: &std::path::Path) -> Result<String, TokenReadRefusal>
         | SecretFileError::Io(_)
         | SecretFileError::NotRegularFile(_) => TokenReadRefusal::Unreadable,
     })?;
-    crate::io_bounded::read_opened_capped(file, path, crate::io_bounded::SMALL_FILE_READ_CAP)
+    let proven = ipe_fs_open::RegularFile::prove(file).map_err(|_| TokenReadRefusal::Unreadable)?;
+    crate::io_bounded::read_proven(proven, path, crate::io_bounded::SMALL_FILE_CAP)
         .map_err(|_| TokenReadRefusal::Unreadable)
 }
 
@@ -252,7 +252,10 @@ fn authorize<T>(scope: GrantScope, parse: fn(&str) -> Option<T>) -> Result<T, Cl
             ),
         )
         .emit();
-    if open_in_browser(device.verification_uri.as_str()) {
+    if matches!(
+        crate::browser::open_url(&device.verification_uri),
+        crate::browser::OpenOutcome::Opened
+    ) {
         crate::screen::chatter(
             crate::screen::Stream::Stderr,
             crate::screen::Tone::Text,
@@ -268,50 +271,11 @@ fn authorize<T>(scope: GrantScope, parse: fn(&str) -> Option<T>) -> Result<T, Cl
     poll_for_token(&device, parse)
 }
 
-/// The verification URL GitHub tells the user to open, parsed once into a value
-/// that is guaranteed `https` on the expected GitHub host.
-///
-/// `parse, don't validate` at the network boundary: a compromised or spoofed
-/// device-code response cannot smuggle an arbitrary scheme (`file:`, `javascript:`,
-/// a custom app handler) or an off-host URL into `xdg-open`/`open`, because only
-/// a `VerificationUri` reaches the opener and it can only hold an accepted URL.
-struct VerificationUri(String);
-
-impl VerificationUri {
-    /// The single accepted host for the device-flow verification URL.
-    const EXPECTED_HOST: &'static str = "github.com";
-    const HTTPS_PREFIX: &'static str = "https://";
-
-    /// Parse a raw verification URL, accepting only `https://github.com[/…]`.
-    ///
-    /// Fails closed: any non-`https` scheme, any other host, or an embedded
-    /// userinfo/`@` that could mask the real host is rejected.
-    fn parse(raw: &str) -> Option<Self> {
-        let after_scheme = raw.strip_prefix(Self::HTTPS_PREFIX)?;
-        // The authority runs up to the first `/`, `?`, or `#`.
-        let authority = after_scheme
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or(after_scheme);
-        // Reject userinfo (`user@host`) so `github.com` in userinfo cannot mask
-        // an attacker host, and reject a port or any non-host authority.
-        if authority == Self::EXPECTED_HOST {
-            Some(Self(raw.to_owned()))
-        } else {
-            None
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// The device-code grant's first response.
 struct DeviceGrant {
     device_code: String,
     user_code: String,
-    verification_uri: VerificationUri,
+    verification_uri: crate::browser::BrowserUrl,
     interval: u64,
     expires_in: u64,
 }
@@ -325,8 +289,11 @@ fn request_device_code(scope: GrantScope) -> Result<DeviceGrant, CliError> {
     let device_code = str_field(&json, "device_code")?;
     let user_code = str_field(&json, "user_code")?;
     let verification_uri_raw = str_field(&json, "verification_uri")?;
-    let verification_uri = VerificationUri::parse(&verification_uri_raw)
-        .ok_or_else(|| login_error(&crate::text::msg::login_verification_url_refused()))?;
+    let verification_uri = crate::browser::BrowserUrl::parse(
+        &verification_uri_raw,
+        crate::browser::BrowserOrigin::GitHub,
+    )
+    .map_err(|_| login_error(&crate::text::msg::login_verification_url_refused()))?;
     // GitHub returns these as JSON numbers; default to safe values if absent.
     let interval = json
         .get("interval")
@@ -734,24 +701,6 @@ fn logout_at(stored: StoredToken) -> Result<Option<PathBuf>, CliError> {
     Ok(Some(path))
 }
 
-/// Best-effort browser open (same contract as publish's opener).
-fn open_in_browser(url: &str) -> bool {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
-    } else if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    } else {
-        let mut c = Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    command.status().is_ok_and(|s| s.success())
-}
-
 /// Build a login error.
 pub(crate) fn login_error(message: &crate::text::Message) -> CliError {
     CliError::Resolve(crate::text::msg::login_error(message))
@@ -939,38 +888,6 @@ mod tests {
     fn publish_token_rejects_empty_and_whitespace_only() {
         assert!(PublishToken::parse("").is_none());
         assert!(PublishToken::parse("   \n\t").is_none());
-    }
-
-    #[test]
-    fn verification_uri_accepts_https_github() {
-        let uri = VerificationUri::parse("https://github.com/login/device").expect("accepted");
-        assert_eq!(uri.as_str(), "https://github.com/login/device");
-    }
-
-    #[test]
-    fn verification_uri_rejects_non_https_scheme() {
-        assert!(VerificationUri::parse("http://github.com/login/device").is_none());
-        assert!(VerificationUri::parse("file:///etc/passwd").is_none());
-        assert!(VerificationUri::parse("javascript:alert(1)").is_none());
-    }
-
-    #[test]
-    fn verification_uri_rejects_other_host() {
-        assert!(VerificationUri::parse("https://evil.example.com/login/device").is_none());
-        // A lookalike host and a subdomain are not github.com.
-        assert!(VerificationUri::parse("https://github.com.evil.com/x").is_none());
-        assert!(VerificationUri::parse("https://notgithub.com/x").is_none());
-    }
-
-    #[test]
-    fn verification_uri_rejects_userinfo_masking_the_host() {
-        // `github.com` in the userinfo must not let an attacker host through.
-        assert!(VerificationUri::parse("https://github.com@evil.example.com/x").is_none());
-    }
-
-    #[test]
-    fn verification_uri_rejects_a_port() {
-        assert!(VerificationUri::parse("https://github.com:8443/login/device").is_none());
     }
 
     #[test]

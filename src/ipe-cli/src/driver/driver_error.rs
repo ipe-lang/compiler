@@ -365,7 +365,7 @@ pub enum CliError {
     /// nothing left to print — the JSON line is the complete machine output.
     DiagnosticJsonEmitted,
     /// A file exceeded the per-surface read ceiling in
-    /// [`io_bounded::read_to_string_capped`]. The read was stopped at the cap;
+    /// [`io_bounded::read_leaf_capped`]. The read was stopped at the cap;
     /// no unbounded allocation was made.
     FileTooLarge {
         /// The path of the oversized file.

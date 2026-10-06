@@ -59,7 +59,8 @@
 //!   completeness note calls out: an add/delete/rename of a module MUST
 //!   yield a different key, never a stale hit), and full source text,
 //! - every emit-shape build flag (target, production, `--debugger`,
-//!   hot-appearance, the webview host and window).
+//!   hot-appearance, the webview host and window),
+//! - the mount base every emitted browser shell URL is built from.
 //!
 //! `blame_path` (diagnostic-only) and the vendored runtime tree are
 //! deliberately NOT part of the key: neither affects [`EmittedProject`]'s
@@ -114,10 +115,12 @@ use ipe_backend_rust::DbDriver;
 use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal, RegularFile};
 use ipe_intern::{Interner, SerdeInternerGuard};
 use ipe_ir::Program;
+use ipe_runtime_rust::encoding::MountBase;
 
 use crate::output_dir::OwnedDir;
 use crate::remote_ingest::{IngestLimit, LocalRefusal, LocalSource, PACKAGE_SOURCE, TreeCeiling};
 use crate::secret_file::OwnerDir;
+use crate::toolchain::RustcVersion;
 use sha2::{Digest, Sha256};
 
 /// Domain-separation tag for the content-address hash — bumped whenever the
@@ -617,6 +620,7 @@ pub fn compute_project_key(
     db_driver: DbDriver,
     target: ipe_ir::Target,
     wasm_public_env: &[String],
+    mount_base: &MountBase,
     intent: ipe_backend_rust::BuildIntent,
     debugger: bool,
     hot_appearance: bool,
@@ -692,6 +696,11 @@ pub fn compute_project_key(
     for name in wasm_public_env {
         update_str(&mut hasher, name);
     }
+
+    // The mount base reaches only the emitted shell (`www/index.html`,
+    // `www/boot.js`), the same final-emit class as `[wasm] publicEnv`: an entry
+    // built for `/app` must never serve a root build, or vice versa.
+    update_str(&mut hasher, mount_base.prefix());
 
     // `BTreeMap` iteration is already sorted by key — deterministic across
     // runs and independent of insertion order.
@@ -790,19 +799,17 @@ fn compiler_revision_hash() -> Option<String> {
 }
 
 /// The active `rustc`'s `-vV` output, hashed — the design doc's
-/// `toolchain_fingerprint()`. `None` when `rustc` is not on `PATH` or exits
-/// non-zero.
+/// `toolchain_fingerprint()`.
+///
+/// `None` when the query is refused: `rustc` is missing, crosses its ceiling,
+/// exits non-zero, or prints a report [`RustcVersion::parse`] refuses.
 fn toolchain_fingerprint_hash() -> Option<String> {
-    let output = std::process::Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(&output.stdout);
-    Some(hex::encode(hasher.finalize()))
+    RustcVersion::active().ok().map(toolchain_fingerprint_of)
+}
+
+/// The fingerprint of `version`'s exact report bytes.
+fn toolchain_fingerprint_of(version: &RustcVersion) -> String {
+    hex::encode(Sha256::digest(version.verbatim()))
 }
 
 /// Derive the version-epoch directory name for this process, or `None` when
@@ -1302,6 +1309,58 @@ pub fn store_ir(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_epoch_hash_input_is_the_verbatim_output() {
+        let report: &[u8] = b"rustc 1.80.0 (abcdef 2024-01-01)\n\
+            binary: rustc\n\
+            host: x86_64-unknown-linux-gnu\n\
+            release: 1.80.0\n\
+            LLVM version: 18.1.7\n\n";
+        let version = RustcVersion::parse(report);
+        assert!(version.is_ok(), "{version:?}");
+        let mut hasher = Sha256::new();
+        hasher.update(report);
+        assert_eq!(
+            version.as_ref().ok().map(toolchain_fingerprint_of),
+            Some(hex::encode(hasher.finalize()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // the test temp root is writable and its path holds no `PATH` separator
+    fn a_rustc_query_past_its_wall_disables_the_cache() {
+        use crate::remote_ingest::{LocalWall, RUSTC_QUERY_LIMITS};
+        use crate::toolchain::{RustcQueryRefusal, RustcRunFailure, StubRustc};
+        let stub = StubRustc::new(
+            "slow",
+            "sleep 30\nprintf 'rustc 1.0 (x)\\nhost: a-b-c\\nrelease: 1.0\\n'",
+        )
+        .expect("write the stub rustc");
+        let mut rustc = std::process::Command::new("rustc");
+        rustc.env("PATH", stub.path().expect("join the stub PATH"));
+        let started = std::time::Instant::now();
+        let query = RustcVersion::query(
+            rustc,
+            RUSTC_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            matches!(
+                query,
+                Err(RustcQueryRefusal::Run(RustcRunFailure::Exceeded(
+                    LocalRefusal {
+                        source: LocalSource::RustcQuery,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }
+                )))
+            ),
+            "{query:?}"
+        );
+        assert_eq!(query.as_ref().ok().map(toolchain_fingerprint_of), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
     /// A fresh, empty scratch directory for one salt test, held as a secret dir.
     #[cfg(unix)]
     fn salt_test_dir(tag: &str) -> (PathBuf, OwnerDir) {
@@ -1489,6 +1548,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1502,6 +1562,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1521,6 +1582,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1537,6 +1599,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1556,6 +1619,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1569,6 +1633,7 @@ mod tests {
             DbDriver::Postgres,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1591,6 +1656,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1604,6 +1670,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Release,
             false,
             false,
@@ -1626,6 +1693,7 @@ mod tests {
                 DbDriver::Sqlite,
                 ipe_ir::Target::Native,
                 &[],
+                &MountBase::root(),
                 ipe_backend_rust::BuildIntent::Development,
                 debugger,
                 false,
@@ -1653,6 +1721,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1666,6 +1735,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             true,
@@ -1695,6 +1765,7 @@ mod tests {
                 DbDriver::Sqlite,
                 ipe_ir::Target::Native,
                 &[],
+                &MountBase::root(),
                 ipe_backend_rust::BuildIntent::Development,
                 false,
                 false,
@@ -1729,6 +1800,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1742,6 +1814,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &["API_BASE_URL".to_owned()],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1754,6 +1827,42 @@ mod tests {
         );
     }
 
+    /// The mount base is part of the key: `/app` and the root never share an
+    /// entry, while the same base twice yields the same key.
+    #[test]
+    fn cache_key_changes_with_mount_base() {
+        let (sources, injected) = sample_sources();
+        let key = |base: &MountBase| {
+            compute_project_key(
+                &sources,
+                &injected,
+                &entry(),
+                DbDriver::Sqlite,
+                ipe_ir::Target::WasmClient,
+                &[],
+                base,
+                ipe_backend_rust::BuildIntent::Development,
+                false,
+                false,
+                false,
+                None,
+            )
+        };
+        let Ok(app) = MountBase::parse("/app") else {
+            return;
+        };
+        let Ok(app_again) = MountBase::parse("/app") else {
+            return;
+        };
+        let Ok(nested) = MountBase::parse("/app/v2") else {
+            return;
+        };
+        let root = MountBase::root();
+        assert_ne!(key(&root), key(&app), "the mount base is part of the key");
+        assert_ne!(key(&app), key(&nested), "each base keys its own entry");
+        assert_eq!(key(&app), key(&app_again), "an equal base reuses the entry");
+    }
+
     #[test]
     fn key_changes_with_entry_path() {
         let (sources, injected) = sample_sources();
@@ -1764,6 +1873,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1777,6 +1887,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1796,6 +1907,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1818,6 +1930,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1837,6 +1950,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1867,6 +1981,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1880,6 +1995,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1911,6 +2027,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1924,6 +2041,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,

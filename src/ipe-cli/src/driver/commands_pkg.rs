@@ -470,11 +470,18 @@ impl<'a> BundleAssembler<'a> {
     /// layout, and materialise the shell on disk. Private: reached only through
     /// a [`GatedMobile`] witness, so the shape gate is already proven passed.
     ///
+    /// The shell is laid out for the manifest's mount base, the one the wasm
+    /// build bakes into the bundle's URLs; a base that changes while the build
+    /// runs is refused before any shell is written.
+    ///
     /// # Errors
-    /// The wasm build's own errors; [`CliError::Io`] on any filesystem failure
+    /// The wasm build's own errors; [`CliError::Usage`] wrapping
+    /// [`pack::mobile::MobileRefusal::ManifestChanged`] when the manifest's mount
+    /// base changed during the build; [`CliError::Io`] on any filesystem failure
     /// while collecting the bundle or materialising the shell.
     fn assemble_mobile(&self, os: pack::mobile::MobileOs) -> Result<(), CliError> {
         let manifest = self.manifest;
+        let base = &manifest.delivery.browser.base;
         let identity = pack::desktop::BundleIdentity::new(
             &manifest.name,
             manifest
@@ -493,7 +500,9 @@ impl<'a> BundleAssembler<'a> {
         // hostable bundle; invoking it through this binary keeps that pipeline
         // authoritative rather than re-implemented here.
         let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
-        build_wasm_for_mobile(self.manifest_path, output.path(), self.profile)?;
+        build_under_fixed_base(self.manifest_path, base, || {
+            build_wasm_for_mobile(self.manifest_path, output.path(), self.profile)
+        })?;
         // The SPA is read from the owned crate; a symlinked `www/` is refused so
         // the shell can never pick up files from outside the build output.
         let www_dir = output
@@ -503,7 +512,8 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon)?;
+        let layout =
+            pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon, base)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
@@ -648,6 +658,35 @@ pub fn build_wasm_for_mobile(
         )));
     }
     Ok(())
+}
+
+/// Run `build`, then re-read the manifest at `manifest_path` and refuse when its
+/// mount base is no longer `planned`: the bundle the build produced and the shell
+/// laid out for `planned` must name one mount path.
+///
+/// # Errors
+/// `build`'s own error; the manifest re-read's error; [`CliError::Usage`]
+/// wrapping [`pack::mobile::MobileRefusal::ManifestChanged`] when the base
+/// differs.
+fn build_under_fixed_base(
+    manifest_path: &Path,
+    planned: &ipe_runtime_rust::encoding::MountBase,
+    build: impl FnOnce() -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    build()?;
+    let after = project::parse_manifest(manifest_path)?
+        .delivery
+        .browser
+        .base;
+    if after == *planned {
+        return Ok(());
+    }
+    Err(CliError::Usage(text::Message::relay(
+        &pack::mobile::MobileRefusal::ManifestChanged {
+            before: planned.clone(),
+            after,
+        },
+    )))
 }
 
 /// The verb a mobile shell's wasm bundle is built with.
@@ -1112,29 +1151,6 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the
-/// source-graph pipeline reads. Same argument convention as `ipe dev build`:
-///
-/// 1. a directory → its `package.ipe`'s `src`-root `Main.ipe`;
-/// 2. a `.ipe` file → itself.
-///
-/// A project's entry module is always `Main` (`project` module doc), so the
-/// entry file is `<src_root>/Main.ipe`.
-///
-/// # Errors
-/// [`CliError::Usage`] for a directory with no `package.ipe`; the manifest's own
-/// parse errors otherwise.
-pub fn resolve_analysis_entry(path: &Path) -> Result<PathBuf, CliError> {
-    let manifest = discover_manifest(path)?;
-    match manifest {
-        Some(m) => {
-            let parsed = project::parse_manifest(&m)?;
-            analysis_root_of(&parsed)
-        }
-        None => Ok(path.to_path_buf()),
-    }
-}
-
 /// The source file `ipe type-check` uses as its analysis root for a manifest
 /// project.
 ///
@@ -1229,7 +1245,7 @@ pub enum AnalysisTarget {
 /// manifest's canonical `tests/` or `src/` root.
 ///
 /// # Errors
-/// Same as [`resolve_analysis_entry`] for a directory argument;
+/// A manifest's own parse errors for a directory argument;
 /// [`CliError::Io`] when the file (a named one, or a directory's entry) cannot
 /// be canonicalised (`NotFound` when it is missing), or a project, `src/`, or
 /// existing `tests/` root cannot be; a manifest's own parse errors for a file
@@ -3010,8 +3026,7 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// # Errors
 /// Returns [`CliError::Io`] on a filesystem failure.
 pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     let Some(diag) = pipeline_first_diagnostic(&source) else {
         writeln!(
@@ -3428,6 +3443,87 @@ mod self_reinvocation_tests {
             let verb = wasm_build_verb(profile);
             assert_eq!(verb.intent(), profile.build_intent(), "{verb}");
         }
+    }
+}
+
+#[cfg(test)]
+mod mobile_base_tests {
+    use super::*;
+    use ipe_runtime_rust::encoding::MountBase;
+
+    /// Write a project whose `delivery.browser.basePath` is `base_path` and
+    /// return its `package.ipe`. `base_path` is printable ASCII without `"` or
+    /// `\`, so its Rust `{:?}` form is also its Ipê string literal.
+    fn write_project(test_name: &str, base_path: &str) -> PathBuf {
+        let root = ipe_test_temp::temp_root().join(format!("ipe_mobile_base_{test_name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("create src/");
+        std::fs::write(
+            src.join("Main.ipe"),
+            "module Main exposing (main)\nmain = 0\n",
+        )
+        .expect("write Main.ipe");
+        let manifest = root.join(crate::package_manifest::PACKAGE_IPE);
+        write_base_path(&manifest, base_path);
+        manifest
+    }
+
+    fn write_base_path(manifest: &Path, base_path: &str) {
+        std::fs::write(
+            manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = \"x\", \
+                 delivery = {{ browser = {{ basePath = {base_path:?} }} }} }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+    }
+
+    fn base(raw: &str) -> MountBase {
+        MountBase::parse(raw).expect("a legal mount base")
+    }
+
+    /// The stub build rewrites the manifest's base; the pack refuses, naming
+    /// both bases, before any shell is laid out.
+    #[test]
+    fn mobile_pack_refuses_manifest_changed_during_build() {
+        let manifest = write_project("changed", "/app");
+        let planned = project::parse_manifest(&manifest)
+            .expect("manifest")
+            .delivery
+            .browser
+            .base;
+        assert_eq!(planned, base("/app"));
+
+        let result = build_under_fixed_base(&manifest, &planned, || {
+            write_base_path(&manifest, "/v2");
+            Ok(())
+        });
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+
+        let refusal = text::Message::relay(&pack::mobile::MobileRefusal::ManifestChanged {
+            before: base("/app"),
+            after: base("/v2"),
+        });
+        assert!(
+            matches!(&result, Err(CliError::Usage(shown)) if *shown == refusal),
+            "a base changed during the build must be refused, got {result:?}"
+        );
+    }
+
+    /// An unchanged base passes once the build has run.
+    #[test]
+    fn mobile_pack_accepts_an_unchanged_base_after_the_build() {
+        let manifest = write_project("unchanged", "/app");
+        let built = std::cell::Cell::new(false);
+        let result = build_under_fixed_base(&manifest, &base("/app"), || {
+            built.set(true);
+            Ok(())
+        });
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(built.get(), "the build step runs before the re-read");
     }
 }
 

@@ -1676,6 +1676,7 @@ pub fn emit_db_call(
         | KernelFn::SqlIsNull
         | KernelFn::SqlIsNotNull
         | KernelFn::SqlLike
+        | KernelFn::SqlStartsWith
         // `Sql.exists : String -> SqlFragment -> SqlFragment` takes a plain
         // `String` table name and a `SqlFragment` — no `Db` handle, no List
         // projection, so the standard call path emits it correctly.

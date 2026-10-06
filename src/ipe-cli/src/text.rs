@@ -943,7 +943,7 @@ messages! {
     cli_source_not_regular_file(path) = "cli-source-not-regular-file";
     /// A source file or directory could not be opened for lack of permission.
     cli_source_access_denied(path) = "cli-source-access-denied";
-    /// A module path was reached through a symlink the no-follow walk refuses.
+    /// A convention file or walked module path is a symlink the no-follow open refuses.
     cli_source_symlink(path) = "cli-source-symlink";
     /// A manifest path escaped the project directory.
     cli_path_escape(raw, reason) = "cli-path-escape";
@@ -1191,6 +1191,18 @@ messages! {
     manifest_entry_segment_invalid(entry, segment) = "manifest-entry-segment-invalid";
     /// A `package.ipe` program entry names no module.
     manifest_entry_no_module(entry) = "manifest-entry-no-module";
+    /// `delivery.browser.basePath` is longer than the mount base limit.
+    manifest_base_path_too_long(len, max) = "manifest-base-path-too-long";
+    /// `delivery.browser.basePath` does not start with `/`.
+    manifest_base_path_no_leading_slash(base) = "manifest-base-path-no-leading-slash";
+    /// `delivery.browser.basePath` other than the root ends with `/`.
+    manifest_base_path_trailing_slash(base) = "manifest-base-path-trailing-slash";
+    /// `delivery.browser.basePath` has an empty segment.
+    manifest_base_path_empty_segment(base) = "manifest-base-path-empty-segment";
+    /// `delivery.browser.basePath` has a `.` or `..` segment.
+    manifest_base_path_dot_segment(base) = "manifest-base-path-dot-segment";
+    /// `delivery.browser.basePath` holds a byte outside the unreserved set.
+    manifest_base_path_reserved_byte(base, byte) = "manifest-base-path-reserved-byte";
     /// A manifest path is not a `package.ipe`.
     manifest_not_package_ipe(path, hint) = "manifest-not-package-ipe";
     /// A package name is not a single path component for a bundle.

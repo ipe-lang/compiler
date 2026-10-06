@@ -19,6 +19,7 @@ use std::fmt::Write as _;
 use ipe_backend::{EmittedProject, RelPath};
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_ir::{IrType, ModPath, Program};
+use ipe_runtime_rust::encoding::{BundlePath, MountBase};
 
 use crate::EmitCtx;
 use crate::crate_specs;
@@ -2239,11 +2240,17 @@ fn rewrite_runtime_paths_for_dep(src: &str) -> String {
 /// link) and the static browser shell (`index.html` + `boot.js`). The
 /// wasm-bindgen CLI drops the JS glue + `.wasm` beside them under `www/pkg/`.
 ///
+/// Every URL the shell loads is `base.url_of` of its bundle path, so a deep
+/// link under the base still reaches the boot script, the glue and the module.
+///
 /// # Errors
 ///
-/// Returns a [`Diagnostic`] only if a fixed [`RelPath`] fails validation — a
-/// compiler bug, never a program property.
-fn insert_wasm_shared_files(files: &mut BTreeMap<RelPath, String>) -> DResult<()> {
+/// Returns a [`Diagnostic`] only if a fixed [`RelPath`] or [`BundlePath`]
+/// fails validation — a compiler bug, never a program property.
+fn insert_wasm_shared_files(
+    files: &mut BTreeMap<RelPath, String>,
+    base: &MountBase,
+) -> DResult<()> {
     // Host/global cargo configs may carry native-linker rustflags (e.g. mold),
     // which rust-lld rejects for wasm32. A target-scoped set here takes
     // precedence — and it must be NON-empty (cargo treats an empty array as unset
@@ -2266,15 +2273,57 @@ fn insert_wasm_shared_files(files: &mut BTreeMap<RelPath, String>) -> DResult<()
          <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; \
          script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; \
          connect-src 'self'\">\n\
-         <title>Ip\u{ea} App</title>\n</head>\n<body>\n\
-         <script type=\"module\" src=\"./boot.js\"></script>\n</body>\n</html>\n"
-            .to_owned(),
+         <title>Ip\u{ea} App</title>\n</head>\n<body>\n"
+            .to_owned()
+            + &shell_boot_script(&base.url_of(&shell_path("boot.js")?))
+            + "</body>\n</html>\n",
     );
     files.insert(
         RelPath::new("www/boot.js")?,
-        "import init from \"./pkg/ipe_app.js\";\ninit();\n".to_owned(),
+        shell_boot_js(
+            &base.url_of(&shell_path("pkg/ipe_app.js")?),
+            &base.url_of(&shell_path("pkg/ipe_app_bg.wasm")?),
+        ),
     );
     Ok(())
+}
+
+/// The bundle path of one fixed shell file.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] when the fixed text is outside the bundle-path
+/// grammar.
+fn shell_path(rel: &str) -> DResult<BundlePath> {
+    BundlePath::parse(rel).map_err(|refusal| Diagnostic::CompilerBug {
+        where_: "backend.wasm_shell",
+        detail: format!("shell file `{rel}` is not a bundle path: {refusal}"),
+    })
+}
+
+/// The `<script>` element that loads the boot module from `boot_url`.
+///
+/// The URL is attribute-escaped, so no byte of it can close the attribute.
+fn shell_boot_script(boot_url: &str) -> String {
+    let mut out = String::from("<script type=\"module\" src=\"");
+    ipe_runtime_rust::escape::html_attr_into(boot_url, &mut out);
+    out.push_str("\"></script>\n");
+    out
+}
+
+/// The boot module: import the wasm-bindgen glue at `glue_url` and instantiate
+/// the module at `wasm_url`.
+///
+/// The module URL is explicit rather than derived from `import.meta.url`. Each
+/// URL is a JS string literal written through the runtime's JS string escaper,
+/// so no byte of it can close the literal.
+fn shell_boot_js(glue_url: &str, wasm_url: &str) -> String {
+    let mut out = String::from("import init from \"");
+    out.push_str(&ipe_runtime_rust::escape::json_str_body(glue_url));
+    out.push_str("\";\ninit({ module_or_path: \"");
+    out.push_str(&ipe_runtime_rust::escape::json_str_body(wasm_url));
+    out.push_str("\" });\n");
+    out
 }
 
 /// Emit the co-located WASI (`wasm32-wasip1`) crate's `.cargo/config.toml`.
@@ -2784,7 +2833,7 @@ fn assemble_project_text(
             };
             files.insert(path, text);
         }
-        insert_wasm_shared_files(&mut files)?;
+        insert_wasm_shared_files(&mut files, &ctx.mount_base)?;
 
         if ctx.runtime_dep.is_some() {
             // Dependency model: the runtime is a relative path dependency selected
@@ -6721,6 +6770,96 @@ mod tests {
 
 #[cfg(test)]
 mod vendored_feature_tests;
+
+#[cfg(test)]
+mod wasm_shell_tests {
+    use super::{insert_wasm_shared_files, shell_boot_js, shell_boot_script};
+    use ipe_backend::RelPath;
+    use ipe_runtime_rust::encoding::MountBase;
+    use std::collections::BTreeMap;
+
+    /// The emitted `www/index.html` and `www/boot.js` under `base`.
+    fn shell(base: &MountBase) -> Result<(String, String), String> {
+        let mut files: BTreeMap<RelPath, String> = BTreeMap::new();
+        insert_wasm_shared_files(&mut files, base).map_err(|d| format!("{d:?}"))?;
+        let index = files.get("www/index.html").ok_or("no index.html")?.clone();
+        let boot = files.get("www/boot.js").ok_or("no boot.js")?.clone();
+        Ok((index, boot))
+    }
+
+    /// Under `/app` every shell URL is absolute under the base, so a deep-link
+    /// reload of `/app/users/7` still reaches the boot script, the glue and
+    /// the module; no page-relative `./` URL remains.
+    #[test]
+    fn shell_urls_derive_from_the_base() -> Result<(), String> {
+        let app = MountBase::parse("/app").map_err(|r| r.to_string())?;
+        let (index, boot) = shell(&app)?;
+        assert!(index.contains("src=\"/app/boot.js\""), "{index}");
+        assert!(
+            boot.contains("import init from \"/app/pkg/ipe_app.js\";"),
+            "{boot}"
+        );
+        assert!(
+            boot.contains("init({ module_or_path: \"/app/pkg/ipe_app_bg.wasm\" });"),
+            "{boot}"
+        );
+        assert!(!index.contains("./"), "{index}");
+        assert!(!boot.contains("./"), "{boot}");
+        Ok(())
+    }
+
+    /// The root base serves the same shell at `/`.
+    #[test]
+    fn root_shell_urls_sit_at_the_root() -> Result<(), String> {
+        let (index, boot) = shell(&MountBase::root())?;
+        assert!(index.contains("src=\"/boot.js\""), "{index}");
+        assert!(
+            boot.contains("import init from \"/pkg/ipe_app.js\";"),
+            "{boot}"
+        );
+        assert!(
+            boot.contains("module_or_path: \"/pkg/ipe_app_bg.wasm\""),
+            "{boot}"
+        );
+        Ok(())
+    }
+
+    /// A URL holding attribute metacharacters cannot close the `src`
+    /// attribute; a plain URL passes through unchanged.
+    #[test]
+    fn boot_script_attribute_escapes_its_url() {
+        let hostile = shell_boot_script("/a\"><script>x</script>");
+        assert!(!hostile.contains("\"><script>x"), "{hostile}");
+        let value = hostile
+            .strip_prefix("<script type=\"module\" src=\"")
+            .and_then(|rest| rest.strip_suffix("\"></script>\n"));
+        assert!(
+            value.is_some_and(|v| !v.contains(['"', '<', '>'])),
+            "{hostile}"
+        );
+        let plain = shell_boot_script("/app/boot.js");
+        assert_eq!(
+            plain,
+            "<script type=\"module\" src=\"/app/boot.js\"></script>\n"
+        );
+    }
+
+    /// A URL holding a quote, a backslash or a line terminator cannot close
+    /// the JS string literal; a plain URL passes through unchanged.
+    #[test]
+    fn boot_js_string_escapes_its_urls() {
+        let hostile = shell_boot_js("/a\";alert(1)//", "/b\\\u{2028}c");
+        assert!(!hostile.contains("\"/a\";alert"), "{hostile}");
+        assert!(hostile.contains("from \"/a\\\";alert(1)//\";"), "{hostile}");
+        assert!(hostile.contains("\"/b\\\\\\u2028c\""), "{hostile}");
+        assert!(!hostile.contains('\u{2028}'), "{hostile}");
+        let plain = shell_boot_js("/pkg/ipe_app.js", "/pkg/ipe_app_bg.wasm");
+        assert_eq!(
+            plain,
+            "import init from \"/pkg/ipe_app.js\";\ninit({ module_or_path: \"/pkg/ipe_app_bg.wasm\" });\n"
+        );
+    }
+}
 
 #[cfg(test)]
 mod escape_toml_basic_tests {

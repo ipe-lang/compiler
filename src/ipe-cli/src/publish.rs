@@ -34,7 +34,6 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::remote_ingest::{
     self, ByteBudget, CappedReadError, Captured, Curl, Git, IngestRefusal, LocalSource, RunError,
@@ -1447,22 +1446,16 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// Best-effort launch of the platform browser on `url`. Returns whether the
-/// opener started — the URL is printed regardless, so `false` is never fatal.
+/// opener started; the URL is printed regardless, so `false` is never fatal. A
+/// URL that is not an admitted GitHub [`crate::browser::BrowserUrl`] is not
+/// opened.
 fn open_in_browser(url: &str) -> bool {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
-    } else if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    } else {
-        let mut c = Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    command.status().is_ok_and(|s| s.success())
+    crate::browser::BrowserUrl::parse(url, crate::browser::BrowserOrigin::GitHub).is_ok_and(|url| {
+        matches!(
+            crate::browser::open_url(&url),
+            crate::browser::OpenOutcome::Opened
+        )
+    })
 }
 
 /// Print the "pushed, now finish the PR" summary, framed and guttered like every

@@ -1706,22 +1706,15 @@ mod windows_jail {
     }
 
     /// The Job Object active-process cap for a profile: 1 when subprocess is
-    /// withheld (only the app itself), else the profile's proc cap (min 1).
-    /// Extracted so the cap policy is unit-testable without a live Job Object.
-    fn active_process_cap(profile: &SandboxProfile) -> u32 {
-        if profile.subprocess {
-            u32::try_from(profile.limits.proc_cap)
-                .unwrap_or(u32::MAX)
-                .max(1)
-        } else {
-            1
-        }
+    /// withheld (only the app itself), else the profile's typed proc cap.
+    const fn active_process_cap(profile: &SandboxProfile) -> u32 {
+        profile.limits.proc_cap.job_limit(profile.subprocess)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::run_jail::{RunResourceLimits, SandboxProfile};
+        use crate::run_jail::{ProcCap, RunResourceLimits, SandboxProfile};
 
         fn profile_with_env(names: &[&str]) -> SandboxProfile {
             SandboxProfile {
@@ -1790,7 +1783,7 @@ mod windows_jail {
             let granted = SandboxProfile {
                 subprocess: true,
                 limits: RunResourceLimits {
-                    proc_cap: 8,
+                    proc_cap: ProcCap::parse(8).expect("8 is in range"),
                     ..RunResourceLimits::default()
                 },
                 ..SandboxProfile::maximally_isolated()

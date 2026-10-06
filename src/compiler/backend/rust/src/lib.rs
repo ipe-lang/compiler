@@ -19,6 +19,8 @@ mod capabilities;
 mod const_fold;
 pub use const_fold::fold_program;
 pub use emit_expr::rust_str_lit;
+/// The typed mount base the emitted browser shell is served under.
+pub use ipe_runtime_rust::encoding::MountBase;
 mod crate_specs;
 mod doc;
 mod emit_console;
@@ -239,6 +241,7 @@ pub struct RustBackend<'a> {
     ffi: Option<FfiEmit>,
     target: ipe_ir::Target,
     wasm_public_env: Vec<String>,
+    mount_base: MountBase,
     wasm_hydrate_mode: bool,
     runtime_dep: Option<RuntimeDep>,
     /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed. Adds
@@ -517,6 +520,7 @@ impl<'a> RustBackend<'a> {
             ffi: None,
             target: ipe_ir::Target::Native,
             wasm_public_env: Vec::new(),
+            mount_base: MountBase::root(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -645,6 +649,17 @@ impl<'a> RustBackend<'a> {
         self
     }
 
+    /// Supply the mount base the emitted browser shell is served under.
+    ///
+    /// Parsed once from the manifest's `browser.basePath`; every shell URL
+    /// (`boot.js`, the wasm-bindgen glue and module) is built from it. The
+    /// default is [`MountBase::root`].
+    #[must_use]
+    pub fn with_mount_base(mut self, base: MountBase) -> Self {
+        self.mount_base = base;
+        self
+    }
+
     /// Enable the `[wasm] mode = "hydrate"` emission path (M7 SSR + hydration).
     /// When set, the emitted wasm crate exports a `#[wasm_bindgen] pub fn
     /// hydrate(model_json: &str)` in addition to the `#[wasm_bindgen(start)]`
@@ -676,6 +691,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -705,6 +721,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -734,6 +751,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -763,6 +781,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -807,6 +826,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -858,6 +878,7 @@ impl Backend for RustBackend<'_> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -1465,6 +1486,9 @@ pub(crate) struct EmitCtx<'a> {
     /// secret-name denylist at manifest parse time. Meaningless / ignored
     /// when [`Self::uses_env_public`] is `false`.
     pub(crate) wasm_public_env: Vec<String>,
+    /// Where the emitted browser shell is served, threaded in via
+    /// [`RustBackend::with_mount_base`]; every shell URL is built from it.
+    pub(crate) mount_base: MountBase,
     /// `true` when `[wasm] mode = "hydrate"` was set in `package.ipe`. When set,
     /// the emitted wasm epilogue includes a `#[wasm_bindgen] pub fn hydrate(…)`
     /// export in addition to the `#[wasm_bindgen(start)] ipe_start` entry —
@@ -1820,6 +1844,7 @@ impl<'a> EmitCtx<'a> {
         ffi: Option<FfiEmit>,
         target: ipe_ir::Target,
         wasm_public_env: Vec<String>,
+        mount_base: MountBase,
         wasm_hydrate_mode: bool,
         runtime_dep: Option<RuntimeDep>,
         debugger: bool,
@@ -2466,6 +2491,7 @@ impl<'a> EmitCtx<'a> {
             uses_env_public,
             uses_async_runtime,
             wasm_public_env,
+            mount_base,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -5398,6 +5424,7 @@ mod record_struct_namespace_tests {
             None,
             ipe_ir::Target::Native,
             Vec::new(),
+            crate::MountBase::root(),
             false,
             None,
             false,
@@ -5505,6 +5532,7 @@ mod record_struct_namespace_tests {
             None,
             ipe_ir::Target::Native,
             Vec::new(),
+            crate::MountBase::root(),
             false,
             None,
             false,
@@ -5596,6 +5624,7 @@ mod record_struct_namespace_tests {
             None,
             ipe_ir::Target::Native,
             Vec::new(),
+            crate::MountBase::root(),
             false,
             None,
             false,

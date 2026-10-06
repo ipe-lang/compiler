@@ -41,7 +41,13 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use zeroize::Zeroizing;
+
 use crate::cli_args::OutputFormat;
+use crate::remote_ingest::{
+    InheritedInput, InheritedRole, LINK_PROBE_LIMITS, LocalCeiling, LocalSource, run_inherited,
+    run_local_fed,
+};
 use crate::style::TerminalSafe;
 use crate::{
     CliError, runtime_embed,
@@ -728,7 +734,7 @@ fn linker_already_configured() -> bool {
         return false;
     };
     let Ok(text) =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
+        crate::io_bounded::read_leaf_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
     else {
         return false;
     };
@@ -775,7 +781,9 @@ fn probe_linker(name: &str) -> LinkerProbeResult {
     if let Some(result) = read_probe_cache(name, cache_key.as_deref()) {
         return result;
     }
-    let result = run_link_probe(name);
+    let Some(result) = run_link_probe(name) else {
+        return LinkerProbeResult::Rejected;
+    };
     write_probe_cache(name, cache_key.as_deref(), &result);
     result
 }
@@ -801,91 +809,75 @@ fn link_driver_for_host_triple(host: &str) -> LinkDriver {
     }
 }
 
-/// Parse the `host:` line out of `rustc -vV`'s raw output text.
+/// Ask the running toolchain for its host triple via `rustc -vV`.
 ///
-/// Pure: no subprocess, no environment lookup — just the line scan. The one
-/// parser both [`host_link_driver`] and [`host_target_triple`] read through,
-/// so "the host triple" has exactly one source wherever `rustc -vV`'s text is
-/// available, instead of two call sites each re-deriving it their own way.
-fn host_triple_from_rustc_vv(text: &str) -> Option<&str> {
-    text.lines().find_map(|l| l.strip_prefix("host: "))
-}
-
-/// Ask the running toolchain for its host triple via `rustc -vV`. `None` when
-/// `rustc` is not on `PATH`, exits non-zero, or its output does not carry a
-/// parseable `host:` line.
-fn rustc_host_triple() -> Option<String> {
-    let text = rustc_vv_text()?;
-    host_triple_from_rustc_vv(&text).map(str::to_owned)
-}
-
-/// The running toolchain's `rustc -vV` text. `None` when `rustc` is not on
-/// `PATH`, exits non-zero, or prints non-UTF-8.
-fn rustc_vv_text() -> Option<String> {
-    let out = Command::new("rustc").arg("-vV").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()
+/// `None` when the query is refused: `rustc` is missing, crosses its ceiling,
+/// exits non-zero, or prints a report [`toolchain::RustcVersion::parse`] refuses.
+fn rustc_host_triple() -> Option<&'static str> {
+    toolchain::RustcVersion::active()
+        .ok()
+        .map(toolchain::RustcVersion::host)
 }
 
 /// The running toolchain's link driver, derived from its host triple. `None`
 /// when the triple cannot be determined — the fast-linker probe then runs
 /// exactly as it did before this check existed.
 fn host_link_driver() -> Option<LinkDriver> {
-    rustc_host_triple().map(|host| link_driver_for_host_triple(&host))
+    rustc_host_triple().map(link_driver_for_host_triple)
 }
 
-/// The `rustc -vV` release line, used as the cache invalidation key. `None`
-/// when `rustc` is not on PATH or its output cannot be parsed.
+/// The `rustc -vV` release line, such as `release: 1.80.0`, used as the cache invalidation key.
+///
+/// `None` when the query is refused, as [`rustc_host_triple`] is.
 fn rustc_version_string() -> Option<String> {
-    let text = rustc_vv_text()?;
-    // The "release:" line uniquely identifies the toolchain version.
-    text.lines()
-        .find(|l| l.starts_with("release:"))
-        .map(str::to_owned)
+    toolchain::RustcVersion::active()
+        .ok()
+        .map(|version| format!("release: {}", version.release()))
 }
 
 /// Run the actual link probe: feed `fn main(){}` to `rustc` with
-/// `-Clink-arg=-fuse-ld=<name>` and return whether it exits 0.
+/// `-Clink-arg=-fuse-ld=<name>` and return whether it exits 0, or `None` when
+/// the probe never ran to an exit.
+fn run_link_probe(name: &str) -> Option<LinkerProbeResult> {
+    run_link_probe_with(Command::new("rustc"), name, LINK_PROBE_LIMITS)
+}
+
+/// Run the link probe through `rustc` under `ceiling`.
 ///
 /// The artifact lands in a `ScratchDir` that is removed on drop, so no debris
-/// reaches the project tree or the shared target.
-fn run_link_probe(name: &str) -> LinkerProbeResult {
+/// reaches the project tree or the shared target. Only a probe that ran to an
+/// exit yields a verdict (`Accepted` on success, `Rejected` otherwise); one
+/// that fails to start or crosses `ceiling` yields `None`, which is no fact
+/// about the linker and so is never cached.
+fn run_link_probe_with(
+    mut rustc: Command,
+    name: &str,
+    ceiling: LocalCeiling,
+) -> Option<LinkerProbeResult> {
     // A ScratchDir gives us an unpredictably-named, exclusively-created, mode-
     // 0700 directory that is removed when the guard drops — no predictable path,
     // no race on the temp name, no leftover artifacts.
-    let Ok(scratch) = ScratchDir::new("ipe-linker-probe") else {
-        return LinkerProbeResult::Rejected;
-    };
-    let Ok(leaf) = LeafName::new("probe") else {
-        return LinkerProbeResult::Rejected;
-    };
+    let scratch = ScratchDir::new("ipe-linker-probe").ok()?;
+    let leaf = LeafName::new("probe").ok()?;
     let out_path = scratch.child(&leaf);
-    let out = Command::new("rustc")
-        .args([
-            "-",
-            "--edition=2021",
-            &format!("-Clink-arg=-fuse-ld={name}"),
-            "-o",
-            &out_path.to_string_lossy(),
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .and_then(|mut child| {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write as _;
-                let _ = stdin.write_all(b"fn main(){}");
-            }
-            child.wait()
-        });
+    rustc
+        .args(["-", "--edition=2021"])
+        .arg(format!("-Clink-arg=-fuse-ld={name}"))
+        .arg("-o")
+        .arg(&out_path);
+    let run = run_local_fed(
+        rustc,
+        Zeroizing::new(b"fn main(){}".to_vec()),
+        ceiling,
+        LocalSource::LinkProbe,
+    );
     // `scratch` drops here, removing the directory and the probe artifact.
-    match out {
-        Ok(status) if status.success() => LinkerProbeResult::Accepted,
-        _ => LinkerProbeResult::Rejected,
-    }
+    let captured = run.ok()?;
+    Some(if captured.status.success() {
+        LinkerProbeResult::Accepted
+    } else {
+        LinkerProbeResult::Rejected
+    })
 }
 
 /// The path of the linker-probe cache file: `$IPE_HOME/linker-probe.toml`.
@@ -901,8 +893,7 @@ fn probe_cache_path() -> Option<PathBuf> {
 fn read_probe_cache(name: &str, toolchain_key: Option<&str>) -> Option<LinkerProbeResult> {
     let path = probe_cache_path()?;
     let text =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
-            .ok()?;
+        crate::io_bounded::read_leaf_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP).ok()?;
     let doc: toml::Table = text.parse().ok()?;
     let entry = doc.get(name)?.as_table()?;
     // If the cached entry carries a toolchain key that differs from the running
@@ -928,7 +919,7 @@ fn write_probe_cache(name: &str, toolchain_key: Option<&str>, result: &LinkerPro
     let accepted = matches!(result, LinkerProbeResult::Accepted);
     // Read the existing cache (if any) so we preserve other linkers' entries.
     let existing =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
+        crate::io_bounded::read_leaf_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
             .unwrap_or_default();
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
@@ -1003,12 +994,18 @@ fn check_cache() -> Check {
 
 /// Whether the ipe-managed shared build target is configured, and — when it is
 /// not — offer to set it up under `$IPE_HOME/target`.
-// A `match` reads clearer than a `map_or_else` over two full `Check` literals.
-#[allow(clippy::option_if_let_else, clippy::single_match_else)]
 fn check_shared_target() -> Check {
     let configured = ipe_home_config_value(&["build", "target-dir"]);
     match configured {
-        Some(dir) => Check {
+        HomeConfigValue::Unreadable(error) => Check {
+            group: Group::Target,
+            id: "shared-target",
+            status: Status::Unknown,
+            detail: format!("the shared build target cannot be determined: {error}"),
+            suggestion: None,
+            fix: None,
+        },
+        HomeConfigValue::Set(dir) => Check {
             group: Group::Target,
             id: "shared-target",
             status: Status::Ok,
@@ -1016,7 +1013,7 @@ fn check_shared_target() -> Check {
             suggestion: None,
             fix: None,
         },
-        None => {
+        HomeConfigValue::Unset => {
             let target_dir = runtime_embed::ipe_home()
                 .map_or_else(|_| PathBuf::from("target"), |h| h.join("target"));
             Check {
@@ -1207,15 +1204,10 @@ const LOW_DISK_FLOOR: u64 = 5 * 1024 * 1024 * 1024;
 /// [`cfg_host_triple_fallback`] when `rustc` is unreachable, and only then to
 /// the generic `"host"` key on an unmapped platform — the linker edit is a
 /// convenience, not a correctness requirement, so a best-effort key is still
-/// useful when the real triple cannot be read. Cached for the process's
-/// lifetime: the host triple cannot change between two calls in one run.
+/// useful when the real triple cannot be read. The query runs once per
+/// process ([`toolchain::RustcVersion::active`]).
 fn host_target_triple() -> &'static str {
-    static TRIPLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TRIPLE
-        .get_or_init(|| {
-            rustc_host_triple().unwrap_or_else(|| cfg_host_triple_fallback().to_owned())
-        })
-        .as_str()
+    rustc_host_triple().unwrap_or_else(cfg_host_triple_fallback)
 }
 
 /// A compile-time per-arch/OS guess at the host triple, used only when
@@ -1293,19 +1285,45 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Read a dotted string value from `$IPE_HOME/config.toml`, or `None` when the
-/// file is absent, unreadable, unparseable, or lacks the key.
-fn ipe_home_config_value(key: &[&str]) -> Option<String> {
-    let path = runtime_embed::ipe_home().ok()?.join("config.toml");
-    let text =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
-            .ok()?;
-    let doc: toml::Table = text.parse().ok()?;
-    let mut node = &toml::Value::Table(doc);
-    for segment in key {
-        node = node.as_table()?.get(*segment)?;
-    }
-    node.as_str().map(str::to_owned)
+/// What a home config file says for one dotted key.
+#[derive(Debug)]
+enum HomeConfigValue {
+    /// The key holds this string.
+    Set(String),
+    /// No home resolves, or the file is absent, unparseable, or lacks the key.
+    Unset,
+    /// The file is there but was refused or could not be read: a link, a
+    /// FIFO, a denied or oversized file.
+    Unreadable(CliError),
+}
+
+/// Read a dotted string value from `$IPE_HOME/config.toml`.
+fn ipe_home_config_value(key: &[&str]) -> HomeConfigValue {
+    runtime_embed::ipe_home().map_or(HomeConfigValue::Unset, |home| home_config_value(&home, key))
+}
+
+/// Read a dotted string value from `config.toml` in `home`, never following a link there.
+fn home_config_value(home: &Path, key: &[&str]) -> HomeConfigValue {
+    let text = match crate::io_bounded::read_named_in(
+        home,
+        &["config.toml"],
+        crate::io_bounded::SMALL_FILE_CAP,
+    ) {
+        Ok(text) => text,
+        Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return HomeConfigValue::Unset;
+        }
+        Err(error) => return HomeConfigValue::Unreadable(error),
+    };
+    let lookup = || {
+        let doc: toml::Table = text.parse().ok()?;
+        let mut node = &toml::Value::Table(doc);
+        for segment in key {
+            node = node.as_table()?.get(*segment)?;
+        }
+        node.as_str().map(str::to_owned)
+    };
+    lookup().map_or(HomeConfigValue::Unset, HomeConfigValue::Set)
 }
 
 /// Free bytes on the filesystem holding `dir`. `None` when the platform query is
@@ -1672,9 +1690,14 @@ fn run_install(argv: &[String]) -> Result<(), CliError> {
     let (program, rest) = argv
         .split_first()
         .ok_or_else(|| CliError::Usage(crate::text::msg::health_install_command_empty()))?;
-    let status = Command::new(program).args(rest).status().map_err(|e| {
-        CliError::Usage(crate::text::msg::health_install_launch_failed(&program, &e))
-    })?;
+    let mut install = Command::new(program);
+    install.args(rest);
+    let status = run_inherited(
+        install,
+        InheritedRole::InteractiveInstall,
+        InheritedInput::Terminal,
+    )
+    .map_err(|e| CliError::Usage(crate::text::msg::health_install_launch_failed(&program, &e)))?;
     if status.success() {
         Ok(())
     } else {
@@ -1701,16 +1724,16 @@ fn run_install(argv: &[String]) -> Result<(), CliError> {
 /// existing file does not parse as TOML (the command will not blindly overwrite
 /// a file it cannot understand).
 fn apply_config_edit(path: &Path, key: &[&str], value: &ConfigValue) -> Result<(), CliError> {
-    let existing = match crate::io_bounded::read_to_string_capped(
-        path,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    ) {
-        Ok(text) => text,
-        Err(CliError::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            String::new()
-        }
-        Err(e) => return Err(e),
-    };
+    let existing =
+        match crate::io_bounded::read_leaf_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP) {
+            Ok(text) => text,
+            Err(CliError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                String::new()
+            }
+            Err(e) => return Err(e),
+        };
 
     let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| {
         CliError::Usage(crate::text::msg::health_config_not_toml(
@@ -1941,6 +1964,58 @@ mod tests {
             std::fs::read_to_string(&home_config).expect("read sentinel"),
             sentinel,
             "a refused CARGO_HOME must never fall back to editing ~/.cargo/config.toml"
+        );
+    }
+
+    /// A home config that is a link is reported unreadable, never read as unset.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_home_config_is_unreadable_not_unset() {
+        let home =
+            ipe_test_temp::temp_root().join(format!("ipe_health_home_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(std::fs::create_dir_all(&home).is_ok(), "make home");
+        let real = home.join("real.toml");
+        assert!(
+            std::fs::write(&real, "[build]\ntarget-dir = \"/t\"\n").is_ok(),
+            "write real config"
+        );
+        assert!(
+            std::os::unix::fs::symlink(&real, home.join("config.toml")).is_ok(),
+            "plant the config link"
+        );
+        let linked = home_config_value(&home, &["build", "target-dir"]);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            matches!(
+                &linked,
+                HomeConfigValue::Unreadable(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a linked home config must be unreadable: {linked:?}"
+        );
+    }
+
+    /// An absent home config is unset; a present one yields its key.
+    #[test]
+    fn a_home_config_is_unset_when_absent_and_set_when_present() {
+        let home = ipe_test_temp::temp_root()
+            .join(format!("ipe_health_home_plain_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(std::fs::create_dir_all(&home).is_ok(), "make home");
+        let absent = home_config_value(&home, &["build", "target-dir"]);
+        assert!(
+            std::fs::write(home.join("config.toml"), "[build]\ntarget-dir = \"/t\"\n").is_ok(),
+            "write config"
+        );
+        let present = home_config_value(&home, &["build", "target-dir"]);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(absent, HomeConfigValue::Unset), "{absent:?}");
+        assert!(
+            matches!(&present, HomeConfigValue::Set(dir) if dir == "/t"),
+            "{present:?}"
         );
     }
 
@@ -2205,7 +2280,7 @@ mod tests {
         // where it is actually reachable in production.
         let result = run_link_probe("__ipe_test_nonexistent_linker__");
         assert!(
-            matches!(result, LinkerProbeResult::Rejected),
+            matches!(result, Some(LinkerProbeResult::Rejected)),
             "a nonexistent linker must be rejected by the probe"
         );
     }
@@ -2240,14 +2315,68 @@ mod tests {
                   binary: rustc\n\
                   host: x86_64-pc-windows-msvc\n\
                   release: 1.80.0\n";
-        assert_eq!(
-            host_triple_from_rustc_vv(vv),
-            Some("x86_64-pc-windows-msvc")
-        );
+        let version = toolchain::RustcVersion::parse(vv.as_bytes());
+        assert!(version.is_ok(), "{version:?}");
+        let Ok(version) = version else { return };
+        assert_eq!(version.host(), "x86_64-pc-windows-msvc");
+        assert!(matches!(
+            link_driver_for_host_triple(version.host()),
+            LinkDriver::Msvc
+        ));
         // No `host:` line at all — the parser refuses rather than guessing.
         let no_host = "rustc 1.80.0 (abcdef 2024-01-01)\nrelease: 1.80.0\n";
-        assert_eq!(host_triple_from_rustc_vv(no_host), None);
-        assert_eq!(host_triple_from_rustc_vv(""), None);
+        assert_eq!(
+            toolchain::RustcVersion::parse(no_host.as_bytes()),
+            Err(toolchain::RustcVersionRefusal::MissingHost)
+        );
+    }
+
+    /// A `rustc` command that resolves to a stub running `body`, with the stub's guard.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // the test temp root is writable and its path holds no `PATH` separator
+    fn stub_rustc(tag: &str, body: &str) -> (Command, toolchain::StubRustc) {
+        let stub = toolchain::StubRustc::new(tag, body).expect("write the stub rustc");
+        let mut rustc = Command::new("rustc");
+        rustc.env("PATH", stub.path().expect("join the stub PATH"));
+        (rustc, stub)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_probe_that_links_is_accepted() {
+        let (rustc, _stub) = stub_rustc("probe_ok", "cat >/dev/null\nexit 0");
+        assert!(matches!(
+            run_link_probe_with(rustc, "mold", LINK_PROBE_LIMITS),
+            Some(LinkerProbeResult::Accepted)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_probe_that_exits_non_zero_is_rejected() {
+        let (rustc, _stub) = stub_rustc("probe_fail", "cat >/dev/null\nexit 1");
+        assert!(matches!(
+            run_link_probe_with(rustc, "mold", LINK_PROBE_LIMITS),
+            Some(LinkerProbeResult::Rejected)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_probe_past_its_wall_is_no_verdict() {
+        use crate::remote_ingest::LocalWall;
+        let (rustc, _stub) = stub_rustc("probe_slow", "cat >/dev/null\nsleep 30\nexit 0");
+        let started = std::time::Instant::now();
+        let probe = run_link_probe_with(
+            rustc,
+            "mold",
+            LINK_PROBE_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            probe.is_none(),
+            "a probe past its wall is no linker verdict"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

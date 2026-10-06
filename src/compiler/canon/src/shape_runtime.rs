@@ -34,6 +34,8 @@
 //! the defence-in-depth backstop that refuses any unclassified native kernel in
 //! a sandboxed bundle even if a new effect module is not yet a row here.
 
+use crate::env::{STDLIB_MODULE_QUALIFIERS, const_str_eq};
+
 /// A rendering shape, pinned by the head of `main` (spec § 1).
 ///
 /// Mirrors [`crate::shape_source::MainShape`]; kept as its own type so this
@@ -200,30 +202,155 @@ pub enum DenyReason {
     },
 }
 
+/// The placement family of every kernel canonical in [`STDLIB_MODULE_QUALIFIERS`].
+///
+/// One row per canonical, so every import path of one module (`Ipe.Http.Server`
+/// and `Ipe.Server.Http`, both canonical `Server`) classifies alike. A
+/// `const` check refuses to build when a canonical has no row, two rows, or a
+/// row names no canonical.
+const CANONICAL_CLASSES: &[(&str, ModuleClass)] = &[
+    ("Crypto", ModuleClass::Pure),
+    ("Secret", ModuleClass::Pure),
+    ("CssSafety", ModuleClass::Pure),
+    ("Jwt", ModuleClass::Pure),
+    ("JsonEnc", ModuleClass::Pure),
+    ("JsonDec", ModuleClass::Pure),
+    ("JsonDecP", ModuleClass::Pure),
+    ("System", ModuleClass::Pure),
+    ("Process", ModuleClass::Pure),
+    ("Http", ModuleClass::ClientHttp),
+    ("HttpStream", ModuleClass::ClientHttp),
+    // The server surface binds a socket and serves.
+    ("Server", ModuleClass::NativeEffect),
+    ("Middleware", ModuleClass::NativeEffect),
+    ("RateLimit", ModuleClass::NativeEffect),
+    ("Stream", ModuleClass::NativeEffect),
+    ("Ws", ModuleClass::NativeEffect),
+    ("Db", ModuleClass::NativeEffect),
+    ("Db.Decode", ModuleClass::NativeEffect),
+    ("Sql", ModuleClass::NativeEffect),
+    ("Auth", ModuleClass::NativeEffect),
+    ("Revocation", ModuleClass::NativeEffect),
+    ("App", ModuleClass::Pure),
+    ("Host", ModuleClass::Pure),
+    ("Console", ModuleClass::Pure),
+    ("Background", ModuleClass::Pure),
+    ("Border", ModuleClass::Pure),
+    ("Font", ModuleClass::Pure),
+    ("Region", ModuleClass::Pure),
+    ("Input", ModuleClass::Pure),
+    ("Lazy", ModuleClass::Pure),
+    ("Keyed", ModuleClass::Pure),
+    ("Event", ModuleClass::Pure),
+    // Shape-render surfaces: governed by the dedicated shape gates.
+    ("Web", ModuleClass::Pure),
+    ("Tui", ModuleClass::Pure),
+    ("Cli", ModuleClass::Pure),
+    ("Worker", ModuleClass::Pure),
+    ("TeaWebPubSub", ModuleClass::Pure),
+    ("TeaWebCmd", ModuleClass::Pure),
+    ("TeaWebSub", ModuleClass::Pure),
+    ("TeaTerminalCmd", ModuleClass::Pure),
+    ("TeaTerminalSub", ModuleClass::Pure),
+    ("TeaTuiCmd", ModuleClass::Pure),
+    ("TeaTuiSub", ModuleClass::Pure),
+    ("TeaCliCmd", ModuleClass::Pure),
+    ("TeaCliSub", ModuleClass::Pure),
+    ("TeaWorkerCmd", ModuleClass::Pure),
+    ("TeaWorkerSub", ModuleClass::Pure),
+];
+
+/// How many class rows name `canonical`.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < len`
+const fn class_rows(rows: &[(&str, ModuleClass)], canonical: &str) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i < rows.len() {
+        if const_str_eq(rows[i].0, canonical) {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// `true` when `canonical` is the canonical of some catalog path.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < len`
+const fn is_catalog_canonical(catalog: &[(&[&str], &str)], canonical: &str) -> bool {
+    let mut i = 0;
+    while i < catalog.len() {
+        if const_str_eq(catalog[i].1, canonical) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `true` when each catalog canonical has one class row and each row names one.
+#[allow(clippy::indexing_slicing)] // indices guarded by `i < len`
+const fn classes_cover(catalog: &[(&[&str], &str)], rows: &[(&str, ModuleClass)]) -> bool {
+    let mut i = 0;
+    while i < catalog.len() {
+        if class_rows(rows, catalog[i].1) != 1 {
+            return false;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < rows.len() {
+        if !is_catalog_canonical(catalog, rows[j].0) {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
+// The build fails when `CANONICAL_CLASSES` and the catalog drift.
+// IPE-RUST-AUDIT:ACCEPTED — this `assert!` runs during const-eval of a `const _`,
+// so it fails the build on drift and can never panic at runtime.
+const _: () = assert!(
+    classes_cover(STDLIB_MODULE_QUALIFIERS, CANONICAL_CLASSES),
+    "every STDLIB_MODULE_QUALIFIERS canonical needs exactly one CANONICAL_CLASSES row"
+);
+
 /// Classify a standard-library module dot-path into its placement family.
 ///
 /// The path is the dotted form (`"Ipe.Db.Store"`, `"Ipe.Browser.Camera"`,
-/// `"String"`). Only the placement-constrained families this table owns —
-/// native effects (`Ipe.Db` / `Ipe.File` / `Ipe.Http.Server` / `Ipe.Auth`) and
-/// browser-host capabilities (`Ipe.Browser.*`) — are recognised; everything
-/// else (pure stdlib, and the shape-render surfaces owned by the dedicated
-/// shape gates) is [`ModuleClass::Pure`], admissible everywhere by this table.
+/// `"String"`). A kernel path (one in [`STDLIB_MODULE_QUALIFIERS`]) classifies
+/// by its canonical module through [`CANONICAL_CLASSES`], so two paths onto
+/// one module never disagree. Any other path classifies by its first segment
+/// after `Ipe.`: native effects (`Ipe.Db` / `Ipe.File` / `Ipe.Auth`), the
+/// server under `Ipe.Http.Server`, the client `Ipe.Http`, and browser-host
+/// capabilities (`Ipe.Browser.*`); everything else (pure stdlib, and the
+/// shape-render surfaces owned by the dedicated shape gates) is
+/// [`ModuleClass::Pure`].
 ///
 /// A user/dep module path (not `Ipe.`-prefixed) is likewise [`ModuleClass::Pure`]
 /// — a user module carries no stdlib placement constraint of its own, and its
 /// own imports are gated when that module is itself resolved.
 #[must_use]
 pub fn classify(path: &str) -> ModuleClass {
+    let kernel_canonical = STDLIB_MODULE_QUALIFIERS
+        .iter()
+        .find(|(segments, _)| segments.iter().copied().eq(path.split('.')))
+        .map(|(_, canonical)| *canonical);
+    if let Some(canonical) = kernel_canonical {
+        // Unreachable fallback: every catalog canonical has a row (const proof above).
+        return CANONICAL_CLASSES
+            .iter()
+            .find(|(c, _)| *c == canonical)
+            .map_or(ModuleClass::NativeEffect, |(_, class)| *class);
+    }
     // Non-`Ipe.` paths: the auto-imported pure prelude, or a user/dep module.
     // Neither carries a placement constraint here, so both are treated as pure —
     // a user module's own stdlib imports are gated when it is resolved.
     let Some(rest) = path.strip_prefix("Ipe.") else {
         return ModuleClass::Pure;
     };
-
-    // The first `Ipe.` segment decides the effect/capability family. Matching on
-    // the segment head keeps every sub-module of a family (`Ipe.Db`,
-    // `Ipe.Db.Store`, `Ipe.Db.Sql`) on the same row.
+    // A compiled-source `Ipe.*` module: the first segment decides the family,
+    // so every sub-module of a family (`Ipe.Db`, `Ipe.Db.Store`) shares a row.
     //
     // Division of labour: the SHAPE-RENDER surfaces — the `Ipe.Tea.*` TEA
     // app/Cmd/Sub machinery and the shape view libraries (`Ipe.Ui.*` cells,
@@ -239,7 +366,7 @@ pub fn classify(path: &str) -> ModuleClass {
     let head = rest.split('.').next().unwrap_or(rest);
     match head {
         // Native effects — direct DB, file, server-http, and the secret surface.
-        "Db" | "File" | "Auth" => ModuleClass::NativeEffect,
+        "Db" | "File" | "Auth" | "Server" => ModuleClass::NativeEffect,
         // `Ipe.Http.Server` is a native effect (it binds a socket and serves);
         // the plain client `Ipe.Http` fetch surface is portable.
         "Http" => {
@@ -399,6 +526,65 @@ mod tests {
                 Admissibility::Allow
             );
         }
+    }
+
+    /// Every import path of one kernel module classifies alike, so a sibling
+    /// spelling (`Ipe.Server.Http`) is never a softer family than its twin.
+    #[test]
+    fn paths_sharing_a_canonical_classify_alike() {
+        let dot = |segments: &[&str]| segments.join(".");
+        for (path, canonical) in STDLIB_MODULE_QUALIFIERS {
+            for (other, other_canonical) in STDLIB_MODULE_QUALIFIERS {
+                if canonical == other_canonical {
+                    assert_eq!(
+                        classify(&dot(path)),
+                        classify(&dot(other)),
+                        "{} vs {}",
+                        dot(path),
+                        dot(other)
+                    );
+                }
+            }
+        }
+        // The `Ipe.Server.*` spellings reach the native server modules.
+        for path in [
+            "Ipe.Server",
+            "Ipe.Server.Http",
+            "Ipe.Server.Middleware",
+            "Ipe.Server.RateLimit",
+            "Ipe.Server.Stream",
+            "Ipe.Server.WebSocket",
+        ] {
+            assert_eq!(classify(path), ModuleClass::NativeEffect, "{path}");
+        }
+        // Positive controls: the client surfaces, a pure kernel, and a
+        // compiled-source path keep their families.
+        assert_eq!(classify("Ipe.Http"), ModuleClass::ClientHttp);
+        assert_eq!(classify("Ipe.Http.Stream"), ModuleClass::ClientHttp);
+        assert_eq!(classify("Ipe.Crypto"), ModuleClass::Pure);
+        assert_eq!(classify("Ipe.Db.Store"), ModuleClass::NativeEffect);
+        // A compiled-source `Ipe.Server.*` path outside the kernel catalog
+        // still classifies as the native server family.
+        assert_eq!(classify("Ipe.Server.Extra"), ModuleClass::NativeEffect);
+    }
+
+    /// The coverage check refuses a canonical with no class row, a duplicated
+    /// row, and a row naming no canonical.
+    #[test]
+    fn canonical_class_coverage_refuses_drift() {
+        assert!(classes_cover(STDLIB_MODULE_QUALIFIERS, CANONICAL_CLASSES));
+        let missing: &[(&[&str], &str)] = &[(&["Ipe", "Nope"], "Nope")];
+        assert!(!classes_cover(missing, &[]));
+        let catalog: &[(&[&str], &str)] = &[(&["Ipe", "Crypto"], "Crypto")];
+        assert!(classes_cover(catalog, &[("Crypto", ModuleClass::Pure)]));
+        assert!(!classes_cover(
+            catalog,
+            &[("Crypto", ModuleClass::Pure), ("Crypto", ModuleClass::Pure)]
+        ));
+        assert!(!classes_cover(
+            catalog,
+            &[("Crypto", ModuleClass::Pure), ("Ghost", ModuleClass::Pure)]
+        ));
     }
 
     #[test]

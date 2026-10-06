@@ -188,14 +188,14 @@ pub enum ScreenOrientation {
 /// `delivery.browser` — browser-SPA host settings.
 #[derive(Clone, Debug)]
 pub struct BrowserDelivery {
-    /// The URL base path the SPA is served from (`"/"` for root).
-    pub base_path: String,
+    /// The URL path every shell serves the bundle at, parsed from `basePath`.
+    pub base: ipe_runtime_rust::encoding::MountBase,
 }
 
 impl Default for BrowserDelivery {
     fn default() -> Self {
         Self {
-            base_path: "/".to_owned(),
+            base: ipe_runtime_rust::encoding::MountBase::root(),
         }
     }
 }

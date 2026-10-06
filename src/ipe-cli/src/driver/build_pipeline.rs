@@ -8,6 +8,7 @@ use crate::{
     ffi, fs, project, render, runtime_embed, text,
 };
 use ipe_backend_rust::rust_str_lit;
+use ipe_runtime_rust::encoding::MountBase;
 
 /// Options modifying a build beyond plain source compilation — some (the
 /// static plan) apply post-emit at write time; others (`target`,
@@ -24,7 +25,7 @@ use ipe_backend_rust::rust_str_lit;
 // a two-variant enum or a state enum would obscure their independence rather than
 // clarify it; the clippy heuristic's usual remedy does not apply here.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct BuildOptions {
     /// `Some` — staticize the emitted project (activate the planned
     /// allocator feature, add the generated `.cargo/config.toml`). `None` —
@@ -41,6 +42,14 @@ pub struct BuildOptions {
     /// [`ipe_backend_rust::RustBackend::with_wasm_public_env`] /
     /// [`ipe_db::BuildConfig::wasm_public_env`].
     pub wasm_public_env: Vec<String>,
+    /// Where the emitted browser shell is served, parsed once from the
+    /// manifest's `browser.basePath`.
+    ///
+    /// A manifest build overwrites it in `build_project_with_options`; a
+    /// single-file build (no manifest) names [`MountBase::root`]. Threaded into
+    /// [`ipe_backend_rust::RustBackend::with_mount_base`] /
+    /// [`ipe_db::BuildConfig::mount_base`] and the build cache key.
+    pub mount_base: MountBase,
     /// `true` when `[wasm] mode = "hydrate"` in the project's `package.ipe`.
     /// Causes the backend to emit a `#[wasm_bindgen] pub fn hydrate(model_json: &str)`
     /// export in addition to the `#[wasm_bindgen(start)] pub fn ipe_start()` entry.
@@ -274,6 +283,30 @@ pub fn bluegreen_from_env_values(no_bluegreen: Option<&str>, bluegreen: Option<&
     true
 }
 
+impl Default for BuildOptions {
+    /// The vendored, native, release-intent options of a single-file build.
+    ///
+    /// The mount base is named [`MountBase::root`]: a single file carries no
+    /// manifest, and a manifest build overwrites it from `browser.basePath`.
+    fn default() -> Self {
+        Self {
+            static_plan: None,
+            target: ipe_ir::Target::default(),
+            wasm_public_env: Vec::new(),
+            mount_base: MountBase::root(),
+            wasm_hydrate_mode: false,
+            intent: ipe_backend_rust::BuildIntent::default(),
+            runtime_dep: false,
+            tree_shake_vendored: false,
+            cargo_name: String::new(),
+            debugger: false,
+            hot_appearance: false,
+            webview_host: false,
+            webview_window: None,
+        }
+    }
+}
+
 impl BuildOptions {
     /// The default build options with the emit model resolved from the
     /// environment (dependency-model by default; vendored under
@@ -328,8 +361,7 @@ pub fn build_with_options_into(
     options: BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
-    let source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     // Parse ONCE with a throwaway interner to learn the entry's declared module
     // path. Using the declared name as the entry's `module_path` means the shared
@@ -549,8 +581,10 @@ pub fn collect_manifest_rooted_entry(
     src_root: &Path,
     entry: &Path,
 ) -> Result<CollectedSources, CliError> {
+    // A named file reaches here canonicalised, its links already resolved, so
+    // it is read beneath `src_root` like the convention entry: never followed.
     let entry_source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+        crate::io_bounded::read_beneath(src_root, entry, crate::io_bounded::SOURCE_CAP)?;
     let entry_module_path = parse_entry_module_path(entry, &entry_source)?;
 
     let mut discovered = project::discover_modules(src_root)?;
@@ -589,8 +623,10 @@ pub fn collect_test_sources(
     tests_root: &Path,
     test_entry: &Path,
 ) -> Result<CollectedSources, CliError> {
+    // A named test file reaches here canonicalised, its links already resolved;
+    // `ipe verify`'s `tests/Main.ipe` is a convention file. Neither is followed.
     let entry_source =
-        crate::io_bounded::read_to_string_capped(test_entry, crate::io_bounded::SOURCE_READ_CAP)?;
+        crate::io_bounded::read_beneath(tests_root, test_entry, crate::io_bounded::SOURCE_CAP)?;
     let entry_module_path = parse_entry_module_path(test_entry, &entry_source)?;
 
     // The `tests/` tree is rooted at `tests_root` (the caller's, e.g. the
@@ -1036,6 +1072,7 @@ pub fn compile_modules_observed(
         db_driver,
         options.target,
         &options.wasm_public_env,
+        &options.mount_base,
         options.intent,
         options.debugger,
         options.hot_appearance,
@@ -1105,6 +1142,7 @@ pub fn compile_modules_observed(
                     .with_db_driver(db_driver)
                     .with_target(options.target)
                     .with_wasm_public_env(options.wasm_public_env.clone())
+                    .with_mount_base(options.mount_base.clone())
                     .with_wasm_hydrate_mode(options.wasm_hydrate_mode)
                     .with_runtime_dep(runtime_dep.clone())
                     .with_debugger(options.debugger)
@@ -1164,6 +1202,7 @@ pub fn compile_modules_observed(
         ffi_emit,
         options.target,
         options.wasm_public_env.clone(),
+        options.mount_base.clone(),
         options.wasm_hydrate_mode,
         options.intent,
         runtime_dep,
@@ -1541,6 +1580,20 @@ pub struct WidgetTagCollision {
     pub new_path: String,
 }
 
+/// Read the containment-checked widget-hook file at `resolved` below `widget_root`.
+///
+/// Every level below the root is opened through the held level above it and
+/// never followed, and the file is opened non-blocking and proven regular: a
+/// link swapped in after the containment check is refused, and a FIFO is
+/// refused rather than waited on.
+///
+/// # Errors
+///
+/// As [`crate::io_bounded::read_beneath`] under [`crate::io_bounded::SMALL_FILE_CAP`].
+fn read_widget_hook(widget_root: &Path, resolved: &Path) -> Result<String, CliError> {
+    crate::io_bounded::read_beneath(widget_root, resolved, crate::io_bounded::SMALL_FILE_CAP)
+}
+
 /// Record `cleaned_path` as the origin of `tag`, or report a collision.
 ///
 /// The custom-element tag is a 64-bit FNV-1a digest, which is not collision-free.
@@ -1733,23 +1786,21 @@ pub fn compile_prepared(
                     widget.cleaned_path
                 ))
             })?;
-        if !contained.resolved().is_file() {
-            return Err(reject(format!(
-                "the widget-hook file `{}` does not exist in the project",
-                widget.cleaned_path
-            )));
-        }
-        // Read the verified in-project file's content for content-addressed +
-        // SRI serving. `resolved()` is the containment-checked canonical path, so
-        // this read stays strictly inside the project root. A read failure (a
-        // race that removed the file between the `is_file` check and here, or a
-        // permission fault) fails the build closed — the widget seam never
-        // reaches emission on a file we could not read whole.
-        let content = std::fs::read_to_string(contained.resolved()).map_err(|e| {
-            reject(format!(
-                "the widget-hook file `{}` could not be read: {e}",
-                widget.cleaned_path
-            ))
+        // A read failure fails the build closed: the widget seam never reaches
+        // emission on a file we could not read whole.
+        let content = read_widget_hook(widget_root, contained.resolved()).map_err(|e| {
+            if matches!(&e, CliError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+            {
+                reject(format!(
+                    "the widget-hook file `{}` does not exist in the project",
+                    widget.cleaned_path
+                ))
+            } else {
+                reject(format!(
+                    "the widget-hook file `{}` could not be read: {e}",
+                    widget.cleaned_path
+                ))
+            }
         })?;
         // The tag is the SINGLE lowerer definition, keyed on the same cleaned
         // path the view node hashed — never a second, drift-prone hash here.
@@ -1947,7 +1998,7 @@ pub fn compile_prepared(
                 inject_widget_registration(&mut emitted, &widget_manifest)?;
             }
             ipe_ir::Target::WasmClient => {
-                inject_wasm_widget_bundle(&mut emitted, &widget_manifest)?;
+                inject_wasm_widget_bundle(&mut emitted, &widget_manifest, config.mount_base(db))?;
             }
         }
     }
@@ -2032,8 +2083,9 @@ pub fn inject_widget_registration(
 ///
 /// The hash the page pins is `sha256` over the served bytes (§ `widget_assets`),
 /// so page integrity == served bytes for the static target exactly as for the
-/// server. `base` is empty: the static SPA is root-mounted, so the absolute
-/// `/_ipe/…` asset URLs resolve against the `www/` document root.
+/// server. Every URL the page and the glue carry is `base.url_of` of the
+/// asset's bundle path, and the file sits at that bundle path under `www/`, so
+/// the URL and the file cannot name different assets.
 ///
 /// # Errors
 /// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if `www/index.html` is
@@ -2042,15 +2094,14 @@ pub fn inject_widget_registration(
 pub fn inject_wasm_widget_bundle(
     emitted: &mut ipe_backend::EmittedProject,
     manifest: &BTreeMap<String, String>,
+    base: &MountBase,
 ) -> Result<(), CliError> {
+    use ipe_runtime_rust::encoding::BundlePath;
     use ipe_runtime_rust::widget_assets::{
         WidgetAsset, WidgetTransport, glue_js_for, glue_path_for, page_scripts_for,
         widget_asset_path,
     };
 
-    // The static SPA is root-mounted; the `/_ipe/…` asset URLs are document-root
-    // absolute, so the `www/`-relative file path drops the leading slash.
-    const BASE: &str = "";
     const TRANSPORT: WidgetTransport = WidgetTransport::WasmClient;
     const HEAD_CLOSE: &str = "</head>";
 
@@ -2062,10 +2113,17 @@ pub fn inject_wasm_widget_bundle(
             detail,
         }),
     };
-    let rel = |p: &str| -> Result<ipe_backend::RelPath, CliError> {
-        ipe_backend::RelPath::new(p.to_owned()).map_err(|_| {
+    // The `www/` file of a bundle path: its segments joined under `www`.
+    let www_file = |path: &BundlePath| -> Result<ipe_backend::RelPath, CliError> {
+        let mut file = String::from("www");
+        for segment in path.file_segments() {
+            file.push('/');
+            file.push_str(segment);
+        }
+        ipe_backend::RelPath::new(file).map_err(|_| {
             bug(format!(
-                "the generated widget asset path `{p}` is not a valid in-project relative path"
+                "the widget bundle path `{}` is not a valid in-project relative path",
+                path.rel()
             ))
         })
     };
@@ -2080,28 +2138,24 @@ pub fn inject_wasm_widget_bundle(
         })
         .collect();
 
-    // Write each author hook file content-addressed under `www/`. `widget_asset_path`
-    // yields the absolute URL path `/_ipe/widget.<hex16>.js`; strip the leading
-    // `/` for the `www/`-relative file key.
+    // Write each author hook file content-addressed under `www/`, at the
+    // bundle path its URL is built from.
     for asset in &assets {
-        let url_path = widget_asset_path(&asset.content);
-        let file_path = format!("www{url_path}");
+        let path = widget_asset_path(&asset.content);
         emitted
             .files
-            .insert(rel(&file_path)?, asset.content.clone());
+            .insert(www_file(&path)?, asset.content.clone());
     }
 
     // Write the generated glue (WasmClient transport) content-addressed under `www/`.
-    let glue_url = glue_path_for(&assets, BASE, TRANSPORT);
-    let glue_body = glue_js_for(&assets, BASE, TRANSPORT);
-    emitted
-        .files
-        .insert(rel(&format!("www{glue_url}"))?, glue_body);
+    let glue_path = glue_path_for(&assets, base, TRANSPORT);
+    let glue_body = glue_js_for(&assets, base, TRANSPORT);
+    emitted.files.insert(www_file(&glue_path)?, glue_body);
 
     // Splice the SRI-pinned preload + glue script references into `index.html`
     // before `</head>` (external + SRI + crossorigin — no inline script, so the
     // static shell's CSP `script-src 'self' 'wasm-unsafe-eval'` is unchanged).
-    let scripts = page_scripts_for(&assets, BASE, TRANSPORT);
+    let scripts = page_scripts_for(&assets, base, TRANSPORT);
     let index = emitted
         .files
         .get_mut("www/index.html")
@@ -2807,6 +2861,7 @@ pub fn build_project_into(
     );
     let options = BuildOptions {
         wasm_public_env: manifest.wasm.public_env.to_names(),
+        mount_base: manifest.delivery.browser.base.clone(),
         wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
         cargo_name,
         webview_window,
@@ -3219,6 +3274,99 @@ mod tests {
                 })
             ),
             "an imported symlink sibling is refused, never followed"
+        );
+    }
+
+    /// A fresh scratch directory for a widget-hook test.
+    fn widget_scratch(tag: &str) -> PathBuf {
+        let dir =
+            ipe_test_temp::temp_root().join(format!("ipe_widget_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok(), "make scratch dir");
+        dir
+    }
+
+    /// A widget hook that is a FIFO is refused at once, never waited on for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_widget_hook_is_refused_not_hung() {
+        let dir = widget_scratch("fifo");
+        let hook = dir.join("hook.js");
+        let made = std::process::Command::new("mkfifo").arg(&hook).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo creates the fixture"
+        );
+        let contained = contained_path::ContainedRelPath::parse(&dir, "hook.js");
+        assert!(contained.is_ok(), "the FIFO lies inside the project");
+        let Ok(contained) = contained else {
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let root = dir.clone();
+        let resolved = contained.resolved().to_path_buf();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = sender.send(read_widget_hook(&root, &resolved));
+            })
+            .expect("spawn the bounded reader thread");
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        if result.is_err() {
+            // A writer releases a reader stuck on the FIFO, so the process can exit.
+            let _ = fs::OpenOptions::new().write(true).open(&hook);
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                result,
+                Ok(Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                }))
+            ),
+            "a FIFO widget hook must be refused without blocking: {result:?}"
+        );
+    }
+
+    /// A widget hook swapped for a link after its containment check is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_widget_hook_swapped_for_a_link_after_containment_is_refused() {
+        let dir = widget_scratch("swapped");
+        let outside = widget_scratch("swapped_outside");
+        let hook = dir.join("hook.js");
+        let planted = outside.join("secret.txt");
+        assert!(fs::write(&hook, "customElements;").is_ok(), "write hook");
+        assert!(fs::write(&planted, "secret").is_ok(), "write planted file");
+        let contained = contained_path::ContainedRelPath::parse(&dir, "hook.js");
+        assert!(contained.is_ok(), "the hook lies inside the project");
+        let Ok(contained) = contained else {
+            return;
+        };
+        let before = read_widget_hook(&dir, contained.resolved());
+        assert!(
+            before
+                .as_deref()
+                .is_ok_and(|text| text == "customElements;"),
+            "a regular in-project hook is read: {before:?}"
+        );
+        assert!(fs::remove_file(&hook).is_ok(), "remove hook");
+        assert!(
+            std::os::unix::fs::symlink(&planted, &hook).is_ok(),
+            "swap in a link"
+        );
+        let after = read_widget_hook(&dir, contained.resolved());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        assert!(
+            matches!(
+                after,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a hook swapped for a link must be refused: {after:?}"
         );
     }
 }

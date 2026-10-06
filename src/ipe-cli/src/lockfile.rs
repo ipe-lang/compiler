@@ -269,19 +269,21 @@ impl Lockfile {
     /// Read the lockfile at `project_root/ipe.lock`.
     ///
     /// A missing lockfile is an empty lockfile (a project with no locked
-    /// dependencies yet), not an error.
+    /// dependencies yet), not an error. The file is opened beneath
+    /// `project_root` without following a symlink or blocking on a FIFO.
     ///
     /// # Errors
     /// [`CliError::Io`] if the file exists but cannot be read;
+    /// [`CliError::SourceRefused`] if it is a symlink or not a regular file;
     /// [`CliError::VersionRefused`] if a `version` is malformed or carries build
     /// metadata; [`CliError::LockRefused`] if a field is missing, a `kind` is
     /// unrecognised, or `source`/`rev`/`kind` pair impossibly;
     /// [`CliError::Resolve`] if a name, source URL, rev, or sha256 is malformed.
     pub fn read(project_root: &Path) -> Result<Self, CliError> {
-        let path = Self::path(project_root);
-        let text = match crate::io_bounded::read_to_string_capped(
-            &path,
-            crate::io_bounded::SMALL_FILE_READ_CAP,
+        let text = match crate::io_bounded::read_named_in(
+            project_root,
+            &[LOCKFILE_NAME],
+            crate::io_bounded::SMALL_FILE_CAP,
         ) {
             Ok(text) => text,
             Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -941,5 +943,58 @@ mod tests {
         assert!(!msg.contains('\x1b'), "{msg:?}");
         assert!(!msg.contains("[2J\n"), "{msg:?}");
         assert!(msg.contains("\\u{1b}[2J\\n"), "{msg:?}");
+    }
+
+    /// A FIFO planted as `ipe.lock` is refused at once, never waited on for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_ipe_lock_is_refused_not_hung() {
+        let root = temp_dir("fifo-lock");
+        let made = std::process::Command::new("mkfifo")
+            .arg(root.join("ipe.lock"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo creates the fixture");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_root = root.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(Lockfile::read(&reader_root));
+            })
+            .expect("spawn the bounded reader thread");
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                outcome,
+                Ok(Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                }))
+            ),
+            "a FIFO lockfile is refused without blocking: {outcome:?}"
+        );
+    }
+
+    /// A symlinked `ipe.lock` is refused by name, never read through.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ipe_lock_is_refused() {
+        let root = temp_dir("link-lock");
+        let elsewhere = root.join("elsewhere.lock");
+        std::fs::write(&elsewhere, "").expect("write target");
+        std::os::unix::fs::symlink(&elsewhere, root.join("ipe.lock")).expect("link lockfile");
+        let read = Lockfile::read(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                read,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a symlinked lockfile is refused: {read:?}"
+        );
     }
 }
