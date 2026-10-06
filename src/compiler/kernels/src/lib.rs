@@ -3497,7 +3497,25 @@ pub enum StdlibKernel {
     SqlInList,
     /// `Sql.like : SqlFragment -> String -> SqlFragment` — the pattern is
     /// always a bound param, never interpolated.
+    ///
+    /// It renders `LIKE ? ESCAPE '\'`: `%` and `_` in the pattern, including
+    /// any from user text, are wildcards, and `\%`, `\_`, `\\` match them
+    /// literally on every engine. A pattern ending in an unpaired `\` is
+    /// refused as a typed error. A literal prefix is `Sql.startsWith`.
     SqlLike,
+    /// `Sql.startsWith : SqlFragment -> String -> SqlFragment` — the rows whose
+    /// text begins with exactly the given prefix.
+    ///
+    /// The prefix is literal: `%`, `_` and `\` in it match themselves, and
+    /// the match is case-sensitive on every engine. A `NULL` value never
+    /// matches. An empty prefix, one holding a NUL character, or one longer
+    /// than 16384 bytes is refused as a typed error before any SQL is sent.
+    /// The predicate renders an escaped `LIKE ? ESCAPE '\'` beside an exact
+    /// `substr` comparison, so an index can serve the scan on Postgres (and
+    /// on SQLite only under `case_sensitive_like`; otherwise SQLite scans).
+    /// Under Postgres with `standard_conforming_strings = off`, `'\'` is a
+    /// syntax error, so such a server refuses the query.
+    SqlStartsWith,
     /// `Sql.exists : String -> SqlFragment -> SqlFragment` — a correlated-
     /// subquery existence test `EXISTS (SELECT 1 FROM <table> WHERE <inner>)`.
     /// The table is validated through the same bare-identifier gate as
@@ -7180,6 +7198,7 @@ impl StdlibKernel {
             Self::SqlIsNotNull => d("Sql", "isNotNull", 1, Db, "sql_is_not_null", IpeOrder),
             Self::SqlInList => d("Sql", "inList", 2, Db, "sql_in_list", IpeOrder),
             Self::SqlLike => d("Sql", "like", 2, Db, "sql_like", IpeOrder),
+            Self::SqlStartsWith => d("Sql", "startsWith", 2, Db, "sql_starts_with", IpeOrder),
             Self::SqlExists => d("Sql", "exists", 2, Db, "sql_exists", IpeOrder),
             Self::SqlMaskedColumn => d("Sql", "maskedColumn", 2, Db, "sql_masked_column", IpeOrder),
             Self::DbFindWhere => d("Db", "findWhere", 3, Db, "db_find_where", IpeOrder),
@@ -8701,6 +8720,7 @@ impl StdlibKernel {
         Self::SqlIsNotNull,
         Self::SqlInList,
         Self::SqlLike,
+        Self::SqlStartsWith,
         Self::SqlExists,
         Self::SqlMaskedColumn,
         Self::DbFindWhere,
@@ -12494,7 +12514,7 @@ impl StdlibKernel {
                 Some(&SQLFRAGMENT_TO_SQLFRAGMENT)
             }
             Self::SqlInList => Some(&SQL_IN_LIST),
-            Self::SqlLike => Some(&SQL_LIKE),
+            Self::SqlLike | Self::SqlStartsWith => Some(&SQL_LIKE),
             Self::SqlExists => Some(&SQL_EXISTS),
             Self::SqlMaskedColumn => Some(&SQL_MASKED_COLUMN),
 
@@ -14406,6 +14426,7 @@ impl StdlibKernel {
             | Self::SqlIsNotNull
             | Self::SqlInList
             | Self::SqlLike
+            | Self::SqlStartsWith
             | Self::SqlExists
             | Self::SqlMaskedColumn
             | Self::SecretFromString

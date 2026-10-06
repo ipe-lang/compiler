@@ -1104,7 +1104,7 @@ mod registry_phase_c_tests {
             K::MoneyGetRate,
             K::MoneyHasRate,
             K::MoneyClearRates,
-            // ── Ipe.Db.Sql — SqlFragment builder (20) ──────────────
+            // ── Ipe.Db.Sql — SqlFragment builder (23) ──────────────
             K::SqlColumn,
             // Ipe.Db.Unsafe.unsafeFragment — the un-validated anti-`Sql.column`.
             K::SqlUnsafeFragment,
@@ -1126,6 +1126,7 @@ mod registry_phase_c_tests {
             K::SqlIsNotNull,
             K::SqlInList,
             K::SqlLike,
+            K::SqlStartsWith,
             // Correlated-subquery existence test (Ipê-new, no legacy oracle).
             K::SqlExists,
             // Column-masking projection term (Ipê-new, no legacy oracle).

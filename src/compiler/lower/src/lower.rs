@@ -27056,7 +27056,7 @@ impl<'a> Lowerer<'a> {
             // ── Ipe.Db.Sql — SqlFragment builder, arity 2 ─────────────────────
             // `eq`/`ne`/`gt`/`lt`/`gte`/`lte`/`and`/`or : SqlFragment -> SqlFragment -> SqlFragment`,
             // `inList : SqlFragment -> List SqlValue -> SqlFragment`,
-            // `like : SqlFragment -> String -> SqlFragment`.
+            // `like`/`startsWith : SqlFragment -> String -> SqlFragment`.
             Callee::Kernel(
                 KernelFn::SqlEq
                 | KernelFn::SqlNe
@@ -27068,6 +27068,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::SqlOr
                 | KernelFn::SqlInList
                 | KernelFn::SqlLike
+                | KernelFn::SqlStartsWith
                 // `exists : String -> SqlFragment -> SqlFragment`.
                 | KernelFn::SqlExists
                 // `maskedColumn : SqlFragment -> String -> SqlFragment`.
@@ -28436,6 +28437,7 @@ impl<'a> Lowerer<'a> {
                     ("Sql", "isNotNull") => Ok(Callee::Kernel(KernelFn::SqlIsNotNull)),
                     ("Sql", "inList") => Ok(Callee::Kernel(KernelFn::SqlInList)),
                     ("Sql", "like") => Ok(Callee::Kernel(KernelFn::SqlLike)),
+                    ("Sql", "startsWith") => Ok(Callee::Kernel(KernelFn::SqlStartsWith)),
                     ("Sql", "exists") => Ok(Callee::Kernel(KernelFn::SqlExists)),
                     ("Sql", "maskedColumn") => Ok(Callee::Kernel(KernelFn::SqlMaskedColumn)),
                     ("Db", "findWhere") => Ok(Callee::Kernel(KernelFn::DbFindWhere)),
