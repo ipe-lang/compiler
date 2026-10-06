@@ -331,7 +331,7 @@ impl EncodedBase {
 /// route matcher, param resolver and base-path strip then reads the decoded
 /// segments and never re-parses the raw text. Splitting precedes decoding, so
 /// an encoded `%2F` stays inside its segment and never becomes a separator.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DecodedPath(Vec<String>);
 
 impl DecodedPath {
@@ -369,6 +369,297 @@ impl DecodedPath {
             .strip_prefix(base.0.as_slice())
             .map(|rest| Self(rest.to_vec()))
     }
+}
+
+/// The longest text [`MountBase::parse`] admits, in bytes.
+pub const MAX_MOUNT_BASE_LEN: usize = 1024;
+
+/// The longest text [`BundlePath::parse`] admits, in bytes.
+pub const MAX_BUNDLE_PATH_LEN: usize = 1024;
+
+/// Why a text is not a mount base.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MountBaseRefusal {
+    /// Longer than [`MAX_MOUNT_BASE_LEN`]; judged before any byte is scanned.
+    TooLong { len: usize },
+    /// A non-root base that does not start with `/` (`app`).
+    NoLeadingSlash,
+    /// A non-root base that ends with `/` (`/app/`); only the root is `/`.
+    TrailingSlash,
+    /// Two adjacent separators (`/a//b`).
+    EmptySegment,
+    /// A `.` or `..` segment, which a client normalizes away.
+    DotSegment,
+    /// A byte outside the unreserved set `[A-Za-z0-9-._~]` (`%`, `?`, `#`, `\` included).
+    Reserved { byte: u8 },
+}
+
+impl std::fmt::Display for MountBaseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong { len } => write!(
+                f,
+                "a mount base is at most {MAX_MOUNT_BASE_LEN} bytes (this one is {len})"
+            ),
+            Self::NoLeadingSlash => write!(f, "a mount base starts with `/`"),
+            Self::TrailingSlash => write!(f, "a mount base other than `/` ends without `/`"),
+            Self::EmptySegment => write!(f, "a mount base has no empty segment (`//`)"),
+            Self::DotSegment => write!(f, "a mount base has no `.` or `..` segment"),
+            Self::Reserved { byte } => write!(
+                f,
+                "a mount base holds only the bytes A-Z a-z 0-9 - . _ ~ and `/` (found byte 0x{byte:02X})"
+            ),
+        }
+    }
+}
+
+/// Why a text is not a bundle-relative asset path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BundlePathRefusal {
+    /// The empty text.
+    Empty,
+    /// Longer than [`MAX_BUNDLE_PATH_LEN`]; judged before any byte is scanned.
+    TooLong { len: usize },
+    /// A leading `/`: the path is relative to the bundle root.
+    LeadingSlash,
+    /// An empty segment (`a//b`, or a trailing `/`).
+    EmptySegment,
+    /// A `.` or `..` segment.
+    DotSegment,
+    /// A byte outside `[A-Za-z0-9._-]`.
+    Reserved { byte: u8 },
+}
+
+impl std::fmt::Display for BundlePathRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "a bundle path is not empty"),
+            Self::TooLong { len } => write!(
+                f,
+                "a bundle path is at most {MAX_BUNDLE_PATH_LEN} bytes (this one is {len})"
+            ),
+            Self::LeadingSlash => write!(f, "a bundle path does not start with `/`"),
+            Self::EmptySegment => write!(f, "a bundle path has no empty segment"),
+            Self::DotSegment => write!(f, "a bundle path has no `.` or `..` segment"),
+            Self::Reserved { byte } => write!(
+                f,
+                "a bundle path holds only the bytes A-Z a-z 0-9 . _ - and `/` (found byte 0x{byte:02X})"
+            ),
+        }
+    }
+}
+
+/// Why one segment of a mount base or a bundle path is refused.
+enum SegmentFault {
+    Empty,
+    Dot,
+    Reserved(u8),
+}
+
+/// Judge one `/`-free segment against the byte set `admits`.
+fn check_segment(segment: &str, admits: fn(u8) -> bool) -> Result<(), SegmentFault> {
+    match segment {
+        "" => Err(SegmentFault::Empty),
+        "." | ".." => Err(SegmentFault::Dot),
+        _ => segment
+            .bytes()
+            .find(|&b| !admits(b))
+            .map_or(Ok(()), |b| Err(SegmentFault::Reserved(b))),
+    }
+}
+
+/// The RFC 3986 unreserved bytes: the only bytes a mount base segment holds.
+const fn is_mount_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+/// The bytes a bundle path segment holds.
+const fn is_bundle_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_')
+}
+
+/// Where a bundle is served: the root, or one or more unreserved segments.
+///
+/// Every URL a shell loads is derived from this one value, so no site joins a
+/// base string by hand. Its grammar is `""` or `/` for the root, else
+/// (`/` segment)+ with each segment non-empty, not `.` or `..`, and made only
+/// of the unreserved bytes `[A-Za-z0-9-._~]`; such a segment percent-encodes to
+/// itself, so the raw, decoded and encoded forms are one text. There is no
+/// `Default`: a site that means the root names [`MountBase::root`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MountBase {
+    path: DecodedPath,
+    prefix: String,
+}
+
+impl MountBase {
+    /// The root base: the bundle is served at `/`.
+    #[must_use]
+    pub const fn root() -> Self {
+        Self {
+            path: DecodedPath(Vec::new()),
+            prefix: String::new(),
+        }
+    }
+
+    /// Parse `text` as a mount base: `""`, `/`, or (`/` segment)+.
+    ///
+    /// # Errors
+    ///
+    /// `TooLong` before any byte is scanned, then the first defect found:
+    /// `NoLeadingSlash`, `TrailingSlash`, `EmptySegment`, `DotSegment` or
+    /// `Reserved`.
+    pub fn parse(text: &str) -> Result<Self, MountBaseRefusal> {
+        if text.len() > MAX_MOUNT_BASE_LEN {
+            return Err(MountBaseRefusal::TooLong { len: text.len() });
+        }
+        if text.is_empty() || text == "/" {
+            return Ok(Self::root());
+        }
+        let Some(rest) = text.strip_prefix('/') else {
+            return Err(MountBaseRefusal::NoLeadingSlash);
+        };
+        if rest.ends_with('/') {
+            return Err(MountBaseRefusal::TrailingSlash);
+        }
+        let segments = rest
+            .split('/')
+            .map(|segment| {
+                check_segment(segment, is_mount_byte)
+                    .map(|()| segment.to_owned())
+                    .map_err(|fault| match fault {
+                        SegmentFault::Empty => MountBaseRefusal::EmptySegment,
+                        SegmentFault::Dot => MountBaseRefusal::DotSegment,
+                        SegmentFault::Reserved(byte) => MountBaseRefusal::Reserved { byte },
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            path: DecodedPath(segments),
+            prefix: text.to_owned(),
+        })
+    }
+
+    /// The base as a URL path prefix: `""` for the root, else `/seg/...`.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// The directory URL the bundle is served at: `/` or `/seg/.../`.
+    #[must_use]
+    pub fn dir_url(&self) -> String {
+        let mut url = String::with_capacity(self.prefix.len().saturating_add(1));
+        url.push_str(&self.prefix);
+        url.push('/');
+        url
+    }
+
+    /// The base's decoded segments, for a segment-wise strip of a request path.
+    #[must_use]
+    pub const fn to_decoded(&self) -> &DecodedPath {
+        &self.path
+    }
+
+    /// The base encoded for a browser-visible `Location`.
+    ///
+    /// Infallible: every segment is unreserved, so [`encode_path_segment`]
+    /// leaves it unchanged, and the base is far below `MAX_URL_COMPONENT_LEN`.
+    #[must_use]
+    pub fn encoded(&self) -> EncodedBase {
+        EncodedBase(self.prefix.clone())
+    }
+
+    /// The absolute URL path of the asset `path` in a bundle served at this base.
+    #[must_use]
+    pub fn url_of(&self, path: &BundlePath) -> String {
+        let mut url = String::with_capacity(
+            self.prefix
+                .len()
+                .saturating_add(path.rel().len())
+                .saturating_add(1),
+        );
+        url.push_str(&self.prefix);
+        url.push('/');
+        url.push_str(path.rel());
+        url
+    }
+
+    /// The base's segments, in path order.
+    pub fn segments(&self) -> impl Iterator<Item = &str> {
+        self.path.segments().iter().map(String::as_str)
+    }
+}
+
+/// A bundle-relative asset path: `/`-separated segments of `[A-Za-z0-9._-]`.
+///
+/// It has no leading `/` and no empty, `.` or `..` segment. The asset's URL is
+/// [`MountBase::url_of`] and its file is the bundle directory joined with
+/// [`BundlePath::file_segments`]: one value, two projections, so neither is
+/// re-derived from the other's text.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BundlePath(String);
+
+impl BundlePath {
+    /// Parse `text` as a bundle-relative asset path.
+    ///
+    /// # Errors
+    ///
+    /// `Empty`, then `TooLong` before any byte is scanned, then the first
+    /// defect found: `LeadingSlash`, `EmptySegment`, `DotSegment` or
+    /// `Reserved`.
+    pub fn parse(text: &str) -> Result<Self, BundlePathRefusal> {
+        if text.is_empty() {
+            return Err(BundlePathRefusal::Empty);
+        }
+        if text.len() > MAX_BUNDLE_PATH_LEN {
+            return Err(BundlePathRefusal::TooLong { len: text.len() });
+        }
+        if text.starts_with('/') {
+            return Err(BundlePathRefusal::LeadingSlash);
+        }
+        for segment in text.split('/') {
+            check_segment(segment, is_bundle_byte).map_err(|fault| match fault {
+                SegmentFault::Empty => BundlePathRefusal::EmptySegment,
+                SegmentFault::Dot => BundlePathRefusal::DotSegment,
+                SegmentFault::Reserved(byte) => BundlePathRefusal::Reserved { byte },
+            })?;
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The path relative to the bundle root, with no leading `/`.
+    #[must_use]
+    pub fn rel(&self) -> &str {
+        &self.0
+    }
+
+    /// The path's segments, in order, for a join under the bundle directory.
+    pub fn file_segments(&self) -> impl Iterator<Item = &str> {
+        self.0.split('/')
+    }
+
+    /// The content-addressed path of a `kind` asset whose digest begins `head`.
+    ///
+    /// Infallible: the stem is fixed and lowercase hex is in the segment grammar.
+    #[must_use]
+    pub fn hashed(kind: HashedAsset, head: [u8; 8]) -> Self {
+        let stem = match kind {
+            HashedAsset::Widget => "widget",
+            HashedAsset::WidgetGlue => "widget-glue",
+        };
+        let hex: String = head.iter().map(|b| format!("{b:02x}")).collect();
+        Self(format!("_ipe/{stem}.{hex}.js"))
+    }
+}
+
+/// A content-addressed asset family served under `_ipe/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashedAsset {
+    /// An author widget module: `_ipe/widget.<hex16>.js`.
+    Widget,
+    /// The widget registration glue: `_ipe/widget-glue.<hex16>.js`.
+    WidgetGlue,
 }
 
 /// A route parameter name, proven to match `[A-Za-z_][A-Za-z0-9_]*`.
@@ -1223,5 +1514,175 @@ mod tests {
             names.admit("9"),
             Err(ParamNameRefusal::NotIdentifier { .. })
         ));
+    }
+
+    /// Every malformed mount base is refused with its own variant; each
+    /// refusal has a well-formed neighbour that is admitted.
+    #[test]
+    fn mount_base_refuses_each_variant() {
+        for ok in ["/app", "/a-b/c.d~e", "/A9/_z", "/a/b/c", "/.well"] {
+            assert!(
+                MountBase::parse(ok).is_ok_and(|b| b.prefix() == ok),
+                "{ok} must be admitted verbatim"
+            );
+        }
+        for (bad, want) in [
+            ("app", MountBaseRefusal::NoLeadingSlash),
+            ("a/b", MountBaseRefusal::NoLeadingSlash),
+            ("/app/", MountBaseRefusal::TrailingSlash),
+            ("//", MountBaseRefusal::TrailingSlash),
+            ("/a//b", MountBaseRefusal::EmptySegment),
+            ("/..", MountBaseRefusal::DotSegment),
+            ("/.", MountBaseRefusal::DotSegment),
+            ("/a/./b", MountBaseRefusal::DotSegment),
+            ("/a/../b", MountBaseRefusal::DotSegment),
+            ("/a%2Fb", MountBaseRefusal::Reserved { byte: b'%' }),
+            ("/a?b", MountBaseRefusal::Reserved { byte: b'?' }),
+            ("/a#b", MountBaseRefusal::Reserved { byte: b'#' }),
+            ("/a\\b", MountBaseRefusal::Reserved { byte: b'\\' }),
+            ("/a b", MountBaseRefusal::Reserved { byte: b' ' }),
+            ("/a\"b", MountBaseRefusal::Reserved { byte: b'"' }),
+            ("/\u{e9}", MountBaseRefusal::Reserved { byte: 0xC3 }),
+        ] {
+            assert_eq!(MountBase::parse(bad), Err(want), "{bad:?}");
+        }
+    }
+
+    /// `""` and `/` are the root; `//` is not.
+    #[test]
+    fn mount_base_root_accepts_empty_and_slash_only() {
+        assert_eq!(MountBase::parse(""), Ok(MountBase::root()));
+        assert_eq!(MountBase::parse("/"), Ok(MountBase::root()));
+        assert_eq!(MountBase::root().prefix(), "");
+        assert_eq!(MountBase::root().dir_url(), "/");
+        assert!(MountBase::root().to_decoded().is_root());
+        assert!(MountBase::parse("//").is_err());
+    }
+
+    /// The length ceiling is judged before any byte is scanned: a base one
+    /// past the limit made only of refused bytes reports `TooLong`, and the
+    /// last legal length is admitted.
+    #[test]
+    fn mount_base_too_long_refused_before_scan() {
+        let over_reserved = format!("/{}", "%".repeat(MAX_MOUNT_BASE_LEN));
+        assert_eq!(
+            MountBase::parse(&over_reserved),
+            Err(MountBaseRefusal::TooLong {
+                len: MAX_MOUNT_BASE_LEN + 1
+            })
+        );
+        let over = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN));
+        assert_eq!(
+            MountBase::parse(&over),
+            Err(MountBaseRefusal::TooLong {
+                len: MAX_MOUNT_BASE_LEN + 1
+            })
+        );
+        let at_limit = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN - 1));
+        assert!(MountBase::parse(&at_limit).is_ok_and(|b| b.prefix() == at_limit));
+    }
+
+    /// A content-addressed path is a member of the parsed grammar, byte for byte.
+    #[test]
+    fn hashed_bundle_path_is_in_the_grammar() {
+        let head = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        for (kind, want) in [
+            (HashedAsset::Widget, "_ipe/widget.0123456789abcdef.js"),
+            (
+                HashedAsset::WidgetGlue,
+                "_ipe/widget-glue.0123456789abcdef.js",
+            ),
+        ] {
+            let path = BundlePath::hashed(kind, head);
+            assert_eq!(path.rel(), want);
+            assert_eq!(BundlePath::parse(want), Ok(path));
+        }
+    }
+
+    /// Every malformed bundle path is refused with its own variant; each
+    /// refusal has a well-formed neighbour that is admitted.
+    #[test]
+    fn bundle_path_refuses_each_variant() {
+        for ok in [
+            "index.html",
+            "pkg/app_bg.wasm",
+            "_ipe/widget.0123abcd.js",
+            "a-b/c.d",
+            ".hidden",
+        ] {
+            assert!(
+                BundlePath::parse(ok).is_ok_and(|p| p.rel() == ok),
+                "{ok} must be admitted verbatim"
+            );
+        }
+        for (bad, want) in [
+            ("", BundlePathRefusal::Empty),
+            ("/index.html", BundlePathRefusal::LeadingSlash),
+            ("a//b", BundlePathRefusal::EmptySegment),
+            ("a/", BundlePathRefusal::EmptySegment),
+            ("..", BundlePathRefusal::DotSegment),
+            ("a/../b", BundlePathRefusal::DotSegment),
+            ("./a", BundlePathRefusal::DotSegment),
+            ("a~b", BundlePathRefusal::Reserved { byte: b'~' }),
+            ("a%2Fb", BundlePathRefusal::Reserved { byte: b'%' }),
+            ("a\\b", BundlePathRefusal::Reserved { byte: b'\\' }),
+            ("a?b", BundlePathRefusal::Reserved { byte: b'?' }),
+            ("a\"b", BundlePathRefusal::Reserved { byte: b'"' }),
+        ] {
+            assert_eq!(BundlePath::parse(bad), Err(want), "{bad:?}");
+        }
+        let over = "a".repeat(MAX_BUNDLE_PATH_LEN + 1);
+        assert_eq!(
+            BundlePath::parse(&over),
+            Err(BundlePathRefusal::TooLong {
+                len: MAX_BUNDLE_PATH_LEN + 1
+            })
+        );
+        let over_reserved = "%".repeat(MAX_BUNDLE_PATH_LEN + 1);
+        assert_eq!(
+            BundlePath::parse(&over_reserved),
+            Err(BundlePathRefusal::TooLong {
+                len: MAX_BUNDLE_PATH_LEN + 1
+            })
+        );
+        assert!(BundlePath::parse(&"a".repeat(MAX_BUNDLE_PATH_LEN)).is_ok());
+    }
+
+    /// Every projection of a mount base agrees with the one carried value:
+    /// the infallible encoding equals encoding its decoded segments.
+    #[test]
+    fn mount_base_projections_agree() {
+        for text in ["", "/", "/app", "/a-b/c.d~e/f_g"] {
+            let base = MountBase::parse(text).unwrap();
+            assert_eq!(
+                Ok(base.encoded()),
+                EncodedBase::encode(base.to_decoded()),
+                "{text}"
+            );
+            assert_eq!(base.encoded().as_str(), base.prefix());
+            assert_eq!(
+                base.segments().collect::<Vec<_>>(),
+                base.to_decoded()
+                    .segments()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let base = MountBase::parse("/app/v1").unwrap();
+        assert_eq!(base.dir_url(), "/app/v1/");
+        assert_eq!(base.segments().collect::<Vec<_>>(), ["app", "v1"]);
+        let asset = BundlePath::parse("pkg/app_bg.wasm").unwrap();
+        assert_eq!(base.url_of(&asset), "/app/v1/pkg/app_bg.wasm");
+        assert_eq!(MountBase::root().url_of(&asset), "/pkg/app_bg.wasm");
+        assert_eq!(
+            asset.file_segments().collect::<Vec<_>>(),
+            ["pkg", "app_bg.wasm"]
+        );
+        let request = DecodedPath::parse("/app/v1/pkg/app_bg.wasm").unwrap();
+        assert_eq!(
+            request.strip_base(base.to_decoded()),
+            Some(DecodedPath::parse("/pkg/app_bg.wasm").unwrap())
+        );
     }
 }

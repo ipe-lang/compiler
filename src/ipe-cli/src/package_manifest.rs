@@ -54,6 +54,7 @@ use ipe_syntax::{Expr, Expr_, Module};
 
 use ipe_backend_rust::static_build::StaticTriple;
 use ipe_kernels::WebCapability;
+use ipe_runtime_rust::encoding::{MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
 
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
@@ -126,6 +127,27 @@ pub fn read_package_manifest(
     };
     let fields = reader.read_module(&module)?;
     fields.into_manifest(root)
+}
+
+/// The manifest refusal for a `delivery.browser.basePath` that
+/// [`MountBase::parse`] turned away, one catalog message per refusal.
+///
+/// The base is author text, so it renders through `{:?}` (escaped); a too-long
+/// base is not echoed at all.
+fn base_path_refusal(raw: &str, refusal: &MountBaseRefusal) -> text::Message {
+    let base = format!("{raw:?}");
+    match refusal {
+        MountBaseRefusal::TooLong { len } => {
+            text::msg::manifest_base_path_too_long(len, &MAX_MOUNT_BASE_LEN)
+        }
+        MountBaseRefusal::NoLeadingSlash => text::msg::manifest_base_path_no_leading_slash(&base),
+        MountBaseRefusal::TrailingSlash => text::msg::manifest_base_path_trailing_slash(&base),
+        MountBaseRefusal::EmptySegment => text::msg::manifest_base_path_empty_segment(&base),
+        MountBaseRefusal::DotSegment => text::msg::manifest_base_path_dot_segment(&base),
+        MountBaseRefusal::Reserved { byte } => {
+            text::msg::manifest_base_path_reserved_byte(&base, &format!("0x{byte:02X}"))
+        }
+    }
 }
 
 /// Borrowed context every walk step shares: the interner to resolve [`Symbol`]s
@@ -922,12 +944,18 @@ impl Reader<'_> {
         }
     }
 
-    /// Read `delivery.browser = { basePath }`.
+    /// Read `delivery.browser = { basePath }`; `basePath` parses into a
+    /// [`MountBase`], and an absent one is [`MountBase::root`].
     fn read_browser(&self, expr: &Expr) -> Result<BrowserDelivery, CliError> {
         let mut b = BrowserDelivery::default();
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
-                "basePath" => b.base_path = self.expect_string(value)?,
+                "basePath" => {
+                    let raw = self.expect_string(value)?;
+                    b.base = MountBase::parse(&raw).map_err(|refusal| {
+                        self.reject(value.span, &base_path_refusal(&raw, &refusal))
+                    })?;
+                }
                 other => {
                     return Err(self.reject(
                         fname.span,
@@ -2310,6 +2338,190 @@ mod tests {
             assert!(
                 msg.contains("DATABASE_URL"),
                 "error names the secret: {msg}"
+            );
+        }
+    }
+
+    /// Read a manifest whose `delivery.browser.basePath` is the string `raw`.
+    ///
+    /// `raw` is printable ASCII without `"` or `\`, so its Rust `{:?}` form is
+    /// also its Ipê string literal.
+    fn read_base_path(test_name: &str, raw: &str) -> Result<ProjectManifest, CliError> {
+        read(
+            test_name,
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ browser = {{ basePath = {raw:?} }} }} }}\n"
+            ),
+        )
+    }
+
+    /// The refusal text a `basePath` read returned, or `None` when it was
+    /// accepted or refused through another channel.
+    fn base_path_refusal_text(test_name: &str, raw: &str) -> Option<String> {
+        match read_base_path(test_name, raw) {
+            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn manifest_base_path_refused_with_key() {
+        let refusal = base_path_refusal_text("base_path_refused_with_key", "app/");
+        let expected = text::msg::manifest_base_path_no_leading_slash(&"\"app/\"").to_string();
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|msg| msg.contains("delivery.browser.basePath")
+                    && msg.contains(&expected)
+                    && msg.contains("package.ipe:")),
+            "`basePath = \"app/\"` is a located manifest refusal naming the key and \
+             the missing leading slash: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_base_path_absent_is_root() {
+        let manifest = read(
+            "base_path_absent_is_root",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ desktop = {{ title = \"t\" }} }} }}\n"
+            ),
+        )
+        .expect("a manifest without `browser` parses");
+        assert_eq!(manifest.delivery.browser.base, MountBase::root());
+        let bare = read(
+            "base_path_absent_no_delivery",
+            &format!("{HEADER}package =\n    {{ name = \"x\" }}\n"),
+        )
+        .expect("a manifest without `delivery` parses");
+        assert_eq!(bare.delivery.browser.base, MountBase::root());
+    }
+
+    /// Which refusal a row exercises; the exhaustive `match` makes a new
+    /// [`MountBaseRefusal`] variant a build error here until it has a row.
+    const fn refusal_slot(refusal: &MountBaseRefusal) -> usize {
+        match refusal {
+            MountBaseRefusal::TooLong { .. } => 0,
+            MountBaseRefusal::NoLeadingSlash => 1,
+            MountBaseRefusal::TrailingSlash => 2,
+            MountBaseRefusal::EmptySegment => 3,
+            MountBaseRefusal::DotSegment => 4,
+            MountBaseRefusal::Reserved { .. } => 5,
+        }
+    }
+
+    #[test]
+    fn manifest_base_path_refuses_each_variant() {
+        let too_long = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN));
+        let quoted = |raw: &str| format!("{raw:?}");
+        let rows: [(&str, &str, MountBaseRefusal, text::Message); 9] = [
+            (
+                "base_path_too_long",
+                too_long.as_str(),
+                MountBaseRefusal::TooLong {
+                    len: MAX_MOUNT_BASE_LEN.saturating_add(1),
+                },
+                text::msg::manifest_base_path_too_long(
+                    &(MAX_MOUNT_BASE_LEN.saturating_add(1)),
+                    &MAX_MOUNT_BASE_LEN,
+                ),
+            ),
+            (
+                "base_path_no_leading_slash",
+                "app",
+                MountBaseRefusal::NoLeadingSlash,
+                text::msg::manifest_base_path_no_leading_slash(&quoted("app")),
+            ),
+            (
+                "base_path_trailing_slash",
+                "/app/",
+                MountBaseRefusal::TrailingSlash,
+                text::msg::manifest_base_path_trailing_slash(&quoted("/app/")),
+            ),
+            (
+                "base_path_double_slash",
+                "//",
+                MountBaseRefusal::TrailingSlash,
+                text::msg::manifest_base_path_trailing_slash(&quoted("//")),
+            ),
+            (
+                "base_path_empty_segment",
+                "/a//b",
+                MountBaseRefusal::EmptySegment,
+                text::msg::manifest_base_path_empty_segment(&quoted("/a//b")),
+            ),
+            (
+                "base_path_dot_dot_segment",
+                "/..",
+                MountBaseRefusal::DotSegment,
+                text::msg::manifest_base_path_dot_segment(&quoted("/..")),
+            ),
+            (
+                "base_path_dot_segment",
+                "/a/./b",
+                MountBaseRefusal::DotSegment,
+                text::msg::manifest_base_path_dot_segment(&quoted("/a/./b")),
+            ),
+            (
+                "base_path_percent",
+                "/a%2Fb",
+                MountBaseRefusal::Reserved { byte: b'%' },
+                text::msg::manifest_base_path_reserved_byte(&quoted("/a%2Fb"), &"0x25"),
+            ),
+            (
+                "base_path_query",
+                "/a?b",
+                MountBaseRefusal::Reserved { byte: b'?' },
+                text::msg::manifest_base_path_reserved_byte(&quoted("/a?b"), &"0x3F"),
+            ),
+        ];
+        let mut covered = [false; 6];
+        for (test_name, raw, refusal, expected) in &rows {
+            assert_eq!(
+                MountBase::parse(raw).as_ref().err(),
+                Some(refusal),
+                "row {test_name} exercises the refusal it names"
+            );
+            if let Some(slot) = covered.get_mut(refusal_slot(refusal)) {
+                *slot = true;
+            }
+            let got = base_path_refusal_text(test_name, raw);
+            assert!(
+                got.as_deref()
+                    .is_some_and(|msg| msg.contains("delivery.browser.basePath")
+                        && msg.contains(expected.as_str())),
+                "{test_name}: expected {expected:?}, got {got:?}"
+            );
+        }
+        assert!(
+            covered.iter().all(|seen| *seen),
+            "every refusal variant reaches the manifest: {covered:?}"
+        );
+        assert!(
+            base_path_refusal_text("base_path_too_long_quiet", &too_long)
+                .is_some_and(|msg| !msg.contains(&too_long)),
+            "a too-long base is not echoed back"
+        );
+    }
+
+    #[test]
+    fn manifest_base_path_admits_the_grammar() {
+        let at_limit = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN.saturating_sub(1)));
+        let rows: [(&str, &str, &str); 5] = [
+            ("base_path_root_slash", "/", ""),
+            ("base_path_root_empty", "", ""),
+            ("base_path_one_segment", "/app", "/app"),
+            ("base_path_unreserved", "/a-b.c_d~e/f9", "/a-b.c_d~e/f9"),
+            ("base_path_at_limit", at_limit.as_str(), at_limit.as_str()),
+        ];
+        for (test_name, raw, prefix) in rows {
+            let manifest = read_base_path(test_name, raw);
+            assert!(
+                manifest
+                    .as_ref()
+                    .is_ok_and(|m| m.delivery.browser.base.prefix() == prefix),
+                "{test_name}: `basePath = {raw:?}` is admitted with prefix {prefix:?}: {:?}",
+                manifest.as_ref().err()
             );
         }
     }

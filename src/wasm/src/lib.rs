@@ -122,6 +122,7 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, String> {
         None,
         ipe_ir::Target::WasmClient,
         Vec::new(),
+        ipe_backend_rust::MountBase::root(),
         false,
         // The browser playground is a development surface — Debug.* is allowed.
         ipe_backend_rust::BuildIntent::Development,
