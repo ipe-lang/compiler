@@ -43,9 +43,11 @@ fn scan_rust(file: &str, src: &str, hits: &mut BTreeMap<Site, usize>) -> Result<
             match tok {
                 TokenTree::Group(g) => pending.push(g.stream()),
                 TokenTree::Ident(id) => {
-                    let name = id.to_string();
-                    if REFUSED_IDENTS.contains(&name.as_str()) {
-                        *hits.entry((file.to_owned(), name)).or_insert(0) += 1;
+                    // A raw identifier (`r#exit`) names the same item as `exit`.
+                    let spelled = id.to_string();
+                    let name = spelled.strip_prefix("r#").unwrap_or(&spelled);
+                    if REFUSED_IDENTS.contains(&name) {
+                        *hits.entry((file.to_owned(), name.to_owned())).or_insert(0) += 1;
                     }
                 }
                 TokenTree::Punct(_) | TokenTree::Literal(_) => {}
@@ -181,7 +183,7 @@ fn synthetic(src: &str) -> Result<Vec<String>, String> {
 /// itself does not.
 #[test]
 fn each_spelling_of_a_raw_process_end_is_refused() -> Result<(), String> {
-    let cases: [(&str, &[&str]); 6] = [
+    let cases: [(&str, &[&str]); 7] = [
         ("fn main() { std::process::exit(1); }", &["exit", "process"]),
         (
             "use std::process as p;\nfn main() { p::exit(0); }",
@@ -199,6 +201,10 @@ fn each_spelling_of_a_raw_process_end_is_refused() -> Result<(), String> {
         (
             "fn main() { rustix::runtime::exit_group(1); }",
             &["exit_group"],
+        ),
+        (
+            "fn main() { std::r#process::r#exit(1); }",
+            &["exit", "process"],
         ),
     ];
     for (src, want) in cases {
