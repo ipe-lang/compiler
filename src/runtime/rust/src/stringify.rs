@@ -739,4 +739,45 @@ mod tests {
         assert!(!shown.contains(['@', '?', '#']), "{shown}");
         assert_eq!(shown, "https://example.com:8443/a/b");
     }
+
+    // A credential that spilled out of the userinfo — a scheme-confused
+    // `user:pw@host`, a host read from the user name, an opaque payload — never
+    // reaches a URL's implicit rendering: only a nameable scheme is shown.
+    #[cfg(feature = "url")]
+    #[test]
+    fn url_show_withholds_a_spilled_credential() {
+        let r = REDACTED_SHOW;
+        let cases = [
+            ("s3cr3tuser:S3CR3TPW@db.internal", r.to_owned()),
+            ("data:text/plain,S3CR3T", format!("data:{r}")),
+            ("mailto:S3CR3T@example.com", format!("mailto:{r}")),
+            (
+                "https://S3CR3TUSER:1/S3CR3TPW@example.com/x",
+                format!("https:{r}"),
+            ),
+            (
+                "https://S3CR3TUSER#S3CR3TPW@example.com",
+                format!("https:{r}"),
+            ),
+            (
+                "https://S3CR3TUSER?S3CR3TPW@example.com",
+                format!("https:{r}"),
+            ),
+            ("s3cr3tuser://example.com/a", format!("{r}://example.com/a")),
+        ];
+        for (raw, expected) in cases {
+            #[allow(clippy::expect_used)] // fixture: each literal is an absolute URL
+            let url = match crate::url::url_from_string::<String>(raw.to_owned()) {
+                IpeResult::Ok(u) => Some(u),
+                IpeResult::Err(_) => None,
+            }
+            .expect("a literal absolute URL");
+            let shown = url.ipe_show();
+            assert!(
+                !shown.to_ascii_lowercase().contains("s3cr3t"),
+                "{raw}: {shown}"
+            );
+            assert_eq!(shown, expected, "{raw}");
+        }
+    }
 }

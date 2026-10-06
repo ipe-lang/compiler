@@ -41,17 +41,44 @@ use url::{Url as UrlCrate, form_urlencoded};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Url(UrlCrate);
 
-// The serialized URL reduced to scheme, host, port and path: userinfo, query
-// and fragment, where credentials and tokens travel, never reach an implicit
-// rendering. `Url.toString` keeps the full URL.
-crate::stringify::show_row!("Url", Redacted, [] Url, |u| {
-    let mut shown = u.0.clone();
-    let _ = shown.set_password(None);
-    let _ = shown.set_username("");
-    shown.set_query(None);
-    shown.set_fragment(None);
-    shown.as_str().to_owned()
-});
+// `Url.toString` keeps the full URL; an implicit rendering shows `shown`.
+crate::stringify::show_row!("Url", Redacted, [] Url, |u| u.shown());
+
+impl Url {
+    /// The URL reduced to scheme, host, port and path.
+    ///
+    /// Userinfo, query and fragment, where credentials and tokens travel, never
+    /// appear. The parser ends the authority at the first `/`, `?`, `#` or
+    /// `\`, so a credential holding one of them spills out of the userinfo:
+    /// `user:pw@host` parses with scheme `user`, no host and path `pw@host`,
+    /// and `https://u:1/pw@host` with host `u`. With no host, or an `@` or `\`
+    /// past the authority, only the scheme is shown. A scheme outside
+    /// [`NAMEABLE_SCHEMES`] may be a user name, so it is withheld.
+    fn shown(&self) -> String {
+        use crate::stringify::REDACTED_SHOW;
+        let scheme = match SchemeShown::of(self.0.scheme()) {
+            SchemeShown::Known(scheme) => Some(scheme),
+            SchemeShown::Withheld => None,
+        };
+        let spilled = [Some(self.0.path()), self.0.query(), self.0.fragment()]
+            .into_iter()
+            .flatten()
+            .any(|part| part.contains(['@', '\\']));
+        if self.0.host_str().is_none() || spilled {
+            return scheme.map_or_else(
+                || REDACTED_SHOW.to_owned(),
+                |scheme| format!("{scheme}:{REDACTED_SHOW}"),
+            );
+        }
+        let mut shown = self.0.clone();
+        let _ = shown.set_password(None);
+        let _ = shown.set_username("");
+        shown.set_query(None);
+        shown.set_fragment(None);
+        let after_scheme = shown.as_str().strip_prefix(shown.scheme()).unwrap_or(":");
+        format!("{}{after_scheme}", scheme.unwrap_or(REDACTED_SHOW))
+    }
+}
 
 /// `Ipe.Url.fromString : String -> Result Error Url` — THE seal. The only public
 /// constructor: every `Url` value in a Ipê program traces back to one of these

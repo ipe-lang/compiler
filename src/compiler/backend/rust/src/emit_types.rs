@@ -1426,7 +1426,7 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
 
 #[cfg(test)]
 mod show_pin_agreement {
-    use super::{GenericScope, render_type};
+    use super::{GenericScope, emit_enum, render_type};
     use crate::RustBackend;
     use ipe_intern::Interner;
     use ipe_ir::{
@@ -1765,6 +1765,18 @@ mod show_pin_agreement {
         };
         let backend = RustBackend::new(&interner);
         let ctx = backend.emit_ctx_for_tests(&program).expect("build EmitCtx");
+        // Each aliased enum's emitted `pub type` resolves where its
+        // `SCOPE_PATHS` entry says, so that entry cannot drift from the alias.
+        for TypeDef::Enum(def) in program.modules.iter().flat_map(|m| &m.types) {
+            let emitted = emit_enum(&ctx, def).expect("emit an aliased enum");
+            let (alias, target) = emitted
+                .trim()
+                .strip_prefix("pub type ")
+                .and_then(|rest| rest.strip_suffix(';'))
+                .and_then(|rest| rest.split_once(" = "))
+                .expect("an aliased enum emits a runtime type alias");
+            assert_eq!(resolved_path(alias), resolved_path(target), "{emitted}");
+        }
         let pins = parse_pins(SHOW_ROWS);
         let samples: Vec<(ShowLeaf, IrType)> = leaf_samples()
             .into_iter()
