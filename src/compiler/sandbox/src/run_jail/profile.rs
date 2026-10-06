@@ -932,7 +932,7 @@ mod limit_mapping_tests {
             "99999999999999999999999".parse::<ProcCap>(),
             Err(ProcCapError::PastCeiling)
         );
-        for not_digits in ["", "+64", "-1", " 64", "64 ", "0x40", "6.4"] {
+        for not_digits in ["", "+64", "-1", " 64", "64 ", "0x40", "6.4", "\u{663}"] {
             assert_eq!(
                 not_digits.parse::<ProcCap>(),
                 Err(ProcCapError::NotANumber),
@@ -945,9 +945,28 @@ mod limit_mapping_tests {
         assert_eq!(ProcCap::parse(4096), Ok(ProcCap::MAX));
         assert_eq!(ProcCap::parse(1).map(ProcCap::get), Ok(1));
         assert_eq!("4096".parse::<ProcCap>(), Ok(ProcCap::MAX));
+        // A leading zero is still a decimal number, as in the other overrides.
+        assert_eq!("0512".parse::<ProcCap>(), Ok(ProcCap::DEFAULT));
         assert_eq!(u64::from(ProcCap::MAX), 4096);
         assert_eq!(ProcCap::MAX.to_string(), "4096");
         assert_eq!(RunResourceLimits::default().proc_cap, ProcCap::DEFAULT);
+    }
+
+    #[test]
+    fn a_deserialized_proc_cap_refuses_zero_and_past_ceiling() {
+        // Serde mints the cap through `ProcCap::parse`, so a profile read from
+        // text cannot carry a cap the type refuses.
+        let limits = |proc_cap: &str| {
+            toml::from_str::<RunResourceLimits>(&format!(
+                "as_bytes = 1\ncpu_secs = 1\nfd_cap = 1\nproc_cap = {proc_cap}\n"
+            ))
+        };
+        for refused in ["0", "4097", "-1", "4294967296"] {
+            assert!(limits(refused).is_err(), "proc_cap = {refused}");
+        }
+        // Controls: the floor and the ceiling deserialize unchanged.
+        assert_eq!(limits("1").ok().map(|l| l.proc_cap.get()), Some(1));
+        assert_eq!(limits("4096").ok().map(|l| l.proc_cap), Some(ProcCap::MAX));
     }
 
     #[test]

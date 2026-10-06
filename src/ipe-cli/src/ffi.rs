@@ -3978,7 +3978,7 @@ mod tests {
         assert_eq!(of("4097"), Err(ProcCapError::PastCeiling));
         assert_eq!(of("18446744073709551615"), Err(ProcCapError::PastCeiling));
         assert_eq!(of("18446744073709551616"), Err(ProcCapError::PastCeiling));
-        for not_digits in ["", "+64", "-1", "64k", " 64"] {
+        for not_digits in ["", "+64", "-1", "64k", " 64", "0x10", "\u{663}"] {
             assert_eq!(
                 of(not_digits),
                 Err(ProcCapError::NotANumber),
