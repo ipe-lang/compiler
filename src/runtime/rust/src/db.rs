@@ -3388,13 +3388,180 @@ pub fn sql_is_not_null(a: SqlFragment) -> SqlFragment {
 ///
 /// The pattern is always a bound param (never interpolated), so it cannot
 /// inject SQL. It is still a `LIKE` pattern: a `%` or `_` in the bound value
-/// is a wildcard, so untrusted text passed here can widen the match. SQLite's
-/// `LIKE` also folds ASCII case; Postgres's does not.
+/// is a wildcard, so untrusted text passed here can widen the match; a literal
+/// prefix is [`sql_starts_with`]. Every engine reads the pattern under
+/// `ESCAPE '\'` ([`LIKE_ESCAPE`]): `\%`, `\_` and `\\` match `%`, `_` and `\`
+/// literally. A pattern ending in an unpaired `\` poisons the fragment, since
+/// SQLite reads it as no match and Postgres as an error. SQLite's `LIKE` also
+/// folds ASCII case; Postgres's does not.
 pub fn sql_like(a: SqlFragment, pattern: String) -> SqlFragment {
+    if ends_with_unpaired_escape(&pattern) {
+        return SqlFragment {
+            sql: String::new(),
+            binds: Vec::new(),
+            invalid: a.invalid.or_else(|| {
+                Some(format!(
+                    "Sql.like: the pattern ends with the escape character {LIKE_ESCAPE}"
+                ))
+            }),
+        };
+    }
     let mut binds = a.binds;
     binds.push(SqlParam::Text(pattern));
     SqlFragment {
-        sql: format!("({} LIKE ?)", a.sql),
+        sql: format!("({})", like_escape_sql(&a.sql)),
+        binds,
+        invalid: a.invalid,
+    }
+}
+
+/// The escape character every rendered `LIKE` names in its `ESCAPE` clause.
+///
+/// `\` escapes the same way on SQLite and on Postgres (whose default escape it
+/// is). Under Postgres with `standard_conforming_strings = off`, the literal
+/// `'\'` is an unterminated string, so such a server refuses the query rather
+/// than reading the pattern another way.
+const LIKE_ESCAPE: char = '\\';
+
+/// Ceiling on a [`LikePrefix`], in UTF-8 bytes.
+const MAX_LIKE_PREFIX_BYTES: usize = 16 * 1024;
+
+/// SQLite's default `SQLITE_MAX_LIKE_PATTERN_LENGTH`, in bytes.
+const SQLITE_DEFAULT_MAX_LIKE_PATTERN_LENGTH: usize = 50_000;
+
+// Every reserved character escaped doubles, plus the trailing `%`: the longest
+// pattern a `LikePrefix` renders stays inside SQLite's pattern ceiling.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the prefix ceiling outgrows SQLite's LIKE pattern ceiling [ledger #boundary]
+const _: () = assert!(2 * MAX_LIKE_PREFIX_BYTES < SQLITE_DEFAULT_MAX_LIKE_PATTERN_LENGTH);
+// The escape character is neither a wildcard nor a character that ends or
+// opens the quoted `ESCAPE` literal or a placeholder.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the LIKE escape character is a wildcard, quote or placeholder [ledger #boundary]
+const _: () = assert!(!matches!(LIKE_ESCAPE, '%' | '_' | '\'' | '"' | '?'));
+
+/// `<subject> LIKE ? ESCAPE '\'`: the one rendering of a `LIKE` predicate.
+fn like_escape_sql(subject_sql: &str) -> String {
+    format!("{subject_sql} LIKE ? ESCAPE '{LIKE_ESCAPE}'")
+}
+
+/// Whether `pattern` ends in an escape character that escapes nothing.
+fn ends_with_unpaired_escape(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .fold(false, |escaping, c| !escaping && c == LIKE_ESCAPE)
+}
+
+/// A literal text prefix, parsed once: non-empty, NUL-free, at most
+/// [`MAX_LIKE_PREFIX_BYTES`] bytes.
+///
+/// It owns the one `LIKE` escaper, so the pattern it renders matches its text
+/// literally and nothing else.
+struct LikePrefix(String);
+
+/// Why a text is not a [`LikePrefix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LikePrefixError {
+    /// The text is empty, which would match every non-`NULL` row.
+    Empty,
+    /// The text holds a NUL character.
+    Nul,
+    /// The text is longer than [`MAX_LIKE_PREFIX_BYTES`].
+    TooLong,
+}
+
+impl LikePrefixError {
+    /// The poison text of a refused `Sql.startsWith`; it never echoes the prefix.
+    fn message(self) -> String {
+        match self {
+            Self::Empty => "Sql.startsWith: the prefix is empty".to_string(),
+            Self::Nul => "Sql.startsWith: the prefix contains a NUL character".to_string(),
+            Self::TooLong => {
+                format!("Sql.startsWith: the prefix is longer than {MAX_LIKE_PREFIX_BYTES} bytes")
+            }
+        }
+    }
+}
+
+impl LikePrefix {
+    /// Parse `raw`, refusing an empty, NUL-bearing or over-long text, in that order.
+    fn parse(raw: String) -> Result<Self, LikePrefixError> {
+        if raw.is_empty() {
+            Err(LikePrefixError::Empty)
+        } else if raw.contains('\0') {
+            Err(LikePrefixError::Nul)
+        } else if raw.len() > MAX_LIKE_PREFIX_BYTES {
+            Err(LikePrefixError::TooLong)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    /// The `LIKE` pattern: each `%`, `_` and [`LIKE_ESCAPE`] preceded by
+    /// [`LIKE_ESCAPE`], then a trailing `%`.
+    fn like_pattern(&self) -> String {
+        let mut pattern = String::with_capacity(self.0.len() + 1);
+        for c in self.0.chars() {
+            match c {
+                '%' | '_' | LIKE_ESCAPE => {
+                    pattern.push(LIKE_ESCAPE);
+                    pattern.push(c);
+                }
+                other => pattern.push(other),
+            }
+        }
+        pattern.push('%');
+        pattern
+    }
+
+    /// The prefix text.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `substr(<subject>, 1, length(?)) = ?`: the exact-prefix shape, written once.
+///
+/// `substr` and `length` count characters on SQLite and Postgres alike, and
+/// `=` compares bytes under a binary or deterministic collation, so the shape
+/// carries no wildcard and no case folding.
+pub(crate) fn text_prefix_equals_sql(subject_sql: &str) -> String {
+    format!("substr({subject_sql}, 1, length(?)) = ?")
+}
+
+/// `Sql.startsWith : SqlFragment -> String -> SqlFragment` — the rows whose
+/// `a` text begins with exactly `prefix`, character for character.
+///
+/// Renders `((<a> LIKE ? ESCAPE '\') AND (substr(<a>, 1, length(?)) = ?))`
+/// with binds `a.binds ++ [pattern] ++ a.binds ++ [prefix, prefix]`. The
+/// escaped `LIKE` conjunct lets an index serve the scan; the `substr` conjunct
+/// makes the match exact and case-sensitive on every engine under a
+/// deterministic collation (a Postgres column declared with a
+/// nondeterministic collation makes `=` compare by that collation). A `NULL` `a` never
+/// matches. An empty, NUL-bearing or over-long prefix poisons the fragment, and
+/// an upstream poison in `a` wins over it.
+pub fn sql_starts_with(a: SqlFragment, prefix: String) -> SqlFragment {
+    let prefix = match LikePrefix::parse(prefix) {
+        Ok(prefix) => prefix,
+        Err(refused) => {
+            return SqlFragment {
+                sql: String::new(),
+                binds: Vec::new(),
+                invalid: a.invalid.or_else(|| Some(refused.message())),
+            };
+        }
+    };
+    let sql = format!(
+        "(({}) AND ({}))",
+        like_escape_sql(&a.sql),
+        text_prefix_equals_sql(&a.sql)
+    );
+    let mut binds = Vec::with_capacity(2 * a.binds.len() + 3);
+    binds.extend(a.binds.iter().cloned());
+    binds.push(SqlParam::Text(prefix.like_pattern()));
+    binds.extend(a.binds);
+    binds.push(SqlParam::Text(prefix.as_str().to_string()));
+    binds.push(SqlParam::Text(prefix.0));
+    SqlFragment {
+        sql,
         binds,
         invalid: a.invalid,
     }
@@ -11690,5 +11857,278 @@ mod tests {
                 "a comment restates the {engine} floor {rendered}; reference the const instead"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod like_prefix_tests {
+    use super::*;
+
+    fn text(s: &str) -> SqlParam {
+        SqlParam::Text(s.to_string())
+    }
+
+    fn pattern_of(raw: &str) -> Result<String, LikePrefixError> {
+        LikePrefix::parse(raw.to_string()).map(|p| p.like_pattern())
+    }
+
+    /// One in-memory SQLite connection holding `names(name TEXT NULL)`.
+    #[allow(clippy::expect_used)] // test fixture: a failed in-memory setup is a broken test host
+    async fn names_db(rows: &[Option<&str>]) -> Db {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::query("CREATE TABLE names (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create table");
+        for row in rows {
+            sqlx::query("INSERT INTO names (name) VALUES (?)")
+                .bind(*row)
+                .execute(&pool)
+                .await
+                .expect("insert row");
+        }
+        pool
+    }
+
+    /// The sorted `name` values `frag` selects from `names`.
+    async fn names_where(db: &Db, frag: SqlFragment) -> Result<Vec<String>, String> {
+        let found: IpeResult<String, Vec<HashMap<String, String>>> =
+            db_find_where(db.clone(), "names".into(), frag).await;
+        match found {
+            IpeResult::Ok(rows) => {
+                let mut names: Vec<String> = rows
+                    .iter()
+                    .filter_map(|row| row.get("name").cloned())
+                    .collect();
+                names.sort();
+                Ok(names)
+            }
+            IpeResult::Err(e) => Err(e),
+        }
+    }
+
+    const U11_ROWS: [Option<&str>; 13] = [
+        Some("Acme-1"),
+        Some("acme-2"),
+        Some("ACME"),
+        Some("50%off"),
+        Some("50 cents"),
+        Some("500"),
+        Some("a_b-x"),
+        Some("axb-y"),
+        Some("!bang"),
+        Some("!x"),
+        Some("a\\b"),
+        Some("ab"),
+        None,
+    ];
+
+    #[test]
+    fn like_prefix_refuses_empty_with_full_text() {
+        assert!(matches!(
+            LikePrefix::parse(String::new()),
+            Err(LikePrefixError::Empty)
+        ));
+        assert_eq!(
+            LikePrefixError::Empty.message(),
+            "Sql.startsWith: the prefix is empty"
+        );
+    }
+
+    #[test]
+    fn like_prefix_refuses_nul_with_full_text() {
+        assert!(matches!(
+            LikePrefix::parse("a\0b".to_string()),
+            Err(LikePrefixError::Nul)
+        ));
+        assert_eq!(
+            LikePrefixError::Nul.message(),
+            "Sql.startsWith: the prefix contains a NUL character"
+        );
+    }
+
+    #[test]
+    fn like_prefix_length_ceiling_is_exact() {
+        assert!(matches!(
+            LikePrefix::parse("a".repeat(MAX_LIKE_PREFIX_BYTES + 1)),
+            Err(LikePrefixError::TooLong)
+        ));
+        assert_eq!(
+            LikePrefixError::TooLong.message(),
+            "Sql.startsWith: the prefix is longer than 16384 bytes"
+        );
+        assert_eq!(
+            pattern_of(&"a".repeat(MAX_LIKE_PREFIX_BYTES)).map(|p| p.len()),
+            Ok(MAX_LIKE_PREFIX_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn like_prefix_escapes_wildcards_and_the_escape_character() {
+        assert_eq!(pattern_of("50%"), Ok("50\\%%".to_string()));
+        assert_eq!(pattern_of("a_b"), Ok("a\\_b%".to_string()));
+        assert_eq!(pattern_of("\\x"), Ok("\\\\x%".to_string()));
+        assert_eq!(pattern_of("!x"), Ok("!x%".to_string()));
+        assert_eq!(pattern_of("ab"), Ok("ab%".to_string()));
+    }
+
+    #[test]
+    fn starts_with_renders_both_conjuncts_and_binds_the_prefix() {
+        let frag = sql_starts_with(sql_column("n".to_string()), "ab".to_string());
+        assert_eq!(
+            frag.sql,
+            "((n LIKE ? ESCAPE '\\') AND (substr(n, 1, length(?)) = ?))"
+        );
+        assert_eq!(frag.binds, vec![text("ab%"), text("ab"), text("ab")]);
+        assert_eq!(frag.invalid, None);
+    }
+
+    #[test]
+    fn starts_with_repeats_subject_binds_in_lockstep() {
+        let frag = sql_starts_with(sql_param("s".to_string()), "a%".to_string());
+        assert_eq!(
+            frag.sql,
+            "((? LIKE ? ESCAPE '\\') AND (substr(?, 1, length(?)) = ?))"
+        );
+        assert_eq!(
+            frag.binds,
+            vec![text("s"), text("a\\%%"), text("s"), text("a%"), text("a%")]
+        );
+    }
+
+    #[test]
+    fn starts_with_upstream_poison_wins() {
+        let frag = sql_starts_with(sql_column("bad name".to_string()), String::new());
+        assert_eq!(
+            frag.invalid,
+            Some("Sql.column: invalid identifier \"bad name\"".to_string())
+        );
+        assert_eq!(frag.sql, "");
+        assert!(frag.binds.is_empty());
+    }
+
+    #[test]
+    fn starts_with_refused_prefix_poisons_without_binds() {
+        let frag = sql_starts_with(sql_column("n".to_string()), "a\0".to_string());
+        assert_eq!(
+            frag.invalid,
+            Some("Sql.startsWith: the prefix contains a NUL character".to_string())
+        );
+        assert_eq!(frag.sql, "");
+        assert!(frag.binds.is_empty());
+    }
+
+    #[test]
+    fn text_prefix_equals_shape_is_the_tenant_shape() {
+        assert_eq!(
+            text_prefix_equals_sql("service_name"),
+            "substr(service_name, 1, length(?)) = ?"
+        );
+    }
+
+    #[tokio::test]
+    async fn starts_with_matches_the_literal_prefix_only() {
+        let db = names_db(&U11_ROWS).await;
+        let cases: [(&str, &[&str]); 8] = [
+            ("acme", &["acme-2"]),
+            ("50%", &["50%off"]),
+            ("a_b", &["a_b-x"]),
+            ("!b", &["!bang"]),
+            ("!x", &["!x"]),
+            ("a\\", &["a\\b"]),
+            ("ab", &["ab"]),
+            ("ACME", &["ACME"]),
+        ];
+        for (prefix, expected) in cases {
+            let exact = sql_starts_with(sql_column("name".to_string()), prefix.to_string());
+            let expected: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                names_where(&db, exact).await,
+                Ok(expected.clone()),
+                "{prefix:?}"
+            );
+
+            // The LIKE conjunct alone may only widen by ASCII case, never by a
+            // wildcard: every row it keeps starts with the prefix up to case.
+            let pattern = match pattern_of(prefix) {
+                Ok(pattern) => pattern,
+                Err(refused) => panic!("{prefix:?}: {refused:?}"),
+            };
+            let like_only =
+                match names_where(&db, sql_like(sql_column("name".to_string()), pattern)).await {
+                    Ok(names) => names,
+                    Err(e) => panic!("{prefix:?}: {e:?}"),
+                };
+            let folded = prefix.to_ascii_lowercase();
+            assert!(
+                like_only
+                    .iter()
+                    .all(|name| name.to_ascii_lowercase().starts_with(folded.as_str())),
+                "{prefix:?} -> {like_only:?}"
+            );
+            assert!(
+                expected.iter().all(|name| like_only.contains(name)),
+                "{prefix:?}"
+            );
+        }
+    }
+
+    /// `Sql.like` sends one engine-independent text, `ESCAPE '\'`, to SQLite and
+    /// Postgres alike; the Postgres rewrite keeping it intact is pinned in
+    /// `config_postgres_test`.
+    #[test]
+    fn like_escape_backslash_same_on_sqlite_and_postgres() {
+        let frag = sql_like(sql_column("n".to_string()), "a%".to_string());
+        assert_eq!(frag.sql, "(n LIKE ? ESCAPE '\\')");
+        assert_eq!(frag.binds, vec![text("a%")]);
+        assert_eq!(frag.invalid, None);
+    }
+
+    #[test]
+    fn like_pattern_ending_in_unpaired_escape_poisons() {
+        let frag = sql_like(sql_column("n".to_string()), "a\\".to_string());
+        assert_eq!(
+            frag.invalid,
+            Some("Sql.like: the pattern ends with the escape character \\".to_string())
+        );
+        assert_eq!(frag.sql, "");
+        assert!(frag.binds.is_empty());
+
+        let paired = sql_like(sql_column("n".to_string()), "a\\\\".to_string());
+        assert_eq!(paired.invalid, None);
+        assert_eq!(paired.binds, vec![text("a\\\\")]);
+    }
+
+    #[tokio::test]
+    async fn like_pattern_with_backslash_matches_literal() {
+        let db = names_db(&[Some("a%x"), Some("abx"), Some("a\\x"), Some("a_x")]).await;
+        let column = || sql_column("name".to_string());
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a\\%%".to_string())).await,
+            Ok(vec!["a%x".to_string()])
+        );
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a\\_%".to_string())).await,
+            Ok(vec!["a_x".to_string()])
+        );
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a\\\\%".to_string())).await,
+            Ok(vec!["a\\x".to_string()])
+        );
+        // Unescaped wildcards stay wildcards.
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a_x".to_string())).await,
+            Ok(vec![
+                "a%x".to_string(),
+                "a\\x".to_string(),
+                "a_x".to_string(),
+                "abx".to_string()
+            ])
+        );
     }
 }

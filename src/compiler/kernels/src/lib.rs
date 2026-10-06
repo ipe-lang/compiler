@@ -2437,6 +2437,17 @@ pub enum StdlibKernel {
     /// leaf. The accessor must name a `String` field; the pattern is a bound
     /// parameter (wildcards are data, never SQL text).
     StoreLike,
+    /// `Store.startsWith : (row -> String) -> String -> Cond` — accessor-typed
+    /// literal-prefix leaf.
+    ///
+    /// The accessor must name a `String` field. The prefix is literal: `%`,
+    /// `_` and `\` in it match themselves, and the match is case-sensitive on
+    /// every engine under a deterministic collation; a Postgres column
+    /// declared with a nondeterministic collation (a case-insensitive ICU one)
+    /// compares by that collation instead. It renders through `Sql.startsWith`,
+    /// so an empty prefix, one holding a NUL character, or one longer than
+    /// 16384 bytes is refused as a typed error before any SQL is sent.
+    StoreStartsWith,
     /// `Store.isNull : (row -> t) -> Cond` — accessor-typed IS NULL leaf.
     /// Arity 1: only the accessor (column name), no value.
     StoreIsNull,
@@ -3497,7 +3508,27 @@ pub enum StdlibKernel {
     SqlInList,
     /// `Sql.like : SqlFragment -> String -> SqlFragment` — the pattern is
     /// always a bound param, never interpolated.
+    ///
+    /// It renders `LIKE ? ESCAPE '\'`: `%` and `_` in the pattern, including
+    /// any from user text, are wildcards, and `\%`, `\_`, `\\` match them
+    /// literally on every engine. A pattern ending in an unpaired `\` is
+    /// refused as a typed error. A literal prefix is `Sql.startsWith`.
     SqlLike,
+    /// `Sql.startsWith : SqlFragment -> String -> SqlFragment` — the rows whose
+    /// text begins with exactly the given prefix.
+    ///
+    /// The prefix is literal: `%`, `_` and `\` in it match themselves, and
+    /// the match is case-sensitive on every engine under a deterministic
+    /// collation; a Postgres column declared with a nondeterministic
+    /// collation (a case-insensitive ICU one) compares by that collation
+    /// instead. A `NULL` value never matches. An empty prefix, one holding a NUL character, or one longer
+    /// than 16384 bytes is refused as a typed error before any SQL is sent.
+    /// The predicate renders an escaped `LIKE ? ESCAPE '\'` beside an exact
+    /// `substr` comparison, so an index can serve the scan on Postgres (and
+    /// on SQLite only under `case_sensitive_like`; otherwise SQLite scans).
+    /// Under Postgres with `standard_conforming_strings = off`, `'\'` is a
+    /// syntax error, so such a server refuses the query.
+    SqlStartsWith,
     /// `Sql.exists : String -> SqlFragment -> SqlFragment` — a correlated-
     /// subquery existence test `EXISTS (SELECT 1 FROM <table> WHERE <inner>)`.
     /// The table is validated through the same bare-identifier gate as
@@ -5310,6 +5341,15 @@ impl StdlibKernel {
             Self::StoreLteBy => d("Store", "lteBy", 3, Pure, "store_lte_by", IpeOrder),
             // `Store.like` — arity 2 (accessor + pattern string).
             Self::StoreLike => d("Store", "like", 2, Pure, "store_like", IpeOrder),
+            // `Store.startsWith` — arity 2 (accessor + prefix string).
+            Self::StoreStartsWith => d(
+                "Store",
+                "startsWith",
+                2,
+                Pure,
+                "store_starts_with",
+                IpeOrder,
+            ),
             // `Store.isNull` / `Store.notNull` — arity 1 (accessor only).
             Self::StoreIsNull => d("Store", "isNull", 1, Pure, "store_is_null", IpeOrder),
             Self::StoreNotNull => d("Store", "notNull", 1, Pure, "store_not_null", IpeOrder),
@@ -7180,6 +7220,7 @@ impl StdlibKernel {
             Self::SqlIsNotNull => d("Sql", "isNotNull", 1, Db, "sql_is_not_null", IpeOrder),
             Self::SqlInList => d("Sql", "inList", 2, Db, "sql_in_list", IpeOrder),
             Self::SqlLike => d("Sql", "like", 2, Db, "sql_like", IpeOrder),
+            Self::SqlStartsWith => d("Sql", "startsWith", 2, Db, "sql_starts_with", IpeOrder),
             Self::SqlExists => d("Sql", "exists", 2, Db, "sql_exists", IpeOrder),
             Self::SqlMaskedColumn => d("Sql", "maskedColumn", 2, Db, "sql_masked_column", IpeOrder),
             Self::DbFindWhere => d("Db", "findWhere", 3, Db, "db_find_where", IpeOrder),
@@ -8098,6 +8139,7 @@ impl StdlibKernel {
         Self::StoreLteCol,
         Self::StoreLteBy,
         Self::StoreLike,
+        Self::StoreStartsWith,
         Self::StoreIsNull,
         Self::StoreNotNull,
         Self::StoreInListCol,
@@ -8701,6 +8743,7 @@ impl StdlibKernel {
         Self::SqlIsNotNull,
         Self::SqlInList,
         Self::SqlLike,
+        Self::SqlStartsWith,
         Self::SqlExists,
         Self::SqlMaskedColumn,
         Self::DbFindWhere,
@@ -11681,7 +11724,7 @@ impl StdlibKernel {
         const STORE_EQ_COL: TyShape = TyShape::Fun(&A_TO_B_GETTER, &B_TO_COND_A);
         // `*By : Codec t -> (row -> t) -> t -> Cond row`.
         const STORE_EQ_BY: TyShape = TyShape::Fun(&CODEC_B, &STORE_EQ_COL);
-        // `like : (row -> String) -> String -> Cond row`.
+        // `like / startsWith : (row -> String) -> String -> Cond row`.
         const A_TO_STRING_GETTER: TyShape = TyShape::Fun(&A, &STRING);
         const STRING_TO_COND_A: TyShape = TyShape::Fun(&STRING, &COND_A);
         const STORE_LIKE: TyShape = TyShape::Fun(&A_TO_STRING_GETTER, &STRING_TO_COND_A);
@@ -12494,7 +12537,7 @@ impl StdlibKernel {
                 Some(&SQLFRAGMENT_TO_SQLFRAGMENT)
             }
             Self::SqlInList => Some(&SQL_IN_LIST),
-            Self::SqlLike => Some(&SQL_LIKE),
+            Self::SqlLike | Self::SqlStartsWith => Some(&SQL_LIKE),
             Self::SqlExists => Some(&SQL_EXISTS),
             Self::SqlMaskedColumn => Some(&SQL_MASKED_COLUMN),
 
@@ -12982,7 +13025,7 @@ impl StdlibKernel {
             | Self::StoreGteBy
             | Self::StoreLtBy
             | Self::StoreLteBy => Some(&STORE_EQ_BY),
-            Self::StoreLike => Some(&STORE_LIKE),
+            Self::StoreLike | Self::StoreStartsWith => Some(&STORE_LIKE),
             Self::StoreIsNull | Self::StoreNotNull => Some(&STORE_IS_NULL),
             Self::StoreInListCol => Some(&STORE_IN_LIST_COL),
             Self::StoreInListBy => Some(&STORE_IN_LIST_BY),
@@ -13078,6 +13121,7 @@ impl StdlibKernel {
         Self::StoreLteCol,
         Self::StoreLteBy,
         Self::StoreLike,
+        Self::StoreStartsWith,
         Self::StoreIsNull,
         Self::StoreNotNull,
         Self::StoreInListCol,
@@ -13650,6 +13694,7 @@ impl StdlibKernel {
             | Self::StoreLteCol
             | Self::StoreLteBy
             | Self::StoreLike
+            | Self::StoreStartsWith
             | Self::StoreIsNull
             | Self::StoreNotNull
             | Self::StoreInListCol
@@ -14406,6 +14451,7 @@ impl StdlibKernel {
             | Self::SqlIsNotNull
             | Self::SqlInList
             | Self::SqlLike
+            | Self::SqlStartsWith
             | Self::SqlExists
             | Self::SqlMaskedColumn
             | Self::SecretFromString

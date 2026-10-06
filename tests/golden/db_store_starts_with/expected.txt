@@ -1,0 +1,17 @@
+startsWith acme: acme-2
+startsWith ACME: ACME
+startsWith 50%: 50%off
+like 50%: 50 cents,50%off,500
+startsWith a_b: a_b-x
+like a_b%: a\b,a_b-x,axb-y
+startsWith !b: !bang
+startsWith a\: a\b
+startsWith ab: ab
+startsWith and eq: ab
+eq and startsWith: a_b-x
+empty prefix: Unexpected: db.findWhereMasked: Sql.startsWith: the prefix is empty
+longest prefix: 
+too-long prefix: Unexpected: db.findWhereMasked: Sql.startsWith: the prefix is longer than 16384 bytes
+deleteWhere startsWith !x: 1
+deleteWhere startsWith : Unexpected: db.deleteWhere: Sql.startsWith: the prefix is empty
+startsWith !: !bang
