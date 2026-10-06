@@ -2826,7 +2826,7 @@ fn clamp_u16(n: i64) -> u16 {
 /// bypasses Drop, so an RAII guard's destructor never runs on that path. A backend
 /// driver that puts the terminal/process into a state needing restoration (the
 /// Ipe.Tui driver: raw mode + alternate screen + hidden cursor + mouse reporting)
-/// registers its idempotent teardown here; `system_exit` runs it BEFORE
+/// registers its idempotent teardown here; `exit_process` runs it BEFORE
 /// `process::exit`. The hook runs teardown before process termination, so RAII-
 /// bypassed cleanup (terminal restore, cursor reset) completes before the OS reclaims
 /// the process. A plain `fn()` keeps the boundary clean — `system` (always compiled) never
@@ -2839,7 +2839,7 @@ pub fn register_exit_hook(f: fn()) {
     let _ = EXIT_HOOK.set(f);
 }
 
-/// Run the registered exit hook, if any. Called by `system_exit`; also safe to
+/// Run the registered exit hook, if any. Called by `exit_process`; also safe to
 /// call from a backend driver's own normal-exit path (the hook is idempotent).
 pub fn run_exit_hook() {
     if let Some(f) = EXIT_HOOK.get() {
@@ -2847,13 +2847,30 @@ pub fn run_exit_hook() {
     }
 }
 
-pub fn system_exit(code: i64) -> ! {
-    // Restore any driver-owned terminal/process state BEFORE exiting — Drop does
-    // NOT run on std::process::exit, so without this a Ipe.Tui `System.exit` quit
-    // would leave the TTY in raw mode + the alternate screen (needing `reset`).
+/// Ends the process with `code` after every pre-exit stage has run.
+///
+/// The one process exit in the runtime; the runtime `clippy.toml` denies
+/// `std::process::exit` everywhere else. `process::exit` skips Drop, so the
+/// stages Drop would have run happen here first: the registered exit hook
+/// (terminal restore), then, in a build with the telemetry exporters, a flush
+/// of their buffered batches bounded by the exporters' flush deadline.
+pub fn exit_process(code: i32) -> ! {
     run_exit_hook();
-    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — this IS the `System.exit` kernel: the Ipê program requested process termination with `code` [ledger #boundary]
-    std::process::exit(code as i32)
+    #[cfg(all(
+        feature = "server",
+        feature = "http_client",
+        feature = "web-core",
+        not(target_arch = "wasm32")
+    ))]
+    crate::web::flush_exporters_before_exit();
+    #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
+    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
+    std::process::exit(code);
+}
+
+/// The `System.exit` kernel: ends the process through `exit_process`.
+pub fn system_exit(code: i64) -> ! {
+    exit_process(code as i32)
 }
 
 /// `Ipe.System.getenv key : String -> Task Error String` — the env var as a
