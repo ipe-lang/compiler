@@ -37,7 +37,12 @@ fn run_with(exe: &str, var: &str, value: &Path, stdin: &[u8]) -> Option<(Option<
         .spawn()
         .ok()?;
     if let Some(mut pipe) = child.stdin.take() {
-        pipe.write_all(stdin).ok()?;
+        // A replay never reads stdin, so the child may exit before the write.
+        match pipe.write_all(stdin) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(_) => return None,
+        }
     }
     let output = child.wait_with_output().ok()?;
     Some((
