@@ -113,10 +113,11 @@ transformation is the string's concern. This keeps `Ipe.Locale` small (only
 
 - **Per-symbol reference:** `ipe doc Ipe.Locale` — `fromTag`, `toTag`, and the
   opaque `Locale` type.
-- **Locale-aware string functions:** `ipe doc Ipe.String` — `toUpperIn`,
-  `toLowerIn`, `containsIn`, `startsWithIn`, `endsWithIn` (locale-sensitive
-  search), and `casefold`/`equalFold` (locale-independent case folding for
-  comparison).
+- **Locale-aware string functions:** `ipe doc Ipe.String` — `toUpperIn` and
+  `toLowerIn`. Its `casefold`/`equalFold` are locale-independent full case
+  folding for comparison, and `containsIn`/`startsWithIn`/`endsWithIn` are
+  haystack-first argument orders of `contains`/`startsWith`/`endsWith`, not
+  locale-sensitive search.
 - **Sibling guides:** [Strings](string.md) — the full text-transform surface,
   including the locale-independent case functions. [Characters](char.md) — Unicode
   code-point classification. [Results and Maybe](result.md) — what `fromTag`
