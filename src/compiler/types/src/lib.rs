@@ -7199,23 +7199,53 @@ mod tests {
         );
     }
 
-    /// `constrain_pattern` must recurse into sub-patterns of a
-    /// constructor whose scheme is not registered (e.g. an imported kernel-stdlib
-    /// ADT like `ChunkEvent`).  If the no-scheme fallback skips binding arg
-    /// variables into `br_local`, the arm body's `VarLocal` lookup
-    /// fires the "unbound local" ICE (IPE-I0001).
+    /// A one-def module `f scrut = case scrut of <pat> -> <body>` built by hand.
     ///
-    /// We exercise this directly by building a `canon::Module` with no `unions`
-    /// (so `ImportedCtor` has no scheme) and a single `case` arm:
-    ///
-    /// ```
-    /// case scrut of
-    ///     ImportedCtor x -> x   -- arm uses `x`, must not ICE
-    /// ```
-    #[test]
-    fn imported_ctor_pvar_does_not_ice() {
-        use ipe_diagnostics::Span;
+    /// Hand-built so a constructor canon could never resolve (one with no
+    /// scheme and no union) reaches the type checker directly.
+    fn one_case_module(
+        main_sym: Symbol,
+        f_sym: Symbol,
+        arg_sym: Symbol,
+        branches: Vec<canon::CaseBranch>,
+    ) -> canon::Module {
+        use ipe_diagnostics::Located;
+        canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            name: vec![main_sym],
+            unions: vec![],
+            defs: vec![canon::Def::Untyped {
+                home: vec![main_sym],
+                name: Located::new(Span::DUMMY, f_sym),
+                patterns: vec![Located::new(Span::DUMMY, canon::Pattern_::PVar(arg_sym))],
+                body: Located::new(
+                    Span::DUMMY,
+                    canon::Expr_::Case(
+                        Box::new(Located::new(Span::DUMMY, canon::Expr_::VarLocal(arg_sym))),
+                        branches,
+                    ),
+                ),
+            }],
+        }
+    }
 
+    /// The `where_` of a `CompilerBug`, or `None` for any other outcome.
+    const fn bug_site<T>(r: &DResult<T>) -> Option<&'static str> {
+        match r {
+            Err(Diagnostic::CompilerBug { where_, .. }) => Some(*where_),
+            _ => None,
+        }
+    }
+
+    /// A constructor pattern with no registered scheme is a `CompilerBug`.
+    ///
+    /// Canon resolved `ImportedCtor`, so a missing scheme is a broken table,
+    /// never an unconstrained fresh type for its payload (`case scrut of
+    /// ImportedCtor x -> x`). CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn unknown_ctor_pattern_is_compiler_bug() {
+        use ipe_diagnostics::Located;
         let mut i = Interner::new();
         let main_sym = i.intern("Main").unwrap();
         let f_sym = i.intern("f").unwrap();
@@ -7223,65 +7253,347 @@ mod tests {
         let ctor_type_sym = i.intern("ImportedType").unwrap();
         let ctor_sym = i.intern("ImportedCtor").unwrap();
         let var_sym = i.intern("x").unwrap();
+        let module = one_case_module(
+            main_sym,
+            f_sym,
+            arg_sym,
+            vec![canon::CaseBranch {
+                pat: Located::new(
+                    Span::DUMMY,
+                    canon::Pattern_::PCtor {
+                        home: vec![],
+                        type_name: ctor_type_sym,
+                        name: ctor_sym,
+                        index: 0,
+                        args: vec![Located::new(Span::DUMMY, canon::Pattern_::PVar(var_sym))],
+                    },
+                ),
+                body: Located::new(Span::DUMMY, canon::Expr_::VarLocal(var_sym)),
+            }],
+        );
+        let result = infer(&module, &mut i);
+        assert_eq!(
+            bug_site(&result),
+            Some("constrain.ctor_scheme"),
+            "a scheme-less constructor pattern must be a CompilerBug, got Ok={}",
+            result.is_ok()
+        );
+    }
 
-        // No `unions` → `ImportedCtor` has no scheme, triggering the no-scheme
-        // fallback path in `constrain_pattern`.
-        let module = canon::Module {
-            imports_unsafe_submodule: false,
-            imported_web_capabilities: std::collections::BTreeSet::new(),
-            name: vec![main_sym],
-            unions: vec![],
-            defs: vec![canon::Def::Untyped {
-                home: vec![main_sym],
-                name: ipe_diagnostics::Located::new(Span::DUMMY, f_sym),
-                patterns: vec![ipe_diagnostics::Located::new(
+    /// A constructor value with no registered scheme is a `CompilerBug`.
+    ///
+    /// The value-side twin of [`unknown_ctor_pattern_is_compiler_bug`]:
+    /// `case scrut of _ -> ImportedCtor`. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn unknown_ctor_value_is_compiler_bug() {
+        use ipe_diagnostics::Located;
+        let mut i = Interner::new();
+        let main_sym = i.intern("Main").unwrap();
+        let f_sym = i.intern("f").unwrap();
+        let arg_sym = i.intern("scrut").unwrap();
+        let ctor_type_sym = i.intern("ImportedType").unwrap();
+        let ctor_sym = i.intern("ImportedCtor").unwrap();
+        let module = one_case_module(
+            main_sym,
+            f_sym,
+            arg_sym,
+            vec![canon::CaseBranch {
+                pat: Located::new(Span::DUMMY, canon::Pattern_::PAnything),
+                body: Located::new(
                     Span::DUMMY,
-                    canon::Pattern_::PVar(arg_sym),
-                )],
-                body: ipe_diagnostics::Located::new(
-                    Span::DUMMY,
-                    canon::Expr_::Case(
-                        Box::new(ipe_diagnostics::Located::new(
-                            Span::DUMMY,
-                            canon::Expr_::VarLocal(arg_sym),
-                        )),
-                        vec![canon::CaseBranch {
-                            // Pattern: `ImportedCtor x`
-                            pat: ipe_diagnostics::Located::new(
-                                Span::DUMMY,
-                                canon::Pattern_::PCtor {
-                                    home: vec![],
-                                    type_name: ctor_type_sym,
-                                    name: ctor_sym,
-                                    index: 0,
-                                    args: vec![ipe_diagnostics::Located::new(
-                                        Span::DUMMY,
-                                        canon::Pattern_::PVar(var_sym),
-                                    )],
-                                },
-                            ),
-                            // Body: `x` — uses the pattern-bound variable
-                            body: ipe_diagnostics::Located::new(
-                                Span::DUMMY,
-                                canon::Expr_::VarLocal(var_sym),
-                            ),
-                        }],
-                    ),
+                    canon::Expr_::VarCtor {
+                        home: vec![],
+                        type_name: ctor_type_sym,
+                        name: ctor_sym,
+                        index: 0,
+                    },
                 ),
             }],
-        };
-
+        );
         let result = infer(&module, &mut i);
+        assert_eq!(
+            bug_site(&result),
+            Some("constrain.ctor_scheme"),
+            "a scheme-less constructor value must be a CompilerBug, got Ok={}",
+            result.is_ok()
+        );
+    }
 
-        // The result may be a type error (e.g. T0001) but must NOT be the
-        // "unbound local" compiler bug.
-        if let Err(ipe_diagnostics::Diagnostic::CompilerBug { detail, .. }) = &result {
-            assert!(
-                !detail.contains("unbound local"),
-                "#145 regression: imported ctor PVar arg must not fire \
-                 'unbound local' ICE; detail: {detail}"
-            );
+    /// Run the exhaustiveness pass alone over a hand-built one-`case` module.
+    fn exhaust_only(module: &canon::Module, i: &mut Interner) -> Option<&'static str> {
+        let mut warnings = Vec::new();
+        let r = exhaust::check(module, &[], &BTreeMap::new(), i, &mut warnings);
+        match r.as_ref().map_err(InferError::diagnostic) {
+            Err(Diagnostic::CompilerBug { where_, .. }) => Some(*where_),
+            _ => None,
         }
+    }
+
+    /// The exhaustiveness pass refuses a constructor outside every signature.
+    ///
+    /// It never skips the `case` unjudged. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn exhaust_unknown_ctor_is_compiler_bug() {
+        use ipe_diagnostics::Located;
+        let mut i = Interner::new();
+        let main_sym = i.intern("Main").unwrap();
+        let f_sym = i.intern("f").unwrap();
+        let arg_sym = i.intern("scrut").unwrap();
+        let ctor_type_sym = i.intern("ImportedType").unwrap();
+        let ctor_sym = i.intern("ImportedCtor").unwrap();
+        let module = one_case_module(
+            main_sym,
+            f_sym,
+            arg_sym,
+            vec![canon::CaseBranch {
+                pat: Located::new(
+                    Span::DUMMY,
+                    canon::Pattern_::PCtor {
+                        home: vec![],
+                        type_name: ctor_type_sym,
+                        name: ctor_sym,
+                        index: 0,
+                        args: vec![],
+                    },
+                ),
+                body: Located::new(Span::DUMMY, canon::Expr_::Int(0)),
+            }],
+        );
+        assert_eq!(exhaust_only(&module, &mut i), Some("exhaust.signature"));
+    }
+
+    /// The exhaustiveness pass refuses a pattern whose arity disagrees with
+    /// its signature.
+    ///
+    /// `Just -> 0 ; Nothing -> 0` (a payload-less `Just`) is never padded to
+    /// the declared arity. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn exhaust_ctor_arity_mismatch_is_compiler_bug() {
+        use ipe_diagnostics::Located;
+        let mut i = Interner::new();
+        let main_sym = i.intern("Main").unwrap();
+        let f_sym = i.intern("f").unwrap();
+        let arg_sym = i.intern("scrut").unwrap();
+        let maybe_sym = i.intern("Maybe").unwrap();
+        let just_sym = i.intern("Just").unwrap();
+        let nothing_sym = i.intern("Nothing").unwrap();
+        let ctor = |name, index| canon::CaseBranch {
+            pat: Located::new(
+                Span::DUMMY,
+                canon::Pattern_::PCtor {
+                    home: vec![],
+                    type_name: maybe_sym,
+                    name,
+                    index,
+                    args: vec![],
+                },
+            ),
+            body: Located::new(Span::DUMMY, canon::Expr_::Int(0)),
+        };
+        let module = one_case_module(
+            main_sym,
+            f_sym,
+            arg_sym,
+            vec![ctor(just_sym, 0), ctor(nothing_sym, 1)],
+        );
+        assert_eq!(exhaust_only(&module, &mut i), Some("exhaust.signature"));
+    }
+
+    /// Fixture prelude: `takesInt` / `takesString` pin a payload's type.
+    const PIN_FNS: &str = "takesInt : Int -> Int\ntakesInt n =\n    n\n\n\
+                           takesString : String -> Int\ntakesString s =\n    0\n\n";
+
+    /// `Chunk`'s payload is a `String`, so passing it where an `Int` belongs is
+    /// a type mismatch, not an unconstrained fresh type.
+    ///
+    /// CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn chunk_payload_is_typed() {
+        let src = format!(
+            "{M2C_HDR}{PIN_FNS}f ev =\n    case ev of\n        Chunk n -> takesInt n\n\
+             \x20       Done -> 0\n        Errored _ -> 0\n\nmain =\n    0\n"
+        );
+        let (r, _, _) = infer_src(&src);
+        assert!(
+            matches!(
+                &r,
+                Err(Diagnostic::Type {
+                    msg: TypeError::TypeMismatch { .. },
+                    ..
+                })
+            ),
+            "a `Chunk` String payload used as Int must be IPE-T0001, got Ok={} bug={:?}",
+            r.is_ok(),
+            bug_site(&r)
+        );
+    }
+
+    /// Control for [`chunk_payload_is_typed`]: the `String` use is accepted.
+    #[test]
+    fn chunk_string_payload_ok() {
+        let src = format!(
+            "{M2C_HDR}{PIN_FNS}f ev =\n    case ev of\n        Chunk s -> takesString s\n\
+             \x20       Done -> 0\n        Errored _ -> 0\n\nmain =\n    0\n"
+        );
+        let (r, _, _) = infer_src(&src);
+        assert!(
+            r.is_ok(),
+            "a `Chunk` String payload used as String must type-check"
+        );
+    }
+
+    /// The `Ipe.Http` import that brings `HttpMethod`'s verbs into bare scope.
+    const HTTP_HDR: &str = "module Main exposing (main)\n\n\
+                            import Ipe.Http as Http exposing (HttpMethod(..))\n\n";
+
+    /// A nullary `HttpMethod` verb matched with a payload is IPE-T0013.
+    ///
+    /// Spelled through `exposing (HttpMethod(..))`, as the `http_method_match`
+    /// golden does. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn http_method_ctor_arity_checked() {
+        let src = format!(
+            "{HTTP_HDR}f m =\n    case m of\n        Get x -> 1\n        _ -> 0\n\nmain =\n    0\n"
+        );
+        let (r, _, _) = infer_src(&src);
+        assert!(
+            matches!(
+                &r,
+                Err(Diagnostic::Type {
+                    msg: TypeError::CtorPatternArity { .. },
+                    ..
+                })
+            ),
+            "`Get x` must be IPE-T0013, got Ok={} bug={:?}",
+            r.is_ok(),
+            bug_site(&r)
+        );
+        let Err(Diagnostic::Type {
+            msg:
+                TypeError::CtorPatternArity {
+                    ctor,
+                    expected,
+                    found,
+                },
+            ..
+        }) = &r
+        else {
+            return;
+        };
+        assert_eq!((&**ctor, *expected, *found), ("Get", 0, 1));
+    }
+
+    /// Control for [`http_method_ctor_arity_checked`]: a total match over
+    /// every verb type-checks with no wildcard finding.
+    #[test]
+    fn http_method_total_ok() {
+        let src = format!(
+            "{HTTP_HDR}f m =\n    case m of\n        Get -> 1\n        Post -> 2\n\
+             \x20       Put -> 3\n        Delete -> 4\n        Patch -> 5\n\
+             \x20       Head -> 6\n        Options -> 7\n\nmain =\n    0\n"
+        );
+        let (r, _, _) = infer_src(&src);
+        assert!(
+            r.is_ok(),
+            "a total HttpMethod match must type-check, got bug={:?}",
+            bug_site(&r)
+        );
+    }
+
+    /// The `ConstructorNotFound` name and suggestion count of `r`, if any.
+    fn ctor_not_found(r: &DResult<SolvedTypes>) -> Option<(&str, usize, Span)> {
+        match r {
+            Err(Diagnostic::Name {
+                span,
+                msg: ipe_diagnostics::NameError::ConstructorNotFound { name, suggestions },
+            }) => Some((&**name, suggestions.names.len(), *span)),
+            _ => None,
+        }
+    }
+
+    /// The capability-handle constructor `StreamId` is sealed in patterns.
+    ///
+    /// Matching it would let source read a runtime handle's raw id; it is
+    /// IPE-N0003 with no suggestions. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn stream_id_ctor_pattern_sealed() {
+        let src =
+            format!("{M2C_HDR}f s =\n    case s of\n        StreamId n -> n\n\nmain =\n    0\n");
+        let (r, _, _) = infer_src(&src);
+        let found = ctor_not_found(&r);
+        assert_eq!(
+            found.map(|(name, n, _)| (name, n)),
+            Some(("StreamId", 0)),
+            "bug={:?}",
+            bug_site(&r)
+        );
+        let Some((_, _, span)) = found else {
+            return;
+        };
+        let lo = usize::try_from(span.lo).unwrap();
+        let hi = usize::try_from(span.hi).unwrap();
+        assert_eq!(src.get(lo..hi), Some("StreamId n"), "the whole pattern");
+    }
+
+    /// The capability-handle constructor `StreamId` is sealed as a value.
+    ///
+    /// `StreamId 7` would forge a handle; it is IPE-N0003 at the constructor's
+    /// span. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn stream_id_ctor_value_sealed() {
+        let src = format!("{M2C_HDR}x =\n    StreamId 7\n\nmain =\n    0\n");
+        let (r, _, _) = infer_src(&src);
+        let found = ctor_not_found(&r);
+        assert!(
+            found.is_some(),
+            "`StreamId 7` must be IPE-N0003, got bug={:?}",
+            bug_site(&r)
+        );
+        let Some((name, n, span)) = found else {
+            return;
+        };
+        assert_eq!((name, n), ("StreamId", 0));
+        let lo = usize::try_from(span.lo).unwrap();
+        let hi = usize::try_from(span.hi).unwrap();
+        assert_eq!(src.get(lo..hi), Some("StreamId"));
+    }
+
+    /// Every canon builtin constructor is exactly one derived table entry.
+    ///
+    /// Each is a scheme of canon's arity under key `([], type, ctor)` or a
+    /// sealed key, never both and never neither, and the table holds nothing
+    /// canon does not register. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn builtin_ctor_schemes_cover_canon_table() {
+        let mut i = Interner::new();
+        let builtins = Builtins::new(&mut i).unwrap();
+        let table = builtins.ctor_schemes(&mut i).unwrap();
+        let mut total = 0usize;
+        for union in ipe_canon::builtins::BUILTIN_UNIONS {
+            let ty = i.intern(union.type_name).unwrap();
+            for (ctor, _, arity) in union.ctors.iter().copied() {
+                total += 1;
+                let key = (Vec::new(), ty, i.intern(ctor).unwrap());
+                let scheme = table.schemes.iter().find(|(k, _)| *k == key);
+                let sealed = table.sealed.contains(&key);
+                assert!(
+                    scheme.is_some() != sealed,
+                    "`{}.{ctor}` must be exactly one of scheme / sealed",
+                    union.type_name
+                );
+                if let Some((_, s)) = scheme {
+                    assert_eq!(s.arg_tys.len(), arity, "`{}.{ctor}` arity", union.type_name);
+                }
+            }
+        }
+        assert_eq!(
+            table.schemes.len() + table.sealed.len(),
+            total,
+            "no extra entries"
+        );
+        let stream_id = i.intern("StreamId").unwrap();
+        assert!(table.sealed.contains(&(Vec::new(), stream_id, stream_id)));
+        assert_eq!(table.sealed.len(), 1, "only `StreamId` is sealed");
     }
 
     /// A cross-module untyped recursive function polymorphic in

@@ -241,6 +241,10 @@ pub struct Builder<'a> {
     /// The `Rc` holds byte-identical data — same fresh vars, same constraints,
     /// same errors. Fully internal to `Builder`.
     pub ctors: BTreeMap<CtorKey, Rc<CtorScheme>>,
+    /// Builtin capability-handle constructors (`StreamId`) source may never
+    /// name. A constructor here has no scheme in [`Self::ctors`]; a reference
+    /// or pattern naming it is refused with `ConstructorNotFound`.
+    pub sealed_ctors: BTreeSet<CtorKey>,
     /// One entry per typed binding: its `(home, name)` and the rigid (skolem)
     /// variable each of its annotation type variables instantiated to while its
     /// body was checked. Read post-solve to recover each variable's super-type
