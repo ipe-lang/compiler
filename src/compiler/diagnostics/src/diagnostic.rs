@@ -468,12 +468,15 @@ pub enum NameError {
     /// `String.join` with no `import Ipe.String`, or `Util.f` with no
     /// `import Util`. Distinct from [`Self::UnknownModule`] (a genuinely unknown
     /// qualifier): here the module exists and the fix is to add its import.
-    /// `qualifier` is the spelling at the use site; `candidates` holds every
-    /// importable module whose bare import binds that spelling, sorted and
-    /// deduplicated (never empty). [IPE-N0034]
+    /// `reached` is how the use site reached the module; `candidates` holds
+    /// every importable module whose bare import binds that spelling, sorted
+    /// and deduplicated (never empty). `imported_as` is set when one of the
+    /// candidates IS imported, under an alias the use site did not write.
+    /// [IPE-N0034]
     ImportRequired {
-        qualifier: Box<str>,
+        reached: StdlibReach,
         candidates: Box<[Box<str>]>,
+        imported_as: Option<Box<ImportedAs>>,
     },
     /// The qualifier resolves but the member is absent. [IPE-N0005]
     NoSuchMember {
@@ -620,6 +623,17 @@ pub enum NameError {
     /// import path; `imported_shape` and `app_shape` name the two shapes;
     /// `expected` is the correct import path for the app's shape. [IPE-N0035]
     WrongShapeCmdSub(Box<CmdSubShapeMismatch>),
+    /// One module imports two different TEA shape modules.
+    ///
+    /// A module builds at most one app shape, and each shape import brings
+    /// that shape's own `Cmd` / `Sub`, so a second shape has no denotation.
+    /// `first_module` is the earlier shape import (at `first`);
+    /// `second_module` is the import refused. [IPE-N0035]
+    TwoShapeImports {
+        first_module: Box<str>,
+        second_module: Box<str>,
+        first: Span,
+    },
     /// A surface binding that has been intentionally removed from the stdlib.
     /// `qualifier.name` is the call site; `replacement` is the migration hint
     /// (empty when no direct replacement exists). [IPE-N0036]
@@ -944,6 +958,34 @@ pub enum SealRejection {
     /// an async/decoder type, a not-yet-classified builtin). Fail-closed: the
     /// conservative branch refuses it rather than guess.
     NotProvenPlain,
+}
+
+/// How a use site reached a module it never imported, reported by IPE-N0034.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StdlibReach {
+    /// A qualified reference `Qualifier.member`, by its qualifier spelling.
+    Qualifier(Box<str>),
+}
+
+impl StdlibReach {
+    /// The spelling the use site wrote.
+    #[must_use]
+    pub fn spelling(&self) -> &str {
+        match self {
+            Self::Qualifier(qualifier) => qualifier,
+        }
+    }
+}
+
+/// A candidate module the importing module already imports under an alias.
+///
+/// Boxed inside [`NameError::ImportRequired`] so `NameError` stays small.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ImportedAs {
+    /// The imported module path.
+    pub module: Box<str>,
+    /// The alias it is imported as.
+    pub alias: Box<str>,
 }
 
 /// The four names IPE-N0035 reports.
@@ -2532,7 +2574,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::BuiltinTypeArity { .. } => IPE_N0031,
         NameError::TypeExpansionTooDeep { .. } => IPE_N0032,
         NameError::ProgramImportsTeaShape { .. } => IPE_N0033,
-        NameError::WrongShapeCmdSub(..) => IPE_N0035,
+        NameError::WrongShapeCmdSub(..) | NameError::TwoShapeImports { .. } => IPE_N0035,
         NameError::RemovedSurface { .. } => IPE_N0036,
         NameError::AssertedCallMalformed { .. } => IPE_N0038,
         NameError::BoundarySealIllegal { .. } => IPE_N0039,
@@ -2725,7 +2767,8 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         | NameError::DuplicateConstructor { first, .. }
         | NameError::DuplicateType { first, .. }
         | NameError::DuplicatePatternBinder { first, .. }
-        | NameError::DuplicateQualifier { first, .. } => vec![HelpLine::SecondarySpan {
+        | NameError::DuplicateQualifier { first, .. }
+        | NameError::TwoShapeImports { first, .. } => vec![HelpLine::SecondarySpan {
             span: *first,
             role: SpanRole::FirstDefinition,
         }],
