@@ -1030,6 +1030,10 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 {out} is inside {owner}, which ipe owns and may delete (`ipe clean`) — an ejected project must live outside ipe's output and cache; choose another --out
 
+## output-inside-claim
+
+{out} is inside {owner}, which an ipe process is claiming as its output (it holds `{claim}`) — an ejected project must live outside ipe's output; choose another --out, or delete `{claim}` in {owner} when no ipe process is active there
+
 ## output-inside-vcs
 
 {out} is inside a `.git` directory — build output must stay out of version-control metadata; choose another --out
@@ -1073,6 +1077,26 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 ## output-in-use
 
 {path} is held open by another program (an editor, a file indexer, or antivirus) — close it there or let that program finish, then run the command again
+
+## output-claim-busy
+
+{path} is being claimed by another ipe process, still in progress after {waited}s — let that run finish, then run the command again; if no ipe process is active, another program holds `{claim}` locked: delete `{claim}` in {path} and run the command again
+
+## output-claim-lock-unavailable
+
+{path} is on a filesystem that refused a file lock ({kind}), so ipe cannot claim it safely — choose an --out on a local disk
+
+## output-claim-interrupted
+
+{path} holds a claim an ipe process left unfinished, with files ipe did not write beside it — check what is there, then delete `{marker}` and `{claim}` in it and run the command again
+
+## output-claim-marker-unfinished
+
+{path} holds a `{marker}` an interrupted ipe process left unfinished — check it is not a file of yours, then delete `{marker}` in it and run the command again
+
+## output-claim-in-flight
+
+{path} is being claimed by an ipe process, or holds a claim an interrupted run left — the next build finishes the claim; run the command again then
 
 # Publisher identity
 

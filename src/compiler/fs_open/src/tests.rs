@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::{
-    ByteCap, EntryCap, EntryName, FileKind, HeldDir, HintedKind, OpenRefusal, RegularFile,
+    ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, HintedKind, OpenRefusal, RegularFile,
     is_one_spelled_name,
 };
 
@@ -459,6 +459,39 @@ fn a_file_held_open_elsewhere_is_in_use() {
     drop(other);
 }
 
+/// Every identity read of one file agrees: the proven handle, a raw handle, the path, and the no-follow entry.
+#[test]
+fn every_identity_read_of_one_file_agrees() {
+    let dir = scratch("identity");
+    std::fs::write(dir.join("f.txt"), "hello").unwrap();
+    let held = held(&dir);
+    let entry = held.entry_id(&name("f.txt")).unwrap().unwrap();
+    let proven = held.open_regular(&name("f.txt")).unwrap();
+    assert_eq!(proven.id().unwrap(), entry);
+    let raw = std::fs::File::open(dir.join("f.txt")).unwrap();
+    assert_eq!(FileId::of_file(&raw).unwrap(), entry);
+    assert_eq!(FileId::of_path(&dir.join("f.txt")).unwrap(), entry);
+    assert_eq!(proven.link_count().unwrap(), 1);
+    std::fs::hard_link(dir.join("f.txt"), dir.join("g.txt")).unwrap();
+    assert_eq!(proven.link_count().unwrap(), 2);
+    assert_eq!(held.entry_id(&name("g.txt")).unwrap(), Some(entry));
+}
+
+/// Each platform builds a [`FileId`] in exactly one function, so no two identity reads can disagree on its form.
+#[test]
+fn each_platform_builds_a_file_id_in_one_place() {
+    for (platform, source) in [
+        ("unix.rs", include_str!("unix.rs")),
+        ("windows.rs", include_str!("windows.rs")),
+    ] {
+        assert_eq!(
+            source.matches("FileId {").count(),
+            1,
+            "{platform} builds a FileId in more than one place"
+        );
+    }
+}
+
 /// The kind listed for `entry`, `None` when the listing lacks it.
 fn hinted_kind_of(listed: &[(EntryName, HintedKind)], entry: &str) -> Option<HintedKind> {
     listed
@@ -569,6 +602,31 @@ fn entries_hinted_types_a_dangling_link_without_following() {
             "{entry} is typed from the listing or left unknown, got {hint:?}"
         );
     }
+}
+
+/// A head read stops at its cap and leaves the proof usable for an identity re-read.
+#[test]
+fn a_head_read_stops_at_its_cap_and_keeps_the_handle() {
+    let dir = scratch("read_head");
+    std::fs::write(dir.join("f.txt"), "hello").unwrap();
+    let held = held(&dir);
+    let proven = held.open_regular(&name("f.txt")).unwrap();
+    assert_eq!(proven.read_head(cap(2)).unwrap(), b"he");
+    assert_eq!(
+        proven.id().unwrap(),
+        held.entry_id(&name("f.txt")).unwrap().unwrap()
+    );
+    let whole = held.open_regular(&name("f.txt")).unwrap();
+    assert_eq!(whole.read_head(cap(64)).unwrap(), b"hello");
+}
+
+/// A raw handle is classified from itself.
+#[test]
+fn a_raw_handle_is_classified_from_itself() {
+    let dir = scratch("kind_of_file");
+    std::fs::write(dir.join("f.txt"), "x").unwrap();
+    let file = std::fs::File::open(dir.join("f.txt")).unwrap();
+    assert_eq!(super::kind_of_file(&file).unwrap(), FileKind::Regular);
 }
 
 #[cfg(unix)]

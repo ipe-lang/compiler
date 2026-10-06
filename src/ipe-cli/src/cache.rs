@@ -893,16 +893,17 @@ impl CacheSite {
 
     /// The bytes of entry `file_name` under `epoch`, read through no symlink.
     ///
-    /// An in-output entry is read only from a marked, non-symlink output dir;
+    /// An in-output entry is read only from an output dir ipe owns now (a
+    /// genuine marker and no claim in flight, read through one held handle);
     /// every level below it (and below an explicit root) is opened from the
     /// held level above without following a link, and a symlink anywhere is a
     /// miss.
     fn read(&self, epoch: &str, file_name: &str) -> Option<Vec<u8>> {
         match self {
             Self::InOutput { out_dir, salt } => {
-                let marked = crate::output_dir::held::HeldDir::open(out_dir).ok()??;
-                read_in_marked(
-                    &marked,
+                let out = crate::output_dir::held::HeldDir::open(out_dir).ok()??;
+                read_in_owned(
+                    &out,
                     &[CACHE_DIR_NAME, salt.as_str(), epoch, file_name],
                     crate::io_bounded::BUILD_CACHE_ENTRY_CAP,
                 )
@@ -960,23 +961,24 @@ fn read_without_links(base: &Path, parts: &[&str], cap: u64) -> Option<Vec<u8>> 
     read_below(&HeldDir::open_root(base).ok()?, parts, cap)
 }
 
-/// Read `<parts...>` below the output dir `marked` holds, when that held dir carries the ownership marker.
+/// Read `<parts...>` below the output dir `out` holds, when ipe owns that held dir now.
 ///
-/// The marker is read through `marked`'s own handle, and the levels below
-/// are opened from a handle proven to be the same directory object as
-/// `marked` (equal identity while both are open), so an output dir swapped
-/// for a link or for another directory after it was held is a miss: the
-/// entry read sits in the directory whose marker was checked.
-fn read_in_marked(
-    marked: &crate::output_dir::held::HeldDir,
+/// Ownership is decided by [`crate::output_dir::held::HeldDir::owned_now`]
+/// on `out`'s own handle (a genuine marker and no claim in flight), and the
+/// levels below are opened from a handle proven to be the same directory
+/// object as `out` (equal identity while both are open), so an output dir
+/// swapped for a link or for another directory after it was held is a miss:
+/// the entry read sits in the directory whose ownership was checked.
+fn read_in_owned(
+    out: &crate::output_dir::held::HeldDir,
     parts: &[&str],
     cap: u64,
 ) -> Option<Vec<u8>> {
-    if !marked.has_marker().ok()? {
+    if out.owned_now().ok()? != crate::output_dir::held::OwnedNow::Owned {
         return None;
     }
-    let dir = HeldDir::open_root(marked.path()).ok()?;
-    if dir.id().ok()? != marked.id().ok()? {
+    let dir = HeldDir::open_root(out.path()).ok()?;
+    if dir.id().ok()? != out.id().ok()? {
         return None;
     }
     read_below(&dir, parts, cap)
@@ -2357,6 +2359,48 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// An in-output read misses while a claim is in flight and when the marker is a hard link.
+    #[test]
+    fn cache_read_misses_on_a_linked_marker_and_on_a_claim_in_flight() {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe-cache-claiming-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("make root");
+        let base = fs::canonicalize(&root).expect("canonicalize root");
+        let out = base.join("out");
+        crate::output_dir::OwnedDir::claim(&out).expect("claim out");
+        let entry = out
+            .join(CACHE_DIR_NAME)
+            .join("salt")
+            .join("epoch")
+            .join("raw.txt");
+        fs::create_dir_all(entry.parent().expect("entry dir")).expect("make entry dir");
+        fs::write(&entry, "hit").expect("plant entry");
+        let site = CacheSite::InOutput {
+            out_dir: out.clone(),
+            salt: "salt".to_owned(),
+        };
+        assert_eq!(site.read("epoch", "raw.txt").as_deref(), Some(&b"hit"[..]));
+
+        let claim = out.join(crate::output_dir::CLAIM_FILE);
+        fs::write(&claim, b"").expect("claim in flight");
+        assert!(
+            site.read("epoch", "raw.txt").is_none(),
+            "a claim in flight is a miss"
+        );
+        fs::remove_file(&claim).expect("drop the claim");
+
+        let marker = out.join(crate::output_dir::OWNERSHIP_MARKER);
+        let aside = base.join("marker-aside");
+        fs::rename(&marker, &aside).expect("move the marker aside");
+        fs::hard_link(&aside, &marker).expect("link the marker back");
+        assert!(
+            site.read("epoch", "raw.txt").is_none(),
+            "a hard-linked marker is a miss"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // -----------------------------------------------------------------
     // The lowered-IR cache tier
     // -----------------------------------------------------------------
@@ -3245,13 +3289,13 @@ mod tests {
         let marked = crate::output_dir::held::HeldDir::open(&out)
             .expect("hold out")
             .expect("out exists");
-        let unswapped = read_in_marked(&marked, &parts, 64);
+        let unswapped = read_in_owned(&marked, &parts, 64);
         fs::rename(&out, &aside).expect("move the held out dir aside");
         std::os::unix::fs::symlink(other.path(), &out).expect("plant a link at out");
-        let through_link = read_in_marked(&marked, &parts, 64);
+        let through_link = read_in_owned(&marked, &parts, 64);
         fs::remove_file(&out).expect("remove the link");
         fs::rename(other.path(), &out).expect("rename the other dir onto out");
-        let through_rename = read_in_marked(&marked, &parts, 64);
+        let through_rename = read_in_owned(&marked, &parts, 64);
         let _ = fs::remove_dir_all(&base);
 
         assert_eq!(unswapped.as_deref(), Some(&b"own"[..]));

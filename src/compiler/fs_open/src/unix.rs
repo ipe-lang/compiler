@@ -110,12 +110,26 @@ fn kind_of_type(file_type: std::fs::FileType) -> FileKind {
     }
 }
 
-/// The identity carried by `meta`.
-fn id_of(meta: &std::fs::Metadata) -> FileId {
-    FileId {
-        dev: meta.dev(),
-        ino: meta.ino(),
-    }
+/// The identity a `stat` carries, the one place a Unix [`FileId`] is built.
+///
+/// Every identity read (a handle, a path, a no-follow entry) goes through
+/// this one representation, so two reads of one object always compare
+/// equal. `dev_t` is signed on some Unixes; a negative device number names
+/// no object this crate compares, so it is refused.
+fn id_of_stat(stat: &rustix::fs::Stat) -> Result<FileId, OpenRefusal> {
+    let widen =
+        |raw: i128| u64::try_from(raw).map_err(|_| OpenRefusal::Io(io::ErrorKind::InvalidData));
+    Ok(FileId {
+        dev: widen(i128::from(stat.st_dev))?,
+        ino: widen(i128::from(stat.st_ino))?,
+    })
+}
+
+/// The identity of the object `file` holds.
+pub fn id_of_file(file: &File) -> Result<FileId, OpenRefusal> {
+    rustix::fs::fstat(file)
+        .map_err(refusal)
+        .and_then(|stat| id_of_stat(&stat))
 }
 
 /// The kind and length of the object `file` holds, read from that handle.
@@ -133,9 +147,9 @@ pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
 
 /// The identity of the object looking `path` up now reaches, following links.
 pub fn id_of_path(path: &Path) -> Result<FileId, OpenRefusal> {
-    std::fs::metadata(path)
-        .map(|meta| id_of(&meta))
-        .map_err(|e| refusal_of(&e))
+    rustix::fs::stat(path)
+        .map_err(refusal)
+        .and_then(|stat| id_of_stat(&stat))
 }
 
 /// Open the path the invoking user named, following links, without blocking.
@@ -197,6 +211,15 @@ impl Dir {
         }
     }
 
+    /// The identity of the entry `name`, read without following a link; `None` when absent.
+    pub fn entry_id(&self, name: &EntryName) -> Result<Option<FileId>, OpenRefusal> {
+        match rustix::fs::statat(&self.0, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => id_of_stat(&stat).map(Some),
+            Err(errno) if errno == Errno::NOENT => Ok(None),
+            Err(errno) => Err(refusal(errno)),
+        }
+    }
+
     /// The target the link `name` stores, read on the held handle.
     ///
     /// An entry that is not a link answers `EINVAL`; it is classified by a
@@ -238,10 +261,7 @@ impl Dir {
 
     /// The identity of this directory.
     pub fn id(&self) -> Result<FileId, OpenRefusal> {
-        self.0
-            .metadata()
-            .map(|meta| id_of(&meta))
-            .map_err(|e| refusal_of(&e))
+        id_of_file(&self.0)
     }
 
     /// Refuse a held directory that was removed: its listing reads as empty, its link count as zero.

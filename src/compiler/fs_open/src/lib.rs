@@ -233,6 +233,36 @@ impl FileId {
     pub fn of_path(path: &Path) -> Result<Self, OpenRefusal> {
         sys::id_of_path(path)
     }
+
+    /// The identity of the object the open `file` holds.
+    ///
+    /// # Errors
+    /// The refusal of a handle that cannot be stat'd.
+    pub fn of_file(file: &File) -> Result<Self, OpenRefusal> {
+        sys::id_of_file(file)
+    }
+}
+
+/// How many directory entries name the object the open `file` holds.
+///
+/// A file reached by a reserved name is believed only when this is one: a
+/// hard link planted at the name shares its object with another entry.
+///
+/// # Errors
+/// The refusal of a handle that cannot be stat'd.
+pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
+    sys::link_count(file)
+}
+
+/// What the open `file` holds, read from that handle.
+///
+/// For a handle a caller must keep as a [`File`] (one it locks, for
+/// instance) and so cannot hand to [`RegularFile::prove`].
+///
+/// # Errors
+/// The refusal of a handle that cannot be stat'd.
+pub fn kind_of_file(file: &File) -> Result<FileKind, OpenRefusal> {
+    sys::kind_and_len(file).map(|(kind, _)| kind)
 }
 
 /// An open directory handle every entry act is relative to.
@@ -311,6 +341,15 @@ impl HeldDir {
     /// The refusal of a failure other than absence.
     pub fn kind_of(&self, name: &EntryName) -> Result<Option<FileKind>, OpenRefusal> {
         self.dir.kind_of(name)
+    }
+
+    /// The identity of the entry `name`, read without following a link; `None` when absent.
+    ///
+    /// # Errors
+    /// The refusal of a failure other than absence; on Windows
+    /// [`OpenRefusal::Denied`] for an entry pending deletion.
+    pub fn entry_id(&self, name: &EntryName) -> Result<Option<FileId>, OpenRefusal> {
+        self.dir.entry_id(name)
     }
 
     /// The target the link `name` stores, read relative to this handle; never followed.
@@ -454,6 +493,14 @@ impl RegularFile {
         }
     }
 
+    /// The identity of the object this handle holds.
+    ///
+    /// # Errors
+    /// The refusal of a handle that cannot be stat'd.
+    pub fn id(&self) -> Result<FileId, OpenRefusal> {
+        sys::id_of_file(&self.file)
+    }
+
     /// How many directory entries name this file now; more than one is a hard link.
     ///
     /// # Errors
@@ -511,8 +558,19 @@ impl RegularFile {
     /// # Errors
     /// [`OpenRefusal::Io`] on a read failure.
     pub fn read_prefix(self, cap: ByteCap) -> Result<Vec<u8>, OpenRefusal> {
+        self.read_head(cap)
+    }
+
+    /// At most the next `cap` bytes, keeping the handle for an identity re-read.
+    ///
+    /// Read from where the handle stands: from the start on a fresh proof.
+    /// A longer file is not refused.
+    ///
+    /// # Errors
+    /// [`OpenRefusal::Io`] on a read failure.
+    pub fn read_head(&self, cap: ByteCap) -> Result<Vec<u8>, OpenRefusal> {
         let mut head = Vec::new();
-        self.file
+        (&self.file)
             .take(cap.get())
             .read_to_end(&mut head)
             .map_err(|e| OpenRefusal::Io(e.kind()))?;
