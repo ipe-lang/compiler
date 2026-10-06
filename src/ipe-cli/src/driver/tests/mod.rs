@@ -1822,7 +1822,7 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
     );
     assert_eq!(cold_outcome, CacheOutcome::Miss);
     assert!(
-        crate::output_dir::has_marker(&out).unwrap_or(false),
+        crate::output_dir::owned_at(&out).unwrap_or(false),
         "the fresh output dir must be claimed (marked) by the build"
     );
     assert!(
