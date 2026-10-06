@@ -3310,7 +3310,7 @@ impl<'a> EmitCtx<'a> {
     /// argument renders as that function's Rust generic (`RecValue<T1>`).
     ///
     /// The prepass collected every `IrType::Record` reachable from a signature,
-    /// so a miss here is an internal invariant violation (IPE-I0204).
+    /// so a miss here is an internal invariant violation (IPE-I0001).
     fn render_record_use(
         &self,
         fields: &BTreeMap<Symbol, IrType>,
@@ -3369,7 +3369,7 @@ impl<'a> EmitCtx<'a> {
     /// literal's solved [`IrType::Record`] shape threaded from the lowerer.
     ///
     /// A miss means the literal's shape never appeared in a signature — a
-    /// lowerer-contract violation (IPE-I0204), surfaced rather than mis-emitted.
+    /// lowerer-contract violation (IPE-I0001), surfaced rather than mis-emitted.
     fn record_name_for_literal(
         &self,
         field_names: &[String],
@@ -3462,7 +3462,7 @@ impl<'a> EmitCtx<'a> {
     ///   invariant violation, never a silent pick.
     ///
     /// A miss (no struct for the set) means the shape never appeared in a
-    /// signature — a lowerer-contract violation (IPE-I0204).
+    /// signature — a lowerer-contract violation (IPE-I0001).
     fn record_struct_by_key(
         &self,
         key: &[String],
@@ -4793,7 +4793,7 @@ fn skeleton_ty(ty: &IrType, idx: &mut BTreeMap<Symbol, usize>, out: &mut String)
 ///
 /// A mismatch means a use site that does not instantiate the struct template —
 /// an upstream-contract violation surfaced as a [`Diagnostic::CompilerBug`]
-/// (IPE-I0205), never a silent mis-emit.
+/// (IPE-I0001), never a silent mis-emit.
 #[allow(clippy::too_many_lines)]
 fn match_template(
     template: &IrType,
