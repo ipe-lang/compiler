@@ -3,7 +3,8 @@
 //! Every build product (`build`, `run`, `watch`, `release`, the `doc` site, the
 //! bundle packager, a recorded session) lands inside a directory this module has
 //! proven ipe owns. Ownership is explicit on disk: an [`OWNERSHIP_MARKER`] file
-//! ipe writes when it creates (or claims an empty) directory. A directory that
+//! ipe writes when it claims an output root or a product area of one, created
+//! or found empty. A directory that
 //! already holds anything but carries no marker is user territory and is
 //! refused — ipe never cleans, prunes, or overwrites inside it.
 //!
@@ -29,10 +30,13 @@
 //!   down; the levels above the anchor are not ipe's and are opened following
 //!   links, so disjointness is proven again on the anchor's canonical path. The
 //!   root itself and the leaf area are always claimed (created and marked, or
-//!   adopted). The anchor below the root, the levels above the root, and the
-//!   areas between root and leaf are entered: each passes the one claim
-//!   decision before anything is created inside it, unless it already holds
-//!   user entries, in which case it is passed through unmarked.
+//!   adopted). The anchor below the root and the levels above the root are
+//!   never the output: each is held as found or created as a plain directory,
+//!   and is never marked, so a marker always means "an output root or an area
+//!   of one", never "a directory ipe passed through". The areas between root
+//!   and leaf lie inside the claimed root: each passes the one claim decision
+//!   before anything is created inside it, unless it already holds user
+//!   entries, in which case it is passed through unmarked.
 //!
 //! A tree ipe hands over to the user (`ipe release eject`) goes through [`HandoverRoot`]
 //! and [`HandoverDir`] instead: it must lie outside every tree ipe owns or may
@@ -335,8 +339,8 @@ pub struct OwnedDir {
 impl OwnedDir {
     /// Claim `path` for ipe output.
     ///
-    /// - Absent: created — with every missing ancestor — and each directory ipe
-    ///   creates gets the marker.
+    /// - Absent: created — with every missing ancestor, each a plain unmarked
+    ///   directory — and marked.
     /// - Present, empty: claimed, and the marker written.
     /// - Present with the marker: already ipe's.
     /// - Anything else — a symlink, a file, a non-empty unmarked directory — is
@@ -481,8 +485,8 @@ fn claim_owned(path: ProvenOutPath) -> Result<OwnedDir, CliError> {
 
 /// Claim `path` without a disjointness proof, returning the claimed directory's handle.
 ///
-/// Only `path` itself is claimed; each missing ancestor is entered as
-/// [`enter_in`] enters it. Each level is opened relative to its held parent
+/// Only `path` itself is claimed; each missing ancestor is created as
+/// [`pass_in`] creates it. Each level is opened relative to its held parent
 /// without following a link. The path carries no `..` or `.`, so each parent
 /// opened is the lexical one on every platform.
 #[cfg(test)]
@@ -497,7 +501,7 @@ fn claim_held(path: &ProvenOutPath) -> Result<held::HeldDir, CliError> {
     claim_in(&hold_level(&parent_path)?, name)
 }
 
-/// Hold the ancestor `path` of a claim, creating and marking each missing level.
+/// Hold the ancestor `path` of a claim, creating each missing level unmarked.
 ///
 /// An existing level is held as it is, never inspected for ownership. The
 /// recursion is bounded by the path's component count.
@@ -509,7 +513,7 @@ fn hold_level(path: &ProvenOutPath) -> Result<held::HeldDir, CliError> {
     let (Some(name), Some(parent_path)) = (path.as_path().file_name(), path.parent()) else {
         return Err(OutputRefusal::ParentTraversal(path.as_path().to_path_buf()).into());
     };
-    enter_in(&hold_level(&parent_path)?, name)
+    pass_in(&hold_level(&parent_path)?, name)
 }
 
 /// Where the output root sits relative to the held anchor of a claim.
@@ -523,9 +527,9 @@ enum RootStep<'a> {
 
 /// The levels of an area claim below its held anchor, each with its ownership step.
 ///
-/// The anchor and the levels above the root are entered (an ancestor holding
-/// user entries is never adopted), the root is always claimed, the areas
-/// above the leaf are entered, and the leaf area is claimed. With no areas
+/// The anchor and the levels above the root are held unmarked (they are never
+/// the output), the root is always claimed, the areas above the leaf are
+/// entered, and the leaf area is claimed. With no areas
 /// the root is the leaf. The root's step is a field of its own, so no claim
 /// can reach an area without claiming the root.
 #[derive(Debug)]
@@ -565,9 +569,9 @@ impl<'a> ClaimPlan<'a> {
                 anchor
             }
             RootStep::Named(name) => {
-                let mut dir = enter_held(anchor)?;
+                let mut dir = anchor;
                 for level in self.above_root {
-                    dir = enter_in(&dir, level)?;
+                    dir = pass_in(&dir, level)?;
                     held::level_held(dir.path());
                 }
                 let root = claim_in(&dir, name)?;
@@ -588,7 +592,20 @@ impl<'a> ClaimPlan<'a> {
     }
 }
 
-/// Enter the intermediate level `name` of the held `parent`, created when absent, as [`enter_held`] enters it.
+/// Hold the level `name` above an output root, created as a plain directory when absent.
+///
+/// Such a level is never the output, so it is never claimed or marked,
+/// whether this claim created it or found it (empty or not): ownership is
+/// the role a claim gives a directory, never the fact that ipe made it. A
+/// level ipe created and a level the user made therefore stay alike, and a
+/// later claim naming either as its root decides it from its entries alone.
+/// A link or a non-directory is refused.
+fn pass_in(parent: &held::HeldDir, name: &std::ffi::OsStr) -> Result<held::HeldDir, CliError> {
+    let (dir, _created) = parent.create_child(name)?;
+    Ok(dir)
+}
+
+/// Enter the area `name` above the leaf, inside the claimed root, created when absent, as [`enter_held`] enters it.
 ///
 /// A link or a non-directory is refused.
 fn enter_in(parent: &held::HeldDir, name: &std::ffi::OsStr) -> Result<held::HeldDir, CliError> {
@@ -596,16 +613,16 @@ fn enter_in(parent: &held::HeldDir, name: &std::ffi::OsStr) -> Result<held::Held
     enter_held(dir)
 }
 
-/// Pass the held level `dir` through its one claim decision before anything is created inside it.
+/// Pass the held area `dir` of a claimed root through its one claim decision before anything is created inside it.
 ///
-/// A level holding user entries is traversed unmarked, never adopted. Every
-/// other level (empty, being claimed, or marked; created by this claim, by a
+/// An area holding user entries is traversed unmarked, never adopted. Every
+/// other area (empty, being claimed, or marked; created by this claim, by a
 /// concurrent one, or found so) goes through [`held::HeldDir::claim`] first:
-/// no claimant fills a level whose claim is still checking it empty, whether
-/// the claimant entered the level or holds it as its anchor, so sibling
-/// claims under one shared level never refuse or unmark each other. A level
-/// the claim finds filled by another program is user territory and is
-/// traversed unmarked.
+/// one claim's area above its leaf can be another claim's leaf, and no
+/// claimant fills an area whose claim is still checking it empty, so sibling
+/// claims under one root never refuse or unmark each other. An empty area is
+/// marked: it lies inside a root that is already ipe's. An area the claim
+/// finds filled by another program is traversed unmarked.
 fn enter_held(dir: held::HeldDir) -> Result<held::HeldDir, CliError> {
     if dir.ownership()? == held::Ownership::User {
         return Ok(dir);
@@ -1144,12 +1161,13 @@ impl OutputRoot {
     /// Claim a (possibly nested) product area for writing now.
     ///
     /// The disjointness proof is taken again on the held handle of the
-    /// deepest existing level, and every missing level is created and marked
-    /// through the handle above it — a level swapped after the proof cannot
-    /// redirect the claim into the project. The root and the leaf area are
-    /// claimed — created or existing, and marked — through a `ClaimPlan`;
-    /// the anchor below the root, the levels above the root, and the areas
-    /// between root and leaf are entered as `enter_held` enters them.
+    /// deepest existing level, and every missing level is created through the
+    /// handle above it — a level swapped after the proof cannot redirect the
+    /// claim into the project. The root and the leaf area are claimed —
+    /// created or existing, and marked — through a `ClaimPlan`; the anchor
+    /// below the root and the levels above the root are held unmarked as
+    /// `pass_in` holds them, and the areas between root and leaf are entered
+    /// as `enter_held` enters them.
     ///
     /// # Errors
     /// As [`OutputRoot::area_path`] and [`OutputRoot::resolve`];
@@ -1401,7 +1419,7 @@ impl HandoverRoot {
 /// A claimed handover destination whose ancestors carry no marker ipe wrote.
 ///
 /// The only way to give a directory back to the user: an ordinary [`OwnedDir`]
-/// may have marked the ancestors it created, and releasing it would leave the
+/// may be an area of a marked output root, and releasing it would leave the
 /// released tree inside an ipe-owned one.
 #[derive(Debug)]
 pub struct HandoverDir(OwnedDir);
@@ -2794,10 +2812,10 @@ mod tests {
         (created, first, other)
     }
 
-    /// A sibling entering a level another claim created waits for that claim before filling the level.
+    /// A sibling entering an area another claim created waits for that claim before filling the area.
     ///
-    /// The creator holds the level's claim lock while the sibling enters the
-    /// same level and creates a child in it; the sibling must meet the held
+    /// The creator holds the area's claim lock while the sibling enters the
+    /// same area and creates a child in it; the sibling must meet the held
     /// lock first, so the creator's emptiness check never sees the child.
     #[test]
     fn a_sibling_entering_a_created_level_waits_for_its_claim() {
@@ -2832,22 +2850,62 @@ mod tests {
         assert!(other.is_ok(), "the sibling enters, got {other:?}");
         assert!(
             owned_at(&level).expect("read ownership"),
-            "the created level is ipe's"
+            "the created area is ipe's"
         );
         assert!(level.join("child").is_dir(), "the sibling's child is kept");
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A sibling whose claim is anchored at a level another claim is still claiming waits for that claim.
+    /// An area one claim enters above its leaf, while another claims it as its leaf, waits for that claim.
     ///
-    /// The sibling resolves after the creator made the level, so the level
-    /// is the held anchor of the sibling's claim rather than a level it
-    /// enters. It must still meet the creator's held claim lock before it
-    /// creates its root inside, so the creator's emptiness check never sees
-    /// that root and the shared level ends marked.
+    /// `release/` is the leaf of one claim and the area above the leaf of
+    /// another. The sibling starts while the creator holds the claim lock of
+    /// `release/`, and must meet that lock before it creates its own leaf
+    /// inside, so the creator's emptiness check never sees that leaf.
     #[test]
-    fn a_sibling_anchored_at_a_claiming_level_waits_for_its_claim() {
-        let base = scratch("sibling_anchor_wait");
+    fn an_area_another_claim_takes_as_its_leaf_waits_for_that_claim() {
+        let base = scratch("area_leaf_wait");
+        let proj = project(&base);
+        let out = OutputRoot::resolve(Some(&base.join("out").to_string_lossy()), &proj)
+            .expect("resolve the root");
+        out.claim().expect("claim the root");
+        let sibling = out.clone();
+        let (claimed, first, other) = race_at_first_lock(
+            || out.claim_area(&[OutputArea::Release]),
+            move || {
+                sibling
+                    .claim_area(&[OutputArea::Release, OutputArea::Bundle])
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}"))
+            },
+        );
+        assert_eq!(
+            first,
+            Some(SiblingSeen::Busy),
+            "the sibling meets the held claim lock before it fills the area"
+        );
+        assert!(claimed.is_ok(), "the leaf claim succeeds, got {claimed:?}");
+        assert!(other.is_ok(), "the nested claim succeeds, got {other:?}");
+        let release = base.join("out").join(OutputArea::Release.dir_name());
+        for owned in [&release, &release.join(OutputArea::Bundle.dir_name())] {
+            assert!(
+                owned_at(owned).expect("read ownership"),
+                "{} is ipe's",
+                owned.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Sibling claims sharing a level above their roots never claim that level, so neither waits on the other there.
+    ///
+    /// The sibling starts while the creator holds the claim lock of its
+    /// root. The shared level above both roots is never the output, so the
+    /// sibling holds it unmarked and its first claim lock is its own root's,
+    /// never one the creator holds; the shared level ends unmarked.
+    #[test]
+    fn sibling_claims_sharing_a_level_above_their_roots_never_claim_it() {
+        let base = scratch("sibling_shared_level");
         let proj = project(&base);
         let level = base.join("level");
         let creator = OutputRoot::resolve(Some(&level.join("a").to_string_lossy()), &proj)
@@ -2864,16 +2922,71 @@ mod tests {
         );
         assert_eq!(
             first,
-            Some(SiblingSeen::Busy),
-            "the sibling meets the held claim lock before it fills the level"
+            Some(SiblingSeen::Done),
+            "the sibling never meets the creator's claim lock"
         );
         assert!(claimed.is_ok(), "the creator claims, got {claimed:?}");
         assert!(other.is_ok(), "the sibling claims, got {other:?}");
-        for owned in [&level, &level.join("a"), &level.join("b")] {
+        for root in [&level.join("a"), &level.join("b")] {
             assert!(
-                owned_at(owned).expect("read ownership"),
+                owned_at(root).expect("read ownership"),
                 "{} is ipe's",
-                owned.display()
+                root.display()
+            );
+        }
+        assert!(
+            !level.join(OWNERSHIP_MARKER).exists(),
+            "the shared level is not marked"
+        );
+        assert!(
+            !level.join(CLAIM_FILE).exists(),
+            "no claim file is left on the shared level"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A level above a root, created by the claim or found empty, is never marked, so naming it later as a root decides it from its entries.
+    ///
+    /// The user fills the level after the claim and names it as the output
+    /// root: it holds user files and no marker, so it is refused, and the
+    /// user's files are untouched.
+    #[test]
+    fn a_level_above_a_root_is_never_marked_nor_adopted_later() {
+        let base = scratch("level_above_root");
+        let proj = project(&base);
+        for (tag, found) in [("created", false), ("found-empty", true)] {
+            let level = base.join(tag);
+            if found {
+                std::fs::create_dir(&level).expect("the user's empty level");
+            }
+            OutputRoot::resolve(Some(&level.join("a").to_string_lossy()), &proj)
+                .and_then(|root| root.claim())
+                .expect("claim the root below the level");
+            assert!(
+                !level.join(OWNERSHIP_MARKER).exists(),
+                "{tag}: the level is not marked"
+            );
+            assert!(
+                !level.join(CLAIM_FILE).exists(),
+                "{tag}: no claim file is left on the level"
+            );
+            let notes = level.join("src").join("notes.txt");
+            std::fs::create_dir(level.join("src")).expect("the user fills the level");
+            std::fs::write(&notes, "mine").expect("user file");
+            let named = OutputRoot::resolve(Some(&level.to_string_lossy()), &proj)
+                .and_then(|root| root.claim());
+            assert!(
+                matches!(refused(&named), Some(OutputRefusal::NotIpeOwned(_))),
+                "{tag}: the filled level named as the root is refused, got {named:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(notes).ok().as_deref(),
+                Some("mine"),
+                "{tag}: the user's file is kept"
+            );
+            assert!(
+                !level.join(OWNERSHIP_MARKER).exists(),
+                "{tag}: the refused level stays unmarked"
             );
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -4483,8 +4596,8 @@ mod tests {
                 );
             }
             assert!(
-                owned_at(&shared).expect("shared marker"),
-                "round {round}: the shared parent one claim created is marked"
+                !shared.join(OWNERSHIP_MARKER).exists() && !shared.join(CLAIM_FILE).exists(),
+                "round {round}: the shared parent above the roots is left unmarked"
             );
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -4510,7 +4623,7 @@ mod tests {
         assert!(owned_at(&shared.join("a")).expect("leaf marker"));
         assert!(
             !shared.join(OWNERSHIP_MARKER).exists(),
-            "a level this claim did not create is left unmarked"
+            "a level above the root is left unmarked"
         );
         assert_eq!(
             std::fs::read_to_string(sibling.join("f.txt"))
