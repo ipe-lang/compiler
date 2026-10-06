@@ -448,7 +448,7 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     // its `["Html"]` type home folded so a qualified `Attr.Attribute` lowers to
     // `html::Attribute`.
     let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    fold_html_stdlib_qualifier_homes(&m.imports, &mut qualifier_paths, interner)?;
+    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
     // The bare single-module entry is always ordinary USER source: the trust tag
     // can only be raised via `canonicalise_module_with_origin`.
     // The single-module entry does not build a `ModuleExports`, so the kernel-
@@ -731,75 +731,27 @@ pub fn canonicalise_module_in_project(
         }
     }
 
-    // Build qualifier → dep-path map so `TType(qualifier, …)` annotations in
-    // type sigs resolve `home` from the dep path, not from the bare type
-    // namespace.  Example: `import Counter` with no `exposing` clause
-    // binds no bare type, so without this map `Counter.Msg`
-    // would look up "Msg" and find the LOCAL `type Msg` instead of Counter's.
-    //
-    // Qualifier = explicit `as Alias` if present, else last segment of the
-    // module path — mirrors `inject_dep_exports`'s `env.qual_vars` logic.
-    let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    // Each qualifier's first-seen import span, so a clash (below) points back
-    // to it like `DuplicateValue`/`DuplicateType`'s `first` field.
-    let mut qualifier_first_span: BTreeMap<Symbol, Span> = BTreeMap::new();
-    for import in &m.imports {
-        let dep_path = &import.name.value;
-        // Skip stdlib kernel imports (not in `deps`).
-        if dep_path.first().copied().is_some_and(|s| s == ipe_sym) && !deps.contains_key(dep_path) {
+    // The type home and dependency aliases of each qualifier, read from the
+    // owner `Env::install_import` decided for it, so a qualified type reaches
+    // exactly the module its qualified values reach.
+    let mut qualifier_paths = source_qualifier_homes(&env);
+    for (&qualifier, path) in &qualifier_paths {
+        let Some(dep) = deps.get(path) else {
             continue;
-        }
-        // Qualifiers this import is reachable under (see `import_qualifiers`).
-        let reachable_qualifiers = import_qualifiers(import.alias, dep_path, interner)?;
-        for qualifier in reachable_qualifiers {
-            // `import App.Utils` + `import Lib.Utils` (both default to the
-            // qualifier `Utils`), or one `as` alias over two distinct dep
-            // modules, is a clash: a qualified `Utils.format` would otherwise
-            // name whichever import came last. Re-importing the SAME dep module
-            // under the same qualifier (a diamond dependency) is a no-op,
-            // matching the module scope's rule for one definition bound twice.
-            if let Some(existing_path) = qualifier_paths.get(&qualifier) {
-                if existing_path != dep_path {
-                    let qualifier_s = name_str(interner, qualifier)?;
-                    let first = qualifier_first_span
-                        .get(&qualifier)
-                        .copied()
-                        .unwrap_or(import.name.span);
-                    return Err(Diagnostic::Name {
-                        span: import.name.span,
-                        msg: NameError::DuplicateQualifier {
-                            qualifier: qualifier_s,
-                            first,
-                        },
-                    });
-                }
-                continue;
-            }
-            qualifier_paths.insert(qualifier, dep_path.clone());
-            qualifier_first_span.insert(qualifier, import.name.span);
-
-            // Register every exported alias of the dep under a synthetic
-            // `Qualifier.Name` key so a QUALIFIED annotation (`Money.Price`)
-            // expands the alias exactly as an `exposing`-injected one would —
-            // qualified access needs no exposure, and the qualified key can never
-            // collide with a bare local name (bare symbols carry no dot).
-            if let Some(dep) = deps.get(dep_path) {
-                let qualifier_s = name_str(interner, qualifier)?;
-                for (&alias_name, ea) in &dep.aliases {
-                    let alias_s = name_str(interner, alias_name)?;
-                    let key = interner.intern(&format!("{qualifier_s}.{alias_s}"))?;
-                    qualified_aliases.entry(key).or_insert_with(|| ea.clone());
-                }
-            }
+        };
+        // Every exported alias of the dep registers under a synthetic
+        // `Qualifier.Name` key so a qualified annotation (`Money.Price`)
+        // expands the alias exactly as an `exposing`-injected one would; the
+        // qualified key never collides with a bare local name (bare symbols
+        // carry no dot).
+        let qualifier_s = name_str(interner, qualifier)?;
+        for (&alias_name, ea) in &dep.aliases {
+            let alias_s = name_str(interner, alias_name)?;
+            let key = interner.intern(&format!("{qualifier_s}.{alias_s}"))?;
+            qualified_aliases.entry(key).or_insert_with(|| ea.clone());
         }
     }
-
-    // Fold Html-family STDLIB import qualifiers into `qualifier_paths` (→
-    // `["Html"]`) so a qualified `Attr.Attribute` (`import Ipe.Html.Attributes as
-    // Attr`) resolves to the `html::Attribute` home. Runs AFTER the
-    // user-dep loop so a user qualifier that also names a Html dep keeps its real
-    // dep path (`entry(..).or_insert` inside the helper is a no-op on a hit).
-    fold_html_stdlib_qualifier_homes(&m.imports, &mut qualifier_paths, interner)?;
+    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
 
     let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
         m,
@@ -2517,6 +2469,7 @@ fn bind_html_type_home(
 /// [`Diagnostic::CompilerBug`] if interning `Html` exhausts the interner.
 fn fold_html_stdlib_qualifier_homes(
     imports: &[src::Import],
+    env: &Env,
     qualifier_paths: &mut BTreeMap<Symbol, Vec<Symbol>>,
     interner: &mut Interner,
 ) -> DResult<()> {
@@ -2534,6 +2487,11 @@ fn fold_html_stdlib_qualifier_homes(
         let qualifier = import
             .alias
             .unwrap_or_else(|| dep_path.last().copied().unwrap_or_else(name_zero));
+        // The spelling must denote this import's module: one another import
+        // owns, or one left ambiguous, takes no home from this import.
+        if !owned_by_import(env, qualifier, dep_path, interner)? {
+            continue;
+        }
         // Register the qualifier's REAL dep path (or the bare `["Html"]` builtin
         // home for a builtin-only module such as `Ipe.Html` that carries no
         // compiled source). The `TType` consumer force-homes the builtin
@@ -2558,6 +2516,41 @@ fn fold_html_stdlib_qualifier_homes(
         }
     }
     Ok(())
+}
+
+/// The dependency path of every spelling a source module owns in `env`'s scope.
+///
+/// Read from [`crate::env::ImportScope::qualifier_owner`], the one record of
+/// which module each spelling denotes, so a spelling a kernel import owns or
+/// one left ambiguous carries no dependency home.
+fn source_qualifier_homes(env: &Env) -> BTreeMap<Symbol, Vec<Symbol>> {
+    env.import_scope
+        .qualifier_owner
+        .iter()
+        .filter_map(|(&spelling, claim)| match &claim.owner {
+            ModuleIdentity::Source(path) => Some((spelling, path.clone())),
+            ModuleIdentity::Kernel(_) => None,
+        })
+        .collect()
+}
+
+/// Whether `spelling` is owned in `env`'s scope by the module `dep_path` names.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if interning a canonical exhausts the interner.
+fn owned_by_import(
+    env: &Env,
+    spelling: Symbol,
+    dep_path: &[Symbol],
+    interner: &mut Interner,
+) -> DResult<bool> {
+    let Some(claim) = env.import_scope.qualifier_owner.get(&spelling) else {
+        return Ok(false);
+    };
+    Ok(match &claim.owner {
+        ModuleIdentity::Source(path) => path.as_slice() == dep_path,
+        ModuleIdentity::Kernel(module) => env.kernel_module(dep_path, interner)? == Some(*module),
+    })
 }
 
 /// The canonical module, its kernel aliases, and its own aliases resolved in its scope.

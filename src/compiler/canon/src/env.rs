@@ -704,12 +704,17 @@ enum ClaimVerdict {
 }
 
 /// Decide how `new` relates to `installed` on one spelling.
+///
+/// `shape` is the TEA shape the module imports, if any.
 fn claim_verdict(
     installed: &QualifierClaim,
     new: &QualifierClaim,
+    shape: Option<TeaShape>,
     interner: &Interner,
 ) -> ClaimVerdict {
-    if installed.owner == new.owner || same_cmd_sub_family(&installed.owner, &new.owner, interner) {
+    if installed.owner == new.owner
+        || same_cmd_sub_family(&installed.owner, &new.owner, shape, interner)
+    {
         return ClaimVerdict::Same;
     }
     match (installed.form, new.form) {
@@ -723,20 +728,32 @@ fn claim_verdict(
     }
 }
 
-/// `true` when both owners are shape-scoped modules of one `Cmd` / `Sub` family.
+/// `true` when both owners are `Cmd` / `Sub` modules of one family that the
+/// imported `shape` admits.
 ///
-/// Every such module re-exports the same canonical member set, and which of
-/// them a shape may import is refused earlier (IPE-N0035), so two admitted
-/// ones under one spelling denote the same members.
-fn same_cmd_sub_family(a: &ModuleIdentity, b: &ModuleIdentity, interner: &Interner) -> bool {
-    let family = |owner: &ModuleIdentity| match owner {
+/// The modules a shape admits are one effect surface (its own row plus the
+/// shared `Terminal` row), so two of them under one spelling denote that
+/// surface. With no shape import nothing admits two different modules: each
+/// shape owns members the others lack (`Ipe.Tea.Tui.Sub.onKey`), so they are
+/// different modules and the spelling is decided like any other.
+fn same_cmd_sub_family(
+    a: &ModuleIdentity,
+    b: &ModuleIdentity,
+    shape: Option<TeaShape>,
+    interner: &Interner,
+) -> bool {
+    let Some(shape) = shape else {
+        return false;
+    };
+    let admitted = |owner: &ModuleIdentity| match owner {
         ModuleIdentity::Kernel(module) => interner
             .resolve(module.symbol())
             .and_then(cmd_sub_module)
+            .filter(|&(segment, _)| shape.admits_cmd_sub_of(segment))
             .map(|(_, family)| family),
         ModuleIdentity::Source(_) => None,
     };
-    family(a).is_some_and(|fa| family(b) == Some(fa))
+    admitted(a).is_some_and(|fa| admitted(b) == Some(fa))
 }
 
 /// The members one import installs under one spelling.
@@ -1846,6 +1863,7 @@ impl Env {
         let scope = Rc::make_mut(&mut self.import_scope);
         scope.imported_modules.insert(claim.owner.clone());
         let installed_span = scope.qualifier_owner.get(&spelling).map(|c| c.span);
+        let shape = scope.cmd_sub_shape.map(|(shape, _)| shape);
         let verdict = if scope.ambiguous.contains_key(&spelling) {
             if claim.form == ClaimForm::Alias {
                 scope.ambiguous.remove(&spelling);
@@ -1858,7 +1876,7 @@ impl Env {
                 .qualifier_owner
                 .get(&spelling)
                 .map_or(ClaimVerdict::Replace, |installed| {
-                    claim_verdict(installed, &claim, interner)
+                    claim_verdict(installed, &claim, shape, interner)
                 })
         };
         let earlier = installed_span.map_or(claim.span, |s| s.min(claim.span));

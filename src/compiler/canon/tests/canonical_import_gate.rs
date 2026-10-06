@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use ipe_canon::ast::{Def, Module, Type};
 use ipe_canon::{ModuleCatalog, ModuleExports, ModuleOrigin, canonicalise_module_in_project};
 use ipe_diagnostics::{DResult, Diagnostic, NameError};
 use ipe_intern::{Interner, Symbol};
@@ -17,19 +18,26 @@ const USER_AUTH: &str = "module Auth exposing (..)\n\nx : Int\nx =\n    1\n";
 const APP_AUTH: &str = "module App.Auth exposing (..)\n\nx : Int\nx =\n    1\n";
 const USER_WEB: &str = "module Web exposing (..)\n\nx : Int\nx =\n    1\n";
 const USER_CMD: &str = "module Cmd exposing (..)\n\nx : Int\nx =\n    1\n";
+const APP_AUTH_TYPE: &str = "module App.Auth exposing (..)\n\ntype T\n    = T\n";
 
 /// Canonicalise `sources` in order, each seeing the exports of every module
 /// before it; the first error, or `Ok` when every module canonicalises.
 fn run(sources: &[&str], catalog: &[&str]) -> DResult<()> {
+    run_last(sources, catalog).map(|_| ())
+}
+
+/// As [`run`], yielding the last module's canonical form and the interner.
+fn run_last(sources: &[&str], catalog: &[&str]) -> DResult<Option<(Module, Interner)>> {
     let catalog = ModuleCatalog::new(catalog.iter().map(|m| Box::<str>::from(*m)));
     let mut interner = Interner::new();
     let mut deps: BTreeMap<Vec<Symbol>, ModuleExports> = BTreeMap::new();
+    let mut last = None;
     for src in sources {
         let parsed = ipe_parse::parse_module(src, &mut interner)?;
         let expected = parsed.name.value.clone();
         let borrowed: BTreeMap<Vec<Symbol>, &ModuleExports> =
             deps.iter().map(|(k, v)| (k.clone(), v)).collect();
-        let (_, exports) = canonicalise_module_in_project(
+        let (module, exports) = canonicalise_module_in_project(
             &parsed,
             &expected,
             &borrowed,
@@ -38,8 +46,9 @@ fn run(sources: &[&str], catalog: &[&str]) -> DResult<()> {
             &mut interner,
         )?;
         deps.insert(exports.path.clone(), exports);
+        last = Some(module);
     }
-    Ok(())
+    Ok(last.map(|module| (module, interner)))
 }
 
 /// `module Main exposing (y)`, then `imports`, then `y = body`.
@@ -249,4 +258,79 @@ fn ipe_dotted_spelling_without_import_is_n0034() {
         matches!(&result, Err(diag) if diag.code().as_str() == "IPE-N0034"),
         "{result:?}"
     );
+}
+
+/// The module path of the annotation head of `name` in `module`, if `name` is
+/// a typed definition whose annotation is a named type.
+fn annotation_home(module: &Module, interner: &Interner, name: &str) -> Option<Vec<String>> {
+    let ty = module.defs.iter().find_map(|def| match def {
+        Def::Typed { name: n, ty, .. } if interner.resolve(n.value) == Some(name) => Some(ty),
+        Def::Typed { .. } | Def::Untyped { .. } => None,
+    })?;
+    let Type::Con { home, .. } = ty else {
+        return None;
+    };
+    Some(
+        home.iter()
+            .filter_map(|s| interner.resolve(*s).map(str::to_owned))
+            .collect(),
+    )
+}
+
+/// A qualified type reaches the module its qualified values reach: a spelling
+/// an alias keeps never takes its type home from a last-segment import the
+/// alias outranked.
+#[test]
+fn qualified_type_follows_the_qualifier_owner() {
+    let catalog = ["Main", "App.Auth"];
+    let shadowed = "module Main exposing (y)\n\nimport Ipe.Auth as Auth\nimport App.Auth\n\n\
+                    y : Auth.T\ny =\n    App.Auth.T\n";
+    let result = run_last(&[APP_AUTH_TYPE, shadowed], &catalog);
+    let home = match &result {
+        Ok(Some((module, interner))) => annotation_home(module, interner, "y"),
+        Ok(None) | Err(_) => None,
+    };
+    assert!(
+        home.as_deref() != Some(&["App".to_owned(), "Auth".to_owned()][..]),
+        "`Auth.T` must not reach `App.Auth`: {home:?} / {result:?}"
+    );
+    let dotted = "module Main exposing (y)\n\nimport Ipe.Auth as Auth\nimport App.Auth\n\n\
+                  y : App.Auth.T\ny =\n    App.Auth.T\n";
+    let result = run_last(&[APP_AUTH_TYPE, dotted], &catalog);
+    let home = match &result {
+        Ok(Some((module, interner))) => annotation_home(module, interner, "y"),
+        Ok(None) | Err(_) => None,
+    };
+    assert_eq!(
+        home.as_deref(),
+        Some(&["App".to_owned(), "Auth".to_owned()][..]),
+        "{result:?}"
+    );
+}
+
+/// With no shape import, two shapes' `Sub` modules under one alias are two
+/// modules: IPE-N0027 at the later import. A shape admits its own and the
+/// shared `Terminal` module under one spelling.
+#[test]
+fn two_shapes_sub_modules_under_one_alias_are_n0027_without_a_shape() {
+    let src = main_module(
+        "import Ipe.Tea.Tui.Sub as Sub\nimport Ipe.Tea.Cli.Sub as Sub\n",
+        "1",
+    );
+    let result = run(&[&src], &["Main"]);
+    assert!(
+        is_shared_qualifier(
+            &result,
+            "Sub",
+            import_name_lo(&src, "Ipe.Tea.Cli.Sub as Sub"),
+            import_name_lo(&src, "Ipe.Tea.Tui.Sub as Sub"),
+        ),
+        "{result:?}"
+    );
+    let admitted = main_module(
+        "import Ipe.Tea.Tui\nimport Ipe.Tea.Terminal.Sub as Sub\n",
+        "1",
+    );
+    let result = run(&[&admitted], &["Main"]);
+    assert!(result.is_ok(), "{result:?}");
 }

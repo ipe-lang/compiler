@@ -308,9 +308,17 @@ pub fn to_lsp(diag: &Diagnostic, text: &str, encoding: PositionEncoding) -> lsp_
 }
 
 /// The `data` payload of an import-required diagnostic: its candidate modules.
+///
+/// None when a candidate is already imported under an alias: the fix is to
+/// write that alias, not to import the module a second time.
 fn import_candidates_data(diag: &Diagnostic) -> Option<serde_json::Value> {
     let Diagnostic::Name {
-        msg: NameError::ImportRequired { candidates, .. },
+        msg:
+            NameError::ImportRequired {
+                candidates,
+                imported_as: None,
+                ..
+            },
         ..
     } = diag
     else {
