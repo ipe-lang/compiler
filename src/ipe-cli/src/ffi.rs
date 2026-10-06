@@ -20,7 +20,8 @@ use ipe_ffi::pkginfo::FeatureName;
 use crate::CliError;
 use crate::owner_trust::{self, TrustedCache};
 use crate::remote_ingest::{
-    ChildStderr, FFI_INSPECT_LIMITS, LocalCeiling, LocalRefusal, LocalSource, RunError, run_local,
+    CHILD_STDERR_MAX_BYTES, ChildStderr, FFI_INSPECT_LIMITS, LocalCeiling, LocalRefusal,
+    LocalSource, RunError, run_local,
 };
 use crate::text;
 
