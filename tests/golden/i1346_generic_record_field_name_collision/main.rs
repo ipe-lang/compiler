@@ -35,12 +35,9 @@ pub struct RecQ<T1> {
     q: T1,
 }
 
-impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for RecQ<T1> {
+impl<T1: IpeStringify> IpeStringify for RecQ<T1> {
     fn ipe_show(&self) -> String {
-        format!(
-            "{{{}}}",
-            (&ipe_runtime::stringify::Wrap(&self.q)).dispatch()
-        )
+        format!("{{{}}}", IpeStringify::ipe_show(&self.q))
     }
 }
 
@@ -49,12 +46,9 @@ pub struct RecQ2<T1> {
     q: (T1, T1),
 }
 
-impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for RecQ2<T1> {
+impl<T1: IpeStringify> IpeStringify for RecQ2<T1> {
     fn ipe_show(&self) -> String {
-        format!(
-            "{{{}}}",
-            (&ipe_runtime::stringify::Wrap(&self.q)).dispatch()
-        )
+        format!("{{{}}}", IpeStringify::ipe_show(&self.q))
     }
 }
 

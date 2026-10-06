@@ -878,61 +878,33 @@ fn named_color(lower: &str) -> Option<Color> {
     Some(c)
 }
 
-impl crate::stringify::IpeStringify for Color {
-    fn ipe_show(&self) -> String {
-        self.to_hex()
-    }
-}
+crate::stringify::show_row!("Color", Value, [] Color, |c| c.to_hex());
 
-impl crate::stringify::IpeStringify for ColorError {
-    fn ipe_show(&self) -> String {
-        match self {
-            ColorError::BadHexDigit(c) => format!("BadHexDigit {c}"),
-            ColorError::BadHexLength(n) => format!("BadHexLength {n}"),
-            ColorError::UnknownColorName(s) => format!("UnknownColorName {s}"),
-        }
-    }
-}
+crate::stringify::show_row!("ColorError", Value, [] ColorError, |e| match e {
+    ColorError::BadHexDigit(c) => format!("BadHexDigit {c}"),
+    ColorError::BadHexLength(n) => format!("BadHexLength {n}"),
+    ColorError::UnknownColorName(s) => format!("UnknownColorName {s}"),
+});
 
-impl crate::stringify::IpeStringify for TermProfile {
-    fn ipe_show(&self) -> String {
-        "<term-profile>".to_owned()
-    }
-}
+crate::stringify::show_row!("TermProfile", Internals, [] TermProfile, |_| "<Ipe.Color.TermProfile>".to_owned());
 
-impl crate::stringify::IpeStringify for AnsiColor {
-    fn ipe_show(&self) -> String {
-        "<ansi-color>".to_owned()
-    }
-}
+crate::stringify::show_row!("AnsiColor", Internals, [] AnsiColor, |_| "<Ipe.Color.AnsiColor>".to_owned());
 
-impl crate::stringify::IpeStringify for WcagLevel {
-    fn ipe_show(&self) -> String {
-        match self {
-            WcagLevel::AA => "AA".to_owned(),
-            WcagLevel::AAA => "AAA".to_owned(),
-        }
-    }
-}
+crate::stringify::show_row!("WcagLevel", Value, [] WcagLevel, |l| match l {
+    WcagLevel::AA => "AA".to_owned(),
+    WcagLevel::AAA => "AAA".to_owned(),
+});
 
-impl crate::stringify::IpeStringify for TextSize {
-    fn ipe_show(&self) -> String {
-        match self {
-            TextSize::NormalText => "NormalText".to_owned(),
-            TextSize::LargeText => "LargeText".to_owned(),
-        }
-    }
-}
+crate::stringify::show_row!("TextSize", Value, [] TextSize, |t| match t {
+    TextSize::NormalText => "NormalText".to_owned(),
+    TextSize::LargeText => "LargeText".to_owned(),
+});
 
-impl crate::stringify::IpeStringify for Deficiency {
-    fn ipe_show(&self) -> String {
-        match self {
-            Deficiency::Protanopia => "Protanopia".to_owned(),
-            Deficiency::Deuteranopia => "Deuteranopia".to_owned(),
-            Deficiency::Tritanopia => "Tritanopia".to_owned(),
-        }
-    }
-}
+crate::stringify::show_row!("Deficiency", Value, [] Deficiency, |d| match d {
+    Deficiency::Protanopia => "Protanopia".to_owned(),
+    Deficiency::Deuteranopia => "Deuteranopia".to_owned(),
+    Deficiency::Tritanopia => "Tritanopia".to_owned(),
+});
 
 // ── Ipe.Color kernel shims ──────────────────────────────────────────────────
 //

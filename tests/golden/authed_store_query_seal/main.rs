@@ -47,38 +47,15 @@ pub enum MainSqlValue {
 impl IpeStringify for MainSqlValue {
     fn ipe_show(&self) -> String {
         match self {
-            MainSqlValue::SqlString(p0) => format!(
-                "SqlString {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlInt(p0) => {
-                format!("SqlInt {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlFloat(p0) => format!(
-                "SqlFloat {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlBool(p0) => {
-                format!("SqlBool {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlBytes(p0) => format!(
-                "SqlBytes {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlTime(p0) => {
-                format!("SqlTime {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlDecimal(p0) => format!(
-                "SqlDecimal {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlMoney(p0) => format!(
-                "SqlMoney {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlNull(p0) => {
-                format!("SqlNull {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            MainSqlValue::SqlString(p0) => format!("SqlString {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlInt(p0) => format!("SqlInt {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlFloat(p0) => format!("SqlFloat {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlBool(p0) => format!("SqlBool {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlBytes(p0) => format!("SqlBytes {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlTime(p0) => format!("SqlTime {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlDecimal(p0) => format!("SqlDecimal {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlMoney(p0) => format!("SqlMoney {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlNull(p0) => format!("SqlNull {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -92,10 +69,7 @@ pub enum MainSqlField {
 impl IpeStringify for MainSqlField {
     fn ipe_show(&self) -> String {
         match self {
-            MainSqlField::SetField(p0) => format!(
-                "SetField {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            MainSqlField::SetField(p0) => format!("SetField {}", IpeStringify::ipe_show(p0)),
             MainSqlField::OmitField => "OmitField".to_string(),
         }
     }
@@ -126,8 +100,8 @@ impl IpeStringify for RecAuthorBody {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.author)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.body)).dispatch()
+            IpeStringify::ipe_show(&self.author),
+            IpeStringify::ipe_show(&self.body)
         )
     }
 }
@@ -162,21 +136,21 @@ impl<T1: Clone + 'static> Clone
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify
+impl<T1: IpeStringify + 'static> IpeStringify
     for RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable<T1>
 {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {} {} {} {} {} {} {} {}}}",
-            "<fn>",
-            (&ipe_runtime::stringify::Wrap(&self.currentColumns)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.frozenColumns)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.frozenTable)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.indexes)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.ops)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.pk)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.specs)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.table)).dispatch()
+            "<function>",
+            IpeStringify::ipe_show(&self.currentColumns),
+            IpeStringify::ipe_show(&self.frozenColumns),
+            IpeStringify::ipe_show(&self.frozenTable),
+            IpeStringify::ipe_show(&self.indexes),
+            IpeStringify::ipe_show(&self.ops),
+            IpeStringify::ipe_show(&self.pk),
+            IpeStringify::ipe_show(&self.specs),
+            IpeStringify::ipe_show(&self.table)
         )
     }
 }
@@ -191,8 +165,8 @@ impl IpeStringify for RecColTypeName {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.colType)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.name)).dispatch()
+            IpeStringify::ipe_show(&self.colType),
+            IpeStringify::ipe_show(&self.name)
         )
     }
 }
@@ -212,13 +186,13 @@ impl IpeStringify for RecDeleteImmutablesInsertMasksOwnersReadUpdate {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {} {} {} {} {} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.delete)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.immutables)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.insert)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.masks)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.owners)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.read)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.update)).dispatch()
+            IpeStringify::ipe_show(&self.delete),
+            IpeStringify::ipe_show(&self.immutables),
+            IpeStringify::ipe_show(&self.insert),
+            IpeStringify::ipe_show(&self.masks),
+            IpeStringify::ipe_show(&self.owners),
+            IpeStringify::ipe_show(&self.read),
+            IpeStringify::ipe_show(&self.update)
         )
     }
 }
@@ -233,8 +207,8 @@ impl IpeStringify for RecDocRefMember {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.docRef)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.member)).dispatch()
+            IpeStringify::ipe_show(&self.docRef),
+            IpeStringify::ipe_show(&self.member)
         )
     }
 }
@@ -255,13 +229,13 @@ impl<T1: Clone + 'static> Clone for RecEncMkDecShp<T1> {
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for RecEncMkDecShp<T1> {
+impl<T1: IpeStringify + 'static> IpeStringify for RecEncMkDecShp<T1> {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {} {}}}",
-            "<fn>",
-            "<fn>",
-            (&ipe_runtime::stringify::Wrap(&self.shp)).dispatch()
+            "<function>",
+            "<function>",
+            IpeStringify::ipe_show(&self.shp)
         )
     }
 }
@@ -279,11 +253,11 @@ impl IpeStringify for RecOuterColShareColShareReadShareTableShareView {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {} {} {} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.outerCol)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.shareCol)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.shareRead)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.shareTable)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.shareView)).dispatch()
+            IpeStringify::ipe_show(&self.outerCol),
+            IpeStringify::ipe_show(&self.shareCol),
+            IpeStringify::ipe_show(&self.shareRead),
+            IpeStringify::ipe_show(&self.shareTable),
+            IpeStringify::ipe_show(&self.shareView)
         )
     }
 }
@@ -298,8 +272,8 @@ impl IpeStringify for RecOwnerSsn {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.owner)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.ssn)).dispatch()
+            IpeStringify::ipe_show(&self.owner),
+            IpeStringify::ipe_show(&self.ssn)
         )
     }
 }

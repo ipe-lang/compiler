@@ -36,10 +36,10 @@ pub enum MainBox<T1> {
     Empty,
 }
 
-impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for MainBox<T1> {
+impl<T1: IpeStringify> IpeStringify for MainBox<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            MainBox::Wrap(p0) => format!("Wrap {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch()),
+            MainBox::Wrap(p0) => format!("Wrap {}", IpeStringify::ipe_show(p0)),
             MainBox::Empty => "Empty".to_string(),
         }
     }
@@ -56,9 +56,9 @@ impl IpeStringify for MainTree {
         match self {
             MainTree::Node(p0, p1, p2) => format!(
                 "Node {} {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p2)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1),
+                IpeStringify::ipe_show(p2)
             ),
             MainTree::Leaf => "Leaf".to_string(),
         }
@@ -75,8 +75,8 @@ impl IpeStringify for RecXY {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            (&ipe_runtime::stringify::Wrap(&self.x)).dispatch(),
-            (&ipe_runtime::stringify::Wrap(&self.y)).dispatch()
+            IpeStringify::ipe_show(&self.x),
+            IpeStringify::ipe_show(&self.y)
         )
     }
 }

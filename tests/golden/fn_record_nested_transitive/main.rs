@@ -48,8 +48,8 @@ impl IpeStringify for RecInnerName {
     fn ipe_show(&self) -> String {
         format!(
             "{{{} {}}}",
-            "<fn>",
-            (&ipe_runtime::stringify::Wrap(&self.name)).dispatch()
+            "<function>",
+            IpeStringify::ipe_show(&self.name)
         )
     }
 }
@@ -70,11 +70,7 @@ impl Clone for RecOpTag {
 
 impl IpeStringify for RecOpTag {
     fn ipe_show(&self) -> String {
-        format!(
-            "{{{} {}}}",
-            "<fn>",
-            (&ipe_runtime::stringify::Wrap(&self.tag)).dispatch()
-        )
+        format!("{{{} {}}}", "<function>", IpeStringify::ipe_show(&self.tag))
     }
 }
 

@@ -691,12 +691,12 @@ fn infer_core(
     let dep_union_closure: Vec<Arc<canon::Union>> =
         scoped.map_or_else(Vec::new, |ctx| reachable_dep_unions(ctx.deps));
     let dep_unions: Vec<&canon::Union> = dep_union_closure.iter().map(Arc::as_ref).collect();
-    // The user enums whose definition embeds a function payload — consulted by
-    // every concrete equality / stringify obligation so a `==` / `{{…}}` on a
-    // function-carrying enum fails closed (the payload arrow is invisible in a
-    // `Ty::Con`'s applied type arguments; see [`fn_embedding_enums`]).
-    let fn_enums = fn_embedding_enums(&m.unions, &dep_unions);
-    let enum_embeds_fn = |home: &[Symbol], name: Symbol| fn_enums.contains(&(home.to_vec(), name));
+    // The user enums whose definition embeds a function payload or an opaque
+    // `Rust.*` handle — consulted by every concrete equality / stringify
+    // obligation so a `==` / `{{…}}` / `errorToString` on such an enum fails
+    // closed (the payload is invisible in a `Ty::Con's applied type
+    // arguments; see [`EnumEmbeds`]).
+    let enum_embeds = EnumEmbeds::of(interner, &m.unions, &dep_unions);
     let generated = match scoped {
         None => Builder::run(&mut uf, interner, m)?,
         Some(ctx) => {
@@ -931,7 +931,7 @@ fn infer_core(
                     name: int_sym,
                     args: Vec::new(),
                 };
-                if !concrete_super_ok(interner, bounds, &int_ty, &enum_embeds_fn) {
+                if !concrete_super_ok(interner, bounds, &int_ty, &enum_embeds) {
                     return Err(InferError::sited(
                         super_unsatisfied(interner, bounds, &int_ty, *span),
                         home,
@@ -957,7 +957,7 @@ fn infer_core(
                     name: sqlvalue_sym,
                     args: Vec::new(),
                 };
-                if !concrete_super_ok(interner, bounds, &sqlvalue_ty, &enum_embeds_fn) {
+                if !concrete_super_ok(interner, bounds, &sqlvalue_ty, &enum_embeds) {
                     return Err(InferError::sited(
                         super_unsatisfied(interner, bounds, &sqlvalue_ty, *span),
                         home,
@@ -983,7 +983,7 @@ fn infer_core(
                     name: string_sym,
                     args: Vec::new(),
                 };
-                if !concrete_super_ok(interner, bounds, &string_ty, &enum_embeds_fn) {
+                if !concrete_super_ok(interner, bounds, &string_ty, &enum_embeds) {
                     return Err(InferError::sited(
                         super_unsatisfied(interner, bounds, &string_ty, *span),
                         home,
@@ -1016,7 +1016,7 @@ fn infer_core(
     // failing closed with IPE-T0014 instead of emitting code `cargo` rejects.
     for (root, orig_bounds, span, home) in pinned {
         let ty = lift!(zonk(&mut uf, budget, root));
-        if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds_fn) {
+        if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
             return Err(InferError::sited(
                 super_unsatisfied(interner, orig_bounds, &ty, span),
                 home,
@@ -1379,7 +1379,7 @@ fn infer_core(
         interner,
         bounds_for_apps,
         &generated.scheme_apps,
-        &enum_embeds_fn,
+        &enum_embeds,
     )?;
     // A pinned parameter wildcard lowers to its one ground type: hold every use
     // — same module, or a dependent one through the interface — to it.
@@ -1888,7 +1888,7 @@ fn check_scheme_applications(
     interner: &Interner,
     bounds: &BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<Symbol, TyBounds>>,
     apps: &[SchemeApp],
-    enum_embeds_fn: &impl Fn(&[Symbol], Symbol) -> bool,
+    enum_embeds: &EnumEmbeds,
 ) -> Result<(), InferError> {
     for app in apps {
         // (AUD-05) keyed by (home, name) — a bare-name lookup would check a
@@ -1919,7 +1919,7 @@ fn check_scheme_applications(
                 },
             };
             let ty = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
-            if !emitted_bound_satisfied(interner, *b, &ty, &enum_embeds_fn) {
+            if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
                     super_unsatisfied(interner, *b, &ty, app.span),
                     &app.use_home,
@@ -2160,14 +2160,14 @@ fn emitted_bound_satisfied(
     interner: &Interner,
     bounds: TyBounds,
     ty: &Ty,
-    enum_embeds_fn: &impl Fn(&[Symbol], Symbol) -> bool,
+    enum_embeds: &EnumEmbeds,
 ) -> bool {
     super_bounds_satisfied(
         interner,
         bounds,
         ty,
         super_bounds::BoundSite::EmittedGeneric,
-        enum_embeds_fn,
+        enum_embeds,
     )
 }
 
@@ -2185,7 +2185,7 @@ fn super_bounds_satisfied(
     bounds: TyBounds,
     ty: &Ty,
     site: super_bounds::BoundSite,
-    enum_embeds_fn: &impl Fn(&[Symbol], Symbol) -> bool,
+    enum_embeds: &EnumEmbeds,
 ) -> bool {
     let prim = match ty {
         Ty::Con { module, name, args } if module.is_empty() && args.is_empty() => {
@@ -2247,12 +2247,11 @@ fn super_bounds_satisfied(
     let interpolable_ok = super_bounds::prim_satisfies_interpolable(prim);
     (!bounds.has_number() || number_ok)
         && (!bounds.has_ord() || ord_ok)
-        && (!bounds.has_eq() || ty_is_equatable(ty, enum_embeds_fn))
+        && (!bounds.has_eq() || ty_is_equatable(ty, enum_embeds))
         && (!bounds.has_comparable_key() || key_ok)
-        // Stringify (`Debug.log` / `Error.toString`): showable iff it contains
-        // no function anywhere — the SAME "no function nested" rule as
-        // equatable, since every non-function type derives `IpeStringify`.
-        && (!bounds.has_show() || ty_is_equatable(ty, enum_embeds_fn))
+        // Stringify (`Debug.log` / `Error.toString`): showable iff every leaf
+        // has a rendering — its own walk, not the equality rule.
+        && (!bounds.has_show() || ty_is_showable(interner, ty, enum_embeds))
         && (!bounds.has_append() || appendable_ok)
         && (!bounds.has_hof_kernel_result() || not_curried_ok)
         && (!bounds.has_sql_param() || sql_param_ok)
@@ -2271,22 +2270,17 @@ pub(crate) fn concrete_super_ok(
     interner: &Interner,
     bounds: TyBounds,
     ty: &Ty,
-    enum_embeds_fn: &impl Fn(&[Symbol], Symbol) -> bool,
+    enum_embeds: &EnumEmbeds,
 ) -> bool {
     super_bounds_satisfied(
         interner,
         bounds,
         ty,
         super_bounds::BoundSite::ConcretePin,
-        enum_embeds_fn,
+        enum_embeds,
     )
 }
 
-/// Whether a resolved type derives Rust's `PartialEq`: true for every fully
-/// concrete type containing no function anywhere (primitives, unit, tuples,
-/// records, and enums all derive `PartialEq`; a function never does). A bare
-/// type variable is rejected (fail-closed): an equality obligation that escaped
-/// into an enclosing generic is not yet propagated across binding boundaries.
 /// Does canonical type `t` embed a function arrow anywhere — a direct `Lambda`,
 /// or one nested in a tuple / record / type-constructor argument?
 fn canon_type_embeds_lambda(t: &canon::Type) -> bool {
@@ -2333,48 +2327,162 @@ fn reachable_dep_unions(
     by_id.into_values().collect()
 }
 
-/// The `(home, name)` set of user enums whose DEFINITION embeds a function in
-/// any constructor payload (`type Handler a = OnClick (Int -> a) | Plain a`).
-///
-/// Such an enum is not `Equatable` / showable however it is applied: its payload
-/// arrow is invisible in a `Ty::Con`'s type arguments (which carry only applied
-/// type parameters), so the structural [`ty_is_equatable`] walk cannot see it
-/// without this out-of-band definition lookup. Consulted at every concrete
-/// equality / stringify obligation so a `==` / `{{…}}` on a function-carrying
-/// enum fails closed (IPE-T0014) instead of emitting Rust that does not build.
-fn fn_embedding_enums(
-    module_unions: &[canon::Union],
-    dep_unions: &[&canon::Union],
-) -> BTreeSet<(Vec<Symbol>, Symbol)> {
-    module_unions
-        .iter()
-        .chain(dep_unions.iter().copied())
-        .filter(|u| {
-            u.ctors
-                .iter()
-                .any(|c| c.args.iter().any(canon_type_embeds_lambda))
-        })
-        .map(|u| (u.home.clone(), u.name))
-        .collect()
+/// Does canonical type `t` name an opaque FFI handle anywhere
+/// ([`EnumEmbeds::is_opaque_handle`])?
+fn canon_type_embeds_opaque_handle(
+    interner: &Interner,
+    embeds: &EnumEmbeds,
+    t: &canon::Type,
+) -> bool {
+    let walk = |t: &canon::Type| canon_type_embeds_opaque_handle(interner, embeds, t);
+    match t {
+        canon::Type::Lambda(a, b) => walk(a) || walk(b),
+        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Tuple(elems) => elems.iter().any(walk),
+        canon::Type::Con { home, name, args } => {
+            embeds.is_opaque_handle(interner, home, *name) || args.iter().any(walk)
+        }
+        canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => {
+            fields.iter().any(|(_, f)| walk(f))
+        }
+    }
 }
 
-fn ty_is_equatable(ty: &Ty, enum_embeds_fn: &impl Fn(&[Symbol], Symbol) -> bool) -> bool {
+/// The user enums whose DEFINITION holds what a `Ty::Con`'s type arguments
+/// cannot show: a function (`type Handler a = OnClick (Int -> a) | Plain a`) or
+/// an opaque FFI handle in a constructor payload.
+///
+/// Such an enum is not `Equatable` (a function) or showable (a function or a
+/// handle) however it is applied: its payload is invisible in a `Ty::Con`'s
+/// type arguments (which carry only applied type parameters), so the structural
+/// [`ty_is_equatable`] / [`ty_is_showable`] walks cannot see it without this
+/// out-of-band definition lookup. Consulted at every concrete equality /
+/// stringify obligation so the use fails closed (IPE-T0014) instead of emitting
+/// Rust that does not build.
+#[derive(Default)]
+pub(crate) struct EnumEmbeds {
+    /// Enums with a function in a payload.
+    fun: BTreeSet<(Vec<Symbol>, Symbol)>,
+    /// Enums with a function or an opaque FFI handle in a payload.
+    show_refused: BTreeSet<(Vec<Symbol>, Symbol)>,
+    /// The transparent FFI unions ([`ipe_ir::FfiUnion::Transparent`]): each
+    /// lowers to an app enum with an emitted `IpeStringify` impl.
+    transparent_ffi: BTreeSet<(Vec<Symbol>, Symbol)>,
+}
+
+impl EnumEmbeds {
+    /// The facts of every union in `module_unions` and `dep_unions`.
+    fn of(
+        interner: &Interner,
+        module_unions: &[canon::Union],
+        dep_unions: &[&canon::Union],
+    ) -> Self {
+        let unions = || module_unions.iter().chain(dep_unions.iter().copied());
+        let mut facts = Self {
+            transparent_ffi: unions()
+                .filter(|u| {
+                    ipe_ir::home_is_ffi_interface(interner, &u.home)
+                        && ipe_ir::FfiUnion::classify(
+                            u.name,
+                            u.ctors.iter().map(|c| (c.name, c.arity)),
+                        ) == ipe_ir::FfiUnion::Transparent
+                })
+                .map(|u| (u.home.clone(), u.name))
+                .collect(),
+            ..Self::default()
+        };
+        for u in unions() {
+            let payloads = || u.ctors.iter().flat_map(|c| c.args.iter());
+            let fun = payloads().any(canon_type_embeds_lambda);
+            if fun {
+                facts.fun.insert((u.home.clone(), u.name));
+            }
+            if fun || payloads().any(|t| canon_type_embeds_opaque_handle(interner, &facts, t)) {
+                facts.show_refused.insert((u.home.clone(), u.name));
+            }
+        }
+        facts
+    }
+
+    /// Is `(home, name)` an opaque FFI handle: a type under an FFI interface
+    /// home that is not a known transparent union?
+    ///
+    /// Decided by the union's definition ([`ipe_ir::FfiUnion`]), the same fact
+    /// the lowerer emits an `EnumDef` by, never by the home prefix alone. A
+    /// `Rust.*` type whose definition is not in scope is a handle (fail closed).
+    fn is_opaque_handle(&self, interner: &Interner, home: &[Symbol], name: Symbol) -> bool {
+        ipe_ir::home_is_ffi_interface(interner, home)
+            && !self.transparent_ffi.contains(&(home.to_vec(), name))
+    }
+
+    /// Does enum `(home, name)`'s definition embed a function?
+    fn embeds_fn(&self, home: &[Symbol], name: Symbol) -> bool {
+        self.fun.contains(&(home.to_vec(), name))
+    }
+
+    /// Does enum `(home, name)`'s definition embed a leaf with no rendering?
+    fn refuses_show(&self, home: &[Symbol], name: Symbol) -> bool {
+        self.show_refused.contains(&(home.to_vec(), name))
+    }
+}
+
+/// The widest tuple the runtime renders; `ipe-cli` asserts it equal to the
+/// compiler's and the runtime's show tables.
+pub const MAX_SHOWN_TUPLE_ARITY: usize = 12;
+
+/// Whether a resolved type has a rendering: every leaf of it has a runtime
+/// show row that is not `Refused`.
+///
+/// Refuses a bare type variable (fail-closed, like every sibling obligation), a
+/// function, a tuple wider than [`MAX_SHOWN_TUPLE_ARITY`], an opaque FFI
+/// handle ([`EnumEmbeds::is_opaque_handle`]), and an enum whose definition
+/// embeds a function or a handle ([`EnumEmbeds`]). A transparent FFI union is
+/// shown like any user union. Every type argument is walked.
+fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
         Ty::Var(_) | Ty::Fun(_, _) => false,
         Ty::Unit => true,
-        Ty::Tuple(elems) => elems.iter().all(|e| ty_is_equatable(e, enum_embeds_fn)),
-        Ty::Record(fields, _) => fields.values().all(|f| ty_is_equatable(f, enum_embeds_fn)),
+        Ty::Tuple(elems) => {
+            elems.len() <= MAX_SHOWN_TUPLE_ARITY
+                && elems
+                    .iter()
+                    .all(|e| ty_is_showable(interner, e, enum_embeds))
+        }
+        Ty::Record(fields, _) => fields
+            .values()
+            .all(|f| ty_is_showable(interner, f, enum_embeds)),
+        Ty::Con { module, name, args } => {
+            !enum_embeds.is_opaque_handle(interner, module, *name)
+                && !enum_embeds.refuses_show(module, *name)
+                && args
+                    .iter()
+                    .all(|a| ty_is_showable(interner, a, enum_embeds))
+        }
+    }
+}
+
+/// Whether a resolved type derives Rust's `PartialEq`: true for every fully
+/// concrete type containing no function anywhere (primitives, unit, tuples,
+/// records, and enums all derive `PartialEq`; a function never does). A bare
+/// type variable is rejected (fail-closed): an equality obligation that escaped
+/// into an enclosing generic is not yet propagated across binding boundaries.
+fn ty_is_equatable(ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
+    match ty {
+        Ty::Var(_) | Ty::Fun(_, _) => false,
+        Ty::Unit => true,
+        Ty::Tuple(elems) => elems.iter().all(|e| ty_is_equatable(e, enum_embeds)),
+        Ty::Record(fields, _) => fields.values().all(|f| ty_is_equatable(f, enum_embeds)),
         // A `Ty::Con` head names a user enum (or a builtin like `Maybe`) whose
         // variant payloads are NOT in `args` — `args` carries only the applied
         // type parameters. An enum whose DEFINITION embeds a function in a
         // payload (`type Handler a = OnClick (Int -> a) | Plain a`) is therefore
         // not equatable however it is applied, even though every `arg` is
-        // (`Handler Int`'s only arg is `Int`). Consult `enum_embeds_fn` on the
+        // (`Handler Int`'s only arg is `Int`). Consult `enum_embeds.embeds_fn` on the
         // head, then still recurse the args so a function reaching a type
         // parameter (`Box (Int -> Int)` for `type Box a = Box a`) is caught too.
         Ty::Con { module, name, args } => {
-            !enum_embeds_fn(module, *name)
-                && args.iter().all(|a| ty_is_equatable(a, enum_embeds_fn))
+            !enum_embeds.embeds_fn(module, *name)
+                && args.iter().all(|a| ty_is_equatable(a, enum_embeds))
         }
     }
 }
@@ -7350,7 +7458,7 @@ mod tests {
             args: Vec::new(),
         };
         let fn_ty = Ty::Fun(Box::new(int_ty.clone()), Box::new(int_ty));
-        let no_fn_enums = |_home: &[Symbol], _name: Symbol| false;
+        let no_fn_enums = EnumEmbeds::default();
         for &bit in TyBounds::ALL_BITS {
             assert!(
                 !bit.is_empty(),
@@ -7405,7 +7513,7 @@ mod tests {
             args: Vec::new(),
         };
         let fn_ty = Ty::Fun(Box::new(int_ty.clone()), Box::new(int_ty));
-        let no_fn_enums = |_home: &[Symbol], _name: Symbol| false;
+        let no_fn_enums = EnumEmbeds::default();
         let show = TyBounds::show();
         assert!(
             !super_bounds_satisfied(
@@ -7432,9 +7540,8 @@ mod tests {
     }
 
     /// The happy path the refusal above must not break: a `Show` obligation is
-    /// satisfied by a non-function type (`Int`), at both use sites — every
-    /// non-function type derives `IpeStringify`. Driven directly against the
-    /// gate for the same reason as the refusal above.
+    /// satisfied by a type with a show row (`Int`), at both use sites. Driven
+    /// directly against the gate for the same reason as the refusal above.
     #[test]
     fn show_bounded_generic_accepts_non_function_arguments() {
         let mut i = Interner::new();
@@ -7444,7 +7551,7 @@ mod tests {
             name: int_sym,
             args: Vec::new(),
         };
-        let no_fn_enums = |_home: &[Symbol], _name: Symbol| false;
+        let no_fn_enums = EnumEmbeds::default();
         let show = TyBounds::show();
         for site in [
             super_bounds::BoundSite::EmittedGeneric,
@@ -7455,6 +7562,270 @@ mod tests {
                 "a Stringify-satisfying non-function type (Int) must be accepted \
                  at {site:?}"
             );
+        }
+    }
+
+    /// A nullary type constructor `name` homed at `home`.
+    fn con_ty(i: &mut Interner, home: &[&str], name: &str) -> Ty {
+        Ty::Con {
+            module: home
+                .iter()
+                .map(|seg| i.intern(seg).expect("intern home segment"))
+                .collect(),
+            name: i.intern(name).expect("intern type name"),
+            args: Vec::new(),
+        }
+    }
+
+    /// `Int -> Int`.
+    fn int_fn_ty(i: &mut Interner) -> Ty {
+        let int_ty = con_ty(i, &[], "Int");
+        Ty::Fun(Box::new(int_ty.clone()), Box::new(int_ty))
+    }
+
+    const BOTH_SITES: [super_bounds::BoundSite; 2] = [
+        super_bounds::BoundSite::EmittedGeneric,
+        super_bounds::BoundSite::ConcretePin,
+    ];
+
+    /// `errorToString` (a `Stringify` obligation) on a value holding a leaf with
+    /// no rendering — an FFI `Rust.*` handle, or a function inside a `List` — is
+    /// refused at both use sites with IPE-T0014 naming the `Stringify` class.
+    /// Driven directly against the gate: the single-module harness has no
+    /// stdlib in scope (see [`show_bounded_generic_escaping_to_function_is_rejected`]).
+    #[test]
+    fn stringify_of_a_rust_handle_or_a_listed_function_is_refused() {
+        let mut i = Interner::new();
+        let handle = con_ty(&mut i, &["Rust", "Zstd"], "Encoder");
+        let fn_ty = int_fn_ty(&mut i);
+        let list = i.intern("List").expect("intern List");
+        let fn_list = Ty::Con {
+            module: Vec::new(),
+            name: list,
+            args: vec![fn_ty],
+        };
+        let show = TyBounds::show();
+        let embeds = EnumEmbeds::default();
+        for ty in [handle, fn_list] {
+            for site in BOTH_SITES {
+                assert!(
+                    !super_bounds_satisfied(&i, show, &ty, site, &embeds),
+                    "a Stringify obligation on {ty:?} must be refused at {site:?}"
+                );
+            }
+            let refusal = super_unsatisfied(&i, show, &ty, Span::DUMMY);
+            assert_eq!(refusal.code().as_str(), "IPE-T0014");
+            assert!(
+                matches!(
+                    &refusal,
+                    Diagnostic::Type {
+                        msg: TypeError::SuperTypeUnsatisfied { class, .. },
+                        ..
+                    } if &**class == "Stringify"
+                ),
+                "the refusal of {ty:?} must name the Stringify class, got {refusal:?}"
+            );
+        }
+    }
+
+    /// Every row of the compiler's show table agrees with the type checker's
+    /// show gate: a `Refused` leaf has a type the gate refuses, and every other
+    /// leaf has a type the gate accepts. A new `Refused` row with no type here
+    /// fails this test until the gate is taught to refuse it.
+    #[test]
+    fn every_refused_show_leaf_is_refused_by_the_gate() {
+        let mut i = Interner::new();
+        let show = TyBounds::show();
+        let embeds = EnumEmbeds::default();
+        for (leaf, policy) in ipe_ir::SHOWN_LEAVES {
+            let refused = policy == ipe_ir::ShowPolicy::Refused;
+            let ty = match (refused, leaf) {
+                (true, "Fun" | "SharedFun" | "FnOnceChain") => int_fn_ty(&mut i),
+                (true, "Foreign") => con_ty(&mut i, &["Rust", "Zstd"], "Encoder"),
+                _ => {
+                    assert!(
+                        !refused,
+                        "the Refused leaf {leaf} has no type the gate refuses"
+                    );
+                    con_ty(&mut i, &[], leaf)
+                }
+            };
+            for site in BOTH_SITES {
+                assert_eq!(
+                    super_bounds_satisfied(&i, show, &ty, site, &embeds),
+                    !refused,
+                    "the show gate disagrees with the {leaf} row ({policy:?}) at {site:?}"
+                );
+            }
+        }
+    }
+
+    /// A tuple renders up to [`MAX_SHOWN_TUPLE_ARITY`] elements; one element
+    /// more is refused.
+    #[test]
+    fn a_tuple_one_past_the_widest_shown_is_refused() {
+        let mut i = Interner::new();
+        let int_ty = con_ty(&mut i, &[], "Int");
+        let embeds = EnumEmbeds::default();
+        let widest = Ty::Tuple(vec![int_ty.clone(); MAX_SHOWN_TUPLE_ARITY]);
+        let too_wide = Ty::Tuple(vec![int_ty; MAX_SHOWN_TUPLE_ARITY + 1]);
+        assert!(ty_is_showable(&i, &widest, &embeds));
+        assert!(!ty_is_showable(&i, &too_wide, &embeds));
+    }
+
+    /// A one-constructor union `name` at home `Main` whose payload is `arg`.
+    fn union_of(i: &mut Interner, name: &str, arg: canon::Type) -> canon::Union {
+        canon::Union {
+            home: vec![i.intern("Main").expect("intern Main")],
+            name: i.intern(name).expect("intern union name"),
+            name_span: Span::DUMMY,
+            vars: Vec::new(),
+            ctors: vec![canon::Ctor {
+                name: i.intern(name).expect("intern ctor name"),
+                index: 0,
+                arity: 1,
+                args: vec![arg],
+                span: Span::DUMMY,
+            }],
+        }
+    }
+
+    /// An enum whose definition holds a `Rust.*` handle is not showable but
+    /// stays equatable; one holding a function is neither; one holding an
+    /// `Int` is both. The handle and the function are invisible in the enum's
+    /// `Ty::Con` arguments, so only the definition lookup can refuse them.
+    #[test]
+    fn an_enum_holding_a_handle_or_a_function_is_not_showable() {
+        let mut i = Interner::new();
+        let canon_con = |i: &mut Interner, home: &[&str], name: &str| canon::Type::Con {
+            home: home
+                .iter()
+                .map(|seg| i.intern(seg).expect("intern home segment"))
+                .collect(),
+            name: i.intern(name).expect("intern type name"),
+            args: Vec::new(),
+        };
+        let handle = canon_con(&mut i, &["Rust", "Zstd"], "Encoder");
+        let int = canon_con(&mut i, &[], "Int");
+        let func = canon::Type::Lambda(Box::new(int.clone()), Box::new(int.clone()));
+        let unions = vec![
+            union_of(&mut i, "HoldsHandle", handle),
+            union_of(&mut i, "HoldsFn", func),
+            union_of(&mut i, "HoldsInt", int),
+        ];
+        let embeds = EnumEmbeds::of(&i, &unions, &[]);
+        let ty_of = |i: &mut Interner, name: &str| con_ty(i, &["Main"], name);
+        let holds_handle = ty_of(&mut i, "HoldsHandle");
+        let holds_fn = ty_of(&mut i, "HoldsFn");
+        let holds_int = ty_of(&mut i, "HoldsInt");
+        assert!(!ty_is_showable(&i, &holds_handle, &embeds));
+        assert!(ty_is_equatable(&holds_handle, &embeds));
+        assert!(!ty_is_showable(&i, &holds_fn, &embeds));
+        assert!(!ty_is_equatable(&holds_fn, &embeds));
+        assert!(ty_is_showable(&i, &holds_int, &embeds));
+        assert!(ty_is_equatable(&holds_int, &embeds));
+    }
+
+    /// A union `name` under `home` with constructors `ctors`, each `(name, payloads)`.
+    fn union_with(
+        i: &mut Interner,
+        home: &[&str],
+        name: &str,
+        ctors: Vec<(&str, Vec<canon::Type>)>,
+    ) -> canon::Union {
+        canon::Union {
+            home: home
+                .iter()
+                .map(|seg| i.intern(seg).expect("intern home segment"))
+                .collect(),
+            name: i.intern(name).expect("intern union name"),
+            name_span: Span::DUMMY,
+            vars: Vec::new(),
+            ctors: ctors
+                .into_iter()
+                .enumerate()
+                .map(|(index, (ctor, args))| canon::Ctor {
+                    name: i.intern(ctor).expect("intern ctor name"),
+                    index,
+                    arity: args.len(),
+                    args,
+                    span: Span::DUMMY,
+                })
+                .collect(),
+        }
+    }
+
+    /// Opacity is a fact of the definition, not of the `Rust.*` home: a
+    /// transparent FFI union (it lowers to an app enum with an emitted
+    /// `IpeStringify` impl) is showable, directly and as a user union's
+    /// payload. The opaque `type Encoder = Encoder` placeholder, a `Rust.*`
+    /// type with no definition in scope, and a transparent union or a user
+    /// union holding the placeholder stay refused.
+    #[test]
+    fn a_transparent_ffi_union_is_showable_and_an_opaque_handle_is_not() {
+        let mut i = Interner::new();
+        let canon_con = |i: &mut Interner, home: &[&str], name: &str| canon::Type::Con {
+            home: home
+                .iter()
+                .map(|seg| i.intern(seg).expect("intern home segment"))
+                .collect(),
+            name: i.intern(name).expect("intern type name"),
+            args: Vec::new(),
+        };
+        let tm = ["Rust", "Tm"];
+        let int = canon_con(&mut i, &[], "Int");
+        let string = canon_con(&mut i, &[], "String");
+        let shade = canon_con(&mut i, &tm, "Shade");
+        let encoder = canon_con(&mut i, &tm, "Encoder");
+        let unions = vec![
+            union_with(
+                &mut i,
+                &tm,
+                "Shade",
+                vec![
+                    ("On", vec![]),
+                    ("Level", vec![int.clone()]),
+                    ("Mix", vec![int, string]),
+                ],
+            ),
+            union_with(&mut i, &tm, "Encoder", vec![("Encoder", vec![])]),
+            union_with(
+                &mut i,
+                &tm,
+                "Wrapped",
+                vec![("Wrapped", vec![encoder.clone()])],
+            ),
+            union_with(&mut i, &["Main"], "Holder", vec![("Holder", vec![shade])]),
+            union_with(&mut i, &["Main"], "Keeps", vec![("Keeps", vec![encoder])]),
+        ];
+        let show = TyBounds::show();
+        for (module_unions, dep_unions) in [
+            (unions.as_slice(), Vec::new()),
+            (&[][..], unions.iter().collect::<Vec<_>>()),
+        ] {
+            let embeds = EnumEmbeds::of(&i, module_unions, &dep_unions);
+            for (home, name, shown) in [
+                (&tm[..], "Shade", true),
+                (&["Main"][..], "Holder", true),
+                (&tm[..], "Encoder", false),
+                (&tm[..], "Undeclared", false),
+                (&tm[..], "Wrapped", false),
+                (&["Main"][..], "Keeps", false),
+            ] {
+                let ty = con_ty(&mut i, home, name);
+                assert_eq!(
+                    ty_is_showable(&i, &ty, &embeds),
+                    shown,
+                    "showability of {home:?}.{name}"
+                );
+                for site in BOTH_SITES {
+                    assert_eq!(
+                        super_bounds_satisfied(&i, show, &ty, site, &embeds),
+                        shown,
+                        "Stringify of {home:?}.{name} at {site:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -8039,7 +8410,7 @@ h x =
         let unit_ty = prim("Unit", Vec::new());
         let list_int = prim("List", vec![int_ty.clone()]);
         let var_ty = Ty::Var(0);
-        let no_fn_enums = |_home: &[Symbol], _name: Symbol| false;
+        let no_fn_enums = EnumEmbeds::default();
         let bounds = TyBounds::interpolable();
         for site in [
             super_bounds::BoundSite::EmittedGeneric,

@@ -43,10 +43,10 @@ impl<T1: Clone + 'static> Clone for MainCodec<T1> {
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for MainCodec<T1> {
+impl<T1: IpeStringify + 'static> IpeStringify for MainCodec<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            MainCodec::Codec(_) => format!("Codec {}", "<fn>"),
+            MainCodec::Codec(_) => format!("Codec {}", "<function>"),
         }
     }
 }
@@ -74,9 +74,9 @@ impl<T1: Clone + 'static> Clone for RecEncMkDec<T1> {
     }
 }
 
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for RecEncMkDec<T1> {
+impl<T1: IpeStringify + 'static> IpeStringify for RecEncMkDec<T1> {
     fn ipe_show(&self) -> String {
-        format!("{{{} {}}}", "<fn>", "<fn>")
+        format!("{{{} {}}}", "<function>", "<function>")
     }
 }
 

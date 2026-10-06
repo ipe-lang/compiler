@@ -33,6 +33,12 @@ pub struct CsvDoc {
     pub rows: Vec<Vec<String>>,
 }
 
+crate::stringify::show_row!("CsvDoc", Value, [] CsvDoc, |d| format!(
+    "{{{} {}}}",
+    crate::stringify::IpeStringify::ipe_show(&d.header),
+    crate::stringify::IpeStringify::ipe_show(&d.rows)
+));
+
 /// Validate that `delim` is exactly one ASCII byte, as required by the csv
 /// crate. A multi-byte string (e.g. a UTF-8 character) or an empty string is
 /// silently mishandled by the old `first_byte` helper — the multi-byte case

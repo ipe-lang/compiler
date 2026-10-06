@@ -47,6 +47,8 @@ pub enum TuiAttr<M> {
     _Msg(core::marker::PhantomData<M>),
 }
 
+crate::stringify::show_row!("TuiAttribute", Internals, [M] TuiAttr<M>, |_| "<Ipe.Ui.Tui.Attribute>".to_owned());
+
 impl<M> TuiAttr<M> {
     /// Lower a cell-native attribute to the honorable `ui::Attribute` the cell
     /// layout engine reads.  `bold` maps to a font weight the renderer treats
@@ -114,6 +116,8 @@ fn term_color_attr<M>(c: AnsiColor, fg: bool) -> Attribute<M> {
 /// `view : Model -> Screen Msg` function.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellsView<M>(pub Element<M>);
+
+crate::stringify::show_row!("Cells", Internals, [M] CellsView<M>, |_| "<Ipe.Ui.Cells>".to_owned());
 
 impl<M> CellsView<M> {
     /// Wrap an existing `Element` as a `Cells` view.
@@ -392,6 +396,8 @@ pub enum CliAttr<M> {
     _Msg(core::marker::PhantomData<M>),
 }
 
+crate::stringify::show_row!("CliAttribute", Internals, [M] CliAttr<M>, |_| "<Ipe.Ui.Cli.Attribute>".to_owned());
+
 impl<M> CliAttr<M> {
     /// Lower a line-native attribute to the honorable `ui::Attribute` the cell
     /// layout engine reads. A `Lines` view is rendered by the same styled-run
@@ -420,6 +426,8 @@ fn translate_cli_attrs<M>(attrs: Vec<CliAttr<M>>) -> Vec<Attribute<M>> {
 /// `Screen`, but its builder surface admits only line-scoped attributes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinesView<M>(pub Element<M>);
+
+crate::stringify::show_row!("CliLines", Internals, [M] LinesView<M>, |_| "<Ipe.Ui.Cli.Lines>".to_owned());
 
 impl<M> LinesView<M> {
     /// Wrap an existing `Element` as a `Lines` view.

@@ -36,10 +36,10 @@ pub enum MainOpt<T1> {
     Non,
 }
 
-impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for MainOpt<T1> {
+impl<T1: IpeStringify> IpeStringify for MainOpt<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            MainOpt::Som(p0) => format!("Som {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch()),
+            MainOpt::Som(p0) => format!("Som {}", IpeStringify::ipe_show(p0)),
             MainOpt::Non => "Non".to_string(),
         }
     }
