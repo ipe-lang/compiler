@@ -14,7 +14,7 @@ key and value percent-encoded, so a metacharacter cannot split off a new
 parameter.
 
 The mental model, a worked example, and the rationale live in the URLs guide
-(`docs/guide/url.md`); this module doc is the reference intro its per-symbol
+(`ipe doc guide:url`); this module doc is the reference intro its per-symbol
 comments back.
 
 ## `fromString`

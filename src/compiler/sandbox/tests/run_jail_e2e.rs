@@ -135,7 +135,18 @@ struct Outcome {
 fn run_jailed(tools: &RunJailTools, profile: &SandboxProfile, payload: &[OsString]) -> Option<i32> {
     // The assertions inherit stderr (a diagnostic when one fails); only the
     // canary captures it.
-    run_jailed_inner(tools, profile, payload, false).code
+    run_jailed_inner(tools, profile, None, payload, false, |_| {}).code
+}
+
+/// Like [`run_jailed`], with `tree` bound as the working tree instead of the
+/// scratch.
+fn run_jailed_in_tree(
+    tools: &RunJailTools,
+    profile: &SandboxProfile,
+    tree: &Path,
+    payload: &[OsString],
+) -> Option<i32> {
+    run_jailed_inner(tools, profile, Some(tree), payload, false, |_| {}).code
 }
 
 /// Like [`run_jailed`], but captures `bwrap`'s stderr so an establishment
@@ -145,17 +156,21 @@ fn run_jailed_capturing(
     profile: &SandboxProfile,
     payload: &[OsString],
 ) -> Outcome {
-    run_jailed_inner(tools, profile, payload, true)
+    run_jailed_inner(tools, profile, None, payload, true, |_| {})
 }
 
 /// Shared spawn core. `capture_stderr` selects whether `bwrap`'s stderr is piped
-/// (canary) or inherited (assertions). Panics (fails the test) if the spawn
-/// itself could not be launched.
+/// (canary) or inherited (assertions). The working tree is `tree`, else the
+/// scratch. `after` inspects the host side of the scoped scratch once the jail
+/// has exited, before it is removed. Panics (fails the test) if the spawn itself
+/// could not be launched.
 fn run_jailed_inner(
     tools: &RunJailTools,
     profile: &SandboxProfile,
+    tree: Option<&Path>,
     payload: &[OsString],
     capture_stderr: bool,
+    after: impl FnOnce(&Path),
 ) -> Outcome {
     // Hold the global lock across the whole spawn — the memfd + cloexec-clear is
     // a process-wide fd-table mutation.
@@ -174,12 +189,17 @@ fn run_jailed_inner(
     let scoped = CanonicalPath::resolve(&scoped).expect("scoped tmp resolves");
     let system_bins = [Path::new("/usr/bin"), Path::new("/bin")]
         .map(|dir| CanonicalPath::resolve(dir).expect("system bin dir resolves"));
-    let mounts = JailMounts::of_invoker(scoped.clone(), scoped.clone(), system_bins.to_vec())
+    let working_tree = tree.map_or_else(
+        || scoped.clone(),
+        |tree| CanonicalPath::resolve(tree).expect("working tree resolves"),
+    );
+    let mounts = JailMounts::of_invoker(scoped.clone(), working_tree, system_bins.to_vec())
         .expect("checked jail mounts");
     // `ipe_env` matches the launcher's crate-private passthrough for every name
     // but a home variable, and no profile in this file grants one.
     let host_env = |k: &str| ipe_env::var_os(k);
-    let argv = run_jail_argv(tools, profile, &mounts, Some(fd), &host_env, payload);
+    let argv = run_jail_argv(tools, profile, &mounts, Some(fd), &host_env, payload)
+        .expect("the argv builds");
     let (prog, rest) = argv.args().split_first().expect("non-empty argv");
     let mut cmd = Command::new(prog);
     cmd.args(rest);
@@ -189,11 +209,154 @@ fn run_jailed_inner(
     let out = cmd.output().expect("spawn jailed process");
     // Reap the memfd.
     drop(seccomp);
+    after(scoped.as_path());
     let _ = std::fs::remove_dir_all(&scoped);
     Outcome {
         code: out.status.code(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
+}
+
+/// A working tree holding a `.git` dir with a `HEAD` and a `hooks` dir, under
+/// the test temp root; removed by the caller.
+fn git_tree(label: &str) -> std::path::PathBuf {
+    let base = ipe_test_temp::temp_root().join(format!("ipe-e2e-{label}-{}", std::process::id()));
+    let hooks = base.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).expect("git hooks dir");
+    std::fs::write(base.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    base
+}
+
+fn tree_granted() -> SandboxProfile {
+    SandboxProfile {
+        filesystem: FilesystemScope::WorkingTreeReadWrite,
+        ..SandboxProfile::maximally_isolated()
+    }
+}
+
+#[test]
+fn a_jailed_write_to_git_hooks_is_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    let tree = git_tree("vcs-hooks");
+    let hook = tree.join(".git").join("hooks").join("pre-commit");
+    let source = tree.join("main.rs");
+    // A builtin `echo` with a redirect: the shell writes without forking.
+    let write = |path: &Path| -> Vec<OsString> {
+        vec![
+            OsString::from("/bin/bash"),
+            OsString::from("-c"),
+            OsString::from(format!("echo pwned > '{}'", path.display())),
+        ]
+    };
+    let hook_code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &write(&hook));
+    let source_code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &write(&source));
+    let hook_written = hook.exists();
+    let source_written = source.exists();
+    let _ = std::fs::remove_dir_all(&tree);
+    assert_eq!(
+        source_code,
+        Some(0),
+        "the rest of a granted tree stays writable (no false-deny)"
+    );
+    assert!(source_written, "the control write landed on the host");
+    assert_ne!(
+        hook_code,
+        Some(0),
+        "a jailed write into .git/hooks must fail (read-only carve)"
+    );
+    assert!(!hook_written, "no hook reached the host");
+}
+
+#[test]
+fn a_jailed_git_status_still_reads_the_repo() {
+    let Some(tools) = e2e_tools() else { return };
+    let tree = git_tree("vcs-read");
+    let payload = vec![
+        OsString::from("/bin/cat"),
+        tree.join(".git").join("HEAD").into_os_string(),
+    ];
+    let code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &payload);
+    let _ = std::fs::remove_dir_all(&tree);
+    assert_eq!(
+        code,
+        Some(0),
+        "the carve is read-only, never hidden: the repo stays readable"
+    );
+}
+
+#[test]
+fn nested_carve_ancestor_rename_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    let tree = std::fs::canonicalize(git_tree("vcs-pins")).expect("tree resolves");
+    let store = tree.join("store");
+    let repo = store.join("repo");
+    std::fs::create_dir_all(repo.join(".git").join("hooks")).expect("nested git dir");
+    let moved = tree.join("store2");
+    let rename = vec![
+        OsString::from("/bin/mv"),
+        store.clone().into_os_string(),
+        moved.clone().into_os_string(),
+    ];
+    let rename_code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &rename);
+    let mounted = |dir: &Path| -> Vec<OsString> {
+        vec![
+            OsString::from("/bin/grep"),
+            OsString::from("-qF"),
+            OsString::from(format!(" {} ", dir.display())),
+            OsString::from("/proc/self/mountinfo"),
+        ]
+    };
+    let pinned: Vec<(std::path::PathBuf, Option<i32>)> = [store.clone(), repo]
+        .into_iter()
+        .map(|dir| {
+            let code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &mounted(&dir));
+            (dir, code)
+        })
+        .collect();
+    let store_kept = store.is_dir();
+    let moved_exists = moved.exists();
+    let _ = std::fs::remove_dir_all(&tree);
+    assert_ne!(
+        rename_code,
+        Some(0),
+        "an ancestor of a nested carve cannot be renamed inside the jail"
+    );
+    assert!(store_kept && !moved_exists, "the host tree kept its layout");
+    for (dir, code) in pinned {
+        assert_eq!(
+            code,
+            Some(0),
+            "{} is a mount point inside the jail",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn an_in_scratch_write_succeeds_under_the_run_jail() {
+    let Some(tools) = e2e_tools() else { return };
+    // A builtin `printf` with a redirect into the jail's `TMPDIR` (the scoped
+    // scratch): the shell writes without forking, so the isolated profile's
+    // subprocess denial is not in play.
+    let payload: Vec<OsString> = ["/bin/sh", "-c", "printf ok > \"$TMPDIR/ipe-e2e-write\""]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let mut written = None;
+    let code = run_jailed_inner(&tools, &isolated(), None, &payload, false, |scoped| {
+        written = std::fs::read_to_string(scoped.join("ipe-e2e-write")).ok();
+    })
+    .code;
+    assert_eq!(
+        code,
+        Some(0),
+        "a write into the scoped scratch succeeds under the isolated jail (no false-deny)"
+    );
+    assert_eq!(
+        written.as_deref(),
+        Some("ok"),
+        "the in-scratch write reached the host's scoped scratch"
+    );
 }
 
 fn isolated() -> SandboxProfile {

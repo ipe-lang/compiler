@@ -11,10 +11,11 @@ name: Build & test
 #     diagnostic-tone, build-tools, the docs-drift gates, the example gates, the
 #     first-party check-floor + shapes build gate, wasm-floor, editors-configure.
 #     A pull request runs only this phase.
-#   • TESTS (`tests`: merge queue, dispatch) — test (nextest), the 14-shard e2e
+#   • TESTS (`tests`: merge queue, dispatch) — test (nextest, with the `ipe`
+#     feature job wasi-run), the 14-shard e2e
 #     SEAL and seal-slice's coverage proof, seal-smoke, seal-modset (vendored),
 #     the runtime feature-combo / full-feature builds, registry-admission, the
-#     Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
+#     release-target checks, the Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
 #     the queue is about to land.
 #   • POST-MERGE (`post_merge`: push to main, dispatch) — the ASAN/TSAN
 #     sanitizers and the arm64 Tier-2 proof.
@@ -293,9 +294,10 @@ jobs:
         if: steps.classify.outputs.panic_scan == 'false'
         run: echo "No panic-scan-relevant paths changed; gate is a no-op for this PR."
 
-  # The Windows-only code of `ipe` and `ipe_fs_open` (held directory handles,
-  # reparse-point refusal) never compiles on a Linux runner, so a cfg(windows)
-  # break would otherwise surface only at release. Type-checks both crates and
+  # The Windows-only code of `ipe`, `ipe_fs_open` and `ipe_sandbox` (held
+  # directory handles, reparse-point refusal, the Windows jail and tool-name
+  # checks) never compiles on a Linux runner, so a cfg(windows)
+  # break would otherwise surface only at release. Type-checks the crates and
   # their tests for Windows on every code change; the Windows test suites do
   # not run in CI.
   windows-check:
@@ -308,7 +310,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --locked -p ipe -p ipe_fs_open --all-targets
+      - run: cargo check --locked -p ipe -p ipe_fs_open -p ipe_sandbox --all-targets
+      - run: cargo check --locked -p ipe-runtime-rust --lib --tests --no-default-features
 
   # No compiler-internal jargon or raw Rust types leak into user-facing text
   # (rendered diagnostic goldens + `ipe explain` pages). Pure git + ripgrep, no
@@ -443,6 +446,84 @@ jobs:
           results: >-
             changes=${{ needs.changes.result }}
             registry-admission-run=${{ needs.registry-admission-run.result }}
+          phase: tests
+          tier: ${{ needs.changes.outputs.tests }}
+          scope: ${{ needs.changes.outputs.code }}
+
+  # The release workflow's targets, type-checked before a release is cut: each
+  # release leg's `cargo build` is a `cargo check` here, on the same runner, target
+  # and pinned toolchain, so a target that cannot compile surfaces in the merge
+  # queue, not on the release tag. `ring` needs a native C toolchain, so each leg
+  # runs natively. Both workflows run the checkout, the one shared
+  # .github/actions/release-target-toolchain step and the cargo command, in that
+  # order and nothing else before the cargo command; ci/verify-manifest.py
+  # check 23 pins all three.
+  # `cargo check` does not link.
+  release-targets-run:
+    needs: [changes, quick-check]
+    # Tests phase: five native runners, so merge queue and dispatch only.
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/release-target-toolchain
+        with:
+          target: ${{ matrix.target }}
+      - name: Check ipe + ipe-ffi-inspector
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+
+  # FreeBSD has no native GitHub runner, so its release leg runs in a VM; this is
+  # that leg's check: release.yml's VM step, its cargo line pinned by check 23.
+  release-targets-freebsd:
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check in FreeBSD VM
+        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
+
+  # Required context for the release-target jobs: the phase verdict (see the header).
+  release-targets:
+    name: release-targets
+    runs-on: ubuntu-latest
+    needs: [changes, release-targets-run, release-targets-freebsd]
+    if: always()
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/phase-verdict
+      - name: Judge the aggregated jobs
+        uses: ./.github/actions/phase-verdict
+        with:
+          results: >-
+            changes=${{ needs.changes.result }}
+            release-targets-run=${{ needs.release-targets-run.result }}
+            release-targets-freebsd=${{ needs.release-targets-freebsd.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
@@ -714,13 +795,44 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Required aggregation gate for `test`: green only when every shard and the
-  # doctest job (in test-prep) passed. Branch protection lists this job, so a
+  # The `wasi_run` and `signing` Cargo features of `ipe` are off by default, so
+  # no other job compiles the embedded wasmtime engine, the sigstore verifier or
+  # the code and tests behind them. This job lints and tests `ipe` with both on,
+  # then runs the WASI seal and the wall-clock and memory ceiling tests of the
+  # embedded run. `ci/verify-manifest.py` check 22 holds every feature of a
+  # workspace member to a command that enables it.
+  wasi-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/mold
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Lint ipe with the optional features on
+        run: cargo clippy --locked -p ipe --features wasi_run,signing --all-targets -- -D warnings
+      - name: Test ipe with the optional features on
+        run: cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci
+      - name: Run the WASI seal end to end
+        env:
+          IPE_E2E: "1"
+        run: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
+
+  # Required aggregation gate for `test`: green only when every shard, the
+  # doctest job (in test-prep) and the feature job `wasi-run` passed. Branch protection lists this job, so a
   # matrix expansion never silently drops a required check. The `always()` guard
   # makes a skipped/failed dependency a FAILURE here, never a false green.
   test:
     runs-on: ubuntu-latest
-    needs: [changes, test-prep, test-run]
+    needs: [changes, test-prep, test-run, wasi-run]
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -734,6 +846,7 @@ jobs:
             changes=${{ needs.changes.result }}
             test-prep=${{ needs.test-prep.result }}
             test-run=${{ needs.test-run.result }}
+            wasi-run=${{ needs.wasi-run.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
@@ -964,9 +1077,9 @@ jobs:
       # `dev-posture` is the dev-intent build outside `full`; its pins prove a
       # dev build on a loopback listener opens each dev-only surface.
       - run: cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
-      # `debugger` is a build-mode opt-in outside `full`; named here so its
-      # overlay and recorder tests run.
-      - run: cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
+      # `debugger` and `locale` are opt-ins outside `full`; named here so the
+      # overlay and recorder tests and the ICU case-fold oracle run.
+      - run: cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci
       - name: Upload JUnit results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

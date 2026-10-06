@@ -10,6 +10,85 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.5.0](https://github.com/ipe-lang/compiler/compare/ipe-v0.4.0...ipe-v0.5.0) (2026-10-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **runtime:** typed cookie and response-header codec, one cookie reader, framing policy parsed once ([#3426](https://github.com/ipe-lang/compiler/issues/3426))
+* **cli:** `ipe dev build` and `ipe dev run` no longer accept `--accept-risks`. Dev builds carry no capability floor and are refused by `ipe release run`; rebuild with `ipe release build`. `IPE_ALLOW_UNSANDBOXED` is gone.
+* **cli:** `ipe build`, `ipe run`, `ipe watch`, `ipe exec`, `ipe eject` and the bare `ipe release` are refused; use `ipe dev build|run|watch` and `ipe release build|run|eject`.
+
+### Features
+
+* **cli:** ipe dev runs no capability checks ([#3431](https://github.com/ipe-lang/compiler/issues/3431)) ([3f96284](https://github.com/ipe-lang/compiler/commit/3f96284a505df2cfce373d267e024a104ab8e257))
+* **fs_open:** list a held directory by entry-type hint and refuse a removed held directory ([#3427](https://github.com/ipe-lang/compiler/issues/3427)) ([e7b506f](https://github.com/ipe-lang/compiler/commit/e7b506fc728c26ada6fde1d361a7fda1b325aec1))
+
+
+### Bug Fixes
+
+* **backend,ffi:** one Rust-literal owner, lexability refused at emit, typed FFI package names ([#3402](https://github.com/ipe-lang/compiler/issues/3402)) ([d2db362](https://github.com/ipe-lang/compiler/commit/d2db3623960297503c96975b0163d1e8195465db))
+* **backend:** emitted programs end through the runtime exit funnel ([#3497](https://github.com/ipe-lang/compiler/issues/3497)) ([a91f8eb](https://github.com/ipe-lang/compiler/commit/a91f8ebeeac76d4d50d2b57c64dcb06f4c10a508))
+* **backend:** evaluate a routed web app's update once and share it between the entry and set_page ([#3421](https://github.com/ipe-lang/compiler/issues/3421)) ([6324208](https://github.com/ipe-lang/compiler/commit/6324208fff0d29f39858d99f2809b4409ab2a1cc))
+* **backend:** one item-separator authority for emitted Rust layout ([#3429](https://github.com/ipe-lang/compiler/issues/3429)) ([c232638](https://github.com/ipe-lang/compiler/commit/c232638f7f02b14debadc2ae66418d36131827e1))
+* bare dev help, bounded exporter flush, one runtime exit funnel, held lint and wrapper reads ([#3486](https://github.com/ipe-lang/compiler/issues/3486)) ([c3799b3](https://github.com/ipe-lang/compiler/commit/c3799b38e20d172448fe4e2709a6490730d47521))
+* **canon:** classify main by its do-block tail through binds ([#3416](https://github.com/ipe-lang/compiler/issues/3416)) ([f524c33](https://github.com/ipe-lang/compiler/commit/f524c335bc35f911264212c55d038b5681255cd7))
+* **canon:** substitute alias row parameters through one walker ([#3420](https://github.com/ipe-lang/compiler/issues/3420)) ([324e7fe](https://github.com/ipe-lang/compiler/commit/324e7feae18442955c56a3c1ec3de3b502ced7b1))
+* **canon:** unimported module qualifier says to import it; N0034 lists every binder ([#3403](https://github.com/ipe-lang/compiler/issues/3403)) ([b67fa1c](https://github.com/ipe-lang/compiler/commit/b67fa1c5a6027527cf58fda20446efa4d07c6a97))
+* **cli:** bound every local child through typed runners ([#3446](https://github.com/ipe-lang/compiler/issues/3446)) ([3d1efda](https://github.com/ipe-lang/compiler/commit/3d1efda44297490a2a1e86ca863a2d4ca22d21cc))
+* **cli:** group build verbs under dev and release; release run runs the returned artifact, jailed ([#3422](https://github.com/ipe-lang/compiler/issues/3422)) ([1b0022f](https://github.com/ipe-lang/compiler/commit/1b0022fddb6c48b39d46f3e550c1309089c9dbd1))
+* **cli:** hash the build-cache source tree through held handles only ([#3443](https://github.com/ipe-lang/compiler/issues/3443)) ([f19ec2d](https://github.com/ipe-lang/compiler/commit/f19ec2df401b64e7bf6968c3990db2d2821fbc45))
+* **cli:** publicEnv refuses temp-root and home variables at the manifest boundary ([#3414](https://github.com/ipe-lang/compiler/issues/3414)) ([97c1a0f](https://github.com/ipe-lang/compiler/commit/97c1a0f2135e0ddf5e55753943c814f86915a8d4))
+* **code-review:** a source view past its ceiling is withheld, never drawn or decided ([#3474](https://github.com/ipe-lang/compiler/issues/3474)) ([b3e4cd6](https://github.com/ipe-lang/compiler/commit/b3e4cd6d65c0ebb8eae9a7d6404f7aa13807fd71))
+* **code-review:** parse uids, page sizes, rebuild bounds and stored decisions once ([#3461](https://github.com/ipe-lang/compiler/issues/3461)) ([e43c44b](https://github.com/ipe-lang/compiler/commit/e43c44b59316ee9d3ed4b33827735cc9e6ac633b))
+* **code-review:** queue membership is open_units; the review log is append-only and hash-chained ([#3455](https://github.com/ipe-lang/compiler/issues/3455)) ([06cf664](https://github.com/ipe-lang/compiler/commit/06cf664645f2a3d42e2751b0f5749e4ba588cbfc))
+* **code-review:** render tests, one read and decision per session, escapes drawn apart ([#3466](https://github.com/ipe-lang/compiler/issues/3466)) ([2b8f349](https://github.com/ipe-lang/compiler/commit/2b8f3499491e4b9d47bed5bedde40408730a4553))
+* **code-review:** startup settings and typed multi-root map, pinned by source scans ([#3447](https://github.com/ipe-lang/compiler/issues/3447)) ([4632a6e](https://github.com/ipe-lang/compiler/commit/4632a6e30f81ed0b44acadf8358651a321a5d603))
+* **code-review:** the review tool runs end to end; nested closure captures are classified once ([#3400](https://github.com/ipe-lang/compiler/issues/3400)) ([7968e51](https://github.com/ipe-lang/compiler/commit/7968e51fc9df86956ca6d4d52bbf1e10cbea726d))
+* **doc:** show every stdlib function with its signature and doc-comment ([#3467](https://github.com/ipe-lang/compiler/issues/3467)) ([71f1010](https://github.com/ipe-lang/compiler/commit/71f1010b10759deaa2c9c429b813294312a210fe))
+* entry-rooted analysis, total int literals, Store projection refusal, InfixOp SSOT, required CI tooling jobs ([#3385](https://github.com/ipe-lang/compiler/issues/3385)) ([24f154b](https://github.com/ipe-lang/compiler/commit/24f154be73fdc3013fe9f618240fd6626058fa1b))
+* **env:** the registry names only variables the tree reads; format the code-review sources ([#3413](https://github.com/ipe-lang/compiler/issues/3413)) ([9e760cb](https://github.com/ipe-lang/compiler/commit/9e760cbbd679531d9d12c1fb67f5d1e77e9167e6))
+* fmt corpus fixed point, one fixity table, classifier stubs, Windows doc/health, typed remote-ingest ceilings ([#3359](https://github.com/ipe-lang/compiler/issues/3359)) ([e5cf41a](https://github.com/ipe-lang/compiler/commit/e5cf41a038f905905abc61d3eb5c70a9219f4219))
+* fuzz templates as data, one program-entry parser, compiled-in audit wrapper, tracked smoke probes ([#3360](https://github.com/ipe-lang/compiler/issues/3360)) ([f54f46f](https://github.com/ipe-lang/compiler/commit/f54f46fbe02cadd7f2cb45dc5c6c5d84d70da108))
+* index reads re-check on the opened handle, typed FFI prep refusals, web store env accessor ([#3397](https://github.com/ipe-lang/compiler/issues/3397)) ([f1862c2](https://github.com/ipe-lang/compiler/commit/f1862c249cbb415ad8690810161004b5ac9daefb))
+* installer output through helpers, held output-dir handles, one jail mount plan ([#3363](https://github.com/ipe-lang/compiler/issues/3363)) ([ca548f2](https://github.com/ipe-lang/compiler/commit/ca548f24b29b99e473f592d0b2617f93867596b5))
+* **ipe-index:** one owner per path across declared repo roots ([#3404](https://github.com/ipe-lang/compiler/issues/3404)) ([e89643f](https://github.com/ipe-lang/compiler/commit/e89643fb316123672904a0b76688a4b4c0b29a8c))
+* **ipe-index:** open_units view over the current tree and a reviewed stamp that survives rebuilds ([#3407](https://github.com/ipe-lang/compiler/issues/3407)) ([a30dec5](https://github.com/ipe-lang/compiler/commit/a30dec5a0f890b874304c2220a5076cd64ee74d8))
+* **ipe-index:** resolve the callgraph over the whole index and stamp the extractor ([#3460](https://github.com/ipe-lang/compiler/issues/3460)) ([63e3769](https://github.com/ipe-lang/compiler/commit/63e37698c118dcb9b6308d6f2a69391969cbce65))
+* **ipe-index:** update judges the files index lists, by content stamp ([#3453](https://github.com/ipe-lang/compiler/issues/3453)) ([89eee21](https://github.com/ipe-lang/compiler/commit/89eee21cde3e5f630b0fe2dcf5d6bde3da39c041))
+* **lower:** a stored function passed to a kernel's function slot builds ([#3373](https://github.com/ipe-lang/compiler/issues/3373)) ([3c47981](https://github.com/ipe-lang/compiler/commit/3c479811f4d181d51db7fbd58da6ffc1ad01c769)), closes [#3332](https://github.com/ipe-lang/compiler/issues/3332)
+* **lower:** owned list case moves non-Clone elements through an ownership-classed view ([#3409](https://github.com/ipe-lang/compiler/issues/3409)) ([7706eec](https://github.com/ipe-lang/compiler/commit/7706eecc2f68d3f2083718902d97b61f103ae33e))
+* mobile bundle held-handle walk, parsed home across boundaries, judged page examples, one comment owner in fmt ([#3388](https://github.com/ipe-lang/compiler/issues/3388)) ([003ca39](https://github.com/ipe-lang/compiler/commit/003ca39f1d0e3cd6b687dd9a84b1aa3d7ee6a9ab))
+* path element regime, Windows runtime tests, display-hazard names, code-review busy timeout, Windows jail env ([#3358](https://github.com/ipe-lang/compiler/issues/3358)) ([7ceea18](https://github.com/ipe-lang/compiler/commit/7ceea184eda71d60fc46574fe9c3eb0fe165ce0c))
+* **runtime:** assemble every server response head through one typed function ([#3457](https://github.com/ipe-lang/compiler/issues/3457)) ([d154605](https://github.com/ipe-lang/compiler/commit/d154605ffdbdea2e0e7e0640c344824afb5ed60b))
+* **runtime:** CORS Vary follows the policy, not the per-request grant ([#3493](https://github.com/ipe-lang/compiler/issues/3493)) ([af18fa0](https://github.com/ipe-lang/compiler/commit/af18fa0516ef5c2be26b9196b00f7c017eb17669)), closes [#3456](https://github.com/ipe-lang/compiler/issues/3456)
+* **runtime:** http streams are capability handles, a close stops the drain, every wait is bounded ([#3419](https://github.com/ipe-lang/compiler/issues/3419)) ([4956554](https://github.com/ipe-lang/compiler/commit/4956554916da881513722ad4ccd30a6b20e801d8))
+* **runtime:** malformed DNS deadline, auth lifetimes, revocation capacity and web TTL are refused ([#3405](https://github.com/ipe-lang/compiler/issues/3405)) ([8a488fc](https://github.com/ipe-lang/compiler/commit/8a488fcbc3e3cf5bc0a9b616d4fef2e27b066682))
+* **runtime:** parse app settings once and refuse them at startup ([#3450](https://github.com/ipe-lang/compiler/issues/3450)) ([bd3f51e](https://github.com/ipe-lang/compiler/commit/bd3f51eb11029873a88ee57e6f9383607f0bc100))
+* **runtime:** redacting Debug, one log-hazard set, posture-gated dev surface ([#3391](https://github.com/ipe-lang/compiler/issues/3391)) ([72b4c15](https://github.com/ipe-lang/compiler/commit/72b4c15a90a692b3cc0657aa46ab2190ee6efb4b))
+* **runtime:** root-confined no-follow file read primitive ([#3482](https://github.com/ipe-lang/compiler/issues/3482)) ([236e07e](https://github.com/ipe-lang/compiler/commit/236e07e04857651f30bb5221cd1214bdb827870f))
+* **runtime:** typed cookie and response-header codec, one cookie reader, framing policy parsed once ([#3426](https://github.com/ipe-lang/compiler/issues/3426)) ([c907317](https://github.com/ipe-lang/compiler/commit/c9073177187bb8bbd0115836487f3b0ceef249f8))
+* **sandbox:** a process cap is a typed bounded value, with jail fixture tests ([#3496](https://github.com/ipe-lang/compiler/issues/3496)) ([f24865c](https://github.com/ipe-lang/compiler/commit/f24865cca6d9470bbc1e5d500cb25a551d43f653))
+* **sandbox:** bind the jail's writable tree through one parsed grant and pin carve ancestors ([#3470](https://github.com/ipe-lang/compiler/issues/3470)) ([dd0e7c0](https://github.com/ipe-lang/compiler/commit/dd0e7c0b94a084ba0d5d8ba562f66fffe57fa5ab))
+* **sandbox:** carve VCS metadata and refuse a tree whose VCS config is not provably inert ([#3425](https://github.com/ipe-lang/compiler/issues/3425)) ([d7dc376](https://github.com/ipe-lang/compiler/commit/d7dc3764c8f1ab9fda19b1740f2f6bae10e1ec44))
+* **sandbox:** decide every Mercurial setting by table and judge key-named tools as programs ([#3458](https://github.com/ipe-lang/compiler/issues/3458)) ([80882c8](https://github.com/ipe-lang/compiler/commit/80882c8f20de709f46cbf7e8b1fd52e53213427f))
+* **sandbox:** decide every VCS setting's consumption through one key table ([#3452](https://github.com/ipe-lang/compiler/issues/3452)) ([f75606a](https://github.com/ipe-lang/compiler/commit/f75606a0e4864b79da2f739daa06be49c442c15d))
+* **sandbox:** judge each VCS config program word as the tool runs it ([#3448](https://github.com/ipe-lang/compiler/issues/3448)) ([11dcf28](https://github.com/ipe-lang/compiler/commit/11dcf28697a07e011694025cde2749e4d2534c3c))
+* **show:** one stringify policy decides how every value becomes text ([#3477](https://github.com/ipe-lang/compiler/issues/3477)) ([bc0ad42](https://github.com/ipe-lang/compiler/commit/bc0ad4219930966f16daf1dcac1e3544bc9fedb3))
+* **stdlib:** String.casefold and equalFold are full Unicode case folding ([#3494](https://github.com/ipe-lang/compiler/issues/3494)) ([b5a6f12](https://github.com/ipe-lang/compiler/commit/b5a6f1298aeb3d6758e9339ce6a6bd0d63b5e7e6))
+* type errors at their owning module, one binding ladder, one-scalar UTF-8 scanning ([#3387](https://github.com/ipe-lang/compiler/issues/3387)) ([77fc424](https://github.com/ipe-lang/compiler/commit/77fc424f7b0b65a0c37d661ae0c636044fecd8d0))
+* typed env ceilings, transfers end on SIGTERM, termination beside hung teardown ([#3374](https://github.com/ipe-lang/compiler/issues/3374)) ([8516c4c](https://github.com/ipe-lang/compiler/commit/8516c4c8c49f82f277287b5a47fcd6350ed64ca0))
+* typed thread-start refusals, one spelled-name predicate, typed session-store persist error ([#3386](https://github.com/ipe-lang/compiler/issues/3386)) ([5b5c08d](https://github.com/ipe-lang/compiler/commit/5b5c08db4f27a69a2ea0f5870fb4839ad26da324))
+* **types:** defer field access and record update until the base record is settled ([#3398](https://github.com/ipe-lang/compiler/issues/3398)) ([42acf3f](https://github.com/ipe-lang/compiler/commit/42acf3f407fdf456b63ddd1963fab5a49ae6bd8c))
+* **types:** derive the builtin constructor table from canon, fail closed on a miss ([#3491](https://github.com/ipe-lang/compiler/issues/3491)) ([55109c0](https://github.com/ipe-lang/compiler/commit/55109c07d5c4b792974af53163d2f70401c3a02e))
+* **types:** exhaustiveness fails closed over the transitive union closure ([#3468](https://github.com/ipe-lang/compiler/issues/3468)) ([273b711](https://github.com/ipe-lang/compiler/commit/273b71153c29b2869063711bfb20742b3695ffb8))
+* **types:** scoped type-check keys generic variables by the tagged solver var and canonicalizes with a ceiling ([#3406](https://github.com/ipe-lang/compiler/issues/3406)) ([f57bb5b](https://github.com/ipe-lang/compiler/commit/f57bb5b3b8cc95dca4670baf321ee464a3ef06cb))
+
+
+### Performance Improvements
+
+* **backend:** linear render layout from composable text measures ([#3390](https://github.com/ipe-lang/compiler/issues/3390)) ([ef4f9ed](https://github.com/ipe-lang/compiler/commit/ef4f9edafd742e39c26a47e36271a4e2f0b2809e))
+
 ## [0.4.0](https://github.com/ipe-lang/compiler/compare/ipe-v0.3.5...ipe-v0.4.0) (2026-10-02)
 
 

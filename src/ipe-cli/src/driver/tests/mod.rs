@@ -4249,45 +4249,24 @@ fn session_is_admitted_for_a_native_cli_or_worker_app() {
     }
 }
 
-// A native-bearing program runs jailed, where the log is unreachable: refused
-// whether the crossing is inferred or only declared, and a pure program passes.
+// A program that can link Rust FFI is refused a session — its replay is not
+// proven deterministic — and told to run without the flag, while a program
+// with no FFI records and replays.
 #[test]
-fn session_is_refused_for_a_native_bearing_program() {
-    use crate::run_sandbox::ResolvedCapabilities;
-    use ipe_ir::Capability;
-    use std::collections::BTreeSet;
-    let native: BTreeSet<Capability> = std::iter::once(Capability::NativeFfi).collect();
-    let raw: BTreeSet<Capability> = std::iter::once(Capability::FfiRaw).collect();
-    let bearing = [
-        ResolvedCapabilities {
-            inferred: native.clone(),
-            declared: BTreeSet::new(),
-        },
-        ResolvedCapabilities {
-            inferred: BTreeSet::new(),
-            declared: native,
-        },
-        ResolvedCapabilities {
-            inferred: raw,
-            declared: BTreeSet::new(),
-        },
-    ];
+fn session_record_refuses_ffi_program() {
+    use crate::ffi::FfiPresence;
     for flag in ["--record", "--replay"] {
-        for resolved in &bearing {
-            let result = gate_session_capabilities(flag, resolved);
-            assert!(
-                matches!(&result, Err(CliError::Usage(msg)) if msg.contains("native-bearing")),
-                "{flag} on a native-bearing program must be refused, got: {result:?}"
-            );
-        }
-        let pure = ResolvedCapabilities {
-            inferred: BTreeSet::new(),
-            declared: BTreeSet::new(),
-        };
-        let result = gate_session_capabilities(flag, &pure);
+        let result = gate_session_ffi(flag, FfiPresence::Present);
+        assert!(
+            matches!(&result, Err(CliError::Usage(msg))
+                if msg.contains("Rust FFI")
+                    && msg.contains(&format!("run it without {flag}"))),
+            "{flag} on an FFI program must be refused with its remedy, got: {result:?}"
+        );
+        let result = gate_session_ffi(flag, FfiPresence::Absent);
         assert!(
             result.is_ok(),
-            "{flag} on a pure program must pass: {result:?}"
+            "{flag} on a program with no FFI must pass: {result:?}"
         );
     }
 }
@@ -4401,7 +4380,7 @@ fn named_replay_log_is_shown_when_it_is_a_trace() {
     assert!(fs::write(&typed, "{}").is_ok(), "write typed log");
     let shown = replay_plan(trace.clone());
     assert!(
-        matches!(&shown, Ok(SessionPlan::ShowTrace(p)) if *p == trace),
+        matches!(&shown, Ok(SessionPlan::ShowTrace(TraceFile::Named(p))) if *p == trace),
         "a named trace must be shown: {shown:?}"
     );
     let folded = replay_plan(typed.clone());
@@ -4443,7 +4422,7 @@ fn default_replay_prefers_the_typed_log_then_the_trace() {
     assert!(fs::write(&trace, "Add(1) => 1\n").is_ok(), "write trace");
     let shown = resolve_session_plan(&replay, &output);
     assert!(
-        matches!(&shown, Ok(SessionPlan::ShowTrace(p)) if p.ends_with(RECORD_LOG_FILE)),
+        matches!(&shown, Ok(SessionPlan::ShowTrace(TraceFile::Recorded(p))) if p.ends_with(RECORD_LOG_FILE)),
         "a lone trace must be shown: {shown:?}"
     );
 
@@ -4472,7 +4451,7 @@ fn shown_trace_strips_every_control_character() {
                  \u{9b}2J\u{9d}0;title\u{9c}Add(\u{85}3\t\u{7f}\u{202e}) => 5\n\
                  \x1b[H\x1b[2J\n";
     assert!(fs::write(&trace, laced).is_ok(), "write planted trace");
-    let shown = load_session_trace(&trace);
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         shown.is_ok(),
         "a UTF-8 trace under the cap must show: {shown:?}"
@@ -4505,6 +4484,54 @@ fn shown_trace_strips_every_control_character() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// A trace the user named through a link is read through it.
+#[cfg(unix)]
+#[test]
+fn a_user_named_trace_symlink_is_followed() {
+    let dir = session_scratch("named_link");
+    let target = dir.join("real.ipelog");
+    let link = dir.join("link.ipelog");
+    assert!(fs::write(&target, "Add(1) => 1\n").is_ok(), "write trace");
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let shown = load_session_trace(&TraceFile::Named(link));
+    assert!(
+        shown
+            .as_deref()
+            .is_ok_and(|out| out.contains("Add(1) => 1")),
+        "a named trace link must be followed: {shown:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// The trace the recorder wrote is never followed when it was swapped for a link.
+#[cfg(unix)]
+#[test]
+fn a_recorded_trace_swapped_for_a_link_is_refused() {
+    let dir = session_scratch("recorded_link");
+    let target = dir.join("elsewhere.txt");
+    let link = dir.join(RECORD_LOG_FILE);
+    assert!(fs::write(&target, "secret\n").is_ok(), "write target");
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let shown = load_session_trace(&TraceFile::Recorded(link));
+    assert!(
+        matches!(
+            &shown,
+            Err(CliError::SourceRefused {
+                reason: SourceRefusal::Symlink,
+                ..
+            })
+        ),
+        "a recorded trace link must be refused: {shown:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // A trace over the cap is refused typed, before anything is rendered.
 #[test]
 fn shown_trace_over_the_cap_is_refused() {
@@ -4515,7 +4542,7 @@ fn shown_trace_over_the_cap_is_refused() {
         fs::write(&trace, vec![b'a'; over]).is_ok(),
         "write big trace"
     );
-    let shown = load_session_trace(&trace);
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         matches!(shown, Err(CliError::FileTooLarge { .. })),
         "an oversized trace must be refused: {shown:?}"
@@ -4532,7 +4559,7 @@ fn shown_trace_not_utf8_is_refused() {
         fs::write(&trace, [b'A', 0xff, 0xfe, b'\n']).is_ok(),
         "write binary trace"
     );
-    let shown = load_session_trace(&trace);
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         matches!(&shown, Err(CliError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::InvalidData),
@@ -4575,7 +4602,14 @@ fn emitting_into_a_user_directory_is_refused_untouched() {
     fs::create_dir_all(&elsewhere).expect("project dir");
     let result = EmitTarget::at(&dir, &ProjectPaths::of_file(&elsewhere.join("Main.ipe")))
         .and_then(|target| {
-            write_emitted_project(&emitted, &target, &dir.join("no-runtime"), None, false)
+            write_emitted_project(
+                &emitted,
+                &target,
+                &dir.join("no-runtime"),
+                None,
+                false,
+                crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+            )
         });
     assert!(
         matches!(result, Err(CliError::OutputRefused(_))),
@@ -4765,6 +4799,7 @@ fn a_replaced_claimed_target_is_refused_untouched() {
         &base.join("no-runtime"),
         None,
         false,
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
     );
     assert!(
         matches!(
@@ -4807,6 +4842,7 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
         &base.join("no-runtime"),
         None,
         false,
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
     );
     assert!(
         matches!(result, Err(CliError::OutputRefused(_))),
@@ -4824,6 +4860,7 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
         &base.join("no-runtime"),
         None,
         false,
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
     );
     assert!(
         matches!(result, Err(CliError::OutputRefused(_))),
@@ -5308,12 +5345,23 @@ fn release_build_capabilities_flag_is_unknown() {
     }
 }
 
-/// A bare `ipe dev` fails with no hint line; `ipe dev --help` is its page.
+/// A bare `ipe dev` prints the group page and succeeds.
+///
+/// A non-member token after it still refuses as an unknown verb of the group.
 #[test]
-fn bare_dev_refuses_nonzero() {
-    assert_group_required(&["dev"], "dev", &[], "");
+fn bare_dev_prints_usage_and_succeeds() {
+    let bare = run_argv(&["dev"]);
+    assert!(bare.is_ok(), "a bare `ipe dev` must succeed: {bare:?}");
     assert!(intercept_help(&["dev".to_owned()]).is_none());
     assert!(intercept_help(&["dev".to_owned(), "--help".to_owned()]).is_some());
+    let unknown = run_argv(&["dev", "nonesuch"]);
+    assert!(
+        matches!(
+            &unknown,
+            Err(CliError::UnknownGroupSub { group: "dev", attempted }) if attempted.as_str() == "nonesuch"
+        ),
+        "`ipe dev <unknown>` must still refuse: {unknown:?}"
+    );
 }
 
 /// A token after `ipe dev` that names no member is an unknown subcommand.
@@ -5383,7 +5431,7 @@ fn group_required_sanitizes_attempted() {
 const DEBUG_LOG_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.Debug as Debug\n\nshout : String -> String\nshout s =\n    Debug.log \"shout\" s\n\nmain : Task Error ()\nmain =\n    Io.println (shout \"hi\")\n";
 
 /// Compile [`DEBUG_LOG_MAIN`] under `verb`'s posture, uncached.
-fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::output_dir::OwnedDir, CliError> {
+fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::driver::EmittedCrate, CliError> {
     let runtime = resolve_runtime().expect("the in-repo runtime resolves");
     let tmp = ipe_test_temp::temp_root()
         .join(format!("ipec-verb-posture-{label}-{}", std::process::id()));
@@ -5485,11 +5533,11 @@ const DEBUG_DESKTOP_PACKAGE: &str = "module Package exposing (package)\n\nimport
 /// The `main` of [`DEBUG_DESKTOP_PACKAGE`].
 const DEBUG_DESKTOP_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Web as Web\nimport Ipe.Tea.Web.Cmd as Cmd\nimport Ipe.Tea.Web.Sub as Sub\nimport Ipe.Debug as Debug\nimport Ipe.String as String\nimport Ipe.Ui as Ui\n\n\ntype alias Model =\n    { count : Int }\n\n\ntype Msg\n    = Increment\n    | NoOp\n\n\ninit : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\nupdate : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        Increment ->\n            ( { model | count = Debug.log \"count\" (model.count + 1) }, Cmd.none )\n\n        NoOp ->\n            ( model, Cmd.none )\n\n\nsubscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\nview : Model -> Element Msg\nview model =\n    Ui.column []\n        [ Ui.button [] { onPress = Just Increment, label = Ui.text \"+\" }\n        , Ui.text (String.fromInt model.count)\n        ]\n\n\nmain =\n    Web.tea\n        { init = init\n        , update = update\n        , view = view\n        , subscriptions = subscriptions\n        , routes = []\n        , notFound = NoOp\n        }\n";
 
-/// Bundle the Debug-using desktop app under `profile`.
-fn bundle_debug_desktop(profile: BundleProfile, label: &str) -> Result<(), CliError> {
+/// Bundle the Debug-using desktop app finished in `finish`.
+fn bundle_debug_desktop(finish: NativeFinish<'_>, label: &str) -> Result<(), CliError> {
     let (tmp, _) = debug_project(label, DEBUG_DESKTOP_PACKAGE, DEBUG_DESKTOP_MAIN);
     let project = tmp.to_string_lossy().into_owned();
-    let result = bundle_delivery(BundleHost::Desktop, profile, Some(&project));
+    let result = bundle_delivery(BundleHost::Desktop, finish, Some(&project));
     let _ = fs::remove_dir_all(&tmp);
     result
 }
@@ -5500,8 +5548,15 @@ fn bundle_debug_desktop(profile: BundleProfile, label: &str) -> Result<(), CliEr
 /// any cargo build.
 #[test]
 fn release_desktop_bundle_gates_debug() {
+    let consented = ConsentedCapabilities::admitted(crate::run_sandbox::ResolvedCapabilities {
+        inferred: std::collections::BTreeSet::new(),
+        declared: std::collections::BTreeSet::new(),
+    });
     let result = bundle_debug_desktop(
-        Verb::RELEASE_BUILD.bundle_profile(),
+        NativeFinish::Release {
+            consented: &consented,
+            driver: ipe_backend_rust::DbDriver::Sqlite,
+        },
         "release-desktop-debug",
     );
     assert!(
@@ -5521,7 +5576,7 @@ fn dev_desktop_bundle_admits_debug() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let result = bundle_debug_desktop(Verb::DEV_BUILD.bundle_profile(), "dev-desktop-debug");
+    let result = bundle_debug_desktop(NativeFinish::Dev, "dev-desktop-debug");
     assert!(
         !matches!(&result, Err(CliError::Pipeline { .. } | CliError::Usage(_))),
         "a dev desktop bundle compiles a Debug.log app past every gate: {result:?}"
@@ -5843,4 +5898,53 @@ fn wrapper_source_ignores_planted_ancestor() {
             "the complete wrapper workspace is admitted (control): {admitted:?}"
         );
     }
+}
+
+// A loose entry file the user named through a link is read through it.
+#[cfg(unix)]
+#[test]
+fn a_user_named_entry_symlink_is_followed() {
+    let dir = session_scratch("named_entry_link");
+    let target = dir.join("Real.ipe");
+    let link = dir.join("Main.ipe");
+    assert!(
+        fs::write(&target, "module Main exposing (main)\n\nmain = 1\n").is_ok(),
+        "write entry"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let shape = classify_entry_shape(&link);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        shape.is_ok(),
+        "a named entry link must be followed: {:?}",
+        shape.err()
+    );
+}
+
+// A file `ipe fix` is pointed at through a link is read through it.
+#[cfg(unix)]
+#[test]
+fn a_user_named_fix_target_symlink_is_followed() {
+    let dir = session_scratch("named_fix_link");
+    let target = dir.join("Real.ipe");
+    let link = dir.join("Main.ipe");
+    assert!(
+        fs::write(&target, "module Main exposing (main)\n\nmain = 1\n").is_ok(),
+        "write entry"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&link, true, &mut out);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        fixed.is_ok(),
+        "a named fix target link must be followed: {:?}",
+        fixed.err()
+    );
 }

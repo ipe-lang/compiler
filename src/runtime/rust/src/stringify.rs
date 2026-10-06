@@ -7,94 +7,269 @@
 //! has a `Debug` fallback.
 //!
 //! `IpeStringify` backs `Basics.errorToString` (and `Ipe.Test.debugShow`, which
-//! is just `errorToString v`). Every type reachable from a generic `errorToString`
-//! call implements this trait (runtime primitives below; every codegen-emitted
-//! record/ADT gets an `IpeStringify` impl from the compiler's emitter).
+//! is just `errorToString v`). A value becomes text through this trait only:
+//! there is no fallback to `Debug`, so a type with no impl cannot be shown and
+//! the compiler refuses the program before the Rust build.
+//!
+//! Every lowered type leaf has exactly one [`ShowPolicy`], declared by the one
+//! `show_row!` invocation that writes its impl, in the module that owns the
+//! type. [`SHOWN_RUNTIME_TYPES`] lists every leaf in the compiler's leaf order;
+//! the build asserts it equal to the compiler's leaf table (`ipe-cli`), each
+//! `show_row!` asserts its leaf and policy are listed, and `tests/show_rows.rs`
+//! pins every listed leaf to the runtime type that renders it. Carriers
+//! (`Vec`, `HashMap`, `BTreeSet`, tuples, `IpeMaybe`, `IpeResult`, references,
+//! boxes) are structural impls in this module.
 //!
 //! Why a trait, not `Debug`: `Debug` QUOTES a `String` (`"hi"`), diverging
-//! from unquoted `hi`. A `Display` re-bind is not total (no codegen type
-//! emits `Display`). `IpeStringify` is the total middle path.
+//! from unquoted `hi`, and prints every field of a runtime struct, secrets
+//! included.
 //!
 //! Totality contract: `ipe_show` NEVER panics — no `unwrap`/`expect`/indexing.
-//! A type with no meaningful string analogue (function-typed fields) renders a
-//! best-effort placeholder rather than failing.
 //!
 //! Rendering conventions:
 //! - String: unquoted (`"hi"` → `hi`)
 //! - Numbers/Bool: Display
 //! - List: space-separated in brackets (`[1 2 3]`)
 //! - Nested list: `[[1 2] [3 4]]`
+//! - Set: like a list, in ascending order
 //! - Tuple: space-separated in braces (`{1 a}`)
 //! - Record: fields in `_fieldIndex` order, space-separated in braces
 //! - Dict: `map[k1:v1 k2:v2]` with keys SORTED, space-separated
+//! - `Redacted` leaves: `<redacted>`; `Bytes`: `<N bytes>`
+//! - `Internals` leaves: `<Module.Type>`
 
 use crate::core::{IpeMaybe, IpeResult};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Total Ipê stringifier. One method, infallible, never panics.
+///
+/// A type with only a `Debug` impl has no rendering:
+///
+/// ```compile_fail
+/// use ipe_runtime_rust::stringify::IpeStringify;
+/// #[derive(Debug)]
+/// struct OnlyDebug;
+/// let _ = IpeStringify::ipe_show(&OnlyDebug);
+/// ```
 pub trait IpeStringify {
     /// Render `self` byte-identically to  `Basics_errorToString` / `%v`.
     fn ipe_show(&self) -> String;
 }
 
-// ─── Autoref specialization: total field rendering ───────────────────────────
-//
-// A codegen-emitted `impl IpeStringify for <GeneratedType>` renders each field
-// by calling the field's stringifier. If it called `field.ipe_show()` directly,
-// a field of a RUNTIME type that doesn't impl `IpeStringify` (e.g.
-// `http_stream::ChunkEvent`) would be a `type-checks ⇒ cargo-fails` E0599 — a
-// soundness-floor regression, and a whack-a-mole (every unhandled runtime type
-// is a latent failure).
-//
-// The dispatch makes field rendering TOTAL BY CONSTRUCTION via dtolnay's
-// autoref-specialization: a field renders via `IpeStringify` IF its type impls
-// it, ELSE falls back to `Debug`. EVERY codegen + runtime type derives `Debug`,
-// so this can NEVER fail to compile, regardless of field type.
-//
-// Mechanism: codegen emits `(&Wrap(&value)).dispatch()` at a CONCRETE field
-// type. `Wrap<&T>: ViaIpeStringify` (no autoref) is preferred over
-// `&Wrap<T>: ViaDebug` (one autoref) when `T: IpeStringify`; otherwise only the
-// `Debug` impl applies. The dispatch is concrete-type-only by design — a generic
-// `fn<T>` frame can't select either arm (the same method name on both traits is
-// ambiguous when T's bounds are unknown), so the dispatch is emitted INLINE at
-// each field site (where the type is concrete or a `IpeStringify + Debug`-bounded
-// generic), NOT routed through a generic free function.
-// (`basics_error_to_string<T: IpeStringify>` keeps its bound: a top-level
-// `errorToString aString` must stay unquoted, which the IpeStringify path
-// guarantees; the autoref-`Debug` fallback would quote a String at a generic
-// frame.)
-
-/// Newtype carrier for the autoref-specialization receiver. Constructed only by
-/// the codegen-emitted `(&Wrap(&field)).dispatch()` field-render expression (and
-/// this module's own tests); not part of the user-facing surface.
-#[doc(hidden)]
-pub struct Wrap<T>(pub T);
-
-/// Higher-priority arm: a `Wrap<&T>` where `T: IpeStringify` renders via the
-/// trait (String unquoted, nested generated types via their own impl). Selected
-/// with ZERO autoref, so it beats the `Debug` fallback.
-#[doc(hidden)]
-pub trait ViaIpeStringify {
-    fn dispatch(&self) -> String;
+/// How a lowered type leaf becomes text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShowPolicy {
+    /// The value itself.
+    Value,
+    /// A fixed marker that never carries the value's content.
+    Redacted,
+    /// A `<Module.Type>` marker for opaque runtime machinery.
+    Internals,
+    /// No rendering: the compiler refuses to show the leaf.
+    Refused,
 }
-impl<T: IpeStringify> ViaIpeStringify for Wrap<&T> {
-    fn dispatch(&self) -> String {
-        self.0.ipe_show()
+
+impl ShowPolicy {
+    /// The policy as a number, comparable in a `const` context.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Value => 0,
+            Self::Redacted => 1,
+            Self::Internals => 2,
+            Self::Refused => 3,
+        }
     }
 }
 
-/// Lower-priority arm: ANY `Wrap<T>` where `T: Debug` renders via `Debug`.
-/// Reached only by ONE autoref (`&Wrap<T>`), so it loses to `ViaIpeStringify`
-/// whenever the field type impls `IpeStringify`. Every type derives `Debug`,
-/// so this arm is always available — the dispatch can never E0599.
-#[doc(hidden)]
-pub trait ViaDebug {
-    fn dispatch(&self) -> String;
+/// A runtime type that a lowered leaf renders to, with that leaf's show policy.
+///
+/// Implemented only by `show_row!`, beside the type's `IpeStringify` impl.
+pub trait ShownRow: IpeStringify {
+    /// The compiler leaf name this type renders.
+    const LEAF: &'static str;
+    /// The leaf's show policy.
+    const POLICY: ShowPolicy;
 }
-impl<T: core::fmt::Debug> ViaDebug for &Wrap<T> {
-    fn dispatch(&self) -> String {
-        format!("{:?}", self.0)
+
+/// Write a type's `IpeStringify` impl and its [`ShownRow`] facts in one place.
+///
+/// `show_row!("Leaf", Policy, [generics] Type, |binder| body)`: `body` renders
+/// `binder` (a `&Type`). Invoked in the module that owns `Type`, so the impl
+/// exists in every build that has the type.
+macro_rules! show_row {
+    ($leaf:literal, $policy:ident, [$($gen:tt)*] $ty:ty, |$v:pat_param| $body:expr) => {
+        impl<$($gen)*> $crate::stringify::IpeStringify for $ty {
+            fn ipe_show(&self) -> String {
+                let $v = self;
+                $body
+            }
+        }
+        impl<$($gen)*> $crate::stringify::ShownRow for $ty {
+            const LEAF: &'static str = $leaf;
+            const POLICY: $crate::stringify::ShowPolicy =
+                $crate::stringify::ShowPolicy::$policy;
+        }
+        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a show row's leaf or policy is missing from `SHOWN_RUNTIME_TYPES` [ledger #boundary]
+        const _: () = assert!(
+            $crate::stringify::leaf_listed($leaf, $crate::stringify::ShowPolicy::$policy),
+            concat!("show row not listed with its policy: ", $leaf)
+        );
+    };
+}
+pub(crate) use show_row;
+
+/// The marker a `Redacted` leaf renders.
+pub const REDACTED_SHOW: &str = crate::redact::REDACTED;
+
+/// Byte equality of two `&str` in a `const` context.
+#[must_use]
+pub const fn str_eq(a: &str, b: &str) -> bool {
+    let mut a = a.as_bytes();
+    let mut b = b.as_bytes();
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_rest @ ..], [y, b_rest @ ..]) if *x == *y => {
+                a = a_rest;
+                b = b_rest;
+            }
+            _ => return false,
+        }
     }
+}
+
+/// Every compiler leaf and its show policy, in the compiler's leaf order:
+/// `"Leaf" => Policy;`. Generates [`SHOWN_RUNTIME_TYPES`], asserted equal to
+/// the compiler's table at build time (`ipe-cli`). The table names no runtime
+/// type, so it compiles in every vendored module set; each `show_row!` asserts
+/// its own leaf and policy are listed here, and `tests/show_rows.rs` pins every
+/// listed leaf to the runtime type that renders it.
+macro_rules! shown_leaves {
+    ($($leaf:literal => $policy:ident;)*) => {
+        /// Every compiler leaf and its show policy, in the compiler's leaf
+        /// order.
+        pub const SHOWN_RUNTIME_TYPES: [(&str, ShowPolicy); [$($leaf),*].len()] =
+            [$(($leaf, ShowPolicy::$policy)),*];
+    };
+}
+
+/// Whether [`SHOWN_RUNTIME_TYPES`] lists `leaf` with `policy`.
+#[must_use]
+pub const fn leaf_listed(leaf: &str, policy: ShowPolicy) -> bool {
+    let mut rows: &[(&str, ShowPolicy)] = &SHOWN_RUNTIME_TYPES;
+    while let [(name, listed), rest @ ..] = rows {
+        if str_eq(name, leaf) && listed.tag() == policy.tag() {
+            return true;
+        }
+        rows = rest;
+    }
+    false
+}
+
+shown_leaves! {
+    "Int" => Value;
+    "Float" => Value;
+    "Bool" => Value;
+    "String" => Value;
+    "Char" => Value;
+    "Unit" => Value;
+    "Order" => Value;
+    "BackoffStrategy" => Value;
+    "HttpMethod" => Value;
+    "RedirectPolicy" => Value;
+    "Decimal" => Value;
+    "ErrorKind" => Value;
+    "Error" => Value;
+    "ErrorDetails" => Value;
+    "ErrorInfo" => Value;
+    "PanicInfo" => Value;
+    "TypeInfo" => Value;
+    "Path" => Value;
+    "UrlRelative" => Value;
+    "Locale" => Value;
+    "EmailAddress" => Value;
+    "CryptoMac" => Value;
+    "Color" => Value;
+    "ColorError" => Value;
+    "WcagLevel" => Value;
+    "TextSize" => Value;
+    "Deficiency" => Value;
+    "CsvDoc" => Value;
+    "CacheStats" => Value;
+    "StreamId" => Value;
+    "Json" => Value;
+    "Bytes" => Redacted;
+    "Url" => Redacted;
+    "Secret" => Redacted;
+    "CryptoKey" => Redacted;
+    "Principal" => Redacted;
+    "Dsn" => Redacted;
+    "SqlFragment" => Redacted;
+    "ServerRequest" => Redacted;
+    "ServerResponse" => Redacted;
+    "ServerCookie" => Redacted;
+    "WebReq" => Redacted;
+    "HttpRequest" => Redacted;
+    "AuthConfig" => Redacted;
+    "TokenSource" => Redacted;
+    "WebSocketClientCfg" => Redacted;
+    "ProcessRunWithCfg" => Redacted;
+    "ProcessRunInPtyCfg" => Redacted;
+    "CacheCfg" => Redacted;
+    "Regex" => Redacted;
+    "EmailMessage" => Redacted;
+    "EmailAttachment" => Redacted;
+    "EmailSesConfig" => Redacted;
+    "EmailSmtpConfig" => Redacted;
+    "Task" => Internals;
+    "Cmd" => Internals;
+    "Sub" => Internals;
+    "Decoder" => Internals;
+    "Db" => Internals;
+    "Connection" => Internals;
+    "Setting" => Internals;
+    "StreamWriter" => Internals;
+    "ServerRoute" => Internals;
+    "WebSocketServer" => Internals;
+    "WebSocketServerCfg" => Internals;
+    "WebApp" => Internals;
+    "TuiApp" => Internals;
+    "CliApp" => Internals;
+    "WorkerApp" => Internals;
+    "WebRoute" => Internals;
+    "CustomElement" => Internals;
+    "CacheHandle" => Internals;
+    "ChunkEvent" => Internals;
+    "EmailProvider" => Internals;
+    "TermProfile" => Internals;
+    "AnsiColor" => Internals;
+    "Html" => Internals;
+    "Element" => Internals;
+    "Cells" => Internals;
+    "UiAttribute" => Internals;
+    "TuiAttribute" => Internals;
+    "CliLines" => Internals;
+    "CliAttribute" => Internals;
+    "HtmlAttribute" => Internals;
+    "HtmlEvent" => Internals;
+    "Label" => Internals;
+    "Placeholder" => Internals;
+    "RadioOption" => Internals;
+    "Length" => Internals;
+    "HAlign" => Internals;
+    "VAlign" => Internals;
+    "Location" => Internals;
+    "PseudoClass" => Internals;
+    "Description" => Internals;
+    "LayoutContext" => Internals;
+    "ProjectionTerm" => Internals;
+    "ProjectionOperand" => Internals;
+    "ArithOp" => Internals;
+    "Fun" => Refused;
+    "SharedFun" => Refused;
+    "FnOnceChain" => Refused;
+    "Foreign" => Refused;
 }
 
 // ─── Interpolation: the closed scalar set ───────────────────────────────────
@@ -146,12 +321,9 @@ interpolable_scalars! {
 
 // ─── Scalars ────────────────────────────────────────────────────────────────
 
-impl IpeStringify for String {
-    // A String returns verbatim (UNQUOTED).
-    fn ipe_show(&self) -> String {
-        self.clone()
-    }
-}
+// A String returns verbatim (UNQUOTED).
+show_row!("String", Value, [] String, |s| s.clone());
+show_row!("Char", Value, [] char, |c| crate::string::string_from_char(*c));
 
 impl IpeStringify for str {
     fn ipe_show(&self) -> String {
@@ -159,13 +331,12 @@ impl IpeStringify for str {
     }
 }
 
-impl IpeStringify for i64 {
-    fn ipe_show(&self) -> String {
-        self.to_string()
-    }
-}
+show_row!("Int", Value, [] i64, |n| n.to_string());
 
-impl IpeStringify for f64 {
+show_row!("Float", Value, [] f64, |x| float_show(*x));
+
+/// The `%g` rendering of a float.
+fn float_show(f: f64) -> String {
     //  `%v` on a float64 is `strconv.FormatFloat(f, 'g', -1, 64)`: the
     // shortest round-trippable digits, formatted with `%e` when the decimal
     // exponent is < -4 or >= 6 and `%f` otherwise, with `+Inf`/`-Inf`/`NaN`
@@ -175,53 +346,45 @@ impl IpeStringify for f64 {
     // (1e21 -> "1000000000000000000000" instead of "1e+21"). Bridge the
     // gap totally: handle the non-finite cases, then reformat Rust's shortest
     // scientific output to `%g`-`%e` shape when needed.
-    fn ipe_show(&self) -> String {
-        let f = *self;
-        if f.is_nan() {
-            return "NaN".to_string();
-        }
-        if f.is_infinite() {
-            return if f > 0.0 { "+Inf" } else { "-Inf" }.to_string();
-        }
-        // `{:e}` gives the shortest mantissa + decimal exponent, lowercase `e`,
-        // no `+` and no zero-padding on the exponent (e.g. "1e21", "1.5e-5").
-        let sci = format!("{f:e}");
-        match sci.split_once('e') {
-            // Exponent form iff exp < -4 || exp >= 6 (shortest-mode cut, same
-            // as `strconv.FormatFloat(f,'g',-1,64)`): 1e6 -> "1e+06", 1e15 ->
-            // "1e+15", 999999 -> "999999" (see reference-audit.md item 27 for
-            // the oracle probe).
-            Some((mantissa, exp_str)) => match exp_str.parse::<i32>() {
-                Ok(exp) if !(-4..6).contains(&exp) => {
-                    //  `%e` exponent: explicit sign, minimum two digits.
-                    // i64 widen so `-exp` can't overflow for any i32.
-                    let (sign, mag) = if exp < 0 {
-                        ('-', -i64::from(exp))
-                    } else {
-                        ('+', i64::from(exp))
-                    };
-                    format!("{mantissa}e{sign}{mag:02}")
-                }
-                _ => f.to_string(),
-            },
-            None => f.to_string(),
-        }
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "+Inf" } else { "-Inf" }.to_string();
+    }
+    // `{:e}` gives the shortest mantissa + decimal exponent, lowercase `e`,
+    // no `+` and no zero-padding on the exponent (e.g. "1e21", "1.5e-5").
+    let sci = format!("{f:e}");
+    match sci.split_once('e') {
+        // Exponent form iff exp < -4 || exp >= 6 (shortest-mode cut, same
+        // as `strconv.FormatFloat(f,'g',-1,64)`): 1e6 -> "1e+06", 1e15 ->
+        // "1e+15", 999999 -> "999999" (see reference-audit.md item 27 for
+        // the oracle probe).
+        Some((mantissa, exp_str)) => match exp_str.parse::<i32>() {
+            Ok(exp) if !(-4..6).contains(&exp) => {
+                //  `%e` exponent: explicit sign, minimum two digits.
+                // i64 widen so `-exp` can't overflow for any i32.
+                let (sign, mag) = if exp < 0 {
+                    ('-', -i64::from(exp))
+                } else {
+                    ('+', i64::from(exp))
+                };
+                format!("{mantissa}e{sign}{mag:02}")
+            }
+            _ => f.to_string(),
+        },
+        None => f.to_string(),
     }
 }
 
-impl IpeStringify for bool {
-    fn ipe_show(&self) -> String {
-        crate::string::string_from_bool(*self)
-    }
-}
+show_row!("Bool", Value, [] bool, |b| crate::string::string_from_bool(*b));
 
-impl IpeStringify for () {
-    // Ipê `()` is  empty struct; `%v` renders `{}`. Rare in errorToString,
-    // kept total for completeness.
-    fn ipe_show(&self) -> String {
-        "{}".to_string()
-    }
-}
+// Ipê `()` renders `{}`, an empty tuple.
+show_row!("Unit", Value, [](), |_| "{}".to_owned());
+
+// Bytes often carry key material or a file body: the length is shown, never
+// the content.
+show_row!("Bytes", Redacted, [] Vec<u8>, |b| format!("<{} bytes>", b.len()));
 
 // ─── References / boxes (delegate) ───────────────────────────────────────────
 
@@ -269,41 +432,47 @@ impl<K: IpeStringify + Ord, V: IpeStringify> IpeStringify for HashMap<K, V> {
     }
 }
 
-// ─── Tuples (Ipê tuples render like  T2/T3 structs: `{a b ...}`) ─────────
+// ─── Sets ────────────────────────────────────────────────────────────────────
 
-impl<A: IpeStringify, B: IpeStringify> IpeStringify for (A, B) {
+impl<T: IpeStringify> IpeStringify for BTreeSet<T> {
+    // Set: like a list, elements in ascending order.
     fn ipe_show(&self) -> String {
-        format!("{{{} {}}}", self.0.ipe_show(), self.1.ipe_show())
+        let parts: Vec<String> = self.iter().map(IpeStringify::ipe_show).collect();
+        format!("[{}]", parts.join(" "))
     }
 }
 
-impl<A: IpeStringify, B: IpeStringify, C: IpeStringify> IpeStringify for (A, B, C) {
-    fn ipe_show(&self) -> String {
-        format!(
-            "{{{} {} {}}}",
-            self.0.ipe_show(),
-            self.1.ipe_show(),
-            self.2.ipe_show()
-        )
-    }
+// ─── Tuples (`{a b ...}`) ───────────────────────────────────────────────────
+
+/// The widest tuple with a structural impl, the arity Rust's own trait impls
+/// stop at; the compiler refuses to show a wider one.
+pub const MAX_SHOWN_TUPLE_ARITY: usize = 12;
+
+macro_rules! tuple_shows {
+    ($(($($t:ident $i:tt),+);)*) => {
+        $(
+            impl<$($t: IpeStringify),+> IpeStringify for ($($t,)+) {
+                fn ipe_show(&self) -> String {
+                    let parts = [$(self.$i.ipe_show()),+];
+                    format!("{{{}}}", parts.join(" "))
+                }
+            }
+        )*
+    };
 }
 
-impl<A, B, C, D> IpeStringify for (A, B, C, D)
-where
-    A: IpeStringify,
-    B: IpeStringify,
-    C: IpeStringify,
-    D: IpeStringify,
-{
-    fn ipe_show(&self) -> String {
-        format!(
-            "{{{} {} {} {}}}",
-            self.0.ipe_show(),
-            self.1.ipe_show(),
-            self.2.ipe_show(),
-            self.3.ipe_show()
-        )
-    }
+tuple_shows! {
+    (A 0, B 1);
+    (A 0, B 1, C 2);
+    (A 0, B 1, C 2, D 3);
+    (A 0, B 1, C 2, D 3, E 4);
+    (A 0, B 1, C 2, D 3, E 4, F 5);
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6);
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8);
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
 }
 
 // ─── Ipê core ADTs ───────────────────────────────────────────────────────────
@@ -327,40 +496,6 @@ impl<E: IpeStringify, A: IpeStringify> IpeStringify for IpeResult<E, A> {
         }
     }
 }
-
-// ─── Runtime opaque value types that flow into errorToString/debugShow ───────
-// These are real runtime types (not codegen-emitted), so their IpeStringify
-// impls live HERE. A generated ADT can carry them as a payload (e.g.
-// `Money(Decimal, …)`, `Claims(Vec<(String, JsonVal)>)`); the codegen's enum
-// `ipe_show` calls `.ipe_show()` on the payload, so the type must impl it.
-
-// `decimal.rs` is behind the `decimal` feature, so this impl — the only
-// `stringify.rs` reference to `crate::decimal::Decimal` — carries the same gate.
-// A program without the feature has no `Decimal` type to render.
-#[cfg(feature = "decimal")]
-impl IpeStringify for crate::decimal::Decimal {
-    // Reuse the canonical Decimal renderer (normalized, no trailing zeros) —
-    // matches `Decimal.toString`. Total (no panic).
-    fn ipe_show(&self) -> String {
-        crate::decimal::decimal_to_string(*self)
-    }
-}
-
-// `serde_json` is only in the dependency tree under the `json` feature; gate the
-// impl so a project that doesn't enable `json` still compiles (the unconditional
-// form was an E0433 `unresolved crate serde_json` on default features).
-#[cfg(feature = "json")]
-impl IpeStringify for serde_json::Value {
-    // Best-effort, total: compact JSON text — human-useful and never panics.
-    // `to_string` on `serde_json::Value` is infallible.
-    fn ipe_show(&self) -> String {
-        self.to_string()
-    }
-}
-
-// `IpeError` is a typed enum (see error.rs) implementing `Display`, so the
-// blanket `ipe_show` above (`self.to_string()`) already renders its message —
-// no separate `Stringify` impl is needed.
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -480,45 +615,28 @@ mod tests {
         assert_eq!(r.ipe_show(), "Err boom");
     }
 
-    // ─── Autoref-specialization dispatch (total field rendering) ─────────────
-
-    // (a) A `String` field renders UNQUOTED via the IpeStringify arm.
     #[test]
-    fn dispatch_string_unquoted() {
-        let s = "hi".to_string();
-        assert_eq!(Wrap(&s).dispatch(), "hi");
-    }
-
-    // (b) A type that impls ONLY `Debug` (NOT IpeStringify) renders via the
-    // Debug fallback — NO compile error (this is the whole point: total by
-    // construction). Mirrors a runtime payload type like `http_stream::ChunkEvent`.
-    #[derive(Debug)]
-    #[allow(dead_code)] // read only via the derived Debug (the test's whole point)
-    struct OnlyDebug {
-        x: i64,
+    fn char_and_set_render_their_values() {
+        assert_eq!('x'.ipe_show(), "x");
+        assert_eq!(BTreeSet::from([3i64, 1, 2]).ipe_show(), "[1 2 3]");
     }
 
     #[test]
-    fn dispatch_debug_fallback() {
-        let d = OnlyDebug { x: 42 };
-        assert_eq!((&Wrap(&d)).dispatch(), "OnlyDebug { x: 42 }");
+    fn a_twelve_tuple_renders_every_element() {
+        let t = (
+            1i64, 2i64, 3i64, 4i64, 5i64, 6i64, 7i64, 8i64, 9i64, 10i64, 11i64, 12i64,
+        );
+        assert_eq!(t.ipe_show(), "{1 2 3 4 5 6 7 8 9 10 11 12}");
     }
 
-    // (c) A generated-style struct whose impl renders fields via the dispatch:
-    // its String field renders unquoted INSIDE the `{...}` wrap.
-    struct GenStruct {
-        name: String,
-        debug_only: OnlyDebug,
-    }
-    impl IpeStringify for GenStruct {
-        fn ipe_show(&self) -> String {
-            // Exactly what codegen now emits per field.
-            format!(
-                "{{{} {}}}",
-                Wrap(&self.name).dispatch(),
-                (&Wrap(&self.debug_only)).dispatch()
-            )
-        }
+    // Bytes render their length, never a byte of their content.
+    #[test]
+    fn bytes_show_their_length_only() {
+        let shown = vec![0x53u8, 0x33, 0x43].ipe_show();
+        assert_eq!(shown, "<3 bytes>");
+        assert!(!shown.contains("83"), "{shown}");
+        assert!(!shown.contains("67"), "{shown}");
+        assert_eq!(<Vec<u8> as ShownRow>::POLICY, ShowPolicy::Redacted);
     }
 
     // Interpolation renders each scalar exactly as its `String.from*` does.
@@ -533,61 +651,133 @@ mod tests {
         assert_eq!("hi".to_string().ipe_interpolate(), "hi");
     }
 
+    // Every leaf is listed once, so the compiler-side agreement is a bijection.
     #[test]
-    fn dispatch_generated_struct_mixed_fields() {
-        let g = GenStruct {
-            name: "alice".to_string(),
-            debug_only: OnlyDebug { x: 7 },
-        };
-        // String field unquoted; Debug-only field via fallback — never E0599.
-        assert_eq!(g.ipe_show(), "{alice OnlyDebug { x: 7 }}");
-    }
-
-    // (d) A generated-style record holding secret-bearing runtime values: the
-    // Debug fallback renders them, and none of their secrets reach the output.
-    #[cfg(feature = "server")]
-    struct GenAuthed {
-        req: crate::server::ServerRequest,
-        cookie: crate::server::ServerCookie,
-        who: crate::principal::Principal,
-    }
-    #[cfg(feature = "server")]
-    impl IpeStringify for GenAuthed {
-        fn ipe_show(&self) -> String {
-            format!(
-                "{{{} {} {}}}",
-                (&Wrap(&self.req)).dispatch(),
-                (&Wrap(&self.cookie)).dispatch(),
-                (&Wrap(&self.who)).dispatch()
-            )
+    fn every_leaf_is_listed_once() {
+        for (i, (a, _)) in SHOWN_RUNTIME_TYPES.iter().enumerate() {
+            for (b, _) in SHOWN_RUNTIME_TYPES.iter().skip(i + 1) {
+                assert_ne!(a, b, "leaf listed twice");
+            }
         }
     }
 
+    // A record-shaped value holding secret-role runtime values renders none
+    // of their secrets: each is a `Redacted` row.
     #[cfg(feature = "server")]
     #[test]
-    fn debug_fallback_renders_no_secret_of_a_runtime_value() {
-        use std::collections::{BTreeMap, HashMap};
+    fn redacted_rows_render_no_secret() {
+        use std::collections::BTreeMap;
         let pair = |k: &str, v: &str| HashMap::from([(k.to_owned(), v.to_owned())]);
-        let g = GenAuthed {
-            req: crate::server::ServerRequest {
-                method: "GET".to_owned(),
-                path: "/me".to_owned(),
-                body: String::new(),
-                headers: pair("Authorization", "Bearer S3CR3T"),
-                params: HashMap::new(),
-                query: HashMap::new(),
-                cookies: pair("sid", "T0K3N"),
-                remoteAddr: String::new(),
-            },
-            cookie: crate::server::server_cookie("sid".to_owned(), "T0K3N".to_owned()),
-            who: crate::principal::principal_mint_with_claims(
-                "user-S3CR3T".to_owned(),
-                BTreeMap::from([("email".to_owned(), "T0K3N@example.com".to_owned())]),
-            ),
+        #[allow(clippy::expect_used)] // fixture: a non-empty cookie name always parses
+        let cookie = match crate::server::server_cookie("sid".to_owned(), "S3CR3T".to_owned()) {
+            IpeResult::Ok(c) => Some(c),
+            IpeResult::Err(_) => None,
+        }
+        .expect("a non-empty cookie name");
+        let req = crate::server::ServerRequest {
+            method: "S3CR3T".to_owned(),
+            path: "/S3CR3T".to_owned(),
+            body: "S3CR3T".to_owned(),
+            headers: pair("Authorization", "Bearer S3CR3T"),
+            params: pair("id", "S3CR3T"),
+            query: pair("q", "S3CR3T"),
+            cookies: pair("sid", "S3CR3T"),
+            remoteAddr: "S3CR3T".to_owned(),
         };
-        let shown = g.ipe_show();
+        let who = crate::principal::principal_mint_with_claims(
+            "user-S3CR3T".to_owned(),
+            BTreeMap::from([("email".to_owned(), "S3CR3T@example.com".to_owned())]),
+        );
+        let shown = format!(
+            "{{{} {} {}}}",
+            IpeStringify::ipe_show(&req),
+            IpeStringify::ipe_show(&cookie),
+            IpeStringify::ipe_show(&who)
+        );
         assert!(!shown.contains("S3CR3T"), "{shown}");
-        assert!(!shown.contains("T0K3N"), "{shown}");
-        assert!(shown.contains("\"GET\""), "{shown}");
+        assert_eq!(shown, "{<redacted> <redacted> <redacted>}");
+    }
+
+    // A `Secret` and a parsed `Dsn` shown directly render the marker only.
+    #[cfg(all(feature = "secret", feature = "db"))]
+    #[test]
+    fn secret_and_dsn_rows_render_no_secret() {
+        let secret = crate::secret::secret_from_string("S3CR3T".to_owned());
+        #[allow(clippy::expect_used)] // fixture: a literal DSN always parses
+        let dsn = match crate::dsn::dsn_parse::<String>(
+            "postgres://user:S3CR3T@localhost/app".to_owned(),
+        ) {
+            IpeResult::Ok(d) => Some(d),
+            IpeResult::Err(_) => None,
+        }
+        .expect("a literal DSN");
+        let shown = format!(
+            "{} {}",
+            IpeStringify::ipe_show(&secret),
+            IpeStringify::ipe_show(&dsn)
+        );
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert_eq!(shown, "<redacted> <redacted>");
+    }
+
+    // A URL's userinfo, query and fragment never reach its implicit
+    // rendering; its scheme, host, port and path do.
+    #[cfg(feature = "url")]
+    #[test]
+    fn url_show_keeps_no_userinfo_query_or_fragment() {
+        #[allow(clippy::expect_used)] // fixture: a literal absolute URL always parses
+        let url = match crate::url::url_from_string::<String>(
+            "https://S3CR3TUSER:S3CR3TPW@example.com:8443/a/b?token=S3CR3TQ#frag=S3CR3TF"
+                .to_owned(),
+        ) {
+            IpeResult::Ok(u) => Some(u),
+            IpeResult::Err(_) => None,
+        }
+        .expect("a literal absolute URL");
+        let shown = url.ipe_show();
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains(['@', '?', '#']), "{shown}");
+        assert_eq!(shown, "https://example.com:8443/a/b");
+    }
+
+    // A credential that spilled out of the userinfo — a scheme-confused
+    // `user:pw@host`, a host read from the user name, an opaque payload — never
+    // reaches a URL's implicit rendering: only a nameable scheme is shown.
+    #[cfg(feature = "url")]
+    #[test]
+    fn url_show_withholds_a_spilled_credential() {
+        let r = REDACTED_SHOW;
+        let cases = [
+            ("s3cr3tuser:S3CR3TPW@db.internal", r.to_owned()),
+            ("data:text/plain,S3CR3T", format!("data:{r}")),
+            ("mailto:S3CR3T@example.com", format!("mailto:{r}")),
+            (
+                "https://S3CR3TUSER:1/S3CR3TPW@example.com/x",
+                format!("https:{r}"),
+            ),
+            (
+                "https://S3CR3TUSER#S3CR3TPW@example.com",
+                format!("https:{r}"),
+            ),
+            (
+                "https://S3CR3TUSER?S3CR3TPW@example.com",
+                format!("https:{r}"),
+            ),
+            ("s3cr3tuser://example.com/a", format!("{r}://example.com/a")),
+        ];
+        for (raw, expected) in cases {
+            #[allow(clippy::expect_used)] // fixture: each literal is an absolute URL
+            let url = match crate::url::url_from_string::<String>(raw.to_owned()) {
+                IpeResult::Ok(u) => Some(u),
+                IpeResult::Err(_) => None,
+            }
+            .expect("a literal absolute URL");
+            let shown = url.ipe_show();
+            assert!(
+                !shown.to_ascii_lowercase().contains("s3cr3t"),
+                "{raw}: {shown}"
+            );
+            assert_eq!(shown, expected, "{raw}");
+        }
     }
 }

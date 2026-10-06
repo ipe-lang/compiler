@@ -34,6 +34,7 @@ type Value = JsonVal;
 pub enum MainDecBox<T1: 'static> {
     DecBox(RecDec<T1>),
 }
+
 impl<T1: Clone + 'static> Clone for MainDecBox<T1> {
     fn clone(&self) -> Self {
         match self {
@@ -41,16 +42,19 @@ impl<T1: Clone + 'static> Clone for MainDecBox<T1> {
         }
     }
 }
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for MainDecBox<T1> {
+
+impl<T1: IpeStringify + 'static> IpeStringify for MainDecBox<T1> {
     fn ipe_show(&self) -> String {
         match self {
-            MainDecBox::DecBox(_) => format!("DecBox {}", "<fn>"),
+            MainDecBox::DecBox(p0) => format!("DecBox {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
+
 pub struct RecDec<T1: 'static> {
     dec: Decoder<T1>,
 }
+
 impl<T1: Clone + 'static> Clone for RecDec<T1> {
     fn clone(&self) -> Self {
         Self {
@@ -58,16 +62,19 @@ impl<T1: Clone + 'static> Clone for RecDec<T1> {
         }
     }
 }
-impl<T1: IpeStringify + std::fmt::Debug + 'static> IpeStringify for RecDec<T1> {
+
+impl<T1: IpeStringify + 'static> IpeStringify for RecDec<T1> {
     fn ipe_show(&self) -> String {
-        format!("{{{}}}", "<fn>")
+        format!("{{{}}}", IpeStringify::ipe_show(&self.dec))
     }
 }
 
 pub use ipe_runtime::error::IpeError;
+
 pub fn str_err(s: &str) -> IpeError {
     IpeError::unexpected(s.to_string())
 }
+
 // Recursion guard shim — every user function body opens with
 // `let _ipe_recursion_guard = crate::recursion_guard();`, which resolves here.
 pub fn recursion_guard() -> ipe_runtime::core::RecursionGuard {
@@ -80,153 +87,196 @@ pub type Decoder<T> = ipe_runtime::json::Decoder<IpeError, T>;
 pub fn ok_res<A>(a: A) -> IpeResult<IpeError, A> {
     ipe_runtime::core::ok_res(a)
 }
+
 pub fn task_succeed<A: Send + 'static>(a: A) -> IpeTask<A> {
     ipe_runtime::task::task_succeed(a)
 }
+
 // ── System (env) kernels ───────────────────────────────────────────────────
 pub fn system_args(_: ()) -> IpeTask<Vec<String>> {
     ipe_runtime::system::system_args(())
 }
+
 pub fn system_setenv(key: String, val: String) -> IpeTask<()> {
     ipe_runtime::system::system_setenv(key, val)
 }
+
 pub fn system_unsetenv(key: String) -> IpeTask<()> {
     ipe_runtime::system::system_unsetenv(key)
 }
+
 // ── File kernels ───────────────────────────────────────────────────────────
 pub fn file_read_file(path: ipe_runtime::path::Path) -> IpeTask<String> {
     ipe_runtime::file::file_read_file(path)
 }
+
 pub fn file_write_file(path: ipe_runtime::path::Path, content: String) -> IpeTask<()> {
     ipe_runtime::file::file_write_file(path, content)
 }
+
 pub fn file_delete(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_delete(path)
 }
+
 // ── Task combinators ───────────────────────────────────────────────────────
 pub fn task_fail<A: Send + 'static>(e: IpeError) -> IpeTask<A> {
     ipe_runtime::task::task_fail(e)
 }
+
 pub fn task_map<A: Send + 'static, B: Send + 'static>(
     f: Box<dyn Fn(A) -> B + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_map(f, t)
 }
+
 pub fn task_and_then<A: Send + 'static, B: Send + 'static>(
     t: IpeTask<A>,
     f: Box<dyn FnOnce(A) -> IpeTask<B> + Send + 'static>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_and_then(t, f)
 }
+
 pub fn task_map_error<A: Send + 'static>(
     f: Box<dyn Fn(IpeError) -> IpeError + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<A> {
     ipe_runtime::task::task_map_error(f, t)
 }
+
 pub fn task_on_error<A: Send + 'static>(
     f: Box<dyn FnOnce(IpeError) -> IpeTask<A> + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<A> {
     ipe_runtime::task::task_on_error(f, t)
 }
+
 pub fn task_from_result<A: Send + 'static>(r: IpeResult<IpeError, A>) -> IpeTask<A> {
     ipe_runtime::task::task_from_result(r)
 }
+
 pub fn task_and_then_result<A: Send + 'static, B: Send + 'static>(
     f: Box<dyn Fn(A) -> IpeResult<IpeError, B> + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_and_then_result(f, t)
 }
+
 pub fn task_sequence<A: Send + 'static>(tasks: Vec<IpeTask<A>>) -> IpeTask<Vec<A>> {
     ipe_runtime::task::task_sequence(tasks)
 }
+
 pub fn task_parallel<A: Send + 'static>(tasks: Vec<IpeTask<A>>) -> IpeTask<Vec<A>> {
     ipe_runtime::task::task_parallel(tasks)
 }
+
 pub fn task_run<A: Send + 'static>(t: IpeTask<A>) -> IpeResult<IpeError, A> {
     ipe_runtime::task::task_run(t)
 }
+
 // ── Io kernels ─────────────────────────────────────────────────────────────
 pub fn io_read_line(_: ()) -> IpeTask<String> {
     ipe_runtime::io::io_read_line(())
 }
+
 pub fn io_write_stdout(s: String) -> IpeTask<()> {
     ipe_runtime::io::io_write_stdout(s)
 }
+
 pub fn io_write_stderr(s: String) -> IpeTask<()> {
     ipe_runtime::io::io_write_stderr(s)
 }
+
 pub fn io_println(msg: String) -> IpeTask<()> {
     ipe_runtime::io::io_println(msg)
 }
+
 pub fn io_eprintln(msg: String) -> IpeTask<()> {
     ipe_runtime::io::io_eprintln(msg)
 }
+
 // ── System kernels ─────────────────────────────────────────────────────────
 pub fn system_getenv(key: String) -> IpeTask<String> {
     ipe_runtime::system::system_getenv(key)
 }
+
 pub fn system_getenv_or(key: String, default: String) -> String {
     ipe_runtime::system::system_getenv_or(key, default)
 }
+
 pub fn system_get_arg(n: i64) -> IpeTask<IpeMaybe<String>> {
     ipe_runtime::system::system_get_arg(n)
 }
+
 pub fn system_getenv_int(key: String) -> IpeTask<i64> {
     ipe_runtime::system::system_getenv_int(key)
 }
+
 pub fn system_getenv_bool(key: String) -> IpeTask<bool> {
     ipe_runtime::system::system_getenv_bool(key)
 }
+
 pub fn system_cwd(_: ()) -> IpeTask<String> {
     ipe_runtime::system::system_cwd(())
 }
+
 pub fn system_getcwd(_: ()) -> IpeTask<String> {
     ipe_runtime::system::system_getcwd(())
 }
+
 pub fn system_load_env(_: ()) -> IpeTask<()> {
     ipe_runtime::system::system_load_env(())
 }
+
 pub fn system_exit(code: i64) -> ! {
     ipe_runtime::system::system_exit(code)
 }
+
 // ── File kernels ───────────────────────────────────────────────────────────
 pub fn file_exists(path: ipe_runtime::path::Path) -> IpeTask<bool> {
     ipe_runtime::file::file_exists(path)
 }
+
 pub fn file_remove(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_remove(path)
 }
+
 pub fn file_mkdir_all(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_mkdir_all(path)
 }
+
 pub fn file_read_file_limit(path: ipe_runtime::path::Path, limit: i64) -> IpeTask<String> {
     ipe_runtime::file::file_read_file_limit(path, limit)
 }
+
 pub fn file_read_file_bytes(path: ipe_runtime::path::Path) -> IpeTask<Vec<i64>> {
     ipe_runtime::file::file_read_file_bytes(path)
 }
+
 pub fn file_append(path: ipe_runtime::path::Path, content: String) -> IpeTask<()> {
     ipe_runtime::file::file_append(path, content)
 }
+
 pub fn file_read_dir(path: ipe_runtime::path::Path) -> IpeTask<Vec<String>> {
     ipe_runtime::file::file_read_dir(path)
 }
+
 pub fn file_is_dir(path: ipe_runtime::path::Path) -> IpeTask<bool> {
     ipe_runtime::file::file_is_dir(path)
 }
+
 pub fn file_temp_file(prefix: String) -> IpeTask<String> {
     ipe_runtime::file::file_temp_file(prefix)
 }
+
 pub fn file_temp_dir(prefix: String) -> IpeTask<String> {
     ipe_runtime::file::file_temp_dir(prefix)
 }
+
 pub fn file_copy(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_copy(src, dst)
 }
+
 pub fn file_rename(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_rename(src, dst)
 }
@@ -237,12 +287,14 @@ pub fn main_int_box() -> MainDecBox<i64> {
         dec: json_decode_int::<IpeError>(),
     })
 }
+
 pub fn main_string_box() -> MainDecBox<String> {
     let _ipe_recursion_guard = crate::recursion_guard();
     MainDecBox::DecBox(RecDec {
         dec: json_decode_string::<IpeError>(),
     })
 }
+
 pub fn main_list_decoder_of<T1: 'static + Send + Clone>(
     box_: MainDecBox<T1>,
 ) -> Box<dyn Fn(String) -> IpeResult<ipe_runtime::error::IpeError, Vec<T1>> + Send + Sync + 'static> {
@@ -261,6 +313,7 @@ pub fn main_list_decoder_of<T1: 'static + Send + Clone>(
         },
     }
 }
+
 pub fn main_report_ints(res: IpeResult<ipe_runtime::error::IpeError, Vec<i64>>) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match res {
@@ -268,6 +321,7 @@ pub fn main_report_ints(res: IpeResult<ipe_runtime::error::IpeError, Vec<i64>>) 
         IpeResult::Err(_) => "ints-err".to_string(),
     }
 }
+
 pub fn main_report_strings(res: IpeResult<ipe_runtime::error::IpeError, Vec<String>>) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match res {
@@ -275,6 +329,7 @@ pub fn main_report_strings(res: IpeResult<ipe_runtime::error::IpeError, Vec<Stri
         IpeResult::Err(_) => "strs-err".to_string(),
     }
 }
+
 pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
@@ -297,10 +352,6 @@ pub fn list_map_consume<T0, T1>(f: impl Fn(T0) -> T1, list: Vec<T0>) -> Vec<T1> 
 }
 
 // ===========================================
-// FFI PLACEHOLDER TYPES (types referenced but not defined)
-// ===========================================
-
-// ===========================================
 // ENTRY POINT
 // ===========================================
 
@@ -309,11 +360,13 @@ fn main() {
     // classify an escaping panic (div-by-zero / index-OOB /
     // overflow) into a Ipe error + exit 1, not a raw Rust backtrace.
     ipe_runtime::core::install_panic_classifier();
+    // Both outcomes end through the runtime's one exit funnel, which runs the
+    // exit hook and flushes buffered telemetry before the process ends.
     match block_on(ipe_main()) {
-        IpeResult::Ok(_) => (),
+        IpeResult::Ok(_) => ipe_runtime::system::exit_process(0),
         IpeResult::Err(e) => {
             ipe_runtime::core::eprint_task_error(&e.to_string());
-            std::process::exit(1);
+            ipe_runtime::system::exit_process(1)
         }
     }
 }

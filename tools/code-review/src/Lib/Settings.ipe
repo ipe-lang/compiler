@@ -1,12 +1,12 @@
-module Lib.Settings exposing (DbLocation, IndexSettings, dbFileName, encodeFilePath, indexReadUrl, indexSettings, indexWriteUrl, ipeTag, openFailure, parseDbLocation, reviewDb, reviewUrl)
+module Lib.Settings exposing (AppSettings, DbLocation, IndexSettings, dbFileName, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, parseReviewDb, reviewUrl)
 
 import Ipe.Encoding as Encoding
 import Ipe.Error as Error
 import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
-import Ipe.System as System
 import Ipe.Task as Task
+import Lib.Epoch exposing (Epoch)
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
 import Lib.SafeText as SafeText exposing (SafeText)
 
@@ -28,6 +28,17 @@ type alias IndexSettings =
     }
 
 
+-- Every location the app serves from: the index and the review database,
+-- each parsed once at startup, and the epoch of the process serving them,
+-- minted once at startup. A request reads this value and never the
+-- environment.
+type alias AppSettings =
+    { index : IndexSettings
+    , review : DbLocation
+    , epoch : Epoch
+    }
+
+
 -- The repo tag `IPE_INDEX_ROOT` binds: `ipe`, the tag of ipe-index's default
 -- `--repo ipe:.`. It is the only bound tag, so a unit stored under any other
 -- tag is refused as `UnknownTag` rather than read from this root.
@@ -36,15 +47,15 @@ ipeTag =
     RepoPath.parseTag "ipe"
 
 
--- The one boundary that turns the index environment into typed values. It
--- reads the environment on every call (the embedded app has no flags, and the
--- tests re-point the variables between cases), and `main` runs it once at
--- startup so a bad value stops the server before it listens.
-indexSettings : Task.Task Error IndexSettings
-indexSettings =
+-- The one boundary that turns the index environment's text into typed values.
+-- `main` reads `IPE_INDEX_DB` and `IPE_INDEX_ROOT` once at startup and parses
+-- them here, so a bad value stops the server before it listens. The value it
+-- returns is the one every request reads: no request reads the environment or
+-- checks the root again, so a request never serves a tree other than the one
+-- startup validated.
+parseIndexSettings : String -> String -> Task.Task Error IndexSettings
+parseIndexSettings rawDb rawRoot =
     do
-        rawDb <- System.getenv "IPE_INDEX_DB"
-        rawRoot <- System.getenv "IPE_INDEX_ROOT"
         db <- parseDbLocation "IPE_INDEX_DB" rawDb
         root <- RepoPath.parseRoot rawRoot
         roots <- ipeTag
@@ -54,11 +65,11 @@ indexSettings =
         Task.succeed { db = db, roots = roots }
 
 
--- The review database location from `IPE_REVIEW_DB`, `review.db` in the
--- working directory when unset.
-reviewDb : Task.Task Error DbLocation
-reviewDb =
-    parseDbLocation "IPE_REVIEW_DB" (System.getenvOr "IPE_REVIEW_DB" "review.db")
+-- The review database location from the raw `IPE_REVIEW_DB` value `main`
+-- reads once at startup (`review.db` in the working directory when unset).
+parseReviewDb : String -> Task.Task Error DbLocation
+parseReviewDb raw =
+    parseDbLocation "IPE_REVIEW_DB" raw
 
 
 -- A file path is refused when blank or when it carries `?`, `#` or `%` (each

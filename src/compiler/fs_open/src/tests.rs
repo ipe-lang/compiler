@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use super::{
-    ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal, RegularFile,
+    ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, HintedKind, OpenRefusal, RegularFile,
     is_one_spelled_name,
 };
 
@@ -492,6 +492,118 @@ fn each_platform_builds_a_file_id_in_one_place() {
     }
 }
 
+/// The kind listed for `entry`, `None` when the listing lacks it.
+fn hinted_kind_of(listed: &[(EntryName, HintedKind)], entry: &str) -> Option<HintedKind> {
+    listed
+        .iter()
+        .find(|(listed_name, _)| listed_name == &name(entry))
+        .map(|(_, kind)| *kind)
+}
+
+#[test]
+fn entries_hinted_charges_cap_at_listing() {
+    let dir = scratch("hinted_cap");
+    for entry in ["a", "b", "c"] {
+        std::fs::write(dir.join(entry), entry).unwrap();
+    }
+    let entry_cap = EntryCap::new(3).unwrap();
+    let held = held(&dir);
+    let at_cap = held.entries_hinted(entry_cap);
+    assert!(
+        matches!(at_cap, Ok(ref found) if found.len() == 3),
+        "exactly the cap is listed, got {at_cap:?}"
+    );
+    std::fs::write(dir.join("d"), "d").unwrap();
+    let past = held.entries_hinted(entry_cap);
+    assert!(
+        matches!(past, Err(OpenRefusal::TooManyEntries(at)) if at == entry_cap),
+        "one past the cap is refused at the listing, got {past:?}"
+    );
+}
+
+/// An over-cap directory of dangling links is refused by its listing; the cap is charged per listed entry.
+#[cfg(unix)]
+#[test]
+fn entries_hinted_refuses_over_cap_at_listing() {
+    let dir = scratch("hinted_cap_dangling");
+    for entry in ["a", "b", "c"] {
+        std::os::unix::fs::symlink(dir.join("absent"), dir.join(entry)).unwrap();
+    }
+    let held = held(&dir);
+    let entry_cap = EntryCap::new(2).unwrap();
+    let past = held.entries_hinted(entry_cap);
+    assert!(
+        matches!(past, Err(OpenRefusal::TooManyEntries(at)) if at == entry_cap),
+        "an over-cap directory is refused by its listing, got {past:?}"
+    );
+}
+
+/// An over-cap directory of dangling links is refused by `entries` before any entry is stat'ed.
+#[cfg(unix)]
+#[test]
+fn entries_refuses_over_cap_before_classifying() {
+    let dir = scratch("entries_cap_dangling");
+    for entry in ["a", "b", "c"] {
+        std::os::unix::fs::symlink(dir.join("absent"), dir.join(entry)).unwrap();
+    }
+    let held = held(&dir);
+    let entry_cap = EntryCap::new(2).unwrap();
+    let past = held.entries(entry_cap);
+    assert!(
+        matches!(past, Err(OpenRefusal::TooManyEntries(at)) if at == entry_cap),
+        "an over-cap directory is refused by its listing, got {past:?}"
+    );
+}
+
+/// A held directory removed from its parent is refused, never listed as empty.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removed_held_directory_is_absent() {
+    let dir = scratch("removed_held");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    let sub = held(&dir.join("sub"));
+    std::fs::remove_dir(dir.join("sub")).unwrap();
+    let entry_cap = EntryCap::new(4).unwrap();
+    let hinted = sub.entries_hinted(entry_cap);
+    assert!(
+        matches!(hinted, Err(OpenRefusal::Absent)),
+        "a removed directory is absent, got {hinted:?}"
+    );
+    let entries = sub.entries(entry_cap);
+    assert!(
+        matches!(entries, Err(OpenRefusal::Absent)),
+        "a removed directory is absent to entries too, got {entries:?}"
+    );
+}
+
+/// A dangling link a following stat would fail on is still typed from the directory entry.
+#[cfg(unix)]
+#[test]
+fn entries_hinted_types_a_dangling_link_without_following() {
+    let dir = scratch("hinted_no_stat");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("file"), "x").unwrap();
+    std::os::unix::fs::symlink(dir.join("absent"), dir.join("gone")).unwrap();
+    let held = held(&dir);
+    let listed = held.entries_hinted(EntryCap::new(8).unwrap());
+    assert!(
+        matches!(listed, Ok(ref found) if found.len() == 3),
+        "a directory with a dangling link still lists, got {listed:?}"
+    );
+    let Ok(listed) = listed else { return };
+    for (entry, expected) in [
+        ("sub", HintedKind::Dir),
+        ("file", HintedKind::Regular),
+        ("gone", HintedKind::Link),
+    ] {
+        let hint = hinted_kind_of(&listed, entry);
+        assert!(
+            hint == Some(expected) || hint == Some(HintedKind::Unknown),
+            "{entry} is typed from the listing or left unknown, got {hint:?}"
+        );
+    }
+}
+
 /// A head read stops at its cap and leaves the proof usable for an identity re-read.
 #[test]
 fn a_head_read_stops_at_its_cap_and_keeps_the_handle() {
@@ -515,4 +627,144 @@ fn a_raw_handle_is_classified_from_itself() {
     std::fs::write(dir.join("f.txt"), "x").unwrap();
     let file = std::fs::File::open(dir.join("f.txt")).unwrap();
     assert_eq!(super::kind_of_file(&file).unwrap(), FileKind::Regular);
+}
+
+#[cfg(unix)]
+#[test]
+fn entries_hinted_reports_a_symlink_as_link_and_resolves_unknown() {
+    let dir = scratch("hinted_kinds");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("file"), "x").unwrap();
+    std::os::unix::fs::symlink(dir.join("sub"), dir.join("to_dir")).unwrap();
+    std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("dangling")).unwrap();
+    make_fifo(&dir.join("fifo"));
+    let held = held(&dir);
+    let listed = held.entries_hinted(EntryCap::new(16).unwrap());
+    assert!(
+        matches!(listed, Ok(ref found) if found.len() == 5),
+        "every entry is listed, got {listed:?}"
+    );
+    let Ok(listed) = listed else { return };
+    for (entry, expected_hint, expected_kind) in [
+        ("sub", HintedKind::Dir, FileKind::Dir),
+        ("file", HintedKind::Regular, FileKind::Regular),
+        ("to_dir", HintedKind::Link, FileKind::Symlink),
+        ("dangling", HintedKind::Link, FileKind::Symlink),
+        ("fifo", HintedKind::Other, FileKind::Fifo),
+    ] {
+        let hint = hinted_kind_of(&listed, entry);
+        assert!(
+            hint == Some(expected_hint) || hint == Some(HintedKind::Unknown),
+            "{entry} is {expected_hint:?} or unknown, got {hint:?}"
+        );
+        if hint == Some(HintedKind::Unknown) {
+            let settled = held.kind_of(&name(entry));
+            assert!(
+                matches!(settled, Ok(Some(kind)) if kind == expected_kind),
+                "{entry} unknown settles to {expected_kind:?}, got {settled:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn kind_of_classifies_without_following() {
+    let dir = scratch("unknown_kinds");
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("file"), "x").unwrap();
+    std::os::unix::fs::symlink(dir.join("sub"), dir.join("to_dir")).unwrap();
+    let held = held(&dir);
+    for (entry, expected) in [
+        ("sub", Some(FileKind::Dir)),
+        ("file", Some(FileKind::Regular)),
+        ("to_dir", Some(FileKind::Symlink)),
+        ("missing", None),
+    ] {
+        let kind = held.kind_of(&name(entry));
+        assert!(
+            matches!(kind, Ok(found) if found == expected),
+            "{entry} is {expected:?}, got {kind:?}"
+        );
+    }
+}
+
+/// A reparse point is a link whatever else its attributes say, never a directory.
+#[cfg(windows)]
+#[test]
+fn entries_hinted_reports_reparse_as_link() {
+    use super::sys::hint_of_attributes;
+    const DIRECTORY: u32 = 0x10;
+    const REPARSE_POINT: u32 = 0x400;
+    const ARCHIVE: u32 = 0x20;
+    const DEVICE: u32 = 0x40;
+    assert_eq!(
+        hint_of_attributes(DIRECTORY | REPARSE_POINT),
+        HintedKind::Link
+    );
+    assert_eq!(hint_of_attributes(REPARSE_POINT), HintedKind::Link);
+    assert_eq!(hint_of_attributes(DIRECTORY), HintedKind::Dir);
+    assert_eq!(hint_of_attributes(ARCHIVE), HintedKind::Regular);
+    assert_eq!(hint_of_attributes(DEVICE), HintedKind::Other);
+
+    let dir = scratch("hinted_junction");
+    std::fs::create_dir(dir.join("real")).unwrap();
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(dir.join("junction"))
+        .arg(dir.join("real"))
+        .status()
+        .unwrap();
+    assert!(made.success(), "mklink /J creates the junction fixture");
+    let listed = held(&dir).entries_hinted(EntryCap::new(8).unwrap());
+    assert!(
+        matches!(listed, Ok(ref found) if found.len() == 2),
+        "both entries are listed, got {listed:?}"
+    );
+    let Ok(listed) = listed else { return };
+    assert_eq!(
+        hinted_kind_of(&listed, "junction"),
+        Some(HintedKind::Link),
+        "a junction is never reported as a directory"
+    );
+    assert_eq!(hinted_kind_of(&listed, "real"), Some(HintedKind::Dir));
+}
+
+/// A link's stored target is read through the handle, never followed; a non-link is refused as what it is.
+#[cfg(unix)]
+#[test]
+fn read_link_reads_the_stored_target_and_refuses_a_non_link() {
+    let dir = scratch("read_link");
+    std::fs::write(dir.join("plain.txt"), "plain").unwrap();
+    std::os::unix::fs::symlink("../elsewhere/run", dir.join("link")).unwrap();
+    let held = held(&dir);
+    let target = held.read_link(&name("link"));
+    assert_eq!(
+        target.ok(),
+        Some(PathBuf::from("../elsewhere/run")),
+        "the stored target is returned verbatim, dangling or not"
+    );
+    let plain = held.read_link(&name("plain.txt"));
+    assert!(
+        matches!(plain, Err(OpenRefusal::NotRegular(FileKind::Regular))),
+        "a regular file is not a link, got {plain:?}"
+    );
+    let absent = held.read_link(&name("absent"));
+    assert!(
+        matches!(absent, Err(OpenRefusal::Absent)),
+        "an absent entry is absent, got {absent:?}"
+    );
+}
+
+/// A second directory entry for a file shows in its link count.
+#[test]
+fn link_count_counts_a_hard_link() {
+    let dir = scratch("link_count");
+    std::fs::write(dir.join("one.txt"), "one").unwrap();
+    let held = held(&dir);
+    let alone = held.open_regular(&name("one.txt")).unwrap().link_count();
+    assert_eq!(alone.ok(), Some(1), "a file with one name counts one");
+    std::fs::hard_link(dir.join("one.txt"), dir.join("two.txt")).unwrap();
+    let linked = held.open_regular(&name("one.txt")).unwrap().link_count();
+    assert_eq!(linked.ok(), Some(2), "a hard link counts as a second name");
 }

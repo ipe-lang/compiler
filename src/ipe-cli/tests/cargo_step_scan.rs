@@ -33,13 +33,11 @@ const SPAWN_CALL: &str = "Command::new";
 /// call chain (empty when the chain passes none), and how often it occurs.
 ///
 /// None is a production `cargo build`. `cargo-deny` runs the dependency
-/// audit, `generate-lockfile` resolves the audited crate's graph, the `build` site is the `cfg(test)` driver
-/// harness compiling a fixture crate, and the rest are environment-mapping test
-/// commands and a doc comment that never spawn.
+/// audit, the `build` site is the `cfg(test)` driver harness compiling a
+/// fixture crate, and the rest are environment-mapping test commands and a doc
+/// comment that never spawn.
 const CARGO_INVENTORY: &[(&str, &str, &str, usize)] = &[
-    ("audit.rs", "\"cargo-deny\"", "", 1),
-    ("audit.rs", "\"cargo-deny\"", "--version", 1),
-    ("audit_native.rs", "&cargo", "generate-lockfile", 1),
+    ("audit.rs", "cargo_deny", "", 2),
     ("driver/tests/mod.rs", "\"cargo\"", "build", 1),
     ("toolchain.rs", "\"cargo\"", "", 1),
     ("watch.rs", "OsStr::new(\"cargo\")", "", 3),

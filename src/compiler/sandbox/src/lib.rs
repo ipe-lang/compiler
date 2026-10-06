@@ -28,6 +28,16 @@ use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4410, SandboxError};
 
 pub use covers::{JailMounts, bind_exposing, path_covers};
 pub use mounts::{CanonicalPath, HomeMasks, JailPathError, MaskedDir};
+pub use vcs_config::{
+    ConfigFault, ConfigLimits, ConfigRefusal, ConfigRoots, ConfigSetting, Grants, Home, MAX_LINKS,
+    MAX_MODULE_DEPTH, MAX_PATH_BYTES, MAX_PATH_COMPONENTS, MAX_WORDS, Named, Unprovable,
+    scan as scan_vcs_config,
+};
+pub use vcs_metadata::{
+    CarvePath, JailArm, MAX_CARVE_ENTRIES, MAX_DEPTH, MAX_HELD_NAME_BYTES, MAX_PIN_MOUNTS,
+    MAX_WALK_ENTRIES, POINTER_CAP, PointerFault, VcsCarve, VcsKind, WalkCeiling, WalkLimits,
+    WritableTree,
+};
 
 pub mod build_jail;
 // Names every path the root `clippy.toml` denies, so a stale path breaks the
@@ -43,6 +53,9 @@ pub mod scratch;
 pub mod seccomp;
 #[cfg(test)]
 mod test_dir;
+mod vcs_config;
+mod vcs_keys;
+mod vcs_metadata;
 
 /// Why a jail could not be established or a jailed run failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,7 +249,7 @@ pub struct ResourceLimits {
     /// Open-file-descriptor cap.
     pub fd_cap: u64,
     /// Process-count cap.
-    pub proc_cap: u64,
+    pub proc_cap: run_jail::ProcCap,
     /// Maximum bytes read from the jailed process's stdout.
     pub out_cap_bytes: u64,
 }
@@ -262,7 +275,7 @@ impl Default for ResourceLimits {
             cpu_secs: 900,
             wall_secs: 900,
             fd_cap: 256,
-            proc_cap: 512,
+            proc_cap: run_jail::ProcCap::DEFAULT,
             out_cap_bytes: 256 * 1024 * 1024,
         }
     }
@@ -309,14 +322,16 @@ pub struct JailSpec {
 /// clock or the rlimits is unrepresentable, so untrusted code can never run
 /// uncapped. A host missing either helper is refused upstream
 /// ([`missing_caps`]) before this is reached.
-#[must_use]
+///
+/// # Errors
+/// Any error of [`mounts::push_mounts`].
 pub fn bwrap_argv(
     bwrap: &Path,
     prlimit: &Path,
     timeout: &Path,
     spec: &JailSpec,
     payload: &[OsString],
-) -> Vec<OsString> {
+) -> Result<Vec<OsString>, JailPathError> {
     // The wall clock wraps everything: `timeout --kill-after=5s <wall> bwrap …`.
     let mut argv: Vec<OsString> = vec![
         timeout.into(),
@@ -363,7 +378,7 @@ pub fn bwrap_argv(
     binds.extend(spec.path_prepend.iter().map(mounts::Bind::ReadOnly));
     binds.extend(spec.rustup_home.iter().map(mounts::Bind::ReadOnly));
     binds.push(mounts::Bind::ReadWrite(&spec.scoped_tmp));
-    mounts::push_mounts(&mut argv, &spec.homes, &binds);
+    mounts::push_mounts(&mut argv, &spec.homes, &binds)?;
     let scoped_tmp = spec.scoped_tmp.as_path();
     argv.push("--chdir".into());
     argv.push(scoped_tmp.into());
@@ -407,7 +422,7 @@ pub fn bwrap_argv(
     argv.push(format!("--fsize={}", spec.limits.out_cap_bytes).into());
     argv.push("--".into());
     argv.extend(payload.iter().cloned());
-    argv
+    Ok(argv)
 }
 
 // ── jailed execution ────────────────────────────────────────────────────────
@@ -689,7 +704,9 @@ fn bwrap_argv_with_seccomp<'fd>(
     payload: &[OsString],
     seccomp_fd: Option<run_jail::SealedFdNumber<'fd>>,
 ) -> Result<run_jail::JailArgv<'fd>, SandboxDefect> {
-    let mut argv = run_jail::JailArgv::fd_free(bwrap_argv(bwrap, prlimit, timeout, spec, payload));
+    let mut argv = run_jail::JailArgv::fd_free(
+        bwrap_argv(bwrap, prlimit, timeout, spec, payload).map_err(SandboxDefect::Path)?,
+    );
     let Some(fd) = seccomp_fd else {
         return Ok(argv);
     };
@@ -746,6 +763,7 @@ mod tests {
             spec,
             &payload,
         )
+        .expect("the argv builds")
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect()
@@ -1159,7 +1177,8 @@ mod tests {
         assert_eq!(l.cpu_secs, 900);
         assert_eq!(l.wall_secs, 900);
         assert_eq!(l.fd_cap, 256);
-        assert_eq!(l.proc_cap, 512);
+        assert_eq!(l.proc_cap, crate::run_jail::ProcCap::DEFAULT);
+        assert_eq!(l.proc_cap.get(), 512);
         assert_eq!(l.out_cap_bytes, 256 * 1024 * 1024);
     }
 

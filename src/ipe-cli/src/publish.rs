@@ -34,7 +34,6 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::remote_ingest::{
     self, ByteBudget, CappedReadError, Captured, Curl, Git, IngestRefusal, LocalSource, RunError,
@@ -846,11 +845,19 @@ impl CurlRunError {
     /// The [`CliError`] for this failure; a failure with no typed error of its own is `other`.
     fn into_cli(self, other: impl FnOnce() -> CliError) -> CliError {
         match self {
-            Self::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
+            Self::Exceeded(refusal) | Self::CouldNotRun(RunError::Exceeded(refusal)) => {
+                CliError::RemoteIngestExceeded(refusal)
+            }
             Self::CouldNotRun(RunError::PipeDrainTimeout(stream)) => {
                 CliError::ChildPipeHeld(stream)
             }
-            Self::Scratch(_) | Self::CouldNotRun(_) | Self::Status(_) | Self::Body => other(),
+            Self::CouldNotRun(RunError::PipeRead(stream, kind)) => {
+                CliError::ChildPipeUnread(stream, kind)
+            }
+            Self::Scratch(_)
+            | Self::CouldNotRun(RunError::Spawn(_) | RunError::Wait(_) | RunError::Measure(..))
+            | Self::Status(_)
+            | Self::Body => other(),
         }
     }
 }
@@ -1373,6 +1380,8 @@ enum GitStepFailure {
     Exceeded(IngestRefusal),
     /// git finished, but a process it started held an output pipe open and was stopped.
     PipeHeld(remote_ingest::Stream),
+    /// Reading one of git's output pipes failed, so its output was not used.
+    PipeUnread(remote_ingest::Stream, std::io::ErrorKind),
 }
 
 impl GitStepFailure {
@@ -1382,6 +1391,7 @@ impl GitStepFailure {
             Self::Git(git) => on_git(&git),
             Self::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
             Self::PipeHeld(stream) => CliError::ChildPipeHeld(stream),
+            Self::PipeUnread(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         }
     }
 }
@@ -1392,10 +1402,11 @@ fn git_step(result: Result<Captured, RunError>) -> Result<(), GitStepFailure> {
     match result {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(GitStepFailure::Git(
-            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            out.stderr.to_terminal().as_str().to_owned(),
         )),
         Err(RunError::Exceeded(refusal)) => Err(GitStepFailure::Exceeded(refusal)),
         Err(RunError::PipeDrainTimeout(stream)) => Err(GitStepFailure::PipeHeld(stream)),
+        Err(RunError::PipeRead(stream, kind)) => Err(GitStepFailure::PipeUnread(stream, kind)),
         Err(RunError::Spawn(e)) => Err(GitStepFailure::Git(format!("could not run `git`: {e}"))),
         Err(other @ (RunError::Wait(_) | RunError::Measure(..))) => {
             Err(GitStepFailure::Git(other.to_string()))
@@ -1435,22 +1446,16 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// Best-effort launch of the platform browser on `url`. Returns whether the
-/// opener started — the URL is printed regardless, so `false` is never fatal.
+/// opener started; the URL is printed regardless, so `false` is never fatal. A
+/// URL that is not an admitted GitHub [`crate::browser::BrowserUrl`] is not
+/// opened.
 fn open_in_browser(url: &str) -> bool {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
-    } else if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    } else {
-        let mut c = Command::new("xdg-open");
-        c.arg(url);
-        c
-    };
-    command.status().is_ok_and(|s| s.success())
+    crate::browser::BrowserUrl::parse(url, crate::browser::BrowserOrigin::GitHub).is_ok_and(|url| {
+        matches!(
+            crate::browser::open_url(&url),
+            crate::browser::OpenOutcome::Opened
+        )
+    })
 }
 
 /// Print the "pushed, now finish the PR" summary, framed and guttered like every
@@ -1619,6 +1624,7 @@ fn run_git_capture(root: &Path, args: &[&str]) -> Result<Option<String>, CliErro
             RunError::Measure(path, source) => CliError::Io { path, source },
             RunError::Exceeded(refusal) => CliError::LocalLimitExceeded(refusal),
             RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
+            RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         })?;
     if output.status.success() {
         Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
@@ -2394,6 +2400,24 @@ mod tests {
                 "status text {stdout_text:?} should refuse as Status({expected:?}), got {result:?}"
             );
         }
+    }
+
+    /// A curl whose output pipe could not be read is that typed error, never
+    /// the caller's catch-all refusal.
+    #[test]
+    fn an_unread_curl_pipe_is_its_own_error() {
+        let unread = CurlRunError::CouldNotRun(RunError::PipeRead(
+            remote_ingest::Stream::Stdout,
+            std::io::ErrorKind::Other,
+        ))
+        .into_cli(|| CliError::Interrupted);
+        assert!(
+            matches!(
+                unread,
+                CliError::ChildPipeUnread(remote_ingest::Stream::Stdout, std::io::ErrorKind::Other)
+            ),
+            "{unread:?}"
+        );
     }
 
     /// A response body past the cap is a typed ingest refusal, never a

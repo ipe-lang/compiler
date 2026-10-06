@@ -1,5 +1,5 @@
-//! The one owner of every `cargo` child the CLI spawns to build a crate or
-//! read its target directory.
+//! The one owner of every `cargo` child the CLI spawns to build a crate,
+//! resolve its lock, or read its target directory.
 //!
 //! A cargo build is described as a typed value — the crate it builds, its
 //! profile, its target and its output mode — and this module alone turns that
@@ -14,6 +14,11 @@
 //! call returns, on success and on every error. Every captured pipe has a
 //! declared byte ceiling: a drain keeps reading to the end of the stream (so
 //! cargo never stalls on a full pipe) but stops storing at the ceiling.
+//!
+//! Every cargo child starts through `spawn_cargo`, so a build script never
+//! inherits a descriptor the CLI holds open and, on Linux, never outlives the
+//! CLI. A `cargo build` carries no wall: it runs as long as the user's build
+//! takes.
 
 use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -22,6 +27,10 @@ use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use ipe_backend_rust::static_build::StaticTriple;
 
 use crate::output_dir::OwnedDir;
+use crate::remote_ingest::{
+    LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal, LocalSource,
+    METADATA_LIMITS, RunError, run_local,
+};
 use crate::style::TerminalSafe;
 use crate::toolchain::CargoBin;
 use crate::watch::{BuildAccel, apply_build_accel_env};
@@ -35,10 +44,6 @@ pub const ARTIFACT_STREAM_CAP: usize = 64 * 1024 * 1024;
 /// build forwards every byte; only the kept copy stops here, at a chunk
 /// boundary, so the diagnostic shows the first errors cargo reported.
 pub const STDERR_KEEP_CAP: usize = 1024 * 1024;
-
-/// Bytes of `cargo metadata --no-deps` stdout kept; a longer document is
-/// refused, never parsed truncated.
-pub const METADATA_STDOUT_CAP: usize = 16 * 1024 * 1024;
 
 /// The cargo build profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,8 +250,26 @@ impl CargoBuild<'_> {
             lock_dependencies(&cmd, dir, self.output.verbosity())?;
         }
         cmd.arg("--locked");
-        let drained =
-            run_to_exit(&mut cmd, StderrMode::Relay, ARTIFACT_STREAM_CAP).map_err(io_err)?;
+        let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP).map_err(io_err)?;
+        let stdout = self.verdict(drained)?;
+        if let CargoCrate::Emitted(dir) = self.krate {
+            dir.verify()?;
+        }
+        Ok(stdout)
+    }
+
+    /// The build's captured stdout, or why the drained build failed.
+    ///
+    /// A stderr that could not be read outranks a non-zero exit, so a partial
+    /// stderr is never rendered as the build's diagnostic.
+    fn verdict(&self, drained: Drained<ExitStatus>) -> Result<String, CliError> {
+        let io_err = |source: std::io::Error| CliError::Io {
+            path: self.dir().to_path_buf(),
+            source,
+        };
+        if let Some(e) = drained.stderr.error {
+            return Err(io_err(e));
+        }
         let status = drained.waited;
         if !status.success() {
             return Err(CliError::EmittedBuildFailed {
@@ -256,14 +279,8 @@ impl CargoBuild<'_> {
                 runtime: self.runtime.clone(),
             });
         }
-        if let Some(e) = drained.stderr.error {
-            return Err(io_err(e));
-        }
         if let Some(e) = drained.stdout.error {
             return Err(io_err(e));
-        }
-        if let CargoCrate::Emitted(dir) = self.krate {
-            dir.verify()?;
         }
         Ok(drained.stdout.text)
     }
@@ -273,32 +290,37 @@ impl CargoBuild<'_> {
 /// `cargo metadata --no-deps` (it honours `CARGO_TARGET_DIR` and any config
 /// relocation).
 ///
+/// The child runs under [`METADATA_LIMITS`] with stdin closed.
+///
 /// # Errors
-/// [`CliError::Io`] if cargo cannot be spawned, waited on or read, or its
-/// document passes [`METADATA_STDOUT_CAP`]; [`CliError::Usage`] if it exits
-/// non-zero or its document carries no target directory.
+/// - [`CliError::LocalLimitExceeded`] if cargo crosses a ceiling (its document
+///   is refused whole, never parsed truncated); its process group is killed.
+/// - [`CliError::Io`] if cargo cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process cargo started holds a pipe open.
+/// - [`CliError::Usage`] if it exits non-zero or its document is not JSON or
+///   carries no target directory.
 pub fn target_directory(cargo: &CargoBin, crate_dir: &Path) -> Result<PathBuf, CliError> {
+    target_directory_within(cargo, crate_dir, METADATA_LIMITS)
+}
+
+/// [`target_directory`] held to `ceiling`.
+fn target_directory_within(
+    cargo: &CargoBin,
+    crate_dir: &Path,
+    ceiling: LocalCeiling,
+) -> Result<PathBuf, CliError> {
     let mut cmd = Command::new(cargo.path());
     cmd.args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(crate_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let io_err = |source: std::io::Error| CliError::Io {
-        path: crate_dir.to_path_buf(),
-        source,
-    };
-    let drained = run_to_exit(&mut cmd, StderrMode::Keep, METADATA_STDOUT_CAP).map_err(io_err)?;
-    if !drained.waited.success() {
+        .current_dir(crate_dir);
+    let captured = run_local(cmd, ceiling, LocalSource::CargoMetadata)
+        .map_err(|e| local_run_error(crate_dir, e))?;
+    if !captured.status.success() {
         return Err(CliError::Usage(text::msg::cargo_metadata_failed(
             &crate_dir.display(),
-            &drained.stderr.text,
+            &captured.stderr.to_terminal(),
         )));
     }
-    if let Some(e) = drained.stdout.error {
-        return Err(io_err(e));
-    }
-    let meta: serde_json::Value = serde_json::from_str(&drained.stdout.text)
+    let meta: serde_json::Value = serde_json::from_slice(&captured.stdout)
         .map_err(|e| CliError::Usage(text::msg::cargo_metadata_unparsable(&e)))?;
     meta.get("target_directory")
         .and_then(serde_json::Value::as_str)
@@ -316,8 +338,9 @@ pub fn target_directory(cargo: &CargoBin, crate_dir: &Path) -> Result<PathBuf, C
 pub struct WatchBuild<'a> {
     /// The `cargo` to run ([`crate::watch::WatchOptions::cargo_path`]).
     pub cargo: &'a Path,
-    /// The emitted crate; cargo runs with it as its working directory.
-    pub crate_dir: &'a Path,
+    /// The emitted crate, proven to carry the development marker; cargo runs
+    /// with it as its working directory.
+    pub krate: crate::DevMarkedCrate<'a>,
     /// A target directory overriding the inherited `CARGO_TARGET_DIR`.
     pub target_dir: Option<&'a Path>,
     /// The compiler acceleration for this rebuild.
@@ -331,7 +354,7 @@ impl WatchBuild<'_> {
     fn command(&self) -> Command {
         let mut cmd = build_command(
             self.cargo,
-            self.crate_dir,
+            self.krate.path(),
             CargoProfile::Dev,
             CargoTarget::Host,
             CargoOutput::JsonStream(self.verbosity),
@@ -346,10 +369,11 @@ impl WatchBuild<'_> {
     /// Spawn the rebuild, its pipes taken for [`CargoPipes::drain_while`].
     ///
     /// # Errors
-    /// The spawn error when cargo cannot be started.
+    /// The spawn error when cargo cannot be started, or the refusal of
+    /// `spawn_cargo`.
     pub fn spawn(&self) -> std::io::Result<(Child, CargoPipes)> {
-        let mut child = self.command().spawn()?;
-        let pipes = CargoPipes::take(&mut child, StderrMode::Relay, ARTIFACT_STREAM_CAP);
+        let mut child = spawn_cargo(self.command())?;
+        let pipes = CargoPipes::take(&mut child, ARTIFACT_STREAM_CAP);
         Ok((child, pipes))
     }
 }
@@ -393,15 +417,23 @@ fn build_command(
     cmd
 }
 
+/// Start a `cargo build` child through the runtime's hardened spawner.
+///
+/// The child inherits no descriptor beyond its three standard streams and, on
+/// Linux, dies with the CLI. No wall is set.
+///
+/// # Errors
+/// The spawn refusal, as an I/O error, when the spawner is unavailable, this
+/// host does not list its open descriptors, or cargo cannot be started.
+fn spawn_cargo(cmd: Command) -> std::io::Result<Child> {
+    ipe_runtime_rust::system::spawn_hardened(cmd).map_err(std::io::Error::from)
+}
+
 /// Spawn `cmd`, drain its pipes while waiting on it, and return its exit
 /// status with both drains; the child is reaped before this returns.
-fn run_to_exit(
-    cmd: &mut Command,
-    stderr: StderrMode,
-    stdout_cap: usize,
-) -> std::io::Result<Drained<ExitStatus>> {
-    let mut child = cmd.spawn()?;
-    let pipes = CargoPipes::take(&mut child, stderr, stdout_cap);
+fn run_to_exit(cmd: Command, stdout_cap: usize) -> std::io::Result<Drained<ExitStatus>> {
+    let mut child = spawn_cargo(cmd)?;
+    let pipes = CargoPipes::take(&mut child, stdout_cap);
     let Drained {
         waited,
         stdout,
@@ -418,16 +450,29 @@ fn run_to_exit(
 /// the build command's program, directory and environment, so the lock comes
 /// from the toolchain that consumes it.
 ///
-/// The resolve is the one silent gap before cargo's own progress starts, so a
-/// [`Verbosity::Progress`] build covers it with a stage, settled before the
-/// relay starts. Its stderr is kept (up to [`STDERR_KEEP_CAP`]) for the
-/// failure diagnostic, never relayed.
+/// The resolve may fetch the registry index, so it runs under
+/// [`LOCK_FETCH_LIMITS`]. It is the one silent gap before cargo's own progress
+/// starts, so a [`Verbosity::Progress`] build covers it with a stage, settled
+/// before the relay starts. Its stderr is kept for the failure diagnostic,
+/// never relayed.
 ///
 /// # Errors
-/// [`CliError::Io`] if the resolve cannot be spawned, waited on or read;
-/// [`CliError::EmittedBuildFailed`] if it exits non-zero (the registry
-/// unreachable, for one).
+/// - [`CliError::LocalLimitExceeded`] if the resolve crosses a ceiling.
+/// - [`CliError::Io`] if the resolve cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process it started holds a pipe open.
+/// - [`CliError::EmittedBuildFailed`] if it exits non-zero (the registry
+///   unreachable, for one).
 fn lock_dependencies(build: &Command, dir: &Path, verbosity: Verbosity) -> Result<(), CliError> {
+    lock_dependencies_within(build, dir, verbosity, LOCK_FETCH_LIMITS)
+}
+
+/// [`lock_dependencies`] held to `ceiling`.
+fn lock_dependencies_within(
+    build: &Command,
+    dir: &Path,
+    verbosity: Verbosity,
+    ceiling: LocalCeiling,
+) -> Result<(), CliError> {
     let stage = (verbosity == Verbosity::Progress).then(|| {
         crate::progress::Stage::start(
             std::io::stderr(),
@@ -435,30 +480,22 @@ fn lock_dependencies(build: &Command, dir: &Path, verbosity: Verbosity) -> Resul
         )
     });
     let mut lock = Command::new(build.get_program());
-    lock.arg("generate-lockfile")
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    lock.arg("generate-lockfile").current_dir(dir);
     for (key, val) in build.get_envs() {
         match val {
             Some(v) => lock.env(key, v),
             None => lock.env_remove(key),
         };
     }
-    let io_err = |source: std::io::Error| CliError::Io {
-        path: dir.to_path_buf(),
-        source,
-    };
-    let resolved = match run_to_exit(&mut lock, StderrMode::Keep, 0) {
-        Ok(drained) if drained.waited.success() => Ok(()),
-        Ok(drained) => Err(CliError::EmittedBuildFailed {
+    let resolved = match run_local(lock, ceiling, LocalSource::LockFetch) {
+        Ok(captured) if captured.status.success() => Ok(()),
+        Ok(captured) => Err(CliError::EmittedBuildFailed {
             what: "the emitted crate's dependency lockfile",
-            code: drained.waited.code().unwrap_or(1),
-            stderr: TerminalSafe::sanitize(&drained.stderr.text),
+            code: captured.status.code().unwrap_or(1),
+            stderr: captured.stderr.to_terminal(),
             runtime: None,
         }),
-        Err(source) => Err(io_err(source)),
+        Err(e) => Err(local_run_error(dir, e)),
     };
     if let Some(stage) = stage {
         if resolved.is_ok() {
@@ -470,16 +507,70 @@ fn lock_dependencies(build: &Command, dir: &Path, verbosity: Verbosity) -> Resul
     resolved
 }
 
-/// What a drain does with a child's stderr.
+/// How an offline `cargo generate-lockfile` that ran within its ceilings ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StderrMode {
-    /// Relay it live to our stderr and keep a copy.
-    Relay,
-    /// Keep it for a diagnostic only.
-    Keep,
+pub enum LockOutcome {
+    /// cargo exited zero: the lock is written.
+    Resolved,
+    /// cargo exited non-zero, or was ended by a signal (`code` is `None`).
+    Unresolved {
+        /// cargo's exit code, when it exited.
+        code: Option<i32>,
+    },
 }
 
-/// The stdout and stderr pipes of a spawned cargo child, with how each is drained.
+/// Resolve `manifest`'s dependency graph into its `Cargo.lock` offline, from the local registry cache.
+///
+/// The child runs under [`LOCK_RESOLVE_LIMITS`] with stdin closed. A
+/// non-zero exit is a [`LockOutcome::Unresolved`], not an error: the caller
+/// decides whether an unresolved lock is fatal.
+///
+/// # Errors
+/// - [`CliError::LocalLimitExceeded`] if cargo crosses a ceiling; its process
+///   group is killed.
+/// - [`CliError::Io`] (naming `manifest`) if cargo cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process cargo started holds a pipe open.
+pub fn lock_offline(cargo: &Path, manifest: &Path) -> Result<LockOutcome, CliError> {
+    lock_offline_within(cargo, manifest, LOCK_RESOLVE_LIMITS)
+}
+
+/// [`lock_offline`] held to `ceiling`.
+fn lock_offline_within(
+    cargo: &Path,
+    manifest: &Path,
+    ceiling: LocalCeiling,
+) -> Result<LockOutcome, CliError> {
+    let mut lock = Command::new(cargo);
+    lock.arg("generate-lockfile")
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(manifest);
+    let captured = run_local(lock, ceiling, LocalSource::LockResolve)
+        .map_err(|e| local_run_error(manifest, e))?;
+    Ok(if captured.status.success() {
+        LockOutcome::Resolved
+    } else {
+        LockOutcome::Unresolved {
+            code: captured.status.code(),
+        }
+    })
+}
+
+/// The CLI error of a local cargo child that produced no result, naming `path` on an I/O failure.
+fn local_run_error(path: &Path, e: RunError<LocalRefusal>) -> CliError {
+    match e {
+        RunError::Exceeded(refusal) => CliError::LocalLimitExceeded(refusal),
+        RunError::Spawn(source) | RunError::Wait(source) => CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        },
+        RunError::Measure(path, source) => CliError::Io { path, source },
+        RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
+        RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
+    }
+}
+
+/// The stdout and stderr pipes of a spawned cargo child; stderr is relayed live and a copy kept.
 #[derive(Debug)]
 pub struct CargoPipes {
     /// stdout, when piped.
@@ -488,8 +579,6 @@ pub struct CargoPipes {
     stdout_cap: usize,
     /// stderr, when piped.
     stderr: Option<ChildStderr>,
-    /// Whether stderr is relayed live.
-    stderr_mode: StderrMode,
 }
 
 /// The text a pipe drain kept, and the error that ended or refused it.
@@ -536,12 +625,11 @@ impl std::error::Error for PipeOverflow {}
 
 impl CargoPipes {
     /// Take both pipes off `child`.
-    const fn take(child: &mut Child, stderr_mode: StderrMode, stdout_cap: usize) -> Self {
+    const fn take(child: &mut Child, stdout_cap: usize) -> Self {
         Self {
             stdout: child.stdout.take(),
             stdout_cap,
             stderr: child.stderr.take(),
-            stderr_mode,
         }
     }
 
@@ -556,7 +644,6 @@ impl CargoPipes {
             stdout,
             stdout_cap,
             stderr,
-            stderr_mode,
         } = self;
         std::thread::scope(|scope| {
             let stdout = std::thread::Builder::new().spawn_scoped(scope, move || {
@@ -566,16 +653,7 @@ impl CargoPipes {
             });
             let stderr = std::thread::Builder::new().spawn_scoped(scope, move || {
                 stderr
-                    .map(|pipe| match stderr_mode {
-                        StderrMode::Relay => relay_stderr(pipe, STDERR_KEEP_CAP),
-                        StderrMode::Keep => {
-                            let kept = read_capped(pipe, STDERR_KEEP_CAP);
-                            Drain {
-                                text: String::from_utf8_lossy(&kept.bytes).into_owned(),
-                                error: kept.error,
-                            }
-                        }
-                    })
+                    .map(|pipe| relay_stderr(pipe, STDERR_KEEP_CAP))
                     .unwrap_or_default()
             });
             let waited = wait();
@@ -773,7 +851,7 @@ mod tests {
         let accel = BuildAccel::MachineDefault;
         let watch = WatchBuild {
             cargo: Path::new("cargo"),
-            crate_dir: Path::new("/crate"),
+            krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
             target_dir: None,
             accel: &accel,
             verbosity: Verbosity::Progress,
@@ -862,7 +940,7 @@ mod tests {
         let accel = BuildAccel::WarmIncremental;
         let cmd = WatchBuild {
             cargo: Path::new("cargo"),
-            crate_dir: Path::new("/crate"),
+            krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
             target_dir: Some(Path::new("/t")),
             accel: &accel,
             verbosity: Verbosity::Quiet,
@@ -973,14 +1051,20 @@ mod tests {
         //! Builds driven through a stub `cargo` that logs every invocation.
 
         use super::super::{
-            CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
-            target_directory,
+            CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, LockOutcome, Verbosity,
+            WatchBuild, lock_dependencies_within, lock_offline, lock_offline_within,
+            target_directory, target_directory_within,
         };
         use crate::CliError;
         use crate::output_dir::OwnedDir;
+        use crate::remote_ingest::{
+            IngestLimit, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalRefusal, LocalSource,
+            LocalWall, METADATA_LIMITS,
+        };
         use crate::toolchain::CargoBin;
         use std::os::unix::fs::PermissionsExt as _;
         use std::path::{Path, PathBuf};
+        use std::time::Duration;
 
         /// A fresh scratch base for `tag`.
         fn scratch(tag: &str) -> PathBuf {
@@ -1028,6 +1112,172 @@ mod tests {
             .run()
         }
 
+        /// Whether the process whose pid is written to `file`, or any process of its group, still exists.
+        fn alive(file: &Path) -> bool {
+            let raw: i32 = std::fs::read_to_string(file)
+                .expect("pid file")
+                .trim()
+                .parse()
+                .expect("pid");
+            let pid = rustix::process::Pid::from_raw(raw).expect("non-zero pid");
+            let gone = Err(rustix::io::Errno::SRCH);
+            rustix::process::test_kill_process(pid) != gone
+                || rustix::process::test_kill_process_group(pid) != gone
+        }
+
+        /// Whether the process whose pid is written to `file` is gone within a few seconds.
+        ///
+        /// A killed process outside the caller's reach is reaped by its new
+        /// parent, so its pid lingers briefly as a zombie.
+        fn gone_soon(file: &Path) -> bool {
+            let waited = std::time::Instant::now();
+            while alive(file) {
+                if waited.elapsed() > Duration::from_secs(10) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            true
+        }
+
+        /// A stub cargo that starts a background `sleep` (its pid in `base/grandchild`),
+        /// records its own pid in `base/pid`, then sleeps far past any test wall.
+        fn sleeping_stub(base: &Path) -> CargoBin {
+            stub(
+                base,
+                &format!(
+                    "sleep 30 &\necho $! > '{}'\necho $$ > '{}'\nexec sleep 30",
+                    base.join("grandchild").display(),
+                    base.join("pid").display()
+                ),
+            )
+        }
+
+        #[test]
+        fn an_offline_lock_past_its_wall_is_refused_and_killed() {
+            let base = scratch("lock-wall");
+            let cargo = sleeping_stub(&base);
+            let started = std::time::Instant::now();
+            let locked = lock_offline_within(
+                cargo.path(),
+                &base.join("Cargo.toml"),
+                LOCK_RESOLVE_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert!(
+                matches!(
+                    &locked,
+                    Err(CliError::LocalLimitExceeded(LocalRefusal {
+                        source: LocalSource::LockResolve,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }))
+                ),
+                "a resolve past its wall is a typed refusal, got {locked:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the refusal lands at the wall, not at the child's exit"
+            );
+            assert!(
+                gone_soon(&base.join("pid")),
+                "the refused cargo is killed and reaped"
+            );
+            assert!(
+                gone_soon(&base.join("grandchild")),
+                "a process the refused cargo started is killed with its group"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn an_offline_lock_flooding_stdout_is_refused() {
+            let base = scratch("lock-stdout");
+            let cargo = stub(&base, "head -c 1048576 /dev/zero");
+            let locked = lock_offline(cargo.path(), &base.join("Cargo.toml"));
+            assert!(
+                matches!(
+                    &locked,
+                    Err(CliError::LocalLimitExceeded(LocalRefusal {
+                        source: LocalSource::LockResolve,
+                        limit: IngestLimit::Bytes(_),
+                        ..
+                    }))
+                ),
+                "a resolve past its stdout ceiling is a typed refusal, got {locked:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn an_offline_lock_that_fails_is_unresolved_not_an_error() {
+            let base = scratch("lock-fail");
+            let cargo = stub(&base, "exit 101");
+            let manifest = base.join("Cargo.toml");
+            let locked = lock_offline(cargo.path(), &manifest);
+            assert_eq!(
+                locked.ok(),
+                Some(LockOutcome::Unresolved { code: Some(101) })
+            );
+            assert_eq!(
+                invocations(&base).first().map(String::as_str),
+                Some(
+                    format!(
+                        "generate-lockfile --offline --manifest-path {}",
+                        manifest.display()
+                    )
+                    .as_str()
+                )
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn an_offline_lock_that_succeeds_is_resolved() {
+            let base = scratch("lock-ok");
+            let cargo = stub(&base, "true");
+            let locked = lock_offline(cargo.path(), &base.join("Cargo.toml"));
+            assert_eq!(locked.ok(), Some(LockOutcome::Resolved));
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn an_emitted_crate_lock_past_its_wall_is_refused_and_killed() {
+            let base = scratch("fetch-wall");
+            let cargo = sleeping_stub(&base);
+            let build = std::process::Command::new(cargo.path());
+            let started = std::time::Instant::now();
+            let locked = lock_dependencies_within(
+                &build,
+                &base,
+                Verbosity::Quiet,
+                LOCK_FETCH_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert!(
+                matches!(
+                    &locked,
+                    Err(CliError::LocalLimitExceeded(LocalRefusal {
+                        source: LocalSource::LockFetch,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }))
+                ),
+                "a networked resolve past its wall is a typed refusal, got {locked:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the refusal lands at the wall, not at the child's exit"
+            );
+            assert!(
+                gone_soon(&base.join("pid")),
+                "the refused cargo is killed and reaped"
+            );
+            assert!(
+                gone_soon(&base.join("grandchild")),
+                "a process the refused cargo started is killed with its group"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
         #[test]
         fn the_wrapper_build_replays_the_committed_lock_and_never_rewrites_it() {
             let base = scratch("wrapper");
@@ -1069,6 +1319,126 @@ mod tests {
                     .get(1)
                     .is_some_and(|c| c.starts_with("build ") && c.contains("--locked")),
                 "the build replays the fresh lock, got {calls:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// An inheritable descriptor open in the test process.
+        fn inheritable_marker() -> rustix::fd::OwnedFd {
+            let held = rustix::fs::open(
+                "/dev/null",
+                rustix::fs::OFlags::RDONLY,
+                rustix::fs::Mode::empty(),
+            )
+            .expect("open /dev/null");
+            assert!(
+                rustix::io::fcntl_getfd(&held)
+                    .is_ok_and(|flags| !flags.contains(rustix::io::FdFlags::CLOEXEC)),
+                "the marker descriptor must be inheritable"
+            );
+            held
+        }
+
+        /// A stub whose `build` records under `base/seen` whether `marker` is open in it.
+        fn descriptor_probe_stub(base: &Path, marker: &rustix::fd::OwnedFd) -> CargoBin {
+            use std::os::fd::AsRawFd as _;
+            let seen = base.join("seen");
+            stub(
+                base,
+                &format!(
+                    "[ \"$1\" = build ] || exit 0\nif [ -e /dev/fd/{fd} ]; then echo inherited > '{seen}'; else echo closed > '{seen}'; fi\nexit 0",
+                    fd = marker.as_raw_fd(),
+                    seen = seen.display()
+                ),
+            )
+        }
+
+        /// What the descriptor probe stub recorded under `base`.
+        fn seen(base: &Path) -> String {
+            std::fs::read_to_string(base.join("seen"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        }
+
+        #[test]
+        fn a_build_child_inherits_no_marker_descriptor() {
+            let base = scratch("build-fd");
+            let marker = inheritable_marker();
+            let cargo = descriptor_probe_stub(&base, &marker);
+            let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(built.is_ok(), "{built:?}");
+            assert_eq!(
+                seen(&base),
+                "closed",
+                "a cargo build child must not inherit the CLI's descriptors"
+            );
+            drop(marker);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_watch_build_child_inherits_no_marker_descriptor() {
+            let base = scratch("watch-fd");
+            let marker = inheritable_marker();
+            let cargo = descriptor_probe_stub(&base, &marker);
+            let crate_dir = base.join("crate");
+            std::fs::create_dir_all(&crate_dir).expect("crate dir");
+            let accel = crate::watch::BuildAccel::MachineDefault;
+            let watch = WatchBuild {
+                cargo: cargo.path(),
+                krate: crate::DevMarkedCrate::assume(&crate_dir),
+                target_dir: None,
+                accel: &accel,
+                verbosity: Verbosity::Quiet,
+            };
+            let (mut child, pipes) = watch.spawn().expect("spawn the watch build");
+            let drained = pipes.drain_while(|| child.wait());
+            assert!(
+                drained
+                    .waited
+                    .as_ref()
+                    .is_ok_and(std::process::ExitStatus::success),
+                "{:?}",
+                drained.waited
+            );
+            assert_eq!(
+                seen(&base),
+                "closed",
+                "a watch rebuild child must not inherit the CLI's descriptors"
+            );
+            drop(marker);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_failed_stderr_read_outranks_a_non_zero_exit() {
+            use std::os::unix::process::ExitStatusExt as _;
+            let base = scratch("stderr-read");
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            let drained = super::super::Drained {
+                waited: std::process::ExitStatus::from_raw(7 << 8),
+                stdout: super::super::Drain::default(),
+                stderr: super::super::Drain {
+                    text: "partial".to_owned(),
+                    error: Some(std::io::Error::other("stderr read failed")),
+                },
+            };
+            let verdict = CargoBuild {
+                cargo: &cargo,
+                krate: CargoCrate::Emitted(&crate_dir),
+                profile: CargoProfile::Dev,
+                target: CargoTarget::Host,
+                output: CargoOutput::JsonStream(Verbosity::Quiet),
+                what: "the stub build",
+                runtime: None,
+            }
+            .verdict(drained);
+            assert!(
+                matches!(&verdict, Err(CliError::Io { .. })),
+                "an unread stderr is an I/O failure, never a partial build diagnostic, got {verdict:?}"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -1119,18 +1489,88 @@ mod tests {
         #[test]
         fn a_metadata_document_past_its_ceiling_is_refused() {
             let base = scratch("metadata-cap");
+            let cargo = stub(&base, "head -c 16777217 /dev/zero");
+            let dir = target_directory(&cargo, &base);
+            assert!(
+                matches!(
+                    &dir,
+                    Err(CliError::LocalLimitExceeded(LocalRefusal {
+                        source: LocalSource::CargoMetadata,
+                        limit: IngestLimit::Bytes(_),
+                        ..
+                    }))
+                ),
+                "an oversized metadata document is a typed refusal, got {dir:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_metadata_query_past_its_wall_is_refused_and_killed() {
+            let base = scratch("metadata-wall");
+            let cargo = sleeping_stub(&base);
+            let started = std::time::Instant::now();
+            let dir = target_directory_within(
+                &cargo,
+                &base,
+                METADATA_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert!(
+                matches!(
+                    &dir,
+                    Err(CliError::LocalLimitExceeded(LocalRefusal {
+                        source: LocalSource::CargoMetadata,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }))
+                ),
+                "a metadata query past its wall is a typed refusal, got {dir:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the refusal lands at the wall, not at the child's exit"
+            );
+            assert!(
+                gone_soon(&base.join("pid")),
+                "the refused cargo is killed and reaped"
+            );
+            assert!(
+                gone_soon(&base.join("grandchild")),
+                "a process the refused cargo started is killed with its group"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_stdout_flood_is_refused_before_the_child_exits() {
+            let base = scratch("lock-flood-early");
             let cargo = stub(
                 &base,
                 &format!(
-                    "head -c {} /dev/zero",
-                    super::super::METADATA_STDOUT_CAP + 1
+                    "echo $$ > '{}'\nhead -c 1048576 /dev/zero\nexec sleep 30",
+                    base.join("pid").display()
                 ),
             );
-            let dir = target_directory(&cargo, &base);
+            let started = std::time::Instant::now();
+            let locked = lock_offline(cargo.path(), &base.join("Cargo.toml"));
             assert!(
-                matches!(&dir, Err(CliError::Io { source, .. })
-                    if source.kind() == std::io::ErrorKind::FileTooLarge),
-                "an oversized metadata document is refused, got {dir:?}"
+                matches!(
+                    &locked,
+                    Err(CliError::LocalLimitExceeded(LocalRefusal {
+                        source: LocalSource::LockResolve,
+                        limit: IngestLimit::Bytes(_),
+                        ..
+                    }))
+                ),
+                "a resolve past its stdout ceiling is a typed refusal, got {locked:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the refusal lands at the overflow, not at the child's exit or its wall"
+            );
+            assert!(
+                gone_soon(&base.join("pid")),
+                "the flooding cargo is killed and reaped"
             );
             let _ = std::fs::remove_dir_all(&base);
         }

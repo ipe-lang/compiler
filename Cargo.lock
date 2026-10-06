@@ -1683,7 +1683,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e-support"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe-test-temp",
  "ipe_env",
@@ -3006,7 +3006,7 @@ checksum = "06432fb54d3be7964ecd3649233cddf80db2832f47fec34c01f65b3d9d774983"
 
 [[package]]
 name = "ipe"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "cap-primitives",
@@ -3075,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "ipe-runtime-rust"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3145,11 +3145,11 @@ dependencies = [
 
 [[package]]
 name = "ipe-test-temp"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "ipe-wasm"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_backend",
  "ipe_backend_rust",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_annotate"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_backend"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_ir",
@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_backend_rust"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "e2e-support",
  "ipe-runtime-rust",
@@ -3212,11 +3212,11 @@ dependencies = [
 
 [[package]]
 name = "ipe_bindgen"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "ipe_canon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3227,7 +3227,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_db"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_backend",
  "ipe_backend_rust",
@@ -3246,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_diagnostics"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_env",
  "ipe_path_core",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_docs"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe-runtime-rust",
  "ipe_annotate",
@@ -3271,26 +3271,26 @@ dependencies = [
 
 [[package]]
 name = "ipe_env"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe-test-temp",
 ]
 
 [[package]]
 name = "ipe_ffi"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "e2e-support",
  "ipe-test-temp",
  "ipe_canon",
  "ipe_diagnostics",
  "ipe_env",
+ "ipe_fs_open",
  "ipe_intern",
  "ipe_kernels",
  "ipe_parse",
  "ipe_syntax",
  "proc-macro2",
- "rustix 0.38.44",
  "serde",
  "serde_json",
  "toml",
@@ -3298,7 +3298,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_fmt"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_fs_open"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cap-primitives",
  "ipe-test-temp",
@@ -3319,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_intern"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_diagnostics",
  "serde",
@@ -3328,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_ir"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_kernels"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "e2e-support",
  "ipe_intern",
@@ -3351,20 +3351,20 @@ dependencies = [
 
 [[package]]
 name = "ipe_lint"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe-test-temp",
  "ipe_canon",
  "ipe_diagnostics",
+ "ipe_fs_open",
  "ipe_intern",
  "ipe_parse",
  "ipe_syntax",
- "rustix 0.38.44",
 ]
 
 [[package]]
 name = "ipe_lower"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3377,7 +3377,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lsp_features"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "e2e-support",
  "ipe_annotate",
@@ -3397,7 +3397,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_lsp_server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crossbeam-channel",
  "ipe-test-temp",
@@ -3416,7 +3416,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_parse"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3425,11 +3425,11 @@ dependencies = [
 
 [[package]]
 name = "ipe_path_core"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "ipe_sandbox"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dunce",
  "e2e-support",
@@ -3437,16 +3437,18 @@ dependencies = [
  "ipe-test-temp",
  "ipe_diagnostics",
  "ipe_env",
+ "ipe_fs_open",
  "ipe_kernels",
  "rustix 0.38.44",
  "serde",
+ "toml",
  "win32job",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "ipe_stdlib"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
@@ -3458,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_syntax"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
@@ -3466,12 +3468,13 @@ dependencies = [
 
 [[package]]
 name = "ipe_types"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
  "ipe_env",
  "ipe_intern",
+ "ipe_ir",
  "ipe_kernels",
  "ipe_parse",
  "strum 0.26.3",
@@ -3479,7 +3482,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_watch"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe-test-temp",
  "notify",
@@ -3488,7 +3491,7 @@ dependencies = [
 
 [[package]]
 name = "ipe_wrapper"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe_env",
  "ipe_fs_open",
@@ -4914,7 +4917,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playground-jail-runner"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "e2e-support",
  "ipe-test-temp",
@@ -5513,7 +5516,7 @@ dependencies = [
 
 [[package]]
 name = "regen-cli-transcripts"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ipe",
  "ipe_docs",
@@ -5522,7 +5525,7 @@ dependencies = [
 
 [[package]]
 name = "regen-goldens"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "e2e-support",
  "ipe",
@@ -5531,9 +5534,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.4"
+version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -5543,9 +5546,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.14"
+version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -7599,9 +7602,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.23.4"
+version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
+checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",

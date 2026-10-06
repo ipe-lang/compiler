@@ -65,12 +65,13 @@ pub(crate) struct Member {
 /// posture of every member ([`Umbrella::intent`]), so a posture is a namespace
 /// rather than a flag: `watch` is a member of `dev` only, so hot-reloading a
 /// shipping build cannot be expressed. A group carries no handler of its own:
-/// `ipe <group> --help` renders its subpage, and a bare `ipe <group>` is refused
-/// with [`CliError::GroupRequired`].
+/// `ipe <group> --help` renders its subpage; a bare `ipe dev` renders the same
+/// page, and a bare `ipe release` is refused with [`CliError::GroupRequired`].
 pub(crate) struct Group {
     /// The umbrella this group is.
     umbrella: Umbrella,
-    /// The group's `.md` page (`help/<name>.md`), holding its one-line summary.
+    /// The group's `.md` page (`help/<name>.md`), holding its one-line summary
+    /// and optional one-line note.
     page: &'static str,
     /// The member verbs, in display order.
     members: &'static [Member],
@@ -219,6 +220,8 @@ pub struct GroupSpec {
     pub name: &'static str,
     /// The one-line description shown on the group's subpage.
     pub summary: &'static str,
+    /// The optional one-line note shown beneath the summary.
+    pub note: Option<&'static str>,
     /// The member verbs' full names (`"dev build"`), in display order; each
     /// names a [`CommandSpec`].
     pub members: Vec<&'static str>,
@@ -282,6 +285,7 @@ pub fn all_group_specs() -> Vec<GroupSpec> {
         .map(|g| GroupSpec {
             name: g.name(),
             summary: g.summary(),
+            note: g.note(),
             members: g.members.iter().map(|m| m.verb.name()).collect(),
         })
         .collect()
@@ -428,6 +432,11 @@ impl Group {
     /// The group's one-line summary.
     fn summary(&self) -> &'static str {
         help_page::summary_of(self.page)
+    }
+
+    /// The group's optional one-line note, shown beneath the summary.
+    fn note(&self) -> Option<&'static str> {
+        help_page::note_of(self.page)
     }
 }
 
@@ -613,12 +622,16 @@ pub fn group(name: &str, stream: &impl IsTerminal) -> Option<String> {
     find_group(name).map(|g| render_group(g, p))
 }
 
-/// Render a group's subpage from its [`Group`] entry: the summary, a synopsis
-/// line, and one aligned member line per verb.
+/// Render a group's subpage from its [`Group`] entry: the summary, its note, a
+/// synopsis line, and one aligned member line per verb.
 fn render_group(g: &Group, p: &Palette) -> String {
     let mut out = String::new();
     out.push('\n');
     let _ = writeln!(out, "{}{}{}", p.dim, g.summary(), p.reset);
+    if let Some(note) = g.note() {
+        out.push('\n');
+        let _ = writeln!(out, "{note}");
+    }
     out.push('\n');
     let _ = writeln!(out, "{}ipe {} <verb>{}", p.yellow, g.name(), p.reset);
     out.push('\n');
@@ -1137,6 +1150,19 @@ mod tests {
             }
             assert!(!page.contains('\x1b'), "plain subpage must carry no ANSI");
         }
+    }
+
+    /// The dev posture runs with the developer's full authority, so its subpage
+    /// says so and names the checked path.
+    #[test]
+    fn dev_subpage_states_it_checks_no_capabilities() {
+        let dev = find_group("dev").map(|g| render_group(g, &Palette::PLAIN));
+        assert!(
+            dev.as_deref().is_some_and(
+                |page| page.contains("checks no capabilities") && page.contains("ipe release")
+            ),
+            "{dev:?}"
+        );
     }
 
     /// `add`/`remove` are withheld from the top-level screen while their only

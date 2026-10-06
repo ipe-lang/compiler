@@ -130,6 +130,26 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         JAIL_ABSENT,
     ),
     (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_jailed_write_to_git_hooks_is_refused",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_jailed_git_status_still_reads_the_repo",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "nested_carve_ancestor_rename_refused",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "an_in_scratch_write_succeeds_under_the_run_jail",
+        JAIL_ABSENT,
+    ),
+    (
         "src/compiler/sandbox/tests/run_jail_windows_e2e.rs",
         "a_child_spawn_is_denied_under_a_subprocess_withholding_job_but_succeeds_under_control",
         CONTROL_INCONCLUSIVE,
@@ -236,12 +256,32 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/ipe-cli/tests/audit_native.rs",
+        "release_run_withheld_subprocess_cannot_fork",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
         "release_run_runs_returned_artifact",
         JAIL_ABSENT,
     ),
     (
         "src/ipe-cli/tests/audit_native.rs",
         "release_run_refuses_a_development_build",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_refuses_real_dev_build",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_refuses_dev_binary_with_forged_release_literal",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
+        "release_run_refuses_dev_run_binary_with_forged_release_literal",
         JAIL_ABSENT,
     ),
     (

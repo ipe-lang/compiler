@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ipe_sandbox::run_jail::{
-    FilesystemScope, RunResourceLimits, SandboxProfile, WindowsBaseEnv,
+    FilesystemScope, ProcCap, RunResourceLimits, SandboxProfile, WindowsBaseEnv,
     run_windows_jailed_for_test, windows_scrubbed_env,
 };
 
@@ -121,7 +121,7 @@ fn subprocess_granted() -> SandboxProfile {
     SandboxProfile {
         subprocess: true,
         limits: RunResourceLimits {
-            proc_cap: 16,
+            proc_cap: ProcCap::parse(16).expect("16 is in range"),
             ..RunResourceLimits::default()
         },
         ..SandboxProfile::maximally_isolated()
@@ -243,11 +243,11 @@ fn a_non_allowlisted_env_var_is_absent_from_the_jailed_child_but_present_under_c
 /// The host values of the names the launcher may forward: the base set plus
 /// `extra`, read through the same allowlisted host-env reader the launcher uses.
 fn host_lookup(extra: &[&str]) -> Vec<(String, OsString)> {
-    let names: Vec<&str> = WindowsBaseEnv::ALL
+    let mut names: Vec<&str> = WindowsBaseEnv::ALL
         .into_iter()
         .map(WindowsBaseEnv::name)
-        .chain(extra.iter().copied())
         .collect();
+    names.extend(extra.iter().copied());
     ipe_sandbox::host_env::granted_env(&env_granted(&names))
 }
 

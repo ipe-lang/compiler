@@ -277,7 +277,7 @@ pub enum CliError {
     GroupRequired {
         /// What the user typed: the legacy verb or the bare group word.
         attempted: TerminalSafe,
-        /// The grouped forms the hint offers; empty for a bare `ipe dev`.
+        /// The grouped forms the hint offers; empty for a group with no page.
         forms: &'static [crate::verb::Verb],
         /// The arguments that followed `attempted`, carried onto each hinted
         /// form; empty when there were none.
@@ -365,7 +365,7 @@ pub enum CliError {
     /// nothing left to print — the JSON line is the complete machine output.
     DiagnosticJsonEmitted,
     /// A file exceeded the per-surface read ceiling in
-    /// [`io_bounded::read_to_string_capped`]. The read was stopped at the cap;
+    /// [`io_bounded::read_leaf_capped`]. The read was stopped at the cap;
     /// no unbounded allocation was made.
     FileTooLarge {
         /// The path of the oversized file.
@@ -390,6 +390,8 @@ pub enum CliError {
         role: crate::threads::ThreadRole,
         source: std::io::Error,
     },
+    /// Reading a child's output pipe failed, so its output was not used.
+    ChildPipeUnread(remote_ingest::Stream, std::io::ErrorKind),
     /// A signal ended a remote transfer before it finished.
     ///
     /// Nothing it staged reached the lock, the manifest or the package cache.
@@ -678,6 +680,7 @@ impl CliError {
             Self::LocalLimitExceeded(_) => "local-limit-exceeded",
             Self::ChildPipeHeld(_) => "child-pipe-held",
             Self::ThreadRefused { .. } => "thread-refused",
+            Self::ChildPipeUnread(..) => "child-pipe-unread",
             Self::Interrupted => "interrupted",
             Self::SourceRefused { .. } => "source-refused",
             Self::PathEscape { .. } => "path-escape",
@@ -763,6 +766,7 @@ impl CliError {
             | Self::LocalLimitExceeded(_)
             | Self::ChildPipeHeld(_)
             | Self::ThreadRefused { .. }
+            | Self::ChildPipeUnread(..)
             | Self::Interrupted
             | Self::SourceRefused { .. }
             | Self::PathEscape { .. }
@@ -1043,6 +1047,9 @@ impl std::fmt::Display for CliError {
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
             Self::ThreadRefused { role, source } => {
                 f.write_str(&text::cli_thread_refused(role, &source.kind()))
+            }
+            Self::ChildPipeUnread(stream, kind) => {
+                f.write_str(&text::cli_child_pipe_unread(stream, kind))
             }
             Self::Interrupted => f.write_str(text::cli_transfer_interrupted()),
             Self::SourceRefused { path, reason } => {

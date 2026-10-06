@@ -15,8 +15,9 @@
 -- for the capability-gated `Ipe.Db.Store.Unsafe`.
 --
 -- The mental model, the secured row-security grammar, and a runnable end-to-end
--- example live in the Store guide; the composable owner/tenant/RBAC/sharing
--- policy algebra lives in its sibling composition guide. This doc-comment is the
+-- example live in the Store guide (`ipe doc guide:db-store`); the composable
+-- owner/tenant/RBAC/sharing policy algebra lives in its sibling composition guide
+-- (`ipe doc guide:db-store-rls-composition`). This doc-comment is the
 -- per-symbol reference — see the guides for the narrative and the worked example.
 module Ipe.Db.Store exposing
     ( Draft(..)
@@ -53,7 +54,7 @@ module Ipe.Db.Store exposing
     , gte, gteBy
     , lt, ltBy
     , lte, lteBy
-    , like
+    , like, startsWith
     , isNull, notNull
     , inList, inListBy
     , and, or, not
@@ -2443,8 +2444,8 @@ deleteWhere conn store cond =
 
 
 -- Whether `cond` constrains at least one column: True when its `Cond` tree
--- contains any leaf (`Compare` / `Like` / `IsNull` / `NotNull` / `InList`, each
--- of which names a store column), False when it is only connectives over no
+-- contains any leaf (`Compare` / `Like` / `StartsWith` / `IsNull` / `NotNull` /
+-- `InList`, each of which names a store column), False when it is only connectives over no
 -- leaves. `and []` (→ `(1 = 1)`, matches every row), `or []` (→ `(1 = 0)`), and
 -- `not` / `and` / `or` nests that bottom out in empty lists all constrain no
 -- column. The mutation surface (`updateWhere` / `deleteWhere`) refuses such an
@@ -2458,6 +2459,9 @@ condConstrainsColumn cond =
             True
 
         Like _ _ ->
+            True
+
+        StartsWith _ _ ->
             True
 
         IsNull _ ->
@@ -2801,6 +2805,7 @@ type CompareOp
 type Cond row
     = Compare CompareOp String SqlValue
     | Like String String
+    | StartsWith String String
     | IsNull String
     | NotNull String
     | InList String (List SqlValue)
@@ -3147,8 +3152,12 @@ lteByNamed col codec v =
 
 -- | `like accessor pattern` — the rows where the `String` column named by
 -- `accessor` matches the SQL `LIKE` `pattern`. The pattern binds as a
--- parameter (wildcards `%` / `_` are DATA the SQL engine interprets, never
--- SQL text the caller injects). The accessor must name a `String` field.
+-- parameter, never as SQL text. It is still a pattern: `%` and `_` in it,
+-- including any that come from user text, are wildcards. It is read under
+-- `ESCAPE '\'` on every engine, so `\%`, `\_` and `\\` match `%`, `_` and `\`
+-- literally; a pattern ending in an unpaired `\` is refused as a typed error.
+-- For a literal prefix, use `Store.startsWith`. The accessor must name a
+-- `String` field.
 --
 -- Example:
 --
@@ -3157,6 +3166,26 @@ lteByNamed col codec v =
 like : (row -> String) -> String -> Cond row
 like =
     Kernel.kernel "Store_like"
+
+
+-- | `startsWith accessor prefix` — the rows where the `String` column named by
+-- `accessor` begins with `prefix`, read literally: `%`, `_` and `\` in it,
+-- including any that come from user text, match only themselves. The prefix
+-- binds as a parameter, never as SQL text, and the match is case-sensitive on
+-- every engine under a deterministic collation; a Postgres column declared
+-- with a nondeterministic collation (a case-insensitive ICU one) compares by
+-- that collation instead. It renders through `Sql.startsWith`, so an empty
+-- prefix, one holding a NUL character, or one longer than 16384 bytes is
+-- refused as a typed error before any SQL is sent. The accessor must name a
+-- `String` field.
+--
+-- Example:
+--
+--     Store.query store
+--         |> Store.where (Store.startsWith .name searchText)
+startsWith : (row -> String) -> String -> Cond row
+startsWith =
+    Kernel.kernel "Store_startsWith"
 
 
 -- | `isNull accessor` — the rows where the column named by `accessor` is SQL
@@ -4415,6 +4444,9 @@ condFragmentIn view cond =
         Like col pattern ->
             Result.map (\live -> Sql.like (Sql.column live) pattern) (liveName view col)
 
+        StartsWith col prefix ->
+            Result.map (\live -> Sql.startsWith (Sql.column live) prefix) (liveName view col)
+
         IsNull col ->
             Result.map (\live -> Sql.isNull (Sql.column live)) (liveName view col)
 
@@ -4478,6 +4510,9 @@ condFragmentInQualified alias view cond =
 
         Like col pattern ->
             Result.map (\live -> Sql.like (Sql.column (qualified alias live)) pattern) (liveName view col)
+
+        StartsWith col prefix ->
+            Result.map (\live -> Sql.startsWith (Sql.column (qualified alias live)) prefix) (liveName view col)
 
         IsNull col ->
             Result.map (\live -> Sql.isNull (Sql.column (qualified alias live))) (liveName view col)
@@ -5623,6 +5658,9 @@ recastCond cond =
         Like col pattern ->
             Like col pattern
 
+        StartsWith col prefix ->
+            StartsWith col prefix
+
         IsNull col ->
             IsNull col
 
@@ -5781,6 +5819,9 @@ condColumns cond =
             [ col ]
 
         Like col _ ->
+            [ col ]
+
+        StartsWith col _ ->
             [ col ]
 
         IsNull col ->

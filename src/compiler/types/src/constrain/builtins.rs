@@ -1,4 +1,6 @@
-use super::{CtorScheme, DResult, Interner, Symbol, Ty, TyBounds};
+use super::{
+    BTreeSet, BuiltinTag, CtorKey, CtorScheme, DResult, Diagnostic, Interner, Symbol, Ty, TyBounds,
+};
 
 /// Interned symbols of every built-in type, constructor, and field name.
 pub struct Builtins {
@@ -1075,599 +1077,180 @@ impl Builtins {
         })
     }
 
-    /// The Prelude-built-in constructor schemes, keyed by constructor name.
+    /// The built-in constructor table, derived from canon's `BUILTIN_UNIONS`.
     ///
-    /// `Bool` (`True` / `False` : `Bool`), `Maybe a` (`Just : a -> Maybe a`,
-    /// `Nothing : Maybe a`), and `Result e a` (`Ok : a -> Result e a`,
-    /// `Err : e -> Result e a`). These types have no user `type` declaration, so
-    /// their schemes are synthesised here; each is instantiated fresh per use
-    /// site exactly like a user constructor's scheme. The built-in `Con`s carry
-    /// an empty module path, matching how `from_canon` renders the builtin type
-    /// names (`Int` / `Bool` / …) and how the lowerer recognises them by name.
-    #[allow(clippy::too_many_lines)]
-    #[must_use]
-    pub fn ctor_schemes(&self) -> Vec<(Symbol, CtorScheme)> {
-        let bool_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.bool,
+    /// Every constructor canon registers maps to exactly one entry: a scheme
+    /// (constructible and matchable from source) or a sealed key (a runtime-only
+    /// capability handle such as `StreamId`). A union or constructor this walk
+    /// does not know, or a payload whose arity disagrees with canon's, is a
+    /// `CompilerBug` — the table can never drift into an unconstrained miss.
+    ///
+    /// # Errors
+    /// `CompilerBug` (`constrain.builtin_ctor_payload`) on a canon entry with no
+    /// payload arm, an arity mismatch, or a tag whose symbol disagrees.
+    pub fn ctor_schemes(&self, interner: &mut Interner) -> DResult<BuiltinCtors> {
+        let mut schemes = Vec::new();
+        let mut sealed = BTreeSet::new();
+        for union in ipe_canon::builtins::BUILTIN_UNIONS {
+            let (tag, params) = self.builtin_union_head(union.type_name)?;
+            let type_sym = interner.intern(union.type_name)?;
+            if let Some(t) = tag
+                && self.builtin_symbol(t) != type_sym
+            {
+                return Err(payload_bug(union.type_name, "<tag symbol>"));
+            }
+            let module = tag.map_or_else(Vec::new, |t| self.builtin_con_module(t).to_vec());
+            let result = Ty::Con {
+                module,
+                name: type_sym,
+                args: params,
+            };
+            for (ctor, _index, arity) in union.ctors.iter().copied() {
+                let ctor_sym = interner.intern(ctor)?;
+                let key: CtorKey = (Vec::new(), type_sym, ctor_sym);
+                match self.builtin_ctor_payload(union.type_name, ctor)? {
+                    CtorPayload::Scheme(arg_tys) if arg_tys.len() == arity => {
+                        schemes.push((
+                            key,
+                            CtorScheme {
+                                arg_tys,
+                                result: result.clone(),
+                            },
+                        ));
+                    }
+                    CtorPayload::Scheme(_) => return Err(payload_bug(union.type_name, ctor)),
+                    CtorPayload::Sealed => {
+                        sealed.insert(key);
+                    }
+                }
+            }
+        }
+        Ok(BuiltinCtors { schemes, sealed })
+    }
+
+    /// The tag and result type parameters of the canon builtin union `type_name`.
+    ///
+    /// `ChunkEvent` and `ArithOp` have no [`BuiltinTag`]; their result `Con`
+    /// carries the empty module every builtin `Con` without a tag carries.
+    fn builtin_union_head(&self, type_name: &str) -> DResult<(Option<BuiltinTag>, Vec<Ty>)> {
+        let a = Ty::Var(self.tv_a.as_raw());
+        let e = Ty::Var(self.tv_e.as_raw());
+        let tag = match type_name {
+            "Maybe" => return Ok((Some(BuiltinTag::Maybe), vec![a])),
+            "Result" => return Ok((Some(BuiltinTag::Result), vec![e, a])),
+            "ChunkEvent" | "ArithOp" => return Ok((None, Vec::new())),
+            "Bool" => BuiltinTag::Bool,
+            "Order" => BuiltinTag::Order,
+            "SqlValue" => BuiltinTag::SqlValue,
+            "SqlField" => BuiltinTag::SqlField,
+            "ProjectionTerm" => BuiltinTag::ProjectionTerm,
+            "ProjectionOperand" => BuiltinTag::ProjectionOperand,
+            "StreamId" => BuiltinTag::StreamId,
+            "HttpMethod" => BuiltinTag::HttpMethod,
+            "RedirectPolicy" => BuiltinTag::RedirectPolicy,
+            "Error" => BuiltinTag::Error,
+            "ErrorKind" => BuiltinTag::ErrorKind,
+            "ErrorDetails" => BuiltinTag::ErrorDetails,
+            _ => return Err(payload_bug(type_name, "<union>")),
+        };
+        Ok((Some(tag), Vec::new()))
+    }
+
+    /// The payload of canon builtin constructor `ctor` of union `type_name`.
+    ///
+    /// One arm per canon constructor; the final arm refuses an unknown pair so a
+    /// constructor added to canon without a payload here breaks every build.
+    fn builtin_ctor_payload(&self, type_name: &str, ctor: &str) -> DResult<CtorPayload> {
+        let a = || Ty::Var(self.tv_a.as_raw());
+        let e = || Ty::Var(self.tv_e.as_raw());
+        let tagged = |tag: BuiltinTag| Ty::Con {
+            module: self.builtin_con_module(tag).to_vec(),
+            name: self.builtin_symbol(tag),
             args: Vec::new(),
         };
-        let maybe_ty = Ty::Con {
+        let untagged = |name: Symbol| Ty::Con {
             module: Vec::new(),
-            name: self.maybe,
-            args: vec![Ty::Var(self.tv_a.as_raw())],
-        };
-        let result_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.result,
-            args: vec![Ty::Var(self.tv_e.as_raw()), Ty::Var(self.tv_a.as_raw())],
-        };
-        // Monomorphic SqlValue / SqlField types (no type parameters).
-        let sqlvalue_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.sqlvalue,
+            name,
             args: Vec::new(),
         };
-        let sqlfield_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.sqlfield,
-            args: Vec::new(),
+        let string = || tagged(BuiltinTag::String);
+        let int = || tagged(BuiltinTag::Int);
+        let operand = || tagged(BuiltinTag::ProjectionOperand);
+        let args = match (type_name, ctor) {
+            ("Bool", "True" | "False")
+            | ("Maybe", "Nothing")
+            | ("Order", "LT" | "EQ" | "GT")
+            | ("SqlField", "OmitField")
+            | ("ProjectionTerm", "LiteralTerm")
+            | ("ProjectionOperand", "OperandLiteral")
+            | ("ArithOp", "ArithAdd" | "ArithSub" | "ArithMul")
+            | ("ChunkEvent", "Done")
+            | ("HttpMethod", "Get" | "Post" | "Put" | "Delete" | "Patch" | "Head" | "Options")
+            | ("RedirectPolicy", "NoRedirects")
+            | (
+                "ErrorKind",
+                "Io" | "Network" | "Ffi" | "Decode" | "Timeout" | "NotFound" | "PermissionDenied"
+                | "InvalidInput" | "Conflict" | "Unavailable" | "Unexpected",
+            ) => Vec::new(),
+            ("Maybe", "Just") | ("Result", "Ok") => vec![a()],
+            ("Result", "Err") => vec![e()],
+            ("SqlValue", "SqlString" | "SqlMoney")
+            | ("ProjectionTerm", "UpperTerm" | "LowerTerm")
+            | ("ProjectionOperand", "OperandColumn")
+            | ("ChunkEvent", "Chunk")
+            | ("ErrorDetails", "JsonDecode" | "Custom") => vec![string()],
+            ("SqlValue", "SqlInt" | "SqlTime")
+            | ("RedirectPolicy", "FollowRedirects")
+            | ("ErrorDetails", "HttpStatus") => vec![int()],
+            ("SqlValue", "SqlFloat") => vec![tagged(BuiltinTag::Float)],
+            ("SqlValue", "SqlBool") => vec![tagged(BuiltinTag::Bool)],
+            ("SqlValue", "SqlBytes") => vec![tagged(BuiltinTag::Bytes)],
+            ("SqlValue", "SqlDecimal") => vec![tagged(BuiltinTag::Decimal)],
+            ("SqlValue", "SqlNull") | ("SqlField", "SetField") => {
+                vec![tagged(BuiltinTag::SqlValue)]
+            }
+            ("ProjectionTerm", "ColumnTerm") => vec![string(), string()],
+            ("ProjectionTerm", "CoalesceTerm") => vec![operand(), operand()],
+            ("ProjectionTerm", "ArithTerm") => {
+                vec![untagged(self.arith_op), operand(), operand()]
+            }
+            ("ChunkEvent", "Errored") => vec![tagged(BuiltinTag::Error)],
+            // `PanicInfo` / `TypeInfo` / `ErrorInfo` are NOMINAL opaque Cons,
+            // not structural records: a bare record literal fails to unify at
+            // ipe time instead of lowering to a struct the runtime rejects.
+            // Source builds them only through the `Error` smart constructors.
+            ("Error", "Error") => vec![tagged(BuiltinTag::ErrorKind), untagged(self.errorinfo)],
+            ("ErrorDetails", "FfiPanic") => vec![untagged(self.panicinfo)],
+            ("ErrorDetails", "TypeMismatch") => vec![untagged(self.typeinfo)],
+            // A stream handle is minted only by the runtime; source never names it.
+            ("StreamId", "StreamId") => return Ok(CtorPayload::Sealed),
+            _ => return Err(payload_bug(type_name, ctor)),
         };
-        let int_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.int,
-            args: Vec::new(),
-        };
-        let float_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.float,
-            args: Vec::new(),
-        };
-        let string_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.string,
-            args: Vec::new(),
-        };
-        let bool_ty_plain = Ty::Con {
-            module: Vec::new(),
-            name: self.bool,
-            args: Vec::new(),
-        };
-        let bytes_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.bytes,
-            args: Vec::new(),
-        };
-        let decimal_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.decimal,
-            args: Vec::new(),
-        };
-        // Monomorphic `Error` / `ErrorKind` — no type params.
-        let error_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.error,
-            args: Vec::new(),
-        };
-        let errorkind_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.errorkind,
-            args: Vec::new(),
-        };
-        // Monomorphic `ErrorDetails` — no type params.
-        let errordetails_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.errordetails,
-            args: Vec::new(),
-        };
-        // `PanicInfo` / `TypeInfo` / `ErrorInfo` — NOMINAL opaque Cons, not
-        // structural records (SEAL fix; see the `TypeNames` field
-        // doc). A bare record literal (`FfiPanic { message = …, stack = … }`)
-        // now fails to unify with a clean ipe-time type mismatch instead of
-        // lowering to a synthesized struct that fails `cargo build` against
-        // the runtime's `IpePanicInfo`/`IpeTypeInfo`/`IpeErrorInfo`. Field
-        // access on values of these types resolves through
-        // `resolve_deferred`'s builtin-record field tables (the `Request`
-        // recipe); construction from Ipê source goes through the smart
-        // constructors (`Error.io`/… + `Error.withDetails`) only.
-        let panic_info_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.panicinfo,
-            args: Vec::new(),
-        };
-        let type_info_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.typeinfo,
-            args: Vec::new(),
-        };
-        let error_info_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.errorinfo,
-            args: Vec::new(),
-        };
-        // Monomorphic `RedirectPolicy` — no type params.
-        let redirect_policy_ty = Ty::Con {
-            module: Vec::new(),
-            name: self.redirect_policy,
-            args: Vec::new(),
-        };
-        vec![
-            (
-                self.true_,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: bool_ty.clone(),
-                },
-            ),
-            (
-                self.false_,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: bool_ty,
-                },
-            ),
-            (
-                self.no_redirects,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: redirect_policy_ty.clone(),
-                },
-            ),
-            (
-                self.follow_redirects,
-                CtorScheme {
-                    arg_tys: vec![int_ty.clone()],
-                    result: redirect_policy_ty,
-                },
-            ),
-            (
-                self.just,
-                CtorScheme {
-                    arg_tys: vec![Ty::Var(self.tv_a.as_raw())],
-                    result: maybe_ty.clone(),
-                },
-            ),
-            (
-                self.nothing,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: maybe_ty,
-                },
-            ),
-            (
-                self.ok,
-                CtorScheme {
-                    arg_tys: vec![Ty::Var(self.tv_a.as_raw())],
-                    result: result_ty.clone(),
-                },
-            ),
-            (
-                self.err,
-                CtorScheme {
-                    arg_tys: vec![Ty::Var(self.tv_e.as_raw())],
-                    result: result_ty,
-                },
-            ),
-            // ── Error / ErrorKind constructors ──────────────
-            // `Error : ErrorKind -> ErrorInfo -> Error` — without it the
-            // no-scheme ctor-pattern fallback would bind `info` to an untied
-            // fresh var. `ErrorKind`'s 11 variants are all nullary.
-            (
-                self.error,
-                CtorScheme {
-                    arg_tys: vec![errorkind_ty.clone(), error_info_ty],
-                    result: error_ty,
-                },
-            ),
-            (
-                self.ek_io,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_network,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_ffi,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_decode,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_timeout,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_not_found,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_permission_denied,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_invalid_input,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_conflict,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_unavailable,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty.clone(),
-                },
-            ),
-            (
-                self.ek_unexpected,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: errorkind_ty,
-                },
-            ),
-            // ── ErrorDetails constructors ───────────────
-            // `FfiPanic : PanicInfo -> ErrorDetails`
-            // `TypeMismatch : TypeInfo -> ErrorDetails`
-            // `HttpStatus : Int -> ErrorDetails`
-            // `JsonDecode : String -> ErrorDetails`
-            // `Custom : String -> ErrorDetails`
-            (
-                self.ed_ffi_panic,
-                CtorScheme {
-                    arg_tys: vec![panic_info_ty],
-                    result: errordetails_ty.clone(),
-                },
-            ),
-            (
-                self.ed_type_mismatch,
-                CtorScheme {
-                    arg_tys: vec![type_info_ty],
-                    result: errordetails_ty.clone(),
-                },
-            ),
-            (
-                self.ed_http_status,
-                CtorScheme {
-                    arg_tys: vec![int_ty.clone()],
-                    result: errordetails_ty.clone(),
-                },
-            ),
-            (
-                self.ed_json_decode,
-                CtorScheme {
-                    arg_tys: vec![string_ty.clone()],
-                    result: errordetails_ty.clone(),
-                },
-            ),
-            (
-                self.ed_custom,
-                CtorScheme {
-                    arg_tys: vec![string_ty.clone()],
-                    result: errordetails_ty,
-                },
-            ),
-            // ── SqlValue constructors ──────────────────────────────────────────
-            // Each maps its payload type → SqlValue.
-            (
-                self.sql_string,
-                CtorScheme {
-                    arg_tys: vec![string_ty.clone()],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            (
-                self.sql_int,
-                CtorScheme {
-                    arg_tys: vec![int_ty.clone()],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            (
-                self.sql_float,
-                CtorScheme {
-                    arg_tys: vec![float_ty],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            (
-                self.sql_bool,
-                CtorScheme {
-                    arg_tys: vec![bool_ty_plain],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            (
-                self.sql_bytes,
-                CtorScheme {
-                    arg_tys: vec![bytes_ty],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            // SqlTime wraps a Unix-millisecond Int timestamp.
-            (
-                self.sql_time,
-                CtorScheme {
-                    arg_tys: vec![int_ty],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            // SqlDecimal carries a native `Decimal` value, bound as a lossless
-            // TEXT param (its `decimal_to_string` render is the inverse of
-            // `db_decode_decimal`'s `RD::from_str` read).
-            (
-                self.sql_decimal,
-                CtorScheme {
-                    arg_tys: vec![decimal_ty],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            // SqlMoney wraps a String in "ISO_CODE AMOUNT" format (TEXT).
-            // Minimal wiring matching the sqlMoneyToString / db_decode_money.
-            // Ipê users write `SqlMoney "USD 1234.56"`.
-            (
-                self.sql_money,
-                CtorScheme {
-                    arg_tys: vec![string_ty.clone()],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            // SqlNull wraps another SqlValue as a type-level witness; the inner
-            // value is discarded (a NULL carries no value) but its VARIANT TAG
-            // is threaded through `into_sql_param()` → `SqlParam::Null(Box<SqlParam>)`
-            // so the bind site can select a correctly-typed `Option::<T>::None`
-            // (load-bearing on Postgres, whose extended query protocol validates
-            // a per-param type-OID hint against the target column — Class 7 §4a).
-            (
-                self.sql_null,
-                CtorScheme {
-                    arg_tys: vec![sqlvalue_ty.clone()],
-                    result: sqlvalue_ty.clone(),
-                },
-            ),
-            // ── SqlField constructors ──────────────────────────────────────────
-            // SetField : SqlValue -> SqlField — wraps a typed parameter value.
-            (
-                self.set_field,
-                CtorScheme {
-                    arg_tys: vec![sqlvalue_ty],
-                    result: sqlfield_ty.clone(),
-                },
-            ),
-            // OmitField : SqlField — nullary; column is omitted from generated SQL.
-            (
-                self.omit_field,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: sqlfield_ty,
-                },
-            ),
-            // ── Order constructors ──────────────────────────────────
-            // LT, EQ, GT are all nullary: no payload, result is Order.
-            (
-                self.lt,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.order,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            (
-                self.eq,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.order,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            (
-                self.gt,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.order,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // ── ProjectionTerm constructors ────────────────────────────────────
-            // ColumnTerm : String -> String -> ProjectionTerm
-            (
-                self.column_term,
-                CtorScheme {
-                    arg_tys: vec![string_ty.clone(), string_ty.clone()],
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_term,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // LiteralTerm : ProjectionTerm  (nullary — a ? literal placeholder)
-            (
-                self.literal_term,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_term,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // UpperTerm : String -> ProjectionTerm
-            (
-                self.upper_term,
-                CtorScheme {
-                    arg_tys: vec![string_ty.clone()],
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_term,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // LowerTerm : String -> ProjectionTerm
-            (
-                self.lower_term,
-                CtorScheme {
-                    arg_tys: vec![string_ty.clone()],
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_term,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // CoalesceTerm : ProjectionOperand -> ProjectionOperand -> ProjectionTerm
-            (
-                self.coalesce_term,
-                CtorScheme {
-                    arg_tys: vec![
-                        Ty::Con {
-                            module: Vec::new(),
-                            name: self.projection_operand,
-                            args: Vec::new(),
-                        },
-                        Ty::Con {
-                            module: Vec::new(),
-                            name: self.projection_operand,
-                            args: Vec::new(),
-                        },
-                    ],
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_term,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // ── ProjectionOperand constructors ───────────────────────────────────
-            // OperandColumn : String -> ProjectionOperand
-            (
-                self.operand_column,
-                CtorScheme {
-                    arg_tys: vec![string_ty],
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_operand,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // OperandLiteral : ProjectionOperand  (nullary — a ? literal placeholder)
-            (
-                self.operand_literal,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_operand,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // ArithTerm : ArithOp -> ProjectionOperand -> ProjectionOperand -> ProjectionTerm
-            (
-                self.arith_term,
-                CtorScheme {
-                    arg_tys: vec![
-                        Ty::Con {
-                            module: Vec::new(),
-                            name: self.arith_op,
-                            args: Vec::new(),
-                        },
-                        Ty::Con {
-                            module: Vec::new(),
-                            name: self.projection_operand,
-                            args: Vec::new(),
-                        },
-                        Ty::Con {
-                            module: Vec::new(),
-                            name: self.projection_operand,
-                            args: Vec::new(),
-                        },
-                    ],
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.projection_term,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            // ── ArithOp constructors ─────────────────────────────────────────────
-            // ArithAdd / ArithSub / ArithMul : ArithOp  (nullary operator tags)
-            (
-                self.arith_add,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.arith_op,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            (
-                self.arith_sub,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.arith_op,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-            (
-                self.arith_mul,
-                CtorScheme {
-                    arg_tys: Vec::new(),
-                    result: Ty::Con {
-                        module: Vec::new(),
-                        name: self.arith_op,
-                        args: Vec::new(),
-                    },
-                },
-            ),
-        ]
+        Ok(CtorPayload::Scheme(args))
+    }
+}
+
+/// How one canon builtin constructor enters the type checker.
+pub enum CtorPayload {
+    /// Constructible and matchable from source, with these payload types.
+    Scheme(Vec<Ty>),
+    /// A runtime-only capability handle: naming it from source is refused.
+    Sealed,
+}
+
+/// The builtin constructor table derived from canon's `BUILTIN_UNIONS`.
+pub struct BuiltinCtors {
+    /// Source-visible constructors, keyed by canon's `(home, type, ctor)`.
+    pub schemes: Vec<(CtorKey, CtorScheme)>,
+    /// Capability-handle constructors source may never name.
+    pub sealed: BTreeSet<CtorKey>,
+}
+
+/// The `CompilerBug` for a canon builtin entry this table cannot derive.
+fn payload_bug(type_name: &str, ctor: &str) -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: "constrain.builtin_ctor_payload",
+        detail: format!("canon builtin `{type_name}.{ctor}` has no matching constructor payload"),
     }
 }
 

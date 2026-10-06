@@ -43,63 +43,44 @@ pub enum MainSqlValue {
     SqlMoney(String),
     SqlNull(Box<MainSqlValue>),
 }
+
 impl IpeStringify for MainSqlValue {
     fn ipe_show(&self) -> String {
         match self {
-            MainSqlValue::SqlString(p0) => format!(
-                "SqlString {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlInt(p0) => {
-                format!("SqlInt {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlFloat(p0) => format!(
-                "SqlFloat {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlBool(p0) => {
-                format!("SqlBool {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlBytes(p0) => format!(
-                "SqlBytes {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlTime(p0) => {
-                format!("SqlTime {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlDecimal(p0) => format!(
-                "SqlDecimal {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlMoney(p0) => format!(
-                "SqlMoney {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlNull(p0) => {
-                format!("SqlNull {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            MainSqlValue::SqlString(p0) => format!("SqlString {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlInt(p0) => format!("SqlInt {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlFloat(p0) => format!("SqlFloat {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlBool(p0) => format!("SqlBool {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlBytes(p0) => format!("SqlBytes {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlTime(p0) => format!("SqlTime {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlDecimal(p0) => format!("SqlDecimal {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlMoney(p0) => format!("SqlMoney {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlNull(p0) => format!("SqlNull {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MainSqlField {
     SetField(MainSqlValue),
     OmitField,
 }
+
 impl IpeStringify for MainSqlField {
     fn ipe_show(&self) -> String {
         match self {
-            MainSqlField::SetField(p0) => format!(
-                "SetField {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            MainSqlField::SetField(p0) => format!("SetField {}", IpeStringify::ipe_show(p0)),
             MainSqlField::OmitField => "OmitField".to_string(),
         }
     }
 }
+
 pub type MainProjectionTerm = ipe_runtime::db::ProjectionTerm;
+
 pub type MainProjectionOperand = ipe_runtime::db::ProjectionOperand;
+
 pub type MainArithOp = ipe_runtime::db::ArithOp;
+
 impl MainSqlValue {
     /// Convert this `SqlValue` into the runtime-nameable `SqlParam`.
     /// Used by `into_field_param` and by legacy call sites that name
@@ -124,6 +105,7 @@ impl MainSqlValue {
         }
     }
 }
+
 /// Allow `SqlParam::from(sql_value)` so the emitter can use the same
 /// `ipe_runtime::db::SqlParam::from` projection for ALL element types in
 /// the polymorphic `Db.exec`/`query` params list (`List a` where `a` may
@@ -133,6 +115,7 @@ impl From<MainSqlValue> for ipe_runtime::db::SqlParam {
         v.into_sql_param()
     }
 }
+
 impl MainSqlField {
     pub fn into_field_param(self) -> Option<ipe_runtime::db::SqlParam> {
         match self {
@@ -143,9 +126,11 @@ impl MainSqlField {
 }
 
 pub use ipe_runtime::error::IpeError;
+
 pub fn str_err(s: &str) -> IpeError {
     IpeError::unexpected(s.to_string())
 }
+
 // Recursion guard shim — every user function body opens with
 // `let _ipe_recursion_guard = crate::recursion_guard();`, which resolves here.
 pub fn recursion_guard() -> ipe_runtime::core::RecursionGuard {
@@ -158,180 +143,231 @@ pub type Decoder<T> = ipe_runtime::json::Decoder<IpeError, T>;
 pub fn ok_res<A>(a: A) -> IpeResult<IpeError, A> {
     ipe_runtime::core::ok_res(a)
 }
+
 pub fn task_succeed<A: Send + 'static>(a: A) -> IpeTask<A> {
     ipe_runtime::task::task_succeed(a)
 }
+
 // ── System (env) kernels ───────────────────────────────────────────────────
 pub fn system_args(_: ()) -> IpeTask<Vec<String>> {
     ipe_runtime::system::system_args(())
 }
+
 pub fn system_setenv(key: String, val: String) -> IpeTask<()> {
     ipe_runtime::system::system_setenv(key, val)
 }
+
 pub fn system_unsetenv(key: String) -> IpeTask<()> {
     ipe_runtime::system::system_unsetenv(key)
 }
+
 // ── Time kernels ───────────────────────────────────────────────────────────
 pub fn time_now(_: ()) -> IpeTask<i64> {
     ipe_runtime::time::time_now(())
 }
+
 pub fn time_sleep(ms: i64) -> IpeTask<()> {
     ipe_runtime::time::time_sleep(ms)
 }
+
 pub fn time_unix_millis(_: ()) -> IpeTask<i64> {
     ipe_runtime::time::time_unix_millis(())
 }
+
 // ── Random kernels ─────────────────────────────────────────────────────────
 pub fn random_int(lo: i64, hi: i64) -> IpeTask<i64> {
     ipe_runtime::random::random_int(lo, hi)
 }
+
 pub fn random_float(lo: f64, hi: f64) -> IpeTask<f64> {
     ipe_runtime::random::random_float(lo, hi)
 }
+
 pub fn random_choice(items: Vec<String>) -> IpeTask<String> {
     ipe_runtime::random::random_choice(items)
 }
+
 // ── File kernels ───────────────────────────────────────────────────────────
 pub fn file_read_file(path: ipe_runtime::path::Path) -> IpeTask<String> {
     ipe_runtime::file::file_read_file(path)
 }
+
 pub fn file_write_file(path: ipe_runtime::path::Path, content: String) -> IpeTask<()> {
     ipe_runtime::file::file_write_file(path, content)
 }
+
 pub fn file_delete(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_delete(path)
 }
+
 // ── Task combinators ───────────────────────────────────────────────────────
 pub fn task_fail<A: Send + 'static>(e: IpeError) -> IpeTask<A> {
     ipe_runtime::task::task_fail(e)
 }
+
 pub fn task_map<A: Send + 'static, B: Send + 'static>(
     f: Box<dyn Fn(A) -> B + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_map(f, t)
 }
+
 pub fn task_and_then<A: Send + 'static, B: Send + 'static>(
     t: IpeTask<A>,
     f: Box<dyn FnOnce(A) -> IpeTask<B> + Send + 'static>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_and_then(t, f)
 }
+
 pub fn task_map_error<A: Send + 'static>(
     f: Box<dyn Fn(IpeError) -> IpeError + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<A> {
     ipe_runtime::task::task_map_error(f, t)
 }
+
 pub fn task_on_error<A: Send + 'static>(
     f: Box<dyn FnOnce(IpeError) -> IpeTask<A> + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<A> {
     ipe_runtime::task::task_on_error(f, t)
 }
+
 pub fn task_from_result<A: Send + 'static>(r: IpeResult<IpeError, A>) -> IpeTask<A> {
     ipe_runtime::task::task_from_result(r)
 }
+
 pub fn task_and_then_result<A: Send + 'static, B: Send + 'static>(
     f: Box<dyn Fn(A) -> IpeResult<IpeError, B> + Send + 'static>,
     t: IpeTask<A>,
 ) -> IpeTask<B> {
     ipe_runtime::task::task_and_then_result(f, t)
 }
+
 pub fn task_sequence<A: Send + 'static>(tasks: Vec<IpeTask<A>>) -> IpeTask<Vec<A>> {
     ipe_runtime::task::task_sequence(tasks)
 }
+
 pub fn task_parallel<A: Send + 'static>(tasks: Vec<IpeTask<A>>) -> IpeTask<Vec<A>> {
     ipe_runtime::task::task_parallel(tasks)
 }
+
 pub fn task_run<A: Send + 'static>(t: IpeTask<A>) -> IpeResult<IpeError, A> {
     ipe_runtime::task::task_run(t)
 }
+
 // ── Io kernels ─────────────────────────────────────────────────────────────
 pub fn io_read_line(_: ()) -> IpeTask<String> {
     ipe_runtime::io::io_read_line(())
 }
+
 pub fn io_write_stdout(s: String) -> IpeTask<()> {
     ipe_runtime::io::io_write_stdout(s)
 }
+
 pub fn io_write_stderr(s: String) -> IpeTask<()> {
     ipe_runtime::io::io_write_stderr(s)
 }
+
 pub fn io_println(msg: String) -> IpeTask<()> {
     ipe_runtime::io::io_println(msg)
 }
+
 pub fn io_eprintln(msg: String) -> IpeTask<()> {
     ipe_runtime::io::io_eprintln(msg)
 }
+
 // ── System kernels ─────────────────────────────────────────────────────────
 pub fn system_getenv(key: String) -> IpeTask<String> {
     ipe_runtime::system::system_getenv(key)
 }
+
 pub fn system_getenv_or(key: String, default: String) -> String {
     ipe_runtime::system::system_getenv_or(key, default)
 }
+
 pub fn system_get_arg(n: i64) -> IpeTask<IpeMaybe<String>> {
     ipe_runtime::system::system_get_arg(n)
 }
+
 pub fn system_getenv_int(key: String) -> IpeTask<i64> {
     ipe_runtime::system::system_getenv_int(key)
 }
+
 pub fn system_getenv_bool(key: String) -> IpeTask<bool> {
     ipe_runtime::system::system_getenv_bool(key)
 }
+
 pub fn system_cwd(_: ()) -> IpeTask<String> {
     ipe_runtime::system::system_cwd(())
 }
+
 pub fn system_getcwd(_: ()) -> IpeTask<String> {
     ipe_runtime::system::system_getcwd(())
 }
+
 pub fn system_load_env(_: ()) -> IpeTask<()> {
     ipe_runtime::system::system_load_env(())
 }
+
 pub fn system_exit(code: i64) -> ! {
     ipe_runtime::system::system_exit(code)
 }
+
 // ── File kernels ───────────────────────────────────────────────────────────
 pub fn file_exists(path: ipe_runtime::path::Path) -> IpeTask<bool> {
     ipe_runtime::file::file_exists(path)
 }
+
 pub fn file_remove(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_remove(path)
 }
+
 pub fn file_mkdir_all(path: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_mkdir_all(path)
 }
+
 pub fn file_read_file_limit(path: ipe_runtime::path::Path, limit: i64) -> IpeTask<String> {
     ipe_runtime::file::file_read_file_limit(path, limit)
 }
+
 pub fn file_read_file_bytes(path: ipe_runtime::path::Path) -> IpeTask<Vec<i64>> {
     ipe_runtime::file::file_read_file_bytes(path)
 }
+
 pub fn file_append(path: ipe_runtime::path::Path, content: String) -> IpeTask<()> {
     ipe_runtime::file::file_append(path, content)
 }
+
 pub fn file_read_dir(path: ipe_runtime::path::Path) -> IpeTask<Vec<String>> {
     ipe_runtime::file::file_read_dir(path)
 }
+
 pub fn file_is_dir(path: ipe_runtime::path::Path) -> IpeTask<bool> {
     ipe_runtime::file::file_is_dir(path)
 }
+
 pub fn file_temp_file(prefix: String) -> IpeTask<String> {
     ipe_runtime::file::file_temp_file(prefix)
 }
+
 pub fn file_temp_dir(prefix: String) -> IpeTask<String> {
     ipe_runtime::file::file_temp_dir(prefix)
 }
+
 pub fn file_copy(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_copy(src, dst)
 }
+
 pub fn file_rename(src: ipe_runtime::path::Path, dst: ipe_runtime::path::Path) -> IpeTask<()> {
     ipe_runtime::file::file_rename(src, dst)
 }
+
 // ── Crypto (entropy) kernels ───────────────────────────────────────────────
 pub fn crypto_random_bytes(n: i64) -> IpeTask<String> {
     ipe_runtime::crypto_core::crypto_random_bytes(n)
 }
+
 pub fn crypto_random_token(n: i64) -> IpeTask<String> {
     ipe_runtime::crypto_core::crypto_random_token(n)
 }
@@ -345,6 +381,7 @@ pub fn main_json_optional<T1: 'static + Send + Sync + Clone, T2: 'static + Send 
     let _ipe_recursion_guard = crate::recursion_guard();
     decode_pipeline_optional(field, dec, default, next)
 }
+
 pub fn main_db_optional<T1: 'static + Send + Sync + Clone, T2: 'static + Send + Clone>(
     col: String,
     dec: Decoder<T1>,
@@ -354,6 +391,7 @@ pub fn main_db_optional<T1: 'static + Send + Sync + Clone, T2: 'static + Send + 
     let _ipe_recursion_guard = crate::recursion_guard();
     db_decode_optional(col, dec, fallback, next)
 }
+
 pub fn main_make_label(name: String, age: i64) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     format!(
@@ -362,10 +400,12 @@ pub fn main_make_label(name: String, age: i64) -> String {
         format!("{}{}", "|".to_string(), string_from_int(age))
     )
 }
+
 pub fn main_make_tag(name: String, nick: String) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     format!("{}{}", name, format!("{}{}", "#".to_string(), nick))
 }
+
 pub fn main_json_int_result(s: String) -> IpeResult<ipe_runtime::error::IpeError, String> {
     let _ipe_recursion_guard = crate::recursion_guard();
     decode_from_json_string(
@@ -411,6 +451,7 @@ pub fn main_json_int_result(s: String) -> IpeResult<ipe_runtime::error::IpeError
         s,
     )
 }
+
 pub fn main_json_string_result(s: String) -> IpeResult<ipe_runtime::error::IpeError, String> {
     let _ipe_recursion_guard = crate::recursion_guard();
     decode_from_json_string(
@@ -464,6 +505,7 @@ pub fn main_json_string_result(s: String) -> IpeResult<ipe_runtime::error::IpeEr
         s,
     )
 }
+
 pub fn main_row_decoder() -> Decoder<String> {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
@@ -506,6 +548,7 @@ pub fn main_row_decoder() -> Decoder<String> {
         })(decode_succeed(curry2(crate::main_make_label))),
     )
 }
+
 pub fn main_report_json(res: IpeResult<ipe_runtime::error::IpeError, String>) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match res {
@@ -513,6 +556,7 @@ pub fn main_report_json(res: IpeResult<ipe_runtime::error::IpeError, String>) ->
         IpeResult::Err(_) => "json-err".to_string(),
     }
 }
+
 pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     task_and_then(
@@ -605,10 +649,6 @@ pub fn list_map_consume<T0, T1>(f: impl Fn(T0) -> T1, list: Vec<T0>) -> Vec<T1> 
 }
 
 // ===========================================
-// FFI PLACEHOLDER TYPES (types referenced but not defined)
-// ===========================================
-
-// ===========================================
 // ENTRY POINT
 // ===========================================
 
@@ -617,11 +657,13 @@ fn main() {
     // classify an escaping panic (div-by-zero / index-OOB /
     // overflow) into a Ipe error + exit 1, not a raw Rust backtrace.
     ipe_runtime::core::install_panic_classifier();
+    // Both outcomes end through the runtime's one exit funnel, which runs the
+    // exit hook and flushes buffered telemetry before the process ends.
     match block_on(ipe_main()) {
-        IpeResult::Ok(_) => (),
+        IpeResult::Ok(_) => ipe_runtime::system::exit_process(0),
         IpeResult::Err(e) => {
             ipe_runtime::core::eprint_task_error(&e.to_string());
-            std::process::exit(1);
+            ipe_runtime::system::exit_process(1)
         }
     }
 }

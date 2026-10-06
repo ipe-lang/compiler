@@ -7,13 +7,16 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{CanonicalPath, HomeMasks, JailPathError};
+use crate::home::HomeDir;
+use crate::{CanonicalPath, Home, HomeMasks, JailPathError};
 
 /// Every host path a build or run jail exposes, none at or above the cargo home.
 ///
 /// The one always-writable scratch, the working tree (writable only when the
-/// profile grants the filesystem axis), and the read-only binds, with the home
-/// masks resolved alongside them. Only [`Self::of_invoker`] builds one, after
+/// profile grants the filesystem axis, and then only as the
+/// [`crate::WritableTree`] each jail build parses from it), and the read-only
+/// binds, with the home masks and the home a version-control tool expands `~`
+/// against resolved alongside them. Only [`Self::of_invoker`] builds one, after
 /// checking every path, whatever its source, against the invoker's cargo home;
 /// [`Self::recheck`] repeats that check when the jail is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +26,7 @@ pub struct JailMounts {
     read_only: Vec<CanonicalPath>,
     homes: HomeMasks,
     cargo_home: PathBuf,
+    vcs_home: Home,
 }
 
 impl JailMounts {
@@ -55,6 +59,7 @@ impl JailMounts {
             read_only,
             homes,
             cargo_home.as_path().to_path_buf(),
+            vcs_home_of(&user_home),
         )
     }
 
@@ -70,6 +75,7 @@ impl JailMounts {
         read_only: Vec<CanonicalPath>,
         homes: HomeMasks,
         cargo_home: PathBuf,
+        vcs_home: Home,
     ) -> Result<Self, JailPathError> {
         let mounts = Self {
             scoped_tmp,
@@ -77,13 +83,15 @@ impl JailMounts {
             read_only,
             homes,
             cargo_home,
+            vcs_home,
         };
         mounts.refuse_exposing()?;
         Ok(mounts)
     }
 
     /// Test-only: the check against a stand-in `cargo_home` under stand-in
-    /// `homes`, for pure argv tests over paths that need not exist.
+    /// `homes`, with no known home, for pure argv tests over paths that need
+    /// not exist.
     ///
     /// # Errors
     /// As the checker: [`JailPathError::ExposesCargoHome`].
@@ -101,6 +109,7 @@ impl JailMounts {
             read_only,
             homes,
             cargo_home.to_path_buf(),
+            Home::unknown(),
         )
     }
 
@@ -167,6 +176,12 @@ impl JailMounts {
         &self.working_tree
     }
 
+    /// The home a version-control tool run from the tree expands `~` against.
+    #[must_use]
+    pub const fn vcs_home(&self) -> &Home {
+        &self.vcs_home
+    }
+
     /// The read-only binds.
     #[must_use]
     pub fn read_only(&self) -> &[CanonicalPath] {
@@ -178,6 +193,13 @@ impl JailMounts {
     pub const fn homes(&self) -> &HomeMasks {
         &self.homes
     }
+}
+
+/// The home a version-control tool expands `~` against for the user `home`,
+/// unknown when it does not resolve.
+#[must_use]
+pub fn vcs_home_of(home: &HomeDir) -> Home {
+    CanonicalPath::resolve(home.as_path()).map_or_else(|_| Home::unknown(), Home::known)
 }
 
 /// The first of `binds` that would make `cargo_home` visible inside the jail.

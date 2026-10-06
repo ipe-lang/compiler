@@ -94,6 +94,49 @@ place that performs it, so purity holds everywhere else.
 
 [principles]: ../../PRINCIPLES.md
 
+## Writing the working tree under the jail
+
+A program granted the filesystem capability runs with its working tree
+writable, except the version-control metadata in it: `.git`, `.hg`, `.jj`, and
+`_darcs` stay read-only, as does the git directory a `.git` file points to when
+it lies in a writable path. That holds at any depth: a submodule's or a nested
+checkout's metadata is found and kept read-only as well. Your version-control
+tools run code that metadata names (hooks, filters, configured commands), so a
+jailed program that could write it could run code outside the jail the next
+time you commit. The program still reads the repository, so `git status` and
+friends work inside it.
+
+Finding nested metadata means reading every directory of the tree once at each
+start of the jail. A tree too large to read in full (too many entries, nested
+too deep, or holding too many repositories), a directory in it that cannot be
+read, or a directory on another filesystem refuses the jail, since metadata
+past it could go unprotected. The refusal names the place and the limit: run
+`ipe clean` to drop build output, run from a directory that holds fewer files,
+or run without the filesystem grant.
+
+On Linux, each directory between the top of the tree and a nested
+repository's metadata is held in place for the run, so the program cannot
+rename it away and recreate the metadata writable. Inside the jail, renaming
+such a directory fails with `EBUSY`, and moving a file across one fails with
+`EXDEV`; tools that move files fall back to copying them.
+
+Keeping the metadata read-only is not enough when its configuration points
+back into a writable path: a `core.hooksPath` of `.husky`, a hook that is a
+symlink to a script in the tree, or a configured command or included file kept
+in the tree. Each build of the jail reads that configuration, and the jail
+refuses to start while any setting names, or may name, code the program could
+write. The refusal names the file and the setting. Point the setting outside
+the writable paths, or run without the filesystem grant. Only the repository's
+own configuration is read; your global and system configuration lie outside
+the jail's writable paths.
+
+On Windows and FreeBSD the jail cannot yet keep that metadata read-only, so it
+refuses to run a granted program from a tree that holds it: run without the
+filesystem grant, or from a tree without version-control metadata, nested
+repositories included. Metadata the program creates while it runs is not
+covered; review a tree a program wrote before running your version-control
+tools over it.
+
 ## Configuration
 
 `IPE_FILE_READ_MAX` sets the per-call byte ceiling of `File.readFile`, and

@@ -48,6 +48,8 @@ pub struct ServerRequest {
     pub remoteAddr: String,
 }
 
+crate::stringify::show_row!("ServerRequest", Redacted, [] ServerRequest, |_| crate::stringify::REDACTED_SHOW.to_owned());
+
 redacting_debug!(ServerRequest {
     shown: [method],
     masked: [path, body, headers, params, query, cookies, remoteAddr],
@@ -93,15 +95,17 @@ pub struct ServerResponse {
     pub body: String,
     pub headers: HashMap<String, String>,
     pub contentType: String,
-    /// Pre-built `Set-Cookie` header VALUES (e.g. `"sid=abc; Path=/; HttpOnly"`),
+    /// Typed `Set-Cookie` header values (e.g. `"sid=abc; Path=/; HttpOnly"`),
     /// one entry per cookie. Kept separate from `headers` because `headers` is a
     /// `HashMap` (one value per key) and HTTP allows/requires MULTIPLE
     /// `Set-Cookie` response headers when a response needs to set more than one
     /// cookie (RFC 6265 §4.1 — Set-Cookie is the one header that must NEVER be
     /// comma-folded). A second caller writing into `headers["Set-Cookie"]` would
     /// silently clobber the first.
-    pub cookies: Vec<String>,
+    pub cookies: Vec<SetCookie>,
 }
+
+crate::stringify::show_row!("ServerResponse", Redacted, [] ServerResponse, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 // The body, headers and `Set-Cookie` values can carry a session id or a token;
 // the emitter builds this struct by field name, so the masking lives in `Debug`.
@@ -114,9 +118,11 @@ redacting_debug!(ServerResponse {
 // The value is the cookie's secret half (a session id, a token); the name is not.
 #[derive(Clone, Debug)]
 pub struct ServerCookie {
-    pub name: String,
-    pub value: Redacted<String>,
+    pub name: CookieName,
+    pub value: Redacted<CookieValue>,
 }
+
+crate::stringify::show_row!("ServerCookie", Redacted, [] ServerCookie, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 /// A handler erased of its Ipê error type `E`: it awaits the Ipê task and maps
 /// the result to either the response (Ok) or a 500 marker (Err). Erasing E here
@@ -208,6 +214,8 @@ pub struct ServerRoute {
     pub path: String,
     target: RouteTarget, // private; was the two pub Options
 }
+
+crate::stringify::show_row!("ServerRoute", Internals, [] ServerRoute, |_| "<Ipe.Http.Server.Route>".to_owned());
 
 // ─── handler erasure ──────────────────────────────────────────────────────
 
@@ -354,8 +362,11 @@ pub enum TokenSource {
     /// `Authorization: Bearer <token>`.
     BearerHeader,
     /// A named request cookie carrying the token.
-    Cookie(String),
+    Cookie(CookieName),
 }
+
+#[cfg(feature = "jwt")]
+crate::stringify::show_row!("TokenSource", Redacted, [] TokenSource, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 /// Ipe.Server.AuthConfig (opaque) — the secret, token source, claim key, and
 /// revocation mode the middleware uses. Built by [`server_auth_config`]; the
@@ -369,6 +380,9 @@ pub struct AuthConfig {
     subject_claim: String,
     revocation_mode: crate::app_config::RevocationMode,
 }
+
+#[cfg(feature = "jwt")]
+crate::stringify::show_row!("AuthConfig", Redacted, [] AuthConfig, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 #[cfg(feature = "jwt")]
 /// Ipe.Server.authConfig : Secret -> TokenSource -> AuthConfig. The subject
@@ -412,11 +426,17 @@ pub fn server_token_bearer() -> TokenSource {
 }
 
 #[cfg(feature = "jwt")]
-/// Ipe.Server.cookieToken : String -> TokenSource. Reads the token from the
-/// named request cookie.
+/// Ipe.Server.cookieToken : String -> Result Error TokenSource. Reads the token
+/// from the named request cookie; an empty name is an `InvalidInput` error, so a
+/// cookie source always names a cookie a request can carry.
 #[must_use]
-pub fn server_cookie_token(name: String) -> TokenSource {
-    TokenSource::Cookie(name)
+pub fn server_cookie_token(name: String) -> IpeResult<IpeError, TokenSource> {
+    match CookieName::parse(&name) {
+        Some(name) => IpeResult::Ok(TokenSource::Cookie(name)),
+        None => IpeResult::Err(IpeError::invalid_input(
+            "Server.cookieToken: a cookie name must not be empty".to_owned(),
+        )),
+    }
 }
 
 #[cfg(feature = "jwt")]
@@ -438,7 +458,7 @@ fn read_token(source: &TokenSource, req: &ServerRequest) -> Option<String> {
         }
         TokenSource::Cookie(name) => req
             .cookies
-            .get(name)
+            .get(name.text())
             .filter(|v| !v.is_empty())
             .map(ToString::to_string),
     }
@@ -463,11 +483,11 @@ fn unauthorized() -> ServerResponse {
 /// in `page_response` (`csrf::cookies_secure() || request_is_https(headers)`):
 /// a re-issued cookie must never be less-Secure than the initial session cookie.
 fn reissue_set_cookie(
-    cookie_name: &str,
+    cookie_name: &CookieName,
     token: &str,
     slide_window_secs: u64,
     is_https: bool,
-) -> String {
+) -> SetCookie {
     // The cookie-security signal lives in `web::csrf` for a program that emits the
     // web surface; a server-only program (no `web` module) falls back to the
     // process `Secure` floor. `feature = "web"` is the exact condition under which
@@ -487,23 +507,32 @@ fn reissue_set_cookie(
 #[cfg(feature = "jwt")]
 /// [`reissue_set_cookie`] under an explicit `Secure` decision.
 fn reissue_set_cookie_with(
-    cookie_name: &str,
+    cookie_name: &CookieName,
     token: &str,
     slide_window_secs: u64,
     secure: bool,
-) -> String {
-    let secure = if secure { "; Secure" } else { "" };
-
-    // Frame-ancestors (CSP embedding) is a web-surface concept; a server-only
-    // program cannot be framed, so `SameSite=Lax` is the fail-closed default.
+) -> SetCookie {
+    // A server-only program has no double-submit CSRF check, so its session
+    // cookie stays `SameSite=Lax` even when `frame-ancestors` admits embedding.
     #[cfg(feature = "web")]
     let embeddable = crate::web::csrf::frame_ancestors().is_some();
     #[cfg(not(feature = "web"))]
     let embeddable = false;
-    let same_site = if embeddable { "None" } else { "Lax" };
-    format!(
-        "{}={}; Path=/; HttpOnly; SameSite={same_site}{secure}; Max-Age={slide_window_secs}",
-        cookie_name, token
+    let same_site = if embeddable {
+        SameSite::None
+    } else {
+        SameSite::Lax
+    };
+    SetCookie::new(
+        cookie_name,
+        &CookieValue::encode(token),
+        CookieAttributes {
+            path: CookiePath::root(),
+            http_only: true,
+            same_site,
+            secure,
+            max_age_secs: Some(slide_window_secs),
+        },
     )
 }
 
@@ -582,61 +611,62 @@ where
 
             // Sliding re-issue — cookie-source only (bearer tokens are API
             // credentials; the client manages re-issue itself via re-auth).
-            let reissue_cookie: Option<String> = if let TokenSource::Cookie(ref name) = cfg.source {
-                if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
-                    // A malformed window refuses the request rather than
-                    // re-issuing under an unknown bound; the detail stays out of
-                    // the response.
-                    let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
-                    else {
-                        return ok_res(plain_resp(503, "service unavailable", &[]));
-                    };
-                    let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
-                    let now = crate::jwt::now_unix_seconds();
-                    // Throttle: re-issue only once past exp - slide_window/2.
-                    // Parse exp from the verified claims string representation.
-                    let past_threshold = claims
-                        .get("exp")
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .map(|exp| now > exp.saturating_sub(slide_i64 / 2))
-                        .unwrap_or(false);
-                    if past_threshold && now < ctx.cap {
-                        // Extra claims to carry into the re-issued token (all
-                        // verified claims except the time anchors and subject —
-                        // those come from the ReissueContext).
-                        let extra: HashMap<String, String> = claims
-                            .iter()
-                            .filter(|(k, _)| {
-                                // Time anchors and session-identity fields come from
-                                // ReissueContext verbatim; skip them in extra_claims.
-                                *k != "exp"
-                                    && *k != "iat"
-                                    && *k != "cap"
-                                    && *k != "jti"
-                                    && *k != "sub"
-                            })
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        match crate::auth::auth_reissue_token::<String>(
-                            &secret, &ctx, extra, slide_i64,
-                        ) {
-                            Some(IpeResult::Ok(new_token)) => Some(reissue_set_cookie(
-                                name,
-                                &new_token,
-                                slide_window_secs,
-                                is_https,
-                            )),
-                            _ => None,
+            let reissue_cookie: Option<SetCookie> =
+                if let TokenSource::Cookie(ref name) = cfg.source {
+                    if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
+                        // A malformed window refuses the request rather than
+                        // re-issuing under an unknown bound; the detail stays out of
+                        // the response.
+                        let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
+                        else {
+                            return ok_res(plain_resp(503, "service unavailable", &[]));
+                        };
+                        let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
+                        let now = crate::jwt::now_unix_seconds();
+                        // Throttle: re-issue only once past exp - slide_window/2.
+                        // Parse exp from the verified claims string representation.
+                        let past_threshold = claims
+                            .get("exp")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .map(|exp| now > exp.saturating_sub(slide_i64 / 2))
+                            .unwrap_or(false);
+                        if past_threshold && now < ctx.cap {
+                            // Extra claims to carry into the re-issued token (all
+                            // verified claims except the time anchors and subject —
+                            // those come from the ReissueContext).
+                            let extra: HashMap<String, String> = claims
+                                .iter()
+                                .filter(|(k, _)| {
+                                    // Time anchors and session-identity fields come from
+                                    // ReissueContext verbatim; skip them in extra_claims.
+                                    *k != "exp"
+                                        && *k != "iat"
+                                        && *k != "cap"
+                                        && *k != "jti"
+                                        && *k != "sub"
+                                })
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            match crate::auth::auth_reissue_token::<String>(
+                                &secret, &ctx, extra, slide_i64,
+                            ) {
+                                Some(IpeResult::Ok(new_token)) => Some(reissue_set_cookie(
+                                    name,
+                                    &new_token,
+                                    slide_window_secs,
+                                    is_https,
+                                )),
+                                _ => None,
+                            }
+                        } else {
+                            None
                         }
                     } else {
                         None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             let mut resp = handler(req, principal).await;
             // Attach the re-issue cookie when warranted. The handler returns an
@@ -728,16 +758,309 @@ pub fn server_with_status(status: i64, mut r: ServerResponse) -> ServerResponse 
     r.status = status;
     r
 }
-pub fn server_with_header(k: String, v: String, mut r: ServerResponse) -> ServerResponse {
-    r.headers.insert(k, v);
-    r
+/// Why a response header has no representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderRefusal {
+    /// The name is not an RFC 7230 `token`.
+    Name,
+    /// The value holds a control byte (CR, LF, NUL, ...) or a non-ASCII byte.
+    Value,
+    /// `Set-Cookie`, in any case: every cookie line is built by `SetCookie`.
+    SetCookie,
+    /// `Content-Length` or `Transfer-Encoding`, in any case: the server frames
+    /// the body it sends, so a handler's value could only disagree with it.
+    Framing,
 }
-/// Ipê `redirect : String -> Response` — a 302 to `location`. Matches the Ipê
-/// kernel's one-arg contract and  `Server_redirectT` (status is hardcoded,
-/// not a parameter; use `withStatus` to override).
+
+impl HeaderRefusal {
+    /// The refusal as the `Server.withHeader` error message; it never echoes the input.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Name => "Server.withHeader: the header name is not an HTTP token",
+            Self::Value => {
+                "Server.withHeader: the header value holds a control character (such as CR or LF) or a non-ASCII character"
+            }
+            Self::SetCookie => {
+                "Server.withHeader: `Set-Cookie` is not a raw header; set a cookie with `Server.withCookie` and `Server.cookie`"
+            }
+            Self::Framing => {
+                "Server.withHeader: `Content-Length` and `Transfer-Encoding` are set by the server from the body it sends"
+            }
+        }
+    }
+}
+
+/// Parse one response header into its typed name and value.
+///
+/// `Set-Cookie` in any case is refused, so a cookie line is only ever the one
+/// `SetCookie` builds from typed parts. `Content-Length` and
+/// `Transfer-Encoding` in any case are refused, so the body framing is only
+/// ever the server's own.
+fn parse_response_header(
+    name: &str,
+    value: &str,
+) -> Result<(axum::http::HeaderName, axum::http::HeaderValue), HeaderRefusal> {
+    let name =
+        axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| HeaderRefusal::Name)?;
+    if name == axum::http::header::SET_COOKIE {
+        return Err(HeaderRefusal::SetCookie);
+    }
+    if name == axum::http::header::CONTENT_LENGTH || name == axum::http::header::TRANSFER_ENCODING {
+        return Err(HeaderRefusal::Framing);
+    }
+    if !value.is_ascii() {
+        return Err(HeaderRefusal::Value);
+    }
+    let value = axum::http::HeaderValue::from_str(value).map_err(|_| HeaderRefusal::Value)?;
+    Ok((name, value))
+}
+
+/// `Server.withHeader : String -> String -> Response -> Result Error Response`.
+///
+/// The header enters the response only when its name is a `token` other than
+/// `Set-Cookie`, `Content-Length` and `Transfer-Encoding` and its value a
+/// visible-ASCII header value; any other header is an `InvalidInput` error.
+/// It replaces every header of the same name in any case, so the response
+/// holds one value per header name.
+#[must_use]
+pub fn server_with_header(
+    k: String,
+    v: String,
+    mut r: ServerResponse,
+) -> IpeResult<IpeError, ServerResponse> {
+    match parse_response_header(&k, &v) {
+        Ok(_) => {
+            set_header_replacing(&mut r.headers, k, v);
+            IpeResult::Ok(r)
+        }
+        Err(refusal) => IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned())),
+    }
+}
+
+/// Sets header `name` to `value` in a response's headers, replacing every
+/// header of the same name in any case, so the map holds one value per header
+/// name. Every runtime write of a response header by name goes through here.
+fn set_header_replacing(headers: &mut HashMap<String, String>, name: String, value: String) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case(&name));
+    headers.insert(name, value);
+}
+
+/// Every value of header `name` in any case, joined by `, ` in name order so
+/// the result does not depend on map iteration order; `None` when absent.
+fn header_values_ci(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    let mut found: Vec<(&String, &String)> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    found.sort();
+    Some(
+        found
+            .into_iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+pub use response_head::ServerResponseHead;
+use response_head::{ServerDelivery, assemble_response_head};
+
+/// The one assembly of a response's status and headers, for every delivery.
+///
+/// A [`ServerResponseHead`] has no constructor but [`assemble_response_head`],
+/// so a buffered and a streamed response carry the same parsed handler
+/// headers, `Set-Cookie` lines and security headers, and refuse alike.
+mod response_head {
+    use super::{ServerResponse, parse_response_header};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+
+    /// How a response body reaches the client.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ServerDelivery {
+        /// The whole body in one piece.
+        Buffered,
+        /// The body chunk by chunk over a held connection.
+        Streamed,
+    }
+
+    impl ServerDelivery {
+        /// The headers this delivery adds when the handler has not set them.
+        fn default_headers(self) -> [Option<(HeaderName, HeaderValue)>; 2] {
+            match self {
+                Self::Buffered => [None, None],
+                // A proxy forwards each chunk as it arrives, and a streamed
+                // body is never replayed from a cache.
+                Self::Streamed => [
+                    Some((
+                        const { HeaderName::from_static("x-accel-buffering") },
+                        const { HeaderValue::from_static("no") },
+                    )),
+                    Some((
+                        header::CACHE_CONTROL,
+                        const { HeaderValue::from_static("no-cache") },
+                    )),
+                ],
+            }
+        }
+    }
+
+    /// Why a response has no head to send; every refusal answers `500`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HeadRefusal {
+        /// A handler header has no representation (see `parse_response_header`),
+        /// or names a header another handler header names in another case.
+        Header,
+        /// The response content type is not a header value.
+        ContentType,
+        /// A cookie line is not a header value.
+        Cookie,
+        /// The framing policy (`IPE_WEB_FRAME_ANCESTORS`) was refused.
+        FramingPolicy,
+        /// A security header is not a header line.
+        SecurityHeader,
+        /// The head holds more header names than a header map can.
+        Oversize,
+    }
+
+    /// A response status and header set, built only by [`assemble_response_head`].
+    pub struct ServerResponseHead {
+        status: StatusCode,
+        headers: HeaderMap,
+    }
+
+    // Header values can carry a session id or a token: only the status is shown.
+    impl std::fmt::Debug for ServerResponseHead {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ServerResponseHead")
+                .field("status", &self.status)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ServerResponseHead {
+        /// Whether the head declares an HTML body.
+        #[must_use]
+        pub fn is_html(&self) -> bool {
+            self.headers
+                .get(header::CONTENT_TYPE)
+                .is_some_and(|v| v.as_bytes().starts_with(b"text/html"))
+        }
+
+        /// The response with this head over `body`.
+        #[must_use]
+        pub fn into_response(self, body: axum::body::Body) -> axum::response::Response {
+            let mut resp = axum::response::Response::new(body);
+            *resp.status_mut() = self.status;
+            *resp.headers_mut() = self.headers;
+            resp
+        }
+    }
+
+    /// Assemble the head of `r` for `delivery` under the read security headers.
+    ///
+    /// Every handler header is parsed again, whatever built it: a `Response`
+    /// record update can carry headers `Server.withHeader` never saw. A handler
+    /// `content-type` header wins over `r.contentType`. Each `Set-Cookie` line
+    /// is its own header, never comma-folded (RFC 6265 §4.1). A security or
+    /// delivery header is added only when the handler has not set it.
+    ///
+    /// # Errors
+    ///
+    /// A [`HeadRefusal`] for a handler header, content type, cookie line or
+    /// security header with no representation, for two handler headers of one
+    /// name, for more header names than a header map holds, or for a refused
+    /// framing policy: no response ships without its framing policy, with a
+    /// raw line, or with a header whose value depends on iteration order.
+    pub fn assemble_response_head(
+        r: &ServerResponse,
+        delivery: ServerDelivery,
+        security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+    ) -> Result<ServerResponseHead, HeadRefusal> {
+        let security = security.map_err(|_| HeadRefusal::FramingPolicy)?;
+        // An out-of-range Ipê status is clamped into the HTTP range first.
+        let status = u16::try_from(r.status.clamp(100, 599))
+            .ok()
+            .and_then(|s| StatusCode::from_u16(s).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut headers = HeaderMap::new();
+        // One value per handler header name: a second spelling of a name is
+        // refused, never appended in `HashMap` iteration order.
+        for (k, v) in &r.headers {
+            let (name, value) = parse_response_header(k, v).map_err(|_| HeadRefusal::Header)?;
+            if headers.contains_key(&name) {
+                return Err(HeadRefusal::Header);
+            }
+            headers
+                .try_insert(name, value)
+                .map_err(|_| HeadRefusal::Oversize)?;
+        }
+        if !r.contentType.is_empty() && !headers.contains_key(header::CONTENT_TYPE) {
+            let (_, value) = parse_response_header("content-type", &r.contentType)
+                .map_err(|_| HeadRefusal::ContentType)?;
+            headers
+                .try_insert(header::CONTENT_TYPE, value)
+                .map_err(|_| HeadRefusal::Oversize)?;
+        }
+        for cookie in &r.cookies {
+            let value = cookie.header_value().ok_or(HeadRefusal::Cookie)?;
+            headers
+                .try_append(header::SET_COOKIE, value)
+                .map_err(|_| HeadRefusal::Oversize)?;
+        }
+        for (name, value) in security {
+            let name =
+                HeaderName::from_bytes(name.as_bytes()).map_err(|_| HeadRefusal::SecurityHeader)?;
+            if !headers.contains_key(&name) {
+                let value =
+                    HeaderValue::from_str(&value).map_err(|_| HeadRefusal::SecurityHeader)?;
+                headers
+                    .try_insert(name, value)
+                    .map_err(|_| HeadRefusal::Oversize)?;
+            }
+        }
+        for (name, value) in delivery.default_headers().into_iter().flatten() {
+            if !headers.contains_key(&name) {
+                headers
+                    .try_insert(name, value)
+                    .map_err(|_| HeadRefusal::Oversize)?;
+            }
+        }
+        Ok(ServerResponseHead { status, headers })
+    }
+}
+
+/// Bytes a `Location` value never holds raw.
+///
+/// CTLs, space, non-ASCII (always encoded by `utf8_percent_encode`) and the
+/// ASCII characters RFC 3986 neither reserves nor leaves unreserved. `%` and
+/// every reserved character are kept, so an already-encoded URI is unchanged.
+const LOCATION_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// Ipê `redirect : String -> Response` — a 302 to `location`.
+///
+/// `location` is percent-encoded into a visible-ASCII URI reference, so every
+/// redirect is a valid response. The status is fixed; `withStatus` overrides it.
+#[must_use]
 pub fn server_redirect(location: String) -> ServerResponse {
     let mut r = resp(302, String::new(), "text/plain");
-    r.headers.insert("Location".to_string(), location);
+    set_header_replacing(
+        &mut r.headers,
+        "Location".to_owned(),
+        percent_encoding::utf8_percent_encode(&location, LOCATION_ESCAPE).to_string(),
+    );
     r
 }
 
@@ -768,6 +1091,11 @@ pub fn server_header(name: String, req: ServerRequest) -> IpeMaybe<String> {
         None => IpeMaybe::Nothing,
     }
 }
+/// `Server.getCookie name req` — the decoded value of the cookie `name`.
+///
+/// `req.cookies` holds only pairs whose wire name is the encoding of their
+/// decoded name and whose value decodes, so this matches exactly the cookie
+/// `Server.cookie name` writes.
 pub fn server_get_cookie(name: String, req: ServerRequest) -> IpeMaybe<String> {
     match req.cookies.get(&name) {
         Some(v) => IpeMaybe::Just(v.clone()),
@@ -791,54 +1119,201 @@ pub fn server_method(req: ServerRequest) -> String {
 
 // ─── cookies ──────────────────────────────────────────────────────────────
 
-pub fn server_cookie(name: String, value: String) -> ServerCookie {
-    ServerCookie {
-        name,
-        value: value.into(),
+pub use crate::http_header::cookie::{CookieName, CookieValue, RuntimeCookie, request_cookies};
+pub use cookie_octets::{CookieAttributes, CookiePath, SameSite, SetCookie};
+
+/// The `Set-Cookie` line grammar, held in types.
+///
+/// A [`SetCookie`] line is assembled only from a [`CookieName`], a
+/// [`CookieValue`] (the shared RFC 6265 grammar in `http_header::cookie`) and a
+/// typed attribute set, so every `Set-Cookie` value the server emits is a valid
+/// header value and carries no attribute or line the caller supplied.
+mod cookie_octets {
+    use super::{CookieName, CookieValue};
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+
+    /// Bytes outside RFC 6265 `av-octet` (a `Path` attribute value): CTLs and `;`.
+    const NOT_AV_OCTET: &AsciiSet = &CONTROLS.add(b';');
+
+    /// The `SameSite` attribute of a `Set-Cookie` line.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SameSite {
+        Lax,
+        Strict,
+        None,
+    }
+
+    impl SameSite {
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::Lax => "Lax",
+                Self::Strict => "Strict",
+                Self::None => "None",
+            }
+        }
+    }
+
+    /// A `Path` attribute value: starts with `/` and holds only `av-octet` bytes.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CookiePath(String);
+
+    impl CookiePath {
+        /// The root path `/`.
+        #[must_use]
+        pub fn root() -> Self {
+            Self("/".to_owned())
+        }
+
+        /// Parse `raw`, percent-encoding every byte that is not an `av-octet`.
+        ///
+        /// A value without a leading `/` gets one, so the browser never falls
+        /// back to the request's default path.
+        #[must_use]
+        pub fn encode(raw: &str) -> Self {
+            let encoded = utf8_percent_encode(raw, NOT_AV_OCTET).to_string();
+            if encoded.starts_with('/') {
+                Self(encoded)
+            } else {
+                Self(format!("/{encoded}"))
+            }
+        }
+
+        /// The encoded path.
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// The attributes of a `Set-Cookie` line.
+    ///
+    /// `SameSite=None` always renders `Secure`: a browser drops a cross-site
+    /// cookie that lacks it, so the pair is never emitted apart.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CookieAttributes {
+        pub path: CookiePath,
+        pub http_only: bool,
+        pub same_site: SameSite,
+        pub secure: bool,
+        pub max_age_secs: Option<u64>,
+    }
+
+    /// One `Set-Cookie` header value built from typed parts.
+    ///
+    /// The line carries the cookie's value (a session id, a token), so its
+    /// `Debug` prints [`crate::redact::REDACTED`], never the line.
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct SetCookie(String);
+
+    impl std::fmt::Debug for SetCookie {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("SetCookie")
+                .field(&crate::redact::Redacted::new(()))
+                .finish()
+        }
+    }
+
+    impl SetCookie {
+        /// Render `name=value; Path=<path>` and then `attributes` in a fixed order.
+        #[must_use]
+        pub fn new(name: &CookieName, value: &CookieValue, attributes: CookieAttributes) -> Self {
+            let http_only = if attributes.http_only {
+                "; HttpOnly"
+            } else {
+                ""
+            };
+            let same_site = attributes.same_site.as_str();
+            let secure = if attributes.secure || attributes.same_site == SameSite::None {
+                "; Secure"
+            } else {
+                ""
+            };
+            let max_age = attributes
+                .max_age_secs
+                .map_or_else(String::new, |secs| format!("; Max-Age={secs}"));
+            Self(format!(
+                "{}={}; Path={}{http_only}; SameSite={same_site}{secure}{max_age}",
+                name.as_str(),
+                value.as_str(),
+                attributes.path.as_str()
+            ))
+        }
+
+        /// The header value.
+        #[must_use]
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+
+        /// The line as a `Set-Cookie` header value.
+        ///
+        /// The one place a cookie line becomes a header: every response path
+        /// appends this, and answers `500` on `None` rather than send the
+        /// response without the cookie.
+        #[must_use]
+        pub fn header_value(&self) -> Option<axum::http::HeaderValue> {
+            axum::http::HeaderValue::from_str(&self.0).ok()
+        }
+
+        /// A line holding `raw` verbatim, bypassing the grammar.
+        #[cfg(test)]
+        #[must_use]
+        pub fn unchecked_for_test(raw: &str) -> Self {
+            Self(raw.to_owned())
+        }
+    }
+
+    impl std::ops::Deref for SetCookie {
+        type Target = str;
+
+        fn deref(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl std::fmt::Display for SetCookie {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
     }
 }
 
-/// Strip any byte that could smuggle extra cookie attributes or inject a header
-/// line. We drop CTLs (incl. CR/LF), `;`, `,`, and whitespace from both the
-/// cookie name and value rather than reject (a total, never-panicking transform):
-/// the resulting Set-Cookie carries exactly one attribute set we control, and the
-/// downstream `builder.header` can't see a CRLF to error on. Conservative — these
-/// bytes are not valid in a cookie name/value per RFC 6265 token/cookie-octet
-/// grammar anyway.
-fn sanitise_cookie_field(s: &str) -> String {
-    s.chars()
-        .filter(|&c| {
-            !c.is_control()
-                && c != ';'
-                && c != ','
-                && c != ' '
-                && c != '\t'
-                && c != '"'
-                && c != '\\'
-        })
-        .collect()
+/// `Server.cookie : String -> String -> Result Error Cookie`.
+///
+/// Parses both fields into their cookie grammar; an empty name is an
+/// `InvalidInput` error, so a `Cookie` always carries a non-empty name.
+#[must_use]
+pub fn server_cookie(name: String, value: String) -> IpeResult<IpeError, ServerCookie> {
+    match CookieName::parse(&name) {
+        Some(name) => IpeResult::Ok(ServerCookie {
+            name,
+            value: Redacted::new(CookieValue::encode(&value)),
+        }),
+        None => IpeResult::Err(IpeError::invalid_input(
+            "Server.cookie: a cookie name must not be empty".to_owned(),
+        )),
+    }
 }
 
+/// `Server.withCookie` — attach `c` with `Path=/; HttpOnly; SameSite=Lax`.
+///
+/// `Secure` is added unless the process holds a dev intent (a dev-intent
+/// binary in a dev posture), so an auth/session cookie never crosses a
+/// cleartext hop; only a dev-intent process omits it, so cookies work over
+/// plain-http localhost. The gate is `cookie_secure_floor`.
+#[must_use]
 pub fn server_with_cookie(c: ServerCookie, mut r: ServerResponse) -> ServerResponse {
-    // Minimal Set-Cookie with safe defaults; full attributes land with step 4.
-    // name/value are sanitised so a value containing `;`/`,`/CRLF can't smuggle
-    // extra attributes or inject a second header line.
-    let name = sanitise_cookie_field(&c.name);
-    let value = sanitise_cookie_field(&c.value);
-    // Add `Secure` unless the process holds a dev intent, so an auth/session
-    // cookie is never transmitted over the cleartext proxy→app hop (SSL-strip /
-    // sniff). Omit it only in a dev build so cookies still work over plain-http
-    // localhost.
-    let secure = if cookie_secure_floor() {
-        "; Secure"
-    } else {
-        ""
-    };
-    let v = format!(
-        "{}={}; HttpOnly; Path=/; SameSite=Lax{}",
-        name, value, secure
-    );
-    r.cookies.push(v);
+    r.cookies.push(SetCookie::new(
+        &c.name,
+        &c.value,
+        CookieAttributes {
+            path: CookiePath::root(),
+            http_only: true,
+            same_site: SameSite::Lax,
+            secure: cookie_secure_floor(),
+            max_age_secs: None,
+        },
+    ));
     r
 }
 
@@ -1108,13 +1583,39 @@ fn strict_serve_dir_with(
     )
 }
 
-fn parse_cookies(header: &str, out: &mut HashMap<String, String>) {
-    for c in header.split(';') {
-        let c = c.trim();
-        if let Some((k, v)) = c.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
-        }
+/// Add the decoded cookies of one request's jar to `out`; the first value of a name wins.
+#[cfg(test)]
+fn parse_cookies<'a, I>(jar: I, out: &mut HashMap<String, String>)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    I::IntoIter: 'a,
+{
+    for (name, value) in request_cookies(jar) {
+        out.entry(name).or_insert(value);
     }
+}
+
+/// The decoded `(name, value)` pairs of every `Cookie` header in `headers`, in order.
+///
+/// Read from the raw header bytes through [`request_cookies`], so a pair with
+/// a byte outside visible ASCII drops only itself, never the other cookies.
+pub fn request_cookie_jar(
+    headers: &axum::http::HeaderMap,
+) -> impl Iterator<Item = (String, String)> + '_ {
+    request_cookies(
+        headers
+            .get_all(axum::http::header::COOKIE)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+    )
+}
+
+/// The decoded value of the request cookie `name`, read from every `Cookie` header.
+///
+/// The first value of `name` wins, as in `parse_cookies`.
+#[must_use]
+pub fn request_cookie(headers: &axum::http::HeaderMap, name: &CookieName) -> Option<String> {
+    request_cookie_jar(headers).find_map(|(k, v)| (k == name.text()).then_some(v))
 }
 
 /// Build the Ipê `ServerRequest` from the axum request.
@@ -1133,11 +1634,14 @@ async fn build_request(
     let query = strict_url_query(&uri)?;
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
+    // Read from the raw bytes of every `Cookie` header, outside the text gate
+    // below, so one pair with a non-ASCII byte drops only itself. The first
+    // value of a name wins.
+    for (name, value) in request_cookie_jar(req.headers()) {
+        cookies.entry(name).or_insert(value);
+    }
     for (k, v) in req.headers() {
         if let Ok(s) = v.to_str() {
-            if k.as_str().eq_ignore_ascii_case("cookie") {
-                parse_cookies(s, &mut cookies);
-            }
             // Store under  canonical MIME casing (`content-type` ->
             // `Content-Type`), aligning with  request-header storage and the
             // Ipe.Web path, so `server_header` (which canonicalises its lookup
@@ -1235,69 +1739,41 @@ async fn build_request(
 }
 
 fn to_axum_response(r: ServerResponse) -> axum::response::Response {
+    to_axum_response_with(r, crate::telemetry::security_headers())
+}
+
+/// [`to_axum_response`] over the outcome of reading the security headers.
+fn to_axum_response_with(
+    r: ServerResponse,
+    security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // Ipe.Http.Server.Stream: a streaming response carries a sentinel body the
-    // handler stashed via ServerStream.stream. Detect it + serve the chunked
-    // body before the buffered path runs.
-    if let Some(streamed) = serve_streaming_sentinel(&r) {
-        return streamed;
-    }
-    // Clamp to the valid HTTP status range before the u16 cast so an out-of-range
-    // Ipê integer (e.g. from a buggy handler returning status=99999) produces a
-    // defined 500 rather than a wrapping or panicking cast.
-    let status_u16 = r.status.clamp(100, 599) as u16;
-    let status = axum::http::StatusCode::from_u16(status_u16)
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let mut builder = axum::http::Response::builder().status(status);
-    // Emit the response's contentType UNLESS the handler already set a
-    // content-type via withHeader (case-insensitive). builder.header APPENDS, so
-    // emitting both would produce two `content-type` headers on the wire; an
-    // explicit handler override wins (parity with the security-headers `if-unset`
-    // policy below).
-    let has_ct_header = r
-        .headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("content-type"));
-    if !r.contentType.is_empty() && !has_ct_header {
-        builder = builder.header("content-type", r.contentType.clone());
-    }
-    for (k, v) in &r.headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
-    // Multiple Set-Cookie response headers (RFC 6265 §4.1 forbids comma-folding
-    // them into one line) — kept in a dedicated Vec (see `ServerResponse.cookies`)
-    // so two cookie-setting code paths (e.g. a handler's `Server.withCookie` plus
-    // a wrapping `Middleware.withCsrf`) never clobber each other via the
-    // single-valued `headers` map. `builder.header` APPENDS, so repeated calls
-    // with the same key name produce separate header lines on the wire.
-    for cookie_v in &r.cookies {
-        builder = builder.header("set-cookie", cookie_v.as_str());
-    }
-    // Safe-by-default security headers — applied only when the handler hasn't
-    // already set them, so an explicit handler override wins. Values are
-    // env/static (no request-derived strings → no header-injection surface).
-    for (name, value) in crate::telemetry::security_headers() {
-        if !r.headers.keys().any(|k| k.eq_ignore_ascii_case(name)) {
-            builder = builder.header(name, value);
+    // A streaming response carries the sentinel body `stream` registered.
+    // Claiming it takes its handler, which runs only once the head is built.
+    let pending = match claim_streaming_sentinel(&r.body) {
+        ServerStreamClaim::Buffered => None,
+        ServerStreamClaim::Stream(pending) => Some(pending),
+        // This process's sentinel with no live handler: serving it as a
+        // buffered body would send the sentinel nonce to the client.
+        ServerStreamClaim::Abandoned => {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
-    // Dev-only "🔍 Console" banner injection for every text/html response.
-    // Runs on the buffered body only; streaming responses returned above via
-    // serve_streaming_sentinel bypass this. Effective content-type = the
-    // handler's override header when present, else r.contentType.
-    let effective_ct: String = if has_ct_header {
-        r.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
-    } else {
-        r.contentType.clone()
     };
-    // Prefix test matches  `strings.HasPrefix(ct, "text/html")` exactly:
-    // case-sensitive, no trimming — Ipê's html builder always sets a lowercase
-    // `text/html; charset=utf-8`, so this is the byte-parity comparison.
-    let banner = if effective_ct.starts_with("text/html") {
+    let delivery = if pending.is_some() {
+        ServerDelivery::Streamed
+    } else {
+        ServerDelivery::Buffered
+    };
+    let Ok(head) = assemble_response_head(&r, delivery, security) else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if let Some(pending) = pending {
+        return pending.serve(head);
+    }
+    // Dev-only "🔍 Console" banner injection for every text/html buffered body.
+    // Prefix test matches `strings.HasPrefix(ct, "text/html")` exactly:
+    // case-sensitive, no trimming.
+    let banner = if head.is_html() {
         crate::telemetry::dev_console_banner("")
     } else {
         String::new()
@@ -1310,10 +1786,7 @@ fn to_axum_response(r: ServerResponse) -> axum::response::Response {
     } else {
         crate::telemetry::inject_dev_banner(&r.body, &banner)
     };
-    match builder.body(axum::body::Body::from(body)) {
-        Ok(resp) => resp,
-        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    head.into_response(axum::body::Body::from(body))
 }
 
 fn method_router(method: &str, h: ErasedHandler) -> axum::routing::MethodRouter {
@@ -1497,10 +1970,23 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         if let Some(msg) = endpoint_conflict(&routes) {
             return IpeResult::Err(msg.into());
         }
+        // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
+        // (env) > the app's `Host.bind` setting > the posture fallback
+        // (loopback unless production). A present `IPE_HTTP_BIND` that is not
+        // an IP address refuses the listener.
+        let host = match crate::app_config::resolve_host_bind() {
+            Ok(host) => host,
+            Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
+        };
         let ceilings = match listen_ceilings() {
             Ok(ceilings) => ceilings,
             Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
         };
+        // The framing policy every response carries is parsed before bind, so
+        // a value with no header representation refuses the listener.
+        if let Err(refusal) = crate::telemetry::frame_ancestors_config() {
+            return IpeResult::Err(format!("Server.listen: {refusal}").into());
+        }
         let mut app: axum::Router = axum::Router::new();
         // At most ONE mounted web app per server: the embedded app's cookie /
         // CSRF / asset paths are scoped through the process-wide base path
@@ -1615,15 +2101,13 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             port,
         );
         let port = resolved.port;
-        // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
-        // (env) > the app's `Host.bind` setting > the build-profile fallback
-        // (loopback in debug, all interfaces in release). The conservative
-        // loopback default keeps a dev console off the LAN by construction.
-        let host = crate::app_config::resolve_host_bind();
+        let Ok(port) = u16::try_from(port) else {
+            return IpeResult::Err(format!("Server.listen: port {port} is not a TCP port").into());
+        };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
-        crate::telemetry::record_bind(&host);
-        let addr = format!("{}:{}", host, port);
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
+        crate::telemetry::record_bind(host);
+        let addr = std::net::SocketAddr::new(host, port);
+        let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return IpeResult::Err(resolved.addr_in_use_message().into());
@@ -1660,6 +2144,8 @@ pub enum WsHandle {
     WebSocketServer(i64),
 }
 
+crate::stringify::show_row!("WebSocketServer", Internals, [] WsHandle, |_| "<Ipe.Http.Server.WebSocket>".to_owned());
+
 /// Ipe.Http.Server.WebSocket.WebSocketServerCfg — fn-pointer callbacks (cannot
 /// capture; capturing handlers need Arc<dyn Fn> erasure, a follow-up).
 ///
@@ -1686,6 +2172,8 @@ pub struct WsServerCfg<E> {
     pub maxMessageBytes: i64,
     pub originPatterns: Vec<String>,
 }
+
+crate::stringify::show_row!("WebSocketServerCfg", Internals, [E] WsServerCfg<E>, |_| "<Ipe.Http.Server.WebSocket.Config>".to_owned());
 
 enum WsOut {
     Text(String),
@@ -2447,7 +2935,7 @@ fn header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a
 fn plain_resp(status: i64, body: &str, extra: &[(&str, &str)]) -> ServerResponse {
     let mut headers = HashMap::new();
     for (k, v) in extra {
-        headers.insert(k.to_string(), v.to_string());
+        set_header_replacing(&mut headers, (*k).to_owned(), (*v).to_owned());
     }
     ServerResponse {
         status,
@@ -2458,90 +2946,144 @@ fn plain_resp(status: i64, body: &str, extra: &[(&str, &str)]) -> ServerResponse
     }
 }
 
-/// Middleware.withCors : List String -> Handler -> Handler. Echoes an allowed
-/// Origin (or `*`), answers preflight OPTIONS with 204, and tags responses.
+/// The response header naming the origin a `withCors` response grants.
+const CORS_ALLOW_ORIGIN: &str = "access-control-allow-origin";
+
+/// The methods every `withCors` preflight answer allows.
+const CORS_PREFLIGHT_METHODS: &str = "GET, POST, PUT, DELETE, OPTIONS";
+
+/// The request headers every `withCors` preflight answer allows.
+const CORS_PREFLIGHT_HEADERS: &str = "Content-Type, Authorization";
+
+/// The origin policy of `Middleware.withCors`, parsed once from its list.
+enum CorsPolicy {
+    /// The list contains `*`: no response depends on `Origin`.
+    Any,
+    /// Exact serialized origins. An empty entry is dropped, since it never
+    /// equals a present non-empty `Origin`, so an empty set refuses every origin.
+    Allowlist(Vec<String>),
+}
+
+/// A request `Origin` the policy grants.
+///
+/// The request's own bytes, equal to an allowlist entry; built only by
+/// `CorsPolicy::tag`.
+struct GrantedOrigin(String);
+
+/// Every CORS header a response from `withCors` carries, as one value.
+///
+/// `Any` comes only from `CorsPolicy::Any`; `ByOrigin` only from
+/// `CorsPolicy::Allowlist`, and every `ByOrigin` response names `Origin` in
+/// `Vary`, the refused and the origin-less ones included.
+enum CorsTag {
+    /// `Access-Control-Allow-Origin: *`; the response does not vary on `Origin`.
+    Any,
+    /// The response varies on `Origin`; it grants the origin when one is held.
+    ByOrigin(Option<GrantedOrigin>),
+}
+
+impl CorsPolicy {
+    /// The policy of the author's origin list: `*` anywhere grants every origin.
+    fn parse(origins: Vec<String>) -> Self {
+        if origins.iter().any(|o| o == "*") {
+            Self::Any
+        } else {
+            Self::Allowlist(origins.into_iter().filter(|o| !o.is_empty()).collect())
+        }
+    }
+
+    /// The CORS tag of a response to a request carrying `origin`.
+    fn tag(&self, origin: Option<&str>) -> CorsTag {
+        match self {
+            Self::Any => CorsTag::Any,
+            Self::Allowlist(set) => CorsTag::ByOrigin(
+                origin
+                    .filter(|o| !o.is_empty() && set.iter().any(|e| e.as_str() == *o))
+                    .map(|o| GrantedOrigin(o.to_owned())),
+            ),
+        }
+    }
+}
+
+impl CorsTag {
+    /// Writes the tag's headers into `resp`.
+    ///
+    /// The one writer of the CORS headers the middleware owns: a handler-set
+    /// `Access-Control-Allow-Origin` in any case is replaced by the grant, or
+    /// removed when there is none.
+    fn apply(self, resp: &mut ServerResponse) {
+        match self {
+            Self::Any => set_header_replacing(
+                &mut resp.headers,
+                CORS_ALLOW_ORIGIN.to_owned(),
+                "*".to_owned(),
+            ),
+            Self::ByOrigin(grant) => {
+                merge_vary_origin(&mut resp.headers);
+                if let Some(GrantedOrigin(origin)) = grant {
+                    set_header_replacing(&mut resp.headers, CORS_ALLOW_ORIGIN.to_owned(), origin);
+                } else {
+                    resp.headers
+                        .retain(|k, _| !k.eq_ignore_ascii_case(CORS_ALLOW_ORIGIN));
+                }
+            }
+        }
+    }
+}
+
+/// Names `Origin` in the `Vary` of `headers`.
+///
+/// A handler's `Vary` in any case is merged into one value, never clobbered;
+/// one already naming `Origin` or `*` is kept as is.
+fn merge_vary_origin(headers: &mut HashMap<String, String>) {
+    let vary = match header_values_ci(headers, "Vary") {
+        Some(prev)
+            if prev.split(',').any(|p| {
+                let p = p.trim();
+                p == "*" || p.eq_ignore_ascii_case("origin")
+            }) =>
+        {
+            prev
+        }
+        Some(prev) => format!("{prev}, Origin"),
+        None => "Origin".to_owned(),
+    };
+    set_header_replacing(headers, "Vary".to_owned(), vary);
+}
+
+/// Middleware.withCors : List String -> Handler -> Handler.
+///
+/// Echoes an allowed `Origin` (or `*`), answers every `OPTIONS` as a preflight
+/// with 204, and tags every response the handler returns. Under a list of
+/// specific origins every response the middleware makes or passes carries
+/// `Vary: Origin`; a refused or absent origin gets no
+/// `Access-Control-Allow-Origin`, including one the handler set.
 pub fn middleware_with_cors<E, H>(origins: Vec<String>, h: H) -> ServerHandler<E>
 where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
     let h = h.into_server_handler();
+    let policy = CorsPolicy::parse(origins);
     Arc::new(move |req: ServerRequest| {
-        let req_origin = header_ci(&req.headers, "origin").unwrap_or("").to_string();
-        let allow = if origins.iter().any(|o| o == "*") {
-            Some("*".to_string())
-        } else if origins.iter().any(|o| o == &req_origin) && !req_origin.is_empty() {
-            Some(req_origin)
-        } else {
-            None
-        };
+        let tag = policy.tag(header_ci(&req.headers, "origin"));
         if req.method.eq_ignore_ascii_case("OPTIONS") {
             let mut resp = plain_resp(
                 204,
                 "",
                 &[
-                    (
-                        "access-control-allow-methods",
-                        "GET, POST, PUT, DELETE, OPTIONS",
-                    ),
-                    (
-                        "access-control-allow-headers",
-                        "Content-Type, Authorization",
-                    ),
+                    ("access-control-allow-methods", CORS_PREFLIGHT_METHODS),
+                    ("access-control-allow-headers", CORS_PREFLIGHT_HEADERS),
                 ],
             );
-            if let Some(a) = allow {
-                // A reflected SPECIFIC origin (not `*`) makes the response
-                // origin-dependent — emit `Vary: Origin` so a shared/intermediary
-                // cache can't serve one origin's ACAO to another (CORS cache
-                // poisoning). `*` is origin-independent, so no Vary needed.
-                if a != "*" {
-                    // MERGE, don't clobber: a handler may already have set Vary
-                    // (e.g. `Accept-Encoding`). Append `Origin` unless present.
-                    let vary = match resp.headers.get("Vary") {
-                        Some(prev)
-                            if !prev
-                                .split(',')
-                                .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
-                        {
-                            format!("{}, Origin", prev)
-                        }
-                        Some(prev) => prev.clone(),
-                        None => "Origin".to_string(),
-                    };
-                    resp.headers.insert("Vary".to_string(), vary);
-                }
-                resp.headers
-                    .insert("access-control-allow-origin".to_string(), a);
-            }
+            tag.apply(&mut resp);
             return Box::pin(async move { ok_res(resp) });
         }
         let task = h(req);
         Box::pin(async move {
             match task.await {
                 IpeResult::Ok(mut resp) => {
-                    if let Some(a) = allow {
-                        // See preflight branch: a reflected specific origin needs
-                        // `Vary: Origin` to be cache-safe.
-                        if a != "*" {
-                            // MERGE, don't clobber: a handler may already have set Vary
-                            // (e.g. `Accept-Encoding`). Append `Origin` unless present.
-                            let vary = match resp.headers.get("Vary") {
-                                Some(prev)
-                                    if !prev
-                                        .split(',')
-                                        .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
-                                {
-                                    format!("{}, Origin", prev)
-                                }
-                                Some(prev) => prev.clone(),
-                                None => "Origin".to_string(),
-                            };
-                            resp.headers.insert("Vary".to_string(), vary);
-                        }
-                        resp.headers
-                            .insert("access-control-allow-origin".to_string(), a);
-                    }
+                    tag.apply(&mut resp);
                     ok_res(resp)
                 }
                 other => other,
@@ -2696,17 +3238,18 @@ fn request_is_https(headers: &HashMap<String, String>) -> bool {
 /// spuriously fail whenever proxy-scheme detection flips between requests.
 /// Only the `Secure` ATTRIBUTE (`csrf_set_cookie_value`) becomes
 /// request-scoped.
-fn csrf_cookie_name() -> &'static str {
+fn csrf_cookie_name() -> CookieName {
     csrf_cookie_name_with(crate::telemetry::dev_intent_from_env().as_ref())
 }
 
 /// [`csrf_cookie_name`] under an explicit dev-intent proof.
-const fn csrf_cookie_name_with(dev: Option<&crate::telemetry::DevIntent>) -> &'static str {
-    if cookie_secure_floor_with(dev) {
-        "__Host-ipe_csrf"
+fn csrf_cookie_name_with(dev: Option<&crate::telemetry::DevIntent>) -> CookieName {
+    let base = if cookie_secure_floor_with(dev) {
+        RuntimeCookie::HostCsrf
     } else {
-        "ipe_csrf"
-    }
+        RuntimeCookie::ServerCsrf
+    };
+    CookieName::runtime(base, "")
 }
 
 /// The process `Secure` floor for an `Ipe.Http.Server` cookie: [`cookie_secure_floor_with`].
@@ -2762,10 +3305,10 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// `server_with_cookie`'s gate and the session cookie's
 /// `csrf::cookies_secure()` half) OR `request_is_https` is true (THIS
 /// specific request arrived over TLS at a trusted proxy, opt-in via
-/// `IPE_TRUSTED_PROXY` — closes the gap where a dev process (`ENV` unset)
+/// `IPE_TRUSTED_PROXY` — closes the gap where a dev-intent process
 /// fronted by a TLS-terminating proxy would otherwise emit a non-Secure CSRF
 /// cookie even though the browser connection was HTTPS). Same OR-gate shape as
-/// the session cookie in `live/mod.rs::page_response`.
+/// the session cookie in `web/mod.rs::page_response`.
 ///
 /// `request_is_https` MUST be computed from the ORIGINAL request headers
 /// before the request is consumed — see the call site in
@@ -2773,7 +3316,7 @@ pub fn csrf_pair_valid(cookie_tok: &str, header_tok: &str) -> bool {
 /// moving `req` into the wrapped handler `h(req)`. By the time this function
 /// runs (after the handler's `Task` resolves), the request itself is gone;
 /// only the pre-captured bool survives.
-fn csrf_set_cookie_value(token: &str, request_is_https: bool) -> String {
+fn csrf_set_cookie_value(token: &str, request_is_https: bool) -> SetCookie {
     let dev = crate::telemetry::dev_intent_from_env();
     csrf_set_cookie_value_with(token, request_is_https, dev.as_ref())
 }
@@ -2783,14 +3326,18 @@ fn csrf_set_cookie_value_with(
     token: &str,
     request_is_https: bool,
     dev: Option<&crate::telemetry::DevIntent>,
-) -> String {
-    let name = csrf_cookie_name_with(dev);
-    let secure = if cookie_secure_floor_with(dev) || request_is_https {
-        "; Secure"
-    } else {
-        ""
-    };
-    format!("{name}={token}; Path=/; SameSite=Strict{secure}")
+) -> SetCookie {
+    SetCookie::new(
+        &csrf_cookie_name_with(dev),
+        &CookieValue::encode(token),
+        CookieAttributes {
+            path: CookiePath::root(),
+            http_only: false,
+            same_site: SameSite::Strict,
+            secure: cookie_secure_floor_with(dev) || request_is_https,
+            max_age_secs: None,
+        },
+    )
 }
 
 /// Middleware.withCsrf : Handler -> Handler. Double-submit-cookie CSRF guard
@@ -2814,7 +3361,7 @@ where
             "GET" | "HEAD" | "OPTIONS"
         );
         let cookie_name = csrf_cookie_name();
-        let existing = req.cookies.get(cookie_name).cloned();
+        let existing = req.cookies.get(cookie_name.text()).cloned();
         let token = existing
             .clone()
             .filter(|t| csrf_token_well_formed(t))
@@ -3090,13 +3637,74 @@ mod tests {
             "a malformed parameter name must refuse the listener"
         );
         let IpeResult::Err(msg) = listened else {
-            return;
+            panic!("a malformed parameter name must refuse the listener");
         };
         assert!(
             msg.contains("endpoint `GET /:id/:id` has a malformed path parameter")
                 && msg.contains("parameter `id` appears twice"),
             "{msg}"
         );
+    }
+
+    /// The listener refuses an `IPE_WEB_FRAME_ANCESTORS` with no
+    /// `frame-ancestors` representation before it binds. The value is read
+    /// once per process, so the check runs in a child holding it.
+    #[test]
+    fn listen_refuses_an_unrepresentable_frame_ancestors() {
+        let (refused, out) = crate::telemetry::frame_ancestors_child::refused(
+            module_path!(),
+            "listen_frame_ancestors_child",
+            "a;b",
+        );
+        assert!(refused, "the child must observe the refusal:\n{out}");
+    }
+
+    /// The child half of `listen_refuses_an_unrepresentable_frame_ancestors`;
+    /// a no-op unless it runs with `IPE_WEB_FRAME_ANCESTORS=a;b`.
+    #[tokio::test]
+    #[ignore = "run as a child process by listen_refuses_an_unrepresentable_frame_ancestors"]
+    async fn listen_frame_ancestors_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok("a;b")
+        {
+            return;
+        }
+        // A listener that got past the refusal would bind and serve forever;
+        // the timeout turns that regression into a failure instead of a hang.
+        let listened: IpeResult<String, ()> = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server_listen(0, Vec::new()),
+        )
+        .await
+        .expect("a refused framing policy must return before binding, not serve");
+        let IpeResult::Err(msg) = listened else {
+            panic!("a `;` in IPE_WEB_FRAME_ANCESTORS must refuse the listener");
+        };
+        assert!(
+            msg.starts_with("Server.listen: IPE_WEB_FRAME_ANCESTORS holds `;`"),
+            "{msg}"
+        );
+        println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
+    }
+
+    /// A present `IPE_HTTP_BIND` that is not an IP address refuses the listener
+    /// before it binds.
+    #[tokio::test]
+    async fn listen_refuses_a_bind_that_is_not_an_ip_address() {
+        for raw in ["localhost", "127.0.0.1:8080", "[::1]", " 127.0.0.1"] {
+            crate::system::locked_set_var("IPE_HTTP_BIND", raw);
+            // A listener that got past the refusal would bind and serve forever;
+            // the timeout turns that regression into a failure instead of a hang.
+            let listened: Result<IpeResult<String, ()>, _> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(0, Vec::new()),
+            )
+            .await;
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+            let refused = matches!(&listened, Ok(IpeResult::Err(msg))
+                if msg.starts_with("Server.listen: IPE_HTTP_BIND must be an IP address"));
+            assert!(refused, "IPE_HTTP_BIND={raw:?} must refuse the listener");
+        }
     }
 
     #[test]
@@ -3171,15 +3779,38 @@ mod tests {
 
     #[test]
     fn cookie_and_response_debug_print_no_secret() {
-        let cookie = server_cookie("sid".to_owned(), "T0K3N".to_owned());
+        let cookie = cookie("sid", "T0K3N");
         let shown = format!("{cookie:?}");
         assert!(!shown.contains("T0K3N"), "{shown}");
         assert!(shown.contains("\"sid\""));
+        let line = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("T0K3N"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: true,
+                max_age_secs: None,
+            },
+        );
+        let shown = format!("{line:?}");
+        assert_eq!(shown, "SetCookie(<redacted>)");
 
         let mut resp = server_text("session=T0K3N".to_owned());
         resp.headers
             .insert("Authorization".to_owned(), "Bearer S3CR3T".to_owned());
-        resp.cookies.push("sid=T0K3N; Path=/; HttpOnly".to_owned());
+        resp.cookies.push(SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("T0K3N"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: false,
+                max_age_secs: None,
+            },
+        ));
         let shown = format!("{resp:?}");
         for secret in ["T0K3N", "S3CR3T"] {
             assert!(!shown.contains(secret), "{secret} leaked: {shown}");
@@ -3228,6 +3859,27 @@ mod tests {
             build_request(wire).await,
             Err(RequestRejection::BadRequest)
         ));
+    }
+
+    /// A `Cookie` header with one non-ASCII byte keeps every other cookie: the
+    /// pair holding the byte is skipped, the session cookie beside it is read.
+    #[tokio::test]
+    async fn build_request_keeps_the_cookies_beside_a_non_ascii_pair() {
+        let tossed = axum::http::HeaderValue::from_bytes(b"x=\x80; sid=v")
+            .expect("obs-text is a valid header value");
+        let wire = axum::http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header(axum::http::header::COOKIE, tossed)
+            .header(axum::http::header::COOKIE, "csrf=t")
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        let Some(Ok(req)) = routed_build("/", wire).await else {
+            panic!("the request builds");
+        };
+        assert_eq!(req.cookies.get("sid").map(String::as_str), Some("v"));
+        assert_eq!(req.cookies.get("csrf").map(String::as_str), Some("t"));
+        assert!(!req.cookies.contains_key("x"), "{:?}", req.cookies);
     }
 
     /// Serve `uri` through a real `method_router` routed on `/u/:id`.
@@ -3605,7 +4257,9 @@ mod tests {
             .expect("test request builds");
         let built = routed_build("/", wire).await;
         assert!(matches!(built, Some(Ok(_))), "a routed request must build");
-        let Some(Ok(req)) = built else { return };
+        let Some(Ok(req)) = built else {
+            panic!("a routed request must build");
+        };
         assert_eq!(
             req.headers.get("X-Trace-Id").map(String::as_str),
             Some("abc123")
@@ -3649,7 +4303,7 @@ mod tests {
     async fn dev_posture_pin_to_axum_response_injects_dev_banner_before_body_close() {
         crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let ipe = server_html("<html><body><h1>hi</h1></body></html>".to_string());
         let out = axum_body_string(to_axum_response(ipe)).await;
         assert!(
@@ -3672,7 +4326,7 @@ mod tests {
     #[tokio::test]
     async fn to_axum_response_omits_dev_banner_on_release_under_env_dev() {
         crate::system::locked_set_var("ENV", "dev");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let html = "<html><body><h1>hi</h1></body></html>";
         let out = axum_body_string(to_axum_response(server_html(html.to_string()))).await;
         crate::system::locked_remove_var("ENV");
@@ -3792,7 +4446,7 @@ mod tests {
         // back to the same-origin check; a release binary refuses outright.
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_ENV");
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let cfg = ws_server_default_cfg::<String>();
         let req = mk_ws_req(&[
             ("origin", "https://evil.example"),
@@ -3820,7 +4474,7 @@ mod tests {
                 None => crate::system::locked_remove_var(key),
             }
         }
-        crate::telemetry::record_bind("127.0.0.1");
+        crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let req = mk_ws_req(&[
             ("origin", "https://victim.example"),
             ("host", "victim.example"),
@@ -4027,7 +4681,9 @@ mod tests {
     fn query_and_cookies() {
         let parsed = parse_query(Some("a=1&b=two%20words&a=ignored&flag"));
         assert!(parsed.is_ok(), "a well-formed query must parse");
-        let Ok(q) = parsed else { return };
+        let Ok(q) = parsed else {
+            panic!("a well-formed query must parse");
+        };
         assert_eq!(q.get("a").map(String::as_str), Some("1")); // first value wins
         assert_eq!(q.get("b").map(String::as_str), Some("two words"));
         assert_eq!(q.get("flag").map(String::as_str), Some(""));
@@ -4038,7 +4694,7 @@ mod tests {
         );
 
         let mut c = std::collections::HashMap::new();
-        parse_cookies("sid=abc; theme=dark", &mut c);
+        parse_cookies([b"sid=abc; theme=dark".as_slice()], &mut c);
         assert_eq!(c.get("sid").map(String::as_str), Some("abc"));
         assert_eq!(c.get("theme").map(String::as_str), Some("dark"));
     }
@@ -4059,8 +4715,8 @@ mod tests {
     #[tokio::test]
     async fn two_set_cookie_headers_both_survive() {
         let mut r = server_text("ok".to_string());
-        r = server_with_cookie(server_cookie("a".into(), "1".into()), r);
-        r = server_with_cookie(server_cookie("b".into(), "2".into()), r);
+        r = server_with_cookie(cookie("a", "1"), r);
+        r = server_with_cookie(cookie("b", "2"), r);
         let resp = to_axum_response(r);
         let cookies: Vec<_> = resp
             .headers()
@@ -4068,6 +4724,1163 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(cookies.len(), 2, "both Set-Cookie lines must survive");
+    }
+
+    /// The cookie `Server.cookie name value` builds for a non-empty `name`.
+    #[allow(clippy::expect_used)] // fixture: every caller passes a non-empty name
+    fn cookie(name: &str, value: &str) -> ServerCookie {
+        let built = match server_cookie(name.to_owned(), value.to_owned()) {
+            IpeResult::Ok(c) => Some(c),
+            IpeResult::Err(_) => None,
+        };
+        built.expect("a non-empty cookie name")
+    }
+
+    /// The parsed cookie name for a non-empty `raw`.
+    #[allow(clippy::expect_used)] // fixture: every caller passes a non-empty name
+    fn parsed_name(raw: &str) -> CookieName {
+        CookieName::parse(raw).expect("a non-empty cookie name")
+    }
+
+    /// The `Set-Cookie` lines of `r` once it is an HTTP response.
+    fn set_cookie_lines(r: ServerResponse) -> Vec<String> {
+        to_axum_response(r)
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect()
+    }
+
+    /// RFC 6265 `cookie-octet`, written out independently of the encoder's set.
+    const fn is_cookie_octet(b: u8) -> bool {
+        matches!(b, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
+    }
+
+    /// RFC 7230 `tchar`, written out independently of the encoder's set.
+    const fn is_tchar(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    }
+
+    #[test]
+    fn cookie_value_encodes_every_byte_outside_cookie_octet() {
+        for (raw, encoded) in [
+            ("é", "%C3%A9"),
+            (";", "%3B"),
+            (",", "%2C"),
+            (" ", "%20"),
+            ("\t", "%09"),
+            ("\"", "%22"),
+            ("\\", "%5C"),
+            ("a\r\nSet-Cookie: x=y", "a%0D%0ASet-Cookie:%20x=y"),
+            ("\u{7f}", "%7F"),
+            ("😀", "%F0%9F%98%80"),
+            ("%", "%25"),
+            ("%41", "%2541"),
+        ] {
+            assert_eq!(CookieValue::encode(raw).as_str(), encoded, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn cookie_value_keeps_cookie_octets_byte_for_byte() {
+        let octets: String = (0u8..=0x7F)
+            .filter(|&b| is_cookie_octet(b) && b != b'%')
+            .map(char::from)
+            .collect();
+        assert_eq!(CookieValue::encode(&octets).as_str(), octets);
+        assert_eq!(CookieValue::encode("").as_str(), "");
+    }
+
+    #[test]
+    fn cookie_name_encodes_every_byte_outside_token() {
+        for (raw, encoded) in [
+            ("a=b", "a%3Db"),
+            ("sé", "s%C3%A9"),
+            ("a b", "a%20b"),
+            ("a;b", "a%3Bb"),
+            ("(x)", "%28x%29"),
+            ("%", "%25"),
+            ("s%69d", "s%2569d"),
+        ] {
+            assert_eq!(parsed_name(raw).as_str(), encoded, "name {raw:?}");
+            assert_eq!(parsed_name(raw).text(), raw, "name {raw:?}");
+        }
+        let tchars: String = (0u8..=0x7F)
+            .filter(|&b| is_tchar(b) && b != b'%')
+            .map(char::from)
+            .collect();
+        assert_eq!(parsed_name(&tchars).as_str(), tchars);
+    }
+
+    /// Every ASCII byte and non-ASCII text, in name and value, yields a line of
+    /// grammar bytes that is a valid header value.
+    #[test]
+    fn set_cookie_from_any_text_is_a_valid_header_value() {
+        let mut inputs: Vec<String> = (0u8..=0x7F).map(|b| char::from(b).to_string()).collect();
+        inputs.extend(["é".to_owned(), "\u{2028}".to_owned(), "日本".to_owned()]);
+        for raw in &inputs {
+            let name = parsed_name(raw);
+            let value = CookieValue::encode(raw);
+            assert!(name.as_str().bytes().all(is_tchar), "name {raw:?}");
+            assert!(value.as_str().bytes().all(is_cookie_octet), "value {raw:?}");
+            let line = SetCookie::new(
+                &name,
+                &value,
+                CookieAttributes {
+                    path: CookiePath::root(),
+                    http_only: true,
+                    same_site: SameSite::Lax,
+                    secure: true,
+                    max_age_secs: Some(60),
+                },
+            );
+            assert!(
+                axum::http::HeaderValue::from_str(line.as_str()).is_ok(),
+                "{line}"
+            );
+            assert_eq!(
+                line.matches(';').count(),
+                5,
+                "no smuggled attribute: {line}"
+            );
+        }
+    }
+
+    /// A non-ASCII, `;`, `,`, whitespace or `"` value no longer fails the whole
+    /// response: it is answered with the encoded cookie.
+    #[tokio::test]
+    async fn with_cookie_non_cookie_octet_value_keeps_the_response() {
+        let r = server_with_cookie(
+            cookie("sid", "é; a, b \"c\""),
+            server_text("ok".to_string()),
+        );
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let cookies: Vec<_> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(cookies.len(), 1, "{cookies:?}");
+        let Some(Ok(line)) = cookies.first() else {
+            panic!("the Set-Cookie header must be visible ASCII: {cookies:?}");
+        };
+        assert!(
+            line.starts_with("sid=%C3%A9%3B%20a%2C%20b%20%22c%22; Path=/; HttpOnly; SameSite=Lax"),
+            "{line}"
+        );
+    }
+
+    /// `SameSite=None` without `Secure` has no representation: the line
+    /// carries `Secure` even when the caller's `secure` flag is off.
+    #[test]
+    fn same_site_none_always_renders_secure() {
+        let line = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("v"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: true,
+                same_site: SameSite::None,
+                secure: false,
+                max_age_secs: None,
+            },
+        );
+        assert_eq!(
+            line.as_str(),
+            "sid=v; Path=/; HttpOnly; SameSite=None; Secure"
+        );
+        let lax = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("v"),
+            CookieAttributes {
+                path: CookiePath::root(),
+                http_only: false,
+                same_site: SameSite::Lax,
+                secure: false,
+                max_age_secs: Some(5),
+            },
+        );
+        assert_eq!(lax.as_str(), "sid=v; Path=/; SameSite=Lax; Max-Age=5");
+    }
+
+    /// A `Path` value keeps every `av-octet`, encodes CTLs, `;` and non-ASCII,
+    /// and always starts with `/`.
+    #[test]
+    fn cookie_path_encodes_every_byte_outside_av_octet() {
+        for (raw, encoded) in [
+            ("/", "/"),
+            ("", "/"),
+            ("/shop", "/shop"),
+            ("shop", "/shop"),
+            ("/a;b", "/a%3Bb"),
+            ("/a\r\nSet-Cookie: x=y", "/a%0D%0ASet-Cookie: x=y"),
+            ("/caf\u{e9}", "/caf%C3%A9"),
+            ("/a b,c\"d", "/a b,c\"d"),
+        ] {
+            assert_eq!(CookiePath::encode(raw).as_str(), encoded, "path {raw:?}");
+        }
+        let line = SetCookie::new(
+            &parsed_name("sid"),
+            &CookieValue::encode("v"),
+            CookieAttributes {
+                path: CookiePath::encode("/a;Domain=evil.example\r\nX: y"),
+                http_only: true,
+                same_site: SameSite::Lax,
+                secure: true,
+                max_age_secs: None,
+            },
+        );
+        assert!(
+            axum::http::HeaderValue::from_str(line.as_str()).is_ok(),
+            "{line}"
+        );
+        assert_eq!(
+            line.matches(';').count(),
+            4,
+            "no smuggled attribute: {line}"
+        );
+    }
+
+    /// An empty cookie name is an `InvalidInput` error, so no `Set-Cookie`
+    /// line starts with `=`.
+    #[tokio::test]
+    async fn with_cookie_never_emits_nameless_line() {
+        assert!(matches!(
+            server_cookie(String::new(), "a=b".into()),
+            IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, _))
+        ));
+        let mut names: Vec<String> = (0u8..=0x7F).map(|b| char::from(b).to_string()).collect();
+        names.extend(["=".to_owned(), " ".to_owned(), "é".to_owned()]);
+        for raw in &names {
+            let lines = set_cookie_lines(server_with_cookie(
+                cookie(raw, "v"),
+                server_text("ok".to_owned()),
+            ));
+            assert_eq!(lines.len(), 1, "name {raw:?}: {lines:?}");
+            for line in &lines {
+                assert!(!line.starts_with('='), "name {raw:?}: {line}");
+                let Some((wire, _)) = line.split_once('=') else {
+                    panic!("name {raw:?}: the Set-Cookie line has no `=`: {line}");
+                };
+                assert!(!wire.is_empty(), "name {raw:?}: {line}");
+                assert!(wire.bytes().all(is_tchar), "name {raw:?}: {line}");
+            }
+        }
+    }
+
+    /// Any name and value `Server.cookie` writes reads back unchanged through
+    /// the request parser and `Server.getCookie`.
+    #[tokio::test]
+    async fn cookie_round_trips_through_get_cookie() {
+        let mut texts: Vec<String> = (0u8..=0x7F).map(|b| char::from(b).to_string()).collect();
+        texts.extend(
+            [
+                "%41", "%", "%%", "%ZZ", "é", "日本", "my sid", "\u{2028}", "😀", "a=b; c",
+            ]
+            .map(str::to_owned),
+        );
+        for name in &texts {
+            for value in [name.as_str(), "", "%41", "é;%"] {
+                let lines = set_cookie_lines(server_with_cookie(
+                    cookie(name, value),
+                    server_text("ok".to_owned()),
+                ));
+                assert_eq!(lines.len(), 1, "name {name:?}: {lines:?}");
+                let Some((pair, _)) = lines.first().and_then(|l| l.split_once(';')) else {
+                    panic!("name {name:?} value {value:?}: no `name=value;` pair in {lines:?}");
+                };
+                let mut jar = HashMap::new();
+                parse_cookies([format!("other=1; {pair}").as_bytes()], &mut jar);
+                let req = mk_req("GET", jar, HashMap::new());
+                assert_eq!(
+                    server_get_cookie(name.clone(), req),
+                    IpeMaybe::Just(value.to_owned()),
+                    "name {name:?} value {value:?} via {pair:?}"
+                );
+            }
+        }
+    }
+
+    /// A `%` without two hex digits, or bytes that are not UTF-8, have no
+    /// decoding: the cookie is absent, never a lossy value.
+    #[test]
+    fn undecodable_cookie_is_nothing() {
+        for wire in ["%ZZ", "%C3", "%FF%FE", "%4", "%", "a%G1"] {
+            assert_eq!(
+                crate::http_header::cookie::decode(wire),
+                None,
+                "wire {wire:?}"
+            );
+        }
+        assert_eq!(
+            crate::http_header::cookie::decode("%C3%A9%25"),
+            Some("é%".to_owned())
+        );
+        let mut jar = HashMap::new();
+        parse_cookies(
+            [b"a=%ZZ; b=%C3; c=%FF%FE; d=%4; e=ok; =v; s%69d=v".as_slice()],
+            &mut jar,
+        );
+        assert_eq!(jar.len(), 1, "{jar:?}");
+        assert_eq!(jar.get("e").map(String::as_str), Some("ok"));
+        for name in ["a", "b", "c", "d", "", "sid", "s%69d"] {
+            let req = mk_req("GET", jar.clone(), HashMap::new());
+            assert_eq!(
+                server_get_cookie(name.to_owned(), req),
+                IpeMaybe::Nothing,
+                "name {name:?}"
+            );
+        }
+    }
+
+    /// Every header lookup keys on the encoded name: a lookup by `ipe_sid`
+    /// never matches a cookie whose wire name only decodes to it.
+    #[test]
+    fn request_cookie_keys_on_the_encoded_name() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("ipe%5Fsid=forged; my%20sid=a%3Bb"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("ipe_sid=real; ipe_sid=second"),
+        );
+        assert_eq!(
+            request_cookie(&headers, &parsed_name("ipe_sid")),
+            Some("real".to_owned())
+        );
+        assert_eq!(
+            request_cookie(&headers, &parsed_name("my sid")),
+            Some("a;b".to_owned())
+        );
+        assert_eq!(request_cookie(&headers, &parsed_name("ipe%5Fsid")), None);
+    }
+
+    /// A lookup reads the session cookie beside a pair with a non-ASCII byte.
+    #[test]
+    fn request_cookie_reads_beside_a_non_ascii_pair() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_bytes(b"x=\x80; ipe_sid=real")
+                .expect("obs-text is a valid header value"),
+        );
+        assert_eq!(
+            request_cookie(&headers, &parsed_name("ipe_sid")),
+            Some("real".to_owned())
+        );
+        assert_eq!(request_cookie(&headers, &parsed_name("x")), None);
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500: no response ships with
+    /// a header set missing its framing policy.
+    #[test]
+    fn response_refuses_a_refused_framing_policy() {
+        let refused = to_axum_response_with(
+            server_text("ok".to_owned()),
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
+        assert_eq!(
+            refused.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(refused.headers().get("x-frame-options").is_none());
+        let framed = to_axum_response_with(
+            server_text("ok".to_owned()),
+            Ok(vec![("x-frame-options", "SAMEORIGIN".to_owned())]),
+        );
+        assert_eq!(framed.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            framed
+                .headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("SAMEORIGIN")
+        );
+    }
+
+    /// The `InvalidInput` message of a refused `Server.withHeader`, or `None`
+    /// when the header was accepted.
+    fn with_header_refusal(name: &str, value: &str) -> Option<String> {
+        match server_with_header(
+            name.to_owned(),
+            value.to_owned(),
+            server_text("ok".to_owned()),
+        ) {
+            IpeResult::Ok(_) => None,
+            IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, info)) => Some(info.message),
+            IpeResult::Err(IpeError::Error(_, info)) => {
+                Some(format!("wrong kind: {}", info.message))
+            }
+        }
+    }
+
+    /// A header value with CR/LF, a name that is not a `token`, and
+    /// `Set-Cookie` in any case are refused; a valid header is kept.
+    #[tokio::test]
+    async fn with_header_refuses_unrepresentable_headers() {
+        for (name, value) in [
+            ("X-Ok", "a\r\nSet-Cookie: x=y"),
+            ("X-Ok", "a\nb"),
+            ("X-Ok", "caf\u{e9}"),
+            ("X Bad", "v"),
+            ("X-Bad:", "v"),
+            ("", "v"),
+        ] {
+            let refusal = with_header_refusal(name, value);
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("Server.withHeader:")),
+                "{name:?}: {value:?} -> {refusal:?}"
+            );
+        }
+        for name in ["Set-Cookie", "set-cookie", "SET-COOKIE"] {
+            let refusal = with_header_refusal(name, "sid=1");
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|m| m.contains("Server.withCookie")),
+                "{name:?} -> {refusal:?}"
+            );
+        }
+        for name in [
+            "Content-Length",
+            "content-length",
+            "Transfer-Encoding",
+            "TRANSFER-ENCODING",
+        ] {
+            let refusal = with_header_refusal(name, "5");
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|m| m.contains("set by the server")),
+                "{name:?} -> {refusal:?}"
+            );
+        }
+        assert_eq!(with_header_refusal("X-Frame-Options", "DENY"), None);
+        let IpeResult::Ok(r) = server_with_header(
+            "X-Frame-Options".to_owned(),
+            "DENY".to_owned(),
+            server_text("ok".to_owned()),
+        ) else {
+            panic!("`X-Frame-Options: DENY` must be accepted by `withHeader`");
+        };
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-frame-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY")
+        );
+    }
+
+    /// A raw header a `Response` record update carries past `withHeader` is
+    /// parsed again: a `Set-Cookie` or CR/LF header answers 500, never a line.
+    #[tokio::test]
+    async fn to_axum_response_refuses_a_raw_unrepresentable_header() {
+        for (name, value) in [
+            ("Set-Cookie", "sid=forged; Path=/"),
+            ("set-cookie", "sid=forged"),
+            ("X-Ok", "a\r\nSet-Cookie: sid=forged"),
+            ("X Bad", "v"),
+            ("Content-Length", "0"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            let mut r = server_text("ok".to_owned());
+            r.headers.insert(name.to_owned(), value.to_owned());
+            let resp = to_axum_response(r);
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{name:?}: {value:?}"
+            );
+            assert!(
+                resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+                "{name:?}: {value:?}"
+            );
+        }
+    }
+
+    /// A cookie line with no header representation answers 500, never a
+    /// response that drops the cookie or splits the line.
+    #[tokio::test]
+    async fn to_axum_response_refuses_an_unrepresentable_cookie_line() {
+        let mut r = server_text("ok".to_owned());
+        r.cookies
+            .push(SetCookie::unchecked_for_test("sid=a\r\nX-Injected: 1"));
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-injected").is_none());
+    }
+
+    /// A `stream` response whose handler emits nothing.
+    async fn streamed(content_type: &str) -> ServerResponse {
+        let task = server_stream_stream::<IpeError, _>(content_type.to_owned(), |_w| {
+            Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+        });
+        let built = match task.await {
+            IpeResult::Ok(r) => Some(r),
+            IpeResult::Err(_) => None,
+        };
+        built.expect("`stream` must build a response")
+    }
+
+    /// The security headers `to_axum_response_with` is handed in these tests.
+    fn framed_security()
+    -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
+        Ok(vec![
+            ("x-content-type-options", "nosniff".to_owned()),
+            ("x-frame-options", "SAMEORIGIN".to_owned()),
+        ])
+    }
+
+    /// The one value of header `name` in `resp`, or `None` for none or several.
+    fn single_header<'a>(resp: &'a axum::response::Response, name: &str) -> Option<&'a str> {
+        let mut all = resp.headers().get_all(name).iter();
+        let first = all.next()?;
+        if all.next().is_some() {
+            return None;
+        }
+        first.to_str().ok()
+    }
+
+    /// A streamed response carries the framing and `nosniff` headers, its
+    /// content type and the streaming hints; a handler header overrides a hint.
+    #[tokio::test]
+    async fn streamed_response_carries_the_security_headers() {
+        let mut r = streamed("text/event-stream").await;
+        r.headers
+            .insert("Cache-Control".to_owned(), "no-store".to_owned());
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(single_header(&resp, "x-frame-options"), Some("SAMEORIGIN"));
+        assert_eq!(
+            single_header(&resp, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            single_header(&resp, "content-type"),
+            Some("text/event-stream")
+        );
+        assert_eq!(single_header(&resp, "x-accel-buffering"), Some("no"));
+        assert_eq!(single_header(&resp, "cache-control"), Some("no-store"));
+    }
+
+    /// A streamed response sends every `Set-Cookie` line of its `cookies`.
+    #[tokio::test]
+    async fn streamed_response_emits_its_set_cookie_lines() {
+        let mut r = streamed("text/event-stream").await;
+        r = server_with_cookie(cookie("a", "1"), r);
+        r = server_with_cookie(cookie("b", "2"), r);
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let lines: Vec<_> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("a=1")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("b=2")), "{lines:?}");
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500 on a streamed response.
+    #[tokio::test]
+    async fn streamed_response_refuses_a_refused_framing_policy() {
+        let r = streamed("text/event-stream").await;
+        let resp = to_axum_response_with(r, Err(crate::telemetry::FrameAncestorsRefusal::Blank));
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("x-frame-options").is_none());
+        assert!(resp.headers().get("x-accel-buffering").is_none());
+    }
+
+    /// A raw header with no representation is the same typed refusal on a
+    /// buffered and a streamed head, and answers 500 on a streamed response.
+    #[tokio::test]
+    async fn buffered_and_streamed_heads_refuse_raw_headers_alike() {
+        for (name, value) in [
+            ("Set-Cookie", "sid=forged; Path=/"),
+            ("set-cookie", "sid=forged"),
+            ("X-Ok", "a\r\nSet-Cookie: sid=forged"),
+            ("X-Ok", "a\nb"),
+            ("X Bad", "v"),
+            ("Content-Length", "0"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            let mut buffered = server_text("ok".to_owned());
+            buffered.headers.insert(name.to_owned(), value.to_owned());
+            for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+                assert!(
+                    matches!(
+                        assemble_response_head(&buffered, delivery, framed_security()),
+                        Err(response_head::HeadRefusal::Header)
+                    ),
+                    "{name:?}: {value:?} under {delivery:?}"
+                );
+            }
+            let mut r = streamed("text/event-stream").await;
+            r.headers.insert(name.to_owned(), value.to_owned());
+            let resp = to_axum_response_with(r, framed_security());
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{name:?}: {value:?}"
+            );
+            assert!(
+                resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+                "{name:?}: {value:?}"
+            );
+        }
+    }
+
+    /// Two handler headers naming one header in different cases are the same
+    /// typed refusal on a buffered and a streamed head, and answer 500 on
+    /// both deliveries: the head never depends on `HashMap` iteration order.
+    #[tokio::test]
+    async fn heads_refuse_two_spellings_of_one_header_name() {
+        for [(first, first_value), (second, second_value)] in [
+            [
+                ("Content-Type", "text/html"),
+                ("content-type", "text/plain"),
+            ],
+            [("X-Custom", "a"), ("x-CUSTOM", "b")],
+        ] {
+            let mut buffered = server_text("ok".to_owned());
+            buffered
+                .headers
+                .insert(first.to_owned(), first_value.to_owned());
+            buffered
+                .headers
+                .insert(second.to_owned(), second_value.to_owned());
+            for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+                assert!(
+                    matches!(
+                        assemble_response_head(&buffered, delivery, framed_security()),
+                        Err(response_head::HeadRefusal::Header)
+                    ),
+                    "{first:?}/{second:?} under {delivery:?}"
+                );
+            }
+            let resp = to_axum_response_with(buffered, framed_security());
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{first:?}/{second:?}"
+            );
+            let mut r = streamed("text/event-stream").await;
+            r.headers.insert(first.to_owned(), first_value.to_owned());
+            r.headers.insert(second.to_owned(), second_value.to_owned());
+            let resp = to_axum_response_with(r, framed_security());
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{first:?}/{second:?}"
+            );
+            assert!(resp.headers().get("x-accel-buffering").is_none());
+        }
+    }
+
+    /// `Server.withHeader` replaces a header of the same name in any case, so
+    /// a response it builds holds one value per header name.
+    #[test]
+    fn with_header_replaces_a_header_of_the_same_name_in_any_case() {
+        let set = |k: &str, v: &str, r: ServerResponse| {
+            let built = match server_with_header(k.to_owned(), v.to_owned(), r) {
+                IpeResult::Ok(r) => Some(r),
+                IpeResult::Err(_) => None,
+            };
+            built.expect("a token name and a visible-ASCII value are a header")
+        };
+        let r = set("Location", "/b", server_redirect("/a".to_owned()));
+        let r = set("X-Custom", "1", r);
+        let r = set("x-custom", "2", r);
+        assert_eq!(r.headers.len(), 2, "{:?}", r.headers);
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
+        assert_eq!(single_header(&resp, "location"), Some("/b"));
+        assert_eq!(single_header(&resp, "x-custom"), Some("2"));
+    }
+
+    /// The response `middleware_with_cors` allowing `origins` makes of a
+    /// `method` request carrying `origin`, whose handler set `headers`, as it
+    /// is sent.
+    async fn cors_tagged(
+        origins: &[&str],
+        method: &str,
+        origin: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let set: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let h = middleware_with_cors::<String, _>(
+            origins.iter().map(|o| (*o).to_owned()).collect(),
+            move |_req: ServerRequest| {
+                let mut r = server_text("ok".into());
+                for (k, v) in set.clone() {
+                    r = match server_with_header(k, v, r) {
+                        IpeResult::Ok(r) => r,
+                        IpeResult::Err(e) => panic!("handler header refused: {e:?}"),
+                    };
+                }
+                Box::pin(ready(ok_res::<String, _>(r))) as IpeTask<String, ServerResponse>
+            },
+        );
+        cors_sent(&h, method, origin).await
+    }
+
+    /// What handler `h` answers a `method` request carrying `origin`, as it is
+    /// sent.
+    async fn cors_sent(
+        h: &ServerHandler<String>,
+        method: &str,
+        origin: Option<&str>,
+    ) -> axum::response::Response {
+        let mut req_headers = HashMap::new();
+        if let Some(o) = origin {
+            req_headers.insert("Origin".to_owned(), o.to_owned());
+        }
+        let IpeResult::Ok(r) = h(mk_req(method, HashMap::new(), req_headers)).await else {
+            panic!("the CORS middleware must pass the handler's response through");
+        };
+        to_axum_response_with(r, framed_security())
+    }
+
+    /// A handler's `Access-Control-Allow-Origin` in any case is replaced by
+    /// the middleware's grant: the sent head carries exactly one value.
+    #[tokio::test]
+    async fn cors_replaces_a_handler_allow_origin_in_any_case() {
+        for name in [
+            "Access-Control-Allow-Origin",
+            "ACCESS-CONTROL-ALLOW-ORIGIN",
+            "access-control-allow-origin",
+        ] {
+            for (origins, granted) in [
+                (&["https://a.example"][..], "https://a.example"),
+                (&["*"][..], "*"),
+            ] {
+                let resp = cors_tagged(
+                    origins,
+                    "GET",
+                    Some("https://a.example"),
+                    &[(name, "https://evil.example")],
+                )
+                .await;
+                assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+                assert_eq!(
+                    single_header(&resp, "access-control-allow-origin"),
+                    Some(granted),
+                    "{name} / {origins:?}"
+                );
+            }
+        }
+    }
+
+    /// A handler's `Vary` in any case is merged with `Origin` into one value,
+    /// and a `Vary` already naming `Origin` is kept as is.
+    #[tokio::test]
+    async fn cors_merges_a_handler_vary_in_any_case_into_one_value() {
+        let allowed = Some("https://a.example");
+        for name in ["Vary", "VARY", "vary"] {
+            let resp = cors_tagged(
+                &["https://a.example"],
+                "GET",
+                allowed,
+                &[(name, "Accept-Encoding")],
+            )
+            .await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+            assert_eq!(
+                single_header(&resp, "vary"),
+                Some("Accept-Encoding, Origin"),
+                "{name}"
+            );
+            let resp =
+                cors_tagged(&["https://a.example"], "GET", allowed, &[(name, "origin")]).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+            assert_eq!(single_header(&resp, "vary"), Some("origin"), "{name}");
+        }
+        let resp = cors_tagged(&["https://a.example"], "GET", allowed, &[]).await;
+        assert_eq!(single_header(&resp, "vary"), Some("Origin"));
+    }
+
+    /// Under an allowlist, a refused origin's response names `Origin` in `Vary`
+    /// and carries no grant, so a shared cache never serves it to an allowed
+    /// origin.
+    #[tokio::test]
+    async fn cors_refused_origin_varies_on_origin_without_a_grant() {
+        let resp = cors_tagged(
+            &["https://a.example"],
+            "GET",
+            Some("https://evil.example"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(single_header(&resp, "vary"), Some("Origin"));
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    /// Under an allowlist, an absent or empty `Origin` is refused and still
+    /// varies on `Origin`, an empty allowlist entry included.
+    #[tokio::test]
+    async fn cors_absent_or_empty_origin_varies_on_origin_without_a_grant() {
+        for (origins, origin) in [
+            (&["https://a.example"][..], None),
+            (&["https://a.example"][..], Some("")),
+            (&["", "https://a.example"][..], Some("")),
+            (&["", "https://a.example"][..], None),
+        ] {
+            let resp = cors_tagged(origins, "GET", origin, &[]).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::OK,
+                "{origins:?} / {origin:?}"
+            );
+            assert_eq!(
+                single_header(&resp, "vary"),
+                Some("Origin"),
+                "{origins:?} / {origin:?}"
+            );
+            assert!(
+                resp.headers().get("access-control-allow-origin").is_none(),
+                "{origins:?} / {origin:?}"
+            );
+        }
+    }
+
+    /// Under an allowlist, every preflight answer varies on `Origin`, and only
+    /// an allowed origin's carries a grant.
+    #[tokio::test]
+    async fn cors_preflight_varies_on_origin_for_every_origin() {
+        for (origin, granted) in [
+            (Some("https://a.example"), Some("https://a.example")),
+            (Some("https://evil.example"), None),
+            (None, None),
+        ] {
+            let resp = cors_tagged(&["https://a.example"], "OPTIONS", origin, &[]).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NO_CONTENT,
+                "{origin:?}"
+            );
+            assert_eq!(single_header(&resp, "vary"), Some("Origin"), "{origin:?}");
+            assert_eq!(
+                resp.headers()
+                    .get_all("access-control-allow-origin")
+                    .iter()
+                    .count(),
+                usize::from(granted.is_some()),
+                "{origin:?}"
+            );
+            assert_eq!(
+                single_header(&resp, "access-control-allow-origin"),
+                granted,
+                "{origin:?}"
+            );
+        }
+    }
+
+    /// Under an allowlist, a handler's `Access-Control-Allow-Origin` in any
+    /// case never reaches a refused or origin-less request.
+    #[tokio::test]
+    async fn cors_refused_origin_strips_a_handler_allow_origin_in_any_case() {
+        for name in [
+            "Access-Control-Allow-Origin",
+            "ACCESS-CONTROL-ALLOW-ORIGIN",
+            "access-control-allow-origin",
+        ] {
+            for origin in [Some("https://evil.example"), None] {
+                let resp = cors_tagged(
+                    &["https://a.example"],
+                    "GET",
+                    origin,
+                    &[(name, "https://evil.example")],
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    axum::http::StatusCode::OK,
+                    "{name} / {origin:?}"
+                );
+                assert!(
+                    resp.headers().get("access-control-allow-origin").is_none(),
+                    "{name} / {origin:?}"
+                );
+                assert_eq!(
+                    single_header(&resp, "vary"),
+                    Some("Origin"),
+                    "{name} / {origin:?}"
+                );
+            }
+        }
+    }
+
+    /// An inner middleware's refusal is tagged like any handler response: it
+    /// varies on `Origin`, and grants only an allowed origin.
+    #[tokio::test]
+    async fn cors_inner_refusal_is_tagged_like_any_response() {
+        let h = middleware_with_cors::<String, _>(
+            vec!["https://a.example".to_owned()],
+            middleware_with_basic_auth::<String, _>(
+                "u".to_owned(),
+                "p".to_owned(),
+                |_req: ServerRequest| {
+                    Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
+                        as IpeTask<String, ServerResponse>
+                },
+            ),
+        );
+        for (origin, granted) in [
+            ("https://evil.example", None),
+            ("https://a.example", Some("https://a.example")),
+        ] {
+            let resp = cors_sent(&h, "GET", Some(origin)).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{origin}"
+            );
+            assert_eq!(single_header(&resp, "vary"), Some("Origin"), "{origin}");
+            assert_eq!(
+                resp.headers()
+                    .get_all("access-control-allow-origin")
+                    .iter()
+                    .count(),
+                usize::from(granted.is_some()),
+                "{origin}"
+            );
+            assert_eq!(
+                single_header(&resp, "access-control-allow-origin"),
+                granted,
+                "{origin}"
+            );
+        }
+    }
+
+    /// A list containing `*` grants every origin and never adds `Vary`: no
+    /// response depends on `Origin`.
+    #[tokio::test]
+    async fn cors_wildcard_policy_never_adds_vary() {
+        for origins in [&["*"][..], &["https://a.example", "*"][..]] {
+            for method in ["GET", "OPTIONS"] {
+                for origin in [
+                    Some("https://a.example"),
+                    Some("https://evil.example"),
+                    None,
+                ] {
+                    let resp = cors_tagged(origins, method, origin, &[]).await;
+                    assert_eq!(
+                        single_header(&resp, "access-control-allow-origin"),
+                        Some("*"),
+                        "{origins:?} / {method} / {origin:?}"
+                    );
+                    assert!(
+                        resp.headers().get("vary").is_none(),
+                        "{origins:?} / {method} / {origin:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A handler's `Vary: *` already varies on every header, so it is kept as
+    /// is for an allowed and a refused origin alike.
+    #[tokio::test]
+    async fn cors_vary_star_is_kept() {
+        for origin in [Some("https://a.example"), Some("https://evil.example")] {
+            let resp = cors_tagged(&["https://a.example"], "GET", origin, &[("Vary", "*")]).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{origin:?}");
+            assert_eq!(single_header(&resp, "vary"), Some("*"), "{origin:?}");
+        }
+    }
+
+    /// More handler header names than a header map holds is a typed refusal,
+    /// never a capacity panic.
+    #[test]
+    fn head_refuses_more_header_names_than_a_header_map_holds() {
+        let mut r = server_text("ok".to_owned());
+        for i in 0..=(1_usize << 15) {
+            r.headers.insert(format!("x-h{i}"), "v".to_owned());
+        }
+        for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+            assert!(
+                matches!(
+                    assemble_response_head(&r, delivery, framed_security()),
+                    Err(response_head::HeadRefusal::Oversize)
+                ),
+                "{delivery:?}"
+            );
+        }
+    }
+
+    /// A content type that is not a visible-ASCII header value answers 500 on
+    /// a buffered and a streamed response alike, as the same handler header.
+    #[tokio::test]
+    async fn heads_refuse_a_non_ascii_content_type() {
+        let mut buffered = server_text("ok".to_owned());
+        buffered.contentType = "text/\u{e9}".to_owned();
+        for delivery in [ServerDelivery::Buffered, ServerDelivery::Streamed] {
+            assert!(
+                matches!(
+                    assemble_response_head(&buffered, delivery, framed_security()),
+                    Err(response_head::HeadRefusal::ContentType)
+                ),
+                "{delivery:?}"
+            );
+        }
+        let resp = to_axum_response_with(buffered, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = to_axum_response_with(streamed("text/\u{e9}").await, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .is_none()
+        );
+    }
+
+    /// A refused head never runs the stream handler; an assembled head does.
+    #[tokio::test]
+    async fn refused_head_never_runs_the_stream_handler() {
+        let stream_with_flag = |ran: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            server_stream_stream::<IpeError, _>("text/event-stream".to_owned(), move |_w| {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+            })
+        };
+        let built = |result: IpeResult<IpeError, ServerResponse>| {
+            let built = match result {
+                IpeResult::Ok(r) => Some(r),
+                IpeResult::Err(_) => None,
+            };
+            built.expect("`stream` must build a response")
+        };
+        let refused_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = built(stream_with_flag(refused_ran.clone()).await);
+        let resp = to_axum_response_with(r, Err(crate::telemetry::FrameAncestorsRefusal::Blank));
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!refused_ran.load(std::sync::atomic::Ordering::SeqCst));
+        let served_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = built(stream_with_flag(served_ran.clone()).await);
+        let resp = to_axum_response_with(r, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        for _ in 0..1024 {
+            if served_ran.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(served_ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A stream sentinel served a second time has no live handler: it answers
+    /// 500, never a buffered body that sends the sentinel nonce.
+    #[tokio::test]
+    async fn abandoned_stream_sentinel_answers_500_without_the_sentinel() {
+        let r = streamed("text/event-stream").await;
+        let again = r.clone();
+        let first = to_axum_response_with(r, framed_security());
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let second = to_axum_response_with(again, framed_security());
+        assert_eq!(
+            second.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum_body_string(second).await;
+        assert!(!body.contains("__ipe_stream:"), "{body:?}");
+    }
+
+    /// `redirect` percent-encodes CTLs, space, non-ASCII and the characters
+    /// RFC 3986 neither reserves nor leaves unreserved; reserved characters
+    /// and existing `%XX` escapes are kept.
+    #[tokio::test]
+    async fn redirect_location_is_percent_encoded() {
+        for (raw, location) in [
+            ("/a b/caf\u{e9}?q=1&r=[x]#f", "/a%20b/caf%C3%A9?q=1&r=[x]#f"),
+            ("/%41", "/%41"),
+            ("/a\r\nSet-Cookie: x=y", "/a%0D%0ASet-Cookie:%20x=y"),
+            (
+                "https://e.example/p?x=\"<{|}>\"",
+                "https://e.example/p?x=%22%3C%7B%7C%7D%3E%22",
+            ),
+            ("/\u{65e5}", "/%E6%97%A5"),
+        ] {
+            let resp = to_axum_response(server_redirect(raw.to_owned()));
+            assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "{raw:?}");
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some(location),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// A parsed non-empty cookie name for a test.
+    #[cfg(feature = "jwt")]
+    fn sid(raw: &str) -> CookieName {
+        CookieName::parse(raw).unwrap()
+    }
+
+    /// `Server.cookieToken ""` is an `InvalidInput` error: no cookie source
+    /// names a cookie no request can carry.
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn cookie_token_empty_name_is_refused() {
+        assert!(matches!(
+            server_cookie_token(String::new()),
+            IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, ref info))
+                if info.message.starts_with("Server.cookieToken:")
+        ));
+        assert!(matches!(
+            server_cookie_token("my sid".to_owned()),
+            IpeResult::Ok(TokenSource::Cookie(ref name)) if name.as_str() == "my%20sid"
+        ));
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn reissue_set_cookie_encodes_name_and_token() {
+        let line = reissue_set_cookie(&sid("my sid"), "t;ok", 1800, false);
+        assert!(
+            line.starts_with("my%20sid=t%3Bok; Path=/; HttpOnly; SameSite="),
+            "{line}"
+        );
+        assert!(
+            axum::http::HeaderValue::from_str(line.as_str()).is_ok(),
+            "{line}"
+        );
     }
 
     fn mk_req(
@@ -4104,7 +5917,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_without_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert(csrf_cookie_name().to_string(), "a".repeat(64));
+        cookies.insert(csrf_cookie_name().text().to_owned(), "a".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
             Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
                 as IpeTask<String, ServerResponse>
@@ -4120,7 +5933,7 @@ mod tests {
     async fn csrf_post_with_matching_cookie_and_header_allowed() {
         let tok = "b".repeat(64);
         let mut cookies = HashMap::new();
-        cookies.insert(csrf_cookie_name().to_string(), tok.clone());
+        cookies.insert(csrf_cookie_name().text().to_owned(), tok.clone());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), tok);
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4137,7 +5950,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_mismatched_cookie_and_header_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert(csrf_cookie_name().to_string(), "c".repeat(64));
+        cookies.insert(csrf_cookie_name().text().to_owned(), "c".repeat(64));
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "d".repeat(64));
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4158,7 +5971,7 @@ mod tests {
     #[tokio::test]
     async fn csrf_post_with_matching_but_malformed_tokens_rejected() {
         let mut cookies = HashMap::new();
-        cookies.insert(csrf_cookie_name().to_string(), "x".to_string());
+        cookies.insert(csrf_cookie_name().text().to_owned(), "x".to_string());
         let mut headers = HashMap::new();
         headers.insert("x-csrf-token".to_string(), "x".to_string());
         let h = middleware_with_csrf::<String, _>(|_req: ServerRequest| {
@@ -4238,13 +6051,7 @@ mod tests {
         let tok = "e".repeat(64);
         let csrf = csrf_set_cookie_value(&tok, false);
         let name = csrf_cookie_name();
-        let resp = server_with_cookie(
-            ServerCookie {
-                name: "sid".to_owned(),
-                value: crate::redact::Redacted::new("v".to_owned()),
-            },
-            server_text("ok".into()),
-        );
+        let resp = server_with_cookie(cookie("sid", "v"), server_text("ok".into()));
         #[cfg(feature = "web")]
         let web_secure = crate::web::csrf::cookies_secure();
         #[cfg(not(feature = "web"))]
@@ -4252,7 +6059,7 @@ mod tests {
         crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
         assert!(csrf.contains("; Secure"), "{csrf}");
-        assert_eq!(name, "__Host-ipe_csrf");
+        assert_eq!(name.as_str(), "__Host-ipe_csrf");
         assert!(
             resp.cookies.iter().all(|c| c.contains("; Secure")),
             "{:?}",
@@ -4431,7 +6238,7 @@ mod tests {
             let token = hs256(&serde_json::json!({ "sub": "user-9", "exp": 9_999_999_999i64 }));
             let cfg = server_auth_config(
                 crate::secret::secret_from_string(SECRET.to_string()),
-                TokenSource::Cookie("ipe_sid".to_string()),
+                TokenSource::Cookie(sid("ipe_sid")),
             );
             let resp = run(cfg, req_with(&[], &[("ipe_sid", &token)])).await;
             assert_eq!(resp.status, 200, "a valid cookie token must dispatch");
@@ -4465,7 +6272,7 @@ mod tests {
         fn cookie_cfg() -> AuthConfig {
             server_auth_config(
                 crate::secret::secret_from_string(SECRET.to_string()),
-                TokenSource::Cookie("ipe_sid".to_string()),
+                TokenSource::Cookie(sid("ipe_sid")),
             )
         }
 
@@ -4573,13 +6380,13 @@ mod tests {
             let dev = crate::telemetry::test_dev_intent();
             let floor = cookie_secure_floor_with(Some(&dev));
 
-            let c_https = reissue_set_cookie_with("ipe_sid", "tok", 1800, true);
+            let c_https = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, true);
             assert!(
                 c_https.contains("; Secure"),
                 "reissue behind TLS proxy must carry Secure: {c_https}"
             );
 
-            let c_plain = reissue_set_cookie_with("ipe_sid", "tok", 1800, floor);
+            let c_plain = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, floor);
             assert!(
                 !c_plain.contains("; Secure"),
                 "reissue over plain HTTP in dev must NOT carry Secure: {c_plain}"
@@ -4598,7 +6405,7 @@ mod tests {
             let is_https = request_is_https_with_trust(&headers, true);
             assert!(is_https, "trusted HTTPS header must be detected");
 
-            let cookie = reissue_set_cookie("ipe_sid", "tok", 1800, is_https);
+            let cookie = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, is_https);
             assert!(
                 cookie.contains("; Secure"),
                 "reissue with HTTPS proxy signal must carry Secure: {cookie}"
@@ -4611,7 +6418,7 @@ mod tests {
         #[test]
         fn reissue_set_cookie_secure_on_release_under_env_dev() {
             crate::system::locked_set_var("ENV", "dev");
-            let cookie = reissue_set_cookie("ipe_sid", "tok", 1800, false);
+            let cookie = reissue_set_cookie(&sid("ipe_sid"), "tok", 1800, false);
             crate::system::locked_remove_var("ENV");
             assert!(cookie.contains("; Secure"), "{cookie}");
         }
@@ -4626,7 +6433,7 @@ mod tests {
 
             let dev = crate::telemetry::test_dev_intent();
             let secure = cookie_secure_floor_with(Some(&dev)) || is_https;
-            let cookie = reissue_set_cookie_with("ipe_sid", "tok", 1800, secure);
+            let cookie = reissue_set_cookie_with(&sid("ipe_sid"), "tok", 1800, secure);
             assert!(
                 !cookie.contains("; Secure"),
                 "reissue over plain HTTP must NOT carry Secure: {cookie}"

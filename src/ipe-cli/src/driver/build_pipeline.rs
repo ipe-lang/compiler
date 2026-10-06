@@ -326,10 +326,9 @@ pub fn build_with_options_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
-    let source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     // Parse ONCE with a throwaway interner to learn the entry's declared module
     // path. Using the declared name as the entry's `module_path` means the shared
@@ -424,7 +423,7 @@ pub fn build_loose_file_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
     let collected = collect_entry_and_siblings(entry)?;
 
@@ -464,7 +463,7 @@ pub fn build_test_into(
     test_entry: &Path,
     out: OutTarget<'_>,
     runtime_dir: &Path,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let project = ProjectPaths::of_file(test_entry).with_sources(project_src_root);
     let target = out.prove(&project)?;
     let collected = collect_test_sources(project_src_root, tests_root, test_entry)?;
@@ -549,8 +548,10 @@ pub fn collect_manifest_rooted_entry(
     src_root: &Path,
     entry: &Path,
 ) -> Result<CollectedSources, CliError> {
+    // A named file reaches here canonicalised, its links already resolved, so
+    // it is read beneath `src_root` like the convention entry: never followed.
     let entry_source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+        crate::io_bounded::read_beneath(src_root, entry, crate::io_bounded::SOURCE_CAP)?;
     let entry_module_path = parse_entry_module_path(entry, &entry_source)?;
 
     let mut discovered = project::discover_modules(src_root)?;
@@ -589,8 +590,10 @@ pub fn collect_test_sources(
     tests_root: &Path,
     test_entry: &Path,
 ) -> Result<CollectedSources, CliError> {
+    // A named test file reaches here canonicalised, its links already resolved;
+    // `ipe verify`'s `tests/Main.ipe` is a convention file. Neither is followed.
     let entry_source =
-        crate::io_bounded::read_to_string_capped(test_entry, crate::io_bounded::SOURCE_READ_CAP)?;
+        crate::io_bounded::read_beneath(tests_root, test_entry, crate::io_bounded::SOURCE_CAP)?;
     let entry_module_path = parse_entry_module_path(test_entry, &entry_source)?;
 
     // The `tests/` tree is rooted at `tests_root` (the caller's, e.g. the
@@ -915,7 +918,7 @@ pub fn compile_modules(
     blame_path: &Path,
     db_driver: ipe_backend_rust::DbDriver,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let cache_site = cache::env_cache_dir(&target.path()?);
     compile_modules_observed(
         sources,
@@ -970,7 +973,7 @@ pub fn compile_modules_observed(
     db_driver: ipe_backend_rust::DbDriver,
     cache_site: Option<&cache::CacheSite>,
     options: BuildOptions,
-) -> (Result<OwnedDir, CliError>, CacheOutcome) {
+) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
     // Inject the transitive compiled-source stdlib closure. `injected` is the
     // driver's unforgeable record of which module paths are trusted stdlib
     // source — the ONLY inputs that earn `ModuleOrigin::EmbeddedStdlib` below.
@@ -1045,6 +1048,7 @@ pub fn compile_modules_observed(
                 runtime_dir,
                 options.static_plan.as_ref(),
                 options.tree_shake_vendored,
+                crate::run_sandbox::EmitFloor::of(options.intent, options.target),
             ),
             CacheOutcome::Hit,
         );
@@ -1113,12 +1117,13 @@ pub fn compile_modules_observed(
                     runtime_dir,
                     options.static_plan.as_ref(),
                     options.tree_shake_vendored,
+                    crate::run_sandbox::EmitFloor::of(options.intent, options.target),
                 );
                 // Warm the (cheaper-to-hit) EmittedProject tier for the
                 // next build too — advisory, best-effort, and rooted in the
                 // claim the write returned.
                 if let Ok(claimed) = &written
-                    && let Some(root) = site.root(claimed)
+                    && let Some(root) = site.root(claimed.dir())
                 {
                     cache::store(&root, epoch, &cache_key, &emitted);
                 }
@@ -1175,6 +1180,7 @@ pub fn compile_modules_observed(
         runtime_dir,
         options.static_plan.as_ref(),
         options.tree_shake_vendored,
+        crate::run_sandbox::EmitFloor::of(options.intent, options.target),
     );
 
     // A writable cache root comes only from the claim the write above
@@ -1182,7 +1188,7 @@ pub fn compile_modules_observed(
     // the target is proven ipe's.
     if let Ok(claimed) = &written
         && let (Some(site), Some(epoch)) = (cache_site, epoch.as_deref())
-        && let Some(root) = site.root(claimed)
+        && let Some(root) = site.root(claimed.dir())
     {
         cache::store(&root, epoch, &cache_key, &emitted);
         // Also store the lowered `Program` at the IR tier.
@@ -1530,6 +1536,20 @@ pub struct WidgetTagCollision {
     pub new_path: String,
 }
 
+/// Read the containment-checked widget-hook file at `resolved` below `widget_root`.
+///
+/// Every level below the root is opened through the held level above it and
+/// never followed, and the file is opened non-blocking and proven regular: a
+/// link swapped in after the containment check is refused, and a FIFO is
+/// refused rather than waited on.
+///
+/// # Errors
+///
+/// As [`crate::io_bounded::read_beneath`] under [`crate::io_bounded::SMALL_FILE_CAP`].
+fn read_widget_hook(widget_root: &Path, resolved: &Path) -> Result<String, CliError> {
+    crate::io_bounded::read_beneath(widget_root, resolved, crate::io_bounded::SMALL_FILE_CAP)
+}
+
 /// Record `cleaned_path` as the origin of `tag`, or report a collision.
 ///
 /// The custom-element tag is a 64-bit FNV-1a digest, which is not collision-free.
@@ -1722,23 +1742,21 @@ pub fn compile_prepared(
                     widget.cleaned_path
                 ))
             })?;
-        if !contained.resolved().is_file() {
-            return Err(reject(format!(
-                "the widget-hook file `{}` does not exist in the project",
-                widget.cleaned_path
-            )));
-        }
-        // Read the verified in-project file's content for content-addressed +
-        // SRI serving. `resolved()` is the containment-checked canonical path, so
-        // this read stays strictly inside the project root. A read failure (a
-        // race that removed the file between the `is_file` check and here, or a
-        // permission fault) fails the build closed — the widget seam never
-        // reaches emission on a file we could not read whole.
-        let content = std::fs::read_to_string(contained.resolved()).map_err(|e| {
-            reject(format!(
-                "the widget-hook file `{}` could not be read: {e}",
-                widget.cleaned_path
-            ))
+        // A read failure fails the build closed: the widget seam never reaches
+        // emission on a file we could not read whole.
+        let content = read_widget_hook(widget_root, contained.resolved()).map_err(|e| {
+            if matches!(&e, CliError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+            {
+                reject(format!(
+                    "the widget-hook file `{}` does not exist in the project",
+                    widget.cleaned_path
+                ))
+            } else {
+                reject(format!(
+                    "the widget-hook file `{}` could not be read: {e}",
+                    widget.cleaned_path
+                ))
+            }
         })?;
         // The tag is the SINGLE lowerer definition, keyed on the same cleaned
         // path the view node hashed — never a second, drift-prone hash here.
@@ -2132,22 +2150,41 @@ pub fn inject_wasm_widget_bundle(
 /// from the project proven again; a claimed target is proven still the
 /// directory it claimed.
 ///
+/// A native development emit's `src/main.rs` carries the development marker
+/// as it is written ([`crate::run_sandbox::EmitFloor`]), so every binary a
+/// dev-intent path links names its posture, whichever cargo step builds it.
+///
 /// # Errors
 /// [`CliError::Io`] on any filesystem failure; [`CliError::StaticRefusal`]
 /// for a webview shape under a static plan; [`CliError::Pipeline`] on a
 /// backend-invariant breach (manifest anchor drift);
 /// [`CliError::OutputRefused`] when the target cannot be claimed or was
-/// replaced since it was claimed.
+/// replaced since it was claimed; [`CliError::Usage`] when a native
+/// development emit has no `src/main.rs` or no `fn main` anchor.
 pub fn write_emitted_project(
     emitted: &ipe_backend::EmittedProject,
     target: &EmitTarget,
     runtime_dir: &Path,
     static_plan: Option<&ipe_backend_rust::static_build::StaticPlan>,
     tree_shake_vendored: bool,
-) -> Result<OwnedDir, CliError> {
+    floor: crate::run_sandbox::EmitFloor,
+) -> Result<EmittedCrate, CliError> {
     use ipe_backend_rust::static_build;
 
     let mut manifest = build_emit_manifest(emitted, runtime_dir, tree_shake_vendored)?;
+    match floor {
+        crate::run_sandbox::EmitFloor::DevelopmentMarker => {
+            let main_rs = manifest
+                .get_mut(Path::new("src/main.rs"))
+                .ok_or_else(|| CliError::Usage(crate::text::msg::run_main_anchor_absent()))?;
+            *main_rs = crate::run_sandbox::embed_floor_text(
+                main_rs,
+                &crate::run_sandbox::dev_floor_marker_source(),
+            )?;
+        }
+        crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild
+        | crate::run_sandbox::EmitFloor::NoNativeBinary => {}
+    }
     if let Some(plan) = static_plan {
         // The webview-under-static refusal reads the backend's typed
         // `uses_webview` signal (set from the resolved runtime/host), never a
@@ -2170,7 +2207,109 @@ pub fn write_emitted_project(
     if static_plan.is_none() {
         remove_stale_static_config(&crate_dir)?;
     }
-    Ok(crate_dir)
+    Ok(EmittedCrate {
+        dir: crate_dir,
+        floor,
+    })
+}
+
+/// An emitted crate together with the floor line [`write_emitted_project`]
+/// wrote into it.
+///
+/// Only [`write_emitted_project`] builds one, so the floor a cargo step reads
+/// here is the floor the crate's `src/main.rs` carries — never a claim a
+/// caller restates.
+#[derive(Debug)]
+pub struct EmittedCrate {
+    dir: OwnedDir,
+    floor: crate::run_sandbox::EmitFloor,
+}
+
+impl EmittedCrate {
+    /// The claimed directory the crate was written into.
+    #[must_use]
+    pub const fn dir(&self) -> &OwnedDir {
+        &self.dir
+    }
+
+    /// The crate directory's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// The floor line written into the crate.
+    #[must_use]
+    pub const fn floor(&self) -> crate::run_sandbox::EmitFloor {
+        self.floor
+    }
+
+    /// Give up the floor witness, keeping only the claimed directory.
+    #[must_use]
+    pub fn into_dir(self) -> OwnedDir {
+        self.dir
+    }
+
+    /// The crate as one carrying the development marker.
+    ///
+    /// # Errors
+    /// [`CliError::Pipeline`] (an internal bug) when the crate was written
+    /// with any other floor line.
+    pub fn dev_marked(&self) -> Result<DevMarkedCrate<'_>, CliError> {
+        match self.floor {
+            crate::run_sandbox::EmitFloor::DevelopmentMarker => Ok(DevMarkedCrate {
+                path: self.dir.path(),
+            }),
+            floor @ (crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild
+            | crate::run_sandbox::EmitFloor::NoNativeBinary) => Err(floor_mismatch_bug(
+                "ipe_cli::EmittedCrate::dev_marked",
+                format!("a development cargo step was handed a crate emitted with {floor:?}"),
+            )),
+        }
+    }
+
+    /// A witness over an already-written directory, for unit tests that
+    /// stage a crate by hand.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assume_written(
+        dir: OwnedDir,
+        floor: crate::run_sandbox::EmitFloor,
+    ) -> Self {
+        Self { dir, floor }
+    }
+}
+
+/// A crate directory proven to carry the development marker: the only crate
+/// a development cargo step outside the floored build may compile.
+#[derive(Clone, Copy, Debug)]
+pub struct DevMarkedCrate<'a> {
+    path: &'a Path,
+}
+
+impl<'a> DevMarkedCrate<'a> {
+    /// The crate directory's path.
+    #[must_use]
+    pub const fn path(&self) -> &'a Path {
+        self.path
+    }
+
+    /// A witness over a hand-staged directory, for unit tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn assume(path: &'a Path) -> Self {
+        Self { path }
+    }
+}
+
+/// The internal-bug error for a cargo step handed a crate whose written floor
+/// is not the one the step's build needs.
+pub fn floor_mismatch_bug(where_: &'static str, detail: String) -> CliError {
+    CliError::Pipeline {
+        file: PathBuf::from("src/main.rs"),
+        src: String::new(),
+        diag: Box::new(Diagnostic::CompilerBug { where_, detail }),
+    }
 }
 
 /// Map a backend-invariant [`Diagnostic`] (a `CompilerBug` from manifest
@@ -2612,7 +2751,7 @@ pub fn build_project_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: &BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let manifest = project::parse_manifest(manifest_path)?;
     let discovered = project::discover_modules(&manifest.src_root)?;
 
@@ -3087,6 +3226,99 @@ mod tests {
                 })
             ),
             "an imported symlink sibling is refused, never followed"
+        );
+    }
+
+    /// A fresh scratch directory for a widget-hook test.
+    fn widget_scratch(tag: &str) -> PathBuf {
+        let dir =
+            ipe_test_temp::temp_root().join(format!("ipe_widget_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok(), "make scratch dir");
+        dir
+    }
+
+    /// A widget hook that is a FIFO is refused at once, never waited on for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_widget_hook_is_refused_not_hung() {
+        let dir = widget_scratch("fifo");
+        let hook = dir.join("hook.js");
+        let made = std::process::Command::new("mkfifo").arg(&hook).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo creates the fixture"
+        );
+        let contained = contained_path::ContainedRelPath::parse(&dir, "hook.js");
+        assert!(contained.is_ok(), "the FIFO lies inside the project");
+        let Ok(contained) = contained else {
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let root = dir.clone();
+        let resolved = contained.resolved().to_path_buf();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = sender.send(read_widget_hook(&root, &resolved));
+            })
+            .expect("spawn the bounded reader thread");
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        if result.is_err() {
+            // A writer releases a reader stuck on the FIFO, so the process can exit.
+            let _ = fs::OpenOptions::new().write(true).open(&hook);
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                result,
+                Ok(Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                }))
+            ),
+            "a FIFO widget hook must be refused without blocking: {result:?}"
+        );
+    }
+
+    /// A widget hook swapped for a link after its containment check is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_widget_hook_swapped_for_a_link_after_containment_is_refused() {
+        let dir = widget_scratch("swapped");
+        let outside = widget_scratch("swapped_outside");
+        let hook = dir.join("hook.js");
+        let planted = outside.join("secret.txt");
+        assert!(fs::write(&hook, "customElements;").is_ok(), "write hook");
+        assert!(fs::write(&planted, "secret").is_ok(), "write planted file");
+        let contained = contained_path::ContainedRelPath::parse(&dir, "hook.js");
+        assert!(contained.is_ok(), "the hook lies inside the project");
+        let Ok(contained) = contained else {
+            return;
+        };
+        let before = read_widget_hook(&dir, contained.resolved());
+        assert!(
+            before
+                .as_deref()
+                .is_ok_and(|text| text == "customElements;"),
+            "a regular in-project hook is read: {before:?}"
+        );
+        assert!(fs::remove_file(&hook).is_ok(), "remove hook");
+        assert!(
+            std::os::unix::fs::symlink(&planted, &hook).is_ok(),
+            "swap in a link"
+        );
+        let after = read_widget_hook(&dir, contained.resolved());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        assert!(
+            matches!(
+                after,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a hook swapped for a link must be refused: {after:?}"
         );
     }
 }

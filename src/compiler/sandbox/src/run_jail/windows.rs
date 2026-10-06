@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use super::SandboxProfile;
 #[cfg(target_os = "windows")]
-use super::{FilesystemScope, RunJailDefect, RunJailTools};
+use super::{RunJailDefect, RunJailTools};
 
 /// Windows: the run jail's primitives are Win32 kernel objects (a Job Object, an
 /// AppContainer lowbox token), built directly through the Windows API rather than
@@ -105,7 +105,25 @@ pub fn exec_in_run_jail(
     app: &Path,
     app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
-    windows_jail::launch(profile, scoped_tmp, working_tree, app, app_args)
+    let mounts = invoker_mounts(scoped_tmp, working_tree)?;
+    windows_jail::launch(profile, &mounts, app, app_args)
+}
+
+/// The invoker's [`crate::JailMounts`] over `scoped_tmp` and `working_tree`,
+/// each resolved once: the paths the jail grants and the home a
+/// version-control tool expands `~` against come from this one value.
+///
+/// # Errors
+/// [`RunJailDefect::Path`] carrying any error of
+/// [`crate::CanonicalPath::resolve`] or [`crate::JailMounts::of_invoker`].
+#[cfg(target_os = "windows")]
+fn invoker_mounts(
+    scoped_tmp: &Path,
+    working_tree: &Path,
+) -> Result<crate::JailMounts, RunJailDefect> {
+    let scoped_tmp = crate::CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?;
+    let working_tree = crate::CanonicalPath::resolve(working_tree).map_err(RunJailDefect::Path)?;
+    crate::JailMounts::of_invoker(scoped_tmp, working_tree, Vec::new()).map_err(RunJailDefect::Path)
 }
 
 /// Test-only seam: run `app` under the SAME Windows run jail
@@ -128,7 +146,8 @@ pub fn run_windows_jailed_for_test(
     app: &Path,
     app_args: &[OsString],
 ) -> Result<u32, RunJailDefect> {
-    windows_jail::run_confined(profile, scoped_tmp, working_tree, app, app_args)
+    let mounts = invoker_mounts(scoped_tmp, working_tree)?;
+    windows_jail::run_confined(profile, &mounts, app, app_args)
 }
 
 /// Run `payload` under the SAME Windows jail sequence [`exec_in_run_jail`] uses —
@@ -153,8 +172,7 @@ pub fn run_windows_jailed_for_test(
 #[cfg(target_os = "windows")]
 pub fn build_windows_jailed(
     profile: &SandboxProfile,
-    scoped_tmp: &Path,
-    working_tree: &Path,
+    mounts: &crate::JailMounts,
     payload: &[OsString],
 ) -> Result<u32, RunJailDefect> {
     let Some((app, args)) = payload.split_first() else {
@@ -162,7 +180,7 @@ pub fn build_windows_jailed(
             detail: "empty build-jail payload".to_owned(),
         });
     };
-    windows_jail::run_confined(profile, scoped_tmp, working_tree, Path::new(app), args)
+    windows_jail::run_confined(profile, mounts, Path::new(app), args)
 }
 
 /// One name every jailed Windows child receives ahead of the profile's allowlist.
@@ -398,6 +416,62 @@ fn env_block_from_pairs(pairs: &[(OsString, OsString)]) -> Vec<u16> {
     block
 }
 
+/// The access mask the container SID is granted on the scratch and a granted
+/// working tree: `FILE_GENERIC_READ | FILE_GENERIC_WRITE`.
+///
+/// It carries neither `DELETE` nor `FILE_DELETE_CHILD`, so the child cannot
+/// unlink or rename an entry the grant did not give it; it can still create and
+/// write entries, which is why a tree holding version-control metadata is
+/// refused ([`windows_working_tree_plan`]).
+#[cfg(any(windows, test))]
+pub const WORKING_TREE_GRANT_MASK: u32 = 0x0012_019F;
+
+/// The path the Windows jail grants read-write for `tree`, which it grants only
+/// when the tree holds no version-control metadata.
+///
+/// The grant is an inheritable allow ACE over the whole tree, and a carve needs
+/// a deny ACE written over each carved path; until the arm writes one, a tree
+/// holding metadata is refused.
+///
+/// # Errors
+/// [`crate::JailPathError::VcsMetadataUncarvable`] naming the first carved path
+/// when the carve is not empty.
+#[cfg(any(windows, test))]
+pub fn windows_working_tree_plan(
+    tree: &crate::WritableTree,
+) -> Result<&crate::CanonicalPath, crate::JailPathError> {
+    tree.carve().paths().next().map_or_else(
+        || Ok(tree.tree()),
+        |first| {
+            Err(crate::JailPathError::VcsMetadataUncarvable {
+                arm: crate::JailArm::Windows,
+                path: first.as_path().to_path_buf(),
+            })
+        },
+    )
+}
+
+/// The working tree a Windows jail over `mounts` grants read-write under
+/// `profile`, parsed and scanned through [`crate::mounts::TreeBind::granted_by`];
+/// `None` when the filesystem axis is withheld.
+///
+/// # Errors
+/// Any error of [`crate::mounts::TreeBind::granted_by`]; any error of
+/// [`windows_working_tree_plan`] for the granted tree.
+#[cfg(any(windows, test))]
+pub fn windows_writable_tree(
+    profile: &SandboxProfile,
+    mounts: &crate::JailMounts,
+) -> Result<Option<crate::WritableTree>, crate::JailPathError> {
+    match crate::mounts::TreeBind::granted_by(&profile.filesystem, mounts)? {
+        crate::mounts::TreeBind::Unbound => Ok(None),
+        crate::mounts::TreeBind::ReadWrite(tree) => {
+            windows_working_tree_plan(&tree)?;
+            Ok(Some(tree))
+        }
+    }
+}
+
 /// The Windows run-jail launcher: assembles the Job Object + AppContainer token +
 /// scrubbed environment and launches the app confined, fail-closed at every step.
 ///
@@ -423,7 +497,7 @@ fn env_block_from_pairs(pairs: &[(OsString, OsString)]) -> Vec<u16> {
     clippy::too_many_arguments
 )]
 mod windows_jail {
-    use super::{FilesystemScope, RunJailDefect, SandboxProfile, windows_scrubbed_env};
+    use super::{RunJailDefect, SandboxProfile, windows_scrubbed_env};
     use std::ffi::{OsStr, OsString};
     use std::os::windows::ffi::OsStrExt as _;
     use std::path::Path;
@@ -466,7 +540,12 @@ mod windows_jail {
     };
 
     /// Access rights ACLed onto a granted path for the container SID (read+write).
-    const FILE_RW: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    const FILE_RW: u32 = super::WORKING_TREE_GRANT_MASK;
+
+    /// Keep the pure [`super::WORKING_TREE_GRANT_MASK`] (whose missing delete
+    /// rights a host-independent test pins) equal to the Win32 read+write rights.
+    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); it fails the build if the cross-platform mask drifts from the Win32 constants [ledger #boundary]
+    const _: () = assert!(FILE_RW == FILE_GENERIC_READ | FILE_GENERIC_WRITE);
 
     /// Inheritance of the read+write grants: every file and subdirectory below a
     /// granted root, present and future, carries the grant.
@@ -549,12 +628,11 @@ mod windows_jail {
     /// alive as the job owner and propagates the exit). Fails closed on any step.
     pub(super) fn launch(
         profile: &SandboxProfile,
-        scoped_tmp: &Path,
-        working_tree: &Path,
+        mounts: &crate::JailMounts,
         app: &Path,
         app_args: &[OsString],
     ) -> Result<std::convert::Infallible, RunJailDefect> {
-        let code = run_confined(profile, scoped_tmp, working_tree, app, app_args)?;
+        let code = run_confined(profile, mounts, app, app_args)?;
         // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — jail exec process control: the launcher is the job owner and replaces itself with the confined child's exit code (returns Infallible) [ledger #boundary]
         std::process::exit(i32::from_ne_bytes(code.to_ne_bytes()));
     }
@@ -567,11 +645,17 @@ mod windows_jail {
     /// process.
     pub(super) fn run_confined(
         profile: &SandboxProfile,
-        scoped_tmp: &Path,
-        working_tree: &Path,
+        mounts: &crate::JailMounts,
         app: &Path,
         app_args: &[OsString],
     ) -> Result<u32, RunJailDefect> {
+        // 0. The working tree is granted only as the tree parsed and scanned
+        //    here, before any container exists; one holding version-control
+        //    metadata is refused, since the grant cannot keep it read-only.
+        let granted_tree =
+            super::windows_writable_tree(profile, mounts).map_err(RunJailDefect::Path)?;
+        let scoped_tmp = mounts.scoped_tmp().as_path();
+
         // 1. Derive a per-run AppContainer SID from a unique per-run name. The
         //    profile is created (idempotently) so the SID is registerable, then
         //    deleted after the SID is derived — the SID outlives the profile.
@@ -610,7 +694,8 @@ mod windows_jail {
         // grant is additive (not a replace-DACL), so it never removes existing
         // permissions.
         grant_traverse_to_ancestors(scoped_tmp, container.sid())?;
-        if profile.filesystem == FilesystemScope::WorkingTreeReadWrite {
+        if let Some(tree) = &granted_tree {
+            let working_tree = tree.tree().as_path();
             probe_volume_persists_acls(working_tree)?;
             acl_path_for_container(working_tree, container.sid())?;
         }
@@ -1621,22 +1706,15 @@ mod windows_jail {
     }
 
     /// The Job Object active-process cap for a profile: 1 when subprocess is
-    /// withheld (only the app itself), else the profile's proc cap (min 1).
-    /// Extracted so the cap policy is unit-testable without a live Job Object.
-    fn active_process_cap(profile: &SandboxProfile) -> u32 {
-        if profile.subprocess {
-            u32::try_from(profile.limits.proc_cap)
-                .unwrap_or(u32::MAX)
-                .max(1)
-        } else {
-            1
-        }
+    /// withheld (only the app itself), else the profile's typed proc cap.
+    const fn active_process_cap(profile: &SandboxProfile) -> u32 {
+        profile.limits.proc_cap.job_limit(profile.subprocess)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::run_jail::{RunResourceLimits, SandboxProfile};
+        use crate::run_jail::{ProcCap, RunResourceLimits, SandboxProfile};
 
         fn profile_with_env(names: &[&str]) -> SandboxProfile {
             SandboxProfile {
@@ -1705,7 +1783,7 @@ mod windows_jail {
             let granted = SandboxProfile {
                 subprocess: true,
                 limits: RunResourceLimits {
-                    proc_cap: 8,
+                    proc_cap: ProcCap::parse(8).expect("8 is in range"),
                     ..RunResourceLimits::default()
                 },
                 ..SandboxProfile::maximally_isolated()
@@ -2011,5 +2089,137 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), total, "two base names collide: {keys:?}");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // test fixtures: the scratch dirs must exist
+    fn windows_refuses_a_tree_with_vcs_metadata() {
+        let base_dir = crate::test_dir::TestDir::new("windows-vcs").expect("test dir");
+        let base = base_dir.path();
+        let tree = base.join("tree");
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(tree.join(".hg")).expect("hg dir");
+        std::fs::create_dir_all(&tmp).expect("tmp dir");
+        let resolve = |path: &Path| crate::CanonicalPath::resolve(path).expect("canonical");
+        let scratch = resolve(&tmp);
+        let home = crate::Home::unknown();
+        let writable = crate::WritableTree::parse(resolve(&tree), &[&scratch], &home)
+            .expect("the tree parses");
+        let planned = windows_working_tree_plan(&writable);
+        assert!(
+            matches!(
+                &planned,
+                Err(crate::JailPathError::VcsMetadataUncarvable {
+                    arm: crate::JailArm::Windows,
+                    path,
+                }) if *path == tree.join(".hg")
+            ),
+            "{planned:?}"
+        );
+        std::fs::remove_dir(tree.join(".hg")).expect("remove hg dir");
+        let plain = crate::WritableTree::parse(resolve(&tree), &[&scratch], &home)
+            .expect("the tree parses");
+        assert!(
+            matches!(windows_working_tree_plan(&plain), Ok(path) if *path == resolve(&tree)),
+            "a tree without metadata is granted"
+        );
+    }
+
+    /// A scratch dir and a working tree under one test base.
+    fn windows_tree_fixture(
+        label: &str,
+    ) -> (
+        crate::test_dir::TestDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let base = crate::test_dir::TestDir::new(label).expect("test dir");
+        let tree = base.path().join("tree");
+        let tmp = base.path().join("tmp");
+        std::fs::create_dir_all(&tree).expect("tree dir");
+        std::fs::create_dir_all(&tmp).expect("tmp dir");
+        (base, tmp, tree)
+    }
+
+    fn write_hooks_path(tree: &Path) {
+        let git = tree.join(".git");
+        std::fs::create_dir_all(&git).expect("git dir");
+        std::fs::write(git.join("config"), "[core]\n\thooksPath = .husky\n").expect("git config");
+    }
+
+    fn rw_profile() -> SandboxProfile {
+        SandboxProfile {
+            filesystem: crate::run_jail::FilesystemScope::WorkingTreeReadWrite,
+            ..SandboxProfile::maximally_isolated()
+        }
+    }
+
+    #[test]
+    fn the_windows_tree_grant_comes_from_the_parsed_tree() {
+        let (_base, tmp, tree) = windows_tree_fixture("windows-tree-grant");
+        let resolve = |path: &Path| crate::CanonicalPath::resolve(path).expect("canonical");
+        let mounts = crate::JailMounts::checked_against(
+            resolve(&tmp),
+            resolve(&tree),
+            Vec::new(),
+            crate::HomeMasks::unmasked(),
+            Path::new("/nonexistent-ipe-cargo-home"),
+        )
+        .expect("mounts");
+        let plain = windows_writable_tree(&rw_profile(), &mounts);
+        assert!(
+            matches!(&plain, Ok(Some(granted)) if *granted.tree() == resolve(&tree)),
+            "a plain tree is granted: {plain:?}"
+        );
+        let isolated = windows_writable_tree(&SandboxProfile::maximally_isolated(), &mounts);
+        assert!(
+            matches!(isolated, Ok(None)),
+            "an isolated profile grants no tree: {isolated:?}"
+        );
+        write_hooks_path(&tree);
+        let husky = resolve(&tree).as_path().join(".husky");
+        let refused = windows_writable_tree(&rw_profile(), &mounts);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    kind: crate::VcsKind::Git,
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "a hooks path into the tree refuses the grant: {refused:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rw_tree_runs_the_scan() {
+        let (_base, tmp, tree) = windows_tree_fixture("windows-rw-scan");
+        write_hooks_path(&tree);
+        let ran = super::run_windows_jailed_for_test(
+            &rw_profile(),
+            &tmp,
+            &tree,
+            Path::new("C:\\nonexistent-ipe-app.exe"),
+            &[],
+        );
+        assert!(
+            matches!(
+                &ran,
+                Err(RunJailDefect::Path(crate::JailPathError::VcsConfig(
+                    crate::ConfigRefusal::NamesWritableCode { .. }
+                )))
+            ),
+            "the Windows launcher refuses before any Win32 step: {ran:?}"
+        );
+    }
+
+    #[test]
+    fn the_working_tree_grant_never_carries_delete_child() {
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_DELETE_CHILD: u32 = 0x0000_0040;
+        assert_eq!(WORKING_TREE_GRANT_MASK & DELETE, 0);
+        assert_eq!(WORKING_TREE_GRANT_MASK & FILE_DELETE_CHILD, 0);
     }
 }

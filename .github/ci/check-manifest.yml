@@ -84,9 +84,11 @@ checks:
     local:
       ci-only: platform
     guards: >-
-      The Windows output-directory and `ipe_fs_open` code compiles, so its
-      held-handle, reparse-point-refusing file operations ship rather than rot
-      unbuilt.
+      The Windows output-directory, `ipe_fs_open`, `ipe_sandbox` and
+      runtime code compiles, tests included, so its held-handle,
+      reparse-point-refusing file operations, the runtime's fail-closed
+      root-confined read and other Windows-only refusals ship rather than
+      rot unbuilt.
   - context: quick-check
     disposition: gate
     producer: ci.yml
@@ -103,7 +105,15 @@ checks:
         - cmd: cargo nextest run {packages} --profile ci --no-tests=warn
           differs: CI runs the same suite from one archive split over shards; locally it runs over the selected crates directly
         - cargo test --doc {lib_packages}
-    aggregates: [test-prep, test-run]
+        - cargo clippy --locked -p ipe --features wasi_run,signing --all-targets -- -D warnings
+        - cmd: cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci
+          env:
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+        - cmd: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
+          env:
+            IPE_E2E: "1"
+            IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
+    aggregates: [test-prep, test-run, wasi-run]
   - context: artifact-guard
     disposition: gate
     producer: ci.yml
@@ -282,7 +292,7 @@ checks:
       tier: affected
       run:
         - cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
-        - cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
+        - cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci
     guards: SEAL
     aggregates: [runtime-full-features-run]
   - context: registry-admission
@@ -296,6 +306,18 @@ checks:
             IPE_E2E: "1"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
     aggregates: [registry-admission-run]
+  - context: release-targets
+    disposition: gate
+    producer: ci.yml
+    local:
+      ci-only: platform
+    guards: >-
+      Every target release.yml builds type-checks on its own runner under the
+      pinned toolchain and the lockfile before merge, so a release target that
+      cannot compile surfaces in the merge queue, not on the release tag;
+      check 23 holds the matrix equal to release.yml's and pins each job's
+      checkout, shared toolchain step and cargo line, nothing between them.
+    aggregates: [release-targets-run, release-targets-freebsd]
 
   # ── Cancel-on-cheap-red watcher — informational (never a merge gate) ──────
   # Normally SKIPPED (its `needs:` all succeed and `failure()` is false), so it

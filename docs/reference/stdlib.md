@@ -1550,6 +1550,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `lte` | `lte accessor value` — the rows where the column named by `accessor` is |
 | `lteBy` | `lteBy codec accessor value` — the accessor-typed less-than-or-equal leaf |
 | `like` | `like accessor pattern` — the rows where the `String` column named by |
+| `startsWith` | `startsWith accessor prefix` — the rows where the `String` column named by |
 | `isNull` | `isNull accessor` — the rows where the column named by `accessor` is SQL |
 | `notNull` | `notNull accessor` — the rows where the column named by `accessor` is NOT |
 | `inList` | `inList accessor values` — the rows where the column named by `accessor` |
@@ -1840,7 +1841,7 @@ Ipe.Env — build-time-embedded public config.
 
 [Full reference](stdlib/Error.md)
 
-Ipe.Error — the structured `Error` type (Layer-3 Ipe source).
+Ipe.Error — the structured `Error` type.
 
 | Export | Summary |
 |--------|----------|
@@ -2197,7 +2198,7 @@ Ipe.Level — the `LogLevel` severity-tag ADT.
 
 [Full reference](stdlib/List.md)
 
-`Ipe.List` — transform, filter, and combine lists (compiled-source Layer-3).
+`Ipe.List` — transform, filter, and combine lists.
 
 | Export | Summary |
 |--------|----------|
@@ -2518,7 +2519,7 @@ Ipe.PubSub — Task-shaped publish, callable wherever a bus runs.
 
 [Full reference](stdlib/Random.md)
 
-Ipe.Random — entropy-driven and seeded random helpers (compiled-source
+Ipe.Random — entropy-driven and seeded random helpers.
 
 | Export | Summary |
 |--------|----------|
@@ -2573,7 +2574,7 @@ Ipe.Regex — RE2 regex helpers.
 
 [Full reference](stdlib/Result.md)
 
-Ipe.Result — combinators over the Result ADT (Layer-3 compiled source).
+Ipe.Result — combinators over the Result ADT.
 
 | Export | Summary |
 |--------|----------|
@@ -2660,11 +2661,11 @@ Ipe.Set — unordered collection of unique elements.
 | `contains` | `contains needle haystack` — `True` when `needle` appears inside `haystack`. |
 | `startsWith` | `startsWith prefix s` — `True` when `s` begins with `prefix`. |
 | `endsWith` | `endsWith suffix s` — `True` when `s` ends with `suffix`. |
-| `containsIn` | `containsIn needle haystack` — `True` when `needle` appears in `haystack`. |
-| `startsWithIn` | `startsWithIn prefix haystack` — `True` when `haystack` starts with `prefix`. |
-| `endsWithIn` | `endsWithIn suffix haystack` — `True` when `haystack` ends with `suffix`. |
-| `casefold` | `casefold s` — case-fold `s` for case-insensitive comparison. |
-| `equalFold` | `equalFold s1 s2` — case-insensitive equality comparison. |
+| `containsIn` | `containsIn haystack needle` — `True` when `needle` appears in `haystack`: `contains` with the arguments swapped. |
+| `startsWithIn` | `startsWithIn haystack prefix` — `True` when `haystack` starts with `prefix`: `startsWith` with the arguments swapped. |
+| `endsWithIn` | `endsWithIn haystack suffix` — `True` when `haystack` ends with `suffix`: `endsWith` with the arguments swapped. |
+| `casefold` | `casefold s` — Unicode default full case folding, for case-insensitive comparison and keys. |
+| `equalFold` | `equalFold a b` — case-insensitive equality: `casefold a == casefold b`. |
 | `isEmail` | `isEmail s` — `True` when `s` looks like a valid email address. |
 | `isUrl` | `isUrl s` — `True` when `s` looks like a valid URL. |
 | `words` | `words s` — split `s` into words on whitespace boundaries. |

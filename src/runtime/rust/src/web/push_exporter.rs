@@ -184,6 +184,28 @@ enum Entry {
 
 static SENDER: OnceLock<mpsc::Sender<Entry>> = OnceLock::new();
 
+/// The runtime the exporter batchers were spawned on; the first enable wins.
+///
+/// `web::flush_exporters_before_exit` drives the pre-exit flush through this
+/// handle, so the flush runs on the runtime whose timers and IO the batchers use.
+static EXPORTER_RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+/// Records the current runtime as the one the exporter batchers run on.
+///
+/// Called by each exporter's enable right before it spawns its batcher. Outside
+/// a runtime there is nothing to record and the spawn that follows has no
+/// runtime to land on either.
+pub(crate) fn record_exporter_runtime() {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let _ = EXPORTER_RUNTIME.set(handle);
+    }
+}
+
+/// The runtime the exporter batchers run on, or `None` when no exporter was enabled.
+pub(crate) fn exporter_runtime() -> Option<tokio::runtime::Handle> {
+    EXPORTER_RUNTIME.get().cloned()
+}
+
 /// The shared secret a push carries in `x-ipe-ingest-token`. Opaque: no
 /// `Debug`, `Display` or `Clone`, so formatting cannot carry it into a log line
 /// and only [`IngestToken::expose`] yields its text, at the header write.
@@ -418,6 +440,7 @@ fn enable(label: &str, pipeline: Pipeline) {
             pipeline.interval_ms.max(MIN_INTERVAL_MS)
         ),
     );
+    record_exporter_runtime();
     tokio::spawn(batcher(rx, client, pipeline));
 }
 
@@ -436,10 +459,19 @@ fn enable(label: &str, pipeline: Pipeline) {
 fn exporter_client(ingest_url: &str) -> Option<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none());
     routed(builder, ingest_url).build().ok()
 }
+
+/// Connect ceiling of the push client, in milliseconds.
+///
+/// The client builder and `FLUSH_DEADLINE` both read it, so the shutdown
+/// flush always outlasts a connect in flight.
+const CONNECT_TIMEOUT_MS: u64 = 2_000;
+
+/// How long the shutdown flush waits for the push batcher's final batch.
+const FLUSH_DEADLINE: FlushDeadline = FlushDeadline::after_connect::<CONNECT_TIMEOUT_MS>();
 
 /// Accumulate entries and flush a batch on each tick. Channel close drains a
 /// final batch then exits. A `Flush` sentinel drains immediately and acks.
@@ -492,18 +524,68 @@ async fn batcher(mut rx: mpsc::Receiver<Entry>, client: reqwest::Client, pipelin
     }
 }
 
-/// Best-effort pre-exit flush: sends a `Flush` sentinel and waits up to
-/// `cap_ms` milliseconds for the batcher to drain its buffer. No-op when the
-/// exporter is disabled or the channel is full. Never panics.
-pub async fn flush_now(cap_ms: u64) {
-    let Some(tx) = SENDER.get() else { return };
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
-    // try_send: non-blocking; if the channel is full the flush is skipped
-    // (best-effort — this is telemetry only, never user/persistent data).
-    if tx.try_send(Entry::Flush(ack_tx)).is_err() {
-        return;
+/// Best-effort pre-exit flush of the push exporter, bounded by `FLUSH_DEADLINE`.
+///
+/// No-op when the exporter is disabled. Never panics.
+pub async fn flush_now() {
+    drain_before_exit(SENDER.get(), Entry::Flush, FLUSH_DEADLINE).await;
+}
+
+/// Extra wait past an exporter's connect timeout for its batch to be sent and answered.
+const FLUSH_SEND_BUDGET_MS: u64 = 500;
+
+/// Upper bound on any exporter's shutdown flush wait, in milliseconds.
+const FLUSH_DEADLINE_CEILING_MS: u64 = 6_000;
+
+/// Slack past `FLUSH_DEADLINE_CEILING_MS` for the exit flush's thread to start and report back.
+const EXIT_FLUSH_SLACK_MS: u64 = 500;
+
+/// Upper bound on the wait `system::exit_process` spends flushing the exporters before it exits.
+pub(crate) const EXIT_FLUSH_BOUND: Duration =
+    Duration::from_millis(FLUSH_DEADLINE_CEILING_MS + EXIT_FLUSH_SLACK_MS);
+
+/// How long a shutdown flush waits for one exporter's final batch.
+///
+/// The only constructor derives it from the exporter's connect timeout plus
+/// `FLUSH_SEND_BUDGET_MS` and refuses at build time a deadline above
+/// `FLUSH_DEADLINE_CEILING_MS`; `drain_before_exit` is the only consumer.
+#[derive(Clone, Copy)]
+pub(crate) struct FlushDeadline(Duration);
+
+impl FlushDeadline {
+    /// The deadline for an exporter whose client connects within `CONNECT_MS` milliseconds.
+    pub(crate) const fn after_connect<const CONNECT_MS: u64>() -> Self {
+        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an exporter's flush deadline exceeds the shutdown ceiling [ledger #boundary]
+        const { assert!(CONNECT_MS.saturating_add(FLUSH_SEND_BUDGET_MS) <= FLUSH_DEADLINE_CEILING_MS) };
+        Self(Duration::from_millis(
+            CONNECT_MS.saturating_add(FLUSH_SEND_BUDGET_MS),
+        ))
     }
-    let _ = tokio::time::timeout(Duration::from_millis(cap_ms), ack_rx).await;
+}
+
+/// Asks an exporter's batcher to push its buffer and waits for its ack until `deadline`.
+///
+/// The one pre-exit flush path: each exporter's `flush_now` routes here with
+/// the deadline derived from its own connect timeout. A full queue is waited
+/// on, not skipped: the sentinel's enqueue and the ack share the one deadline,
+/// so the batcher draining the queue makes room for the sentinel and the wait
+/// as a whole never outlasts `deadline`. No-op when the exporter is disabled
+/// (`tx` is `None`) or its batcher is gone (telemetry is best-effort, never
+/// user data).
+pub(crate) async fn drain_before_exit<E>(
+    tx: Option<&mpsc::Sender<E>>,
+    sentinel: fn(tokio::sync::oneshot::Sender<()>) -> E,
+    deadline: FlushDeadline,
+) {
+    let Some(tx) = tx else { return };
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+    let flushed = async move {
+        if tx.send(sentinel(ack_tx)).await.is_err() {
+            return;
+        }
+        let _ = ack_rx.await;
+    };
+    let _ = tokio::time::timeout(deadline.0, flushed).await;
 }
 
 /// Build the `{ "logs": [...], "spans": [...] }` payload the receiver accepts.
@@ -861,7 +943,7 @@ mod tests {
             },
         ));
 
-        // The ack must arrive within 500 ms — same cap as flush_now uses.
+        // The POST fails at once, so the ack arrives well inside 500 ms.
         let result = tokio::time::timeout(Duration::from_millis(500), ack_rx).await;
         assert!(result.is_ok(), "flush ack must arrive within 500 ms");
         assert!(result.unwrap().is_ok(), "ack oneshot must not be dropped");
@@ -953,11 +1035,251 @@ mod tests {
     #[tokio::test]
     async fn flush_now_noop_when_disabled() {
         // flush_now on a fresh (not-enabled) state must return quickly.
-        let deadline = tokio::time::timeout(Duration::from_millis(200), flush_now(250)).await;
+        let deadline = tokio::time::timeout(Duration::from_millis(200), flush_now()).await;
         assert!(
             deadline.is_ok(),
             "flush_now must not block when exporter is off"
         );
+    }
+
+    /// The text a test batch carries, so an ingest can tell it reached the wire.
+    const MARKER: &str = "final-batch";
+
+    /// A loopback ingest that accepts one connection after `accept_after`.
+    ///
+    /// It reads the request until it holds [`MARKER`], then runs `on_marker`
+    /// and sets the returned flag BEFORE it answers, so a batcher that acks only
+    /// after the answer cannot ack a batch the ingest has not recorded.
+    #[allow(clippy::expect_used)] // test setup: a bind/local_addr failure is a test environment issue
+    async fn marker_ingest(
+        accept_after: Duration,
+        on_marker: fn(),
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const READ_CAP: usize = 64 * 1024;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback ingest");
+        let port = listener.local_addr().expect("listener local addr").port();
+        let received = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&received);
+        tokio::spawn(async move {
+            tokio::time::sleep(accept_after).await;
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let marker = MARKER.as_bytes();
+            let holds_marker = |r: &[u8]| r.windows(marker.len()).any(|w| w == marker);
+            while request.len() < READ_CAP && !holds_marker(&request) {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                }
+            }
+            if holds_marker(&request) {
+                on_marker();
+                seen.store(true, Ordering::SeqCst);
+            }
+            let _ = socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        (port, received)
+    }
+
+    /// A log entry carrying [`MARKER`].
+    fn marker_log() -> Entry {
+        Entry::Log {
+            ts_ms: 1,
+            level: "info".into(),
+            message: MARKER.into(),
+        }
+    }
+
+    /// A batcher pushing to the loopback ingest on `port`, ticking too rarely to flush on its own.
+    fn idle_batcher(rx: mpsc::Receiver<Entry>, port: u16) -> impl Future<Output = ()> {
+        let url = format!("http://127.0.0.1:{port}");
+        batcher(
+            rx,
+            client(&url),
+            Pipeline {
+                ingest_url: url,
+                token: None,
+                interval_ms: 60_000,
+            },
+        )
+    }
+
+    /// The shutdown flush waits out a POST whose ingest has not yet accepted.
+    ///
+    /// The ingest accepts only after 1.5 s, inside the deadline the connect
+    /// timeout derives (2.5 s) and far past a fixed 250 ms cap. The listener
+    /// records the batch before it answers and the batcher acks only after the
+    /// answer, so the record is set when the drain returns exactly when the
+    /// drain waited for the ack.
+    #[allow(clippy::expect_used)] // test setup: a full queue at setup is a test bug
+    #[tokio::test]
+    async fn flush_waits_out_a_connect_in_flight() {
+        let (port, received) = marker_ingest(Duration::from_millis(1_500), || {}).await;
+        let (tx, rx) = mpsc::channel::<Entry>(4);
+        tx.try_send(marker_log()).expect("queue the final batch");
+        tokio::spawn(idle_batcher(rx, port));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            drain_before_exit(Some(&tx), Entry::Flush, FLUSH_DEADLINE),
+        )
+        .await
+        .expect("the drain is bounded by its deadline");
+        assert!(
+            received.load(std::sync::atomic::Ordering::SeqCst),
+            "the shutdown flush returned before the final batch reached the ingest"
+        );
+    }
+
+    /// A full exporter queue delays the shutdown flush's sentinel, never drops it.
+    ///
+    /// The queue holds one entry and is full when the drain starts; on this
+    /// single-threaded runtime the batcher has not run yet, so an enqueue that
+    /// gives up on a full queue returns before the batch is sent. The drain
+    /// must instead wait, inside its deadline, for the batcher to make room,
+    /// and return only once the ingest has recorded the batch.
+    #[allow(clippy::expect_used)] // test setup: a full queue at setup is a test bug
+    #[tokio::test]
+    async fn a_full_queue_does_not_skip_the_flush() {
+        let (port, received) = marker_ingest(Duration::ZERO, || {}).await;
+        let (tx, rx) = mpsc::channel::<Entry>(1);
+        tx.try_send(marker_log()).expect("queue the final batch");
+        assert_eq!(
+            tx.capacity(),
+            0,
+            "the queue must be full when the drain starts"
+        );
+        tokio::spawn(idle_batcher(rx, port));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            drain_before_exit(Some(&tx), Entry::Flush, FLUSH_DEADLINE),
+        )
+        .await
+        .expect("the drain is bounded by its deadline");
+        assert!(
+            received.load(std::sync::atomic::Ordering::SeqCst),
+            "a full queue made the shutdown flush skip the final batch"
+        );
+    }
+
+    /// Printed by the exit-funnel child once its ingest has recorded the final batch.
+    #[cfg(feature = "server")]
+    const CHILD_RECEIVED: &str = "exit-funnel ingest recorded the final batch";
+
+    /// How long the parent waits for the exit-funnel child before it fails the test.
+    #[cfg(feature = "server")]
+    const CHILD_LIMIT: Duration = Duration::from_secs(30);
+
+    /// A `System.exit` flushes the batch the exporter holds before the process ends.
+    ///
+    /// Runs [`exit_funnel_child`] as a child process of this test binary, so
+    /// its process-wide exporter and its exit stay out of this process. The
+    /// child records one batch and ends through `system::system_exit` at once,
+    /// long before the batcher's own tick; only the exit funnel's flush can
+    /// carry the batch to the child's ingest, which prints
+    /// [`CHILD_RECEIVED`] before it answers. A child still alive after
+    /// [`CHILD_LIMIT`] is killed and fails the test.
+    #[cfg(feature = "server")]
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    #[test]
+    fn system_exit_flushes_the_exporters_before_the_process_ends() {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::exit_funnel_child");
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the exit-funnel child");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the exit-funnel child") {
+                break Some(status);
+            }
+            if started.elapsed() > CHILD_LIMIT {
+                let _ = child.kill();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let out = child
+            .wait_with_output()
+            .expect("collect the child's output");
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        let stderr = String::from_utf8(out.stderr).unwrap_or_default();
+        assert!(
+            status.is_some(),
+            "the exit-funnel child hung past {CHILD_LIMIT:?}:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            status.is_some_and(|s| s.code() == Some(0)),
+            "the exit-funnel child did not exit 0 ({status:?}):\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(CHILD_RECEIVED),
+            "the process ended before its exporter's final batch reached the ingest:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The child half of `system_exit_flushes_the_exporters_before_the_process_ends`.
+    ///
+    /// Enables the push exporter towards a loopback ingest, records one batch
+    /// and calls `System.exit 0` from a task on the runtime's only worker, the
+    /// shape an Ipê program's exit takes. Ignored so it runs only as that
+    /// test's child.
+    #[cfg(feature = "server")]
+    #[allow(clippy::expect_used)] // test setup: a token the OS RNG cannot mint is a test environment issue
+    #[ignore = "run as a child process by system_exit_flushes_the_exporters_before_the_process_ends"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn exit_funnel_child() {
+        let (port, _) = marker_ingest(Duration::ZERO, || {
+            crate::system::write_stdout_line(CHILD_RECEIVED);
+        })
+        .await;
+        let token = IngestToken::mint().expect("mint an ingest token");
+        enable_to_console(port, token).await;
+        offer_log(1, "info", MARKER);
+        let exit = tokio::spawn(async {
+            crate::system::system_exit(0);
+        });
+        let _ = exit.await;
+    }
+
+    /// A batcher that never acks holds the drain for exactly its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn drain_gives_up_at_its_deadline() {
+        let (tx, _rx) = mpsc::channel::<Entry>(4);
+        let start = tokio::time::Instant::now();
+        drain_before_exit(Some(&tx), Entry::Flush, FLUSH_DEADLINE).await;
+        let waited = start.elapsed();
+        assert!(waited >= FLUSH_DEADLINE.0, "gave up early: {waited:?}");
+        assert!(
+            waited < FLUSH_DEADLINE.0 + Duration::from_millis(10),
+            "waited past the deadline: {waited:?}"
+        );
+        assert!(FLUSH_DEADLINE.0 > Duration::from_millis(CONNECT_TIMEOUT_MS));
+        assert!(FLUSH_DEADLINE.0 <= Duration::from_millis(FLUSH_DEADLINE_CEILING_MS));
     }
 
     fn client(url: &str) -> reqwest::Client {

@@ -53,6 +53,9 @@ pub struct IpeStreamId {
     key: StreamKey,
 }
 
+// A stream id names a live registry slot; its key is never rendered.
+crate::stringify::show_row!("StreamId", Value, [] IpeStreamId, |_| "<stream>".to_owned());
+
 /// The registry key behind a `StreamId`: nonzero, so no zeroed value names a stream.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct StreamKey(NonZeroU128);
@@ -177,6 +180,8 @@ pub enum ChunkEvent<E> {
     Done,
     Errored(E),
 }
+
+crate::stringify::show_row!("ChunkEvent", Internals, [E] ChunkEvent<E>, |_| "<Ipe.Http.Stream.ChunkEvent>".to_owned());
 
 /// Live upstream connections allowed at once: the live-table cap and the
 /// connection-permit count.

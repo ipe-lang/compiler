@@ -160,7 +160,7 @@ pub fn spans_json(limit: usize) -> String {
 ///
 /// Keeps a present-but-non-UTF-8 value distinct from an absent one, so a
 /// garbled explicit setting can never fall through to the unset default.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RawEnv<'a> {
     /// The variable is not set.
     Absent,
@@ -168,6 +168,18 @@ pub enum RawEnv<'a> {
     Value(&'a str),
     /// The variable is set but is not valid UTF-8.
     NotUnicode,
+}
+
+// The read's shape only: a set value renders the redaction marker, never the
+// variable's content.
+impl std::fmt::Debug for RawEnv<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Value(_) => write!(f, "Value({})", crate::redact::REDACTED),
+            Self::NotUnicode => f.write_str("NotUnicode"),
+        }
+    }
 }
 
 impl<'a> RawEnv<'a> {
@@ -206,9 +218,9 @@ impl BuildPosture {
 
 /// Whether one HTTP listener is reachable from beyond this host.
 ///
-/// Parsed from a resolved bind host. Only a literal loopback IP address is
-/// `Loopback`; a hostname (`localhost` included), a wildcard, any other
-/// address, or an unparsable value is `Exposed`.
+/// Classified from the IP address a listener binds. Only a loopback address is
+/// `Loopback`; a wildcard or any other address, an IPv4-mapped loopback
+/// included, is `Exposed`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ListenScope {
     /// Bound to a loopback address: reachable from this host only.
@@ -218,18 +230,14 @@ pub enum ListenScope {
 }
 
 impl ListenScope {
-    /// Classify a bind host (trimmed).
+    /// The scope of a listener bound to `ip`.
     #[must_use]
-    pub fn parse(host: &str) -> Self {
-        host.trim()
-            .parse::<std::net::IpAddr>()
-            .map_or(Self::Exposed, |ip| {
-                if ip.is_loopback() {
-                    Self::Loopback
-                } else {
-                    Self::Exposed
-                }
-            })
+    pub const fn of(ip: std::net::IpAddr) -> Self {
+        if ip.is_loopback() {
+            Self::Loopback
+        } else {
+            Self::Exposed
+        }
     }
 }
 
@@ -289,12 +297,12 @@ impl ProcessScope {
 /// The monotone [`ProcessScope`] of this process, as its byte encoding.
 static PROCESS_SCOPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Record an app listener's bind host before it binds, returning its scope.
+/// Record an app listener's bind address before it binds, returning its scope.
 ///
 /// Every app bind path (`serve_web`, `Server.listen`) calls this, so the
 /// process scope is the join of all of them.
-pub fn record_bind(host: &str) -> ListenScope {
-    let scope = ListenScope::parse(host);
+pub fn record_bind(host: std::net::IpAddr) -> ListenScope {
+    let scope = ListenScope::of(host);
     let byte = ProcessScope::Unbound.join(scope).to_byte();
     PROCESS_SCOPE.fetch_max(byte, std::sync::atomic::Ordering::SeqCst);
     scope
@@ -467,6 +475,10 @@ pub(crate) const fn test_dev_surface() -> DevSurface {
 /// A dev-only relaxation never negates this: it takes a [`DevIntent`] or
 /// [`DevSurface`]. The source inventory `tests/posture_read_inventory.rs`
 /// admits every caller by name.
+#[cfg(any(
+    feature = "server",
+    all(test, not(target_arch = "wasm32"), not(feature = "dev-posture"))
+))]
 #[must_use]
 pub(crate) fn posture_is_production() -> bool {
     Posture::from_env() == Posture::Production
@@ -740,31 +752,136 @@ pub fn inject_dev_banner(body: &str, banner: &str) -> String {
     }
 }
 
-/// `Some(value)` when responses run in cross-origin-iframe mode
-/// (`IPE_WEB_FRAME_ANCESTORS` set). Snapshotted once into a `OnceLock` so env
-/// is read only once (eliminates the TOCTOU window where a dynamic env mutation
-/// could split the cookie name / CSP framing decision within a single request).
+/// The environment variable holding the `frame-ancestors` source list.
+pub const FRAME_ANCESTORS_ENV: &str = "IPE_WEB_FRAME_ANCESTORS";
+
+/// The `Content-Security-Policy` value `frame-ancestors <sources>` of an
+/// operator-configured embed allow-list.
 ///
-/// Lives here (the always-compiled telemetry module) rather than under `web`
-/// so the Ipe.Http.Server path (`server.rs`) can reach it too — the `web`
-/// module is DCE'd out of server-only builds.
-pub fn frame_ancestors() -> Option<&'static str> {
+/// Built only by [`FrameAncestors::parse`], so the value holds only visible
+/// ASCII, spaces and tabs, at least one source, and no `;` or `,`: it is
+/// always a header value, and it adds no directive and no second policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameAncestors(String);
+
+/// Why an `IPE_WEB_FRAME_ANCESTORS` value has no `frame-ancestors` representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameAncestorsRefusal {
+    /// A byte outside visible ASCII, space and tab: a control (CR, LF, NUL), DEL,
+    /// a non-ASCII byte, or a value that is not UTF-8.
+    NotVisibleAscii,
+    /// A `;`, which starts another policy directive.
+    DirectiveSeparator,
+    /// A `,`, which starts another policy.
+    PolicySeparator,
+    /// Only spaces or tabs: no source at all.
+    Blank,
+}
+
+impl std::fmt::Display for FrameAncestorsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let why = match self {
+            Self::NotVisibleAscii => {
+                "holds a control, DEL or non-ASCII byte (write an internationalised host in its \
+                 `xn--` form)"
+            }
+            Self::DirectiveSeparator => "holds `;`, which would start another policy directive",
+            Self::PolicySeparator => "holds `,`, which would start another policy",
+            Self::Blank => "holds only whitespace",
+        };
+        write!(
+            f,
+            "{FRAME_ANCESTORS_ENV} {why}; set it to space-separated sources such as \
+             `https://app.example.com`, or unset it to refuse every embedding"
+        )
+    }
+}
+
+impl std::error::Error for FrameAncestorsRefusal {}
+
+impl FrameAncestors {
+    /// Parse a raw `IPE_WEB_FRAME_ANCESTORS` value.
+    ///
+    /// The empty value is `Ok(None)`: no embedding, as when the variable is
+    /// unset. Surrounding spaces and tabs are dropped.
+    ///
+    /// # Errors
+    ///
+    /// A [`FrameAncestorsRefusal`] for a value with a byte outside visible
+    /// ASCII, space and tab, a `;` or `,`, or only whitespace.
+    pub fn parse(raw: &str) -> Result<Option<Self>, FrameAncestorsRefusal> {
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        for b in raw.bytes() {
+            match b {
+                b';' => return Err(FrameAncestorsRefusal::DirectiveSeparator),
+                b',' => return Err(FrameAncestorsRefusal::PolicySeparator),
+                b'\t' | b' '..=b'~' => {}
+                _ => return Err(FrameAncestorsRefusal::NotVisibleAscii),
+            }
+        }
+        let sources = raw.trim_matches([' ', '\t']);
+        if sources.is_empty() {
+            return Err(FrameAncestorsRefusal::Blank);
+        }
+        Ok(Some(Self(format!("frame-ancestors {sources}"))))
+    }
+
+    /// Parse a lookup of `IPE_WEB_FRAME_ANCESTORS`: absent is `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`]; a value that is not UTF-8 is
+    /// [`FrameAncestorsRefusal::NotVisibleAscii`].
+    pub fn from_lookup(
+        raw: &Result<String, std::env::VarError>,
+    ) -> Result<Option<Self>, FrameAncestorsRefusal> {
+        match raw {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(FrameAncestorsRefusal::NotVisibleAscii),
+            Ok(v) => Self::parse(v),
+        }
+    }
+
+    /// The `Content-Security-Policy` header value, `frame-ancestors <sources>`.
+    #[must_use]
+    pub const fn csp_value(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// The process's parsed `IPE_WEB_FRAME_ANCESTORS`: `Ok(Some)` in
+/// cross-origin-iframe mode, `Ok(None)` when unset or empty.
+///
+/// The one reader of the variable, parsed once into a `OnceLock` so the cookie
+/// `SameSite` and the framing header never decide on two different values.
+/// `Server.listen` and every `Ipe.Web` router refuse to start on the `Err`.
+///
+/// Lives in the always-compiled telemetry module so the `Ipe.Http.Server`
+/// path reaches it in server-only builds.
+///
+/// # Errors
+///
+/// The [`FrameAncestorsRefusal`] of a present, unrepresentable value.
+pub fn frame_ancestors_config() -> Result<Option<&'static FrameAncestors>, FrameAncestorsRefusal> {
     use std::sync::OnceLock;
-    static FA: OnceLock<String> = OnceLock::new();
-    let v = FA.get_or_init(|| {
-        // Strip CR / LF / NUL: this value is spliced verbatim into the
-        // Content-Security-Policy response header. A CR or LF would terminate
-        // the header line and inject a new response header (HTTP response
-        // splitting); NUL is rejected by header encoders. The remaining
-        // `frame-ancestors` source-list grammar is the operator's
-        // responsibility — we only close the response-splitting vector.
-        crate::system::read_env_var("IPE_WEB_FRAME_ANCESTORS")
-            .unwrap_or_default()
-            .chars()
-            .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
-            .collect()
-    });
-    if v.is_empty() { None } else { Some(v.as_str()) }
+    static FA: OnceLock<Result<Option<FrameAncestors>, FrameAncestorsRefusal>> = OnceLock::new();
+    match FA.get_or_init(|| {
+        FrameAncestors::from_lookup(&crate::system::read_env_var(FRAME_ANCESTORS_ENV))
+    }) {
+        Ok(fa) => Ok(fa.as_ref()),
+        Err(refusal) => Err(*refusal),
+    }
+}
+
+/// `Some` when responses run in cross-origin-iframe mode.
+///
+/// A refused value is `None`: cookies keep the same-site default, and the
+/// security headers refuse the response (see [`security_headers`]).
+#[must_use]
+pub fn frame_ancestors() -> Option<&'static FrameAncestors> {
+    frame_ancestors_config().ok().flatten()
 }
 
 /// The closed, ordered `Permissions-Policy` directive vocabulary Ipê emits an
@@ -870,8 +987,20 @@ fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>)
 /// `(name, value)` pairs so each
 /// caller splices them into its response builder only when the header is unset
 /// (an explicit handler override wins).
-#[must_use]
-pub fn security_headers() -> Vec<(&'static str, String)> {
+///
+/// # Errors
+///
+/// The [`FrameAncestorsRefusal`] of a refused `IPE_WEB_FRAME_ANCESTORS`: the
+/// caller answers `500` rather than send a response without its framing policy.
+pub fn security_headers() -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
+    security_headers_with(frame_ancestors_config())
+}
+
+/// [`security_headers`] under an explicit framing configuration.
+fn security_headers_with(
+    framing: Result<Option<&FrameAncestors>, FrameAncestorsRefusal>,
+) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
+    let framing = framing?;
     let mut h: Vec<(&'static str, String)> = vec![
         //
         ("x-content-type-options", "nosniff".to_string()),
@@ -887,12 +1016,12 @@ pub fn security_headers() -> Vec<(&'static str, String)> {
         ("permissions-policy", permissions_policy_value()),
     ];
     // Framing: CSP frame-ancestors when an embed origin is configured, else
-    // X-Frame-Options: SAMEORIGIN (mutually exclusive
-    match frame_ancestors() {
-        Some(fa) => h.push(("content-security-policy", format!("frame-ancestors {fa}"))),
+    // X-Frame-Options: SAMEORIGIN (mutually exclusive).
+    match framing {
+        Some(fa) => h.push(("content-security-policy", fa.csp_value().to_owned())),
         None => h.push(("x-frame-options", "SAMEORIGIN".to_string())),
     }
-    h
+    Ok(h)
 }
 
 /// Record a structured log line (called from `Ipe.Log.*`). Errors also land in
@@ -1305,6 +1434,102 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    // A raw environment read's `{:?}` keeps its shape and hides the value.
+    #[test]
+    fn raw_env_debug_hides_the_value() {
+        let shown = format!(
+            "{:?} {:?} {:?}",
+            RawEnv::Value("S3CR3T"),
+            RawEnv::Absent,
+            RawEnv::NotUnicode
+        );
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert_eq!(shown, "Value(<redacted>) Absent NotUnicode");
+    }
+
+    /// Every byte class with no `frame-ancestors` representation is refused,
+    /// the empty value is no embedding, and a source list is kept as written.
+    #[test]
+    fn frame_ancestors_parse_refuses_each_unrepresentable_class() {
+        let refused = [
+            ("https://\u{e9}.x", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\rb", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\nb", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\0b", FrameAncestorsRefusal::NotVisibleAscii),
+            ("a\u{7f}b", FrameAncestorsRefusal::NotVisibleAscii),
+            (
+                "'self'; script-src *",
+                FrameAncestorsRefusal::DirectiveSeparator,
+            ),
+            (
+                "https://a.example, https://b.example",
+                FrameAncestorsRefusal::PolicySeparator,
+            ),
+            ("  ", FrameAncestorsRefusal::Blank),
+            (" \t ", FrameAncestorsRefusal::Blank),
+        ];
+        for (raw, want) in refused {
+            assert_eq!(FrameAncestors::parse(raw), Err(want), "{raw:?}");
+        }
+        assert_eq!(FrameAncestors::parse(""), Ok(None));
+        let kept = FrameAncestors::parse(" https://a.example https://b.example ");
+        assert_eq!(
+            kept.as_ref()
+                .map(|fa| fa.as_ref().map(FrameAncestors::csp_value)),
+            Ok(Some("frame-ancestors https://a.example https://b.example"))
+        );
+        assert_eq!(
+            FrameAncestors::from_lookup(&Err(std::env::VarError::NotPresent)),
+            Ok(None)
+        );
+        assert_eq!(
+            FrameAncestors::from_lookup(&not_unicode()),
+            Err(FrameAncestorsRefusal::NotVisibleAscii)
+        );
+    }
+
+    /// The refusal names the variable and the remedy and never echoes the value.
+    #[test]
+    fn frame_ancestors_refusal_names_the_variable_not_the_value() {
+        let Err(refusal) = FrameAncestors::parse("https://evil\rX-Injected: 1") else {
+            panic!("a CR must be refused");
+        };
+        let text = refusal.to_string();
+        assert!(text.starts_with("IPE_WEB_FRAME_ANCESTORS "), "{text}");
+        assert!(text.contains("https://app.example.com"), "{text}");
+        assert!(
+            !text.contains("evil") && !text.contains("Injected"),
+            "{text}"
+        );
+    }
+
+    /// The security headers carry the parsed framing policy, and a refused
+    /// value yields no header set at all, so no response ships without framing.
+    #[test]
+    fn security_headers_follow_the_parsed_framing_policy() {
+        let embed = FrameAncestors::parse("https://a.example").ok().flatten();
+        let framed = security_headers_with(Ok(embed.as_ref()));
+        assert!(
+            framed
+                .as_ref()
+                .is_ok_and(|h| h.iter().any(|(k, v)| *k == "content-security-policy"
+                    && v == "frame-ancestors https://a.example")
+                    && !h.iter().any(|(k, _)| *k == "x-frame-options")),
+            "{framed:?}"
+        );
+        let same_origin = security_headers_with(Ok(None));
+        assert!(
+            same_origin.as_ref().is_ok_and(|h| h
+                .iter()
+                .any(|(k, v)| *k == "x-frame-options" && v == "SAMEORIGIN")),
+            "{same_origin:?}"
+        );
+        assert_eq!(
+            security_headers_with(Err(FrameAncestorsRefusal::Blank)),
+            Err(FrameAncestorsRefusal::Blank)
+        );
+    }
+
     fn not_unicode() -> Result<String, std::env::VarError> {
         Err(std::env::VarError::NotUnicode(std::ffi::OsString::new()))
     }
@@ -1509,7 +1734,7 @@ mod tests {
     fn env_dev_on_release_binary_mints_no_token() {
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_set_var("IPE_ENV", "dev");
-        record_bind("127.0.0.1");
+        record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert_eq!(ProcessScope::current(), ProcessScope::Loopback);
         assert_eq!(Posture::from_env(), Posture::Production);
         assert!(dev_intent_from_env().is_none());
@@ -1528,10 +1753,10 @@ mod tests {
         crate::system::locked_remove_var("IPE_ENV");
         assert!(dev_intent_from_env().is_some());
         assert!(dev_surface_from_env().is_none(), "unbound: no surface");
-        record_bind("127.0.0.1");
+        record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert!(dev_surface_from_env().is_some());
         assert!(!dev_console_banner("").is_empty());
-        record_bind("0.0.0.0");
+        record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         assert!(dev_surface_from_env().is_none());
         assert_eq!(dev_console_banner(""), "");
         assert!(dev_intent_from_env().is_some());
@@ -1545,7 +1770,7 @@ mod tests {
         assert_eq!(dev_console_banner_with("", None), "");
         if !cfg!(feature = "dev-posture") {
             crate::system::locked_set_var("ENV", "dev");
-            record_bind("127.0.0.1");
+            record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
             assert_eq!(dev_console_banner(""), "");
             crate::system::locked_remove_var("ENV");
         }
@@ -1992,6 +2217,10 @@ mod tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod listen_scope_tests {
     use super::{ListenScope, ProcessScope, record_bind};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const UNSPECIFIED: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
     #[test]
     fn process_scope_bytes_decode_closed() {
@@ -2026,37 +2255,71 @@ mod listen_scope_tests {
             ProcessScope::Exposed
         );
         assert_eq!(ProcessScope::current(), ProcessScope::Unbound);
-        assert_eq!(record_bind("127.0.0.1"), ListenScope::Loopback);
+        assert_eq!(record_bind(LOOPBACK), ListenScope::Loopback);
         assert_eq!(ProcessScope::current(), ProcessScope::Loopback);
-        assert_eq!(record_bind("0.0.0.0"), ListenScope::Exposed);
-        assert_eq!(record_bind("127.0.0.1"), ListenScope::Loopback);
+        assert_eq!(record_bind(UNSPECIFIED), ListenScope::Exposed);
+        assert_eq!(record_bind(LOOPBACK), ListenScope::Loopback);
         assert_eq!(ProcessScope::current(), ProcessScope::Exposed);
     }
 
     #[test]
-    fn only_a_literal_loopback_address_is_loopback() {
-        for host in [
-            "0.0.0.0",
-            "::",
-            "10.0.0.1",
-            "localhost",
-            "",
-            "not-an-ip",
-            "[::1]",
-            "::ffff:127.0.0.1",
+    fn only_a_loopback_address_is_loopback() {
+        for ip in [
+            UNSPECIFIED,
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
         ] {
             assert_eq!(
-                ListenScope::parse(host),
+                ListenScope::of(ip),
                 ListenScope::Exposed,
-                "bind host {host:?} must read as exposed"
+                "bind address {ip} must read as exposed"
             );
         }
-        for host in ["127.0.0.1", "::1", " 127.0.0.1 ", "127.1.2.3"] {
+        for ip in [
+            LOOPBACK,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3)),
+        ] {
             assert_eq!(
-                ListenScope::parse(host),
+                ListenScope::of(ip),
                 ListenScope::Loopback,
-                "bind host {host:?} must read as loopback"
+                "bind address {ip} must read as loopback"
             );
         }
+    }
+}
+
+/// Runs one ignored test of this test binary as a child process holding a
+/// given `IPE_WEB_FRAME_ANCESTORS`, so the process-wide parse is made under
+/// that value and no other test of the parent can have made it first.
+#[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
+pub(crate) mod frame_ancestors_child {
+    /// Printed by a child test once it has observed the startup refusal.
+    pub(crate) const REFUSED: &str = "frame-ancestors startup refusal observed";
+
+    /// Run the ignored test `name` of `module` (a `module_path!()`) with
+    /// `IPE_WEB_FRAME_ANCESTORS` set to `raw`. `true` when the child exited 0
+    /// having printed [`REFUSED`]; the child's stdout comes back for the report.
+    #[allow(clippy::expect_used)] // test helper: a test binary that cannot re-run itself is an environment issue
+    pub(crate) fn refused(module: &str, name: &str, raw: &str) -> (bool, String) {
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::{name}");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(super::FRAME_ANCESTORS_ENV, raw)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let ran = out.status.success();
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        (ran && stdout.contains(REFUSED), stdout)
     }
 }

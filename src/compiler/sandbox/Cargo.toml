@@ -9,11 +9,15 @@ description = "Isolation jail for compiling/inspecting untrusted foreign crates:
 ipe_diagnostics = { path = "../diagnostics" }
 ipe_kernels = { path = "../kernels" }
 ipe_env = { path = "../env" }
+# Held-handle, size-capped, no-follow reads of the VCS configuration a jail scans.
+ipe_fs_open = { path = "../fs_open" }
 serde = { version = "1", features = ["derive"] }
 # Scratch names draw 128 bits from each target's real CSPRNG (`getrandom(2)`,
 # `BCryptGenRandom`) with no weaker fallback. `std` supplies the
 # `getrandom::Error` -> `io::Error` conversion.
 getrandom = { version = "0.3", features = ["std"] }
+# Jujutsu's configuration is TOML; the same major the CLI and FFI crates parse with.
+toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 # The private-scratch exclusive `O_NOFOLLOW` open, and the effective uid/gid the

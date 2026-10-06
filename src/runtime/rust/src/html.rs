@@ -107,11 +107,14 @@ impl<M: PartialEq> PartialEq for Attribute<M> {
     }
 }
 
+// The attribute name only: a value (a token, a prefilled field) never reaches
+// a `{:?}` rendering.
 impl<M> std::fmt::Debug for Attribute<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let hidden = crate::redact::REDACTED;
         match self {
-            Attribute::Attr(k, v) => write!(f, "Attr({k:?},{v:?})"),
-            Attribute::BoolAttr(k, v) => write!(f, "BoolAttr({k:?},{v})"),
+            Attribute::Attr(k, _) => write!(f, "Attr({k:?},{hidden})"),
+            Attribute::BoolAttr(k, _) => write!(f, "BoolAttr({k:?},{hidden})"),
             Attribute::EventAttr(e) => write!(f, "{e:?}"),
             Attribute::NoAttr => write!(f, "NoAttr"),
         }
@@ -974,8 +977,11 @@ pub fn html_on_raw_fixed_<M>(_name: String, _msg: M) -> Attribute<M> {
 
 /// `Ffi.callPure "htmlEscapeText"` — HTML-escape a string for text content.
 ///
-/// Routes through the same escaper as render, so the set (`& ' < >`; `"` stays
-/// raw, it carries no meaning in text content) can never drift.
+/// Escapes exactly `&` `<` `>` `'`, each to the entity the `crate::escape`
+/// text form names, and leaves `"` raw, so the output is safe only as element
+/// text content. A
+/// double-quoted attribute value needs [`html_escape_attr_`], which also
+/// escapes `"`. Routes through render's escaper, so the set cannot drift.
 #[must_use]
 pub fn html_escape_text_(s: String) -> String {
     crate::escape::html_text(&s)
@@ -1015,26 +1021,12 @@ pub fn html_attr_to_string_<M>(attr: Attribute<M>) -> String {
     }
 }
 
-// ─── IpeStringify for the Html runtime types ────────────────────────────────
-// Same rationale as the Ipe.Ui impls in ui/element.rs: a codegen-emitted
-// `ipe_show` recurses into every field, so an Html/Attribute/Event a generated
-// type can hold must impl the trait (else E0599). A stable type-tag placeholder
-// is total and never recurses into `M`.
-impl<M> crate::stringify::IpeStringify for Html<M> {
-    fn ipe_show(&self) -> String {
-        "<html>".to_string()
-    }
-}
-impl<M> crate::stringify::IpeStringify for Attribute<M> {
-    fn ipe_show(&self) -> String {
-        "<html-attribute>".to_string()
-    }
-}
-impl<M> crate::stringify::IpeStringify for Event<M> {
-    fn ipe_show(&self) -> String {
-        "<event>".to_string()
-    }
-}
+// ─── Show rows for the Html runtime types ───────────────────────────────────
+// `Internals` leaves: the `<Module.Type>` marker, never the tree, an attribute
+// value, or the `M` payload.
+crate::stringify::show_row!("Html", Internals, [M] Html<M>, |_| "<Ipe.Html.Html>".to_owned());
+crate::stringify::show_row!("HtmlAttribute", Internals, [M] Attribute<M>, |_| "<Ipe.Html.Attribute>".to_owned());
+crate::stringify::show_row!("HtmlEvent", Internals, [M] Event<M>, |_| "<Ipe.Html.Events.Event>".to_owned());
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -1043,6 +1035,21 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
+    }
+
+    // An attribute's `{:?}` names the attribute and hides its value.
+    #[test]
+    fn attribute_debug_hides_the_value() {
+        let shown = format!(
+            "{:?} {:?}",
+            Attribute::<()>::Attr("value".into(), "S3CR3T".into()),
+            Attribute::<()>::BoolAttr("checked".into(), true),
+        );
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert_eq!(
+            shown,
+            "Attr(\"value\",<redacted>) BoolAttr(\"checked\",<redacted>)"
+        );
     }
 
     #[test]
@@ -1258,6 +1265,30 @@ mod tests {
             "select strips value: {}",
             render_html(&sel)
         );
+    }
+
+    /// The text kernel escapes exactly `& < > '` and leaves `"` raw; the attr
+    /// kernel adds `"`, the one byte that separates the two contexts. Each
+    /// writes the owner's bytes; `crate::escape` pins the entities themselves.
+    #[test]
+    fn escape_kernels_pin_their_escaped_sets() {
+        for c in (0x20u8..=0x7E).map(char::from) {
+            let raw = c.to_string();
+            let text = html_escape_text_(raw.clone());
+            let attr = html_escape_attr_(raw.clone());
+            assert_eq!(text, crate::escape::html_text(&raw), "{c:?}");
+            assert_eq!(attr, crate::escape::html_attr(&raw), "{c:?}");
+            assert_eq!(
+                text != raw,
+                matches!(c, '&' | '<' | '>' | '\''),
+                "text kernel on {c:?}"
+            );
+            assert_eq!(
+                attr != raw,
+                matches!(c, '&' | '<' | '>' | '\'' | '"'),
+                "attr kernel on {c:?}"
+            );
+        }
     }
 
     #[test]

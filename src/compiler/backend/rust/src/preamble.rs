@@ -2,8 +2,8 @@
 //!
 //! The Ipê → Rust codegen wraps the user's emitted types and functions in a
 //! fixed prologue (header, imports, basic type aliases, runtime re-exports) and
-//! a fixed epilogue (list helpers, FFI-placeholder banner, entry point). Those
-//! two fixed regions are produced here.
+//! a fixed epilogue (list helpers, entry point). Those two fixed regions are
+//! produced here.
 //!
 //! The byte source of truth is the hand-maintained template at
 //! `templates/main.rs` — a canonical whole-program rendering that owns the fixed
@@ -92,8 +92,8 @@ pub fn preamble(keep_json: bool) -> DResult<String> {
 
 /// The fixed epilogue emitted after the user's function definitions.
 ///
-/// Spans the list helpers, the FFI-placeholder banner, and the entry point
-/// (`fn main`) — the tail of the golden program. `Ffi.kernel` calls are routed
+/// Spans the list helpers and the entry point (`fn main`) — the tail of the
+/// golden program. `Ffi.kernel` calls are routed
 /// directly by codegen, so no runtime polyfill is emitted; a construction path
 /// that could not be routed is rejected at ipe-time, never left to a runtime
 /// panic in emitted pure-Ipê Rust.
@@ -173,6 +173,20 @@ mod tests {
         // emitted pure-Ipê Rust is a compiler bug the package gate forbids).
         assert!(!epilogue()?.contains("ffi_kernel_polyfill"));
         assert!(!epilogue()?.contains("panic!"));
+        Ok(())
+    }
+
+    #[test]
+    fn epilogue_ends_the_process_only_through_the_runtime_exit_funnel() -> DResult<()> {
+        // Both `fn main` outcomes reach `exit_process`, which runs the exit hook
+        // and the exporter flush; a raw `std::process::exit` skips both.
+        let tail = epilogue()?;
+        assert!(
+            !tail.contains("process::exit"),
+            "the epilogue ends the process outside the runtime funnel: {tail}"
+        );
+        assert!(tail.contains("IpeResult::Ok(_) => ipe_runtime::system::exit_process(0)"));
+        assert!(tail.contains("ipe_runtime::system::exit_process(1)"));
         Ok(())
     }
 

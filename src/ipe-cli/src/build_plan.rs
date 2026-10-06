@@ -14,6 +14,7 @@ use std::fmt;
 
 use ipe_backend_rust::static_build::{CProfile, StaticAllocator, StaticPlan, StaticTriple};
 
+use crate::remote_ingest::{LocalCeiling, LocalSource, TOOL_QUERY_LIMITS, run_local};
 use crate::text;
 
 /// The user's allocator choice before AUTO resolution — a closed enum.
@@ -342,10 +343,19 @@ pub fn preflight_with(
 /// The installed rustup targets, or `None` when `rustup` cannot be run
 /// (absent or failing — both fail-soft).
 fn rustup_installed_targets() -> Option<Vec<String>> {
-    let output = std::process::Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-        .ok()?;
+    installed_targets_of(std::ffi::OsStr::new("rustup"), TOOL_QUERY_LIMITS)
+}
+
+/// The targets `rustup target list --installed` reports, the query held to `ceiling`.
+///
+/// `None` when the query cannot start, exits non-zero, crosses a ceiling (its
+/// process group is killed), or prints a list that is not UTF-8: the check is
+/// skipped, as when rustup is absent, and the cargo build that follows stays
+/// the authority on whether the target's std is present.
+fn installed_targets_of(rustup: &std::ffi::OsStr, ceiling: LocalCeiling) -> Option<Vec<String>> {
+    let mut query = std::process::Command::new(rustup);
+    query.args(["target", "list", "--installed"]);
+    let output = run_local(query, ceiling, LocalSource::ToolQuery).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -591,5 +601,80 @@ mod tests {
             ),
             Err(Refusal::TargetNotInstalled { .. })
         ));
+    }
+
+    /// The rustup target query driven through a stub that runs a shell `body`.
+    #[cfg(unix)]
+    mod stubbed_rustup {
+        use super::super::installed_targets_of;
+        use crate::remote_ingest::{LocalWall, TOOL_QUERY_LIMITS};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::{Path, PathBuf};
+        use std::time::{Duration, Instant};
+
+        /// A fresh scratch base for `tag` holding a stub `rustup` that runs `body`.
+        fn stub(tag: &str, body: &str) -> PathBuf {
+            let base = ipe_test_temp::temp_root().join(format!(
+                "ipe-build-plan-rustup-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("scratch base");
+            let path = base.join("rustup");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("stub executable");
+            path
+        }
+
+        /// Remove the scratch base holding the stub at `path`.
+        fn clean(path: &Path) {
+            if let Some(base) = path.parent() {
+                let _ = std::fs::remove_dir_all(base);
+            }
+        }
+
+        #[test]
+        fn the_installed_targets_are_read_one_per_line() {
+            let rustup = stub("ok", "echo x86_64-unknown-linux-musl\necho wasm32-wasip1");
+            assert_eq!(
+                installed_targets_of(rustup.as_os_str(), TOOL_QUERY_LIMITS),
+                Some(vec![
+                    "x86_64-unknown-linux-musl".to_owned(),
+                    "wasm32-wasip1".to_owned()
+                ])
+            );
+            clean(&rustup);
+        }
+
+        #[test]
+        fn a_target_query_past_its_wall_is_skipped() {
+            let rustup = stub("wall", "echo x86_64-unknown-linux-musl\nexec sleep 30");
+            let started = Instant::now();
+            let targets = installed_targets_of(
+                rustup.as_os_str(),
+                TOOL_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert_eq!(targets, None, "a query stopped at its wall reports no list");
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the query is stopped at its wall, not at the child's exit"
+            );
+            clean(&rustup);
+        }
+
+        #[test]
+        fn a_target_query_flooding_stdout_is_skipped() {
+            let rustup = stub(
+                "flood",
+                "echo x86_64-unknown-linux-musl\nhead -c 131072 /dev/zero | tr '\\0' 'x'",
+            );
+            assert_eq!(
+                installed_targets_of(rustup.as_os_str(), TOOL_QUERY_LIMITS),
+                None,
+                "a query past its stdout ceiling reports no list"
+            );
+            clean(&rustup);
+        }
     }
 }

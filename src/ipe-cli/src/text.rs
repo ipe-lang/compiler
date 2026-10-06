@@ -130,6 +130,7 @@ relayable!(
     ipe_docs::argv::NonUtf8Argument,
     ipe_lint::ConfigError,
     ipe_sandbox::run_jail::RunJailDefect,
+    ipe_sandbox::run_jail::FloorRefusal,
     ipe_ffi::diag::Diagnostic,
     ipe_ffi::diag::WireDefect,
 );
@@ -932,11 +933,15 @@ messages! {
     cli_local_tree_refused(source, shape) = "cli-local-tree-refused";
     /// A finished child's output pipe stayed open past the grace.
     cli_child_pipe_held(stream) = "cli-child-pipe-held";
+    /// Reading a child's output pipe failed, so its output is incomplete.
+    cli_child_pipe_unread(stream, kind) = "cli-child-pipe-unread";
+    /// A child's stderr was cut at its ceiling; the line closes the kept text.
+    cli_child_stderr_truncated(limit) = "cli-child-stderr-truncated";
     /// A source path named a FIFO, device, socket or other non-regular file.
     cli_source_not_regular_file(path) = "cli-source-not-regular-file";
     /// A source file or directory could not be opened for lack of permission.
     cli_source_access_denied(path) = "cli-source-access-denied";
-    /// A module path was reached through a symlink the no-follow walk refuses.
+    /// A convention file or walked module path is a symlink the no-follow open refuses.
     cli_source_symlink(path) = "cli-source-symlink";
     /// A manifest path escaped the project directory.
     cli_path_escape(raw, reason) = "cli-path-escape";
@@ -1475,12 +1480,12 @@ messages! {
     publish_fresh_refused(name) = "publish-fresh-refused";
     /// The emitted `fn main` anchor is absent from the build.
     run_main_anchor_absent = "run-main-anchor-absent";
+    /// The emitted source holds more than one `fn main` anchor line.
+    run_main_anchor_ambiguous = "run-main-anchor-ambiguous";
+    /// An emitted source's prior floor block is not one ipe wrote.
+    run_floor_block_malformed = "run-floor-block-malformed";
     /// A jail profile does not parse.
     run_profile_unparsable(code, detail) = "run-profile-unparsable";
-    /// A binary carries no readable capability floor.
-    run_floor_unreadable(code) = "run-floor-unreadable";
-    /// A binary's capability floor was embedded by a development build.
-    run_floor_not_release(code) = "run-floor-not-release";
     /// A declared program entry outside `Main` is not yet buildable.
     build_entry_not_main(module) = "build-entry-not-main";
     /// `ipe pack` is retired.
@@ -1529,8 +1534,8 @@ messages! {
     session_no_recordable(flag, name) = "session-no-recordable";
     /// `ipe dev run --record`/`--replay` with `--target wasi`.
     session_native_only(flag) = "session-native-only";
-    /// `ipe dev run --record`/`--replay` on a native-bearing program.
-    session_jailed(flag) = "session-jailed";
+    /// `ipe dev run --record`/`--replay` on a program that can link Rust FFI.
+    session_ffi_unproven(flag) = "session-ffi-unproven";
     /// `ipe dev run --record` with `--replay`.
     session_flags_exclusive(first, second) = "session-flags-exclusive";
     /// `ipe dev run --replay` with no recorded log or trace in the output root.

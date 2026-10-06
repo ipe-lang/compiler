@@ -1,4 +1,4 @@
-module Lib.Highlight exposing (Lang(..), Token(..), langFor, sourceTokenStyle, tokenText, tokenize)
+module Lib.Highlight exposing (Lang(..), Token(..), langFor, tokenText, tokenize)
 
 import Ipe.Char as Char
 import Ipe.List as List
@@ -58,14 +58,6 @@ langFor stored =
 tokenText : Token -> SafeText
 tokenText tok =
     SafeText.renderForeign (tokenSource tok)
-
-
--- The CSS every displayed source token carries: its characters are drawn in
--- byte (logical) order, so strong right-to-left letters cannot reorder the
--- neutral characters around them inside one token.
-sourceTokenStyle : List ( String, String )
-sourceTokenStyle =
-    [ ( "unicode-bidi", "bidi-override" ), ( "direction", "ltr" ) ]
 
 
 tokenSource : Token -> String

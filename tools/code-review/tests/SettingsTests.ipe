@@ -30,7 +30,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
+import TestSupport exposing (tableExists, envReview, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
 
 
 -- An `IPE_INDEX_DB` value carrying hazards is refused by naming the variable,
@@ -58,7 +58,7 @@ dbRefusalNamesOnlyVariable =
 settingsRefusal : String -> Task.Task Error (Maybe String)
 settingsRefusal indexDb =
     System.setenv "IPE_INDEX_DB" indexDb
-        |> Task.andThen (\_ -> Settings.indexSettings)
+        |> Task.andThen (\_ -> envSettings)
         |> Task.map (\_ -> Nothing)
         |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
 
@@ -200,7 +200,7 @@ probesNameTheirVariable =
         at <- freshScratch "ipe-index-probe"
         removeFileIfAny at.indexDb
         seedIndex at.indexDb at.repo
-        good <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        good <- probeMessage (envSettings |> Task.andThen Index.probe)
         missing <- missingIndexProbed at
         notIndex <- foreignDbProbed at
         review <- reviewProbed at
@@ -219,7 +219,7 @@ missingIndexProbed at =
     do
         removeFileIfAny missingDb
         System.setenv "IPE_INDEX_DB" missingDb
-        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
         created <- Task.fromResult (Path.fromString missingDb) |> Task.andThen File.exists
         Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "ipe-index index" message && not created)
 
@@ -235,7 +235,7 @@ foreignDbProbed at =
         conn <- Db.open "sqlite" ("sqlite://" ++ otherDb ++ "?mode=rwc")
         Db.exec conn "CREATE TABLE IF NOT EXISTS other (x INTEGER)" []
         System.setenv "IPE_INDEX_DB" otherDb
-        message <- probeMessage (Settings.indexSettings |> Task.andThen Index.probe)
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
         removeFileIfAny otherDb
         Task.succeed (probeNames "IPE_INDEX_DB" otherDb message)
 
@@ -249,7 +249,7 @@ reviewProbed at =
     in
     do
         System.setenv "IPE_REVIEW_DB" badReview
-        message <- probeMessage (Settings.reviewDb |> Task.andThen LibDb.probe)
+        message <- probeMessage (envReview |> Task.andThen LibDb.probe)
         Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && not (maybeContains "ipe-index index" message))
 
 
@@ -287,6 +287,563 @@ dbRefusalsStateOneFix =
             )
 
 
+-- The environment is read and parsed at startup alone. Every name that can
+-- read the environment or the working directory, check a directory, or
+-- parse a configured location is counted in every module of `src`, and each
+-- module's count must equal its row in `admittedSites`: a new call, a
+-- wrapper around an admitted one, a second import of `Ipe.System`, or a read
+-- in a new module is red whatever it is spelled as or whatever variable it
+-- names. Every use of `Ipe.System` is counted as `System.`, its `getenv*`
+-- and `*cwd` readers again by name, and the only admitted import is the
+-- exact `import Ipe.System as System`, so an alias or an `exposing` import
+-- cannot dodge the count. In `Main`: the environment is read on exactly two
+-- code lines — `requireEnv`'s read and the `requireSettings` call in
+-- `main` — and `requireEnv` is named only by its declaration and its two
+-- literal-key calls, so no wrapper can pass it a key. `Settings` exports both
+-- parsers and neither the bare `indexSettings` nor `reviewDb`.
+startupReadsAdmittedOnly : Task.Task Error Bool
+startupReadsAdmittedOnly =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
+        settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
+        mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
+        Task.succeed
+            (layoutAdmits topNames libNames
+                && List.length sources
+                >= 12
+                && sitesAdmitted sources
+                && mainAdmits mainSource
+                && settingsExports settings
+            )
+
+
+readDirAt : String -> Task.Task Error (List String)
+readDirAt dir =
+    Task.fromResult (Path.fromString dir) |> Task.andThen File.readDir
+
+
+-- Every module of `src` by its path relative to `src`.
+moduleFiles : List String -> List String -> List String
+moduleFiles topNames libNames =
+    List.filter (String.endsWith ".ipe") topNames
+        ++ List.map (\name -> "Lib/" ++ name) (List.filter (String.endsWith ".ipe") libNames)
+
+
+-- `src` holds `.ipe` modules and the `Lib` directory, and `Lib` holds only
+-- `.ipe` modules, so every module is one `moduleFiles` lists. A dot-named
+-- entry is admitted: no module path can pass through it.
+layoutAdmits : List String -> List String -> Bool
+layoutAdmits topNames libNames =
+    List.member "Lib" topNames
+        && List.all (\name -> name == "Lib" || String.endsWith ".ipe" name || String.startsWith "." name) topNames
+        && List.all (\name -> String.endsWith ".ipe" name || String.startsWith "." name) libNames
+
+
+readLibSource : String -> Task.Task Error String
+readLibSource file =
+    Task.fromResult (Path.fromString file)
+        |> Task.andThen (\path -> File.readFileLimit path (ByteSize.kib 256))
+
+
+-- The source with every whole-line comment dropped, so prose naming a
+-- reader is never counted as a call.
+withoutCommentLines : String -> String
+withoutCommentLines source =
+    String.join "\n" (List.filter (\line -> not (String.startsWith "--" (String.trimStart line))) (String.lines source))
+
+
+occurrences : String -> String -> Int
+occurrences needle text =
+    List.length (String.split needle text) - 1
+
+
+-- Each needle and, for every module admitted to name it, the exact number of
+-- times its code does. A module absent from a needle's row names it zero
+-- times. `System.` counts every qualified use of the module: `Main`'s
+-- `getenv`, `getenvOr` and two `exit`s, `RepoPath`'s `cwd`. `absolute`
+-- counts `Path.absolute`, which resolves against the working directory, beside
+-- the message text that names the word. `Ipe.Env` reads
+-- the live environment on the native target and `Ipe.Process` can run a
+-- child that prints it, so neither is admitted anywhere.
+admittedSites : List ( String, List ( String, Int ) )
+admittedSites =
+    [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ) ] )
+    , ( "Ipe.Ffi", [] )
+    , ( "Ipe.Env", [] )
+    , ( "Ipe.Process", [] )
+    , ( "System.", [ ( "Main.ipe", 4 ), ( "Lib/RepoPath.ipe", 1 ) ] )
+    , ( "getenv", [ ( "Main.ipe", 2 ) ] )
+    , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
+    , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ) ] )
+    , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/Settings.ipe", 3 ) ] )
+    , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "parseDbLocation", [ ( "Lib/Settings.ipe", 5 ) ] )
+    , ( "parseIndexSettings", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "parseReviewDb", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    ]
+
+
+admittedCount : String -> List ( String, Int ) -> Int
+admittedCount rel admitted =
+    case List.find (\( file, _ ) -> file == rel) admitted of
+        Just ( _, count ) ->
+            count
+
+        Nothing ->
+            0
+
+
+-- Every module names every needle exactly as often as `admittedSites`
+-- admits, every admitted module exists (a stale row is drift), and every
+-- import of `Ipe.System` is the exact admitted line.
+sitesAdmitted : List ( String, String ) -> Bool
+sitesAdmitted sources =
+    List.all
+        (\( needle, admitted ) ->
+            List.all (\( rel, text ) -> occurrences needle text == admittedCount rel admitted) sources
+                && List.all (\( file, _ ) -> List.any (\( rel, _ ) -> rel == file) sources) admitted
+        )
+        admittedSites
+        && List.all (\( _, text ) -> List.all systemImportAdmitted (String.lines text)) sources
+
+
+systemImportAdmitted : String -> Bool
+systemImportAdmitted line =
+    let
+        parts =
+            String.words line
+    in
+    List.take 2 parts /= [ "import", "Ipe.System" ] || parts == [ "import", "Ipe.System", "as", "System" ]
+
+
+-- The scan refuses each way around it: a reader behind an alias or an
+-- `exposing` import, `getcwd` beside `cwd`, a wrapper that calls an admitted
+-- parser from a request path, a reader in a module outside `src/Lib`, and a
+-- directory the inventory would not read. Red while the scan matches one
+-- qualified spelling per reader or reads `src/Lib` alone.
+startupScanRefusesEvasions : Task.Task Error Bool
+startupScanRefusesEvasions =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
+        Task.succeed
+            (sitesAdmitted sources
+                && evaded sources "Lib/Queue.ipe" "import Ipe.System as Sys\nroot = Sys.getcwd ()"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.System exposing (getenvOr)\nraw = getenvOr \"X\" \"\""
+                && evaded sources "Lib/RepoPath.ipe" "again = System.getcwd ()"
+                && evaded sources "Lib/RepoPath.ipe" "reparse raw = parseRoot raw"
+                && evaded sources "Lib/Settings.ipe" "again raw = RepoPath.absolutize raw"
+                && evaded sources "Lib/Queue.ipe" "reload = Settings.parseIndexSettings"
+                && evaded sources "Migrations.ipe" "import Ipe.System as System\nraw = System.getenvOr \"X\" \"\""
+                && evaded sources "Lib/Index.ipe" "fresh = File.isDir"
+                && evaded sources "Lib/Index.ipe" "fresh = Path.absolute"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Env as Env\nraw = Env.public \"INDEX_DB\""
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Process as Process\nraw = Process.run \"printenv\" []"
+                && not (sitesAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/RepoPath.ipe") sources))
+                && not (layoutAdmits ("Pages" :: topNames) libNames)
+                && not (layoutAdmits topNames ("Extra" :: libNames))
+                && not (systemImportAdmitted "import  Ipe.System  as  System exposing (cwd)")
+                && mainAdmits (mainCode sources)
+                && not (mainAdmits (mainCode sources ++ "\nreread name = requireEnv name \"\""))
+                && not (mainAdmits (String.replace "rawDb <- requireEnv \"IPE_INDEX_DB\" " "rawDb <- readDb " (mainCode sources) ++ "\nreadDb = requireEnv \"IPE_INDEX_DB\""))
+            )
+
+
+-- The code of `Main`, empty when the inventory has no `Main`.
+mainCode : List ( String, String ) -> String
+mainCode sources =
+    moduleCode "Main.ipe" sources
+
+
+-- The code of module `rel`, empty when the inventory has no such module.
+moduleCode : String -> List ( String, String ) -> String
+moduleCode rel sources =
+    case List.find (\( name, _ ) -> name == rel) sources of
+        Just ( _, text ) ->
+            text
+
+        Nothing ->
+            ""
+
+
+-- The scan refuses `sources` once `extra` is appended to module `rel`.
+evaded : List ( String, String ) -> String -> String -> Bool
+evaded sources rel extra =
+    not (sitesAdmitted (appendTo rel extra sources))
+
+
+-- `sources` with `extra` appended to the code of module `rel`.
+appendTo : String -> String -> List ( String, String ) -> List ( String, String )
+appendTo rel extra sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, text ++ "\n" ++ extra )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+mainAdmits : String -> Bool
+mainAdmits text =
+    let
+        envLines =
+            List.filter (String.contains "getenv") (String.lines text)
+    in
+    List.length envLines
+        == 2
+        && List.any (String.contains "(System.getenv key)") envLines
+        && List.any (\line -> String.startsWith "settings <- requireSettings" (String.trim line)) envLines
+        && occurrences "getenv" text
+        == 2
+        && occurrences "requireEnv \"" text
+        == 2
+        && occurrences "requireEnv" text
+        == 4
+        && occurrences "requireSettings" text
+        == 3
+        && occurrences "parseIndexSettings" text
+        == 1
+        && occurrences "parseReviewDb" text
+        == 1
+        && List.all (\needle -> occurrences needle text == 0) [ "parseDbLocation", "parseRoot", "absolutize", "isDir", "System.cwd" ]
+        && mainPinned text
+
+
+-- `main` opens with the two literal-key `requireEnv` reads, the settings
+-- parse and the listen, in that order, so a partially applied `requireEnv`
+-- that a request could run cannot take the place of either read.
+mainPinned : String -> Bool
+mainPinned text =
+    case String.split "\nmain =\n    do\n" text of
+        [ _, body ] ->
+            case List.take 4 (String.lines body) of
+                [ dbLine, rootLine, settingsLine, listenLine ] ->
+                    String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
+                        && String.startsWith "        rawRoot <- requireEnv \"IPE_INDEX_ROOT\" \"" rootLine
+                        && settingsLine
+                        == "        settings <- requireSettings rawDb rawRoot (System.getenvOr \"IPE_REVIEW_DB\" \"review.db\")"
+                        && listenLine
+                        == "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]"
+
+                _ ->
+                    False
+
+        _ ->
+            False
+
+
+-- True when the module header exports both parsers and neither the bare
+-- `indexSettings` nor `reviewDb`.
+settingsExports : String -> Bool
+settingsExports source =
+    case List.head (String.lines source) of
+        Just header ->
+            let
+                names =
+                    List.map (\part -> String.replace ")" "" (String.trim part)) (String.split "," header)
+            in
+            List.any (\name -> name == "parseIndexSettings") names
+                && List.any (\name -> name == "parseReviewDb") names
+                && not (List.any (\name -> name == "indexSettings" || name == "reviewDb") names)
+
+        Nothing ->
+            False
+
+
+-- The startup settings never ride in session state. The session `Model` is
+-- persisted, and every type it can hold is declared in a module of `src`,
+-- so no `type` declaration in `src` may name a settings-carrying type except
+-- the declarations that define the settings themselves (`admittedCarriers`).
+-- The scan reads each declaration whole (`typeDeclarations`) and judges
+-- every word by its unqualified name, so a
+-- qualified or wrapped spelling (`Settings.AppSettings`,
+-- `Maybe RepoPath.RootMap`) is caught alike. The `Model` is declared in
+-- `src/Lib/App.ipe`; its source is scanned for the declaration, and the scan
+-- must find `Model` there. Red while the `Model` holds a `settings` field.
+settingsNeverInSessionState : Task.Task Error Bool
+settingsNeverInSessionState =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
+        Task.succeed
+            (layoutAdmits topNames libNames
+                && stateAdmitted sources
+                && not (stateAdmitted (withModelField sources))
+                && not (stateAdmitted (appendTo "Main.ipe" "type alias Held =\n    { settings : Settings.AppSettings\n    }" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Index.ipe" "type alias Held =\n    { roots : Maybe RepoPath.RootMap }" sources))
+                && not (stateAdmitted (appendTo "Lib/Db.ipe" "type Held\n    = Held (List Settings.DbLocation)" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n\t= Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note -}\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type\tHeld\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "{- note -} type Held\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note\nend -}\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/App.ipe") sources))
+                && statePinned sources
+                && not (statePinned (replaceIn "Main.ipe" "init : Web.WebReq -> ( Model, Cmd Msg )" "init : Web.WebReq -> ( ( Model, Settings.AppSettings ), Cmd Msg )" sources))
+                && not (statePinned (replaceIn "Lib/View.ipe" "view : Model -> Ui.Element Msg" "view : ( Model, Settings.AppSettings ) -> Ui.Element Msg" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , view = View.view\n" "        , view = View.view settings\n" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , update = App.update settings\n" "        , update = \\msg state -> App.update settings msg state\n" sources))
+                && not (statePinned (replaceIn "Lib/App.ipe" "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" "update : Msg -> ( Model, Settings.AppSettings ) -> ( Model, Cmd Msg )" sources))
+                && not (statePinned (appendTo "Lib/Queue.ipe" "other = Web.embed" sources))
+                && not (statePinned (replaceIn "Main.ipe" "reviewApp settings =\n    Web.embed\n" "reviewApp settings =\n    let\n        update = \\s msg state -> state\n    in\n    Web.embed\n" sources))
+            )
+
+
+-- The app's session state is `Model`: the app functions carry it by these
+-- exact annotations and the one `embed` in `src`, the body of `reviewApp`
+-- with no `let` that could shadow them, wires exactly these functions, so
+-- the state cannot be a tuple or record that pairs `Model` with the
+-- settings, which no `type` declaration would show.
+statePinned : List ( String, String ) -> Bool
+statePinned sources =
+    let
+        code =
+            mainCode sources
+    in
+    List.all (\( rel, line ) -> List.member line (String.lines (moduleCode rel sources))) stateAnnotations
+        && occurrences stateWiring code
+        == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources)
+        == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "mountApp" text) sources)
+        == 1
+
+
+stateAnnotations : List ( String, String )
+stateAnnotations =
+    [ ( "Main.ipe", "init : Web.WebReq -> ( Model, Cmd Msg )" )
+    , ( "Lib/App.ipe", "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" )
+    , ( "Lib/View.ipe", "view : Model -> Ui.Element Msg" )
+    , ( "Main.ipe", "subscriptions : Model -> Sub Msg" )
+    ]
+
+
+stateWiring : String
+stateWiring =
+    "reviewApp settings =\n    Web.embed\n        { init = init\n        , update = App.update settings\n        , view = View.view\n        , subscriptions = subscriptions\n"
+
+
+-- `sources` with `old` replaced by `new` in the code of module `rel`.
+replaceIn : String -> String -> String -> List ( String, String ) -> List ( String, String )
+replaceIn rel old new sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, String.replace old new text )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+-- `sources` with a `settings` field added to the `Model` declaration of
+-- `Lib.App`, the shape a session carrying the startup settings takes.
+withModelField : List ( String, String ) -> List ( String, String )
+withModelField sources =
+    List.map
+        (\( rel, text ) ->
+            if rel == "Lib/App.ipe" then
+                ( rel, String.replace "    { page : Page\n" "    { page : Page\n    , settings : Settings.AppSettings\n" text )
+
+            else
+                ( rel, text )
+        )
+        sources
+
+
+-- The types that carry a configured location, by unqualified name.
+settingsCarriers : List String
+settingsCarriers =
+    [ "AppSettings", "IndexSettings", "DbLocation", "RootMap", "Root", "Binding", "Entry" ]
+
+
+-- The declarations admitted to name a settings carrier: the ones that
+-- define the settings, each in its own module.
+admittedCarriers : List ( String, List String )
+admittedCarriers =
+    [ ( "Lib/Settings.ipe", [ "DbLocation", "IndexSettings", "AppSettings" ] )
+    , ( "Lib/RepoPath.ipe", [ "Root", "Entry", "Binding", "RootMap" ] )
+    ]
+
+
+-- `Lib.App` declares a `Model`, and no declaration outside `admittedCarriers`
+-- names a settings carrier.
+stateAdmitted : List ( String, String ) -> Bool
+stateAdmitted sources =
+    List.any (\( rel, text ) -> rel == "Lib/App.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
+        && List.all
+            (\( rel, text ) ->
+                List.all
+                    (\( name, words ) -> declarationAdmitted rel name || not (List.any namesCarrier words))
+                    (typeDeclarations text)
+            )
+            sources
+
+
+declarationAdmitted : String -> String -> Bool
+declarationAdmitted rel name =
+    List.any (\( file, names ) -> file == rel && List.member name names) admittedCarriers
+
+
+-- A word naming a settings carrier, qualified or not.
+namesCarrier : String -> Bool
+namesCarrier word =
+    case List.head (List.reverse (String.split "." word)) of
+        Just last ->
+            List.member last settingsCarriers
+
+        Nothing ->
+            False
+
+
+-- A `type` declaration: its name and every word of it.
+type alias Declaration =
+    ( String, List String )
+
+
+-- The declarations closed so far, newest first, the one being read, and
+-- how many `{-` block comments are open after the last line.
+type alias DeclarationScan =
+    { closed : List Declaration
+    , current : Maybe Declaration
+    , depth : Int
+    }
+
+
+-- Every `type` declaration of `text`, from its `type` line up to the next
+-- line that starts a top-level item: a line at column 0 that is not inside
+-- or opening a block comment. A line indented by a space or a tab, a blank
+-- line, and any line of a block comment continue the declaration, so a
+-- comment or a tab between a declaration's head and its body cannot end the
+-- scan early. A miscounted comment can only add words to a declaration or
+-- start a spurious one, never drop a real one.
+typeDeclarations : String -> List Declaration
+typeDeclarations text =
+    let
+        scan =
+            List.foldl declarationStep { closed = [], current = Nothing, depth = 0 } (String.lines text)
+    in
+    List.reverse (closeDeclaration scan.current scan.closed)
+
+
+declarationStep : String -> DeclarationScan -> DeclarationScan
+declarationStep line scan =
+    let
+        depth =
+            commentDepthAfter scan.depth line
+    in
+    if startsDeclaration line then
+        { closed = closeDeclaration scan.current scan.closed, current = Just ( declarationName line, typeWords line ), depth = depth }
+
+    else if endsDeclaration scan.depth line then
+        { closed = closeDeclaration scan.current scan.closed, current = Nothing, depth = depth }
+
+    else
+        case scan.current of
+            Just ( name, words ) ->
+                { closed = scan.closed, current = Just ( name, words ++ typeWords line ), depth = depth }
+
+            Nothing ->
+                { scan | depth = depth }
+
+
+-- A line at column 0 holding the word `type` anywhere, so a block comment
+-- before the keyword cannot hide the declaration.
+startsDeclaration : String -> Bool
+startsDeclaration line =
+    not (indented line) && List.member "type" (String.words line)
+
+
+-- A line at column 0 outside a block comment, not opening one.
+endsDeclaration : Int -> String -> Bool
+endsDeclaration depth line =
+    depth == 0 && line /= "" && not (indented line) && not (String.startsWith "{-" line)
+
+
+indented : String -> Bool
+indented line =
+    String.startsWith " " line || String.startsWith "\t" line
+
+
+-- The open block-comment count after `line`, never below zero.
+commentDepthAfter : Int -> String -> Int
+commentDepthAfter depth line =
+    let
+        next =
+            depth + occurrences "{-" line - occurrences "-}" line
+    in
+    if next < 0 then
+        0
+
+    else
+        next
+
+
+closeDeclaration : Maybe Declaration -> List Declaration -> List Declaration
+closeDeclaration current closed =
+    case current of
+        Just declaration ->
+            declaration :: closed
+
+        Nothing ->
+            closed
+
+
+-- The word after `type`, or after `type alias`.
+declarationName : String -> String
+declarationName line =
+    afterType (String.words line)
+        |> List.filter (\word -> word /= "alias")
+        |> List.head
+        |> Maybe.withDefault ""
+
+
+-- The words after the first `type`.
+afterType : List String -> List String
+afterType words =
+    case words of
+        word :: rest ->
+            if word == "type" then
+                rest
+
+            else
+                afterType rest
+
+        [] ->
+            []
+
+
+-- The words of one declaration line, with type punctuation read as space.
+typeWords : String -> List String
+typeWords line =
+    String.words (List.foldl (\mark text -> String.replace mark " " text) line [ "->", "{", "}", "(", ")", "[", "]", ",", ":", "|", "=" ])
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -296,4 +853,7 @@ checks =
         , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
         , check "each db refusal states one fix" dbRefusalsStateOneFix
         , check "startup probes name the variable and the file" probesNameTheirVariable
+        , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
+        , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
+        , check "no session state type carries the startup settings" settingsNeverInSessionState
         ]

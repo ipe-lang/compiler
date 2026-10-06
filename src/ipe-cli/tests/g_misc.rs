@@ -96,6 +96,8 @@ mod golden_region_seal;
 mod golden_secret;
 #[path = "g_misc/golden_session_replay_seal.rs"]
 mod golden_session_replay_seal;
+#[path = "g_misc/golden_show_policy.rs"]
+mod golden_show_policy;
 #[path = "g_misc/golden_static_bound.rs"]
 mod golden_static_bound;
 #[path = "g_misc/golden_stdlib_module_seal.rs"]

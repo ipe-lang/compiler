@@ -1,12 +1,12 @@
 use super::{
-    AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, OutTarget,
+    AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget,
     RuntimeContext, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
     bluegreen_enabled, build_loose_file_into, build_project_into, bundle_delivery,
     collect_entry_and_siblings, collect_manifest_rooted_entry, collect_test_sources,
     compile_prepared, create_source_root, emit_machine_error, emit_permissions,
     find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
-    io_err, resolve_analysis_entry, resolve_analysis_target, resolve_vendored_runtime_dir,
-    run_version, runtime_dep_from_env, single_file_cargo_name_from_env,
+    io_err, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
+    runtime_dep_from_env, single_file_cargo_name_from_env,
 };
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
@@ -98,8 +98,8 @@ pub fn intercept_help(args: &[String]) -> Option<HelpRequest> {
     }
 
     // A help flag directly on a group (`ipe dev --help`): its subpage. A bare
-    // group is not a help request — `run_cli` refuses it with
-    // [`CliError::GroupRequired`].
+    // group is not a help request here — `run_cli` answers it per
+    // [`bare_group`].
     if let Some((first, rest)) = args.split_first()
         && help::is_group(first)
         && rest.first().is_some_and(|a| is_help_flag(a))
@@ -191,12 +191,15 @@ pub fn run_cli(args: &[String]) -> Result<(), CliError> {
     }
     // An umbrella group (`ipe dev <verb> …`) resolves its member to a typed
     // `Verb`, and `dispatch` runs it with the umbrella's posture. A bare group
-    // refuses; a `release` followed by a non-member token (`release web`)
-    // refuses with the `release build` form carrying that tail; a `dev`
-    // followed by a non-member token is an unknown verb of the group.
+    // answers per [`bare_group`]; a `release` followed by a non-member token
+    // (`release web`) refuses with the `release build` form carrying that tail;
+    // a `dev` followed by a non-member token is an unknown verb of the group.
     if let Some(umbrella) = Umbrella::from_name(cmd) {
         let Some((sub, tail)) = rest.split_first() else {
-            return Err(group_required(cmd, bare_group_forms(umbrella), &[]));
+            return match bare_group(umbrella) {
+                BareGroup::Page => show_group_page(cmd),
+                BareGroup::Refuse(forms) => Err(group_required(cmd, forms, &[])),
+            };
         };
         return match (Verb::member(umbrella, sub), umbrella) {
             (Some(verb), _) => dispatch(verb, tail),
@@ -234,15 +237,37 @@ pub const GROUP_REQUIRED: &[(&str, &[Verb])] = &[
     ("eject", &[Verb::RELEASE_EJECT]),
 ];
 
-/// The forms a bare umbrella group's refusal names.
-///
-/// A bare `ipe dev` names none; its members stay discoverable through
-/// `ipe dev --help`.
-const fn bare_group_forms(umbrella: Umbrella) -> &'static [Verb] {
+/// How a bare umbrella group (`ipe dev`, no member verb) is answered.
+enum BareGroup {
+    /// The group's own help page, exit 0.
+    Page,
+    /// A [`CliError::GroupRequired`] refusal naming these grouped forms.
+    Refuse(&'static [Verb]),
+}
+
+/// The answer to a bare `ipe <umbrella>`.
+const fn bare_group(umbrella: Umbrella) -> BareGroup {
     match umbrella {
-        Umbrella::Dev => &[],
-        Umbrella::Release => &[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT],
+        Umbrella::Dev => BareGroup::Page,
+        Umbrella::Release => {
+            BareGroup::Refuse(&[Verb::RELEASE_BUILD, Verb::RELEASE_RUN, Verb::RELEASE_EJECT])
+        }
     }
+}
+
+/// Print the help page of the group `name`, the page `ipe <name> --help` shows.
+///
+/// A name with no page refuses with an empty-forms [`CliError::GroupRequired`],
+/// so a group that lost its page fails closed rather than printing nothing and
+/// exiting 0.
+fn show_group_page(name: &str) -> Result<(), CliError> {
+    help::group(name, &std::io::stdout()).map_or_else(
+        || Err(group_required(name, &[], &[])),
+        |page| {
+            show_help_page(&page);
+            Ok(())
+        },
+    )
 }
 
 /// The [`CliError::GroupRequired`] refusal for `attempted` followed by `tail`.
@@ -408,17 +433,25 @@ pub fn resolve_output_root(
 ///
 /// The shape is the single source of truth for delivery: it is derived from
 /// code, never from config or the CLI. `entry_arg` is the raw positional (a
-/// `.ipe` file, a project directory, or a bare `.`); it is routed to its entry
-/// source file the same way the analysis surfaces route it. A source that does
-/// not parse yields [`delivery::Shape::Script`] — the cross-check then does not
-/// fire and the build pipeline reports the real parse error with a blamed span.
+/// `.ipe` file, a project directory, or a bare `.`): a file no manifest governs
+/// is read as the user named it, following a link; a governed project's entry
+/// is the convention file below its source root, never followed. A source that
+/// does not parse yields [`delivery::Shape::Script`] — the cross-check then
+/// does not fire and the build pipeline reports the real parse error with a
+/// blamed span.
 ///
 /// # Errors
 /// [`CliError::Io`] when the entry source cannot be read, or the manifest /
-/// entry-resolution errors of [`resolve_analysis_entry`].
+/// entry-resolution errors of [`super::analysis_root_of`].
 pub fn classify_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliError> {
-    let entry_file = resolve_analysis_entry(entry_arg)?;
-    let source = io_bounded::read_to_string_capped(&entry_file, io_bounded::SOURCE_READ_CAP)?;
+    let source = match discover_manifest(entry_arg)? {
+        None => io_bounded::read_user_named(entry_arg, io_bounded::SOURCE_CAP)?,
+        Some(manifest) => {
+            let parsed = project::parse_manifest(&manifest)?;
+            let entry = super::analysis_root_of(&parsed)?;
+            io_bounded::read_beneath(&parsed.src_root, &entry, io_bounded::SOURCE_CAP)?
+        }
+    };
     let mut interner = Interner::new();
     // A parse failure is the compile pipeline's to report (with a blamed span);
     // the shape cross-check simply does not fire, so classify as a script.
@@ -729,8 +762,8 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         Verb::DEV_BUILD.name(),
     )?;
 
-    // Human-friendly progress: the consent gates and the compile+emit below are
-    // otherwise silent, so the banner and a start line come first and a done line
+    // Human-friendly progress: the compile+emit below is otherwise silent, so
+    // the banner and a start line come first and a done line
     // closes the build. Shown only on an interactive terminal so piped / CI output
     // stays clean; status goes to stderr (stdout carries data). Suppressed in
     // quiet mode (only warnings/errors) and in JSON mode (machine output only —
@@ -753,34 +786,17 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     // A `desktop`/`ios`/`android` host is an application bundle, not a plain
     // artifact: it is routed through the delivery-grammar bundler (a fast dev
-    // bundle for `build`) once the consent gates below admit it.
+    // bundle for `build`).
     let bundle_host = BundleHost::from_delivery_host(delivery.host())?;
 
     // `--fix` carries durable authorization: apply machine-applicable fixes
-    // non-interactively before the capability resolution and the build see the
-    // source, so the consented capability set describes the source that is
-    // actually compiled.
+    // non-interactively before the build sees the source.
     if bundle_host.is_none() && args.fix {
         apply_fixes_cmd(&entry_path, true, &mut std::io::stdout())?;
     }
 
-    // Trust-boundary consent gates over ONE capability resolution — ahead of the
-    // bundle route so a `desktop`/`ios`/`android` bundle build is gated too (a
-    // bundle is a distributable), and ahead of the (costly) emit + cargo build.
-    // A disclosed `.Unsafe` import needs `--accept-risks`, the manifest token, or
-    // an interactive yes (a non-interactive build without consent fails closed
-    // rather than blocking on a prompt); a disclosed `js-port:<axis>` must be
-    // granted by THIS app's `[capabilities] accept`; a disclosed `native-ffi`
-    // crossing by THIS app's `[capabilities] declared`.
-    let consented = consent_to_capabilities(
-        manifest_parsed.as_ref(),
-        manifest.as_deref(),
-        &entry_path,
-        args.accept_risks,
-    )?;
-
     if let Some(host) = bundle_host {
-        bundle_delivery(host, Verb::DEV_BUILD.bundle_profile(), Some(entry.as_str()))?;
+        bundle_delivery(host, NativeFinish::Dev, Some(entry.as_str()))?;
         return Ok(BuildSuccess {
             entry,
             out_dir: PathBuf::new(),
@@ -871,11 +887,11 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     let native_artifact = match compile_target {
         CompileTarget::WasmClient => {
-            bundle_wasm(&crate_dir)?;
+            bundle_wasm(crate_dir.dir())?;
             None
         }
         CompileTarget::WasmWasi => {
-            bundle_wasi(&crate_dir)?;
+            bundle_wasi(crate_dir.dir())?;
             None
         }
         CompileTarget::Native => Some(compile_and_finalize_native_build(
@@ -888,7 +904,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
                 quiet: args.quiet,
             },
             manifest.as_deref(),
-            &consented,
         )?),
     };
 
@@ -925,7 +940,7 @@ fn emit_into(
     target: &EmitTarget,
     runtime_dir: &Path,
     options: BuildOptions,
-) -> Result<OwnedDir, CliError> {
+) -> Result<EmittedCrate, CliError> {
     let out = OutTarget::Proven(target);
     match manifest {
         Some(m) => build_project_into(m, out, runtime_dir, &options),
@@ -945,52 +960,104 @@ pub struct NativeBuild {
     pub quiet: bool,
 }
 
-/// The cargo build of an emitted native crate together with its enforcement
-/// artifacts: the one path every floored dev and release build takes.
-struct FlooredBuild<'a> {
+/// The posture a native crate is finished in.
+///
+/// A development build embeds only the constant development marker and writes
+/// no profile, so every release reader refuses it. A release build lowers its
+/// consented capabilities to the floor it embeds, so a release floor exists
+/// only behind a [`ConsentedCapabilities`] witness.
+pub enum NativeFinish<'a> {
+    /// `ipe dev`: the development marker, no profile, a debug build.
+    Dev,
+    /// `ipe release`: the consented capabilities' profile and release floor are
+    /// written before an optimised build.
+    Release {
+        /// The capabilities the release consent gates admitted.
+        consented: &'a ConsentedCapabilities,
+        /// The database driver the profile's socket allowances follow.
+        driver: ipe_backend_rust::DbDriver,
+    },
+}
+
+impl NativeFinish<'_> {
+    /// The posture's name in an internal-bug diagnostic.
+    const fn posture(&self) -> &'static str {
+        match self {
+            Self::Dev => "development",
+            Self::Release { .. } => "release",
+        }
+    }
+}
+
+/// The cargo build of an emitted native crate in its [`NativeFinish`]
+/// posture: the one path every dev and release native build takes.
+pub struct FlooredBuild<'a> {
     /// The resolved `cargo`.
-    cargo: &'a toolchain::CargoBin,
-    /// The emitted crate, both floored and built.
-    crate_dir: &'a OwnedDir,
-    /// The enforcement profile of a native-bearing program; `None` for pure Ipê,
-    /// which is structurally bounded and carries neither profile nor floor.
-    enforcement: Option<&'a ipe_sandbox::run_jail::SandboxProfile>,
-    /// The pipeline building the crate: it names the floor and picks the cargo
-    /// profile, so a release floor is never built as a debug binary.
-    intent: ipe_backend_rust::BuildIntent,
+    pub(crate) cargo: &'a toolchain::CargoBin,
+    /// The emitted crate, both floored and built; the floor line it was
+    /// written with must be the one [`Self::finish`] builds.
+    pub(crate) crate_dir: &'a EmittedCrate,
+    /// The posture: it decides the floor and picks the cargo profile, so a
+    /// release floor is never built as a debug binary and a dev build carries
+    /// only the development marker.
+    pub(crate) finish: NativeFinish<'a>,
     /// The compile target.
-    target: CargoTarget,
+    pub(crate) target: CargoTarget,
     /// Where cargo's output goes.
-    output: CargoOutput,
+    pub(crate) output: CargoOutput,
     /// What is built, named in the failure diagnostic.
-    what: &'static str,
+    pub(crate) what: &'static str,
     /// The runtime crate the build links against, when resolved.
-    runtime: Option<RuntimeContext>,
+    pub(crate) runtime: Option<RuntimeContext>,
 }
 
 impl FlooredBuild<'_> {
-    /// Write the `ipe.profile` mirror and the embedded floor, then run cargo, so
-    /// the binary cargo produces carries exactly this build's floor — never
-    /// none and never a stale one left by an earlier build.
+    /// Run cargo in the build's posture. A release build first writes the
+    /// `ipe.profile` mirror and the embedded floor, so the binary cargo
+    /// produces carries exactly this build's floor — never none and never a
+    /// stale one left by an earlier build. A dev build first embeds the
+    /// constant development marker, with no capability inference.
     ///
     /// # Errors
-    /// The errors of [`run_sandbox::write_build_artifacts`] and
-    /// [`CargoBuild::run`].
-    fn run(self) -> Result<String, CliError> {
-        if let Some(profile) = self.enforcement {
-            run_sandbox::write_build_artifacts(
-                self.crate_dir,
-                profile,
-                run_sandbox::floor_intent(self.intent),
-            )?;
-        }
+    /// [`CliError::Pipeline`] (an internal bug) when the crate was emitted
+    /// with a floor line other than the one the finish builds, before anything
+    /// is written or cargo runs; the errors of [`run_sandbox::build_profile`],
+    /// [`run_sandbox::write_build_artifacts`],
+    /// [`run_sandbox::write_dev_floor_marker`] and [`CargoBuild::run`].
+    pub(crate) fn run(self) -> Result<String, CliError> {
+        let crate_dir = self.crate_dir.dir();
+        let profile = match (self.crate_dir.floor(), self.finish) {
+            (run_sandbox::EmitFloor::DevelopmentMarker, NativeFinish::Dev) => {
+                run_sandbox::write_dev_floor_marker(crate_dir)?;
+                CargoProfile::Dev
+            }
+            (
+                run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+                NativeFinish::Release { consented, driver },
+            ) => {
+                let floor = run_sandbox::build_profile(consented.resolved(), driver)?;
+                run_sandbox::write_build_artifacts(crate_dir, &floor)?;
+                CargoProfile::Release
+            }
+            (floor @ run_sandbox::EmitFloor::NoNativeBinary, finish)
+            | (
+                floor @ run_sandbox::EmitFloor::DevelopmentMarker,
+                finish @ NativeFinish::Release { .. },
+            )
+            | (floor @ run_sandbox::EmitFloor::ReleaseFloorAtBuild, finish @ NativeFinish::Dev) => {
+                return Err(super::build_pipeline::floor_mismatch_bug(
+                    "ipe_cli::FlooredBuild::run",
+                    format!(
+                        "a {} native build was handed a crate emitted with {floor:?}",
+                        finish.posture()
+                    ),
+                ));
+            }
+        };
         CargoBuild {
             cargo: self.cargo,
-            krate: CargoCrate::Emitted(self.crate_dir),
-            profile: match self.intent {
-                ipe_backend_rust::BuildIntent::Development => CargoProfile::Dev,
-                ipe_backend_rust::BuildIntent::Release => CargoProfile::Release,
-            },
+            krate: CargoCrate::Emitted(crate_dir),
+            profile,
             target: self.target,
             output: self.output,
             what: self.what,
@@ -1000,8 +1067,33 @@ impl FlooredBuild<'_> {
     }
 }
 
-/// Compile the just-emitted native crate and write its runtime-enforcement
-/// artifacts. Split out of [`run_build`] so each stays a readable unit.
+/// Build the pure-native release binary of `crate_dir` for `triple`: an
+/// optimised static build carrying the floor `consented` lowers to.
+///
+/// # Errors
+/// The errors of [`FlooredBuild::run`].
+fn build_pure_native_release(
+    cargo: &toolchain::CargoBin,
+    crate_dir: &EmittedCrate,
+    consented: &ConsentedCapabilities,
+    driver: ipe_backend_rust::DbDriver,
+    triple: ipe_backend_rust::static_build::StaticTriple,
+    verbosity: Verbosity,
+) -> Result<String, CliError> {
+    FlooredBuild {
+        cargo,
+        crate_dir,
+        finish: NativeFinish::Release { consented, driver },
+        target: CargoTarget::Static(triple),
+        output: CargoOutput::Human(verbosity),
+        what: "the release binary",
+        runtime: None,
+    }
+    .run()
+}
+
+/// Compile the just-emitted native dev crate. Split out of [`run_build`] so
+/// each stays a readable unit.
 ///
 /// The compile is the SEAL: a reported build success MUST mean the crate
 /// actually built, so a non-zero cargo exit surfaces as a typed
@@ -1011,10 +1103,8 @@ impl FlooredBuild<'_> {
 /// `.cargo/config.toml` is discovered; a static plan additionally selects the
 /// target triple explicitly.
 ///
-/// A native-bearing artifact then carries its own runtime enforcement — an
-/// `ipe.profile` mirror plus the authoritative capability floor embedded in the
-/// binary — so the jail travels with a copied-off-host artifact (ADR 0004). A
-/// pure Ipê artifact is structurally bounded and needs neither profile nor floor.
+/// A dev artifact carries only the development marker and no profile, so a
+/// release run refuses it as a development build.
 ///
 /// Returns the path the built binary was copied to under the project
 /// (`<project>/out/bin/<name>`), so the artifact is findable regardless of a
@@ -1023,14 +1113,12 @@ impl FlooredBuild<'_> {
 /// # Errors
 /// - [`CliError::EmittedBuildFailed`] when the emitted crate fails to compile.
 /// - [`CliError::Io`] when the artifact cannot be copied into the project.
-/// - The toolchain, manifest-parse, and profile-construction errors of the
-///   steps it composes.
+/// - The toolchain and manifest-parse errors of the steps it composes.
 pub fn compile_and_finalize_native_build(
     output: &OutputRoot,
-    crate_dir: &OwnedDir,
+    crate_dir: &EmittedCrate,
     build: NativeBuild,
     manifest: Option<&Path>,
-    consented: &ConsentedCapabilities,
 ) -> Result<PathBuf, CliError> {
     let NativeBuild {
         cargo: native_cargo,
@@ -1055,24 +1143,10 @@ pub fn compile_and_finalize_native_build(
         Some(m) => Some(project::parse_manifest(m)?),
         None => None,
     };
-    // The enforcement artifacts (the `ipe.profile` mirror and the embedded
-    // floor) are written BEFORE the build, so the binary cargo produces
-    // carries exactly this floor — never a stale one left by an earlier build.
-    let driver = manifest_parsed
-        .as_ref()
-        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-    let resolved = consented.resolved();
-    let enforcement = if run_sandbox::is_native_bearing(&resolved.union()) {
-        Some(run_sandbox::build_profile(resolved, driver)?)
-    } else {
-        None
-    };
-
     FlooredBuild {
         cargo: &cargo_bin,
         crate_dir,
-        enforcement: enforcement.as_ref(),
-        intent: Verb::DEV_BUILD.intent(),
+        finish: NativeFinish::Dev,
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
@@ -1470,8 +1544,8 @@ pub fn release_pipeline(
         None => None,
     };
 
-    // The same trust-boundary consent gates `build` and `run` enforce, applied
-    // BEFORE any emit, cargo build, OR bundle — hoisted above the bundle
+    // The trust-boundary consent gates, applied BEFORE any emit, cargo build,
+    // OR bundle — hoisted above the bundle
     // early-return so EVERY release target (served artifact AND a
     // desktop/ios/android distributable bundle) is gated. A distributable is the
     // most consequential output, so it must never ship a disclosed `.Unsafe`
@@ -1480,12 +1554,8 @@ pub fn release_pipeline(
     // carries no `--accept-risks` and never prompts, so an ungranted disclosure
     // fails closed here, and the durable manifest `[capabilities]` grant is the
     // only way through (a CI release must not block on a TTY prompt).
-    let consented = consent_to_capabilities(
-        manifest_parsed.as_ref(),
-        manifest.as_deref(),
-        &entry_path,
-        false,
-    )?;
+    let consented =
+        consent_to_capabilities(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
 
     // A `desktop`/`ios`/`android` host is a production distributable bundle:
     // route it through the delivery-grammar bundler (the `release` production
@@ -1500,8 +1570,19 @@ pub fn release_pipeline(
     ) {
         return Err(CliError::NoRunForm { target });
     }
+    // The database driver a release profile's socket allowances follow.
+    let driver = manifest_parsed
+        .as_ref()
+        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
-        bundle_delivery(host, verb.bundle_profile(), Some(entry.as_str()))?;
+        bundle_delivery(
+            host,
+            NativeFinish::Release {
+                consented: &consented,
+                driver,
+            },
+            Some(entry.as_str()),
+        )?;
         return Ok(ReleaseOutput::Distributable);
     }
 
@@ -1593,7 +1674,7 @@ pub fn release_pipeline(
                 &runtime_dir,
                 options,
             )?;
-            bundle_wasm(&crate_dir)?;
+            bundle_wasm(crate_dir.dir())?;
             if show_progress {
                 crate::screen::chatter(
                     crate::screen::Stream::Stderr,
@@ -1611,9 +1692,6 @@ pub fn release_pipeline(
 
     // The consented capabilities discriminate between native-bearing (needs jail
     // wrapper) and pure-native (plain optimised binary).
-    let driver = manifest_parsed
-        .as_ref()
-        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
     let resolved = consented.resolved();
 
     let runtime_dir = resolve_vendored_runtime_dir(args.runtime.clone(), false)?;
@@ -1666,16 +1744,14 @@ pub fn release_pipeline(
             options,
         )?;
 
-        CargoBuild {
-            cargo: &cargo_bin,
-            krate: CargoCrate::Emitted(&crate_dir),
-            profile: CargoProfile::Release,
-            target: CargoTarget::Static(triple),
-            output: CargoOutput::Human(Verbosity::Progress),
-            what: "the release binary",
-            runtime: None,
-        }
-        .run()?;
+        build_pure_native_release(
+            &cargo_bin,
+            &crate_dir,
+            &consented,
+            driver,
+            triple,
+            Verbosity::Progress,
+        )?;
 
         let app_target_dir = crate::cargo_step::target_directory(&cargo_bin, &out_dir)?;
         // Cargo names the built binary after the emitted crate IDENTITY (the
@@ -1765,12 +1841,13 @@ pub fn release_pipeline(
         options,
     )?;
 
-    let profile = run_sandbox::build_profile(resolved, driver)?;
     FlooredBuild {
         cargo: &cargo_bin,
         crate_dir: &app_dir,
-        enforcement: Some(&profile),
-        intent: verb.intent(),
+        finish: NativeFinish::Release {
+            consented: &consented,
+            driver,
+        },
         target: CargoTarget::Static(triple),
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the release app",
@@ -2394,7 +2471,7 @@ pub fn typed_log_file() -> PathBuf {
 /// loops and dumps (or replays) its log from the directly executed native
 /// binary; a script or TUI/web app has no such loop, and a `--target wasi` run
 /// executes in wasmtime. Pure over the delivery shape and compile target, so it
-/// runs before any capability resolution or consent prompt.
+/// runs before any build work.
 ///
 /// # Errors
 /// [`CliError::Usage`] naming why the session cannot be recorded or
@@ -2421,23 +2498,16 @@ pub fn gate_session(
     Ok(())
 }
 
-/// Refuse `ipe dev run --record` / `--replay` for a native-bearing program.
-///
-/// A native-bearing program runs inside the jail, where the session log is not
-/// reachable. Judges the capabilities the run's consent gates already resolved,
-/// so the session gate never re-infers them.
+/// Refuse `ipe dev run --record` / `--replay` for a program that can link Rust
+/// FFI: foreign code's effects are not proven to replay deterministically.
 ///
 /// # Errors
-/// [`CliError::Usage`] when the resolved capability union is
-/// native-bearing.
-pub fn gate_session_capabilities(
-    flag: &str,
-    resolved: &run_sandbox::ResolvedCapabilities,
-) -> Result<(), CliError> {
-    if run_sandbox::is_native_bearing(&resolved.union()) {
-        return Err(CliError::Usage(text::msg::session_jailed(&flag)));
+/// [`CliError::Usage`] when `presence` is [`ffi::FfiPresence::Present`].
+pub fn gate_session_ffi(flag: &str, presence: ffi::FfiPresence) -> Result<(), CliError> {
+    match presence {
+        ffi::FfiPresence::Absent => Ok(()),
+        ffi::FfiPresence::Present => Err(CliError::Usage(text::msg::session_ffi_unproven(&flag))),
     }
-    Ok(())
 }
 
 /// Refuse a Tui app before any build work when no interactive terminal is
@@ -2483,8 +2553,27 @@ pub fn gate_terminal_decision(
 pub enum SessionPlan {
     /// Build the app and run it with this session env.
     Run(SessionEnv),
-    /// Show the plain trace at this path: nothing is built and nothing re-runs.
-    ShowTrace(PathBuf),
+    /// Show this plain trace: nothing is built and nothing re-runs.
+    ShowTrace(TraceFile),
+}
+
+/// A plain trace to show, typed by who named its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceFile {
+    /// The trace the user named on `--replay`: a final link is followed.
+    Named(PathBuf),
+    /// The trace `--record` wrote in the claimed output directory: never followed.
+    Recorded(PathBuf),
+}
+
+impl TraceFile {
+    /// The trace's path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Named(path) | Self::Recorded(path) => path,
+        }
+    }
 }
 
 /// Resolve what a run does with its session, once the output root is known.
@@ -2517,7 +2606,7 @@ pub fn resolve_session_plan(
             }
             let trace = owned.path_to(RECORD_LOG_FILE)?.path();
             if is_regular_file(&trace) {
-                return Ok(SessionPlan::ShowTrace(trace));
+                return Ok(SessionPlan::ShowTrace(TraceFile::Recorded(trace)));
             }
             Err(CliError::Usage(text::msg::replay_no_default_log(
                 &typed.display(),
@@ -2539,7 +2628,7 @@ pub fn replay_plan(path: PathBuf) -> Result<SessionPlan, CliError> {
         )));
     }
     if is_session_trace(&path) {
-        Ok(SessionPlan::ShowTrace(path))
+        Ok(SessionPlan::ShowTrace(TraceFile::Named(path)))
     } else {
         Ok(SessionPlan::Run(SessionEnv::Replay(path)))
     }
@@ -2585,27 +2674,34 @@ pub fn render_session_trace(path: &Path, text: &str) -> String {
     out
 }
 
-/// Read the recorded trace at `path` whole and render it sanitised.
+/// Read `trace` whole and render it sanitised.
 ///
 /// # Errors
 /// [`CliError::FileTooLarge`] past [`io_bounded::SESSION_TRACE_READ_CAP`];
-/// [`CliError::Io`] when the trace cannot be read or is not UTF-8 (kind
-/// `InvalidData`).
-pub fn load_session_trace(path: &Path) -> Result<String, CliError> {
-    let text = io_bounded::read_to_string_capped(path, io_bounded::SESSION_TRACE_READ_CAP)?;
-    Ok(render_session_trace(path, &text))
+/// [`CliError::SourceRefused`] for a recorded trace that is a link or for any
+/// trace that is not a regular file; [`CliError::Io`] when the trace cannot be
+/// read or is not UTF-8 (kind `InvalidData`).
+pub fn load_session_trace(trace: &TraceFile) -> Result<String, CliError> {
+    let text = match trace {
+        TraceFile::Named(path) => io_bounded::read_user_named(path, io_bounded::SESSION_TRACE_CAP)?,
+        TraceFile::Recorded(path) => {
+            io_bounded::read_leaf_capped(path, io_bounded::SESSION_TRACE_READ_CAP)?
+        }
+    };
+    Ok(render_session_trace(trace.path(), &text))
 }
 
-/// Print the recorded trace at `path` to stdout, sanitised.
+/// Print `trace` to stdout, sanitised.
 ///
 /// The read is capped and whole: an oversized or non-UTF-8 trace is refused
 /// before anything is printed.
 ///
 /// # Errors
 /// As [`load_session_trace`]; [`CliError::Io`] when stdout cannot be written.
-pub fn show_session_trace(path: &Path) -> Result<(), CliError> {
+pub fn show_session_trace(trace: &TraceFile) -> Result<(), CliError> {
     use std::io::Write as _;
-    let rendered = load_session_trace(path)?;
+    let path = trace.path();
+    let rendered = load_session_trace(trace)?;
     let mut stdout = std::io::stdout().lock();
     stdout
         .write_all(rendered.as_bytes())
@@ -2648,15 +2744,16 @@ pub fn run_run_body(rest: &[String]) -> Result<(), CliError> {
     run_run_with_args(args)
 }
 
-/// Execute a fully-parsed `ipe dev run`: compile → cargo build → jailed exec.
+/// Execute a fully-parsed `ipe dev run`: compile → cargo build → exec, with no
+/// capability check and no jail.
 ///
 /// With `--record`, `IPE_DEBUGGER_RECORD` is injected into the executed child
 /// so the runtime dumps the session's trace and typed log into the output root
 /// on exit; with `--replay`, `IPE_DEBUGGER_REPLAY` names the typed log the child
 /// re-folds instead of running live, and a plain trace is shown sanitised
 /// without building anything.
-// A linear pipeline (compile → cargo build → resolve capabilities → jail →
-// exec); the steps share enough locals that splitting reads worse than the whole.
+// A linear pipeline (compile → cargo build → exec); the steps share enough
+// locals that splitting reads worse than the whole.
 #[allow(clippy::too_many_lines)]
 pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let output_format = args.format;
@@ -2715,8 +2812,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // failing on the raw-mode syscall inside the built binary.
     gate_terminal(Verb::DEV_RUN.name(), delivery.shape())?;
 
-    // Human-friendly progress: the consent gates and the compile+emit below are
-    // otherwise silent, so the banner and the running step come first. On a
+    // Human-friendly progress: the compile+emit below is otherwise silent, so
+    // the banner and the running step come first. On a
     // terminal only (piped / CI output stays clean); to stderr, so stdout carries
     // only the program's own output. The cargo build that follows streams its own
     // progress; the exec that ends `ipe dev run` leaves no room for a settled "done"
@@ -2748,23 +2845,10 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let wasm_target = compile_target.is_wasm();
 
     // A session over a shape or target with no recordable update loop is
-    // refused before capability resolution and any consent prompt.
+    // refused before any build work.
     if let Some(flag) = session.flag() {
         gate_session(flag, delivery.shape(), compile_target)?;
     }
-
-    // The same trust-boundary consent gates as `ipe dev build`, over ONE capability
-    // resolution, BEFORE the (costly) emit + cargo build: a disclosed `.Unsafe`
-    // import needs consent (a non-interactive run without it fails closed rather
-    // than blocking on a prompt), and a disclosed `js-port:<axis>` / `native-ffi`
-    // crossing must be granted by this app's manifest, else fail closed. The
-    // consented set is the one the WASI context and the native jail enforce.
-    let consented = consent_to_capabilities(
-        manifest_parsed.as_ref(),
-        manifest.as_deref(),
-        &entry_path,
-        args.accept_risks,
-    )?;
 
     // Fail closed unless the delivery runtime and the compile target agree — the
     // `(engine, triple)` validity matrix is the single live gate — so the
@@ -2787,7 +2871,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     }
 
     if let Some(flag) = session.flag() {
-        gate_session_capabilities(flag, consented.resolved())?;
+        let blame = manifest.as_deref().unwrap_or(&entry_path);
+        gate_session_ffi(flag, ffi::project_ffi_presence(blame)?)?;
     }
 
     // Resolved after every program refusal above. The session log lands in the
@@ -2862,25 +2947,16 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     //     produce the bundle (same step as `ipe dev build --target wasm`) and stop.
     //   * WasmWasi — build the `wasm32-wasip1` module (THE SEAL, via the SAME
     //     `bundle_wasi` build path `ipe dev build --target wasi` uses) and then
-    //     EXECUTE it under embedded wasmtime, confined by a WASI context derived
-    //     from the SAME declared capability floor the native run jail reads.
-    //   * Native — fall through to the cargo build + jailed exec below.
+    //     EXECUTE it under embedded wasmtime with the dev ambient context.
+    //   * Native — fall through to the cargo build + exec below.
     match compile_target {
-        CompileTarget::WasmClient => return bundle_wasm(&crate_dir),
+        CompileTarget::WasmClient => return bundle_wasm(crate_dir.dir()),
         CompileTarget::WasmWasi => {
             // The `wasi_run` feature gate already fired before emit (above), so
             // reaching here means the embedded engine is linked. Build the module
             // first — a green build is THE SEAL (ipe-accepts ⇒ cargo-builds for
             // the target) — then run it.
-            let module = bundle_wasi(&crate_dir)?;
-            // Derive the capability floor exactly as the native jail does (the
-            // consented set → `build_profile`), so the WASI context enforces the
-            // SAME deny-by-default model — defend-in-depth, one capability model
-            // expressed two ways (seccomp+bwrap vs a `WasiCtx`).
-            let driver = manifest_parsed
-                .as_ref()
-                .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-            let profile = run_sandbox::build_profile(consented.resolved(), driver)?;
+            let module = bundle_wasi(crate_dir.dir())?;
             let working_tree = std::env::current_dir().map_err(|e| CliError::Io {
                 path: PathBuf::from("."),
                 source: e,
@@ -2889,7 +2965,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
             // the build's JSON artifact stream), so the executor loads precisely
             // the module the build produced regardless of a relocated
             // `CARGO_TARGET_DIR` or a divergent `cargo metadata`.
-            return wasi_run::run_wasi_module(&module, &profile, &working_tree, &bin_args);
+            let ctx = wasi_run::WasiCtx::dev_ambient();
+            return wasi_run::run_wasi_module(&module, &ctx, &working_tree, &bin_args);
         }
         CompileTarget::Native => {}
     }
@@ -2912,10 +2989,10 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     } else {
         None
     };
-    CargoBuild {
+    FlooredBuild {
         cargo: &cargo_bin,
-        krate: CargoCrate::Emitted(&crate_dir),
-        profile: CargoProfile::Dev,
+        crate_dir: &crate_dir,
+        finish: NativeFinish::Dev,
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
@@ -2942,50 +3019,11 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     bin.push("debug");
     bin.push(&bin_name);
 
-    // --- Step 3a: resolve the capability set and, for native code, the jail ---
-    // The jail confines the emitted app to `inferred ∪ declared`. It is scoped to
-    // native-bearing programs (ADR 0004): pure Ipê is structurally bounded to its
-    // inferred capabilities and runs directly; only a `Rust.` crossing has
-    // effects inference cannot prove, and only that is jailed. For a native
-    // program a missing primitive is fail-closed (refuses unless recorded
-    // consent).
-    let driver = manifest_parsed
-        .as_ref()
-        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
-    let resolved = consented.resolved();
-    let union = resolved.union();
-    let native = run_sandbox::is_native_bearing(&union);
-    let profile = run_sandbox::build_profile(resolved, driver)?;
-    let bin_args_os: Vec<std::ffi::OsString> =
-        bin_args.iter().map(std::ffi::OsString::from).collect();
-
+    // The binary runs with the developer's own permissions: `ipe dev` checks
+    // no capabilities and runs no jail.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        if native {
-            // The scoped writable tempdir (the sole writable mount when
-            // `filesystem` is absent) and the working tree (bound read-write only
-            // when granted) — built only for a jailed run.
-            let scoped_tmp = run_sandbox::make_scoped_tmp()?;
-            let working_tree = std::env::current_dir().map_err(|e| CliError::Io {
-                path: PathBuf::from("."),
-                source: e,
-            })?;
-            // The jail is established and `exec_in_run_jail` replaces this process
-            // with the jailed app (does not return on success). On a platform with
-            // no jail primitive, the fail-closed policy either refuses or (recorded
-            // consent) returns to run unconfined below.
-            run_sandbox::jail_and_exec(
-                &profile,
-                &union,
-                scoped_tmp.path(),
-                &working_tree,
-                &bin,
-                &bin_args_os,
-            )?;
-        }
-        // Pure Ipê (structural guarantee, no jail) or a native program that
-        // proceeded unconfined after the recorded-consent warning: run directly.
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(&bin_args);
         set_session_env(&mut cmd, &session_env);
@@ -2997,24 +3035,6 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     }
     #[cfg(not(unix))]
     {
-        if native {
-            // Off Unix there is no jail (the documented refuse-gap): `jail_and_exec`
-            // applies the fail-closed policy — refuse the native program, or
-            // (recorded consent) return Ok to run unconfined below.
-            let scoped_tmp = run_sandbox::make_scoped_tmp()?;
-            let working_tree = std::env::current_dir().map_err(|e| CliError::Io {
-                path: PathBuf::from("."),
-                source: e,
-            })?;
-            run_sandbox::jail_and_exec(
-                &profile,
-                &union,
-                scoped_tmp.path(),
-                &working_tree,
-                &bin,
-                &bin_args_os,
-            )?;
-        }
         let mut cmd = std::process::Command::new(&bin);
         cmd.args(&bin_args);
         set_session_env(&mut cmd, &session_env);
@@ -3213,8 +3233,11 @@ fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliEr
 /// a default would locate another program's binary.
 pub fn emitted_bin_name(crate_dir: &Path) -> Result<String, CliError> {
     let manifest = crate_dir.join("Cargo.toml");
-    let source =
-        crate::io_bounded::read_to_string_capped(&manifest, crate::io_bounded::MANIFEST_READ_CAP)?;
+    let source = crate::io_bounded::read_named_in(
+        crate_dir,
+        &["Cargo.toml"],
+        crate::io_bounded::MANIFEST_CAP,
+    )?;
     emitted_package_name(&source)
         .map(str::to_owned)
         .ok_or_else(|| {
@@ -3775,14 +3798,21 @@ fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliErr
 ///
 /// The one constructor is [`consent_to_capabilities`]: it resolves (infers) the
 /// capability set exactly once and runs the `.Unsafe`, web, and native-crossing
-/// gates over that single value. Every downstream consumer — the build-artifact
-/// profile, the release jail, the run jail, the WASI context — takes this
-/// witness, so none of them re-infers, and none is reachable without consent.
+/// gates over that single value. Every downstream consumer — the release
+/// floor and profile, the release jail — takes this witness, so none of them
+/// re-infers, and none is reachable without consent.
 pub struct ConsentedCapabilities {
     resolved: run_sandbox::ResolvedCapabilities,
 }
 
 impl ConsentedCapabilities {
+    /// A witness over `resolved` with no consent gate run, for a test that
+    /// needs a release posture without a project to infer.
+    #[cfg(test)]
+    pub(crate) const fn admitted(resolved: run_sandbox::ResolvedCapabilities) -> Self {
+        Self { resolved }
+    }
+
     /// The inferred and declared sets the consent gates admitted.
     #[must_use]
     pub const fn resolved(&self) -> &run_sandbox::ResolvedCapabilities {
@@ -3791,8 +3821,8 @@ impl ConsentedCapabilities {
 }
 
 /// Resolve the program's capabilities once and pass them through every
-/// trust-boundary consent gate, shared by `ipe dev build`, `ipe dev run`, and
-/// `ipe release`: the `.Unsafe` acknowledgment, then the app-boundary web
+/// trust-boundary consent gate of `ipe release`: the `.Unsafe`
+/// acknowledgment, then the app-boundary web
 /// consent, then the app-boundary native-crossing consent. All three judge the
 /// SAME resolved value, and the value is released only once all three admit it.
 ///
@@ -3803,16 +3833,9 @@ pub fn consent_to_capabilities(
     manifest_parsed: Option<&project::ProjectManifest>,
     manifest_path: Option<&Path>,
     entry: &Path,
-    accept_risks_flag: bool,
 ) -> Result<ConsentedCapabilities, CliError> {
     let resolved = run_sandbox::resolve_for_run(manifest_parsed, manifest_path, entry)?;
-    acknowledge_unsafe_imports(
-        &resolved,
-        manifest_parsed,
-        manifest_path,
-        entry,
-        accept_risks_flag,
-    )?;
+    acknowledge_unsafe_imports(&resolved, manifest_parsed, manifest_path, entry)?;
     gate_web_consent(&resolved, manifest_parsed, manifest_path, entry)?;
     gate_native_ffi_consent(&resolved, manifest_parsed, manifest_path, entry)?;
     Ok(ConsentedCapabilities { resolved })
@@ -3822,10 +3845,9 @@ pub fn consent_to_capabilities(
 ///
 /// Judges the program's resolved capabilities, and — only when the disclosed
 /// `unsafe` capability is present — surfaces the risk and requires consent
-/// (the `--accept-risks` flag, a `[capabilities] accept = ["unsafe"]` manifest
-/// token, or an interactive `y`). A non-interactive
-/// build without pre-acceptance fails closed (`IPE-S0001`); it never blocks on a
-/// prompt. A program with no `.Unsafe` import is untouched.
+/// (a `[capabilities] accept = ["unsafe"]` manifest token, or an interactive
+/// `y`). A non-interactive build without pre-acceptance fails closed
+/// (`IPE-S0001`); it never blocks on a prompt. A program with no `.Unsafe` import is untouched.
 ///
 /// # Errors
 /// [`CliError::Usage`] (`IPE-S0001`) when consent is required but absent;
@@ -3835,7 +3857,6 @@ fn acknowledge_unsafe_imports(
     manifest_parsed: Option<&project::ProjectManifest>,
     manifest_path: Option<&Path>,
     entry: &Path,
-    accept_risks_flag: bool,
 ) -> Result<(), CliError> {
     // Short-circuit before any source read when the disclosed capability is
     // absent — the safe path does no work at all.
@@ -3851,7 +3872,6 @@ fn acknowledge_unsafe_imports(
     let mut stderr = std::io::stderr().lock();
     unsafe_ack::gate(
         &resolved.inferred,
-        accept_risks_flag,
         &manifest_accept,
         &via,
         unsafe_ack::is_interactive(),
@@ -4167,12 +4187,12 @@ mod artifact_name_tests {
 
 #[cfg(test)]
 mod capability_resolution_once_tests {
-    //! Whole-program capability inference is the costliest pre-build step, and
-    //! its result is a trust-boundary fact: `build`, `run`, and `release` each
-    //! resolve it exactly once and hand that one value to every consent gate and
-    //! every enforcement artifact through the `ConsentedCapabilities` witness.
-    //! These tripwires pin that no second resolution site creeps back into this
-    //! module.
+    //! Whole-program capability inference is a trust-boundary fact of
+    //! `release` alone: it resolves it exactly once and hands that one value to
+    //! every consent gate and every enforcement artifact through the
+    //! `ConsentedCapabilities` witness, while `ipe dev` resolves and consents to
+    //! nothing. These tripwires pin that no second resolution site, and no dev
+    //! consent, creeps back into this module.
 
     const SOURCE: &str = include_str!("commands.rs");
     // Spelled in pieces so the needles never match this module's own text.
@@ -4180,19 +4200,23 @@ mod capability_resolution_once_tests {
     const INFER_CALL: &str = concat!("infer_package", "_capabilities(");
     const CONSENT_CALL: &str = concat!("consent_to", "_capabilities(");
 
-    /// The text of the `pub fn` named `name`, up to the next top-level `pub fn`.
+    /// The text of the `pub fn` named `name`, up to the next top-level item.
     fn fn_body(name: &str) -> Option<&'static str> {
         let head = format!("\npub fn {name}(");
         let start = SOURCE.find(&head)?;
         let rest = SOURCE.get(start + head.len()..)?;
-        let end = rest.find("\npub fn ").unwrap_or(rest.len());
+        let end = ["\npub ", "\nfn ", "\nimpl", "\nstruct ", "\nenum ", "\n#["]
+            .iter()
+            .filter_map(|item| rest.find(item))
+            .min()
+            .unwrap_or(rest.len());
         rest.get(..end)
     }
 
     #[test]
     fn capability_resolution_has_one_consent_site() {
-        // `consent_to_capabilities` (dev build / dev run / release build) is the
-        // one resolution site; `ipe capabilities` is the inspection form.
+        // `consent_to_capabilities` (release) is the one resolution site;
+        // `ipe capabilities` is the inspection form.
         assert_eq!(SOURCE.matches(RESOLVE_CALL).count(), 1);
         assert_eq!(SOURCE.matches(INFER_CALL).count(), 0);
         let site = "consent_to_capabilities";
@@ -4203,18 +4227,64 @@ mod capability_resolution_once_tests {
     }
 
     #[test]
-    fn build_run_release_each_consent_exactly_once() {
-        for entry_point in ["run_build_body", "release_pipeline", "run_run_with_args"] {
+    fn only_release_consents_and_exactly_once() {
+        for (entry_point, consents) in [
+            ("run_build_body", 0),
+            ("run_run_with_args", 0),
+            ("release_pipeline", 1),
+        ] {
             let body = fn_body(entry_point);
             assert!(body.is_some(), "{entry_point} is defined in this module");
             let Some(body) = body else { return };
             assert_eq!(
                 body.matches(CONSENT_CALL).count(),
-                1,
-                "{entry_point} resolves and consents to its capabilities exactly once"
+                consents,
+                "{entry_point} consents to its capabilities {consents} time(s)"
             );
             assert_eq!(body.matches(RESOLVE_CALL).count(), 0, "{entry_point}");
         }
+    }
+
+    #[test]
+    fn dev_runs_neither_floor_nor_session_capability_gate() {
+        // The dev entry points lower no capability set to a profile and judge no
+        // capability union: their only native posture is `NativeFinish::Dev`.
+        let profile_call = concat!("build", "_profile(");
+        let native_bearing = concat!("is_native", "_bearing(");
+        for entry_point in [
+            "run_build_body",
+            "run_run_with_args",
+            "compile_and_finalize_native_build",
+        ] {
+            let body = fn_body(entry_point);
+            assert!(body.is_some(), "{entry_point} is defined in this module");
+            let Some(body) = body else { return };
+            assert_eq!(body.matches(profile_call).count(), 0, "{entry_point}");
+            assert_eq!(body.matches(native_bearing).count(), 0, "{entry_point}");
+            assert_eq!(
+                body.matches(concat!("NativeFinish", "::Release")).count(),
+                0,
+                "{entry_point}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasi_dev_ctx_is_not_reachable_from_release() {
+        // The ambient WASI context is the dev posture: every release entry point
+        // is free of it, and `ipe dev run` names it exactly once.
+        let ambient = concat!("dev", "_ambient(");
+        for entry_point in ["release_pipeline", "run_release_run", "run_release_body"] {
+            let body = fn_body(entry_point);
+            assert!(body.is_some(), "{entry_point} is defined in this module");
+            let Some(body) = body else { return };
+            assert_eq!(body.matches(ambient).count(), 0, "{entry_point}");
+        }
+        let dev = fn_body("run_run_with_args");
+        assert!(dev.is_some(), "run_run_with_args is defined in this module");
+        let Some(dev) = dev else { return };
+        assert_eq!(dev.matches(ambient).count(), 1);
+        assert_eq!(SOURCE.matches(ambient).count(), 1);
     }
 }
 
@@ -4386,10 +4456,14 @@ mod held_crate_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A claimed crate holding a bare `src/main.rs`, and a stub `cargo` that
-    /// records the `main.rs` and the arguments it was handed, then fails the
-    /// build. Returns `(base, crate, cargo, seen main.rs, seen arguments)`.
-    fn floor_recording_build(tag: &str) -> (PathBuf, OwnedDir, PathBuf, PathBuf, PathBuf) {
+    /// A claimed crate holding a bare `src/main.rs`, staged as emitted with
+    /// `floor`, and a stub `cargo` that records the `main.rs` and the
+    /// arguments it was handed, then fails the build. Returns
+    /// `(base, crate, cargo, seen main.rs, seen arguments)`.
+    fn floor_recording_build(
+        tag: &str,
+        floor: crate::run_sandbox::EmitFloor,
+    ) -> (PathBuf, super::EmittedCrate, PathBuf, PathBuf, PathBuf) {
         let (base, crate_dir) = scratch(tag);
         let src = crate_dir.path().join("src");
         std::fs::create_dir_all(&src).expect("src dir");
@@ -4407,7 +4481,13 @@ mod held_crate_tests {
                 seen_args.display()
             ),
         );
-        (base, crate_dir, cargo, seen, seen_args)
+        (
+            base,
+            super::EmittedCrate::assume_written(crate_dir, floor),
+            cargo,
+            seen,
+            seen_args,
+        )
     }
 
     /// The resolved capabilities of a native-bearing program.
@@ -4419,25 +4499,29 @@ mod held_crate_tests {
         }
     }
 
-    /// The enforcement artifacts are written before cargo builds the crate, so
-    /// the binary cargo produces embeds this build's floor (a development
-    /// build's), never none and never a stale one from an earlier build.
+    /// A dev build embeds the constant development marker and no release floor,
+    /// and writes no profile: cargo is handed a `main.rs` whose only floor line
+    /// names development, so a release reader refuses the artifact as a
+    /// development build even when the program's own data holds a
+    /// release-shaped line.
     /// Runs in the Linux `test` CI job.
     #[test]
-    fn the_dev_build_embeds_its_floor_before_cargo_runs() {
-        use super::{ConsentedCapabilities, NativeBuild, compile_and_finalize_native_build};
+    fn the_dev_build_embeds_a_development_marker_and_no_release_floor() {
+        use super::{NativeBuild, compile_and_finalize_native_build};
         use crate::output_dir::{OutputRoot, ProjectPaths};
         use crate::run_sandbox;
-        use ipe_sandbox::run_jail::FloorIntent;
+        use ipe_sandbox::run_jail::{
+            FloorIntent, FloorRefusal, SandboxProfile, scan_capfloor, verify_release_floor,
+        };
 
-        let (base, crate_dir, cargo, seen, _) = floor_recording_build("floor-first");
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build(
+            "dev-marker",
+            crate::run_sandbox::EmitFloor::DevelopmentMarker,
+        );
         let project = base.join("project");
         std::fs::create_dir_all(&project).expect("project dir");
         let paths = ProjectPaths::of_file(&project.join("Main.ipe"));
         let output = OutputRoot::at(&base.join("out"), &paths).expect("output root");
-        let consented = ConsentedCapabilities {
-            resolved: native_bearing(),
-        };
         let built = compile_and_finalize_native_build(
             &output,
             &crate_dir,
@@ -4448,45 +4532,84 @@ mod held_crate_tests {
                 quiet: true,
             },
             None,
-            &consented,
         );
         assert!(built.is_err(), "the stub fails the build: {built:?}");
-        let profile =
-            run_sandbox::build_profile(consented.resolved(), ipe_backend_rust::DbDriver::Sqlite)
-                .expect("profile");
         let handed = std::fs::read_to_string(&seen).expect("cargo ran over the crate");
+        let isolated = SandboxProfile::maximally_isolated();
+        let marker = run_sandbox::capfloor_static_source(&isolated, FloorIntent::Development);
         assert!(
-            handed.contains(&run_sandbox::capfloor_static_source(
-                &profile,
-                FloorIntent::Development
+            handed.contains(&marker)
+                && handed.contains("std::hint::black_box(&IPE_CAPABILITY_FLOOR)"),
+            "a dev build embeds the retained development marker:\n{handed}"
+        );
+        assert_eq!(
+            handed.matches("IPE_CAPABILITY_FLOOR:").count(),
+            1,
+            "a dev build embeds exactly one floor static:\n{handed}"
+        );
+        assert!(
+            !handed.contains(&run_sandbox::capfloor_static_source(
+                &isolated,
+                FloorIntent::Release
             )),
-            "cargo must build a main.rs already carrying the development floor:\n{handed}"
+            "a dev build never carries a release floor:\n{handed}"
+        );
+        assert!(
+            !crate_dir.path().join("ipe.profile").exists(),
+            "a dev build writes no profile"
+        );
+        // The marker's bytes, beside a forged release line the program could
+        // carry as a string literal, still read as a development build.
+        let mut binary = isolated
+            .to_capfloor_line(FloorIntent::Development)
+            .into_bytes();
+        binary.push(b'\n');
+        binary.extend_from_slice(b"ipe-capfloor 1 net=true fs=rw sub=true env= intent=release\n");
+        assert_eq!(
+            scan_capfloor(&binary).map(|floor| floor.intent),
+            Some(FloorIntent::Development)
+        );
+        assert_eq!(
+            verify_release_floor(&isolated, &binary),
+            Err(FloorRefusal::NotRelease)
+        );
+        let args = std::fs::read_to_string(&seen_args).expect("cargo arguments");
+        assert!(
+            !args.contains("--release"),
+            "a dev build is a debug build: {args}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The release app build takes the same floored path as the dev build: cargo
-    /// is handed a `main.rs` already carrying the release floor, and builds it
-    /// `--release` for the static target.
+    /// The release app build writes its floor before cargo runs: cargo is handed
+    /// a `main.rs` already carrying the release floor, and builds it `--release`
+    /// for the static target.
     /// Runs in the Linux `test` CI job.
     #[test]
     fn the_release_build_embeds_its_floor_before_cargo_runs() {
-        use super::FlooredBuild;
+        use super::{ConsentedCapabilities, FlooredBuild, NativeFinish};
         use crate::run_sandbox;
-        use crate::verb::Verb;
         use ipe_backend_rust::static_build::StaticTriple;
         use ipe_sandbox::run_jail::FloorIntent;
 
-        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build("release-floor");
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build(
+            "release-floor",
+            crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+        );
+        let consented = ConsentedCapabilities {
+            resolved: native_bearing(),
+        };
         let profile =
-            run_sandbox::build_profile(&native_bearing(), ipe_backend_rust::DbDriver::Sqlite)
+            run_sandbox::build_profile(consented.resolved(), ipe_backend_rust::DbDriver::Sqlite)
                 .expect("profile");
         let triple = StaticTriple::X8664LinuxMusl;
         let built = FlooredBuild {
             cargo: &CargoBin::stub(cargo),
             crate_dir: &crate_dir,
-            enforcement: Some(&profile),
-            intent: Verb::RELEASE_BUILD.intent(),
+            finish: NativeFinish::Release {
+                consented: &consented,
+                driver: ipe_backend_rust::DbDriver::Sqlite,
+            },
             target: CargoTarget::Static(triple),
             output: CargoOutput::Human(Verbosity::Quiet),
             what: "the release app",
@@ -4515,6 +4638,193 @@ mod held_crate_tests {
             "a release floor is built --release for its static target: {args}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pure-native release binary carries the floor its consented
+    /// capabilities lower to, written before cargo runs, and no development
+    /// marker: `ipe release run` reads the floor the release consented to.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn pure_native_release_embeds_its_floor() {
+        use super::{ConsentedCapabilities, build_pure_native_release};
+        use crate::run_sandbox;
+        use ipe_backend_rust::static_build::StaticTriple;
+        use ipe_sandbox::run_jail::FloorIntent;
+
+        let (base, crate_dir, cargo, seen, seen_args) = floor_recording_build(
+            "pure-native",
+            crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+        );
+        let consented = ConsentedCapabilities {
+            resolved: crate::run_sandbox::ResolvedCapabilities {
+                inferred: std::collections::BTreeSet::new(),
+                declared: std::collections::BTreeSet::new(),
+            },
+        };
+        assert!(!run_sandbox::is_native_bearing(
+            &consented.resolved().union()
+        ));
+        let driver = ipe_backend_rust::DbDriver::Sqlite;
+        let profile = run_sandbox::build_profile(consented.resolved(), driver).expect("profile");
+        let triple = StaticTriple::X8664LinuxMusl;
+        let built = build_pure_native_release(
+            &CargoBin::stub(cargo),
+            &crate_dir,
+            &consented,
+            driver,
+            triple,
+            Verbosity::Quiet,
+        );
+        assert!(built.is_err(), "the stub fails the build: {built:?}");
+        let handed = std::fs::read_to_string(&seen).expect("cargo ran over the crate");
+        assert!(
+            handed.contains(&run_sandbox::capfloor_static_source(
+                &profile,
+                FloorIntent::Release
+            )),
+            "cargo must build a main.rs already carrying the release floor:\n{handed}"
+        );
+        assert!(
+            !handed.contains(&run_sandbox::dev_floor_marker_source()),
+            "a release build never carries the development marker:\n{handed}"
+        );
+        assert_eq!(
+            handed.matches("IPE_CAPABILITY_FLOOR:").count(),
+            1,
+            "a release build embeds exactly one floor static:\n{handed}"
+        );
+        let args = std::fs::read_to_string(&seen_args).expect("cargo arguments");
+        assert!(
+            args.contains("--release") && args.contains(&format!("--target {}", triple.as_str())),
+            "the pure-native release is built --release for its static target: {args}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Run a floored build of a crate emitted with `floor` in `finish`, and
+    /// assert it is refused as an internal bug before anything is written or
+    /// cargo runs.
+    fn assert_mismatch_refused(
+        tag: &str,
+        floor: crate::run_sandbox::EmitFloor,
+        finish: impl FnOnce(&super::ConsentedCapabilities) -> super::NativeFinish<'_>,
+    ) {
+        use super::{ConsentedCapabilities, FlooredBuild};
+
+        let (base, crate_dir, cargo, seen, _) = floor_recording_build(tag, floor);
+        let main_rs = crate_dir.path().join("src").join("main.rs");
+        let before = std::fs::read_to_string(&main_rs).expect("main.rs");
+        let consented = ConsentedCapabilities {
+            resolved: native_bearing(),
+        };
+        let built = FlooredBuild {
+            cargo: &CargoBin::stub(cargo),
+            crate_dir: &crate_dir,
+            finish: finish(&consented),
+            target: CargoTarget::Host,
+            output: CargoOutput::Human(Verbosity::Quiet),
+            what: "the emitted program",
+            runtime: None,
+        }
+        .run();
+        assert!(
+            matches!(
+                &built,
+                Err(CliError::Pipeline { diag, .. })
+                    if matches!(**diag, ipe_diagnostics::Diagnostic::CompilerBug { .. })
+            ),
+            "a {floor:?} crate in the wrong finish is an internal bug: {built:?}"
+        );
+        assert!(!seen.exists(), "cargo never runs over a mismatched crate");
+        assert_eq!(
+            std::fs::read_to_string(&main_rs).expect("main.rs"),
+            before,
+            "a mismatched crate is left unwritten"
+        );
+        assert!(
+            !crate_dir.path().join("ipe.profile").exists(),
+            "a mismatched crate gets no profile"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A crate emitted with the development marker is never built in the
+    /// release finish: its release floor would sit beside the marker.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn a_dev_marked_crate_is_refused_by_the_release_finish() {
+        assert_mismatch_refused(
+            "mismatch-dev-in-release",
+            crate::run_sandbox::EmitFloor::DevelopmentMarker,
+            |consented| super::NativeFinish::Release {
+                consented,
+                driver: ipe_backend_rust::DbDriver::Sqlite,
+            },
+        );
+    }
+
+    /// A crate emitted for the release floor is never built in the dev finish:
+    /// it would ship a debug binary from a release-intent emit.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn a_release_emit_is_refused_by_the_dev_finish() {
+        assert_mismatch_refused(
+            "mismatch-release-in-dev",
+            crate::run_sandbox::EmitFloor::ReleaseFloorAtBuild,
+            |_| super::NativeFinish::Dev,
+        );
+    }
+
+    /// A wasm emit is never built as a native binary in either finish.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn a_wasm_emit_is_refused_by_both_native_finishes() {
+        assert_mismatch_refused(
+            "mismatch-wasm-in-dev",
+            crate::run_sandbox::EmitFloor::NoNativeBinary,
+            |_| super::NativeFinish::Dev,
+        );
+        assert_mismatch_refused(
+            "mismatch-wasm-in-release",
+            crate::run_sandbox::EmitFloor::NoNativeBinary,
+            |consented| super::NativeFinish::Release {
+                consented,
+                driver: ipe_backend_rust::DbDriver::Sqlite,
+            },
+        );
+    }
+
+    /// Only a crate emitted with the development marker yields a dev-marked
+    /// witness for a development cargo step outside the floored build.
+    /// Runs in the Linux `test` CI job.
+    #[test]
+    fn only_a_dev_marked_emit_yields_a_dev_marked_crate() {
+        use crate::run_sandbox::EmitFloor;
+        for (tag, floor, admitted) in [
+            ("witness-dev", EmitFloor::DevelopmentMarker, true),
+            ("witness-release", EmitFloor::ReleaseFloorAtBuild, false),
+            ("witness-wasm", EmitFloor::NoNativeBinary, false),
+        ] {
+            let (base, crate_dir) = scratch(tag);
+            let emitted = super::EmittedCrate::assume_written(crate_dir, floor);
+            let marked = emitted.dev_marked();
+            assert_eq!(
+                marked.is_ok(),
+                admitted,
+                "{floor:?} yields a dev-marked crate only when it is the marker: {marked:?}"
+            );
+            if !admitted {
+                assert!(
+                    matches!(
+                        &marked,
+                        Err(CliError::Pipeline { diag, .. })
+                            if matches!(**diag, ipe_diagnostics::Diagnostic::CompilerBug { .. })
+                    ),
+                    "{marked:?}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }
 

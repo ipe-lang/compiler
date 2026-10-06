@@ -65,7 +65,7 @@ impl Builder<'_> {
                 type_name,
                 name,
                 ..
-            } => self.constrain_var_ctor(home, *type_name, *name)?,
+            } => self.constrain_var_ctor(span, home, *type_name, *name)?,
             canon::Expr_::Call(callee, args) => {
                 let callee_var = self.constrain_expr(local, callee)?;
                 // Each argument gets a FRESH param var rather than flowing its

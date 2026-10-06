@@ -19,6 +19,7 @@ pub mod advisory;
 pub mod api_surface;
 pub mod audit;
 pub mod audit_native;
+mod browser;
 pub mod build_plan;
 mod cache;
 mod cargo_step;
@@ -117,6 +118,45 @@ const _: () = assert!(
     "the interpolable scalar set must match the runtime's IpeInterpolate impls"
 );
 
+// The compiler's show-leaf table and the runtime's show-row table name the
+// same leaves with the same policies in the same order, and agree on the
+// widest rendered tuple: a leaf the compiler shows is a leaf the runtime
+// renders, and a drift on either side breaks this crate's build instead of
+// reaching an emitted `cargo` E0277.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the show-leaf table drifts from the runtime's show rows, the stringify SEAL [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    shown_eq(
+        &ipe_ir::SHOWN_LEAVES,
+        &ipe_runtime_rust::stringify::SHOWN_RUNTIME_TYPES,
+    ) && ipe_ir::MAX_SHOWN_TUPLE_ARITY == ipe_runtime_rust::stringify::MAX_SHOWN_TUPLE_ARITY
+        && ipe_types::MAX_SHOWN_TUPLE_ARITY == ipe_ir::MAX_SHOWN_TUPLE_ARITY,
+    "the compiler's show leaves must match the runtime's show rows"
+);
+
+/// Ordered element-wise equality of the two show tables, name and policy tag, in one pass.
+const fn shown_eq(
+    compiler: &[(&str, ipe_ir::ShowPolicy)],
+    runtime: &[(&str, ipe_runtime_rust::stringify::ShowPolicy)],
+) -> bool {
+    let (mut left, mut right) = (compiler, runtime);
+    loop {
+        match (left, right) {
+            ([], []) => return true,
+            ([(lname, lpolicy), left_rest @ ..], [(rname, rpolicy), right_rest @ ..]) => {
+                if !text::bytes_eq(lname.as_bytes(), rname.as_bytes())
+                    || lpolicy.tag() != rpolicy.tag()
+                {
+                    return false;
+                }
+                left = left_rest;
+                right = right_rest;
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Element-wise `&str`-slice equality in a `const` context.
 const fn names_eq(a: &[&str], b: &[&str]) -> bool {
     match (a, b) {
@@ -144,10 +184,10 @@ pub use driver::{
 // (`watch`, `pkg`, …). Kept `pub(crate)` so no originally-private helper widens
 // to public API; the block above re-exports the genuine public surface as `pub`.
 pub(crate) use driver::{
-    RewriteKind, build_source_graph, capabilities_including_served_widgets, default_entry,
-    find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err, lower_entry_via_graph,
-    read_progress_chunk, read_yes_no, read_yes_no_default, resolve_vendored_runtime_dir,
-    rewrite_user_file, rewrite_walked_file, run_capabilities, run_fix, run_installer, run_package,
-    run_test, run_type_check, run_verify, run_version, typecheck_entry_via_graph,
-    write_emitted_project,
+    DevMarkedCrate, RewriteKind, build_source_graph, capabilities_including_served_widgets,
+    default_entry, find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err,
+    lower_entry_via_graph, read_progress_chunk, read_yes_no, read_yes_no_default,
+    resolve_vendored_runtime_dir, rewrite_user_file, rewrite_walked_file, run_capabilities,
+    run_fix, run_installer, run_package, run_test, run_type_check, run_verify, run_version,
+    typecheck_entry_via_graph, write_emitted_project,
 };

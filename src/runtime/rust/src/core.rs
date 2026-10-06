@@ -24,6 +24,8 @@ pub type IpeTask<E, A> = Pin<Box<dyn Future<Output = IpeResult<E, A>> + Send + '
 #[cfg(target_arch = "wasm32")]
 pub type IpeTask<E, A> = Pin<Box<dyn Future<Output = IpeResult<E, A>> + 'static>>;
 
+crate::stringify::show_row!("Task", Internals, [E, A] IpeTask<E, A>, |_| "<Ipe.Task.Task>".to_owned());
+
 /// Construct Ok with generic error type.  Use `ok_res::<IpeError>` to
 /// instantiate with the project's concrete error type.
 pub fn ok_res<E, A>(a: A) -> IpeResult<E, A> {
@@ -1248,6 +1250,12 @@ pub fn install_panic_classifier() {
     // shape that never installs the hook simply runs depth-only there.
     #[cfg(not(target_arch = "wasm32"))]
     record_stack_floor(RUNTIME_THREAD_STACK_SIZE);
+    // A malformed `IPE_LOG_LEVEL` refuses the program before its first line.
+    #[cfg(feature = "log")]
+    if let Err(refusal) = super::log::startup_check() {
+        eprint_task_error(&refusal.to_string());
+        crate::system::system_exit(1);
+    }
     std::panic::set_hook(Box::new(|info| {
         // Log (classified, with errId) — diagnostic fires regardless of whether
         // the panic is subsequently caught by catch_unwind / tokio::task::spawn.

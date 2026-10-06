@@ -1,7 +1,8 @@
 //! `Ipe.Locale` — opaque BCP-47 locale handle + locale-aware case mapping.
 //!
-//! Default `String.toUpper`/`toLower`/`casefold` remain locale-independent
-//! (Rust std `to_uppercase`/`to_lowercase`).  This module adds an explicit-
+//! Default `String.toUpper`/`toLower` remain locale-independent (Rust std
+//! `to_uppercase`/`to_lowercase`), and `casefold` is locale-independent Unicode
+//! default case folding (the `string.rs` table).  This module adds an explicit-
 //! locale surface so callers that need correct case conversion for a specific
 //! language (the motivating example: Turkish dotted/dotless `i`) can opt in.
 //!
@@ -41,11 +42,7 @@ impl std::fmt::Display for Locale {
     }
 }
 
-impl crate::stringify::IpeStringify for Locale {
-    fn ipe_show(&self) -> String {
-        self.0.clone()
-    }
-}
+crate::stringify::show_row!("Locale", Value, [] Locale, |l| l.0.clone());
 
 /// `Locale.fromTag : String -> Maybe Locale` — the single parse boundary.
 ///

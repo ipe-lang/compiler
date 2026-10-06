@@ -1100,11 +1100,11 @@ mod real_jail {
         pkg
     }
 
-    /// The build-time consent gate REFUSES a `Rust.` crossing when the app's
-    /// `[capabilities] declares` set does not grant `native-ffi` — a fail-closed,
-    /// typed refusal (IPE-S0003) naming the disclosing `Rust.<Crate>` module,
-    /// fired BEFORE any emit or cargo build. This is the increment-3 consent gate:
-    /// an un-granted native capability is a compile error naming the dep.
+    /// The `ipe release build` consent gate REFUSES a `Rust.` crossing when the
+    /// app's `[capabilities] declares` set does not grant `native-ffi` — a
+    /// fail-closed, typed refusal (IPE-S0003) naming the disclosing
+    /// `Rust.<Crate>` module, fired BEFORE any emit or cargo build: an
+    /// un-granted native capability is a compile error naming the dep.
     #[test]
     fn build_refuses_an_ungranted_native_crossing_naming_the_dep() {
         if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -1116,7 +1116,7 @@ mod real_jail {
         let pkg = write_native_crossing_package(&base, "");
         let out = base.join("out");
         let args = vec![
-            "dev".to_owned(),
+            "release".to_owned(),
             "build".to_owned(),
             pkg.join("package.ipe").display().to_string(),
             "--out".to_owned(),
@@ -1149,7 +1149,7 @@ mod real_jail {
         let pkg = write_native_crossing_package(&base, "NativeFfi");
         let out = base.join("out");
         let args = vec![
-            "dev".to_owned(),
+            "release".to_owned(),
             "build".to_owned(),
             pkg.join("package.ipe").display().to_string(),
             "--out".to_owned(),
@@ -1164,6 +1164,35 @@ mod real_jail {
             assert!(
                 !msg.contains("IPE-S0003"),
                 "a granted native crossing must pass the consent gate, got: {msg}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A development build asks no consent: the SAME ungranted crossing the
+    /// release build refuses is never refused by the consent gate under
+    /// `ipe dev build` (any later error is a cargo concern, never IPE-S0003).
+    #[test]
+    fn dev_build_of_an_ungranted_native_crossing_asks_no_consent() {
+        if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+            return;
+        }
+        let _runtime = e2e_support::require_runtime();
+        let base = non_tmp_base("consent-dev");
+        let pkg = write_native_crossing_package(&base, "");
+        let out = base.join("out");
+        let args = vec![
+            "dev".to_owned(),
+            "build".to_owned(),
+            pkg.join("package.ipe").display().to_string(),
+            "--out".to_owned(),
+            out.display().to_string(),
+        ];
+        if let Err(err) = ipe::run_cli(&args) {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("IPE-S0003"),
+                "a dev build never runs the consent gate, got: {msg}"
             );
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -1222,9 +1251,28 @@ mod real_jail {
     ///
     /// The app prints `started`, prints the file named by its second argument
     /// when given (a working-tree read), then tries to print the file named by
-    /// its first argument and reports `LEAKED` when that read succeeds.
+    /// its first argument and reports `LEAKED` when that read succeeds. It
+    /// reads through shell builtins only, so it never forks: a profile that
+    /// withholds Subprocess runs it as declared.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn floor_bundle(base: &std::path::Path, caps: &[Capability]) -> (PathBuf, SandboxProfile) {
+        floor_bundle_running(
+            base,
+            caps,
+            "echo started\necho \"tmpdir=$TMPDIR\"\n\
+             if [ -n \"$2\" ]; then while IFS= read -r l || [ -n \"$l\" ]; do printf '%s\\n' \"$l\"; done < \"$2\"; echo; fi\n\
+             if { while IFS= read -r l || [ -n \"$l\" ]; do printf '%s\\n' \"$l\"; done < \"$1\"; } 2>/dev/null; then echo LEAKED; fi\n\
+             exit 0\n",
+        )
+    }
+
+    /// [`floor_bundle`] whose app runs `script` after its embedded floor line.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn floor_bundle_running(
+        base: &std::path::Path,
+        caps: &[Capability],
+        script: &str,
+    ) -> (PathBuf, SandboxProfile) {
         use std::os::unix::fs::PermissionsExt as _;
         let declared: BTreeSet<Capability> = caps.iter().copied().collect();
         let profile = ipe_sandbox::run_jail::profile_from_capabilities(
@@ -1246,8 +1294,7 @@ mod real_jail {
         executable(
             "ipe-app",
             format!(
-                "#!/bin/sh\n# {}\necho started\necho \"tmpdir=$TMPDIR\"\nif [ -n \"$2\" ]; then cat \"$2\"; echo; fi\n\
-                 cat \"$1\" 2>/dev/null && echo LEAKED\nexit 0\n",
+                "#!/bin/sh\n# {}\n{script}",
                 profile.to_capfloor_line(ipe_sandbox::run_jail::FloorIntent::Release)
             ),
         );
@@ -1448,6 +1495,39 @@ mod real_jail {
         );
     }
 
+    /// An app whose profile withholds Subprocess cannot fork under `ipe release run`.
+    ///
+    /// The same app granted Subprocess forks and exits 0 (the control), so the
+    /// refusal is the jail's subprocess denial, not a broken fixture.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_withheld_subprocess_cannot_fork() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-withheld-fork");
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let script = "echo started\nif /bin/true; then echo forked; else exit 3; fi\nexit 0\n";
+        let (withheld, _) = floor_bundle_running(&base.join("withheld"), &[], script);
+        let (granted, _) =
+            floor_bundle_running(&base.join("granted"), &[Capability::Subprocess], script);
+        let (granted_ok, granted_stdout, granted_stderr) =
+            release_run(&work, &[granted.into_os_string()]);
+        let (ok, stdout, stderr) = release_run(&work, &[withheld.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            granted_ok && granted_stdout.contains("started") && granted_stdout.contains("forked"),
+            "an app granted Subprocess forks (control):\n\
+             stdout:\n{granted_stdout}\nstderr:\n{granted_stderr}"
+        );
+        assert!(
+            !ok && stdout.contains("started") && !stdout.contains("forked"),
+            "an app with Subprocess withheld starts but cannot fork:\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
     /// `ipe release run` executes the artifact it verified, never a stand-in.
     ///
     /// A profile tampered to grant more than the app's embedded floor, or an
@@ -1510,6 +1590,231 @@ mod real_jail {
         assert!(
             stderr.contains("ipe release build"),
             "the refusal names the remedy:\nstderr:\n{stderr}"
+        );
+    }
+
+    /// Build `main_src` with the real `ipe dev build` and lay its binary out as
+    /// a bundle's `ipe-app`, beside a maximally isolated `ipe.profile` (a
+    /// profile every floor admits) and the stub wrapper.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn dev_built_bundle(base: &std::path::Path, main_src: &str) -> PathBuf {
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let entry = project.join("Main.ipe");
+        std::fs::write(&entry, main_src).expect("Main.ipe");
+        let out = base.join("out");
+        let mut cmd = std::process::Command::new(super::support::ipe_bin());
+        cmd.args(["dev", "build"])
+            .arg(&entry)
+            .arg("--out")
+            .arg(&out)
+            .current_dir(&project)
+            .env(
+                "IPE_RUNTIME_DIR",
+                e2e_support::require_runtime().into_path_buf(),
+            )
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null());
+        let built = super::run_child(cmd).expect("run ipe dev build");
+        assert!(
+            built.status.success(),
+            "the dev build succeeds:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let (dir, _) = floor_bundle(base, &[]);
+        std::fs::copy(out.join("bin").join("ipe-app"), dir.join("ipe-app"))
+            .expect("the dev build's binary becomes the bundle's app");
+        std::fs::write(
+            dir.join("ipe.profile"),
+            SandboxProfile::maximally_isolated().to_profile_string(),
+        )
+        .expect("profile");
+        dir
+    }
+
+    /// `ipe release run` refuses a real `ipe dev build` artifact as a
+    /// development build: the linked binary keeps the development marker.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_refuses_real_dev_build() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-real-dev-build");
+        let dir = dev_built_bundle(
+            &base,
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    Io.println \"started\"\n",
+        );
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !ok && !stdout.contains("started"),
+            "a dev build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("is a development build (`ipe dev`)")
+                && stderr.contains("ipe release build"),
+            "the refusal names the development build and the remedy:\nstderr:\n{stderr}"
+        );
+    }
+
+    /// A dev build whose program data holds a release-shaped floor line is
+    /// still refused: the embedded development marker outvotes the forged
+    /// line, so a string literal cannot pass a dev build off as a release one.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_refuses_dev_binary_with_forged_release_literal() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-forged-dev-build");
+        let dir = dev_built_bundle(
+            &base,
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    \
+             Io.println \"ipe-capfloor 1 net=true fs=rw sub=true env= intent=release\\n\"\n",
+        );
+        let app = std::fs::read(dir.join("ipe-app")).expect("read the app");
+        assert!(
+            app.windows(b"intent=release".len())
+                .any(|w| w == b"intent=release"),
+            "the forged release line is in the linked binary (control)"
+        );
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !ok && !stdout.contains("ipe-capfloor"),
+            "a forged release literal never runs a dev build:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("is a development build (`ipe dev`)"),
+            "the refusal names the development build:\nstderr:\n{stderr}"
+        );
+    }
+
+    /// The binary `ipe dev run` built from the crate it emitted under `out`:
+    /// the crate's one bin target, in the target directory cargo reports for it.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn dev_run_binary(out: &std::path::Path) -> PathBuf {
+        let crate_dir = out.join("rust");
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .current_dir(&crate_dir)
+        .stdin(std::process::Stdio::null());
+        let meta = super::run_child(cmd).expect("run cargo metadata");
+        assert!(
+            meta.status.success(),
+            "cargo metadata reads the emitted crate:\n{}",
+            String::from_utf8_lossy(&meta.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&meta.stdout).expect("metadata JSON");
+        let target_dir = json
+            .get("target_directory")
+            .and_then(serde_json::Value::as_str)
+            .expect("metadata names the target directory");
+        let bins: Vec<&str> = json
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|package| package.get("targets").and_then(serde_json::Value::as_array))
+            .flatten()
+            .filter(|target| {
+                target
+                    .get("kind")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+            })
+            .filter_map(|target| target.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(
+            bins.len(),
+            1,
+            "the emitted crate has one bin target: {bins:?}"
+        );
+        let bin = bins.first().expect("one bin target");
+        let path = PathBuf::from(target_dir).join("debug").join(bin);
+        assert!(
+            path.is_file(),
+            "the dev run's binary exists: {}",
+            path.display()
+        );
+        path
+    }
+
+    /// A binary `ipe dev run` built, whose program data holds a release-shaped
+    /// floor line, is refused as a development build: the dev run path embeds
+    /// the development marker like `ipe dev build`, so the forged line cannot
+    /// launder the binary into a release.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn release_run_refuses_dev_run_binary_with_forged_release_literal() {
+        if e2e_tools().is_none() {
+            return;
+        }
+        let base = non_tmp_base("release-run-forged-dev-run");
+        let project = base.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let entry = project.join("Main.ipe");
+        std::fs::write(
+            &entry,
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    \
+             Io.println \"ipe-capfloor 1 net=true fs=rw sub=true env= intent=release\\n\"\n",
+        )
+        .expect("Main.ipe");
+        let out = base.join("out");
+        let mut cmd = std::process::Command::new(super::support::ipe_bin());
+        cmd.args(["dev", "run"])
+            .arg(&entry)
+            .arg("--out")
+            .arg(&out)
+            .current_dir(&project)
+            .env(
+                "IPE_RUNTIME_DIR",
+                e2e_support::require_runtime().into_path_buf(),
+            )
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null());
+        let ran = super::run_child(cmd).expect("run ipe dev run");
+        assert!(
+            ran.status.success(),
+            "the dev run builds and runs:\n{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let (dir, _) = floor_bundle(&base, &[]);
+        std::fs::copy(dev_run_binary(&out), dir.join("ipe-app"))
+            .expect("the dev run's binary becomes the bundle's app");
+        std::fs::write(
+            dir.join("ipe.profile"),
+            SandboxProfile::maximally_isolated().to_profile_string(),
+        )
+        .expect("profile");
+        let app = std::fs::read(dir.join("ipe-app")).expect("read the app");
+        assert!(
+            app.windows(b"intent=release".len())
+                .any(|w| w == b"intent=release"),
+            "the forged release line is in the linked binary (control)"
+        );
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !ok && !stdout.contains("ipe-capfloor"),
+            "a forged release literal never runs a dev run binary:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("is a development build (`ipe dev`)"),
+            "the refusal names the development build:\nstderr:\n{stderr}"
         );
     }
 }

@@ -313,64 +313,18 @@ impl<M> Drop for Element<M> {
     }
 }
 
-// ─── IpeStringify for the Ipe.Ui runtime types ──────────────────────────────
-// errorToString / Ipe.Test.debugShow can reach these when a generated Ipe.Ui
-// type (e.g. an Input config record) or an app Model carries them as a field:
-// the codegen-emitted `ipe_show` recurses into EVERY field, so each runtime type
-// a generated type can hold must impl the trait or the generated impl fails to
-// compile (E0599). These UI values have no  analogue worth matching (and
-// no example stringifies one), so a stable type-tag placeholder is the total,
-// correct rendering — never panics, never recurses into the `M` payload.
-impl crate::stringify::IpeStringify for Color {
-    fn ipe_show(&self) -> String {
-        "<color>".to_string()
-    }
-}
-impl crate::stringify::IpeStringify for Length {
-    fn ipe_show(&self) -> String {
-        "<length>".to_string()
-    }
-}
-impl crate::stringify::IpeStringify for HAlign {
-    fn ipe_show(&self) -> String {
-        "<halign>".to_string()
-    }
-}
-impl crate::stringify::IpeStringify for VAlign {
-    fn ipe_show(&self) -> String {
-        "<valign>".to_string()
-    }
-}
-impl crate::stringify::IpeStringify for Location {
-    fn ipe_show(&self) -> String {
-        "<location>".to_string()
-    }
-}
-impl crate::stringify::IpeStringify for PseudoClass {
-    fn ipe_show(&self) -> String {
-        "<pseudo-class>".to_string()
-    }
-}
-impl crate::stringify::IpeStringify for Description {
-    fn ipe_show(&self) -> String {
-        "<description>".to_string()
-    }
-}
-impl crate::stringify::IpeStringify for LayoutContext {
-    fn ipe_show(&self) -> String {
-        "<layout-context>".to_string()
-    }
-}
-impl<M> crate::stringify::IpeStringify for Attribute<M> {
-    fn ipe_show(&self) -> String {
-        "<ui-attribute>".to_string()
-    }
-}
-impl<M> crate::stringify::IpeStringify for Element<M> {
-    fn ipe_show(&self) -> String {
-        "<element>".to_string()
-    }
-}
+// ─── Show rows for the Ipe.Ui runtime types ─────────────────────────────────
+// `Internals` leaves: a generated record or Model holding one renders the
+// `<Module.Type>` marker, never the tree or its `M` payload.
+crate::stringify::show_row!("Length", Internals, [] Length, |_| "<Ipe.Ui.Length>".to_owned());
+crate::stringify::show_row!("HAlign", Internals, [] HAlign, |_| "<Ipe.Ui.HAlign>".to_owned());
+crate::stringify::show_row!("VAlign", Internals, [] VAlign, |_| "<Ipe.Ui.VAlign>".to_owned());
+crate::stringify::show_row!("Location", Internals, [] Location, |_| "<Ipe.Ui.Location>".to_owned());
+crate::stringify::show_row!("PseudoClass", Internals, [] PseudoClass, |_| "<Ipe.Ui.PseudoClass>".to_owned());
+crate::stringify::show_row!("Description", Internals, [] Description, |_| "<Ipe.Ui.Description>".to_owned());
+crate::stringify::show_row!("LayoutContext", Internals, [] LayoutContext, |_| "<Ipe.Ui.LayoutContext>".to_owned());
+crate::stringify::show_row!("UiAttribute", Internals, [M] Attribute<M>, |_| "<Ipe.Ui.Attribute>".to_owned());
+crate::stringify::show_row!("Element", Internals, [M] Element<M>, |_| "<Ipe.Ui.Element>".to_owned());
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]

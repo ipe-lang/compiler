@@ -53,6 +53,23 @@ type Regions = BTreeMap<(Vec<Symbol>, Span), Ty>;
 /// `where_` tag for any internal-invariant bug raised while checking.
 const STAGE: &str = "intern.resolve";
 
+/// `where_` tag for a lookup the signature tables must answer but do not.
+const SIGNATURE_STAGE: &str = "exhaust.signature";
+
+/// The compiler bug a constructor absent from its union's signature raises.
+///
+/// Every ADT head the matrix walk meets names a constructor of a union in
+/// [`Sigs`] at its declared arity: constraint generation refuses any other, and
+/// witness heads are read back from the same tables. A miss or an arity
+/// disagreement is therefore a broken invariant, refused rather than read as
+/// arity `0`, an incomplete column, or a skipped `case`.
+fn ctor_not_in_signature() -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: SIGNATURE_STAGE,
+        detail: "exhaust: constructor not in its union's signature".to_owned(),
+    }
+}
+
 /// Upper bound on the number of distinct missing-pattern witnesses reported for
 /// one non-exhaustive `case`. Keeps the diagnostic bounded (and the witness
 /// search from fanning out) without losing the common small cases.
@@ -160,6 +177,10 @@ impl ExhaustBudget {
 /// (a spurious or missed IPE-T0010) once both are linked.
 type TyId = (Vec<Symbol>, Symbol);
 
+/// A union's identity paired with its constructors and their payload arities,
+/// in declaration order.
+type UnionSig<'a> = (&'a TyId, &'a [(Symbol, usize)]);
+
 /// Constructor-signature tables, built once per module from its `type` decls.
 struct Sigs {
     /// Home module → (constructor name → its owning union's identity). Nesting on
@@ -242,27 +263,42 @@ impl Sigs {
         })
     }
 
-    /// The payload arity of a head constructor. A [`Head::Tuple`] carries its own
-    /// arity; an ADT head is looked up. A missing ADT entry can only arise for a
-    /// constructor outside this module's unions — and [`case_analysable`] has
-    /// already excluded any such `case` from the matrix walk — so the `0`
-    /// fallback is unreachable in practice yet keeps the function total (no panic).
-    fn arity(&self, head: &Head) -> usize {
+    /// The payload arity of a head constructor.
+    ///
+    /// A [`Head::Tuple`] carries its own arity; an ADT head is looked up, and a
+    /// miss is [`ctor_not_in_signature`].
+    fn arity(&self, head: &Head) -> DResult<usize> {
         match head {
-            Head::Tuple(n) => *n,
+            Head::Tuple(n) => Ok(*n),
             Head::Adt(h, c) => self
                 .ctor_arity
                 .get(h.as_slice())
                 .and_then(|by_ctor| by_ctor.get(c))
                 .copied()
-                .unwrap_or(0),
+                .ok_or_else(ctor_not_in_signature),
             // Literal heads carry no sub-patterns; the empty-list `[]` (`Nil`) is
             // likewise nullary.
-            Head::Bool(_) | Head::Int(_) | Head::Char(_) | Head::Str(_) | Head::Nil => 0,
+            Head::Bool(_) | Head::Int(_) | Head::Char(_) | Head::Str(_) | Head::Nil => Ok(0),
             // The cons constructor `head :: tail` carries the head element and the
             // tail list.
-            Head::Cons => 2,
+            Head::Cons => Ok(2),
         }
+    }
+
+    /// The union an ADT head's constructor belongs to, with its constructors.
+    ///
+    /// A miss is [`ctor_not_in_signature`].
+    fn union_of(&self, home: &[Symbol], ctor: Symbol) -> DResult<UnionSig<'_>> {
+        let union = self
+            .ctor_to_union
+            .get(home)
+            .and_then(|by_ctor| by_ctor.get(&ctor))
+            .ok_or_else(ctor_not_in_signature)?;
+        let all = self
+            .union_ctors
+            .get(union)
+            .ok_or_else(ctor_not_in_signature)?;
+        Ok((union, all))
     }
 }
 
@@ -318,7 +354,11 @@ enum UPat {
 /// one the hand-written alternatives would produce, the usefulness algorithm's
 /// coverage / redundancy proofs carry over unchanged — no new [`Head`] and no
 /// re-proving.
-fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<UPat>> {
+fn expand_upats(
+    p: &canon::Pattern_,
+    sigs: &Sigs,
+    budget: &mut ExhaustBudget,
+) -> DResult<Vec<UPat>> {
     match p {
         // The unit pattern matches the single value of the unit type, so — like a
         // wildcard, the dev-only `Debug._`, a variable, or a field-pun record —
@@ -334,20 +374,28 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         canon::Pattern_::PCtor {
             home, name, args, ..
         } => {
+            // A constructor outside every signature, or one whose sub-pattern
+            // count disagrees with its declared arity, is a broken invariant
+            // (constraint generation already refused both): never padded,
+            // truncated, or skipped.
+            let head = Head::Adt(home.clone(), *name);
+            if sigs.arity(&head)? != args.len() {
+                return Err(ctor_not_in_signature());
+            }
             let mut columns = Vec::with_capacity(args.len());
             for a in args {
-                columns.push(expand_upats(&a.value, budget)?);
+                columns.push(expand_upats(&a.value, sigs, budget)?);
             }
             let combos = cartesian(columns, budget)?;
             Ok(combos
                 .into_iter()
-                .map(|combo| UPat::Ctor(Head::Adt(home.clone(), *name), combo))
+                .map(|combo| UPat::Ctor(head.clone(), combo))
                 .collect())
         }
         canon::Pattern_::PTuple(elems) => {
             let mut columns = Vec::with_capacity(elems.len());
             for e in elems {
-                columns.push(expand_upats(&e.value, budget)?);
+                columns.push(expand_upats(&e.value, sigs, budget)?);
             }
             let combos = cartesian(columns, budget)?;
             Ok(combos
@@ -374,7 +422,7 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         }
         // An alias is transparent for coverage — it matches exactly what its
         // inner pattern matches (and expands the same way).
-        canon::Pattern_::PAlias(inner, _) => expand_upats(&inner.value, budget),
+        canon::Pattern_::PAlias(inner, _) => expand_upats(&inner.value, sigs, budget),
         // `List` is the closed two-constructor type `Nil | Cons`. A cons pattern
         // `head :: tail` abstracts to a [`Head::Cons`] over its two sub-patterns;
         // a list literal `[a, b, c]` desugars to the right-nested cons spine
@@ -382,8 +430,8 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         // judged with the SAME `Nil | Cons` signature. Each sub-position expands,
         // so a nested or-pattern multiplies the rows cartesian-wise.
         canon::Pattern_::PCons(head, tail) => {
-            let head_rows = expand_upats(&head.value, budget)?;
-            let tail_rows = expand_upats(&tail.value, budget)?;
+            let head_rows = expand_upats(&head.value, sigs, budget)?;
+            let tail_rows = expand_upats(&tail.value, sigs, budget)?;
             let combos = cartesian(vec![head_rows, tail_rows], budget)?;
             Ok(combos
                 .into_iter()
@@ -404,7 +452,7 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
             }
             let mut rows = vec![UPat::Ctor(Head::Nil, Vec::new())];
             for e in elems.iter().rev() {
-                let heads = expand_upats(&e.value, budget)?;
+                let heads = expand_upats(&e.value, sigs, budget)?;
                 // Every product row is charged before allocation, so a breadth
                 // blow-up (a wide list of or-patterns) fails closed rather than
                 // exhausting memory.
@@ -423,7 +471,7 @@ fn expand_upats(p: &canon::Pattern_, budget: &mut ExhaustBudget) -> DResult<Vec<
         canon::Pattern_::POr(alts) => {
             let mut out = Vec::new();
             for a in alts {
-                out.extend(expand_upats(&a.value, budget)?);
+                out.extend(expand_upats(&a.value, sigs, budget)?);
             }
             budget.charge(out.len() as u64)?;
             Ok(out)
@@ -454,61 +502,6 @@ fn cartesian(columns: Vec<Vec<UPat>>, budget: &mut ExhaustBudget) -> DResult<Vec
         acc = next;
     }
     Ok(acc)
-}
-
-/// Does `p` reference a name this end-of-checking pass cannot analyse soundly
-/// here? The one excluded case is a constructor outside this module's unions (an
-/// imported / unknown enum whose full constructor set is unavailable — the
-/// lowerer rejects the unknown scrutinee enum separately). List / cons patterns
-/// are NOT excluded: they are analysed via the built-in closed `Nil | Cons`
-/// signature (see `to_upat`), so their exhaustiveness (IPE-T0010) is enforced
-/// here — a nested unknown constructor inside one still excludes the `case`.
-fn pattern_uses_unknown_ctor(p: &canon::Pattern_, sigs: &Sigs) -> bool {
-    match p {
-        // Wildcards (`_` / `Debug._`), variables, field-pun records, and literal
-        // leaves reference no ADT constructor.
-        canon::Pattern_::PAnything
-        | canon::Pattern_::PDebugAnything
-        | canon::Pattern_::PVar(_)
-        | canon::Pattern_::PUnit
-        | canon::Pattern_::PRecord(_)
-        | canon::Pattern_::PInt(_)
-        | canon::Pattern_::PBool(_)
-        | canon::Pattern_::PChar(_)
-        | canon::Pattern_::PStr(_) => false,
-        canon::Pattern_::PCtor {
-            home, name, args, ..
-        } => {
-            !sigs
-                .ctor_to_union
-                .get(home.as_slice())
-                .is_some_and(|by_ctor| by_ctor.contains_key(name))
-                || args
-                    .iter()
-                    .any(|a| pattern_uses_unknown_ctor(&a.value, sigs))
-        }
-        canon::Pattern_::PTuple(elems) => elems
-            .iter()
-            .any(|e| pattern_uses_unknown_ctor(&e.value, sigs)),
-        canon::Pattern_::PAlias(inner, _) => pattern_uses_unknown_ctor(&inner.value, sigs),
-        // List / cons patterns are over the built-in closed `Nil | Cons` type —
-        // analysable here. Their element / tail sub-patterns recurse (a nested
-        // unknown constructor still excludes the `case`).
-        canon::Pattern_::PCons(head, tail) => {
-            pattern_uses_unknown_ctor(&head.value, sigs)
-                || pattern_uses_unknown_ctor(&tail.value, sigs)
-        }
-        canon::Pattern_::PList(elems) => elems
-            .iter()
-            .any(|e| pattern_uses_unknown_ctor(&e.value, sigs)),
-        // An or-pattern is analysable iff every alternative is — any alternative
-        // referencing an unknown constructor excludes the whole `case` from the
-        // matrix walk, so no expansion is attempted against an incomplete
-        // signature.
-        canon::Pattern_::POr(alts) => alts
-            .iter()
-            .any(|a| pattern_uses_unknown_ctor(&a.value, sigs)),
-    }
 }
 
 /// Locate the outermost **refutable** sub-pattern of a parameter / binder
@@ -754,8 +747,8 @@ fn check_expr_ctx(e: &canon::Expr, ctx: &Ctx<'_>, warnings: &mut Vec<Diagnostic>
 /// Check one `case`: first redundancy (a later arm useless against the earlier
 /// ones), then exhaustiveness (the wildcard row useful against the whole arm
 /// matrix), and finally the wildcard-covers-known-constructors lint. A `case`
-/// mentioning a constructor outside this module's unions is skipped — its
-/// signature is unavailable, so it cannot be judged soundly here.
+/// mentioning a constructor outside every known signature is a `CompilerBug`
+/// ([`ctor_not_in_signature`]), never skipped unjudged.
 ///
 /// Redundant-branch findings are pushed onto `warnings` (IPE-T0011 is a
 /// Warning-severity diagnostic that must not abort compilation).
@@ -769,13 +762,6 @@ fn check_case(
 ) -> DResult<()> {
     let sigs = ctx.sigs;
     let interner = ctx.interner;
-    if branches
-        .iter()
-        .any(|br| pattern_uses_unknown_ctor(&br.pat.value, sigs))
-    {
-        return Ok(());
-    }
-
     // A per-`case` work budget bounds both the or-pattern row expansion and the
     // usefulness walk. A crafted-but-small `case` (e.g. many independent
     // 2-alternative or-patterns whose product is exponential) would otherwise
@@ -826,7 +812,7 @@ fn check_case(
             other => vec![(br.pat.span, other)],
         };
         for (span, unit_pat) in units {
-            let rows = expand_upats(unit_pat, &mut budget)?;
+            let rows = expand_upats(unit_pat, sigs, &mut budget)?;
             let mut alternative_covered = true;
             for row in &rows {
                 if !useful(&prior, std::slice::from_ref(row), sigs, 1, &mut budget)?.is_empty() {
@@ -855,7 +841,7 @@ fn check_case(
     // enumerating a union via `A | B | C` covers all three constructors.
     let mut matrix: Vec<Vec<UPat>> = Vec::new();
     for br in branches {
-        for p in expand_upats(&br.pat.value, &mut budget)? {
+        for p in expand_upats(&br.pat.value, sigs, &mut budget)? {
             matrix.push(vec![p]);
         }
     }
@@ -895,8 +881,7 @@ fn check_case(
     // `union_ctors` ADT entry, so they never reach this branch. Open types
     // (`Int` / `Char` / `String`) and tuples are likewise not ADT unions here.
     if let Some(span) = catch_all_span
-        && let Some(union_key) = scrutinee_union(scrut, ctx)
-        && let Some(all_ctors) = sigs.union_ctors.get(union_key)
+        && let Some((union_key, all_ctors)) = scrutinee_union(scrut, ctx)?
     {
         // Constructors the arms name EXPLICITLY (a top-level constructor arm, or
         // any alternative of a top-level or-pattern). Whatever the catch-all
@@ -928,37 +913,58 @@ fn check_case(
     Ok(())
 }
 
-/// The identity `(home, name)` of the scrutinee's union when its solved type is
-/// a CLOSED ADT union carried in the exhaustiveness signatures, else `None`.
-/// `None` covers every non-union scrutinee: `Bool`, `List`, open literal types,
-/// tuples, records, functions, and a scrutinee whose type never settled to a
-/// `Con` (an unsolved variable — the pass cannot prove the domain is a finite
-/// closed union, so it fails OPEN here, deferring to the ordinary exhaustiveness
-/// check rather than firing a false T0018). The caller reads the union's
-/// constructor list from [`Sigs::union_ctors`] under the returned key.
+/// The scrutinee's closed union, identity and constructors, or `None` when its
+/// solved type is no union.
+///
+/// `None` is reached only through a named arm: an unsolved variable (the pass
+/// cannot prove the domain is a finite closed union, so the ordinary
+/// exhaustiveness check stands and no T0018 fires), a function, unit, tuple or
+/// record, or a builtin head that carries no union (`Int`, `Dict`, `Html`, …).
 ///
 /// The head is matched by [`crate::unify::con_heads_compatible`], the one
 /// head-identity rule the solver unifies by: a builtin re-exported under a
 /// stdlib home (`Ipe.Result exposing (Result(..))` solves to
 /// `Con { module: [Ipe, Result], name: Result }`) is the empty-home builtin
 /// union, so its catch-all is judged against the builtin's constructors.
-fn scrutinee_union<'a>(scrut: &canon::Expr, ctx: &'a Ctx<'_>) -> Option<&'a TyId> {
-    let ty = ctx.regions.get(&(ctx.home.to_vec(), scrut.span))?;
-    let Ty::Con { module, name, .. } = ty else {
-        return None;
+///
+/// # Errors
+/// A [`Diagnostic::CompilerBug`] when the scrutinee has no recorded type, or
+/// when its head is a declared type (a home no builtin answers to) absent from
+/// [`Sigs`]: every union a module can reach is in its signature tables, so a
+/// miss is a broken closure, never a type without constructors.
+fn scrutinee_union<'a>(scrut: &canon::Expr, ctx: &'a Ctx<'_>) -> DResult<Option<UnionSig<'a>>> {
+    let ty = ctx
+        .regions
+        .get(&(ctx.home.to_vec(), scrut.span))
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: SIGNATURE_STAGE,
+            detail: "exhaust: case scrutinee has no solved type".to_owned(),
+        })?;
+    let (module, name) = match ty {
+        // An unsolved scrutinee (`Var`): its domain is unknown, so no catch-all
+        // can be proven to swallow a constructor. The structural types carry no
+        // constructors at all.
+        Ty::Var(_) | Ty::Fun(..) | Ty::Unit | Ty::Tuple(_) | Ty::Record(..) => return Ok(None),
+        Ty::Con { module, name, .. } => (module, *name),
     };
-    let key = (module.clone(), *name);
-    if let Some((k, _)) = ctx.sigs.union_ctors.get_key_value(&key) {
-        return Some(k);
+    let lookup = |key: &TyId| {
+        ctx.sigs
+            .union_ctors
+            .get_key_value(key)
+            .map(|(k, ctors)| (k, ctors.as_slice()))
+    };
+    if let Some(hit) = lookup(&(module.clone(), name)) {
+        return Ok(Some(hit));
     }
-    if !crate::unify::con_heads_compatible(module, *name, &[], *name, ctx.interner) {
-        return None;
+    if crate::unify::con_heads_compatible(module, name, &[], name, ctx.interner) {
+        // A builtin head: the builtin union when it is one, else a builtin
+        // without constructors.
+        return Ok(lookup(&(Vec::new(), name)));
     }
-    let builtin_key = (Vec::new(), *name);
-    ctx.sigs
-        .union_ctors
-        .get_key_value(&builtin_key)
-        .map(|(k, _)| k)
+    Err(Diagnostic::CompilerBug {
+        where_: SIGNATURE_STAGE,
+        detail: "exhaust: union head absent from the exhaustiveness signatures".to_owned(),
+    })
 }
 
 /// Accumulate the constructor names a pattern refers to at the TOP column —
@@ -1014,22 +1020,23 @@ fn useful(
 
     match first {
         UPat::Ctor(c, args) => {
-            let specialised = specialise(matrix, c, sigs);
+            let arity = sigs.arity(c)?;
+            let specialised = specialise(matrix, c, arity);
             let mut sub_q = args.clone();
             sub_q.extend_from_slice(rest_q);
             Ok(useful(&specialised, &sub_q, sigs, cap, budget)?
                 .into_iter()
-                .map(|w| rebuild(c, sigs.arity(c), w))
+                .map(|w| rebuild(c, arity, w))
                 .collect())
         }
         UPat::Wild => {
             let roots = column_heads(matrix);
-            if let Some(signature) = complete_signature(&roots, sigs) {
+            if let Some(signature) = complete_signature(&roots, sigs)? {
                 // The first column's constructors are complete: a witness must
                 // refine the wildcard into one of them. Try each in turn.
                 let mut out: Vec<Vec<UPat>> = Vec::new();
                 for (head, arity) in signature {
-                    let specialised = specialise(matrix, &head, sigs);
+                    let specialised = specialise(matrix, &head, arity);
                     let mut sub_q = vec![UPat::Wild; arity];
                     sub_q.extend_from_slice(rest_q);
                     for w in useful(&specialised, &sub_q, sigs, cap - out.len(), budget)? {
@@ -1049,7 +1056,7 @@ fn useful(
                 if tails.is_empty() {
                     return Ok(Vec::new());
                 }
-                let heads = missing_heads(&roots, sigs);
+                let heads = missing_heads(&roots, sigs)?;
                 let mut out: Vec<Vec<UPat>> = Vec::new();
                 for head in &heads {
                     for tail in &tails {
@@ -1070,10 +1077,9 @@ fn useful(
 
 /// Specialise `matrix` by head constructor `c` (Maranget's `S(c, P)`): rows whose
 /// first pattern is `c` expand its sub-patterns into the leading columns; rows
-/// with a wildcard first contribute `arity(c)` fresh wildcards; rows with a
-/// different head are dropped.
-fn specialise(matrix: &[Vec<UPat>], c: &Head, sigs: &Sigs) -> Vec<Vec<UPat>> {
-    let arity = sigs.arity(c);
+/// with a wildcard first contribute `arity` (the payload arity of `c`) fresh
+/// wildcards; rows with a different head are dropped.
+fn specialise(matrix: &[Vec<UPat>], c: &Head, arity: usize) -> Vec<Vec<UPat>> {
     let mut out = Vec::new();
     for row in matrix {
         let Some((first, rest)) = row.split_first() else {
@@ -1125,10 +1131,13 @@ fn column_heads(matrix: &[Vec<UPat>]) -> Vec<Head> {
 /// If the column's `roots` form a complete constructor signature, return the full
 /// signature to branch over (each head with its arity), in declaration order for
 /// ADTs. A tuple column has a single constructor and is always complete. An empty
-/// or constructor-incomplete column returns `None` (use the default matrix).
-fn complete_signature(roots: &[Head], sigs: &Sigs) -> Option<Vec<(Head, usize)>> {
-    let first = roots.first()?;
-    match first {
+/// or constructor-incomplete column returns `None` (use the default matrix); an
+/// ADT head absent from `sigs` is [`ctor_not_in_signature`].
+fn complete_signature(roots: &[Head], sigs: &Sigs) -> DResult<Option<Vec<(Head, usize)>>> {
+    let Some(first) = roots.first() else {
+        return Ok(None);
+    };
+    Ok(match first {
         Head::Tuple(n) => Some(vec![(Head::Tuple(*n), *n)]),
         // `Bool` is closed: the signature is complete once both `True` and
         // `False` appear in the column.
@@ -1156,8 +1165,7 @@ fn complete_signature(roots: &[Head], sigs: &Sigs) -> Option<Vec<(Head, usize)>>
             }
         }
         Head::Adt(h, c) => {
-            let union = sigs.ctor_to_union.get(h.as_slice())?.get(c)?;
-            let all = sigs.union_ctors.get(union)?;
+            let (union, all) = sigs.union_of(h, *c)?;
             // The union's home fixes each missing/present head's identity. All
             // roots in one column share this union (the type checker pins the
             // scrutinee's type before exhaustiveness runs), so comparing bare
@@ -1180,14 +1188,15 @@ fn complete_signature(roots: &[Head], sigs: &Sigs) -> Option<Vec<(Head, usize)>>
                 None
             }
         }
-    }
+    })
 }
 
 /// The witness heads for an incomplete first column: each ADT constructor the
 /// column is missing (with wildcard arguments), in declaration order — or a bare
 /// wildcard when the column carries no constructor at all (nothing to refine).
-fn missing_heads(roots: &[Head], sigs: &Sigs) -> Vec<UPat> {
-    match roots.first() {
+/// An ADT head absent from `sigs` is [`ctor_not_in_signature`].
+fn missing_heads(roots: &[Head], sigs: &Sigs) -> DResult<Vec<UPat>> {
+    Ok(match roots.first() {
         // A `Bool` column missing one literal: the precise witness is that
         // literal (`True` / `False`), not a bare wildcard.
         Some(Head::Bool(_)) => {
@@ -1204,16 +1213,7 @@ fn missing_heads(roots: &[Head], sigs: &Sigs) -> Vec<UPat> {
             out
         }
         Some(Head::Adt(h, c)) => {
-            let Some(union) = sigs
-                .ctor_to_union
-                .get(h.as_slice())
-                .and_then(|by_ctor| by_ctor.get(c))
-            else {
-                return vec![UPat::Wild];
-            };
-            let Some(all) = sigs.union_ctors.get(union) else {
-                return vec![UPat::Wild];
-            };
+            let (union, all) = sigs.union_of(h, *c)?;
             let uhome = &union.0;
             let present: BTreeSet<Symbol> = roots
                 .iter()
@@ -1255,7 +1255,7 @@ fn missing_heads(roots: &[Head], sigs: &Sigs) -> Vec<UPat> {
         Some(Head::Int(_) | Head::Char(_) | Head::Str(_) | Head::Tuple(_)) | None => {
             vec![UPat::Wild]
         }
-    }
+    })
 }
 
 /// Re-wrap a specialised witness `w` (its leading `arity` columns are the
@@ -1369,6 +1369,15 @@ mod tests {
     use super::*;
     use ipe_diagnostics::Located;
 
+    /// Signature tables with no unions, for patterns that name no constructor.
+    const fn empty_sigs() -> Sigs {
+        Sigs {
+            ctor_to_union: BTreeMap::new(),
+            union_ctors: BTreeMap::new(),
+            ctor_arity: BTreeMap::new(),
+        }
+    }
+
     fn boolp(b: bool) -> canon::Pattern {
         Located::new(Span::DUMMY, canon::Pattern_::PBool(b))
     }
@@ -1396,7 +1405,7 @@ mod tests {
         // never materialising the rows.
         let pat = wide_or_tuple(40);
         let mut budget = ExhaustBudget::with_limit(1_000);
-        let result = expand_upats(&pat, &mut budget);
+        let result = expand_upats(&pat, &empty_sigs(), &mut budget);
         assert!(
             matches!(
                 result,
@@ -1417,7 +1426,8 @@ mod tests {
         // proving the ceiling is the only thing the trip depends on.
         let pat = wide_or_tuple(8);
         let mut budget = ExhaustBudget::unbounded();
-        let rows = expand_upats(&pat, &mut budget).expect("unbounded budget never errors");
+        let rows =
+            expand_upats(&pat, &empty_sigs(), &mut budget).expect("unbounded budget never errors");
         assert_eq!(rows.len(), 1 << 8, "8-wide product expands to 2^8 rows");
     }
 
@@ -1433,7 +1443,7 @@ mod tests {
             .collect();
         let pat = canon::Pattern_::PList(elems);
         let mut budget = ExhaustBudget::unbounded();
-        let result = expand_upats(&pat, &mut budget);
+        let result = expand_upats(&pat, &empty_sigs(), &mut budget);
         assert!(
             matches!(
                 result,
@@ -1458,7 +1468,7 @@ mod tests {
         let pat = canon::Pattern_::PList(elems);
         let mut budget = ExhaustBudget::unbounded();
         assert!(
-            expand_upats(&pat, &mut budget).is_ok(),
+            expand_upats(&pat, &empty_sigs(), &mut budget).is_ok(),
             "a list pattern at the cap must still expand"
         );
     }
@@ -1470,22 +1480,22 @@ mod tests {
         // single `True | False` is two rows.
         let pat = true_or_false().value;
         let mut budget = ExhaustBudget::from_env();
-        let rows = expand_upats(&pat, &mut budget).expect("small pattern fits any default budget");
+        let rows = expand_upats(&pat, &empty_sigs(), &mut budget)
+            .expect("small pattern fits any default budget");
         assert_eq!(rows.len(), 2, "True | False expands to two rows");
     }
 
-    /// The union a scrutinee of solved type `module.name` is judged against, if
-    /// any, spelled as `(home segments, name)` so calls with separate interners
-    /// compare.
+    /// The union a scrutinee of the solved type `build` makes is judged against.
+    ///
+    /// Spelled as `(home segments, name)` so calls with separate interners
+    /// compare; the signature tables hold the builtins only.
     #[allow(clippy::expect_used)] // interning short literals cannot exhaust the interner
-    fn union_of_scrutinee(module: &[&str], name: &str) -> Option<(Vec<String>, String)> {
+    fn union_of_scrutinee_ty(
+        build: impl FnOnce(&mut Interner) -> Ty,
+    ) -> DResult<Option<(Vec<String>, String)>> {
         let mut interner = Interner::new();
         let main = vec![interner.intern("Main").expect("intern Main")];
-        let module: Vec<Symbol> = module
-            .iter()
-            .map(|seg| interner.intern(seg).expect("intern a home segment"))
-            .collect();
-        let name = interner.intern(name).expect("intern the type name");
+        let ty = build(&mut interner);
         let entry = canon::Module {
             name: main.clone(),
             unions: Vec::new(),
@@ -1496,14 +1506,7 @@ mod tests {
         let sigs = Sigs::build(&entry, &[], &mut interner).expect("builtin signatures build");
         let scrut: canon::Expr = Located::new(Span::DUMMY, canon::Expr_::Unit);
         let mut regions = Regions::new();
-        regions.insert(
-            (main.clone(), scrut.span),
-            Ty::Con {
-                module,
-                name,
-                args: Vec::new(),
-            },
-        );
+        regions.insert((main.clone(), scrut.span), ty);
         let ctx = Ctx {
             sigs: &sigs,
             home: &main,
@@ -1516,8 +1519,21 @@ mod tests {
                 .expect("a union symbol resolves in its interner")
                 .to_owned()
         };
-        scrutinee_union(&scrut, &ctx)
-            .map(|(home, name)| (home.iter().copied().map(spell).collect(), spell(*name)))
+        Ok(scrutinee_union(&scrut, &ctx)?
+            .map(|((home, name), _)| (home.iter().copied().map(spell).collect(), spell(*name))))
+    }
+
+    /// The union a scrutinee of solved type `module.name` is judged against.
+    #[allow(clippy::expect_used)] // interning short literals cannot exhaust the interner
+    fn union_of_scrutinee(module: &[&str], name: &str) -> DResult<Option<(Vec<String>, String)>> {
+        union_of_scrutinee_ty(|interner| Ty::Con {
+            module: module
+                .iter()
+                .map(|seg| interner.intern(seg).expect("intern a home segment"))
+                .collect(),
+            name: interner.intern(name).expect("intern the type name"),
+            args: Vec::new(),
+        })
     }
 
     /// A builtin re-exported under its stdlib home is judged as the builtin union.
@@ -1527,8 +1543,10 @@ mod tests {
     /// builtin, so the catch-all check must see the same union or it fails open.
     #[test]
     fn a_stdlib_spelled_builtin_scrutinee_is_the_builtin_union() {
-        let stdlib = union_of_scrutinee(&["Ipe", "Result"], "Result");
-        let ambient = union_of_scrutinee(&[], "Result");
+        let stdlib = union_of_scrutinee(&["Ipe", "Result"], "Result")
+            .ok()
+            .flatten();
+        let ambient = union_of_scrutinee(&[], "Result").ok().flatten();
         assert!(
             stdlib.as_ref().is_some_and(|(home, _)| home.is_empty()),
             "an `Ipe.Result`-homed `Result` must key the builtin union, got {stdlib:?}"
@@ -1536,20 +1554,80 @@ mod tests {
         assert_eq!(stdlib, ambient, "both spellings name one union");
     }
 
-    /// A user-homed head sharing a builtin union's name keys no builtin union.
+    /// A user-homed head absent from the signatures is a compiler bug.
     ///
     /// `Order` is a builtin union a user module may also declare; the solver
-    /// keeps `Lib.Order` apart from it, so the catch-all check must too.
+    /// keeps `Lib.Order` apart from it, so the catch-all check must never read
+    /// it as the builtin. A declared union is always in the signature tables, so
+    /// its absence is a broken closure, refused rather than skipped.
     #[test]
-    fn a_user_homed_builtin_named_scrutinee_is_not_the_builtin_union() {
+    fn a_user_homed_head_absent_from_the_signatures_is_a_compiler_bug() {
         assert!(
-            union_of_scrutinee(&[], "Order").is_some(),
+            union_of_scrutinee(&[], "Order").is_ok_and(|union| union.is_some()),
             "the ambient `Order` is a builtin union"
         );
-        assert_eq!(
-            union_of_scrutinee(&["Lib"], "Order"),
-            None,
-            "a user `Lib.Order` is never mistaken for the builtin"
+        assert!(
+            matches!(
+                union_of_scrutinee(&["Lib"], "Order"),
+                Err(Diagnostic::CompilerBug { .. })
+            ),
+            "a `Lib.Order` the signatures lack is neither the builtin nor skipped"
         );
+    }
+
+    /// A scrutinee whose type is no union is judged by no union.
+    ///
+    /// An unsolved variable, a structural type, and a builtin head without
+    /// constructors each skip the catch-all judgement through a named arm.
+    #[test]
+    fn a_non_union_scrutinee_is_judged_by_no_union() {
+        assert!(matches!(union_of_scrutinee_ty(|_| Ty::Var(0)), Ok(None)));
+        assert!(matches!(union_of_scrutinee_ty(|_| Ty::Unit), Ok(None)));
+        assert!(matches!(union_of_scrutinee(&[], "Int"), Ok(None)));
+        assert!(matches!(
+            union_of_scrutinee(&["Ipe", "Dict"], "Dict"),
+            Ok(None)
+        ));
+    }
+
+    /// A constructor absent from its union's signature is a compiler bug.
+    ///
+    /// A hand-built signature table that never saw `Ghost` must refuse its
+    /// arity, its column completion, its witness heads, and the usefulness walk
+    /// over it, never read it as nullary or as an incomplete column.
+    #[test]
+    #[allow(clippy::expect_used)] // interning short literals cannot exhaust the interner
+    fn constructor_missing_from_signature_is_a_compiler_bug() {
+        let mut interner = Interner::new();
+        let main = vec![interner.intern("Main").expect("intern Main")];
+        let ghost = interner.intern("Ghost").expect("intern Ghost");
+        let entry = canon::Module {
+            name: main.clone(),
+            unions: Vec::new(),
+            defs: Vec::new(),
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+        };
+        let sigs = Sigs::build(&entry, &[], &mut interner).expect("builtin signatures build");
+        let head = Head::Adt(main, ghost);
+        let roots = std::slice::from_ref(&head);
+        assert!(matches!(
+            sigs.arity(&head),
+            Err(Diagnostic::CompilerBug { .. })
+        ));
+        assert!(matches!(
+            complete_signature(roots, &sigs),
+            Err(Diagnostic::CompilerBug { .. })
+        ));
+        assert!(matches!(
+            missing_heads(roots, &sigs),
+            Err(Diagnostic::CompilerBug { .. })
+        ));
+        let matrix = vec![vec![UPat::Ctor(head.clone(), Vec::new())]];
+        let mut budget = ExhaustBudget::unbounded();
+        assert!(matches!(
+            useful(&matrix, &[UPat::Wild], &sigs, WITNESS_CAP, &mut budget),
+            Err(Diagnostic::CompilerBug { .. })
+        ));
     }
 }

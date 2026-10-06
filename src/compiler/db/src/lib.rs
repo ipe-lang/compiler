@@ -958,6 +958,13 @@ pub enum ScopedModuleTypes {
         /// The module's closed typed interface, for importers' scoped solves.
         interface: Arc<ipe_types::TypedInterface>,
     },
+    /// The module's interface is closed, so its importers solve against it,
+    /// but its own solved facts read its importers' use sites: the module's
+    /// own types come from the whole-program solve.
+    InterfaceOnly {
+        /// The module's closed typed interface, for importers' scoped solves.
+        interface: Arc<ipe_types::TypedInterface>,
+    },
     /// Fall back to the whole-program solve: the module's scoped solve was
     /// red, a dep's (or its own) interface is open (an importer can pin a
     /// residual variable — information flows against the import direction),
@@ -1039,6 +1046,11 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                     interface: Arc::new(interface),
                 }
             }
+            ipe_types::InterfaceStatus::ImporterDependent(interface) => {
+                ScopedModuleTypes::InterfaceOnly {
+                    interface: Arc::new(interface),
+                }
+            }
             ipe_types::InterfaceStatus::Open => ScopedModuleTypes::WholeProgram,
         },
         Err(_) => ScopedModuleTypes::WholeProgram,
@@ -1062,7 +1074,8 @@ pub fn typed_interface(
     module: SourceFile,
 ) -> Option<Arc<ipe_types::TypedInterface>> {
     match infer_module_scoped(db, root, module) {
-        ScopedModuleTypes::PerModule { interface, .. } => Some(interface.clone()),
+        ScopedModuleTypes::PerModule { interface, .. }
+        | ScopedModuleTypes::InterfaceOnly { interface } => Some(interface.clone()),
         ScopedModuleTypes::WholeProgram => None,
     }
 }
@@ -1081,8 +1094,8 @@ pub fn typed_interface(
 ///   elsewhere in the program does not blank this module's types
 ///   (diagnostics still come from the whole-program [`typecheck`]).
 /// - **Fallback path**: the whole-program projection, for modules the
-///   scoped tier cannot faithfully stand for (open interfaces, red scoped
-///   solve, import cycle) — exactly the joint solve's slice, with the joint
+///   scoped tier cannot faithfully stand for (open interfaces, own facts
+///   that read an importer's use site, red scoped solve, import cycle) — exactly the joint solve's slice, with the joint
 ///   solve's own error surfaced verbatim on a red program.
 ///
 /// Both paths return NORMALIZED values (see [`normalize_module_types`]);
@@ -1097,7 +1110,7 @@ pub fn typecheck_module(
 ) -> ModuleTypesResult {
     match infer_module_scoped(db, root, module) {
         ScopedModuleTypes::PerModule { types, .. } => Ok(types.clone()),
-        ScopedModuleTypes::WholeProgram => {
+        ScopedModuleTypes::InterfaceOnly { .. } | ScopedModuleTypes::WholeProgram => {
             let solved = typecheck(db, root, entry).clone()?;
             let home: Vec<Symbol> = {
                 let mut interner = db.interner().lock();

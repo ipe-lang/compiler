@@ -8,15 +8,18 @@
 //!
 //!   1. `stream ct handler` stashes the (E-erased) handler closure in a global
 //!      registry under a fresh token and returns a normal `ServerResponse`
-//!      whose body is the sentinel `__ipe_stream:<token>`. This survives the
+//!      whose body is the sentinel `__ipe_stream:<nonce>:<token>`. This survives the
 //!      ServerResponse bridge (which has no handler field).
 //!
-//!   2. `to_axum_response` (server.rs) calls `serve_streaming_sentinel`. On a
-//!      sentinel hit it: pops the handler, opens a bounded mpsc channel,
-//!      registers the sender under a stream id, spawns the handler driving a
-//!      `StreamWriter(id)`, and returns an axum response whose body streams the
-//!      channel (`Body::from_stream`). Headers + status are committed when this
-//!      response is returned — before the first chunk — exactly as SSE requires.
+//!   2. `to_axum_response` (server.rs) calls `claim_streaming_sentinel`. On a
+//!      sentinel hit it pops the handler, builds the response head through the
+//!      one assembler every response goes through (`ServerResponseHead`), and
+//!      only then `ServerPendingStream::serve`s: open a bounded mpsc channel,
+//!      register the sender under a stream id, spawn the handler driving a
+//!      `StreamWriter(id)`, and return the response whose body streams the
+//!      channel (`Body::from_stream`). The head is committed when this
+//!      response is returned, before the first chunk, as SSE requires. A
+//!      refused head answers 500 and the handler never runs.
 //!
 //!   3. `emit chunk writer` resolves the id → sender and `send(chunk).await`s
 //!      (bounded → backpressure). `finish writer` drops the sender (ends the
@@ -28,7 +31,7 @@
 //!
 //! `pending_handlers` entries are reaped on a TTL (`PENDING_HANDLER_TTL`) so a
 //! `stream()` call whose sentinel response never reaches
-//! `serve_streaming_sentinel` (a middleware replaced/discarded it) does not
+//! `claim_streaming_sentinel` (a middleware replaced/discarded it) does not
 //! pin its handler closure in the registry for the life of the process.
 
 use super::*;
@@ -45,13 +48,15 @@ pub enum StreamWriter {
     StreamWriter(i64),
 }
 
+crate::stringify::show_row!("StreamWriter", Internals, [] StreamWriter, |_| "<Ipe.Http.Server.StreamWriter>".to_owned());
+
 /// Handler with its Ipê error type E erased: the effect IS the emits, the
 /// IpeResult is discarded (await`).
 type ErasedStreamHandler =
     Arc<dyn Fn(StreamWriter) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Every entry is stamped with its insertion time so an abandoned one (the
-/// response carrying its sentinel never reached `serve_streaming_sentinel` —
+/// response carrying its sentinel never reached `claim_streaming_sentinel` —
 /// e.g. a middleware replaced/discarded it before it reached the axum bridge)
 /// can be reaped instead of living for the life of the process (memory-DoS:
 /// each leaked entry pins its `ErasedStreamHandler` closure, which may itself
@@ -71,7 +76,7 @@ static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
 static NEXT_STREAM_ID: AtomicI64 = AtomicI64::new(1);
 
 /// How long a `stream()`-registered handler waits in `pending_handlers` for
-/// its sentinel response to reach `serve_streaming_sentinel` before it is
+/// its sentinel response to reach `claim_streaming_sentinel` before it is
 /// considered abandoned. On the normal path the sentinel is consumed within
 /// the same request's response handling (effectively immediate); this is a
 /// generous upper bound so a slow-but-legitimate middleware chain is never
@@ -228,80 +233,91 @@ pub fn server_stream_with_content_type<E: From<String> + Send + 'static>(
     Box::pin(async move { IpeResult::Ok(()) })
 }
 
-/// Called from server.rs `to_axum_response`. If `r.body` carries the streaming
-/// sentinel, set up the channel + spawn the handler and return the streaming
-/// axum response; otherwise None (the caller falls back to the buffered path).
-pub fn serve_streaming_sentinel(r: &ServerResponse) -> Option<axum::response::Response> {
-    // Sentinel shape: `__ipe_stream:<nonce>:<token>`. The per-process nonce must
-    // match exactly, so application/relayed body content can neither forge nor
-    // collide with a real pending stream. A non-match falls through to buffered.
-    let rest = r.body.strip_prefix(SENTINEL_PREFIX)?;
-    let token_str = rest.strip_prefix(sentinel_nonce())?.strip_prefix(':')?;
-    let token: i64 = token_str.parse().ok()?;
-    let (_, handler) = pending_handlers()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&token)?;
+/// What a response body is to the streaming registry.
+pub enum ServerStreamClaim {
+    /// Not a streaming sentinel: the body is served as it is.
+    Buffered,
+    /// A live sentinel, whose handler this claim now holds.
+    Stream(ServerPendingStream),
+    /// This process's sentinel with no live handler (reaped, or already
+    /// served): it has no body to send.
+    Abandoned,
+}
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
-    let id = loop {
-        let n = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-        if n != 0 {
-            break n;
-        }
+/// A claimed stream handler, run only by [`ServerPendingStream::serve`].
+pub struct ServerPendingStream {
+    handler: ErasedStreamHandler,
+}
+
+/// Claim the stream handler `body` names, when it is a streaming sentinel.
+///
+/// Sentinel shape: `__ipe_stream:<nonce>:<token>`. The per-process nonce must
+/// match exactly, so application or relayed body content can neither forge nor
+/// collide with a real pending stream; a non-match is [`ServerStreamClaim::Buffered`].
+/// A matching nonce whose token names no pending handler is
+/// [`ServerStreamClaim::Abandoned`], never a buffered body that would send the
+/// nonce to the client.
+#[must_use]
+pub fn claim_streaming_sentinel(body: &str) -> ServerStreamClaim {
+    let Some(token_str) = body
+        .strip_prefix(SENTINEL_PREFIX)
+        .and_then(|rest| rest.strip_prefix(sentinel_nonce()))
+        .and_then(|rest| rest.strip_prefix(':'))
+    else {
+        return ServerStreamClaim::Buffered;
     };
-    stream_senders()
+    let Ok(token) = token_str.parse::<i64>() else {
+        return ServerStreamClaim::Abandoned;
+    };
+    pending_handlers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id, tx);
+        .remove(&token)
+        .map_or(ServerStreamClaim::Abandoned, |(_, handler)| {
+            ServerStreamClaim::Stream(ServerPendingStream { handler })
+        })
+}
 
-    // Drive the handler in its own task; on completion drop the sender so the
-    // body stream terminates even if the handler forgot to call `finish`.
-    tokio::spawn(async move {
-        handler(StreamWriter::StreamWriter(id)).await;
+impl ServerPendingStream {
+    /// Serve the stream under `head`, which the shared response assembler built.
+    ///
+    /// Opens the bounded channel, registers its sender under a fresh stream id,
+    /// spawns the handler driving a `StreamWriter(id)`, and returns the response
+    /// whose body streams the channel. The head is committed when the response
+    /// is returned, before the first chunk, as SSE requires.
+    #[must_use]
+    pub fn serve(self, head: ServerResponseHead) -> axum::response::Response {
+        let handler = self.handler;
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
+        let id = loop {
+            let n = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+            if n != 0 {
+                break n;
+            }
+        };
         stream_senders()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
-    });
+            .insert(id, tx);
 
-    // Receiver → byte stream. unfold yields each chunk; None ends the body when
-    // every sender has dropped (finish / handler exit).
-    let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv()
-            .await
-            .map(|chunk| (Ok::<String, std::io::Error>(chunk), rx))
-    });
+        // Drive the handler in its own task; on completion drop the sender so
+        // the body stream terminates even if the handler forgot to call `finish`.
+        tokio::spawn(async move {
+            handler(StreamWriter::StreamWriter(id)).await;
+            stream_senders()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        });
 
-    // Clamp to the valid HTTP range before the u16 cast (parity with server.rs's
-    // buffered path) so an out-of-range Ipê status can't wrap/panic the cast.
-    let status = axum::http::StatusCode::from_u16(r.status.clamp(100, 599) as u16)
-        .unwrap_or(axum::http::StatusCode::OK);
-    let mut builder = axum::http::Response::builder().status(status);
-    if !r.contentType.is_empty() {
-        builder = builder.header("content-type", r.contentType.clone());
-    }
-    // Disable proxy buffering for SSE — same hint the Ipe.Web SSE path sends.
-    builder = builder.header("x-accel-buffering", "no");
-    builder = builder.header("cache-control", "no-cache");
-    for (k, v) in &r.headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
-    // On builder failure — an invalid Ipê-supplied content-type / header name or
-    // value makes `body()` return Err — DO NOT fall through to `None`: the
-    // caller's None-fallback serves the raw `__ipe_stream:<nonce>:<token>`
-    // sentinel verbatim to the client (leaking the per-process nonce + emitting
-    // garbage). The handler is already popped and its task already spawned, so the
-    // only correct outcome is a real streaming response. Emit a 500 with an empty
-    // body instead of leaking the sentinel.
-    match builder.body(axum::body::Body::from_stream(body_stream)) {
-        Ok(resp) => Some(resp),
-        Err(_) => Some(
-            axum::http::Response::builder()
-                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::empty())
-                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())),
-        ),
+        // Receiver to byte stream: unfold yields each chunk; `None` ends the
+        // body once every sender has dropped (finish / handler exit).
+        let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|chunk| (Ok::<String, std::io::Error>(chunk), rx))
+        });
+        head.into_response(axum::body::Body::from_stream(body_stream))
     }
 }
 
@@ -312,7 +328,7 @@ mod tests {
     /// An expired `pending_handlers` entry is reaped; a fresh one survives.
     /// Uses distinctive high tokens (never issued by `NEXT_TOKEN`, which starts
     /// at 1) so this test cannot collide with concurrently-running tests that
-    /// exercise the real `server_stream_stream` → `serve_streaming_sentinel`
+    /// exercise the real `server_stream_stream` → `claim_streaming_sentinel`
     /// path against the same process-global registry.
     #[test]
     fn reap_evicts_only_expired_entries() {

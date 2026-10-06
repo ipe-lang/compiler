@@ -1,16 +1,16 @@
 //! Unix primitives: every entry open is an `openat` on a held descriptor, never following a final link.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::{EntryName, FileId, FileKind, OpenRefusal};
+use crate::{EntryName, FileId, FileKind, HintedKind, OpenRefusal};
 
 /// A held directory descriptor.
 #[derive(Debug)]
@@ -78,6 +78,19 @@ const fn kind_of_stat_type(file_type: FileType) -> FileKind {
     }
 }
 
+/// The hint a directory entry's `d_type` carries; a filesystem that leaves it unset yields `Unknown`.
+const fn hint_of_dirent_type(file_type: FileType) -> HintedKind {
+    match file_type {
+        FileType::RegularFile => HintedKind::Regular,
+        FileType::Directory => HintedKind::Dir,
+        FileType::Symlink => HintedKind::Link,
+        FileType::Fifo | FileType::Socket | FileType::CharacterDevice | FileType::BlockDevice => {
+            HintedKind::Other
+        }
+        FileType::Unknown => HintedKind::Unknown,
+    }
+}
+
 /// The kind a standard-library file type carries.
 fn kind_of_type(file_type: std::fs::FileType) -> FileKind {
     if file_type.is_file() {
@@ -119,17 +132,17 @@ pub fn id_of_file(file: &File) -> Result<FileId, OpenRefusal> {
         .and_then(|stat| id_of_stat(&stat))
 }
 
+/// The kind and length of the object `file` holds, read from that handle.
+pub fn kind_and_len(file: &File) -> Result<(FileKind, u64), OpenRefusal> {
+    let meta = file.metadata().map_err(|e| refusal_of(&e))?;
+    Ok((kind_of_type(meta.file_type()), meta.len()))
+}
+
 /// How many directory entries name the object `file` holds.
 pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
     file.metadata()
         .map(|meta| meta.nlink())
         .map_err(|e| refusal_of(&e))
-}
-
-/// The kind and length of the object `file` holds, read from that handle.
-pub fn kind_and_len(file: &File) -> Result<(FileKind, u64), OpenRefusal> {
-    let meta = file.metadata().map_err(|e| refusal_of(&e))?;
-    Ok((kind_of_type(meta.file_type()), meta.len()))
 }
 
 /// The identity of the object looking `path` up now reaches, following links.
@@ -207,15 +220,33 @@ impl Dir {
         }
     }
 
-    /// The names of this directory's entries, `.` and `..` excluded.
-    pub fn names(
+    /// The target the link `name` stores, read on the held handle.
+    ///
+    /// An entry that is not a link answers `EINVAL`; it is classified by a
+    /// no-follow stat of `name`.
+    pub fn read_link(&self, name: &EntryName) -> Result<PathBuf, OpenRefusal> {
+        match rustix::fs::readlinkat(&self.0, name.as_os_str(), Vec::new()) {
+            Ok(target) => Ok(PathBuf::from(OsString::from_vec(target.into_bytes()))),
+            Err(errno) if errno == Errno::INVAL => Err(self
+                .kind_of(name)?
+                .map_or(OpenRefusal::Absent, OpenRefusal::NotRegular)),
+            Err(errno) => Err(refusal(errno)),
+        }
+    }
+
+    /// The names of this directory's entries with their `d_type` hint, `.` and `..` excluded; never stats.
+    pub fn hinted_names(
         &self,
-    ) -> Result<impl Iterator<Item = Result<EntryName, OpenRefusal>>, OpenRefusal> {
+    ) -> Result<impl Iterator<Item = Result<(EntryName, HintedKind), OpenRefusal>>, OpenRefusal>
+    {
         let entries = rustix::fs::Dir::read_from(&self.0).map_err(refusal)?;
         Ok(entries.filter_map(|entry| match entry {
             Ok(entry) => {
                 let name = OsStr::from_bytes(entry.file_name().to_bytes());
-                (name != "." && name != "..").then(|| EntryName::parse(name))
+                (name != "." && name != "..").then(|| {
+                    EntryName::parse(name)
+                        .map(|name| (name, hint_of_dirent_type(entry.file_type())))
+                })
             }
             Err(errno) => Some(Err(refusal(errno))),
         }))
@@ -233,8 +264,39 @@ impl Dir {
         id_of_file(&self.0)
     }
 
+    /// Refuse a held directory that was removed: its listing reads as empty, its link count as zero.
+    pub fn require_live(&self) -> Result<(), OpenRefusal> {
+        let meta = self.0.metadata().map_err(|e| refusal_of(&e))?;
+        if meta.nlink() == 0 {
+            Err(OpenRefusal::Absent)
+        } else {
+            Ok(())
+        }
+    }
+
     /// The held descriptor.
     pub const fn handle(&self) -> &File {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::{FileType, HintedKind, hint_of_dirent_type};
+
+    #[test]
+    fn every_dirent_type_maps_to_its_own_hint() {
+        for (file_type, hint) in [
+            (FileType::RegularFile, HintedKind::Regular),
+            (FileType::Directory, HintedKind::Dir),
+            (FileType::Symlink, HintedKind::Link),
+            (FileType::Fifo, HintedKind::Other),
+            (FileType::Socket, HintedKind::Other),
+            (FileType::CharacterDevice, HintedKind::Other),
+            (FileType::BlockDevice, HintedKind::Other),
+            (FileType::Unknown, HintedKind::Unknown),
+        ] {
+            assert_eq!(hint_of_dirent_type(file_type), hint, "{file_type:?}");
+        }
     }
 }

@@ -136,7 +136,8 @@ type SpillQuery<'q> =
 /// The tenant-scoping predicate of one spill query.
 ///
 /// Appended to the SQL text once, then bound at the same placeholder
-/// position. `substr(service_name, 1, length(?)) = ?` is exactly
+/// position. The shape is the runtime's one exact-prefix rendering
+/// ([`crate::db::text_prefix_equals_sql`]), which is exactly
 /// [`TenantPrefix::admits`]: SQLite's `substr`/`length` count characters on
 /// TEXT and `=` compares with the binary collation, so the prefix carries no
 /// wildcard and no case folding (unlike `LIKE`).
@@ -146,7 +147,8 @@ impl<'p> TenantFilter<'p> {
     /// Append the predicate to `sql` when a tenant is in scope.
     fn push(sql: &mut String, tenant: Option<&'p TenantPrefix>) -> Option<Self> {
         let tenant = tenant?;
-        sql.push_str(" AND substr(service_name, 1, length(?)) = ?");
+        sql.push_str(" AND ");
+        sql.push_str(crate::db::text_prefix_equals_sql("service_name").as_str());
         Some(Self(tenant))
     }
 

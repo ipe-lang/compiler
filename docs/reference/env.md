@@ -144,7 +144,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_FFI_INSPECTOR` | unset (auto-located beside test binary) | Explicit path to the `ipe-ffi-inspector` binary used in integration tests. Not needed in normal use. | `Tunable` |
 | `IPE_FFI_OUT_CAP_MB` | unset (sandbox default) | Output-size cap (MB) for each sandboxed FFI inspector phase. Prevents inspector stdout from exhausting memory. | `SecurityTunable` |
 | `IPE_FFI_PROBE_DIR` | unset (per-run temp dir) | Root directory for the FFI inspector's probe workspace. Setting a stable path allows Cargo to reuse dependency build artefacts across repeated `ipe add` invocations. | `Tunable` |
-| `IPE_FFI_PROC_CAP` | unset (sandbox default) | Process-count limit for each sandboxed FFI inspector phase. | `SecurityTunable` |
+| `IPE_FFI_PROC_CAP` | unset (sandbox default) | Process-count limit for each sandboxed FFI inspector phase: a whole number from 1 to 4096. Zero, a larger value, or anything but digits refuses the inspection. | `SecurityTunable` |
 | `IPE_FFI_RSS_MB` | unset (sandbox default) | RSS memory limit (MB) for each sandboxed FFI inspector phase. | `SecurityTunable` |
 | `IPE_FFI_WALL_SECS` | unset (sandbox default) | Wall-clock time limit (seconds) for each sandboxed FFI inspector phase. | `SecurityTunable` |
 | `IPE_FFI_XC_LOAD` | unset | Path to a pre-generated cross-compilation manifest to load instead of running the inspector. Developer / CI optimisation. | `Tunable` |
@@ -161,7 +161,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
-| `IPE_HTTP_BIND` | unset (loopback in dev, all-interfaces in release) | Override the host address the HTTP server binds. Takes precedence over the `Host.bind` setting and the build-profile default. The conservative loopback default keeps a dev server off the LAN. | `SecurityTunable` |
+| `IPE_HTTP_BIND` | unset (loopback in dev, all-interfaces in release) | Override the IP address the HTTP server binds: IPv4 such as `127.0.0.1`, or bare IPv6 such as `::1`. A hostname, a socket form (`host:port`), brackets, a scope id, padding, or an empty value refuses startup. Takes precedence over the `Host.bind` setting and the build-profile default. The conservative loopback default keeps a dev server off the LAN. | `SecurityTunable` |
 | `IPE_HTTP_DENY_PRIVATE` | unset (on, except a development binary with no exposed listener) | Set to `1`, `on`, or `true` to block all outbound HTTP / SMTP / database connections to RFC-1918 private, loopback, and link-local addresses, closing the SSRF attack surface; `0`, `off`, or `false` disables it. Unset, the guard is on in every `ipe release` artifact and production posture, and off only in a development binary in a dev posture that has bound no listener beyond loopback. Any other value turns the guard on and logs one warning. | `SecurityTunable` |
 | `IPE_HTTP_DNS_TIMEOUT_MS` | 5000 (5 s) | Deadline (ms) for each SSRF-gate DNS resolve (HTTP, WebSocket, database, SMTP), through the non-blocking resolver. A host still unresolved at the deadline is refused, so a slow or stalling resolver cannot hold an outbound dial. | `SecurityTunable` |
 | `IPE_HTTP_MAX_BODY_BYTES` | 33554432 (32 MiB) | Maximum request-body size (bytes) for outbound `Http.*` calls. Prevents OOM from unexpectedly large responses. | `Tunable` |
@@ -175,7 +175,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 |----------|---------|--------|-------|
 | `IPE_ENV` | unset (development in a dev build, production in a release build) | Deployment environment marker. Any non-empty value other than `dev`, `development`, or `local` activates production mode: SSRF guard on, console requires a token, Secure cookies, no dev banner. Unset, the build decides: `ipe dev build`, `ipe dev run`, `ipe test` and `ipe dev watch` binaries read as development, `ipe release` artifacts as production. An `ipe release` artifact is production whatever this says: a dev marker there opens no dev-only surface and logs one notice. Also accepted as bare `ENV`. | `Tunable` |
 | `IPE_LOG_FORMAT` | unset (human-readable) | Set to `json` to emit structured JSON log lines instead of the default human-readable format. Recommended for log aggregation pipelines (Datadog, Loki, etc.). | `Tunable` |
-| `IPE_LOG_LEVEL` | unset (info) | Minimum log level: `debug`, `info`, `warn`, or `error`. Takes precedence over an installed `Log.level` setting. | `Tunable` |
+| `IPE_LOG_LEVEL` | unset (info) | Minimum log level: `debug`, `info`, `warn` (or `warning`), or `error`, ASCII case-insensitive. Any other value, an empty or padded one included, refuses startup. Read once at process start, so a later `System.setenv` or `System.loadEnv` does not change it. Takes precedence over an installed `Log.level` setting. | `Tunable` |
 | `IPE_OBSERVABILITY_BUFFER` | 1024 | Bounded queue depth for the parent-push telemetry exporter. Overflow drops and warns rather than blocking the application. | `Tunable` |
 | `IPE_OBSERVABILITY_PUSH_INTERVAL_MS` | 2000 | Flush cadence (ms) for telemetry shipped from a sub-app to its parent's `/_ipe/ingest` endpoint. | `Tunable` |
 | `IPE_PARENT_URL` | unset | Base URL of the parent app to which this sub-app pushes telemetry. Presence of this variable activates the push exporter. | `Tunable` |
@@ -187,7 +187,6 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
-| `IPE_ALLOW_UNSANDBOXED` | unset (false) | When `bwrap` confinement is unavailable, set to `1` to allow `ipe dev run` to proceed unconfined instead of refusing. Widens the trust boundary. Never set in CI or production. | `SecurityTunable` |
 | `IPE_HOME` | unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe) | Root directory for materialised runtime source, config, and cached binaries. Overrides the XDG / home-directory fallback. Must be an absolute path. | `Tunable` |
 | `IPE_RUNTIME_DIR` | unset (embedded / in-repo) | Explicit path to the runtime crate source directory. Overrides the embedded fallback. Used in tests and in-repo development. | `Tunable` |
 | `IPE_RUNTIME_VENDORED` | unset (false) | Set to `1` to declare that the runtime is vendored (already present on disk) and skip materialization. Used during packaging. | `Tunable` |
@@ -198,7 +197,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 |----------|---------|--------|-------|
 | `IPE_AUTH_MAX_LIFETIME` | 28800 (8 h) | Absolute lifetime cap (seconds) for a signed session token. A stolen but unrevoked token is worthless after this deadline. Takes precedence over `Web.authMaxLifetime`. | `Tunable` |
 | `IPE_AUTH_REVOCATION` | unset (Off) | Session-token revocation mode. Set to `store` or `1` to enable the in-process revocation store, which checks each request against a list of revoked token IDs. `off` or `0` disables; default is Off (zero overhead). | `Tunable` |
-| `IPE_AUTH_SLIDE_WINDOW` | 1800 (30 min) | Rolling re-issue window (seconds) for a signed session token. A request within this window of expiry re-issues a fresh token, keeping an active session alive without a full login. Clamped so `slide_window < max_lifetime`. Takes precedence over `Web.authSlideWindow`. | `Tunable` |
+| `IPE_AUTH_SLIDE_WINDOW` | 1800 (30 min) | Rolling re-issue window (seconds) for a signed session token. A request within this window of expiry re-issues a fresh token, keeping an active session alive without a full login. It must be below the max lifetime, else startup refuses. Takes precedence over `Web.authSlideWindow`. | `Tunable` |
 | `IPE_AUTH_TOKEN_SECRET` | unset | HMAC signing secret for session tokens. Must be at least 32 bytes. Rotate with care — outstanding tokens signed with the old secret become invalid. Provide via your secret manager; never commit. | `Secret` |
 | `IPE_CSRF` | unset (on) | Set to `off`, `0`, or `false` to disable CSRF protection. Disabling widens the trust boundary — only safe on loopback in automated tests. | `SecurityTunable` |
 | `IPE_REVOCATION_CAPACITY` | 1048576 (2^20) | Maximum number of entries in the per-process token revocation store. Each entry is roughly 64 bytes; the default cap holds ~64 MB. Raise for very high user volumes with token revocation enabled. | `Tunable` |
@@ -206,7 +205,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_WEB_BANNER` | unset (on in dev) | Set to `off`, `0`, or `false` to disable the reconnection-status banner in the browser client. | `Tunable` |
 | `IPE_WEB_BASE_PATH` | unset (root-mounted) | Sub-app mount prefix, e.g. `/billing`. All session-cookie, CSRF-cookie, and asset paths are scoped to this prefix. Set automatically when mounting a sub-app. | `Tunable` |
 | `IPE_WEB_CSRF_ORIGIN_CHECK` | unset (off) | Set to `on` to enforce strict `Origin`-header cross-origin checking on top of the double-submit CSRF token. | `SecurityTunable` |
-| `IPE_WEB_FRAME_ANCESTORS` | unset (no embedding allowed) | Space-separated `Content-Security-Policy: frame-ancestors` allow-list, e.g. `https://app.example.com`. Enables embedding this app in a third-party iframe; also sets `SameSite=None; Secure` on session cookies. | `SecurityTunable` |
+| `IPE_WEB_FRAME_ANCESTORS` | unset (no embedding allowed) | Space-separated `Content-Security-Policy: frame-ancestors` allow-list, e.g. `https://app.example.com`. Enables embedding this app in a third-party iframe; also sets `SameSite=None; Secure` on session cookies. A value holding a control or non-ASCII byte, a `;` or `,`, or only whitespace refuses to start the server. | `SecurityTunable` |
 | `IPE_WEB_HEARTBEAT_TTL_MS` | 35000 | SSE heartbeat interval (ms) the browser uses to detect a stale connection. | `Tunable` |
 | `IPE_WEB_HELLO_TIMEOUT_MS` | 8000 | Timeout (ms) for the initial SSE hello handshake. The browser closes and retries if this deadline passes. | `Tunable` |
 | `IPE_WEB_MAX_BODY_BYTES` | 33554432 (32 MiB) | Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise for large file uploads; lower to tighten the DoS floor. | `Tunable` |

@@ -1,14 +1,13 @@
 use super::{
-    BuildOptions, CliError, OutTarget, attribute_canon_errors, attribute_post_link_error,
-    build_loose_file_into, build_project_into, build_source_graph, build_test_into,
-    capabilities_including_served_widgets, classify_entry_shape, create_source_root, default_entry,
-    discover_manifest, emit_machine_error, emitted_bin_filename, frame_infer_error,
-    home_to_source_map, program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir,
-    run_build, runtime_context_for_message, source_graph_for_target, typecheck_target,
+    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, attribute_canon_errors,
+    attribute_post_link_error, build_loose_file_into, build_project_into, build_source_graph,
+    build_test_into, capabilities_including_served_widgets, classify_entry_shape,
+    create_source_root, default_entry, discover_manifest, emit_machine_error, emitted_bin_filename,
+    frame_infer_error, home_to_source_map, program_constructs_a_widget, resolve_runtime,
+    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, source_graph_for_target,
+    typecheck_target,
 };
-use crate::cargo_step::{
-    CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
-};
+use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::publisher::{AttestedActor, BlessedPublisher};
@@ -34,6 +33,15 @@ pub enum BundleProfile {
 }
 
 impl BundleProfile {
+    /// The bundle profile a native build finished in `finish` packages: a
+    /// release bundle only behind the release consent witness.
+    pub(crate) const fn of(finish: &NativeFinish<'_>) -> Self {
+        match finish {
+            NativeFinish::Dev => Self::Dev,
+            NativeFinish::Release { .. } => Self::Release,
+        }
+    }
+
     /// The build intent the bundle's crate is emitted with.
     ///
     /// The `release` bundle is a shipped artifact, so it is a release build;
@@ -43,14 +51,6 @@ impl BundleProfile {
             Self::Dev => ipe_backend_rust::BuildIntent::Development,
             Self::Release => ipe_backend_rust::BuildIntent::Release,
         }
-    }
-
-    /// The cargo build the bundle's binary is compiled with: a plain debug build
-    /// for [`Self::Dev`], an optimised `--release` build for [`Self::Release`].
-    /// The one place the profile decides the compile, so the two bundle verbs
-    /// stay a single packager parameterised by profile, not two code paths.
-    const fn cargo_release(self) -> bool {
-        matches!(self, Self::Release)
     }
 
     /// The emitted crate's area under the output root.
@@ -76,7 +76,7 @@ impl BundleProfile {
     }
 
     /// The compiled binary's `target/` profile subdirectory (`debug` / `release`),
-    /// matching [`Self::cargo_release`].
+    /// matching the cargo profile [`FlooredBuild`] picks for the same posture.
     const fn target_subdir(self) -> &'static str {
         match self {
             Self::Dev => "debug",
@@ -139,12 +139,12 @@ impl BundleHost {
 /// the underlying build's errors; [`CliError::Io`] on any filesystem failure.
 pub fn bundle_delivery(
     host: BundleHost,
-    profile: BundleProfile,
+    finish: NativeFinish<'_>,
     path: Option<&str>,
 ) -> Result<(), CliError> {
     match host {
-        BundleHost::Desktop => pack_desktop(profile, path),
-        BundleHost::Mobile(os) => pack_mobile(os, profile, path),
+        BundleHost::Desktop => pack_desktop(finish, path),
+        BundleHost::Mobile(os) => pack_mobile(os, BundleProfile::of(&finish), path),
     }
 }
 
@@ -270,7 +270,10 @@ struct BundleAssembler<'a> {
 /// for the wrapped assembler. The ONLY way to obtain one is
 /// [`BundleAssembler::gate_desktop`], which runs the gate first; its
 /// [`assemble`](GatedDesktop::assemble) is the sole entry to desktop assembly.
-pub struct GatedDesktop<'a>(BundleAssembler<'a>);
+pub struct GatedDesktop<'a> {
+    assembler: BundleAssembler<'a>,
+    finish: NativeFinish<'a>,
+}
 
 /// A mobile-shape gate witness: proof that [`validate_mobile_shape`] passed for
 /// the wrapped assembler. The ONLY way to obtain one is
@@ -286,7 +289,7 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.0.assemble_desktop(os)
+        self.assembler.assemble_desktop(os, self.finish)
     }
 }
 
@@ -329,11 +332,14 @@ impl<'a> BundleAssembler<'a> {
     pub fn gate_desktop(
         manifest: &'a project::ProjectManifest,
         manifest_path: &'a Path,
-        profile: BundleProfile,
+        finish: NativeFinish<'a>,
         root: &Path,
     ) -> Result<GatedDesktop<'a>, CliError> {
         validate_desktop_shape(manifest.default_program().and_then(|p| p.shape), root)?;
-        Ok(GatedDesktop(Self::new(manifest, manifest_path, profile)))
+        Ok(GatedDesktop {
+            assembler: Self::new(manifest, manifest_path, BundleProfile::of(&finish)),
+            finish,
+        })
     }
 
     /// Run the mobile shape gate ([`validate_mobile_shape`]) and, only when it
@@ -367,7 +373,11 @@ impl<'a> BundleAssembler<'a> {
     /// # Errors
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
-    fn assemble_desktop(&self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
+    fn assemble_desktop(
+        &self,
+        os: pack::desktop::DesktopOs,
+        finish: NativeFinish<'_>,
+    ) -> Result<(), CliError> {
         use std::fmt::Write as _;
 
         let manifest = self.manifest;
@@ -402,16 +412,13 @@ impl<'a> BundleAssembler<'a> {
         )?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
-        CargoBuild {
+        // A `release web desktop` bundle carries an optimised binary and its
+        // consented floor; the `build` dev bundle carries a plain debug one and
+        // the development marker.
+        FlooredBuild {
             cargo: &cargo_bin,
-            krate: CargoCrate::Emitted(&crate_dir),
-            // A `release web desktop` bundle carries an optimised binary; the
-            // `build` dev bundle carries a plain debug one.
-            profile: if self.profile.cargo_release() {
-                CargoProfile::Release
-            } else {
-                CargoProfile::Dev
-            },
+            crate_dir: &crate_dir,
+            finish,
             target: CargoTarget::Host,
             output: CargoOutput::Human(Verbosity::Progress),
             what: "the desktop app",
@@ -538,7 +545,7 @@ impl<'a> BundleAssembler<'a> {
 /// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`];
 /// build/emit errors from the underlying compile; [`CliError::Io`] on any
 /// filesystem failure while materialising the bundle.
-pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), CliError> {
+pub fn pack_desktop(finish: NativeFinish<'_>, path: Option<&str>) -> Result<(), CliError> {
     // The desktop bundle is the host OS's webview-native app; the delivery
     // grammar carries no per-OS override (a cross-OS artifact is finished on that
     // OS's own runner), so the packager always targets this host's OS.
@@ -559,7 +566,7 @@ pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), Cl
     // naming its shape. The witness constructor runs the gate and is the only
     // way to obtain a runnable assembler — assembling an ungated shape has no
     // representation.
-    BundleAssembler::gate_desktop(&manifest, &manifest_path, profile, &root)?.assemble(os)
+    BundleAssembler::gate_desktop(&manifest, &manifest_path, finish, &root)?.assemble(os)
 }
 
 /// `build|release web solo <os> [<path>]` — build the client-wasm SPA and lay out
@@ -1105,29 +1112,6 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the
-/// source-graph pipeline reads. Same argument convention as `ipe dev build`:
-///
-/// 1. a directory → its `package.ipe`'s `src`-root `Main.ipe`;
-/// 2. a `.ipe` file → itself.
-///
-/// A project's entry module is always `Main` (`project` module doc), so the
-/// entry file is `<src_root>/Main.ipe`.
-///
-/// # Errors
-/// [`CliError::Usage`] for a directory with no `package.ipe`; the manifest's own
-/// parse errors otherwise.
-pub fn resolve_analysis_entry(path: &Path) -> Result<PathBuf, CliError> {
-    let manifest = discover_manifest(path)?;
-    match manifest {
-        Some(m) => {
-            let parsed = project::parse_manifest(&m)?;
-            analysis_root_of(&parsed)
-        }
-        None => Ok(path.to_path_buf()),
-    }
-}
-
 /// The source file `ipe type-check` uses as its analysis root for a manifest
 /// project.
 ///
@@ -1222,7 +1206,7 @@ pub enum AnalysisTarget {
 /// manifest's canonical `tests/` or `src/` root.
 ///
 /// # Errors
-/// Same as [`resolve_analysis_entry`] for a directory argument;
+/// A manifest's own parse errors for a directory argument;
 /// [`CliError::Io`] when the file (a named one, or a directory's entry) cannot
 /// be canonicalised (`NotFound` when it is missing), or a project, `src/`, or
 /// existing `tests/` root cannot be; a manifest's own parse errors for a file
@@ -1572,10 +1556,10 @@ pub fn build_and_run_test_entry(
     };
 
     // Compile the emitted Rust project.
-    CargoBuild {
+    FlooredBuild {
         cargo: cargo_bin,
-        krate: CargoCrate::Emitted(&crate_dir),
-        profile: CargoProfile::Dev,
+        crate_dir: &crate_dir,
+        finish: NativeFinish::Dev,
         target: CargoTarget::Host,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
@@ -2202,6 +2186,7 @@ fn download_installer() -> Result<crate::scratch::ScratchFile, CliError> {
             RunError::Measure(path, source) => CliError::Io { path, source },
             RunError::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
             RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
+            RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         })?;
     if let Some(refusal) =
         remote_ingest::curl_refusal(output.status, remote_ingest::INSTALLER_MAX_BYTES, budget)
@@ -2210,9 +2195,7 @@ fn download_installer() -> Result<crate::scratch::ScratchFile, CliError> {
     }
     if !output.status.success() {
         return Err(CliError::Usage(
-            text::msg::upgrade_installer_download_failed(&crate::style::TerminalSafe::sanitize(
-                String::from_utf8_lossy(&output.stderr).trim(),
-            )),
+            text::msg::upgrade_installer_download_failed(&output.stderr.to_terminal()),
         ));
     }
     Ok(script)
@@ -3004,8 +2987,7 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// # Errors
 /// Returns [`CliError::Io`] on a filesystem failure.
 pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     let Some(diag) = pipeline_first_diagnostic(&source) else {
         writeln!(
@@ -3420,7 +3402,6 @@ mod self_reinvocation_tests {
         );
         for profile in [BundleProfile::Dev, BundleProfile::Release] {
             let verb = wasm_build_verb(profile);
-            assert_eq!(verb.bundle_profile(), profile, "{verb}");
             assert_eq!(verb.intent(), profile.build_intent(), "{verb}");
         }
     }

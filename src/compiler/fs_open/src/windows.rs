@@ -20,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
 
-use crate::{EntryName, FileId, FileKind, OpenRefusal};
+use crate::{EntryName, FileId, FileKind, HintedKind, OpenRefusal};
 
 /// `FILE_FLAG_BACKUP_SEMANTICS`: allows opening a directory handle.
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -34,6 +34,8 @@ const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
 const ATTR_DIRECTORY: u32 = 0x10;
 /// `FILE_ATTRIBUTE_REPARSE_POINT`.
 const ATTR_REPARSE_POINT: u32 = 0x400;
+/// `FILE_ATTRIBUTE_DEVICE`.
+const ATTR_DEVICE: u32 = 0x40;
 /// `ERROR_REPARSE_POINT_ENCOUNTERED`: the typed refusal of a reparse point.
 const ERROR_REPARSE_POINT_ENCOUNTERED: i32 = 4395;
 /// `ERROR_SHARING_VIOLATION`: another open handle denies the access asked for.
@@ -68,6 +70,36 @@ const fn kind_of_attributes(attributes: u32) -> Option<FileKind> {
     } else {
         None
     }
+}
+
+/// The hint find-data `attributes` carry: a reparse point is a link, never a directory.
+///
+/// A directory listing of a volume holds files, directories and reparse
+/// points; an entry marked a device is another kind, and any other entry is a
+/// regular file.
+pub const fn hint_of_attributes(attributes: u32) -> HintedKind {
+    if attributes & ATTR_REPARSE_POINT != 0 {
+        HintedKind::Link
+    } else if attributes & ATTR_DIRECTORY != 0 {
+        HintedKind::Dir
+    } else if attributes & ATTR_DEVICE != 0 {
+        HintedKind::Other
+    } else {
+        HintedKind::Regular
+    }
+}
+
+/// The name and hint of one listed entry, read from the find data the listing already holds.
+fn hinted_entry(
+    entry: io::Result<std::fs::DirEntry>,
+) -> Result<(EntryName, HintedKind), OpenRefusal> {
+    let entry = entry.map_err(|e| refusal_of(&e))?;
+    let name = EntryName::parse(&entry.file_name())?;
+    let attributes = entry
+        .metadata()
+        .map_err(|e| refusal_of(&e))?
+        .file_attributes();
+    Ok((name, hint_of_attributes(attributes)))
 }
 
 /// The kind and length of the object `file` holds, read from that handle.
@@ -159,8 +191,9 @@ pub fn id_of_file(file: &File) -> Result<FileId, OpenRefusal> {
 
 /// How many directory entries name the object `file` holds.
 pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
-    let info = winapi_util::file::information(file).map_err(|e| refusal_of(&e))?;
-    Ok(info.number_of_links())
+    winapi_util::file::information(file)
+        .map(|info| info.number_of_links())
+        .map_err(|e| refusal_of(&e))
 }
 
 /// The identity of the object looking `path` up now reaches, following links.
@@ -263,21 +296,35 @@ impl Dir {
         }
     }
 
-    /// The names of this directory's entries.
+    /// The target the reparse point `name` stores.
+    ///
+    /// Read through the held directory's proven real path, then the held
+    /// handle is re-proven, as for a listing. An entry that is not a reparse
+    /// point is classified by an attribute-only open of `name` first.
+    pub fn read_link(&self, name: &EntryName) -> Result<PathBuf, OpenRefusal> {
+        match self.kind_of(name)? {
+            None => return Err(OpenRefusal::Absent),
+            Some(FileKind::Symlink) => {}
+            Some(kind) => return Err(OpenRefusal::NotRegular(kind)),
+        }
+        let target =
+            std::fs::read_link(self.real.join(name.as_os_str())).map_err(|e| refusal_of(&e))?;
+        self.reprove()?;
+        Ok(target)
+    }
+
+    /// The names of this directory's entries with the hint their find data carries; never opens an entry.
     ///
     /// The listing reads the real path, then the held handle is re-proven, so
     /// a directory that turned into a reparse point before the listing was
     /// read is refused rather than listed through.
-    pub fn names(
+    pub fn hinted_names(
         &self,
-    ) -> Result<impl Iterator<Item = Result<EntryName, OpenRefusal>>, OpenRefusal> {
+    ) -> Result<impl Iterator<Item = Result<(EntryName, HintedKind), OpenRefusal>>, OpenRefusal>
+    {
         let entries = std::fs::read_dir(&self.real).map_err(|e| refusal_of(&e))?;
         self.reprove()?;
-        Ok(entries.map(|entry| {
-            entry
-                .map_err(|e| refusal_of(&e))
-                .and_then(|entry| EntryName::parse(&entry.file_name()))
-        }))
+        Ok(entries.map(hinted_entry))
     }
 
     /// Open the directory above this one; `None` at the volume root.

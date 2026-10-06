@@ -6,7 +6,9 @@
 //           keys alphabetically sorted)
 //
 // Stream routing
-// `IPE_LOG_LEVEL` gates output (debug < info < warn < error; default info);
+// `IPE_LOG_LEVEL` gates output (debug < info < warn < error; default info). A
+// present value outside `debug`/`info`/`warn`/`warning`/`error` (ASCII
+// case-insensitive, unpadded, non-empty) refuses startup;
 // `IPE_LOG_FORMAT=json` switches to the JSON shape. Each line is also mirrored
 // into the telemetry ring (the Ipê Console reads it).
 //
@@ -19,29 +21,105 @@ const LOG_LEVEL_INFO: i32 = 1;
 const LOG_LEVEL_WARN: i32 = 2;
 const LOG_LEVEL_ERROR: i32 = 3;
 
+/// A minimum severity `IPE_LOG_LEVEL` names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LogThreshold {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogThreshold {
+    /// The severity a line must reach under this threshold.
+    const fn severity(self) -> i32 {
+        match self {
+            Self::Debug => LOG_LEVEL_DEBUG,
+            Self::Info => LOG_LEVEL_INFO,
+            Self::Warn => LOG_LEVEL_WARN,
+            Self::Error => LOG_LEVEL_ERROR,
+        }
+    }
+}
+
+/// The accepted `IPE_LOG_LEVEL` values, as a refusal states them.
+const LOG_LEVEL_EXPECTED: &str = "one of debug, info, warn, warning, error";
+
+/// The parsed `IPE_LOG_LEVEL`: `None` when unset, a refusal when present but not
+/// a level name.
+type EnvThreshold = Result<Option<LogThreshold>, crate::system::EnvValueRefusal>;
+
+/// Parses the raw `IPE_LOG_LEVEL` lookup into a threshold.
+fn threshold_from(raw: Result<String, std::env::VarError>) -> EnvThreshold {
+    let refuse =
+        |raw: &[u8]| crate::system::EnvValueRefusal::new("IPE_LOG_LEVEL", LOG_LEVEL_EXPECTED, raw);
+    let value = match raw {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(os)) => return Err(refuse(os.as_encoded_bytes())),
+    };
+    let is = |name: &str| value.eq_ignore_ascii_case(name);
+    let threshold = if is("debug") {
+        LogThreshold::Debug
+    } else if is("info") {
+        LogThreshold::Info
+    } else if is("warn") || is("warning") {
+        LogThreshold::Warn
+    } else if is("error") {
+        LogThreshold::Error
+    } else {
+        return Err(refuse(value.as_bytes()));
+    };
+    Ok(Some(threshold))
+}
+
+/// `IPE_LOG_LEVEL`, read and parsed once per process.
+fn env_threshold() -> &'static EnvThreshold {
+    static ENV_THRESHOLD: std::sync::OnceLock<EnvThreshold> = std::sync::OnceLock::new();
+    ENV_THRESHOLD.get_or_init(|| threshold_from(crate::system::read_env_var("IPE_LOG_LEVEL")))
+}
+
+/// Refuses a present `IPE_LOG_LEVEL` that is not a level name, before any line
+/// is logged.
+///
+/// # Errors
+///
+/// The refusal naming `IPE_LOG_LEVEL` and echoing its escaped value.
+// The vendored emit compiles `log.rs` without the `log` feature, so no entry
+// calls this check there.
+#[cfg_attr(not(feature = "log"), allow(dead_code))]
+pub(crate) fn startup_check() -> Result<(), crate::system::EnvValueRefusal> {
+    env_threshold().as_ref().map(|_| ()).map_err(Clone::clone)
+}
+
 /// The minimum severity a line must reach to be emitted, under the one config
-/// precedence `env > setting-in-code > fallback`: `IPE_LOG_LEVEL` (parsed as
-/// `debug`/`warn`|`warning`/`error`, else info) wins; absent it, an installed
-/// `Log.level` setting applies (its tag `0` debug … `3` error, clamped to the
-/// known range); absent both, the built-in default is info.
+/// precedence `env > setting-in-code > fallback`: `IPE_LOG_LEVEL` wins; absent
+/// it, an installed `Log.level` setting applies (its tag `0` debug … `3` error,
+/// clamped to the known range); absent both, the built-in default is info. A
+/// malformed `IPE_LOG_LEVEL` is refused by [`startup_check`]; an entry that runs
+/// no such check logs at info.
 fn log_threshold() -> i32 {
-    if let Some(tag) = crate::app_config::resolve_log_level_override() {
-        return match tag {
+    threshold_under(
+        env_threshold(),
+        crate::app_config::resolve_log_level_override(),
+    )
+}
+
+/// The precedence over the one `IPE_LOG_LEVEL` snapshot and the installed
+/// `Log.level` tag. A present `IPE_LOG_LEVEL`, malformed included, shadows the
+/// setting; a variable set after startup (`System.setenv`, `System.loadEnv`) is
+/// not in the snapshot and changes neither tier.
+fn threshold_under(env: &EnvThreshold, setting: Option<i64>) -> i32 {
+    match env {
+        Ok(Some(threshold)) => threshold.severity(),
+        Ok(None) => setting.map_or(LOG_LEVEL_INFO, |tag| match tag {
             t if t <= i64::from(LOG_LEVEL_DEBUG) => LOG_LEVEL_DEBUG,
             1 => LOG_LEVEL_INFO,
             2 => LOG_LEVEL_WARN,
             _ => LOG_LEVEL_ERROR,
-        };
-    }
-    match crate::system::read_env_var("IPE_LOG_LEVEL")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "debug" => LOG_LEVEL_DEBUG,
-        "warn" | "warning" => LOG_LEVEL_WARN,
-        "error" => LOG_LEVEL_ERROR,
-        _ => LOG_LEVEL_INFO,
+        }),
+        // Refused by `startup_check`; an entry without it logs at info.
+        Err(_) => LOG_LEVEL_INFO,
     }
 }
 
@@ -260,4 +338,63 @@ pub fn log_warn_with<E: Send + 'static, A: IpeInterpolate>(
         log_emit(LOG_LEVEL_WARN, "warn", &line);
         ok_res(())
     })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod threshold_tests {
+    use super::{
+        LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO, LOG_LEVEL_WARN, LogThreshold,
+        threshold_from, threshold_under,
+    };
+
+    fn parse(raw: &str) -> super::EnvThreshold {
+        threshold_from(Ok(raw.to_owned()))
+    }
+
+    #[test]
+    fn a_level_name_parses_case_insensitively() {
+        for (raw, threshold) in [
+            ("debug", LogThreshold::Debug),
+            ("info", LogThreshold::Info),
+            ("warn", LogThreshold::Warn),
+            ("warning", LogThreshold::Warn),
+            ("WARN", LogThreshold::Warn),
+            ("Error", LogThreshold::Error),
+        ] {
+            assert_eq!(parse(raw), Ok(Some(threshold)), "{raw:?}");
+        }
+        assert_eq!(
+            threshold_from(Err(std::env::VarError::NotPresent)),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_level_name_is_refused() {
+        for raw in ["verbose", "", " warn", "warn ", "trace", "2"] {
+            let outcome = parse(raw);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == "IPE_LOG_LEVEL"
+                    && r.to_string()
+                        .contains("one of debug, info, warn, warning, error")),
+                "{raw:?} must be refused naming IPE_LOG_LEVEL, got {outcome:?}"
+            );
+        }
+    }
+
+    /// The setting applies only when the startup snapshot holds no
+    /// `IPE_LOG_LEVEL`; a present one, malformed included, shadows it.
+    #[test]
+    fn the_snapshot_alone_decides_whether_the_setting_applies() {
+        let unset = Ok(None);
+        assert_eq!(threshold_under(&unset, Some(0)), LOG_LEVEL_DEBUG);
+        assert_eq!(threshold_under(&unset, Some(-7)), LOG_LEVEL_DEBUG);
+        assert_eq!(threshold_under(&unset, Some(1)), LOG_LEVEL_INFO);
+        assert_eq!(threshold_under(&unset, Some(2)), LOG_LEVEL_WARN);
+        assert_eq!(threshold_under(&unset, Some(9)), LOG_LEVEL_ERROR);
+        assert_eq!(threshold_under(&unset, None), LOG_LEVEL_INFO);
+        let error = Ok(Some(LogThreshold::Error));
+        assert_eq!(threshold_under(&error, Some(0)), LOG_LEVEL_ERROR);
+        assert_eq!(threshold_under(&parse("verbose"), Some(0)), LOG_LEVEL_INFO);
+    }
 }

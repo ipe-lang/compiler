@@ -110,12 +110,14 @@ const DENIED_PATHS: &[&str] = &[
 ];
 
 /// The paths the runtime `clippy.toml` denies for its other rules (abrupt
-/// failure, environment and temp-root reads, panicking thread starts), which
+/// failure, a process exit outside its funnel, environment and temp-root
+/// reads, panicking thread starts), which
 /// this scan does not own.
 const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "core::option::Option::unwrap_unchecked",
     "core::result::Result::unwrap_unchecked",
     "std::process::abort",
+    "std::process::exit",
     "std::panic::panic_any",
     "core::hint::unreachable_unchecked",
     "std::env::var",

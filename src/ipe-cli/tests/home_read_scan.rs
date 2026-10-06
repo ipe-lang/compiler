@@ -61,7 +61,8 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// proofs; the dev-only temp-root test reader; and in the runtime crate, which has its own `clippy.toml`, the build
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
-/// crate-private accessor, the ban proofs, the one blocking-pool start, and the
+/// crate-private accessor, the ban proofs, the one blocking-pool start, the one
+/// process exit, and the
 /// audited lossy-UTF-8 sites that render bytes already refused or never parsed.
 const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/env/src/lib.rs", 3),
@@ -80,7 +81,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/runtime/rust/src/scratch_core.rs", 2),
     ("src/runtime/rust/src/server.rs", 2),
     ("src/runtime/rust/src/ssrf.rs", 1),
-    ("src/runtime/rust/src/system.rs", 9),
+    ("src/runtime/rust/src/system.rs", 10),
     ("src/runtime/rust/src/terminal_access.rs", 1),
     ("src/runtime/rust/src/threads.rs", 1),
     ("src/runtime/rust/src/tui/key.rs", 1),
@@ -453,11 +454,13 @@ fn reaches_raw_passthrough(src: &str) -> bool {
 }
 
 /// Whether `src` names a procfs environment file (`/proc/self/environ`, a
-/// `join("environ")`): literals included, line comments not.
+/// `join("environ")`): literals included, line comments not. The literal's
+/// last path component must be exactly `environ`, so a key that merely ends in
+/// those letters (`exportableenviron`) is not a procfs read.
 fn reads_proc_environ(src: &str) -> bool {
     src.lines()
         .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
-        .any(|line| line.contains("environ\""))
+        .any(|line| line.contains("\"environ\"") || line.contains("/environ\""))
 }
 
 /// How many times `src`'s code (comments and literals aside) names the
@@ -874,6 +877,10 @@ fn a_planted_passthrough_or_procfs_bypass_is_detected() {
     assert!(!names_ident("let e = granted_envs;", JAIL_ENV_FN));
     assert!(!reads_proc_environ("// read /proc/self/environ\"x\""));
     assert!(!reads_proc_environ("let e = \"the environment\";"));
+    assert!(!reads_proc_environ(
+        "(\"experimental.exportableenviron\", INERT),"
+    ));
+    assert!(!reads_proc_environ("let k = \"hooks.subenviron\";"));
 }
 
 #[test]

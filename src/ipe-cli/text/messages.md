@@ -675,6 +675,14 @@ a signal ended the transfer — stopped; nothing was recorded
 
 {stream} of a finished child stayed open past the grace — a process it started still holds it; stopped
 
+## cli-child-pipe-unread
+
+reading the {stream} of a child failed ({kind}) — its output is incomplete, so it was not used; stopped
+
+## cli-child-stderr-truncated
+
+… stderr cut at the {limit} ceiling; the rest was dropped
+
 ## cli-source-not-regular-file
 
 {path}: not a regular file — ipe reads source only from regular files, never a FIFO, device, socket, directory or a symlink met while walking modules; point ipe at a regular `.ipe` file
@@ -685,7 +693,7 @@ a signal ended the transfer — stopped; nothing was recorded
 
 ## cli-source-symlink
 
-{path}: reached through a symlink — ipe never follows a symlink while walking a loose file's imports; replace the link with the real file or directory
+{path}: is a symlink or is reached through one — ipe never follows a symlink to a file it finds by convention or while walking imports; replace the link with the real file or directory
 
 ## cli-path-escape
 
@@ -1893,19 +1901,19 @@ ipe package publish: `--fresh` is only permitted on a reserved-namespace package
 
 ## run-main-anchor-absent
 
-ipe dev build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+the emitted `fn main` anchor is absent, so the embedded capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+
+## run-main-anchor-ambiguous
+
+the emitted source holds more than one `fn main` anchor, so the embedded capability floor has no single place to be retained from — refusing to write an ambiguous artifact
+
+## run-floor-block-malformed
+
+the emitted source carries a capability floor block other than the one ipe writes — refusing to embed a floor beside one it cannot account for
 
 ## run-profile-unparsable
 
 {code}: {detail} — refusing to run (a profile that does not parse is not honored)
-
-## run-floor-unreadable
-
-{code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified
-
-## run-floor-not-release
-
-{code}: the app was built by `ipe dev build`, not `ipe release build` — `ipe release run` runs only a release build: rebuild it with `ipe release build`
 
 ## build-entry-not-main
 
@@ -2003,9 +2011,9 @@ ipe dev run {flag}: {name} has no recordable session — recording and replay ca
 
 ipe dev run {flag}: works on a native run only — drop `--target wasi`
 
-## session-jailed
+## session-ffi-unproven
 
-ipe dev run {flag}: a native-bearing program runs jailed, where the session log cannot be reached — record and replay a pure Ipê build of the app
+ipe dev run {flag}: a program with Rust FFI cannot be recorded or replayed, since its replay is not proven deterministic — run it without {flag}
 
 ## session-flags-exclusive
 

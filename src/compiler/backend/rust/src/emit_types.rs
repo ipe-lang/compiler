@@ -7,14 +7,14 @@
 
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
-use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, ir_type_is_derivable};
+use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, refused_marker, runtime_aliased_enum};
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 use ipe_ir::Program;
 
 use crate::doc::Doc;
+use crate::items::{Items, braced};
 use crate::naming::{
     field_witness_assoc_type_name, field_witness_getter_name, field_witness_trait_name,
     mangle_reserved,
@@ -729,6 +729,7 @@ fn render_fn_once_chain(
 ///     Increment,
 ///     Decrement,
 /// }
+///
 /// impl IpeStringify for MainMsg {
 ///     fn ipe_show(&self) -> String {
 ///         match self {
@@ -741,18 +742,18 @@ fn render_fn_once_chain(
 ///
 /// A payload-carrying and/or generic enum gains tuple-variant payloads, a
 /// `<T1, …>` clause on the enum and its impl, and `IpeStringify` arms that bind
-/// each payload field and render it through the total autoref dispatch — mirroring
-/// `ipeStringifyEnumImpl`:
+/// each payload field and render it through its own `IpeStringify` impl:
 /// ```text
 /// #[derive(Clone, Debug, PartialEq)]
 /// pub enum MainMaybe<T1> {
 ///     Just(T1),
 ///     Nothing,
 /// }
-/// impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for MainMaybe<T1> {
+///
+/// impl<T1: IpeStringify> IpeStringify for MainMaybe<T1> {
 ///     fn ipe_show(&self) -> String {
 ///         match self {
-///             MainMaybe::Just(p0) => format!("Just {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch()),
+///             MainMaybe::Just(p0) => format!("Just {}", IpeStringify::ipe_show(p0)),
 ///             MainMaybe::Nothing => "Nothing".to_string(),
 ///         }
 ///     }
@@ -781,12 +782,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     // `db_find_projection` signature names), emit a type alias so the
     // generated crate and the runtime share ONE nominal type.
     let resolved_name = ctx.interner.resolve(def.name);
-    if def.home.0.is_empty()
-        && matches!(
-            resolved_name,
-            Some("ProjectionTerm" | "ProjectionOperand" | "ArithOp")
-        )
-    {
+    if def.home.0.is_empty() && resolved_name.and_then(runtime_aliased_enum).is_some() {
         let alias_name = ctx.enum_name(&def.home, def.name)?.to_owned();
         let runtime_name = resolved_name.unwrap_or("");
         return Ok(format!(
@@ -811,7 +807,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     // is unaffected — no `'static` bound, byte-identical to before.
     let params_need_static = enum_stores_shared_fun(ctx, def);
 
-    // Generic clauses: `<T1, T2>` on the enum, `<T1: IpeStringify + Debug, …>` on
+    // Generic clauses: `<T1, T2>` on the enum, `<T1: IpeStringify, …>` on
     // the impl, `<T1, T2>` on the impl's `for` type. All empty when the enum is
     // non-generic, so that path emits no generic clause.
     let params: Vec<String> = (1..=def.type_params.len())
@@ -826,7 +822,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     } else {
         let bounds: Vec<String> = params
             .iter()
-            .map(|p| format!("{p}: IpeStringify + std::fmt::Debug{bound_static}"))
+            .map(|p| format!("{p}: IpeStringify{bound_static}"))
             .collect();
         let decl_params: Vec<String> = params.iter().map(|p| format!("{p}{decl_static}")).collect();
         (
@@ -881,29 +877,32 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
         String::new()
     };
     let ipe_impl_head = impl_header(&impl_bounds, "IpeStringify", &format!("{name}{use_clause}"));
-    Ok(format!(
-        "{derive_prefix}pub enum {name}{decl_clause} {{
-{variants}
-}}
-{clone_impl}{ipe_impl_head}
+    let mut items = Items::new();
+    items.push(&braced(
+        &format!("{derive_prefix}pub enum {name}{decl_clause}"),
+        &variants,
+    ));
+    items.push(&clone_impl);
+    items.push(&format!(
+        "{ipe_impl_head}
     fn ipe_show(&self) -> String {{
         match self {{
 {arms}
         }}
     }}
-}}
-"
-    ))
+}}"
+    ));
+    Ok(items.render())
 }
 
 /// Emit an enum's variant declaration lines and its `ipe_show` match arms.
 ///
 /// A nullary variant renders a bare ident and a `Name::V => "V".to_string()`
 /// arm; a payload variant renders `V(field types…)` (boxing a direct self-edge)
-/// and a `format!`-based arm binding `p0..pN`. A derivable field is stringified
-/// through the runtime autoref `Wrap(..).dispatch()`; a non-derivable payload (a
-/// function / opaque wrapper) is bound `_` and rendered as the `<fn>` placeholder
-/// (its `.dispatch()` would not resolve).
+/// and a `format!`-based arm binding `p0..pN`. A field whose every component
+/// has a show row renders through its `IpeStringify` impl; a field holding a
+/// component with no rendering (a function, an opaque `Rust.*` handle) is bound
+/// `_` and renders as that component's fixed marker ([`refused_marker`]).
 fn emit_enum_variant_lines_and_arms(
     ctx: &EmitCtx,
     def: &EnumDef,
@@ -939,24 +938,21 @@ fn emit_enum_variant_lines_and_arms(
                     rendered
                 };
                 field_types.push(rendered);
-                if ir_type_is_derivable(field_ty, &|home, name| ctx.enum_is_derivable(home, name)) {
-                    let binder = format!("p{i}");
-                    // `binder` is a `match self` binder → already a `&FieldType`,
-                    // so `Wrap(binder)` carries the reference the dispatch
-                    // expects. Sound because a derivable field type impls
-                    // `IpeStringify` or `Debug` (the autoref fallback).
-                    show_args.push(format!(
-                        "(&ipe_runtime::stringify::Wrap({binder})).dispatch()"
-                    ));
-                    binders.push(binder);
-                } else {
-                    // seal: a non-derivable payload (a function / opaque
-                    // wrapper) impls neither `IpeStringify` nor `Debug`, so the
-                    // autoref `.dispatch()` would not resolve (E0599). Bind it
-                    // with `_` and render a `<fn>` placeholder — these carry no
-                    // user-visible data, matching the reference backend.
-                    binders.push("_".to_owned());
-                    show_args.push("\"<fn>\"".to_owned());
+                // seal: a field holding a component with no show row has no
+                // `IpeStringify` impl, so it binds `_` and renders as its fixed
+                // marker; every other field has one (the `ipe-cli` show-table
+                // assertion pins each leaf to a runtime row). `binder` is a
+                // `match self` binder, already a `&FieldType`.
+                match refused_marker(field_ty, &ctx.enum_variants, ctx.interner) {
+                    None => {
+                        let binder = format!("p{i}");
+                        show_args.push(format!("IpeStringify::ipe_show({binder})"));
+                        binders.push(binder);
+                    }
+                    Some(marker) => {
+                        binders.push("_".to_owned());
+                        show_args.push(rust_str_lit(&marker));
+                    }
                 }
             }
             variant_lines.push(format!("    {vn}({}),", field_types.join(", ")));
@@ -1080,9 +1076,10 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 ///     x: i64,
 ///     y: i64,
 /// }
+///
 /// impl IpeStringify for RecXY {
 ///     fn ipe_show(&self) -> String {
-///         format!("{{{} {}}}", (&ipe_runtime::stringify::Wrap(&self.x)).dispatch(), (&ipe_runtime::stringify::Wrap(&self.y)).dispatch())
+///         format!("{{{} {}}}", IpeStringify::ipe_show(&self.x), IpeStringify::ipe_show(&self.y))
 ///     }
 /// }
 /// ```
@@ -1090,8 +1087,8 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 /// The `ipe_show` body mirrors the reference's `%v` rendering of a struct
 /// (`{f0 f1 ...}`, fields space-separated in declared order, no field names) so
 /// stringifying a record reads identically across the two backends. Each field
-/// renders through the runtime's total autoref `Wrap(..).dispatch()` shim, which
-/// never fails to resolve a method regardless of the field type.
+/// renders through its `IpeStringify` impl, or as a fixed marker when it holds
+/// a component with no rendering ([`refused_marker`]).
 ///
 /// A GENERIC record shape (a field typed by a type variable) gains a
 /// generic clause on both the struct and its impl. Shape (for `{ value : a }`):
@@ -1100,17 +1097,13 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 /// pub struct RecValue<T1> {
 ///     value: T1,
 /// }
-/// impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for RecValue<T1> {
+///
+/// impl<T1: IpeStringify> IpeStringify for RecValue<T1> {
 ///     ...
 /// }
 /// ```
-/// The impl bounds each parameter `IpeStringify + std::fmt::Debug` so the inline
-/// autoref `Wrap(..).dispatch()` resolves at the generic frame (the
-/// `IpeStringify` arm is selected with zero autoref, the `Debug` arm is the
-/// always-available fallback). `std::fmt::Debug` is spelled in full — the
-/// emitted crate's `pub use ipe_runtime::*` shadows the `core` crate with the
-/// runtime's `core` module, so `core::fmt` would not resolve. A monomorphic
-/// record emits an empty clause.
+/// The impl bounds each parameter `IpeStringify`, so a field typed by it
+/// renders at the generic frame. A monomorphic record emits an empty clause.
 pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> {
     let name = &rec.name;
     // The struct's own generic scope: each parameter symbol → `T1`, `T2`, … by
@@ -1122,15 +1115,11 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
         let ident = mangle_reserved(field_name.clone());
         let rust_ty = render_type(ctx, field_ty, scope)?;
         field_lines.push(format!("    {ident}: {rust_ty},"));
-        if ir_type_is_derivable(field_ty, &|home, name| ctx.enum_is_derivable(home, name)) {
-            show_args.push(format!(
-                "(&ipe_runtime::stringify::Wrap(&self.{ident})).dispatch()"
-            ));
-        } else {
-            // seal: a non-derivable field (a function / opaque wrapper)
-            // impls neither `IpeStringify` nor `Debug`, so `.dispatch()` would
-            // not resolve. Render a `<fn>` placeholder for that `{}` slot.
-            show_args.push("\"<fn>\"".to_owned());
+        // seal: a field holding a component with no show row has no
+        // `IpeStringify` impl, so it renders as its fixed marker.
+        match refused_marker(field_ty, &ctx.enum_variants, ctx.interner) {
+            None => show_args.push(format!("IpeStringify::ipe_show(&self.{ident})")),
+            Some(marker) => show_args.push(rust_str_lit(&marker)),
         }
     }
     let fields_block = field_lines.join("\n");
@@ -1150,7 +1139,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     let decl_static = if params_need_static { ": 'static" } else { "" };
     let bound_static = if params_need_static { " + 'static" } else { "" };
 
-    // Generic clauses: `<T1, T2>` on the struct, `<T1: IpeStringify + Debug, …>`
+    // Generic clauses: `<T1, T2>` on the struct, `<T1: IpeStringify, …>`
     // on the impl, `<T1, T2>` on the impl's `for` type. All empty when the record
     // is monomorphic.
     let params: Vec<String> = (1..=rec.type_params.len())
@@ -1161,7 +1150,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     } else {
         let bounds: Vec<String> = params
             .iter()
-            .map(|p| format!("{p}: IpeStringify + std::fmt::Debug{bound_static}"))
+            .map(|p| format!("{p}: IpeStringify{bound_static}"))
             .collect();
         let decl_params: Vec<String> = params.iter().map(|p| format!("{p}{decl_static}")).collect();
         (
@@ -1227,31 +1216,62 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     // would be an `ipe`-0-then-cargo-fail `E0599`. A fully-derivable record takes
     // the derive above instead, so the two paths never both emit a `Clone` impl.
     let clone_impl = if rec.is_clone && !rec.is_derivable {
-        let field_clones: Vec<String> = rec
-            .fields
+        emit_record_clone_impl(rec, &params, bound_static, &format!("{name}{use_clause}"))
+    } else {
+        String::new()
+    };
+    let ipe_impl_head = impl_header(&impl_bounds, "IpeStringify", &format!("{name}{use_clause}"));
+    let mut items = Items::new();
+    items.push(&braced(
+        &format!("{derive_prefix}pub struct {name}{decl_clause}"),
+        &fields_block,
+    ));
+    items.push(&clone_impl);
+    items.push(&format!(
+        "{ipe_impl_head}
+    fn ipe_show(&self) -> String {{
+        {body}
+    }}
+}}"
+    ));
+    Ok(items.render())
+}
+
+/// The hand-written `impl Clone` of a record that is `Clone` but not derivable,
+/// cloning every field. `params` are the struct's `T1..Tn` names and
+/// `for_type` is the impl's `for` type (`Name<T1, ..>`).
+///
+/// Every type parameter carries a `Clone` bound: the bare-variable admission in
+/// the `is_clone` fixpoint (`field_is_clone`) is sound only under it — a record
+/// may carry a bare-`Tn` field (or a `SharedFun` slot keyed on `Tn`) whose
+/// per-`Tn` clone rides this bound, exactly as the sibling function-carrier
+/// enum's hand-written `impl<Tn: Clone> Clone`.
+fn emit_record_clone_impl(
+    rec: &RecordStruct,
+    params: &[String],
+    bound_static: &str,
+    for_type: &str,
+) -> String {
+    let field_clones: Vec<String> = rec
+        .fields
+        .iter()
+        .map(|(field_name, _)| {
+            let ident = mangle_reserved(field_name.clone());
+            format!("            {ident}: self.{ident}.clone(),")
+        })
+        .collect();
+    let impl_clone_bounds = if params.is_empty() {
+        String::new()
+    } else {
+        let bounds: Vec<String> = params
             .iter()
-            .map(|(field_name, _)| {
-                let ident = mangle_reserved(field_name.clone());
-                format!("            {ident}: self.{ident}.clone(),")
-            })
+            .map(|p| format!("{p}: Clone{bound_static}"))
             .collect();
-        // Every type parameter carries a `Clone` bound: the bare-variable
-        // admission in the `is_clone` fixpoint (`field_is_clone`) is sound
-        // only under it — a record may carry a bare-`Tn` field (or a `SharedFun`
-        // slot keyed on `Tn`) whose per-`Tn` clone rides this bound, exactly as
-        // the sibling function-carrier enum's hand-written `impl<Tn: Clone> Clone`.
-        let impl_clone_bounds = if params.is_empty() {
-            String::new()
-        } else {
-            let bounds: Vec<String> = params
-                .iter()
-                .map(|p| format!("{p}: Clone{bound_static}"))
-                .collect();
-            format!("<{}>", bounds.join(", "))
-        };
-        let clone_head = impl_header(&impl_clone_bounds, "Clone", &format!("{name}{use_clause}"));
-        format!(
-            "{clone_head}
+        format!("<{}>", bounds.join(", "))
+    };
+    let clone_head = impl_header(&impl_clone_bounds, "Clone", for_type);
+    format!(
+        "{clone_head}
     fn clone(&self) -> Self {{
         Self {{
 {}
@@ -1259,23 +1279,8 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     }}
 }}
 ",
-            field_clones.join("\n"),
-        )
-    } else {
-        String::new()
-    };
-    let ipe_impl_head = impl_header(&impl_bounds, "IpeStringify", &format!("{name}{use_clause}"));
-    Ok(format!(
-        "{derive_prefix}pub struct {name}{decl_clause} {{
-{fields_block}
-}}
-{clone_impl}{ipe_impl_head}
-    fn ipe_show(&self) -> String {{
-        {body}
-    }}
-}}
-"
-    ))
+        field_clones.join("\n"),
+    )
 }
 
 /// Every distinct field name required by any row-polymorphic function's
@@ -1341,7 +1346,7 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
         return Ok(String::new());
     }
     let updated_field_names = row_updated_field_names(program);
-    let mut out = String::new();
+    let mut items = Items::new();
     for field_sym in &field_names {
         let field_name = ctx.resolve_ident(*field_sym)?.to_owned();
         let trait_name = field_witness_trait_name(&field_name);
@@ -1351,10 +1356,9 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
         // borrowing getter. The associated type keeps the trait type-agnostic
         // so a single trait serves the field at every type it occurs at across
         // structs.
-        let _ = write!(
-            out,
-            "pub trait {trait_name} {{\n    type {assoc};\n    fn {getter}(&self) -> &Self::{assoc};\n}}\n"
-        );
+        items.push(&format!(
+            "pub trait {trait_name} {{\n    type {assoc};\n    fn {getter}(&self) -> &Self::{assoc};\n}}"
+        ));
         // Setter trait for fields that are updated in some row-poly body (G2).
         // Supertraits the getter: `IpeWithF: IpeHasF`. The setter consumes
         // `self` and returns `Self` so the `..self` rebuild in each struct impl
@@ -1364,10 +1368,9 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
         if needs_setter {
             let setter_trait = crate::naming::field_setter_witness_trait_name(&field_name);
             let setter_method = crate::naming::field_setter_witness_method_name(&field_name);
-            let _ = write!(
-                out,
-                "pub trait {setter_trait}: {trait_name} {{\n    fn {setter_method}(self, v: Self::{assoc}) -> Self;\n}}\n"
-            );
+            items.push(&format!(
+                "pub trait {setter_trait}: {trait_name} {{\n    fn {setter_method}(self, v: Self::{assoc}) -> Self;\n}}"
+            ));
         }
         // One getter impl per registry struct carrying this field — total over
         // the struct namespace, no reachability analysis (correctness needs
@@ -1396,10 +1399,9 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
             };
             let struct_ty = format!("{}{use_clause}", rec.name);
             let head = impl_header(&decl_clause, &trait_name, &struct_ty);
-            let _ = write!(
-                out,
-                "{head}\n    type {assoc} = {assoc_ty};\n    fn {getter}(&self) -> &{assoc_ty} {{ &self.{ident} }}\n}}\n"
-            );
+            items.push(&format!(
+                "{head}\n    type {assoc} = {assoc_ty};\n    fn {getter}(&self) -> &{assoc_ty} {{ &self.{ident} }}\n}}"
+            ));
             // Setter impl for this (field, struct) pair when needed.
             if needs_setter {
                 let setter_trait = crate::naming::field_setter_witness_trait_name(&field_name);
@@ -1413,12 +1415,446 @@ pub fn emit_row_witnesses(ctx: &EmitCtx, program: &Program) -> DResult<String> {
                 // struct name — it is the entire point of the impl
                 // separation.
                 let struct_name = &rec.name;
-                let _ = write!(
-                    out,
-                    "{setter_head}\n    fn {setter_method}(self, v: {assoc_ty}) -> Self {{ {struct_name}{use_clause} {{ {ident}: v, ..self }} }}\n}}\n"
-                );
+                items.push(&format!(
+                    "{setter_head}\n    fn {setter_method}(self, v: {assoc_ty}) -> Self {{ {struct_name}{use_clause} {{ {ident}: v, ..self }} }}\n}}"
+                ));
             }
         }
     }
-    Ok(out)
+    Ok(items.render())
+}
+
+#[cfg(test)]
+mod show_pin_agreement {
+    use super::{GenericScope, emit_enum, render_type};
+    use crate::RustBackend;
+    use ipe_intern::Interner;
+    use ipe_ir::{
+        EnumDef, IrType, ModPath, Module, Program, RUNTIME_ALIASED_ENUMS, RuntimeBridgedEnum,
+        SHOWN_LEAVES, ShowLeaf, ShowPolicy, ShowShape, TypeDef, UiCtor, UiPlain,
+    };
+
+    /// The runtime's show-row pins: each leaf with the Rust type that renders it.
+    const SHOW_ROWS: &str = include_str!("../../../../runtime/rust/tests/show_rows.rs");
+
+    /// Every `"Leaf" => Policy: Type;` line of `text`.
+    fn parse_pins(text: &str) -> Vec<(&str, &str)> {
+        text.lines()
+            .filter_map(|line| {
+                let (leaf, rest) = line.trim().strip_prefix('"')?.split_once('"')?;
+                let (_, ty) = rest.trim().strip_prefix("=>")?.split_once(':')?;
+                Some((leaf, ty.trim().strip_suffix(';')?.trim()))
+            })
+            .collect()
+    }
+
+    /// The runtime path of each name an emitted crate spells bare or at the
+    /// runtime's root: in scope through its `pub use ipe_runtime::*` glob, a
+    /// preamble alias, or the `pub type` alias a runtime-aliased Prelude enum
+    /// emits under entry module `Main`, each re-exported from the module that
+    /// defines it.
+    const SCOPE_PATHS: &[(&str, &str)] = &[
+        ("IpeTask", "ipe_runtime::core::IpeTask"),
+        ("JsonVal", "ipe_runtime::json::JsonVal"),
+        ("Decoder", "ipe_runtime::json::Decoder"),
+        ("Db", "ipe_runtime::db::Db"),
+        ("IpeCmd", "ipe_runtime::tea::IpeCmd"),
+        ("IpeSub", "ipe_runtime::tea::IpeSub"),
+        ("ServerRequest", "ipe_runtime::server::ServerRequest"),
+        ("ServerResponse", "ipe_runtime::server::ServerResponse"),
+        ("ServerRoute", "ipe_runtime::server::ServerRoute"),
+        ("ServerCookie", "ipe_runtime::server::ServerCookie"),
+        ("WsHandle", "ipe_runtime::server::WsHandle"),
+        ("WsServerCfg", "ipe_runtime::server::WsServerCfg"),
+        ("StreamWriter", "ipe_runtime::server_stream::StreamWriter"),
+        ("HttpRequest", "ipe_runtime::http_client::HttpRequest"),
+        ("HttpMethod", "ipe_runtime::http_client::HttpMethod"),
+        ("RedirectPolicy", "ipe_runtime::http_client::RedirectPolicy"),
+        (
+            "ProcessRunWithCfg",
+            "ipe_runtime::system::ProcessRunWithCfg",
+        ),
+        (
+            "ProcessRunInPtyCfg",
+            "ipe_runtime::system::ProcessRunInPtyCfg",
+        ),
+        ("CacheCfg", "ipe_runtime::cache::CacheCfg"),
+        ("CacheStats", "ipe_runtime::cache::CacheStats"),
+        ("IpeCacheHandle", "ipe_runtime::cache::IpeCacheHandle"),
+        ("WsClientCfg", "ipe_runtime::ws_client::WsClientCfg"),
+        ("CsvDoc", "ipe_runtime::csv::CsvDoc"),
+        ("EmailMessage", "ipe_runtime::email::EmailMessage"),
+        ("EmailAttachment", "ipe_runtime::email::EmailAttachment"),
+        ("SesConfig", "ipe_runtime::email::SesConfig"),
+        ("SmtpConfig", "ipe_runtime::email::SmtpConfig"),
+        ("EmailProvider", "ipe_runtime::email::EmailProvider"),
+        ("ChunkEvent", "ipe_runtime::http_stream::ChunkEvent"),
+        ("IpeStreamId", "ipe_runtime::http_stream::IpeStreamId"),
+        ("MainProjectionTerm", "ipe_runtime::db::ProjectionTerm"),
+        (
+            "MainProjectionOperand",
+            "ipe_runtime::db::ProjectionOperand",
+        ),
+        ("MainArithOp", "ipe_runtime::db::ArithOp"),
+    ];
+
+    /// A Rust type's resolved path, type arguments dropped: the runtime crate
+    /// spelled `ipe_runtime` (the pins name it `ipe_runtime_rust`), and a bare
+    /// or root-level name replaced by its [`SCOPE_PATHS`] path. A name with no
+    /// entry keeps its spelling, so it matches only a pin spelled the same way.
+    fn resolved_path(spelled: &str) -> String {
+        let head = spelled
+            .split_once('<')
+            .map_or(spelled, |(head, _)| head)
+            .trim();
+        let head = head
+            .strip_prefix("ipe_runtime_rust::")
+            .map_or_else(|| head.to_owned(), |rest| format!("ipe_runtime::{rest}"));
+        let in_scope = head
+            .strip_prefix("ipe_runtime::")
+            .filter(|rest| !rest.contains("::"))
+            .unwrap_or(head.as_str());
+        SCOPE_PATHS
+            .iter()
+            .find(|(name, _)| *name == in_scope)
+            .map_or_else(|| head.clone(), |(_, path)| (*path).to_owned())
+    }
+
+    fn leaf_of(ty: &IrType) -> Option<ShowLeaf> {
+        match ty.show_shape() {
+            ShowShape::Leaf(leaf) => Some(leaf),
+            ShowShape::Carrier(_)
+            | ShowShape::Param
+            | ShowShape::Named { .. }
+            | ShowShape::TooWide => None,
+        }
+    }
+
+    /// One sample type per shown leaf the backend renders without a program.
+    fn leaf_samples() -> Vec<IrType> {
+        let unit = || Box::new(IrType::Unit);
+        let mut samples = vec![
+            IrType::Int,
+            IrType::SessionHandle,
+            IrType::Float,
+            IrType::Bool,
+            IrType::Str,
+            IrType::Char,
+            IrType::Unit,
+            IrType::Task(unit()),
+            IrType::Bytes,
+            IrType::Json,
+            IrType::Decoder(unit()),
+            IrType::Db,
+            IrType::Cmd(unit()),
+            IrType::Sub(unit()),
+            IrType::ServerRequest,
+            IrType::ServerResponse,
+            IrType::ServerRoute,
+            IrType::ServerCookie,
+            IrType::StreamWriter,
+            IrType::HttpRequest,
+            IrType::WebSocketServer,
+            IrType::WebSocketServerCfg,
+            IrType::WebReq,
+            IrType::WebRoute(unit()),
+            IrType::CustomElement {
+                down: unit(),
+                up: unit(),
+            },
+            IrType::Order,
+            IrType::BackoffStrategy,
+            IrType::HttpMethod,
+            IrType::Decimal,
+            IrType::Principal,
+            IrType::AuthConfig,
+            IrType::TokenSource,
+            IrType::ErrorKind,
+            IrType::Error,
+            IrType::ErrorDetails,
+            IrType::ErrorInfo,
+            IrType::PanicInfo,
+            IrType::TypeInfo,
+            IrType::SqlFragment,
+            IrType::Secret,
+            IrType::Path,
+            IrType::Regex,
+            IrType::ProcessRunWithCfg,
+            IrType::ProcessRunInPtyCfg,
+            IrType::CacheCfg,
+            IrType::CacheStats,
+            IrType::WebSocketClientCfg,
+            IrType::CsvDoc,
+            IrType::EmailMessage,
+            IrType::EmailAttachment,
+            IrType::EmailSesConfig,
+            IrType::EmailSmtpConfig,
+            IrType::EmailProvider,
+            IrType::CryptoKey,
+            IrType::CryptoMac,
+            IrType::EmailAddress,
+            IrType::Url,
+            IrType::UrlRelative,
+            IrType::Dsn,
+            IrType::Connection,
+            IrType::ConnReadOnly,
+            IrType::ConnReadWrite,
+            IrType::Setting,
+            IrType::ShapeWeb,
+            IrType::ShapeWebView,
+            IrType::ShapeTerminal,
+            IrType::Locale,
+            IrType::WebApp,
+            IrType::TuiApp,
+            IrType::CliApp,
+            IrType::WorkerApp,
+        ];
+        samples.extend(ui_leaf_samples());
+        samples
+    }
+
+    /// The shown `Ui` and `UiPlain` leaves.
+    fn ui_leaf_samples() -> Vec<IrType> {
+        let ui = |ctor| IrType::Ui {
+            ctor,
+            msg: Box::new(IrType::Unit),
+        };
+        vec![
+            ui(UiCtor::Html),
+            ui(UiCtor::Element),
+            ui(UiCtor::Cells),
+            ui(UiCtor::UiAttribute),
+            ui(UiCtor::TuiAttribute),
+            ui(UiCtor::CliLines),
+            ui(UiCtor::CliAttribute),
+            ui(UiCtor::HtmlAttribute),
+            ui(UiCtor::HtmlEvent),
+            ui(UiCtor::Label),
+            ui(UiCtor::Placeholder),
+            ui(UiCtor::RadioOption),
+            IrType::UiPlain(UiPlain::Length),
+            IrType::UiPlain(UiPlain::Color),
+            IrType::UiPlain(UiPlain::HAlign),
+            IrType::UiPlain(UiPlain::VAlign),
+            IrType::UiPlain(UiPlain::Location),
+            IrType::UiPlain(UiPlain::PseudoClass),
+            IrType::UiPlain(UiPlain::Description),
+            IrType::UiPlain(UiPlain::LayoutContext),
+            IrType::UiPlain(UiPlain::ColorError),
+            IrType::UiPlain(UiPlain::TermProfile),
+            IrType::UiPlain(UiPlain::AnsiColor),
+            IrType::UiPlain(UiPlain::WcagLevel),
+            IrType::UiPlain(UiPlain::TextSize),
+            IrType::UiPlain(UiPlain::Deficiency),
+        ]
+    }
+
+    /// The runtime-bridged enums `render_type` names without a registered
+    /// definition, as `(leaf, type)` samples.
+    fn bridged_samples(interner: &mut Interner) -> Vec<(ShowLeaf, IrType)> {
+        [
+            RuntimeBridgedEnum::CacheHandle,
+            RuntimeBridgedEnum::ChunkEvent,
+            RuntimeBridgedEnum::StreamId,
+            RuntimeBridgedEnum::RedirectPolicy,
+        ]
+        .into_iter()
+        .map(|bridged| {
+            let home = bridged
+                .home()
+                .iter()
+                .map(|seg| interner.intern(seg).expect("intern a home segment"))
+                .collect();
+            let name = interner.intern(bridged.name()).expect("intern a name");
+            let ty = IrType::Enum {
+                home: ModPath(home),
+                name,
+                args: Vec::new(),
+            };
+            (bridged.show_leaf(), ty)
+        })
+        .collect()
+    }
+
+    /// The runtime-aliased Prelude enums, each declared with the empty Prelude
+    /// home in one entry module `Main`, as that module and `(leaf, type)`
+    /// samples.
+    fn aliased_samples(interner: &mut Interner) -> (Module, Vec<(ShowLeaf, IrType)>) {
+        let mut types = Vec::with_capacity(RUNTIME_ALIASED_ENUMS.len());
+        let mut samples = Vec::with_capacity(RUNTIME_ALIASED_ENUMS.len());
+        for (name, leaf) in RUNTIME_ALIASED_ENUMS {
+            let name = interner.intern(name).expect("intern an aliased enum name");
+            types.push(TypeDef::Enum(EnumDef {
+                name,
+                home: ModPath(vec![]),
+                type_params: vec![],
+                variants: vec![],
+            }));
+            samples.push((
+                leaf,
+                IrType::Enum {
+                    home: ModPath(vec![]),
+                    name,
+                    args: vec![],
+                },
+            ));
+        }
+        let main = interner
+            .intern("Main")
+            .expect("intern the entry module name");
+        let module = Module {
+            name: ModPath(vec![main]),
+            types,
+            funcs: vec![],
+            entry: None,
+            records: vec![],
+            uses_tea: false,
+            uses_server: false,
+            uses_http: false,
+            uses_config: false,
+            uses_compression: false,
+            uses_csv: false,
+            uses_cache: false,
+            uses_encoding: false,
+            uses_regex: false,
+            uses_uuid: false,
+            uses_random: false,
+            uses_log: false,
+            uses_decimal: false,
+            uses_char_category: false,
+            uses_crypto_core: false,
+            uses_secret: false,
+            uses_json: false,
+            uses_crypto: false,
+            uses_jwt: false,
+            uses_url: false,
+            uses_ui: false,
+            uses_web: false,
+            uses_tui: false,
+            uses_console: false,
+            uses_webview: false,
+            uses_css: false,
+            uses_auth: false,
+            uses_principal: false,
+            uses_websocket: false,
+            uses_email: false,
+            uses_locale: false,
+            uses_time: false,
+            uses_env_public: false,
+            uses_debug: false,
+            uses_ffi: false,
+            uses_async_runtime: false,
+        };
+        (module, samples)
+    }
+
+    /// The Rust type `render_type` spells for each shown leaf resolves to the
+    /// full path of a type the runtime's `show_rows.rs` pins to that leaf, every
+    /// shown leaf has a sample here, and every [`SCOPE_PATHS`] entry resolves a
+    /// sample, so a renamed render, a moved pin or a same-named type in another
+    /// module breaks this test.
+    #[test]
+    fn every_rendered_leaf_type_is_its_pinned_row_type() {
+        let mut interner = Interner::new();
+        let bridged = bridged_samples(&mut interner);
+        let (aliased_module, aliased) = aliased_samples(&mut interner);
+        let program = Program {
+            modules: vec![aliased_module],
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+        };
+        let backend = RustBackend::new(&interner);
+        let ctx = backend.emit_ctx_for_tests(&program).expect("build EmitCtx");
+        // Each aliased enum's emitted `pub type` resolves where its
+        // `SCOPE_PATHS` entry says, so that entry cannot drift from the alias.
+        for TypeDef::Enum(def) in program.modules.iter().flat_map(|m| &m.types) {
+            let emitted = emit_enum(&ctx, def).expect("emit an aliased enum");
+            let (alias, target) = emitted
+                .trim()
+                .strip_prefix("pub type ")
+                .and_then(|rest| rest.strip_suffix(';'))
+                .and_then(|rest| rest.split_once(" = "))
+                .expect("an aliased enum emits a runtime type alias");
+            assert_eq!(resolved_path(alias), resolved_path(target), "{emitted}");
+        }
+        let pins = parse_pins(SHOW_ROWS);
+        let samples: Vec<(ShowLeaf, IrType)> = leaf_samples()
+            .into_iter()
+            .map(|ty| {
+                let leaf = leaf_of(&ty).expect("a leaf sample classifies as a leaf");
+                (leaf, ty)
+            })
+            .chain(bridged)
+            .chain(aliased)
+            .collect();
+        let mut resolved: Vec<String> = Vec::new();
+        for (leaf, ty) in &samples {
+            let rendered = render_type(&ctx, ty, GenericScope::new(&[])).expect("render");
+            let pinned: Vec<String> = pins
+                .iter()
+                .filter(|(name, _)| *name == leaf.name())
+                .map(|(_, pin)| resolved_path(pin))
+                .collect();
+            let path = resolved_path(&rendered);
+            assert!(
+                pinned.contains(&path),
+                "leaf {} renders as `{rendered}` (`{path}`), but show_rows.rs pins it to {pinned:?}",
+                leaf.name()
+            );
+            resolved.push(path);
+        }
+        for (name, path) in SCOPE_PATHS {
+            assert!(
+                resolved.iter().any(|p| p == path),
+                "`SCOPE_PATHS` entry {name} resolves no rendered sample"
+            );
+        }
+        for (name, policy) in SHOWN_LEAVES {
+            if policy.tag() == ShowPolicy::Refused.tag() {
+                continue;
+            }
+            assert!(
+                samples.iter().any(|(leaf, _)| leaf.name() == name),
+                "shown leaf {name} has no render sample"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pin_parser_reads_a_row_and_skips_the_rest() {
+        let text = "pins! {\n    \"Int\" => Value: i64;\n    #[cfg(feature = \"x\")]\n    \"Task\" => Internals: a::IpeTask<b::E, ()>;\n}\n";
+        assert_eq!(
+            parse_pins(text),
+            vec![("Int", "i64"), ("Task", "a::IpeTask<b::E, ()>")]
+        );
+        assert_eq!(resolved_path("()"), "()");
+        assert_eq!(resolved_path("Vec<u8>"), "Vec");
+        assert_eq!(
+            resolved_path("IpeTask<()>"),
+            resolved_path("ipe_runtime_rust::core::IpeTask<ipe_runtime_rust::error::IpeError, ()>")
+        );
+        assert_eq!(
+            resolved_path("ipe_runtime::HttpMethod"),
+            "ipe_runtime::http_client::HttpMethod"
+        );
+    }
+
+    /// Two types sharing a last segment in different modules never match, and
+    /// a bare name with no [`SCOPE_PATHS`] entry resolves to no module path.
+    #[test]
+    fn a_same_named_type_in_another_module_is_refused() {
+        assert_ne!(
+            resolved_path("ipe_runtime::html::Attribute<()>"),
+            resolved_path("ipe_runtime_rust::ui::element::Attribute<()>")
+        );
+        assert_ne!(
+            resolved_path("ipe_runtime::url::Url"),
+            resolved_path("x::Url")
+        );
+        assert_eq!(resolved_path("Attribute<()>"), "Attribute");
+        assert_ne!(
+            resolved_path("ipe_runtime::Attribute"),
+            resolved_path("ipe_runtime_rust::html::Attribute")
+        );
+    }
 }

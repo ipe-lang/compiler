@@ -83,6 +83,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::ScratchUnavailable { .. }
         | CliError::ChildPipeHeld(_)
         | CliError::ThreadRefused { .. }
+        | CliError::ChildPipeUnread(..)
         | CliError::Interrupted => LoadError::Io(detail),
         CliError::SourceRefused { .. } | CliError::DeviceNamedModule { .. } => {
             LoadError::Refused(detail)

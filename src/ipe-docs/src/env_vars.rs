@@ -672,7 +672,9 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_FFI_PROC_CAP",
         default: "unset (sandbox default)",
-        purpose: "Process-count limit for each sandboxed FFI inspector phase.",
+        purpose: "Process-count limit for each sandboxed FFI inspector phase: a whole \
+                  number from 1 to 4096. Zero, a larger value, or anything but digits \
+                  refuses the inspection.",
         subsystem: Subsystem::Ffi,
         class: Class::SecurityTunable,
     },
@@ -720,9 +722,12 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_HTTP_BIND",
         default: "unset (loopback in dev, all-interfaces in release)",
-        purpose: "Override the host address the HTTP server binds. Takes precedence \
-                  over the `Host.bind` setting and the build-profile default. \
-                  The conservative loopback default keeps a dev server off the LAN.",
+        purpose: "Override the IP address the HTTP server binds: IPv4 such as \
+                  `127.0.0.1`, or bare IPv6 such as `::1`. A hostname, a socket \
+                  form (`host:port`), brackets, a scope id, padding, or an empty \
+                  value refuses startup. Takes precedence over the `Host.bind` \
+                  setting and the build-profile default. The conservative loopback \
+                  default keeps a dev server off the LAN.",
         subsystem: Subsystem::Http,
         class: Class::SecurityTunable,
     },
@@ -814,8 +819,11 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_LOG_LEVEL",
         default: "unset (info)",
-        purpose: "Minimum log level: `debug`, `info`, `warn`, or `error`. Takes \
-                  precedence over an installed `Log.level` setting.",
+        purpose: "Minimum log level: `debug`, `info`, `warn` (or `warning`), or \
+                  `error`, ASCII case-insensitive. Any other value, an empty or \
+                  padded one included, refuses startup. Read once at process start, \
+                  so a later `System.setenv` or `System.loadEnv` does not change it. \
+                  Takes precedence over an installed `Log.level` setting.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
@@ -879,15 +887,6 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     // ── Runtime ───────────────────────────────────────────────────────────────
     EnvVar {
-        name: "IPE_ALLOW_UNSANDBOXED",
-        default: "unset (false)",
-        purpose: "When `bwrap` confinement is unavailable, set to `1` to allow \
-                  `ipe dev run` to proceed unconfined instead of refusing. Widens the \
-                  trust boundary. Never set in CI or production.",
-        subsystem: Subsystem::Runtime,
-        class: Class::SecurityTunable,
-    },
-    EnvVar {
         name: "IPE_HOME",
         default: "unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe)",
         purpose: "Root directory for materialised runtime source, config, and cached \
@@ -937,9 +936,9 @@ pub static ENV_VARS: &[EnvVar] = &[
         default: "1800 (30 min)",
         purpose: "Rolling re-issue window (seconds) for a signed session token. A \
                   request within this window of expiry re-issues a fresh token, \
-                  keeping an active session alive without a full login. Clamped so \
-                  `slide_window < max_lifetime`. Takes precedence over \
-                  `Web.authSlideWindow`.",
+                  keeping an active session alive without a full login. It must be \
+                  below the max lifetime, else startup refuses. Takes precedence \
+                  over `Web.authSlideWindow`.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1011,7 +1010,8 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "Space-separated `Content-Security-Policy: frame-ancestors` allow-list, \
                   e.g. `https://app.example.com`. Enables embedding this app in a \
                   third-party iframe; also sets `SameSite=None; Secure` on session \
-                  cookies.",
+                  cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
+                  or only whitespace refuses to start the server.",
         subsystem: Subsystem::Web,
         class: Class::SecurityTunable,
     },
@@ -1257,7 +1257,8 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_FUZZ_SEED",           // fuzz template harness: random-run seed
     "IPE_HOST_ENV_TEST_UNSET_7F3A9C21D84E", // sandbox host_env test: a name no host sets
     "IPE_HTTP_TEST_URL",
-    "IPE_JUNCTION_OUT", // Windows junction test helper: compiled helper output path
+    "IPE_INDEX_EXTRACTOR", // ipe-index build script: extractor digest handed to the crate at compile time
+    "IPE_JUNCTION_OUT",    // Windows junction test helper: compiled helper output path
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
     "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
