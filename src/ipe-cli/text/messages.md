@@ -687,6 +687,20 @@ reading the {stream} of a child failed ({kind}) — its output is incomplete, so
 
 … stderr cut at the {limit} ceiling; the rest was dropped
 
+## ffi-inspector-exited
+
+ipe add: the FFI inspector exited with code {code}
+{stderr}
+
+## ffi-inspector-signalled
+
+ipe add: a signal ended the FFI inspector
+{stderr}
+
+## ffi-inspector-not-utf8
+
+ipe add: the FFI inspector's report is not valid UTF-8
+
 ## cli-source-not-regular-file
 
 {path}: not a regular file — ipe reads source only from regular files, never a FIFO, device, socket, directory or a symlink met while walking modules; point ipe at a regular `.ipe` file

@@ -25,6 +25,9 @@ use std::collections::BTreeMap;
 
 use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
+use ipe_kernels::{BUILTIN_TYPES, BuiltinRow, KernelHome};
+
+use crate::env::const_str_eq;
 
 /// One Prelude built-in union: its type name plus its constructors, each with a
 /// declaration index and payload arity.
@@ -217,6 +220,83 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
     },
 ];
 
+/// Whether `union` may name `row`: the row's role admits constructors, and a
+/// qualifier the constructors are reachable through also spells the type.
+const fn union_fits_row(union: &BuiltinUnion, row: &BuiltinRow) -> bool {
+    if !row.role().admits_ctors() {
+        return false;
+    }
+    let Some(qualifier) = union.qualified_home else {
+        return true;
+    };
+    let mut spellings = row.qualified_via();
+    while let Some((&spelling, rest)) = spellings.split_first() {
+        if const_str_eq(spelling, qualifier) {
+            return true;
+        }
+        spellings = rest;
+    }
+    false
+}
+
+/// Whether every union names a [`BUILTIN_TYPES`] row that fits it.
+///
+/// A union's row is the empty-home row of its `type_name`, else the one
+/// module-home row of that name. One pass over the rows folds each union's
+/// outcome into bitmasks (one bit per union), compared once at the end.
+const fn unions_agree(unions: &[BuiltinUnion], mut rows: &[BuiltinRow]) -> bool {
+    if unions.len() > 64 {
+        return false;
+    }
+    let mut bare_seen = 0_u64;
+    let mut bare_bad = 0_u64;
+    let mut homed_seen = 0_u64;
+    let mut homed_dup = 0_u64;
+    let mut homed_bad = 0_u64;
+    while let Some((row, rest)) = rows.split_first() {
+        let mut bit = 1_u64;
+        let mut pending = unions;
+        while let Some((union, more)) = pending.split_first() {
+            if const_str_eq(union.type_name, row.name()) {
+                let fits = union_fits_row(union, row);
+                if matches!(row.home(), KernelHome::Builtin) {
+                    bare_seen |= bit;
+                    if !fits {
+                        bare_bad |= bit;
+                    }
+                } else {
+                    if homed_seen & bit != 0 {
+                        homed_dup |= bit;
+                    }
+                    homed_seen |= bit;
+                    if !fits {
+                        homed_bad |= bit;
+                    }
+                }
+            }
+            bit <<= 1;
+            pending = more;
+        }
+        rows = rest;
+    }
+    let mut every = 0_u64;
+    let mut pending = unions;
+    while let Some((_, more)) = pending.split_first() {
+        every = (every << 1) | 1;
+        pending = more;
+    }
+    let bare_ok = bare_seen & !bare_bad;
+    let homed_ok = !bare_seen & homed_seen & !homed_dup & !homed_bad;
+    ((bare_ok | homed_ok) & every) == every
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a builtin union's type is not a `BUILTIN_TYPES` row admitting constructors, or its constructor qualifier does not spell the type [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    unions_agree(BUILTIN_UNIONS, BUILTIN_TYPES),
+    "every BUILTIN_UNIONS entry must name a BUILTIN_TYPES row that admits its constructors",
+);
+
 /// One interned built-in constructor: its owning union's interned type name plus
 /// its declaration index and payload arity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -285,8 +365,54 @@ pub fn intern_builtins(interner: &mut Interner) -> DResult<InternedBuiltins> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILTIN_UNIONS, intern_builtins};
+    use super::{BUILTIN_UNIONS, BuiltinUnion, intern_builtins, unions_agree};
     use ipe_intern::Interner;
+    use ipe_kernels::BUILTIN_TYPES;
+
+    const fn stub_union(
+        type_name: &'static str,
+        qualified_home: Option<&'static str>,
+    ) -> BuiltinUnion {
+        BuiltinUnion {
+            type_name,
+            ctors: &[],
+            exhaust_union: false,
+            qualified_home,
+        }
+    }
+
+    #[test]
+    fn unions_agree_with_the_builtin_type_table() {
+        assert!(unions_agree(BUILTIN_UNIONS, BUILTIN_TYPES));
+        assert!(unions_agree(
+            &[
+                stub_union("HttpMethod", Some("Http")),
+                stub_union("RedirectPolicy", None)
+            ],
+            BUILTIN_TYPES
+        ));
+    }
+
+    #[test]
+    fn unions_agree_refuses_a_union_the_table_does_not_admit() {
+        for (bad, why) in [
+            (stub_union("NoSuchType", None), "a type with no row"),
+            (
+                stub_union("Handler", None),
+                "a kernel-implicit row admits no constructors",
+            ),
+            (
+                stub_union("Maybe", Some("Http")),
+                "a qualifier the row does not list",
+            ),
+            (
+                stub_union("Draft", Some("Http")),
+                "a module-home row without the qualifier",
+            ),
+        ] {
+            assert!(!unions_agree(&[bad], BUILTIN_TYPES), "{why}");
+        }
+    }
 
     #[test]
     fn every_union_index_is_dense_from_zero() {

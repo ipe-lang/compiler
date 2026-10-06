@@ -35,9 +35,9 @@ pub use env::{
     kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
-    ModuleOrigin, QualifierForm, RESERVED_BUILTIN_TYPES, builtin_empty_home_arity,
-    import_qualifier_forms, import_qualifiers, is_reserved_builtin_type_name,
-    is_user_type_declaration_forbidden, to_snake_case,
+    ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
+    import_qualifiers, is_reserved_builtin_type_name, is_user_type_declaration_forbidden,
+    to_snake_case,
 };
 
 /// A type alias exported by a module, resolved in the defining module's scope.
@@ -1205,6 +1205,53 @@ mod tests {
             assert!(
                 is_reserved_builtin_type_name(name),
                 "`{name}` must still be a known builtin name"
+            );
+        }
+
+        // Names both reserved and lowered by a fixed arm: forbidden and builtin.
+        for name in &[
+            "Html",
+            "CustomElement",
+            "Description",
+            "HAlign",
+            "LayoutContext",
+            "Length",
+            "Location",
+            "PseudoClass",
+            "VAlign",
+            "WebReq",
+        ] {
+            assert!(
+                is_user_type_declaration_forbidden(name),
+                "`{name}` must be user-declaration-forbidden"
+            );
+            assert!(
+                is_reserved_builtin_type_name(name),
+                "`{name}` must be a known builtin"
+            );
+        }
+
+        // Below-guard and kernel-implicit names: builtin, user-shadowable.
+        for name in &["Order", "Color", "Decimal", "Value"] {
+            assert!(
+                !is_user_type_declaration_forbidden(name),
+                "`{name}` must NOT be user-declaration-forbidden (user-shadowable)"
+            );
+            assert!(
+                is_reserved_builtin_type_name(name),
+                "`{name}` must still be a known builtin name"
+            );
+        }
+
+        // Heads that live only at a module home are never bare builtins.
+        for name in &["Claims", "Draft", "Cond", "RadioOption"] {
+            assert!(
+                !is_reserved_builtin_type_name(name),
+                "`{name}` lives only at a module home"
+            );
+            assert!(
+                !is_user_type_declaration_forbidden(name),
+                "`{name}` lives only at a module home"
             );
         }
     }

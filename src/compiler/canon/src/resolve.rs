@@ -1,9 +1,8 @@
 //! Name resolution: `ipe_syntax` source tree → canonical AST. Port of the
 //! supported subset of `Ipe.Canonicalise.{Module,Expression,Pattern,Type}`.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 use ipe_diagnostics::{
     AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
@@ -11,7 +10,7 @@ use ipe_diagnostics::{
     NameError, ParseError, SealRejection, SortedNames, Span, TypeError,
 };
 use ipe_intern::{Interner, Symbol};
-use ipe_kernels::{AppSurface, StdlibKernel, WebCapability};
+use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
 use ipe_syntax as src;
 use ipe_syntax::{Assoc, BinOp};
 
@@ -84,551 +83,64 @@ const CUSTOM_ELEMENT_CTOR: &str = "fromFile";
 /// `Ipe.Ffi.Js.CustomElement` module the constructor is reached through.
 const CUSTOM_ELEMENT_TYPE: &str = "CustomElement";
 
-/// Type-constructor names the compiler reserves for built-ins. A user `type` /
-/// `type alias` whose name is one of these is rejected at declaration
-/// ([`NameError::ReservedBuiltinType`], IPE-N0026).
+/// The empty-home builtin row an unqualified type name resolves to, if any.
 ///
-/// This is the exact set that `ipe_lower`'s `ir_type_from_ty` matches *ahead of*
-/// its user-enum lookup (`enum_variants` guard). Because that match keys on the
-/// type name alone, a user declaration of any of these names would be silently
-/// overridden by the built-in IR mapping and miscompile with **no diagnostic** —
-/// so the shadow must be rejected here, at the parse/canon boundary, rather than
-/// validated downstream (parse-don't-validate; make-invalid-states-
-/// unrepresentable).
-///
-/// Every entry is cited to its `crates/ipe_lower/src/lower.rs::ir_type_from_ty`
-/// arm (HEAD line numbers):
-///
-/// ```text
-/// Int 2069, Float 2070, Bool 2071, String/Error 2077, Char 2078, Bytes 2081,
-/// Task 2084, Maybe 2103, Result 2108, List 2114, Dict 2119, Set 2133,
-/// Decoder 2148, Db 2162, Cmd 2167, Sub 2179, SqlValue/SqlField 2195,
-/// Request 2203, Response 2204, Route 2205, Cookie 2206, Html 2221,
-/// Element 2236, Attribute 2254, Event 2279, Length 2295, HAlign 2297,
-/// VAlign 2298, Location 2299, PseudoClass 2300, Description 2301,
-/// LayoutContext 2302, WebReq 2304.
-/// ```
-///
-/// `SqlFragment` is not in this citation list; see its own arm in
-/// `ir_type_from_ty` / `ir_type_from_canon`.
-///
-/// Several names that `ir_type_from_ty` also matches are deliberately EXCLUDED,
-/// because they sit BELOW the `enum_variants` guard in BOTH lowering
-/// paths (ty + canon), so a program union of that name wins by its
-/// `(home, name)` identity and only a genuine opaque builtin (no union entry)
-/// reaches the fallback arm:
-///   * `Value` — matched *after* the `enum_variants` guard, so a user
-///     `type Value` already wins; it is not a silent-override hole.
-///   * `Color`, `Length`, `HAlign`, `VAlign`, `Location`, `PseudoClass`,
-///     `Description`, `LayoutContext`, `WebReq` — the nullary Ipe.Ui / Ipe.Web
-///     opaque names. Leaving them UNRESERVED is what lets a user ADT — and,
-///     crucially, a compiled-source `Ipe.Css` type (`Color` / `Length` / …) —
-///     declare them; the home-aware guard keeps the genuine Ipe.Ui
-///     builtin resolving to `UiPlain`. Multiple shipped `.ipe` fixtures
-///     (`dict_adt_gate`, `set_adt_fn_gate`, `mm_local_pkg`, …) already
-///     declare `type Color` as a benign sample ADT and now lower correctly.
-pub const RESERVED_BUILTIN_TYPES: &[&str] = &[
-    "Int",
-    "Float",
-    "Bool",
-    "String",
-    "Error",
-    "Char",
-    "Bytes",
-    "Task",
-    "Maybe",
-    "Result",
-    "List",
-    "Dict",
-    "Set",
-    "Decoder",
-    "Db",
-    "Cmd",
-    "Sub",
-    "SqlValue",
-    "SqlField",
-    // `Ipe.Db.Store`'s typed projection-descriptor ADTs.  Reserved so user code
-    // cannot declare a same-named union and silently override the synthetic
-    // `EnumDef` the lowerer injects (same precedent as `SqlValue`/`SqlField`).
-    "ProjectionTerm",
-    "ProjectionOperand",
-    "ArithOp",
-    // `Ipe.Db.Sql`'s opaque WHERE-fragment type — reserved (not
-    // `EXTRA_BUILTIN_TYPE_NAMES`) so user shadowing of this security-tier type
-    // is a hard canon error, matching the `SqlValue`/`SqlField` precedent.
-    "SqlFragment",
-    // `Ipe.Secret`'s opaque sealed secret-string type —
-    // reserved for the same reason as `SqlFragment`: a security-tier type
-    // must not be shadowable by user code.
-    "Secret",
-    // `Ipe.Jwt`'s opaque signing-algorithm descriptor — shares the `Secret`
-    // runtime representation (sealed, no Debug/Display surface on key material).
-    // Reserved because its lowerer arm sits above the `enum_variants` guard
-    // in both `ir_type_from_canon` and `ir_type_from_ty`, fixing a silent
-    // SEAL break where a user `type Algorithm` would be mis-lowered.
-    "Algorithm",
-    // `Ipe.Path`'s opaque validated filesystem-path type — reserved for the
-    // same reason: a security-tier type (the traversal/NUL-rejection boundary)
-    // must not be shadowable by user code.
-    "Path",
-    // `Ipe.Regex`'s opaque compiled-pattern type — reserved so `Regex.compile`'s
-    // typed-`Err`-on-invalid-pattern guarantee cannot be defeated by a user
-    // `type Regex` shadowing the built-in handle.
-    "Regex",
-    // `Ipe.Url`'s opaque validated URL type — reserved for the same reason: a
-    // security-tier type (the scheme/SSRF parse boundary) must not be
-    // shadowable by user code defeating `Url.fromString`'s parse guarantee.
-    "Url",
-    // `Ipe.Url`'s opaque same-origin relative reference — reserved for the same
-    // reason: a security-tier type (the browser-href SSRF boundary) must not be
-    // shadowable by user code defeating `Url.relative`'s parse guarantee.
-    "Relative",
-    // `Ipe.Db.Dsn`'s opaque validated connection descriptor — reserved for the
-    // same reason: a security-tier type (the DSN parse boundary, carrying a
-    // `Secret` password and a fail-closed TLS posture) must not be shadowable by
-    // user code, or a forged look-alike `Dsn` could smuggle a host/credential
-    // past the parser once a connect step consumes it.
-    "Dsn",
-    // `Ipe.Crypto`'s opaque role-typed crypto key — reserved because a user
-    // `type Key` would be silently mis-lowered to `IrType::CryptoKey` (the
-    // lowerer arm sits above the `enum_variants` guard), causing SEAL breaks
-    // wherever the user's ADT constructors are used.
-    "Key",
-    // `Ipe.Crypto`'s opaque HMAC output — reserved for the same reason as `Key`.
-    "Mac",
-    // `Ipe.Email`'s opaque validated email address — reserved because its lowerer
-    // arm sits above the `enum_variants` guard; a user `type EmailAddress` would
-    // be silently mis-lowered to `IrType::EmailAddress`, breaking the SEAL.
-    "EmailAddress",
-    // `Ipe.Locale`'s opaque BCP-47 locale handle — reserved for the same reason:
-    // its lowerer arm sits above the `enum_variants` guard and a user
-    // `type Locale` would be mis-lowered.
-    "Locale",
-    // `Ipe.Auth`'s opaque authenticated subject — reserved because it is a
-    // security-tier type: a user `type Principal` could forge a look-alike that
-    // an `…As` row-security op would trust as an authenticated caller. It has no
-    // Ipê constructor, so the type name being unshadowable keeps the mint the
-    // sole origin.
-    "Principal",
-    // `Ipe.Db`'s external-connection handle `Connection mode` and its two phantom
-    // access-mode markers. Reserved because the read-only-by-type guarantee is the
-    // load-bearing security property: a user `type Connection …` or a shadowed
-    // `ReadOnly`/`ReadWrite` could forge a read-write handle to a foreign DB from a
-    // read-only one, defeating the compile-time write barrier. The markers appear
-    // only as `Connection`'s argument (phantom), never as a standalone value.
-    "Connection",
-    "ReadOnly",
-    "ReadWrite",
-    // The JS-interop visual-widget boundary type. A binding typed
-    // `CustomElement down up` names, in its two concrete type parameters, the
-    // sealed down-state and up-event that cross the Ipê↔JS seam — every value
-    // is decoded on the way in / encoded on the way out, never an untyped blob.
-    // Reserved so user code cannot declare its own `type CustomElement …` and
-    // smuggle an untyped widget past the seal: the reservation is what makes the
-    // typed boundary the ONLY spelling of the boundary (Security #1, fail-closed
-    // by construction). A USE of the name in an annotation resolves in
-    // `canonicalise_type` only through two fail-closed gates — exactly two type
-    // parameters (arity, IPE-N0031) and a plain-value SEAL on each (IPE-N0039).
-    // `CustomElement down up` is the shipped typed JS-widget boundary.
-    // Its two type parameters name the sealed down-state and up-event.
-    "CustomElement",
-    // `Ipe.PubSub`'s phantom topic handle type — reserved so user code cannot
-    // define `type Topic` and silently bypass the lowerer's `Topic a → Str` arm.
-    // `PubSub.ipe` (EmbeddedStdlib) may declare it without penalty.
-    "Topic",
-    "StreamId",
-    "ChunkEvent",
-    // `Ipe.Http`'s closed HTTP-verb ADT. Reserved because it drives
-    // exhaustiveness (`exhaust_union`) and lowers to a fixed
-    // `IrType::HttpMethod` enum; a user `type HttpMethod` would be hijacked by
-    // the bare-name lowerer arm and mis-lower.
-    "HttpMethod",
-    "Request",
-    "Response",
-    "Route",
-    "Cookie",
-    // `Ipe.Server`'s opaque authed-route descriptors. Reserved because they are
-    // security-tier: `AuthConfig` carries the token-verification `Secret`, and a
-    // user look-alike `type AuthConfig …`/`type TokenSource …` could smuggle a
-    // forged configuration into an authed route and defeat the fail-closed auth
-    // gate. Built only through the `Server` auth kernels, never an Ipê term.
-    "AuthConfig",
-    "TokenSource",
-    // `Ipe.App`'s runtime-config carrier `Setting shape`. Reserved because it is
-    // security-tier: a setting may carry a `Secret` (a `Db.url` credential), and
-    // the phantom `shape` marker is the load-bearing guarantee that a `Web`-only
-    // setting cannot be smuggled into another shape's settings list. A user
-    // `type Setting …` could forge a look-alike and defeat that shape barrier.
-    // Built only through the setting kernels, never an Ipê term.
-    "Setting",
-    // `Program shape msg` — the TEA shape carrier, the uniform result of every
-    // `<Shape>.app` entry. Reserved so a user `type Program …` cannot forge a
-    // look-alike carrier and cross a `main`'s shape barrier; built only by the
-    // app-entry kernels, never an Ipê term. The phantom `shape` tag and `msg`
-    // both erase at lower.
-    "Program",
-    // The closed config-tag ADTs — the argument types of `Host.bind` /
-    // `Log.level` / `Web.csrf`. Reserved so a user `type HostMode …` cannot forge
-    // a look-alike with an out-of-range or CSRF-disabling variant that the setting
-    // builders would then accept; each is built only through its constructor
-    // kernels, never an Ipê term. `CsrfMode` in particular has no disabling
-    // variant, so a setting cannot express turning CSRF off.
-    "HostMode",
-    "LogLevel",
-    "CsrfMode",
-    // `RevocationMode` — nullary closed revocation-gate ADT (`Off` / `Store`).
-    // Reserved so a user `type RevocationMode …` cannot forge a look-alike with an
-    // out-of-range or enabling variant; built only through `Web.revocationOff` /
-    // `Web.revocationStore` constructor kernels.
-    "RevocationMode",
-    "Html",
-    // `View engine msg` — the engine-tagged view carrier and SSOT surface.
-    // Reserved so a user `type View …` cannot shadow the builtin and forge a
-    // view over an out-of-set engine tag, defeating the closed `{Web, Tui, Cli}`
-    // engine gate.
-    "View",
-    "Element",
-    // `Ipe.Ui.Tui`'s Tui-only view type `Screen msg`. Reserved so a user
-    // `type Screen …` cannot shadow the builtin and defeat the shape-gate that
-    // prevents Web/Cli builders from appearing in a `view : M -> Screen Msg`
-    // function. Built only through `Ipe.Ui.Tui.*` kernels. `Cells` is
-    // reserved alongside it — the internal rendering-model spelling.
-    "Screen",
-    "Cells",
-    // `Ipe.Ui.Tui`'s cell-native attribute type `Attribute msg` (interned
-    // `TuiAttr`). Reserved so a user `type TuiAttr …` cannot forge a look-alike
-    // that would admit a DOM attribute into a `Screen` view.
-    "TuiAttr",
-    // `Ipe.Ui.Cli`'s line-oriented view type `Lines msg` and its line-native
-    // attribute type `Attribute msg` (interned `CliAttr`). Reserved so a user
-    // `type Lines …` / `type CliAttr …` cannot shadow the builtins and defeat the
-    // shape-gate that keeps DOM and 2D cell builders out of a `Lines` view. Built
-    // only through `Ipe.Ui.Cli.*` kernels.
-    "Lines",
-    "CliAttr",
-    // `Ipe.Color`'s opaque companion types. The unified colour value type `Color`
-    // is user-shadowable via the empty-home `Ui.Color` name (its lowerer arm sits
-    // below the `enum_variants` guard); these companions instead carry a fixed
-    // `ipe_runtime::color::*` identity and are built ONLY through `Ipe.Color`
-    // kernels — the typed parse-error channel (`ColorError`), the terminal
-    // capability profile and down-sampled result (`TermProfile` / `AnsiColor`),
-    // and the accessibility bands (`WcagLevel` / `TextSize` / `Deficiency`).
-    // Reserved so a user type of the same name cannot forge a look-alike over the
-    // opaque runtime carrier.
-    "ColorError",
-    "TermProfile",
-    "AnsiColor",
-    "WcagLevel",
-    "TextSize",
-    "Deficiency",
-    "Attribute",
-    "Event",
-    "Length",
-    "HAlign",
-    "VAlign",
-    "Location",
-    "PseudoClass",
-    "Description",
-    "LayoutContext",
-    "WebReq",
-    // `Ipe.Ffi.Js`'s opaque session-stream handle — reserved for the same reason as
-    // the other security-tier opaque handles (`Principal` / `Connection`): the
-    // handle is the SOLE address of a bounded session, obtained only from
-    // `Js.openSession`, and a user `type SessionHandle …` could forge a look-alike
-    // to address a session it never opened, defeating the fail-closed cross-handle
-    // routing. It has no Ipê constructor, so reserving the name keeps the mint the
-    // sole origin. Its lowerer arm sits ABOVE the `enum_variants` guard.
-    "SessionHandle",
-];
-
-/// Extra built-in type names that are handled by the lowerer's explicit arms
-/// (`ipe_lower::ir_type_from_canon`) but are NOT listed in
-/// [`RESERVED_BUILTIN_TYPES`] (and therefore may NOT be user-defined).
-///
-/// These names must receive the empty-home sentinel (`Vec::new()`) from
-/// `canonicalise_type` just like the reserved builtins — omitting them would
-/// cause `canonicalise_type` to emit [`NameError::TypeNotFound`] for a
-/// legitimate builtin annotation such as `relay : Order` or `ws : WebSocketServer`.
-///
-/// The names below are absent from `RESERVED_BUILTIN_TYPES` because they are
-/// either:
-/// * Nullary Ipe.Ui/Ipe.Web opaque names whose lowerer arm sits BELOW the
-///   `enum_variants` guard (so a user `type Color` wins by its real home) — and
-///   therefore can never be shadowed in a user annotation either; OR
-/// * Additional opaque kernel types added after the original reservation list
-///   was drawn up.
-///
-/// Keeping this list in sync with `ir_type_from_canon`'s explicit arms is the
-/// only invariant. Any name handled by an explicit arm with `home = []` that
-/// is NOT in `RESERVED_BUILTIN_TYPES` belongs here.
-const EXTRA_BUILTIN_TYPE_NAMES: &[&str] = &[
-    // Three-way comparison result (`lt`/`eq`/`gt`).
-    "Order",
-    // Ipe.Ui plain types — lowerer guard is BELOW `enum_variants` so user ADTs
-    // of the same name win via their real home; but annotations that name them
-    // without a program-level definition still need the empty-home sentinel.
-    "Color",
-    "Length",
-    "HAlign",
-    "VAlign",
-    "Location",
-    "PseudoClass",
-    "Description",
-    "LayoutContext",
-    "WebReq",
-    // Ipe.Web / Ipe.Http.Server / Ipe.Http.Server.WebSocket opaque types.
-    "WebRoute",
-    "StreamWriter",
-    "HttpRequest",
-    "WebSocketServer",
-    "WebSocketServerCfg",
-    // Ipe.Ui.Input parametric label/placeholder types.
-    "Label",
-    "Placeholder",
-    // Ipe.Decimal opaque arbitrary-precision decimal type.
-    // Lowerer arm: `ir_type_from_canon` `"Decimal" => IrType::Decimal`.
-    "Decimal",
-    // `Ipe.Db.Migration` record alias `{ name : String, sql : String }`
-    // (reference `Ipe/Db.ipe:237`). Structural record — `normalize_annotation_ty`
-    // expands the name to the record; the lowerer keeps it a synthesised struct
-    // (no opaque arm), so it is user-shadowable-safe like `HttpRequest`.
-    "Migration",
-    // `Ipe.Error`'s `ErrorKind` / `ErrorDetails` unions. Both have an
-    // `ir_type_from_canon` arm (`"ErrorKind" => IrType::ErrorKind` /
-    // `"ErrorDetails" => IrType::ErrorDetails`) and are declared in the shared
-    // built-in table (`crate::builtins::BUILTIN_UNIONS`), so an annotation such
-    // as `classify : ErrorKind -> String` must resolve to the empty-home
-    // sentinel rather than IPE-N0002.
-    "ErrorKind",
-    "ErrorDetails",
-    // `Ipe.Error`'s NOMINAL payload types (see
-    // `docs/adr/0001-language-semantics-and-types.md`).
-    // Opaque nominal Cons backed
-    // by `ipe_runtime::error::{IpePanicInfo, IpeTypeInfo, IpeErrorInfo}`, so
-    // annotations such as `describePanic : PanicInfo -> String` must resolve.
-    // Lowerer arms: `ir_type_from_canon` / `ir_type_from_ty`
-    // `"PanicInfo" => IrType::PanicInfo` (etc.).
-    "PanicInfo",
-    "TypeInfo",
-    "ErrorInfo",
-    // `CustomElement down up` — the JS-widget boundary type (reserved in
-    // `RESERVED_BUILTIN_TYPES`). Registered here too so a bare annotation
-    // `codeEditor : CustomElement EditorState EditorEvent` resolves to the
-    // empty-home sentinel rather than IPE-N0002; `canonicalise_type` then gates
-    // it fail-closed on arity (IPE-N0031) and the plain-value SEAL (IPE-N0039),
-    // and the typed seam is fully emittable.
-    "CustomElement",
-];
-
-/// Kernel-implicit built-in type names that are globally in scope in
-/// every Ipê program but are NOT declared by any compiled `.ipe` source file —
-/// they are resolved by the runtime as opaque handles.
-///
-/// Without these entries, bare annotations
-/// like `handleHome : Handler` fail with `TypeNotFound` / IPE-N0002 even
-/// though they are legitimate kernel builtins. Each entry receives the
-/// empty-home sentinel (`Vec::new()`) just like `RESERVED_BUILTIN_TYPES` and
-/// `EXTRA_BUILTIN_TYPE_NAMES`.
-///
-/// Note: not all of these have explicit arms in `ipe_lower::ir_type_from_canon`
-/// yet (`Handler` / `Middleware` / `Session` / `Store` /
-/// `VNode`). Registering them here is the canon-level fix; lowerer arms complete
-/// the end-to-end path.
-///
-/// **User-shadowable**: every name here may be declared by a user `.ipe` module
-/// without a canon error. The lowerer arm for each sits BELOW the
-/// `enum_variants` guard, so a user ADT wins via its real home — the same
-/// `Color`/`Length` precedent used by [`EXTRA_BUILTIN_TYPE_NAMES`]. Names
-/// whose lowerer arm sits ABOVE the guard with a fixed `IrType` mapping
-/// (`HttpMethod`, `Connection`, …) live in [`RESERVED_BUILTIN_TYPES`] instead.
-const KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES: &[&str] = &[
-    // `Request -> Task Error Response` alias from Ipe.Http.Server.
-    "Handler",
-    // `Html msg` — the top-level rendered HTML node type from Ipe.Html / Ipe.Ui.
-    // Needed so `viewFoo : Model -> Html Msg` annotations typecheck without
-    // `import Ipe.Html exposing (Html)`.
-    "Html",
-    // Opaque JSON value type (`Value = any` in Ipê). The lowerer handles this
-    // via an explicit arm placed after the `enum_variants` guard — so a user
-    // `type Value` still wins, but a bare annotation compiles.
-    "Value",
-    // `Handler -> Handler` middleware alias from Ipe.Http.Middleware.
-    "Middleware",
-    // Ipe.Web session object.
-    "Session",
-    // Ipe.Web session store.
-    "Store",
-    // Virtual DOM node (Ipe.Web diff engine).
-    "VNode",
-];
+/// Every builtin-name question canon asks — is it a builtin, may a user declare
+/// it, its fixed arity, its boundary seal class — reads this one row of
+/// [`ipe_kernels::BUILTIN_TYPES`]. A row with a module home is never returned:
+/// such a head is reached only by its qualified `(home, name)`.
+fn bare_builtin(name: &str) -> Option<&'static BuiltinRow> {
+    BuiltinType::of_bare_name(name).map(BuiltinType::row)
+}
 
 /// `true` when `name` is any known Ipê built-in type name.
 ///
-/// Covers the union of the reserved set, the lowerer's extra explicit-arm
-/// names, and the kernel-implicit names. Answers "is this a known built-in
-/// at all?".
-///
-/// Used for annotation resolution (the empty-home sentinel in
+/// Answers "is this a known empty-home built-in at all?", whatever its
+/// [`ipe_kernels::BuiltinRole`]. Used for annotation resolution (the empty-home sentinel in
 /// `resolve_unqualified_type_home`) and for re-export tracking in stdlib
 /// modules. NOT the right predicate for "may a user declare this name?" —
 /// use [`is_user_type_declaration_forbidden`] for that gate.
 #[must_use]
 pub fn is_reserved_builtin_type_name(name: &str) -> bool {
-    builtin_type_name_set().contains(name)
-}
-
-/// The union of every built-in type-name table, as an O(1)-membership set built
-/// once. The three source slices stay the single source of truth; this only
-/// caches their union so per-node membership tests avoid three linear scans.
-fn builtin_type_name_set() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        RESERVED_BUILTIN_TYPES
-            .iter()
-            .chain(EXTRA_BUILTIN_TYPE_NAMES)
-            .chain(KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES)
-            .copied()
-            .collect()
-    })
+    bare_builtin(name).is_some()
 }
 
 /// `true` when a user `.ipe` module (or an FFI-generated shadow module) may
 /// NOT soundly declare a type with this name.
 ///
-/// Only [`RESERVED_BUILTIN_TYPES`] names are forbidden: those are types whose
-/// lowerer arm in `ir_type_from_ty` / `ir_type_from_canon` sits ABOVE the
-/// `enum_variants` guard with a fixed `IrType` mapping. A competing user ADT
-/// would be silently overridden and mis-lower — IPE-N0026 blocks it.
+/// Only a [`ipe_kernels::BuiltinRole::Reserved`] row is forbidden: its lowerer arm in
+/// `ir_type_from_ty` / `ir_type_from_canon` sits ABOVE the `enum_variants`
+/// guard with a fixed `IrType` mapping, keyed on the name alone, so a competing
+/// user ADT would be silently overridden and mis-lower — IPE-N0026 blocks it.
 ///
-/// [`EXTRA_BUILTIN_TYPE_NAMES`] and [`KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES`]
-/// names are explicitly NOT forbidden: their lowerer arms sit below the guard
-/// (the user ADT wins via its own home). A user `type Handler a`, `type Store`,
-/// or `type Color` is valid and lowers correctly. An FFI interface wrapping a
+/// [`ipe_kernels::BuiltinRole::LoweredBelowGuard`] and
+/// [`ipe_kernels::BuiltinRole::KernelImplicit`] rows
+/// are NOT forbidden: their lowerer arms sit below the guard, so the user ADT
+/// wins via its own home. A user `type Handler a`, `type Store`, or
+/// `type Color` is valid and lowers correctly; an FFI interface wrapping a
 /// foreign `struct Handler` or `struct Store` is equally sound.
 ///
 /// Both [`reject_reserved_builtin_type`] (the canon resolve gate, IPE-N0026)
-/// and the FFI shadow gate call this predicate — it is the SSOT for "is this
-/// user-declaration forbidden?".
+/// and the FFI shadow gate call this predicate.
 #[must_use]
 pub fn is_user_type_declaration_forbidden(name: &str) -> bool {
-    RESERVED_BUILTIN_TYPES.contains(&name)
+    bare_builtin(name).is_some_and(|row| row.role().forbids_user_declaration())
 }
 
 /// Fixed type-argument arity for empty-home builtins, or `None`.
 ///
 /// Drives the IPE-N0031 canon gate: a mis-arity application would otherwise
-/// fall through to the lowerer's empty-home ICE catch-all (IPE-I0001). This
-/// is the single source of truth for the fixed-arity gate; the lower-side
-/// and seal-side tables derive from it so any future addition closes the gate
-/// at all sites at once.
+/// fall through to the lowerer's empty-home ICE catch-all (IPE-I0001). The
+/// arity is the row's [`BuiltinRow::fixed_arity`] column, which the kernels
+/// table proves reserved, so a fixed-arity head can never be user-shadowed.
 ///
-/// Members:
-/// * closed containers (`List`/`Maybe`/`Set`, `Dict`/`Result`);
-/// * `Connection mode` — `Ipe.Db`'s external-connection handle (arity 1);
-/// * `Setting shape` — `Ipe.App`'s runtime-config carrier (arity 1);
-/// * `ReadOnly`/`ReadWrite` — nullary phantom access-mode markers;
-/// * `HostMode`/`LogLevel`/`CsrfMode`/`RevocationMode` — nullary closed config-tag ADTs (the
-///   argument types of `Host.bind`/`Log.level`/`Web.csrf`/`Web.withRevocation`).
-/// * `ColorError`/`TermProfile`/`AnsiColor`/`WcagLevel`/`TextSize`/`Deficiency` —
-///   the nullary opaque `Ipe.Color` companion types, each carrying an
-///   `ipe_runtime::color::*` identity.
-///
-/// `Task`/`Cmd`/`Sub` are absent (their gate is in `ipe_types::constrain`).
-/// `CustomElement` is absent (name-based gate, fused with its boundary SEAL).
+/// `Task`/`Cmd`/`Sub` carry no arity here (their gate is in
+/// `ipe_types::constrain`); `CustomElement` carries none either (its
+/// name-based gate is fused with its boundary SEAL).
 #[must_use]
 pub fn builtin_empty_home_arity(name: Option<&str>) -> Option<usize> {
-    match name? {
-        "List" | "Maybe" | "Set" | "Connection" | "Setting" => Some(1),
-        // `Program shape msg` — the TEA shape carrier (arity 2); the phantom
-        // `shape` tag and `msg` both erase at lower. Widened here FIRST so a
-        // `Program`-carrier application resolves through the IPE-N0031 arity gate
-        // instead of falling into the lowerer's empty-home ICE (IPE-I0001).
-        // `View engine msg` — the engine-tagged view carrier (arity 2); the
-        // phantom `engine` tag erases at lower to the per-engine `IrType::Ui`
-        // ctor. Gated here so a mis-arity `View` application resolves through
-        // IPE-N0031 rather than the lowerer's empty-home ICE.
-        "Dict" | "Result" | "Program" | "View" => Some(2),
-        "ReadOnly" | "ReadWrite" | "HostMode" | "LogLevel" | "CsrfMode" | "RevocationMode"
-        | "ProjectionTerm" | "ProjectionOperand" | "ArithOp" | "ColorError" | "TermProfile"
-        | "AnsiColor" | "WcagLevel" | "TextSize" | "Deficiency" => Some(0),
-        _ => None,
-    }
+    bare_builtin(name?)?.fixed_arity().map(usize::from)
 }
-
-/// Built-in primitive value types that ARE plain, closed, and serialisable —
-/// the leaves the boundary seal (§2.1) accepts directly. Every crossing value is
-/// encoded/decoded as canonical JSON, so this is exactly the set of primitives
-/// with a total JSON denotation.
-const SEAL_PLAIN_PRIMITIVES: &[&str] = &["Int", "Float", "Bool", "String", "Char", "Bytes"];
-
-/// All value containers the boundary seal recurses into, listed once.
-///
-/// `Connection` is deliberately absent even though it appears in
-/// [`builtin_empty_home_arity`]: it is an opaque DB handle, not a value
-/// container the seal should recurse into. The test
-/// `seal_container_arity_derives_from_builtin_arity` asserts this split.
-const SEAL_VALUE_CONTAINERS: &[&str] = &["List", "Set", "Maybe", "Dict", "Result"];
-
-/// The arity a value-container name contributes to the boundary seal recursion.
-///
-/// Returns the expected argument count for names in [`SEAL_VALUE_CONTAINERS`].
-/// Returns `None` for anything outside that set (including `Connection`, which
-/// has an entry in [`builtin_empty_home_arity`] but is intentionally excluded
-/// from seal recursion as an opaque handle).
-///
-/// Derived from [`builtin_empty_home_arity`] to keep the two tables in sync:
-/// any arity added there for a value container must be mirrored here, and the
-/// test `seal_container_arity_derives_from_builtin_arity` will red if they diverge.
-fn seal_container_arity(name: &str) -> Option<usize> {
-    if SEAL_VALUE_CONTAINERS.contains(&name) {
-        builtin_empty_home_arity(Some(name))
-    } else {
-        None
-    }
-}
-
-/// Built-in effect carriers — never a boundary DATA value.
-const SEAL_EFFECT_CARRIERS: &[&str] = &["Cmd", "Sub", "Task"];
-
-/// Built-in view / `Ipe.Ui` value types — clonable but not a boundary
-/// serialisable data value.
-const SEAL_VIEW_TYPES: &[&str] = &[
-    "Html",
-    "View",
-    "Element",
-    "Attribute",
-    "Event",
-    "Color",
-    "Length",
-    "HAlign",
-    "VAlign",
-    "Location",
-    "PseudoClass",
-    "Description",
-    "LayoutContext",
-];
-
-/// Built-in `Secret` / reserved-sink / opaque security-boundary handle types.
-/// A secret- or sink-privileged value, or an opaque validated handle, must never
-/// be serialised across the JS seam — these mirror the non-serde leaves of the
-/// `HydrationState` plain-value gate
-/// (`ipe_backend_rust::project::ir_type_contains_non_serde`), extended with the
-/// explicit `Secret` / sink exclusion the boundary seal adds.
-const SEAL_SECRET_OR_SINK: &[&str] = &[
-    "Secret",
-    "SqlFragment",
-    "SqlValue",
-    "SqlField",
-    "Regex",
-    "Path",
-    "Url",
-    "Relative",
-    "Dsn",
-    "Key",
-    "Mac",
-    "EmailAddress",
-    "Locale",
-];
 
 /// The boundary-seal legality check over a canonicalised type (§2.1). Returns
 /// `Some(reason)` when `ty` may NOT cross the Ipê↔JS seam, `None` when it is a
@@ -669,34 +181,25 @@ fn boundary_seal_rejection(ty: &canon::Type, interner: &Interner) -> Option<Seal
                 // fail closed rather than treat it as plain.
                 return Some(SealRejection::NotProvenPlain);
             };
-            if SEAL_PLAIN_PRIMITIVES.contains(&text) {
-                return None;
-            }
-            if SEAL_EFFECT_CARRIERS.contains(&text) {
-                return Some(SealRejection::EffectCarrier);
-            }
-            if SEAL_VIEW_TYPES.contains(&text) {
-                return Some(SealRejection::ViewValue);
-            }
-            if SEAL_SECRET_OR_SINK.contains(&text) {
-                return Some(SealRejection::SecretOrSink);
-            }
-            if seal_container_arity(text).is_some() {
-                return args
+            match bare_builtin(text).map(BuiltinRow::seal) {
+                Some(SealClass::EffectCarrier) => Some(SealRejection::EffectCarrier),
+                Some(SealClass::View) => Some(SealRejection::ViewValue),
+                Some(SealClass::SecretOrSink) => Some(SealRejection::SecretOrSink),
+                Some(SealClass::ValueContainer) => args
                     .iter()
-                    .find_map(|a| boundary_seal_rejection(a, interner));
+                    .find_map(|a| boundary_seal_rejection(a, interner)),
+                // An empty-home builtin no class above admits (an opaque handle
+                // such as `Db`, `Decoder`, a server type, or `CustomElement`
+                // itself) is NOT proven plain — fail closed. A same-named head
+                // with a real defining home is a user ADT.
+                Some(SealClass::SealedHandle | SealClass::Opaque) if home.is_empty() => {
+                    Some(SealRejection::NotProvenPlain)
+                }
+                // A plain primitive crosses the seam. A user-declared ADT
+                // reference is accepted at this layer (its payloads are
+                // re-verified by the generated codec later).
+                Some(SealClass::Plain | SealClass::SealedHandle | SealClass::Opaque) | None => None,
             }
-            // A user-declared ADT reference: accepted at this layer (its payloads
-            // are re-verified by the generated codec later). Distinguished from an
-            // unknown/opaque builtin by having a real defining home OR by not
-            // being any known builtin type name. An empty-home name that IS a
-            // known builtin but reached none of the arms above (an opaque handle
-            // such as `Db`, `Decoder`, a server type, or `CustomElement` itself)
-            // is NOT proven plain — fail closed.
-            if home.is_empty() && is_reserved_builtin_type_name(text) {
-                return Some(SealRejection::NotProvenPlain);
-            }
-            None
         }
     }
 }
@@ -723,7 +226,8 @@ fn canon_type_display(ty: &canon::Type, interner: &Interner) -> Box<str> {
     }
 }
 
-/// The subset of [`RESERVED_BUILTIN_TYPES`] that a trusted
+/// The subset of the reserved builtin names
+/// ([`is_user_type_declaration_forbidden`]) that a trusted
 /// [`ModuleOrigin::EmbeddedStdlib`] module is permitted to DEFINE, while a
 /// [`ModuleOrigin::User`] module stays rejected (IPE-N0026).
 ///
@@ -761,7 +265,8 @@ const STDLIB_DEFINABLE_UI_TYPES: &[&str] = &[
     "WebReq",
 ];
 
-/// The subset of [`RESERVED_BUILTIN_TYPES`] that a trusted
+/// The subset of the reserved builtin names
+/// ([`is_user_type_declaration_forbidden`]) that a trusted
 /// [`ModuleOrigin::EmbeddedStdlib`] module may DEFINE as the source-level
 /// re-declaration of a shared opaque BOXED-WRAPPER carrier — as opposed to the
 /// nullary Ipe.Ui plain names in [`STDLIB_DEFINABLE_UI_TYPES`].
@@ -801,8 +306,7 @@ const STDLIB_DEFINABLE_CARRIER_TYPES: &[&str] = &[
 ];
 
 /// Reject a `type` / `type alias` whose name shadows a reserved built-in type
-/// constructor. See [`RESERVED_BUILTIN_TYPES`] and
-/// [`is_user_type_declaration_forbidden`].
+/// constructor. See [`is_user_type_declaration_forbidden`].
 ///
 /// A [`ModuleOrigin::EmbeddedStdlib`] module is exempt for the
 /// [`STDLIB_DEFINABLE_UI_TYPES`] subset (nullary Ipe.Ui plain names — `Ipe.Css`)
@@ -4136,7 +3640,7 @@ fn field_leaf_codecs(
     if let canon::Type::Con { name, args, .. } = ty
         && args.is_empty()
         && let Some(text) = interner.resolve(*name)
-        && SEAL_SECRET_OR_SINK.contains(&text)
+        && bare_builtin(text).is_some_and(|row| row.seal() == SealClass::SecretOrSink)
     {
         return Err(bad(CodecAutoRejection::SecretField, &field_name));
     }
@@ -9005,44 +8509,41 @@ mod exposed_ctor_subset_tests {
 }
 
 #[cfg(test)]
-mod seal_container_arity_tests {
-    use super::{SEAL_VALUE_CONTAINERS, builtin_empty_home_arity, seal_container_arity};
+mod seal_container_tests {
+    use ipe_kernels::{BUILTIN_TYPES, KernelHome, SealClass};
 
-    /// Every name in `SEAL_VALUE_CONTAINERS` has a matching entry in
-    /// `builtin_empty_home_arity`. This test reds if an arity changes in the
-    /// gate but the seal list is not updated, or vice versa.
+    use super::builtin_empty_home_arity;
+
+    /// Every value container the seal recurses into has a gate arity.
     #[test]
-    fn seal_container_arity_derives_from_builtin_arity() {
-        for name in SEAL_VALUE_CONTAINERS {
-            let gate_arity = builtin_empty_home_arity(Some(name));
-            let seal_arity = seal_container_arity(name);
-            assert_eq!(
-                gate_arity, seal_arity,
-                "`{name}`: gate arity {gate_arity:?} != seal arity {seal_arity:?}"
-            );
+    fn every_value_container_has_a_gate_arity() {
+        let containers = BUILTIN_TYPES
+            .iter()
+            .filter(|row| row.home() == KernelHome::Builtin)
+            .filter(|row| row.seal() == SealClass::ValueContainer);
+        let mut count = 0_usize;
+        for row in containers {
+            let name = row.name();
             assert!(
-                gate_arity.is_some(),
-                "`{name}` is in SEAL_VALUE_CONTAINERS but has no gate arity"
+                builtin_empty_home_arity(Some(name)).is_some(),
+                "`{name}` is a value container with no gate arity"
             );
+            count += 1;
         }
+        assert_eq!(count, 5, "List, Set, Maybe, Dict and Result");
     }
 
-    /// `Connection` has a gate arity entry (it is a builtin container) but must
-    /// NOT appear in `SEAL_VALUE_CONTAINERS` — it is an opaque DB handle, not
-    /// a value container the seal recurses into.
+    /// `Connection` has a gate arity but is a sealed handle, not a value
+    /// container the seal recurses into.
     #[test]
     fn connection_excluded_from_seal_value_containers() {
-        assert!(
-            builtin_empty_home_arity(Some("Connection")).is_some(),
-            "Connection must have a gate arity (arity=1)"
-        );
-        assert!(
-            !SEAL_VALUE_CONTAINERS.contains(&"Connection"),
-            "Connection must NOT be in SEAL_VALUE_CONTAINERS"
-        );
-        assert!(
-            seal_container_arity("Connection").is_none(),
-            "seal_container_arity(Connection) must return None"
+        assert_eq!(builtin_empty_home_arity(Some("Connection")), Some(1));
+        let connection = BUILTIN_TYPES
+            .iter()
+            .find(|row| row.home() == KernelHome::Builtin && row.name() == "Connection");
+        assert_eq!(
+            connection.map(ipe_kernels::BuiltinRow::seal),
+            Some(SealClass::SealedHandle)
         );
     }
 }
