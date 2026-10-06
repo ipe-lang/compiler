@@ -3,9 +3,10 @@
 //! A session's LIVE state (the tokio driver, SSE channel, rebuilt `HandlerIndex`)
 //! is always per-process. A persistent backend additionally keeps a serialized
 //! **checkpoint** of the model (+ metadata) so a returning cookie / a restart can
-//! reconstruct the session. `get` therefore returns either a `Web` handle (the
-//! in-process session, owns its driver) or a `Cold` model (decoded from the
-//! checkpoint; the caller spawns a fresh driver seeded with it).
+//! reconstruct the session. `get` returns only the in-process live handle
+//! (which owns its driver); a checkpoint is decoded only by a claimed
+//! `get_reconstructing`, which hands the caller the cold model beside the
+//! claim that admits it, and the caller spawns a fresh driver seeded with it.
 
 use super::SessionEntry;
 use crate::tea::IpeCmd;
@@ -85,28 +86,11 @@ fn split_checkpoint(blob: &str) -> Option<([u8; 32], Vec<u8>)> {
     Some((tag, body.to_vec()))
 }
 
-/// Decode one persisted checkpoint: base64 → split the leading 32-byte tag →
-/// reject on mismatch BEFORE deserializing (H24) → JSON-decode the body.
-/// EVERY failure (bad base64 — including a pre-`v2` bincode row —, short
-/// blob, foreign tag, corrupt body, oversized body) is `None`: the same
-/// fail-soft drop-session/fresh-`init` path H22 guarantees, never a panic.
-#[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
-fn decode_checkpoint<Model: serde::de::DeserializeOwned>(
-    schema_tag: &[u8; 32],
-    blob: &str,
-) -> Option<Model> {
-    let (tag, body) = split_checkpoint(blob)?;
-    if &tag != schema_tag {
-        return None;
-    }
-    serde_json::from_slice(&body).ok()
-}
-
 /// Decode a persisted checkpoint, with an additive-superset fallback when the
 /// stored tag does NOT match the live one.
 ///
-/// Exact-tag match → the fast path (byte-identical to [`decode_checkpoint`]):
-/// the stored fields decode straight into `Model`, state preserved verbatim.
+/// Exact-tag match → the fast path: the stored fields decode straight into
+/// `Model`, state preserved verbatim, and `init` is never evaluated.
 ///
 /// Tag mismatch → the Model schema changed. Instead of unconditionally
 /// dropping the session, attempt [`super::additive::reconstruct`] with the
@@ -114,9 +98,10 @@ fn decode_checkpoint<Model: serde::de::DeserializeOwned>(
 /// superset (every persisted field still present by name; only new fields
 /// added) whose merged object decodes strictly, so old state is kept and each
 /// new field takes its `init` value. Any non-additive change (a removed or
-/// retyped field), a corrupt / non-object / oversized body, or a pre-`v2`
-/// row → `None` (the caller re-inits cleanly). Never panics; the persisted
-/// body is untrusted and every failure is a typed `None`.
+/// retyped field), bad base64, a short blob, a corrupt / non-object /
+/// oversized body, or a pre-`v2` row → `None` (the caller re-inits cleanly).
+/// Never panics; the persisted body is untrusted and every failure is a
+/// typed `None`.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
 fn decode_or_reconstruct_checkpoint<Model, Seed>(
     schema_tag: &[u8; 32],
@@ -167,14 +152,6 @@ impl<Model, Msg> Decoded<Model, IpeCmd<Msg>> {
 
 /// The in-process live session (owns its driver goroutine + SSE channel).
 pub type SessionHandle<Model, Msg> = Arc<Mutex<SessionEntry<Model, Msg>>>;
-
-/// Result of a store lookup. `Web` = the in-process session (reuse it). `Cold`
-/// = a model decoded from a persistent checkpoint (the caller hydrates: spawn a
-/// fresh driver seeded with this model). Memory stores only ever return `Web`.
-pub enum StoreHit<Model, Msg> {
-    Web(SessionHandle<Model, Msg>),
-    Cold(Model),
-}
 
 /// Result of a claimed page-entry lookup that may rebuild a session across a Model change.
 ///
@@ -385,8 +362,13 @@ impl std::fmt::Debug for SidClaim {
 /// so call sites just `.await`.
 #[async_trait]
 pub trait SessionStore<Model, Msg>: Send + Sync {
-    /// Look up a session by sid. `None` = unknown (caller creates a new one).
-    async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>>;
+    /// Look up the live in-process session for `sid`.
+    ///
+    /// `None` when this process holds none. A persisted checkpoint is never
+    /// returned here: only a claimed
+    /// [`get_reconstructing`](SessionStore::get_reconstructing) turns one into
+    /// a session.
+    async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>>;
 
     /// This store's per-session claim table.
     fn admission(&self) -> &SidAdmission;
@@ -402,10 +384,9 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
 
     /// Look up the claimed session, reconstructing across a purely-additive Model change.
     ///
-    /// Behaves exactly like [`get`](SessionStore::get) on a live-handle
-    /// hit and on an exact-schema checkpoint. The one difference: when a
-    /// PERSISTED checkpoint's schema tag no longer matches this binary's (the
-    /// Model changed), instead of the flat miss `get` returns, it attempts an
+    /// A live handle is `Live`; an exact-schema checkpoint decodes verbatim
+    /// as `Restored`. When a PERSISTED checkpoint's schema tag no longer
+    /// matches this binary's (the Model changed), it attempts an
     /// additive-superset splice — decode the persisted fields, overlay them
     /// onto the model `make_init` produces, and return `Rebuilt` (that model
     /// plus the Cmd `make_init` returned beside it) ONLY if the merge is a
@@ -422,8 +403,8 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// the effect runs only when the caller runs the returned `init_cmd`.
     ///
     /// The default delegates to [`get`](SessionStore::get): a store with no
-    /// persisted body (the memory store) has nothing to reconstruct FROM, so a
-    /// schema change is a plain miss there and `Rebuilt` is never returned.
+    /// persisted body (the memory store) has nothing to restore or
+    /// reconstruct FROM, so it answers only `Live` or `Miss`.
     async fn get_reconstructing(
         &self,
         claim: SidClaim,
@@ -433,11 +414,9 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
         if !self.admission().admits(&claim) {
             return Rejoin::Miss;
         }
-        match self.get(claim.key().as_str()).await {
-            Some(StoreHit::Web(handle)) => Rejoin::Live(handle),
-            Some(StoreHit::Cold(model)) => Rejoin::Restored { claim, model },
-            None => Rejoin::Miss,
-        }
+        self.get(claim.key().as_str())
+            .await
+            .map_or(Rejoin::Miss, Rejoin::Live)
     }
     /// Insert/refresh the live handle (and, for persistent backends, checkpoint
     /// the model). Called on session create and write-through on every commit.
@@ -454,7 +433,7 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// Every session handle THIS PROCESS currently holds live (i.e. has an
     /// in-memory driver + possibly an open SSE connection). Deliberately
     /// scoped to the LOCAL mem-cache, never the full persisted table: a
-    /// `Cold` row on disk (another replica's session, or one this process
+    /// persisted row (another replica's session, or one this process
     /// simply hasn't touched yet) has no SSE connection in THIS process to
     /// push anything to, so it is out of scope for what this method is for.
     /// Returns handles directly (not bare sids) — the caller
@@ -495,11 +474,11 @@ impl<Model, Msg> MemoryStore<Model, Msg> {
 impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
     for MemoryStore<Model, Msg>
 {
-    async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
+    async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
         let mut w = self.sessions.write().unwrap_or_else(|e| e.into_inner());
         w.get_mut(sid).map(|(h, seen)| {
             *seen = Instant::now(); // touch — keep active sessions alive
-            StoreHit::Web(h.clone())
+            h.clone()
         })
     }
     fn admission(&self) -> &SidAdmission {
@@ -544,7 +523,7 @@ impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
 /// for a plain `Web.tea` — such an app reaches no DB kernel, so the emitted
 /// crate carries no `db` feature and the sqlite store compiles out; this store
 /// rides the `web` feature every web build already has (`base64` + `bincode` +
-/// `serde`), reusing the SAME `encode_checkpoint`/`decode_checkpoint` codec and
+/// `serde`), reusing the SAME `encode_checkpoint`/`decode_or_reconstruct_checkpoint` codec and
 /// the SAME H24 schema-tag reject-before-deserialize gate as the sqlite/redis
 /// backends. A structurally different (Model-type-changed) checkpoint is
 /// rejected before deserialize → fail-soft fresh `init`, never a torn Model.
@@ -692,28 +671,13 @@ where
     Model: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
     Msg: Send + Sync + 'static,
 {
-    async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
-        // Same-process live handle wins (owns the running driver).
-        let cached = {
-            let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
-            w.get_mut(sid).map(|(h, seen)| {
-                *seen = Instant::now();
-                h.clone()
-            })
-        };
-        if let Some(h) = cached {
-            return Some(StoreHit::Web(h));
-        }
-        // Cold: decode the persisted checkpoint. The leading 32-byte tag is
-        // compared BEFORE deserialization (H24) — a mismatch (Model-type
-        // change), a corrupt blob, or a missing entry all take the same
-        // fail-soft miss path.
-        let blob = {
-            let disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
-            disk.get(sid).map(|(b, _)| b.clone())
-        }?;
-        let model: Model = decode_checkpoint(&self.schema_tag, &blob)?;
-        Some(StoreHit::Cold(model))
+    async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+        // Only the same-process live handle (it owns the running driver).
+        let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
+        w.get_mut(sid).map(|(h, seen)| {
+            *seen = Instant::now();
+            h.clone()
+        })
     }
     fn admission(&self) -> &SidAdmission {
         &self.admission
@@ -727,15 +691,8 @@ where
             return Rejoin::Miss;
         }
         let sid = claim.key().as_str();
-        // Live handle wins, exactly as `get` — no `init`, no reconstruction.
-        let cached = {
-            let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
-            w.get_mut(sid).map(|(h, seen)| {
-                *seen = Instant::now();
-                h.clone()
-            })
-        };
-        if let Some(h) = cached {
+        // Live handle wins — no `init`, no reconstruction.
+        if let Some(h) = self.get(sid).await {
             return Rejoin::Live(h);
         }
         // Cold: on an exact tag the checkpoint decodes verbatim; on a
@@ -938,9 +895,9 @@ fn store_unavailable_message(backend: &str, refused: &StoreOpenError) -> String 
 
 /// Persistent store: keeps a `mem_cache` of live handles (same-process, owns the
 /// driver) AND a `ipe_sessions(sid, blob, last_seen)` table holding the
-/// serde-JSON model checkpoint. `get` returns the live handle on a cache hit,
-/// else a `Cold` model decoded from the blob (the caller hydrates a fresh
-/// driver). Requires `Model: Serialize + DeserializeOwned` (the codegen derives
+/// serde-JSON model checkpoint. `get` returns the live handle on a cache hit;
+/// a claimed `get_reconstructing` decodes the blob into a cold model (the
+/// caller hydrates a fresh driver). Requires `Model: Serialize + DeserializeOwned` (the codegen derives
 /// it). Implements `sqliteStore`.
 #[cfg(feature = "db")]
 pub struct SqliteStore<Model, Msg> {
@@ -1003,8 +960,8 @@ where
     Model: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
     Msg: Send + Sync + 'static,
 {
-    async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
-        // Same-process live handle wins (owns the running driver).
+    async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+        // Only the same-process live handle (it owns the running driver).
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
             w.get_mut(sid).map(|(h, seen)| {
@@ -1012,33 +969,14 @@ where
                 h.clone()
             })
         };
-        if let Some(h) = cached {
+        if cached.is_some() {
             let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = ? WHERE sid = ?")
                 .bind(now_secs())
                 .bind(sid)
                 .execute(&self.pool)
                 .await;
-            return Some(StoreHit::Web(h));
         }
-        // Cold: decode the persisted model checkpoint (post-restart / other
-        // replica). The blob is self-contained (base64(tag ++ json)); the
-        // leading 32-byte tag is compared BEFORE deserialization (H24) — a
-        // mismatch, a pre-`v2` row, or a corrupt body all take the same
-        // fail-soft miss path. The legacy schema_tag COLUMN is still written
-        // (NOT NULL) but no longer read.
-        let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = ?")
-            .bind(sid)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten();
-        let model: Model = decode_checkpoint(&self.schema_tag, &row?.0)?;
-        let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = ? WHERE sid = ?")
-            .bind(now_secs())
-            .bind(sid)
-            .execute(&self.pool)
-            .await;
-        Some(StoreHit::Cold(model))
+        cached
     }
     fn admission(&self) -> &SidAdmission {
         &self.admission
@@ -1052,21 +990,13 @@ where
             return Rejoin::Miss;
         }
         let sid = claim.key().as_str();
-        let cached = {
-            let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
-            w.get_mut(sid).map(|(h, seen)| {
-                *seen = Instant::now();
-                h.clone()
-            })
-        };
-        if let Some(h) = cached {
-            let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = ? WHERE sid = ?")
-                .bind(now_secs())
-                .bind(sid)
-                .execute(&self.pool)
-                .await;
+        if let Some(h) = self.get(sid).await {
             return Rejoin::Live(h);
         }
+        // Cold (post-restart / other replica): the blob is self-contained
+        // (`base64(tag ++ json)`), and its tag picks a verbatim decode or an
+        // additive splice. The legacy `schema_tag` column is still written
+        // (NOT NULL) but never read.
         let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = ?")
             .bind(sid)
             .fetch_optional(&self.pool)
@@ -1134,8 +1064,8 @@ where
         // Bound the in-RAM handle cache by idle-TTL too. Without this, every
         // distinct sid ever seen (e.g. a flood of cookie-less requests) leaves a
         // live handle in mem_cache forever → unbounded growth → OOM (session-DoS).
-        // An evicted-but-still-valid session simply re-hydrates Cold from the
-        // checkpoint blob on its next request.
+        // An evicted-but-still-valid session simply re-hydrates from the
+        // checkpoint blob on its next claimed request.
         let now = Instant::now();
         let ttl = self.ttl;
         self.mem_cache
@@ -1215,7 +1145,7 @@ where
     Model: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
     Msg: Send + Sync + 'static,
 {
-    async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
+    async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
             w.get_mut(sid).map(|(h, seen)| {
@@ -1223,29 +1153,14 @@ where
                 h.clone()
             })
         };
-        if let Some(h) = cached {
+        if cached.is_some() {
             let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = $1 WHERE sid = $2")
                 .bind(now_secs())
                 .bind(sid)
                 .execute(&self.pool)
                 .await;
-            return Some(StoreHit::Web(h));
         }
-        // Self-contained framed blob — see SqliteStore::get. The legacy
-        // schema_tag COLUMN is still written (NOT NULL) but no longer read.
-        let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = $1")
-            .bind(sid)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten();
-        let model: Model = decode_checkpoint(&self.schema_tag, &row?.0)?;
-        let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = $1 WHERE sid = $2")
-            .bind(now_secs())
-            .bind(sid)
-            .execute(&self.pool)
-            .await;
-        Some(StoreHit::Cold(model))
+        cached
     }
     fn admission(&self) -> &SidAdmission {
         &self.admission
@@ -1259,21 +1174,11 @@ where
             return Rejoin::Miss;
         }
         let sid = claim.key().as_str();
-        let cached = {
-            let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
-            w.get_mut(sid).map(|(h, seen)| {
-                *seen = Instant::now();
-                h.clone()
-            })
-        };
-        if let Some(h) = cached {
-            let _ = sqlx::query("UPDATE ipe_sessions SET last_seen = $1 WHERE sid = $2")
-                .bind(now_secs())
-                .bind(sid)
-                .execute(&self.pool)
-                .await;
+        if let Some(h) = self.get(sid).await {
             return Rejoin::Live(h);
         }
+        // Cold: the sqlite store's self-contained framed blob. The legacy
+        // `schema_tag` column is still written (NOT NULL) but never read.
         let row: Option<(String,)> = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = $1")
             .bind(sid)
             .fetch_optional(&self.pool)
@@ -1430,7 +1335,7 @@ where
     Model: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
     Msg: Send + Sync + 'static,
 {
-    async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
+    async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
         use redis::AsyncCommands;
         let cached = {
             let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
@@ -1439,25 +1344,12 @@ where
                 h.clone()
             })
         };
-        let mut conn = self.conn.clone();
-        if let Some(h) = cached {
+        if cached.is_some() {
             // Touch native TTL so an active session doesn't expire mid-conversation.
+            let mut conn = self.conn.clone();
             let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
-            return Some(StoreHit::Web(h));
         }
-        // The session HASH's blob field is the self-contained framed
-        // checkpoint (see SqliteStore::get); a pre-HASH string key errs
-        // WRONGTYPE → `.ok()?` → the same fail-soft miss path. The legacy
-        // companion `tag` field is retired (no longer written or read).
-        let blob: Option<String> = redis::cmd("HGET")
-            .arg(redis_key(sid))
-            .arg("blob")
-            .query_async(&mut conn)
-            .await
-            .ok()?;
-        let model: Model = decode_checkpoint(&self.schema_tag, &blob?)?;
-        let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
-        Some(StoreHit::Cold(model))
+        cached
     }
     fn admission(&self) -> &SidAdmission {
         &self.admission
@@ -1470,20 +1362,15 @@ where
         if !self.admission.admits(&claim) {
             return Rejoin::Miss;
         }
-        let sid = claim.key().as_str();
         use redis::AsyncCommands;
-        let cached = {
-            let mut w = self.mem_cache.write().unwrap_or_else(|e| e.into_inner());
-            w.get_mut(sid).map(|(h, seen)| {
-                *seen = Instant::now();
-                h.clone()
-            })
-        };
-        let mut conn = self.conn.clone();
-        if let Some(h) = cached {
-            let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
+        let sid = claim.key().as_str();
+        if let Some(h) = self.get(sid).await {
             return Rejoin::Live(h);
         }
+        // Cold: the session HASH's `blob` field is the self-contained framed
+        // checkpoint; a pre-HASH string key errs WRONGTYPE and takes the miss
+        // path. The legacy companion `tag` field is neither written nor read.
+        let mut conn = self.conn.clone();
         let blob: Option<String> = redis::cmd("HGET")
             .arg(redis_key(sid))
             .arg("blob")
@@ -1541,7 +1428,7 @@ where
         // Redis evicts the persisted blob natively, but the in-RAM handle cache
         // still needs idle-TTL eviction — otherwise a cookie-less request flood
         // grows mem_cache without bound → OOM (session-DoS). An evicted-but-valid
-        // session re-hydrates Cold from Redis on its next request.
+        // session re-hydrates from Redis on its next claimed request.
         let now = Instant::now();
         let ttl = Duration::from_secs(self.ttl_secs);
         self.mem_cache
@@ -1829,12 +1716,34 @@ mod tests {
         }))
     }
 
+    // Sids the claimed checkpoint lookups below parse.
+    #[cfg(feature = "db")]
+    const COLD_SID: &str = "c01dc01dc01dc01dc01dc01dc01dc01d";
+    #[cfg(feature = "db")]
+    const OLD_SID: &str = "01d001d001d001d001d001d001d001d0";
+
+    // A per-process sid for test `lane`, so concurrent runs on one shared server never collide.
+    #[cfg(any(feature = "db", feature = "redis_store"))]
+    fn test_sid(lane: u16) -> String {
+        format!("{lane:04x}{:028x}", std::process::id())
+    }
+
+    // The model a claimed lookup of `sid` restores verbatim, if any.
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    async fn restored_i32(s: &impl SessionStore<i32, ()>, sid: &str) -> Option<i32> {
+        let init = || (0, IpeCmd::<()>::None);
+        match reconstruct(s, sid, &init).await {
+            Rejoin::Restored { model, .. } => Some(model),
+            Rejoin::Live(_) | Rejoin::Rebuilt { .. } | Rejoin::Miss => None,
+        }
+    }
+
     #[tokio::test]
     async fn memory_store_get_set_delete() {
         let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         assert!(s.get("a").await.is_none());
         s.set("a", handle()).await;
-        assert!(matches!(s.get("a").await, Some(StoreHit::Web(_))));
+        assert!(s.get("a").await.is_some());
         s.delete("a").await;
         assert!(s.get("a").await.is_none());
     }
@@ -2042,7 +1951,7 @@ mod tests {
     }
 
     /// Restart survival: a store writes a checkpoint, a FRESH store over the same
-    /// file (no mem-cache) decodes it as a `Cold` model.
+    /// file (no mem-cache) restores it verbatim through a claimed lookup.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_checkpoint_survives_restart() {
@@ -2054,26 +1963,27 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            s.set("s1", handle_i32(42)).await;
+            s.set(SID, handle_i32(42)).await;
             // same-process get is a Web cache hit
-            assert!(matches!(s.get("s1").await, Some(StoreHit::Web(_))));
+            assert!(s.get(SID).await.is_some());
         }
         {
             // "restart": new store, empty mem-cache → decodes the checkpoint
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            match s.get("s1").await {
-                Some(StoreHit::Cold(m)) => assert_eq!(m, 42),
-                _ => panic!("expected Cold(42) after restart"),
-            }
+            assert_eq!(
+                restored_i32(&s, SID).await,
+                Some(42),
+                "the checkpoint restores verbatim after a restart"
+            );
         }
         let _ = std::fs::remove_file(p);
     }
 
     /// H24: a checkpoint written under a DIFFERENT Model schema tag is
-    /// rejected BEFORE deserialization — `get()` returns `None` (fresh
-    /// `init`), never `Some(Cold(stale_shape))`.
+    /// never restored — a claimed lookup is a miss (fresh `init`), never a
+    /// stale shape.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_rejects_a_row_written_by_a_different_schema_tag() {
@@ -2085,7 +1995,7 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), [0xAA; 32])
                 .await
                 .unwrap();
-            s.set("s1", handle_i32(42)).await;
+            s.set(SID, handle_i32(42)).await;
         }
         {
             // "redeploy with a changed Model": same file, different tag.
@@ -2093,7 +2003,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                s.get("s1").await.is_none(),
+                restored_i32(&s, SID).await.is_none(),
                 "a foreign-schema checkpoint must be rejected before deserialize"
             );
         }
@@ -2101,7 +2011,7 @@ mod tests {
     }
 
     /// The gate isn't "always reject": the SAME tag on both sides still
-    /// round-trips the checkpoint as `Cold`.
+    /// restores the checkpoint verbatim.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_accepts_a_row_written_by_the_same_schema_tag() {
@@ -2113,16 +2023,17 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), [0xAA; 32])
                 .await
                 .unwrap();
-            s.set("s1", handle_i32(42)).await;
+            s.set(SID, handle_i32(42)).await;
         }
         {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), [0xAA; 32])
                 .await
                 .unwrap();
-            match s.get("s1").await {
-                Some(StoreHit::Cold(m)) => assert_eq!(m, 42),
-                _ => panic!("expected Cold(42) under the SAME schema tag"),
-            }
+            assert_eq!(
+                restored_i32(&s, SID).await,
+                Some(42),
+                "the checkpoint restores verbatim under the same schema tag"
+            );
         }
         let _ = std::fs::remove_file(p);
     }
@@ -2134,7 +2045,7 @@ mod tests {
         let Ok(url) = crate::system::read_env_var("IPE_TEST_PG_URL") else {
             return;
         };
-        let sid = format!("pgtest_h24_{}", std::process::id());
+        let sid = test_sid(1);
         {
             let s: PostgresStore<i32, ()> =
                 PostgresStore::new(&url, Duration::from_secs(60), [0xAA; 32])
@@ -2149,7 +2060,7 @@ mod tests {
                     .await
                     .unwrap();
             assert!(
-                s.get(&sid).await.is_none(),
+                restored_i32(&s, &sid).await.is_none(),
                 "a foreign-schema checkpoint must be rejected before deserialize"
             );
             s.delete(&sid).await;
@@ -2164,7 +2075,7 @@ mod tests {
         let Ok(url) = crate::system::read_env_var("IPE_TEST_REDIS_URL") else {
             return;
         };
-        let sid = format!("redistest_h24_{}", std::process::id());
+        let sid = test_sid(2);
         {
             let s: RedisStore<i32, ()> = RedisStore::new(&url, Duration::from_secs(60), [0xAA; 32])
                 .await
@@ -2177,7 +2088,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                s.get(&sid).await.is_none(),
+                restored_i32(&s, &sid).await.is_none(),
                 "a foreign-schema checkpoint must be rejected before deserialize"
             );
             s.delete(&sid).await;
@@ -2199,7 +2110,7 @@ mod tests {
         let Ok(url) = crate::system::read_env_var("IPE_TEST_PG_URL") else {
             return;
         };
-        let sid = format!("pgtest_{}", std::process::id());
+        let sid = test_sid(3);
         {
             let s: PostgresStore<i32, ()> =
                 PostgresStore::new(&url, Duration::from_secs(60), TEST_TAG)
@@ -2207,17 +2118,18 @@ mod tests {
                     .unwrap();
             s.delete(&sid).await;
             s.set(&sid, handle_i32(7)).await;
-            assert!(matches!(s.get(&sid).await, Some(StoreHit::Web(_))));
+            assert!(s.get(&sid).await.is_some());
         }
         {
             let s: PostgresStore<i32, ()> =
                 PostgresStore::new(&url, Duration::from_secs(60), TEST_TAG)
                     .await
                     .unwrap();
-            match s.get(&sid).await {
-                Some(StoreHit::Cold(m)) => assert_eq!(m, 7),
-                _ => panic!("expected Cold(7) after restart"),
-            }
+            assert_eq!(
+                restored_i32(&s, &sid).await,
+                Some(7),
+                "the checkpoint restores verbatim after a restart"
+            );
             s.delete(&sid).await;
         }
     }
@@ -2229,23 +2141,24 @@ mod tests {
         let Ok(url) = crate::system::read_env_var("IPE_TEST_REDIS_URL") else {
             return;
         };
-        let sid = format!("redistest_{}", std::process::id());
+        let sid = test_sid(4);
         {
             let s: RedisStore<i32, ()> = RedisStore::new(&url, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
             s.delete(&sid).await;
             s.set(&sid, handle_i32(9)).await;
-            assert!(matches!(s.get(&sid).await, Some(StoreHit::Web(_))));
+            assert!(s.get(&sid).await.is_some());
         }
         {
             let s: RedisStore<i32, ()> = RedisStore::new(&url, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            match s.get(&sid).await {
-                Some(StoreHit::Cold(m)) => assert_eq!(m, 9),
-                _ => panic!("expected Cold(9) after restart"),
-            }
+            assert_eq!(
+                restored_i32(&s, &sid).await,
+                Some(9),
+                "the checkpoint restores verbatim after a restart"
+            );
             s.delete(&sid).await;
         }
     }
@@ -2280,7 +2193,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) VALUES (?, ?, ?, ?)",
         )
-        .bind("cold_sid")
+        .bind(COLD_SID)
         .bind(encode_checkpoint(&TEST_TAG, &41_i32).unwrap())
         .bind(now_secs())
         .bind(hex::encode(TEST_TAG))
@@ -2296,15 +2209,15 @@ mod tests {
             "only the locally-set session has a live handle; the cold row \
              (no SSE connection in this process) must be excluded"
         );
-        // The cold row is still a valid checkpoint through get().
-        assert!(matches!(s.get("cold_sid").await, Some(StoreHit::Cold(41))));
+        // The cold row is still a valid checkpoint through a claimed lookup.
+        assert_eq!(restored_i32(&s, COLD_SID).await, Some(41));
         let _ = std::fs::remove_file(p);
     }
 
     /// `v2` wire format: the raw persisted blob is
     /// `base64(schema_tag(32) ++ serde_json(model))` — the JSON body is
     /// field-keyed and self-describing (what makes an additive splice
-    /// possible) — and a fresh store still round-trips it as `Cold`.
+    /// possible) — and a fresh store still restores it verbatim.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_new_format_round_trips_model_through_json() {
@@ -2318,9 +2231,10 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            s.set("s1", handle_i32(model)).await;
+            s.set(SID, handle_i32(model)).await;
             // Read the raw column back and assert the format identity.
-            let row: (String,) = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = 's1'")
+            let row: (String,) = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = ?")
+                .bind(SID)
                 .fetch_one(&s.pool)
                 .await
                 .unwrap();
@@ -2339,16 +2253,17 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            match s.get("s1").await {
-                Some(StoreHit::Cold(m)) => assert_eq!(m, 42),
-                _ => panic!("expected Cold(42) through the json path"),
-            }
+            assert_eq!(
+                restored_i32(&s, SID).await,
+                Some(42),
+                "the checkpoint restores verbatim through the json path"
+            );
         }
         let _ = std::fs::remove_file(p);
     }
 
     /// A non-base64 garbage row (seeded directly, bypassing `set()`) is
-    /// rejected cleanly by `get()` — `None`, NEVER a panic: it fails base64
+    /// rejected cleanly by a claimed lookup — a miss, NEVER a panic: it fails base64
     /// decode (or the tag prefix) and takes the same fail-soft path a
     /// corrupt blob always took.
     #[cfg(feature = "db")]
@@ -2364,7 +2279,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) VALUES (?, ?, ?, ?)",
         )
-        .bind("old")
+        .bind(OLD_SID)
         .bind("!! not base64 !!")
         .bind(now_secs())
         .bind(hex::encode(TEST_TAG))
@@ -2372,7 +2287,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            s.get("old").await.is_none(),
+            restored_i32(&s, OLD_SID).await.is_none(),
             "a garbage row ages out via the fail-soft miss path"
         );
         let _ = std::fs::remove_file(p);
@@ -2386,8 +2301,8 @@ mod tests {
         let Ok(url) = crate::system::read_env_var("IPE_TEST_PG_URL") else {
             return;
         };
-        let sid = format!("pgtest_json_{}", std::process::id());
-        let old_sid = format!("pgtest_garbage_{}", std::process::id());
+        let sid = test_sid(5);
+        let old_sid = test_sid(6);
         {
             let s: PostgresStore<i32, ()> =
                 PostgresStore::new(&url, Duration::from_secs(60), TEST_TAG)
@@ -2413,11 +2328,12 @@ mod tests {
                 PostgresStore::new(&url, Duration::from_secs(60), TEST_TAG)
                     .await
                     .unwrap();
-            match s.get(&sid).await {
-                Some(StoreHit::Cold(m)) => assert_eq!(m, 7),
-                _ => panic!("expected Cold(7) through the json path"),
-            }
-            assert!(s.get(&old_sid).await.is_none());
+            assert_eq!(
+                restored_i32(&s, &sid).await,
+                Some(7),
+                "the checkpoint restores verbatim through the json path"
+            );
+            assert!(restored_i32(&s, &old_sid).await.is_none());
             s.delete(&sid).await;
             s.delete(&old_sid).await;
         }
@@ -2431,8 +2347,8 @@ mod tests {
         let Ok(url) = crate::system::read_env_var("IPE_TEST_REDIS_URL") else {
             return;
         };
-        let sid = format!("redistest_json_{}", std::process::id());
-        let old_sid = format!("redistest_garbage_{}", std::process::id());
+        let sid = test_sid(7);
+        let old_sid = test_sid(8);
         {
             let s: RedisStore<i32, ()> = RedisStore::new(&url, Duration::from_secs(60), TEST_TAG)
                 .await
@@ -2456,11 +2372,12 @@ mod tests {
             let s: RedisStore<i32, ()> = RedisStore::new(&url, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            match s.get(&sid).await {
-                Some(StoreHit::Cold(m)) => assert_eq!(m, 9),
-                _ => panic!("expected Cold(9) through the json path"),
-            }
-            assert!(s.get(&old_sid).await.is_none());
+            assert_eq!(
+                restored_i32(&s, &sid).await,
+                Some(9),
+                "the checkpoint restores verbatim through the json path"
+            );
+            assert!(restored_i32(&s, &old_sid).await.is_none());
             s.delete(&sid).await;
             s.delete(&old_sid).await;
         }
@@ -2720,7 +2637,7 @@ mod tests {
     }
 
     /// File-store restart survival: a store writes a checkpoint, a FRESH store
-    /// over the same file (empty mem-cache) decodes it as a `Cold` model — the
+    /// over the same file (empty mem-cache) restores it verbatim — the
     /// dev-handoff persistence path, with NO sqlx.
     #[cfg(feature = "web")]
     #[tokio::test]
@@ -2731,16 +2648,16 @@ mod tests {
         let _ = std::fs::remove_file(p);
         {
             let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
-            s.set("s1", handle_i32(42)).await;
-            assert!(matches!(s.get("s1").await, Some(StoreHit::Web(_))));
+            s.set(SID, handle_i32(42)).await;
+            assert!(s.get(SID).await.is_some());
         }
         {
             // "rebuild": a new store, empty mem-cache → decodes the checkpoint.
             let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
-            let cold = matches!(s.get("s1").await, Some(StoreHit::Cold(42)));
-            assert!(
-                cold,
-                "expected Cold(42) after a rebuild: the checkpoint must survive on disk"
+            assert_eq!(
+                restored_i32(&s, SID).await,
+                Some(42),
+                "the checkpoint must survive a rebuild on disk"
             );
         }
         let _ = std::fs::remove_file(p);
@@ -2748,7 +2665,7 @@ mod tests {
 
     /// H24 for the file store: a checkpoint written under a DIFFERENT Model
     /// schema tag (a Model-type change across a rebuild) is REJECTED before
-    /// deserialize — `get()` returns `None` (fresh `init`), never a torn Model.
+    /// deserialize — a claimed lookup is a miss (fresh `init`), never a torn Model.
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_rejects_a_row_written_by_a_different_schema_tag() {
@@ -2758,13 +2675,13 @@ mod tests {
         let _ = std::fs::remove_file(p);
         {
             let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), [0xAA; 32]);
-            s.set("s1", handle_i32(42)).await;
+            s.set(SID, handle_i32(42)).await;
         }
         {
             // "rebuild with a changed Model": same file, different tag.
             let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), [0xBB; 32]);
             assert!(
-                s.get("s1").await.is_none(),
+                restored_i32(&s, SID).await.is_none(),
                 "a foreign-schema checkpoint must be rejected before deserialize"
             );
         }
@@ -2783,7 +2700,7 @@ mod tests {
         std::fs::write(p, b"{ this is not valid json").unwrap();
         let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
         assert!(
-            s.get("anything").await.is_none(),
+            restored_i32(&s, SID).await.is_none(),
             "a corrupt map must yield an empty store, not a panic"
         );
         let _ = std::fs::remove_file(p);
@@ -2822,7 +2739,8 @@ mod tests {
         framed.extend_from_slice(&TEST_TAG);
         framed.resize(32 + MAX_CHECKPOINT_BYTES as usize + 1, b'0');
         let blob = B64.encode(&framed);
-        let decoded: Option<serde_json::Value> = decode_checkpoint(&TEST_TAG, &blob);
+        let init = || (serde_json::Value::Null, ());
+        let decoded = decode_or_reconstruct_checkpoint(&TEST_TAG, &blob, &init);
         assert!(
             decoded.is_none(),
             "an oversized body must decode to None, never OOM"
@@ -2838,8 +2756,9 @@ mod tests {
         let blob = encode_checkpoint(&TEST_TAG, &payload);
         assert!(blob.is_some(), "encoding a small Vec<u8> cannot fail");
         if let Some(blob) = blob {
-            let decoded: Option<Vec<u8>> = decode_checkpoint(&TEST_TAG, &blob);
-            assert_eq!(decoded, Some(payload));
+            let init = || (Vec::new(), ());
+            let decoded = decode_or_reconstruct_checkpoint(&TEST_TAG, &blob, &init);
+            assert!(matches!(decoded, Some(Decoded::Verbatim(p)) if p == payload));
         }
     }
 
@@ -2904,7 +2823,7 @@ mod tests {
         let p = path.to_string_lossy().into_owned();
         let _ = std::fs::remove_file(&p);
         let s: FileStore<i32, ()> = FileStore::new(&p, Duration::from_secs(60), TEST_TAG);
-        s.set("s1", handle_i32(42)).await;
+        s.set(SID, handle_i32(42)).await;
         let meta = std::fs::metadata(&p);
         assert!(
             meta.is_ok(),
@@ -3048,13 +2967,8 @@ mod tests {
             .await;
         }
         {
-            // NEW binary: three-field Model, NEW_TAG. The plain `get` (exact-tag
-            // gate) drops it; `get_reconstructing` splices it.
+            // NEW binary: three-field Model, NEW_TAG; `get_reconstructing` splices it.
             let s: FileStore<NewModel, ()> = FileStore::new(p, Duration::from_secs(60), NEW_TAG);
-            assert!(
-                s.get(SID).await.is_none(),
-                "the exact-tag gate still drops a schema-changed row"
-            );
             let init = || {
                 (
                     NewModel {
@@ -3167,8 +3081,8 @@ mod tests {
     }
 
     /// File store: an UNCHANGED schema still restores verbatim through
-    /// `get_reconstructing` — the fast (exact-tag) path is behaviour-identical
-    /// to `get`, state preserved, `init` never consulted.
+    /// `get_reconstructing` — the fast (exact-tag) path keeps the state and
+    /// never consults `init`.
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_reconstructing_unchanged_schema_restores_verbatim() {
@@ -3280,10 +3194,6 @@ mod tests {
                 SqliteStore::new(p, Duration::from_secs(60), NEW_TAG)
                     .await
                     .unwrap();
-            assert!(
-                s.get(SID).await.is_none(),
-                "the exact-tag gate still drops a schema-changed row"
-            );
             let init = || {
                 (
                     NewModel {

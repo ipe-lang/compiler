@@ -3529,10 +3529,7 @@ mod handlers {
         };
         let sid = sid_from_cookie(&headers);
         let entry = match &sid {
-            Some(s) => match st.store.get(s).await {
-                Some(store::StoreHit::Web(h)) => Some(h),
-                _ => None,
-            },
+            Some(s) => st.store.get(s).await,
             None => None,
         };
         let entry = match entry {
@@ -3776,10 +3773,6 @@ mod handlers {
             }
         };
         let entry = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => Some(h),
-            _ => None,
-        };
-        let entry = match entry {
             Some(e) => e,
             // X-Ipê-Web: 1 lets the client distinguish a genuine session-lost
             // 404 (reload to recover) from a wedged proxy (client.js probes for
@@ -4478,16 +4471,13 @@ mod handlers {
         // The session must exist (a live Web session) for the frame to have a
         // destination; an unknown sid is the same session-lost 404 the event
         // path returns.
-        match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(_)) => {}
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
+        if st.store.get(&sid).await.is_none() {
+            return (
+                StatusCode::NOT_FOUND,
+                [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
+                SESSION_LOST_BODY,
+            )
+                .into_response();
         }
         // Fail-closed boundary gate: reject an oversized / malformed /
         // over-nested frame BEFORE delivering it. A rejected frame is dropped
@@ -4547,8 +4537,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4614,8 +4604,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4676,8 +4666,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
             }
         };
@@ -4747,8 +4737,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4837,8 +4827,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4909,8 +4899,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -4982,8 +4972,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
             }
         };
@@ -5057,8 +5047,8 @@ mod handlers {
             }
         };
         let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
+            Some(h) => h,
+            None => {
                 return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
             }
         };
@@ -5915,12 +5905,7 @@ mod hot_appearance_push_tests {
             let model_after = store
                 .get("live")
                 .await
-                .and_then(|hit| match hit {
-                    store::StoreHit::Web(h) => {
-                        Some(h.lock().unwrap_or_else(|e| e.into_inner()).model)
-                    }
-                    _ => None,
-                })
+                .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).model)
                 .expect("session still present");
             assert_eq!(model_after, 7, "a hot-swap must not advance the Model");
         });
@@ -8235,7 +8220,7 @@ mod hot_init_session_scoping_tests {
     use crate::web::init_datum::{InitDatum, apply_init_hot, clear_dev_init_for_test};
     use crate::web::literal_table::{overlay_test_lock, set_dev_overlay_active_for_test};
     use crate::web::req::WebReq;
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -8439,14 +8424,14 @@ mod hot_init_session_scoping_tests {
             let live_sid = extract_sid(&resp1);
 
             // Confirm the store holds the live session at count = 0.
-            let live_model_before = match store.get(&live_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected live Web session in store"),
-            };
+            let live_model_before = store
+                .get(&live_sid)
+                .await
+                .expect("expected live Web session in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 live_model_before.count, 0,
                 "live session must start at count = 0 (compiled baked datum)"
@@ -8471,14 +8456,14 @@ mod hot_init_session_scoping_tests {
             );
 
             // Step 3: live session Model in the store is UNCHANGED (count = 0).
-            let live_model_after = match store.get(&live_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected live Web session still in store"),
-            };
+            let live_model_after = store
+                .get(&live_sid)
+                .await
+                .expect("expected live Web session still in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 live_model_after.count, 0,
                 "hot-init must not touch a live session's Model"
@@ -8499,14 +8484,14 @@ mod hot_init_session_scoping_tests {
             let fresh_sid = extract_sid(&resp2);
             assert_ne!(fresh_sid, live_sid, "fresh GET must mint a new session id");
 
-            let fresh_model = match store.get(&fresh_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected fresh Web session in store"),
-            };
+            let fresh_model = store
+                .get(&fresh_sid)
+                .await
+                .expect("expected fresh Web session in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 fresh_model.count, 99,
                 "fresh session must decode the replacement init datum (count = 99)"
@@ -9287,7 +9272,7 @@ mod emitted_router_behavior_tests {
 
     use super::*;
     use crate::web::req::WebReq;
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde::{Deserialize, Serialize};
@@ -9542,12 +9527,10 @@ mod emitted_router_behavior_tests {
     /// here; polling it avoids a fixed sleep — the same commit the second socket
     /// GET observes).
     async fn model_of(store: &Arc<Store>, sid: &str) -> Option<Model> {
-        match store.get(sid).await {
-            Some(StoreHit::Web(h)) => {
-                Some(h.lock().unwrap_or_else(|e| e.into_inner()).model.clone())
-            }
-            _ => None,
-        }
+        store
+            .get(sid)
+            .await
+            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).model.clone())
     }
 
     /// Wait (bounded) for the async `drive_session` task to commit a model
@@ -10138,7 +10121,7 @@ mod route_entry_cmd_tests {
     use super::*;
     use crate::web::req::WebReq;
     use crate::web::route::{RenderArg, RenderRefusal, Route, RoutePath, render_route};
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde::{Deserialize, Serialize};
@@ -10360,10 +10343,7 @@ mod route_entry_cmd_tests {
     }
 
     async fn handle_of(store: &Store, sid: &str) -> Option<SessionHandle<Model, Msg>> {
-        match store.get(sid).await {
-            Some(StoreHit::Web(h)) => Some(h),
-            _ => None,
-        }
+        store.get(sid).await
     }
 
     async fn model_of(store: &Store, sid: &str) -> Option<Model> {
@@ -10441,18 +10421,34 @@ mod route_entry_cmd_tests {
 
     #[async_trait::async_trait]
     impl SessionStore<Model, Msg> for ColdStore {
-        async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
-            match self.live.get(sid).await {
-                Some(hit) => Some(hit),
-                None if sid == self.cold_sid => Some(StoreHit::Cold(Model {
-                    page: Page::Home,
-                    log: vec!["persisted".to_owned()],
-                })),
-                None => None,
-            }
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.live.get(sid).await
         }
         fn admission(&self) -> &store::SidAdmission {
             self.live.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            _make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            if !self.admission().admits(&claim) {
+                return store::Rejoin::Miss;
+            }
+            if let Some(h) = self.live.get(claim.key().as_str()).await {
+                return store::Rejoin::Live(h);
+            }
+            if claim.key().as_str() == self.cold_sid {
+                store::Rejoin::Restored {
+                    claim,
+                    model: Model {
+                        page: Page::Home,
+                        log: vec!["persisted".to_owned()],
+                    },
+                }
+            } else {
+                store::Rejoin::Miss
+            }
         }
         async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
             self.live.set(sid, handle).await;
@@ -10729,11 +10725,18 @@ mod route_entry_cmd_tests {
 
     #[async_trait::async_trait]
     impl SessionStore<Model, Msg> for GatedStore {
-        async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
             self.inner.get(sid).await
         }
         fn admission(&self) -> &store::SidAdmission {
             self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            self.inner.get_reconstructing(claim, make_init).await
         }
         async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
             self.entered.notify_one();
