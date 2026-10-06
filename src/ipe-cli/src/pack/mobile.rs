@@ -164,8 +164,8 @@ pub const fn require_web_spa(cap: WebSpaCapability) -> Result<(), MobileRefusal>
 /// A typed, fail-closed refusal from the mobile packager.
 ///
 /// Every mobile-packaging error the packager itself raises is a member here, so
-/// the CLI boundary renders each with a stable code and remedy and no path
-/// produces a bundle it should have refused.
+/// the CLI boundary renders each with its remedy (and its stable code, where one
+/// is registered) and no path produces a bundle it should have refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MobileRefusal {
     /// No mobile-OS host word was given, and there is no host default for a
@@ -179,7 +179,7 @@ pub enum MobileRefusal {
     /// The app is a `Web` app but its `[wasm]` mode is off/absent, so a
     /// `--target wasm` build produces no hostable SPA bundle.
     WasmDisabled,
-    /// `browser.basePath` read after the wasm build differs from the one the
+    /// `delivery.browser.basePath` read after the wasm build differs from the one the
     /// shell was planned for, so the bundle's URLs and the shell's handlers
     /// would name two different mount paths.
     ManifestChanged {
@@ -1364,7 +1364,8 @@ fn ios_readme(root_name: &str, base: &MountBase) -> String {
          The client-wasm SPA rides under App/www/; a WKURLSchemeHandler serves it under\n\
          the custom ipe-app:// scheme with a correct MIME per file (WKWebView cannot\n\
          cleanly file://-load .wasm), so the WKWebView loads {entry} —\n\
-         a local origin, never a remote URL; any other request answers a local 404.\n\
+         a local origin, never a remote URL; an ipe-app:// request outside the\n\
+         bundle answers a local 404.\n\
          The Info.plist NS…UsageDescription keys are derived from the app's accepted\n\
          web capabilities — never hand-authored.\n\
          \n\
@@ -2442,6 +2443,21 @@ mod tests {
         }
     }
 
+    /// The iOS note scopes its 404 claim to the custom scheme: a `WKWebView`
+    /// routes only `ipe-app://` loads to the handler, never an `https://` one.
+    #[test]
+    fn ios_readme_scopes_the_local_404_to_the_custom_scheme() {
+        for (base, dir) in bases() {
+            let readme = shell_text(MobileOs::Ios, &base, "README.txt");
+            assert!(readme.contains(&format!("ipe-app://app{dir}")), "{readme}");
+            assert!(
+                readme.contains("an ipe-app:// request outside the\nbundle answers a local 404"),
+                "{readme}"
+            );
+            assert!(!readme.contains("any other request"), "{readme}");
+        }
+    }
+
     // ── Literal escapers: hostile text never leaves its literal ───────────────
 
     /// The UTF-16 units of every `\uXXXX` Java's pre-lexing translation would
@@ -2456,7 +2472,7 @@ mod tests {
                 backslashes = 0;
                 continue;
             }
-            if backslashes % 2 == 0 {
+            if backslashes.is_multiple_of(2) {
                 let rest: String = chars.iter().skip(at + 1).collect();
                 let hex = rest.trim_start_matches('u');
                 if hex.len() < rest.len() {
@@ -2483,8 +2499,8 @@ mod tests {
             ("\u{7}", r#""\007""#),
             ("\u{7f}", r#""\177""#),
             ("é", r#""\351""#),
-            ("\u{2028}", r#"" ""#),
-            ("😀", r#""😀""#),
+            ("\u{2028}", r#""\u2028""#),
+            ("😀", r#""\ud83d\ude00""#),
         ];
         for (text, quoted) in cases {
             let literal = JavaStringLiteral::of(text).to_string();
