@@ -496,29 +496,35 @@ fn watch_banner_active_with(base: &str, dev: Option<&crate::telemetry::DevIntent
 }
 
 #[cfg(feature = "server")]
-pub fn render_page_full(sid: &str, base: &str, body: &str, csrf_token: &str) -> String {
+pub fn render_page_full(
+    sid: &str,
+    base: &crate::encoding::MountBase,
+    body: &str,
+    csrf_token: &str,
+) -> String {
     // sid_js / base_js / csrf_js: Rust Debug ("{:?}") of a &str yields a
     // double-quoted, properly-escaped JS string literal for plain ASCII
     // session ids, base paths, and the hex CSRF token.
     let sid_js = format!("{sid:?}");
-    let base_js = format!("{base:?}");
+    let prefix = base.prefix();
+    let base_js = format!("{prefix:?}");
     let csrf_js = format!("{csrf_token:?}");
-    let dev_banner = dev_console_banner(base);
+    let dev_banner = dev_console_banner(prefix);
     // Content-addressed client asset URL and SRI hash — computed once at first call.
     let (hex16, b64) = client_js_hashes();
     // Honour the sub-app base prefix so the external script request goes through
     // the parent proxy (same as /_ipe/sse, /_ipe/event, /_ipe/console).
-    let client_src = format!("{base}/_ipe/client.{hex16}.js");
+    let client_src = format!("{prefix}/_ipe/client.{hex16}.js");
     let integrity = format!("sha256-{b64}");
     let config_js = web_client_config_js();
-    let head_extra = format!("<meta name=\"ipe-base\" content=\"{base}\">");
+    let head_extra = format!("<meta name=\"ipe-base\" content=\"{prefix}\">");
     let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}");
     // Custom-element glue: an EXTERNAL, SRI-pinned `<script type="module">` plus a
     // `modulepreload` SRI pin per author asset. Empty when the program registers
     // no widget, so a widget-free page is byte-identical and its CSP is unchanged.
     // It loads AFTER the client core so `__ipeEmitWidgetUp` can reuse `__ipeSend`.
     let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
-    let port_glue = port_glue_script(base);
+    let port_glue = port_glue_script(prefix);
     let tail_scripts = format!(
         "<script>window.__IPE_SID={sid_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
          <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
@@ -557,23 +563,24 @@ fn port_glue_script(_base: &str) -> String {
 #[cfg(all(feature = "server", feature = "debugger"))]
 fn render_page_full_with_overlay(
     sid: &str,
-    base: &str,
+    base: &crate::encoding::MountBase,
     body: &str,
     csrf_token: &str,
     overlay: &str,
 ) -> String {
     let sid_js = format!("{sid:?}");
-    let base_js = format!("{base:?}");
+    let prefix = base.prefix();
+    let base_js = format!("{prefix:?}");
     let csrf_js = format!("{csrf_token:?}");
-    let dev_banner = dev_console_banner(base);
+    let dev_banner = dev_console_banner(prefix);
     let (hex16, b64) = client_js_hashes();
-    let client_src = format!("{base}/_ipe/client.{hex16}.js");
+    let client_src = format!("{prefix}/_ipe/client.{hex16}.js");
     let integrity = format!("sha256-{b64}");
     let config_js = web_client_config_js();
-    let head_extra = format!("<meta name=\"ipe-base\" content=\"{base}\">");
+    let head_extra = format!("<meta name=\"ipe-base\" content=\"{prefix}\">");
     let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}{overlay}");
     let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
-    let port_glue = port_glue_script(base);
+    let port_glue = port_glue_script(prefix);
     let tail_scripts = format!(
         "<script>window.__IPE_SID={sid_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
          <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
@@ -1625,7 +1632,10 @@ fn page_response(
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let html = render_page_full(sid, &web_base_path(), body, csrf_token);
+    let Ok(base) = web_mount_base() else {
+        return ttl_unavailable_response();
+    };
+    let html = render_page_full(sid, &base, body, csrf_token);
     // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
     // when this specific request arrived over TLS at a trusted proxy
     // (`request_is_https`, opt-in via `IPE_TRUSTED_PROXY` — closes the gap where
@@ -1674,7 +1684,10 @@ fn page_response_with_overlay(
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let html = render_page_full_with_overlay(sid, &web_base_path(), body, csrf_token, overlay);
+    let Ok(base) = web_mount_base() else {
+        return ttl_unavailable_response();
+    };
+    let html = render_page_full_with_overlay(sid, &base, body, csrf_token, overlay);
     let Ok(ttl) = web_ttl() else {
         return ttl_unavailable_response();
     };
@@ -1883,7 +1896,8 @@ fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
     WEB_TTL.parse(raw).map(std::time::Duration::from_secs)
 }
 
-/// The `503` a request answers when the session TTL cannot be resolved.
+/// The `503` a request answers when the session TTL or the mount base cannot
+/// be resolved.
 #[cfg(feature = "server")]
 fn ttl_unavailable_response() -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -2684,6 +2698,11 @@ pub(crate) enum StartupRefusal {
         base: String,
         refusal: crate::encoding::DecodeRefusal,
     },
+    /// The base path is outside the mount-base grammar every shell URL uses.
+    MountBase {
+        base: String,
+        refusal: crate::encoding::MountBaseRefusal,
+    },
     /// An environment ceiling the app applies is present but malformed.
     Ceiling(crate::system::EnvCeilingRefusal),
     /// `IPE_WEB_FRAME_ANCESTORS` has no `frame-ancestors` representation.
@@ -2700,6 +2719,9 @@ impl std::fmt::Display for StartupRefusal {
             Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
             Self::BasePath { base, refusal } => {
                 write!(f, "web base path `{base}` is malformed: {refusal}")
+            }
+            Self::MountBase { base, refusal } => {
+                write!(f, "web base path `{base}` is not a mount base: {refusal}")
             }
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
             Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
@@ -2726,6 +2748,31 @@ fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
         base: base.to_string(),
         refusal,
     })
+}
+
+/// Parse the normalised base path into the [`crate::encoding::MountBase`]
+/// every page and widget URL is built from. The empty base is the root.
+///
+/// # Errors
+///
+/// [`StartupRefusal::MountBase`] for a base outside the mount-base grammar.
+#[cfg(feature = "server")]
+fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRefusal> {
+    crate::encoding::MountBase::parse(base).map_err(|refusal| StartupRefusal::MountBase {
+        base: base.to_string(),
+        refusal,
+    })
+}
+
+/// The process's [`crate::encoding::MountBase`], read from `IPE_WEB_BASE_PATH`.
+///
+/// # Errors
+///
+/// [`StartupRefusal::MountBase`] for a base outside the mount-base grammar;
+/// [`build_web_router`] refuses such a base before any request is served.
+#[cfg(feature = "server")]
+fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
+    parse_mount_base(&web_base_path())
 }
 
 /// A router that answers EVERY path with `503 Service Unavailable` and the
@@ -5052,6 +5099,7 @@ where
     // a malformed base refuses the router rather than a per-request re-parse
     // that silently matches the unstripped path.
     let sse_base = Arc::new(parse_route_base(&web_base_path())?);
+    let mount_base = web_mount_base()?;
     // Every environment ceiling the app applies resolves here, so a malformed
     // one refuses the router instead of a request; the per-request sites
     // re-read and refuse that request on their own.
@@ -5366,19 +5414,26 @@ where
     // the page's SRI pins, so a tampered asset makes the browser refuse the
     // module. A widget-free program registers nothing here (no extra routes).
     if widget_assets::has_widgets() {
-        let base = web_base_path();
+        // The child router is root-relative: a parent proxy strips the base
+        // before forwarding, so routes sit at the root and only the URLs the
+        // page and glue carry are built from `mount_base`.
+        let route_root = crate::encoding::MountBase::root();
         for asset in widget_assets::registered() {
-            let path = widget_assets::widget_asset_path(&asset.content);
+            let path = route_root.url_of(&widget_assets::widget_asset_path(&asset.content));
             let content: &'static str = &asset.content;
             router = router.route(&path, get(move || async move { serve_widget_js(content) }));
         }
-        let glue_path = widget_assets::glue_path(&base, widget_assets::WidgetTransport::Server);
+        let glue_path = route_root.url_of(&widget_assets::glue_path(
+            &mount_base,
+            widget_assets::WidgetTransport::Server,
+        ));
         // The glue body folds in the base-prefixed author URLs, so it is
         // computed once here for the process (base is stable at startup) and
         // leaked to `'static` for the handler — a one-time, bounded allocation
         // sized by the program's widget count, never per-request.
         let glue_body: &'static str = Box::leak(
-            widget_assets::glue_js(&base, widget_assets::WidgetTransport::Server).into_boxed_str(),
+            widget_assets::glue_js(&mount_base, widget_assets::WidgetTransport::Server)
+                .into_boxed_str(),
         );
         router = router.route(
             &glue_path,
@@ -6140,18 +6195,28 @@ mod base_path_tests {
 
     #[test]
     fn render_page_threads_base_into_meta_and_window_global() {
-        let root = render_page_full("sid1", "", "<b>x</b>", "deadbeef");
+        let root = render_page_full(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            "<b>x</b>",
+            "deadbeef",
+        );
         assert!(root.contains("<meta name=\"ipe-base\" content=\"\">"));
         assert!(root.contains("window.__IPE_BASE=\"\""));
 
-        let sub = render_page_full("sid1", "/_ipe/console", "<b>x</b>", "deadbeef");
+        let sub = render_page_full("sid1", &console_base(), "<b>x</b>", "deadbeef");
         assert!(sub.contains("<meta name=\"ipe-base\" content=\"/_ipe/console\">"));
         assert!(sub.contains("window.__IPE_BASE=\"/_ipe/console\""));
     }
 
     #[test]
     fn render_page_emits_external_client_script_with_sri() {
-        let root = render_page_full("sid1", "", "<b>x</b>", "tok1");
+        let root = render_page_full(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            "<b>x</b>",
+            "tok1",
+        );
         // Per-session values stay inline.
         assert!(root.contains("window.__IPE_SID=\"sid1\""));
         assert!(root.contains("window.__IPE_CSRF_TOKEN=\"tok1\""));
@@ -6167,9 +6232,14 @@ mod base_path_tests {
 
     #[test]
     fn render_page_sub_app_prefixes_client_src() {
-        let sub = render_page_full("sid1", "/_ipe/console", "<b>x</b>", "tok1");
+        let sub = render_page_full("sid1", &console_base(), "<b>x</b>", "tok1");
         // External script src must carry the base prefix.
         assert!(root_or_sub_has_prefixed_client_src(&sub, "/_ipe/console"));
+    }
+
+    #[allow(clippy::expect_used)] // a fixed literal inside the mount-base grammar
+    fn console_base() -> crate::encoding::MountBase {
+        crate::encoding::MountBase::parse("/_ipe/console").expect("a well-formed base")
     }
 
     fn root_or_sub_has_prefixed_client_src(html: &str, base: &str) -> bool {
@@ -6842,6 +6912,24 @@ mod sse_reconnect_reconcile_tests {
                 "{skip} names no route path"
             );
         }
+    }
+
+    /// A base path outside the mount-base grammar is refused when the router
+    /// is built, as the typed `StartupRefusal::MountBase` naming the base; a
+    /// well-formed base and the empty root are admitted.
+    #[test]
+    fn non_mount_base_path_is_refused_at_build() {
+        for bad in ["/a b", "/app/x%41", "/a\"b", "/a//b", "/app/.."] {
+            assert!(
+                matches!(
+                    parse_mount_base(bad),
+                    Err(StartupRefusal::MountBase { ref base, .. }) if base == bad
+                ),
+                "base {bad} must be refused"
+            );
+        }
+        assert_eq!(parse_mount_base(""), Ok(crate::encoding::MountBase::root()));
+        assert!(parse_mount_base("/_ipe/console").is_ok_and(|b| b.prefix() == "/_ipe/console"));
     }
 
     /// A base path that does not decode is refused when the router is built,
@@ -9349,6 +9437,30 @@ mod emitted_router_behavior_tests {
                 "{name}={raw:?} must refuse the router, got {refused:?}"
             );
         }
+    }
+
+    /// A base path that decodes but is outside the mount-base grammar refuses
+    /// the router at startup, so no page or widget URL is built from it.
+    #[tokio::test]
+    async fn a_non_mount_base_path_refuses_the_router() {
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/app/x%41");
+        let refused = build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+            false,
+        )
+        .err();
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert!(
+            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base == "/app/x%41"),
+            "a non-mount base must refuse the router, got {refused:?}"
+        );
     }
 
     /// A present `IPE_HTTP_BIND` that is not an IP address refuses the app

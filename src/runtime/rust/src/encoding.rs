@@ -638,6 +638,28 @@ impl BundlePath {
     pub fn file_segments(&self) -> impl Iterator<Item = &str> {
         self.0.split('/')
     }
+
+    /// The content-addressed path of a `kind` asset whose digest begins `head`.
+    ///
+    /// Infallible: the stem is fixed and lowercase hex is in the segment grammar.
+    #[must_use]
+    pub fn hashed(kind: HashedAsset, head: [u8; 8]) -> Self {
+        let stem = match kind {
+            HashedAsset::Widget => "widget",
+            HashedAsset::WidgetGlue => "widget-glue",
+        };
+        let hex: String = head.iter().map(|b| format!("{b:02x}")).collect();
+        Self(format!("_ipe/{stem}.{hex}.js"))
+    }
+}
+
+/// A content-addressed asset family served under `_ipe/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashedAsset {
+    /// An author widget module: `_ipe/widget.<hex16>.js`.
+    Widget,
+    /// The widget registration glue: `_ipe/widget-glue.<hex16>.js`.
+    WidgetGlue,
 }
 
 /// A route parameter name, proven to match `[A-Za-z_][A-Za-z0-9_]*`.
@@ -1558,6 +1580,23 @@ mod tests {
         );
         let at_limit = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN - 1));
         assert!(MountBase::parse(&at_limit).is_ok_and(|b| b.prefix() == at_limit));
+    }
+
+    /// A content-addressed path is a member of the parsed grammar, byte for byte.
+    #[test]
+    fn hashed_bundle_path_is_in_the_grammar() {
+        let head = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        for (kind, want) in [
+            (HashedAsset::Widget, "_ipe/widget.0123456789abcdef.js"),
+            (
+                HashedAsset::WidgetGlue,
+                "_ipe/widget-glue.0123456789abcdef.js",
+            ),
+        ] {
+            let path = BundlePath::hashed(kind, head);
+            assert_eq!(path.rel(), want);
+            assert_eq!(BundlePath::parse(want), Ok(path));
+        }
     }
 
     /// Every malformed bundle path is refused with its own variant; each
