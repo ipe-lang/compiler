@@ -366,7 +366,7 @@ pub fn classify(path: &str) -> ModuleClass {
     let head = rest.split('.').next().unwrap_or(rest);
     match head {
         // Native effects — direct DB, file, server-http, and the secret surface.
-        "Db" | "File" | "Auth" => ModuleClass::NativeEffect,
+        "Db" | "File" | "Auth" | "Server" => ModuleClass::NativeEffect,
         // `Ipe.Http.Server` is a native effect (it binds a socket and serves);
         // the plain client `Ipe.Http` fetch surface is portable.
         "Http" => {
@@ -563,6 +563,9 @@ mod tests {
         assert_eq!(classify("Ipe.Http.Stream"), ModuleClass::ClientHttp);
         assert_eq!(classify("Ipe.Crypto"), ModuleClass::Pure);
         assert_eq!(classify("Ipe.Db.Store"), ModuleClass::NativeEffect);
+        // A compiled-source `Ipe.Server.*` path outside the kernel catalog
+        // still classifies as the native server family.
+        assert_eq!(classify("Ipe.Server.Extra"), ModuleClass::NativeEffect);
     }
 
     /// The coverage check refuses a canonical with no class row, a duplicated
