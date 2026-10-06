@@ -283,6 +283,11 @@ type Lexing
     | InChar
     | InCharEscape
     | InLifetime
+    | AfterLess
+    | BareEscape
+    | AfterDollar
+    | InAnsi
+    | InAnsiEscape
     | AfterOpener Char
     | InLineComment
     | BlockOpened
@@ -421,6 +426,44 @@ hasRawStrings lang =
             True
 
         Shell ->
+            False
+
+        Ipe ->
+            False
+
+        Unknown ->
+            False
+
+
+-- Whether `<` and the operator character after it are one token (`<-`,
+-- `<<`, `<|`, `<=`), as the Ipê compiler's lexer munches them: `<--x` is an
+-- arrow then `-x`, never a `--` comment.
+munchesLess : Lang -> Bool
+munchesLess lang =
+    case lang of
+        Ipe ->
+            True
+
+        Rust ->
+            False
+
+        Shell ->
+            False
+
+        Unknown ->
+            False
+
+
+-- Whether a `\` outside quotes escapes the next character and `$'…'` is a
+-- string that honours `\'`: the shell's, no other language's. `\'`, `\"`
+-- and `\ ` open no string and end no word.
+shellEscapes : Lang -> Bool
+shellEscapes lang =
+    case lang of
+        Shell ->
+            True
+
+        Rust ->
             False
 
         Ipe ->
@@ -622,6 +665,36 @@ step lang c ( lexing, buf, toks ) =
             else
                 begin lang AfterText c (toks ++ [ Plain buf ])
 
+        AfterLess ->
+            if String.contains (String.fromChar c) "-<|=" then
+                ( Start AfterText, "", toks ++ [ Plain (String.append buf (String.fromChar c)) ] )
+
+            else
+                begin lang (gapAfter '<') c (toks ++ [ Plain buf ])
+
+        BareEscape ->
+            ( Start AfterText, "", toks ++ [ Plain (String.append buf (String.fromChar c)) ] )
+
+        AfterDollar ->
+            if c == '\'' then
+                ( InAnsi, "$'", toks )
+
+            else
+                begin lang AfterText c (toks ++ [ Plain buf ])
+
+        InAnsi ->
+            if c == '\'' then
+                ( Start AfterText, "", toks ++ [ Str (String.append buf "'") ] )
+
+            else if c == '\\' then
+                ( InAnsiEscape, String.append buf "\\", toks )
+
+            else
+                ( InAnsi, String.append buf (String.fromChar c), toks )
+
+        InAnsiEscape ->
+            ( InAnsi, String.append buf (String.fromChar c), toks )
+
         AfterOpener first ->
             afterOpener lang first c buf toks
 
@@ -757,6 +830,15 @@ begin lang gap c toks =
     else if c == '\'' then
         beginTick lang toks
 
+    else if c == '<' && munchesLess lang then
+        ( AfterLess, "<", toks )
+
+    else if c == '\\' && shellEscapes lang then
+        ( BareEscape, "\\", toks )
+
+    else if c == '$' && shellEscapes lang then
+        ( AfterDollar, "$", toks )
+
     else if opensComment lang c then
         ( AfterOpener c, String.fromChar c, toks )
 
@@ -875,6 +957,21 @@ finish lang ( lexing, buf, toks ) =
 
         InLifetime ->
             toks ++ [ Plain buf ]
+
+        AfterLess ->
+            toks ++ [ Plain buf ]
+
+        BareEscape ->
+            toks ++ [ Plain buf ]
+
+        AfterDollar ->
+            toks ++ [ Plain buf ]
+
+        InAnsi ->
+            toks ++ [ Str buf ]
+
+        InAnsiEscape ->
+            toks ++ [ Str buf ]
 
         AfterOpener _ ->
             toks ++ [ Plain buf ]

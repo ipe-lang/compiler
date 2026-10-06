@@ -473,6 +473,44 @@ shellSingleQuoteRaw =
         == [ Str "'a\\'", Plain " ", Ident "b" ]
 
 
+-- An Ipê `<` munches the operator character after it, as the compiler's
+-- lexer does, so `<--y` is an arrow then `-y` and `<<--y` a composition then
+-- a comment. Red if `<--y` draws code as a `--` comment, or if `<<` is not
+-- one token (then `<<--y` loses its comment).
+ipeLessMunch : Bool
+ipeLessMunch =
+    toks Highlight.Ipe "x <--y"
+        == [ Ident "x", Plain " ", Plain "<-", Plain "-", Ident "y" ]
+        && toks Highlight.Ipe "x <<--y"
+        == [ Ident "x", Plain " ", Plain "<<", Comment "--y" ]
+        && toks Highlight.Ipe "x <|--y"
+        == [ Ident "x", Plain " ", Plain "<|", Comment "--y" ]
+        && toks Highlight.Ipe "x < --y"
+        == [ Ident "x", Plain " ", Plain "<", Plain " ", Comment "--y" ]
+        && toks Highlight.Rust "a <--b"
+        == [ Ident "a", Plain " ", Plain "<", Plain "-", Plain "-", Ident "b" ]
+
+
+-- A shell `\` outside quotes escapes the next character, and `$'…'` honours
+-- `\'`. Red if `\'` or `\"` opens a string that draws the code after it as
+-- text, if `\ #` starts a comment mid-word, or if `$'\''` closes at its
+-- escaped quote and opens a string over the rest of the line.
+shellBareEscape : Bool
+shellBareEscape =
+    toks Highlight.Shell "\\' a \\'"
+        == [ Plain "\\'", Plain " ", Ident "a", Plain " ", Plain "\\'" ]
+        && toks Highlight.Shell "\\\" a \\\""
+        == [ Plain "\\\"", Plain " ", Ident "a", Plain " ", Plain "\\\"" ]
+        && toks Highlight.Shell "a\\ #b"
+        == [ Ident "a", Plain "\\ ", Plain "#", Ident "b" ]
+        && toks Highlight.Shell "$'\\'' a"
+        == [ Str "$'\\''", Plain " ", Ident "a" ]
+        && toks Highlight.Shell "'a' \"b\""
+        == [ Str "'a'", Plain " ", Str "\"b\"" ]
+        && toks Highlight.Shell "$x"
+        == [ Plain "$", Ident "x" ]
+
+
 -- A Rust `'"'` is one char literal, opening no string. Red if its `"` opens
 -- a string that swallows the rest of the line.
 rustQuoteChar : Bool
@@ -588,6 +626,10 @@ lexLossless =
             , "'"
             , "\"a\nb\""
             , "/* a\r\n b */ c\r\n"
+            , "x <--y <<--z <"
+            , "a \\\nb \\' \\"
+            , "$'a\\'b\nc' $"
+            , "$'open\\"
             ]
     in
     List.all (\lang -> List.all (lossless lang) corpus) [ Highlight.Rust, Highlight.Shell, Highlight.Ipe, Highlight.Unknown ]
@@ -709,6 +751,8 @@ checks =
         , Task.succeed ( "an Ipe triple string closes at its first triple quote", ipeTripleString )
         , Task.succeed ( "a shell # comments only at a word start", shellHashAtWordStart )
         , Task.succeed ( "a shell single-quoted string escapes nothing", shellSingleQuoteRaw )
+        , Task.succeed ( "an Ipe < munches its operator like the compiler", ipeLessMunch )
+        , Task.succeed ( "a shell backslash escapes outside quotes", shellBareEscape )
         , Task.succeed ( "a Rust quote char opens no string", rustQuoteChar )
         , Task.succeed ( "a Rust lifetime opens no char literal", rustLifetime )
         , Task.succeed ( "a Rust block comment nests", rustNestedBlock )
