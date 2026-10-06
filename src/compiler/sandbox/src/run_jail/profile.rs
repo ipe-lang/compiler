@@ -114,6 +114,14 @@ impl ProcCap {
         Ok(Self(cap))
     }
 
+    /// A cap known at compile time; a count outside `1..=MAX` fails the build.
+    #[must_use]
+    pub const fn of<const N: u32>() -> Self {
+        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a literal cap is zero or past the ceiling [ledger #boundary]
+        const { assert!(N >= 1 && N <= Self::MAX.get()) };
+        Self(NonZeroU32::MIN.saturating_add(N - 1))
+    }
+
     /// The cap as a count.
     #[must_use]
     pub const fn get(self) -> u32 {
