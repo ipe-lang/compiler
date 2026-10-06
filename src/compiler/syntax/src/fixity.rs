@@ -1,8 +1,8 @@
-//! Binary-operator fixity: the one table every consumer groups a chain by.
+//! Binary operators: the closed set and the one fixity table it groups by.
 //!
-//! The parser records an operator chain flat; name resolution re-associates it
-//! and the formatter decides where a multiline chain may break. Both read
-//! [`fixity`], so the two can never disagree about how an expression groups.
+//! The parser records an operator chain flat, each operator one [`BinOp`];
+//! name resolution re-associates the chain from [`BinOp::fixity`]. The set is
+//! closed: an operator text outside it has no [`BinOp`], so it has no fixity.
 
 /// Operator associativity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub enum Assoc {
 
 /// The precedence (higher binds tighter) and associativity of one operator.
 ///
-/// Built only by [`fixity`], so every value is a row of the table.
+/// Built only by [`BinOp::fixity`], so every value is a row of the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fixity {
     prec: u8,
@@ -42,39 +42,201 @@ impl Fixity {
     }
 }
 
-/// The fixity of `op`.
+/// One binary operator of the surface language.
 ///
-/// Covers the core operator set; any other operator defaults to `9 L`, the
-/// same catch-all the reference grammar uses.
-#[must_use]
-pub const fn fixity(op: &str) -> Fixity {
-    match op.as_bytes() {
-        b"*" | b"/" | b"//" | b"%" => Fixity::new(7, Assoc::Left),
-        // `|.` (parser-pipeline discard, yields left's result) shares prec 6
-        // left-assoc with arithmetic `+`/`-`.
-        b"+" | b"-" | b"|." => Fixity::new(6, Assoc::Left),
-        b"++" | b"::" => Fixity::new(5, Assoc::Right),
-        // `|=` (parser-pipeline keep, yields right's result): prec 5 like
-        // `++`/`::` but left-assoc. `a |= b |. c` groups as `a |= (b |. c)`
-        // because `|.` at 6 is tighter.
-        b"|=" => Fixity::new(5, Assoc::Left),
-        b"==" | b"/=" | b"<" | b">" | b"<=" | b">=" => Fixity::new(4, Assoc::None),
-        b"&&" => Fixity::new(3, Assoc::Right),
-        b"||" => Fixity::new(2, Assoc::Right),
-        // Pipes are the loosest operators: `x |> f |> g` = `(x |> f) |> g`,
-        // `f <| g <| x` = `f <| (g <| x)`.
-        b"|>" => Fixity::new(0, Assoc::Left),
-        b"<|" => Fixity::new(0, Assoc::Right),
-        // Composition is the tightest: `f << g << h` = `f << (g << h)`.
-        // `>>` is left-assoc (`(f >> g) >> h`), which is the `9 L` catch-all.
-        b"<<" => Fixity::new(9, Assoc::Right),
-        _ => Fixity::new(9, Assoc::Left),
+/// The set is closed: every operator the parser accepts is one variant, and
+/// [`BinOp::ALL`] lists each variant once, in declaration order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BinOp {
+    /// `*`
+    Mul,
+    /// `/`
+    FloatDiv,
+    /// `//`
+    IntDiv,
+    /// `+`
+    Add,
+    /// `-`
+    Sub,
+    /// `|.`, the parser-pipeline ignorer (yields the left result).
+    ParserIgnorer,
+    /// `++`
+    Append,
+    /// `::`
+    Cons,
+    /// `|=`, the parser-pipeline keeper (yields the right result).
+    ParserKeeper,
+    /// `==`
+    Eq,
+    /// `/=`
+    Neq,
+    /// `<`
+    Lt,
+    /// `>`
+    Gt,
+    /// `<=`
+    Le,
+    /// `>=`
+    Ge,
+    /// `&&`
+    And,
+    /// `||`
+    Or,
+    /// `|>`
+    PipeRight,
+    /// `<|`
+    PipeLeft,
+    /// `<<`
+    ComposeLeft,
+    /// `>>`
+    ComposeRight,
+}
+
+impl BinOp {
+    /// Every operator, once each, in declaration order.
+    pub const ALL: [Self; 21] = [
+        Self::Mul,
+        Self::FloatDiv,
+        Self::IntDiv,
+        Self::Add,
+        Self::Sub,
+        Self::ParserIgnorer,
+        Self::Append,
+        Self::Cons,
+        Self::ParserKeeper,
+        Self::Eq,
+        Self::Neq,
+        Self::Lt,
+        Self::Gt,
+        Self::Le,
+        Self::Ge,
+        Self::And,
+        Self::Or,
+        Self::PipeRight,
+        Self::PipeLeft,
+        Self::ComposeLeft,
+        Self::ComposeRight,
+    ];
+
+    /// The operator's source text.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::Mul => "*",
+            Self::FloatDiv => "/",
+            Self::IntDiv => "//",
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::ParserIgnorer => "|.",
+            Self::Append => "++",
+            Self::Cons => "::",
+            Self::ParserKeeper => "|=",
+            Self::Eq => "==",
+            Self::Neq => "/=",
+            Self::Lt => "<",
+            Self::Gt => ">",
+            Self::Le => "<=",
+            Self::Ge => ">=",
+            Self::And => "&&",
+            Self::Or => "||",
+            Self::PipeRight => "|>",
+            Self::PipeLeft => "<|",
+            Self::ComposeLeft => "<<",
+            Self::ComposeRight => ">>",
+        }
+    }
+
+    /// The operator spelled exactly `text`, or `None` outside the closed set.
+    #[must_use]
+    pub const fn from_text(text: &str) -> Option<Self> {
+        let mut rest: &[Self] = &Self::ALL;
+        while let [op, tail @ ..] = rest {
+            if bytes_eq(op.text().as_bytes(), text.as_bytes()) {
+                return Some(*op);
+            }
+            rest = tail;
+        }
+        None
+    }
+
+    /// The operator's precedence and associativity.
+    #[must_use]
+    pub const fn fixity(self) -> Fixity {
+        match self {
+            Self::Mul | Self::FloatDiv | Self::IntDiv => Fixity::new(7, Assoc::Left),
+            // `|.` shares prec 6 left-assoc with arithmetic `+`/`-`.
+            Self::Add | Self::Sub | Self::ParserIgnorer => Fixity::new(6, Assoc::Left),
+            Self::Append | Self::Cons => Fixity::new(5, Assoc::Right),
+            // `|=`: prec 5 like `++`/`::` but left-assoc. `a |= b |. c` groups as
+            // `a |= (b |. c)` because `|.` at 6 is tighter.
+            Self::ParserKeeper => Fixity::new(5, Assoc::Left),
+            Self::Eq | Self::Neq | Self::Lt | Self::Gt | Self::Le | Self::Ge => {
+                Fixity::new(4, Assoc::None)
+            }
+            Self::And => Fixity::new(3, Assoc::Right),
+            Self::Or => Fixity::new(2, Assoc::Right),
+            // Pipes are the loosest operators: `x |> f |> g` = `(x |> f) |> g`,
+            // `f <| g <| x` = `f <| (g <| x)`.
+            Self::PipeRight => Fixity::new(0, Assoc::Left),
+            Self::PipeLeft => Fixity::new(0, Assoc::Right),
+            // Composition is the tightest: `f << g << h` = `f << (g << h)`,
+            // `f >> g >> h` = `(f >> g) >> h`.
+            Self::ComposeLeft => Fixity::new(9, Assoc::Right),
+            Self::ComposeRight => Fixity::new(9, Assoc::Left),
+        }
     }
 }
 
+/// `const`-context byte-exact slice equality (`<[u8]>::eq` is not `const`).
+const fn bytes_eq(mut a: &[u8], mut b: &[u8]) -> bool {
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_tail @ ..], [y, b_tail @ ..]) if *x == *y => {
+                a = a_tail;
+                b = b_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// `true` iff [`BinOp::ALL`] holds every variant once in declaration order,
+/// no two texts are equal, and each text round-trips through
+/// [`BinOp::from_text`].
+const fn closed_set_round_trips() -> bool {
+    let mut position = 0;
+    let mut rest: &[BinOp] = &BinOp::ALL;
+    while let [op, tail @ ..] = rest {
+        if *op as usize != position {
+            return false;
+        }
+        let mut others: &[BinOp] = tail;
+        while let [other, others_tail @ ..] = others {
+            if bytes_eq(op.text().as_bytes(), other.text().as_bytes()) {
+                return false;
+            }
+            others = others_tail;
+        }
+        if !matches!(BinOp::from_text(op.text()), Some(found) if found as usize == *op as usize) {
+            return false;
+        }
+        position += 1;
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `BinOp::ALL` misses or repeats a variant, two operators share a text, or a text does not round-trip through `from_text` [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    closed_set_round_trips(),
+    "BinOp::ALL must list every variant once in order, with distinct texts that round-trip"
+);
+
 #[cfg(test)]
 mod tests {
-    use super::{Assoc, fixity};
+    use super::{Assoc, BinOp, closed_set_round_trips};
 
     #[test]
     fn core_operator_fixities() {
@@ -82,7 +244,6 @@ mod tests {
             ("*", 7, Assoc::Left),
             ("/", 7, Assoc::Left),
             ("//", 7, Assoc::Left),
-            ("%", 7, Assoc::Left),
             ("+", 6, Assoc::Left),
             ("-", 6, Assoc::Left),
             ("|.", 6, Assoc::Left),
@@ -102,17 +263,28 @@ mod tests {
             ("<<", 9, Assoc::Right),
             (">>", 9, Assoc::Left),
         ];
-        for &(op, prec, assoc) in table {
-            let f = fixity(op);
-            assert_eq!((f.prec(), f.assoc()), (prec, assoc), "fixity of `{op}`");
+        assert_eq!(table.len(), BinOp::ALL.len(), "every operator has a row");
+        for &(text, prec, assoc) in table {
+            let op = BinOp::from_text(text);
+            assert!(op.is_some(), "`{text}` is an operator");
+            let Some(op) = op else { return };
+            let f = op.fixity();
+            assert_eq!((f.prec(), f.assoc()), (prec, assoc), "fixity of `{text}`");
         }
     }
 
     #[test]
-    fn unknown_operator_defaults_to_nine_left() {
-        for op in ["<?>", "</>", "&", "", "===", "+ "] {
-            let f = fixity(op);
-            assert_eq!((f.prec(), f.assoc()), (9, Assoc::Left), "fixity of `{op}`");
+    fn unknown_operator_text_is_none() {
+        for text in ["%", "<?>", "</>", "&", "", "===", "+ ", "|", "."] {
+            assert_eq!(BinOp::from_text(text), None, "`{text}` is not an operator");
+        }
+    }
+
+    #[test]
+    fn closed_set_text_round_trips() {
+        assert!(closed_set_round_trips());
+        for op in BinOp::ALL {
+            assert_eq!(BinOp::from_text(op.text()), Some(op), "`{}`", op.text());
         }
     }
 }
