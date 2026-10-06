@@ -475,3 +475,36 @@ fn fmt_output_too_large_screen_sanitizes_the_path() {
         "the refusal names the file: {screen}"
     );
 }
+
+/// A source of exactly `len` bytes: one small module padded with newlines.
+fn stdin_source_of(len: usize) -> Vec<u8> {
+    let mut src = b"module M exposing (x)\n\n\nx =\n    1\n".to_vec();
+    src.resize(len, b'\n');
+    src
+}
+
+/// Stdin one byte past the source read cap is refused before it is formatted.
+#[test]
+fn fmt_stdin_past_the_read_cap_is_refused() {
+    let cap = usize::try_from(ipe::io_bounded::SOURCE_READ_CAP).unwrap();
+    let res = fmt::format_stdin_from(stdin_source_of(cap + 1).as_slice());
+    assert!(
+        matches!(&res, Err(CliError::FileTooLarge { max, .. }) if *max == ipe::io_bounded::SOURCE_READ_CAP),
+        "{res:?}"
+    );
+}
+
+/// Stdin of exactly the source read cap is read in full and handed to the
+/// formatter, never refused as too large.
+#[test]
+fn fmt_stdin_at_the_read_cap_is_read() {
+    let cap = usize::try_from(ipe::io_bounded::SOURCE_READ_CAP).unwrap();
+    let res = fmt::format_stdin_from(stdin_source_of(cap).as_slice());
+    assert!(
+        !matches!(&res, Err(CliError::FileTooLarge { .. })),
+        "{res:?}"
+    );
+    if let Ok(out) = &res {
+        assert_eq!(out.source.len(), cap, "the whole input was read");
+    }
+}

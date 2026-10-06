@@ -55,6 +55,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ipe_diagnostics::Diagnostic;
@@ -205,16 +206,40 @@ fn report_check(
     }
 }
 
-/// Format stdin to stdout. When `check` is true, print a diff instead.
-fn run_fmt_stdin(check: bool) -> Result<(), CliError> {
-    let src = crate::io_bounded::read_opened_capped(
-        std::io::stdin().lock(),
+/// A source read from standard input and its formatted text.
+#[derive(Debug)]
+pub struct StdinFormatted {
+    /// The source exactly as read.
+    pub source: String,
+    /// The formatter's output for `source`.
+    pub formatted: String,
+}
+
+/// Read a source from `reader` the way `ipe fmt` reads stdin, and format it.
+///
+/// The read stops at [`crate::io_bounded::SOURCE_READ_CAP`], the same ceiling a
+/// source file is read under.
+///
+/// # Errors
+/// [`CliError::FileTooLarge`] when the input passes the read cap;
+/// [`CliError::Io`] when it cannot be read or is not UTF-8; otherwise the
+/// errors of [`run_fmt`] for a file named `<stdin>`.
+pub fn format_stdin_from(reader: impl Read) -> Result<StdinFormatted, CliError> {
+    let source = crate::io_bounded::read_opened_capped(
+        reader,
         Path::new("<stdin>"),
         crate::io_bounded::SOURCE_READ_CAP,
     )?;
+    let formatted = format_source(&source).map_err(|e| fmt_err_to_cli(Path::new("<stdin>"), e))?;
+    Ok(StdinFormatted { source, formatted })
+}
 
-    let formatted =
-        format_source(&src).map_err(|e| fmt_err_to_cli(&PathBuf::from("<stdin>"), e))?;
+/// Format stdin to stdout. When `check` is true, print a diff instead.
+fn run_fmt_stdin(check: bool) -> Result<(), CliError> {
+    let StdinFormatted {
+        source: src,
+        formatted,
+    } = format_stdin_from(std::io::stdin().lock())?;
 
     if check {
         if formatted != src {
