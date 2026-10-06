@@ -512,13 +512,12 @@ pub fn read_stream_capped(
     max: u64,
 ) -> Result<String, CliError> {
     let mut buf = Vec::new();
-    reader
-        .take(max.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(|source| CliError::Io {
+    std::io::Read::read_to_end(&mut reader.take(max.saturating_add(1)), &mut buf).map_err(
+        |source| CliError::Io {
             path: path.to_path_buf(),
             source,
-        })?;
+        },
+    )?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {
         return Err(CliError::FileTooLarge {
             path: path.to_path_buf(),
