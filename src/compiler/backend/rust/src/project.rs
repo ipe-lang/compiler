@@ -5659,16 +5659,29 @@ mod tests {
     use super::{
         CARGO_DEP_TOML, CARGO_TOML, CARGO_WASM_DEP_TOML, RUNTIME_CONFIG_RS_DB_POSTGRES,
         RUNTIME_CONFIG_RS_DB_SQLITE, RUNTIME_MOD_RS_WEB_APPEND, RUNTIME_MOD_RS_WEB_CORE_APPEND,
-        WASM_ABSENT_MODULE_PATHS, WASM_CARGO_TOML, WASM_PRESENT_OVERRIDES,
+        WASM_ABSENT_MODULE_PATHS, WASM_CARGO_TOML, WASM_ENTRY, WASM_PRESENT_OVERRIDES,
         async_runtime_cargo_toml, crypto_core_heavy_cargo_toml, db_cargo_toml,
         dev_posture_cargo_toml, insert_wasi_linker_config, jwt_cargo_toml, runtime_bindings,
-        server_cargo_toml, shake_ffi_by_fn_ident, ssrf_cargo_toml, wasm_present_modules,
-        wasm_runtime_bindings, web_cargo_toml, wrapper_call_paths,
+        server_cargo_toml, shake_ffi_by_fn_ident, ssrf_cargo_toml, wasm_hydrate_entry,
+        wasm_present_modules, wasm_runtime_bindings, web_cargo_toml, wrapper_call_paths,
     };
     use crate::DbDriver;
     use crate::crate_specs;
     use ipe_backend::RelPath;
     use std::collections::BTreeMap;
+
+    /// The browser entries replace `fn main` and run on the microtask queue: a
+    /// browser has no process to end, so neither holds a process exit.
+    #[test]
+    fn wasm_entries_hold_no_process_exit() {
+        let hydrate = wasm_hydrate_entry("MainHydrationState");
+        for entry in [WASM_ENTRY, hydrate.as_str()] {
+            assert!(
+                !entry.contains("process::") && !entry.contains("exit_process"),
+                "a browser entry ends no process: {entry}"
+            );
+        }
+    }
 
     /// Drift-guard for the `overflow-checks = false` dev-profile flag, stated
     /// once per emitted manifest source. Since #1124 the flag is a pure

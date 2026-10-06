@@ -177,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn epilogue_ends_the_process_only_through_the_runtime_exit_funnel() -> DResult<()> {
+        // Both `fn main` outcomes reach `exit_process`, which runs the exit hook
+        // and the exporter flush; a raw `std::process::exit` skips both.
+        let tail = epilogue()?;
+        assert!(
+            !tail.contains("process::exit"),
+            "the epilogue ends the process outside the runtime funnel: {tail}"
+        );
+        assert!(tail.contains("IpeResult::Ok(_) => ipe_runtime::system::exit_process(0)"));
+        assert!(tail.contains("ipe_runtime::system::exit_process(1)"));
+        Ok(())
+    }
+
+    #[test]
     fn preamble_is_a_prefix_of_golden() -> DResult<()> {
         assert!(GOLDEN.starts_with(&preamble(true)?));
         Ok(())
