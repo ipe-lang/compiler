@@ -65,8 +65,8 @@ pub(crate) struct Member {
 /// posture of every member ([`Umbrella::intent`]), so a posture is a namespace
 /// rather than a flag: `watch` is a member of `dev` only, so hot-reloading a
 /// shipping build cannot be expressed. A group carries no handler of its own:
-/// `ipe <group> --help` renders its subpage, and a bare `ipe <group>` is refused
-/// with [`CliError::GroupRequired`].
+/// `ipe <group> --help` renders its subpage; a bare `ipe dev` renders the same
+/// page, and a bare `ipe release` is refused with [`CliError::GroupRequired`].
 pub(crate) struct Group {
     /// The umbrella this group is.
     umbrella: Umbrella,
