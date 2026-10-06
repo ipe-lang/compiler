@@ -1435,13 +1435,39 @@ like : (row -> String) -> String -> Cond row
 
 `like accessor pattern` — the rows where the `String` column named by
 `accessor` matches the SQL `LIKE` `pattern`. The pattern binds as a
-parameter (wildcards `%` / `_` are DATA the SQL engine interprets, never
-SQL text the caller injects). The accessor must name a `String` field.
+parameter, never as SQL text. It is still a pattern: `%` and `_` in it,
+including any that come from user text, are wildcards. It is read under
+`ESCAPE '\'` on every engine, so `\%`, `\_` and `\\` match `%`, `_` and `\`
+literally; a pattern ending in an unpaired `\` is refused as a typed error.
+For a literal prefix, use `Store.startsWith`. The accessor must name a
+`String` field.
 
 Example:
 
     Store.query store
         |> Store.where (Store.like .name "al%")
+
+## `startsWith`
+
+```ipe
+startsWith : (row -> String) -> String -> Cond row
+```
+
+`startsWith accessor prefix` — the rows where the `String` column named by
+`accessor` begins with `prefix`, read literally: `%`, `_` and `\` in it,
+including any that come from user text, match only themselves. The prefix
+binds as a parameter, never as SQL text, and the match is case-sensitive on
+every engine under a deterministic collation; a Postgres column declared
+with a nondeterministic collation (a case-insensitive ICU one) compares by
+that collation instead. It renders through `Sql.startsWith`, so an empty
+prefix, one holding a NUL character, or one longer than 16384 bytes is
+refused as a typed error before any SQL is sent. The accessor must name a
+`String` field.
+
+Example:
+
+    Store.query store
+        |> Store.where (Store.startsWith .name searchText)
 
 ## `isNull`
 

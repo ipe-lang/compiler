@@ -831,6 +831,7 @@ pub const PRELUDE_QUALIFIERS: &[(&str, &[&str])] = &[
                 "isNotNull",
                 "inList",
                 "like",
+                "startsWith",
                 "exists",
             ],
         ),

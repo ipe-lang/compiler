@@ -1550,6 +1550,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `lte` | `lte accessor value` — the rows where the column named by `accessor` is |
 | `lteBy` | `lteBy codec accessor value` — the accessor-typed less-than-or-equal leaf |
 | `like` | `like accessor pattern` — the rows where the `String` column named by |
+| `startsWith` | `startsWith accessor prefix` — the rows where the `String` column named by |
 | `isNull` | `isNull accessor` — the rows where the column named by `accessor` is SQL |
 | `notNull` | `notNull accessor` — the rows where the column named by `accessor` is NOT |
 | `inList` | `inList accessor values` — the rows where the column named by `accessor` |
