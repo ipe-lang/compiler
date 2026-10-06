@@ -693,7 +693,7 @@ reading the {stream} of a child failed ({kind}) — its output is incomplete, so
 
 ## cli-source-symlink
 
-{path}: is a symlink — ipe never follows a symlink to a file it finds by convention or while walking imports; replace the link with the real file or directory
+{path}: is a symlink or is reached through one — ipe never follows a symlink to a file it finds by convention or while walking imports; replace the link with the real file or directory
 
 ## cli-path-escape
 
