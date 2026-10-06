@@ -1286,7 +1286,7 @@ impl std::fmt::Display for LocalSource {
             Self::LinkProbe => "linker probe",
             Self::FfiInspect => "FFI inspector",
             Self::WasmTool => "wasm bundle tool",
-            Self::SelfRun => "`ipe dev run` of an example",
+            Self::SelfRun => "self-run of a snippet",
         })
     }
 }
