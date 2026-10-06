@@ -3,9 +3,13 @@
 //! It parses with `syn`, so a construct named inside a string literal or a
 //! comment is invisible and a construct split across lines (`panic!\n(…)`,
 //! `obj.\nunwrap()`) is still found. Test-only exemption is decided per syntax
-//! node: a `#[cfg(test)]` or `#[test]` exempts exactly the item, arm, field,
+//! node: a test-only `#[cfg(…)]` exempts exactly the item, arm, field,
 //! statement, or expression it decorates and never reaches a sibling, so a
-//! `,` or `;` can never carry the exemption past its node. Macro bodies have no
+//! `,` or `;` can never carry the exemption past its node. A bare `#[test]`
+//! exempts nothing: it names a shadowable attribute macro, not a cfg, so its
+//! function compiles into production unless a `cfg(test)` scope encloses it.
+//! An exemption or ban is never keyed on a name the program can rebind: a
+//! renamed `process` module or `std` crate root is itself a hit. Macro bodies have no
 //! syntax tree; their tokens are scanned flat, where a test-only attribute
 //! exempts only a whole item it parses as.
 //!
@@ -22,8 +26,9 @@ use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{
     Arm, Attribute, Expr, ExprLit, ExprMethodCall, ExprPath, Field, FieldValue, ForeignItem,
-    ImplItem, Item, ItemMod, ItemUse, Lit, LitStr, Local, Macro, MacroDelimiter, Meta, MetaList,
-    Pat, Path, StmtMacro, TraitItem, Type, TypeParamBound, UseTree, Variant, Visibility,
+    ImplItem, Item, ItemExternCrate, ItemMod, ItemUse, Lit, LitStr, Local, Macro, MacroDelimiter,
+    Meta, MetaList, Pat, Path, StmtMacro, TraitItem, Type, TypeParamBound, UseTree, Variant,
+    Visibility,
 };
 
 mod includes;
@@ -102,6 +107,12 @@ const CFG_ATTR: &str = "cfg_attr";
 /// Macro compiling another file's tokens in place.
 const INCLUDE_MACRO: &str = "include";
 
+/// Module holding [`PROCESS_FNS`].
+const PROCESS_MODULE: &str = "process";
+
+/// Crate root that holds [`PROCESS_MODULE`].
+const STD_CRATE: &str = "std";
+
 /// Directory name of test code a production module must never declare.
 const TESTS_MODULE: &str = "tests";
 
@@ -109,8 +120,7 @@ const TESTS_MODULE: &str = "tests";
 ///
 /// Test-only nodes are skipped: this scanner attests the *production* surface.
 /// A node is test-only when a `#[cfg(…)]` whose predicate is guaranteed active
-/// only under the `test` cfg decorates it, or when `#[test]` decorates a
-/// function.
+/// only under the `test` cfg decorates it.
 ///
 /// # Errors
 ///
@@ -147,7 +157,7 @@ pub fn scan_source(src: &str) -> Result<Scan, syn::Error> {
 
 /// Scan an already-parsed file; `src` is its text, read for audit markers.
 pub(crate) fn scan_file(file: &syn::File, src: &str) -> Scan {
-    if attrs_test_only(&file.attrs, false) {
+    if attrs_test_only(&file.attrs) {
         return Scan::default();
     }
     let mut scanner = Scanner::default();
@@ -165,12 +175,10 @@ pub(crate) fn scan_file(file: &syn::File, src: &str) -> Scan {
 
 /// Whether `attrs` make their node test-only.
 ///
-/// `is_fn` admits a bare `#[test]`, which gates only a function.
-pub(crate) fn attrs_test_only(attrs: &[Attribute], is_fn: bool) -> bool {
-    attrs.iter().any(|attr| {
-        meta_is_test_cfg(&attr.meta)
-            || (is_fn && matches!(&attr.meta, Meta::Path(path) if path.is_ident("test")))
-    })
+/// Only the builtin `cfg` exempts: a bare `#[test]` names an attribute macro
+/// a program can shadow, so it never marks its node as test code.
+pub(crate) fn attrs_test_only(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| meta_is_test_cfg(&attr.meta))
 }
 
 /// Whether `meta` is `cfg(P)` with a test-only predicate `P`.
@@ -283,34 +291,34 @@ fn expr_attrs(expr: &Expr) -> &[Attribute] {
 
 /// Whether an item is test-only.
 pub(crate) fn item_test_only(item: &Item) -> bool {
-    let (attrs, is_fn): (&[Attribute], bool) = match item {
-        Item::Const(i) => (&i.attrs, false),
-        Item::Enum(i) => (&i.attrs, false),
-        Item::ExternCrate(i) => (&i.attrs, false),
-        Item::Fn(i) => (&i.attrs, true),
-        Item::ForeignMod(i) => (&i.attrs, false),
-        Item::Impl(i) => (&i.attrs, false),
-        Item::Macro(i) => (&i.attrs, false),
-        Item::Mod(i) => (&i.attrs, false),
-        Item::Static(i) => (&i.attrs, false),
-        Item::Struct(i) => (&i.attrs, false),
-        Item::Trait(i) => (&i.attrs, false),
-        Item::TraitAlias(i) => (&i.attrs, false),
-        Item::Type(i) => (&i.attrs, false),
-        Item::Union(i) => (&i.attrs, false),
-        Item::Use(i) => (&i.attrs, false),
-        _ => (&[], false),
+    let attrs: &[Attribute] = match item {
+        Item::Const(i) => &i.attrs,
+        Item::Enum(i) => &i.attrs,
+        Item::ExternCrate(i) => &i.attrs,
+        Item::Fn(i) => &i.attrs,
+        Item::ForeignMod(i) => &i.attrs,
+        Item::Impl(i) => &i.attrs,
+        Item::Macro(i) => &i.attrs,
+        Item::Mod(i) => &i.attrs,
+        Item::Static(i) => &i.attrs,
+        Item::Struct(i) => &i.attrs,
+        Item::Trait(i) => &i.attrs,
+        Item::TraitAlias(i) => &i.attrs,
+        Item::Type(i) => &i.attrs,
+        Item::Union(i) => &i.attrs,
+        Item::Use(i) => &i.attrs,
+        _ => &[],
     };
-    attrs_test_only(attrs, is_fn)
+    attrs_test_only(attrs)
 }
 
 /// Whether an impl item is test-only.
 fn impl_item_test_only(item: &ImplItem) -> bool {
     match item {
-        ImplItem::Const(i) => attrs_test_only(&i.attrs, false),
-        ImplItem::Fn(i) => attrs_test_only(&i.attrs, true),
-        ImplItem::Type(i) => attrs_test_only(&i.attrs, false),
-        ImplItem::Macro(i) => attrs_test_only(&i.attrs, false),
+        ImplItem::Const(i) => attrs_test_only(&i.attrs),
+        ImplItem::Fn(i) => attrs_test_only(&i.attrs),
+        ImplItem::Type(i) => attrs_test_only(&i.attrs),
+        ImplItem::Macro(i) => attrs_test_only(&i.attrs),
         _ => false,
     }
 }
@@ -318,10 +326,10 @@ fn impl_item_test_only(item: &ImplItem) -> bool {
 /// Whether a trait item is test-only.
 fn trait_item_test_only(item: &TraitItem) -> bool {
     match item {
-        TraitItem::Const(i) => attrs_test_only(&i.attrs, false),
-        TraitItem::Fn(i) => attrs_test_only(&i.attrs, true),
-        TraitItem::Type(i) => attrs_test_only(&i.attrs, false),
-        TraitItem::Macro(i) => attrs_test_only(&i.attrs, false),
+        TraitItem::Const(i) => attrs_test_only(&i.attrs),
+        TraitItem::Fn(i) => attrs_test_only(&i.attrs),
+        TraitItem::Type(i) => attrs_test_only(&i.attrs),
+        TraitItem::Macro(i) => attrs_test_only(&i.attrs),
         _ => false,
     }
 }
@@ -329,10 +337,10 @@ fn trait_item_test_only(item: &TraitItem) -> bool {
 /// Whether a foreign item is test-only.
 fn foreign_item_test_only(item: &ForeignItem) -> bool {
     match item {
-        ForeignItem::Fn(i) => attrs_test_only(&i.attrs, false),
-        ForeignItem::Static(i) => attrs_test_only(&i.attrs, false),
-        ForeignItem::Type(i) => attrs_test_only(&i.attrs, false),
-        ForeignItem::Macro(i) => attrs_test_only(&i.attrs, false),
+        ForeignItem::Fn(i) => attrs_test_only(&i.attrs),
+        ForeignItem::Static(i) => attrs_test_only(&i.attrs),
+        ForeignItem::Type(i) => attrs_test_only(&i.attrs),
+        ForeignItem::Macro(i) => attrs_test_only(&i.attrs),
         _ => false,
     }
 }
@@ -340,12 +348,10 @@ fn foreign_item_test_only(item: &ForeignItem) -> bool {
 /// End index of the whole item a flat test-only attribute gates, if any.
 ///
 /// `toks[start..]` follows the attribute. The item runs to the first top-level
-/// `;` or brace group and must parse as one item; a `cfg` gates any item, a
-/// bare `test` only a function. Anything else is not exempted.
+/// `;` or brace group and must parse as one item; only a test-only `cfg`
+/// gates it. Anything else is not exempted.
 fn gated_item_end(meta: &Meta, toks: &[TokenTree], start: usize) -> Option<usize> {
-    let cfg = meta_is_test_cfg(meta);
-    let bare_test = matches!(meta, Meta::Path(path) if path.is_ident("test"));
-    if !(cfg || bare_test) {
+    if !meta_is_test_cfg(meta) {
         return None;
     }
     let rest = toks.get(start..)?;
@@ -354,8 +360,27 @@ fn gated_item_end(meta: &Meta, toks: &[TokenTree], start: usize) -> Option<usize
             || matches!(tok, TokenTree::Group(g) if g.delimiter() == Delimiter::Brace)
     })?;
     let item: TokenStream = rest.get(..=last)?.iter().cloned().collect();
-    let item = syn::parse2::<Item>(item).ok()?;
-    (cfg || matches!(item, Item::Fn(_))).then_some(start.saturating_add(last).saturating_add(1))
+    syn::parse2::<Item>(item).ok()?;
+    Some(start.saturating_add(last).saturating_add(1))
+}
+
+/// The module a rename would hide from the path checks, if `name` under
+/// `parent` names one.
+///
+/// A banned call is matched on its `process::abort` / `process::exit` path, so
+/// an alias of `process` (`use std::process as p`, `use std::process::{self as
+/// p}`) or of the `std` root (`use ::std as s`, `extern crate std as s`) would
+/// let `p::exit` or `s::process::exit` through. The rename itself is the hit.
+fn renamed_root(name: &str, parent: Option<&Ident>) -> Option<&'static str> {
+    let parent = parent.map(name_of);
+    let named = |root: &str| name == root || (name == "self" && parent.as_deref() == Some(root));
+    if named(PROCESS_MODULE) {
+        Some(PROCESS_MODULE)
+    } else if named(STD_CRATE) && (parent.is_none() || name == "self") {
+        Some(STD_CRATE)
+    } else {
+        None
+    }
 }
 
 /// Visitor state for one file.
@@ -462,7 +487,7 @@ impl Scanner {
 
     /// Record banned names a `use` tree imports under another name or path.
     fn use_tree(&mut self, tree: &UseTree, parent: Option<&Ident>, exported: bool) {
-        let under_process = parent.is_some_and(|p| name_of(p) == "process");
+        let under_process = parent.is_some_and(|p| name_of(p) == PROCESS_MODULE);
         match tree {
             UseTree::Path(p) => self.use_tree(&p.tree, Some(&p.ident), exported),
             UseTree::Name(n) => {
@@ -478,14 +503,18 @@ impl Scanner {
             UseTree::Rename(r) => {
                 let name = name_of(&r.ident);
                 let line = line_of(&r.ident);
+                let rename = name_of(&r.rename);
                 if under_process && PROCESS_FNS.contains(&name.as_str()) {
                     self.hit(line, format!("process::{name}"));
+                }
+                if let Some(root) = renamed_root(&name, parent) {
+                    self.hit(line, format!("{root} as {rename}"));
                 }
                 let banned = [MACROS, METHODS, FNS]
                     .iter()
                     .any(|names| names.contains(&name.as_str()));
                 if banned {
-                    self.hit(line, format!("{name} as {}", name_of(&r.rename)));
+                    self.hit(line, format!("{name} as {rename}"));
                 }
                 if name == INCLUDE_MACRO {
                     self.aliased(line);
@@ -627,16 +656,32 @@ impl Scanner {
                     self.hit(line_of(f), format!("process::{fname}"));
                 }
             }
-        } else if name == "mod"
-            && let (Some(TokenTree::Ident(m)), Some(semi)) = (after, second)
-        {
-            let module = name_of(m);
-            if is_punct(semi, ';') && module.eq_ignore_ascii_case(TESTS_MODULE) {
-                self.refuse(
-                    line_of(m),
+        } else if name == "mod" {
+            match (after, second) {
+                (Some(TokenTree::Ident(m)), Some(semi)) => {
+                    let module = name_of(m);
+                    if is_punct(semi, ';') && module.eq_ignore_ascii_case(TESTS_MODULE) {
+                        self.refuse(
+                            line_of(m),
+                            IncludeForm::ModDecl,
+                            IncludeTarget::TestPath(module),
+                        );
+                    }
+                }
+                // A module named by a metavariable (`mod $n;`) or any other
+                // non-identifier token resolves to a file only at expansion,
+                // so the file it reaches cannot be judged here.
+                (
+                    Some(
+                        named @ (TokenTree::Punct(_) | TokenTree::Group(_) | TokenTree::Literal(_)),
+                    ),
+                    _,
+                ) => self.refuse(
+                    line,
                     IncludeForm::ModDecl,
-                    IncludeTarget::TestPath(module),
-                );
+                    IncludeTarget::Opaque(format!("mod {named}")),
+                ),
+                _ => {}
             }
         }
     }
@@ -684,7 +729,7 @@ impl<'ast> Visit<'ast> for Scanner {
     }
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
-        if attrs_test_only(expr_attrs(expr), false) {
+        if attrs_test_only(expr_attrs(expr)) {
             return;
         }
         match expr {
@@ -715,37 +760,37 @@ impl<'ast> Visit<'ast> for Scanner {
     }
 
     fn visit_arm(&mut self, arm: &'ast Arm) {
-        if !attrs_test_only(&arm.attrs, false) {
+        if !attrs_test_only(&arm.attrs) {
             visit::visit_arm(self, arm);
         }
     }
 
     fn visit_field_value(&mut self, field: &'ast FieldValue) {
-        if !attrs_test_only(&field.attrs, false) {
+        if !attrs_test_only(&field.attrs) {
             visit::visit_field_value(self, field);
         }
     }
 
     fn visit_field(&mut self, field: &'ast Field) {
-        if !attrs_test_only(&field.attrs, false) {
+        if !attrs_test_only(&field.attrs) {
             visit::visit_field(self, field);
         }
     }
 
     fn visit_variant(&mut self, variant: &'ast Variant) {
-        if !attrs_test_only(&variant.attrs, false) {
+        if !attrs_test_only(&variant.attrs) {
             visit::visit_variant(self, variant);
         }
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
-        if !attrs_test_only(&local.attrs, false) {
+        if !attrs_test_only(&local.attrs) {
             visit::visit_local(self, local);
         }
     }
 
     fn visit_stmt_macro(&mut self, stmt: &'ast StmtMacro) {
-        if !attrs_test_only(&stmt.attrs, false) {
+        if !attrs_test_only(&stmt.attrs) {
             visit::visit_stmt_macro(self, stmt);
         }
     }
@@ -827,6 +872,17 @@ impl<'ast> Visit<'ast> for Scanner {
             }
         }
         visit::visit_path(self, path);
+    }
+
+    fn visit_item_extern_crate(&mut self, item: &'ast ItemExternCrate) {
+        let name = name_of(&item.ident);
+        if let (Some((_, rename)), Some(root)) = (&item.rename, renamed_root(&name, None)) {
+            self.hit(
+                line_of(&item.ident),
+                format!("{root} as {}", name_of(rename)),
+            );
+        }
+        visit::visit_item_extern_crate(self, item);
     }
 
     fn visit_item_use(&mut self, item: &'ast ItemUse) {
@@ -1211,12 +1267,38 @@ fn f() {
             "fn f(o: Option<u8>) -> S {\n    S {\n        #[cfg(test)]\n        a: o.unwrap(),\n    }\n}\n",
             "fn f(o: Option<u8>) {\n    #[cfg(test)]\n    let a = o.unwrap();\n}\n",
             "#![cfg(test)]\nfn f(o: Option<u8>) {\n    o.unwrap();\n}\n",
-            "impl S {\n    #[test]\n    fn t() {\n        panic!();\n    }\n}\n",
+            "impl S {\n    #[cfg(test)]\n    fn t() {\n        panic!();\n    }\n}\n",
         ];
         for src in cases {
             assert!(scan_str(src).is_ok(), "must parse:\n{src}");
             assert_eq!(hit_lines(src), Vec::<usize>::new(), "not exempt:\n{src}");
         }
+    }
+
+    /// A bare `#[test]` exempts nothing: it names a shadowable attribute macro,
+    /// so outside a `cfg(test)` scope its function is production code.
+    #[test]
+    fn bare_test_attribute_is_production() {
+        let cases: [(&str, usize); 4] = [
+            ("#[test]\nfn t(o: Option<u8>) {\n    o.unwrap();\n}\n", 3),
+            (
+                "impl S {\n    #[test]\n    fn t() {\n        panic!();\n    }\n}\n",
+                4,
+            ),
+            (
+                "trait T {\n    #[test]\n    fn t() {\n        panic!();\n    }\n}\n",
+                4,
+            ),
+            (
+                "macro_rules! m {\n    () => {\n        #[test]\n        fn t() { o.unwrap(); }\n    };\n}\n",
+                4,
+            ),
+        ];
+        for (src, line) in cases {
+            assert_eq!(hit_lines(src), vec![line], "exempted:\n{src}");
+        }
+        let gated = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t(o: Option<u8>) {\n        o.unwrap();\n    }\n}\n";
+        assert_eq!(hit_lines(gated), Vec::<usize>::new());
     }
 
     /// Macro bodies are scanned flat; a test-only attribute there exempts only
@@ -1236,9 +1318,52 @@ fn f() {
             "use std::process::exit as leave;\n",
             "use std::process::*;\n",
             "use std::panic::panic_any as boom;\n",
+            "use std::process as p;\nfn f() { p::exit(0); }\n",
+            "use std::process::{self as p};\n",
+            "use ::std as s;\nfn f() { s::fs::read(p); }\n",
+            "use std::{self as s};\n",
+            "extern crate std as s;\nfn f() { s::fs::read(p); }\n",
+            "use other::process as p;\n",
         ] {
             assert_eq!(hit_lines(src), vec![1], "missed:\n{src}");
         }
+        for src in [
+            "use other::std as s;\n",
+            "extern crate core as c;\n",
+            "use std::fs as f;\n",
+        ] {
+            assert_eq!(
+                hit_lines(src),
+                Vec::<usize>::new(),
+                "not a hidden root:\n{src}"
+            );
+        }
+    }
+
+    /// A macro-body `mod` named by a metavariable resolves to a file only at
+    /// expansion, so it is refused like a literal `mod tests;`.
+    #[test]
+    fn macro_body_metavariable_mod_is_refused() {
+        let refused = |src: &str| {
+            scan_source(src).is_ok_and(|scan| {
+                matches!(
+                    scan.test_path_includes.as_slice(),
+                    [TestPathInclude {
+                        form: IncludeForm::ModDecl,
+                        target: IncludeTarget::Opaque(_),
+                        ..
+                    }]
+                )
+            })
+        };
+        assert!(refused(
+            "macro_rules! d {\n    ($n:ident) => {\n        mod $n;\n    };\n}\n"
+        ));
+        assert!(refused(
+            "macro_rules! d {\n    ($n:ident) => {\n        mod $n {}\n    };\n}\n"
+        ));
+        let literal = "macro_rules! d {\n    () => {\n        mod inner;\n    };\n}\n";
+        assert!(scan_source(literal).is_ok_and(|scan| scan.test_path_includes.is_empty()));
     }
 
     /// Source that does not parse is an error, never an empty clean scan.

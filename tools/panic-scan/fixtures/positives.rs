@@ -64,3 +64,15 @@ fn f29() { assert_eq!(a, b); } //@HIT
 #[cfg(test)]
 const TEST_ONLY_K: u32 = 1;
 fn f30() { panic!("sibling of a braceless test item — still production"); } //@HIT
+
+// A bare `#[test]` names a shadowable attribute macro, not a cfg: outside a
+// `cfg(test)` scope its function is production code and MUST be flagged.
+#[test]
+fn f36() { assert!(cond); } //@HIT
+
+// A renamed `process` module or `std` root hides `process::exit` from the path
+// check, so the rename itself MUST be flagged.
+use std::process as proc_alias; //@HIT
+use std::process::{self as proc_self}; //@HIT
+use ::std as std_alias; //@HIT
+extern crate std as std_crate; //@HIT
