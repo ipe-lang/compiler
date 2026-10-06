@@ -197,7 +197,7 @@ pub fn canonicalise_module_in_project(
 mod tests {
     use super::*;
     use ast::{Def, Expr, Expr_, Pattern_};
-    use ipe_diagnostics::{Diagnostic, NameError};
+    use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
     use ipe_intern::Symbol;
 
     const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
@@ -974,8 +974,9 @@ mod tests {
         let Some(Diagnostic::Name {
             msg:
                 NameError::ImportRequired {
-                    qualifier,
+                    reached: StdlibReach::Qualifier(qualifier),
                     candidates,
+                    imported_as: None,
                 },
             ..
         }) = err
@@ -1506,8 +1507,8 @@ mod tests {
             );
             let sym = i.intern(canonical).expect("intern canonical");
             assert!(
-                env.qual_members(sym).is_some(),
-                "canonical `{canonical}` for path {path:?} is not a registered qualifier"
+                env.kernel_module_of(sym).is_some(),
+                "canonical `{canonical}` for path {path:?} is not a registered kernel module"
             );
         }
     }
@@ -1519,7 +1520,7 @@ mod tests {
         // module cannot ship without an `import … as Alias` route.
         //
         // Primary qualifiers are the bare short-names (no `.`) plus the sole
-        // dotted canonical `Db.Decode`; the other dotted `qual_vars` keys are the
+        // dotted canonical `Db.Decode`; the other dotted kernel-pool keys are the
         // inline-qualifier convenience aliases (`Ipe.Html`, …), not import targets.
         //
         // The canonical `Cmd` / `Sub` kernel qualifiers are internal-only: they
@@ -1534,7 +1535,7 @@ mod tests {
             .iter()
             .map(|(_, c)| *c)
             .collect();
-        for &key in env.qual_vars.keys() {
+        for key in env.kernel_members.keys().map(|module| module.symbol()) {
             let Some(name) = i.resolve(key) else { continue };
             if INTERNAL_ONLY_QUALIFIERS.contains(&name) {
                 continue;
@@ -2523,14 +2524,14 @@ mod tests {
     ///
     /// Forward direction (registry → canon): for every
     /// [`ipe_kernels::StdlibKernel`] variant in `ALL`, if the variant's
-    /// declared qualifier IS present in `Env.qual_vars`, then the variant's
+    /// declared qualifier IS present in `Env.kernel_members`, then the variant's
     /// declared name must ALSO be present in that qualifier's member map.  A
     /// failure here means `QUALIFIERS` in `env.rs` diverged from
     /// `StdlibKernel::ALL + decl()` — the anti-drift invariant is broken.
     ///
     /// The forward check is intentionally one-directional: names present in
     /// `QUALIFIERS` but absent from the registry (e.g. `Basics.*` helper
-    /// aliases) are NOT an error.  Qualifiers absent from `qual_vars` entirely
+    /// aliases) are NOT an error.  Qualifiers absent from the pool entirely
     /// (e.g. `"Log"`, `"PubSub"`) are skipped automatically.
     ///
     /// Reverse direction (canon → registry, "G1"): every
@@ -2570,7 +2571,7 @@ mod tests {
         // `Ipe.<M>.Unsafe` escape-hatch submodule. The canonical qualifier stays
         // (so `Kernel.kernel "Db_unsafeExecRaw"` still splits to `("Db", …)` and
         // resolves the same kernel), but the member is intentionally ABSENT from
-        // `qual_vars[qualifier]` so it no longer resolves off a plain import of
+        // `kernel_members[qualifier]` so it no longer resolves off a plain import of
         // the native module. Verified positively by the `Ipe.Db.Unsafe`
         // disclosure + resolution tests; this set exempts them from the
         // surface-parity tripwire below.
@@ -2618,7 +2619,7 @@ mod tests {
 
             // Intern qualifier + name.  If they were already interned by
             // install_prelude_qualifiers we get the same symbol; if not, the
-            // fresh symbol will simply not appear in qual_vars (correct skip).
+            // fresh symbol will simply not appear in the pool (correct skip).
             // `Interner::intern` is infallible in practice (OOM only).
             let qual_sym = interner
                 .intern(decl.qualifier)
@@ -2627,9 +2628,9 @@ mod tests {
                 .intern(decl.name)
                 .expect("tripwire: intern name OOM");
 
-            // If the qualifier is not in qual_vars at all (e.g. "Log" is only
-            // in `vars`, not `qual_vars`; "PubSub" is not yet wired), skip.
-            let Some(members) = env.qual_vars.get(&qual_sym) else {
+            // If the qualifier is not in the kernel pool at all (e.g. "Log" is
+            // only in `vars`; "PubSub" is not yet wired), skip.
+            let Some(members) = env.kernel_members.get(&qual_sym) else {
                 continue;
             };
 
@@ -2637,7 +2638,7 @@ mod tests {
             assert!(
                 members.contains_key(&name_sym),
                 "StdlibKernel::{sk:?} declares ({:?}, {:?}) but {:?} is missing \
-                 from env.qual_vars[{:?}]; update QUALIFIERS in env.rs to match \
+                 from env.kernel_members[{:?}]; update QUALIFIERS in env.rs to match \
                  StdlibKernel::decl()",
                 decl.qualifier,
                 decl.name,
@@ -2648,7 +2649,7 @@ mod tests {
             // Also verify the stdlib_index was populated for this entry.
             assert!(
                 env.stdlib_index.contains_key(&(qual_sym, name_sym)),
-                "StdlibKernel::{sk:?} is in qual_vars but missing from stdlib_index; \
+                "StdlibKernel::{sk:?} is in kernel_members but missing from stdlib_index; \
                  the Phase-A registry-population loop in install_prelude_qualifiers \
                  must have skipped it",
             );
@@ -2672,13 +2673,13 @@ mod tests {
         // decl() (covered by ipe_kernels::tests::no_colliding_qualifier_name_pairs)
         // nor decl-equiv-legacy equivalence (covered by
         // ipe_lower::tests::decl_equiv_legacy_match).
-        for (qual_sym, members) in env.qual_vars.iter() {
-            let qual_str = interner.resolve(*qual_sym).unwrap_or("<unknown>");
+        for (module, members) in env.kernel_members.iter() {
+            let qual_str = interner.resolve(module.symbol()).unwrap_or("<unknown>");
             for (name_sym, home) in members {
                 if let VarHome::Kernel(actual_sk, m, f) = home {
                     // The carried kernel is verified against stdlib_index using
                     // the CANONICAL (module, name) stored in VarHome, not the
-                    // qual_vars KEY.
+                    // pool KEY.
                     //
                     // For plain entries: m == qual_sym, f == name_sym.
                     // For FUNC_ALIASES: name_sym is the ALIAS (e.g.
@@ -2697,7 +2698,7 @@ mod tests {
                     assert_eq!(
                         Some(actual_sk),
                         expected,
-                        "G1 reverse: VarHome::Kernel in qual_vars[{qual_str:?}][{name_str:?}] \
+                        "G1 reverse: VarHome::Kernel in kernel_members[{qual_str:?}][{name_str:?}] \
                          (canonical fn={canon_str:?}) carries kernel {actual_sk:?} but \
                          stdlib_index has {expected:?}; \
                          install_prelude_qualifiers propagation is incorrect",
@@ -2714,13 +2715,13 @@ mod tests {
         // reserved variant instead of a `None` inside `Kernel`.
         //
         // The allowlist is intentionally empty: `("String", "toChar")` which was
-        // previously the sole entry is no longer registered in `qual_vars` because
+        // previously the sole entry is no longer registered in the pool because
         // `Ipe.String` is now a compiled-source module (not a kernel qualifier).
         // Any future reserved entry must be added here with a comment explaining
         // why it deliberately lacks a `StdlibKernel` variant.
         let reserved_allowlist: std::collections::BTreeSet<(&str, &str)> =
             std::collections::BTreeSet::new();
-        let reserved_actual = reserved_kernel_members(&env.qual_vars, &interner);
+        let reserved_actual = reserved_kernel_members(&env.kernel_members, &interner);
         assert_eq!(
             reserved_actual, reserved_allowlist,
             "reserved-category gate: VarHome::ReservedKernel members must be \
@@ -2735,11 +2736,12 @@ mod tests {
 
     /// Collect the `(qualifier, name)` pairs of every reachable-but-unbacked
     /// member — the [`crate::env::VarHome::ReservedKernel`] entries — in
-    /// `qual_vars`. `canon_equals_registry` asserts the result equals the fixed
-    /// reserved allowlist, so the reserved set cannot drift.
-    fn reserved_kernel_members<'a>(
+    /// a qualifier-keyed member table. `canon_equals_registry` asserts the
+    /// result equals the fixed reserved allowlist, so the reserved set cannot
+    /// drift.
+    fn reserved_kernel_members<'a, K>(
         qual_vars: &std::collections::BTreeMap<
-            ipe_intern::Symbol,
+            K,
             std::collections::BTreeMap<ipe_intern::Symbol, crate::env::VarHome>,
         >,
         interner: &'a ipe_intern::Interner,
@@ -2811,11 +2813,11 @@ mod tests {
 
     /// `Ipe.PubSub` (the top-level, Task-shaped publish surface) is a
     /// COMPILED-SOURCE stdlib module (`src/stdlib/Ipe/PubSub.ipe`), so the bare
-    /// `"PubSub"` KERNEL qualifier must NOT be registered in `env.qual_vars`
+    /// `"PubSub"` KERNEL qualifier must NOT be registered in `env.kernel_members`
     /// (kernel qualifier OR compiled-source — never both). `Ipe.PubSub.publish`
     /// resolves through the compiled module's `Kernel.kernel "PubSub_publish"` alias,
     /// whose fast-path mints a `VarKernel` with a concrete kernel id — so the
-    /// `stdlib_scheme` totality flip stays sound without a `qual_vars` entry.
+    /// `stdlib_scheme` totality flip stays sound without a kernel-pool entry.
     #[test]
     fn pubsub_kernel_qualifier_absent_compiled_source() {
         use ipe_intern::Interner;
@@ -2828,8 +2830,8 @@ mod tests {
             .expect("Env::initial must not fail in the tripwire test");
 
         assert!(
-            !env.qual_vars.contains_key(&pubsub),
-            "The `PubSub` kernel qualifier must stay OUT of env.qual_vars — \
+            env.kernel_module_of(pubsub).is_none(),
+            "The `PubSub` kernel qualifier must stay OUT of env.kernel_members — \
              `Ipe.PubSub` is a compiled-source module resolved via the \
              `Kernel.kernel \"PubSub_publish\"` alias, not a kernel qualifier.",
         );
@@ -3376,7 +3378,7 @@ mod tests {
         use ipe_intern::Interner;
 
         // `Ipe.Html` is a COMPILED-SOURCE module (`COMPILED_STD_MODULES`), so the
-        // `Html` kernel qualifier must be ABSENT from `env.qual_vars`: its element
+        // `Html` kernel qualifier must be ABSENT from `env.kernel_members`: its element
         // builders and the re-exposed serialiser (`render` / `renderStatic` / …)
         // resolve through the `Kernel.kernel "Html_*"` aliases in `Ipe/Html.ipe`, not
         // a kernel-qualifier prelude (mirrors the `PubSub` precedent).
@@ -3385,8 +3387,8 @@ mod tests {
         let env = Env::initial(vec![], &mut interner)
             .expect("Env::initial must not fail in the tripwire test");
         assert!(
-            !env.qual_vars.contains_key(&html),
-            "The `Html` kernel qualifier must stay OUT of env.qual_vars — \
+            env.kernel_module_of(html).is_none(),
+            "The `Html` kernel qualifier must stay OUT of env.kernel_members — \
              `Ipe.Html` is a compiled-source module resolved via the \
              `Kernel.kernel \"Html_*\"` alias, not a kernel qualifier.",
         );
@@ -4531,11 +4533,10 @@ mod tests {
     //
     // Ipe.Money imports `Ipe.String as String` and uses `String.*` in its body.
     // The Tier-C import gate (ADR 0001) must see that import as satisfied —
-    // `register_stdlib_import_aliases` marks the qualifier imported BEFORE
-    // `resolve_qual_var` consults `stdlib_import_required`. If that ordering
-    // were broken (e.g. the gate were checked before alias registration),
-    // every compiled-source stdlib module that imports a kernel module would
-    // fail with IPE-N0034 on its own import.
+    // `register_stdlib_import_aliases` installs the qualifier BEFORE any body
+    // reference reaches `resolve_qual_var`. If that ordering were broken, every
+    // compiled-source stdlib module that imports a kernel module would fail
+    // with IPE-N0034 on its own import.
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
