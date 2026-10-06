@@ -705,7 +705,7 @@ pub fn build_and_run_emitted_capturing_stderr(
 /// Fails the calling test if `cargo build` fails (surfacing cargo's stderr), the
 /// binary cannot be located, or it cannot be spawned.
 #[must_use]
-#[allow(dead_code)] // only the recursion-guard goldens use it
+#[allow(dead_code)] // only the recursion-guard and regex-ceiling goldens use it
 pub fn build_and_run_emitted_capturing_stderr_with_env(
     golden_name: &str,
     emitted_dir: &Path,

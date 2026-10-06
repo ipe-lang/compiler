@@ -143,6 +143,41 @@ fn regex_builds_and_runs() {
     seal_module("regex", REGEX_MAIN, "MATCH INVALID a#b# 42 1,2,3 a|b|c");
 }
 
+/// `IPE_REGEX_MAX_INPUT_BYTES` reaches `Regex.compile` and every handle it builds.
+///
+/// A malformed or zero value makes each `Regex.compile` an `Err`; a one-byte
+/// ceiling turns back every subject the program scans. Both outputs differ from
+/// the default run's, so the variable is read and applied, never ignored.
+#[test]
+fn regex_ceiling_env_reaches_compile_and_the_handle() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let dir = compile_module_probe("regex_ceiling", REGEX_MAIN);
+    for (raw, expected) in [
+        ("abc", "COMPILE-ERR INVALID - - - -"),
+        ("0", "COMPILE-ERR INVALID - - - -"),
+        ("1", "NOMATCH INVALID a1b2 -  a,b,c"),
+    ] {
+        let out = crate::support::build_and_run_emitted_capturing_stderr_with_env(
+            "regex_ceiling",
+            &dir,
+            &[("IPE_REGEX_MAX_INPUT_BYTES", raw)],
+        );
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "IPE_REGEX_MAX_INPUT_BYTES={raw:?}: the program must run\n--- stderr ---\n{}",
+            out.stderr
+        );
+        assert_eq!(
+            out.stdout.trim(),
+            expected,
+            "IPE_REGEX_MAX_INPUT_BYTES={raw:?}: stdout mismatch"
+        );
+    }
+}
+
 // ── Ipe.Path ──────────────────────────────────────────────────────
 
 const PATH_MAIN: &str = "module Main exposing (main)\n\
