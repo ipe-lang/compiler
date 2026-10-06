@@ -79,7 +79,7 @@ Two tiers are ambient — in scope with no `import`; a third requires an explici
 `import`.
 
 - **Tier A — `Ipe.Basics`.** The grammar-level surface, unqualified in every
-  module: the arithmetic/comparison/function operators (`+ - * / // ^`,
+  module: the arithmetic/comparison/function operators (`+ - * / //`,
   `== /= < > <= >=`, `<| |> << >>`, `++`), the base types
   `Int`/`Float`/`Char`/`String`, `Bool` with `not`/`&&`/`||`/`xor`, `Order` with
   `LT`/`EQ`/`GT`, `Never`/`never`, `identity`/`always`, and the numeric helpers
