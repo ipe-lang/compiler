@@ -2028,6 +2028,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn cargo_config_path_honours_an_absolute_cargo_home_and_defaults_when_unset_or_empty() {
         let home = crate::env_dir::HomeDir::try_parse(Some("/home/u".into()))
             .expect("an absolute test home");

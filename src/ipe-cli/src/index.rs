@@ -498,9 +498,15 @@ pub struct EntryVersion {
 /// path component by construction — an unvalidated string cannot reach this
 /// join and reroot it outside the index root.
 fn entry_path(index_root: &Path, name: &PackageName) -> PathBuf {
-    index_root
-        .join("packages")
-        .join(format!("{}.toml", name.as_str()))
+    index_root.join(PACKAGES_DIR).join(entry_file_name(name))
+}
+
+/// The index checkout directory holding one entry file per package.
+const PACKAGES_DIR: &str = "packages";
+
+/// The entry file name of the package `name` inside [`PACKAGES_DIR`].
+fn entry_file_name(name: &PackageName) -> String {
+    format!("{}.toml", name.as_str())
 }
 
 /// Whether the package named `name` has an entry file in the index checkout at
@@ -622,10 +628,10 @@ pub fn read_entry(index_root: &Path, name: &str) -> Result<IndexEntry, CliError>
 /// An index checkout is fetched content: a link planted at the entry or at
 /// `packages` is refused, never followed out of the checkout.
 fn read_entry_text(index_root: &Path, name: &PackageName) -> Result<String, CliError> {
-    let file = format!("{}.toml", name.as_str());
+    let file = entry_file_name(name);
     crate::io_bounded::read_named_in(
         index_root,
-        &["packages", &file],
+        &[PACKAGES_DIR, &file],
         crate::io_bounded::SMALL_FILE_CAP,
     )
 }

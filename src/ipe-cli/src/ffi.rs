@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -21,6 +21,7 @@ use ipe_ffi::pkginfo::FeatureName;
 use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal};
 
 use crate::CliError;
+use crate::io_bounded::{FFI_CACHE_CAP, MANIFEST_CAP, SMALL_FILE_CAP, refusal_error};
 use crate::owner_trust::{self, TrustedCache};
 use crate::text;
 
@@ -35,58 +36,15 @@ const PROJECT_MANIFEST: &str = "package.ipe";
 /// work that lifts those bindings out of a `package.ipe`.
 const PROJECT_MANIFEST_TOML: &str = "ipe.toml";
 
-/// A [`ByteCap`] of `bytes`, never below one byte.
-const fn byte_cap(bytes: u64) -> ByteCap {
-    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(bytes.saturating_sub(1)))
-}
-
-/// The ceiling on a project manifest or `.ipe` source read.
-pub const MANIFEST_CAP: ByteCap = byte_cap(crate::io_bounded::MANIFEST_READ_CAP);
-
-/// The ceiling on an FFI cache, wrapper source, or emitted sidecar read.
-pub const FFI_CACHE_CAP: ByteCap = byte_cap(crate::io_bounded::FFI_CACHE_READ_CAP);
-
-/// The ceiling on a `Cargo.toml` read.
-pub const SMALL_FILE_CAP: ByteCap = byte_cap(crate::io_bounded::SMALL_FILE_READ_CAP);
-
 /// The most entries one source-tree read lists, across every level, before it is refused.
 const TREE_ENTRY_CAP: EntryCap = EntryCap::from_nonzero(NonZeroU32::MIN.saturating_add(65_535));
-
-/// The error for a held open or read of `path` that `refusal` turned back.
-///
-/// Every refusal keeps its own kind: a link, a non-regular entry and a denied
-/// open are [`CliError::SourceRefused`], a read past its cap is
-/// [`CliError::FileTooLarge`], and the rest are [`CliError::Io`] of the
-/// refusal's own kind.
-#[must_use]
-pub fn held_read_error(path: &Path, refusal: OpenRefusal) -> CliError {
-    use crate::io_bounded::{SourceRefusal, source_refused};
-    match refusal {
-        OpenRefusal::Link => source_refused(path, SourceRefusal::Symlink),
-        OpenRefusal::NotRegular(_) => source_refused(path, SourceRefusal::NotRegularFile),
-        OpenRefusal::Denied => source_refused(path, SourceRefusal::AccessDenied),
-        OpenRefusal::TooLarge(cap) => CliError::FileTooLarge {
-            path: path.to_path_buf(),
-            max: cap.get(),
-        },
-        OpenRefusal::Absent
-        | OpenRefusal::InUse
-        | OpenRefusal::TooManyEntries(_)
-        | OpenRefusal::BadName
-        | OpenRefusal::NotUtf8
-        | OpenRefusal::Io(_) => CliError::Io {
-            path: path.to_path_buf(),
-            source: refusal.into_io(),
-        },
-    }
-}
 
 /// `result` with absence as `None`; every other refusal is the error for `path`.
 fn absent_as_none<T>(result: Result<T, OpenRefusal>, path: &Path) -> Result<Option<T>, CliError> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(OpenRefusal::Absent) => Ok(None),
-        Err(refusal) => Err(held_read_error(path, refusal)),
+        Err(refusal) => Err(refusal_error(path, refusal)),
     }
 }
 
@@ -103,7 +61,7 @@ fn joined(dir: &Path, below: &[&str]) -> PathBuf {
 /// every level of `below` is opened without following a link.
 ///
 /// # Errors
-/// The [`held_read_error`] of a level that is a link, not a directory, or not
+/// The [`refusal_error`] of a level that is a link, not a directory, or not
 /// openable.
 pub fn open_project_dir(dir: &Path, below: &[&str]) -> Result<Option<HeldDir>, CliError> {
     absent_as_none(open_levels(dir, below), &joined(dir, below))
@@ -124,7 +82,7 @@ fn open_levels(dir: &Path, below: &[&str]) -> Result<HeldDir, OpenRefusal> {
 /// checked on the opened handle; `None` when the entry is absent.
 ///
 /// # Errors
-/// The [`held_read_error`] of a link, a non-regular entry, a denied open, a
+/// The [`refusal_error`] of a link, a non-regular entry, a denied open, a
 /// read past `cap`, or a read failure.
 pub fn read_held_file(
     dir: &HeldDir,
@@ -160,7 +118,7 @@ pub fn read_project_file(
 /// `None` when the entry is absent.
 ///
 /// # Errors
-/// The [`held_read_error`] of a failure other than absence.
+/// The [`refusal_error`] of a failure other than absence.
 pub fn held_entry_kind(
     dir: &HeldDir,
     dir_path: &Path,
@@ -168,7 +126,7 @@ pub fn held_entry_kind(
 ) -> Result<Option<FileKind>, CliError> {
     EntryName::parse(OsStr::new(name))
         .and_then(|entry| dir.kind_of(&entry))
-        .map_err(|refusal| held_read_error(&dir_path.join(name), refusal))
+        .map_err(|refusal| refusal_error(&dir_path.join(name), refusal))
 }
 
 /// Which entries a [`read_source_tree`] takes.
@@ -210,7 +168,7 @@ enum Level {
 ///
 /// # Errors
 /// [`CliError::Io`] when the tree lists more entries than its budget; under
-/// [`Unreadable::Refuse`], the [`held_read_error`] of the first selected entry
+/// [`Unreadable::Refuse`], the [`refusal_error`] of the first selected entry
 /// that is a link, not regular, or unreadable.
 pub fn read_source_tree(
     top: HeldDir,
@@ -221,7 +179,7 @@ pub fn read_source_tree(
 ) -> Result<Vec<(PathBuf, String)>, CliError> {
     let refused = |path: &Path, refusal: OpenRefusal| -> Result<(), CliError> {
         match unreadable {
-            Unreadable::Refuse => Err(held_read_error(path, refusal)),
+            Unreadable::Refuse => Err(refusal_error(path, refusal)),
             Unreadable::Skip => Ok(()),
         }
     };
@@ -240,8 +198,7 @@ pub fn read_source_tree(
                 continue;
             }
         };
-        let over_budget =
-            || held_read_error(&dir_path, OpenRefusal::TooManyEntries(TREE_ENTRY_CAP));
+        let over_budget = || refusal_error(&dir_path, OpenRefusal::TooManyEntries(TREE_ENTRY_CAP));
         let listing_cap =
             EntryCap::new(TREE_ENTRY_CAP.get().saturating_sub(listed)).ok_or_else(over_budget)?;
         let entries = match dir.entries(listing_cap) {
@@ -2177,7 +2134,7 @@ fn enforce_wrapper_capabilities(
     // source are opened from that handle, no link followed, and a link where a
     // source or directory could be is refused, so nothing hides from the scan.
     let wrapper = open_project_dir(wrapper_dir, &[])?
-        .ok_or_else(|| held_read_error(wrapper_dir, OpenRefusal::Absent))?;
+        .ok_or_else(|| refusal_error(wrapper_dir, OpenRefusal::Absent))?;
 
     // A wrapper with any non-`std` Cargo dependency is opaque: a dependency's
     // capabilities live in source the scan never opens.
@@ -2275,7 +2232,7 @@ fn enforce_wrapper_capabilities(
 /// build-only, never shipped).
 ///
 /// # Errors
-/// The [`held_read_error`] of a manifest that is a link, not a regular file,
+/// The [`refusal_error`] of a manifest that is a link, not a regular file,
 /// past its cap, or unreadable (refused, not silently treated as
 /// dependency-free).
 fn wrapper_non_std_dependencies(
@@ -2556,17 +2513,18 @@ fn add_one(
 /// following a link and never blocking on a FIFO.
 ///
 /// # Errors
-/// [`CliError::Io`] when the manifest is absent or its name is not one plain
-/// UTF-8 entry name; the [`held_read_error`] of a sidecar or manifest that is a
-/// link, not a regular file, past [`MANIFEST_CAP`], or unreadable.
+/// [`CliError::Io`] when the manifest is absent; the [`refusal_error`] of a
+/// manifest path that does not end in one plain UTF-8 entry name, or of a
+/// sidecar or manifest that is a link, not a regular file, past
+/// [`MANIFEST_CAP`], or unreadable.
 fn read_ffi_vocabulary(manifest_path: &Path) -> Result<String, CliError> {
     let (Some(dir), Some(name)) = (
         manifest_path.parent(),
         manifest_path.file_name().and_then(OsStr::to_str),
     ) else {
-        return Err(held_read_error(manifest_path, OpenRefusal::BadName));
+        return Err(refusal_error(manifest_path, OpenRefusal::BadName));
     };
-    let absent = || held_read_error(manifest_path, OpenRefusal::Absent);
+    let absent = || refusal_error(manifest_path, OpenRefusal::Absent);
     let held = open_project_dir(dir, &[])?.ok_or_else(absent)?;
     if name == PROJECT_MANIFEST
         && let Some(sidecar) = read_held_file(&held, dir, PROJECT_MANIFEST_TOML, MANIFEST_CAP)?
@@ -6634,6 +6592,23 @@ version = \"1\"
                 }) if path.ends_with("linked_bindings.rs")
             ),
             "a symlinked binding is refused as a symlink, got: {refused:?}"
+        );
+    }
+
+    /// A manifest path with no entry name is refused as not a regular file, the one mapping every held read shares.
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_path_without_an_entry_name_is_refused_as_not_a_regular_file() {
+        let refused = read_ffi_vocabulary(Path::new("/"));
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                })
+            ),
+            "a nameless manifest path is refused as not a regular file, got: {refused:?}"
         );
     }
 

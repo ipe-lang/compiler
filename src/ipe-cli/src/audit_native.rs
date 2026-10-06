@@ -685,7 +685,7 @@ impl WrapperScan {
             cache,
             &root.join(ipe_ffi::driver::FFI_CACHE_REL),
             crate::ffi::BINDING_SOURCES,
-            crate::ffi::FFI_CACHE_CAP,
+            crate::io_bounded::FFI_CACHE_CAP,
             crate::ffi::Unreadable::Refuse,
         )?
         .into_iter()
@@ -1198,7 +1198,7 @@ fn emitted_wrapper_paths(emitted_dir: &Path) -> Result<Vec<WrapperEntry>, CliErr
         &src,
         &src_path,
         FFI_WRAPPERS_SIDECAR,
-        crate::ffi::FFI_CACHE_CAP,
+        crate::io_bounded::FFI_CACHE_CAP,
     )?;
     if let Some(text) = sidecar {
         return parse_ffi_wrappers_sidecar(&text, &sidecar_path);
@@ -1440,11 +1440,15 @@ fn emit_probe_and_build_argv(
     // Append the probe `[[bin]]` to the emitted manifest (idempotent: a re-audit
     // rewrites the whole file from the emitted base + this one appended target).
     let manifest_path = emitted_dir.join("Cargo.toml");
-    let base =
-        crate::ffi::read_project_file(emitted_dir, &[], "Cargo.toml", crate::ffi::SMALL_FILE_CAP)?
-            .ok_or_else(|| {
-                crate::ffi::held_read_error(&manifest_path, ipe_fs_open::OpenRefusal::Absent)
-            })?;
+    let base = crate::ffi::read_project_file(
+        emitted_dir,
+        &[],
+        "Cargo.toml",
+        crate::io_bounded::SMALL_FILE_CAP,
+    )?
+    .ok_or_else(|| {
+        crate::io_bounded::refusal_error(&manifest_path, ipe_fs_open::OpenRefusal::Absent)
+    })?;
     let bin_stanza = "\n[[bin]]\nname = \"tier2_probe\"\npath = \"src/tier2_probe.rs\"\n";
     if !base.contains("name = \"tier2_probe\"") {
         let patched = format!("{base}{bin_stanza}");
@@ -1703,7 +1707,7 @@ fn emitted_crate_ro_binds(emitted_dir: &CanonicalPath) -> Result<Vec<CanonicalPa
         emitted_dir.as_path(),
         &[],
         "Cargo.toml",
-        crate::ffi::SMALL_FILE_CAP,
+        crate::io_bounded::SMALL_FILE_CAP,
     ) {
         for path in manifest_path_dependencies(&text) {
             if !path.is_absolute() {
@@ -1742,7 +1746,7 @@ fn cargo_workspace_root(crate_dir: &Path) -> Option<PathBuf> {
     // `None` when the manifest is refused, which ends the walk with the crate
     // bound alone, never a wider bind.
     let declares_workspace = |dir: &Path| -> Option<bool> {
-        crate::ffi::read_project_file(dir, &[], "Cargo.toml", crate::ffi::SMALL_FILE_CAP)
+        crate::ffi::read_project_file(dir, &[], "Cargo.toml", crate::io_bounded::SMALL_FILE_CAP)
             .ok()
             .map(|text| {
                 text.is_some_and(|t| t.lines().any(|l| l.trim_start().starts_with("[workspace]")))
