@@ -663,11 +663,16 @@ impl WrapperScan {
     /// trigger (native FFI, unenumerable module, non-lexing source) is
     /// conservatively read as reaching all tightenable axes.
     ///
+    /// Every level of the cache and every binding is opened from its parent's
+    /// handle without following a link, and a link or special file named as a
+    /// binding is refused, so no binding goes unscanned.
+    ///
     /// # Errors
-    /// [`CliError::Io`] on a failure to read the FFI wrapper cache.
+    /// [`CliError::Io`] or [`CliError::SourceRefused`] on a failure to read the
+    /// FFI wrapper cache; [`CliError::FileTooLarge`] for a binding past its cap.
     pub fn over_package(root: &Path) -> Result<Self, CliError> {
-        let cache_root = root.join(".ipe/cache/ffi/rust");
-        if !cache_root.is_dir() {
+        let cache_rel: Vec<&str> = ipe_ffi::driver::FFI_CACHE_REL.split('/').collect();
+        let Some(cache) = crate::ffi::open_project_dir(root, &cache_rel)? else {
             // No author wrapper Rust: the static scan sees no reachable axis, so
             // it cannot veto a declared-but-unused reject. That is the correct
             // conservative reading — with no wrapper source, a declared axis that
@@ -675,18 +680,17 @@ impl WrapperScan {
             return Ok(Self {
                 reaches: BTreeSet::new(),
             });
-        }
-        let mut sources: Vec<(String, String)> = Vec::new();
-        let mut files: Vec<PathBuf> = Vec::new();
-        collect_bindings(&cache_root, &mut files)?;
-        files.sort();
-        for file in files {
-            let src = crate::io_bounded::read_to_string_capped(
-                &file,
-                crate::io_bounded::FFI_CACHE_READ_CAP,
-            )?;
-            sources.push((file.display().to_string(), src));
-        }
+        };
+        let sources: Vec<(String, String)> = crate::ffi::read_source_tree(
+            cache,
+            &root.join(ipe_ffi::driver::FFI_CACHE_REL),
+            crate::ffi::BINDING_SOURCES,
+            crate::ffi::FFI_CACHE_CAP,
+            crate::ffi::Unreadable::Refuse,
+        )?
+        .into_iter()
+        .map(|(file, src)| (file.display().to_string(), src))
+        .collect();
         let outcome = ipe_ffi::capability_scan::scan_sources(
             sources.iter().map(|(f, s)| (f.as_str(), s.as_str())),
         );
@@ -705,38 +709,6 @@ impl StaticReachability for WrapperScan {
     fn reaches(&self, axis: TightenableAxis) -> bool {
         self.reaches.contains(&axis.capability())
     }
-}
-
-/// Recursively collect every `_bindings.rs` file under `dir`.
-///
-/// # Errors
-/// [`CliError::Io`] on a directory-read failure.
-fn collect_bindings(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| CliError::Io {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| CliError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| CliError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
-        if file_type.is_dir() {
-            collect_bindings(&path, out)?;
-        } else if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with("_bindings.rs"))
-        {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Run Tier-2 native enforcement over an already-built package (ADR 0004).
@@ -1214,30 +1186,51 @@ struct WrapperEntry {
     target_os = "windows"
 ))]
 fn emitted_wrapper_paths(emitted_dir: &Path) -> Result<Vec<WrapperEntry>, CliError> {
-    let sidecar_path = emitted_dir.join("src").join("ffi-wrappers.json");
+    let src_path = emitted_dir.join("src");
+    let sidecar_path = src_path.join(FFI_WRAPPERS_SIDECAR);
+    // With no `src` the package has no FFI surface — an empty set.
+    let Some(src) = crate::ffi::open_project_dir(emitted_dir, &["src"])? else {
+        return Ok(Vec::new());
+    };
+    // The sidecar is read from the held `src` without following a link or
+    // blocking: a link, FIFO or other non-regular sidecar is refused.
+    let sidecar = crate::ffi::read_held_file(
+        &src,
+        &src_path,
+        FFI_WRAPPERS_SIDECAR,
+        crate::ffi::FFI_CACHE_CAP,
+    )?;
+    if let Some(text) = sidecar {
+        return parse_ffi_wrappers_sidecar(&text, &sidecar_path);
+    }
     // When neither the sidecar nor `src/ffi.rs` exists the package has no FFI
-    // surface — an empty set, not a parse error.
-    let ffi_rs = emitted_dir.join("src").join("ffi.rs");
-    if !sidecar_path.is_file() && !ffi_rs.is_file() {
+    // surface — an empty set, not a parse error. Any entry named `ffi.rs`, of
+    // whatever kind, counts as present.
+    if crate::ffi::held_entry_kind(&src, &src_path, "ffi.rs")?.is_none() {
         return Ok(Vec::new());
     }
     // A present `src/ffi.rs` with no sidecar means the emitted crate predates
     // this hardening: fail-closed rather than fall back to the line-scan.
-    if !sidecar_path.is_file() {
-        return Err(CliError::PackageAudit(Rejection {
-            check: Check::NativeTier2,
-            message: "the emitted crate carries `src/ffi.rs` but no `src/ffi-wrappers.json` \
-                      sidecar — re-build the package with the current compiler to generate the \
-                      structured sidecar Tier-2 reads (fail-closed)"
-                .to_owned(),
-        }));
-    }
-    let text = crate::io_bounded::read_to_string_capped(
-        &sidecar_path,
-        crate::io_bounded::FFI_CACHE_READ_CAP,
-    )?;
-    parse_ffi_wrappers_sidecar(&text, &sidecar_path)
+    Err(CliError::PackageAudit(Rejection {
+        check: Check::NativeTier2,
+        message: "the emitted crate carries `src/ffi.rs` but no `src/ffi-wrappers.json` \
+                  sidecar — re-build the package with the current compiler to generate the \
+                  structured sidecar Tier-2 reads (fail-closed)"
+            .to_owned(),
+    }))
 }
+
+/// The emitted crate's FFI wrapper sidecar, in its `src`.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+const FFI_WRAPPERS_SIDECAR: &str = "ffi-wrappers.json";
 
 /// Parse the JSON sidecar text into wrapper entries. Fail-closed: any
 /// structural deviation — not a JSON object, missing `wrappers` array, a
@@ -1447,10 +1440,11 @@ fn emit_probe_and_build_argv(
     // Append the probe `[[bin]]` to the emitted manifest (idempotent: a re-audit
     // rewrites the whole file from the emitted base + this one appended target).
     let manifest_path = emitted_dir.join("Cargo.toml");
-    let base = crate::io_bounded::read_to_string_capped(
-        &manifest_path,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    )?;
+    let base =
+        crate::ffi::read_project_file(emitted_dir, &[], "Cargo.toml", crate::ffi::SMALL_FILE_CAP)?
+            .ok_or_else(|| {
+                crate::ffi::held_read_error(&manifest_path, ipe_fs_open::OpenRefusal::Absent)
+            })?;
     let bin_stanza = "\n[[bin]]\nname = \"tier2_probe\"\npath = \"src/tier2_probe.rs\"\n";
     if !base.contains("name = \"tier2_probe\"") {
         let patched = format!("{base}{bin_stanza}");
@@ -1704,10 +1698,13 @@ const CARGO_HOME_TOOL_DIRS: [&str; 3] = ["bin", "registry", "git"];
 ))]
 fn emitted_crate_ro_binds(emitted_dir: &CanonicalPath) -> Result<Vec<CanonicalPath>, CliError> {
     let mut binds = vec![emitted_dir.clone()];
-    let manifest = emitted_dir.as_path().join("Cargo.toml");
-    if let Ok(text) =
-        crate::io_bounded::read_to_string_capped(&manifest, crate::io_bounded::SMALL_FILE_READ_CAP)
-    {
+    // An unreadable manifest binds the crate alone: the narrower bind set.
+    if let Ok(Some(text)) = crate::ffi::read_project_file(
+        emitted_dir.as_path(),
+        &[],
+        "Cargo.toml",
+        crate::ffi::SMALL_FILE_CAP,
+    ) {
         for path in manifest_path_dependencies(&text) {
             if !path.is_absolute() {
                 continue;
@@ -1741,19 +1738,22 @@ fn emitted_crate_ro_binds(emitted_dir: &CanonicalPath) -> Result<Vec<CanonicalPa
     target_os = "freebsd"
 ))]
 fn cargo_workspace_root(crate_dir: &Path) -> Option<PathBuf> {
-    let declares_workspace = |dir: &Path| -> bool {
-        crate::io_bounded::read_to_string_capped(
-            &dir.join("Cargo.toml"),
-            crate::io_bounded::SMALL_FILE_READ_CAP,
-        )
-        .is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("[workspace]")))
+    // Whether `dir`'s manifest declares `[workspace]` (an absent one does not);
+    // `None` when the manifest is refused, which ends the walk with the crate
+    // bound alone, never a wider bind.
+    let declares_workspace = |dir: &Path| -> Option<bool> {
+        crate::ffi::read_project_file(dir, &[], "Cargo.toml", crate::ffi::SMALL_FILE_CAP)
+            .ok()
+            .map(|text| {
+                text.is_some_and(|t| t.lines().any(|l| l.trim_start().starts_with("[workspace]")))
+            })
     };
-    if declares_workspace(crate_dir) {
+    if declares_workspace(crate_dir)? {
         return None;
     }
     let mut dir = crate_dir.parent();
     while let Some(candidate) = dir {
-        if declares_workspace(candidate) {
+        if declares_workspace(candidate)? {
             return Some(candidate.to_path_buf());
         }
         dir = candidate.parent();
@@ -2863,6 +2863,106 @@ mod tests {
             "a package with no emitted src/ffi.rs or sidecar has no probeable surface"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO standing as `src/ffi-wrappers.json` is refused as a non-regular
+    /// file without blocking, never read as an absent sidecar (an empty set).
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos",
+        target_os = "freebsd"
+    ))]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed `mkfifo` or thread IS the failure
+    fn a_fifo_sidecar_is_refused_not_hung() {
+        let dir =
+            ipe_test_temp::temp_root().join(format!("ipe-fifo-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("src dir");
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("src").join("ffi-wrappers.json"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo creates the fixture");
+        let (send, recv) = std::sync::mpsc::channel();
+        let probe = dir.clone();
+        std::thread::Builder::new()
+            .name("fifo-sidecar".to_owned())
+            .spawn(move || {
+                let _ = send.send(emitted_wrapper_paths(&probe));
+            })
+            .expect("spawn reader");
+        let outcome = recv.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                outcome,
+                Ok(Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                }))
+            ),
+            "a FIFO sidecar is refused as not regular within the timeout, got: {outcome:?}"
+        );
+    }
+
+    /// The static scan refuses a linked binding, a linked directory in the
+    /// cache, and a linked cache level, never following or skipping one: a
+    /// binding the scan never reads is source the reachability cross-check
+    /// never weighs.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write, rename or symlink IS the failure
+    fn the_static_scan_refuses_every_linked_cache_entry() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-scan-linked-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join(ipe_ffi::driver::FFI_CACHE_REL);
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join("hidden_bindings.rs"), "pub fn h() {}\n")
+            .expect("write link target");
+        std::fs::write(cache.join("real_bindings.rs"), "pub fn g() {}\n").expect("write binding");
+        let regular = WrapperScan::over_package(&root).is_ok();
+
+        let file_link = cache.join("linked_bindings.rs");
+        std::os::unix::fs::symlink(outside.join("hidden_bindings.rs"), &file_link)
+            .expect("plant file link");
+        let file_refused = WrapperScan::over_package(&root).err();
+        std::fs::remove_file(&file_link).expect("remove file link");
+
+        let dir_link = cache.join("linked");
+        std::os::unix::fs::symlink(&outside, &dir_link).expect("plant dir link");
+        let dir_refused = WrapperScan::over_package(&root).err();
+        std::fs::remove_file(&dir_link).expect("remove dir link");
+
+        let moved = root.join("moved-cache");
+        std::fs::rename(&cache, &moved).expect("move cache level");
+        std::os::unix::fs::symlink(&moved, &cache).expect("plant level link");
+        let level_refused = WrapperScan::over_package(&root).err();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(regular, "a cache of regular bindings scans");
+        for (what, refused) in [
+            ("a linked binding", file_refused),
+            ("a linked cache directory", dir_refused),
+            ("a linked cache level", level_refused),
+        ] {
+            assert!(
+                matches!(
+                    refused,
+                    Some(CliError::SourceRefused {
+                        reason: crate::io_bounded::SourceRefusal::Symlink,
+                        ..
+                    })
+                ),
+                "{what} is refused as a symlink, got: {refused:?}"
+            );
+        }
     }
 
     #[cfg(any(
