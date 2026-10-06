@@ -321,7 +321,13 @@ fn repo_root() -> PathBuf {
 /// rendering the constructors. The opaque-handle refusal is
 /// `g_misc::golden_show_policy::showing_a_rust_handle_is_refused_before_cargo`.
 #[test]
-fn showing_a_transparent_union_builds_and_renders_it() {
+fn showing_a_transparent_union_is_accepted() {
+    let (tmp, _out) = build_show_transparent();
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// Writes and builds the `show_transparent_foreign` project; returns its dir and build output.
+fn build_show_transparent() -> (PathBuf, PathBuf) {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let source = repo_root()
         .join("tests")
@@ -341,10 +347,15 @@ fn showing_a_transparent_union_builds_and_renders_it() {
     if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
         panic!("showing a transparent union must be accepted, got: {err}")
     }
+    (tmp, out)
+}
+
+#[test]
+fn showing_a_transparent_union_renders_it() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
-        let _ = fs::remove_dir_all(&tmp);
         return;
     }
+    let (tmp, out) = build_show_transparent();
     let run = cargo_run_against_local_tm(&tmp, &out);
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);

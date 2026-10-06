@@ -28,8 +28,8 @@ fn golden_entry(root: &Path, name: &str) -> PathBuf {
 /// The DSN password sentinel `show_policy_every_leaf` parses.
 const DSN_PASSWORD: &str = "hunter2SENTINEL";
 
-#[test]
-fn every_shown_leaf_renders_through_its_row() {
+/// Builds the every-leaf fixture, refusing the test when `ipe` rejects it.
+fn build_every_leaf() -> PathBuf {
     let entry = golden_entry(&repo_root(), "show_policy_every_leaf");
     let out = crate::support::scratch_root().join("ipec_show_policy_every_leaf");
     let _ = std::fs::remove_dir_all(&out);
@@ -40,9 +40,20 @@ fn every_shown_leaf_renders_through_its_row() {
         "showing every constructible leaf must compile: {:?}",
         built.err()
     );
+    out
+}
+
+#[test]
+fn every_shown_leaf_is_accepted() {
+    build_every_leaf();
+}
+
+#[test]
+fn every_shown_leaf_renders_through_its_row() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
+    let out = build_every_leaf();
     let outcome = crate::support::build_and_run_emitted("show_policy_every_leaf", &out);
     assert_eq!(outcome.exit_code, Some(0), "{}", outcome.stdout);
     let stdout = outcome.stdout;
