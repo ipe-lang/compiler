@@ -563,7 +563,7 @@ pub(crate) fn resolve_project_sources(
             blame_path: manifest_path,
             db_driver: manifest.driver,
             wasm_public_env: manifest.wasm.public_env.to_names(),
-            mount_base: manifest.browser.base.clone(),
+            mount_base: manifest.delivery.browser.base.clone(),
             cargo_name,
             scope: ScopeSpec::Package {
                 root: package_root,
