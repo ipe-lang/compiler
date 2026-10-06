@@ -665,7 +665,7 @@ fn shown_env_value(raw: &[u8]) -> String {
 /// (`USERPROFILE` on Windows, `HOME` elsewhere), overlay-aware like
 /// [`read_env_var`]. Gated to its readers: the console proxy's cached-binary
 /// lookup, and off Unix the scratch primitive's profile-containment check.
-#[cfg(any(all(feature = "web-core", feature = "http_client"), not(unix)))]
+#[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
 pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     home_dir_from_var(read_env_var(super::home_core::HOME_VAR))
 }
@@ -677,7 +677,7 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
 /// counts as a home directory (UTF-8, absolute, and, on Windows, not a
 /// verbatim/device-namespace prefix) — this function makes none of them
 /// itself.
-#[cfg(any(all(feature = "web-core", feature = "http_client"), not(unix)))]
+#[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
 fn home_dir_from_var(raw: Result<String, std::env::VarError>) -> Option<std::path::PathBuf> {
     super::home_core::HomeDir::parse(raw.ok().map(std::ffi::OsString::from))
         .map(super::home_core::HomeDir::into_path)
@@ -2862,12 +2862,7 @@ pub fn run_exit_hook() {
 /// caller (a shutdown grace timer, a watchdog) would keep running.
 pub fn exit_process(code: i32) -> ! {
     let _ = std::panic::catch_unwind(run_exit_hook);
-    #[cfg(all(
-        feature = "server",
-        feature = "http_client",
-        feature = "web-core",
-        not(target_arch = "wasm32")
-    ))]
+    #[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
     let _ = std::panic::catch_unwind(crate::web::flush_exporters_before_exit);
     #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
@@ -4110,7 +4105,7 @@ mod scrub_log_controls_tests {
     }
 }
 
-#[cfg(all(test, feature = "web-core", feature = "http_client"))]
+#[cfg(all(test, feature = "web", feature = "http_client"))]
 mod home_dir_tests {
     use super::home_dir_from_var;
     use std::env::VarError;

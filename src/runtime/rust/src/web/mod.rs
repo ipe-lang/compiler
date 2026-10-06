@@ -44,9 +44,11 @@ pub mod style_inject;
 pub use crate::widget_assets;
 // Pre-built console child + reverse-proxy — spawns the bundled console
 // binary and proxies /_ipe/console/*; falls back to in-process `console` when the
-// binary is absent. Uses reqwest for the reverse-proxy path; gated so a web
-// app that makes no outbound HTTP calls (no `http_client` feature) stays reqwest-free.
-#[cfg(feature = "http_client")]
+// binary is absent. Uses reqwest for the reverse-proxy path and the `web`
+// surface (tokio process, the hardened child spawner); gated on both so a web
+// app that makes no outbound HTTP calls (no `http_client` feature) stays
+// reqwest-free and a server-only or webview build never compiles it.
+#[cfg(all(feature = "web", feature = "http_client"))]
 pub mod console_proxy;
 // Observability middleware + noise ingest — axum request/response types, server-only.
 #[cfg(feature = "server")]
@@ -55,9 +57,9 @@ pub mod observability;
 // and remote-hub OTLP push. Both env-gated + inert by default.
 // Use reqwest for outbound push; gated so a web app with no outbound HTTP
 // kernel (`http_client` absent) stays reqwest-free.
-#[cfg(feature = "http_client")]
+#[cfg(all(feature = "web", feature = "http_client"))]
 pub mod hub_exporter;
-#[cfg(feature = "http_client")]
+#[cfg(all(feature = "web", feature = "http_client"))]
 pub mod push_exporter;
 // Hub read-side kernels (the bundled console's data plane). Gated on `db` —
 // they read the SQLite telemetry spill via sqlx, so a `live`-only program with
@@ -1949,14 +1951,14 @@ fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefu
 /// process exit reaches it through `system::exit_process`
 /// (`flush_exporters_before_exit`).
 ///
-/// No-op when `http_client` is absent: the push/hub exporters make outbound
-/// HTTP calls and are gated behind that feature; a web app with no outbound
-/// HTTP kernel has no exporters to flush.
-#[cfg(all(feature = "server", feature = "http_client"))]
+/// No-op unless both `web` and `http_client` are on: the push/hub exporters
+/// make outbound HTTP calls and are gated behind both features; a server with
+/// no outbound HTTP kernel has no exporters to flush.
+#[cfg(all(feature = "web", feature = "http_client"))]
 async fn flush_exporters() {
     tokio::join!(push_exporter::flush_now(), hub_exporter::flush_now());
 }
-#[cfg(all(feature = "server", not(feature = "http_client")))]
+#[cfg(all(feature = "server", not(all(feature = "web", feature = "http_client"))))]
 async fn flush_exporters() {}
 
 /// Runs `flush_exporters` to completion from synchronous code, bounded by `push_exporter::EXIT_FLUSH_BOUND`.
@@ -1970,11 +1972,7 @@ async fn flush_exporters() {}
 /// `block_in_place`, which hands the worker's queued tasks, the batchers among
 /// them, to another thread first. No-op when no exporter was enabled or the
 /// flush thread cannot start. Never panics.
-#[cfg(all(
-    feature = "server",
-    feature = "http_client",
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
 pub(crate) fn flush_exporters_before_exit() {
     let Some(handle) = push_exporter::exporter_runtime() else {
         return;
@@ -2182,7 +2180,7 @@ async fn web_shutdown_signal<Model, Msg>(
     // (`kill_on_drop`) never runs on `process::exit`, so this explicit
     // `start_kill` is what prevents an orphan console child after a clean exit.
     // Absent when `http_client` is not active: the console proxy uses reqwest.
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     console_proxy::shutdown_console();
 
     // Telemetry export pipelines (push/hub exporters) flush every ~2 s on a
@@ -2202,7 +2200,7 @@ async fn web_shutdown_signal<Model, Msg>(
         tokio::time::sleep(grace).await;
         // Defense-in-depth: kill the console child again in case it was spawned
         // after the first teardown call (shutdown_console is idempotent).
-        #[cfg(feature = "http_client")]
+        #[cfg(all(feature = "web", feature = "http_client"))]
         console_proxy::shutdown_console();
         // The exit funnel flushes the exporters before the process ends.
         crate::system::exit_process(0);
@@ -2213,7 +2211,7 @@ async fn web_shutdown_signal<Model, Msg>(
     tokio::spawn(async {
         wait_for_term_or_int().await;
         crate::system::write_stderr_line("Ipe.Web: forcing exit (second signal)");
-        #[cfg(feature = "http_client")]
+        #[cfg(all(feature = "web", feature = "http_client"))]
         console_proxy::shutdown_console();
         // 128 + SIGINT(2); the exit funnel flushes the exporters first.
         crate::system::exit_process(130);
@@ -4962,9 +4960,9 @@ where
     // (IPE_PARENT_URL) and remote-hub OTLP push (IPE_CONSOLE_HUB).
     // Both env-gated + inert by default. Only available when `http_client`
     // is active: these pipelines make outbound HTTP calls via reqwest.
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     push_exporter::enable_from_env().await;
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     hub_exporter::enable_from_env().await;
 
     // Console precedence: try the pre-built console child +
@@ -4984,16 +4982,16 @@ where
         Err(cause) => return IpeResult::Err(cause.to_string().into()),
     };
     crate::telemetry::record_bind(host);
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     let use_console_proxy = console_proxy::ensure_console_proxy().await;
 
     // Cloned for the shutdown path's dev-only reload push — the router's
     // `.with_state(state)` takes ownership of `state` below.
     let shutdown_store = state.store.clone();
 
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     let console_proxy_flag = use_console_proxy;
-    #[cfg(not(feature = "http_client"))]
+    #[cfg(not(all(feature = "web", feature = "http_client")))]
     let console_proxy_flag = false;
 
     let app = match build_web_router::<Model, Msg, FInit, FUpdate, FView, FSubs>(
@@ -5059,7 +5057,11 @@ pub(crate) fn build_web_router<Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
     // Read only when `http_client` is active (the console-proxy arm); the
     // in-process console path ignores it, so it is unused without that feature.
-    #[cfg_attr(not(feature = "http_client"), allow(unused_variables))] use_console_proxy: bool,
+    #[cfg_attr(
+        not(all(feature = "web", feature = "http_client")),
+        allow(unused_variables)
+    )]
+    use_console_proxy: bool,
 ) -> Result<axum::Router, StartupRefusal>
 where
     // IpeStringify: required by inspect_handler for the live-datum GET.
@@ -5347,7 +5349,7 @@ where
     // spawned and all `/_ipe/console/*` traffic is forwarded to it via
     // reqwest. The child logs its own `session store: …` + `reverse-proxy
     // ready` lines, so the parent does not duplicate the inline-mount log.
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     if use_console_proxy {
         router = console_proxy::proxy_routes(router);
     }
@@ -5359,11 +5361,11 @@ where
     // the proxy is live (`use_console_proxy` true) it owns `/_ipe/console`,
     // so we skip this block to avoid duplicate route registration.
     let proxy_active = {
-        #[cfg(feature = "http_client")]
+        #[cfg(all(feature = "web", feature = "http_client"))]
         {
             use_console_proxy
         }
-        #[cfg(not(feature = "http_client"))]
+        #[cfg(not(all(feature = "web", feature = "http_client")))]
         {
             false
         }
