@@ -2135,7 +2135,9 @@ mod read_file_beneath_tests {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(test)]
+#[cfg(not(unix))]
+#[cfg(not(target_arch = "wasm32"))]
 mod read_file_beneath_stub_tests {
     use super::*;
 
