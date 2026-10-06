@@ -44,7 +44,9 @@ const COMMAND_ALIAS: &str = "Commandas";
 /// `remote_ingest::run_probe`. A mention of `Command::new` that is not called
 /// in place is listed under the empty expression.
 const SPAWN_INVENTORY: &[(&str, &str, usize)] = &[
+    ("audit.rs", "\"mkfifo\"", 1),
     ("audit.rs", "cargo_deny", 2),
+    ("audit_native.rs", "\"mkfifo\"", 1),
     ("build_plan.rs", "rustup", 1),
     ("cache.rs", "\"mkfifo\"", 1),
     ("cache.rs", "\"rustc\"", 1),
@@ -54,6 +56,7 @@ const SPAWN_INVENTORY: &[(&str, &str, usize)] = &[
     ("coverage/probe.rs", "&ipe_bin", 1),
     ("doc.rs", "&ipe_bin", 1),
     ("doc.rs", "opener", 1),
+    ("driver/build_pipeline.rs", "\"mkfifo\"", 1),
     ("driver/commands.rs", "", 1),
     ("driver/commands.rs", "&bin", 2),
     ("driver/commands.rs", "program", 2),
@@ -67,7 +70,9 @@ const SPAWN_INVENTORY: &[(&str, &str, usize)] = &[
     ("ffi.rs", "program", 1),
     ("health.rs", "\"rustc\"", 2),
     ("health.rs", "program", 1),
+    ("init.rs", "\"mkfifo\"", 1),
     ("io_bounded.rs", "\"mkfifo\"", 1),
+    ("lockfile.rs", "\"mkfifo\"", 1),
     ("login.rs", "\"cmd\"", 1),
     ("login.rs", "\"open\"", 1),
     ("login.rs", "\"xdg-open\"", 1),
