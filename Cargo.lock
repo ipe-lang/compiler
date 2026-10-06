@@ -3311,6 +3311,7 @@ name = "ipe_fs_open"
 version = "0.5.0"
 dependencies = [
  "cap-primitives",
+ "e2e-support",
  "ipe-test-temp",
  "rustix 0.38.44",
  "syn 3.0.6",
