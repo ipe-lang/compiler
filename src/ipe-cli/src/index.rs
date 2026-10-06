@@ -498,9 +498,15 @@ pub struct EntryVersion {
 /// path component by construction — an unvalidated string cannot reach this
 /// join and reroot it outside the index root.
 fn entry_path(index_root: &Path, name: &PackageName) -> PathBuf {
-    index_root
-        .join("packages")
-        .join(format!("{}.toml", name.as_str()))
+    index_root.join(PACKAGES_DIR).join(entry_file_name(name))
+}
+
+/// The index checkout directory holding one entry file per package.
+const PACKAGES_DIR: &str = "packages";
+
+/// The entry file name of the package `name` inside [`PACKAGES_DIR`].
+fn entry_file_name(name: &PackageName) -> String {
+    format!("{}.toml", name.as_str())
 }
 
 /// Whether the package named `name` has an entry file in the index checkout at
@@ -579,11 +585,7 @@ pub fn read_entry_lookup(index_root: &Path, name: &str) -> EntryLookup {
         Ok(name) => name,
         Err(err) => return EntryLookup::Unreadable(err),
     };
-    let path = entry_path(index_root, &name);
-    let text = match crate::io_bounded::read_to_string_capped(
-        &path,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    ) {
+    let text = match read_entry_text(index_root, &name) {
         Ok(t) => t,
         Err(crate::CliError::Io { ref source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
@@ -614,14 +616,24 @@ pub fn read_entry_lookup(index_root: &Path, name: &str) -> EntryLookup {
 /// [`CliError::Resolve`] when the entry file is absent or malformed.
 pub fn read_entry(index_root: &Path, name: &str) -> Result<IndexEntry, CliError> {
     let package_name = PackageName::parse(name)?;
-    let path = entry_path(index_root, &package_name);
-    let text =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
-            .map_err(|e| match e {
-                crate::CliError::Io { ref source, .. } => read_entry_error(&package_name, source),
-                other => other,
-            })?;
+    let text = read_entry_text(index_root, &package_name).map_err(|e| match e {
+        crate::CliError::Io { ref source, .. } => read_entry_error(&package_name, source),
+        other => other,
+    })?;
     parse_entry(&package_name, &text)
+}
+
+/// The text of `packages/<name>.toml` below `index_root`, opened level by level, never through a symlink.
+///
+/// An index checkout is fetched content: a link planted at the entry or at
+/// `packages` is refused, never followed out of the checkout.
+fn read_entry_text(index_root: &Path, name: &PackageName) -> Result<String, CliError> {
+    let file = entry_file_name(name);
+    crate::io_bounded::read_named_in(
+        index_root,
+        &[PACKAGES_DIR, &file],
+        crate::io_bounded::SMALL_FILE_CAP,
+    )
 }
 
 /// The typed diagnostic when an index entry cannot be read. A missing entry is
@@ -668,8 +680,9 @@ pub fn validate_entry_file(path: &Path) -> Result<IndexEntry, CliError> {
             CliError::Usage(crate::text::msg::index_entry_path_invalid(&path.display()))
         })?;
     let name = PackageName::parse(name)?;
-    let text =
-        crate::io_bounded::read_to_string_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP)?;
+    // Named on the command line, but the file comes from an untrusted registry
+    // checkout: a link there is refused, never followed.
+    let text = crate::io_bounded::read_leaf_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP)?;
     parse_entry(&name, &text)
 }
 
@@ -1230,6 +1243,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    /// An index entry, or the `packages` directory, planted as a symlink is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_index_entry_is_refused() {
+        let outside = temp_dir("link-outside");
+        write_fixture_index(&outside, "http-extras", &["1.0.0"]);
+        let real_entry = outside.join("packages").join("http-extras.toml");
+        let linked_entry = temp_dir("link-entry");
+        std::fs::create_dir_all(linked_entry.join("packages")).expect("create packages dir");
+        std::os::unix::fs::symlink(
+            &real_entry,
+            linked_entry.join("packages").join("http-extras.toml"),
+        )
+        .expect("link the entry");
+        let linked_dir = temp_dir("link-dir");
+        std::os::unix::fs::symlink(outside.join("packages"), linked_dir.join("packages"))
+            .expect("link the packages dir");
+        let entry = read_entry(&linked_entry, "http-extras");
+        let lookup = super::read_entry_lookup(&linked_entry, "http-extras");
+        let through_dir = read_entry(&linked_dir, "http-extras");
+        let direct = read_entry(&outside, "http-extras");
+        for dir in [&outside, &linked_entry, &linked_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        for result in [&entry, &through_dir] {
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::CliError::SourceRefused {
+                        reason: crate::io_bounded::SourceRefusal::Symlink,
+                        ..
+                    })
+                ),
+                "a symlinked index entry is refused: {result:?}"
+            );
+        }
+        assert!(
+            matches!(lookup, super::EntryLookup::Unreadable(_)),
+            "a symlinked entry is unreadable, never absent or present"
+        );
+        assert!(direct.is_ok(), "the real entry reads: {direct:?}");
     }
 
     #[test]

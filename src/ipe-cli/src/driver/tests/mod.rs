@@ -4380,7 +4380,7 @@ fn named_replay_log_is_shown_when_it_is_a_trace() {
     assert!(fs::write(&typed, "{}").is_ok(), "write typed log");
     let shown = replay_plan(trace.clone());
     assert!(
-        matches!(&shown, Ok(SessionPlan::ShowTrace(p)) if *p == trace),
+        matches!(&shown, Ok(SessionPlan::ShowTrace(TraceFile::Named(p))) if *p == trace),
         "a named trace must be shown: {shown:?}"
     );
     let folded = replay_plan(typed.clone());
@@ -4422,7 +4422,7 @@ fn default_replay_prefers_the_typed_log_then_the_trace() {
     assert!(fs::write(&trace, "Add(1) => 1\n").is_ok(), "write trace");
     let shown = resolve_session_plan(&replay, &output);
     assert!(
-        matches!(&shown, Ok(SessionPlan::ShowTrace(p)) if p.ends_with(RECORD_LOG_FILE)),
+        matches!(&shown, Ok(SessionPlan::ShowTrace(TraceFile::Recorded(p))) if p.ends_with(RECORD_LOG_FILE)),
         "a lone trace must be shown: {shown:?}"
     );
 
@@ -4451,7 +4451,7 @@ fn shown_trace_strips_every_control_character() {
                  \u{9b}2J\u{9d}0;title\u{9c}Add(\u{85}3\t\u{7f}\u{202e}) => 5\n\
                  \x1b[H\x1b[2J\n";
     assert!(fs::write(&trace, laced).is_ok(), "write planted trace");
-    let shown = load_session_trace(&trace);
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         shown.is_ok(),
         "a UTF-8 trace under the cap must show: {shown:?}"
@@ -4484,6 +4484,54 @@ fn shown_trace_strips_every_control_character() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// A trace the user named through a link is read through it.
+#[cfg(unix)]
+#[test]
+fn a_user_named_trace_symlink_is_followed() {
+    let dir = session_scratch("named_link");
+    let target = dir.join("real.ipelog");
+    let link = dir.join("link.ipelog");
+    assert!(fs::write(&target, "Add(1) => 1\n").is_ok(), "write trace");
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let shown = load_session_trace(&TraceFile::Named(link));
+    assert!(
+        shown
+            .as_deref()
+            .is_ok_and(|out| out.contains("Add(1) => 1")),
+        "a named trace link must be followed: {shown:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// The trace the recorder wrote is never followed when it was swapped for a link.
+#[cfg(unix)]
+#[test]
+fn a_recorded_trace_swapped_for_a_link_is_refused() {
+    let dir = session_scratch("recorded_link");
+    let target = dir.join("elsewhere.txt");
+    let link = dir.join(RECORD_LOG_FILE);
+    assert!(fs::write(&target, "secret\n").is_ok(), "write target");
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let shown = load_session_trace(&TraceFile::Recorded(link));
+    assert!(
+        matches!(
+            &shown,
+            Err(CliError::SourceRefused {
+                reason: SourceRefusal::Symlink,
+                ..
+            })
+        ),
+        "a recorded trace link must be refused: {shown:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // A trace over the cap is refused typed, before anything is rendered.
 #[test]
 fn shown_trace_over_the_cap_is_refused() {
@@ -4494,7 +4542,7 @@ fn shown_trace_over_the_cap_is_refused() {
         fs::write(&trace, vec![b'a'; over]).is_ok(),
         "write big trace"
     );
-    let shown = load_session_trace(&trace);
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         matches!(shown, Err(CliError::FileTooLarge { .. })),
         "an oversized trace must be refused: {shown:?}"
@@ -4511,7 +4559,7 @@ fn shown_trace_not_utf8_is_refused() {
         fs::write(&trace, [b'A', 0xff, 0xfe, b'\n']).is_ok(),
         "write binary trace"
     );
-    let shown = load_session_trace(&trace);
+    let shown = load_session_trace(&TraceFile::Named(trace));
     assert!(
         matches!(&shown, Err(CliError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::InvalidData),
@@ -5850,4 +5898,53 @@ fn wrapper_source_ignores_planted_ancestor() {
             "the complete wrapper workspace is admitted (control): {admitted:?}"
         );
     }
+}
+
+// A loose entry file the user named through a link is read through it.
+#[cfg(unix)]
+#[test]
+fn a_user_named_entry_symlink_is_followed() {
+    let dir = session_scratch("named_entry_link");
+    let target = dir.join("Real.ipe");
+    let link = dir.join("Main.ipe");
+    assert!(
+        fs::write(&target, "module Main exposing (main)\n\nmain = 1\n").is_ok(),
+        "write entry"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let shape = classify_entry_shape(&link);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        shape.is_ok(),
+        "a named entry link must be followed: {:?}",
+        shape.err()
+    );
+}
+
+// A file `ipe fix` is pointed at through a link is read through it.
+#[cfg(unix)]
+#[test]
+fn a_user_named_fix_target_symlink_is_followed() {
+    let dir = session_scratch("named_fix_link");
+    let target = dir.join("Real.ipe");
+    let link = dir.join("Main.ipe");
+    assert!(
+        fs::write(&target, "module Main exposing (main)\n\nmain = 1\n").is_ok(),
+        "write entry"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&target, &link).is_ok(),
+        "make link"
+    );
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&link, true, &mut out);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        fixed.is_ok(),
+        "a named fix target link must be followed: {:?}",
+        fixed.err()
+    );
 }

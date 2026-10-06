@@ -328,8 +328,7 @@ pub fn build_with_options_into(
     options: BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
     let target = out.prove(&ProjectPaths::of_file(entry))?;
-    let source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     // Parse ONCE with a throwaway interner to learn the entry's declared module
     // path. Using the declared name as the entry's `module_path` means the shared
@@ -549,8 +548,10 @@ pub fn collect_manifest_rooted_entry(
     src_root: &Path,
     entry: &Path,
 ) -> Result<CollectedSources, CliError> {
+    // A named file reaches here canonicalised, its links already resolved, so
+    // it is read beneath `src_root` like the convention entry: never followed.
     let entry_source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+        crate::io_bounded::read_beneath(src_root, entry, crate::io_bounded::SOURCE_CAP)?;
     let entry_module_path = parse_entry_module_path(entry, &entry_source)?;
 
     let mut discovered = project::discover_modules(src_root)?;
@@ -589,8 +590,10 @@ pub fn collect_test_sources(
     tests_root: &Path,
     test_entry: &Path,
 ) -> Result<CollectedSources, CliError> {
+    // A named test file reaches here canonicalised, its links already resolved;
+    // `ipe verify`'s `tests/Main.ipe` is a convention file. Neither is followed.
     let entry_source =
-        crate::io_bounded::read_to_string_capped(test_entry, crate::io_bounded::SOURCE_READ_CAP)?;
+        crate::io_bounded::read_beneath(tests_root, test_entry, crate::io_bounded::SOURCE_CAP)?;
     let entry_module_path = parse_entry_module_path(test_entry, &entry_source)?;
 
     // The `tests/` tree is rooted at `tests_root` (the caller's, e.g. the
@@ -1533,6 +1536,20 @@ pub struct WidgetTagCollision {
     pub new_path: String,
 }
 
+/// Read the containment-checked widget-hook file at `resolved` below `widget_root`.
+///
+/// Every level below the root is opened through the held level above it and
+/// never followed, and the file is opened non-blocking and proven regular: a
+/// link swapped in after the containment check is refused, and a FIFO is
+/// refused rather than waited on.
+///
+/// # Errors
+///
+/// As [`crate::io_bounded::read_beneath`] under [`crate::io_bounded::SMALL_FILE_CAP`].
+fn read_widget_hook(widget_root: &Path, resolved: &Path) -> Result<String, CliError> {
+    crate::io_bounded::read_beneath(widget_root, resolved, crate::io_bounded::SMALL_FILE_CAP)
+}
+
 /// Record `cleaned_path` as the origin of `tag`, or report a collision.
 ///
 /// The custom-element tag is a 64-bit FNV-1a digest, which is not collision-free.
@@ -1725,23 +1742,21 @@ pub fn compile_prepared(
                     widget.cleaned_path
                 ))
             })?;
-        if !contained.resolved().is_file() {
-            return Err(reject(format!(
-                "the widget-hook file `{}` does not exist in the project",
-                widget.cleaned_path
-            )));
-        }
-        // Read the verified in-project file's content for content-addressed +
-        // SRI serving. `resolved()` is the containment-checked canonical path, so
-        // this read stays strictly inside the project root. A read failure (a
-        // race that removed the file between the `is_file` check and here, or a
-        // permission fault) fails the build closed — the widget seam never
-        // reaches emission on a file we could not read whole.
-        let content = std::fs::read_to_string(contained.resolved()).map_err(|e| {
-            reject(format!(
-                "the widget-hook file `{}` could not be read: {e}",
-                widget.cleaned_path
-            ))
+        // A read failure fails the build closed: the widget seam never reaches
+        // emission on a file we could not read whole.
+        let content = read_widget_hook(widget_root, contained.resolved()).map_err(|e| {
+            if matches!(&e, CliError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+            {
+                reject(format!(
+                    "the widget-hook file `{}` does not exist in the project",
+                    widget.cleaned_path
+                ))
+            } else {
+                reject(format!(
+                    "the widget-hook file `{}` could not be read: {e}",
+                    widget.cleaned_path
+                ))
+            }
         })?;
         // The tag is the SINGLE lowerer definition, keyed on the same cleaned
         // path the view node hashed — never a second, drift-prone hash here.
@@ -3211,6 +3226,99 @@ mod tests {
                 })
             ),
             "an imported symlink sibling is refused, never followed"
+        );
+    }
+
+    /// A fresh scratch directory for a widget-hook test.
+    fn widget_scratch(tag: &str) -> PathBuf {
+        let dir =
+            ipe_test_temp::temp_root().join(format!("ipe_widget_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok(), "make scratch dir");
+        dir
+    }
+
+    /// A widget hook that is a FIFO is refused at once, never waited on for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_widget_hook_is_refused_not_hung() {
+        let dir = widget_scratch("fifo");
+        let hook = dir.join("hook.js");
+        let made = std::process::Command::new("mkfifo").arg(&hook).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo creates the fixture"
+        );
+        let contained = contained_path::ContainedRelPath::parse(&dir, "hook.js");
+        assert!(contained.is_ok(), "the FIFO lies inside the project");
+        let Ok(contained) = contained else {
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let root = dir.clone();
+        let resolved = contained.resolved().to_path_buf();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = sender.send(read_widget_hook(&root, &resolved));
+            })
+            .expect("spawn the bounded reader thread");
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        if result.is_err() {
+            // A writer releases a reader stuck on the FIFO, so the process can exit.
+            let _ = fs::OpenOptions::new().write(true).open(&hook);
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                result,
+                Ok(Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                }))
+            ),
+            "a FIFO widget hook must be refused without blocking: {result:?}"
+        );
+    }
+
+    /// A widget hook swapped for a link after its containment check is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_widget_hook_swapped_for_a_link_after_containment_is_refused() {
+        let dir = widget_scratch("swapped");
+        let outside = widget_scratch("swapped_outside");
+        let hook = dir.join("hook.js");
+        let planted = outside.join("secret.txt");
+        assert!(fs::write(&hook, "customElements;").is_ok(), "write hook");
+        assert!(fs::write(&planted, "secret").is_ok(), "write planted file");
+        let contained = contained_path::ContainedRelPath::parse(&dir, "hook.js");
+        assert!(contained.is_ok(), "the hook lies inside the project");
+        let Ok(contained) = contained else {
+            return;
+        };
+        let before = read_widget_hook(&dir, contained.resolved());
+        assert!(
+            before
+                .as_deref()
+                .is_ok_and(|text| text == "customElements;"),
+            "a regular in-project hook is read: {before:?}"
+        );
+        assert!(fs::remove_file(&hook).is_ok(), "remove hook");
+        assert!(
+            std::os::unix::fs::symlink(&planted, &hook).is_ok(),
+            "swap in a link"
+        );
+        let after = read_widget_hook(&dir, contained.resolved());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+        assert!(
+            matches!(
+                after,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a hook swapped for a link must be refused: {after:?}"
         );
     }
 }

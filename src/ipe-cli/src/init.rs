@@ -518,17 +518,24 @@ fn guard_rerun_conflict(
 /// (spec § 5): the re-run guard over-permits toward *reconcile* rather than refuse
 /// a project that is not confidently a different shape; the only cost of a missed
 /// conflict is a reconcile that leaves every present file untouched anyway.
+///
+/// The entry is opened beneath `target_dir` level by level, never through a
+/// symlink and never blocking on a FIFO, and read under [`crate::io_bounded::SOURCE_CAP`].
+///
+/// # Errors
+/// [`CliError::SourceRefused`] for a symlinked or non-regular `src/Main.ipe`;
+/// [`CliError::FileTooLarge`] past the cap; [`CliError::Io`] for another read failure.
 fn existing_project_shape(target_dir: &Path) -> Result<Option<InitShape>, CliError> {
-    let entry = target_dir.join("src").join("Main.ipe");
-    let source = match std::fs::read_to_string(&entry) {
+    let source = match crate::io_bounded::read_named_in(
+        target_dir,
+        &["src", "Main.ipe"],
+        crate::io_bounded::SOURCE_CAP,
+    ) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(CliError::Io {
-                path: entry,
-                source: e,
-            });
+        Err(CliError::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
         }
+        Err(e) => return Err(e),
     };
     let mut interner = ipe_intern::Interner::new();
     let Ok(module) = ipe_parse::parse_module(&source, &mut interner) else {
@@ -1483,6 +1490,90 @@ mod tests {
         .expect("write unpinnable Main.ipe");
         assert_eq!(existing_project_shape(&root).expect("classify"), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A FIFO planted as `src/Main.ipe` is refused at once, never waited on for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_main_ipe_does_not_hang_init() {
+        let root = ipe_test_temp::temp_root().join(format!("ipe_init_fifo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let made = std::process::Command::new("mkfifo")
+            .arg(root.join("src").join("Main.ipe"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo creates the fixture");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_root = root.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(existing_project_shape(&reader_root));
+            })
+            .expect("spawn the bounded reader thread");
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                outcome,
+                Ok(Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                }))
+            ),
+            "a FIFO entry is refused without blocking: {outcome:?}"
+        );
+    }
+
+    /// An entry one byte past the source cap is refused, never buffered whole.
+    #[test]
+    fn an_oversized_main_ipe_is_refused_by_init() {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe_init_oversized_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let file = std::fs::File::create(root.join("src").join("Main.ipe")).expect("create entry");
+        file.set_len(crate::io_bounded::SOURCE_READ_CAP + 1)
+            .expect("size the entry one byte past the cap");
+        drop(file);
+        let outcome = existing_project_shape(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                outcome,
+                Err(CliError::FileTooLarge { max, .. }) if max == crate::io_bounded::SOURCE_READ_CAP
+            ),
+            "an oversized entry is refused at the source cap: {outcome:?}"
+        );
+    }
+
+    /// A symlinked `src/Main.ipe` is refused by name, never read through.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_main_ipe_is_refused_by_init() {
+        let root = ipe_test_temp::temp_root().join(format!("ipe_init_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        let target = root.join("elsewhere.ipe");
+        std::fs::write(
+            &target,
+            "module Main exposing (main)\n\nmain =\n    Tui.tea config\n",
+        )
+        .expect("write target");
+        std::os::unix::fs::symlink(&target, root.join("src").join("Main.ipe"))
+            .expect("link the entry");
+        let outcome = existing_project_shape(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                outcome,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a symlinked entry is refused: {outcome:?}"
+        );
     }
 
     #[test]

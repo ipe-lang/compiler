@@ -195,7 +195,7 @@ enum TokenReadRefusal {
     Unreadable,
 }
 
-/// Read the token file at `path` through a handle proven owner-only.
+/// Read the token file at `path` through a handle proven owner-only and regular.
 fn read_stored_token(path: &std::path::Path) -> Result<String, TokenReadRefusal> {
     let file = crate::secret_file::open_existing(HOST_SECRET_STORE, path).map_err(|e| match e {
         SecretFileError::NotOwnerOnly(_) => TokenReadRefusal::Exposed,
@@ -205,7 +205,8 @@ fn read_stored_token(path: &std::path::Path) -> Result<String, TokenReadRefusal>
         | SecretFileError::Io(_)
         | SecretFileError::NotRegularFile(_) => TokenReadRefusal::Unreadable,
     })?;
-    crate::io_bounded::read_opened_capped(file, path, crate::io_bounded::SMALL_FILE_READ_CAP)
+    let proven = ipe_fs_open::RegularFile::prove(file).map_err(|_| TokenReadRefusal::Unreadable)?;
+    crate::io_bounded::read_proven(proven, path, crate::io_bounded::SMALL_FILE_CAP)
         .map_err(|_| TokenReadRefusal::Unreadable)
 }
 
