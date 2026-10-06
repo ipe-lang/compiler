@@ -6665,6 +6665,9 @@ mod tests {
 }
 
 #[cfg(test)]
+mod vendored_feature_tests;
+
+#[cfg(test)]
 mod escape_toml_basic_tests {
     use super::{SafeTomlString, apply_cargo_name, escape_toml_basic};
 
