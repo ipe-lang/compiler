@@ -454,6 +454,9 @@ pub(crate) struct ResolvedProject {
     /// The `[wasm] publicEnv` allowlist (empty for the no-manifest loose-file
     /// path — there is no manifest to declare one).
     pub(crate) wasm_public_env: Vec<String>,
+    /// The manifest's `browser.basePath` (the root for the no-manifest
+    /// loose-file path).
+    pub(crate) mount_base: ipe_backend_rust::MountBase,
     /// The sanitized Cargo package name for the emitted crate (from `package.ipe`
     /// name via [`ipe_backend_rust::sanitize_cargo_name`]). Empty string
     /// when no manifest is present (sibling-discovery path uses `"ipe-app"`).
@@ -560,6 +563,7 @@ pub(crate) fn resolve_project_sources(
             blame_path: manifest_path,
             db_driver: manifest.driver,
             wasm_public_env: manifest.wasm.public_env.to_names(),
+            mount_base: manifest.browser.base.clone(),
             cargo_name,
             scope: ScopeSpec::Package {
                 root: package_root,
@@ -581,6 +585,7 @@ pub(crate) fn resolve_project_sources(
         blame_path: entry.to_path_buf(),
         db_driver: ipe_backend_rust::DbDriver::Sqlite,
         wasm_public_env: Vec::new(),
+        mount_base: ipe_backend_rust::MountBase::root(),
         cargo_name: String::new(),
         scope: ScopeSpec::LooseFile {
             entry: entry.to_path_buf(),
@@ -1328,6 +1333,11 @@ fn run_inner(
                         cfg.set_wasm_public_env(&mut db_main)
                             .to(resolved.wasm_public_env.clone());
                     }
+                    if cfg.mount_base(&db_main) != &resolved.mount_base {
+                        use salsa::Setter as _;
+                        cfg.set_mount_base(&mut db_main)
+                            .to(resolved.mount_base.clone());
+                    }
                     cfg
                 } else {
                     // Pass ffi_prep.emit so the backend can write FFI
@@ -1339,6 +1349,7 @@ fn run_inner(
                         ffi_prep.emit,
                         REBUILD_TARGET,
                         resolved.wasm_public_env.clone(),
+                        resolved.mount_base.clone(),
                         false,
                         REBUILD_INTENT,
                         // Dependency-model emit: the project links the runtime as a

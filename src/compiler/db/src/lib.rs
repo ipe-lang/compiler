@@ -1316,6 +1316,11 @@ pub struct BuildConfig {
     /// section/key is absent. See [`ipe_backend_rust::RustBackend::with_wasm_public_env`].
     #[returns(ref)]
     pub wasm_public_env: Vec<String>,
+    /// The mount base the emitted browser shell is served under, parsed once
+    /// from the manifest's `browser.basePath`; the root for a single file.
+    /// See [`ipe_backend_rust::RustBackend::with_mount_base`].
+    #[returns(ref)]
+    pub mount_base: ipe_backend_rust::MountBase,
     /// `true` when `[wasm] mode = "hydrate"` is set in `package.ipe`. Passed
     /// through to [`ipe_backend_rust::RustBackend::with_wasm_hydrate_mode`]
     /// to emit the `#[wasm_bindgen] pub fn hydrate(…)` export (M7 SSR +
@@ -1447,6 +1452,7 @@ pub fn emit_project(
     let ffi = config.ffi(db).clone();
     let target = *config.target(db);
     let wasm_public_env = config.wasm_public_env(db).clone();
+    let mount_base = config.mount_base(db).clone();
     let wasm_hydrate_mode = *config.wasm_hydrate_mode(db);
     let runtime_dep = config.runtime_dep(db).clone();
     let debugger = *config.debugger(db);
@@ -1460,6 +1466,7 @@ pub fn emit_project(
         .with_ffi(ffi)
         .with_target(target)
         .with_wasm_public_env(wasm_public_env)
+        .with_mount_base(mount_base)
         .with_wasm_hydrate_mode(wasm_hydrate_mode)
         .with_runtime_dep(runtime_dep)
         .with_debugger(debugger)
@@ -1548,6 +1555,7 @@ pub fn emit_spine_file(
     let ffi = config.ffi(db).clone();
     let target = *config.target(db);
     let wasm_public_env = config.wasm_public_env(db).clone();
+    let mount_base = config.mount_base(db).clone();
     let wasm_hydrate_mode = *config.wasm_hydrate_mode(db);
     let runtime_dep = config.runtime_dep(db).clone();
     let hot_appearance = *config.hot_appearance(db);
@@ -1557,6 +1565,7 @@ pub fn emit_spine_file(
         .with_ffi(ffi)
         .with_target(target)
         .with_wasm_public_env(wasm_public_env)
+        .with_mount_base(mount_base)
         .with_wasm_hydrate_mode(wasm_hydrate_mode)
         .with_runtime_dep(runtime_dep)
         .with_hot_appearance(hot_appearance)
@@ -1664,6 +1673,7 @@ pub fn emit_manifest(
     let ffi = config.ffi(db).clone();
     let target = *config.target(db);
     let wasm_public_env = config.wasm_public_env(db).clone();
+    let mount_base = config.mount_base(db).clone();
     let wasm_hydrate_mode = *config.wasm_hydrate_mode(db);
     let runtime_dep = config.runtime_dep(db).clone();
     let debugger = *config.debugger(db);
@@ -1676,6 +1686,7 @@ pub fn emit_manifest(
         .with_ffi(ffi)
         .with_target(target)
         .with_wasm_public_env(wasm_public_env)
+        .with_mount_base(mount_base)
         .with_wasm_hydrate_mode(wasm_hydrate_mode)
         .with_runtime_dep(runtime_dep)
         .with_debugger(debugger)

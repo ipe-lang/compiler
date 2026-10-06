@@ -815,6 +815,10 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         static_plan,
         target: compile_target.ir_target(),
         wasm_public_env: Vec::new(),
+        // A single file carries no manifest: its shell is served at the root.
+        // A manifest project overwrites this from `browser.basePath` in
+        // build_project_with_options.
+        mount_base: ipe_backend_rust::MountBase::root(),
         wasm_hydrate_mode: false,
         // A `dev build` is a development artifact — Debug.* is permitted.
         intent: Verb::DEV_BUILD.intent(),
@@ -1618,6 +1622,13 @@ pub fn release_pipeline(
                     .as_ref()
                     .map(|m| m.wasm.public_env.to_names())
                     .unwrap_or_default(),
+                // The manifest's `browser.basePath`; a single file (no
+                // manifest) is served at the root.
+                mount_base: manifest_parsed
+                    .as_ref()
+                    .map_or_else(ipe_backend_rust::MountBase::root, |m| {
+                        m.browser.base.clone()
+                    }),
                 wasm_hydrate_mode: manifest_wasm
                     .as_ref()
                     .is_some_and(|w| w.mode.as_deref() == Some("hydrate")),
@@ -2849,6 +2860,10 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         static_plan,
         target: compile_target.ir_target(),
         wasm_public_env: Vec::new(),
+        // A single file carries no manifest: its shell is served at the root.
+        // A manifest project overwrites this from `browser.basePath` in
+        // build_project_with_options.
+        mount_base: ipe_backend_rust::MountBase::root(),
         wasm_hydrate_mode: false,
         intent: Verb::DEV_RUN.intent(),
         runtime_dep,
@@ -4018,6 +4033,7 @@ pub fn front_check_entry(entry: &Path) -> Result<(), CliError> {
         None,
         ipe_ir::Target::Native,
         Vec::new(),
+        ipe_backend_rust::MountBase::root(),
         false,
         ipe_backend_rust::BuildIntent::Development,
         None,
