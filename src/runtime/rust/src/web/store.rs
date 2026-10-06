@@ -2756,7 +2756,7 @@ mod tests {
         let blob = encode_checkpoint(&TEST_TAG, &payload);
         assert!(blob.is_some(), "encoding a small Vec<u8> cannot fail");
         if let Some(blob) = blob {
-            let init = || (Vec::new(), ());
+            let init = || (Vec::<u8>::new(), ());
             let decoded = decode_or_reconstruct_checkpoint(&TEST_TAG, &blob, &init);
             assert!(matches!(decoded, Some(Decoded::Verbatim(p)) if p == payload));
         }
