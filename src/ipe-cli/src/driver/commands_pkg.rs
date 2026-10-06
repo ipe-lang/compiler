@@ -11,12 +11,14 @@ use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::publisher::{AttestedActor, BlessedPublisher};
+use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
 use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
     audit, cli_args, contained_path, delivery, ffi, fmt, fs, index, pack, progress, project,
     publish, resolve, scratch, style, text, toolchain, version_check,
 };
+use zeroize::Zeroizing;
 
 /// Whether a delivery-routed bundle is a fast development build or a production
 /// distributable. `build web <host>` yields [`BundleProfile::Dev`]; `release web
@@ -633,7 +635,8 @@ pub fn pack_mobile(
 ///
 /// # Errors
 /// [`CliError::Usage`] when this binary's path cannot be resolved or the
-/// wasm build exits non-zero; [`CliError::Io`] when the build cannot be spawned.
+/// wasm build exits non-zero; [`CliError::Io`] when the build cannot be spawned
+/// or waited on.
 pub fn build_wasm_for_mobile(
     manifest_path: &Path,
     output_root: &Path,
@@ -642,15 +645,18 @@ pub fn build_wasm_for_mobile(
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Usage(text::msg::wasm_ipe_binary_unknown(&e)))?;
     let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    let status = std::process::Command::new(&exe)
+    let mut build = std::process::Command::new(&exe);
+    build
         .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
         .args(["--target", "wasm", "--out"])
-        .arg(output_root)
-        .status()
-        .map_err(|source| CliError::Io {
-            path: exe.clone(),
-            source,
+        .arg(output_root);
+    let status =
+        run_inherited(build, InheritedRole::SelfBuild, InheritedInput::Terminal).map_err(|e| {
+            CliError::Io {
+                path: exe,
+                source: e.into(),
+            }
         })?;
     if !status.success() {
         return Err(CliError::Usage(text::msg::mobile_wasm_build_failed(
@@ -1615,30 +1621,8 @@ pub fn build_and_run_test_entry(
     bin.push(&test_bin_name);
 
     // Run the test binary. `Ipe.Test.runMain` exits 0 on all-pass, 1 on any
-    // failure — propagate that as a stage error. Under `--json` the child's own
-    // human summary is captured and re-emitted on OUR stderr, so our stdout stays
-    // a single JSON line a consumer can parse.
-    let run_status = match stdio {
-        TestStdio::Inherit => {
-            std::process::Command::new(&bin)
-                .status()
-                .map_err(|e| CliError::Io {
-                    path: bin.clone(),
-                    source: e,
-                })?
-        }
-        TestStdio::Quiet => {
-            let output = std::process::Command::new(&bin)
-                .stdout(std::process::Stdio::piped())
-                .output()
-                .map_err(|e| CliError::Io {
-                    path: bin.clone(),
-                    source: e,
-                })?;
-            let _ = std::io::stderr().write_all(&output.stdout);
-            output.status
-        }
-    };
+    // failure — propagate that as a stage error.
+    let run_status = run_test_binary(bin, stdio, std::io::stderr)?;
 
     if run_status.success() {
         Ok(TestOutcome::AllPassed)
@@ -1649,6 +1633,43 @@ pub fn build_and_run_test_entry(
         let code = run_status.code().unwrap_or(1);
         Err(CliError::TestFailed { code })
     }
+}
+
+/// Run the compiled test binary `bin` to its exit, its output placed as `stdio` says.
+///
+/// [`TestStdio::Inherit`] leaves the terminal's stdout and stderr in place.
+/// [`TestStdio::Quiet`] points both of the binary's streams at `cli_stderr`
+/// (the CLI's own stderr in production), so the CLI's stdout carries only its
+/// machine verdict while the binary's summary and its own stderr still reach
+/// the user. Nothing the binary writes passes through the CLI's memory.
+///
+/// # Errors
+/// [`CliError::Io`] naming `bin` when the binary cannot be started or waited on.
+fn run_test_binary<S: Into<std::process::Stdio>>(
+    bin: PathBuf,
+    stdio: TestStdio,
+    cli_stderr: impl Fn() -> S,
+) -> Result<std::process::ExitStatus, CliError> {
+    let ran = match stdio {
+        TestStdio::Inherit => run_inherited(
+            std::process::Command::new(&bin),
+            InheritedRole::UserProgram,
+            InheritedInput::Terminal,
+        ),
+        TestStdio::Quiet => {
+            let mut command = std::process::Command::new(&bin);
+            command.stdout(cli_stderr()).stderr(cli_stderr());
+            run_inherited(
+                command,
+                InheritedRole::UserProgram,
+                InheritedInput::Terminal,
+            )
+        }
+    };
+    ran.map_err(|e| CliError::Io {
+        path: bin,
+        source: e.into(),
+    })
 }
 
 /// Stage 4 of `ipe verify`: run the project's tests via the shared
@@ -2240,11 +2261,44 @@ fn download_installer() -> Result<crate::scratch::ScratchFile, CliError> {
     Ok(script)
 }
 
+/// Read the downloaded installer `script` back, held to the download's byte ceiling.
+///
+/// The download measured the file against `INSTALLER_MAX_BYTES`; reading it
+/// back under the same ceiling bounds the bytes held in memory at the read
+/// itself, whatever the file holds by then.
+///
+/// # Errors
+/// [`CliError::Io`] when the file cannot be rewound or read;
+/// [`CliError::RemoteIngestExceeded`] when it holds more than the ceiling.
+fn read_installer_script(
+    mut script: crate::scratch::ScratchFile,
+) -> Result<Zeroizing<Vec<u8>>, CliError> {
+    use crate::remote_ingest::{self, CappedReadError};
+    script.rewind().map_err(|source| CliError::Io {
+        path: script.path().to_path_buf(),
+        source,
+    })?;
+    remote_ingest::read_capped(
+        &script.file,
+        remote_ingest::INSTALLER_MAX_BYTES,
+        remote_ingest::INSTALLER.source(),
+    )
+    .map(Zeroizing::new)
+    .map_err(|e| match e {
+        CappedReadError::Io(source) => CliError::Io {
+            path: script.path().to_path_buf(),
+            source,
+        },
+        CappedReadError::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
+    })
+}
+
 /// Download the installer script, then run it and wait for it to finish.
 ///
-/// The script reaches `sh` on its standard input from the retained handle of
-/// the file it was downloaded into, exactly as a `curl | sh` pipe would, so the
-/// bytes run are the bytes that were downloaded and measured. The installer
+/// The script is read back through the retained handle of the file it was
+/// downloaded into, held to the download's own byte ceiling, and reaches `sh`
+/// on its standard input exactly as a `curl | sh` pipe would, so the bytes run
+/// are the bytes that were downloaded and measured. The installer
 /// exits 2 when no prebuilt binary exists for the current platform; any other
 /// non-zero exit is a generic failure.
 ///
@@ -2261,17 +2315,7 @@ pub fn run_installer() -> Result<(), CliError> {
     }
 
     let download = progress::Stage::start(std::io::stderr(), "Downloading the release installer…");
-    let script = match download_installer().and_then(|mut script| {
-        script.rewind().map_err(|source| CliError::Io {
-            path: script.path().to_path_buf(),
-            source,
-        })?;
-        let stdin = script.file.try_clone().map_err(|source| CliError::Io {
-            path: script.path().to_path_buf(),
-            source,
-        })?;
-        Ok((script, stdin))
-    }) {
+    let script = match download_installer().and_then(read_installer_script) {
         Ok(script) => {
             download.success("Installer downloaded.");
             script
@@ -2281,48 +2325,38 @@ pub fn run_installer() -> Result<(), CliError> {
             return Err(e);
         }
     };
-    let (_script, script_stdin) = script;
 
-    // Render the hand-off to the installer as a stage on stderr: a running
-    // light-yellow line while we spawn `sh`, settled to a green success (or a
-    // red failure) BEFORE the child inherits the terminal, so the installer's
-    // own staged output begins on a fresh, uncorrupted line.
+    // Render the hand-off to the installer as a stage on stderr, settled BEFORE
+    // the child inherits the terminal, so the installer's own staged output
+    // begins on a fresh, uncorrupted line. A launch that fails after the
+    // hand-off is reported as the command's error.
     let stage = progress::Stage::start(std::io::stderr(), "Launching the release installer…");
     // IPE_UPGRADE_WRAPPED tells install.sh it is running under us: on its
     // "no prebuilt binary" failure it skips its own stderr banner (we render
     // the one failure message ourselves, below) and writes the tag it actually
     // resolved and probed into the private (0600, unpredictably named) file
     // named by IPE_UPGRADE_TAG_FILE, so we report the real target version
-    // instead of guessing. The script arrives on stdin from its private file;
-    // stdout and stderr stay inherited, untouched. Without a
-    // tag file install.sh keeps its own banner.
+    // instead of guessing. The script arrives on stdin; stdout and stderr stay
+    // inherited, untouched. Without a tag file install.sh keeps its own banner.
     let mut tag_file = crate::scratch::ScratchFile::create("ipe-upgrade-tag").ok();
     let mut installer = std::process::Command::new("sh");
-    installer
-        .arg("-s")
-        .stdin(script_stdin)
-        .env(UPGRADE_WRAPPED_ENV, "1");
+    installer.arg("-s").env(UPGRADE_WRAPPED_ENV, "1");
     match &tag_file {
         Some(file) => installer.env(UPGRADE_TAG_FILE_ENV, file.path()),
         None => installer.env_remove(UPGRADE_TAG_FILE_ENV),
     };
-    let child = installer.spawn();
-    let mut child = match child {
-        Ok(child) => {
-            stage.success("Installer launched — following its progress below.");
-            child
+    stage.success("Handing off to the installer — following its progress below.");
+    let status = run_inherited(
+        installer,
+        InheritedRole::InteractiveInstall,
+        InheritedInput::Bytes(script),
+    )
+    .map_err(|e| match e {
+        InheritedError::Spawn(refusal) => {
+            CliError::Usage(text::msg::upgrade_installer_launch_failed(&refusal))
         }
-        Err(e) => {
-            stage.failure(format!("Could not launch the installer (needs `sh`): {e}"));
-            return Err(CliError::Usage(text::msg::upgrade_installer_launch_failed(
-                &e,
-            )));
-        }
-    };
-
-    let status = child
-        .wait()
-        .map_err(|e| CliError::Usage(text::msg::upgrade_installer_wait_failed(&e)))?;
+        InheritedError::Wait(e) => CliError::Usage(text::msg::upgrade_installer_wait_failed(&e)),
+    })?;
     if status.success() {
         return Ok(());
     }
@@ -3899,5 +3933,79 @@ mod capability_fold_tests {
             matches!(&verdict, Ok(set) if *set == expected),
             "expected the union {expected:?}, got {verdict:?}"
         );
+    }
+}
+
+// A quiet test binary writes its summary and its own stderr to the CLI's
+// stderr: neither stream is dropped, and nothing is held in the CLI's memory.
+
+#[cfg(all(test, unix))]
+mod test_binary_tests {
+    use super::*;
+    use crate::scratch::{ScratchDir, ScratchFile};
+
+    /// A compiled test runner stood in for by the `sh` script `body`, inside `dir`.
+    #[allow(clippy::expect_used)] // a fixture that cannot be written fails the test
+    fn stub_binary(dir: &ScratchDir, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = dir.path().join("runner");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write the stub binary");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("mark the stub binary executable");
+        bin
+    }
+
+    /// Run `bin` quiet with a scratch file as the CLI's stderr; the outcome and what reached that file.
+    #[allow(clippy::expect_used)] // a fixture that cannot be read fails the test
+    fn run_quiet(bin: PathBuf) -> (Result<std::process::ExitStatus, CliError>, String) {
+        let mut sink = ScratchFile::create("ipe-test-binary-stderr").expect("scratch sink");
+        let ran = run_test_binary(bin, TestStdio::Quiet, || {
+            sink.file.try_clone().expect("clone the sink handle")
+        });
+        let written = sink.read_all().expect("read the sink");
+        (ran, String::from_utf8_lossy(&written).into_owned())
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that cannot be created fails the test
+    fn a_quiet_test_binary_stdout_reaches_the_cli_stderr() {
+        let dir = ScratchDir::new("ipe-test-binary").expect("scratch dir");
+        let (ran, written) = run_quiet(stub_binary(&dir, "printf 'summary-on-stdout'"));
+        assert!(
+            matches!(&ran, Ok(status) if status.success()),
+            "the stub exits 0: {ran:?}"
+        );
+        assert!(
+            written.contains("summary-on-stdout"),
+            "the binary's stdout must reach the CLI's stderr, got {written:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that cannot be created fails the test
+    fn a_quiet_test_binary_keeps_its_stderr() {
+        let dir = ScratchDir::new("ipe-test-binary").expect("scratch dir");
+        let (ran, written) = run_quiet(stub_binary(&dir, "printf 'failure-on-stderr' >&2\nexit 3"));
+        assert!(
+            matches!(&ran, Ok(status) if status.code() == Some(3)),
+            "the stub's own exit code is the outcome: {ran:?}"
+        );
+        assert!(
+            written.contains("failure-on-stderr"),
+            "the binary's stderr must reach the CLI's stderr, got {written:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that cannot be created fails the test
+    fn a_test_binary_that_cannot_start_is_an_io_error_naming_it() {
+        let dir = ScratchDir::new("ipe-test-binary").expect("scratch dir");
+        let absent = dir.path().join("absent-runner");
+        let (ran, _) = run_quiet(absent.clone());
+        let Err(CliError::Io { path, .. }) = ran else {
+            assert!(matches!(ran, Err(CliError::Io { .. })), "got {ran:?}");
+            return;
+        };
+        assert_eq!(path, absent);
     }
 }
