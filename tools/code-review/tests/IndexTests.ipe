@@ -961,7 +961,9 @@ sourceCeilingBinds =
         past <- oversizeTag False (paddedLibRs (ByteSize.toBytes Index.sourceCeiling + 1)) 3 6 (Index.attest viewA)
         Task.succeed
             (ByteSize.toBytes Index.sourceCeiling
-                == 16 * 1024 * 1024
+                == 16
+                * 1024
+                * 1024
                 && atCeiling
                 == "shown"
                 && String.startsWith "unreadable: " past
