@@ -1294,12 +1294,15 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// Read a dotted string value from `$IPE_HOME/config.toml`, or `None` when the
-/// file is absent, unreadable, unparseable, or lacks the key.
+/// file is absent, a symlink, unreadable, unparseable, or lacks the key.
 fn ipe_home_config_value(key: &[&str]) -> Option<String> {
-    let path = runtime_embed::ipe_home().ok()?.join("config.toml");
-    let text =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
-            .ok()?;
+    let home = runtime_embed::ipe_home().ok()?;
+    let text = crate::io_bounded::read_named_in(
+        &home,
+        &["config.toml"],
+        crate::io_bounded::SMALL_FILE_CAP,
+    )
+    .ok()?;
     let doc: toml::Table = text.parse().ok()?;
     let mut node = &toml::Value::Table(doc);
     for segment in key {

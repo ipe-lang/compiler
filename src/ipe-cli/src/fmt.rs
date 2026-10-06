@@ -117,8 +117,11 @@ fn run_fmt_inplace(
     let walked = !root.is_file();
     let mut unformatted: Vec<PathBuf> = Vec::new();
     for file in &files {
-        let src =
-            crate::io_bounded::read_to_string_capped(file, crate::io_bounded::SOURCE_READ_CAP)?;
+        let src = if walked {
+            crate::io_bounded::read_walked_source(file)?
+        } else {
+            crate::io_bounded::read_user_named(file, crate::io_bounded::SOURCE_CAP)?
+        };
         let formatted = format_source(&src).map_err(|e| fmt_err_to_cli(file, e))?;
         if check {
             if formatted != src {
