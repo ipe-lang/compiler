@@ -290,13 +290,54 @@ fn raw_string(chars: &[char], mut i: usize, hashes: usize) -> (String, usize, us
     (out, i, lines)
 }
 
+/// When `toks[at..]` opens a `#[cfg(test)]` attribute, the index of the last
+/// token of the item it gates, which no vendored build compiles.
+///
+/// The item ends at its matching `}` or, with no body, at its `;`. Only the
+/// exact `cfg(test)` form is skipped, so `cfg(not(test))` and a gate that
+/// combines `test` with other predicates stay scanned.
+fn test_only_item_end(toks: &[(usize, Tok)], at: usize) -> Option<usize> {
+    let word =
+        |k: usize, name: &str| matches!(toks.get(at + k), Some((_, Tok::Ident(w))) if w == name);
+    let punct = |k: usize, c: char| matches!(toks.get(at + k), Some((_, Tok::Punct(p))) if *p == c);
+    let is_attr = punct(0, '#')
+        && punct(1, '[')
+        && word(2, "cfg")
+        && punct(3, '(')
+        && word(4, "test")
+        && punct(5, ')')
+        && punct(6, ']');
+    if !is_attr {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (k, (_, tok)) in toks.iter().enumerate().skip(at + 7) {
+        match tok {
+            Tok::Punct('{') => depth += 1,
+            Tok::Punct('}') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            Tok::Punct(';') if depth == 0 => return Some(k),
+            _ => {}
+        }
+    }
+    Some(toks.len().saturating_sub(1))
+}
+
 /// Every `feature = "name"` inside a `cfg` / `cfg_attr` attribute or a `cfg!`
-/// macro, with the line it sits on.
+/// macro, with the line it sits on. Items gated by `#[cfg(test)]` are skipped.
 fn cfg_features(src: &str) -> Vec<(usize, String)> {
     let toks = lex(src);
     let mut found = Vec::new();
     let mut i = 0usize;
     while let Some((_, tok)) = toks.get(i) {
+        if let Some(end) = test_only_item_end(&toks, i) {
+            i = end + 1;
+            continue;
+        }
         let is_cfg = matches!(tok, Tok::Ident(w) if w == "cfg" || w == "cfg_attr");
         let in_attr = i > 0 && matches!(toks.get(i - 1), Some((_, Tok::Punct('['))));
         let as_macro = matches!(toks.get(i + 1), Some((_, Tok::Punct('!'))));
@@ -601,4 +642,31 @@ fn undeclared_feature_is_drift() {
         .map(|(_, n)| n.as_str())
         .collect();
     assert_eq!(undeclared, ["http_client"]);
+}
+
+/// A `#[cfg(test)]` item, body or bodiless, is never read, while a gate before
+/// or after it, and a `cfg(not(test))` item, still are.
+#[test]
+fn cfg_scan_skips_test_only_items() {
+    let src = r#"
+        #[cfg(feature = "before")]
+        fn a() {}
+        #[cfg(test)]
+        mod tests {
+            #[cfg(feature = "in_test_mod")]
+            #[test]
+            fn t() { if true { let _ = 1; } }
+        }
+        #[cfg(test)]
+        mod external;
+        #[cfg(not(test))]
+        #[cfg(feature = "not_test")]
+        fn b() {}
+        #[cfg(all(test, feature = "mixed"))]
+        fn c() {}
+        #[cfg(feature = "after")]
+        fn d() {}
+    "#;
+    let names: Vec<String> = cfg_features(src).into_iter().map(|(_, n)| n).collect();
+    assert_eq!(names, ["before", "not_test", "mixed", "after"]);
 }

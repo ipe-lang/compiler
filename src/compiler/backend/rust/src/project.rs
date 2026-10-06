@@ -4624,7 +4624,7 @@ fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> D
         .find(DEFAULT_PREFIX)
         .ok_or_else(|| Diagnostic::CompilerBug {
             where_,
-            detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
+            detail: format!("Cargo.toml anchor `{DEFAULT_PREFIX}` not found — golden drifted"),
         })?;
     let search_from = pfx + DEFAULT_PREFIX.len();
     let close = base

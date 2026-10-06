@@ -68,6 +68,12 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
     ("project.rs", "email_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "http_client_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "json_string", Breach::LoneQuote, 2),
+    (
+        "project.rs",
+        "promote_default_feature",
+        Breach::HandQuote,
+        1,
+    ),
     ("project.rs", "jwt_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "locale_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "server_cargo_toml", Breach::HandQuote, 3),

@@ -32,9 +32,7 @@ const SHIPPED_TEXT: &[(&str, &[&str])] = &[
 const WIRE_LEN: usize = 9;
 
 fn source_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
+    e2e_support::manifest_dir!().join("..").join("..")
 }
 
 /// Whether `bytes` is `IPE-` followed by an uppercase letter and four digits.
