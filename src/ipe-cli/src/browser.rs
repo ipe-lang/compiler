@@ -243,7 +243,8 @@ const fn opener_argv(platform: Platform, url: &BrowserUrl) -> (&'static str, [&s
 /// stream null and is watched for at most [`OPENER_GRACE`]; one still running
 /// then is left running (an opener may wait on the browser it started) and
 /// the call returns, so it never holds the caller. A caller prints the URL
-/// whenever the outcome is not [`OpenOutcome::Opened`].
+/// whenever the outcome is not [`OpenOutcome::Opened`]. Call it from a thread
+/// that outlives the opener: a spawning thread's exit signals the opener.
 pub fn open_url(url: &BrowserUrl) -> OpenOutcome {
     let (program, args) = opener_argv(Platform::HOST, url);
     let mut command = Command::new(program);
@@ -415,10 +416,15 @@ mod tests {
         ] {
             assert_eq!(github(raw), Err(BrowserUrlRefusal::Host), "{raw}");
         }
-        assert_eq!(
-            loopback("http://10.0.0.1:8080/"),
-            Err(BrowserUrlRefusal::Host)
-        );
+        for raw in [
+            "http://10.0.0.1:8080/",
+            "http://localhost.evil.com:80/",
+            "http://127.0.0.1.evil:80/",
+            "http://[::1]:80/",
+            "http://LOCALHOST:80/",
+        ] {
+            assert_eq!(loopback(raw), Err(BrowserUrlRefusal::Host), "{raw}");
+        }
     }
 
     #[test]
@@ -549,7 +555,7 @@ mod tests {
         assert!(matches!(outcome, OpenOutcome::OpenerMissing), "{outcome}");
     }
 
-    /// The opener writes its marker one second after the grace ends, so only an
+    /// The opener writes its marker three seconds after the grace ends, so only an
     /// opener left running past the grace can write it.
     #[cfg(unix)]
     #[test]
@@ -562,14 +568,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test dir");
         let marker = dir.join("still-running");
-        let mut command = sh("sleep 1; : > \"$0\"");
+        let mut command = sh("sleep 3; : > \"$0\"");
         command.arg(&marker);
 
         let started = Instant::now();
         let outcome = run_opener(command, true, Duration::from_millis(100));
         assert!(matches!(outcome, OpenOutcome::Opened), "{outcome}");
         assert!(
-            started.elapsed() < Duration::from_millis(900),
+            started.elapsed() < Duration::from_millis(2500),
             "the opener held the caller past its grace"
         );
         assert!(!marker.exists(), "the opener exited before the grace ended");
