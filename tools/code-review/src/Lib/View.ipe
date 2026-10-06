@@ -777,7 +777,7 @@ sourceBlock loaded =
             [ Ui.width Ui.fill, Ui.spacing 2 ]
             (case loaded.view of
                 Shown shown ->
-                    List.map (numberedLine loaded.unit.lang) (Index.shownLines shown loaded.unit.lineStart)
+                    List.map numberedLine (Index.shownLines shown)
 
                 Stale _ ->
                     withheldSource loaded.view
@@ -801,8 +801,8 @@ withheldSource view =
             []
 
 
-numberedLine : Highlight.Lang -> ( Int, String ) -> Ui.Element Msg
-numberedLine lang ( n, line ) =
+numberedLine : Highlight.SourceLine -> Ui.Element Msg
+numberedLine line =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 8 ]
         [ Ui.el
@@ -812,7 +812,7 @@ numberedLine lang ( n, line ) =
             , Font.color (Ui.rgb 120 120 135)
             , Ui.alignRight
             ]
-            (Ui.text (String.fromInt n))
+            (Ui.text (String.fromInt line.number))
         , Ui.el
             [ Ui.width Ui.fill
             , Font.family Font.monospace
@@ -820,7 +820,7 @@ numberedLine lang ( n, line ) =
             ]
             (Ui.wrappedRow
                 [ Ui.width Ui.fill, Ui.spacing 0 ]
-                (List.map tokenEl (Highlight.tokenize lang line))
+                (List.map tokenEl line.tokens)
             )
         ]
 

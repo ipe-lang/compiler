@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownLines, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownLexed, shownLines, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -100,14 +100,11 @@ linksOf conn row view =
     case view of
         Shown shown ->
             let
-                lang =
-                    langOf row.lang
-
-                source =
-                    shownText shown
+                lexed =
+                    shownLexed shown
 
                 wanted =
-                    Links.candidates lang { kind = row.kind, name = row.name, qualified = row.qualified } (Links.references lang source)
+                    Links.candidates (Highlight.lexedLang lexed) { kind = row.kind, name = row.name, qualified = row.qualified } (Links.references lexed)
             in
             do
                 edges <- edgeLinks conn row.uid
@@ -117,7 +114,7 @@ linksOf conn row view =
                         { edges = edgeReach edges, candidates = wanted.reach }
                         (List.map (\( uid, qualified ) -> Links.internal qualified uid) edges)
                         (Links.resolveCandidates wanted.lookups resolved)
-                        (Links.sourceUrls source)
+                        (Links.sourceUrls lexed)
                     )
 
         Stale _ ->
@@ -759,29 +756,37 @@ nameFor conn uid =
 -- The one verification of a unit's source. The stored hash is parsed first,
 -- so an unknown scheme refuses before any read; then the stored path is
 -- resolved, a span past the line ceiling is withheld before any read, the
--- file is read and `classifyView` judges the view. Every per-unit cause
+-- file is read and `judgeView` judges the view. Every per-unit cause
 -- (refused path, unreadable file, oversized view, bad range, drift) is a
--- `SourceView` state, never a failed task.
-viewOf : RootMap -> RowUnit -> Task.Task Error SourceView
-viewOf roots row =
+-- `Withheld` value, never a failed task. Nothing here lexes: a decision
+-- re-proves bytes through this alone.
+readVerified : RootMap -> RowUnit -> Task.Task Error (Result Withheld VerifiedText)
+readVerified roots row =
     case parseAttested row.bodyHash of
         UnknownScheme _ ->
-            Task.succeed (Stale UnverifiableHash)
+            Task.succeed (Err (WithheldStale UnverifiableHash))
 
         Sha256 stored ->
             case RepoPath.resolve roots row.path of
                 Err refusal ->
-                    Task.succeed (Unreadable (RepoPath.toError refusal))
+                    Task.succeed (Err (WithheldUnreadable (RepoPath.toError refusal)))
 
                 Ok path ->
                     case spanOversize row.lineStart row.lineEnd of
                         Just over ->
-                            Task.succeed (TooLarge over)
+                            Task.succeed (Err (WithheldTooLarge over))
 
                         Nothing ->
                             File.readFileLimit path sourceCeiling
-                                |> Task.map (classifyView row.uid stored row.lineStart row.lineEnd)
-                                |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
+                                |> Task.map (judgeView row.uid stored row.lineStart row.lineEnd)
+                                |> Task.onError (\e -> Task.succeed (Err (WithheldUnreadable (readFailure row.path e))))
+
+
+-- A unit's view for a page: the verified bytes lexed once, under the unit's
+-- file language, into the one token stream every drawn line and link reads.
+viewOf : RootMap -> RowUnit -> Task.Task Error SourceView
+viewOf roots row =
+    readVerified roots row |> Task.map (sourceViewOf (langOf row.lang))
 
 
 -- A read error re-worded to name the stored path it came from.
@@ -802,19 +807,19 @@ readFailure stored e =
 
 -- The one judgement of a unit's view, in precedence order: a span past the
 -- line ceiling, a range outside `text`, a view past the byte ceiling, then
--- the attestation compare. `ShownSource` is built only here, so holding one
+-- the attestation compare. `VerifiedText` is built only here, so holding one
 -- proves the view is within both ceilings and re-hashes to `stored`. An
 -- oversized view is never hashed: re-indexing cannot make it shown.
-classifyView : Uid -> String -> Int -> Int -> String -> SourceView
-classifyView uid stored start end text =
+judgeView : Uid -> String -> Int -> Int -> String -> Result Withheld VerifiedText
+judgeView uid stored start end text =
     case spanOversize start end of
         Just over ->
-            TooLarge over
+            Err (WithheldTooLarge over)
 
         Nothing ->
             case viewText start end text of
                 Err reason ->
-                    Stale reason
+                    Err (WithheldStale reason)
 
                 Ok view ->
                     let
@@ -822,13 +827,51 @@ classifyView uid stored start end text =
                             Bytes.length (Bytes.fromString view)
                     in
                     if size > ByteSize.toBytes viewByteCeiling then
-                        TooLarge (ViewBytes { size = ByteSize.bytes size })
+                        Err (WithheldTooLarge (ViewBytes { size = ByteSize.bytes size }))
 
                     else if attest view == stored then
-                        Shown (ShownSource { uid = uid, text = view, hash = stored })
+                        Ok (VerifiedText { uid = uid, start = start, text = view, hash = stored })
 
                     else
-                        Stale Drifted
+                        Err (WithheldStale Drifted)
+
+
+-- The page view of `text` judged as lines `start..end` under `stored`, a
+-- shown view lexed once as `lang`.
+classifyView : Highlight.Lang -> Uid -> String -> Int -> Int -> String -> SourceView
+classifyView lang uid stored start end text =
+    sourceViewOf lang (judgeView uid stored start end text)
+
+
+-- The one place a verified text is lexed: `ShownSource` is built only here,
+-- from a `VerifiedText`, so its tokens are the attested bytes.
+sourceViewOf : Highlight.Lang -> Result Withheld VerifiedText -> SourceView
+sourceViewOf lang judged =
+    case judged of
+        Ok (VerifiedText v) ->
+            Shown (ShownSource { uid = v.uid, text = v.text, hash = v.hash, lexed = Highlight.lex lang v.start v.text })
+
+        Err (WithheldStale reason) ->
+            Stale reason
+
+        Err (WithheldUnreadable e) ->
+            Unreadable e
+
+        Err (WithheldTooLarge over) ->
+            TooLarge over
+
+
+-- Source bytes proved within both view ceilings and equal to their
+-- attestation, before any lexing. Opaque: built only by `judgeView`.
+type VerifiedText
+    = VerifiedText { uid : Uid, start : Int, text : String, hash : String }
+
+
+-- Why verified bytes could not be produced, one case per withheld view.
+type Withheld
+    = WithheldStale StaleReason
+    | WithheldUnreadable Error
+    | WithheldTooLarge Oversize
 
 
 -- A span of more than `viewLineCeiling` lines, judged on the indexed range
@@ -883,13 +926,14 @@ withRow row =
     }
 
 
--- A stored file language parsed for highlighting; a unit with no file row
--- reads as `Unknown`, shown as escaped plain text.
+-- A stored file language parsed for highlighting; a unit with no file row,
+-- or a stored value outside ipe-index's vocabulary, reads as `Unknown`, shown
+-- as escaped plain text.
 langOf : Maybe String -> Highlight.Lang
 langOf stored =
-    case stored of
+    case Maybe.andThen Highlight.parseStored stored of
         Just lang ->
-            Highlight.langFor lang
+            Highlight.dialect lang
 
         Nothing ->
             Highlight.Unknown
@@ -941,11 +985,12 @@ hashDigits attested =
             other
 
 
--- Source text proved within both view ceilings and equal to its attestation.
--- Opaque: built only by `classifyView`, so holding one means the bytes were
--- measured and re-hashed.
+-- Source text proved within both view ceilings and equal to its attestation,
+-- with its one token stream. Opaque: built only by `sourceViewOf` from a
+-- `VerifiedText`, so holding one means the bytes were measured and re-hashed,
+-- and every line drawn and reference linked is a reading of those bytes.
 type ShownSource
-    = ShownSource { uid : Uid, text : String, hash : String }
+    = ShownSource { uid : Uid, text : String, hash : String, lexed : Highlight.Lexed }
 
 
 shownText : ShownSource -> String
@@ -955,14 +1000,21 @@ shownText shown =
             s.text
 
 
--- The shown view's lines numbered from the unit's first line `start`: the
--- exact lines `viewText` joined and the attestation hashed, so the drawn rows,
--- the counted rows and the hashed rows are one list.
-shownLines : ShownSource -> Int -> List ( Int, String )
-shownLines shown start =
-    shownText shown
-        |> String.split "\n"
-        |> List.indexedMap (\i line -> ( start + i, line ))
+-- The shown view's token stream, lexed once from the attested bytes.
+shownLexed : ShownSource -> Highlight.Lexed
+shownLexed shown =
+    case shown of
+        ShownSource s ->
+            s.lexed
+
+
+-- The shown view's lines numbered from the unit's first line: the exact
+-- lines `viewText` joined and the attestation hashed, each drawn from the one
+-- token stream, so the drawn rows, the counted rows and the hashed rows are
+-- one list.
+shownLines : ShownSource -> List Highlight.SourceLine
+shownLines shown =
+    Highlight.lexedLines (shownLexed shown)
 
 
 shownHash : ShownSource -> String
@@ -994,12 +1046,12 @@ attestedHash attested =
 
 
 -- Re-proves a shown source at decision time: the unit's row is re-read from
--- the index and its file re-hashed through `viewOf`, and the fresh view must
--- be shown under the same hash. A unit gone from the index, or a source that
--- changed or became unreadable since it was shown, is a conflict, so no
--- decision is recorded against bytes the reviewer did not see. The index and
--- root are the one `settings` value resolved at startup, the tree the page
--- showed the unit from.
+-- the index and its file re-hashed through `readVerified`, which lexes
+-- nothing, and the fresh bytes must verify under the same hash. A unit gone
+-- from the index, or a source that changed or became unreadable since it
+-- was shown, is a conflict, so no decision is recorded against bytes the
+-- reviewer did not see. The index and root are the one `settings` value
+-- resolved at startup, the tree the page showed the unit from.
 reverify : IndexSettings -> ShownSource -> Task.Task Error Attested
 reverify settings shown =
     case shown of
@@ -1009,30 +1061,30 @@ reverify settings shown =
                 rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql s.uid ] rowDecoder
                 case List.head rows of
                     Just row ->
-                        viewOf settings.roots row
+                        readVerified settings.roots row
                             |> Task.andThen (confirmShown s.uid s.hash)
 
                     Nothing ->
                         Task.fail (Error.conflict "unit no longer indexed")
 
 
-confirmShown : Uid -> String -> SourceView -> Task.Task Error Attested
+confirmShown : Uid -> String -> Result Withheld VerifiedText -> Task.Task Error Attested
 confirmShown uid hash fresh =
     case fresh of
-        Shown now ->
-            if shownHash now == hash then
+        Ok (VerifiedText now) ->
+            if now.hash == hash then
                 Task.succeed (Attested { uid = uid, hash = hash })
 
             else
                 Task.fail sourceChanged
 
-        Stale _ ->
+        Err (WithheldStale _) ->
             Task.fail sourceChanged
 
-        Unreadable _ ->
+        Err (WithheldUnreadable _) ->
             Task.fail sourceChanged
 
-        TooLarge _ ->
+        Err (WithheldTooLarge _) ->
             Task.fail pastCeiling
 
 
