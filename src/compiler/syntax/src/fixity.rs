@@ -42,110 +42,65 @@ impl Fixity {
     }
 }
 
-/// One binary operator of the surface language.
+/// Declares [`BinOp`], [`BinOp::ALL`] and [`BinOp::text`] from one list.
 ///
-/// The set is closed: every operator the parser accepts is one variant, and
-/// [`BinOp::ALL`] lists each variant once, in declaration order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BinOp {
-    /// `*`
-    Mul,
-    /// `/`
-    FloatDiv,
-    /// `//`
-    IntDiv,
-    /// `+`
-    Add,
-    /// `-`
-    Sub,
-    /// `|.`, the parser-pipeline ignorer (yields the left result).
-    ParserIgnorer,
-    /// `++`
-    Append,
-    /// `::`
-    Cons,
-    /// `|=`, the parser-pipeline keeper (yields the right result).
-    ParserKeeper,
-    /// `==`
-    Eq,
-    /// `/=`
-    Neq,
-    /// `<`
-    Lt,
-    /// `>`
-    Gt,
-    /// `<=`
-    Le,
-    /// `>=`
-    Ge,
-    /// `&&`
-    And,
-    /// `||`
-    Or,
-    /// `|>`
-    PipeRight,
-    /// `<|`
-    PipeLeft,
-    /// `<<`
-    ComposeLeft,
-    /// `>>`
-    ComposeRight,
+/// A variant cannot be missing from `ALL` or lack a source text.
+macro_rules! closed_binops {
+    ($($doc:literal, $variant:ident, $text:literal;)+) => {
+        /// One binary operator of the surface language.
+        ///
+        /// The set is closed: every operator the parser accepts is one variant, and
+        /// [`BinOp::ALL`] lists each variant once, in declaration order.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum BinOp {
+            $(
+                #[doc = $doc]
+                $variant,
+            )+
+        }
+
+        impl BinOp {
+            /// Every operator, once each, in declaration order.
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+
+            const COUNT: usize = [$(Self::$variant),+].len();
+
+            /// The operator's source text.
+            #[must_use]
+            pub const fn text(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text,)+
+                }
+            }
+        }
+    };
+}
+
+closed_binops! {
+    "`*`", Mul, "*";
+    "`/`", FloatDiv, "/";
+    "`//`", IntDiv, "//";
+    "`+`", Add, "+";
+    "`-`", Sub, "-";
+    "`|.`, the parser-pipeline ignorer (yields the left result).", ParserIgnorer, "|.";
+    "`++`", Append, "++";
+    "`::`", Cons, "::";
+    "`|=`, the parser-pipeline keeper (yields the right result).", ParserKeeper, "|=";
+    "`==`", Eq, "==";
+    "`/=`", Neq, "/=";
+    "`<`", Lt, "<";
+    "`>`", Gt, ">";
+    "`<=`", Le, "<=";
+    "`>=`", Ge, ">=";
+    "`&&`", And, "&&";
+    "`||`", Or, "||";
+    "`|>`", PipeRight, "|>";
+    "`<|`", PipeLeft, "<|";
+    "`<<`", ComposeLeft, "<<";
+    "`>>`", ComposeRight, ">>";
 }
 
 impl BinOp {
-    /// Every operator, once each, in declaration order.
-    pub const ALL: [Self; 21] = [
-        Self::Mul,
-        Self::FloatDiv,
-        Self::IntDiv,
-        Self::Add,
-        Self::Sub,
-        Self::ParserIgnorer,
-        Self::Append,
-        Self::Cons,
-        Self::ParserKeeper,
-        Self::Eq,
-        Self::Neq,
-        Self::Lt,
-        Self::Gt,
-        Self::Le,
-        Self::Ge,
-        Self::And,
-        Self::Or,
-        Self::PipeRight,
-        Self::PipeLeft,
-        Self::ComposeLeft,
-        Self::ComposeRight,
-    ];
-
-    /// The operator's source text.
-    #[must_use]
-    pub const fn text(self) -> &'static str {
-        match self {
-            Self::Mul => "*",
-            Self::FloatDiv => "/",
-            Self::IntDiv => "//",
-            Self::Add => "+",
-            Self::Sub => "-",
-            Self::ParserIgnorer => "|.",
-            Self::Append => "++",
-            Self::Cons => "::",
-            Self::ParserKeeper => "|=",
-            Self::Eq => "==",
-            Self::Neq => "/=",
-            Self::Lt => "<",
-            Self::Gt => ">",
-            Self::Le => "<=",
-            Self::Ge => ">=",
-            Self::And => "&&",
-            Self::Or => "||",
-            Self::PipeRight => "|>",
-            Self::PipeLeft => "<|",
-            Self::ComposeLeft => "<<",
-            Self::ComposeRight => ">>",
-        }
-    }
-
     /// The operator spelled exactly `text`, or `None` outside the closed set.
     #[must_use]
     pub const fn from_text(text: &str) -> Option<Self> {
