@@ -85,6 +85,7 @@ const SPAWN_INVENTORY: &[(&str, &str, usize)] = &[
     ("terminate.rs", "\"sleep\"", 2),
     ("toolchain.rs", "", 1),
     ("toolchain.rs", "\"cargo\"", 1),
+    ("toolchain.rs", "\"rustc\"", 2),
     ("watch.rs", "OsStr::new(\"cargo\")", 3),
     ("watch.rs", "exe_path", 1),
 ];

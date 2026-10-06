@@ -118,6 +118,7 @@ use ipe_ir::Program;
 use crate::output_dir::OwnedDir;
 use crate::remote_ingest::{IngestLimit, LocalRefusal, LocalSource, PACKAGE_SOURCE, TreeCeiling};
 use crate::secret_file::OwnerDir;
+use crate::toolchain::RustcVersion;
 use sha2::{Digest, Sha256};
 
 /// Domain-separation tag for the content-address hash — bumped whenever the
@@ -790,19 +791,17 @@ fn compiler_revision_hash() -> Option<String> {
 }
 
 /// The active `rustc`'s `-vV` output, hashed — the design doc's
-/// `toolchain_fingerprint()`. `None` when `rustc` is not on `PATH` or exits
-/// non-zero.
+/// `toolchain_fingerprint()`.
+///
+/// `None` when the query is refused: `rustc` is missing, crosses its ceiling,
+/// exits non-zero, or prints a report [`RustcVersion::parse`] refuses.
 fn toolchain_fingerprint_hash() -> Option<String> {
-    let output = std::process::Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(&output.stdout);
-    Some(hex::encode(hasher.finalize()))
+    toolchain_fingerprint_of(RustcVersion::active().ok())
+}
+
+/// The fingerprint of `version`'s exact report bytes, `None` without a version.
+fn toolchain_fingerprint_of(version: Option<&RustcVersion>) -> Option<String> {
+    version.map(|version| hex::encode(Sha256::digest(version.verbatim())))
 }
 
 /// Derive the version-epoch directory name for this process, or `None` when
@@ -1301,6 +1300,59 @@ pub fn store_ir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_epoch_hash_input_is_the_verbatim_output() {
+        let report: &[u8] = b"rustc 1.80.0 (abcdef 2024-01-01)\n\
+            binary: rustc\n\
+            host: x86_64-unknown-linux-gnu\n\
+            release: 1.80.0\n\
+            LLVM version: 18.1.7\n\n";
+        let version = RustcVersion::parse(report);
+        assert!(version.is_ok(), "{version:?}");
+        let mut hasher = Sha256::new();
+        hasher.update(report);
+        assert_eq!(
+            toolchain_fingerprint_of(version.as_ref().ok()),
+            Some(hex::encode(hasher.finalize()))
+        );
+        assert_eq!(toolchain_fingerprint_of(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // the test temp root is writable and its path holds no `PATH` separator
+    fn a_rustc_query_past_its_wall_disables_the_cache() {
+        use crate::remote_ingest::{LocalWall, RUSTC_QUERY_LIMITS};
+        use crate::toolchain::{RustcQueryRefusal, RustcRunFailure, StubRustc};
+        let stub = StubRustc::new(
+            "slow",
+            "sleep 30\nprintf 'rustc 1.0 (x)\\nhost: a-b-c\\nrelease: 1.0\\n'",
+        )
+        .expect("write the stub rustc");
+        let mut rustc = std::process::Command::new("rustc");
+        rustc.env("PATH", stub.path().expect("join the stub PATH"));
+        let started = std::time::Instant::now();
+        let query = RustcVersion::query(
+            rustc,
+            RUSTC_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            matches!(
+                query,
+                Err(RustcQueryRefusal::Run(RustcRunFailure::Exceeded(
+                    LocalRefusal {
+                        source: LocalSource::RustcQuery,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }
+                )))
+            ),
+            "{query:?}"
+        );
+        assert_eq!(toolchain_fingerprint_of(query.as_ref().ok()), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
 
     /// A fresh, empty scratch directory for one salt test, held as a secret dir.
     #[cfg(unix)]
