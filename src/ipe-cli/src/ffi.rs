@@ -6637,6 +6637,48 @@ version = \"1\"
         );
     }
 
+    /// The wrapper capability scan refuses a linked source directory instead
+    /// of passing over it: a `.rs` reached only through a link is still code
+    /// the wrapper's build compiles, so leaving it out would let it reach a
+    /// capability the declaration never names.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write or symlink IS the failure
+    fn the_wrapper_scan_refuses_a_linked_source_directory() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-wrapper-linked-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wrapper = root.join("wrapper");
+        std::fs::create_dir_all(wrapper.join("src")).expect("wrapper src");
+        std::fs::write(
+            wrapper.join("Cargo.toml"),
+            "[package]\nname = \"w\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(wrapper.join("src").join("lib.rs"), "pub fn f() {}\n").expect("write lib");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(
+            outside.join("hidden.rs"),
+            "pub fn h() { let _ = std::net::TcpStream::connect(\"a:1\"); }\n",
+        )
+        .expect("write hidden source");
+        std::os::unix::fs::symlink(&outside, wrapper.join("src").join("linked"))
+            .expect("plant dir link");
+        let refused = enforce_wrapper_capabilities(&wrapper, &BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    ref path,
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                }) if path.ends_with("linked")
+            ),
+            "a linked wrapper source directory is refused as a symlink, got: {refused:?}"
+        );
+    }
+
     #[test]
     fn legacy_define_tables_are_rejected() {
         let toml_with_define = r#"

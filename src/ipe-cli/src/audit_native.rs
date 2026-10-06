@@ -2909,6 +2909,62 @@ mod tests {
         );
     }
 
+    /// The static scan refuses a linked binding, a linked directory in the
+    /// cache, and a linked cache level, never following or skipping one: a
+    /// binding the scan never reads is source the reachability cross-check
+    /// never weighs.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write, rename or symlink IS the failure
+    fn the_static_scan_refuses_every_linked_cache_entry() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-scan-linked-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join(ipe_ffi::driver::FFI_CACHE_REL);
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join("hidden_bindings.rs"), "pub fn h() {}\n")
+            .expect("write link target");
+        std::fs::write(cache.join("real_bindings.rs"), "pub fn g() {}\n").expect("write binding");
+        let regular = WrapperScan::over_package(&root).is_ok();
+
+        let file_link = cache.join("linked_bindings.rs");
+        std::os::unix::fs::symlink(outside.join("hidden_bindings.rs"), &file_link)
+            .expect("plant file link");
+        let file_refused = WrapperScan::over_package(&root).err();
+        std::fs::remove_file(&file_link).expect("remove file link");
+
+        let dir_link = cache.join("linked");
+        std::os::unix::fs::symlink(&outside, &dir_link).expect("plant dir link");
+        let dir_refused = WrapperScan::over_package(&root).err();
+        std::fs::remove_file(&dir_link).expect("remove dir link");
+
+        let moved = root.join("moved-cache");
+        std::fs::rename(&cache, &moved).expect("move cache level");
+        std::os::unix::fs::symlink(&moved, &cache).expect("plant level link");
+        let level_refused = WrapperScan::over_package(&root).err();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(regular, "a cache of regular bindings scans");
+        for (what, refused) in [
+            ("a linked binding", file_refused),
+            ("a linked cache directory", dir_refused),
+            ("a linked cache level", level_refused),
+        ] {
+            assert!(
+                matches!(
+                    refused,
+                    Some(CliError::SourceRefused {
+                        reason: crate::io_bounded::SourceRefusal::Symlink,
+                        ..
+                    })
+                ),
+                "{what} is refused as a symlink, got: {refused:?}"
+            );
+        }
+    }
+
     #[cfg(any(
         all(
             target_os = "linux",
