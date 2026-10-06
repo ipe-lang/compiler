@@ -19,6 +19,9 @@ use ipe_ffi::pkginfo::FeatureName;
 
 use crate::CliError;
 use crate::owner_trust::{self, TrustedCache};
+use crate::remote_ingest::{
+    ChildStderr, FFI_INSPECT_LIMITS, LocalCeiling, LocalRefusal, LocalSource, RunError, run_local,
+};
 use crate::text;
 
 /// The project-relative FFI cache directory.
@@ -1633,19 +1636,13 @@ fn write_inspector_manifest_chunk(
 }
 
 /// The explicit `IPE_FFI_ALLOW_UNSANDBOXED=1` escape hatch: one direct argv
-/// spawn, loudly labelled.
+/// spawn, loudly labelled, held to [`FFI_INSPECT_LIMITS`].
 fn run_inspector_job_unsandboxed(
     inspector: &Path,
     job: &InspectorJob,
     scratch_hint: &str,
     allow_build_scripts: bool,
 ) -> Result<String, CliError> {
-    let io_err = |detail: String| {
-        CliError::Usage(text::msg::command_refusal(
-            &"add",
-            &crate::style::TerminalSafe::sanitize(&detail),
-        ))
-    };
     crate::screen::chatter(
         crate::screen::Stream::Stderr,
         crate::screen::Tone::UserError,
@@ -1666,21 +1663,81 @@ fn run_inspector_job_unsandboxed(
     let (program, rest) = payload
         .split_first()
         .ok_or(CliError::Usage(text::msg::ffi_add_no_payload()))?;
-    let out = std::process::Command::new(program)
-        .args(rest)
-        .output()
-        .map_err(|e| io_err(e.to_string()));
+    let inspected = inspect_unsandboxed(program, rest, FFI_INSPECT_LIMITS);
     let _ = std::fs::remove_dir_all(&scoped_tmp);
-    let out = out?;
-    if !out.status.success() {
-        return Err(io_err(format!(
-            "inspector exited with {:?}\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
+    inspected.map_err(|failure| failure.into_cli_error(inspector))
+}
+
+/// Why the unsandboxed inspector produced no inspection report.
+#[derive(Debug)]
+enum InspectorFailure {
+    /// The run left no captured result: the inspector did not start, crossed
+    /// its ceiling and was killed, or left an output pipe held or unread.
+    Run(RunError<LocalRefusal>),
+    /// The inspector exited unsuccessfully.
+    Exit {
+        /// The exit code, absent when a signal ended the inspector.
+        code: Option<i32>,
+        /// The inspector's stderr as kept, marked when cut at its ceiling.
+        stderr: ChildStderr,
+    },
+    /// The inspection report is not UTF-8.
+    NotUtf8,
+}
+
+impl InspectorFailure {
+    /// The CLI error of this failure; `inspector` names the binary on a start or wait failure.
+    fn into_cli_error(self, inspector: &Path) -> CliError {
+        match self {
+            Self::Run(RunError::Exceeded(refusal)) => CliError::LocalLimitExceeded(refusal),
+            Self::Run(RunError::Spawn(source) | RunError::Wait(source)) => CliError::Io {
+                path: inspector.to_path_buf(),
+                source,
+            },
+            Self::Run(RunError::Measure(path, source)) => CliError::Io { path, source },
+            Self::Run(RunError::PipeDrainTimeout(stream)) => CliError::ChildPipeHeld(stream),
+            Self::Run(RunError::PipeRead(stream, kind)) => CliError::ChildPipeUnread(stream, kind),
+            Self::Exit { code, stderr } => inspector_refusal(&format!(
+                "inspector exited with {code:?}\n{}",
+                stderr.to_terminal()
+            )),
+            Self::NotUtf8 => inspector_refusal("inspector produced non-UTF-8 output"),
+        }
     }
-    String::from_utf8(out.stdout)
-        .map_err(|_| io_err("inspector produced non-UTF-8 output".to_owned()))
+}
+
+/// The `ipe add` refusal carrying `detail`, sanitised for the terminal.
+fn inspector_refusal(detail: &str) -> CliError {
+    CliError::Usage(text::msg::command_refusal(
+        &"add",
+        &crate::style::TerminalSafe::sanitize(detail),
+    ))
+}
+
+/// Run the inspector `program` with `args` outside the jail, held to `ceiling`.
+///
+/// A crossed ceiling kills the inspector's process group.
+///
+/// # Errors
+/// [`InspectorFailure::Run`] when the run left no result,
+/// [`InspectorFailure::Exit`] on an unsuccessful exit, and
+/// [`InspectorFailure::NotUtf8`] on a report that is not UTF-8.
+fn inspect_unsandboxed(
+    program: &std::ffi::OsStr,
+    args: &[OsString],
+    ceiling: LocalCeiling,
+) -> Result<String, InspectorFailure> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let captured =
+        run_local(command, ceiling, LocalSource::FfiInspect).map_err(InspectorFailure::Run)?;
+    if !captured.status.success() {
+        return Err(InspectorFailure::Exit {
+            code: captured.status.code(),
+            stderr: captured.stderr,
+        });
+    }
+    String::from_utf8(captured.stdout).map_err(|_| InspectorFailure::NotUtf8)
 }
 
 /// Inspect + install a `[rust.wrapper]` local wrapper crate.
@@ -6582,5 +6639,94 @@ iced = "=0.12.1"
             "{relayed:?}"
         );
         assert!(!relayed.contains("evil"), "{relayed:?}");
+    }
+
+    /// Run a `sh -c` stub inspector through the unsandboxed path under `ceiling`.
+    #[cfg(unix)]
+    fn stub_inspector(script: &str, ceiling: LocalCeiling) -> Result<String, InspectorFailure> {
+        inspect_unsandboxed(
+            std::ffi::OsStr::new("sh"),
+            &[OsString::from("-c"), OsString::from(script)],
+            ceiling,
+        )
+    }
+
+    /// An unsandboxed inspector still running at its wall is killed and refused on time.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsandboxed_inspector_past_its_wall_is_refused() {
+        let started = std::time::Instant::now();
+        let run = stub_inspector(
+            "exec sleep 30",
+            FFI_INSPECT_LIMITS.with_wall(crate::remote_ingest::LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            matches!(
+                run,
+                Err(InspectorFailure::Run(RunError::Exceeded(LocalRefusal {
+                    source: LocalSource::FfiInspect,
+                    limit: crate::remote_ingest::IngestLimit::Time(_),
+                    ..
+                })))
+            ),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// An unsandboxed inspector writing past its stdout ceiling is killed before its wall.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // 16 is inside the byte budget's range; a refusal is a red test
+    fn an_unsandboxed_inspector_flooding_stdout_is_refused() {
+        let cap = crate::remote_ingest::ByteBudget::for_test(16).expect("in-range byte budget");
+        let started = std::time::Instant::now();
+        let run = stub_inspector(
+            "head -c 4096 /dev/zero; exec sleep 30",
+            FFI_INSPECT_LIMITS.with_stdout(cap),
+        );
+        assert!(
+            matches!(
+                run,
+                Err(InspectorFailure::Run(RunError::Exceeded(LocalRefusal {
+                    source: LocalSource::FfiInspect,
+                    limit: crate::remote_ingest::IngestLimit::Bytes(16),
+                    ..
+                })))
+            ),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// An inspection report that is not UTF-8 is a typed failure, never lossily decoded.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_inspector_output_is_a_typed_failure() {
+        let run = stub_inspector("printf '\\377'", FFI_INSPECT_LIMITS);
+        assert!(matches!(run, Err(InspectorFailure::NotUtf8)), "{run:?}");
+    }
+
+    /// An inspector exiting unsuccessfully keeps its code and its stderr as kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_unsandboxed_inspector_keeps_its_code_and_stderr() {
+        let run = stub_inspector("echo boom >&2; exit 3", FFI_INSPECT_LIMITS);
+        assert!(
+            matches!(run, Err(InspectorFailure::Exit { code: Some(3), .. })),
+            "{run:?}"
+        );
+        let Err(InspectorFailure::Exit { stderr, .. }) = run else {
+            return;
+        };
+        assert_eq!(stderr.to_terminal().as_str(), "boom");
+    }
+
+    /// The unsandboxed inspector is held to the jailed inspector's default stdout and wall caps.
+    #[test]
+    fn the_unsandboxed_ceiling_equals_the_jail_default() {
+        let jail = ipe_sandbox::ResourceLimits::default();
+        assert_eq!(FFI_INSPECT_LIMITS.stdout_bytes().get(), jail.out_cap_bytes);
+        assert_eq!(FFI_INSPECT_LIMITS.wall().secs(), jail.wall_secs);
     }
 }
