@@ -510,6 +510,22 @@ fn db_sql_starts_with() {
     assert_runs_and_matches_oracle("db_sql_starts_with");
 }
 
+/// `Store.startsWith` matches a literal prefix only, on a typed record store.
+///
+/// `%`, `_` and `\` in the prefix match themselves where `Store.like` with the
+/// same text matches wildcards, the match is case-sensitive, the bind order
+/// survives `Store.and` on either side, an empty or one-past-the-ceiling
+/// prefix poisons the query (and a `deleteWhere`) with a typed error while the
+/// longest legal prefix is admitted, and a `deleteWhere` over the leaf removes
+/// only the matching row.
+///
+/// Sanctioned divergence: `Store.startsWith` has no reference counterpart;
+/// oracle is Ipê's own output.
+#[test]
+fn db_store_starts_with() {
+    assert_runs_and_matches_oracle("db_store_starts_with");
+}
+
 /// `Ipe.Db.Dsn` parse-don't-validate surface, end-to-end and PURE (no connect,
 /// no I/O beyond stdout). Parses a valid Postgres DSN carrying a password and
 /// prints its `Driver`, host, default TLS mode, and REDACTED render — the

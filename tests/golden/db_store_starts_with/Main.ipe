@@ -1,0 +1,141 @@
+module Main exposing (main)
+
+-- `Store.startsWith` end to end on a typed record store: a literal prefix
+-- matches itself only. `%`, `_` and `\` in the prefix match literally, the
+-- match is case-sensitive, and `Store.like` with the same text is the
+-- wildcard control. A refused prefix (empty, or one byte past the
+-- 16384-byte ceiling) poisons the query and surfaces as a typed `Task`
+-- error, while the longest legal prefix is admitted. The prefix's binds keep
+-- their order when composed with `Store.and`, and a `deleteWhere` over the
+-- leaf counts as a constrained condition.
+
+
+import Ipe.Codec as Codec exposing (Codec(..), Shape(..), ColType(..))
+import Ipe.Db as Db
+import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.Json.Encode as Encode
+import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task
+
+
+type alias Name =
+    { name : String
+    }
+
+
+nameCodec : Codec Name
+nameCodec =
+    Codec
+        { enc = \row -> Encode.object [ ( "name", Encode.string row.name ) ]
+        , mkDec = \_ -> Decode.map (\n -> { name = n }) (Decode.field "name" Decode.string)
+        , shp = SRecord [ ( "name", CText ) ]
+        }
+
+
+seed : List Name
+seed =
+    List.map (\n -> { name = n })
+        [ "Acme-1"
+        , "acme-2"
+        , "ACME"
+        , "50%off"
+        , "50 cents"
+        , "500"
+        , "a_b-x"
+        , "axb-y"
+        , "!bang"
+        , "!x"
+        , "a\\b"
+        , "ab"
+        ]
+
+
+report : Db -> Store Name -> String -> Store.Cond Name -> Task Error ()
+report conn store label cond =
+    Store.query store
+        |> Store.where cond
+        |> Store.orderAsc "name"
+        |> Store.toList conn
+        |> Task.andThen
+            (\found ->
+                Io.println (label ++ ": " ++ String.join "," (List.map .name found))
+            )
+        |> Task.onError (\e -> Io.println (label ++ ": " ++ Error.toString e))
+
+
+prefix : Db -> Store Name -> String -> Task Error ()
+prefix conn store p =
+    report conn store ("startsWith " ++ p) (Store.startsWith .name p)
+
+
+deleted : Db -> Store Name -> String -> Task Error ()
+deleted conn store p =
+    Store.deleteWhere conn store (Store.startsWith .name p)
+        |> Task.andThen (\n -> Io.println ("deleteWhere startsWith " ++ p ++ ": " ++ String.fromInt n))
+        |> Task.onError (\e -> Io.println ("deleteWhere startsWith " ++ p ++ ": " ++ Error.toString e))
+
+
+checks : Db -> Store Name -> Task Error ()
+checks conn store =
+    Task.sequence
+        [ prefix conn store "acme"
+        , prefix conn store "ACME"
+        , prefix conn store "50%"
+        , report conn store "like 50%" (Store.like .name "50%")
+        , prefix conn store "a_b"
+        , report conn store "like a_b%" (Store.like .name "a_b%")
+        , prefix conn store "!b"
+        , prefix conn store "a\\"
+        , prefix conn store "ab"
+        , report conn
+            store
+            "startsWith and eq"
+            (Store.and [ Store.startsWith .name "a", Store.eq .name "ab" ])
+        , report conn
+            store
+            "eq and startsWith"
+            (Store.and [ Store.eq .name "a_b-x", Store.startsWith .name "a_" ])
+        , report conn store "empty prefix" (Store.startsWith .name "")
+        , report conn store "longest prefix" (Store.startsWith .name (String.repeat 16384 "a"))
+        , report conn store "too-long prefix" (Store.startsWith .name (String.repeat 16385 "a"))
+        , deleted conn store "!x"
+        , deleted conn store ""
+        , prefix conn store "!"
+        ]
+        |> Task.map (\_ -> ())
+
+
+seedAll : Db -> Store Name -> Task Error ()
+seedAll conn store =
+    List.foldl
+        (\row acc -> Task.andThen (\_ -> Task.map (\_ -> ()) (Store.insert conn store row)) acc)
+        (Task.succeed ())
+        seed
+
+
+main : Task Error ()
+main =
+    case Store.fromCodec "names" nameCodec of
+        Err e ->
+            Io.println (Error.toString e)
+
+        Ok draft ->
+            Task.andThen
+                (\conn ->
+                    Db.withTransaction conn
+                        (\txconn ->
+                            let
+                                store =
+                                    Store.public draft
+                            in
+                            Store.create txconn store
+                                |> Task.andThen (\_ -> seedAll txconn store)
+                                |> Task.andThen (\_ -> checks txconn store)
+                        )
+                )
+                (Db.open "sqlite" "sqlite::memory:")
