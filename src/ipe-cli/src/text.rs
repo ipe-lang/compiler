@@ -1632,7 +1632,7 @@ messages! {
     output_reparse_point(path) = "output-reparse-point";
     /// An entry another program holds open, so ipe cannot remove or replace it.
     output_in_use(path) = "output-in-use";
-    /// An output directory another ipe run is still claiming past the wait bound.
+    /// An output directory another ipe process is still claiming past the wait bound.
     output_claim_busy(path, waited, claim) = "output-claim-busy";
     /// An output directory on a filesystem that refused the claim's file lock.
     output_claim_lock_unavailable(path, kind) = "output-claim-lock-unavailable";

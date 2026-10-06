@@ -234,7 +234,7 @@ pub enum OutputRefusal {
     /// On Windows an editor, a file indexer, or antivirus holding a file or
     /// directory without delete sharing blocks its removal until released.
     InUse(PathBuf),
-    /// Another ipe run still holds the directory's claim after the wait bound.
+    /// Another ipe process still holds the directory's claim after the wait bound.
     ClaimBusy {
         /// The directory being claimed.
         dir: PathBuf,

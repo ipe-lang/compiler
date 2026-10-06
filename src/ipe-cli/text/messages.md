@@ -1028,7 +1028,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-inside-claim
 
-{out} is inside {owner}, which an ipe run is claiming as its output (it holds `{claim}`) — an ejected project must live outside ipe's output; choose another --out, or delete `{claim}` in {owner} when no ipe run is active there
+{out} is inside {owner}, which an ipe process is claiming as its output (it holds `{claim}`) — an ejected project must live outside ipe's output; choose another --out, or delete `{claim}` in {owner} when no ipe process is active there
 
 ## output-inside-vcs
 
@@ -1076,7 +1076,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-claim-busy
 
-{path} is being claimed by another ipe run, still in progress after {waited}s — let that run finish, then run the command again; if no ipe run is active, another program holds `{claim}` locked: delete `{claim}` in {path} and run the command again
+{path} is being claimed by another ipe process, still in progress after {waited}s — let that run finish, then run the command again; if no ipe process is active, another program holds `{claim}` locked: delete `{claim}` in {path} and run the command again
 
 ## output-claim-lock-unavailable
 
@@ -1084,15 +1084,15 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-claim-interrupted
 
-{path} holds a claim an ipe run left unfinished, with files ipe did not write beside it — check what is there, then delete `{marker}` and `{claim}` in it and run the command again
+{path} holds a claim an ipe process left unfinished, with files ipe did not write beside it — check what is there, then delete `{marker}` and `{claim}` in it and run the command again
 
 ## output-claim-marker-unfinished
 
-{path} holds a `{marker}` an interrupted ipe run left unfinished — check it is not a file of yours, then delete `{marker}` in it and run the command again
+{path} holds a `{marker}` an interrupted ipe process left unfinished — check it is not a file of yours, then delete `{marker}` in it and run the command again
 
 ## output-claim-in-flight
 
-{path} is being claimed by an ipe run, or holds a claim an interrupted run left — the next build finishes the claim; run the command again then
+{path} is being claimed by an ipe process, or holds a claim an interrupted run left — the next build finishes the claim; run the command again then
 
 # Publisher identity
 
