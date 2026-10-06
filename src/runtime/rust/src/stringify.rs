@@ -720,22 +720,23 @@ mod tests {
         assert_eq!(shown, "<redacted> <redacted>");
     }
 
-    // A URL's userinfo never reaches its implicit rendering.
+    // A URL's userinfo, query and fragment never reach its implicit
+    // rendering; its scheme, host, port and path do.
     #[cfg(feature = "url")]
     #[test]
-    fn url_show_strips_userinfo() {
+    fn url_show_keeps_no_userinfo_query_or_fragment() {
         #[allow(clippy::expect_used)] // fixture: a literal absolute URL always parses
         let url = match crate::url::url_from_string::<String>(
-            "https://S3CR3TUSER:S3CR3TPW@example.com/a?b=c".to_owned(),
+            "https://S3CR3TUSER:S3CR3TPW@example.com:8443/a/b?token=S3CR3TQ#frag=S3CR3TF"
+                .to_owned(),
         ) {
             IpeResult::Ok(u) => Some(u),
             IpeResult::Err(_) => None,
         }
         .expect("a literal absolute URL");
         let shown = url.ipe_show();
-        assert!(!shown.contains("S3CR3TUSER"), "{shown}");
-        assert!(!shown.contains("S3CR3TPW"), "{shown}");
-        assert!(!shown.contains('@'), "{shown}");
-        assert_eq!(shown, "https://example.com/a?b=c");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains(['@', '?', '#']), "{shown}");
+        assert_eq!(shown, "https://example.com:8443/a/b");
     }
 }

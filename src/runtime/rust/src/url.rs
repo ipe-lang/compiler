@@ -41,13 +41,15 @@ use url::{Url as UrlCrate, form_urlencoded};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Url(UrlCrate);
 
-// The serialized URL with its userinfo removed: a password or user name in
-// the authority never reaches an implicit rendering. `Url.toString` keeps the
-// full URL.
+// The serialized URL reduced to scheme, host, port and path: userinfo, query
+// and fragment, where credentials and tokens travel, never reach an implicit
+// rendering. `Url.toString` keeps the full URL.
 crate::stringify::show_row!("Url", Redacted, [] Url, |u| {
     let mut shown = u.0.clone();
     let _ = shown.set_password(None);
     let _ = shown.set_username("");
+    shown.set_query(None);
+    shown.set_fragment(None);
     shown.as_str().to_owned()
 });
 
