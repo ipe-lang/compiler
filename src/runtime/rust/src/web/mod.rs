@@ -10657,14 +10657,54 @@ mod route_entry_cmd_tests {
         });
     }
 
+    /// A store that yields between its claimed lookup and the caller's publish, as a networked store's I/O does.
+    ///
+    /// Without the yield every fixture lookup completes in one poll, so two
+    /// concurrent GETs never interleave between lookup and `set` and a race
+    /// test passes with or without the claim.
+    #[cfg(feature = "web")]
+    struct YieldingStore {
+        inner: Store,
+    }
+
+    #[cfg(feature = "web")]
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for YieldingStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            let rejoin = self.inner.get_reconstructing(claim, make_init).await;
+            tokio::task::yield_now().await;
+            rejoin
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
     /// Two concurrent GETs rejoining one schema-rebuilt sid evaluate `init` once; the second joins live.
     #[cfg(feature = "web")]
     #[test]
     fn two_concurrent_rebuilt_gets_run_init_once() {
         run(false, || async {
             let sid = new_sid();
-            let (store, _dir) =
+            let (file, _dir) =
                 file_store_with("racedinit", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let store: Store = Arc::new(YieldingStore { inner: file });
             take_init_sids();
             let ((first, ..), (second, ..)) =
                 tokio::join!(get(&store, "/", Some(&sid)), get(&store, "/", Some(&sid)));
@@ -10689,11 +10729,12 @@ mod route_entry_cmd_tests {
     fn restored_concurrent_gets_spawn_one_driver() {
         run(false, || async {
             let sid = new_sid();
-            let (store, _dir) = file_store_with(
+            let (file, _dir) = file_store_with(
                 "raceddriver",
                 &sid,
                 checkpoint(LIVE_TAG, r#"{"page":"Home","log":["persisted"]}"#),
             );
+            let store: Store = Arc::new(YieldingStore { inner: file });
             let drivers = Arc::new(AtomicUsize::new(0));
             let ((first, ..), (second, ..)) = tokio::join!(
                 get_via(
@@ -10787,6 +10828,73 @@ mod route_entry_cmd_tests {
             gated.release.add_permits(1);
             let (status, ..) = get(&store, "/", Some(&cold_sid)).await;
             assert_eq!(status, StatusCode::OK, "the committed claim was released");
+        });
+    }
+
+    /// A cold store whose first `set` panics, so a test drives a commit that unwinds mid-publish.
+    struct PanicOnceStore {
+        inner: ColdStore,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for PanicOnceStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            self.inner.get_reconstructing(claim, make_init).await
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                panic!("the first commit unwinds mid-publish");
+            }
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// A commit that panics answers the panic 500 and releases its claim, so a retry restores the session.
+    #[test]
+    fn panicking_commit_is_500_and_releases_claim() {
+        run(false, || async {
+            let cold_sid = new_sid();
+            let store: Store = Arc::new(PanicOnceStore {
+                inner: ColdStore {
+                    live: MemoryStore::new(Duration::from_secs(60)),
+                    cold_sid: cold_sid.clone(),
+                },
+                armed: std::sync::atomic::AtomicBool::new(true),
+            });
+            let (status, _, _, body) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a panicked commit is the panic 500"
+            );
+            assert!(
+                !body.contains(&cold_sid),
+                "the panic body never carries the sid: {body}"
+            );
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the unwound commit released its claim"
+            );
+            assert_eq!(cookie_sid, cold_sid, "the retry restores the cold session");
         });
     }
 
