@@ -251,6 +251,11 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/ipe-cli/tests/audit_native.rs",
+        "release_run_withheld_subprocess_cannot_fork",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
         "release_run_runs_returned_artifact",
         JAIL_ABSENT,
     ),
