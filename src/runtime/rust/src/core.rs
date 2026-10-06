@@ -1251,9 +1251,13 @@ pub fn panic_500_body(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Install the classifying panic hook. Idempotent in effect (re-installing just
-/// replaces the hook). Called at the top of generated `fn main()` for non-server
-/// shapes (Ipe.Console/Tui); server/live binaries rely on the per-request
-/// `CatchPanicLayer` instead (so a handler panic returns a 500, not exit).
+/// replaces the hook). The first statement of every generated native and WASI
+/// `fn main()`; server/live handlers additionally catch a panic per request
+/// (`CatchPanicLayer`, so a handler panic returns a 500, not exit).
+///
+/// Before installing the hook it runs the runtime's startup checks: a malformed
+/// `IPE_LOG_LEVEL` or `IPE_RECURSION_LIMIT` writes its refusal to stderr and
+/// exits 1 before the program's first line.
 ///
 /// **Design note — hook logs then RESUMES the unwind (never calls exit).** Calling
 /// `process::exit(1)` from the hook would prevent `catch_unwind` anywhere in the
