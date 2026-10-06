@@ -48,11 +48,13 @@ impl Url {
     /// The URL reduced to scheme, host, port and path.
     ///
     /// Userinfo, query and fragment, where credentials and tokens travel, never
-    /// appear. The parser ends the authority at the first `/`, `?`, `#` or
-    /// `\`, so a credential holding one of them spills out of the userinfo:
-    /// `user:pw@host` parses with scheme `user`, no host and path `pw@host`,
-    /// and `https://u:1/pw@host` with host `u`. With no host, or an `@` or `\`
-    /// past the authority, only the scheme is shown. A scheme outside
+    /// appear. The parser ends the authority at the first `/`, `?` or `#` (and,
+    /// under a special scheme, `\`), so a credential holding one of them
+    /// spills out of the userinfo: `user:pw@host` parses with scheme `user`,
+    /// no host and path `pw@host`, and `https://u:1/pw@host` with host `u`.
+    /// The `@` that ended the userinfo stays literal in the path, query or
+    /// fragment it spilled into. With no host, or an `@` or `\` past the
+    /// authority, only the scheme is shown. A scheme outside
     /// [`NAMEABLE_SCHEMES`] may be a user name, so it is withheld.
     fn shown(&self) -> String {
         use crate::stringify::REDACTED_SHOW;
