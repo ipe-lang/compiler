@@ -87,14 +87,51 @@ fn collect_ipe_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Every `.ipe` file under the corpus roots.
+fn corpus_files(root: &Path) -> Vec<PathBuf> {
+    ["src", "examples", "tools", "tests", "packages"]
+        .iter()
+        .flat_map(|top| collect_ipe_files(&root.join(top)))
+        .collect()
+}
+
+/// Every corpus file the formatter accepts formats under its output cap, so
+/// the cap never refuses real code. Red if the cap tightens past the corpus.
+#[test]
+fn fmt_cap_admits_the_corpus() {
+    let root = workspace_root();
+    let mut formatted_count = 0usize;
+    for path in &corpus_files(&root) {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let src = fs::read_to_string(path).expect("corpus .ipe file is UTF-8");
+        let cap = ipe_fmt::OutputCap::for_input(src.len());
+        match ipe_fmt::format_source(&src) {
+            Ok(out) => {
+                assert!(cap.admits(&out), "{rel}: output passed its cap {cap}");
+                formatted_count += 1;
+            }
+            Err(e) => assert!(
+                !matches!(e, ipe_fmt::FmtError::Limit(_)),
+                "{rel}: the output cap refused real code: {e}"
+            ),
+        }
+    }
+    assert!(
+        formatted_count >= MIN_FORMATTED_FILES,
+        "formatted_count {formatted_count} is below the anti-vacuity floor of \
+         {MIN_FORMATTED_FILES}"
+    );
+}
+
 #[test]
 fn every_repo_ipe_file_is_a_meaning_preserving_fixed_point() {
     let root = workspace_root();
 
-    let mut files = Vec::new();
-    for top in ["src", "examples", "tools", "tests", "packages"] {
-        files.extend(collect_ipe_files(&root.join(top)));
-    }
+    let files = corpus_files(&root);
 
     let mut skipped: Vec<String> = Vec::new();
     let mut formatted_count = 0usize;

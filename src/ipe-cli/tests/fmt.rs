@@ -372,3 +372,57 @@ fn int_literal_out_of_range_is_refused_unwritten() {
         "a refused file must not be rewritten"
     );
 }
+
+/// A module whose one value is a list of `items` ones written on one line two
+/// lets deep; formatting puts every item on its own deeply indented line.
+fn nested_long_list(items: usize) -> String {
+    let ones = vec!["1"; items].join(",");
+    format!(
+        "module M exposing (x)\n\n\nx =\n    let\n        y =\n            let\n                z =\n                    [ {ones}\n                    ]\n            in\n            z\n    in\n    y\n"
+    )
+}
+
+/// A file whose formatted output would pass its cap is refused: the screen
+/// names the file, the cap and the remedy, and the file is left unchanged.
+/// The same shape small enough to fit formats, so the refusal is the cap's.
+#[test]
+fn fmt_output_too_large_screen() {
+    let small = nested_long_list(200);
+    let small_out = format_source(&small).expect("a small list formats under the floor");
+    let growth = small_out.len() / 200;
+    assert!(
+        growth > 2 * fmt::OutputCap::GROWTH,
+        "precondition: each two-byte item must grow past the cap, got {growth}"
+    );
+
+    let src = nested_long_list(10_000);
+    let cap = fmt::OutputCap::for_input(src.len());
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fmt_output_cap");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("M.ipe");
+    fs::write(&file, &src).unwrap();
+    let res = fmt::run_fmt(&[file.to_string_lossy().into_owned()]);
+    let screen = res
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(res.is_err(), "fmt wrote output past its cap");
+    assert!(
+        screen.contains(&file.display().to_string()),
+        "the refusal names the file: {screen}"
+    );
+    assert!(
+        screen.contains(&cap.to_string()),
+        "the refusal names the cap: {screen}"
+    );
+    assert!(
+        screen.contains("Split it"),
+        "the refusal names the remedy: {screen}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        src,
+        "a refused file must not be rewritten"
+    );
+}
