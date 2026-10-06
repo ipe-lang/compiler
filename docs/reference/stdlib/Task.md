@@ -19,8 +19,8 @@ concurrency (`sequence`, `parallel`), deferral (`lazy`), iteration (`loop`,
 `exponentialBackoff` and the `with*` refinements, applied by `retryWith`). Two
 or more chained `andThen` steps read best as a `do` block.
 
-The Task guide walks the mental model and a worked example; this module is the
-per-symbol reference.
+The Task guide (`ipe doc guide:task`) walks the mental model and a worked
+example; this module is the per-symbol reference.
 
 ## `succeed`
 

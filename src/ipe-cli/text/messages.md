@@ -675,6 +675,14 @@ a signal ended the transfer — stopped; nothing was recorded
 
 {stream} of a finished child stayed open past the grace — a process it started still holds it; stopped
 
+## cli-child-pipe-unread
+
+reading the {stream} of a child failed ({kind}) — its output is incomplete, so it was not used; stopped
+
+## cli-child-stderr-truncated
+
+… stderr cut at the {limit} ceiling; the rest was dropped
+
 ## cli-source-not-regular-file
 
 {path}: not a regular file — ipe reads source only from regular files, never a FIFO, device, socket, directory or a symlink met while walking modules; point ipe at a regular `.ipe` file

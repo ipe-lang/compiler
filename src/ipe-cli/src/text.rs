@@ -933,6 +933,10 @@ messages! {
     cli_local_tree_refused(source, shape) = "cli-local-tree-refused";
     /// A finished child's output pipe stayed open past the grace.
     cli_child_pipe_held(stream) = "cli-child-pipe-held";
+    /// Reading a child's output pipe failed, so its output is incomplete.
+    cli_child_pipe_unread(stream, kind) = "cli-child-pipe-unread";
+    /// A child's stderr was cut at its ceiling; the line closes the kept text.
+    cli_child_stderr_truncated(limit) = "cli-child-stderr-truncated";
     /// A source path named a FIFO, device, socket or other non-regular file.
     cli_source_not_regular_file(path) = "cli-source-not-regular-file";
     /// A source file or directory could not be opened for lack of permission.

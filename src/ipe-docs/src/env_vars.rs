@@ -1255,7 +1255,8 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_FUZZ_SEED",           // fuzz template harness: random-run seed
     "IPE_HOST_ENV_TEST_UNSET_7F3A9C21D84E", // sandbox host_env test: a name no host sets
     "IPE_HTTP_TEST_URL",
-    "IPE_JUNCTION_OUT", // Windows junction test helper: compiled helper output path
+    "IPE_INDEX_EXTRACTOR", // ipe-index build script: extractor digest handed to the crate at compile time
+    "IPE_JUNCTION_OUT",    // Windows junction test helper: compiled helper output path
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
     "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode

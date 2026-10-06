@@ -1408,7 +1408,9 @@ fn extract_json_bool(obj: &str, key: &str) -> Option<bool> {
 ///
 /// # Errors
 /// [`CliError::Io`] when the probe source or the patched manifest cannot be
-/// written.
+/// written, or the offline lock resolve cannot run;
+/// [`CliError::LocalLimitExceeded`] when that resolve crosses its time or
+/// output ceiling.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -1469,12 +1471,10 @@ fn emit_probe_and_build_argv(
     // resolved graph and writes nothing but its own scratch-local target dir. A
     // lock-generation failure is not itself a jail verdict; the jailed `--locked`
     // build surfaces any residual resolution gap as a build failure, fail-closed.
-    let _ = std::process::Command::new(&cargo)
-        .arg("generate-lockfile")
-        .arg("--offline")
-        .arg("--manifest-path")
-        .arg(&manifest_path)
-        .output();
+    // A resolve that crosses its time or output ceiling fails the audit.
+    let (crate::cargo_step::LockOutcome::Resolved
+    | crate::cargo_step::LockOutcome::Unresolved { .. }) =
+        crate::cargo_step::lock_offline(&cargo, &manifest_path)?;
 
     Ok(vec![
         cargo.into_os_string(),

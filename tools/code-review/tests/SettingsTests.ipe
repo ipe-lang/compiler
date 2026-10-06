@@ -466,7 +466,13 @@ startupScanRefusesEvasions =
 -- The code of `Main`, empty when the inventory has no `Main`.
 mainCode : List ( String, String ) -> String
 mainCode sources =
-    case List.find (\( rel, _ ) -> rel == "Main.ipe") sources of
+    moduleCode "Main.ipe" sources
+
+
+-- The code of module `rel`, empty when the inventory has no such module.
+moduleCode : String -> List ( String, String ) -> String
+moduleCode rel sources =
+    case List.find (\( name, _ ) -> name == rel) sources of
         Just ( _, text ) ->
             text
 
@@ -568,10 +574,9 @@ settingsExports source =
 -- The scan reads each declaration whole (`typeDeclarations`) and judges
 -- every word by its unqualified name, so a
 -- qualified or wrapped spelling (`Settings.AppSettings`,
--- `Maybe RepoPath.RootMap`) is caught alike. `tests/Main.ipe` is this
--- suite's entry, so `src/Main.ipe` cannot be compiled here to round-trip its
--- `Model`; its source is scanned instead, and the scan must find `Model`
--- there. Red while the `Model` holds a `settings` field.
+-- `Maybe RepoPath.RootMap`) is caught alike. The `Model` is declared in
+-- `src/Lib/App.ipe`; its source is scanned for the declaration, and the scan
+-- must find `Model` there. Red while the `Model` holds a `settings` field.
 settingsNeverInSessionState : Task.Task Error Bool
 settingsNeverInSessionState =
     do
@@ -596,10 +601,13 @@ settingsNeverInSessionState =
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type\tHeld\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "{- note -} type Held\n    = Held IndexSettings" sources))
                 && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note\nend -}\n    = Held IndexSettings" sources))
-                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Main.ipe") sources))
+                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/App.ipe") sources))
                 && statePinned sources
                 && not (statePinned (replaceIn "Main.ipe" "init : Web.WebReq -> ( Model, Cmd Msg )" "init : Web.WebReq -> ( ( Model, Settings.AppSettings ), Cmd Msg )" sources))
-                && not (statePinned (replaceIn "Main.ipe" "        , update = update settings\n" "        , update = \\msg state -> update settings msg state\n" sources))
+                && not (statePinned (replaceIn "Lib/View.ipe" "view : Model -> Ui.Element Msg" "view : ( Model, Settings.AppSettings ) -> Ui.Element Msg" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , view = View.view\n" "        , view = View.view settings\n" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , update = App.update settings\n" "        , update = \\msg state -> App.update settings msg state\n" sources))
+                && not (statePinned (replaceIn "Lib/App.ipe" "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" "update : Msg -> ( Model, Settings.AppSettings ) -> ( Model, Cmd Msg )" sources))
                 && not (statePinned (appendTo "Lib/Queue.ipe" "other = Web.embed" sources))
                 && not (statePinned (replaceIn "Main.ipe" "reviewApp settings =\n    Web.embed\n" "reviewApp settings =\n    let\n        update = \\s msg state -> state\n    in\n    Web.embed\n" sources))
             )
@@ -615,11 +623,8 @@ statePinned sources =
     let
         code =
             mainCode sources
-
-        codeLines =
-            String.lines code
     in
-    List.all (\line -> List.member line codeLines) stateAnnotations
+    List.all (\( rel, line ) -> List.member line (String.lines (moduleCode rel sources))) stateAnnotations
         && occurrences stateWiring code
         == 1
         && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources)
@@ -628,18 +633,18 @@ statePinned sources =
         == 1
 
 
-stateAnnotations : List String
+stateAnnotations : List ( String, String )
 stateAnnotations =
-    [ "init : Web.WebReq -> ( Model, Cmd Msg )"
-    , "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )"
-    , "view : Model -> Ui.Element Msg"
-    , "subscriptions : Model -> Sub Msg"
+    [ ( "Main.ipe", "init : Web.WebReq -> ( Model, Cmd Msg )" )
+    , ( "Lib/App.ipe", "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" )
+    , ( "Lib/View.ipe", "view : Model -> Ui.Element Msg" )
+    , ( "Main.ipe", "subscriptions : Model -> Sub Msg" )
     ]
 
 
 stateWiring : String
 stateWiring =
-    "reviewApp settings =\n    Web.embed\n        { init = init\n        , update = update settings\n        , view = view\n        , subscriptions = subscriptions\n"
+    "reviewApp settings =\n    Web.embed\n        { init = init\n        , update = App.update settings\n        , view = View.view\n        , subscriptions = subscriptions\n"
 
 
 -- `sources` with `old` replaced by `new` in the code of module `rel`.
@@ -657,12 +662,12 @@ replaceIn rel old new sources =
 
 
 -- `sources` with a `settings` field added to the `Model` declaration of
--- `Main`, the shape a session carrying the startup settings takes.
+-- `Lib.App`, the shape a session carrying the startup settings takes.
 withModelField : List ( String, String ) -> List ( String, String )
 withModelField sources =
     List.map
         (\( rel, text ) ->
-            if rel == "Main.ipe" then
+            if rel == "Lib/App.ipe" then
                 ( rel, String.replace "    { page : Page\n" "    { page : Page\n    , settings : Settings.AppSettings\n" text )
 
             else
@@ -686,11 +691,11 @@ admittedCarriers =
     ]
 
 
--- `Main` declares a `Model`, and no declaration outside `admittedCarriers`
+-- `Lib.App` declares a `Model`, and no declaration outside `admittedCarriers`
 -- names a settings carrier.
 stateAdmitted : List ( String, String ) -> Bool
 stateAdmitted sources =
-    List.any (\( rel, text ) -> rel == "Main.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
+    List.any (\( rel, text ) -> rel == "Lib/App.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
         && List.all
             (\( rel, text ) ->
                 List.all

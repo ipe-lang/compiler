@@ -98,6 +98,7 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Epoch as Epoch
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
@@ -504,13 +505,14 @@ envReview =
 
 
 -- Every setting a server resolves once at startup, from the current
--- environment.
+-- environment, under a freshly minted epoch.
 envAppSettings : Task.Task Error Settings.AppSettings
 envAppSettings =
     do
         index <- envSettings
         review <- envReview
-        Task.succeed { index = index, review = review }
+        epoch <- Epoch.mint
+        Task.succeed { index = index, review = review, epoch = epoch }
 
 
 -- Each request-time function below, run on settings resolved from the current

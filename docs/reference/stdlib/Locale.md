@@ -13,7 +13,7 @@ typed absence, never a silent default.  The locale-aware case functions
 `Locale` produced here.
 
 For the mental model, worked example, and design rationale see the Locales
-guide in the project documentation.
+guide (`ipe doc guide:locale`).
 
 ## `Locale`
 

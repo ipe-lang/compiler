@@ -21,6 +21,7 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), StoredDecision(..))
+import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
@@ -185,12 +186,13 @@ onlySelectedShownDecidable =
         seedIndex at.indexDb at.repo
         found <- loadUnitNow (uid "u-a")
         cleanupIndex at.indexDb at.repo
+        epoch <- Epoch.mint
         Task.succeed
             (case found of
                 Just loaded ->
                     not (isNothing (Queue.decidableSource (uid "u-a") (ViewShown loaded)))
                         && isNothing (Queue.decidableSource (uid "u-b") (ViewShown loaded))
-                        && isNothing (Queue.decidableSource (uid "u-a") (ViewLoading { uid = uid "u-a", wanted = Nothing, fresh = True }))
+                        && isNothing (Queue.decidableSource (uid "u-a") (ViewLoading { uid = uid "u-a", wanted = Nothing, fresh = True, owner = epoch }))
                         && isNothing (Queue.decidableSource (uid "u-a") NoneSelected)
 
                 Nothing ->
@@ -225,17 +227,17 @@ isNothing m =
 -- only recorded, and the latest one is read once the in-flight read returns.
 -- Red if `selectView` starts a read during a read, or if `viewArrived`
 -- settles an outdated read instead of reading the wanted unit.
-selectionsDuringReadCoalesce : Bool
-selectionsDuringReadCoalesce =
+selectionsDuringReadCoalesce : Epoch -> Bool
+selectionsDuringReadCoalesce epoch =
     let
         ( afterB, readB ) =
-            Queue.selectView (uid "b") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True })
+            Queue.selectView epoch (uid "b") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
 
         ( afterC, readC ) =
-            Queue.selectView (uid "c") afterB
+            Queue.selectView epoch (uid "c") afterB
 
         ( arrived, next ) =
-            Queue.viewArrived (uid "a") (Ok Nothing) afterC
+            Queue.viewArrived epoch (uid "a") (Ok Nothing) afterC
     in
     readB
         == Nothing
@@ -252,26 +254,26 @@ selectionsDuringReadCoalesce =
 -- A response for any uid but the in-flight one changes nothing and starts no
 -- read; the in-flight unit selected again records nothing to read after it.
 -- Red if a late response for an earlier selection settles the view.
-outdatedResponseDropped : Bool
-outdatedResponseDropped =
+outdatedResponseDropped : Epoch -> Bool
+outdatedResponseDropped epoch =
     let
         loading =
-            ViewLoading { uid = uid "b", wanted = Nothing, fresh = True }
+            ViewLoading { uid = uid "b", wanted = Nothing, fresh = True, owner = epoch }
 
         ( afterLate, lateNext ) =
-            Queue.viewArrived (uid "a") (Ok Nothing) loading
+            Queue.viewArrived epoch (uid "a") (Ok Nothing) loading
 
         ( reselected, reselectNext ) =
-            Queue.selectView (uid "b") (ViewLoading { uid = uid "b", wanted = Just (uid "c"), fresh = True })
+            Queue.selectView epoch (uid "b") (ViewLoading { uid = uid "b", wanted = Just (uid "c"), fresh = True, owner = epoch })
 
         ( settled, settledNext ) =
-            Queue.viewArrived (uid "b") (Ok Nothing) loading
+            Queue.viewArrived epoch (uid "b") (Ok Nothing) loading
 
         ( fresh, freshNext ) =
-            Queue.selectView (uid "a") NoneSelected
+            Queue.selectView epoch (uid "a") NoneSelected
 
         ( cleared, clearedNext ) =
-            Queue.reloadView (uid "a") (Queue.clearView loading)
+            Queue.reloadView epoch (uid "a") (Queue.clearView epoch loading)
     in
     selectedTag afterLate
         == "loading b"
@@ -301,23 +303,23 @@ outdatedResponseDropped =
 -- flight when the page cleared is dropped. Red if re-selecting the
 -- in-flight unit cancels the reload's re-read, or if a cleared read
 -- installs its view.
-outdatedReadNeverSettles : Bool
-outdatedReadNeverSettles =
+outdatedReadNeverSettles : Epoch -> Bool
+outdatedReadNeverSettles epoch =
     let
         ( reloaded, reloadNext ) =
-            Queue.reloadView (uid "a") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True })
+            Queue.reloadView epoch (uid "a") (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch })
 
         ( viaB, _ ) =
-            Queue.selectView (uid "b") reloaded
+            Queue.selectView epoch (uid "b") reloaded
 
         ( backToA, backNext ) =
-            Queue.selectView (uid "a") viaB
+            Queue.selectView epoch (uid "a") viaB
 
         ( arrived, arrivedNext ) =
-            Queue.viewArrived (uid "a") (Ok Nothing) backToA
+            Queue.viewArrived epoch (uid "a") (Ok Nothing) backToA
 
         ( dropped, droppedNext ) =
-            Queue.viewArrived (uid "a") (Ok Nothing) (Queue.clearView (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True }))
+            Queue.viewArrived epoch (uid "a") (Ok Nothing) (Queue.clearView epoch (ViewLoading { uid = uid "a", wanted = Nothing, fresh = True, owner = epoch }))
     in
     reloadNext
         == Nothing
@@ -713,8 +715,13 @@ unitPageStatesDistinct =
         seedIndex at.indexDb at.repo
         loaded <- loadUnitViewNow (uid "no-such")
         cleanupIndex at.indexDb at.repo
+        epoch <- Epoch.mint
+        let
+            ( settled, _ ) =
+                Queue.viewArrived epoch (uid "no-such") (Ok loaded) (ViewLoading { uid = uid "no-such", wanted = Nothing, fresh = True, owner = epoch })
+        in
         Task.succeed
-            (isNotFound (Queue.unitPageFromResult (Ok loaded))
+            (isNotFound (Queue.unitPageOf (uid "no-such") settled)
                 && List.length pageTexts
                 == 4
                 && List.length sourceTexts
@@ -1854,6 +1861,7 @@ pageCountEqualsRowsAcrossPagesIn base =
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
+        epoch <- Epoch.mint
         first <- Task.sequence
             [ check "decided unit drained from queue" drainFlow
             , check "a drain writes nothing to the review database" drainWritesNothingToReview
@@ -1871,9 +1879,9 @@ checks =
             , check "a decision on a unit gone from the index is refused" approveRefusedAfterUnitDeleted
             , check "a stale unit cannot be refused either" staleRefuseAlsoRefused
             , check "only the selected unit's shown view is decidable" onlySelectedShownDecidable
-            , Task.succeed ( "a selection during a source read starts no second read", selectionsDuringReadCoalesce )
-            , Task.succeed ( "a source read's outdated response is dropped", outdatedResponseDropped )
-            , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles )
+            , Task.succeed ( "a selection during a source read starts no second read", selectionsDuringReadCoalesce epoch )
+            , Task.succeed ( "a source read's outdated response is dropped", outdatedResponseDropped epoch )
+            , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles epoch )
             , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
             ]
         rest <- Task.sequence
