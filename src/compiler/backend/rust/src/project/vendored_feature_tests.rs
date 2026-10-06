@@ -494,7 +494,7 @@ fn exclusion_and_replacement_lists_are_current() {
             "stale exclusion: {file} ({why}) is not in the runtime tree"
         );
         let module = file.trim_end_matches(".rs");
-        let declares = |text: &str| {
+        let names_module = |text: &str| {
             let toks = lex(text);
             toks.windows(2).any(|w| {
                 matches!(
@@ -504,7 +504,7 @@ fn exclusion_and_replacement_lists_are_current() {
             })
         };
         assert!(
-            !declares(RUNTIME_MOD_RS) && !appends.iter().any(|(_, body)| declares(body)),
+            !names_module(RUNTIME_MOD_RS) && !appends.iter().any(|(_, body)| names_module(body)),
             "stale exclusion: the vendored module tree declares {file}, so it must be scanned"
         );
         assert!(
