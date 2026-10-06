@@ -1430,8 +1430,8 @@ mod show_pin_agreement {
     use crate::RustBackend;
     use ipe_intern::Interner;
     use ipe_ir::{
-        IrType, ModPath, Program, RuntimeBridgedEnum, SHOWN_LEAVES, ShowLeaf, ShowPolicy,
-        ShowShape, UiCtor, UiPlain,
+        EnumDef, IrType, ModPath, Module, Program, RUNTIME_ALIASED_ENUMS, RuntimeBridgedEnum,
+        SHOWN_LEAVES, ShowLeaf, ShowPolicy, ShowShape, TypeDef, UiCtor, UiPlain,
     };
 
     /// The runtime's show-row pins: each leaf with the Rust type that renders it.
@@ -1449,8 +1449,10 @@ mod show_pin_agreement {
     }
 
     /// The runtime path of each name an emitted crate spells bare or at the
-    /// runtime's root: in scope through its `pub use ipe_runtime::*` glob or a
-    /// preamble alias, each re-exported from the module that defines it.
+    /// runtime's root: in scope through its `pub use ipe_runtime::*` glob, a
+    /// preamble alias, or the `pub type` alias a runtime-aliased Prelude enum
+    /// emits under entry module `Main`, each re-exported from the module that
+    /// defines it.
     const SCOPE_PATHS: &[(&str, &str)] = &[
         ("IpeTask", "ipe_runtime::core::IpeTask"),
         ("JsonVal", "ipe_runtime::json::JsonVal"),
@@ -1488,6 +1490,12 @@ mod show_pin_agreement {
         ("EmailProvider", "ipe_runtime::email::EmailProvider"),
         ("ChunkEvent", "ipe_runtime::http_stream::ChunkEvent"),
         ("IpeStreamId", "ipe_runtime::http_stream::IpeStreamId"),
+        ("MainProjectionTerm", "ipe_runtime::db::ProjectionTerm"),
+        (
+            "MainProjectionOperand",
+            "ipe_runtime::db::ProjectionOperand",
+        ),
+        ("MainArithOp", "ipe_runtime::db::ArithOp"),
     ];
 
     /// A Rust type's resolved path, type arguments dropped: the runtime crate
@@ -1668,6 +1676,78 @@ mod show_pin_agreement {
         .collect()
     }
 
+    /// The runtime-aliased Prelude enums, each declared with the empty Prelude
+    /// home in one entry module `Main`, as that module and `(leaf, type)`
+    /// samples.
+    fn aliased_samples(interner: &mut Interner) -> (Module, Vec<(ShowLeaf, IrType)>) {
+        let mut types = Vec::with_capacity(RUNTIME_ALIASED_ENUMS.len());
+        let mut samples = Vec::with_capacity(RUNTIME_ALIASED_ENUMS.len());
+        for (name, leaf) in RUNTIME_ALIASED_ENUMS {
+            let name = interner.intern(name).expect("intern an aliased enum name");
+            types.push(TypeDef::Enum(EnumDef {
+                name,
+                home: ModPath(vec![]),
+                type_params: vec![],
+                variants: vec![],
+            }));
+            samples.push((
+                leaf,
+                IrType::Enum {
+                    home: ModPath(vec![]),
+                    name,
+                    args: vec![],
+                },
+            ));
+        }
+        let main = interner
+            .intern("Main")
+            .expect("intern the entry module name");
+        let module = Module {
+            name: ModPath(vec![main]),
+            types,
+            funcs: vec![],
+            entry: None,
+            records: vec![],
+            uses_tea: false,
+            uses_server: false,
+            uses_http: false,
+            uses_config: false,
+            uses_compression: false,
+            uses_csv: false,
+            uses_cache: false,
+            uses_encoding: false,
+            uses_regex: false,
+            uses_uuid: false,
+            uses_random: false,
+            uses_log: false,
+            uses_decimal: false,
+            uses_char_category: false,
+            uses_crypto_core: false,
+            uses_secret: false,
+            uses_json: false,
+            uses_crypto: false,
+            uses_jwt: false,
+            uses_url: false,
+            uses_ui: false,
+            uses_web: false,
+            uses_tui: false,
+            uses_console: false,
+            uses_webview: false,
+            uses_css: false,
+            uses_auth: false,
+            uses_principal: false,
+            uses_websocket: false,
+            uses_email: false,
+            uses_locale: false,
+            uses_time: false,
+            uses_env_public: false,
+            uses_debug: false,
+            uses_ffi: false,
+            uses_async_runtime: false,
+        };
+        (module, samples)
+    }
+
     /// The Rust type `render_type` spells for each shown leaf resolves to the
     /// full path of a type the runtime's `show_rows.rs` pins to that leaf, every
     /// shown leaf has a sample here, and every [`SCOPE_PATHS`] entry resolves a
@@ -1677,8 +1757,9 @@ mod show_pin_agreement {
     fn every_rendered_leaf_type_is_its_pinned_row_type() {
         let mut interner = Interner::new();
         let bridged = bridged_samples(&mut interner);
+        let (aliased_module, aliased) = aliased_samples(&mut interner);
         let program = Program {
-            modules: vec![],
+            modules: vec![aliased_module],
             imports_unsafe_submodule: false,
             imported_web_capabilities: std::collections::BTreeSet::new(),
         };
@@ -1692,6 +1773,7 @@ mod show_pin_agreement {
                 (leaf, ty)
             })
             .chain(bridged)
+            .chain(aliased)
             .collect();
         let mut resolved: Vec<String> = Vec::new();
         for (leaf, ty) in &samples {
