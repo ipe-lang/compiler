@@ -41,6 +41,7 @@ pub fn body_layout_budgets(
         None,
         ipe_ir::Target::Native,
         Vec::new(),
+        crate::MountBase::root(),
         false,
         None,
         false,

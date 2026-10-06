@@ -1167,7 +1167,10 @@ mod tests {
         assert_eq!(parsed.name, "demo-app");
         assert_eq!(parsed.delivery.desktop.width, 1024);
         assert_eq!(parsed.delivery.desktop.height, 768);
-        assert_eq!(parsed.delivery.browser.base_path, "/");
+        assert_eq!(
+            parsed.delivery.browser.base,
+            ipe_runtime_rust::encoding::MountBase::root()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1662,7 +1665,10 @@ mod tests {
         assert_eq!(parsed.delivery.desktop.height, 768);
         assert_eq!(parsed.delivery.desktop.title, "proj");
         // browser default
-        assert_eq!(parsed.delivery.browser.base_path, "/");
+        assert_eq!(
+            parsed.delivery.browser.base,
+            ipe_runtime_rust::encoding::MountBase::root()
+        );
         // mobile default orientation
         assert_eq!(
             parsed.delivery.mobile.orientation,

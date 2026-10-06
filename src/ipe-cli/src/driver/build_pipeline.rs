@@ -8,6 +8,7 @@ use crate::{
     ffi, fs, project, render, runtime_embed, text,
 };
 use ipe_backend_rust::rust_str_lit;
+use ipe_runtime_rust::encoding::MountBase;
 
 /// Options modifying a build beyond plain source compilation — some (the
 /// static plan) apply post-emit at write time; others (`target`,
@@ -24,7 +25,7 @@ use ipe_backend_rust::rust_str_lit;
 // a two-variant enum or a state enum would obscure their independence rather than
 // clarify it; the clippy heuristic's usual remedy does not apply here.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct BuildOptions {
     /// `Some` — staticize the emitted project (activate the planned
     /// allocator feature, add the generated `.cargo/config.toml`). `None` —
@@ -41,6 +42,14 @@ pub struct BuildOptions {
     /// [`ipe_backend_rust::RustBackend::with_wasm_public_env`] /
     /// [`ipe_db::BuildConfig::wasm_public_env`].
     pub wasm_public_env: Vec<String>,
+    /// Where the emitted browser shell is served, parsed once from the
+    /// manifest's `browser.basePath`.
+    ///
+    /// A manifest build overwrites it in `build_project_with_options`; a
+    /// single-file build (no manifest) names [`MountBase::root`]. Threaded into
+    /// [`ipe_backend_rust::RustBackend::with_mount_base`] /
+    /// [`ipe_db::BuildConfig::mount_base`] and the build cache key.
+    pub mount_base: MountBase,
     /// `true` when `[wasm] mode = "hydrate"` in the project's `package.ipe`.
     /// Causes the backend to emit a `#[wasm_bindgen] pub fn hydrate(model_json: &str)`
     /// export in addition to the `#[wasm_bindgen(start)] pub fn ipe_start()` entry.
@@ -272,6 +281,30 @@ pub fn bluegreen_from_env_values(no_bluegreen: Option<&str>, bluegreen: Option<&
     }
     // Default on.
     true
+}
+
+impl Default for BuildOptions {
+    /// The vendored, native, release-intent options of a single-file build.
+    ///
+    /// The mount base is named [`MountBase::root`]: a single file carries no
+    /// manifest, and a manifest build overwrites it from `browser.basePath`.
+    fn default() -> Self {
+        Self {
+            static_plan: None,
+            target: ipe_ir::Target::default(),
+            wasm_public_env: Vec::new(),
+            mount_base: MountBase::root(),
+            wasm_hydrate_mode: false,
+            intent: ipe_backend_rust::BuildIntent::default(),
+            runtime_dep: false,
+            tree_shake_vendored: false,
+            cargo_name: String::new(),
+            debugger: false,
+            hot_appearance: false,
+            webview_host: false,
+            webview_window: None,
+        }
+    }
 }
 
 impl BuildOptions {
@@ -1031,6 +1064,7 @@ pub fn compile_modules_observed(
         db_driver,
         options.target,
         &options.wasm_public_env,
+        &options.mount_base,
         options.intent,
         options.debugger,
         options.hot_appearance,
@@ -1100,6 +1134,7 @@ pub fn compile_modules_observed(
                     .with_db_driver(db_driver)
                     .with_target(options.target)
                     .with_wasm_public_env(options.wasm_public_env.clone())
+                    .with_mount_base(options.mount_base.clone())
                     .with_wasm_hydrate_mode(options.wasm_hydrate_mode)
                     .with_runtime_dep(runtime_dep.clone())
                     .with_debugger(options.debugger)
@@ -1159,6 +1194,7 @@ pub fn compile_modules_observed(
         ffi_emit,
         options.target,
         options.wasm_public_env.clone(),
+        options.mount_base.clone(),
         options.wasm_hydrate_mode,
         options.intent,
         runtime_dep,
@@ -1954,7 +1990,7 @@ pub fn compile_prepared(
                 inject_widget_registration(&mut emitted, &widget_manifest)?;
             }
             ipe_ir::Target::WasmClient => {
-                inject_wasm_widget_bundle(&mut emitted, &widget_manifest)?;
+                inject_wasm_widget_bundle(&mut emitted, &widget_manifest, config.mount_base(db))?;
             }
         }
     }
@@ -2039,8 +2075,9 @@ pub fn inject_widget_registration(
 ///
 /// The hash the page pins is `sha256` over the served bytes (§ `widget_assets`),
 /// so page integrity == served bytes for the static target exactly as for the
-/// server. `base` is empty: the static SPA is root-mounted, so the absolute
-/// `/_ipe/…` asset URLs resolve against the `www/` document root.
+/// server. Every URL the page and the glue carry is `base.url_of` of the
+/// asset's bundle path, and the file sits at that bundle path under `www/`, so
+/// the URL and the file cannot name different assets.
 ///
 /// # Errors
 /// [`CliError`] carrying a [`Diagnostic::CompilerBug`] if `www/index.html` is
@@ -2049,15 +2086,14 @@ pub fn inject_widget_registration(
 pub fn inject_wasm_widget_bundle(
     emitted: &mut ipe_backend::EmittedProject,
     manifest: &BTreeMap<String, String>,
+    base: &MountBase,
 ) -> Result<(), CliError> {
+    use ipe_runtime_rust::encoding::BundlePath;
     use ipe_runtime_rust::widget_assets::{
         WidgetAsset, WidgetTransport, glue_js_for, glue_path_for, page_scripts_for,
         widget_asset_path,
     };
 
-    // The static SPA is root-mounted; the `/_ipe/…` asset URLs are document-root
-    // absolute, so the `www/`-relative file path drops the leading slash.
-    const BASE: &str = "";
     const TRANSPORT: WidgetTransport = WidgetTransport::WasmClient;
     const HEAD_CLOSE: &str = "</head>";
 
@@ -2069,10 +2105,17 @@ pub fn inject_wasm_widget_bundle(
             detail,
         }),
     };
-    let rel = |p: &str| -> Result<ipe_backend::RelPath, CliError> {
-        ipe_backend::RelPath::new(p.to_owned()).map_err(|_| {
+    // The `www/` file of a bundle path: its segments joined under `www`.
+    let www_file = |path: &BundlePath| -> Result<ipe_backend::RelPath, CliError> {
+        let mut file = String::from("www");
+        for segment in path.file_segments() {
+            file.push('/');
+            file.push_str(segment);
+        }
+        ipe_backend::RelPath::new(file).map_err(|_| {
             bug(format!(
-                "the generated widget asset path `{p}` is not a valid in-project relative path"
+                "the widget bundle path `{}` is not a valid in-project relative path",
+                path.rel()
             ))
         })
     };
@@ -2087,28 +2130,24 @@ pub fn inject_wasm_widget_bundle(
         })
         .collect();
 
-    // Write each author hook file content-addressed under `www/`. `widget_asset_path`
-    // yields the absolute URL path `/_ipe/widget.<hex16>.js`; strip the leading
-    // `/` for the `www/`-relative file key.
+    // Write each author hook file content-addressed under `www/`, at the
+    // bundle path its URL is built from.
     for asset in &assets {
-        let url_path = widget_asset_path(&asset.content);
-        let file_path = format!("www{url_path}");
+        let path = widget_asset_path(&asset.content);
         emitted
             .files
-            .insert(rel(&file_path)?, asset.content.clone());
+            .insert(www_file(&path)?, asset.content.clone());
     }
 
     // Write the generated glue (WasmClient transport) content-addressed under `www/`.
-    let glue_url = glue_path_for(&assets, BASE, TRANSPORT);
-    let glue_body = glue_js_for(&assets, BASE, TRANSPORT);
-    emitted
-        .files
-        .insert(rel(&format!("www{glue_url}"))?, glue_body);
+    let glue_path = glue_path_for(&assets, base, TRANSPORT);
+    let glue_body = glue_js_for(&assets, base, TRANSPORT);
+    emitted.files.insert(www_file(&glue_path)?, glue_body);
 
     // Splice the SRI-pinned preload + glue script references into `index.html`
     // before `</head>` (external + SRI + crossorigin — no inline script, so the
     // static shell's CSP `script-src 'self' 'wasm-unsafe-eval'` is unchanged).
-    let scripts = page_scripts_for(&assets, BASE, TRANSPORT);
+    let scripts = page_scripts_for(&assets, base, TRANSPORT);
     let index = emitted
         .files
         .get_mut("www/index.html")
@@ -2814,6 +2853,7 @@ pub fn build_project_into(
     );
     let options = BuildOptions {
         wasm_public_env: manifest.wasm.public_env.to_names(),
+        mount_base: manifest.delivery.browser.base.clone(),
         wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
         cargo_name,
         webview_window,

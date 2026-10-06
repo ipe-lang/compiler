@@ -61,6 +61,7 @@ fn native_config(db: &ipe_db::IpeDatabase) -> ipe_db::BuildConfig {
         None,
         ipe_ir::Target::Native,
         Vec::new(),
+        ipe_backend_rust::MountBase::root(),
         false,
         ipe_backend_rust::BuildIntent::Development,
         None,

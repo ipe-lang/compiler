@@ -51,6 +51,12 @@ package =
     }
 ```
 
+`basePath` is the URL path the client bundle is served at; the `web solo`
+host, static hosts, and mobile shells all serve the bundle under it. It is `"/"`
+(or `""`) for the root, or one or more `/segment` parts made only of
+`A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty, `.`, or `..` segment, and
+at most 1024 bytes in all; the manifest refuses any other value.
+
 Run `ipe doc Ipe.Package` for every field.
 
 ## Desktop: a webview-native bundle
