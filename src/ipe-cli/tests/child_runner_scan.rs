@@ -26,23 +26,39 @@
 //!   receiver, held to [`METHODS`], so a raw `.output()` is red and a non-child
 //!   `.status()` is admitted only by its own row.
 //!
-//! Macro bodies are parsed as comma-separated expressions, or else matched
-//! token by token. A renaming `use` of `Command`, `CommandExt`, `Child` or a
-//! runner fn, a type alias naming `Command`, `CommandExt` or `Child`, and a
-//! `Command::new` not called in place are refused. A `ureq` body read is held
-//! to `remote_ingest::read_capped` by a whitespace-free text match.
+//! Names are compared with any `r#` prefix removed, and a qualified path
+//! `<T>::f` or `<T as Tr>::f` is read with `T` before `f`; a qualified path
+//! whose self type has no name is refused. Macro bodies are parsed as
+//! comma-separated expressions, or else matched token by token; there a
+//! method name or a child-type path segment a macro metavariable supplies is
+//! refused, and every identifier counts as a use and a binding of its name.
+//! A renaming `use` of `Command`, `CommandExt`, `Child`, `LocalCeiling`,
+//! `InheritedRole` or a runner fn, a type alias naming `Command`, `CommandExt`
+//! or `Child`, and a `Command::new` not called in place are refused.
+//!
+//! A ceiling is named only by the top-level `LocalCeiling` consts of
+//! `remote_ingest.rs`: a `LocalCeiling` const elsewhere, any const, static,
+//! binding or renaming `use` sharing a ceiling's name, and a fn outside
+//! `remote_ingest.rs` named as a runner or a sink fn are refused, so a name the
+//! proof matches cannot stand for another value. A ceiling parameter or a
+//! helper's ceiling parameter must be bound once in its fn, and a fn key two
+//! items share proves nothing. A `ureq` body read is held to
+//! `remote_ingest::read_capped` by a whitespace-free text match.
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use proc_macro2::{Delimiter, Ident, TokenStream, TokenTree};
+use syn::ext::IdentExt as _;
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Expr, FnArg, ImplItem, ImplItemType, Item, ItemImpl, ItemMod, ItemType, Lit, Macro,
-    Member, Meta, Pat, ReturnType, Signature, Token, TraitItem, TraitItemType, Type, UseTree,
+    Attribute, Expr, ExprMethodCall, ExprPath, FnArg, ImplItem, ImplItemType, Item, ItemImpl,
+    ItemMod, ItemType, Lit, Macro, Member, Meta, Pat, PatIdent, ReturnType, Signature, Token,
+    TraitItem, TraitItemType, Type, UseTree,
 };
 
 /// The runner a child site reaches, as its [`SITES`] row names it.
@@ -278,11 +294,17 @@ const RUNNER_BODIES: &[NameRow] = &[
     ("watch.rs", "spawn_command", "spawn_hardened", 1),
 ];
 
-/// Every admitted zero-argument call of a child-start method name: a non-child
-/// receiver (an HTTP response's `status()`) or a runner's own method.
+/// Every admitted zero-argument call of a child-start method name, keyed by
+/// its rendered receiver and name: a non-child receiver (an HTTP response's
+/// `status()`) or a runner's own method.
 const METHODS: &[NameRow] = &[
-    ("ssh_signing_key.rs", "post_signing_key", "status", 2),
-    ("watch.rs", "spawn_cargo_build", "spawn", 1),
+    (
+        "ssh_signing_key.rs",
+        "post_signing_key",
+        "response.status",
+        2,
+    ),
+    ("watch.rs", "spawn_cargo_build", "build.spawn", 1),
 ];
 
 /// The rows a judgement holds the scanned sources to.
@@ -340,6 +362,18 @@ const RUN_INHERITED: &str = "run_inherited";
 const RUN_PROBE: &str = "run_probe";
 const EXEC_NAMING: &str = "exec_naming";
 
+/// The qualifier a token-matched path takes when its self type has no name.
+const UNNAMED_QUALIFIER: &str = "<unnamed>";
+
+/// The qualifier a token-matched path takes when a macro metavariable supplies it.
+const METAVAR_QUALIFIER: &str = "<metavariable>";
+
+/// The receiver a token-matched method call renders with.
+const MACRO_RECEIVER: &str = "<macro>";
+
+/// The binding a glob `use` inside a fn stands for: any name.
+const GLOB_BINDING: &str = "*";
+
 /// The macro that splices a file the walk does not reach.
 const INCLUDE_MACRO: &str = "include";
 
@@ -377,9 +411,11 @@ type Named = (String, String);
 /// What one parsed file contributes, production facts only, plus the module
 /// files it declares, each with the directory its own children resolve in and
 /// whether it is reached as production.
+///
+/// A fn key two production fns share maps to `None`, so no proof reads either.
 #[derive(Default)]
 struct FileScan {
-    fns: BTreeMap<String, FnSig>,
+    fns: BTreeMap<String, Option<FnSig>>,
     calls: Vec<Call>,
     methods: Vec<Named>,
     values: Vec<String>,
@@ -387,6 +423,16 @@ struct FileScan {
     path_sinks: Vec<Named>,
     method_sinks: Vec<Named>,
     ceilings: Vec<String>,
+    /// Every pattern binding, by enclosing fn.
+    bindings: Vec<Named>,
+    /// Every name a `use` brings into scope, by enclosing item.
+    imports: Vec<Named>,
+    /// Every identifier of a token-matched macro body, by enclosing item.
+    macro_idents: Vec<Named>,
+    /// Every const and static, by enclosing item.
+    consts: Vec<Named>,
+    /// Every renaming `use`, as (imported name, new name).
+    renames: Vec<(String, String)>,
     refusals: Vec<String>,
     children: Vec<(PathBuf, PathBuf, bool)>,
 }
@@ -414,19 +460,35 @@ fn last_component(key: &str) -> &str {
     key.rsplit("::").next().unwrap_or(key)
 }
 
+/// An identifier's name, any `r#` prefix removed.
+fn name_of(ident: &Ident) -> String {
+    ident.unraw().to_string()
+}
+
+/// Whether `qualifier` may name a type a child starts through: a child type,
+/// or a qualifier the token matcher cannot name.
+fn child_qualifier(qualifier: &str) -> bool {
+    listed(CHILD_TYPES, qualifier)
+        || qualifier == UNNAMED_QUALIFIER
+        || qualifier == METAVAR_QUALIFIER
+}
+
 /// Whether the call path `path` starts a child directly.
 fn is_path_sink(path: &[String]) -> bool {
     let Some((last, before)) = path.split_last() else {
         return false;
     };
     listed(SINK_FNS, last)
-        || (listed(SINK_METHODS, last) && before.last().is_some_and(|q| listed(CHILD_TYPES, q)))
+        || (listed(SINK_METHODS, last) && before.iter().any(|q| child_qualifier(q)))
 }
 
-/// Whether a renaming `use` of `ident` is refused.
-fn rename_refused(ident: &Ident) -> bool {
-    let name = ident.to_string();
-    listed(CHILD_TYPES, &name) || listed(RUNNER_FNS, &name) || listed(SINK_FNS, &name)
+/// Whether a renaming `use` of `name` is refused.
+fn rename_refused(name: &str) -> bool {
+    listed(CHILD_TYPES, name)
+        || listed(RUNNER_FNS, name)
+        || listed(SINK_FNS, name)
+        || name == CEILING_TYPE
+        || name == ROLE_TYPE
 }
 
 /// Whether the `cfg` predicate `meta` holds only under `cfg(test)`.
@@ -475,12 +537,39 @@ fn names_a_path(attr: &Attribute) -> bool {
             }))
 }
 
-/// The last identifier of `ty`'s path, if it is a path type.
+/// The last identifier of `ty`'s path, if it is a path type, parentheses and
+/// invisible groups looked through.
 fn type_last(ty: &Type) -> Option<String> {
     match ty {
-        Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        Type::Path(path) => path.path.segments.last().map(|seg| name_of(&seg.ident)),
+        Type::Paren(inner) => type_last(&inner.elem),
+        Type::Group(inner) => type_last(&inner.elem),
         _ => None,
     }
+}
+
+/// The name of a qualified path's self type, references and pointers looked
+/// through; `None` when it has no path name (`<[T]>`, `<_>`, `<dyn Tr>`).
+fn qself_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Reference(inner) => qself_name(&inner.elem),
+        Type::Ptr(inner) => qself_name(&inner.elem),
+        Type::Paren(inner) => qself_name(&inner.elem),
+        Type::Group(inner) => qself_name(&inner.elem),
+        _ => type_last(ty),
+    }
+}
+
+/// The segments of an expression path, a qualified self type `<T>::f` or
+/// `<T as Tr>::f` inserted before the last segment; `None` when the self type
+/// has no name.
+fn expr_path(path: &ExprPath) -> Option<Vec<String>> {
+    let mut found = segments(&path.path);
+    if let Some(qself) = &path.qself {
+        let at = found.len().saturating_sub(1);
+        found.insert(at, qself_name(&qself.ty)?);
+    }
+    Some(found)
 }
 
 /// The impl name an `impl` block's fns are keyed under.
@@ -492,7 +581,7 @@ fn impl_name(item: &ItemImpl) -> String {
     let trait_name = path
         .segments
         .last()
-        .map_or_else(String::new, |seg| seg.ident.to_string());
+        .map_or_else(String::new, |seg| name_of(&seg.ident));
     format!("<{self_name} as {trait_name}>")
 }
 
@@ -500,14 +589,14 @@ fn impl_name(item: &ItemImpl) -> String {
 fn segments(path: &syn::Path) -> Vec<String> {
     path.segments
         .iter()
-        .map(|seg| seg.ident.to_string())
+        .map(|seg| name_of(&seg.ident))
         .collect()
 }
 
 /// The binding name of a plain identifier pattern.
 fn pat_ident(pat: &Pat) -> Option<String> {
     match pat {
-        Pat::Ident(binding) => Some(binding.ident.to_string()),
+        Pat::Ident(binding) => Some(name_of(&binding.ident)),
         _ => None,
     }
 }
@@ -539,7 +628,7 @@ fn fn_sig(sig: &Signature) -> FnSig {
 /// A struct field name or tuple index.
 fn member(member: &Member) -> String {
     match member {
-        Member::Named(ident) => ident.to_string(),
+        Member::Named(ident) => name_of(ident),
         Member::Unnamed(index) => index.index.to_string(),
     }
 }
@@ -556,7 +645,7 @@ fn render(expr: &Expr) -> String {
             lit: Lit::Str(text),
             ..
         }) => format!("\"{}\"", text.value()),
-        Expr::Path(path) => segments(&path.path).join("::"),
+        Expr::Path(path) => expr_path(path).map_or_else(|| "<expr>".to_owned(), |p| p.join("::")),
         Expr::Reference(reference) => {
             let mutability = if reference.mutability.is_some() {
                 "mut "
@@ -569,7 +658,7 @@ fn render(expr: &Expr) -> String {
         Expr::MethodCall(call) => format!(
             "{}.{}({})",
             render(&call.receiver),
-            call.method,
+            name_of(&call.method),
             arguments_marker(&call.args)
         ),
         Expr::Call(call) => format!("{}({})", render(&call.func), arguments_marker(&call.args)),
@@ -581,7 +670,7 @@ fn render(expr: &Expr) -> String {
 /// The path segments of an argument, when it is a path.
 fn arg_path(arg: &Expr) -> Option<Vec<String>> {
     match arg {
-        Expr::Path(path) => Some(segments(&path.path)),
+        Expr::Path(path) => expr_path(path),
         _ => None,
     }
 }
@@ -609,22 +698,64 @@ fn item_attrs(item: &Item) -> Option<&[Attribute]> {
     Some(attrs)
 }
 
-/// The qualifier before a `::` that ends `before`, if any.
+/// Whether `tree` is the punctuation `ch`.
+fn is_punct(tree: &TokenTree, ch: char) -> bool {
+    matches!(tree, TokenTree::Punct(punct) if punct.as_char() == ch)
+}
+
+/// The qualifier before a `::` that ends `before`, if any: the identifier
+/// before it, the [`angle_qualifier`] of a `<..>` before it, or
+/// [`METAVAR_QUALIFIER`] for a `$name`.
 fn qualifier_of(before: &[TokenTree]) -> Option<String> {
-    match before {
-        [
-            ..,
-            TokenTree::Ident(qualifier),
-            TokenTree::Punct(first),
-            TokenTree::Punct(second),
-        ] if first.as_char() == ':' && second.as_char() == ':' => Some(qualifier.to_string()),
+    let [rest @ .., first, second] = before else {
+        return None;
+    };
+    if !is_punct(first, ':') || !is_punct(second, ':') {
+        return None;
+    }
+    match rest {
+        [.., dollar, TokenTree::Ident(_)] if is_punct(dollar, '$') => {
+            Some(METAVAR_QUALIFIER.to_owned())
+        }
+        [.., TokenTree::Ident(qualifier)] => Some(name_of(qualifier)),
+        [.., close] if is_punct(close, '>') => Some(angle_qualifier(rest)),
         _ => None,
     }
 }
 
+/// The qualifier the `<..>` ending `rest` names: a [`CHILD_TYPES`] name
+/// anywhere inside it, else its first identifier, else [`UNNAMED_QUALIFIER`].
+fn angle_qualifier(rest: &[TokenTree]) -> String {
+    let mut depth = 0_usize;
+    let mut inside = Vec::new();
+    for tree in rest.iter().rev() {
+        if is_punct(tree, '>') {
+            depth = depth.saturating_add(1);
+        } else if is_punct(tree, '<') {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                break;
+            }
+        } else if let TokenTree::Ident(ident) = tree {
+            inside.push(name_of(ident));
+        }
+    }
+    inside
+        .iter()
+        .find(|name| listed(CHILD_TYPES, name.as_str()))
+        .or_else(|| inside.last())
+        .cloned()
+        .unwrap_or_else(|| UNNAMED_QUALIFIER.to_owned())
+}
+
 /// Whether `before` ends in a `.`.
 fn follows_dot(before: &[TokenTree]) -> bool {
-    matches!(before.last(), Some(TokenTree::Punct(dot)) if dot.as_char() == '.')
+    before.last().is_some_and(|dot| is_punct(dot, '.'))
+}
+
+/// Whether `next` opens a turbofish `::<..>`.
+fn opens_turbofish(next: Option<&TokenTree>) -> bool {
+    next.is_some_and(|colon| is_punct(colon, ':'))
 }
 
 /// Whether `next` is an empty `( )` group.
@@ -680,12 +811,53 @@ impl Scanner<'_> {
     }
 
     fn function(&mut self, sig: &Signature, walk: impl FnOnce(&mut Self)) {
-        self.within(sig.ident.to_string(), |s| {
+        let name = name_of(&sig.ident);
+        let impersonates = listed(RUNNER_FNS, &name) || listed(SINK_FNS, &name);
+        self.within(name, |s| {
             if s.production {
-                s.out.fns.insert(s.key(), fn_sig(sig));
+                if impersonates && s.file != CEILING_OWNER {
+                    s.refuse(&format!(
+                        "a fn named as a runner or sink fn outside `{CEILING_OWNER}`"
+                    ));
+                }
+                match s.out.fns.entry(s.key()) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(Some(fn_sig(sig)));
+                    }
+                    Entry::Occupied(mut slot) => {
+                        slot.insert(None);
+                    }
+                }
             }
             walk(s);
         });
+    }
+
+    /// Record one const or static named `ident` of type `ty`.
+    fn constant(&mut self, ident: &Ident, ty: &Type) {
+        if !self.production {
+            return;
+        }
+        let name = name_of(ident);
+        if type_last(ty).is_some_and(|last| last == CEILING_TYPE) {
+            if self.file == CEILING_OWNER && self.context.is_empty() {
+                self.out.ceilings.push(name.clone());
+            } else {
+                self.refuse(&format!(
+                    "a `{CEILING_TYPE}` `{name}` outside the top level of `{CEILING_OWNER}`"
+                ));
+            }
+        }
+        let key = self.key();
+        self.out.consts.push((key, name));
+    }
+
+    /// Record one name a `use` brings into scope.
+    fn import(&mut self, name: String) {
+        if self.production {
+            let key = self.key();
+            self.out.imports.push((key, name));
+        }
     }
 
     fn path_sink(&mut self, name: String) {
@@ -701,6 +873,15 @@ impl Scanner<'_> {
     fn site(&mut self, program: String) {
         let key = self.key();
         self.out.sites.push((key, program));
+    }
+
+    /// The segments of `path`, refusing a qualified path whose self type has no name.
+    fn path_of(&mut self, path: &ExprPath) -> Option<Vec<String>> {
+        let found = expr_path(path);
+        if found.is_none() && self.production {
+            self.refuse("a qualified path whose self type this scan cannot name");
+        }
+        found
     }
 
     fn path_call(&mut self, callee: Vec<String>, args: &Punctuated<Expr, Token![,]>) {
@@ -740,15 +921,15 @@ impl Scanner<'_> {
         self.out.values.push(last.clone());
     }
 
-    fn method_call(&mut self, method: &Ident, without_args: bool) {
+    fn method_call(&mut self, call: &ExprMethodCall) {
         if !self.production {
             return;
         }
-        let name = method.to_string();
+        let name = name_of(&call.method);
         let key = self.key();
         self.out.methods.push((key, name.clone()));
-        if without_args && listed(SINK_METHODS, &name) {
-            self.method_sink(name);
+        if call.args.is_empty() && listed(SINK_METHODS, &name) {
+            self.method_sink(format!("{}.{name}", render(&call.receiver)));
         }
     }
 
@@ -772,15 +953,28 @@ impl Scanner<'_> {
     }
 
     fn scan_token(&mut self, ident: &Ident, before: &[TokenTree], next: Option<&TokenTree>) {
-        let name = ident.to_string();
+        let name = name_of(ident);
+        let key = self.key();
+        self.out.macro_idents.push((key, name.clone()));
+        self.out.values.push(name.clone());
+        if let [rest @ .., dollar] = before
+            && is_punct(dollar, '$')
+        {
+            let child_path = qualifier_of(rest).is_some_and(|q| child_qualifier(&q));
+            if follows_dot(rest) || child_path {
+                self.refuse("a method or child-type path segment a macro metavariable supplies");
+            }
+            return;
+        }
         let qualifier = qualifier_of(before);
-        let qualified_by_child = qualifier.as_deref().is_some_and(|q| listed(CHILD_TYPES, q));
+        let qualified_by_child = qualifier.as_deref().is_some_and(child_qualifier);
+        let called = empty_parens(next) || opens_turbofish(next);
         if listed(SINK_FNS, &name) || (listed(SINK_METHODS, &name) && qualified_by_child) {
             self.path_sink(name);
-        } else if listed(SINK_METHODS, &name) && follows_dot(before) && empty_parens(next) {
-            self.method_sink(name);
-        } else if name == "new" && qualifier.as_deref() == Some("Command") {
-            self.site("<macro>".to_owned());
+        } else if listed(SINK_METHODS, &name) && follows_dot(before) && called {
+            self.method_sink(format!("{MACRO_RECEIVER}.{name}"));
+        } else if name == "new" && qualified_by_child {
+            self.site(MACRO_RECEIVER.to_owned());
         }
     }
 
@@ -810,15 +1004,14 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         };
         self.gated(is_test_only(attrs), |s| match item {
             Item::Fn(f) => s.function(&f.sig, |s| visit::visit_item_fn(s, f)),
-            Item::Trait(t) => s.within(t.ident.to_string(), |s| visit::visit_item_trait(s, t)),
+            Item::Trait(t) => s.within(name_of(&t.ident), |s| visit::visit_item_trait(s, t)),
             Item::Const(c) => {
-                if s.production
-                    && s.file == CEILING_OWNER
-                    && type_last(&c.ty).is_some_and(|name| name == CEILING_TYPE)
-                {
-                    s.out.ceilings.push(c.ident.to_string());
-                }
+                s.constant(&c.ident, &c.ty);
                 visit::visit_item_const(s, c);
+            }
+            Item::Static(st) => {
+                s.constant(&st.ident, &st.ty);
+                visit::visit_item_static(s, st);
             }
             _ => visit::visit_item(s, item),
         });
@@ -834,6 +1027,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                 s.function(&f.sig, |s| visit::visit_impl_item_fn(s, f));
             }),
             ImplItem::Const(c) => self.gated(is_test_only(&c.attrs), |s| {
+                s.constant(&c.ident, &c.ty);
                 visit::visit_impl_item_const(s, c);
             }),
             ImplItem::Type(t) => {
@@ -853,6 +1047,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                 s.function(&f.sig, |s| visit::visit_trait_item_fn(s, f));
             }),
             TraitItem::Const(c) => self.gated(is_test_only(&c.attrs), |s| {
+                s.constant(&c.ident, &c.ty);
                 visit::visit_trait_item_const(s, c);
             }),
             TraitItem::Type(t) => {
@@ -879,9 +1074,18 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
 
     fn visit_ident(&mut self, ident: &'ast Ident) {
-        if self.production && self.in_alias > 0 && listed(CHILD_TYPES, &ident.to_string()) {
-            self.refuse(&format!("a type alias naming `{ident}`"));
+        let name = name_of(ident);
+        if self.production && self.in_alias > 0 && listed(CHILD_TYPES, &name) {
+            self.refuse(&format!("a type alias naming `{name}`"));
         }
+    }
+
+    fn visit_pat_ident(&mut self, pat: &'ast PatIdent) {
+        if self.production {
+            let key = self.key();
+            self.out.bindings.push((key, name_of(&pat.ident)));
+        }
+        visit::visit_pat_ident(self, pat);
     }
 
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
@@ -889,7 +1093,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.refuse("a `#[path]` module");
             return;
         }
-        let name = item.ident.to_string();
+        let name = name_of(&item.ident);
         let child_dir = self.dir.join(&name);
         if item.content.is_some() {
             let outer = std::mem::replace(&mut self.dir, child_dir);
@@ -903,11 +1107,18 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_use_tree(&mut self, tree: &'ast UseTree) {
         match tree {
             UseTree::Rename(rename) => {
-                if self.production && rename.rename != "_" && rename_refused(&rename.ident) {
-                    self.refuse(&format!("a renaming `use` of `{}`", rename.ident));
+                let from = name_of(&rename.ident);
+                let to = name_of(&rename.rename);
+                if self.production && to != "_" {
+                    if rename_refused(&from) {
+                        self.refuse(&format!("a renaming `use` of `{from}`"));
+                    }
+                    self.out.renames.push((from, to.clone()));
+                    self.import(to);
                 }
             }
-            UseTree::Name(_) | UseTree::Glob(_) => {}
+            UseTree::Name(used) => self.import(name_of(&used.ident)),
+            UseTree::Glob(_) => self.import(GLOB_BINDING.to_owned()),
             UseTree::Path(_) | UseTree::Group(_) => visit::visit_use_tree(self, tree),
         }
     }
@@ -916,15 +1127,21 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         if let Expr::Call(call) = expr
             && let Expr::Path(callee) = &*call.func
         {
-            self.path_call(segments(&callee.path), &call.args);
+            if let Some(path) = self.path_of(callee) {
+                self.path_call(path, &call.args);
+            }
             for arg in &call.args {
                 self.visit_expr(arg);
             }
             return;
         }
         match expr {
-            Expr::Path(path) => self.value_path(&segments(&path.path)),
-            Expr::MethodCall(call) => self.method_call(&call.method, call.args.is_empty()),
+            Expr::Path(path) => {
+                if let Some(path) = self.path_of(path) {
+                    self.value_path(&path);
+                }
+            }
+            Expr::MethodCall(call) => self.method_call(call),
             _ => {}
         }
         visit::visit_expr(self, expr);
@@ -1116,12 +1333,65 @@ fn listed_names(rows: &[NameRow]) -> BTreeMap<Key, usize> {
     counts
 }
 
+/// The names of the ceilings `remote_ingest.rs` declares.
+fn ceiling_names(scans: &Scans) -> BTreeSet<&str> {
+    scans.get(CEILING_OWNER).map_or_else(BTreeSet::new, |scan| {
+        scan.ceilings.iter().map(String::as_str).collect()
+    })
+}
+
+/// Every name that could stand for another value than the ceiling it spells,
+/// one line each: a binding, a const or static other than the ceiling itself,
+/// a renaming `use`, or an identifier of a token-matched macro outside
+/// `remote_ingest.rs`.
+fn shadowed_ceilings(scans: &Scans) -> Vec<String> {
+    let ceilings = ceiling_names(scans);
+    let is_ceiling = |name: &String| ceilings.contains(name.as_str());
+    let mut found = Vec::new();
+    for (file, scan) in scans {
+        let owner = file == CEILING_OWNER;
+        let named = scan
+            .bindings
+            .iter()
+            .filter(|(_, name)| is_ceiling(name))
+            .map(|(within, name)| ("a binding", within, name));
+        let declared = scan
+            .consts
+            .iter()
+            .filter(|(within, name)| is_ceiling(name) && !(owner && within.is_empty()))
+            .map(|(within, name)| ("a const or static", within, name));
+        let spliced = scan
+            .macro_idents
+            .iter()
+            .filter(|(_, name)| !owner && is_ceiling(name))
+            .map(|(within, name)| ("a token-matched macro identifier", within, name));
+        found.extend(
+            named
+                .chain(declared)
+                .chain(spliced)
+                .map(|(what, within, name)| {
+                    format!("{file}: {what} named as the ceiling `{name}` in `{within}`")
+                }),
+        );
+        found.extend(
+            scan.renames
+                .iter()
+                .filter(|(from, to)| is_ceiling(from) || is_ceiling(to))
+                .map(|(from, to)| {
+                    format!("{file}: a renaming `use` of `{from}` as `{to}` touches a ceiling")
+                }),
+        );
+    }
+    found
+}
+
 /// Every refusal and every drift between `scans` and `inventory`, one line each.
 fn judge(scans: &Scans, inventory: &Inventory<'_>) -> Vec<String> {
     let mut found: Vec<String> = scans
         .values()
         .flat_map(|scan| scan.refusals.iter().cloned())
         .collect();
+    found.extend(shadowed_ceilings(scans));
     let mut sites = BTreeMap::new();
     for (file, within, program, _, count) in inventory.sites {
         let key = (
@@ -1158,18 +1428,33 @@ struct World<'a> {
 
 impl<'a> World<'a> {
     fn new(scans: &'a Scans, bodies: &'a [NameRow]) -> Self {
-        let ceilings = scans.get(CEILING_OWNER).map_or_else(BTreeSet::new, |scan| {
-            scan.ceilings.iter().map(String::as_str).collect()
-        });
         Self {
             scans,
-            ceilings,
+            ceilings: ceiling_names(scans),
             bodies,
         }
     }
 
+    /// The signature of the one production fn keyed `fun` in `file`.
     fn sig(&self, file: &str, fun: &str) -> Option<&'a FnSig> {
-        self.scans.get(file)?.fns.get(fun)
+        self.scans.get(file)?.fns.get(fun)?.as_ref()
+    }
+
+    /// How many times `fun` of `file` binds `name`: a pattern, a `use`, a
+    /// glob `use`, or a token-matched macro identifier.
+    fn binds(&self, file: &str, fun: &str, name: &str) -> usize {
+        let Some(scan) = self.scans.get(file) else {
+            return 0;
+        };
+        let count = |facts: &[Named]| {
+            facts
+                .iter()
+                .filter(|(within, bound)| within == fun && (bound == name || bound == GLOB_BINDING))
+                .count()
+        };
+        count(scan.bindings.as_slice())
+            .saturating_add(count(scan.imports.as_slice()))
+            .saturating_add(count(scan.macro_idents.as_slice()))
     }
 
     /// The production path calls inside `fun` of `file`.
@@ -1203,22 +1488,21 @@ impl<'a> World<'a> {
     }
 
     /// The fn of `file` a call of `callee` inside `fun` reaches: `Self::g` in
-    /// the enclosing impl, or the one fn of the file whose last component is `g`.
+    /// the enclosing inherent impl, or, from a top-level fn binding no `g` and
+    /// declaring no inner fn `g`, the top-level fn `g`.
     fn resolve(&self, file: &str, fun: &str, callee: &[String]) -> Option<String> {
         match callee {
             [qualifier, name] if qualifier == "Self" => {
                 let (prefix, _) = fun.rsplit_once("::")?;
-                Some(format!("{prefix}::{name}"))
+                (!prefix.contains('<')).then(|| format!("{prefix}::{name}"))
             }
             [name] => {
-                let mut found = self
-                    .scans
-                    .get(file)?
-                    .fns
-                    .keys()
-                    .filter(|key| last_component(key) == name);
-                let only = found.next()?;
-                found.next().is_none().then(|| only.clone())
+                let fns = &self.scans.get(file)?.fns;
+                let top_level = !fun.contains("::")
+                    && self.binds(file, fun, name) == 0
+                    && !fns.contains_key(&format!("{fun}::{name}"))
+                    && fns.contains_key(name);
+                top_level.then(|| name.clone())
             }
             _ => None,
         }
@@ -1267,7 +1551,7 @@ fn every_caller_passes(
         .params
         .iter()
         .position(|p| p.ceiling && p.name.as_deref() == Some(param));
-    let (false, Some(at)) = (sig.receiver, at) else {
+    let (false, Some(at), 1) = (sig.receiver, at, world.binds(file, fun, param)) else {
         return false;
     };
     world.callers_of(fun).is_some_and(|callers| {
@@ -1298,9 +1582,10 @@ fn through_helper(
             param.ceiling
                 && names(arg_at(call, at), ceiling)
                 && param.name.as_deref().is_some_and(|name| {
-                    world.calls_in(file, &helper).any(|inner| {
-                        calls(inner, runner.0) && is_ident(arg_at(inner, runner.1), name)
-                    })
+                    world.binds(file, &helper, name) == 1
+                        && world.calls_in(file, &helper).any(|inner| {
+                            calls(inner, runner.0) && is_ident(arg_at(inner, runner.1), name)
+                        })
                 })
         })
 }
@@ -1591,9 +1876,12 @@ fn matcher_admits_the_bounded_forms() {
 const SAMPLE_CEILINGS: &str = "pub const TOOL_QUERY_LIMITS: LocalCeiling = LocalCeiling(L);\n\
                                pub const NOT_A_CEILING: u64 = 1;\n";
 
-/// The sample tool file every refusal sample appends to.
-const SAMPLE_TOOL: &str = "fn query(tool: &OsStr) { let c = Command::new(tool); run_local(c, TOOL_QUERY_LIMITS, S); }\n\
-     fn post(r: Response) { let _ = r.status(); }\n";
+/// The sample tool file's one child site.
+const SAMPLE_QUERY: &str =
+    "fn query(tool: &OsStr) { let c = Command::new(tool); run_local(c, TOOL_QUERY_LIMITS, S); }\n";
+
+/// The sample tool file's one admitted child-start method name.
+const SAMPLE_POST: &str = "fn post(r: Response) { let _ = r.status(); }\n";
 
 /// The sample tool file's site row.
 const SAMPLE_SITES: &[SiteRow] = &[(
@@ -1605,7 +1893,7 @@ const SAMPLE_SITES: &[SiteRow] = &[(
 )];
 
 /// The sample tool file's method row.
-const SAMPLE_METHODS: &[NameRow] = &[("tool.rs", "post", "status", 1)];
+const SAMPLE_METHODS: &[NameRow] = &[("tool.rs", "post", "r.status", 1)];
 
 /// Every refusal, drift and failed proof of `tool` as `tool.rs` beside the
 /// sample ceilings, held to `inventory`.
@@ -1631,7 +1919,12 @@ fn sample_verdict(extra: &str) -> Vec<String> {
         bodies: &[],
         methods: SAMPLE_METHODS,
     };
-    verdict(&format!("{SAMPLE_TOOL}{extra}"), &inventory)
+    verdict(&format!("{SAMPLE_QUERY}{SAMPLE_POST}{extra}"), &inventory)
+}
+
+/// Whether `found` holds a line naming `why`.
+fn refused_for(found: &[String], why: &str) -> bool {
+    found.iter().any(|line| line.contains(why))
 }
 
 #[test]
@@ -1734,8 +2027,8 @@ fn a_site_without_its_row_or_a_row_without_its_site_is_refused() {
         ),
     ];
     let stale_method: &[NameRow] = &[
-        ("tool.rs", "post", "status", 1),
-        ("tool.rs", "gone", "status", 1),
+        ("tool.rs", "post", "r.status", 1),
+        ("tool.rs", "gone", "r.status", 1),
     ];
     let stale_body: &[NameRow] = &[("tool.rs", "gone", "spawn_hardened", 1)];
     let inventories = [
@@ -1760,9 +2053,10 @@ fn a_site_without_its_row_or_a_row_without_its_site_is_refused() {
             methods: SAMPLE_METHODS,
         },
     ];
+    let sample = format!("{SAMPLE_QUERY}{SAMPLE_POST}");
     for inventory in &inventories {
         assert!(
-            !verdict(SAMPLE_TOOL, inventory).is_empty(),
+            !verdict(&sample, inventory).is_empty(),
             "a stale or missing row must be refused"
         );
     }
@@ -1970,6 +2264,253 @@ fn test_code_and_the_admitted_imports_are_not_sites() {
         let found = sample_verdict(sample);
         assert!(found.is_empty(), "{sample}: {found:?}");
     }
+}
+
+#[test]
+fn a_qualified_self_type_is_read_as_its_path() {
+    let refused = [
+        (
+            "fn f(mut c: Command) { let _ = <Command>::output(&mut c); }",
+            "direct child start `output`",
+        ),
+        (
+            "fn f(mut c: Command) { let _ = <(Command)>::output(&mut c); }",
+            "direct child start `output`",
+        ),
+        (
+            "fn f(mut c: Command) { let _ = <&Command>::status(&mut c); }",
+            "direct child start `status`",
+        ),
+        (
+            "fn f() { let c = <Command>::new(\"x\"); }",
+            "child site `\"x\"`",
+        ),
+        (
+            "fn f() { let _ = <[u8]>::len(&[]); }",
+            "a qualified path whose self type",
+        ),
+        (
+            "fn f(mut c: Command) { m! { let _ = <Command>::output(&mut c); } }",
+            "direct child start `output`",
+        ),
+        (
+            "fn f(mut c: Command) { m! { let _ = <Command as Ext<X>>::exec(&mut c); } }",
+            "direct child start `exec`",
+        ),
+    ];
+    for (sample, why) in refused {
+        let found = sample_verdict(sample);
+        assert!(refused_for(&found, why), "{sample}: {found:?}");
+    }
+}
+
+#[test]
+fn a_raw_identifier_is_read_as_its_name() {
+    let refused = [
+        (
+            "fn f(mut c: Command) { let _ = c.r#output(); }",
+            "method name `c.output`",
+        ),
+        (
+            "fn f(c: Command) { let _ = r#spawn_hardened(c); }",
+            "direct child start `spawn_hardened`",
+        ),
+        (
+            "fn f() { let c = r#Command::r#new(\"x\"); }",
+            "child site `\"x\"`",
+        ),
+        (
+            "fn f(mut c: Command) { m! { let _ = c.r#output(); } }",
+            "method name `<macro>.output`",
+        ),
+    ];
+    for (sample, why) in refused {
+        let found = sample_verdict(sample);
+        assert!(refused_for(&found, why), "{sample}: {found:?}");
+    }
+}
+
+#[test]
+fn a_child_start_a_macro_splices_together_is_refused() {
+    let refused = [
+        (
+            "macro_rules! call { ($c:expr, $m:ident) => { $c.$m() }; }\n\
+             fn f(mut c: Command) { call!(c, output); }",
+            "a method or child-type path segment a macro metavariable supplies",
+        ),
+        (
+            "macro_rules! call { ($m:ident, $c:expr) => { Command::$m(&mut $c) }; }\n\
+             fn f(mut c: Command) { call!(output, c); }",
+            "a method or child-type path segment a macro metavariable supplies",
+        ),
+        (
+            "macro_rules! call { ($t:ident, $c:expr) => { $t::output(&mut $c) }; }\n\
+             fn f(mut c: Command) { call!(Command, c); }",
+            "direct child start `output`",
+        ),
+        (
+            "fn f(mut c: Command) { m! { let _ = c.output::<>(); } }",
+            "method name `<macro>.output`",
+        ),
+    ];
+    for (sample, why) in refused {
+        let found = sample_verdict(sample);
+        assert!(refused_for(&found, why), "{sample}: {found:?}");
+    }
+}
+
+#[test]
+fn a_local_fn_named_as_a_runner_is_refused() {
+    let refused = [
+        "fn run_local(c: Command, l: LocalCeiling, s: S) { run_inherited(c, InheritedRole::UserProgram, I); }",
+        "impl Tool { fn run_local(c: Command, l: LocalCeiling, s: S) { let _ = (c, l, s); } }",
+        "fn spawn_detached(c: Command) { let _ = c; }",
+    ];
+    for sample in refused {
+        let found = sample_verdict(sample);
+        assert!(
+            refused_for(&found, "a fn named as a runner or sink fn"),
+            "{sample}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rebound_ceiling_name_is_refused() {
+    let refused = [
+        (
+            "use crate::remote_ingest::SELF_RUN_LIMITS as TOOL_QUERY_LIMITS;",
+            "touches a ceiling",
+        ),
+        (
+            "use crate::remote_ingest::LocalCeiling as C;",
+            "a renaming `use` of `LocalCeiling`",
+        ),
+        (
+            "const TOOL_QUERY_LIMITS: LocalCeiling = LocalCeiling(WIDE);",
+            "outside the top level of `remote_ingest.rs`",
+        ),
+        (
+            "impl Tool { const TOOL_QUERY_LIMITS: LocalCeiling = LocalCeiling(WIDE); }",
+            "outside the top level of `remote_ingest.rs`",
+        ),
+        (
+            "const TOOL_QUERY_LIMITS: Wide = WIDE;",
+            "a const or static named as the ceiling",
+        ),
+        (
+            "static TOOL_QUERY_LIMITS: Wide = WIDE;",
+            "a const or static named as the ceiling",
+        ),
+        (
+            "macro_rules! wide { () => { const TOOL_QUERY_LIMITS: L = W; }; }",
+            "a token-matched macro identifier named as the ceiling",
+        ),
+        (
+            "fn f(TOOL_QUERY_LIMITS: Wide) { let _ = TOOL_QUERY_LIMITS; }",
+            "a binding named as the ceiling",
+        ),
+    ];
+    for (sample, why) in refused {
+        let found = sample_verdict(sample);
+        assert!(refused_for(&found, why), "{sample}: {found:?}");
+    }
+    let shadowed = "fn query(tool: &OsStr) { let TOOL_QUERY_LIMITS = wider(); let c = Command::new(tool); run_local(c, TOOL_QUERY_LIMITS, S); }";
+    let found = one_site(
+        shadowed,
+        "query",
+        "tool",
+        Runner::Local("TOOL_QUERY_LIMITS"),
+    );
+    assert!(
+        refused_for(&found, "a binding named as the ceiling"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_proof_through_a_rebound_or_unresolved_name_is_refused() {
+    let local = Runner::Local("TOOL_QUERY_LIMITS");
+    let one_hop = "neither directly, nor through a ceiling parameter";
+    let refused = [
+        // The ceiling parameter is rebound before it reaches the runner.
+        (
+            "fn query(tool: &OsStr, ceiling: LocalCeiling) { let ceiling = widen(ceiling); let c = Command::new(tool); run_local(c, ceiling, S); }\n\
+             fn a(t: &OsStr) { query(t, TOOL_QUERY_LIMITS); }",
+            "query",
+        ),
+        (
+            "fn query(tool: &OsStr) { let c = Command::new(tool); helper(c, TOOL_QUERY_LIMITS); }\n\
+             fn helper(c: Command, ceiling: LocalCeiling) { let ceiling = widen(ceiling); run_local(c, ceiling, S); }",
+            "query",
+        ),
+        // A caller hidden in a macro the expression parse does not read.
+        (
+            "fn query(tool: &OsStr, ceiling: LocalCeiling) { let c = Command::new(tool); run_local(c, ceiling, S); }\n\
+             fn a(t: &OsStr) { query(t, TOOL_QUERY_LIMITS); }\n\
+             fn b(t: &OsStr) { m! { let _ = query(t, WIDE); } }",
+            "query",
+        ),
+        // A bare call that reaches no top-level fn of the file.
+        (
+            "fn query(tool: &OsStr) { let c = Command::new(tool); helper(c, TOOL_QUERY_LIMITS); }\n\
+             impl Tool { fn helper(c: Command, ceiling: LocalCeiling) { run_local(c, ceiling, S); } }",
+            "query",
+        ),
+        (
+            "fn query(tool: &OsStr) { use other::helper; let c = Command::new(tool); helper(c, TOOL_QUERY_LIMITS); }\n\
+             fn helper(c: Command, ceiling: LocalCeiling) { run_local(c, ceiling, S); }",
+            "query",
+        ),
+        // `Self::` in a trait impl reaches an inherent fn first.
+        (
+            "impl Run for Tool { fn query() { let _ = Self::helper(Command::new(\"rustc\"), TOOL_QUERY_LIMITS); }\n\
+             fn helper(c: Command, ceiling: LocalCeiling) { run_local(c, ceiling, S); } }\n\
+             impl Tool { fn helper(c: Command, ceiling: LocalCeiling) { run_local(c, wider(), S); } }",
+            "<Tool as Run>::query",
+        ),
+    ];
+    for (source, within) in refused {
+        let program = if within == "query" {
+            "tool"
+        } else {
+            "\"rustc\""
+        };
+        let found = one_site(source, within, program, local);
+        assert!(refused_for(&found, one_hop), "{source}: {found:?}");
+    }
+}
+
+#[test]
+fn two_fns_under_one_key_are_refused() {
+    let source = "impl Tool<A> { fn build(p: &Path) -> Command { Command::new(p) } }\n\
+                  impl Tool<B> { fn build(p: &Path) { let _ = exec_naming(make(p), N); } }";
+    let sites = [("tool.rs", "Tool::build", "p", Runner::Replace, 1)];
+    let bodies = [("tool.rs", "Tool::build", "exec_naming", 1)];
+    let inventory = Inventory {
+        sites: &sites,
+        bodies: &bodies,
+        methods: &[],
+    };
+    let found = verdict(source, &inventory);
+    assert!(
+        refused_for(&found, "the site is not inside a production fn"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn an_admitted_method_name_is_held_to_its_receiver() {
+    let inventory = Inventory {
+        sites: SAMPLE_SITES,
+        bodies: &[],
+        methods: SAMPLE_METHODS,
+    };
+    let found = verdict(
+        &format!("{SAMPLE_QUERY}fn post(c: Command) {{ let _ = c.status(); }}\n"),
+        &inventory,
+    );
+    assert!(refused_for(&found, "method name `c.status`"), "{found:?}");
 }
 
 #[test]
