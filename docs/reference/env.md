@@ -111,7 +111,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
-| `IPE_REGEX_MAX_INPUT_BYTES` | 16777216 (16 MiB) | Maximum subject (input) size in bytes that any `Ipe.Regex` match/find/findAll/replace/split will scan. Past the ceiling the operation returns its safe empty result, bounding untrusted-input work and allocation. | `Tunable` |
+| `IPE_REGEX_MAX_INPUT_BYTES` | 16777216 (16 MiB) | Maximum subject (input) size in bytes that any `Ipe.Regex` match/find/findAll/replace/split will scan. Past the ceiling the operation returns its safe empty result, bounding untrusted-input work and allocation. Read once, at the first `Regex.compile`; a value that is not a positive decimal byte count (`0` included) makes `Regex.compile` return `Err` naming the variable. | `Tunable` |
 
 ## Database
 
@@ -179,7 +179,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_OBSERVABILITY_BUFFER` | 1024 | Bounded queue depth for the parent-push telemetry exporter. Overflow drops and warns rather than blocking the application. | `Tunable` |
 | `IPE_OBSERVABILITY_PUSH_INTERVAL_MS` | 2000 | Flush cadence (ms) for telemetry shipped from a sub-app to its parent's `/_ipe/ingest` endpoint. | `Tunable` |
 | `IPE_PARENT_URL` | unset | Base URL of the parent app to which this sub-app pushes telemetry. Presence of this variable activates the push exporter. | `Tunable` |
-| `IPE_RECURSION_LIMIT` | 10000 | Maximum Ipê call-stack depth before a recursion-limit error is raised. Prevents stack-overflow crashes from unbounded recursion. | `Tunable` |
+| `IPE_RECURSION_LIMIT` | 10000 | Maximum Ipê call-stack depth before a recursion-limit error is raised. Prevents stack-overflow crashes from unbounded recursion. Read once, at process start; a value that is not a positive decimal integer (`0` included) refuses the program before its first line. | `Tunable` |
 | `IPE_SERVICE_NAME` | unset (binary name) | Service name attached as the `service.name` resource attribute on telemetry records shipped to the Hub or the telemetry SQLite spill. | `Tunable` |
 | `IPE_TRACE` | unset (false) | Set to any non-empty truthy value (`1`, `true`, etc.) to emit `Trace.span` timings to stderr. Off by default — no noise in production. | `Tunable` |
 
