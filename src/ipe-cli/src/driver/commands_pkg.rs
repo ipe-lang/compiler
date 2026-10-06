@@ -503,7 +503,15 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon)?;
+        let layout = pack::mobile::layout(
+            os,
+            self.profile,
+            &identity,
+            accepts,
+            &bundle,
+            icon,
+            &manifest.delivery.browser.base,
+        )?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;

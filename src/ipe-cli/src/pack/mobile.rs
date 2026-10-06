@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use ipe_fs_open::{EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal};
 use ipe_ir::Capability;
+use ipe_runtime_rust::encoding::MountBase;
 
 use crate::CliError;
 use crate::driver::BundleProfile;
@@ -178,6 +179,15 @@ pub enum MobileRefusal {
     /// The app is a `Web` app but its `[wasm]` mode is off/absent, so a
     /// `--target wasm` build produces no hostable SPA bundle.
     WasmDisabled,
+    /// `browser.basePath` read after the wasm build differs from the one the
+    /// shell was planned for, so the bundle's URLs and the shell's handlers
+    /// would name two different mount paths.
+    ManifestChanged {
+        /// The mount base read before the build.
+        before: MountBase,
+        /// The mount base read after the build.
+        after: MountBase,
+    },
 }
 
 impl std::fmt::Display for MobileRefusal {
@@ -207,6 +217,15 @@ impl std::fmt::Display for MobileRefusal {
                  but this project's `[wasm]` mode is off (or absent)\n  \
                  = enable the wasm client target so a hostable browser bundle exists: set \
                  `[wasm] mode = Solo` (or `Hydrate`) in package.ipe."
+            ),
+            Self::ManifestChanged { before, after } => write!(
+                f,
+                "error: `delivery.browser.basePath` changed from `{}` to `{}` while the \
+                 wasm bundle was building\n  \
+                 = the bundle and the mobile shell must serve one mount path; leave \
+                 package.ipe unchanged during the pack and run it again.",
+                before.dir_url(),
+                after.dir_url()
             ),
         }
     }
@@ -739,8 +758,10 @@ impl ShellLayout {
 ///
 /// The `Info.plist` / `AndroidManifest.xml` permission entries are derived from
 /// `accepts` through [`permissions::derive_permissions`] — never authored here.
-/// The SPA bundle assets are placed under the OS's web-asset root and the webview
-/// is wired to load `index.html` from there (a local origin, never a remote URL).
+/// The SPA bundle assets are placed under the OS's web-asset root, and the shell
+/// serves them at `base`'s [`MountBase::dir_url`] on a local origin (never a
+/// remote URL) — the same mount path the wasm build baked into the bundle's own
+/// URLs. A request outside that directory has no mapping and answers a local 404.
 ///
 /// # Errors
 /// Propagates any error from the permission derivation.
@@ -751,10 +772,11 @@ pub fn layout(
     accepts: &BTreeSet<Capability>,
     bundle: &SpaBundle,
     icon: Option<&Path>,
+    base: &MountBase,
 ) -> Result<ShellLayout, super::super::CliError> {
     match os {
-        MobileOs::Android => android_layout(profile, identity, accepts, bundle, icon),
-        MobileOs::Ios => ios_layout(identity, accepts, bundle, icon),
+        MobileOs::Android => android_layout(profile, identity, accepts, bundle, icon, base),
+        MobileOs::Ios => ios_layout(identity, accepts, bundle, icon, base),
     }
 }
 
@@ -769,16 +791,17 @@ fn app_slug(name: &str) -> String {
 /// Assemble the Android Gradle shell project layout.
 ///
 /// The SPA assets ride under `app/src/main/assets/www/`; a `WebViewAssetLoader`
-/// serves them at `https://appassets.androidplatform.net/assets/www/`, so the
-/// webview loads `index.html` from a same-origin local URL (no remote host, no
-/// `file://`). The `AndroidManifest.xml` `<uses-permission>` lines come only from
-/// the permission derivation.
+/// path handler registered at `base`'s directory serves them at
+/// [`android_entry_url`], so the webview loads the bundle from a same-origin
+/// local URL (no remote host, no `file://`). The `AndroidManifest.xml`
+/// `<uses-permission>` lines come only from the permission derivation.
 fn android_layout(
     profile: BundleProfile,
     identity: &super::desktop::BundleIdentity,
     accepts: &BTreeSet<Capability>,
     bundle: &SpaBundle,
     icon: Option<&Path>,
+    base: &MountBase,
 ) -> Result<ShellLayout, super::super::CliError> {
     let slug = app_slug(&identity.name);
     let root_name = format!("{slug}-android");
@@ -806,11 +829,11 @@ fn android_layout(
     });
     files.push(ShellFile {
         rel_path: "app/src/main/java/dev/ipe/app/MainActivity.java".to_owned(),
-        content: ShellContent::Generated(render_android_activity(identity)),
+        content: ShellContent::Generated(render_android_activity(base)),
     });
     files.push(ShellFile {
         rel_path: "README.txt".to_owned(),
-        content: ShellContent::Generated(android_readme(&root_name, profile)),
+        content: ShellContent::Generated(android_readme(&root_name, profile, base)),
     });
 
     // The offline SPA assets, under the WebViewAssetLoader-served asset root.
@@ -942,53 +965,111 @@ fn render_android_build_gradle(identity: &super::desktop::BundleIdentity) -> Str
     )
 }
 
-/// Render the `MainActivity` that wires a `WebView` to the offline SPA through a
-/// `WebViewAssetLoader`. The loaded URL is a same-origin local asset URL — the
-/// webview never reaches a remote host.
-fn render_android_activity(_identity: &super::desktop::BundleIdentity) -> String {
-    // The activity is a fixed shell (no author text is interpolated), so it needs
-    // no escaping. It loads only the bundled local `index.html`.
-    "package dev.ipe.app;\n\
-     \n\
-     import android.app.Activity;\n\
-     import android.os.Bundle;\n\
-     import android.webkit.WebView;\n\
-     import android.webkit.WebViewClient;\n\
-     import android.webkit.WebResourceRequest;\n\
-     import android.webkit.WebResourceResponse;\n\
-     import androidx.webkit.WebViewAssetLoader;\n\
-     \n\
-     public final class MainActivity extends Activity {\n\
-     \x20   @Override\n\
-     \x20   protected void onCreate(Bundle savedInstanceState) {\n\
-     \x20       super.onCreate(savedInstanceState);\n\
-     \x20       final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()\n\
-     \x20           .addPathHandler(\"/assets/\", new WebViewAssetLoader.AssetsPathHandler(this))\n\
-     \x20           .build();\n\
-     \x20       WebView webView = new WebView(this);\n\
-     \x20       webView.getSettings().setJavaScriptEnabled(true);\n\
-     \x20       webView.getSettings().setAllowFileAccess(false);\n\
-     \x20       webView.getSettings().setAllowContentAccess(false);\n\
-     \x20       webView.setWebViewClient(new WebViewClient() {\n\
-     \x20           @Override\n\
-     \x20           public WebResourceResponse shouldInterceptRequest(\n\
-     \x20                   WebView view, WebResourceRequest request) {\n\
-     \x20               return loader.shouldInterceptRequest(request.getUrl());\n\
-     \x20           }\n\
-     \x20       });\n\
-     \x20       setContentView(webView);\n\
-     \x20       webView.loadUrl(\
-     \"https://appassets.androidplatform.net/assets/www/index.html\");\n\
-     \x20   }\n\
-     }\n"
-    .to_owned()
+/// The local origin a `WebViewAssetLoader` serves on; it never leaves the device.
+const ANDROID_ASSET_ORIGIN: &str = "https://appassets.androidplatform.net";
+
+/// The URL the Android shell opens: [`ANDROID_ASSET_ORIGIN`] plus `base`'s
+/// [`MountBase::dir_url`].
+fn android_entry_url(base: &MountBase) -> String {
+    let dir = base.dir_url();
+    let mut url = String::with_capacity(ANDROID_ASSET_ORIGIN.len().saturating_add(dir.len()));
+    url.push_str(ANDROID_ASSET_ORIGIN);
+    url.push_str(&dir);
+    url
+}
+
+/// Render the `MainActivity` that serves the offline SPA at `base`'s directory.
+///
+/// A `BundleHandler` registered at [`MountBase::dir_url`] maps the path below it
+/// into `assets/www/` (the empty path is `index.html`) and refuses a `\`, a `%`,
+/// and an empty, `.` or `..` segment. Every request the loader leaves unmapped
+/// answers a local 404, so the webview never reaches the network. The base
+/// reaches the Java text only as [`JavaStringLiteral`]s.
+fn render_android_activity(base: &MountBase) -> String {
+    format!(
+        "package dev.ipe.app;\n\
+         \n\
+         import android.app.Activity;\n\
+         import android.content.Context;\n\
+         import android.os.Bundle;\n\
+         import android.webkit.WebView;\n\
+         import android.webkit.WebViewClient;\n\
+         import android.webkit.WebResourceRequest;\n\
+         import android.webkit.WebResourceResponse;\n\
+         import androidx.webkit.WebViewAssetLoader;\n\
+         import java.io.ByteArrayInputStream;\n\
+         import java.util.Collections;\n\
+         \n\
+         public final class MainActivity extends Activity {{\n\
+         \x20   /** The directory the bundle is served at: the manifest's mount base. */\n\
+         \x20   private static final String BUNDLE_DIR = {dir};\n\
+         \x20   /** The URL the shell opens: the local asset origin plus BUNDLE_DIR. */\n\
+         \x20   private static final String ENTRY_URL = {entry};\n\
+         \n\
+         \x20   /** Serves assets/www/ for the path below BUNDLE_DIR. */\n\
+         \x20   private static final class BundleHandler implements WebViewAssetLoader.PathHandler {{\n\
+         \x20       private final WebViewAssetLoader.AssetsPathHandler assets;\n\
+         \n\
+         \x20       BundleHandler(Context context) {{\n\
+         \x20           this.assets = new WebViewAssetLoader.AssetsPathHandler(context);\n\
+         \x20       }}\n\
+         \n\
+         \x20       @Override\n\
+         \x20       public WebResourceResponse handle(String path) {{\n\
+         \x20           if (path.isEmpty()) {{\n\
+         \x20               return assets.handle(\"www/index.html\");\n\
+         \x20           }}\n\
+         \x20           if (path.indexOf('\\\\') >= 0 || path.indexOf('%') >= 0) {{\n\
+         \x20               return null;\n\
+         \x20           }}\n\
+         \x20           for (String segment : path.split(\"/\", -1)) {{\n\
+         \x20               if (segment.isEmpty() || segment.equals(\".\") || segment.equals(\"..\")) {{\n\
+         \x20                   return null;\n\
+         \x20               }}\n\
+         \x20           }}\n\
+         \x20           return assets.handle(\"www/\" + path);\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         \n\
+         \x20   /** The answer to every request the loader leaves unmapped: a local 404. */\n\
+         \x20   private static WebResourceResponse localNotFound() {{\n\
+         \x20       return new WebResourceResponse(\"text/plain\", \"utf-8\", 404, \"Not Found\",\n\
+         \x20               Collections.<String, String>emptyMap(),\n\
+         \x20               new ByteArrayInputStream(new byte[0]));\n\
+         \x20   }}\n\
+         \n\
+         \x20   @Override\n\
+         \x20   protected void onCreate(Bundle savedInstanceState) {{\n\
+         \x20       super.onCreate(savedInstanceState);\n\
+         \x20       final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()\n\
+         \x20           .addPathHandler(BUNDLE_DIR, new BundleHandler(this))\n\
+         \x20           .build();\n\
+         \x20       WebView webView = new WebView(this);\n\
+         \x20       webView.getSettings().setJavaScriptEnabled(true);\n\
+         \x20       webView.getSettings().setAllowFileAccess(false);\n\
+         \x20       webView.getSettings().setAllowContentAccess(false);\n\
+         \x20       webView.setWebViewClient(new WebViewClient() {{\n\
+         \x20           @Override\n\
+         \x20           public WebResourceResponse shouldInterceptRequest(\n\
+         \x20                   WebView view, WebResourceRequest request) {{\n\
+         \x20               WebResourceResponse mapped = loader.shouldInterceptRequest(request.getUrl());\n\
+         \x20               return mapped != null ? mapped : localNotFound();\n\
+         \x20           }}\n\
+         \x20       }});\n\
+         \x20       setContentView(webView);\n\
+         \x20       webView.loadUrl(ENTRY_URL);\n\
+         \x20   }}\n\
+         }}\n",
+        dir = JavaStringLiteral::of(&base.dir_url()),
+        entry = JavaStringLiteral::of(&android_entry_url(base)),
+    )
 }
 
 /// The Android shell's build/README note.
 ///
 /// The Gradle project carries no `signingConfig`, so the note states that it is
 /// unsigned and what each Gradle task yields, for either profile.
-fn android_readme(root_name: &str, profile: BundleProfile) -> String {
+fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> String {
     let purpose = match profile {
         BundleProfile::Dev => "a dev bundle, for local install and inspection",
         BundleProfile::Release => {
@@ -1000,8 +1081,8 @@ fn android_readme(root_name: &str, profile: BundleProfile) -> String {
          ({purpose}).\n\
          \n\
          The client-wasm SPA rides under app/src/main/assets/www/; a WebViewAssetLoader\n\
-         serves it at https://appassets.androidplatform.net/assets/www/index.html, so the\n\
-         WebView loads a same-origin local bundle (no remote host, no file:// access).\n\
+         serves it at {entry}, so the WebView loads a same-origin local bundle (no\n\
+         remote host, no file:// access); any other request answers a local 404.\n\
          The <uses-permission> lines in AndroidManifest.xml are derived from the app's\n\
          accepted web capabilities — never hand-authored.\n\
          \n\
@@ -1009,7 +1090,8 @@ fn android_readme(root_name: &str, profile: BundleProfile) -> String {
          - ./gradlew assembleDebug (requires the Android SDK; API 34) builds an APK\n\
          \x20 signed with the SDK's debug key, for local install only.\n\
          - A store build needs your own keystore: add a signingConfig for it to\n\
-         \x20 app/build.gradle, then run ./gradlew assembleRelease.\n"
+         \x20 app/build.gradle, then run ./gradlew assembleRelease.\n",
+        entry = android_entry_url(base),
     )
 }
 
@@ -1020,14 +1102,15 @@ fn android_readme(root_name: &str, profile: BundleProfile) -> String {
 /// The SPA assets ride under `App/www/`; a `WKURLSchemeHandler` serves them under
 /// a custom `ipe-app://` scheme with the correct MIME per extension (a bare
 /// `file://` load cannot serve `.wasm` with `application/wasm`), so the
-/// `WKWebView` loads `ipe-app://app/index.html` — a local origin, never a remote
-/// URL. The `Info.plist` usage-description keys come only from the permission
-/// derivation.
+/// `WKWebView` loads [`ios_entry_url`] — `base`'s directory on a local origin,
+/// never a remote URL. The `Info.plist` usage-description keys come only from the
+/// permission derivation.
 fn ios_layout(
     identity: &super::desktop::BundleIdentity,
     accepts: &BTreeSet<Capability>,
     bundle: &SpaBundle,
     icon: Option<&Path>,
+    base: &MountBase,
 ) -> Result<ShellLayout, super::super::CliError> {
     let slug = app_slug(&identity.name);
     let root_name = format!("{slug}-ios");
@@ -1040,15 +1123,15 @@ fn ios_layout(
     });
     files.push(ShellFile {
         rel_path: "App/AppDelegate.swift".to_owned(),
-        content: ShellContent::Generated(render_ios_app_delegate()),
+        content: ShellContent::Generated(render_ios_app_delegate(base)),
     });
     files.push(ShellFile {
         rel_path: "App/SchemeHandler.swift".to_owned(),
-        content: ShellContent::Generated(render_ios_scheme_handler()),
+        content: ShellContent::Generated(render_ios_scheme_handler(base)),
     });
     files.push(ShellFile {
         rel_path: "README.txt".to_owned(),
-        content: ShellContent::Generated(ios_readme(&root_name)),
+        content: ShellContent::Generated(ios_readme(&root_name, base)),
     });
 
     for asset in &bundle.assets {
@@ -1116,40 +1199,54 @@ fn render_ios_info_plist(
     ))
 }
 
+/// The custom-scheme origin the iOS shell serves on; it never leaves the device.
+const IOS_SCHEME_ORIGIN: &str = "ipe-app://app";
+
+/// The URL the iOS shell opens: [`IOS_SCHEME_ORIGIN`] plus `base`'s
+/// [`MountBase::dir_url`].
+fn ios_entry_url(base: &MountBase) -> String {
+    let dir = base.dir_url();
+    let mut url = String::with_capacity(IOS_SCHEME_ORIGIN.len().saturating_add(dir.len()));
+    url.push_str(IOS_SCHEME_ORIGIN);
+    url.push_str(&dir);
+    url
+}
+
 /// Render the iOS `AppDelegate` that hosts a `WKWebView` bound to the custom-scheme
-/// handler and loads the offline SPA. The loaded URL is the custom `ipe-app://`
-/// scheme, served from bundled assets — the webview never reaches a remote host.
-fn render_ios_app_delegate() -> String {
-    // A fixed shell (no author text interpolated); it loads only the bundled
-    // local index.html through the custom scheme.
-    "import UIKit\n\
-     import WebKit\n\
-     \n\
-     @main\n\
-     final class AppDelegate: UIResponder, UIApplicationDelegate {\n\
-     \x20   var window: UIWindow?\n\
-     \x20   var webView: WKWebView?\n\
-     \n\
-     \x20   func application(_ application: UIApplication,\n\
-     \x20       didFinishLaunchingWithOptions launchOptions:\n\
-     \x20       [UIApplication.LaunchOptionsKey: Any]?) -> Bool {\n\
-     \x20       let config = WKWebViewConfiguration()\n\
-     \x20       config.setURLSchemeHandler(SchemeHandler(), forURLScheme: \"ipe-app\")\n\
-     \x20       let webView = WKWebView(frame: .zero, configuration: config)\n\
-     \x20       self.webView = webView\n\
-     \x20       let window = UIWindow(frame: UIScreen.main.bounds)\n\
-     \x20       let controller = UIViewController()\n\
-     \x20       controller.view = webView\n\
-     \x20       window.rootViewController = controller\n\
-     \x20       window.makeKeyAndVisible()\n\
-     \x20       self.window = window\n\
-     \x20       if let url = URL(string: \"ipe-app://app/index.html\") {\n\
-     \x20           webView.load(URLRequest(url: url))\n\
-     \x20       }\n\
-     \x20       return true\n\
-     \x20   }\n\
-     }\n"
-    .to_owned()
+/// handler and opens [`ios_entry_url`], served from bundled assets — the webview
+/// never reaches a remote host. The base reaches the Swift text only as a
+/// [`SwiftStringLiteral`].
+fn render_ios_app_delegate(base: &MountBase) -> String {
+    format!(
+        "import UIKit\n\
+         import WebKit\n\
+         \n\
+         @main\n\
+         final class AppDelegate: UIResponder, UIApplicationDelegate {{\n\
+         \x20   var window: UIWindow?\n\
+         \x20   var webView: WKWebView?\n\
+         \n\
+         \x20   func application(_ application: UIApplication,\n\
+         \x20       didFinishLaunchingWithOptions launchOptions:\n\
+         \x20       [UIApplication.LaunchOptionsKey: Any]?) -> Bool {{\n\
+         \x20       let config = WKWebViewConfiguration()\n\
+         \x20       config.setURLSchemeHandler(SchemeHandler(), forURLScheme: \"ipe-app\")\n\
+         \x20       let webView = WKWebView(frame: .zero, configuration: config)\n\
+         \x20       self.webView = webView\n\
+         \x20       let window = UIWindow(frame: UIScreen.main.bounds)\n\
+         \x20       let controller = UIViewController()\n\
+         \x20       controller.view = webView\n\
+         \x20       window.rootViewController = controller\n\
+         \x20       window.makeKeyAndVisible()\n\
+         \x20       self.window = window\n\
+         \x20       if let url = URL(string: {entry}) {{\n\
+         \x20           webView.load(URLRequest(url: url))\n\
+         \x20       }}\n\
+         \x20       return true\n\
+         \x20   }}\n\
+         }}\n",
+        entry = SwiftStringLiteral::of(&ios_entry_url(base)),
+    )
 }
 
 /// Render the `WKURLSchemeHandler` that serves the bundled SPA assets under the
@@ -1157,70 +1254,123 @@ fn render_ios_app_delegate() -> String {
 ///
 /// `WKWebView` cannot cleanly `file://`-load a `.wasm` with the required
 /// `application/wasm` MIME; a custom scheme handler resolves each request to a
-/// bundled resource and sets its content type explicitly. Only paths under the
-/// bundled `www/` are served — a request escaping it resolves to nothing.
-fn render_ios_scheme_handler() -> String {
-    // A fixed shell (no author text interpolated). It maps a request path to a
-    // bundled resource under `www/` and refuses anything outside it.
-    "import Foundation\n\
-     import WebKit\n\
-     \n\
-     final class SchemeHandler: NSObject, WKURLSchemeHandler {\n\
-     \x20   func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {\n\
-     \x20       guard let url = urlSchemeTask.request.url else {\n\
-     \x20           urlSchemeTask.didFailWithError(URLError(.badURL))\n\
-     \x20           return\n\
-     \x20       }\n\
-     \x20       let path = url.path.isEmpty ? \"/index.html\" : url.path\n\
-     \x20       let rel = path.hasPrefix(\"/\") ? String(path.dropFirst()) : path\n\
-     \x20       guard let base = Bundle.main.resourceURL?\
-     .appendingPathComponent(\"www\") else {\n\
-     \x20           urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))\n\
-     \x20           return\n\
-     \x20       }\n\
-     \x20       let resolved = base.appendingPathComponent(rel).standardizedFileURL\n\
-     \x20       guard resolved.path.hasPrefix(base.standardizedFileURL.path),\n\
-     \x20             let data = try? Data(contentsOf: resolved) else {\n\
-     \x20           urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))\n\
-     \x20           return\n\
-     \x20       }\n\
-     \x20       let mime = SchemeHandler.mimeType(for: resolved.pathExtension)\n\
-     \x20       let response = URLResponse(url: url, mimeType: mime,\n\
-     \x20           expectedContentLength: data.count, textEncodingName: nil)\n\
-     \x20       urlSchemeTask.didReceive(response)\n\
-     \x20       urlSchemeTask.didReceive(data)\n\
-     \x20       urlSchemeTask.didFinish()\n\
-     \x20   }\n\
-     \n\
-     \x20   func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}\n\
-     \n\
-     \x20   static func mimeType(for ext: String) -> String {\n\
-     \x20       switch ext.lowercased() {\n\
-     \x20       case \"html\": return \"text/html\"\n\
-     \x20       case \"js\": return \"text/javascript\"\n\
-     \x20       case \"wasm\": return \"application/wasm\"\n\
-     \x20       case \"json\": return \"application/json\"\n\
-     \x20       case \"css\": return \"text/css\"\n\
-     \x20       default: return \"application/octet-stream\"\n\
-     \x20       }\n\
-     \x20   }\n\
-     }\n"
-    .to_owned()
+/// bundled resource and sets its content type explicitly. The handler strips
+/// `base`'s segments from the request path (a path outside the base answers
+/// 404), maps the bare directory to `index.html`, refuses an empty, `.` or `..`
+/// segment and a `\`, and serves a resolved file only when it lies below the
+/// `www/` directory plus `/`. Every refusal answers a local 404. The base's
+/// segments reach the Swift text only as [`SwiftStringLiteral`]s.
+fn render_ios_scheme_handler(base: &MountBase) -> String {
+    let segments = base
+        .segments()
+        .map(|segment| SwiftStringLiteral::of(segment).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "import Foundation\n\
+         import WebKit\n\
+         \n\
+         final class SchemeHandler: NSObject, WKURLSchemeHandler {{\n\
+         \x20   /// The manifest mount base's path segments; the bundle is served below them.\n\
+         \x20   static let baseSegments: [String] = [{segments}]\n\
+         \n\
+         \x20   func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {{\n\
+         \x20       guard let url = urlSchemeTask.request.url,\n\
+         \x20             let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {{\n\
+         \x20           SchemeHandler.notFound(urlSchemeTask)\n\
+         \x20           return\n\
+         \x20       }}\n\
+         \x20       let path = components.path.isEmpty ? \"/\" : components.path\n\
+         \x20       guard path.hasPrefix(\"/\") else {{\n\
+         \x20           SchemeHandler.notFound(urlSchemeTask)\n\
+         \x20           return\n\
+         \x20       }}\n\
+         \x20       var segments = path.dropFirst()\n\
+         \x20           .split(separator: \"/\", omittingEmptySubsequences: false)\n\
+         \x20           .map(String.init)\n\
+         \x20       for expected in SchemeHandler.baseSegments {{\n\
+         \x20           guard let first = segments.first, first == expected else {{\n\
+         \x20               SchemeHandler.notFound(urlSchemeTask)\n\
+         \x20               return\n\
+         \x20           }}\n\
+         \x20           segments.removeFirst()\n\
+         \x20       }}\n\
+         \x20       if segments.isEmpty || segments == [\"\"] {{\n\
+         \x20           segments = [\"index.html\"]\n\
+         \x20       }}\n\
+         \x20       for segment in segments {{\n\
+         \x20           if segment.isEmpty || segment == \".\" || segment == \"..\"\n\
+         \x20               || segment.contains(\"\\\\\") {{\n\
+         \x20               SchemeHandler.notFound(urlSchemeTask)\n\
+         \x20               return\n\
+         \x20           }}\n\
+         \x20       }}\n\
+         \x20       guard let www = Bundle.main.resourceURL?.appendingPathComponent(\"www\") else {{\n\
+         \x20           SchemeHandler.notFound(urlSchemeTask)\n\
+         \x20           return\n\
+         \x20       }}\n\
+         \x20       let boundary = www.standardizedFileURL.path + \"/\"\n\
+         \x20       let resolved = segments\n\
+         \x20           .reduce(www) {{ $0.appendingPathComponent($1) }}\n\
+         \x20           .standardizedFileURL\n\
+         \x20       guard resolved.path.hasPrefix(boundary),\n\
+         \x20             let data = try? Data(contentsOf: resolved) else {{\n\
+         \x20           SchemeHandler.notFound(urlSchemeTask)\n\
+         \x20           return\n\
+         \x20       }}\n\
+         \x20       let mime = SchemeHandler.mimeType(for: resolved.pathExtension)\n\
+         \x20       let response = URLResponse(url: url, mimeType: mime,\n\
+         \x20           expectedContentLength: data.count, textEncodingName: nil)\n\
+         \x20       urlSchemeTask.didReceive(response)\n\
+         \x20       urlSchemeTask.didReceive(data)\n\
+         \x20       urlSchemeTask.didFinish()\n\
+         \x20   }}\n\
+         \n\
+         \x20   func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {{}}\n\
+         \n\
+         \x20   /// Answer a local 404: nothing outside the bundle is ever fetched.\n\
+         \x20   static func notFound(_ urlSchemeTask: WKURLSchemeTask) {{\n\
+         \x20       guard let url = urlSchemeTask.request.url,\n\
+         \x20             let response = HTTPURLResponse(url: url, statusCode: 404,\n\
+         \x20                 httpVersion: \"HTTP/1.1\",\n\
+         \x20                 headerFields: [\"Content-Type\": \"text/plain\"]) else {{\n\
+         \x20           urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))\n\
+         \x20           return\n\
+         \x20       }}\n\
+         \x20       urlSchemeTask.didReceive(response)\n\
+         \x20       urlSchemeTask.didReceive(Data())\n\
+         \x20       urlSchemeTask.didFinish()\n\
+         \x20   }}\n\
+         \n\
+         \x20   static func mimeType(for ext: String) -> String {{\n\
+         \x20       switch ext.lowercased() {{\n\
+         \x20       case \"html\": return \"text/html\"\n\
+         \x20       case \"js\": return \"text/javascript\"\n\
+         \x20       case \"wasm\": return \"application/wasm\"\n\
+         \x20       case \"json\": return \"application/json\"\n\
+         \x20       case \"css\": return \"text/css\"\n\
+         \x20       default: return \"application/octet-stream\"\n\
+         \x20       }}\n\
+         \x20   }}\n\
+         }}\n"
+    )
 }
 
 /// The iOS shell's build/README note.
-fn ios_readme(root_name: &str) -> String {
+fn ios_readme(root_name: &str, base: &MountBase) -> String {
     format!(
         "{root_name}: an iOS system-webview shell for an offline Ipê Web SPA.\n\
          \n\
          The client-wasm SPA rides under App/www/; a WKURLSchemeHandler serves it under\n\
          the custom ipe-app:// scheme with a correct MIME per file (WKWebView cannot\n\
-         cleanly file://-load .wasm), so the WKWebView loads ipe-app://app/index.html —\n\
-         a local origin, never a remote URL. The Info.plist NS…UsageDescription keys are\n\
-         derived from the app's accepted web capabilities — never hand-authored.\n\
+         cleanly file://-load .wasm), so the WKWebView loads {entry} —\n\
+         a local origin, never a remote URL; any other request answers a local 404.\n\
+         The Info.plist NS…UsageDescription keys are derived from the app's accepted\n\
+         web capabilities — never hand-authored.\n\
          \n\
          Build: open this project in Xcode on macOS; a signed, runnable .ipa requires\n\
-         macOS + Xcode + a signing identity (out of scope on this host).\n"
+         macOS + Xcode + a signing identity (out of scope on this host).\n",
+        entry = ios_entry_url(base),
     )
 }
 
@@ -1252,6 +1402,96 @@ fn gradle_string_escape(text: &str) -> String {
         }
     }
     out
+}
+
+/// A complete double-quoted Java string literal, quotes included, whose value
+/// is exactly the text it was built from.
+///
+/// Printable ASCII other than `"` and `\` passes through; `"`, `\`, newline,
+/// carriage return and tab take their named escapes; any other character up to
+/// U+00FF is an octal escape, and anything above is one `\uXXXX` per UTF-16
+/// unit. A `\uXXXX` is never emitted for a unit at or below U+00FF: Java
+/// translates unicode escapes before it lexes, so `"`, `\` or
+/// `\u000a` would end the literal or the line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JavaStringLiteral(String);
+
+impl JavaStringLiteral {
+    /// Quote `text` as a Java string literal.
+    fn of(text: &str) -> Self {
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(text.len().saturating_add(2));
+        out.push('"');
+        for ch in text.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ if ch == ' ' || ch.is_ascii_graphic() => out.push(ch),
+                _ if u32::from(ch) <= 0xff => {
+                    let _ = write!(out, "\\{:03o}", u32::from(ch));
+                }
+                _ => {
+                    let mut units = [0_u16; 2];
+                    for unit in ch.encode_utf16(&mut units) {
+                        let _ = write!(out, "\\u{unit:04x}");
+                    }
+                }
+            }
+        }
+        out.push('"');
+        Self(out)
+    }
+}
+
+impl std::fmt::Display for JavaStringLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A complete double-quoted Swift string literal, quotes included, whose value
+/// is exactly the text it was built from.
+///
+/// Printable ASCII other than `"` and `\` passes through, so no `\(` can open an
+/// interpolation; `"`, `\`, newline, carriage return, tab and NUL take their
+/// named escapes; every other character is a `\u{X}` escape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SwiftStringLiteral(String);
+
+impl SwiftStringLiteral {
+    /// Quote `text` as a Swift string literal.
+    fn of(text: &str) -> Self {
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(text.len().saturating_add(2));
+        out.push('"');
+        for ch in text.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\0' => out.push_str("\\0"),
+                _ if ch == ' ' || ch.is_ascii_graphic() => out.push(ch),
+                _ => {
+                    let _ = write!(out, "\\u{{{:x}}}", u32::from(ch));
+                }
+            }
+        }
+        out.push('"');
+        Self(out)
+    }
+}
+
+impl std::fmt::Display for SwiftStringLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Materialise `layout` as the shell `dist/<root_name>` inside the owned `dist`.
@@ -1593,6 +1833,7 @@ mod tests {
             &accepts(&[]),
             &spa,
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         std::fs::rename(&www, base.join("www-collected")).expect("move www away");
@@ -1721,6 +1962,7 @@ mod tests {
             &a,
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let manifest = layout
@@ -1741,6 +1983,7 @@ mod tests {
             &accepts(&[]),
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let manifest = layout
@@ -1768,6 +2011,7 @@ mod tests {
             &accepts(&[]),
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let manifest = layout
@@ -1796,6 +2040,7 @@ mod tests {
             &a,
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let manifest = layout
@@ -1813,6 +2058,7 @@ mod tests {
             &accepts(&[]),
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let paths: Vec<&str> = layout.files.iter().map(|f| f.rel_path.as_str()).collect();
@@ -1822,7 +2068,7 @@ mod tests {
         let activity = layout
             .generated("app/src/main/java/dev/ipe/app/MainActivity.java")
             .expect("activity");
-        assert!(activity.contains("appassets.androidplatform.net/assets/www/index.html"));
+        assert!(activity.contains("ENTRY_URL = \"https://appassets.androidplatform.net/\";"));
         assert!(!activity.contains("http://") || activity.contains("https://appassets"));
     }
 
@@ -1838,6 +2084,7 @@ mod tests {
             &a,
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let plist = layout.generated("App/Info.plist").expect("ios plist");
@@ -1857,6 +2104,7 @@ mod tests {
             &accepts(&[]),
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let plist = layout.generated("App/Info.plist").expect("ios plist");
@@ -1876,6 +2124,7 @@ mod tests {
             &accepts(&[]),
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let handler = layout
@@ -1889,7 +2138,7 @@ mod tests {
         let delegate = layout
             .generated("App/AppDelegate.swift")
             .expect("app delegate");
-        assert!(delegate.contains("ipe-app://app/index.html"));
+        assert!(delegate.contains("URL(string: \"ipe-app://app/\")"));
         assert!(!delegate.contains("http://"));
     }
 
@@ -1902,6 +2151,7 @@ mod tests {
             &accepts(&[]),
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let paths: Vec<&str> = layout.files.iter().map(|f| f.rel_path.as_str()).collect();
@@ -1926,6 +2176,7 @@ mod tests {
             &a,
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let manifest = android
@@ -1943,6 +2194,7 @@ mod tests {
             &a,
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let plist = ios.generated("App/Info.plist").expect("ios plist");
@@ -1969,6 +2221,7 @@ mod tests {
             &accepts(&[]),
             &bundle(),
             None,
+            &MountBase::root(),
         )
         .expect("layout");
         let settings = android
@@ -1998,6 +2251,7 @@ mod tests {
                 &accepts(&[]),
                 &bundle(),
                 Some(&icon),
+                &MountBase::root(),
             )
             .expect("l");
             assert!(
@@ -2011,6 +2265,7 @@ mod tests {
                 &accepts(&[]),
                 &bundle(),
                 None,
+                &MountBase::root(),
             )
             .expect("l");
             assert!(
@@ -2027,8 +2282,8 @@ mod tests {
     /// names the keystore step a store build needs; it never claims a signed build.
     #[test]
     fn android_readme_states_the_project_is_unsigned() {
-        let dev = android_readme("app-android", BundleProfile::Dev);
-        let release = android_readme("app-android", BundleProfile::Release);
+        let dev = android_readme("app-android", BundleProfile::Dev, &MountBase::root());
+        let release = android_readme("app-android", BundleProfile::Release, &MountBase::root());
         for note in [&dev, &release] {
             assert!(note.contains("this Gradle project is unsigned"), "{note}");
             assert!(note.contains("debug key, for local install only"), "{note}");
@@ -2038,5 +2293,243 @@ mod tests {
         assert!(dev.contains("a dev bundle"), "{dev}");
         assert!(release.contains("a production bundle"), "{release}");
         assert_ne!(dev, release);
+    }
+
+    // ── Mount base: every shell URL and handler boundary derives from it ──────
+
+    /// The root base and a nested one, each with its directory URL.
+    fn bases() -> [(MountBase, &'static str); 2] {
+        [
+            (MountBase::root(), "/"),
+            (
+                MountBase::parse("/app").expect("a legal mount base"),
+                "/app/",
+            ),
+        ]
+    }
+
+    fn shell_text(os: MobileOs, base: &MountBase, rel_path: &str) -> String {
+        layout(
+            os,
+            BundleProfile::Dev,
+            &identity(),
+            &accepts(&[]),
+            &bundle(),
+            None,
+            base,
+        )
+        .expect("layout")
+        .generated(rel_path)
+        .expect("generated shell file")
+        .to_owned()
+    }
+
+    const ACTIVITY: &str = "app/src/main/java/dev/ipe/app/MainActivity.java";
+
+    #[test]
+    fn android_handler_registered_at_base() {
+        for (base, dir) in bases() {
+            let activity = shell_text(MobileOs::Android, &base, ACTIVITY);
+            assert!(
+                activity.contains(&format!("String BUNDLE_DIR = \"{dir}\";")),
+                "{activity}"
+            );
+            assert!(
+                activity.contains(".addPathHandler(BUNDLE_DIR, new BundleHandler(this))"),
+                "{activity}"
+            );
+            assert!(
+                !activity.contains("addPathHandler(\"/assets/\""),
+                "{activity}"
+            );
+        }
+    }
+
+    #[test]
+    fn android_loads_dir_url() {
+        for (base, dir) in bases() {
+            let activity = shell_text(MobileOs::Android, &base, ACTIVITY);
+            assert!(
+                activity.contains(&format!(
+                    "String ENTRY_URL = \"https://appassets.androidplatform.net{dir}\";"
+                )),
+                "{activity}"
+            );
+            assert!(
+                activity.contains("webView.loadUrl(ENTRY_URL);"),
+                "{activity}"
+            );
+            assert!(!activity.contains("/assets/www/"), "{activity}");
+            let readme = shell_text(MobileOs::Android, &base, "README.txt");
+            assert!(
+                readme.contains(&format!("https://appassets.androidplatform.net{dir}")),
+                "{readme}"
+            );
+        }
+    }
+
+    #[test]
+    fn android_null_intercept_answers_local_404() {
+        for (base, _) in bases() {
+            let activity = shell_text(MobileOs::Android, &base, ACTIVITY);
+            assert!(
+                activity.contains("return mapped != null ? mapped : localNotFound();"),
+                "{activity}"
+            );
+            assert!(
+                activity.contains("404, \"Not Found\""),
+                "the unmapped answer is a local 404: {activity}"
+            );
+            assert!(
+                !activity.contains("return loader.shouldInterceptRequest("),
+                "a null from the loader must never fall through to the network: {activity}"
+            );
+            assert!(activity.contains("segment.equals(\"..\")"), "{activity}");
+            assert!(
+                activity.contains("assets.handle(\"www/index.html\")"),
+                "{activity}"
+            );
+        }
+    }
+
+    #[test]
+    fn ios_handler_boundary_is_dir_plus_slash() {
+        for (base, segments) in [
+            (MountBase::root(), "[]"),
+            (
+                MountBase::parse("/app/v2").expect("a legal mount base"),
+                "[\"app\", \"v2\"]",
+            ),
+        ] {
+            let handler = shell_text(MobileOs::Ios, &base, "App/SchemeHandler.swift");
+            assert!(
+                handler.contains(&format!("static let baseSegments: [String] = {segments}")),
+                "{handler}"
+            );
+            assert!(
+                handler.contains("let boundary = www.standardizedFileURL.path + \"/\""),
+                "{handler}"
+            );
+            assert!(
+                handler.contains("resolved.path.hasPrefix(boundary)"),
+                "{handler}"
+            );
+            assert!(!handler.contains("hasPrefix(base"), "{handler}");
+            assert!(handler.contains("segment == \"..\""), "{handler}");
+            assert!(handler.contains("statusCode: 404"), "{handler}");
+        }
+    }
+
+    #[test]
+    fn ios_root_maps_to_index() {
+        for (base, dir) in bases() {
+            let handler = shell_text(MobileOs::Ios, &base, "App/SchemeHandler.swift");
+            assert!(
+                handler.contains("if segments.isEmpty || segments == [\"\"] {"),
+                "{handler}"
+            );
+            assert!(handler.contains("segments = [\"index.html\"]"), "{handler}");
+            assert!(
+                handler.contains("omittingEmptySubsequences: false"),
+                "the trailing-slash directory keeps its empty segment: {handler}"
+            );
+            let delegate = shell_text(MobileOs::Ios, &base, "App/AppDelegate.swift");
+            assert!(
+                delegate.contains(&format!("URL(string: \"ipe-app://app{dir}\")")),
+                "{delegate}"
+            );
+            assert!(!delegate.contains("ipe-app://app/index.html"), "{delegate}");
+        }
+    }
+
+    // ── Literal escapers: hostile text never leaves its literal ───────────────
+
+    /// The UTF-16 units of every `\uXXXX` Java's pre-lexing translation would
+    /// read in `literal`: a `\` that an even run of backslashes precedes, then
+    /// `u`s, then four hex digits.
+    fn java_unicode_escapes(literal: &str) -> Vec<u32> {
+        let chars: Vec<char> = literal.chars().collect();
+        let mut units = Vec::new();
+        let mut backslashes = 0_usize;
+        for (at, ch) in chars.iter().enumerate() {
+            if *ch != '\\' {
+                backslashes = 0;
+                continue;
+            }
+            if backslashes % 2 == 0 {
+                let rest: String = chars.iter().skip(at + 1).collect();
+                let hex = rest.trim_start_matches('u');
+                if hex.len() < rest.len() {
+                    let digits: String = hex.chars().take(4).collect();
+                    if let Ok(unit) = u32::from_str_radix(&digits, 16) {
+                        units.push(unit);
+                    }
+                }
+            }
+            backslashes += 1;
+        }
+        units
+    }
+
+    #[test]
+    fn java_string_literal_keeps_hostile_text_inside_the_literal() {
+        let cases = [
+            ("a\"b", r#""a\"b""#),
+            ("a\\b", r#""a\\b""#),
+            ("a\nb", r#""a\nb""#),
+            ("a\rb\tc", r#""a\rb\tc""#),
+            ("$x${y}", r#""$x${y}""#),
+            ("\\u0022", r#""\\u0022""#),
+            ("\u{7}", r#""\007""#),
+            ("\u{7f}", r#""\177""#),
+            ("é", r#""\351""#),
+            ("\u{2028}", r#"" ""#),
+            ("😀", r#""😀""#),
+        ];
+        for (text, quoted) in cases {
+            let literal = JavaStringLiteral::of(text).to_string();
+            assert_eq!(literal, quoted, "{text:?}");
+            assert!(
+                java_unicode_escapes(&literal)
+                    .iter()
+                    .all(|unit| *unit > 0xff),
+                "no unicode escape Java translates before lexing names a quote, \
+                 backslash or line break: {literal}"
+            );
+            assert!(!literal.contains(['\n', '\r']), "{literal}");
+        }
+    }
+
+    #[test]
+    fn swift_string_literal_keeps_hostile_text_inside_the_literal() {
+        let cases = [
+            ("a\"b", r#""a\"b""#),
+            ("a\\b", r#""a\\b""#),
+            ("a\nb", r#""a\nb""#),
+            ("a\rb\tc", r#""a\rb\tc""#),
+            ("$x${y}", r#""$x${y}""#),
+            ("\\(exit(1))", r#""\\(exit(1))""#),
+            ("\0", r#""\0""#),
+            ("\u{7}", r#""\u{7}""#),
+            ("é", r#""\u{e9}""#),
+            ("\u{202e}", r#""\u{202e}""#),
+            ("😀", r#""\u{1f600}""#),
+        ];
+        for (text, quoted) in cases {
+            let literal = SwiftStringLiteral::of(text).to_string();
+            assert_eq!(literal, quoted, "{text:?}");
+            assert!(!literal.contains(['\n', '\r', '\0']), "{literal}");
+        }
+    }
+
+    #[test]
+    fn manifest_changed_names_both_bases_and_the_remedy() {
+        let shown = MobileRefusal::ManifestChanged {
+            before: MountBase::root(),
+            after: MountBase::parse("/app").expect("a legal mount base"),
+        }
+        .to_string();
+        assert!(shown.contains("from `/` to `/app/`"), "{shown}");
+        assert!(shown.contains("run it again"), "{shown}");
     }
 }
