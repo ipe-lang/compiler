@@ -2270,24 +2270,6 @@ enum WasmOptSkip {
     Run(CliError),
 }
 
-/// Map a wasm tool's runner failure to the CLI error naming `program`.
-fn wasm_tool_error(
-    program: &Path,
-    e: crate::remote_ingest::RunError<crate::remote_ingest::LocalRefusal>,
-) -> CliError {
-    use crate::remote_ingest::RunError;
-    match e {
-        RunError::Exceeded(refusal) => CliError::LocalLimitExceeded(refusal),
-        RunError::Spawn(source) | RunError::Wait(source) => CliError::Io {
-            path: program.to_path_buf(),
-            source,
-        },
-        RunError::Measure(path, source) => CliError::Io { path, source },
-        RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
-        RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
-    }
-}
-
 /// Bundle the linked `wasm_path` into the owned crate's `www/pkg/` with `tools`.
 ///
 /// Each tool runs under `ceiling`. `wasm-opt` writes a sibling of the bundle,
@@ -2327,7 +2309,7 @@ fn bundle_wasm_pkg(
         .args(["--target", "web", "--no-typescript", "--out-dir"])
         .arg(&pkg_dir);
     let bound = run_local(bindgen, ceiling, LocalSource::WasmTool)
-        .map_err(|e| wasm_tool_error(tools.bindgen, e))?;
+        .map_err(|e| crate::cargo_step::local_run_error(tools.bindgen, e))?;
     if !bound.status.success() {
         let stderr = bound.stderr.to_terminal();
         if !stderr.as_str().is_empty() {
@@ -2362,7 +2344,9 @@ fn bundle_wasm_pkg(
             Err(RunError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 Some(WasmOptSkip::Missing)
             }
-            Err(e) => Some(WasmOptSkip::Run(wasm_tool_error(tools.opt, e))),
+            Err(e) => Some(WasmOptSkip::Run(crate::cargo_step::local_run_error(
+                tools.opt, e,
+            ))),
         };
         // The staged file is removed on every outcome, after the crate is
         // proven still owned: nothing `wasm-opt` wrote outlives this step.

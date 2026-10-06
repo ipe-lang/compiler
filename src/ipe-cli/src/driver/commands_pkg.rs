@@ -1650,26 +1650,35 @@ fn run_test_binary<S: Into<std::process::Stdio>>(
     stdio: TestStdio,
     cli_stderr: impl Fn() -> S,
 ) -> Result<std::process::ExitStatus, CliError> {
-    let ran = match stdio {
-        TestStdio::Inherit => run_inherited(
-            std::process::Command::new(&bin),
-            InheritedRole::UserProgram,
-            InheritedInput::Terminal,
-        ),
+    let command = match stdio {
+        TestStdio::Inherit => std::process::Command::new(&bin),
         TestStdio::Quiet => {
             let mut command = std::process::Command::new(&bin);
             command.stdout(cli_stderr()).stderr(cli_stderr());
-            run_inherited(
-                command,
-                InheritedRole::UserProgram,
-                InheritedInput::Terminal,
-            )
+            command
         }
     };
+    let ran = run_inherited(
+        command,
+        InheritedRole::UserProgram,
+        test_binary_stdin(stdio),
+    );
     ran.map_err(|e| CliError::Io {
         path: bin,
         source: e.into(),
     })
+}
+
+/// What the compiled test binary reads on its stdin when its output is placed as `stdio` says.
+///
+/// An inherited run is the user's, at the terminal. A quiet run serves a
+/// machine consumer of the CLI's stdout, so the binary reads the null device
+/// rather than the stdin that consumer may still be writing to or holding open.
+const fn test_binary_stdin(stdio: TestStdio) -> InheritedInput {
+    match stdio {
+        TestStdio::Inherit => InheritedInput::Terminal,
+        TestStdio::Quiet => InheritedInput::Null,
+    }
 }
 
 /// Stage 4 of `ipe verify`: run the project's tests via the shared
@@ -2354,6 +2363,9 @@ pub fn run_installer() -> Result<(), CliError> {
     .map_err(|e| match e {
         InheritedError::Spawn(refusal) => {
             CliError::Usage(text::msg::upgrade_installer_launch_failed(&refusal))
+        }
+        InheritedError::Feed(kind) => {
+            CliError::Usage(text::msg::upgrade_installer_short_feed(&kind))
         }
         InheritedError::Wait(e) => CliError::Usage(text::msg::upgrade_installer_wait_failed(&e)),
     })?;
@@ -3964,6 +3976,19 @@ mod test_binary_tests {
         });
         let written = sink.read_all().expect("read the sink");
         (ran, String::from_utf8_lossy(&written).into_owned())
+    }
+
+    /// A quiet run keeps the binary off the stdin a machine consumer of the CLI holds.
+    #[test]
+    fn a_quiet_test_binary_reads_the_null_device() {
+        assert!(matches!(
+            test_binary_stdin(TestStdio::Quiet),
+            InheritedInput::Null
+        ));
+        assert!(matches!(
+            test_binary_stdin(TestStdio::Inherit),
+            InheritedInput::Terminal
+        ));
     }
 
     #[test]
