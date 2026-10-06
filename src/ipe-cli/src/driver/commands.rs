@@ -261,13 +261,13 @@ const fn bare_group(umbrella: Umbrella) -> BareGroup {
 /// so a group that lost its page fails closed rather than printing nothing and
 /// exiting 0.
 fn show_group_page(name: &str) -> Result<(), CliError> {
-    match help::group(name, &std::io::stdout()) {
-        Some(page) => {
+    help::group(name, &std::io::stdout()).map_or_else(
+        || Err(group_required(name, &[], &[])),
+        |page| {
             show_help_page(&page);
             Ok(())
-        }
-        None => Err(group_required(name, &[], &[])),
-    }
+        },
+    )
 }
 
 /// The [`CliError::GroupRequired`] refusal for `attempted` followed by `tail`.
