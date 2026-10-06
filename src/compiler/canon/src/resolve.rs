@@ -419,6 +419,27 @@ struct TypeCtx<'a> {
     ann_span: Span,
 }
 
+/// The aliases each imported module is written under, keyed by its dotted
+/// path: the one table IPE-N0034 reads to name an alias to use.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if an alias symbol is not interned.
+fn import_alias_table(
+    imports: &[src::Import],
+    interner: &Interner,
+) -> DResult<Rc<BTreeMap<Box<str>, BTreeSet<Box<str>>>>> {
+    let mut table: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
+    for import in imports {
+        if let Some(alias) = import.alias {
+            table
+                .entry(path_to_dot_string(interner, &import.name.value))
+                .or_default()
+                .insert(name_str(interner, alias)?);
+        }
+    }
+    Ok(Rc::new(table))
+}
+
 /// Canonicalise a parsed module into its name-resolved form.
 ///
 /// # Errors
@@ -433,6 +454,7 @@ struct TypeCtx<'a> {
 pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::Module> {
     let home = m.name.value.clone();
     let mut env = Env::initial(home, interner)?;
+    env.import_aliases = import_alias_table(&m.imports, interner)?;
     // Register `import Ipê.… as Alias` / `import Ipe.… as Alias` qualifiers.
     // The single-module path does no dep injection, but stdlib qualifier
     // aliases must still resolve (`import Ipe.Json.Encode as Encode` →
@@ -605,16 +627,7 @@ pub fn canonicalise_module_in_project(
     let mut env = Env::initial(home.clone(), interner)?;
     env.origin = origin;
     env.module_catalog = catalog.clone();
-    let mut import_aliases: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
-    for import in &m.imports {
-        if let Some(alias) = import.alias {
-            import_aliases
-                .entry(path_to_dot_string(interner, &import.name.value))
-                .or_default()
-                .insert(name_str(interner, alias)?);
-        }
-    }
-    env.import_aliases = Rc::new(import_aliases);
+    env.import_aliases = import_alias_table(&m.imports, interner)?;
     // Fail closed at the boundary on an `Ipe.*` import that names neither a
     // kernel stdlib module nor a compiled-source dep (a typo such as
     // `Ipe.Strng`), before alias registration and the dep loop silently skip it.

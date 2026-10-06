@@ -305,7 +305,7 @@ fn qualified_type_follows_the_qualifier_owner() {
     };
     assert!(
         home.as_deref() != Some(&["App".to_owned(), "Auth".to_owned()][..]),
-        "`Auth.T` must not reach `App.Auth`: {home:?} / {result:?}"
+        "`Auth.T` must not reach `App.Auth`: {home:?}"
     );
     let dotted = "module Main exposing (y)\n\nimport Ipe.Auth as Auth\nimport App.Auth\n\n\
                   y : App.Auth.T\ny =\n    App.Auth.T\n";
@@ -317,7 +317,7 @@ fn qualified_type_follows_the_qualifier_owner() {
     assert_eq!(
         home.as_deref(),
         Some(&["App".to_owned(), "Auth".to_owned()][..]),
-        "{result:?}"
+        "{home:?}"
     );
 }
 
@@ -386,5 +386,5 @@ fn native_binding_never_resolves_through_a_foreign_ffi_spelling() {
         ],
         &["Main", "Rust.Ffi"],
     );
-    assert!(result.is_ok(), "{result:?}");
+    assert!(result.is_ok(), "{:?}", result.as_ref().map(Option::is_some));
 }

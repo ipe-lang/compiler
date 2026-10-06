@@ -3420,10 +3420,10 @@ mod tests {
     }
 
     #[test]
-    fn main_branching_between_shapes_is_rejected_n0045() {
+    fn main_branching_between_shapes_is_rejected_n0035() {
         // A `main` whose head is an `if` choosing between two app entries selects
-        // its shape at run time — refused (static pinning). This precise gate
-        // fires ahead of the coarser IPE-N0033 import contradiction.
+        // its shape at run time. The second shape import is already refused at
+        // the import (IPE-N0035), ahead of the `main` gate.
         let src = "module Main exposing (main)\n\
                    import Ipe.Tea.Web as Web\n\
                    import Ipe.Tea.Tui as Tui\n\n\
@@ -3434,11 +3434,11 @@ mod tests {
             matches!(
                 canon_module_err(src),
                 Some(Diagnostic::Name {
-                    msg: NameError::RuntimeBranchedMain,
+                    msg: NameError::TwoShapeImports { .. },
                     ..
                 })
             ),
-            "a `main` that picks its shape from an `if` must be rejected IPE-N0045"
+            "a module importing two shapes must be rejected IPE-N0035 at the second import"
         );
     }
 
@@ -3632,11 +3632,19 @@ mod tests {
             "Ipe.Tea.Cli.Sub",
             "onKey"
         ));
-        assert!(!resolves(
+        // The shared terminal `Sub` adds nothing to the shape's own `Sub`: the
+        // spelling holds the shape's members and never another shape's.
+        assert!(resolves(
             "Ipe.Tea.Tui as Tui",
             "Tui.tea",
             "Ipe.Tea.Terminal.Sub",
             "onKey"
+        ));
+        assert!(!resolves(
+            "Ipe.Tea.Tui as Tui",
+            "Tui.tea",
+            "Ipe.Tea.Terminal.Sub",
+            "onLine"
         ));
         assert!(!resolves(
             "Ipe.Tea.Web as Web",

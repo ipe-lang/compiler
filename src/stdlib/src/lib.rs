@@ -2867,18 +2867,30 @@ mod tests {
             .collect();
         let mut shared = 0usize;
         for qualifier in qualifiers {
-            let expected: Vec<&str> = catalog
-                .paths()
-                .filter(|module| *module != "Main")
-                .filter(|module| ipe_canon::bare_import_binds(module, qualifier))
-                .collect();
+            // `Cmd` / `Sub` belong to the shape modules: an unimported use names
+            // the four shapes to import, not every module whose bare import
+            // happens to end in `Cmd` / `Sub`.
+            let expected: Vec<&str> = if matches!(qualifier, "Cmd" | "Sub") {
+                vec![
+                    "Ipe.Tea.Cli",
+                    "Ipe.Tea.Tui",
+                    "Ipe.Tea.Web",
+                    "Ipe.Tea.Worker",
+                ]
+            } else {
+                catalog
+                    .paths()
+                    .filter(|module| *module != "Main")
+                    .filter(|module| ipe_canon::bare_import_binds(module, qualifier))
+                    .collect()
+            };
             if expected.is_empty() {
                 continue;
             }
             let src = format!("module Main exposing (main)\n\nmain =\n    {qualifier}.x\n");
             let result = canon_main(&src, &catalog);
-            // An ambient qualifier (`Cmd`) resolves with no import, so it never
-            // raises IPE-N0034 and builds no candidate list.
+            // An ambient qualifier resolves with no import, so it never raises
+            // IPE-N0034 and builds no candidate list.
             if matches!(
                 &result,
                 Ok(())
