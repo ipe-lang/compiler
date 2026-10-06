@@ -1939,8 +1939,12 @@ fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefu
 }
 
 /// Best-effort bounded flush of all active telemetry exporters (push + hub).
-/// Waits at most 500 ms in total. Never panics, never blocks shutdown beyond
-/// the cap. This MUST be called before every `process::exit` because
+///
+/// The two flushes run concurrently, each bounded by its exporter's flush
+/// deadline (its connect timeout plus one send budget), so shutdown waits at
+/// most the larger deadline, never their sum, and never past
+/// `push_exporter::FLUSH_DEADLINE_CEILING_MS`. Never panics. This MUST be
+/// called before every `process::exit` because
 /// `process::exit` skips Drop, so the mpsc Sender never drops and the
 /// batchers' channel-close drain path never runs without this explicit flush.
 ///
@@ -1949,12 +1953,7 @@ fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefu
 /// HTTP kernel has no exporters to flush.
 #[cfg(all(feature = "server", feature = "http_client"))]
 async fn flush_exporters() {
-    // 500 ms total cap (split across two exporters in sequence — each is capped
-    // independently so a slow/unavailable first target doesn't eat all of the
-    // second exporter's budget).
-    const CAP_MS: u64 = 250;
-    push_exporter::flush_now(CAP_MS).await;
-    hub_exporter::flush_now(CAP_MS).await;
+    tokio::join!(push_exporter::flush_now(), hub_exporter::flush_now());
 }
 #[cfg(all(feature = "server", not(feature = "http_client")))]
 async fn flush_exporters() {}
@@ -2151,8 +2150,8 @@ async fn web_shutdown_signal<Model, Msg>(
     // explicit pre-exit flush the grace-timer and watchdog paths below would
     // silently lose ≤1 batch-interval (~2 s default) of buffered telemetry.
     // `flush_exporters` sends a Flush sentinel to each active exporter and waits
-    // a bounded 500 ms; it is best-effort (telemetry only, never user data) and
-    // never hangs shutdown.
+    // at most the larger exporter flush deadline; it is best-effort (telemetry
+    // only, never user data) and never hangs shutdown.
 
     // Grace timer: force a CLEAN exit-0 after the window so a never-idle SSE
     // connection can't hang the drain. Spawned (not awaited) so we still return

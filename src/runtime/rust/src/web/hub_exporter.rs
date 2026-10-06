@@ -20,7 +20,9 @@
 //! full), push failures fall back to the spool, the spool itself is bounded
 //! (oldest batch evicted when full). No `unwrap`/`expect`/indexing.
 
-use super::push_exporter::{ExporterEnv, OutcomeLog, PushOutcome};
+use super::push_exporter::{
+    ExporterEnv, FlushDeadline, OutcomeLog, PushOutcome, drain_before_exit,
+};
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -174,7 +176,7 @@ struct HubTarget {
 fn exporter_client(base: &str) -> Option<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none());
     super::push_exporter::routed(builder, base).build().ok()
 }
@@ -221,17 +223,20 @@ async fn batcher(mut rx: mpsc::Receiver<Entry>, target: HubTarget, interval_ms: 
     }
 }
 
-/// Best-effort pre-exit flush: sends a `Flush` sentinel and waits up to
-/// `cap_ms` milliseconds for the batcher to drain its buffer and the spool.
-/// No-op when the exporter is disabled or the channel is full. Never panics.
-pub async fn flush_now(cap_ms: u64) {
-    let Some(tx) = SENDER.get() else { return };
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
-    // try_send: non-blocking; best-effort (telemetry only).
-    if tx.try_send(Entry::Flush(ack_tx)).is_err() {
-        return;
-    }
-    let _ = tokio::time::timeout(Duration::from_millis(cap_ms), ack_rx).await;
+/// Connect ceiling of the hub client, in milliseconds.
+///
+/// The client builder and `FLUSH_DEADLINE` both read it, so the shutdown
+/// flush always outlasts a connect in flight.
+const CONNECT_TIMEOUT_MS: u64 = 5_000;
+
+/// How long the shutdown flush waits for the hub batcher's buffer and spool.
+const FLUSH_DEADLINE: FlushDeadline = FlushDeadline::after_connect::<CONNECT_TIMEOUT_MS>();
+
+/// Best-effort pre-exit flush of the hub exporter, bounded by `FLUSH_DEADLINE`.
+///
+/// No-op when the exporter is disabled. Never panics.
+pub async fn flush_now() {
+    drain_before_exit(SENDER.get(), Entry::Flush, FLUSH_DEADLINE).await;
 }
 
 /// Encode the accumulated logs/spans into OTLP batches, then push the spool
