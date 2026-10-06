@@ -1627,7 +1627,7 @@ pub fn release_pipeline(
                 mount_base: manifest_parsed
                     .as_ref()
                     .map_or_else(ipe_backend_rust::MountBase::root, |m| {
-                        m.browser.base.clone()
+                        m.delivery.browser.base.clone()
                     }),
                 wasm_hydrate_mode: manifest_wasm
                     .as_ref()
