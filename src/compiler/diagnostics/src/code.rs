@@ -149,7 +149,7 @@ pub const FAMILIES: [FamilyRow; 8] = [
     FamilyRow {
         family: Family::Security,
         letter: 'S',
-        summary: "security consent — an effect or escape hatch that needs your explicit approval",
+        summary: "security consent — an effect, escape hatch, or control model that needs your explicit approval",
     },
     FamilyRow {
         family: Family::Environment,
@@ -728,6 +728,12 @@ code! {
     /// acknowledged (non-interactive release build without manifest
     /// pre-acceptance, or an interactive "no")
     IPE_S0001 = "IPE-S0001", "unsafe escape hatch imported without acknowledgment", "IPE-S0001";
+    /// a program reaches a browser web capability the app has not granted
+    IPE_S0002 = "IPE-S0002", "a web capability is reached without the app's grant", "IPE-S0002";
+    /// a program crosses into native `Rust.` code the app has not granted
+    IPE_S0003 = "IPE-S0003", "native Rust code is crossed without the app's grant", "IPE-S0003";
+    /// the program's control model is not covered by the declared `acceptsControl` set
+    IPE_S0004 = "IPE-S0004", "the control model is not covered by acceptsControl", "IPE-S0004";
 
     // -----------------------------------------------------------------------
     // Environment (IPE-E####)

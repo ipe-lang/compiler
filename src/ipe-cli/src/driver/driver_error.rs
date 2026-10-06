@@ -596,6 +596,18 @@ pub fn emit_machine_error(
 }
 
 impl CliError {
+    /// A consent gate's refusal, framed by the shared diagnostic renderer.
+    ///
+    /// The refusal has no source location, so the entry path and source are empty.
+    #[must_use]
+    pub fn consent_refused(msg: ipe_diagnostics::ConsentError) -> Self {
+        Self::Pipeline {
+            file: PathBuf::new(),
+            src: String::new(),
+            diag: Box::new(Diagnostic::Consent { msg }),
+        }
+    }
+
     /// The manifest refusal for a program entry that [`parse_entry`] turned away.
     ///
     /// The entry and the refused segment are author text, so both render through

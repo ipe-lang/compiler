@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ipe_diagnostics::ConsentError;
 use ipe_ir::{Capability, WebCapability};
 
 use crate::CliError;
@@ -142,15 +143,15 @@ pub fn gate(
 /// The typed, fail-closed refusal naming each ungranted web axis, its disclosing
 /// module(s), and the remedy.
 fn refusal(ungranted: &[crate::text::Message]) -> CliError {
-    CliError::Usage(crate::text::Message::lines(
-        std::iter::once(crate::text::msg::web_consent_header())
-            .chain(
-                ungranted
-                    .iter()
-                    .map(|item| crate::text::msg::consent_item(item)),
-            )
+    let body = crate::text::Message::lines(
+        ungranted
+            .iter()
+            .map(|item| crate::text::msg::consent_item(item))
             .chain(std::iter::once(crate::text::msg::web_consent_remedy())),
-    ))
+    );
+    CliError::consent_refused(ConsentError::WebAxisUngranted {
+        body: body.to_string(),
+    })
 }
 
 #[cfg(test)]
