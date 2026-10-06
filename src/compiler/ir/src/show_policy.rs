@@ -181,6 +181,9 @@ show_leaves! {
     PSEUDO_CLASS = "PseudoClass" => Internals;
     DESCRIPTION = "Description" => Internals;
     LAYOUT_CONTEXT = "LayoutContext" => Internals;
+    PROJECTION_TERM = "ProjectionTerm" => Internals;
+    PROJECTION_OPERAND = "ProjectionOperand" => Internals;
+    ARITH_OP = "ArithOp" => Internals;
     FUN = "Fun" => Refused;
     SHARED_FUN = "SharedFun" => Refused;
     FN_ONCE_CHAIN = "FnOnceChain" => Refused;
@@ -355,9 +358,26 @@ pub enum NamedShow {
     Leaf(ShowLeaf),
 }
 
+/// The Prelude enums the backend emits as a type alias to the runtime's own
+/// definition, with the leaf each is shown through. The runtime owns the one
+/// nominal type and its `IpeStringify` row, so the emitted crate holds no impl.
+pub const RUNTIME_ALIASED_ENUMS: [(&str, ShowLeaf); 3] = [
+    ("ProjectionTerm", show_leaf::PROJECTION_TERM),
+    ("ProjectionOperand", show_leaf::PROJECTION_OPERAND),
+    ("ArithOp", show_leaf::ARITH_OP),
+];
+
+/// The leaf of a Prelude enum emitted as a runtime alias, by name.
+#[must_use]
+pub fn runtime_aliased_enum(name: &str) -> Option<ShowLeaf> {
+    RUNTIME_ALIASED_ENUMS
+        .iter()
+        .find_map(|(n, leaf)| (*n == name).then_some(*leaf))
+}
+
 /// Classify the named enum `(home, name)`.
 ///
-/// A registered enum (one in `payloads`) is shown through its emitted impl. An
+/// A Prelude enum emitted as a runtime alias is its own leaf. A registered enum (one in `payloads`) is shown through its emitted impl. An
 /// unregistered one is a runtime-bridged enum's leaf, else an opaque `Rust.*`
 /// handle, else unclassified; the last two have no rendering, so both are
 /// [`show_leaf::FOREIGN`] (fail closed).
@@ -368,6 +388,11 @@ pub fn named_enum_shape(
     home: &ModPath,
     name: Symbol,
 ) -> NamedShow {
+    if home.0.is_empty()
+        && let Some(leaf) = interner.resolve(name).and_then(runtime_aliased_enum)
+    {
+        return NamedShow::Leaf(leaf);
+    }
     if payloads.contains_key(&(home.clone(), name)) {
         return NamedShow::Registered;
     }
@@ -495,6 +520,32 @@ mod tests {
             assert!(
                 SHOWN_LEAVES.contains(&(leaf.name(), leaf.policy())),
                 "{e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_runtime_aliased_enum_has_a_listed_leaf() {
+        for (name, leaf) in RUNTIME_ALIASED_ENUMS {
+            assert_eq!(leaf.name(), name);
+            assert!(
+                SHOWN_LEAVES.contains(&(leaf.name(), leaf.policy())),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_runtime_aliased_enum_is_its_leaf_even_when_registered() {
+        let mut interner = Interner::new();
+        for (name, leaf) in RUNTIME_ALIASED_ENUMS {
+            let sym = interner.intern(name).expect("intern");
+            let home = ModPath(vec![]);
+            let payloads = BTreeMap::from([((home.clone(), sym), vec![])]);
+            assert_eq!(
+                named_enum_shape(&interner, &payloads, &home, sym),
+                NamedShow::Leaf(leaf),
+                "{name} has no emitted impl, so it must not be classified registered"
             );
         }
     }

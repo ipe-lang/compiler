@@ -7,7 +7,7 @@
 
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
-use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, refused_marker};
+use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, refused_marker, runtime_aliased_enum};
 
 use std::collections::BTreeSet;
 
@@ -782,12 +782,7 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     // `db_find_projection` signature names), emit a type alias so the
     // generated crate and the runtime share ONE nominal type.
     let resolved_name = ctx.interner.resolve(def.name);
-    if def.home.0.is_empty()
-        && matches!(
-            resolved_name,
-            Some("ProjectionTerm" | "ProjectionOperand" | "ArithOp")
-        )
-    {
+    if def.home.0.is_empty() && resolved_name.and_then(runtime_aliased_enum).is_some() {
         let alias_name = ctx.enum_name(&def.home, def.name)?.to_owned();
         let runtime_name = resolved_name.unwrap_or("");
         return Ok(format!(

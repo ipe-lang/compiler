@@ -263,6 +263,9 @@ shown_leaves! {
     "PseudoClass" => Internals;
     "Description" => Internals;
     "LayoutContext" => Internals;
+    "ProjectionTerm" => Internals;
+    "ProjectionOperand" => Internals;
+    "ArithOp" => Internals;
     "Fun" => Refused;
     "SharedFun" => Refused;
     "FnOnceChain" => Refused;

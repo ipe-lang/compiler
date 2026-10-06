@@ -171,6 +171,12 @@ pins! {
     "PseudoClass" => Internals: ipe_runtime_rust::ui::element::PseudoClass;
     "Description" => Internals: ipe_runtime_rust::ui::element::Description;
     "LayoutContext" => Internals: ipe_runtime_rust::ui::element::LayoutContext;
+    #[cfg(feature = "db")]
+    "ProjectionTerm" => Internals: ipe_runtime_rust::db::ProjectionTerm;
+    #[cfg(feature = "db")]
+    "ProjectionOperand" => Internals: ipe_runtime_rust::db::ProjectionOperand;
+    #[cfg(feature = "db")]
+    "ArithOp" => Internals: ipe_runtime_rust::db::ArithOp;
 }
 
 const fn pinned(leaf: &str) -> bool {
