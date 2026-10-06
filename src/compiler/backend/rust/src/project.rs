@@ -2698,7 +2698,7 @@ const _: () = assert!(
 ///
 /// Every [`Diagnostic`] of [`assemble_project_text`] and of
 /// [`refuse_lexer_hazards`].
-pub(crate) fn assemble_project_files(
+pub fn assemble_project_files(
     ctx: &EmitCtx,
     rust_sources: Vec<(RelPath, String)>,
 ) -> DResult<EmittedProject> {
