@@ -920,15 +920,17 @@ fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliEr
         if !is_bindings {
             continue;
         }
-        if let Some(hit) = first_hit(&file)? {
+        if let Some(hit) = first_hit(&cache_root, &file)? {
             return Ok(Some(hit));
         }
     }
     Ok(None)
 }
 
-/// Run the shared [`panic_scan`] token scanner over one file, returning its first
+/// Run the shared [`panic_scan`] token scanner over one file below `root`, returning its first
 /// hit (lowest line) if any.
+///
+/// The file is read beneath `root`, every level held and never followed.
 ///
 /// Fail closed on a non-lexing file: a `_bindings.rs` the scanner cannot
 /// tokenise is opaque — the no-panic audit cannot attest its content. The
@@ -940,9 +942,8 @@ fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliEr
 /// # Errors
 /// [`CliError::Io`] on a file-read failure; [`CliError::PackageAudit`] when
 /// the file does not parse as Rust.
-fn first_hit(file: &Path) -> Result<Option<LocatedHit>, CliError> {
-    let src =
-        crate::io_bounded::read_to_string_capped(file, crate::io_bounded::FFI_CACHE_READ_CAP)?;
+fn first_hit(root: &Path, file: &Path) -> Result<Option<LocatedHit>, CliError> {
+    let src = crate::io_bounded::read_beneath(root, file, crate::io_bounded::FFI_CACHE_CAP)?;
     let hits = panic_scan::scan_str(&src).map_err(|_| {
         reject(
             Check::Provenance,
@@ -1095,32 +1096,34 @@ fn derive_disclosure(
     let entry = crate::driver::analysis_root_of(&prepared.manifest)?;
 
     // A library ships no runnable `Main.ipe`; `analysis_root_of` then points at
-    // the first exposed module (or a non-existent default). Absent an entry file,
-    // the package drives nothing of its own — an honest absence, not a fail-open
-    // default.
-    if !entry.is_file() {
+    // the first exposed module (or a non-existent default). Only an ABSENT entry
+    // is an honest absence; any other read failure (a link, a FIFO, a denied or
+    // oversized file) fails the audit closed rather than disclosing a permissive
+    // default for a source we cannot classify.
+    let read = crate::io_bounded::read_beneath(
+        &prepared.manifest.src_root,
+        &entry,
+        crate::io_bounded::SOURCE_CAP,
+    );
+    if let Err(CliError::Io { source, .. }) = &read
+        && source.kind() == std::io::ErrorKind::NotFound
+    {
         return Ok(Disclosure {
             control_model: ControlModelDisclosure::NotApplicable,
             capabilities: inferred,
         });
     }
-
-    // The entry file exists. Read + parse it. A read or parse failure fails the
-    // audit closed rather than disclosing a permissive default for a source we
-    // cannot classify.
-    let source =
-        crate::io_bounded::read_to_string_capped(&entry, crate::io_bounded::SOURCE_READ_CAP)
-            .map_err(|_| {
-                reject(
-                    Check::Capability,
-                    format!(
-                        "the package's entry source (`{}`) could not be read, so its control model \
+    let source = read.map_err(|_| {
+        reject(
+            Check::Capability,
+            format!(
+                "the package's entry source (`{}`) could not be read, so its control model \
                      cannot be derived. A program whose self-driving model the audit cannot state \
                      is refused rather than certified with an assumed model.",
-                        entry.display()
-                    ),
-                )
-            })?;
+                entry.display()
+            ),
+        )
+    })?;
     let mut interner = ipe_intern::Interner::new();
     let module = ipe_parse::parse_module(&source, &mut interner).map_err(|_| {
         reject(
@@ -1653,11 +1656,14 @@ fn check_one_dep_advisories(
     }
 }
 
+/// The workspace's cargo-deny config file name.
+const DENY_CONFIG: &str = "deny.toml";
+
 /// Locate the workspace's `deny.toml` so the supply-chain check applies the same
 /// posture the workspace CI does. Walks up from the current directory, then from
 /// the resolved runtime tree's ancestry (the runtime lives inside the workspace,
-/// so `deny.toml` sits at the workspace root above it). Returns `None` when no
-/// `deny.toml` is found.
+/// so `deny.toml` sits at the workspace root above it). Returns the directory
+/// holding it, or `None` when no `deny.toml` is found.
 fn locate_workspace_deny_config() -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
@@ -1669,9 +1675,8 @@ fn locate_workspace_deny_config() -> Option<PathBuf> {
     for root in roots {
         let mut here: Option<&Path> = Some(root.as_path());
         while let Some(dir) = here {
-            let candidate = dir.join("deny.toml");
-            if candidate.is_file() {
-                return Some(candidate);
+            if dir.join(DENY_CONFIG).is_file() {
+                return Some(dir.to_path_buf());
             }
             here = dir.parent();
         }
@@ -1693,11 +1698,14 @@ fn locate_workspace_deny_config() -> Option<PathBuf> {
 /// # Errors
 /// [`CliError::Io`] on a read/write failure.
 fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
-    let Some(source) = locate_workspace_deny_config() else {
+    let Some(workspace) = locate_workspace_deny_config() else {
         return Ok(None);
     };
-    let text =
-        crate::io_bounded::read_to_string_capped(&source, crate::io_bounded::SMALL_FILE_READ_CAP)?;
+    let text = crate::io_bounded::read_named_in(
+        &workspace,
+        &[DENY_CONFIG],
+        crate::io_bounded::SMALL_FILE_CAP,
+    )?;
 
     // Line-filter out the `[graph]` table (up to the next top-level `[section]`).
     // The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
@@ -2418,7 +2426,7 @@ mod tests {
         // Unterminated raw string — proc-macro2 cannot tokenise this.
         std::fs::write(&file, r#"fn f() { let x = r##"unterminated"#)
             .expect("write non-lexing fixture");
-        let result = super::first_hit(&file);
+        let result = super::first_hit(&dir, &file);
         assert!(
             result.is_err(),
             "a non-lexing _bindings.rs must return Err (refuse), not Ok(None)"
@@ -2433,7 +2441,7 @@ mod tests {
         let file = dir.join("x_bindings.rs");
         std::fs::write(&file, "pub fn add(a: i64, b: i64) -> i64 { a + b }")
             .expect("write clean fixture");
-        let result = super::first_hit(&file);
+        let result = super::first_hit(&dir, &file);
         assert!(result.is_ok(), "a clean file must return Ok(_)");
         assert!(
             result.unwrap().is_none(),
@@ -2448,7 +2456,7 @@ mod tests {
         let dir = make_test_dir("first-hit-panic");
         let file = dir.join("x_bindings.rs");
         std::fs::write(&file, "pub fn f() { panic!(\"oops\"); }").expect("write panic fixture");
-        let result = super::first_hit(&file);
+        let result = super::first_hit(&dir, &file);
         assert!(result.is_ok(), "a lexing file must return Ok(_)");
         assert!(
             result.unwrap().is_some(),
@@ -2539,6 +2547,31 @@ mod tests {
             "a library with no runnable entry discloses no control model"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A library whose entry module is a FIFO is refused, never disclosed as having no entry.
+    #[cfg(unix)]
+    #[test]
+    fn disclosure_refuses_a_fifo_entry_rather_than_disclosing_absence() {
+        let dir = make_test_dir("disclosure-fifo");
+        let src = dir.join("src");
+        assert!(std::fs::create_dir_all(&src).is_ok(), "create src/");
+        let made = std::process::Command::new("mkfifo")
+            .arg(src.join("MyLib.ipe"))
+            .status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo creates the fixture"
+        );
+        let mut prepared = make_prepared(&dir);
+        prepared.manifest.exposed_modules = vec!["MyLib".to_owned()];
+        let result = derive_disclosure(&prepared, BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&result, Err(CliError::PackageAudit(r)) if r.check == Check::Capability),
+            "a FIFO entry must fail the audit closed: {:?}",
+            result.as_ref().map(|d| &d.control_model)
+        );
     }
 
     #[test]

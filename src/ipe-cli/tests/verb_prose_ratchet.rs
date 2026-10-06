@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use ipe::CliError;
-use ipe::io_bounded::{SOURCE_READ_CAP, read_to_string_capped};
+use ipe::io_bounded::{SOURCE_READ_CAP, read_leaf_capped};
 
 /// Files allowed to spell a refused form: this scan, whose fixtures must.
 const EXEMPT: &[&str] = &["src/ipe-cli/tests/verb_prose_ratchet.rs"];
@@ -278,7 +278,7 @@ fn tracked() -> Vec<String> {
 
 /// The text of `path`, `None` for a file that is not UTF-8.
 fn text_of(path: &Path) -> Option<String> {
-    let read = read_to_string_capped(path, SOURCE_READ_CAP);
+    let read = read_leaf_capped(path, SOURCE_READ_CAP);
     let binary = matches!(
         &read,
         Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::InvalidData

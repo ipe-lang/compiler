@@ -5,17 +5,18 @@
 //! FIFO, never taking a terminal as the controlling one, refusing anything but
 //! a regular file by the type of the handle it opened, and never following a
 //! symlink in the final component. A file found by convention (`ipe.lock`, an
-//! index entry, a trust policy, `src/Main.ipe`) is read by [`read_in`] or
-//! [`read_to_string_capped`], both no-follow; a path the invoking user named
-//! is read by [`read_user_named`], the one open that follows a final symlink.
+//! index entry, a trust policy, `src/Main.ipe`) is read by [`read_in`],
+//! [`read_named_in`], [`read_beneath`] or [`read_leaf_capped`], all no-follow;
+//! a path the invoking user named is read by [`read_user_named`], the one open
+//! that follows a final symlink. Every caller picks one of them by who named
+//! the path; none inherits a policy from a shared default.
 //!
 //! Cap constants are declared here as the single source of truth so a new call
 //! site cannot silently introduce a different ceiling.
 
 use std::fs::File;
-use std::io::Read as _;
 use std::num::NonZeroU64;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use ipe_fs_open::{ByteCap, EntryName, HeldDir, OpenRefusal, RegularFile};
 
@@ -79,6 +80,12 @@ pub const FFI_CACHE_CAP: ByteCap = held_cap::<FFI_CACHE_READ_CAP>();
 
 /// [`SMALL_FILE_READ_CAP`] as a [`ByteCap`].
 pub const SMALL_FILE_CAP: ByteCap = held_cap::<SMALL_FILE_READ_CAP>();
+
+/// [`MANIFEST_READ_CAP`] as a [`ByteCap`].
+pub const MANIFEST_CAP: ByteCap = held_cap::<MANIFEST_READ_CAP>();
+
+/// [`SESSION_TRACE_READ_CAP`] as a [`ByteCap`].
+pub const SESSION_TRACE_CAP: ByteCap = held_cap::<SESSION_TRACE_READ_CAP>();
 
 // ── Regular-file open ─────────────────────────────────────────────────────────
 
@@ -312,6 +319,46 @@ pub fn read_named_in(dir: &Path, names: &[&str], cap: ByteCap) -> Result<String,
     read_in(dir, &rel, cap)
 }
 
+/// [`read_in`] for a `path` below `root`, spelled under `root` as written or as canonicalised.
+///
+/// For a convention file whose full path was derived from a trusted root (a
+/// manifest's source root, a containment-checked project file): every level
+/// below `root` is opened through the held level above it and never followed,
+/// so a link swapped in after the path was derived is refused.
+///
+/// # Errors
+///
+/// [`CliError::SourceRefused`] with [`SourceRefusal::NotRegularFile`] when
+/// `path` is not below `root` or a level is not one plain entry name;
+/// otherwise as [`read_in`].
+pub fn read_beneath(root: &Path, path: &Path, cap: ByteCap) -> Result<String, CliError> {
+    let not_below = || refusal_error(path, OpenRefusal::BadName);
+    let (base, rel) = match path.strip_prefix(root) {
+        Ok(rel) => (root.to_path_buf(), rel),
+        Err(_) => {
+            let canonical = std::fs::canonicalize(root).map_err(|_| not_below())?;
+            let rel = path.strip_prefix(&canonical).map_err(|_| not_below())?;
+            (canonical, rel)
+        }
+    };
+    let names = rel
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .map(|component| match component {
+            Component::Normal(name) => EntryName::parse(name),
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => Err(OpenRefusal::BadName),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|refusal| refusal_error(path, refusal))?;
+    if names.is_empty() {
+        return Err(not_below());
+    }
+    read_in(&base, &names, cap)
+}
+
 /// Read the file the invoking user named at `path` to a `String` under `cap`.
 ///
 /// The one open that follows a final symlink: the user named that exact path
@@ -325,6 +372,31 @@ pub fn read_user_named(path: &Path, cap: ByteCap) -> Result<String, CliError> {
     let file =
         RegularFile::open_user_named(path).map_err(|refusal| refusal_error(path, refusal))?;
     read_proven(file, path, cap)
+}
+
+/// Prove a handle the caller opened itself a regular file, for [`read_proven`].
+///
+/// `path` only names the file in errors.
+///
+/// # Errors
+///
+/// [`CliError::SourceRefused`] when the handle is not a regular file;
+/// [`CliError::Io`] when it cannot be stat'd.
+pub fn prove_regular(file: File, path: &Path) -> Result<RegularFile, CliError> {
+    RegularFile::prove(file).map_err(|refusal| refusal_error(path, refusal))
+}
+
+/// Read a file already proven regular on its own handle to a `String` under a `max`-byte budget.
+///
+/// The budget twin of [`read_proven`] for a running byte budget: a `max` of
+/// zero admits only an empty file.
+///
+/// # Errors
+///
+/// [`CliError::FileTooLarge`] past `max`; [`CliError::Io`] for content that
+/// is not UTF-8 or a failed read.
+pub fn read_proven_within(file: RegularFile, path: &Path, max: u64) -> Result<String, CliError> {
+    utf8(read_handle_bytes(file, path, max)?, path)
 }
 
 /// Read a file already proven regular on its own handle to a `String` under `cap`.
@@ -357,7 +429,7 @@ fn open_leaf(path: &Path) -> Result<RegularFile, CliError> {
 /// Read `file` as raw bytes, refusing (never truncating) one past `max` bytes.
 ///
 /// A `max` of zero admits only an empty file.
-fn read_leaf_bytes(file: RegularFile, path: &Path, max: u64) -> Result<Vec<u8>, CliError> {
+fn read_handle_bytes(file: RegularFile, path: &Path, max: u64) -> Result<Vec<u8>, CliError> {
     let too_large = || CliError::FileTooLarge {
         path: path.to_path_buf(),
         max,
@@ -377,18 +449,16 @@ fn read_leaf_bytes(file: RegularFile, path: &Path, max: u64) -> Result<Vec<u8>, 
 
 // ── Capped reader ─────────────────────────────────────────────────────────────
 
-/// Read a file to a `String`, refusing past `max` bytes with a typed
-/// [`CliError::FileTooLarge`] instead of allocating without a ceiling.
+/// Read the file a no-follow walk or a convention found at `path` to a `String` under `max` bytes.
 ///
+/// Never for a path the invoking user named: that is [`read_user_named`].
 /// The file is opened beneath its parent directory, never following a final
 /// symlink and never blocking, and proven regular on its own handle (as
-/// [`read_in`] with one entry). Reads at most `max + 1` bytes and checks the
-/// actual byte count, so it never buffers more than the cap. A file exactly at
-/// the cap succeeds; a file one byte over fails. Call it with the
-/// appropriate [`MANIFEST_READ_CAP`] / [`SOURCE_READ_CAP`] /
-/// [`FFI_CACHE_READ_CAP`] / [`SMALL_FILE_READ_CAP`] constant — never pass an
-/// ad-hoc magic number. A path the invoking user named is read with
-/// [`read_user_named`] instead.
+/// [`read_in`] with one entry); past `max` it is a typed
+/// [`CliError::FileTooLarge`], never an allocation without a ceiling. A file
+/// exactly at the cap succeeds; one byte over fails. Call it with a
+/// [`MANIFEST_READ_CAP`] / [`SOURCE_READ_CAP`] / [`FFI_CACHE_READ_CAP`] /
+/// [`SMALL_FILE_READ_CAP`] constant, never an ad-hoc number.
 ///
 /// # Errors
 ///
@@ -396,54 +466,35 @@ fn read_leaf_bytes(file: RegularFile, path: &Path, max: u64) -> Result<Vec<u8>, 
 /// - [`CliError::Io`] if the file cannot otherwise be opened or read.
 /// - [`CliError::FileTooLarge`] if the file exceeds `max` bytes.
 /// - [`CliError::Io`] (kind `InvalidData`) if the content is not valid UTF-8.
-pub fn read_to_string_capped(path: &Path, max: u64) -> Result<String, CliError> {
+pub fn read_leaf_capped(path: &Path, max: u64) -> Result<String, CliError> {
     let file = open_leaf(path)?;
-    utf8(read_leaf_bytes(file, path, max)?, path)
+    utf8(read_handle_bytes(file, path, max)?, path)
 }
 
 /// Read a source file a no-follow walk found, refusing a final symlink swapped in since.
 ///
-/// Capped at [`SOURCE_READ_CAP`] and opened as [`read_to_string_capped`] opens.
+/// Capped at [`SOURCE_READ_CAP`] and opened as [`read_leaf_capped`] opens.
 ///
 /// # Errors
 ///
-/// As [`read_to_string_capped`].
+/// As [`read_leaf_capped`].
 pub fn read_walked_source(path: &Path) -> Result<String, CliError> {
-    read_to_string_capped(path, SOURCE_READ_CAP)
+    read_leaf_capped(path, SOURCE_READ_CAP)
 }
 
-/// Read an already-opened `reader` to a `String` under a `max`-byte ceiling.
+/// Read the file a no-follow walk or a convention found at `path` as raw bytes under `max` bytes.
 ///
-/// For callers that vetted the handle itself (an `fstat` after an
-/// `O_NOFOLLOW` open beneath a held directory) and must read from THAT
-/// handle, not reopen the path. `path` only names the file in errors.
-///
-/// # Errors
-///
-/// - [`CliError::Io`] if the reader fails.
-/// - [`CliError::FileTooLarge`] if it yields more than `max` bytes.
-/// - [`CliError::Io`] (kind `InvalidData`) if the content is not valid UTF-8.
-pub fn read_opened_capped(
-    reader: impl std::io::Read,
-    path: &Path,
-    max: u64,
-) -> Result<String, CliError> {
-    utf8(read_opened_bytes_capped(reader, path, max)?, path)
-}
-
-/// Read the file at `path` as raw bytes under a `max`-byte ceiling.
-///
-/// The byte twin of [`read_to_string_capped`] for binaries (no UTF-8 check),
-/// opened the same no-follow way.
+/// The byte twin of [`read_leaf_capped`] for binaries (no UTF-8 check),
+/// opened the same no-follow way; never for a path the invoking user named.
 ///
 /// # Errors
 ///
 /// - [`CliError::SourceRefused`] if the path is a symlink, not a regular file, or may not be opened.
 /// - [`CliError::Io`] if the file cannot otherwise be opened or read.
 /// - [`CliError::FileTooLarge`] if the file exceeds `max` bytes.
-pub fn read_bytes_capped(path: &Path, max: u64) -> Result<Vec<u8>, CliError> {
+pub fn read_leaf_bytes_capped(path: &Path, max: u64) -> Result<Vec<u8>, CliError> {
     let file = open_leaf(path)?;
-    read_leaf_bytes(file, path, max)
+    read_handle_bytes(file, path, max)
 }
 
 /// `bytes` as UTF-8 text, or the typed `InvalidData` error naming `path`.
@@ -452,29 +503,6 @@ fn utf8(bytes: Vec<u8>, path: &Path) -> Result<String, CliError> {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
     })
-}
-
-/// Read at most `max` bytes from `reader`, refusing (never truncating) a source that yields more.
-fn read_opened_bytes_capped(
-    reader: impl std::io::Read,
-    path: &Path,
-    max: u64,
-) -> Result<Vec<u8>, CliError> {
-    let mut buf = Vec::new();
-    reader
-        .take(max.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(|e| CliError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {
-        return Err(CliError::FileTooLarge {
-            path: path.to_path_buf(),
-            max,
-        });
-    }
-    Ok(buf)
 }
 
 #[cfg(test)]
@@ -491,7 +519,7 @@ mod tests {
     #[test]
     fn under_cap_reads_full_content() {
         let p = write_temp("under", b"hello world");
-        let result = read_to_string_capped(&p, SMALL_FILE_READ_CAP);
+        let result = read_leaf_capped(&p, SMALL_FILE_READ_CAP);
         let _ = std::fs::remove_file(&p);
         assert_eq!(result.expect("under cap must succeed"), "hello world");
     }
@@ -500,7 +528,7 @@ mod tests {
     fn exactly_at_cap_is_ok() {
         let content = vec![b'a'; 16];
         let p = write_temp("exact", &content);
-        let result = read_to_string_capped(&p, 16);
+        let result = read_leaf_capped(&p, 16);
         let _ = std::fs::remove_file(&p);
         assert_eq!(result.expect("exactly at cap must succeed").len(), 16);
     }
@@ -509,7 +537,7 @@ mod tests {
     fn one_byte_over_cap_is_typed_error() {
         let content = vec![b'a'; 17];
         let p = write_temp("over", &content);
-        let result = read_to_string_capped(&p, 16);
+        let result = read_leaf_capped(&p, 16);
         let _ = std::fs::remove_file(&p);
         assert!(
             matches!(result, Err(CliError::FileTooLarge { .. })),
@@ -523,7 +551,7 @@ mod tests {
         // 512 KiB + 1 byte; the literal avoids a u64→usize cast lint in tests.
         let content = vec![b'x'; 512 * 1024 + 1];
         let p = write_temp("manifest_over", &content);
-        let result = read_to_string_capped(&p, MANIFEST_READ_CAP);
+        let result = read_leaf_capped(&p, MANIFEST_READ_CAP);
         let _ = std::fs::remove_file(&p);
         assert!(
             matches!(result, Err(CliError::FileTooLarge { .. })),
@@ -534,9 +562,9 @@ mod tests {
     #[test]
     fn bytes_capped_reads_non_utf8_at_cap_and_refuses_one_over() {
         let at = write_temp("bytes_at", &[0xff; 16]);
-        let at_result = read_bytes_capped(&at, 16);
+        let at_result = read_leaf_bytes_capped(&at, 16);
         let over = write_temp("bytes_over", &[0xff; 17]);
-        let over_result = read_bytes_capped(&over, 16);
+        let over_result = read_leaf_bytes_capped(&over, 16);
         let _ = std::fs::remove_file(&at);
         let _ = std::fs::remove_file(&over);
         assert_eq!(at_result.expect("at cap must succeed"), vec![0xff; 16]);
@@ -549,7 +577,7 @@ mod tests {
     #[test]
     fn missing_file_is_io_error() {
         let p = std::path::PathBuf::from("/nonexistent/path/that/cannot/exist");
-        let result = read_to_string_capped(&p, 1024);
+        let result = read_leaf_capped(&p, 1024);
         assert!(
             matches!(result, Err(CliError::Io { .. })),
             "missing file must be Io error"
@@ -586,7 +614,7 @@ mod tests {
         let dir = scratch_dir("fifo");
         let fifo = dir.join("Main.ipe");
         make_fifo(&fifo);
-        let convention = read_to_string_capped(&fifo, SOURCE_READ_CAP);
+        let convention = read_leaf_capped(&fifo, SOURCE_READ_CAP);
         let walked = read_walked_source(&fifo);
         let held = read_in(&dir, &[entry("Main.ipe")], SOURCE_CAP);
         let named = read_user_named(&fifo, SOURCE_CAP);
@@ -609,7 +637,7 @@ mod tests {
     #[test]
     fn directory_is_refused_as_not_a_regular_file() {
         let dir = scratch_dir("isdir");
-        let result = read_to_string_capped(&dir, SOURCE_READ_CAP);
+        let result = read_leaf_capped(&dir, SOURCE_READ_CAP);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             matches!(
@@ -656,9 +684,9 @@ mod tests {
         let link = dir.join("ipe.lock");
         std::os::unix::fs::symlink(&target, &link).expect("link the file");
         std::os::unix::fs::symlink(&real_dir, dir.join("linked")).expect("link the dir");
-        let convention = read_to_string_capped(&link, SMALL_FILE_READ_CAP);
+        let convention = read_leaf_capped(&link, SMALL_FILE_READ_CAP);
         let walked = read_walked_source(&link);
-        let bytes = read_bytes_capped(&link, SMALL_FILE_READ_CAP);
+        let bytes = read_leaf_bytes_capped(&link, SMALL_FILE_READ_CAP);
         let held = read_in(&dir, &[entry("ipe.lock")], SMALL_FILE_CAP);
         let through_dir = read_in(&dir, &[entry("linked"), entry("ipe.lock")], SMALL_FILE_CAP);
         let real = read_in(&dir, &[entry("real"), entry("ipe.lock")], SMALL_FILE_CAP);
@@ -688,7 +716,7 @@ mod tests {
         std::fs::write(&target, "module Real exposing (..)\n").expect("write target");
         std::os::unix::fs::symlink(&target, &link).expect("create symlink");
         let named = read_user_named(&link, SOURCE_CAP);
-        let convention = read_to_string_capped(&link, SOURCE_READ_CAP);
+        let convention = read_leaf_capped(&link, SOURCE_READ_CAP);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(named.ok().as_deref(), Some("module Real exposing (..)\n"));
         assert!(
@@ -792,7 +820,7 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))
             .expect("drop the read bit");
         let privileged = std::fs::File::open(&file).is_ok();
-        let result = read_to_string_capped(&file, SOURCE_READ_CAP);
+        let result = read_leaf_capped(&file, SOURCE_READ_CAP);
         let _ = std::fs::remove_dir_all(&dir);
         if privileged {
             return;

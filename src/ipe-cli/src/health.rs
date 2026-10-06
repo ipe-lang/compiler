@@ -728,7 +728,7 @@ fn linker_already_configured() -> bool {
         return false;
     };
     let Ok(text) =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
+        crate::io_bounded::read_leaf_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
     else {
         return false;
     };
@@ -901,8 +901,7 @@ fn probe_cache_path() -> Option<PathBuf> {
 fn read_probe_cache(name: &str, toolchain_key: Option<&str>) -> Option<LinkerProbeResult> {
     let path = probe_cache_path()?;
     let text =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
-            .ok()?;
+        crate::io_bounded::read_leaf_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP).ok()?;
     let doc: toml::Table = text.parse().ok()?;
     let entry = doc.get(name)?.as_table()?;
     // If the cached entry carries a toolchain key that differs from the running
@@ -928,7 +927,7 @@ fn write_probe_cache(name: &str, toolchain_key: Option<&str>, result: &LinkerPro
     let accepted = matches!(result, LinkerProbeResult::Accepted);
     // Read the existing cache (if any) so we preserve other linkers' entries.
     let existing =
-        crate::io_bounded::read_to_string_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
+        crate::io_bounded::read_leaf_capped(&path, crate::io_bounded::SMALL_FILE_READ_CAP)
             .unwrap_or_default();
     let mut doc = existing
         .parse::<toml_edit::DocumentMut>()
@@ -1003,12 +1002,18 @@ fn check_cache() -> Check {
 
 /// Whether the ipe-managed shared build target is configured, and — when it is
 /// not — offer to set it up under `$IPE_HOME/target`.
-// A `match` reads clearer than a `map_or_else` over two full `Check` literals.
-#[allow(clippy::option_if_let_else, clippy::single_match_else)]
 fn check_shared_target() -> Check {
     let configured = ipe_home_config_value(&["build", "target-dir"]);
     match configured {
-        Some(dir) => Check {
+        HomeConfigValue::Unreadable(error) => Check {
+            group: Group::Target,
+            id: "shared-target",
+            status: Status::Unknown,
+            detail: format!("the shared build target cannot be determined: {error}"),
+            suggestion: None,
+            fix: None,
+        },
+        HomeConfigValue::Set(dir) => Check {
             group: Group::Target,
             id: "shared-target",
             status: Status::Ok,
@@ -1016,7 +1021,7 @@ fn check_shared_target() -> Check {
             suggestion: None,
             fix: None,
         },
-        None => {
+        HomeConfigValue::Unset => {
             let target_dir = runtime_embed::ipe_home()
                 .map_or_else(|_| PathBuf::from("target"), |h| h.join("target"));
             Check {
@@ -1293,22 +1298,45 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Read a dotted string value from `$IPE_HOME/config.toml`, or `None` when the
-/// file is absent, a symlink, unreadable, unparseable, or lacks the key.
-fn ipe_home_config_value(key: &[&str]) -> Option<String> {
-    let home = runtime_embed::ipe_home().ok()?;
-    let text = crate::io_bounded::read_named_in(
-        &home,
+/// What a home config file says for one dotted key.
+#[derive(Debug)]
+enum HomeConfigValue {
+    /// The key holds this string.
+    Set(String),
+    /// No home resolves, or the file is absent, unparseable, or lacks the key.
+    Unset,
+    /// The file is there but was refused or could not be read: a link, a
+    /// FIFO, a denied or oversized file.
+    Unreadable(CliError),
+}
+
+/// Read a dotted string value from `$IPE_HOME/config.toml`.
+fn ipe_home_config_value(key: &[&str]) -> HomeConfigValue {
+    runtime_embed::ipe_home().map_or(HomeConfigValue::Unset, |home| home_config_value(&home, key))
+}
+
+/// Read a dotted string value from `config.toml` in `home`, never following a link there.
+fn home_config_value(home: &Path, key: &[&str]) -> HomeConfigValue {
+    let text = match crate::io_bounded::read_named_in(
+        home,
         &["config.toml"],
         crate::io_bounded::SMALL_FILE_CAP,
-    )
-    .ok()?;
-    let doc: toml::Table = text.parse().ok()?;
-    let mut node = &toml::Value::Table(doc);
-    for segment in key {
-        node = node.as_table()?.get(*segment)?;
-    }
-    node.as_str().map(str::to_owned)
+    ) {
+        Ok(text) => text,
+        Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return HomeConfigValue::Unset;
+        }
+        Err(error) => return HomeConfigValue::Unreadable(error),
+    };
+    let lookup = || {
+        let doc: toml::Table = text.parse().ok()?;
+        let mut node = &toml::Value::Table(doc);
+        for segment in key {
+            node = node.as_table()?.get(*segment)?;
+        }
+        node.as_str().map(str::to_owned)
+    };
+    lookup().map_or(HomeConfigValue::Unset, HomeConfigValue::Set)
 }
 
 /// Free bytes on the filesystem holding `dir`. `None` when the platform query is
@@ -1704,16 +1732,16 @@ fn run_install(argv: &[String]) -> Result<(), CliError> {
 /// existing file does not parse as TOML (the command will not blindly overwrite
 /// a file it cannot understand).
 fn apply_config_edit(path: &Path, key: &[&str], value: &ConfigValue) -> Result<(), CliError> {
-    let existing = match crate::io_bounded::read_to_string_capped(
-        path,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    ) {
-        Ok(text) => text,
-        Err(CliError::Io { ref source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            String::new()
-        }
-        Err(e) => return Err(e),
-    };
+    let existing =
+        match crate::io_bounded::read_leaf_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP) {
+            Ok(text) => text,
+            Err(CliError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                String::new()
+            }
+            Err(e) => return Err(e),
+        };
 
     let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| {
         CliError::Usage(crate::text::msg::health_config_not_toml(
@@ -1947,8 +1975,59 @@ mod tests {
         );
     }
 
+    /// A home config that is a link is reported unreadable, never read as unset.
+    #[cfg(unix)]
     #[test]
-    #[cfg(not(windows))]
+    fn a_symlinked_home_config_is_unreadable_not_unset() {
+        let home =
+            ipe_test_temp::temp_root().join(format!("ipe_health_home_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(std::fs::create_dir_all(&home).is_ok(), "make home");
+        let real = home.join("real.toml");
+        assert!(
+            std::fs::write(&real, "[build]\ntarget-dir = \"/t\"\n").is_ok(),
+            "write real config"
+        );
+        assert!(
+            std::os::unix::fs::symlink(&real, home.join("config.toml")).is_ok(),
+            "plant the config link"
+        );
+        let linked = home_config_value(&home, &["build", "target-dir"]);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            matches!(
+                &linked,
+                HomeConfigValue::Unreadable(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a linked home config must be unreadable: {linked:?}"
+        );
+    }
+
+    /// An absent home config is unset; a present one yields its key.
+    #[test]
+    fn a_home_config_is_unset_when_absent_and_set_when_present() {
+        let home = ipe_test_temp::temp_root()
+            .join(format!("ipe_health_home_plain_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(std::fs::create_dir_all(&home).is_ok(), "make home");
+        let absent = home_config_value(&home, &["build", "target-dir"]);
+        assert!(
+            std::fs::write(home.join("config.toml"), "[build]\ntarget-dir = \"/t\"\n").is_ok(),
+            "write config"
+        );
+        let present = home_config_value(&home, &["build", "target-dir"]);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(matches!(absent, HomeConfigValue::Unset), "{absent:?}");
+        assert!(
+            matches!(&present, HomeConfigValue::Set(dir) if dir == "/t"),
+            "{present:?}"
+        );
+    }
+
+    #[test]
     fn cargo_config_path_honours_an_absolute_cargo_home_and_defaults_when_unset_or_empty() {
         let home = crate::env_dir::HomeDir::try_parse(Some("/home/u".into()))
             .expect("an absolute test home");

@@ -105,16 +105,18 @@ fn run_fmt_inplace(
     format: crate::cli_args::OutputFormat,
 ) -> Result<(), CliError> {
     let root = PathBuf::from(path.unwrap_or("."));
-    let files = collect_ipe_files(&root)?;
+    // A file reached by walking a directory must stay inside it; only an
+    // explicitly named file may be a symlink to elsewhere.
+    let (walked, files) = match collect_ipe_files(&root)? {
+        FmtTargets::Named(file) => (false, vec![file]),
+        FmtTargets::Walked(files) => (true, files),
+    };
     if files.is_empty() {
         return Err(CliError::Usage(crate::text::msg::fmt_no_files(
             &root.display(),
         )));
     }
 
-    // A file reached by walking a directory must stay inside it; only an
-    // explicitly named file may be a symlink to elsewhere.
-    let walked = !root.is_file();
     let mut unformatted: Vec<PathBuf> = Vec::new();
     for file in &files {
         let src = if walked {
@@ -278,11 +280,19 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
     }
 }
 
+/// The files one `ipe fmt` run formats, typed by who named them.
+enum FmtTargets {
+    /// The one file the user named.
+    Named(PathBuf),
+    /// Every `.ipe` a walk of the named directory found, sorted.
+    Walked(Vec<PathBuf>),
+}
+
 /// Collect every `.ipe` file governed by `root`: a single file if `root` is one,
 /// otherwise every `.ipe` under the directory tree (deterministically sorted).
-fn collect_ipe_files(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+fn collect_ipe_files(root: &Path) -> Result<FmtTargets, CliError> {
     if root.is_file() {
-        return Ok(vec![root.to_path_buf()]);
+        return Ok(FmtTargets::Named(root.to_path_buf()));
     }
     if !root.is_dir() {
         return Err(CliError::Usage(crate::text::msg::fmt_no_such_path(
@@ -320,5 +330,5 @@ fn collect_ipe_files(root: &Path) -> Result<Vec<PathBuf>, CliError> {
         }
     }
     out.sort();
-    Ok(out)
+    Ok(FmtTargets::Walked(out))
 }

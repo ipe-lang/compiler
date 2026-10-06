@@ -378,10 +378,8 @@ fn embed_floor(
     floor_static: &str,
 ) -> Result<(), CliError> {
     let main_rs = crate_dir.path_to(Path::new("src").join("main.rs"))?;
-    let existing = crate::io_bounded::read_to_string_capped(
-        &main_rs.path(),
-        crate::io_bounded::SOURCE_READ_CAP,
-    )?;
+    let existing =
+        crate::io_bounded::read_leaf_capped(&main_rs.path(), crate::io_bounded::SOURCE_READ_CAP)?;
     let with_floor = embed_floor_text(&existing, floor_static)?;
     if with_floor == existing {
         return Ok(());
@@ -525,7 +523,7 @@ fn verify_artifact_under(
 ) -> Result<VerifiedArtifact, CliError> {
     // Parse the profile mirror strictly (parse-fail ⇒ refuse).
     let profile_text =
-        crate::io_bounded::read_to_string_capped(profile_path, run_jail::PROFILE_READ_CAP)?;
+        crate::io_bounded::read_leaf_capped(profile_path, run_jail::PROFILE_READ_CAP)?;
     let profile = run_jail::parse_profile(&profile_text).map_err(|e| {
         CliError::Usage(crate::text::msg::run_profile_unparsable(
             &RunJailDefect::ProfileWeakerThanFloor.code().as_str(),
@@ -537,7 +535,7 @@ fn verify_artifact_under(
     // (passively — the binary is NOT executed). The floor must be readable,
     // a release build's, and no narrower than the profile — the one check the
     // release wrapper applies too.
-    let bytes = crate::io_bounded::read_bytes_capped(binary_path, binary_cap)?;
+    let bytes = crate::io_bounded::read_leaf_bytes_capped(binary_path, binary_cap)?;
     // The refusal's text is the jail's own, the one the release wrapper
     // prints too.
     if let Err(refusal) = run_jail::verify_release_floor(&profile, &bytes) {

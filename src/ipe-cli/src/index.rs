@@ -674,8 +674,9 @@ pub fn validate_entry_file(path: &Path) -> Result<IndexEntry, CliError> {
             CliError::Usage(crate::text::msg::index_entry_path_invalid(&path.display()))
         })?;
     let name = PackageName::parse(name)?;
-    let text =
-        crate::io_bounded::read_to_string_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP)?;
+    // Named on the command line, but the file comes from an untrusted registry
+    // checkout: a link there is refused, never followed.
+    let text = crate::io_bounded::read_leaf_capped(path, crate::io_bounded::SMALL_FILE_READ_CAP)?;
     parse_entry(&name, &text)
 }
 
