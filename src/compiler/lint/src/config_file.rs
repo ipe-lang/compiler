@@ -346,4 +346,26 @@ mod tests {
             Some(Err(LintConfigLoadError::Read(WorkspaceReadError::NotAFile)))
         ));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_lint_ipe_is_refused() {
+        let dir = scratch("sock");
+        let bound = std::os::unix::net::UnixListener::bind(dir.join(LINT_CONFIG_FILE));
+        assert!(bound.is_ok(), "bind: {bound:?}");
+        assert!(matches!(
+            load_lint_config(&dir),
+            Err(LintConfigLoadError::Read(WorkspaceReadError::NotAFile))
+        ));
+    }
+
+    #[test]
+    fn a_file_where_the_directory_is_is_unreadable_not_absent() {
+        let dir = scratch("notdir");
+        assert!(std::fs::write(dir.join("d"), "").is_ok());
+        assert!(matches!(
+            read_workspace_file(&dir.join("d"), &entry("f"), cap(16)),
+            Err(WorkspaceReadError::Unreadable(_))
+        ));
+    }
 }
