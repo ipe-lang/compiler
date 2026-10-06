@@ -3148,8 +3148,12 @@ lteByNamed col codec v =
 
 -- | `like accessor pattern` — the rows where the `String` column named by
 -- `accessor` matches the SQL `LIKE` `pattern`. The pattern binds as a
--- parameter (wildcards `%` / `_` are DATA the SQL engine interprets, never
--- SQL text the caller injects). The accessor must name a `String` field.
+-- parameter, never as SQL text. It is still a pattern: `%` and `_` in it,
+-- including any that come from user text, are wildcards. It is read under
+-- `ESCAPE '\'` on every engine, so `\%`, `\_` and `\\` match `%`, `_` and `\`
+-- literally; a pattern ending in an unpaired `\` is refused as a typed error.
+-- For a literal prefix, use `Sql.startsWith`. The accessor must name a
+-- `String` field.
 --
 -- Example:
 --
