@@ -35,9 +35,17 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 /// Compile `tests/golden/<name>/Main.ipe` into an emitted Rust project and return
 /// its directory. Fails the test loudly on a compile error.
 fn compile_golden(name: &str) -> PathBuf {
+    compile_golden_into(name, &format!("ipec_{name}_e2e"))
+}
+
+/// Compile `tests/golden/<name>/Main.ipe` into the scratch directory `scratch`.
+///
+/// A test building a golden another test also builds takes its own directory,
+/// so the two never race on one emitted project.
+fn compile_golden_into(name: &str, scratch: &str) -> PathBuf {
     let root = repo_root();
     let entry = golden_dir(&root, name).join("Main.ipe");
-    let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
+    let out = crate::support::scratch_root().join(scratch);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
@@ -109,4 +117,53 @@ fn recursion_normal_depth_runs_clean_and_returns_value() {
         out.exit_code
     );
     assert_eq!(out.stdout.trim(), "500500");
+}
+
+/// A malformed `IPE_RECURSION_LIMIT` refuses the program before its first line.
+///
+/// The refusal is exit 1, stderr naming the variable, and none of the program's
+/// output. The same binary under a well-formed value runs normally, so the
+/// refusal is the value, not the build.
+#[test]
+fn malformed_recursion_limit_refuses_before_first_line() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let name = "recursion_normal_depth";
+    let dir = compile_golden_into(name, "ipec_recursion_env_refusal_e2e");
+
+    let refused = crate::support::build_and_run_emitted_capturing_stderr_with_env(
+        name,
+        &dir,
+        &[("IPE_RECURSION_LIMIT", "10k")],
+    );
+    assert_eq!(
+        refused.exit_code,
+        Some(1),
+        "a malformed IPE_RECURSION_LIMIT must refuse with exit 1\n--- stderr ---\n{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("IPE_RECURSION_LIMIT"),
+        "the refusal must name the variable\n--- stderr ---\n{}",
+        refused.stderr
+    );
+    assert!(
+        !refused.stdout.contains("500500"),
+        "the program must not run past a refused limit\n--- stdout ---\n{}",
+        refused.stdout
+    );
+
+    let control = crate::support::build_and_run_emitted_capturing_stderr_with_env(
+        name,
+        &dir,
+        &[("IPE_RECURSION_LIMIT", "20000")],
+    );
+    assert_eq!(
+        control.exit_code,
+        Some(0),
+        "a well-formed IPE_RECURSION_LIMIT must run normally\n--- stderr ---\n{}",
+        control.stderr
+    );
+    assert_eq!(control.stdout.trim(), "500500");
 }

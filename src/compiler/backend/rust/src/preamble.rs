@@ -211,6 +211,35 @@ mod tests {
         Ok(())
     }
 
+    /// The emitted `main` runs the runtime's startup checks before the entry.
+    ///
+    /// `install_panic_classifier` refuses a malformed `IPE_RECURSION_LIMIT` (and
+    /// `IPE_LOG_LEVEL`) before the program's first line, so it must precede the
+    /// entry under both the `block_on` form and the `run_blocking` form a shaped
+    /// application substitutes at the same site.
+    #[test]
+    fn epilogue_installs_classifier_before_entry() -> DResult<()> {
+        const INSTALL: &str = "install_panic_classifier();";
+        let tail = epilogue()?;
+        let shaped = tail.replace("block_on(ipe_main())", "ipe_main().run_blocking()");
+        for (text, entry) in [(&tail, "block_on("), (&shaped, "run_blocking(")] {
+            let install = text.find(INSTALL);
+            let call = text.find(entry);
+            assert!(
+                install.is_some() && call.is_some(),
+                "the epilogue carries `{INSTALL}` and `{entry}`: {text}"
+            );
+            let (Some(install), Some(call)) = (install, call) else {
+                return Ok(());
+            };
+            assert!(
+                install < call,
+                "`{INSTALL}` must run before `{entry}`: {text}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn epilogue_starts_with_list_helpers_and_ends_with_main() -> DResult<()> {
         assert!(epilogue()?.starts_with("// List helpers"));

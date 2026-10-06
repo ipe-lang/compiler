@@ -3462,7 +3462,7 @@ mod env_ceiling_tests {
 
     /// The functions that read the environment and parse a number without
     /// [`EnvCeiling`], as `(file, fn, why)`.
-    const NON_CEILING_READS: [(&str, &str, &str); 5] = [
+    const NON_CEILING_READS: [(&str, &str, &str); 3] = [
         (
             "control.rs",
             "control_port_from_env",
@@ -3477,16 +3477,6 @@ mod env_ceiling_tests {
             "server.rs",
             "build_request",
             "the number parsed is a request's `Content-Length`; the environment read is `IPE_TRUSTED_PROXY`",
-        ),
-        (
-            "regex_kernel.rs",
-            "regex_max_input_bytes",
-            "pending: the regex kernels have no error channel to refuse through",
-        ),
-        (
-            "core.rs",
-            "recursion_limit",
-            "pending: the depth guard has no error channel to refuse through",
         ),
     ];
 

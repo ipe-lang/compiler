@@ -5,37 +5,48 @@
 //! string (parse, don't validate).
 
 use super::{IpeMaybe, IpeResult};
-use std::sync::Arc;
+use crate::system::{EnvCeiling, EnvCeilingRefusal, ZeroCeiling};
+use std::sync::{Arc, OnceLock};
 
 /// Subject-length ceiling (default 16 MiB) shared by every `Ipe.Regex`
-/// operation. The `regex` crate is linear-time (RE2, no catastrophic
-/// backtracking) and `Regex::new` bounds COMPILE via its 10 MB `size_limit`,
-/// but the SUBJECT is otherwise unbounded: a multi-hundred-MB attacker-supplied
-/// string handed to `findAll` on `\b` allocates tens of millions of small
-/// `String`s. Bounded by construction (PRINCIPLES §3, and §1's exhaustion
-/// clause when the subject arrives over the network): past this ceiling each
-/// operation returns its total safe outcome (no match / no split / identity)
-/// rather than being driven through an unbounded scan-and-collect. Mirrors the
-/// sibling decode caps (`IPE_CSV_MAX_BYTES`, `IPE_DECOMPRESS_MAX_BYTES`,
-/// `DEFAULT_SEAL_MAX_INPUT_BYTES`). Overridable via `IPE_REGEX_MAX_INPUT_BYTES`.
-fn regex_max_input_bytes() -> usize {
-    crate::system::read_env_var("IPE_REGEX_MAX_INPUT_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(16 * 1024 * 1024)
+/// operation, read from `IPE_REGEX_MAX_INPUT_BYTES`.
+///
+/// The `regex` crate is linear-time (RE2, no catastrophic backtracking) and
+/// `Regex::new` bounds COMPILE via its 10 MB `size_limit`, but the SUBJECT is
+/// otherwise unbounded: a multi-hundred-MB attacker-supplied string handed to
+/// `findAll` on `\b` allocates tens of millions of small `String`s. Past this
+/// ceiling each operation returns its total safe outcome (no match / no split /
+/// identity) rather than being driven through an unbounded scan-and-collect. A
+/// present value must be a positive decimal byte count; anything else (`0`
+/// included) makes [`regex_compile`] return `Err` naming the variable.
+const REGEX_INPUT_CEILING: EnvCeiling = EnvCeiling::new(
+    "IPE_REGEX_MAX_INPUT_BYTES",
+    16 * 1024 * 1024,
+    ZeroCeiling::Refused,
+    "decimal byte count",
+);
+
+/// The process's one snapshot of [`REGEX_INPUT_CEILING`], parsed at the first
+/// `Regex.compile`; a later `System.setenv` does not move it.
+fn regex_input_ceiling() -> Result<usize, EnvCeilingRefusal> {
+    static CAP: OnceLock<Result<usize, EnvCeilingRefusal>> = OnceLock::new();
+    CAP.get_or_init(|| REGEX_INPUT_CEILING.read::<usize>())
+        .clone()
 }
 
-/// The single fail-closed gate all five entrypoints share: is `s` within the
-/// declared subject ceiling? A subject past the bound is turned back at the
-/// boundary before any scan begins.
-fn within_input_ceiling(s: &str) -> bool {
-    s.len() <= regex_max_input_bytes()
+/// Whether `s` is within the subject ceiling `re` was compiled under.
+///
+/// The single fail-closed gate all five entrypoints share: a subject past the
+/// bound is turned back at the boundary before any scan begins.
+const fn within_input_ceiling(re: &Regex, s: &str) -> bool {
+    s.len() <= re.max_input
 }
 
-/// `Ipe.Regex`'s opaque compiled-pattern handle. Newtype over an `Arc`-shared
-/// [`regex::Regex`] so cloning is a refcount bump (a `Regex` value may flow
-/// through several call sites).
+/// `Ipe.Regex`'s opaque compiled-pattern handle.
+///
+/// Holds an `Arc`-shared [`regex::Regex`], so cloning is a refcount bump (a
+/// `Regex` value may flow through several call sites), and the subject ceiling
+/// parsed when it was compiled, so no handle exists without a parsed ceiling.
 ///
 /// Deliberately carries only `Clone`: `regex::Regex` is neither `PartialEq`,
 /// `Eq`, `Hash`, `Ord` nor serde, so the opaque handle inherits none of those.
@@ -44,65 +55,88 @@ fn within_input_ceiling(s: &str) -> bool {
 /// silent wrong behaviour. `Debug` is derived (prints the source pattern),
 /// backing `{{…}}` interpolation through the runtime's `Debug`-based stringify fallback.
 #[derive(Clone, Debug)]
-pub struct Regex(Arc<regex::Regex>);
+pub struct Regex {
+    re: Arc<regex::Regex>,
+    max_input: usize,
+}
 
 crate::stringify::show_row!("Regex", Redacted, [] Regex, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 /// `Regex.compile : String -> Result Error Regex` — THE construction boundary.
 /// Every [`Regex`] value traces back to one of these calls; an invalid pattern
-/// surfaces here as a typed `Err`, never anywhere downstream as a silent
-/// no-match.
+/// or a malformed `IPE_REGEX_MAX_INPUT_BYTES` surfaces here as a typed `Err`,
+/// never anywhere downstream as a silent no-match or a default ceiling.
 #[must_use]
 pub fn regex_compile<E: From<String>>(pattern: String) -> IpeResult<E, Regex> {
-    match regex::Regex::new(&pattern) {
-        Ok(re) => IpeResult::Ok(Regex(Arc::new(re))),
+    compile_within(&pattern, regex_input_ceiling())
+}
+
+/// Compiles `pattern` under an already parsed subject `ceiling`.
+///
+/// A refused ceiling is the `Err`, before the pattern is compiled.
+fn compile_within<E: From<String>>(
+    pattern: &str,
+    ceiling: Result<usize, EnvCeilingRefusal>,
+) -> IpeResult<E, Regex> {
+    let max_input = match ceiling {
+        Ok(max_input) => max_input,
+        Err(refusal) => return IpeResult::Err(E::from(String::from(refusal))),
+    };
+    match regex::Regex::new(pattern) {
+        Ok(re) => IpeResult::Ok(Regex {
+            re: Arc::new(re),
+            max_input,
+        }),
         Err(e) => IpeResult::Err(format!("Ipe.Regex: invalid pattern: {e}").into()),
     }
 }
 
 /// `Regex.match : Regex -> String -> Bool` — does the pattern match anywhere?
-/// A subject past the shared ceiling yields `false` (fail-closed: absent a
+/// A subject past the handle's ceiling yields `false` (fail-closed: absent a
 /// bounded scan, the safe answer is "no proven match").
 #[must_use]
 pub fn regex_match(re: Regex, s: String) -> bool {
-    within_input_ceiling(&s) && re.0.is_match(&s)
+    within_input_ceiling(&re, &s) && re.re.is_match(&s)
 }
 
 /// `Regex.find : Regex -> String -> Maybe String` — first match, if any.
-/// A subject past the shared ceiling yields `Nothing` (fail-closed).
+/// A subject past the handle's ceiling yields `Nothing` (fail-closed).
 #[must_use]
 pub fn regex_find(re: Regex, s: String) -> IpeMaybe<String> {
-    if !within_input_ceiling(&s) {
+    if !within_input_ceiling(&re, &s) {
         return IpeMaybe::Nothing;
     }
-    match re.0.find(&s) {
+    match re.re.find(&s) {
         Some(m) => IpeMaybe::Just(m.as_str().to_string()),
         None => IpeMaybe::Nothing,
     }
 }
 
 /// `Regex.findAll : Regex -> String -> List String` — every match, in order.
-/// A subject past the shared ceiling yields the empty list (fail-closed: no
+/// A subject past the handle's ceiling yields the empty list (fail-closed: no
 /// unbounded `Vec<String>` collect over an oversized subject).
 #[must_use]
 pub fn regex_find_all(re: Regex, s: String) -> Vec<String> {
-    if !within_input_ceiling(&s) {
+    if !within_input_ceiling(&re, &s) {
         return Vec::new();
     }
-    re.0.find_iter(&s).map(|m| m.as_str().to_string()).collect()
+    re.re
+        .find_iter(&s)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 /// `Regex.replace : Regex -> String -> String -> String` — replace every match
 /// with `replacement` (RE2 `$1` substitution syntax).
-/// A subject past the shared ceiling is returned unchanged (fail-closed: the
+/// A subject past the handle's ceiling is returned unchanged (fail-closed: the
 /// identity is the total safe outcome, applying no replacements rather than
 /// scanning an oversized subject).
 #[must_use]
 pub fn regex_replace(re: Regex, replacement: String, s: String) -> String {
-    if !within_input_ceiling(&s) {
+    if !within_input_ceiling(&re, &s) {
         return s;
     }
-    re.0.replace_all(&s, replacement.as_str()).to_string()
+    re.re.replace_all(&s, replacement.as_str()).to_string()
 }
 
 /// `Regex.split : Regex -> String -> List String` — split on every match.
@@ -113,14 +147,14 @@ pub fn regex_replace(re: Regex, replacement: String, s: String) -> String {
 /// Implements this by tracking the start of the most recent match manually.
 #[must_use]
 pub fn regex_split(re: Regex, s: String) -> Vec<String> {
-    // A subject past the shared ceiling yields the whole subject as one field
+    // A subject past the handle's ceiling yields the whole subject as one field
     // (fail-closed: the no-split outcome, applying no split rather than
     // collecting one owned String per match over an oversized subject).
-    if !within_input_ceiling(&s) {
+    if !within_input_ceiling(&re, &s) {
         return vec![s];
     }
     // A non-empty pattern against empty input yields one empty field.
-    if !re.0.as_str().is_empty() && s.is_empty() {
+    if !re.re.as_str().is_empty() && s.is_empty() {
         return vec![String::new()];
     }
     let mut out: Vec<String> = Vec::new();
@@ -128,17 +162,23 @@ pub fn regex_split(re: Regex, s: String) -> Vec<String> {
     // `end` tracks the START offset of the most recent match;
     // the trailing field is suppressed when it reaches len(s).
     let mut end: usize = 0;
-    for m in re.0.find_iter(&s) {
+    for m in re.re.find_iter(&s) {
         end = m.start();
         // Skip the field for a match ending at byte 0 — drops the leading
-        // empty produced by a zero-width match at position 0.
-        if m.end() != 0 {
-            out.push(s[beg..end].to_string());
+        // empty produced by a zero-width match at position 0. Match offsets
+        // lie on char boundaries, so each piece is `Some`; a `None` pushes
+        // nothing.
+        if m.end() != 0
+            && let Some(piece) = s.get(beg..end)
+        {
+            out.push(piece.to_string());
         }
         beg = m.end();
     }
-    if end != s.len() {
-        out.push(s[beg..].to_string());
+    if end != s.len()
+        && let Some(piece) = s.get(beg..)
+    {
+        out.push(piece.to_string());
     }
     out
 }
@@ -243,61 +283,102 @@ mod tests {
         assert_eq!(parts, vec!["a", "b", "c", "d"]);
     }
 
-    /// A subject one byte past the default ceiling is turned back at the
-    /// boundary by EVERY entrypoint — the refusal that keeps an untrusted
-    /// subject from driving an unbounded scan-and-collect (issue #2644). Each
-    /// op returns its total safe outcome, never an unbounded `Vec<String>`.
-    #[test]
-    fn oversized_subject_is_refused_by_every_entrypoint() {
-        let cap = regex_max_input_bytes();
-        // One byte past the ceiling: `a`*cap then a trailing byte, so a match
-        // WOULD exist were the subject scanned — proving the refusal is the
-        // ceiling, not an absent match.
-        let mut oversized = "a".repeat(cap);
-        oversized.push('b');
-        assert!(oversized.len() > cap);
-
-        let re = ok(r"a|b");
-
-        // match → false (no proven match)
-        assert!(!regex_match(re.clone(), oversized.clone()));
-
-        // find → Nothing
-        assert!(matches!(
-            regex_find(re.clone(), oversized.clone()),
-            IpeMaybe::Nothing
-        ));
-
-        // findAll → empty list (the unbounded-Vec vector, closed)
-        assert!(regex_find_all(re.clone(), oversized.clone()).is_empty());
-
-        // replace → identity (input returned unchanged, no replacements)
-        assert_eq!(
-            regex_replace(re.clone(), "X".to_string(), oversized.clone()),
-            oversized
-        );
-
-        // split → whole subject as one field (no split applied)
-        assert_eq!(regex_split(re, oversized.clone()), vec![oversized]);
+    /// Compiles `pattern` under an explicit subject `ceiling`, as `Regex.compile`
+    /// does under the parsed environment snapshot.
+    fn within(pattern: &str, ceiling: usize) -> Option<Regex> {
+        match compile_within::<String>(pattern, Ok(ceiling)) {
+            IpeResult::Ok(re) => Some(re),
+            IpeResult::Err(_) => None,
+        }
     }
 
-    /// A subject exactly AT the ceiling is still processed normally — the bound
-    /// is `len() <= cap`, so the last legal size is not spuriously refused.
+    /// Every malformed `IPE_REGEX_MAX_INPUT_BYTES` (zero included) makes the
+    /// constructor return `Err` naming the variable, never a handle under the
+    /// default ceiling.
     #[test]
-    fn subject_at_ceiling_is_processed_normally() {
-        let cap = regex_max_input_bytes();
-        // `cap`-byte subject beginning with a digit, so a match exists and is
-        // returned — confirming AT-cap is inside the accepted region.
-        let mut at_cap = String::with_capacity(cap);
-        at_cap.push('7');
-        at_cap.push_str(&"a".repeat(cap - 1));
-        assert_eq!(at_cap.len(), cap);
+    fn regex_ceiling_refuses_malformed() {
+        use std::env::VarError;
+        let refused = |raw: Result<String, VarError>| {
+            let shown = format!("{raw:?}");
+            let outcome = compile_within::<String>("a", REGEX_INPUT_CEILING.parse_as::<usize>(raw));
+            assert!(
+                matches!(&outcome, IpeResult::Err(e) if e.starts_with("IPE_REGEX_MAX_INPUT_BYTES")),
+                "{shown} must be refused naming the variable"
+            );
+        };
+        for raw in ["", "abc", "0", "-5", " 42", "16MiB", "18446744073709551616"] {
+            refused(Ok(raw.to_owned()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            refused(Err(VarError::NotUnicode(std::ffi::OsString::from_vec(
+                vec![b'1', 0xFF],
+            ))));
+        }
+        crate::system::assert_env_ceiling_contract(REGEX_INPUT_CEILING);
+    }
 
-        assert!(regex_match(ok(r"\d"), at_cap.clone()));
+    /// An absent variable compiles a handle under the 16 MiB default.
+    #[test]
+    fn regex_ceiling_absent_is_default() {
+        let outcome = compile_within::<String>(
+            "a",
+            REGEX_INPUT_CEILING.parse_as::<usize>(Err(std::env::VarError::NotPresent)),
+        );
+        let max_input = match outcome {
+            IpeResult::Ok(re) => Some(re.max_input),
+            IpeResult::Err(_) => None,
+        };
+        assert_eq!(max_input, Some(16 * 1024 * 1024));
+    }
+
+    /// Every entrypoint judges a subject against the ceiling its handle carries.
+    ///
+    /// One byte past it takes the refused outcome, exactly at it is processed.
+    /// The pattern matches the oversized subject, so the refusal is the ceiling,
+    /// not an absent match.
+    #[test]
+    fn regex_handle_carries_its_ceiling() {
+        #[allow(clippy::expect_used)] // a literal pattern under a literal ceiling
+        let re = within(",", 3).expect("`,` compiles");
+        let at_cap = "a,b".to_string();
+        let past_cap = "a,b,".to_string();
+
+        assert!(!regex_match(re.clone(), past_cap.clone()));
         assert!(matches!(
-            regex_find(ok(r"\d"), at_cap),
-            IpeMaybe::Just(ref d) if d == "7"
+            regex_find(re.clone(), past_cap.clone()),
+            IpeMaybe::Nothing
         ));
+        assert!(regex_find_all(re.clone(), past_cap.clone()).is_empty());
+        assert_eq!(
+            regex_replace(re.clone(), ";".to_string(), past_cap.clone()),
+            past_cap
+        );
+        assert_eq!(regex_split(re.clone(), past_cap.clone()), vec![past_cap]);
+
+        assert!(regex_match(re.clone(), at_cap.clone()));
+        assert!(matches!(
+            regex_find(re.clone(), at_cap.clone()),
+            IpeMaybe::Just(ref m) if m == ","
+        ));
+        assert_eq!(regex_find_all(re.clone(), at_cap.clone()), vec![","]);
+        assert_eq!(
+            regex_replace(re.clone(), ";".to_string(), at_cap.clone()),
+            "a;b"
+        );
+        assert_eq!(regex_split(re, at_cap), vec!["a", "b"]);
+    }
+
+    /// Splitting a subject of multibyte characters yields whole characters, on a
+    /// separator match and on zero-width matches between characters alike.
+    #[test]
+    fn regex_split_multibyte_subject() {
+        assert_eq!(
+            regex_split(ok(","), "é,日本,ü".to_string()),
+            vec!["é", "日本", "ü"]
+        );
+        assert_eq!(regex_split(ok(""), "é日".to_string()), vec!["é", "日"]);
     }
 
     #[test]
