@@ -1,5 +1,6 @@
 module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitPageState(..), clearView, decidableSource, decide, decisionSettled, drainThenLoad, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, startDecision, stateFromResult, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
+import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
 import Ipe.Error as Error
 import Ipe.List as List
@@ -15,7 +16,7 @@ import Lib.Format as Format
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
 -- module.
 import Lib.Highlight as Highlight
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.SafeText as SafeText exposing (SafeText)
@@ -574,6 +575,9 @@ decidableSource uid state =
                 Unreadable _ ->
                     Nothing
 
+                TooLarge _ ->
+                    Nothing
+
         Nothing ->
             Nothing
 
@@ -743,6 +747,25 @@ sourceStatusText view =
 
         Unreadable e ->
             Just ("Source unreadable: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+
+        TooLarge (SpanLines o) ->
+            Just ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)
+
+        TooLarge (ViewBytes o) ->
+            Just ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)
+
+
+-- What a reviewer can do about a view past a ceiling.
+notShownRemedy : String
+notShownRemedy =
+    " It is not shown and cannot be decided here; split the unit to review it."
+
+
+-- A byte count in whole KiB, rounded up, so a size one byte past a ceiling
+-- never reads as the ceiling itself.
+kibText : Int -> String
+kibText n =
+    String.fromInt ((n + 1023) // 1024) ++ " KiB"
 
 
 -- One unit's view by uid through `Index.loadView`, the one source read the

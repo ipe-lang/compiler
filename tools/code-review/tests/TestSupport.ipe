@@ -101,7 +101,7 @@ import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch as Epoch
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
+import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
@@ -246,6 +246,12 @@ viewTag view =
         Unreadable e ->
             "unreadable: " ++ Error.toString e
 
+        TooLarge (SpanLines o) ->
+            "too large lines " ++ String.fromInt o.lines
+
+        TooLarge (ViewBytes o) ->
+            "too large bytes " ++ String.fromInt (ByteSize.toBytes o.size)
+
 
 shownTextOf : Index.SourceView -> Maybe String
 shownTextOf view =
@@ -259,6 +265,9 @@ shownTextOf view =
         Unreadable _ ->
             Nothing
 
+        TooLarge _ ->
+            Nothing
+
 
 shownOf : Index.SourceView -> Maybe Index.ShownSource
 shownOf view =
@@ -270,6 +279,9 @@ shownOf view =
             Nothing
 
         Unreadable _ ->
+            Nothing
+
+        TooLarge _ ->
             Nothing
 
 
@@ -919,6 +931,9 @@ reverifyShown unit found =
 
                 Unreadable _ ->
                     Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is unreadable"))
+
+                TooLarge _ ->
+                    Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is too large"))
 
         Nothing ->
             Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is not in the index"))

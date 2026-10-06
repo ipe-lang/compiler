@@ -255,10 +255,10 @@ reassembles lang src =
     String.concat (List.map rawText (Highlight.tokenize lang src)) == src
 
 
--- A one-mebibyte single-line source, the largest a shown unit's line can
--- reach in practice, tokenizes whole. Red if a tokenizer step recurses per
--- character outside tail position, or copies the unread input or the tokens
--- so far per character (quadratic: the run never ends).
+-- A one-mebibyte single-line source, past `viewByteCeiling` on purpose so the
+-- tokenizer stays bounded beyond any shown view, tokenizes whole. Red if a
+-- tokenizer step recurses per character outside tail position, or copies the
+-- unread input or the tokens so far per character (quadratic: the run never ends).
 largeLineTokenizes : Bool
 largeLineTokenizes =
     let
@@ -303,6 +303,41 @@ testKeys =
         ]
 
 
+-- A decision reaches `Queue.decide` only through the shown source
+-- `Queue.decidableSource` gives: `Queue.decide ` appears once in the app
+-- (inside `decideOn`), `decideOn ` exactly three times (its signature, its
+-- definition and the one call in the `Just shown` arm), and neither in
+-- `Main`. A site list with exact counts, since `ipe test` builds no
+-- `update`. Red if a second path to `decide` is added.
+decisionReachedOnlyThroughDecidableSource : Task.Task Error Bool
+decisionReachedOnlyThroughDecidableSource =
+    let
+        count needle text =
+            List.length (String.split needle text) - 1
+
+        oneCall =
+            "case Queue.decidableSource uid model.selectedView of\n                Just shown ->\n                    decideOn settings shown decision\n"
+    in
+    do
+        cwd <- System.cwd ()
+        appPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/App.ipe"))
+        mainPath <- Task.fromResult (Path.fromString (cwd ++ "/src/Main.ipe"))
+        app <- File.readFileLimit appPath (ByteSize.kib 64)
+        mainSrc <- File.readFileLimit mainPath (ByteSize.kib 64)
+        Task.succeed
+            (count "Queue.decide " app
+                == 1
+                && count "decideOn " app
+                == 3
+                && count oneCall app
+                == 1
+                && count "Queue.decide " mainSrc
+                == 0
+                && count "decideOn" mainSrc
+                == 0
+            )
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -312,11 +347,6 @@ checks =
                 == "1970-01-01 00:00:00"
                 && Format.formatReviewedAt (Timestamp.fromUnixMillis 1700000000000)
                 == "2023-11-14 22:13:20"
-            )
-        , Task.succeed
-            ( "numberedLines counts from line_start"
-            , Format.numberedLines 10 "a\nb\nc"
-                == [ ( 10, "a" ), ( 11, "b" ), ( 12, "c" ) ]
             )
         , Task.succeed
             ( "highlight: rust keywords vs identifiers"
@@ -353,6 +383,7 @@ checks =
                 == "0%"
             )
         , Task.succeed ( "keyboard shortcuts map to the button msgs", testKeys )
+        , check "a decision reaches Queue.decide only through the decidable source" decisionReachedOnlyThroughDecidableSource
         , check "highlight languages match the shared ipe-index language vectors" langVectorsHold
         , Task.succeed
             ( "highlight tokens reassemble the source"

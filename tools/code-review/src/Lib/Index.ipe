@@ -1,6 +1,7 @@
-module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownText, storedHash, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownLines, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
+import Ipe.Bytes as Bytes
 import Ipe.Crypto as Crypto
 import Ipe.Db
 import Ipe.Db.Decode
@@ -123,6 +124,9 @@ linksOf conn row view =
             Task.succeed Links.noLinks
 
         Unreadable _ ->
+            Task.succeed Links.noLinks
+
+        TooLarge _ ->
             Task.succeed Links.noLinks
 
 
@@ -754,9 +758,9 @@ nameFor conn uid =
 
 -- The one verification of a unit's source. The stored hash is parsed first,
 -- so an unknown scheme refuses before any read; then the stored path is
--- resolved, the file read, the line range checked and the view re-hashed.
--- Only a view whose attestation equals the stored one is `Shown`. Every
--- per-unit cause (refused path, unreadable file, bad range, drift) is a
+-- resolved, a span past the line ceiling is withheld before any read, the
+-- file is read and `classifyView` judges the view. Every per-unit cause
+-- (refused path, unreadable file, oversized view, bad range, drift) is a
 -- `SourceView` state, never a failed task.
 viewOf : RootMap -> RowUnit -> Task.Task Error SourceView
 viewOf roots row =
@@ -770,9 +774,14 @@ viewOf roots row =
                     Task.succeed (Unreadable (RepoPath.toError refusal))
 
                 Ok path ->
-                    File.readFileLimit path sourceCeiling
-                        |> Task.map (\text -> verifyView row.uid stored (viewText row.lineStart row.lineEnd text))
-                        |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
+                    case spanOversize row.lineStart row.lineEnd of
+                        Just over ->
+                            Task.succeed (TooLarge over)
+
+                        Nothing ->
+                            File.readFileLimit path sourceCeiling
+                                |> Task.map (classifyView row.uid stored row.lineStart row.lineEnd)
+                                |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
 
 
 -- A read error re-worded to name the stored path it came from.
@@ -791,18 +800,61 @@ readFailure stored e =
         e
 
 
-verifyView : Uid -> String -> Result StaleReason String -> SourceView
-verifyView uid stored sliced =
-    case sliced of
-        Err reason ->
-            Stale reason
+-- The one judgement of a unit's view, in precedence order: a span past the
+-- line ceiling, a range outside `text`, a view past the byte ceiling, then
+-- the attestation compare. `ShownSource` is built only here, so holding one
+-- proves the view is within both ceilings and re-hashes to `stored`. An
+-- oversized view is never hashed: re-indexing cannot make it shown.
+classifyView : Uid -> String -> Int -> Int -> String -> SourceView
+classifyView uid stored start end text =
+    case spanOversize start end of
+        Just over ->
+            TooLarge over
 
-        Ok view ->
-            if attest view == stored then
-                Shown (ShownSource { uid = uid, text = view, hash = stored })
+        Nothing ->
+            case viewText start end text of
+                Err reason ->
+                    Stale reason
 
-            else
-                Stale Drifted
+                Ok view ->
+                    let
+                        size =
+                            Bytes.length (Bytes.fromString view)
+                    in
+                    if size > ByteSize.toBytes viewByteCeiling then
+                        TooLarge (ViewBytes { size = ByteSize.bytes size })
+
+                    else if attest view == stored then
+                        Shown (ShownSource { uid = uid, text = view, hash = stored })
+
+                    else
+                        Stale Drifted
+
+
+-- A span of more than `viewLineCeiling` lines, judged on the indexed range
+-- alone. Only a valid range (`1 <= start <= end`) is judged, which keeps
+-- `end - start` and its `+ 1` inside `Int` for any stored integers; an invalid
+-- range is left to `viewText`, which refuses it.
+spanOversize : Int -> Int -> Maybe Oversize
+spanOversize start end =
+    if 1 <= start && start <= end && end - start >= viewLineCeiling then
+        Just (SpanLines { lines = end - start + 1 })
+
+    else
+        Nothing
+
+
+-- The most lines a shown view may have: each line is a drawn row.
+viewLineCeiling : Int
+viewLineCeiling =
+    5000
+
+
+-- The most UTF-8 bytes a shown view may hold: bytes bound the drawn tokens,
+-- which a single long line can multiply without adding rows.
+viewByteCeiling : ByteSize
+viewByteCeiling =
+    ByteSize.kib 256
 
 
 -- The largest source file a unit is sliced from; a bigger file under the root
@@ -889,8 +941,9 @@ hashDigits attested =
             other
 
 
--- Source text proved equal to its attestation. Opaque: built only by
--- `viewOf`, so holding one means the bytes were re-hashed.
+-- Source text proved within both view ceilings and equal to its attestation.
+-- Opaque: built only by `classifyView`, so holding one means the bytes were
+-- measured and re-hashed.
 type ShownSource
     = ShownSource { uid : Uid, text : String, hash : String }
 
@@ -900,6 +953,16 @@ shownText shown =
     case shown of
         ShownSource s ->
             s.text
+
+
+-- The shown view's lines numbered from the unit's first line `start`: the
+-- exact lines `viewText` joined and the attestation hashed, so the drawn rows,
+-- the counted rows and the hashed rows are one list.
+shownLines : ShownSource -> Int -> List ( Int, String )
+shownLines shown start =
+    shownText shown
+        |> String.split "\n"
+        |> List.indexedMap (\i line -> ( start + i, line ))
 
 
 shownHash : ShownSource -> String
@@ -969,6 +1032,15 @@ confirmShown uid hash fresh =
         Unreadable _ ->
             Task.fail sourceChanged
 
+        TooLarge _ ->
+            Task.fail pastCeiling
+
+
+-- A shown unit that grew past a view ceiling before its decision.
+pastCeiling : Error
+pastCeiling =
+    Error.conflict "source is now past the review ceiling; it cannot be decided"
+
 
 sourceChanged : Error
 sourceChanged =
@@ -982,12 +1054,20 @@ type StaleReason
     | UnverifiableHash
 
 
+-- Which view ceiling a withheld view passed, with the measure taken.
+type Oversize
+    = SpanLines { lines : Int }
+    | ViewBytes { size : ByteSize }
+
+
 -- What the unit page may show of a unit's source: the verified view, a
--- reason it is withheld, or the error that kept it from being read.
+-- reason it is withheld, the error that kept it from being read, or the
+-- ceiling it passed. Only `Shown` holds source text.
 type SourceView
     = Shown ShownSource
     | Stale StaleReason
     | Unreadable Error
+    | TooLarge Oversize
 
 
 -- The scheme prefix of every attestation ipe-index stores in `body_hash`.
