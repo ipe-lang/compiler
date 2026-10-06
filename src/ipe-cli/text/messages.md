@@ -1175,6 +1175,10 @@ stdin is not formatted (run `ipe fmt --stdin` to fix)
 
 fmt: no such file or directory: {root}
 
+## fmt-output-too-large
+
+formatted output of `{file}` would exceed {cap} bytes; the file is left unchanged. Split it into smaller modules.
+
 ## health-home-unknown
 
 health: cannot locate your home directory (neither CARGO_HOME nor HOME is an absolute path)

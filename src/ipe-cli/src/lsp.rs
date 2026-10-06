@@ -89,6 +89,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
             LoadError::Refused(detail)
         }
         CliError::FileTooLarge { .. }
+        | CliError::FmtOutputTooLarge { .. }
         | CliError::DiscoveryLimitReached { .. }
         | CliError::RemoteIngestExceeded(_)
         | CliError::LocalLimitExceeded(_) => LoadError::Limit { lifted_by, detail },
