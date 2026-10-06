@@ -1702,7 +1702,8 @@ mod walk_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod read_file_beneath_tests {
     use super::beneath::{
         BeneathRefusal, BeneathRoot, EntryName, open_dir_chain, open_leaf, read_capped,
