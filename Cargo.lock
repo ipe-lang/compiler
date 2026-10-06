@@ -3285,12 +3285,12 @@ dependencies = [
  "ipe_canon",
  "ipe_diagnostics",
  "ipe_env",
+ "ipe_fs_open",
  "ipe_intern",
  "ipe_kernels",
  "ipe_parse",
  "ipe_syntax",
  "proc-macro2",
- "rustix 0.38.44",
  "serde",
  "serde_json",
  "toml",
@@ -3355,10 +3355,10 @@ dependencies = [
  "ipe-test-temp",
  "ipe_canon",
  "ipe_diagnostics",
+ "ipe_fs_open",
  "ipe_intern",
  "ipe_parse",
  "ipe_syntax",
- "rustix 0.38.44",
 ]
 
 [[package]]
@@ -3473,6 +3473,7 @@ dependencies = [
  "ipe_diagnostics",
  "ipe_env",
  "ipe_intern",
+ "ipe_ir",
  "ipe_kernels",
  "ipe_parse",
  "strum 0.26.3",

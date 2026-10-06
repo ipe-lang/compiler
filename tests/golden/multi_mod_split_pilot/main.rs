@@ -47,38 +47,15 @@ pub enum MainSqlValue {
 impl IpeStringify for MainSqlValue {
     fn ipe_show(&self) -> String {
         match self {
-            MainSqlValue::SqlString(p0) => format!(
-                "SqlString {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlInt(p0) => {
-                format!("SqlInt {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlFloat(p0) => format!(
-                "SqlFloat {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlBool(p0) => {
-                format!("SqlBool {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlBytes(p0) => format!(
-                "SqlBytes {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlTime(p0) => {
-                format!("SqlTime {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
-            MainSqlValue::SqlDecimal(p0) => format!(
-                "SqlDecimal {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlMoney(p0) => format!(
-                "SqlMoney {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
-            MainSqlValue::SqlNull(p0) => {
-                format!("SqlNull {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            MainSqlValue::SqlString(p0) => format!("SqlString {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlInt(p0) => format!("SqlInt {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlFloat(p0) => format!("SqlFloat {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlBool(p0) => format!("SqlBool {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlBytes(p0) => format!("SqlBytes {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlTime(p0) => format!("SqlTime {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlDecimal(p0) => format!("SqlDecimal {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlMoney(p0) => format!("SqlMoney {}", IpeStringify::ipe_show(p0)),
+            MainSqlValue::SqlNull(p0) => format!("SqlNull {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -92,10 +69,7 @@ pub enum MainSqlField {
 impl IpeStringify for MainSqlField {
     fn ipe_show(&self) -> String {
         match self {
-            MainSqlField::SetField(p0) => format!(
-                "SetField {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            MainSqlField::SetField(p0) => format!("SetField {}", IpeStringify::ipe_show(p0)),
             MainSqlField::OmitField => "OmitField".to_string(),
         }
     }

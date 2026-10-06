@@ -565,8 +565,15 @@ impl PkgPath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrapperCratePath(String);
 
-/// The read ceiling for a wrapper crate's `Cargo.toml`, in bytes.
-pub const WRAPPER_MANIFEST_LIMIT: u64 = 1024 * 1024;
+/// The read ceiling for a wrapper crate's `Cargo.toml`.
+pub const WRAPPER_MANIFEST_CAP: ipe_fs_open::ByteCap =
+    ipe_fs_open::ByteCap::from_nonzero(std::num::NonZeroU64::MIN.saturating_add(1024 * 1024 - 1));
+
+/// [`WRAPPER_MANIFEST_CAP`] in bytes, as an oversized-manifest refusal reports it.
+pub const WRAPPER_MANIFEST_LIMIT: u64 = WRAPPER_MANIFEST_CAP.get();
+
+/// The file name of a wrapper crate's manifest inside its directory.
+const WRAPPER_MANIFEST_FILE: &str = "Cargo.toml";
 
 impl WrapperCratePath {
     /// Validate and wrap a wrapper-crate path.
@@ -697,38 +704,19 @@ struct WrapperCargoPackage {
 
 /// Read and parse the `[package] name` of the `Cargo.toml` in `dir`.
 ///
-/// The manifest is opened without following a symlink at its final
-/// component, must be a regular file, and is read up to
-/// [`WRAPPER_MANIFEST_LIMIT`] bytes; one byte more is refused as oversized.
+/// The manifest is opened through `ipe_fs_open` relative to the held `dir`:
+/// never through a link at its name, never blocking, proven a regular file
+/// from the opened handle, and read up to [`WRAPPER_MANIFEST_CAP`]; one byte
+/// more is refused as oversized.
 fn read_wrapper_package(
     dir: &std::path::Path,
 ) -> Result<PackageName, crate::diag::WrapperManifestDefect> {
     use crate::diag::WrapperManifestDefect as Defect;
-    use std::io::Read as _;
-    let unreadable = |e: std::io::Error| Defect::Unreadable {
-        detail: e.to_string(),
-    };
-    let file = open_manifest_no_follow(&dir.join("Cargo.toml"))?;
-    let metadata = file.metadata().map_err(unreadable)?;
-    if !metadata.is_file() {
-        return Err(Defect::NotRegularFile);
-    }
-    let oversized = Defect::Oversized {
-        limit: WRAPPER_MANIFEST_LIMIT,
-    };
-    if metadata.len() > WRAPPER_MANIFEST_LIMIT {
-        return Err(oversized);
-    }
-    let mut bytes = Vec::new();
-    file.take(WRAPPER_MANIFEST_LIMIT.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(unreadable)?;
-    if !u64::try_from(bytes.len()).is_ok_and(|n| n <= WRAPPER_MANIFEST_LIMIT) {
-        return Err(oversized);
-    }
-    let text = String::from_utf8(bytes).map_err(|e| Defect::Invalid {
-        detail: e.to_string(),
-    })?;
+    use ipe_fs_open::{EntryName, HeldDir};
+    let text = EntryName::parse(std::ffi::OsStr::new(WRAPPER_MANIFEST_FILE))
+        .and_then(|name| HeldDir::open_root(dir)?.open_regular(&name))
+        .and_then(|file| file.read_utf8(WRAPPER_MANIFEST_CAP))
+        .map_err(manifest_refusal)?;
     let manifest: WrapperCargoManifest = toml::from_str(&text).map_err(|e| Defect::Invalid {
         detail: e.message().to_owned(),
     })?;
@@ -736,66 +724,25 @@ fn read_wrapper_package(
     PackageName::parse(&found).map_err(|_| Defect::PackageNameIllegal { found })
 }
 
-/// Open `path` read-only without following a symlink at its final component.
-///
-/// `O_NONBLOCK` keeps a FIFO planted in place of the manifest from blocking
-/// the open; the caller's regular-file check then refuses it.
-#[cfg(unix)]
-fn open_manifest_no_follow(
-    path: &std::path::Path,
-) -> Result<std::fs::File, crate::diag::WrapperManifestDefect> {
+/// The manifest defect a refused open or read of the wrapper `Cargo.toml` reports.
+fn manifest_refusal(refusal: ipe_fs_open::OpenRefusal) -> crate::diag::WrapperManifestDefect {
     use crate::diag::WrapperManifestDefect as Defect;
-    use rustix::fs::{Mode, OFlags};
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    rustix::fs::open(path, flags, Mode::empty())
-        .map(std::fs::File::from)
-        .map_err(|errno| {
-            let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-            if is_link {
-                Defect::NotRegularFile
-            } else {
-                Defect::Unreadable {
-                    detail: std::io::Error::from(errno).to_string(),
-                }
-            }
-        })
-}
-
-/// Open `path` read-only, refusing a reparse point at its final component.
-#[cfg(windows)]
-fn open_manifest_no_follow(
-    path: &std::path::Path,
-) -> Result<std::fs::File, crate::diag::WrapperManifestDefect> {
-    use crate::diag::WrapperManifestDefect as Defect;
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    /// `FILE_FLAG_OPEN_REPARSE_POINT`: opens a reparse point itself, never its target.
-    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
-    const ATTR_REPARSE_POINT: u32 = 0x400;
-    let unreadable = |e: std::io::Error| Defect::Unreadable {
-        detail: e.to_string(),
-    };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(unreadable)?;
-    let attributes = file.metadata().map_err(unreadable)?.file_attributes();
-    if attributes & ATTR_REPARSE_POINT == 0 {
-        Ok(file)
-    } else {
-        Err(Defect::NotRegularFile)
+    use ipe_fs_open::OpenRefusal;
+    match refusal {
+        OpenRefusal::Link | OpenRefusal::NotRegular(_) => Defect::NotRegularFile,
+        OpenRefusal::TooLarge(cap) => Defect::Oversized { limit: cap.get() },
+        OpenRefusal::NotUtf8 => Defect::Invalid {
+            detail: refusal.to_string(),
+        },
+        OpenRefusal::Absent
+        | OpenRefusal::Denied
+        | OpenRefusal::InUse
+        | OpenRefusal::BadName
+        | OpenRefusal::TooManyEntries(_)
+        | OpenRefusal::Io(_) => Defect::Unreadable {
+            detail: refusal.to_string(),
+        },
     }
-}
-
-/// Refuse: this platform has no symlink-refusing open.
-#[cfg(not(any(unix, windows)))]
-fn open_manifest_no_follow(
-    _path: &std::path::Path,
-) -> Result<std::fs::File, crate::diag::WrapperManifestDefect> {
-    Err(crate::diag::WrapperManifestDefect::Unreadable {
-        detail: "this platform has no symlink-refusing open".to_owned(),
-    })
 }
 
 /// A wrapper-crate directory proven, at load, to be the crate cargo builds.
@@ -2826,5 +2773,95 @@ mod tests {
             "serde-json"
         );
         assert_eq!(pkg.modules(), ["semver".to_owned()]);
+    }
+
+    /// A wrapper manifest declaring the package `engine`.
+    const ENGINE_WRAPPER_MANIFEST: &str = "[package]\nname = \"engine\"\n";
+
+    /// A fresh, empty wrapper directory for one manifest-read test.
+    fn wrapper_scratch(name: &str) -> std::path::PathBuf {
+        let dir = ipe_test_temp::temp_root().join(format!(
+            "ipe-ffi-wrapper-read-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create wrapper scratch");
+        dir
+    }
+
+    /// `ENGINE_WRAPPER_MANIFEST` padded with a trailing comment to exactly `len` bytes.
+    fn padded_manifest(len: usize) -> Vec<u8> {
+        let mut bytes = ENGINE_WRAPPER_MANIFEST.as_bytes().to_vec();
+        bytes.push(b'#');
+        bytes.resize(len, b'x');
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_wrapper_cargo_toml_is_not_regular() {
+        let dir = wrapper_scratch("link");
+        let real = dir.join("real.toml");
+        let manifest = dir.join(WRAPPER_MANIFEST_FILE);
+        std::fs::write(&real, ENGINE_WRAPPER_MANIFEST).expect("write link target");
+        std::os::unix::fs::symlink(&real, &manifest).expect("symlink manifest");
+        let linked = read_wrapper_package(&dir);
+        std::fs::remove_file(&manifest).expect("remove link");
+        std::fs::rename(&real, &manifest).expect("make the manifest a plain file");
+        let plain = read_wrapper_package(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            linked,
+            Err(crate::diag::WrapperManifestDefect::NotRegularFile)
+        );
+        assert!(
+            matches!(&plain, Ok(name) if name.as_str() == "engine"),
+            "{plain:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_wrapper_cargo_toml_is_refused_not_hung() {
+        let dir = wrapper_scratch("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join(WRAPPER_MANIFEST_FILE))
+            .status();
+        assert!(matches!(made, Ok(s) if s.success()), "mkfifo: {made:?}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_dir = dir.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(read_wrapper_package(&reader_dir));
+            })
+            .expect("spawn reader thread");
+        let read = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            read,
+            Ok(Err(crate::diag::WrapperManifestDefect::NotRegularFile))
+        );
+    }
+
+    #[test]
+    fn a_wrapper_manifest_one_past_the_limit_is_oversized() {
+        let limit = usize::try_from(WRAPPER_MANIFEST_LIMIT).expect("limit fits usize");
+        let dir = wrapper_scratch("oversized");
+        let manifest = dir.join(WRAPPER_MANIFEST_FILE);
+        std::fs::write(&manifest, padded_manifest(limit + 1)).expect("write oversized manifest");
+        let over = read_wrapper_package(&dir);
+        std::fs::write(&manifest, padded_manifest(limit)).expect("write manifest at the limit");
+        let at = read_wrapper_package(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            over,
+            Err(crate::diag::WrapperManifestDefect::Oversized {
+                limit: WRAPPER_MANIFEST_LIMIT
+            })
+        );
+        assert!(
+            matches!(&at, Ok(name) if name.as_str() == "engine"),
+            "{at:?}"
+        );
     }
 }

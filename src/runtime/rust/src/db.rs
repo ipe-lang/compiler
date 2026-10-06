@@ -12,6 +12,15 @@ use std::collections::HashMap;
 
 pub type Db = DbPool;
 
+#[cfg(feature = "db")]
+crate::stringify::show_row!("Db", Internals, [] Db, |_| "<Ipe.Db.Db>".to_owned());
+#[cfg(feature = "db")]
+crate::stringify::show_row!("ProjectionTerm", Internals, [] ProjectionTerm, |_| "<Ipe.Db.ProjectionTerm>".to_owned());
+#[cfg(feature = "db")]
+crate::stringify::show_row!("ProjectionOperand", Internals, [] ProjectionOperand, |_| "<Ipe.Db.ProjectionOperand>".to_owned());
+#[cfg(feature = "db")]
+crate::stringify::show_row!("ArithOp", Internals, [] ArithOp, |_| "<Ipe.Db.ArithOp>".to_owned());
+
 /// One term in a `Store.select` projection — the typed carrier that replaces the
 /// stringly-encoded `(tag, operand_a, operand_b)` triple.  Illegal states are
 /// unrepresentable: the variant set is closed, there is no tag-string re-derivation,
@@ -3226,6 +3235,8 @@ pub struct SqlFragment {
     binds: Vec<SqlParam>,
     invalid: Option<String>,
 }
+
+crate::stringify::show_row!("SqlFragment", Redacted, [] SqlFragment, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 impl std::fmt::Debug for SqlFragment {
     /// SQL text + bind COUNT only — never bind VALUES. A bind may carry a

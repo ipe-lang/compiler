@@ -40,9 +40,7 @@ impl IpeStringify for MainEven {
     fn ipe_show(&self) -> String {
         match self {
             MainEven::EZero => "EZero".to_string(),
-            MainEven::ESucc(p0) => {
-                format!("ESucc {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            MainEven::ESucc(p0) => format!("ESucc {}", IpeStringify::ipe_show(p0)),
         }
     }
 }
@@ -55,9 +53,7 @@ pub enum MainOdd {
 impl IpeStringify for MainOdd {
     fn ipe_show(&self) -> String {
         match self {
-            MainOdd::OSucc(p0) => {
-                format!("OSucc {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            MainOdd::OSucc(p0) => format!("OSucc {}", IpeStringify::ipe_show(p0)),
         }
     }
 }

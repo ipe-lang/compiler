@@ -26,7 +26,7 @@
 //!   `ipe_types::concrete_super_ok` / `emitted_bound_satisfied`.
 //! * `Debug` — hand-written, ALWAYS returns the fixed redacted placeholder,
 //!   regardless of the wrapped value.
-//! * `IpeStringify` — hand-written, ALWAYS returns the same redacted
+//! * `IpeStringify` — a `Redacted` show row, ALWAYS returns the same redacted
 //!   placeholder. This is the trait that backs `Error.toString` / `Debug.log`
 //!   (`ipe_runtime::stringify::IpeStringify`), so a `Secret` nested in a
 //!   debug-rendered value never leaks.
@@ -64,8 +64,6 @@
 
 use zeroize::Zeroize;
 
-use super::stringify::IpeStringify;
-
 // The fixed placeholder every stringification path returns, regardless of the
 // wrapped value; one spelling shared with every redacting `Debug`.
 use crate::redact::REDACTED;
@@ -98,16 +96,9 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-impl IpeStringify for Secret {
-    /// Backs Ipê's `toString` / string interpolation / `Log.*With` attr
-    /// stringification. ALWAYS the fixed placeholder — a caller that logs a
-    /// `Secret` directly (forgetting to call `Secret.redacted` first) gets
-    /// the safe redacted output automatically rather than a compile error
-    /// whose only fix is remembering the very escape hatch they forgot.
-    fn ipe_show(&self) -> String {
-        REDACTED.to_owned()
-    }
-}
+// ALWAYS the fixed placeholder: a `Secret` shown directly (without
+// `Secret.redacted`) renders the safe redacted output, never its content.
+crate::stringify::show_row!("Secret", Redacted, [] Secret, |_| REDACTED.to_owned());
 
 impl Drop for Secret {
     /// Zeroize the backing buffer so the plaintext does not linger in freed
@@ -190,9 +181,10 @@ pub fn secret_use<A>(s: Secret, f: impl FnOnce(String) -> A) -> A {
 
 /// `Secret.redacted : Secret -> String` — the EXPLICIT redaction accessor.
 /// Also exactly what `toString` / interpolation gives automatically via
-/// [`IpeStringify`] above; exists as a named, discoverable, non-`Debug`-
-/// reliant way to get a display-safe placeholder string (e.g. to embed in a
-/// user-facing message: `"using key " ++ Secret.redacted k`).
+/// [`IpeStringify`](crate::stringify::IpeStringify) above; exists as a named,
+/// discoverable, non-`Debug`-reliant way to get a display-safe placeholder
+/// string (e.g. to embed in a user-facing message:
+/// `"using key " ++ Secret.redacted k`).
 #[must_use]
 pub fn secret_redacted(s: Secret) -> String {
     let _ = s; // never read — proves the placeholder never derives from the payload
@@ -203,6 +195,7 @@ pub fn secret_redacted(s: Secret) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+    use crate::stringify::IpeStringify;
 
     // ── (a) normal safe usage works end-to-end ──────────────────────────────
 

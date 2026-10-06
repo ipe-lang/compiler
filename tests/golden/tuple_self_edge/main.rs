@@ -40,10 +40,7 @@ impl IpeStringify for MainChain {
     fn ipe_show(&self) -> String {
         match self {
             MainChain::ChainEnd => "ChainEnd".to_string(),
-            MainChain::ChainNode(p0) => format!(
-                "ChainNode {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            MainChain::ChainNode(p0) => format!("ChainNode {}", IpeStringify::ipe_show(p0)),
         }
     }
 }

@@ -39,13 +39,11 @@ pub enum MainShape {
 impl IpeStringify for MainShape {
     fn ipe_show(&self) -> String {
         match self {
-            MainShape::Circle(p0) => {
-                format!("Circle {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
-            }
+            MainShape::Circle(p0) => format!("Circle {}", IpeStringify::ipe_show(p0)),
             MainShape::Rect(p0, p1) => format!(
                 "Rect {} {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch(),
-                (&ipe_runtime::stringify::Wrap(p1)).dispatch()
+                IpeStringify::ipe_show(p0),
+                IpeStringify::ipe_show(p1)
             ),
         }
     }
