@@ -3522,7 +3522,9 @@ pub(crate) fn text_prefix_equals_sql(subject_sql: &str) -> String {
 /// Renders `((<a> LIKE ? ESCAPE '\') AND (substr(<a>, 1, length(?)) = ?))`
 /// with binds `a.binds ++ [pattern] ++ a.binds ++ [prefix, prefix]`. The
 /// escaped `LIKE` conjunct lets an index serve the scan; the `substr` conjunct
-/// makes the match exact and case-sensitive on every engine. A `NULL` `a` never
+/// makes the match exact and case-sensitive on every engine under a
+/// deterministic collation (a Postgres column declared with a
+/// nondeterministic collation makes `=` compare by that collation). A `NULL` `a` never
 /// matches. An empty, NUL-bearing or over-long prefix poisons the fragment, and
 /// an upstream poison in `a` wins over it.
 pub fn sql_starts_with(a: SqlFragment, prefix: String) -> SqlFragment {
@@ -12042,16 +12044,15 @@ mod like_prefix_tests {
 
             // The LIKE conjunct alone may only widen by ASCII case, never by a
             // wildcard: every row it keeps starts with the prefix up to case.
-            let Ok(pattern) = pattern_of(prefix) else {
-                assert!(matches!(pattern_of(prefix), Ok(_)), "{prefix:?}");
-                return;
+            let pattern = match pattern_of(prefix) {
+                Ok(pattern) => pattern,
+                Err(refused) => panic!("{prefix:?}: {refused:?}"),
             };
             let like_only =
-                names_where(&db, sql_like(sql_column("name".to_string()), pattern)).await;
-            let Ok(like_only) = like_only else {
-                assert!(matches!(like_only, Ok(_)), "{prefix:?}");
-                return;
-            };
+                match names_where(&db, sql_like(sql_column("name".to_string()), pattern)).await {
+                    Ok(names) => names,
+                    Err(e) => panic!("{prefix:?}: {e:?}"),
+                };
             let folded = prefix.to_ascii_lowercase();
             assert!(
                 like_only
