@@ -249,7 +249,7 @@ pub struct ResourceLimits {
     /// Open-file-descriptor cap.
     pub fd_cap: u64,
     /// Process-count cap.
-    pub proc_cap: u64,
+    pub proc_cap: run_jail::ProcCap,
     /// Maximum bytes read from the jailed process's stdout.
     pub out_cap_bytes: u64,
 }
@@ -275,7 +275,7 @@ impl Default for ResourceLimits {
             cpu_secs: 900,
             wall_secs: 900,
             fd_cap: 256,
-            proc_cap: 512,
+            proc_cap: run_jail::ProcCap::DEFAULT,
             out_cap_bytes: 256 * 1024 * 1024,
         }
     }
@@ -1177,7 +1177,8 @@ mod tests {
         assert_eq!(l.cpu_secs, 900);
         assert_eq!(l.wall_secs, 900);
         assert_eq!(l.fd_cap, 256);
-        assert_eq!(l.proc_cap, 512);
+        assert_eq!(l.proc_cap, crate::run_jail::ProcCap::DEFAULT);
+        assert_eq!(l.proc_cap.get(), 512);
         assert_eq!(l.out_cap_bytes, 256 * 1024 * 1024);
     }
 

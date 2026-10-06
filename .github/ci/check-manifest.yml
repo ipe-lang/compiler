@@ -292,7 +292,7 @@ checks:
       tier: affected
       run:
         - cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
-        - cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
+        - cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci
     guards: SEAL
     aggregates: [runtime-full-features-run]
   - context: registry-admission

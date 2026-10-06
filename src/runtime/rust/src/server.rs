@@ -2946,76 +2946,144 @@ fn plain_resp(status: i64, body: &str, extra: &[(&str, &str)]) -> ServerResponse
     }
 }
 
-/// Tags `resp` with the allowed origin `allow`, replacing any
-/// `Access-Control-Allow-Origin` the handler set in any case. A specific
-/// origin (not `*`) makes the response origin-dependent, so `Origin` joins the
-/// handler's `Vary` (merged in any case, never clobbered) and a shared cache
-/// cannot serve one origin's grant to another.
-fn tag_cors(resp: &mut ServerResponse, allow: Option<String>) {
-    let Some(a) = allow else {
-        return;
-    };
-    if a != "*" {
-        let vary = match header_values_ci(&resp.headers, "Vary") {
-            Some(prev)
-                if prev
-                    .split(',')
-                    .any(|p| p.trim().eq_ignore_ascii_case("origin")) =>
-            {
-                prev
-            }
-            Some(prev) => format!("{prev}, Origin"),
-            None => "Origin".to_owned(),
-        };
-        set_header_replacing(&mut resp.headers, "Vary".to_owned(), vary);
-    }
-    set_header_replacing(
-        &mut resp.headers,
-        "access-control-allow-origin".to_owned(),
-        a,
-    );
+/// The response header naming the origin a `withCors` response grants.
+const CORS_ALLOW_ORIGIN: &str = "access-control-allow-origin";
+
+/// The methods every `withCors` preflight answer allows.
+const CORS_PREFLIGHT_METHODS: &str = "GET, POST, PUT, DELETE, OPTIONS";
+
+/// The request headers every `withCors` preflight answer allows.
+const CORS_PREFLIGHT_HEADERS: &str = "Content-Type, Authorization";
+
+/// The origin policy of `Middleware.withCors`, parsed once from its list.
+enum CorsPolicy {
+    /// The list contains `*`: no response depends on `Origin`.
+    Any,
+    /// Exact serialized origins. An empty entry is dropped, since it never
+    /// equals a present non-empty `Origin`, so an empty set refuses every origin.
+    Allowlist(Vec<String>),
 }
 
-/// Middleware.withCors : List String -> Handler -> Handler. Echoes an allowed
-/// Origin (or `*`), answers preflight OPTIONS with 204, and tags responses.
+/// A request `Origin` the policy grants.
+///
+/// The request's own bytes, equal to an allowlist entry; built only by
+/// `CorsPolicy::tag`.
+struct GrantedOrigin(String);
+
+/// Every CORS header a response from `withCors` carries, as one value.
+///
+/// `Any` comes only from `CorsPolicy::Any`; `ByOrigin` only from
+/// `CorsPolicy::Allowlist`, and every `ByOrigin` response names `Origin` in
+/// `Vary`, the refused and the origin-less ones included.
+enum CorsTag {
+    /// `Access-Control-Allow-Origin: *`; the response does not vary on `Origin`.
+    Any,
+    /// The response varies on `Origin`; it grants the origin when one is held.
+    ByOrigin(Option<GrantedOrigin>),
+}
+
+impl CorsPolicy {
+    /// The policy of the author's origin list: `*` anywhere grants every origin.
+    fn parse(origins: Vec<String>) -> Self {
+        if origins.iter().any(|o| o == "*") {
+            Self::Any
+        } else {
+            Self::Allowlist(origins.into_iter().filter(|o| !o.is_empty()).collect())
+        }
+    }
+
+    /// The CORS tag of a response to a request carrying `origin`.
+    fn tag(&self, origin: Option<&str>) -> CorsTag {
+        match self {
+            Self::Any => CorsTag::Any,
+            Self::Allowlist(set) => CorsTag::ByOrigin(
+                origin
+                    .filter(|o| !o.is_empty() && set.iter().any(|e| e.as_str() == *o))
+                    .map(|o| GrantedOrigin(o.to_owned())),
+            ),
+        }
+    }
+}
+
+impl CorsTag {
+    /// Writes the tag's headers into `resp`.
+    ///
+    /// The one writer of the CORS headers the middleware owns: a handler-set
+    /// `Access-Control-Allow-Origin` in any case is replaced by the grant, or
+    /// removed when there is none.
+    fn apply(self, resp: &mut ServerResponse) {
+        match self {
+            Self::Any => set_header_replacing(
+                &mut resp.headers,
+                CORS_ALLOW_ORIGIN.to_owned(),
+                "*".to_owned(),
+            ),
+            Self::ByOrigin(grant) => {
+                merge_vary_origin(&mut resp.headers);
+                if let Some(GrantedOrigin(origin)) = grant {
+                    set_header_replacing(&mut resp.headers, CORS_ALLOW_ORIGIN.to_owned(), origin);
+                } else {
+                    resp.headers
+                        .retain(|k, _| !k.eq_ignore_ascii_case(CORS_ALLOW_ORIGIN));
+                }
+            }
+        }
+    }
+}
+
+/// Names `Origin` in the `Vary` of `headers`.
+///
+/// A handler's `Vary` in any case is merged into one value, never clobbered;
+/// one already naming `Origin` or `*` is kept as is.
+fn merge_vary_origin(headers: &mut HashMap<String, String>) {
+    let vary = match header_values_ci(headers, "Vary") {
+        Some(prev)
+            if prev.split(',').any(|p| {
+                let p = p.trim();
+                p == "*" || p.eq_ignore_ascii_case("origin")
+            }) =>
+        {
+            prev
+        }
+        Some(prev) => format!("{prev}, Origin"),
+        None => "Origin".to_owned(),
+    };
+    set_header_replacing(headers, "Vary".to_owned(), vary);
+}
+
+/// Middleware.withCors : List String -> Handler -> Handler.
+///
+/// Echoes an allowed `Origin` (or `*`), answers every `OPTIONS` as a preflight
+/// with 204, and tags every response the handler returns. Under a list of
+/// specific origins every response the middleware makes or passes carries
+/// `Vary: Origin`; a refused or absent origin gets no
+/// `Access-Control-Allow-Origin`, including one the handler set.
 pub fn middleware_with_cors<E, H>(origins: Vec<String>, h: H) -> ServerHandler<E>
 where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
     let h = h.into_server_handler();
+    let policy = CorsPolicy::parse(origins);
     Arc::new(move |req: ServerRequest| {
-        let req_origin = header_ci(&req.headers, "origin").unwrap_or("").to_string();
-        let allow = if origins.iter().any(|o| o == "*") {
-            Some("*".to_string())
-        } else if origins.iter().any(|o| o == &req_origin) && !req_origin.is_empty() {
-            Some(req_origin)
-        } else {
-            None
-        };
+        let tag = policy.tag(header_ci(&req.headers, "origin"));
         if req.method.eq_ignore_ascii_case("OPTIONS") {
             let mut resp = plain_resp(
                 204,
                 "",
                 &[
-                    (
-                        "access-control-allow-methods",
-                        "GET, POST, PUT, DELETE, OPTIONS",
-                    ),
-                    (
-                        "access-control-allow-headers",
-                        "Content-Type, Authorization",
-                    ),
+                    ("access-control-allow-methods", CORS_PREFLIGHT_METHODS),
+                    ("access-control-allow-headers", CORS_PREFLIGHT_HEADERS),
                 ],
             );
-            tag_cors(&mut resp, allow);
+            tag.apply(&mut resp);
             return Box::pin(async move { ok_res(resp) });
         }
         let task = h(req);
         Box::pin(async move {
             match task.await {
                 IpeResult::Ok(mut resp) => {
-                    tag_cors(&mut resp, allow);
+                    tag.apply(&mut resp);
                     ok_res(resp)
                 }
                 other => other,
@@ -5358,9 +5426,15 @@ mod tests {
         assert_eq!(single_header(&resp, "x-custom"), Some("2"));
     }
 
-    /// The response `middleware_with_cors` allowing `origins` makes of a GET
-    /// from `https://a.example` whose handler set `headers`, as it is sent.
-    async fn cors_tagged(origins: &[&str], headers: &[(&str, &str)]) -> axum::response::Response {
+    /// The response `middleware_with_cors` allowing `origins` makes of a
+    /// `method` request carrying `origin`, whose handler set `headers`, as it
+    /// is sent.
+    async fn cors_tagged(
+        origins: &[&str],
+        method: &str,
+        origin: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
         let set: Vec<(String, String)> = headers
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -5378,9 +5452,21 @@ mod tests {
                 Box::pin(ready(ok_res::<String, _>(r))) as IpeTask<String, ServerResponse>
             },
         );
+        cors_sent(&h, method, origin).await
+    }
+
+    /// What handler `h` answers a `method` request carrying `origin`, as it is
+    /// sent.
+    async fn cors_sent(
+        h: &ServerHandler<String>,
+        method: &str,
+        origin: Option<&str>,
+    ) -> axum::response::Response {
         let mut req_headers = HashMap::new();
-        req_headers.insert("Origin".to_owned(), "https://a.example".to_owned());
-        let IpeResult::Ok(r) = h(mk_req("GET", HashMap::new(), req_headers)).await else {
+        if let Some(o) = origin {
+            req_headers.insert("Origin".to_owned(), o.to_owned());
+        }
+        let IpeResult::Ok(r) = h(mk_req(method, HashMap::new(), req_headers)).await else {
             panic!("the CORS middleware must pass the handler's response through");
         };
         to_axum_response_with(r, framed_security())
@@ -5399,7 +5485,13 @@ mod tests {
                 (&["https://a.example"][..], "https://a.example"),
                 (&["*"][..], "*"),
             ] {
-                let resp = cors_tagged(origins, &[(name, "https://evil.example")]).await;
+                let resp = cors_tagged(
+                    origins,
+                    "GET",
+                    Some("https://a.example"),
+                    &[(name, "https://evil.example")],
+                )
+                .await;
                 assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
                 assert_eq!(
                     single_header(&resp, "access-control-allow-origin"),
@@ -5414,20 +5506,219 @@ mod tests {
     /// and a `Vary` already naming `Origin` is kept as is.
     #[tokio::test]
     async fn cors_merges_a_handler_vary_in_any_case_into_one_value() {
+        let allowed = Some("https://a.example");
         for name in ["Vary", "VARY", "vary"] {
-            let resp = cors_tagged(&["https://a.example"], &[(name, "Accept-Encoding")]).await;
+            let resp = cors_tagged(
+                &["https://a.example"],
+                "GET",
+                allowed,
+                &[(name, "Accept-Encoding")],
+            )
+            .await;
             assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
             assert_eq!(
                 single_header(&resp, "vary"),
                 Some("Accept-Encoding, Origin"),
                 "{name}"
             );
-            let resp = cors_tagged(&["https://a.example"], &[(name, "origin")]).await;
+            let resp =
+                cors_tagged(&["https://a.example"], "GET", allowed, &[(name, "origin")]).await;
             assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
             assert_eq!(single_header(&resp, "vary"), Some("origin"), "{name}");
         }
-        let resp = cors_tagged(&["https://a.example"], &[]).await;
+        let resp = cors_tagged(&["https://a.example"], "GET", allowed, &[]).await;
         assert_eq!(single_header(&resp, "vary"), Some("Origin"));
+    }
+
+    /// Under an allowlist, a refused origin's response names `Origin` in `Vary`
+    /// and carries no grant, so a shared cache never serves it to an allowed
+    /// origin.
+    #[tokio::test]
+    async fn cors_refused_origin_varies_on_origin_without_a_grant() {
+        let resp = cors_tagged(
+            &["https://a.example"],
+            "GET",
+            Some("https://evil.example"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(single_header(&resp, "vary"), Some("Origin"));
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+
+    /// Under an allowlist, an absent or empty `Origin` is refused and still
+    /// varies on `Origin`, an empty allowlist entry included.
+    #[tokio::test]
+    async fn cors_absent_or_empty_origin_varies_on_origin_without_a_grant() {
+        for (origins, origin) in [
+            (&["https://a.example"][..], None),
+            (&["https://a.example"][..], Some("")),
+            (&["", "https://a.example"][..], Some("")),
+            (&["", "https://a.example"][..], None),
+        ] {
+            let resp = cors_tagged(origins, "GET", origin, &[]).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::OK,
+                "{origins:?} / {origin:?}"
+            );
+            assert_eq!(
+                single_header(&resp, "vary"),
+                Some("Origin"),
+                "{origins:?} / {origin:?}"
+            );
+            assert!(
+                resp.headers().get("access-control-allow-origin").is_none(),
+                "{origins:?} / {origin:?}"
+            );
+        }
+    }
+
+    /// Under an allowlist, every preflight answer varies on `Origin`, and only
+    /// an allowed origin's carries a grant.
+    #[tokio::test]
+    async fn cors_preflight_varies_on_origin_for_every_origin() {
+        for (origin, granted) in [
+            (Some("https://a.example"), Some("https://a.example")),
+            (Some("https://evil.example"), None),
+            (None, None),
+        ] {
+            let resp = cors_tagged(&["https://a.example"], "OPTIONS", origin, &[]).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NO_CONTENT,
+                "{origin:?}"
+            );
+            assert_eq!(single_header(&resp, "vary"), Some("Origin"), "{origin:?}");
+            assert_eq!(
+                resp.headers()
+                    .get_all("access-control-allow-origin")
+                    .iter()
+                    .count(),
+                usize::from(granted.is_some()),
+                "{origin:?}"
+            );
+            assert_eq!(
+                single_header(&resp, "access-control-allow-origin"),
+                granted,
+                "{origin:?}"
+            );
+        }
+    }
+
+    /// Under an allowlist, a handler's `Access-Control-Allow-Origin` in any
+    /// case never reaches a refused or origin-less request.
+    #[tokio::test]
+    async fn cors_refused_origin_strips_a_handler_allow_origin_in_any_case() {
+        for name in [
+            "Access-Control-Allow-Origin",
+            "ACCESS-CONTROL-ALLOW-ORIGIN",
+            "access-control-allow-origin",
+        ] {
+            for origin in [Some("https://evil.example"), None] {
+                let resp = cors_tagged(
+                    &["https://a.example"],
+                    "GET",
+                    origin,
+                    &[(name, "https://evil.example")],
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    axum::http::StatusCode::OK,
+                    "{name} / {origin:?}"
+                );
+                assert!(
+                    resp.headers().get("access-control-allow-origin").is_none(),
+                    "{name} / {origin:?}"
+                );
+                assert_eq!(
+                    single_header(&resp, "vary"),
+                    Some("Origin"),
+                    "{name} / {origin:?}"
+                );
+            }
+        }
+    }
+
+    /// An inner middleware's refusal is tagged like any handler response: it
+    /// varies on `Origin`, and grants only an allowed origin.
+    #[tokio::test]
+    async fn cors_inner_refusal_is_tagged_like_any_response() {
+        let h = middleware_with_cors::<String, _>(
+            vec!["https://a.example".to_owned()],
+            middleware_with_basic_auth::<String, _>(
+                "u".to_owned(),
+                "p".to_owned(),
+                |_req: ServerRequest| {
+                    Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
+                        as IpeTask<String, ServerResponse>
+                },
+            ),
+        );
+        for (origin, granted) in [
+            ("https://evil.example", None),
+            ("https://a.example", Some("https://a.example")),
+        ] {
+            let resp = cors_sent(&h, "GET", Some(origin)).await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{origin}"
+            );
+            assert_eq!(single_header(&resp, "vary"), Some("Origin"), "{origin}");
+            assert_eq!(
+                resp.headers()
+                    .get_all("access-control-allow-origin")
+                    .iter()
+                    .count(),
+                usize::from(granted.is_some()),
+                "{origin}"
+            );
+            assert_eq!(
+                single_header(&resp, "access-control-allow-origin"),
+                granted,
+                "{origin}"
+            );
+        }
+    }
+
+    /// A list containing `*` grants every origin and never adds `Vary`: no
+    /// response depends on `Origin`.
+    #[tokio::test]
+    async fn cors_wildcard_policy_never_adds_vary() {
+        for origins in [&["*"][..], &["https://a.example", "*"][..]] {
+            for method in ["GET", "OPTIONS"] {
+                for origin in [
+                    Some("https://a.example"),
+                    Some("https://evil.example"),
+                    None,
+                ] {
+                    let resp = cors_tagged(origins, method, origin, &[]).await;
+                    assert_eq!(
+                        single_header(&resp, "access-control-allow-origin"),
+                        Some("*"),
+                        "{origins:?} / {method} / {origin:?}"
+                    );
+                    assert!(
+                        resp.headers().get("vary").is_none(),
+                        "{origins:?} / {method} / {origin:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A handler's `Vary: *` already varies on every header, so it is kept as
+    /// is for an allowed and a refused origin alike.
+    #[tokio::test]
+    async fn cors_vary_star_is_kept() {
+        for origin in [Some("https://a.example"), Some("https://evil.example")] {
+            let resp = cors_tagged(&["https://a.example"], "GET", origin, &[("Vary", "*")]).await;
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{origin:?}");
+            assert_eq!(single_header(&resp, "vary"), Some("*"), "{origin:?}");
+        }
     }
 
     /// More handler header names than a header map holds is a typed refusal,
