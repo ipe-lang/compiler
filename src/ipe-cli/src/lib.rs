@@ -19,6 +19,7 @@ pub mod advisory;
 pub mod api_surface;
 pub mod audit;
 pub mod audit_native;
+mod browser;
 pub mod build_plan;
 mod cache;
 mod cargo_step;
