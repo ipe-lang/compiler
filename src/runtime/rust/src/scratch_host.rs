@@ -6,7 +6,7 @@
 
 use super::scratch_core::EntropyUnavailable;
 
-pub use super::home_core::HomeDir;
+pub use super::home_core::{HomeDir, HomeRefusal};
 
 /// The variable naming the current user's profile directory on Windows.
 pub const PROFILE_VAR: &str = super::home_core::WINDOWS_HOME_VAR;
@@ -22,8 +22,10 @@ pub fn fill_entropy(buf: &mut [u8]) -> Result<(), EntropyUnavailable> {
 }
 
 /// The current user's profile directory, which off Unix must contain every scratch base.
+///
+/// # Errors
+/// The [`HomeRefusal`] the profile variable earns.
 #[cfg(not(unix))]
-#[must_use]
-pub fn profile_dir() -> Option<HomeDir> {
-    super::system::home_dir().ok()
+pub fn profile_dir() -> Result<HomeDir, HomeRefusal> {
+    super::system::home_dir()
 }

@@ -434,7 +434,10 @@ fn refused(path: &Path, refusal: ScratchRefusal) -> io::Error {
 /// Why a scratch root cannot be proven private to the current user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScratchRootRefusal {
-    /// No absolute profile directory is set, so no root can be proven private.
+    /// The profile variable names no trusted directory, so no root can be proven private.
+    ProfileRefused(scratch_host::HomeRefusal),
+    /// The resolved profile is relative, holds a `..` segment, or is a bare
+    /// filesystem root, so no root can be proven private.
     NoProfile,
     /// A path could not be resolved to its canonical form.
     Unresolvable {
@@ -459,10 +462,17 @@ const FIX: &str = "set TEMP and TMP to a directory inside your user profile, \
 impl fmt::Display for ScratchRootRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProfileRefused(refusal) => write!(
+                f,
+                "refusing to create scratch files: {refusal}, so the scratch location cannot \
+                 be proven private to you; set {PROFILE_VAR} to your local user profile \
+                 directory, such as C:\\Users\\<you>"
+            ),
             Self::NoProfile => write!(
                 f,
-                "refusing to create scratch files: {PROFILE_VAR} does not name an absolute \
-                 directory, so the scratch location cannot be proven private to you; {FIX}"
+                "refusing to create scratch files: {PROFILE_VAR} does not resolve to a \
+                 directory below a filesystem root, so the scratch location cannot be proven \
+                 private to you; {FIX}"
             ),
             Self::Unresolvable { path, detail } => write!(
                 f,
@@ -643,9 +653,10 @@ pub fn root_within_profile(root: &Path, profile: &Path) -> Result<(), ScratchRoo
 
 /// Resolve `root` and `profile`, require the root inside the profile, and return the resolved root.
 ///
-/// `profile` is the parsed [`PROFILE_VAR`] home; an absent one proves nothing
-/// and is refused. Resolution follows every link, so a
-/// link inside the profile that points outside it is refused too. Entries must
+/// `profile` is the parsed [`PROFILE_VAR`] home, or the refusal its value
+/// earned; a refused one proves nothing and is refused with that reason.
+/// Resolution follows every link, so a link inside the profile that points
+/// outside it is refused too. Entries must
 /// be created under the returned path, not under `root`, so that a link on
 /// `root` re-pointed after the check cannot redirect the creation.
 ///
@@ -654,9 +665,9 @@ pub fn root_within_profile(root: &Path, profile: &Path) -> Result<(), ScratchRoo
 /// resolved root lies outside the resolved profile.
 pub fn verify_root_within_profile(
     root: &Path,
-    profile: Option<&scratch_host::HomeDir>,
+    profile: Result<&scratch_host::HomeDir, scratch_host::HomeRefusal>,
 ) -> Result<PathBuf, ScratchRootRefusal> {
-    let profile = profile.ok_or(ScratchRootRefusal::NoProfile)?;
+    let profile = profile.map_err(ScratchRootRefusal::ProfileRefused)?;
     let root = canonical(root)?;
     root_within_profile(&root, &canonical(profile.as_path())?)?;
     Ok(root)
@@ -735,7 +746,7 @@ fn trusted_base(base: &Path) -> io::Result<PathBuf> {
 #[cfg(not(unix))]
 fn trusted_base(base: &Path) -> io::Result<PathBuf> {
     let home = scratch_host::profile_dir();
-    let profile = home.as_ref();
+    let profile = home.as_ref().map_err(|refusal| *refusal);
     let existing = base
         .ancestors()
         .find(|a| !a.as_os_str().is_empty() && a.exists())
@@ -1801,14 +1812,27 @@ mod tests {
         );
     }
 
+    /// A refused profile is refused with the reason its value earned, never
+    /// collapsed into one cause.
     #[test]
-    fn an_absent_profile_is_refused() -> io::Result<()> {
+    fn a_refused_profile_keeps_its_reason() -> io::Result<()> {
+        use scratch_host::HomeRefusal;
         let tree = Tree::new("noprofile")?;
         let root = tree.profile().join("temp");
-        assert_eq!(
-            verify_root_within_profile(&root, None),
-            Err(ScratchRootRefusal::NoProfile)
-        );
+        for refusal in [
+            HomeRefusal::Unset,
+            HomeRefusal::NotUtf8,
+            HomeRefusal::ContainsNul,
+            HomeRefusal::NotAbsolute,
+            HomeRefusal::ParentComponent,
+            HomeRefusal::WindowsDeviceOrVerbatim,
+            HomeRefusal::WindowsUnc,
+        ] {
+            assert_eq!(
+                verify_root_within_profile(&root, Err(refusal)),
+                Err(ScratchRootRefusal::ProfileRefused(refusal))
+            );
+        }
         Ok(())
     }
 
@@ -1818,7 +1842,7 @@ mod tests {
         let profile = tree.profile();
         let resolved = std::fs::canonicalize(profile.join("temp"))?;
         assert_eq!(
-            verify_root_within_profile(&profile.join("temp"), Some(&tree.home()?)),
+            verify_root_within_profile(&profile.join("temp"), Ok(&tree.home()?)),
             Ok(resolved)
         );
         Ok(())
@@ -1833,7 +1857,7 @@ mod tests {
         let profile = tree.profile();
         let link = profile.join("temp-link");
         std::os::unix::fs::symlink(profile.join("temp"), &link)?;
-        let resolved = verify_root_within_profile(&link, Some(&tree.home()?));
+        let resolved = verify_root_within_profile(&link, Ok(&tree.home()?));
         assert_eq!(resolved, Ok(std::fs::canonicalize(profile.join("temp"))?));
         Ok(())
     }
@@ -1841,7 +1865,7 @@ mod tests {
     #[test]
     fn shared_root_outside_profile_is_refused() -> io::Result<()> {
         let tree = Tree::new("shared")?;
-        let refused = verify_root_within_profile(&tree.0.join("shared"), Some(&tree.home()?));
+        let refused = verify_root_within_profile(&tree.0.join("shared"), Ok(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::OutsideProfile { .. })
@@ -1854,7 +1878,7 @@ mod tests {
         let tree = Tree::new("dotdot")?;
         let profile = tree.profile();
         let escaping = profile.join("temp").join("..").join("..").join("shared");
-        let refused = verify_root_within_profile(&escaping, Some(&tree.home()?));
+        let refused = verify_root_within_profile(&escaping, Ok(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::OutsideProfile { .. })
@@ -1869,7 +1893,7 @@ mod tests {
         let profile = tree.profile();
         let link = profile.join("temp-link");
         std::os::unix::fs::symlink(tree.0.join("shared"), &link)?;
-        let refused = verify_root_within_profile(&link, Some(&tree.home()?));
+        let refused = verify_root_within_profile(&link, Ok(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::OutsideProfile { .. })
@@ -1881,7 +1905,7 @@ mod tests {
     fn missing_root_is_refused() -> io::Result<()> {
         let tree = Tree::new("missing")?;
         let profile = tree.profile();
-        let refused = verify_root_within_profile(&profile.join("absent"), Some(&tree.home()?));
+        let refused = verify_root_within_profile(&profile.join("absent"), Ok(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::Unresolvable { .. })
@@ -1912,6 +1936,22 @@ mod tests {
                 io::ErrorKind::PermissionDenied
             );
         }
+    }
+
+    /// A refused profile names its own reason and the variable to fix, not
+    /// the temp-root remedy, and still denies permission.
+    #[test]
+    fn a_refused_profile_names_its_reason_and_denies_permission() {
+        let home_refusal = scratch_host::HomeRefusal::WindowsUnc;
+        let refusal = ScratchRootRefusal::ProfileRefused(home_refusal);
+        let message = refusal.to_string();
+        assert!(message.contains(&home_refusal.to_string()), "{message}");
+        assert!(message.contains(&format!("set {PROFILE_VAR}")), "{message}");
+        assert!(!message.contains("set TEMP and TMP"), "{message}");
+        assert_eq!(
+            io::Error::from(refusal).kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     /// An unavailable CSPRNG fails the creation before any entry is attempted;

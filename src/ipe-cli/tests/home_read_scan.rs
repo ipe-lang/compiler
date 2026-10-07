@@ -3,9 +3,10 @@
 //! reader, as a second layer beneath the clippy `disallowed-methods` deny.
 //!
 //! An unset, empty, or relative `HOME` resolves against whatever the current
-//! working directory is, so every home read goes through one validated accessor
-//! that yields an absolute path or nothing: `ipe_sandbox::home::home_dir` on the
-//! compiler side and `system::home_dir` in the standalone runtime. Every other
+//! working directory is, so every home read goes through one parsing accessor
+//! that yields a `HomeDir` or the refusal its value earns:
+//! `ipe_sandbox::home::home_dir` on the compiler side and `system::home_dir` in
+//! the standalone runtime. Every other
 //! compiler-side variable is read through `ipe_env`, which refuses each home
 //! name however it is spelled or computed, and a jail's granted variables are
 //! forwarded verbatim by the sandbox-private `ipe_sandbox::host_env::granted`,
