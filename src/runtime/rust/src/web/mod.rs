@@ -6790,16 +6790,17 @@ mod base_path_tests {
 
     #[test]
     fn render_page_emits_external_client_script_with_sri() {
+        let epoch = page_epoch();
         let root = render_page_full(
             "sid1",
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
-            &page_epoch(),
+            &epoch,
             "tok1",
         );
         // Per-session values stay inline.
         assert!(root.contains("window.__IPE_SID=\"sid1\""));
-        let epoch_global = format!("window.__IPE_EPOCH=\"{}\";", page_epoch().to_token());
+        let epoch_global = format!("window.__IPE_EPOCH=\"{}\";", epoch.to_token());
         assert!(root.contains(&epoch_global), "{root}");
         assert!(root.contains("window.__IPE_CSRF_TOKEN=\"tok1\""));
         // CLIENT_JS body must NOT be inlined.
@@ -10338,7 +10339,11 @@ mod emitted_router_behavior_tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read body");
-        (status, marker, String::from_utf8(bytes.to_vec()).expect("a UTF-8 body"))
+        (
+            status,
+            marker,
+            String::from_utf8(bytes.to_vec()).expect("a UTF-8 body"),
+        )
     }
 
     /// GET `path` with the session cookie; return the `X-Ipe-Epoch` header and the body.
@@ -10367,7 +10372,10 @@ mod emitted_router_behavior_tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read body");
-        (epoch, String::from_utf8(bytes.to_vec()).expect("a UTF-8 body"))
+        (
+            epoch,
+            String::from_utf8(bytes.to_vec()).expect("a UTF-8 body"),
+        )
     }
 
     /// The session's live entry.
