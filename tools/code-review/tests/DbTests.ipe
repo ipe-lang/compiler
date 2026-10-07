@@ -32,7 +32,7 @@ import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, tamperLog, headTextOf, logRowCount, testReviewKey)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -954,6 +954,27 @@ crossLogReplayTampered db =
         Task.succeed (isCounted control && whyOf found == Just Tampered)
 
 
+-- A row's sequence number and its link to the entry before it are signed:
+-- a row stored at seq 2 but signed for seq 7, and a row stored after the
+-- head but signed with another `prev`, each read `Tampered` while the
+-- chain itself stays intact (the stored seqs and links are contiguous) and
+-- the correctly signed first row counts. Red if the seq or the `prev` is
+-- left out of the mac input (the first row stops counting, since the test
+-- spells both out), or if a renumbered or relinked row counts.
+renumberedRowTampered : Db -> Task.Task Error Bool
+renumberedRowTampered db =
+    do
+        appendSigned db (rawRow "renumber-control" "hN" "approve" Nothing)
+        control <- lookUp db "renumber-control" "hN"
+        appendSignedClaiming db (\h -> { h | seq = h.seq + 5 }) (rawRow "renumber-seq" "hN" "approve" Nothing)
+        appendSignedClaiming db (\h -> { h | head = String.repeat 64 "f" }) (rawRow "renumber-prev" "hN" "approve" Nothing)
+        head <- LibDb.currentHead db
+        verdict <- LibDb.checkChainWithin db PageSize.pairs LibDb.logPageCeiling (Error.conflict "ceiling") head
+        renumbered <- lookUp db "renumber-seq" "hN"
+        relinked <- lookUp db "renumber-prev" "hN"
+        Task.succeed (isCounted control && verdict == Intact && whyOf renumbered == Just Tampered && whyOf relinked == Just Tampered)
+
+
 -- Three signed entries, a tamper `edit` applied to them, and the verdict of
 -- the chain check up to the head.
 chainAfter : Db -> List ( String, List SqlValue ) -> Task.Task Error ChainVerdict
@@ -1058,6 +1079,7 @@ reviewLogChecks =
         , check "an absent reason made empty reads tampered" (onFreshReview "ipe-review-emptyReasonTampered" emptyReasonTampered)
         , check "a forged entry never counts" (onFreshReview "ipe-review-forgedRowTampered" forgedRowTampered)
         , check "a row replayed from another log reads tampered" (onFreshReview "ipe-review-crossLogReplayTampered" crossLogReplayTampered)
+        , check "a renumbered or relinked row reads tampered on an intact chain" (onFreshReview "ipe-review-renumberedRowTampered" renumberedRowTampered)
         , check "a removed entry breaks the chain and uncounts the rows before it" (onFreshReview "ipe-review-chainBreakUncounts" chainBreakUncounts)
         , check "reordered entries break the chain" (onFreshReview "ipe-review-chainReorderBreaks" chainReorderBreaks)
         , check "a decision on a broken chain is refused and inserts nothing" (onFreshReview "ipe-review-decideOnBrokenChainRefused" decideOnBrokenChainRefused)

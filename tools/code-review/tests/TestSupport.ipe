@@ -81,6 +81,8 @@ module TestSupport exposing
     , rawRow
     , appendSigned
     , appendSignedAs
+    , appendSignedClaiming
+    , RawHead
     , tamperLog
     , headTextOf
     , logIdOf
@@ -878,14 +880,28 @@ appendSignedAs db logId row =
     rawHead db |> Task.andThen (\head -> appendSignedAt db logId head row)
 
 
+-- `appendSigned` with the mac computed as if the head were `claim head`:
+-- the row is stored at the next seq and linked to the real head, but signed
+-- for the seq after the claimed one and with the claimed head as its
+-- `prev` — a signed row renumbered or relinked outside the tool.
+appendSignedClaiming : Db -> (RawHead -> RawHead) -> RawRow -> Task.Task Error Int
+appendSignedClaiming db claim row =
+    rawHead db |> Task.andThen (\head -> appendClaimedAt db head.logId (claim head) head row)
+
+
 appendSignedAt : Db -> String -> RawHead -> RawRow -> Task.Task Error Int
 appendSignedAt db logId head row =
+    appendClaimedAt db logId head head row
+
+
+appendClaimedAt : Db -> String -> RawHead -> RawHead -> RawRow -> Task.Task Error Int
+appendClaimedAt db logId claimed head row =
     let
         seq =
             head.seq + 1
 
         mac =
-            rawMac (rawMacInput logId seq head.head row)
+            rawMac (rawMacInput logId (claimed.seq + 1) claimed.head row)
     in
     do
         Db.exec db
