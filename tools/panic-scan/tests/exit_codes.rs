@@ -668,3 +668,75 @@ fn a_macro_body_rename_is_a_hit() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("lib.rs:3:"), "{}", streams(&out));
 }
+
+/// A source nested past the depth ceiling is refused with exit 2, never a crash.
+#[test]
+fn a_too_deep_file_fails_closed() {
+    let root = scratch("too_deep");
+    let depth = panic_scan::NestDepth::CEILING.get().saturating_add(1);
+    put(
+        &root,
+        "deep.rs",
+        &format!(
+            "pub fn f() -> bool {{\n    {}true\n}}\n",
+            "! ".repeat(depth)
+        ),
+    );
+    let out = scan_in(&root, &["deep.rs"]);
+    assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("too deep"), "{}", streams(&out));
+}
+
+/// A source one byte past the size ceiling is refused with exit 2.
+#[test]
+fn a_too_large_file_fails_closed() {
+    let root = scratch("too_large");
+    let padding = panic_scan::SourceBytes::CEILING
+        .get()
+        .saturating_sub(CLEAN_LIB.len())
+        .saturating_sub(1);
+    put(
+        &root,
+        "large.rs",
+        &format!("{CLEAN_LIB}//{}", "x".repeat(padding)),
+    );
+    let out = scan_in(&root, &["large.rs"]);
+    assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("too large"), "{}", streams(&out));
+}
+
+/// Rust under a `templates` directory ships verbatim, so its hits count.
+#[test]
+fn a_template_source_is_scanned() {
+    let root = scratch("template_hit");
+    put(&root, "src/lib.rs", CLEAN_LIB);
+    put(
+        &root,
+        "src/x/templates/mod.rs",
+        "pub fn f(o: Option<u8>) -> u8 {\n    o.unwrap()\n}\n",
+    );
+    for args in [&["src/x/templates/mod.rs"][..], &["--walk", "src"][..]] {
+        let out = scan_in(&root, args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", streams(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("templates/mod.rs:2:"),
+            "{args:?}: {}",
+            streams(&out)
+        );
+    }
+}
+
+/// A manifest under a `templates` directory is read like any other.
+#[test]
+fn a_template_manifest_is_checked() {
+    let root = scratch("template_manifest");
+    put(&root, "src/lib.rs", CLEAN_LIB);
+    put(&root, "src/templates/Cargo.toml", "[lib]\npath =\n");
+    let out = scan_in(&root, &["--walk", "src"]);
+    assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("templates/Cargo.toml"), "{}", streams(&out));
+}
