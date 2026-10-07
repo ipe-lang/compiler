@@ -11,6 +11,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Epoch exposing (Epoch)
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
+import Lib.ReviewKey exposing (ReviewKey)
 import Lib.SafeText as SafeText exposing (SafeText)
 
 
@@ -32,12 +33,15 @@ type alias IndexSettings =
 
 
 -- Every location the app serves from: the index and the review database,
--- each parsed once at startup, and the epoch of the process serving them,
--- minted once at startup. A request reads this value and never the
--- environment.
+-- each parsed once at startup, the key that signs and verifies the review
+-- log (or `ReadOnly` when none is set), read once at startup, and the epoch
+-- of the process serving them, minted once at startup. A request reads this
+-- value and never the environment. The key lives here and nowhere else: it
+-- never enters the model, a session, a view or a log line.
 type alias AppSettings =
     { index : IndexSettings
     , review : DbLocation
+    , key : ReviewKey
     , epoch : Epoch
     }
 

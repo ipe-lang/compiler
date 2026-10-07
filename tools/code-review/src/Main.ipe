@@ -13,6 +13,7 @@ import Lib.Db as LibDb
 import Lib.Epoch as Epoch
 import Lib.Index as Index
 import Lib.Queue as Queue
+import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.View as View
@@ -61,18 +62,43 @@ requireEnv key fix =
         (System.getenv key)
 
 
+-- The review-log key, read and parsed once: a malformed value stops startup
+-- with its own refusal, which never repeats the value; no value set starts
+-- the server read-only, with a notice saying so.
+requireReviewKey : Task Error ReviewKey
+requireReviewKey =
+    Task.onError
+        (\e ->
+            do
+                Io.eprintln ("code-review: " ++ Error.message e)
+                System.exit 1
+        )
+        (ReviewKey.readReviewKey |> Task.andThen announceKey)
+
+
+announceKey : ReviewKey -> Task Error ReviewKey
+announceKey key =
+    case key of
+        ReadOnly ->
+            Io.eprintln ReviewKey.readOnlyNotice |> Task.map (\_ -> key)
+
+        Signing _ ->
+            Task.succeed key
+
+
 -- Parse every configured location, then open and probe each one before
 -- serving: the index read-only with every column a page reads, the review
 -- database created and migrated, and the root, which the parse requires to
 -- be an existing directory and `Index.probeRoot` to hold the index's files.
 -- A relative value resolves against the working directory. Then the index's
 -- `reviewed` copy is rebuilt from the review database once and stamped with
--- the review log's head, so the first load already reads a current copy. Any
--- failure stops startup with a message naming the variable and one fix.
+-- the review log's head under `key`, so the first load already reads a
+-- current copy. Any failure stops startup with a message naming the
+-- variable and one fix.
 -- Last, this process's epoch is minted.
 -- Returns the settings, the one value the app serves from.
-requireSettings : String -> String -> String -> Task Error Settings.AppSettings
-requireSettings rawDb rawRoot rawReview =
+requireSettings : ReviewKey -> String -> String -> String -> Task Error Settings.AppSettings
+requireSettings key rawDb rawRoot rawReview =
     Task.onError
         (\e ->
             do
@@ -86,9 +112,9 @@ requireSettings rawDb rawRoot rawReview =
             review <- Settings.parseReviewDb rawReview
             LibDb.probe review
             db <- LibDb.openAt review
-            Queue.resyncReviewed index db
+            Queue.resyncReviewed key index db
             epoch <- Epoch.mint
-            Task.succeed { index = index, review = review, epoch = epoch }
+            Task.succeed { index = index, review = review, key = key, epoch = epoch }
         )
 
 
@@ -97,5 +123,6 @@ main =
     do
         rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the path or sqlite:// URL of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
         rawRoot <- requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
-        settings <- requireSettings rawDb rawRoot (System.getenvOr "IPE_REVIEW_DB" "review.db")
+        key <- requireReviewKey
+        settings <- requireSettings key rawDb rawRoot (System.getenvOr "IPE_REVIEW_DB" "review.db")
         Server.listen 8000 [ Server.mountApp "/" (reviewApp settings) ]

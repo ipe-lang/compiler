@@ -1,0 +1,104 @@
+module Lib.ReviewKey exposing (MacKey, ReviewKey(..), keyVar, parseMacKey, readOnlyError, readOnlyNotice, readReviewKey, sign, verifies)
+
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Error as Error
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+
+
+-- The key that signs and verifies review-log rows. Opaque: built only by
+-- `parseMacKey`, and read only by `sign` and `verifies`, so its material
+-- never reaches a view, a log line or an error. `Crypto.Key` renders
+-- redacted and compares in constant time.
+type MacKey
+    = MacKey Crypto.Key
+
+
+-- How this server treats the review log: it signs new rows and counts the
+-- rows that verify, or, with no key configured, it records nothing and
+-- counts nothing.
+type ReviewKey
+    = Signing MacKey
+    | ReadOnly
+
+
+-- The environment variable that carries the key.
+keyVar : String
+keyVar =
+    "IPE_REVIEW_MAC_KEY"
+
+
+-- The key's one decode point: exactly 64 ASCII hex digits (32 random bytes),
+-- in either case. The text is lowercased, so `AB..` and `ab..` are one key,
+-- and its 64 bytes are the key material. The refusal never repeats the value
+-- or its length.
+parseMacKey : String -> Result Error MacKey
+parseMacKey raw =
+    if String.length raw == 64 && String.all Char.isHexDigit raw then
+        case Crypto.keyFromString (String.toLower raw) of
+            Just key ->
+                Ok (MacKey key)
+
+            Nothing ->
+                Err malformedKey
+
+    else
+        Err malformedKey
+
+
+malformedKey : Error
+malformedKey =
+    Error.invalidInput (keyVar ++ " must be exactly 64 hexadecimal characters (32 random bytes); the value set is not.\n  fix: generate one with `openssl rand -hex 32`.")
+
+
+-- The key this server runs with, read once at startup: no variable set is
+-- `ReadOnly`; a set value, empty or blank included, must parse, and a value
+-- that does not refuses startup.
+readReviewKey : Task.Task Error ReviewKey
+readReviewKey =
+    System.getenv keyVar
+        |> Task.map Just
+        |> Task.onError (\_ -> Task.succeed Nothing)
+        |> Task.andThen keyOf
+
+
+keyOf : Maybe String -> Task.Task Error ReviewKey
+keyOf found =
+    case found of
+        Nothing ->
+            Task.succeed ReadOnly
+
+        Just raw ->
+            Task.fromResult (Result.map Signing (parseMacKey raw))
+
+
+-- The startup notice of a server running with no key.
+readOnlyNotice : String
+readOnlyNotice =
+    "code-review: " ++ keyVar ++ " is not set, so this server is read-only: it records no decision and counts none.\n  fix: set " ++ keyVar ++ " to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, stored outside the review database."
+
+
+-- The refusal of a decision on a server running with no key.
+readOnlyError : Error
+readOnlyError =
+    Error.withMessage ("This server is read-only: " ++ keyVar ++ " is not set, so no decision can be signed. Restart it with the key set to record decisions.") Error.permissionDenied
+
+
+-- The HMAC-SHA-256 tag of `message`, as the lowercase hex the log stores.
+sign : MacKey -> String -> String
+sign key message =
+    case key of
+        MacKey k ->
+            Crypto.macToHex (Crypto.hmacSha256 k message)
+
+
+-- True exactly when `mac` is the tag of `message` under `key`: recomputed
+-- and compared in constant time on the raw bytes.
+verifies : MacKey -> String -> Crypto.Mac -> Bool
+verifies key message mac =
+    case key of
+        MacKey k ->
+            Crypto.verifyHmacSha256 k message mac
