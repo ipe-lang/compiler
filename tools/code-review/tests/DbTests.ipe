@@ -260,7 +260,10 @@ staleCasRefused db stale =
 
 
 -- A review file whose log head is gone fails the startup probe, naming the
--- variable and the file. Red if the probe only migrates.
+-- variable and the file: the legacy head table dropped, and the review
+-- log's head row deleted with its guards put back, so only the read of the
+-- head can see it, refused as a log with no single head row. Red if the
+-- probe only migrates, or checks the guards and never reads the head.
 probeRefusesReviewWithoutHead : Task.Task Error Bool
 probeRefusesReviewWithoutHead =
     freshDir "ipe-review-probe-no-head" |> Task.andThen probeRefusesReviewWithoutHeadIn
@@ -269,16 +272,24 @@ probeRefusesReviewWithoutHead =
 probeRefusesReviewWithoutHeadIn : String -> Task.Task Error Bool
 probeRefusesReviewWithoutHeadIn base =
     let
-        dbPath =
+        legacy =
             base ++ "/review.db"
+
+        logHead =
+            base ++ "/log-head.db"
     in
     do
-        db <- migratedReviewAt dbPath
-        Db.exec db "DROP TABLE review_head" []
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
-        message <- probeMessage (LibDb.probe loc)
-        removeReviewFiles dbPath
-        Task.succeed (probeNames "IPE_REVIEW_DB" dbPath message)
+        legacyMessage <- probeAfterEdits legacy [ "DROP TABLE review_head" ]
+        logHeadMessage <- probeAfterEdits logHead
+            [ "DROP TRIGGER review_log_head_no_delete"
+            , "DELETE FROM review_log_head"
+            , "CREATE TRIGGER review_log_head_no_delete BEFORE DELETE ON review_log_head BEGIN SELECT RAISE(ABORT, 'review_log_head is permanent'); END"
+            ]
+        Task.succeed
+            (probeNames "IPE_REVIEW_DB" legacy legacyMessage
+                && probeNames "IPE_REVIEW_DB" logHead logHeadMessage
+                && maybeContains "no single head row" logHeadMessage
+            )
 
 
 -- A review file whose append-only guards are gone fails the startup probe,
