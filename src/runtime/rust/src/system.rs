@@ -1083,7 +1083,7 @@ impl ResolvedPort {
                 format!("port {port} was refused to this process by the operating system's policy.")
             }
             BindRefusal::AddressNotLocal => {
-                let host = host.map_or_else(
+                let host = host.as_ref().map_or_else(
                     || "the bind address".to_owned(),
                     std::string::ToString::to_string,
                 );
