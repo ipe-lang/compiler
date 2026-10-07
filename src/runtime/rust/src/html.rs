@@ -196,6 +196,13 @@ pub fn render_html<M>(node: &Html<M>) -> String {
     s
 }
 
+/// Marker attribute on a radio group's `<fieldset>`.
+///
+/// The ipe-id stamping pass reads it to give the group's unnamed radios one
+/// shared `name`, then removes it. Forging it only names the forger's own
+/// unnamed radios.
+pub(crate) const RADIO_GROUP_MARKER: &str = "data-ipe-radio-group";
+
 /// Maximum Html nesting depth the renderer and the ipe-id stamper descend.
 /// The Html tree is produced by the Ipê `view` from Model, and Model commonly
 /// holds attacker-influenced data (nested comments / replies / a worst-case
@@ -817,8 +824,16 @@ pub(crate) fn safe_patch_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'a 
 /// The id holds only `[A-Za-z0-9_.:-]`: a tag that fails `is_safe_html_name`
 /// contributes [`UNSAFE_TAG_ID_SEGMENT`] instead of its own text, and a key is
 /// sanitised, so `style_inject` can quote the id inside a CSS selector.
+///
+/// The same descent names radio groups: a `<fieldset>` carrying
+/// [`RADIO_GROUP_MARKER`] loses it, and every unnamed `<input type="radio">`
+/// below it (up to a nested marked fieldset) gets `name="ipe-rg-{fieldset ipe-id}"`.
+/// The name is a pure function of the fieldset's path, so it is stable across
+/// renders and distinct per group within one document. A radio that already
+/// has a non-empty `name` keeps it. A serialiser that does not stamp
+/// (`Html.toString`) leaves the marker and the radios unnamed.
 pub fn assign_ipe_ids<M>(node: &mut Html<M>, path: &str) {
-    assign_ipe_ids_depth(node, path, 0);
+    assign_ipe_ids_depth(node, path, 0, None);
 }
 
 /// The `ipe-id` tag segment of an element whose tag fails `is_safe_html_name`.
@@ -830,15 +845,25 @@ const UNSAFE_TAG_ID_SEGMENT: &str = "x";
 // stamper recurses once per nesting level, so an attacker-influenced deep tree
 // would overflow the stack. Stop descending at the cap. Kept in step with the
 // renderer's cap so a node the renderer drops is also left unstamped.
-fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize) {
+fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: Option<&str>) {
     if depth >= MAX_HTML_DEPTH {
         return;
     }
-    if let Html::HElement(_tag, attrs, kids) = node {
+    if let Html::HElement(tag, attrs, kids) = node {
         set_attr(attrs, "ipe-id", path);
+        let own_group = (tag.as_str() == "fieldset" && take_radio_group_marker(attrs))
+            .then(|| format!("ipe-rg-{path}"));
+        let group = own_group.as_deref().or(group);
         let mut idx = 0usize;
         for child in kids.iter_mut() {
             if let Html::HElement(ctag, cattrs, _) = child {
+                if let Some(name) = group
+                    && ctag.as_str() == "input"
+                    && attr_value(cattrs, "type") == Some("radio")
+                    && attr_value(cattrs, "name").is_none_or(str::is_empty)
+                {
+                    set_attr(cattrs, "name", name);
+                }
                 let tag_seg = if is_safe_html_name(ctag) {
                     ctag.as_str()
                 } else {
@@ -850,10 +875,17 @@ fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize) {
                     seg.push_str(&key);
                 }
                 idx += 1;
-                assign_ipe_ids_depth(child, &seg, depth.saturating_add(1));
+                assign_ipe_ids_depth(child, &seg, depth.saturating_add(1), group);
             }
         }
     }
+}
+
+/// Remove [`RADIO_GROUP_MARKER`] from `attrs`; true when it was present.
+fn take_radio_group_marker<M>(attrs: &mut Vec<Attribute<M>>) -> bool {
+    let before = attrs.len();
+    attrs.retain(|a| !matches!(a, Attribute::Attr(k, _) if k == RADIO_GROUP_MARKER));
+    attrs.len() != before
 }
 
 /// Stable disambiguator for an element, or `None`. Priority: an explicit
@@ -1467,6 +1499,185 @@ mod tests {
         let mut out = vec![];
         collect_ids_go(n, &mut out);
         out
+    }
+
+    fn radio_input(name: Option<&str>) -> Html<()> {
+        let mut attrs = vec![Attribute::Attr("type".into(), "radio".into())];
+        if let Some(n) = name {
+            attrs.push(Attribute::Attr("name".into(), n.into()));
+        }
+        Html::HElement("input".into(), attrs, vec![])
+    }
+
+    /// A radio group the way `ui::input` builds it: a fieldset (marked or not)
+    /// around a container of labelled radios.
+    fn radio_fieldset(marked: bool, extra: Vec<Attribute<()>>, radios: Vec<Html<()>>) -> Html<()> {
+        let mut attrs = extra;
+        if marked {
+            attrs.push(Attribute::Attr(RADIO_GROUP_MARKER.into(), String::new()));
+        }
+        let labels = radios
+            .into_iter()
+            .map(|r| Html::HElement("label".into(), vec![], vec![r]))
+            .collect();
+        Html::HElement(
+            "fieldset".into(),
+            attrs,
+            vec![Html::HElement("div".into(), vec![], labels)],
+        )
+    }
+
+    fn radio_names_go(n: &Html<()>, out: &mut Vec<Option<String>>) {
+        if let Html::HElement(tag, attrs, kids) = n {
+            if tag == "input" && attr_value(attrs, "type") == Some("radio") {
+                out.push(attr_value(attrs, "name").map(str::to_owned));
+            }
+            for c in kids {
+                radio_names_go(c, out);
+            }
+        }
+    }
+
+    fn radio_names(n: &Html<()>) -> Vec<Option<String>> {
+        let mut out = vec![];
+        radio_names_go(n, &mut out);
+        out
+    }
+
+    fn named(name: &str) -> Option<String> {
+        Some(name.to_owned())
+    }
+
+    /// Every unnamed radio of a marked fieldset gets the group name derived from
+    /// the fieldset's path, and the marker is consumed. Red if the stamper stops
+    /// naming radios or leaves the marker in the output.
+    #[test]
+    fn radio_group_gets_path_name() {
+        let mut t = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![radio_fieldset(
+                true,
+                vec![],
+                vec![radio_input(None), radio_input(None)],
+            )],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let group = named("ipe-rg-r_0_fieldset");
+        assert_eq!(radio_names(&t), vec![group.clone(), group]);
+        assert!(!render_html(&t).contains(RADIO_GROUP_MARKER));
+    }
+
+    /// Two groups in one document never share a name, or the browser would merge
+    /// them into one selection. Red if the name stops being a function of the
+    /// fieldset's own path.
+    #[test]
+    fn two_groups_in_one_document_get_distinct_names() {
+        let group = || radio_fieldset(true, vec![], vec![radio_input(None), radio_input(None)]);
+        let mut t = Html::HElement("div".into(), vec![], vec![group(), group()]);
+        assign_ipe_ids(&mut t, "r");
+        let (first, second) = (named("ipe-rg-r_0_fieldset"), named("ipe-rg-r_1_fieldset"));
+        assert_eq!(
+            radio_names(&t),
+            vec![first.clone(), first, second.clone(), second]
+        );
+    }
+
+    /// A radio that already has a non-empty `name` keeps it; an empty `name` is
+    /// as good as none. Red if the stamper overwrites an author's name.
+    #[test]
+    fn user_radio_name_is_not_overwritten() {
+        let mut t = radio_fieldset(
+            true,
+            vec![],
+            vec![
+                radio_input(Some("mine")),
+                radio_input(None),
+                radio_input(Some("")),
+            ],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let group = named("ipe-rg-r");
+        assert_eq!(radio_names(&t), vec![named("mine"), group.clone(), group]);
+    }
+
+    /// A fieldset without the marker is an ordinary fieldset: its radios stay
+    /// unnamed. Red if naming keys off the tag instead of the marker.
+    #[test]
+    fn unmarked_fieldset_radios_untouched() {
+        let mut t = radio_fieldset(false, vec![], vec![radio_input(None), radio_input(None)]);
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(radio_names(&t), vec![None, None]);
+    }
+
+    /// A marked fieldset inside a marked fieldset names its own radios, and the
+    /// outer group's radios keep the outer name. Red if the group name is not
+    /// replaced on entering the inner fieldset.
+    #[test]
+    fn nested_group_uses_innermost_fieldset() {
+        let inner = radio_fieldset(true, vec![], vec![radio_input(None)]);
+        let mut t = Html::HElement(
+            "fieldset".into(),
+            vec![Attribute::Attr(RADIO_GROUP_MARKER.into(), String::new())],
+            vec![radio_input(None), inner],
+        );
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(
+            radio_names(&t),
+            vec![named("ipe-rg-r"), named("ipe-rg-r_1_fieldset")]
+        );
+    }
+
+    /// Stamping again, or stamping a fresh build of the same view, yields the
+    /// same names, so a diff sees no spurious `name` change. Red if the name
+    /// depends on anything but the fieldset's path.
+    #[test]
+    fn radio_names_survive_diff_restamp() {
+        let build = || {
+            Html::HElement(
+                "div".into(),
+                vec![],
+                vec![radio_fieldset(
+                    true,
+                    vec![],
+                    vec![radio_input(None), radio_input(None)],
+                )],
+            )
+        };
+        let mut first = build();
+        assign_ipe_ids(&mut first, "r");
+        let names = radio_names(&first);
+        assign_ipe_ids(&mut first, "r");
+        assert_eq!(radio_names(&first), names);
+        let mut second = build();
+        assign_ipe_ids(&mut second, "r");
+        assert_eq!(radio_names(&second), names);
+        assert_eq!(render_html(&first), render_html(&second));
+    }
+
+    /// A group name built from a path that carries a hostile `ipe-key` stays in
+    /// the id alphabet and cannot break out of the attribute. Red if the name
+    /// uses an unsanitised key.
+    #[test]
+    fn radio_group_name_is_escaped_and_in_alphabet() {
+        let hostile = Attribute::Attr("ipe-key".into(), "a\"<b>&'".into());
+        let mut t = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![radio_fieldset(true, vec![hostile], vec![radio_input(None)])],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let names = radio_names(&t);
+        assert_eq!(names.len(), 1);
+        let name = names.into_iter().next().flatten().unwrap_or_default();
+        assert!(name.starts_with("ipe-rg-r_0_fieldset"), "{name}");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_.:-".contains(c)),
+            "{name}"
+        );
+        let html = render_html(&t);
+        assert!(!html.contains("<b>"), "{html}");
     }
 
     #[test]

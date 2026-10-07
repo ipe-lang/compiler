@@ -9,7 +9,8 @@
 //! and to avoid shadowing the runtime's own `element` type names.
 
 use super::element::{
-    Attribute, Description, Element, HAlign, Length, Location, Portion, PseudoClass, VAlign,
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, PseudoClass,
+    VAlign,
 };
 use crate::color::Color;
 use crate::core::IpeMaybe;
@@ -1169,7 +1170,7 @@ pub fn ui_region_aside_<M>() -> Attribute<M> {
 /// `Region.heading : Int -> Attribute msg`
 #[must_use]
 pub fn ui_region_heading_<M>(n: i64) -> Attribute<M> {
-    Attribute::AttrDescribe(Description::DescHeading(n))
+    Attribute::AttrDescribe(Description::DescHeading(HeadingLevel::from_requested(n)))
 }
 
 /// `Region.label : String -> Attribute msg`
@@ -1261,7 +1262,7 @@ pub fn ui_desc_live_assertive_() -> Description {
 /// `Ui.descHeading : Int -> Description`
 #[must_use]
 pub fn ui_desc_heading_(n: i64) -> Description {
-    Description::DescHeading(n)
+    Description::DescHeading(HeadingLevel::from_requested(n))
 }
 
 /// `Ui.descLabel : String -> Description`

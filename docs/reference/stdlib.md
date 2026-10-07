@@ -2961,7 +2961,7 @@ Ipe.Tuple — helpers for 2-tuples (pairs).
 | `descComplementary` | (no summary) |
 | `descLivePolite` | (no summary) |
 | `descLiveAssertive` | (no summary) |
-| `descHeading` | (no summary) |
+| `descHeading` | `descHeading n` — a heading of level `n`. Levels 1–6 render `<h1>`–`<h6>`; |
 | `descLabel` | (no summary) |
 | `iconButton` | (no summary) |
 | `Role` | (no summary) |
