@@ -2254,9 +2254,12 @@ mod registry_phase_c_tests {
             if k.def().qualifier != "Db" {
                 continue;
             }
-            let Some(scheme) = builder.resolve_scheme(k.def().scheme) else {
-                continue;
-            };
+            let scheme = builder.resolve_scheme(k.def().scheme);
+            assert!(
+                scheme.is_some(),
+                "{k:?} is a Db kernel with no resolvable scheme"
+            );
+            let Some(scheme) = scheme else { continue };
             let list_vars = list_var_arguments(&scheme, list);
             if list_vars.is_empty() {
                 assert!(

@@ -718,7 +718,7 @@ fn security_db_bind_list_refuses_non_sql_param_elements() {
         assert_compiles(&format!("db_bind_list_{label}_control"), &control);
         for (shape, binds, code) in [
             ("record", "[ { id = 1 } ]", "IPE-T0014"),
-            ("function", r"[ \x -> x ]", "IPE-T0001"),
+            ("function", "[ not ]", "IPE-T0001"),
         ] {
             let src = db_bind_list_program(imports, probe, binds);
             assert_rejected(&format!("db_bind_list_{label}_{shape}"), &src, code);
