@@ -1135,6 +1135,15 @@ function __ipeDrainQueue() {
 // input (same DOM node, same .value, same IME/composition state)
 // through the new HTML so it's never destroyed. Per-attr and
 // textContent updates are fine as-is — they don't regenerate nodes.
+// Attributes a patch mirrors onto a live property, by attribute name. Once the
+// user or the client sets `checked` or `selected` the property stops following
+// its attribute, so a patch writes the property beside the attribute on every
+// set and every removal: a removed attribute clears its property.
+var __IPE_LIVE_PROPS = Object.freeze({
+  checked: "checked",
+  selected: "selected",
+  disabled: "disabled"
+});
 function __ipeApplyPatches(patches) {
   if (!patches || patches.length === 0) return;
   // Open <select> defence: native dropdowns close on ANY DOM mutation
@@ -1200,17 +1209,19 @@ function __ipeApplyPatches(patches) {
         if (dirty && (k === "value" || k === "checked" || k === "selected")) {
           continue;
         }
-        if (v === "") { el.removeAttribute(k); }
-        else {
+        var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
+            ? __IPE_LIVE_PROPS[k] : null;
+        if (v === "") {
+          el.removeAttribute(k);
+          if (prop !== null) el[prop] = false;
+        } else {
           el.setAttribute(k, v);
           // Sync DOM properties that don't reflect from attrs.
           if (k === "value" && ("value" in el)) {
             el.value = v;
             valueChanged = true;
           }
-          if (k === "checked") el.checked = v !== "" && v !== "false";
-          if (k === "selected") el.selected = v !== "" && v !== "false";
-          if (k === "disabled") el.disabled = v !== "" && v !== "false";
+          if (prop !== null) el[prop] = v !== "false";
         }
       }
       // Restore selection on focused input/textarea after a value
