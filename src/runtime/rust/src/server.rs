@@ -5281,6 +5281,46 @@ mod tests {
         }
     }
 
+    /// A header the response already carries keeps its value; the default
+    /// fills only the header the response lacks.
+    #[test]
+    fn security_headers_keep_a_header_the_response_set() {
+        type Defaults =
+            Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>;
+        let defaults = || -> Defaults {
+            Ok(vec![
+                ("content-security-policy", "default-src 'none'".to_owned()),
+                ("x-frame-options", "SAMEORIGIN".to_owned()),
+            ])
+        };
+        let mut set = axum::response::IntoResponse::into_response("ok");
+        set.headers_mut().insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("img-src 'self'"),
+        );
+        let kept = with_security_headers(set, defaults());
+        assert_eq!(kept.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            single_header(&kept, "content-security-policy"),
+            Some("img-src 'self'")
+        );
+        assert_eq!(single_header(&kept, "x-frame-options"), Some("SAMEORIGIN"));
+
+        let filled = with_security_headers(
+            axum::response::IntoResponse::into_response("ok"),
+            defaults(),
+        );
+        assert_eq!(filled.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            single_header(&filled, "content-security-policy"),
+            Some("default-src 'none'")
+        );
+        assert_eq!(
+            single_header(&filled, "x-frame-options"),
+            Some("SAMEORIGIN")
+        );
+    }
+
     /// The `InvalidInput` message of a refused `Server.withHeader`, or `None`
     /// when the header was accepted.
     fn with_header_refusal(name: &str, value: &str) -> Option<String> {
