@@ -64,7 +64,7 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
 /// crate-private accessor, the ban proofs, the one blocking-pool start, the one
-/// process exit, and the
+/// process exit, the non-Unicode environ probe test, and the
 /// audited lossy-UTF-8 sites that render bytes already refused or never parsed.
 const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/env/src/lib.rs", 3),
@@ -84,7 +84,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/runtime/rust/src/scratch_core.rs", 2),
     ("src/runtime/rust/src/server.rs", 2),
     ("src/runtime/rust/src/ssrf.rs", 1),
-    ("src/runtime/rust/src/system.rs", 10),
+    ("src/runtime/rust/src/system.rs", 11),
     ("src/runtime/rust/src/terminal_access.rs", 1),
     ("src/runtime/rust/src/threads.rs", 1),
     ("src/runtime/rust/src/tui/key.rs", 1),
