@@ -1953,7 +1953,7 @@ fn endpoint_param_refusal(routes: &[ServerRoute]) -> Option<EndpointParamRefusal
     })
 }
 
-pub fn server_listen<E: From<String> + Send + 'static>(
+pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
     port: i64,
     routes: Vec<ServerRoute>,
 ) -> IpeTask<E, ()> {
@@ -2102,17 +2102,22 @@ pub fn server_listen<E: From<String> + Send + 'static>(
         );
         let port = resolved.port;
         let Ok(port) = u16::try_from(port) else {
-            return IpeResult::Err(format!("Server.listen: port {port} is not a TCP port").into());
+            return IpeResult::Err(E::from_ipe_error(crate::IpeError::invalid_input(format!(
+                "Server.listen: port {port} is not a TCP port"
+            ))));
         };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
         crate::telemetry::record_bind(host);
         let addr = std::net::SocketAddr::new(host, port);
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                return IpeResult::Err(resolved.addr_in_use_message().into());
+            Err(e) => {
+                return IpeResult::Err(E::from_ipe_error(resolved.bind_refusal(
+                    "Server.listen",
+                    addr,
+                    &e,
+                )));
             }
-            Err(e) => return IpeResult::Err(format!("Server.listen: bind {}: {}", addr, e).into()),
         };
         crate::system::emit_runtime_log("http.server", &format!("listening on http://{addr}"));
         // with_connect_info so each request carries the peer SocketAddr —
@@ -3528,15 +3533,119 @@ mod tests {
         assert_eq!(resolve(None, Some("9123")).port, 9123);
         assert_eq!(resolve(Some("9100"), Some("9123")).port, 9100);
         assert_eq!(resolve(None, Some("0")).port, 8000);
+        let in_use = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8000));
+        let dev = crate::telemetry::BuildPosture::Development;
+        let advice = |r: crate::system::ResolvedPort| {
+            crate::ipe_error_message(r.bind_refusal_for(dev, "Server.listen", addr, &in_use))
+        };
+        assert!(advice(resolve(None, None)).contains("IPE_SERVER_PORT=8123 ipe dev run"));
+        assert!(!advice(resolve(Some("9100"), None)).contains("IPE_SERVER_PORT"));
+    }
+
+    /// A port another socket holds refuses `Server.listen` as a typed
+    /// `Conflict` naming `IPE_SERVER_PORT`, never the `Unexpected` catch-all,
+    /// and a release binary's fix line names no `ipe` verb.
+    #[tokio::test]
+    async fn listen_on_a_held_port_is_a_typed_conflict() {
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind an ephemeral loopback port to hold");
+        let port = held.local_addr().expect("the held port's address").port();
+        crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+        // A listener that bound anyway would serve forever; the timeout turns
+        // that regression into a failure instead of a hang.
+        let listened: Result<IpeResult<crate::IpeError, ()>, _> = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server_listen(i64::from(port), Vec::new()),
+        )
+        .await;
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+        drop(held);
         assert!(
-            resolve(None, None)
-                .addr_in_use_message()
-                .contains("IPE_SERVER_PORT=8123 ipe dev run")
+            matches!(&listened, Ok(IpeResult::Err(_))),
+            "a held port must refuse the listener: {listened:?}"
         );
+        let Ok(IpeResult::Err(error)) = listened else {
+            return;
+        };
+        assert_eq!(
+            crate::ipe_error_kind(error.clone()),
+            crate::IpeErrorKind::Conflict
+        );
+        let text = error.to_ipe_string();
         assert!(
-            !resolve(Some("9100"), None)
-                .addr_in_use_message()
-                .contains("IPE_SERVER_PORT")
+            text.starts_with(&format!("Conflict: port {port} is already in use")),
+            "{text}"
+        );
+        assert!(text.contains("IPE_SERVER_PORT=8123"), "{text}");
+        assert!(
+            cfg!(feature = "dev-posture") || !text.contains("ipe dev"),
+            "a release binary must not advise an `ipe` verb: {text}"
+        );
+    }
+
+    /// Each operator-fixable bind failure is its own error kind with a fix
+    /// line; a release binary's fix line names the program, not `ipe dev run`.
+    #[test]
+    fn bind_refusals_are_typed_and_release_advice_names_no_dev_verb() {
+        use crate::telemetry::BuildPosture;
+        use std::io::ErrorKind;
+        let resolved = crate::system::resolve_listen_port(None, (SERVER_PORT_ENV, None), 80);
+        let addr = std::net::SocketAddr::from(([10, 255, 255, 1], 80));
+        let refusal = |posture: BuildPosture, kind: ErrorKind| {
+            let error = resolved.bind_refusal_for(
+                posture,
+                "Server.listen",
+                addr,
+                &std::io::Error::from(kind),
+            );
+            (
+                crate::ipe_error_kind(error.clone()),
+                crate::ipe_error_message(error),
+            )
+        };
+        for (kind, expected, fix) in [
+            (
+                ErrorKind::AddrInUse,
+                crate::IpeErrorKind::Conflict,
+                "IPE_SERVER_PORT=8123",
+            ),
+            (
+                ErrorKind::PermissionDenied,
+                crate::IpeErrorKind::PermissionDenied,
+                "IPE_SERVER_PORT=8123",
+            ),
+            (
+                ErrorKind::AddrNotAvailable,
+                crate::IpeErrorKind::InvalidInput,
+                "IPE_HTTP_BIND=127.0.0.1",
+            ),
+        ] {
+            let (release_kind, release) = refusal(BuildPosture::Release, kind);
+            assert_eq!(release_kind, expected, "{kind:?}: {release}");
+            assert!(
+                release.contains(&format!("{fix} ./<program>")) && !release.contains("ipe dev"),
+                "{kind:?}: {release}"
+            );
+            let (dev_kind, dev) = refusal(BuildPosture::Development, kind);
+            assert_eq!(dev_kind, expected, "{kind:?}: {dev}");
+            assert!(
+                dev.contains(&format!("{fix} ipe dev run")),
+                "{kind:?}: {dev}"
+            );
+        }
+        let (_, privileged) = refusal(BuildPosture::Release, ErrorKind::PermissionDenied);
+        assert!(privileged.contains("below 1024"), "{privileged}");
+        let (_, not_local) = refusal(BuildPosture::Release, ErrorKind::AddrNotAvailable);
+        assert!(
+            not_local.starts_with("10.255.255.1 is not an address of this host"),
+            "{not_local}"
+        );
+        let (other_kind, other) = refusal(BuildPosture::Release, ErrorKind::ConnectionReset);
+        assert_eq!(other_kind, crate::IpeErrorKind::Io, "{other}");
+        assert!(
+            other.starts_with("Server.listen: bind 10.255.255.1:80: "),
+            "{other}"
         );
     }
 
@@ -3704,6 +3813,33 @@ mod tests {
             let refused = matches!(&listened, Ok(IpeResult::Err(msg))
                 if msg.starts_with("Server.listen: IPE_HTTP_BIND must be an IP address"));
             assert!(refused, "IPE_HTTP_BIND={raw:?} must refuse the listener");
+        }
+    }
+
+    /// A program port no TCP listener can take refuses `Server.listen` as a
+    /// typed `InvalidInput` before it binds, never the `Unexpected` catch-all.
+    #[tokio::test]
+    async fn listen_on_an_out_of_range_port_is_invalid_input() {
+        crate::system::locked_remove_var(SERVER_PORT_ENV);
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        for port in [-1, 65_536, i64::MAX] {
+            let listened: Result<IpeResult<crate::IpeError, ()>, _> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(port, Vec::new()),
+            )
+            .await;
+            let Ok(IpeResult::Err(error)) = listened else {
+                panic!("port {port} must refuse the listener: {listened:?}");
+            };
+            assert_eq!(
+                crate::ipe_error_kind(error.clone()),
+                crate::IpeErrorKind::InvalidInput,
+                "{error:?}"
+            );
+            assert_eq!(
+                crate::ipe_error_message(error),
+                format!("Server.listen: port {port} is not a TCP port")
+            );
         }
     }
 
