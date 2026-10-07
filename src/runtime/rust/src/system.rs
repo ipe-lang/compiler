@@ -3818,7 +3818,7 @@ mod getenv_kind_tests {
     /// Marker bytes no failure message may carry, as ASCII or as a lossy rendering.
     const SECRET_MARKER: &str = "zq9";
 
-    /// The variable the child half of the non-Unicode test is started with.
+    /// The variable the re-exec of the non-Unicode environ test is started with.
     #[cfg(unix)]
     const NOT_UNICODE_PROBE: &str = "IPE_GETENV_NOT_UNICODE_PROBE";
 
@@ -3955,56 +3955,41 @@ mod getenv_kind_tests {
         locked_remove_var(key);
     }
 
-    /// The child half of `a_non_unicode_environ_value_is_invalid_input`.
+    /// The real environ read fails `InvalidInput` for a non-Unicode value, and
+    /// `getenvOr` answers its default.
     ///
-    /// Ignored so it runs only as that test's child, started with the probe set
-    /// to non-Unicode bytes in the real environ.
+    /// The value is set at spawn on a re-exec of this test binary that must run
+    /// and pass this one test: the overlay holds only Unicode and the process
+    /// environ is never mutated. The re-exec sees the probe and checks the
+    /// kernels; the parent, without it, starts the re-exec.
     #[cfg(unix)]
-    #[ignore = "run as a child process by a_non_unicode_environ_value_is_invalid_input"]
-    #[test]
-    fn non_unicode_environ_child() {
-        assert!(every_kernel_fails_as(
-            NOT_UNICODE_PROBE,
-            IpeErrorKind::InvalidInput
-        ));
-        assert_eq!(
-            super::system_getenv_or(NOT_UNICODE_PROBE.to_owned(), "fallback".to_owned()),
-            "fallback",
-            "`getenvOr` answers its default for a non-Unicode value"
-        );
-    }
-
-    /// The real environ read fails `InvalidInput` for a non-Unicode value.
-    ///
-    /// Runs [`non_unicode_environ_child`] as a child process of this test binary
-    /// with the value set through `Command::env`: the overlay holds only Unicode
-    /// and the process environ is never mutated.
-    #[cfg(unix)]
-    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
     #[test]
     fn a_non_unicode_environ_value_is_invalid_input() {
+        if super::read_env_var_os(NOT_UNICODE_PROBE).is_some() {
+            assert!(every_kernel_fails_as(
+                NOT_UNICODE_PROBE,
+                IpeErrorKind::InvalidInput
+            ));
+            assert_eq!(
+                super::system_getenv_or(NOT_UNICODE_PROBE.to_owned(), "fallback".to_owned()),
+                "fallback",
+                "`getenvOr` answers its default for a non-Unicode value"
+            );
+            return;
+        }
         let module = module_path!();
-        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-        let filter = format!("{module}::non_unicode_environ_child");
-        let exe = std::env::current_exe().expect("the test binary");
-        let out = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                filter.as_str(),
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(NOT_UNICODE_PROBE, not_unicode_value())
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("run the non-Unicode child");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let name = format!(
+            "{}::a_non_unicode_environ_value_is_invalid_input",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
+        let rerun = e2e_support::rerun_this_test_exact(&name, |cmd| {
+            cmd.arg("--test-threads=1")
+                .env(NOT_UNICODE_PROBE, not_unicode_value())
+                .stdin(std::process::Stdio::null());
+        });
         assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "the child did not pass ({:?}):\n{stdout}\n{stderr}",
-            out.status
+            rerun.is_ok(),
+            "the non-Unicode re-exec did not pass: {rerun:?}"
         );
     }
 }
