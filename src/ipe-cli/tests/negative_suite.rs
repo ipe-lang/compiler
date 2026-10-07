@@ -645,7 +645,7 @@ fn security_db_sql_column_still_validates_and_compiles() {
 
 /// Every `Db` kernel taking a SQL bind list, as `(label, imports, probe)`.
 ///
-/// `probe` is one function calling the kernel with `{binds}` in the bind-list
+/// `probe` is one function calling the kernel with `@binds@` in the bind-list
 /// position; `imports` are the extra imports it needs.
 const DB_BIND_LIST_KERNELS: [(&str, &str, &str); 6] = [
     (
@@ -653,7 +653,7 @@ const DB_BIND_LIST_KERNELS: [(&str, &str, &str); 6] = [
         "import Ipe.Db as Db\n",
         r#"probe : Db -> Task Error Int
 probe conn =
-    Db.exec conn "SELECT 1" {binds}
+    Db.exec conn "SELECT 1" @binds@
 "#,
     ),
     (
@@ -661,7 +661,7 @@ probe conn =
         "import Ipe.Db as Db\nimport Ipe.Db.Unsafe as Unsafe\n",
         r#"probe : Db -> Task Error (List (Dict String String))
 probe conn =
-    Unsafe.unsafeQuery conn "SELECT 1" {binds}
+    Unsafe.unsafeQuery conn "SELECT 1" @binds@
 "#,
     ),
     (
@@ -669,7 +669,7 @@ probe conn =
         "import Ipe.Db as Db\nimport Ipe.Db.Decode\n",
         r#"probe : Db -> Task Error (List Int)
 probe conn =
-    Db.queryDecode conn "SELECT 1" {binds} (Db.Decode.int "n")
+    Db.queryDecode conn "SELECT 1" @binds@ (Db.Decode.int "n")
 "#,
     ),
     (
@@ -677,7 +677,7 @@ probe conn =
         "import Ipe.Db.Dsn as Dsn exposing (Connection, ReadOnly)\nimport Ipe.Db as Db\nimport Ipe.Db.Decode\n",
         r#"probe : Connection ReadOnly -> Task Error (List Int)
 probe conn =
-    Db.queryDecodeOn conn "SELECT 1" {binds} (Db.Decode.int "n")
+    Db.queryDecodeOn conn "SELECT 1" @binds@ (Db.Decode.int "n")
 "#,
     ),
     (
@@ -685,7 +685,7 @@ probe conn =
         "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
         r#"probe : Db -> Task Error (List (Dict String String))
 probe conn =
-    Db.findProjection conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] {binds}
+    Db.findProjection conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] @binds@
 "#,
     ),
     (
@@ -693,14 +693,14 @@ probe conn =
         "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
         r#"probe : Db -> Task Error (List (Dict String String))
 probe conn =
-    Db.findProjectionOrdered conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] {binds} "a0" "id" True
+    Db.findProjectionOrdered conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] @binds@ "a0" "id" True
 "#,
     ),
 ];
 
 /// A program holding one probe over a `Db` kernel, with `binds` as its bind list.
 fn db_bind_list_program(imports: &str, probe: &str, binds: &str) -> String {
-    let probe = probe.replace("{binds}", binds);
+    let probe = probe.replace("@binds@", binds);
     format!(
         "{HEAD}{imports}import Ipe.Task as Task\n\n{probe}\nmain : Task Error ()\nmain =\n    Task.succeed ()\n"
     )
