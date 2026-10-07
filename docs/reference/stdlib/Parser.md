@@ -56,7 +56,8 @@ Divergences from `elm/parser` (recorded in `docs/divergences-from-elm.md`):
     always compose through the combinators.
   * Records are built with `map2` … `map5` (apply a builder directly to the
     results of several parsers) and sequenced with `keep` / `ignore` (or their
-    infix aliases `|.` / `|=`) for punctuation to skip.
+    infix aliases `|.` / `|=`, available after `import Ipe.Parser` in any
+    form) for punctuation to skip.
     `a |= b` desugars to `ignore a b` (run a then b, yield b's result — keep
     the right); `a |. b` desugars to `keep a b` (run a then b, yield a's
     result — keep the left). Elm instead threads a curried constructor through
