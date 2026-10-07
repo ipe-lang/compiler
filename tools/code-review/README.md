@@ -43,7 +43,7 @@ joining a stored path outside the repo:
 | Variable         | Meaning                                                       |
 |------------------|---------------------------------------------------------------|
 | `IPE_INDEX_DB`   | Path or `sqlite://` URL of the `ipe-index` DB.                |
-| `IPE_INDEX_ROOT` | Repo root the index's `ipe:relative` paths join to; must be an existing directory. |
+| `IPE_INDEX_ROOT` | Repo root the index's `ipe:relative` paths join to; must be an existing directory holding the indexed files, checked at startup. |
 | `IPE_REVIEW_DB`  | Optional path or `sqlite://` URL of the review DB; defaults to `review.db`. |
 
 A relative path in any of the three resolves against the working directory. A

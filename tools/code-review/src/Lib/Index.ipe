@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -11,13 +11,14 @@ import Ipe.Error as Error
 import Ipe.File as File
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
-import Lib.RepoPath as RepoPath exposing (RootMap)
+import Lib.RepoPath as RepoPath exposing (PathError, RootMap)
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
@@ -317,6 +318,91 @@ probe settings =
         Task.succeed ()
     )
         |> Task.mapError (Settings.openFailure "IPE_INDEX_DB" (SafeText.literal "build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at an existing index") settings.db)
+
+
+-- The startup check of `IPE_INDEX_ROOT` against the index: of the first
+-- `rootSample` distinct indexed paths, those a configured root binds, at
+-- least one must exist beneath it. A root other than the tree the index was
+-- built from holds none of them and is refused naming the variable, the
+-- first sampled path and where it was looked for; a file or two deleted
+-- since the last index run does not refuse a right root while another
+-- sampled file remains. An index with no bound path has nothing to check.
+probeRoot : IndexSettings -> Task.Task Error ()
+probeRoot settings =
+    do
+        conn <- readConnection settings
+        stored <- Db.queryDecode conn indexedPathsSql [ SqlInt rootSample ] storedPathDecoder
+        anyPresent (List.filterMap (boundPath settings.roots) stored)
+
+
+-- Succeeds when `bound` is empty or any of its files exists.
+anyPresent : List ( String, Path ) -> Task.Task Error ()
+anyPresent bound =
+    case List.head bound of
+        Nothing ->
+            Task.succeed ()
+
+        Just ( first, firstPath ) ->
+            Task.sequence (List.map presentAt bound)
+                |> Task.andThen
+                    (\present ->
+                        if List.member True present then
+                            Task.succeed ()
+
+                        else
+                            Task.fail (rootMismatch (List.length bound) first firstPath)
+                    )
+
+
+-- How many distinct indexed paths the root check samples.
+rootSample : Int
+rootSample =
+    16
+
+
+indexedPathsSql : String
+indexedPathsSql =
+    "SELECT DISTINCT path FROM units LIMIT ?"
+
+
+storedPathDecoder : Db.Decode.Decoder String
+storedPathDecoder =
+    Db.Decode.succeed (\path -> path)
+        |> Db.Decode.required "path" (Db.Decode.string "path")
+
+
+-- A stored path with the file it joins to, when a configured root binds it.
+boundPath : RootMap -> String -> Maybe ( String, Path )
+boundPath roots stored =
+    case RepoPath.resolve roots stored of
+        Ok path ->
+            Just ( stored, path )
+
+        Err _ ->
+            Nothing
+
+
+presentAt : ( String, Path ) -> Task.Task Error Bool
+presentAt ( _, path ) =
+    File.exists path |> Task.onError (\_ -> Task.succeed False)
+
+
+rootMismatch : Int -> String -> Path -> Error
+rootMismatch sampled first path =
+    Error.invalidInput
+        (SafeText.toString
+            (SafeText.concat
+                [ SafeText.literal "IPE_INDEX_ROOT holds none of the "
+                , SafeText.render (String.fromInt sampled)
+                , SafeText.literal " indexed files checked: index path "
+                , SafeText.quoted first
+                , SafeText.literal " is not at "
+                , SafeText.quoted (Path.toString path)
+                , SafeText.literal "; "
+                , RepoPath.rootFix
+                ]
+            )
+        )
 
 
 reviewedPairDecoder : Db.Decode.Decoder ( String, String )
@@ -772,7 +858,7 @@ viewOf conn roots row =
         Sha256 stored ->
             case RepoPath.resolve roots row.path of
                 Err refusal ->
-                    Task.succeed (Unreadable (RepoPath.toError refusal))
+                    Task.succeed (Unreadable (PathRefused refusal))
 
                 Ok path ->
                     case spanOversize row.lineStart row.lineEnd of
@@ -789,7 +875,7 @@ viewOf conn roots row =
                                     Ok covered ->
                                         File.readFileLimit path sourceCeiling
                                             |> Task.map (classifyView row.uid stored covered)
-                                            |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
+                                            |> Task.onError (\_ -> unreadableAt row.path path)
 
 
 -- What `row`'s attestation covers, ipe-index's rule: a file unit attests its
@@ -841,20 +927,47 @@ childSpanCeiling =
     4 * viewLineCeiling
 
 
--- A read error re-worded to name the stored path it came from.
-readFailure : String -> Error -> Error
-readFailure stored e =
-    Error.withMessage
-        (SafeText.toString
-            (SafeText.concat
+-- Why the read of `stored`'s joined `path` failed, judged by whether
+-- anything is there. The read error's own text is never kept, so no OS
+-- wording or error number reaches the page.
+unreadableAt : String -> Path -> Task.Task Error SourceView
+unreadableAt stored path =
+    File.exists path
+        |> Task.map (failureFor stored)
+        |> Task.onError (\_ -> Task.succeed (Unreadable (CannotRead stored)))
+
+
+failureFor : String -> Bool -> SourceView
+failureFor stored present =
+    if present then
+        Unreadable (CannotRead stored)
+
+    else
+        Unreadable (NoFile stored)
+
+
+-- The one rendering of a `ReadFailure`, naming the stored path and the fix.
+readFailureText : ReadFailure -> SafeText
+readFailureText failure =
+    case failure of
+        PathRefused refusal ->
+            RepoPath.describe refusal
+
+        NoFile stored ->
+            SafeText.concat
                 [ SafeText.literal "index path "
                 , SafeText.quoted stored
-                , SafeText.literal " could not be read: "
-                , SafeText.render (Error.message e)
+                , SafeText.literal " names no file under the repository root; re-run `ipe-index index` if the file was moved or deleted"
                 ]
-            )
-        )
-        e
+
+        CannotRead stored ->
+            SafeText.concat
+                [ SafeText.literal "index path "
+                , SafeText.quoted stored
+                , SafeText.literal " exists but did not read as text: it is past the "
+                , SafeText.render (String.fromInt (ByteSize.toBytes sourceCeiling))
+                , SafeText.literal "-byte limit, not UTF-8, not a regular file, or not readable by this process"
+                ]
 
 
 -- The one judgement of a unit's view, in precedence order: a body past the
@@ -1162,13 +1275,23 @@ type SourceRow
 
 
 -- What the unit page may show of a unit's source: the verified view, a
--- reason it is withheld, the error that kept it from being read, or the
+-- reason it is withheld, why it could not be read, or the
 -- ceiling it passed. Only `Shown` holds source text.
 type SourceView
     = Shown ShownSource
     | Stale StaleReason
-    | Unreadable Error
+    | Unreadable ReadFailure
     | TooLarge Oversize
+
+
+-- Why a unit's file was not read: its stored path was refused before any
+-- read, nothing is at the joined path, or what is there did not read as
+-- text within `sourceCeiling`. Each case but a refusal names the stored
+-- path; a refusal's `PathError` names it itself.
+type ReadFailure
+    = PathRefused PathError
+    | NoFile String
+    | CannotRead String
 
 
 -- The scheme prefix of every attestation ipe-index stores in `body_hash`.

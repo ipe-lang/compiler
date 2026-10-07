@@ -745,8 +745,8 @@ sourceStatusText view =
         Stale UnverifiableHash ->
             Just "This unit's hash predates source attestation; re-run `ipe-index index` to verify it."
 
-        Unreadable e ->
-            Just ("Source unreadable: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        Unreadable failure ->
+            Just ("Source unreadable: " ++ SafeText.toString (Index.readFailureText failure))
 
         TooLarge (SpanLines o) ->
             Just ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)

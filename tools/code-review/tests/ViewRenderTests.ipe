@@ -17,9 +17,10 @@ import Ipe.Ui as Ui
 import Lib.App exposing (Model, Page(..), initialModel)
 import Lib.Db as LibDb exposing (HistoryCursor(..), StoredDecision(..))
 import Lib.Format as Format
-import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
 import Lib.View as View
@@ -266,7 +267,9 @@ withheldCases =
     [ staleCase Drifted
     , staleCase (RangeOutOfFile { lineCount = 2 })
     , staleCase UnverifiableHash
-    , { view = Unreadable (Error.invalidInput "gone"), reason = "Source unreadable: " }
+    , { view = Unreadable (NoFile "ipe:gone.rs"), reason = "Source unreadable: " }
+    , { view = Unreadable (CannotRead "ipe:dir.rs"), reason = "Source unreadable: " }
+    , { view = Unreadable (PathRefused (UnknownTag "other:a.rs")), reason = "Source unreadable: " }
     , oversizeCase (SpanLines { lines = Index.viewLineCeiling + 1 })
     , oversizeCase (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
     , oversizeCase (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
@@ -274,7 +277,7 @@ withheldCases =
 
 
 -- The constructor a withheld view is named by: the reason's own constructor
--- for a stale or an oversize view, the view's otherwise; `Shown` withholds
+-- for a stale, an unreadable or an oversize view; `Shown` withholds
 -- nothing.
 withheldName : SourceView -> Maybe String
 withheldName view =
@@ -291,8 +294,14 @@ withheldName view =
         Stale UnverifiableHash ->
             Just "UnverifiableHash"
 
-        Unreadable _ ->
-            Just "Unreadable"
+        Unreadable (PathRefused _) ->
+            Just "PathRefused"
+
+        Unreadable (NoFile _) ->
+            Just "NoFile"
+
+        Unreadable (CannotRead _) ->
+            Just "CannotRead"
 
         TooLarge (SpanLines _) ->
             Just "SpanLines"
@@ -334,8 +343,8 @@ constructorsOf name source =
 
 -- Every withheld constructor `Lib.Index` declares has a case in
 -- `withheldCases`, so it is rendered by the withheld checks: each
--- `SourceView` but `Shown`, with `Stale` and `TooLarge` read as their
--- reasons' constructors. Read from the declarations themselves, so a new
+-- `SourceView` but `Shown`, with `Stale`, `Unreadable` and `TooLarge` read
+-- as their reasons' constructors. Read from the declarations themselves, so a new
 -- variant is red here until it is rendered, not only until it compiles.
 everyWithheldConstructorRendered : Task.Task Error Bool
 everyWithheldConstructorRendered =
@@ -357,6 +366,9 @@ everyWithheldConstructorRendered =
 
                             else if c == "TooLarge" then
                                 constructorsOf "Oversize" source
+
+                            else if c == "Unreadable" then
+                                constructorsOf "ReadFailure" source
 
                             else
                                 [ c ]

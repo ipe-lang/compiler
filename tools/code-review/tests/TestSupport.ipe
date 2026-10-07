@@ -243,8 +243,8 @@ viewTag view =
         Stale UnverifiableHash ->
             "unverifiable"
 
-        Unreadable e ->
-            "unreadable: " ++ Error.toString e
+        Unreadable failure ->
+            "unreadable: " ++ SafeText.toString (Index.readFailureText failure)
 
         TooLarge (SpanLines o) ->
             "too large lines " ++ String.fromInt o.lines

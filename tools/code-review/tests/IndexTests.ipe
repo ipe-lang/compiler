@@ -152,6 +152,41 @@ oneMissingFileIsolated =
             )
 
 
+-- A unit whose file is gone reads as naming no file; one whose path now
+-- holds a directory reads as present but not read as text. Neither carries
+-- the read error's own wording, its kind or an OS error number. Red if a
+-- read error's message reaches the view again.
+unreadableReasonsTyped : Task.Task Error Bool
+unreadableReasonsTyped =
+    do
+        gone <- viewTagsAfter "ipe-index-unreadable-gone" (\at -> removeFileIfAny (at.repo ++ "/src/Main.ipe"))
+        dir <- viewTagsAfter "ipe-index-unreadable-dir" mainIpeAsDirectory
+        Task.succeed (typedUnreadable "names no file" gone && typedUnreadable "did not read as text" dir)
+
+
+-- `src/Main.ipe` replaced by a directory of that name.
+mainIpeAsDirectory : Scratch -> Task.Task Error ()
+mainIpeAsDirectory at =
+    removeFileIfAny (at.repo ++ "/src/Main.ipe")
+        |> Task.andThen (\_ -> Task.fromResult (Path.fromString (at.repo ++ "/src/Main.ipe")))
+        |> Task.andThen File.mkdirAll
+
+
+-- `u-b` is unreadable naming its stored path and `reason`, with no OS
+-- wording or error kind in the text.
+typedUnreadable : String -> List String -> Bool
+typedUnreadable reason tags =
+    List.any
+        (\t ->
+            String.startsWith "u-b=unreadable: " t
+                && String.contains reason t
+                && String.contains "ipe:src/Main.ipe" t
+                && not (String.contains "os error" t)
+                && not (String.contains "Unexpected" t)
+        )
+        tags
+
+
 -- A queued unit whose source file is one byte past the 16 MiB read ceiling
 -- is unreadable for that reason, rather than read whole; the page still
 -- loads.
@@ -1000,7 +1035,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1052,6 +1087,7 @@ checks =
         , check "an unprefixed or foreign-scheme hash is unverifiable" legacyHashUnverifiable
         , check "one missing file fails only its unit" oneMissingFileIsolated
         , check "source file past the read ceiling refused" oversizedSourceRefused
+        , check "an unreadable file renders a typed reason, never the OS error" unreadableReasonsTyped
         , check "view and attestation match the shared ipe-index vectors" viewHashVectors
         , check "a file unit's residual matches the shared ipe-index vectors" residualVectors
         , check "a file unit shows and attests its residual, never its whole range" fileUnitShowsResidual

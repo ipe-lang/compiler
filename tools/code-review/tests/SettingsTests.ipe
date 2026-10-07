@@ -209,6 +209,39 @@ probesNameTheirVariable =
         Task.succeed (good == Nothing && missing && notIndex && review)
 
 
+-- An `IPE_INDEX_ROOT` that is a directory but not the tree the index was
+-- built from is refused at startup naming the variable, an indexed path and
+-- the fix; the right root passes, and so does the right root with one of
+-- its two indexed files deleted. Red if the startup probe stops joining an
+-- indexed path under the root.
+rootProbeJoinsIndexedPath : Task.Task Error Bool
+rootProbeJoinsIndexedPath =
+    do
+        at <- freshScratch "ipe-index-root-probe"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        good <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        removeFileIfAny (at.repo ++ "/src/Main.ipe")
+        oneGone <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        empty <- freshDir "ipe-index-root-probe-empty"
+        System.setenv "IPE_INDEX_ROOT" empty
+        wrong <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        System.setenv "IPE_INDEX_ROOT" at.repo
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (good
+                == Nothing
+                && oneGone
+                == Nothing
+                && Maybe.map (String.startsWith "IPE_INDEX_ROOT ") wrong
+                == Just True
+                && maybeContains "ipe:src/" wrong
+                && maybeContains empty wrong
+                && maybeContains "repository root the index was built from" wrong
+                && not (maybeContains "os error" wrong)
+            )
+
+
 -- A nonexistent index is refused with the build hint and is not created.
 missingIndexProbed : Scratch -> Task.Task Error Bool
 missingIndexProbed at =
@@ -853,6 +886,7 @@ checks =
         , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
         , check "each db refusal states one fix" dbRefusalsStateOneFix
         , check "startup probes name the variable and the file" probesNameTheirVariable
+        , check "a root holding none of the index's files is refused at startup" rootProbeJoinsIndexedPath
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
         , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
         , check "no session state type carries the startup settings" settingsNeverInSessionState

@@ -24,7 +24,7 @@ import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), StoredDecision
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
+import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
@@ -790,7 +790,9 @@ unitPageStatesDistinct =
             [ Stale Drifted
             , Stale (RangeOutOfFile { lineCount = 3 })
             , Stale UnverifiableHash
-            , Unreadable (Error.conflict "boom")
+            , Unreadable (NoFile "ipe:gone.rs")
+            , Unreadable (CannotRead "ipe:dir.rs")
+            , Unreadable (PathRefused (UnknownTag "other:a.rs"))
             , TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 })
             , TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
             , TooLarge (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
