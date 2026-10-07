@@ -33,7 +33,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -1607,9 +1607,10 @@ writtenOf decided =
             written
 
 
--- With the `reviewed` table gone the drain fails and the queue row stays:
--- the copy insert and the queue delete commit together or not at all. Red if
--- the delete runs first outside the transaction.
+-- With the `reviewed` table gone the drain fails as `Db.InvalidStatement`
+-- (SQLite does not tell a missing table from a malformed statement) and the
+-- queue row stays: the copy insert and the queue delete commit together or
+-- not at all. Red if the delete runs first outside the transaction.
 drainIsAtomic : Task.Task Error Bool
 drainIsAtomic =
     do
@@ -1619,12 +1620,12 @@ drainIsAtomic =
         decided <- decideA db page
         queuedBefore <- queueRows at.indexDb "u-a" (Index.attest viewA)
         execIndex at.indexDb "DROP TABLE reviewed" []
-        refusal <- drainFor decided
-            |> Task.map (\_ -> Nothing)
-            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        refused <- drainFor decided
+            |> Task.map (\_ -> False)
+            |> Task.onError (\e -> Task.succeed (carriesFailure Db.InvalidStatement e))
         queuedAfter <- queueRows at.indexDb "u-a" (Index.attest viewA)
         cleanupProgressScratch at
-        Task.succeed (maybeContains "database error" refusal && queuedBefore == 1 && queuedAfter == 1)
+        Task.succeed (refused && queuedBefore == 1 && queuedAfter == 1)
 
 
 -- Two pages of decisions against a one-page ceiling refuse the rebuild and
