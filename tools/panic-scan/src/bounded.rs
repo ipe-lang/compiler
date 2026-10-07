@@ -32,7 +32,7 @@ use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use proc_macro2::{Delimiter, Ident, Punct, Spacing, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Ident, Literal, Punct, Spacing, TokenStream, TokenTree};
 
 /// Largest source, in bytes, the scanner reads or parses.
 const SOURCE_BYTES: usize = 8 << 20;
@@ -435,6 +435,8 @@ struct Pending {
     base: usize,
     /// 1-based line of the group's open delimiter.
     line: usize,
+    /// The group sits inside a `use` declaration, whose `::` recurse.
+    in_use: bool,
 }
 
 /// Count `stream`'s tokens and measure its nest depth, without recursion.
@@ -455,6 +457,7 @@ fn nest_depth(stream: TokenStream) -> Result<Measure, ScanError> {
         stream,
         base: 0,
         line: 1,
+        in_use: false,
     }];
     while let Some(group) = work.pop() {
         let trees: Vec<TokenTree> = group.stream.into_iter().collect();
@@ -465,13 +468,13 @@ fn nest_depth(stream: TokenStream) -> Result<Measure, ScanError> {
                 ceiling,
             });
         }
-        let segments = Segments::of(&trees);
+        let segments = Segments::of(&trees, group.in_use);
         let depth = group.base.saturating_add(segments.heaviest());
         if depth > found.depth {
             found.depth = depth;
             found.line = group.line;
         }
-        for (tree, segment) in trees.iter().zip(&segments.of_tree) {
+        for ((tree, segment), in_use) in trees.iter().zip(&segments.of_tree).zip(&segments.in_use) {
             if let TokenTree::Group(inner) = tree {
                 work.push(Pending {
                     stream: inner.stream(),
@@ -480,6 +483,7 @@ fn nest_depth(stream: TokenStream) -> Result<Measure, ScanError> {
                         .saturating_add(1)
                         .saturating_add(segments.weight_of(*segment)),
                     line: inner.span_open().start().line,
+                    in_use: *in_use,
                 });
             }
         }
@@ -491,23 +495,32 @@ fn nest_depth(stream: TokenStream) -> Result<Measure, ScanError> {
 struct Segments {
     /// The segment index of each token, in order.
     of_tree: Vec<usize>,
+    /// Whether each token, in order, sits inside a `use` declaration.
+    in_use: Vec<bool>,
     /// The total weight of each segment.
     weight: Vec<usize>,
 }
 
 impl Segments {
-    /// Split `trees`, one group's tokens, into weighted segments.
-    fn of(trees: &[TokenTree]) -> Self {
+    /// Split `trees`, one group's tokens, into weighted segments; `in_use`
+    /// when the group sits inside a `use` declaration.
+    fn of(trees: &[TokenTree], in_use: bool) -> Self {
         let mut segments = Self {
             of_tree: Vec::with_capacity(trees.len()),
+            in_use: Vec::with_capacity(trees.len()),
             weight: vec![0],
         };
-        let mut cutter = Cutter::default();
+        let mut cutter = Cutter {
+            in_use,
+            inherited_use: in_use,
+            ..Cutter::default()
+        };
         for (index, tree) in trees.iter().enumerate() {
             if cutter.after_brace && opens_segment(tree) {
                 segments.open();
                 cutter.piped = false;
             }
+            segments.in_use.push(cutter.in_use);
             let (weight, ends) = cutter.step(tree, trees.get(index.saturating_add(1)));
             segments.add(weight);
             if ends {
@@ -556,6 +569,13 @@ fn is_punct(tree: Option<&TokenTree>, ch: char) -> bool {
     matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == ch)
 }
 
+/// Whether `literal` is a float such as `0.1`, which after a `.` is two
+/// nested tuple-index fields (`a.0.1`) behind one counted `.`.
+fn is_field_pair(literal: &Literal) -> bool {
+    let text = literal.to_string();
+    text.starts_with(|c: char| c.is_ascii_digit()) && text.contains('.')
+}
+
 /// Whether `ident` is a keyword.
 fn is_keyword(ident: &Ident) -> bool {
     KEYWORDS.iter().any(|keyword| ident == keyword)
@@ -574,6 +594,10 @@ struct Cutter {
     prev_joint: Option<char>,
     /// The current token is the second `:` of a joint `::`.
     colon_tail: bool,
+    /// A `use` declaration is open: its tree recurses once per `::`.
+    in_use: bool,
+    /// The group itself sits inside a `use` declaration.
+    inherited_use: bool,
 }
 
 impl Cutter {
@@ -584,8 +608,13 @@ impl Cutter {
             matches!(tree, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace);
         match tree {
             TokenTree::Group(_) => (1, false),
-            TokenTree::Ident(ident) => (usize::from(is_keyword(ident)), false),
-            TokenTree::Literal(_) => (0, false),
+            TokenTree::Ident(ident) => {
+                if ident == "use" && !is_punct(next, '<') {
+                    self.in_use = true;
+                }
+                (usize::from(is_keyword(ident)), false)
+            }
+            TokenTree::Literal(literal) => (usize::from(is_field_pair(literal)), false),
             TokenTree::Punct(punct) => {
                 self.prev_joint = (punct.spacing() == Spacing::Joint).then_some(punct.as_char());
                 self.punct(punct, prev_joint, next)
@@ -606,13 +635,14 @@ impl Cutter {
             ';' => {
                 self.angle = 0;
                 self.piped = false;
+                self.in_use = self.inherited_use;
                 (0, true)
             }
             ',' => (0, self.angle == 0 && !self.piped),
             ':' if colon_tail => (0, false),
             ':' if punct.spacing() == Spacing::Joint && is_punct(next, ':') => {
                 self.colon_tail = true;
-                (0, false)
+                (usize::from(self.in_use), false)
             }
             '|' => {
                 self.piped = true;

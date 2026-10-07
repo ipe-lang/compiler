@@ -128,6 +128,9 @@ fn expressions_fit_at_the_ceiling_and_are_refused_past_it() {
         ("yield chain", |n| expr(&format!("{}a", "yield ".repeat(n)))),
         ("method chain", |n| expr(&format!("a{}", ".m()".repeat(n)))),
         ("field chain", |n| expr(&format!("a{}", ".f".repeat(n)))),
+        ("tuple index chain", |n| {
+            expr(&format!("a{}", ".0.1".repeat(n)))
+        }),
         ("try chain", |n| expr(&format!("a{}", "?".repeat(n)))),
         ("parentheses", |n| expr(&wrap(n, "(", "a", ")"))),
         ("prefix against segment", |n| {
@@ -234,6 +237,42 @@ fn macro_bodies_fit_at_the_ceiling_and_are_refused_past_it() {
         }),
     ];
     proves(cases);
+}
+
+#[test]
+fn use_trees_fit_at_the_ceiling_and_are_refused_past_it() {
+    // `syn` parses a `use` tree, and the scan judges it, one recursion per `::`.
+    let cases: &[Case] = &[
+        ("use path chain", |n| format!("use a{};\n", "::a".repeat(n))),
+        ("use path chain in a group", |n| {
+            format!("use a::{{a{}}};\n", "::a".repeat(n))
+        }),
+        ("use path chain in a macro body", |n| {
+            format!("m! {{\n    use a{};\n}}\n", "::a".repeat(n))
+        }),
+    ];
+    proves(cases);
+}
+
+#[test]
+fn a_tuple_index_pair_weighs_as_two_fields() {
+    // `a.0.1` is two nested fields behind one `.`: the float `0.1` is split.
+    for n in [1_usize, 64, 1024] {
+        let pairs = depth_of(
+            "tuple index pairs",
+            |k| expr(&format!("a{}", ".0.1".repeat(k))),
+            n,
+        );
+        let fields = depth_of(
+            "named fields",
+            |k| expr(&format!("a{}", ".f".repeat(k))),
+            n.saturating_mul(2),
+        );
+        assert!(
+            pairs >= fields,
+            "{n} tuple-index pairs measure {pairs}, under the {fields} of as many named fields"
+        );
+    }
 }
 
 #[test]
