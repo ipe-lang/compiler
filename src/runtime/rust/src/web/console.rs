@@ -53,22 +53,18 @@ pub fn gate_allows() -> bool {
     !(needs_credential && !admin_credential().is_configured())
 }
 
-/// `GET /_ipe/console` — the plain-HTML dashboard shell (no framework, no CSS
-/// deps). Polls the api endpoints below.
-pub async fn console_html() -> impl IntoResponse {
-    let body = r#"<!doctype html><html><head><meta charset="utf-8">
-<title>Ipe Console</title>
-<style>
+/// The console page's one inline stylesheet; the console policy admits it by
+/// its hash.
+pub const CONSOLE_CSS: &str = r#"
  body{font-family:ui-monospace,monospace;background:#12141c;color:#dfe3ee;margin:0;padding:16px}
  h1{font-size:16px;color:#8ec8a8} .tab{cursor:pointer;padding:4px 10px;margin-right:6px;border:1px solid #2a2f40;border-radius:4px;display:inline-block}
  .tab.on{background:#2a2f40} pre{background:#0c0e14;padding:10px;border-radius:4px;overflow:auto;max-height:70vh}
  .err{color:#e88} .lvl{color:#7a86a8}
-</style></head><body>
-<h1>Ipe Console</h1>
-<div id="ov"></div>
-<div><span class="tab on" data-t="logs">Logs</span><span class="tab" data-t="errors">Errors</span></div>
-<pre id="out">loading…</pre>
-<script>
+"#;
+
+/// The console page's one inline script; the console policy admits it by its
+/// hash.
+pub const CONSOLE_JS: &str = r#"
  let tab="logs";
  async function j(u){try{const r=await fetch(u);return await r.json()}catch(e){return null}}
  async function ov(){const o=await j("/_ipe/console/api/overview");if(o)document.getElementById("ov").textContent=
@@ -83,11 +79,46 @@ pub async fn console_html() -> impl IntoResponse {
    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));t.classList.add("on");
    tab=t.dataset.t;refresh();});
  refresh();setInterval(refresh,2000);
-</script></body></html>"#;
-    (
+"#;
+
+/// The console page: [`CONSOLE_CSS`] and [`CONSOLE_JS`] embedded verbatim, so
+/// the policy hashes match the bytes served.
+fn console_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| {
+        format!(
+            r#"<!doctype html><html><head><meta charset="utf-8">
+<title>Ipe Console</title>
+<style>{CONSOLE_CSS}</style></head><body>
+<h1>Ipe Console</h1>
+<div id="ov"></div>
+<div><span class="tab on" data-t="logs">Logs</span><span class="tab" data-t="errors">Errors</span></div>
+<pre id="out">loading…</pre>
+<script>{CONSOLE_JS}</script></body></html>"#
+        )
+    })
+}
+
+/// `GET /_ipe/console` — the plain-HTML dashboard shell (no framework, no CSS
+/// deps). Polls the api endpoints below.
+///
+/// The response carries the console policy, the shared security headers and
+/// `no-store`; a refused framing configuration answers `500`.
+pub async fn console_html() -> axum::response::Response {
+    let resp = (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        body,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        console_page(),
+    )
+        .into_response();
+    crate::server::with_security_headers(
+        resp,
+        telemetry::security_headers(telemetry::HeaderProfile::Policy(
+            crate::csp::Profile::Console,
+        )),
     )
 }
 
@@ -661,6 +692,36 @@ mod tests {
         assert!(!gate_allows());
         assert!(gate_blocked(Surface::Console, &axum::http::HeaderMap::new()).is_some());
         seed_console_env(&[]);
+    }
+
+    /// The console response carries the console policy, `nosniff`,
+    /// `no-store` and same-origin framing, and embeds exactly the hashed
+    /// constants as its one style and one script element.
+    #[tokio::test]
+    async fn console_csp_and_headers() {
+        let resp = console_html().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let get = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let want =
+            crate::csp::ContentSecurityPolicy::for_profile(crate::csp::Profile::Console, None)
+                .header_value();
+        assert_eq!(get("content-security-policy"), Some(want.clone()));
+        assert!(want.contains("script-src 'sha256-"), "{want}");
+        assert!(!want.contains("'unsafe-inline'"), "{want}");
+        assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"));
+        assert_eq!(get("cache-control").as_deref(), Some("no-store"));
+        assert_eq!(get("x-frame-options").as_deref(), Some("SAMEORIGIN"));
+        assert!(get("referrer-policy").is_some());
+        let page = console_page();
+        assert_eq!(page.matches("<script").count(), 1, "{page}");
+        assert_eq!(page.matches("<style").count(), 1, "{page}");
+        assert!(page.contains(&format!("<script>{CONSOLE_JS}</script>")));
+        assert!(page.contains(&format!("<style>{CONSOLE_CSS}</style>")));
     }
 
     #[test]
