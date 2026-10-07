@@ -34,11 +34,16 @@ use syn::{
     Visibility,
 };
 
+mod bounded;
 mod includes;
 mod manifest;
 mod test_lines;
 mod test_path;
 
+pub use bounded::{
+    Measure, NestDepth, ParseStack, ScanError, SourceBytes, SourceReadError, TokenCeiling, measure,
+    read_source, with_parsed, with_parsed_on,
+};
 pub use includes::{
     IncludeForm, IncludeTarget, IncludedSource, PathRefusal, TestPathInclude, judge_literal,
 };
@@ -127,11 +132,9 @@ const TESTS_MODULE: &str = "tests";
 ///
 /// # Errors
 ///
-/// The parse error's text when `src` does not parse as a Rust file.
-pub fn scan_str(src: &str) -> Result<Vec<Hit>, String> {
-    scan_source(src)
-        .map(|scan| scan.hits)
-        .map_err(|e| e.to_string())
+/// [`ScanError`] when `src` is over a ceiling or does not parse as a Rust file.
+pub fn scan_str(src: &str) -> Result<Vec<Hit>, ScanError> {
+    scan_source(src).map(|scan| scan.hits)
 }
 
 /// Everything a production scan of one source file finds.
@@ -153,9 +156,18 @@ pub struct Scan {
 ///
 /// # Errors
 ///
-/// [`syn::Error`] when `src` does not parse as a Rust file.
-pub fn scan_source(src: &str) -> Result<Scan, syn::Error> {
-    syn::parse_file(src).map(|file| scan_file(&file, src))
+/// [`ScanError`] when `src` is over a ceiling or does not parse as a Rust file.
+pub fn scan_source(src: &str) -> Result<Scan, ScanError> {
+    scan_source_on(ParseStack::CEILING, src)
+}
+
+/// [`scan_source`] on a parse thread of `stack` bytes; see [`with_parsed_on`].
+///
+/// # Errors
+///
+/// As [`scan_source`].
+pub fn scan_source_on(stack: ParseStack, src: &str) -> Result<Scan, ScanError> {
+    with_parsed_on(stack, src, |file| scan_file(file, src))
 }
 
 /// Scan an already-parsed file; `src` is its text, read for audit markers.

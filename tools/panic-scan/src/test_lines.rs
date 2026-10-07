@@ -12,6 +12,7 @@ use syn::token::{Brace, Semi};
 use syn::visit::{self, Visit};
 use syn::{Attribute, Fields, ForeignItem, ImplItem, Item, MacroDelimiter, TraitItem};
 
+use crate::bounded::{ScanError, with_parsed};
 use crate::{
     attrs_test_only, foreign_item_test_only, impl_item_test_only, item_test_only,
     trait_item_test_only,
@@ -31,19 +32,20 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`syn::Error`] when `src` does not parse as a Rust file.
-pub fn test_only_item_lines(src: &str) -> Result<Vec<RangeInclusive<usize>>, syn::Error> {
-    let file = syn::parse_file(src)?;
-    if attrs_test_only(&file.attrs) {
-        let whole_file = 1..=src.lines().count().max(1);
-        return Ok(vec![whole_file]);
-    }
-    let mut spans = TestSpans {
-        lines: src.lines().collect(),
-        spans: Vec::new(),
-    };
-    spans.visit_file(&file);
-    Ok(spans.spans)
+/// [`ScanError`] when `src` is over a ceiling or does not parse as a Rust file.
+pub fn test_only_item_lines(src: &str) -> Result<Vec<RangeInclusive<usize>>, ScanError> {
+    with_parsed(src, |file| {
+        if attrs_test_only(&file.attrs) {
+            let whole_file = 1..=src.lines().count().max(1);
+            return vec![whole_file];
+        }
+        let mut spans = TestSpans {
+            lines: src.lines().collect(),
+            spans: Vec::new(),
+        };
+        spans.visit_file(file);
+        spans.spans
+    })
 }
 
 /// The source lines and the spans collected so far.

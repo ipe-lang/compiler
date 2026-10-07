@@ -17,8 +17,9 @@
 //! legal source is resolved and that source scanned in turn; one that escapes
 //! the root, names no file, or lands in test or template code exits 2. Files
 //! under `templates/` hold emitted-program Rust copied verbatim into every
-//! generated binary; the emitted-output package gate covers them, not this
-//! compiler-code scan. Inline `#[cfg(test)]` bodies are skipped by the scanner
+//! generated binary, so they are scanned as production code. A file too large,
+//! too many tokens long, or nested too deep to parse within the scanner's
+//! ceilings exits 2. Inline `#[cfg(test)]` bodies are skipped by the scanner
 //! itself.
 
 use std::collections::BTreeSet;
@@ -87,8 +88,11 @@ enum Unauditable {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// A file does not parse as Rust.
-    Parse { path: PathBuf, source: syn::Error },
+    /// A file is over a parse ceiling or does not parse as Rust.
+    Parse {
+        path: PathBuf,
+        source: panic_scan::ScanError,
+    },
     /// A walk met a symlink to a directory, whose contents it cannot vouch for.
     SymlinkedDirectory { path: PathBuf },
     /// A file to scan resolves outside the scanned root.
@@ -131,7 +135,7 @@ impl fmt::Display for Unauditable {
             }
             Self::Parse { path, source } => write!(
                 f,
-                "{}: could not parse as Rust ({source}) — cannot audit; fail closed",
+                "{}: could not parse as Rust within the scan ceilings ({source}) — cannot audit; fail closed",
                 path.display()
             ),
             Self::SymlinkedDirectory { path } => write!(
@@ -260,9 +264,6 @@ fn run(mode: &Mode) -> Result<bool, Unauditable> {
     let mut verified_test_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let mut found = false;
     for path in &files {
-        if panic_scan::is_template_path(path) {
-            continue;
-        }
         if panic_scan::is_test_path(path) {
             let dir = path.parent().unwrap_or_else(|| Path::new(""));
             if !verified_test_dirs.contains(dir) {
@@ -443,9 +444,15 @@ fn normalize(path: &Path) -> Option<PathBuf> {
 ///
 /// Returns whether any hit was found, with the legal sources the file includes.
 fn scan_file(path: &Path) -> Result<(bool, Vec<IncludedSource>), Unauditable> {
-    let src = std::fs::read_to_string(path).map_err(|source| Unauditable::Io {
-        path: path.to_path_buf(),
-        source,
+    let src = panic_scan::read_source(path).map_err(|error| match error {
+        panic_scan::SourceReadError::Io(source) => Unauditable::Io {
+            path: path.to_path_buf(),
+            source,
+        },
+        panic_scan::SourceReadError::Refused(source) => Unauditable::Parse {
+            path: path.to_path_buf(),
+            source,
+        },
     })?;
     // A file the scanner cannot parse is unaudited, not clean: "cannot
     // analyze" must never read as "no panics".

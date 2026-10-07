@@ -28,6 +28,7 @@ use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{Expr, ForeignItem, ImplItem, Item, Pat, TraitItem, Type, TypeParamBound};
 
+use crate::bounded::{ScanError, SourceReadError, read_source, with_parsed};
 use crate::manifest::{ManifestError, names_test_code, parse_manifest};
 use crate::{item_test_only, scan_file};
 
@@ -59,8 +60,10 @@ pub fn is_test_path(rel: &Path) -> bool {
 
 /// Whether `rel` lies under an emitted-program `templates` directory.
 ///
-/// That Rust is copied verbatim into every generated binary and is covered by
-/// the emitted-output package gate, not by the compiler-code scan.
+/// That Rust is copied verbatim into every generated binary, so it is scanned
+/// as production code like any other file. This rule serves only to refuse a
+/// `#[path]` or `include!` that compiles a template into the compiler, never
+/// to skip a scan.
 #[must_use]
 pub fn is_template_path(rel: &Path) -> bool {
     rel.parent()
@@ -107,15 +110,18 @@ pub fn check_test_path(root: &Path, rel: &Path) -> Result<(), TestPathError> {
     let dir = root.join(&marker.declaring_dir);
     let mut declared = false;
     for file in declaring_candidates(&dir)? {
-        let src = std::fs::read_to_string(&file).map_err(|error| TestPathError::Unreadable {
+        let src = read_bounded(&file)?;
+        let (declaration, includes_test_code) = with_parsed(&src, |parsed| {
+            (
+                tests_declaration(parsed),
+                !scan_file(parsed, &src).test_path_includes.is_empty(),
+            )
+        })
+        .map_err(|error| TestPathError::Unparseable {
             file: file.clone(),
             error,
         })?;
-        let parsed = syn::parse_file(&src).map_err(|error| TestPathError::Unparseable {
-            file: file.clone(),
-            error,
-        })?;
-        match tests_declaration(&parsed) {
+        match declaration {
             Declaration::Absent => {}
             Declaration::TestOnly => declared = true,
             Declaration::Ungated(by) => {
@@ -125,7 +131,7 @@ pub fn check_test_path(root: &Path, rel: &Path) -> Result<(), TestPathError> {
                 });
             }
         }
-        if !scan_file(&parsed, &src).test_path_includes.is_empty() {
+        if includes_test_code {
             return Err(TestPathError::Ungated {
                 declaring_file: file,
                 by: UngatedBy::IncludesTestCode,
@@ -154,14 +160,12 @@ pub fn check_test_path(root: &Path, rel: &Path) -> Result<(), TestPathError> {
 ///
 /// # Errors
 ///
-/// [`TestPathError::Unreadable`] or [`TestPathError::ManifestUnparseable`] when
-/// the manifest cannot be read, and [`TestPathError::TestTarget`] when a
+/// [`TestPathError::Unreadable`], [`TestPathError::Unparseable`] (over the
+/// source ceiling) or [`TestPathError::ManifestUnparseable`] when the manifest
+/// cannot be read, and [`TestPathError::TestTarget`] when a
 /// production target names test code.
 pub fn check_manifest(manifest: &Path) -> Result<(), TestPathError> {
-    let src = std::fs::read_to_string(manifest).map_err(|error| TestPathError::Unreadable {
-        file: manifest.to_path_buf(),
-        error,
-    })?;
+    let src = read_bounded(manifest)?;
     let targets = parse_manifest(&src).map_err(|error| TestPathError::ManifestUnparseable {
         manifest: manifest.to_path_buf(),
         error,
@@ -191,8 +195,9 @@ pub enum TestPathError {
         file: PathBuf,
         error: std::io::Error,
     },
-    /// A candidate declaring file does not parse as a Rust file.
-    Unparseable { file: PathBuf, error: syn::Error },
+    /// A candidate declaring file or a manifest is refused by the bounded
+    /// parse: over a ceiling, or not a Rust file.
+    Unparseable { file: PathBuf, error: ScanError },
     /// A manifest leaves the TOML subset the target reader accepts.
     ManifestUnparseable {
         manifest: PathBuf,
@@ -250,7 +255,7 @@ impl fmt::Display for TestPathError {
                 write!(f, "{}: cannot read ({error})", file.display())
             }
             Self::Unparseable { file, error } => {
-                write!(f, "{}: does not parse as Rust ({error})", file.display())
+                write!(f, "{}: cannot be audited ({error})", file.display())
             }
             Self::ManifestUnparseable { manifest, error } => {
                 write!(
@@ -269,6 +274,20 @@ impl fmt::Display for TestPathError {
 }
 
 impl std::error::Error for TestPathError {}
+
+/// Read `file` within the source ceiling.
+fn read_bounded(file: &Path) -> Result<String, TestPathError> {
+    read_source(file).map_err(|error| match error {
+        SourceReadError::Io(error) => TestPathError::Unreadable {
+            file: file.to_path_buf(),
+            error,
+        },
+        SourceReadError::Refused(error) => TestPathError::Unparseable {
+            file: file.to_path_buf(),
+            error,
+        },
+    })
+}
 
 /// Whether the test marker is a `tests` directory or a `tests.rs` file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,9 +522,7 @@ mod tests {
 
     /// The declaration class of `src`, or `None` when it does not parse.
     fn declaration(src: &str) -> Option<Declaration> {
-        syn::parse_file(src)
-            .ok()
-            .map(|file| tests_declaration(&file))
+        with_parsed(src, tests_declaration).ok()
     }
 
     #[test]
