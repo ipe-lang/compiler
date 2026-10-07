@@ -640,6 +640,13 @@ mod tests {
 
     type Msg = u8;
     type TextHandler = Arc<dyn Fn(String) -> Msg + Send + Sync>;
+    type TextBuilder = fn(
+        Vec<Attribute<Msg>>,
+        TextHandler,
+        String,
+        IpeMaybe<Placeholder<Msg>>,
+        Label<Msg>,
+    ) -> Element<Msg>;
 
     fn on_text() -> TextHandler {
         Arc::new(|_s: String| 0)
@@ -736,16 +743,7 @@ mod tests {
         input_label_hidden_("Name".to_owned())
     }
 
-    fn text_kind(
-        build: fn(
-            Vec<Attribute<Msg>>,
-            TextHandler,
-            String,
-            IpeMaybe<Placeholder<Msg>>,
-            Label<Msg>,
-        ) -> Element<Msg>,
-        label: Label<Msg>,
-    ) -> Element<Msg> {
+    fn text_kind(build: TextBuilder, label: Label<Msg>) -> Element<Msg> {
         build(
             Vec::new(),
             on_text(),
