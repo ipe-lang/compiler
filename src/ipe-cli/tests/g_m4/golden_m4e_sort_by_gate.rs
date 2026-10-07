@@ -37,9 +37,31 @@ fn fixture_entry(fixture: &str) -> PathBuf {
         .join("Main.ipe")
 }
 
-/// Build `fixture`, assert it fails with `expected`, and assert NO Rust was
-/// emitted (the pipeline stopped before codegen).
-fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code) {
+/// The rendered diagnostic with terminal colour sequences removed.
+fn plain_render(diag: &ipe_diagnostics::Diagnostic, entry: &std::path::Path) -> String {
+    let source = std::fs::read_to_string(entry).unwrap_or_default();
+    let rendered = ipe_diagnostics::render(diag, &entry.display().to_string(), &source);
+    let mut out = String::with_capacity(rendered.len());
+    let mut chars = rendered.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Build `fixture`, assert it fails with `expected` AND that the rendered
+/// diagnostic names the rejected type (`needle`), so a refusal of the wrong
+/// kind or at the wrong site does not pass on the code alone, and assert NO
+/// Rust was emitted (the pipeline stopped before codegen).
+fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code, needle: &str) {
     let entry = fixture_entry(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
@@ -55,6 +77,13 @@ fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code)
         Some(expected),
         "fixture {fixture}: expected {expected:?}, got build result {built:?}"
     );
+    if let Err(CliError::Pipeline { diag, .. }) = &built {
+        let rendered = plain_render(diag, &entry);
+        assert!(
+            rendered.contains(needle),
+            "fixture {fixture}: the diagnostic must name `{needle}`; got:\n{rendered}"
+        );
+    }
 
     let emitted = out.join("src").join("main.rs");
     assert!(
@@ -73,6 +102,7 @@ fn sort_by_record_key_is_ipe_t0001() {
         "sort_by_record_key_gate",
         "m4e_sort_by_record_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
+        "expected { name : String }, found a",
     );
 }
 
@@ -83,16 +113,20 @@ fn sort_by_custom_type_key_is_ipe_t0001() {
         "sort_by_adt_key_gate",
         "m4e_sort_by_adt_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
+        "expected Main.Shade, found a",
     );
 }
 
 /// `List.sortBy (\n -> \m -> n + m) offsets` — a function key has no ordering.
+/// The callback-result tie refuses this on its own; the case pins that the
+/// refusal holds, it is not evidence for the ordering obligation.
 #[test]
 fn sort_by_function_key_is_ipe_t0001() {
     assert_gate(
         "sort_by_fn_key_gate",
         "m4e_sort_by_fn_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
+        "expected a, found b -> b",
     );
 }
 
@@ -104,6 +138,7 @@ fn sort_by_tuple_key_is_ipe_t0001() {
         "sort_by_tuple_key_gate",
         "m4e_sort_by_tuple_key_gate_emit",
         ipe_diagnostics::IPE_T0001,
+        "expected a, found (b, c)",
     );
 }
 
@@ -117,6 +152,7 @@ fn sort_by_forwarder_record_key_is_ipe_t0014() {
         "sort_by_wrapper_record_gate",
         "m4e_sort_by_wrapper_record_gate_emit",
         ipe_diagnostics::IPE_T0014,
+        "{ name : String } is not a Comparable",
     );
 }
 
@@ -128,6 +164,7 @@ fn sort_by_forwarder_string_key_is_ipe_t0014() {
         "sort_by_wrapper_string_gate",
         "m4e_sort_by_wrapper_string_gate_emit",
         ipe_diagnostics::IPE_T0014,
+        "String is not a Comparable",
     );
 }
 
@@ -140,6 +177,7 @@ fn member_function_record_is_ipe_t0014() {
         "member_fn_record_gate",
         "m4e_member_fn_record_gate_emit",
         ipe_diagnostics::IPE_T0014,
+        "{ name : String, run : Int -> Int } is not a Equatable",
     );
 }
 
@@ -152,6 +190,7 @@ fn unique_forwarder_function_record_is_ipe_t0014() {
         "unique_fn_record_gate",
         "m4e_unique_fn_record_gate_emit",
         ipe_diagnostics::IPE_T0014,
+        "{ name : String, run : Int -> Int } is not a Equatable",
     );
 }
 

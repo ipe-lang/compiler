@@ -2332,11 +2332,11 @@ mod registry_phase_c_tests {
                 }
                 Ty::Con { args, .. } | Ty::Tuple(args) => {
                     let root = uf.find(var).ok()?;
-                    let items = match uf.content(root).ok()? {
-                        Content::Structure(
-                            FlatType::Con { args: items, .. } | FlatType::Tuple(items),
-                        ) => items,
-                        _ => return None,
+                    let Content::Structure(
+                        FlatType::Con { args: items, .. } | FlatType::Tuple(items),
+                    ) = uf.content(root).ok()?
+                    else {
+                        return None;
                     };
                     args.iter()
                         .zip(items)
