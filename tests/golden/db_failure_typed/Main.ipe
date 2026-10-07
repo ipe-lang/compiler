@@ -82,7 +82,22 @@ outcome label task =
                             Just (Database failure) ->
                                 Task.succeed (String.concat [ label, ":", failureName failure ])
 
-                            _ ->
+                            Just (Custom _) ->
+                                Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                            Just (FfiPanic _) ->
+                                Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                            Just (HttpStatus _) ->
+                                Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                            Just (JsonDecode _) ->
+                                Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                            Just (TypeMismatch _) ->
+                                Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                            Nothing ->
                                 Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
             )
             (Task.map (\_ -> String.concat [ label, ":ok" ]) task)

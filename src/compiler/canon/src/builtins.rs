@@ -395,7 +395,7 @@ pub fn intern_builtins(interner: &mut Interner) -> DResult<InternedBuiltins> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILTIN_UNIONS, BuiltinUnion, intern_builtins, unions_agree};
+    use super::{BUILTIN_UNIONS, BuiltinUnion, DB_FAILURE_CTORS, intern_builtins, unions_agree};
     use ipe_intern::Interner;
     use ipe_kernels::BUILTIN_TYPES;
 
