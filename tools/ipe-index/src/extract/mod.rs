@@ -345,7 +345,7 @@ mod tests {
     fn residual_text_matches_the_shared_vectors() {
         let rows: Vec<serde_json::Value> = serde_json::from_str(RESIDUAL_VECTORS).unwrap();
         assert!(
-            rows.len() >= 15,
+            rows.len() >= 20,
             "the shared residual vector file lost rows"
         );
         for row in rows {

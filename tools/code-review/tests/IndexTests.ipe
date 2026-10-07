@@ -634,7 +634,7 @@ residualVectors =
         path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "residual_vectors.json"))
         text <- File.readFileLimit path (ByteSize.kib 64)
         vectors <- Task.fromResult (Decode.decodeString (Decode.list residualVectorDecoder) text)
-        Task.succeed (not (List.isEmpty vectors) && List.all residualVectorHolds vectors)
+        Task.succeed (List.length vectors >= 20 && List.all residualVectorHolds vectors)
 
 
 residualVectorDecoder : Decode.Decoder ResidualVector

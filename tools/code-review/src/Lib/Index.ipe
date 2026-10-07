@@ -400,7 +400,7 @@ rootSample =
 -- compared by `substr`, so no character of the tag is a pattern.
 taggedPathsSql : String
 taggedPathsSql =
-    "SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? LIMIT ?"
+    "SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?"
 
 
 anyPathSql : String
@@ -438,6 +438,7 @@ rootMismatch sampled first rootDir =
                 , SafeText.quoted (Path.toString rootDir)
                 , SafeText.literal "; "
                 , RepoPath.rootFix
+                , SafeText.literal ", or re-run `tools/scripts/ipe-index index` if the indexed files have moved"
                 ]
             )
         )
