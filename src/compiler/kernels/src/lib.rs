@@ -15431,8 +15431,9 @@ impl StdlibKernel {
     /// available with only the `crypto-core` feature — the cryptographic floor:
     /// SHA-2 hash (`sha256`/`sha512`), the HMAC family (`hmacSha256`/`hmacSha512`
     /// and their `Key`-typed `WithKey` forms), the constant-time compare, the
+    /// entropy pair (`randomBytes`/`randomToken`), and the typed `Key`/`Mac`
     /// newtype kernels (`Key.fromString` / `Key.fromBytes` / `Mac.toHex` /
-    /// `Mac.fromHex`) and the typed tag check `Crypto.verifyHmacSha256`.
+    /// `Mac.fromHex`), plus the typed tag check `Crypto.verifyHmacSha256`.
     ///
     /// EXCLUDES RSA sign/verify: although their emit symbols reside in
     /// `crypto_core.rs`, their bodies are `#[cfg(feature = "crypto")]` (they pull
