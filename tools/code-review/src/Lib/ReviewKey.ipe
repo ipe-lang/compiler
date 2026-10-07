@@ -7,6 +7,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
+import Lib.EnvLookup as EnvLookup
 
 
 -- The key that signs and verifies review-log rows. Opaque: built only by
@@ -74,18 +75,11 @@ keyFromLookup lookup =
             Result.map Signing (parseMacKey raw)
 
         Err e ->
-            if isUnset e then
+            if EnvLookup.isUnset e then
                 Ok ReadOnly
 
             else
                 Err unreadableKey
-
-
--- `System.getenv` reports a variable that is not set as `NotFound`; every
--- other kind is a variable that is set but unusable, or a failed read.
-isUnset : Error -> Bool
-isUnset e =
-    Error.kind e == Error.kind (Error.notFound "")
 
 
 unreadableKey : Error

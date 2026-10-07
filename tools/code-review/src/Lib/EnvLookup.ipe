@@ -1,0 +1,25 @@
+module Lib.EnvLookup exposing (isUnset, requiredVarRefusal)
+
+import Ipe.Error as Error exposing (Error)
+
+
+-- Whether a failed environment read means the variable is not set, decided
+-- by the failure's kind and never its text: a read reports absence as
+-- `NotFound`; every other kind is a variable that is set but unusable, or a
+-- read that failed.
+isUnset : Error -> Bool
+isUnset e =
+    Error.kind e == Error.kind Error.notFound
+
+
+-- The startup refusal of the required variable `key` whose read failed with
+-- `failure`, ending with `fix`: it says whether the variable is not set or
+-- could not be read, names the variable, and never repeats the failure's
+-- own text.
+requiredVarRefusal : String -> String -> Error -> String
+requiredVarRefusal key fix failure =
+    if isUnset failure then
+        "code-review: required environment variable " ++ key ++ " is not set.\n  " ++ fix
+
+    else
+        "code-review: required environment variable " ++ key ++ " could not be read from the environment.\n  " ++ fix
