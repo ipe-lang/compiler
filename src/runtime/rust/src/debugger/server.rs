@@ -202,7 +202,7 @@ fn build_overlay_script(scrub_url_js: &str, reset_url_js: &str, selected_bg: &st
           var d=JSON.parse(xhr.responseText);\n\
           if(d&&d.body){{\n\
             var root=document.getElementById('ipe-root');\n\
-            if(root)root.innerHTML=d.body;\n\
+            if(root){{root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'?d.epoch:null;}}\n\
           }}\n\
         }}catch(e){{}}\n\
       }}\n\
@@ -319,6 +319,10 @@ mod tests {
         assert!(
             html.contains("data-ipe-dbg-reset"),
             "overlay must include the reset button"
+        );
+        assert!(
+            html.contains("root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'"),
+            "a scrubbed render must replace the client's render epoch with its own"
         );
     }
 

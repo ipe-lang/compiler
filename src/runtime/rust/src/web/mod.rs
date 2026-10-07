@@ -720,34 +720,95 @@ impl TabId {
     }
 }
 
-/// The last event seq of the most recently active tabs, at most [`TAB_SEQ_CAP`].
+/// How many seqs at and below a tab's highest dispatched seq its window
+/// remembers one by one.
+#[cfg(feature = "server")]
+pub const TAB_SEQ_WINDOW: u32 = u128::BITS;
+
+/// The seqs one tab has had dispatched: its highest seq, and for each of the
+/// [`TAB_SEQ_WINDOW`] seqs at and below it whether it was dispatched.
 ///
-/// An event whose seq is not above its tab's last recorded seq is a duplicate
-/// and is acked without a dispatch. An unknown or evicted tab is accepted; the
-/// render epoch, not this map, is what keeps a replay from retargeting.
+/// A tab's events can reach the server out of order: two posts in flight race
+/// for the session lock, and a retried event lands after a later one. So an
+/// earlier seq is a duplicate only when that exact seq was dispatched, never
+/// merely because a later one was.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SeqWindow {
+    top: u64,
+    /// Bit `k` is set when seq `top - k` was dispatched.
+    seen: u128,
+}
+
+#[cfg(feature = "server")]
+impl SeqWindow {
+    const fn first(seq: u64) -> Self {
+        Self { top: seq, seen: 1 }
+    }
+
+    /// The bit of `seq`, when `seq` is at most `top` and inside the window.
+    fn bit(self, seq: u64) -> Option<u128> {
+        let back = u32::try_from(self.top.checked_sub(seq)?).ok()?;
+        1_u128.checked_shl(back)
+    }
+
+    /// Whether `seq` was dispatched. A seq above `top` is new; one older than
+    /// the window can no longer be told apart and counts as dispatched.
+    fn has(self, seq: u64) -> bool {
+        if seq > self.top {
+            return false;
+        }
+        self.bit(seq).is_none_or(|bit| (self.seen & bit) != 0)
+    }
+
+    fn mark(&mut self, seq: u64) {
+        if let Some(ahead) = seq.checked_sub(self.top).filter(|&ahead| ahead > 0) {
+            let kept = u32::try_from(ahead)
+                .ok()
+                .and_then(|ahead| self.seen.checked_shl(ahead))
+                .unwrap_or(0);
+            self.top = seq;
+            self.seen = kept | 1;
+        } else if let Some(bit) = self.bit(seq) {
+            self.seen |= bit;
+        }
+    }
+}
+
+/// The dispatched event seqs of the most recently active tabs, at most
+/// [`TAB_SEQ_CAP`] tabs.
+///
+/// An event whose seq its tab already had dispatched is a duplicate and is
+/// acked without a dispatch. An unknown or evicted tab is accepted; the render
+/// epoch, not this map, is what keeps a replay from retargeting.
 #[cfg(feature = "server")]
 #[derive(Default)]
 pub struct TabSeqs {
-    recent: std::collections::VecDeque<(TabId, u64)>,
+    recent: std::collections::VecDeque<(TabId, SeqWindow)>,
 }
 
 #[cfg(feature = "server")]
 impl TabSeqs {
-    /// Whether `tab` already posted an event at `seq` or later.
+    /// Whether `tab` already had an event at `seq` dispatched.
     #[must_use]
     pub fn is_duplicate(&self, tab: TabId, seq: u64) -> bool {
-        self.recent.iter().any(|&(t, last)| t == tab && seq <= last)
+        self.recent
+            .iter()
+            .any(|&(t, window)| t == tab && window.has(seq))
     }
 
-    /// Record `seq` as `tab`'s last dispatched event, making `tab` the most recent.
+    /// Record `seq` as dispatched for `tab`, making `tab` the most recent.
     pub fn record(&mut self, tab: TabId, seq: u64) {
-        let last = self
+        let window = self
             .recent
             .iter()
             .position(|&(t, _)| t == tab)
             .and_then(|pos| self.recent.remove(pos))
-            .map_or(seq, |(_, prev)| prev.max(seq));
-        self.recent.push_back((tab, last));
+            .map_or(SeqWindow::first(seq), |(_, mut window)| {
+                window.mark(seq);
+                window
+            });
+        self.recent.push_back((tab, window));
         while self.recent.len() > TAB_SEQ_CAP.get() {
             self.recent.pop_front();
         }
@@ -4757,6 +4818,17 @@ mod handlers {
             .into_response()
     }
 
+    /// Install the render a debugger endpoint shows as the session's current
+    /// render, minting its epoch; `None` when no epoch is left to mint.
+    #[cfg(feature = "debugger")]
+    fn commit_debug_render<Model, Msg: Clone>(
+        handle: &store::SessionHandle<Model, Msg>,
+        tree: Html<Msg>,
+    ) -> Option<RenderEpoch> {
+        let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
+        e.rendered.commit(tree).ok().map(|step| step.to)
+    }
+
     // ── POST /_ipe/debug/scrub ────────────────────────────────────────
     // Session-scoped time-travel scrub endpoint. Registered only when the
     // `debugger` feature is active. The CSRF middleware (wrapped around
@@ -4815,7 +4887,14 @@ mod handlers {
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
-        let resp_json = serde_json::json!({ "body": html_body });
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
+        let resp_json = serde_json::json!({ "body": html_body, "epoch": epoch.to_token() });
         (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -5112,8 +5191,16 @@ mod handlers {
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
         let resp_json = serde_json::json!({
             "body":   html_body,
+            "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
@@ -5181,8 +5268,16 @@ mod handlers {
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
         let resp_json = serde_json::json!({
             "body":   html_body,
+            "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
@@ -5254,8 +5349,16 @@ mod handlers {
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
         let resp_json = serde_json::json!({
             "body":   html_body,
+            "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
@@ -10538,6 +10641,110 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// A tab's earlier seq that reaches the server after a later one (a retried
+    /// event, or two posts racing for the lock) is no duplicate: it dispatches,
+    /// and only its own replay is acked as a duplicate.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn an_earlier_tab_seq_arriving_late_still_dispatches_once() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let later = click_body(&plus, Some(&first), Some((TAB, 2)));
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &later).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+
+            let earlier = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &earlier).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                !reply.contains("duplicate"),
+                "a late earlier seq is no duplicate: {reply}"
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(Msg::Increment)),
+                "a late earlier seq must dispatch"
+            );
+
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &earlier).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                reply.contains("\"duplicate\":true"),
+                "its replay is a duplicate: {reply}"
+            );
+            assert!(rx.try_recv().is_err(), "the replay must not dispatch again");
+        });
+    }
+
+    /// A debugger step commits the render it shows: its reply names a fresh
+    /// current epoch whose handler index is the shown DOM's, so a click on the
+    /// stepped DOM resolves against that render, never the one it replaced.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the step reply are fixtures
+    fn a_debugger_step_commits_the_render_it_shows() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let event = click_body(&plus, Some(&first), None);
+            assert_eq!(
+                post_event(make_router(store.clone()), &sid, &event).await,
+                StatusCode::OK
+            );
+            await_model(&store, &sid, |m| m.count == 1).await;
+            let before = current_epoch(&store, &sid).await;
+
+            let resp = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_ipe/debug/step-to")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .body(Body::from(r#"{"index":0}"#))
+                        .expect("build POST"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let reply: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("the step reply is JSON");
+            let after = current_epoch(&store, &sid).await;
+            assert_ne!(after, before, "the step must commit a new render");
+            assert_eq!(
+                reply.get("epoch").and_then(serde_json::Value::as_str),
+                Some(after.as_str()),
+                "the reply names the committed epoch"
+            );
+            let shown = render_html(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .rendered
+                    .last_view(),
+            );
+            assert_eq!(
+                reply.get("body").and_then(serde_json::Value::as_str),
+                Some(shown.as_str()),
+                "the committed render is the one the debugger shows"
+            );
+        });
+    }
+
     /// A `429` leaves the tab's seq unrecorded, so the client's retry of the
     /// same event dispatches once the queue drains.
     #[test]
@@ -12083,5 +12290,61 @@ mod route_entry_cmd_tests {
             let m = settled(&store, &sid, 3).await;
             assert_eq!(m.map(|m| count(&m, "enter:home")), Some(1));
         });
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tab_seq_window_tests {
+    use super::{TAB_SEQ_CAP, TAB_SEQ_WINDOW, TabId, TabSeqs};
+
+    const TAB: TabId = TabId(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+
+    #[test]
+    fn only_a_dispatched_seq_is_a_duplicate_inside_the_window() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 500);
+        let oldest_tracked = 500 - u64::from(TAB_SEQ_WINDOW) + 1;
+        assert!(seqs.is_duplicate(TAB, 500));
+        assert!(!seqs.is_duplicate(TAB, 501));
+        assert!(!seqs.is_duplicate(TAB, 499));
+        assert!(!seqs.is_duplicate(TAB, oldest_tracked));
+        seqs.record(TAB, oldest_tracked);
+        assert!(seqs.is_duplicate(TAB, oldest_tracked));
+        assert!(!seqs.is_duplicate(TAB, oldest_tracked + 1));
+    }
+
+    #[test]
+    fn a_seq_older_than_the_window_counts_as_dispatched() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 500);
+        let past = 500 - u64::from(TAB_SEQ_WINDOW);
+        assert!(seqs.is_duplicate(TAB, past));
+        assert!(seqs.is_duplicate(TAB, 0));
+        seqs.record(TAB, u64::MAX);
+        assert!(seqs.is_duplicate(TAB, 0));
+        assert!(!seqs.is_duplicate(TAB, u64::MAX - 1));
+    }
+
+    #[test]
+    fn advancing_slides_the_window_and_keeps_the_marks_inside_it() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 10);
+        seqs.record(TAB, 12);
+        assert!(seqs.is_duplicate(TAB, 10));
+        assert!(!seqs.is_duplicate(TAB, 11));
+        seqs.record(TAB, 10 + u64::from(TAB_SEQ_WINDOW));
+        assert!(seqs.is_duplicate(TAB, 10), "10 slid out of the window");
+        assert!(!seqs.is_duplicate(TAB, 11));
+        assert!(seqs.is_duplicate(TAB, 12));
+    }
+
+    #[test]
+    fn the_least_recent_tab_is_forgotten_past_the_cap() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 1);
+        for k in 1..=TAB_SEQ_CAP.get() {
+            seqs.record(TabId(u128::try_from(k).unwrap_or(u128::MAX)), 1);
+        }
+        assert!(!seqs.is_duplicate(TAB, 1), "the oldest tab was evicted");
     }
 }
