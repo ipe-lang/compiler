@@ -1,4 +1,4 @@
-module Lib.ReviewKey exposing (MacKey, ReviewKey(..), keyVar, parseMacKey, readOnlyError, readOnlyNotice, readReviewKey, sign, verifies)
+module Lib.ReviewKey exposing (MacKey, ReviewKey(..), keyFromLookup, keyVar, parseMacKey, readOnlyError, readOnlyNotice, readReviewKey, sign, verifies)
 
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
@@ -54,25 +54,45 @@ malformedKey =
     Error.invalidInput (keyVar ++ " must be exactly 64 hexadecimal characters (32 random bytes); the value set is not.\n  fix: generate one with `openssl rand -hex 32`.")
 
 
--- The key this server runs with, read once at startup: no variable set is
--- `ReadOnly`; a set value, empty or blank included, must parse, and a value
--- that does not refuses startup.
+-- The key this server runs with, read once at startup.
 readReviewKey : Task.Task Error ReviewKey
 readReviewKey =
     System.getenv keyVar
-        |> Task.map Just
-        |> Task.onError (\_ -> Task.succeed Nothing)
-        |> Task.andThen keyOf
+        |> Task.map Ok
+        |> Task.onError (\e -> Task.succeed (Err e))
+        |> Task.andThen (\lookup -> Task.fromResult (keyFromLookup lookup))
 
 
-keyOf : Maybe String -> Task.Task Error ReviewKey
-keyOf found =
-    case found of
-        Nothing ->
-            Task.succeed ReadOnly
+-- The key from the outcome of reading its variable: only the variable not
+-- being set is `ReadOnly`; a set value, empty or blank included, must
+-- parse; any other failure to read it refuses startup, naming the variable
+-- and never the failure's own text.
+keyFromLookup : Result Error String -> Result Error ReviewKey
+keyFromLookup lookup =
+    case lookup of
+        Ok raw ->
+            Result.map Signing (parseMacKey raw)
 
-        Just raw ->
-            Task.fromResult (Result.map Signing (parseMacKey raw))
+        Err e ->
+            if isUnset e then
+                Ok ReadOnly
+
+            else
+                Err unreadableKey
+
+
+-- The one failure `System.getenv` reports for a variable that is not set.
+isUnset : Error -> Bool
+isUnset e =
+    Error.kind e
+        == Error.kind (Error.unexpected "")
+        && Error.message e
+        == ("environment variable \"" ++ keyVar ++ "\" is not set")
+
+
+unreadableKey : Error
+unreadableKey =
+    Error.invalidInput (keyVar ++ " could not be read from the environment.\n  fix: set it to 64 hex characters (32 random bytes), e.g. `openssl rand -hex 32`, or unset it to run read-only.")
 
 
 -- The startup notice of a server running with no key.
