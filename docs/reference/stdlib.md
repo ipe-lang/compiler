@@ -1210,11 +1210,13 @@ Ipe.Crypto — cryptographic primitives.
 | `randomToken` | (no summary) |
 | `Key` | An opaque cryptographic key.  Construct only via `keyFromString` |
 | `Mac` | An opaque message authentication code (HMAC output).  Inspect via |
-| `keyFromString` | Parse a hex-encoded or raw string into a `Key`.  Returns `Nothing` |
+| `keyFromString` | Wrap a string as a `Key`: the string's bytes are the key material as |
 | `keyFromBytes` | Parse raw bytes (as Ipe `String`/`Bytes`) into a `Key`. |
 | `macToHex` | Render a `Mac` as a lowercase hex string for storage or display. |
+| `macFromHex` | Parse a stored hex tag back into a `Mac`: exactly 64 hex digits (an |
 | `hmacSha256` | `hmacSha256 key message` — HMAC-SHA-256.  Returns a typed `Mac`. |
 | `hmacSha512` | `hmacSha512 key message` — HMAC-SHA-512.  Returns a typed `Mac`. |
+| `verifyHmacSha256` | `verifyHmacSha256 key message mac` — `True` exactly when `mac` is the |
 
 ## Css
 
