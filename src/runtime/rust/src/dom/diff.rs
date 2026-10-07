@@ -1,4 +1,4 @@
-use crate::html::{Attribute, Html};
+use crate::html::{Attribute, ElementBody, Html, admit_rendered};
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -70,20 +70,41 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
     None
 }
 
-/// Emit a whole-subtree innerHTML replace at `id` .
+/// Emit a replace of every child of the element at `id`.
 ///
-/// `parent_tag` is the tag of the element whose children are being replaced.
-/// When it is `"script"` or `"style"`, the rendered body is passed through the
-/// same sink-neutralise that `render_into_ctx` applies on the first-paint path,
-/// so the SSE replace cannot smuggle a raw `</script>`/`</style>` into the DOM
-/// even if the `HRaw`-provenance invariant were to slip in a future change.
-fn push_html_replace<M>(id: &str, parent_tag: &str, new_kids: &[Html<M>], out: &mut Vec<Patch>) {
+/// `parent_body` is how `admit_rendered` admitted that element. A markup body
+/// is sent as `Patch.html`, which the client parses as markup. A `<script>` or
+/// `<style>` body is a raw-text body: it is sent as `Patch.text`, which the
+/// client assigns to `textContent` without parsing, so the element holds the
+/// same neutralised bytes the first paint's raw-text parse produced. Sent as
+/// `html`, the body would be parsed in a `<div>` context, where an
+/// `<img onerror>` or a `<script src>` inside it is live markup and an entity
+/// such as `&amp;` is decoded.
+fn push_children_replace<M>(
+    id: &str,
+    parent_body: ElementBody,
+    new_kids: &[Html<M>],
+    out: &mut Vec<Patch>,
+) {
     if id.is_empty() {
         return;
     }
     let mut p = Patch::for_id(id);
-    p.html = Some(render_children(parent_tag, new_kids));
+    let body = render_children(parent_body, new_kids);
+    match parent_body {
+        ElementBody::Markup => p.html = Some(body),
+        ElementBody::Script | ElementBody::Style => p.text = Some(body),
+    }
     out.push(p);
+}
+
+/// True when `node` is an element the render sink's admission rule refuses, so
+/// the renderer leaves it out of the page.
+fn is_refused_element<M>(node: &Html<M>) -> bool {
+    match node {
+        Html::HElement(tag, _, kids) => admit_rendered(tag, kids).is_err(),
+        Html::HText(_) | Html::HRaw(_) => false,
+    }
 }
 
 /// Bounded-descent diff. Stops at `MAX_HTML_DEPTH` (same ceiling as
@@ -93,7 +114,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
     if depth >= crate::html::MAX_HTML_DEPTH {
         return;
     }
-    let (ot, oa, ok, _nt, na, nk) = match (old, new) {
+    let (ot, oa, ok, nt, na, nk) = match (old, new) {
         (Html::HElement(ot, oa, ok), Html::HElement(nt, na, nk)) if ot == nt => {
             (ot, oa, ok, nt, na, nk)
         }
@@ -101,6 +122,16 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
         // A top-level mismatch has no parent to address, so nothing to emit.
         _ => return,
     };
+    // SECURITY: the render sink's own admission rule. A refused element is
+    // absent from the rendered page, so neither side of a refused pair has a
+    // DOM node to patch; a parent whose child changes admission replaces its
+    // whole subtree (see the per-position loop), which re-renders through the
+    // same rule. The `Html.doctype` wrapper is admitted as markup, so a view
+    // rooted at it is diffed through to its children.
+    let (Ok(new_rendered), Ok(_)) = (admit_rendered(nt, nk), admit_rendered(ot, ok)) else {
+        return;
+    };
+    let body = new_rendered.body();
     // Patch id targets the element currently in the DOM — the OLD tree's id
     // . Borrowed: `Patch::for_id` copies it only when
     // a Patch is actually built, so an unchanged element pair allocates
@@ -129,7 +160,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
 
     // Child-count change → replace the whole subtree.
     if ok.len() != nk.len() {
-        push_html_replace(id, ot, nk, out);
+        push_children_replace(id, body, nk, out);
         return;
     }
 
@@ -142,19 +173,31 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                 // (single-text is the fast path above; anything else is a
                 // parent html-replace).
                 if o != n {
-                    push_html_replace(id, ot, nk, out);
+                    push_children_replace(id, body, nk, out);
                     return;
                 }
             }
-            // Raw-vs-raw: changed raw content is not patched (no-op); avoid
-            // emitting a spurious replace.
-            (Html::HRaw(_), Html::HRaw(_)) => {}
+            // A changed trusted raw body (a dynamic `styleNode`, an
+            // `unsafeRaw` fragment) re-renders the parent's children through
+            // the same body class the first paint used.
+            (Html::HRaw(o), Html::HRaw(n)) => {
+                if o != n {
+                    push_children_replace(id, body, nk, out);
+                    return;
+                }
+            }
             (Html::HElement(t1, _, _), Html::HElement(t2, _, _)) if t1 == t2 => {
+                // A child that gains or loses admission appears in or vanishes
+                // from the page, so the parent's subtree is replaced.
+                if is_refused_element(oc) != is_refused_element(nc) {
+                    push_children_replace(id, body, nk, out);
+                    return;
+                }
                 diff_node_depth(oc, nc, out, child_depth);
             }
             // Tag / kind mismatch → replace the subtree at the parent.
             _ => {
-                push_html_replace(id, ot, nk, out);
+                push_children_replace(id, body, nk, out);
                 return;
             }
         }
@@ -263,31 +306,13 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
 
 /// Render `kids` into an HTML string for an SSE innerHTML replace.
 ///
-/// When `parent_tag` is `"script"` or `"style"`, the raw-text body is rendered
-/// into a scratch buffer (text verbatim, not HTML-escaped) then passed through
-/// `neutralise_script_close` / `strip_style_close` — the same sink-neutralise
-/// the first-paint renderer applies — before it is returned. All other tags use
-/// the normal element-level render path via `render_into`.
-fn render_children<M>(parent_tag: &str, kids: &[Html<M>]) -> String {
-    // Write every child into ONE shared accumulator instead of allocating a
-    // throwaway String per child (efficiency-audit §6 medium).
+/// The children render through `render_children_into` with the parent's
+/// admitted body class, the same path the first-paint renderer takes, so a
+/// `<script>`/`<style>` body is neutralised and a refused child is left out.
+fn render_children<M>(parent_body: ElementBody, kids: &[Html<M>]) -> String {
     let mut s = String::new();
-    if parent_tag == "script" {
-        for c in kids {
-            crate::html::render_into_raw_text(c, &mut s);
-        }
-        crate::css_safety::neutralise_script_close(&s)
-    } else if parent_tag == "style" {
-        for c in kids {
-            crate::html::render_into_raw_text(c, &mut s);
-        }
-        crate::css_safety::strip_style_close(&s)
-    } else {
-        for c in kids {
-            crate::html::render_into(c, &mut s);
-        }
-        s
-    }
+    crate::html::render_children_into(parent_body, kids, &mut s);
+    s
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -551,54 +576,158 @@ mod tests {
     }
 
     // RT-SEC-001: SSE innerHTML-replace on a `<script>` element neutralises any
-    // `</script>` sequence in a text child — the injected close-tag cannot
+    // `</script>` sequence in a trusted raw child: the injected close-tag cannot
     // terminate the element early on the browser's HTML parser, even when the
     // patch is applied via `innerHTML`.
     #[test]
     fn diff_sse_script_replace_neutralises_close_tag() {
-        // Old: <script> with one text child "// safe"
-        // New: <script> with one text child containing an injected `</script>`
-        // Child-count is 1→2, so a whole-subtree innerHTML replace fires.
+        // Child-count is 1 -> 2, so a whole-subtree innerHTML replace fires.
         let mut old: Html<()> =
-            Html::HElement("script".into(), vec![], vec![Html::HText("// safe".into())]);
+            Html::HElement("script".into(), vec![], vec![Html::HRaw("// safe".into())]);
         let mut new: Html<()> = Html::HElement(
             "script".into(),
             vec![],
             vec![
-                Html::HText("// safe".into()),
-                Html::HText("</script><img onerror=alert(1)>".into()),
+                Html::HRaw("// safe".into()),
+                Html::HRaw("</script><img onerror=alert(1)>".into()),
             ],
         );
         ids(&mut old);
         ids(&mut new);
         let p = diff(&old, &new);
-        assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
-        let html = p[0].html.as_deref().expect("expected html field on patch");
+        assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
+        let Some(patch) = p.first() else {
+            return;
+        };
         assert!(
-            !html.contains("</script>"),
-            "`</script>` must not appear raw in the patch html; got: {html:?}"
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
         );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
         assert!(
-            !html.contains("</script"),
-            "`</script` byte run must be neutralised; got: {html:?}"
+            !text.to_ascii_lowercase().contains("</script"),
+            "`</script` byte run must be neutralised; got: {text:?}"
         );
     }
 
     // RT-SEC-002: SSE innerHTML-replace on a `<style>` element strips any
-    // `</style>` sequence in a text child.
+    // `</style>` sequence in a trusted raw child and opens no markup.
     #[test]
     fn diff_sse_style_replace_strips_close_tag() {
         let mut old: Html<()> = Html::HElement(
             "style".into(),
             vec![],
-            vec![Html::HText("body { color: red }".into())],
+            vec![Html::HRaw("body { color: red }".into())],
         );
         let mut new: Html<()> = Html::HElement(
             "style".into(),
             vec![],
             vec![
-                Html::HText("body { color: red }".into()),
-                Html::HText("</style><script>alert(1)</script>".into()),
+                Html::HRaw("body { color: red }".into()),
+                Html::HRaw("</style><script>alert(1)</script>".into()),
+            ],
+        );
+        ids(&mut old);
+        ids(&mut new);
+        let p = diff(&old, &new);
+        assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
+        let Some(patch) = p.first() else {
+            return;
+        };
+        assert!(
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
+        );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
+        assert!(
+            !text.contains("</style"),
+            "`</style` byte run must be stripped; got: {text:?}"
+        );
+        assert!(
+            !text.contains("<script"),
+            "no markup may open; got: {text:?}"
+        );
+    }
+
+    /// A `<script>`/`<style>` whose body is text is refused by the shared tag
+    /// gate, so the diff patches nothing into it: no `text` fast-path patch and
+    /// no `html` replace carrying the text.
+    #[test]
+    fn diff_refused_raw_text_element_emits_no_patch() {
+        for tag in ["script", "SCRIPT", "style", "Style"] {
+            let mut old: Html<()> =
+                Html::HElement(tag.into(), vec![], vec![Html::HText("a".into())]);
+            let mut new: Html<()> = Html::HElement(
+                tag.into(),
+                vec![],
+                vec![Html::HText("alert(document.cookie)".into())],
+            );
+            ids(&mut old);
+            ids(&mut new);
+            assert!(
+                diff(&old, &new).is_empty(),
+                "<{tag}> text body must not be patched"
+            );
+        }
+    }
+
+    /// A child `<script>` that turns from a trusted raw body into a text body
+    /// leaves the page: the parent is replaced, and the replacement html holds
+    /// no script element and no script text.
+    #[test]
+    fn diff_child_losing_admission_replaces_parent_without_it() {
+        let script = |kid: Html<()>| Html::HElement("script".into(), vec![], vec![kid]);
+        let mut old: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![script(Html::HRaw("init()".into()))],
+        );
+        let mut new: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![script(Html::HText("alert(document.cookie)".into()))],
+        );
+        ids(&mut old);
+        ids(&mut new);
+        let p = diff(&old, &new);
+        assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
+        let html = p[0].html.as_deref().expect("expected html field on patch");
+        assert!(
+            !html.contains("<script"),
+            "refused script must not render; got: {html:?}"
+        );
+        assert!(
+            !html.contains("alert"),
+            "refused body must not render; got: {html:?}"
+        );
+    }
+
+    /// A child-count change that adds a text-bodied `<script>` (or an empty,
+    /// not-yet-started one carrying a `src`) replaces the parent without it.
+    #[test]
+    fn diff_count_change_drops_refused_script_child() {
+        let mut old: Html<()> = Html::HElement("div".into(), vec![], vec![]);
+        let mut new: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![
+                Html::HElement(
+                    "script".into(),
+                    vec![],
+                    vec![Html::HText("alert(1)".into())],
+                ),
+                Html::HElement(
+                    "script".into(),
+                    vec![Attribute::Attr("src".into(), "/evil.js".into())],
+                    vec![],
+                ),
+                Html::HElement("p".into(), vec![], vec![Html::HText("ok".into())]),
             ],
         );
         ids(&mut old);
@@ -607,8 +736,167 @@ mod tests {
         assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
         let html = p[0].html.as_deref().expect("expected html field on patch");
         assert!(
-            !html.contains("</style"),
-            "`</style` byte run must be stripped; got: {html:?}"
+            !html.contains("<script"),
+            "refused scripts must not render; got: {html:?}"
         );
+        assert!(
+            html.contains("ok</p>"),
+            "admitted sibling must render; got: {html:?}"
+        );
+    }
+
+    /// A view rooted at `Html.doctype` is diffed through the wrapper the render
+    /// sink admits, so a changed text deep inside it reaches the page.
+    #[test]
+    fn diff_doctype_root_patches_a_changed_text_child() {
+        let page = |text: &str| -> Html<()> {
+            let p = Html::HElement("p".into(), vec![], vec![Html::HText(text.into())]);
+            let body = Html::HElement("body".into(), vec![], vec![p]);
+            let html = Html::HElement("html".into(), vec![], vec![body]);
+            Html::HElement(crate::html::DOCTYPE_WRAPPER_TAG.into(), vec![], vec![html])
+        };
+        let mut old = page("before");
+        let mut new = page("after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_html_0_body_0_p");
+        assert_eq!(patch.text.as_deref(), Some("after"));
+    }
+
+    /// A doctype wrapper nested below the root is on the page too, so it is
+    /// not a refused child: a text change inside it patches only that text.
+    #[test]
+    fn diff_nested_doctype_is_not_a_refused_child() {
+        let tree = |text: &str| -> Html<()> {
+            let p = Html::HElement("p".into(), vec![], vec![Html::HText(text.into())]);
+            let doctype = Html::HElement(crate::html::DOCTYPE_WRAPPER_TAG.into(), vec![], vec![p]);
+            Html::HElement("div".into(), vec![], vec![doctype])
+        };
+        let mut old = tree("before");
+        let mut new = tree("after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.text.as_deref(), Some("after"));
+        assert!(
+            patch.html.is_none(),
+            "no subtree replace expected: {patch:?}"
+        );
+    }
+
+    /// True when `s` holds a `<` the HTML tokenizer would read as the start of
+    /// a tag, end tag, comment or declaration.
+    fn has_markup_opener(s: &str) -> bool {
+        s.as_bytes().windows(2).any(|w| {
+            matches!(w, [b'<', c] if c.is_ascii_alphabetic() || matches!(*c, b'/' | b'!' | b'?'))
+        })
+    }
+
+    /// A trusted raw `<script>` body (an `unsafeJsonLd`/`unsafeScript` value
+    /// holding user data but no `</script`) that changes is sent as text, the
+    /// neutralised bytes the first paint wrote, never as html the client would
+    /// parse into a live `<img onerror>` or `<script src>`.
+    #[test]
+    fn diff_changed_trusted_script_body_is_a_text_patch() {
+        let script = |body: &str| -> Html<()> {
+            Html::HElement("script".into(), vec![], vec![Html::HRaw(body.into())])
+        };
+        let body = r#"["<script src=//e><img src=x onerror=alert(1)>"]"#;
+        let mut old: Html<()> = Html::HElement("div".into(), vec![], vec![script("null")]);
+        let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![script(body)]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        assert!(
+            patches
+                .iter()
+                .all(|p| p.html.as_deref().is_none_or(|h| !has_markup_opener(h))),
+            "no html patch may carry a markup opener: {patches:?}"
+        );
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_script");
+        assert!(patch.html.is_none(), "{patch:?}");
+        assert_eq!(patch.text.as_deref(), Some(body), "{patch:?}");
+        assert!(
+            crate::html::render_html(&new).contains(body),
+            "the text patch holds the first paint's body bytes"
+        );
+    }
+
+    /// A trusted raw `<style>` body that changes between renders (a dynamic
+    /// `styleNode`) is sent as its neutralised text, which keeps an entity such
+    /// as `&amp;` as the bytes CSS reads instead of decoding it.
+    #[test]
+    fn diff_changed_trusted_style_body_replaces_it() {
+        let style = |css: &str| -> Html<()> {
+            Html::HElement("style".into(), vec![], vec![Html::HRaw(css.into())])
+        };
+        let mut old: Html<()> =
+            Html::HElement("div".into(), vec![], vec![style("p { color: red }")]);
+        let mut new: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![style(
+                "p::after { content: \"&amp;\"; color: blue }</style><img src=x>",
+            )],
+        );
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_style");
+        assert!(
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
+        );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
+        assert!(
+            text.contains("content: \"&amp;\"; color: blue"),
+            "new body must arrive byte for byte; got {text:?}"
+        );
+        assert!(
+            !text.contains("</style"),
+            "close tag must be neutralised; got {text:?}"
+        );
+        assert!(!has_markup_opener(text), "no markup may open; got {text:?}");
+        assert!(
+            crate::html::render_html(&new).contains(text),
+            "the text patch holds the first paint's body bytes"
+        );
+    }
+
+    /// An unchanged trusted raw body produces no patch.
+    #[test]
+    fn diff_unchanged_trusted_raw_body_is_empty() {
+        let tree = || -> Html<()> {
+            Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HRaw("<b>x</b>".into()), Html::HRaw("<i>y</i>".into())],
+            )
+        };
+        let mut old = tree();
+        let mut new = tree();
+        ids(&mut old);
+        ids(&mut new);
+        assert!(diff(&old, &new).is_empty());
     }
 }

@@ -961,6 +961,41 @@ pub(crate) fn strip_style_close(s: &str) -> String {
     }
 }
 
+/// Neutralise a `<style>` body so it can open or close no markup in any context.
+///
+/// A `<style>` is raw text only while it sits in ordinary HTML. Inside an
+/// `<svg>` or `<math>` subtree its body is parsed as markup, and inside a
+/// `<textarea>`, `<title>`, `<noscript>`, `<iframe>`, `<xmp>`, `<noembed>` or
+/// `<noframes>` ancestor the ancestor's own close tag ends it. Stripping
+/// `</style` alone therefore leaves `x{}</textarea><img onerror=...>` able to
+/// break out. After `strip_style_close`, every `<` that the HTML tokenizer would
+/// read as the start of a tag, end tag, comment or declaration (a `<` followed
+/// by an ASCII letter, `/`, `!` or `?`) gets a space inserted after it, which
+/// the tokenizer reads as plain text. CSS reads the space as whitespace, so a
+/// range media feature such as `(400px<width)` keeps its meaning. Inside a CSS
+/// string, a `url(...)` or a comment the space is kept and a `</style` run is
+/// gone, so `url("data:image/svg+xml,<svg ...>")` reaches CSS as `< svg`: a
+/// divergence `Ipe.Html.styleNode` documents, as security outranks
+/// byte-for-byte output.
+///
+/// Total and a fixpoint: no output `<` is followed by a tag-opening byte.
+pub(crate) fn neutralise_style_body(css: &str) -> String {
+    let stripped = strip_style_close(css);
+    let mut out = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '<'
+            && chars
+                .peek()
+                .is_some_and(|&n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'))
+        {
+            out.push(' ');
+        }
+    }
+    out
+}
+
 /// Split any ASCII-case-insensitive `</script` breakout in a `<script>` body so
 /// it cannot terminate the enclosing element early. The browser's HTML parser
 /// ends a script element only at a literal `</script` byte run; inserting a `\`
@@ -1009,6 +1044,53 @@ pub(crate) fn neutralise_script_close(body: &str) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+
+    /// A `<style>` body cannot end an RCDATA/RAWTEXT ancestor or open a tag
+    /// inside foreign content: every tag-opening `<` gains a space, and the
+    /// result is a fixpoint.
+    #[test]
+    fn neutralise_style_body_opens_and_closes_no_markup() {
+        for (body, banned) in [
+            ("x{}</textarea><img src=x onerror=alert(1)>", "</textarea"),
+            ("x{}</title><script>alert(1)</script>", "<script"),
+            ("x{}</noscript><img src=x onerror=alert(1)>", "</noscript"),
+            ("x{}<img src=x onerror=alert(1)>", "<img"),
+            ("x{}</svg><img src=x onerror=alert(1)>", "</svg"),
+            ("x{}<!--", "<!"),
+            ("x{}<?php", "<?"),
+            ("x{}</StYlE ><script>", "<script"),
+        ] {
+            let out = neutralise_style_body(body);
+            assert!(
+                !out.to_ascii_lowercase().contains(banned),
+                "{body:?} -> {out:?}"
+            );
+            let opens_markup = out.as_bytes().windows(2).any(|w| {
+                w.first() == Some(&b'<')
+                    && w.get(1)
+                        .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, b'/' | b'!' | b'?'))
+            });
+            assert!(!opens_markup, "{body:?} -> {out:?}");
+            assert_eq!(neutralise_style_body(&out), out, "not a fixpoint: {body:?}");
+        }
+    }
+
+    /// Ordinary CSS, a spaced comparison and a range media feature keep their
+    /// meaning: a `<` before a digit or a space is untouched, and a `<` before a
+    /// name only gains whitespace CSS ignores.
+    #[test]
+    fn neutralise_style_body_keeps_benign_css() {
+        let plain = ".card { color: red; padding: 8px }\n@media (width < 40em) { a { b: c } }";
+        assert_eq!(neutralise_style_body(plain), plain);
+        assert_eq!(
+            neutralise_style_body("@media (width<600px) {}"),
+            "@media (width<600px) {}"
+        );
+        assert_eq!(
+            neutralise_style_body("@media (400px<width) {}"),
+            "@media (400px< width) {}"
+        );
+    }
 
     #[test]
     fn value_rejects_expression_and_scheme_sinks() {

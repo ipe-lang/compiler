@@ -16,7 +16,9 @@ module Main exposing (main)
 --
 --   2. The same Ipe source you'd write for a served `Web` page works
 --      under the webview host — `Ipe.Html.script`, `Ipe.Html.link`,
---      `Ipe.Html.node "canvas"` all render identically.
+--      `Ipe.Html.node "canvas"` all render identically. A `<script>` only
+--      renders over a trusted body, so the external scripts carry an empty
+--      `Ipe.Html.Unsafe.unsafeRaw` body.
 --
 --   3. `<script>` tags in the rendered view bootstrap correctly after
 --      the initial HTML lands in the document.
@@ -25,6 +27,7 @@ import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
+import Ipe.Html.Unsafe as HtmlUnsafe
 import Ipe.Ui as Ui
 
 -- ═══════════════════════════════════════════════════════════════════
@@ -134,8 +137,8 @@ view _ =
                     [Html.text "toggle wireframe"]
               ]
         , Html.node "div" [Attr.id "canvas-wrap"] []
-        , Html.script [srcRel "/static/three.min.js"] []
-        , Html.script [srcRel "/static/scene.js"] []
+        , Html.script [srcRel "/static/three.min.js"] [HtmlUnsafe.unsafeRaw ""]
+        , Html.script [srcRel "/static/scene.js"] [HtmlUnsafe.unsafeRaw ""]
         ])
 
 

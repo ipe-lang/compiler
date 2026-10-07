@@ -15,7 +15,7 @@
 //! name-gates exactly as it does a compiled literal. There is no code path,
 //! including deserialization, by which a `Template` yields unescaped HTML.
 
-use crate::html::{Attribute, Html};
+use crate::html::{Attribute, Html, admit_element};
 
 /// The maximum template nesting depth accepted on decode and descended on
 /// materialize. Shares the render/diff ceiling ([`crate::html::MAX_HTML_DEPTH`])
@@ -162,10 +162,17 @@ fn materialize_at<M>(template: &Template, depth: usize) -> Html<M> {
                 .iter()
                 .map(|a| Attribute::Attr(a.key.clone(), a.value.clone()))
                 .collect();
-            let html_children = children
+            let html_children: Vec<Html<M>> = children
                 .iter()
                 .map(|c| materialize_at(c, depth.saturating_add(1)))
                 .collect();
+            // SECURITY: the shared tag gate. A template holds only text and
+            // elements, never trusted raw markup, so a `<script>`/`<style>`
+            // (or `<plaintext>`, or an unsafe tag name) from a baked or patched
+            // slot materializes to inert empty text.
+            if admit_element(tag, &html_children).is_err() {
+                return Html::HText(String::new());
+            }
             Html::HElement(tag.clone(), html_attrs, html_children)
         }
     }
@@ -666,6 +673,71 @@ mod tests {
         let rendered = render_html(&bogus);
         assert!(!rendered.contains("<script>"), "no raw markup: {rendered}");
         assert_eq!(rendered, "");
+    }
+
+    // SECURITY: a template holds no trusted raw markup, so a `<script>`, a
+    // `<style>` or a `<plaintext>` element (any ASCII case) from a baked or a
+    // patched slot materializes to inert empty text through the shared tag
+    // gate; an ordinary element beside it still renders.
+    #[test]
+    fn materialize_refuses_raw_text_and_executable_elements() {
+        for tag in ["script", "SCRIPT", "style", "Style", "plaintext"] {
+            let template = Template::Element {
+                tag: "div".to_string(),
+                attrs: vec![],
+                children: vec![
+                    Template::Element {
+                        tag: tag.to_string(),
+                        attrs: vec![TemplateAttr {
+                            key: "src".to_string(),
+                            value: "/x.js".to_string(),
+                        }],
+                        children: vec![Template::Text("alert(document.cookie)".to_string())],
+                    },
+                    Template::Element {
+                        tag: "p".to_string(),
+                        attrs: vec![],
+                        children: vec![Template::Text("ok".to_string())],
+                    },
+                ],
+            };
+            // The materialised node itself carries the refusal value in the
+            // refused element's place: the render sink refuses a text-bodied
+            // `<script>` again, so the rendered string alone would pass
+            // without the materialiser's gate.
+            let node = materialize_template::<()>(&template);
+            let Html::HElement(div, _, kids) = &node else {
+                assert!(matches!(node, Html::HElement(..)), "<{tag}>: {node:?}");
+                return;
+            };
+            assert_eq!(div, "div");
+            assert_eq!(kids.len(), 2, "<{tag}>: {node:?}");
+            assert_eq!(
+                kids.first(),
+                Some(&Html::HText(String::new())),
+                "<{tag}> must materialize to inert empty text: {node:?}"
+            );
+            assert!(
+                matches!(kids.get(1), Some(Html::HElement(p, _, _)) if p == "p"),
+                "<{tag}>: the admitted sibling must survive: {node:?}"
+            );
+            assert_eq!(
+                render_html(&node),
+                "<div><p>ok</p></div>",
+                "<{tag}> must be refused"
+            );
+        }
+    }
+
+    // The patched-slot front door runs the same gate.
+    #[test]
+    fn str_materialize_refuses_a_script_element() {
+        let json = r#"{"Element":{"tag":"script","attrs":[],"children":[{"Text":"alert(1)"}]}}"#;
+        let out: Html<()> = materialize_template_str(json);
+        // The node, not only its rendering, is the refusal value: the render
+        // sink would drop a text-bodied `<script>` element anyway.
+        assert_eq!(out, Html::HText(String::new()));
+        assert_eq!(render_html(&out), "");
     }
 
     // A decoded template's text stays escaped through the string front door — no

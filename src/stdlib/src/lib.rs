@@ -445,11 +445,11 @@ const STD_LIVE_HEAD: &str = include_str!("../Ipe/Web/Head.ipe");
 /// compiled-source Layer-3.
 ///
 /// The single member `unsafeJsonLd` is a pure-Ipê definition over the `Html`
-/// kernel qualifier (`Html.script`/`Html.text`) — the same body it had on
-/// `Ipe.Web.Head`; only the surface home moved here so the raw-script sink no
-/// longer resolves off a plain `Ipe.Web.Head` import. Importing this dotted
-/// `Ipe.<M>.Unsafe` submodule discloses the `unsafe` capability. The emitted
-/// output and the render sink are unchanged. `Ipe.Web.Head.Unsafe` is NOT in
+/// kernel qualifier (`Html.script` over an `Ipe.Html.Unsafe.unsafeRaw` body, as
+/// the safe surface refuses a text-bodied `<script>`), homed here so the
+/// raw-script sink never resolves off a plain `Ipe.Web.Head` import. Importing
+/// this dotted `Ipe.<M>.Unsafe` submodule discloses the `unsafe` capability.
+/// `Ipe.Web.Head.Unsafe` is NOT in
 /// `STDLIB_MODULE_QUALIFIERS` (no kernel qualifier), so the disjointness
 /// invariant holds.
 const STD_LIVE_HEAD_UNSAFE: &str = include_str!("../Ipe/Web/Head/Unsafe.ipe");
@@ -1492,9 +1492,9 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
         source: STD_LIVE_HEAD,
     },
     // Ipe.Web.Head.Unsafe — Layer-3 source; the single `unsafeJsonLd` verbatim
-    // JSON-LD `<script>` hatch, relocated out of `Ipe.Web.Head`. Its body is pure
-    // Ipê over the `Html` kernel qualifier — no new kernel. Importing it discloses
-    // the `unsafe` capability.
+    // JSON-LD `<script>` hatch. Its body is pure Ipê over the `Html` kernel
+    // qualifier and `Ipe.Html.Unsafe.unsafeRaw` — no new kernel. Importing it
+    // discloses the `unsafe` capability.
     CompiledStdModule {
         dotted: "Ipe.Web.Head.Unsafe",
         source: STD_LIVE_HEAD_UNSAFE,
