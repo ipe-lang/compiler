@@ -17,7 +17,7 @@ import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
 import Lib.Index as Index exposing (Attested, DecidedPair)
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.SafeText as SafeText exposing (SafeText)
-import Lib.Settings as Settings exposing (DbLocation)
+import Lib.Settings as Settings exposing (DbLocation, DbRole(..))
 import Lib.Uid as Uid exposing (Uid)
 import Migrations exposing (all)
 
@@ -246,17 +246,30 @@ reviewStore =
 -- (created when absent) and migrated, its append-only guards are found on
 -- the tables they guard, and its log head is read, so an unwritable
 -- location, a file whose guards are gone, or one whose head is missing stops
--- the server before it listens, naming the variable and the file.
+-- the server before it listens, naming the variable, the file and the fix.
+-- A driver failure is refused once, through `Settings.openFailure`; a lost
+-- guard is its own refusal, since no change of location repairs that log.
 probe : DbLocation -> Task.Task Error ()
 probe loc =
-    (do
-        db <- openAt loc
-        migrate db
-        requireGuards db
-        currentHead db
+    do
+        db <- openMigrated loc
+        requireGuards loc db
+        headAt loc db
         Task.succeed ()
-    )
-        |> Task.mapError (Settings.openFailure "IPE_REVIEW_DB" (SafeText.literal "point IPE_REVIEW_DB at a writable SQLite file") loc)
+
+
+openMigrated : DbLocation -> Task.Task Error Db
+openMigrated loc =
+    openAt loc
+        |> Task.andThen (\db -> Task.map (\_ -> db) (migrate db))
+        |> Task.onError (Settings.openFailure ReviewDb loc)
+
+
+headAt : DbLocation -> Db -> Task.Task Error Index.ChainHead
+headAt loc db =
+    headRows db
+        |> Task.onError (Settings.openFailure ReviewDb loc)
+        |> Task.andThen (\rows -> Task.mapError (\_ -> Settings.brokenLog loc "its review log has no single head row") (oneHead rows))
 
 
 -- The triggers that keep the review log append-only, each named with the
@@ -280,15 +293,21 @@ guardDecoder =
 
 -- Every guard in `appendOnlyGuards` is present on its table; a file missing
 -- one is refused, since its review rows could be rewritten unseen.
-requireGuards : Db -> Task.Task Error ()
-requireGuards db =
+requireGuards : DbLocation -> Db -> Task.Task Error ()
+requireGuards loc db =
     do
-        present <- Db.queryDecode db "SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger'" [] guardDecoder
+        present <- presentGuards loc db
         if List.all (\entry -> List.member entry present) appendOnlyGuards then
             Task.succeed ()
 
         else
-            Task.fail (Error.unexpected "the review log's append-only triggers are not all in place")
+            Task.fail (Settings.brokenLog loc "its review log has lost an append-only trigger, so its decisions could be rewritten unseen")
+
+
+presentGuards : DbLocation -> Db -> Task.Task Error (List String)
+presentGuards loc db =
+    Db.queryDecode db "SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger'" [] guardDecoder
+        |> Task.onError (Settings.openFailure ReviewDb loc)
 
 
 -- The review database at a parsed location, opened through the one review URL
@@ -365,14 +384,22 @@ linkInserted tx uid bodyHash inserted =
 -- is a failed read, never a default head.
 currentHead : Db -> Task.Task Error Index.ChainHead
 currentHead db =
-    do
-        rows <- Db.queryDecode db "SELECT head FROM review_head WHERE one = 1" [] Index.chainHeadDecoder
-        case rows of
-            [ head ] ->
-                Task.succeed head
+    headRows db |> Task.andThen oneHead
 
-            _ ->
-                Task.fail (Error.unexpected "review_head did not return exactly one row")
+
+headRows : Db -> Task.Task Error (List Index.ChainHead)
+headRows db =
+    Db.queryDecode db "SELECT head FROM review_head WHERE one = 1" [] Index.chainHeadDecoder
+
+
+oneHead : List Index.ChainHead -> Task.Task Error Index.ChainHead
+oneHead rows =
+    case rows of
+        [ head ] ->
+            Task.succeed head
+
+        _ ->
+            Task.fail (Error.unexpected "review_head did not return exactly one row")
 
 
 -- The head moved from `prev` to `next` only if it still reads `prev`: a head

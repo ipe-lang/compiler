@@ -1,4 +1,4 @@
-module Lib.RepoPath exposing (PathError(..), Root, RootMap, Tag, absolutize, describe, maxRoots, parseRoot, parseTag, resolve, rootMap, rootPath, tagName, toError)
+module Lib.RepoPath exposing (PathError(..), Root, RootMap, Tag, absolutize, boundRoots, describe, maxRoots, parseRoot, parseTag, resolve, rootFix, rootMap, rootPath, tagName, toError)
 
 import Ipe.Error as Error
 import Ipe.File as File
@@ -241,6 +241,14 @@ rootPath root =
             path
 
 
+-- Each tag the map binds with its root, in binding order.
+boundRoots : RootMap -> List ( Tag, Root )
+boundRoots roots =
+    case roots of
+        RootMap bound ->
+            List.map (\binding -> ( binding.tag, binding.root )) bound
+
+
 -- A configured path made absolute: an absolute value is taken as-is, a
 -- relative one is resolved against the working directory. The result is a
 -- sealed `Path`, so a NUL byte is refused and `..` segments are cleaned
@@ -312,9 +320,17 @@ rootRefusal raw problem =
             , SafeText.quoted raw
             , SafeText.literal " "
             , problem
-            , SafeText.literal "; set it to the repository root the index was built from (absolute, or relative to the working directory)"
+            , SafeText.literal "; "
+            , rootFix
             ]
         )
+
+
+-- The one fix for every `IPE_INDEX_ROOT` refusal, at parse and at the
+-- startup check against the index.
+rootFix : SafeText
+rootFix =
+    SafeText.literal "set it to the repository root the index was built from (absolute, or relative to the working directory)"
 
 
 -- A stored `tag:relative` path joined under its tag's root. The prefix

@@ -63,12 +63,13 @@ requireEnv key fix =
 
 -- Parse every configured location, then open and probe each one before
 -- serving: the index read-only with every column a page reads, the review
--- database created and migrated, and the root, which the parse already
--- requires to be an existing directory. A relative value resolves against
--- the working directory. Then the index's `reviewed` copy is rebuilt from
--- the review database once and stamped with the review log's head, so the
--- first load already reads a current copy. Any failure stops startup with a message
--- naming the variable and one fix. Last, this process's epoch is minted.
+-- database created and migrated, and the root, which the parse requires to
+-- be an existing directory and `Index.probeRoot` to hold the index's files.
+-- A relative value resolves against the working directory. Then the index's
+-- `reviewed` copy is rebuilt from the review database once and stamped with
+-- the review log's head, so the first load already reads a current copy. Any
+-- failure stops startup with a message naming the variable and one fix.
+-- Last, this process's epoch is minted.
 -- Returns the settings, the one value the app serves from.
 requireSettings : String -> String -> String -> Task Error Settings.AppSettings
 requireSettings rawDb rawRoot rawReview =
@@ -81,6 +82,7 @@ requireSettings rawDb rawRoot rawReview =
         (do
             index <- Settings.parseIndexSettings rawDb rawRoot
             Index.probe index
+            Index.probeRoot index
             review <- Settings.parseReviewDb rawReview
             LibDb.probe review
             db <- LibDb.openAt review

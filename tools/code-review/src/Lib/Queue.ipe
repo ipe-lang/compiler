@@ -745,14 +745,17 @@ sourceStatusText view =
         Stale UnverifiableHash ->
             Just "This unit's hash predates source attestation; re-run `ipe-index index` to verify it."
 
-        Unreadable e ->
-            Just ("Source unreadable: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        Unreadable failure ->
+            Just ("Source unreadable: " ++ SafeText.toString (Index.readFailureText failure))
 
         TooLarge (SpanLines o) ->
             Just ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)
 
         TooLarge (ViewBytes o) ->
             Just ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)
+
+        TooLarge (ChildSpans o) ->
+            Just ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")
 
 
 -- What a reviewer can do about a view past a ceiling.

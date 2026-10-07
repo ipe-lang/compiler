@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, readConnection, readSnapshot, readStamp, rebuildReviewed, reverify, shortHash, shownHash, shownLines, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -11,15 +11,17 @@ import Ipe.Error as Error
 import Ipe.File as File
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
+import Ipe.Tuple as Tuple
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
-import Lib.RepoPath as RepoPath exposing (RootMap)
+import Lib.RepoPath as RepoPath exposing (PathError, Root, RootMap, Tag)
 import Lib.SafeText as SafeText exposing (SafeText)
-import Lib.Settings as Settings exposing (IndexSettings)
+import Lib.Settings as Settings exposing (DbRole(..), IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
 
 
@@ -82,7 +84,7 @@ loadView conn roots uid =
         case List.head rows of
             Just row ->
                 do
-                    view <- viewOf roots row
+                    view <- viewOf conn roots row
                     links <- linksOf conn row view
                     Task.succeed (Just { unit = withRow row, view = view, links = links })
 
@@ -316,7 +318,143 @@ probe settings =
         Db.queryDecode conn "SELECT head FROM reviewed_stamp LIMIT 0" [] stampDecoder
         Task.succeed ()
     )
-        |> Task.mapError (Settings.openFailure "IPE_INDEX_DB" (SafeText.literal "build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at an existing index") settings.db)
+        |> Task.onError (Settings.openFailure IndexDb settings.db)
+
+
+-- The startup check of `IPE_INDEX_ROOT` against the index, per configured
+-- root: of the first `rootSample` distinct indexed paths under the root's
+-- tag, at least one must join to a file that exists beneath it. A root
+-- other than the tree the index was built from holds none of them and is
+-- refused naming the variable, the first sampled path and the root; a file
+-- or two deleted since the last index run does not refuse a right root
+-- while another sampled file remains. An index holding units, none under a
+-- configured tag, is refused too: none of its units could be read. Only an
+-- empty index has nothing to check.
+probeRoot : IndexSettings -> Task.Task Error ()
+probeRoot settings =
+    (do
+        conn <- readConnection settings
+        samples <- Task.sequence (List.map (rootSampleOf conn) (RepoPath.boundRoots settings.roots))
+        anyUnit <- Db.queryDecode conn anyPathSql [] storedPathDecoder
+        Task.succeed ( samples, anyUnit )
+    )
+        |> Task.onError (Settings.openFailure IndexDb settings.db)
+        |> Task.andThen (\( samples, anyUnit ) -> rootsHold settings.roots samples anyUnit)
+
+
+-- One configured root with the indexed paths sampled under its tag.
+type alias RootSample =
+    { tag : Tag
+    , rootDir : Path
+    , stored : List String
+    }
+
+
+rootsHold : RootMap -> List RootSample -> List String -> Task.Task Error ()
+rootsHold roots samples anyUnit =
+    if List.all (\sample -> List.isEmpty sample.stored) samples && not (List.isEmpty anyUnit) then
+        Task.fail (noTaggedPath (List.map (\sample -> sample.tag) samples))
+
+    else
+        Task.sequence (List.map (rootHolds roots) samples)
+            |> Task.map (\_ -> ())
+
+
+rootSampleOf : Db.Db -> ( Tag, Root ) -> Task.Task Error RootSample
+rootSampleOf conn ( tag, root ) =
+    let
+        prefix =
+            RepoPath.tagName tag ++ ":"
+    in
+    Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] storedPathDecoder
+        |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, stored = stored })
+
+
+-- Succeeds when the sample is empty or any sampled path joins to a file
+-- that exists; a path the map refuses counts as absent.
+rootHolds : RootMap -> RootSample -> Task.Task Error ()
+rootHolds roots sample =
+    case List.head sample.stored of
+        Nothing ->
+            Task.succeed ()
+
+        Just first ->
+            Task.sequence (List.map (presentUnder roots) sample.stored)
+                |> Task.andThen
+                    (\present ->
+                        if List.member True present then
+                            Task.succeed ()
+
+                        else
+                            Task.fail (rootMismatch (List.length sample.stored) first sample.rootDir)
+                    )
+
+
+-- How many distinct indexed paths the root check samples per root.
+rootSample : Int
+rootSample =
+    16
+
+
+-- The distinct paths under one tag: the stored path starts with `tag:`,
+-- compared by `substr`, so no character of the tag is a pattern.
+taggedPathsSql : String
+taggedPathsSql =
+    "SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?"
+
+
+anyPathSql : String
+anyPathSql =
+    "SELECT path FROM units LIMIT 1"
+
+
+storedPathDecoder : Db.Decode.Decoder String
+storedPathDecoder =
+    Db.Decode.succeed (\path -> path)
+        |> Db.Decode.required "path" (Db.Decode.string "path")
+
+
+-- Whether `stored` joins under its root to something that exists.
+presentUnder : RootMap -> String -> Task.Task Error Bool
+presentUnder roots stored =
+    case RepoPath.resolve roots stored of
+        Ok path ->
+            File.exists path |> Task.onError (\_ -> Task.succeed False)
+
+        Err _ ->
+            Task.succeed False
+
+
+rootMismatch : Int -> String -> Path -> Error
+rootMismatch sampled first rootDir =
+    Error.invalidInput
+        (SafeText.toString
+            (SafeText.concat
+                [ SafeText.literal "IPE_INDEX_ROOT holds none of the "
+                , SafeText.render (String.fromInt sampled)
+                , SafeText.literal " indexed files checked: index path "
+                , SafeText.quoted first
+                , SafeText.literal " is not under "
+                , SafeText.quoted (Path.toString rootDir)
+                , SafeText.literal "; "
+                , RepoPath.rootFix
+                , SafeText.literal ", or re-run `tools/scripts/ipe-index index` if the indexed files have moved"
+                ]
+            )
+        )
+
+
+noTaggedPath : List Tag -> Error
+noTaggedPath tags =
+    Error.invalidInput
+        (SafeText.toString
+            (SafeText.concat
+                [ SafeText.literal "IPE_INDEX_DB holds units, but no index path starts with a configured repo tag ("
+                , SafeText.concat (List.intersperse (SafeText.literal ", ") (List.map (\tag -> SafeText.quoted (RepoPath.tagName tag ++ ":")) tags))
+                , SafeText.literal "); build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at the index of this repository"
+                ]
+            )
+        )
 
 
 reviewedPairDecoder : Db.Decode.Decoder ( String, String )
@@ -758,20 +896,21 @@ nameFor conn uid =
 
 -- The one verification of a unit's source. The stored hash is parsed first,
 -- so an unknown scheme refuses before any read; then the stored path is
--- resolved, a span past the line ceiling is withheld before any read, the
--- file is read and `classifyView` judges the view. Every per-unit cause
--- (refused path, unreadable file, oversized view, bad range, drift) is a
--- `SourceView` state, never a failed task.
-viewOf : RootMap -> RowUnit -> Task.Task Error SourceView
-viewOf roots row =
-    case parseAttested row.bodyHash of
-        UnknownScheme _ ->
+-- resolved, a span past the line ceiling is withheld before any read, a file
+-- unit's child spans are read on `conn`, the file is read and `classifyView`
+-- judges the view. Every per-unit cause (refused path, unreadable file,
+-- oversized view, bad range, drift) is a `SourceView` state, never a failed
+-- task.
+viewOf : Db.Db -> RootMap -> RowUnit -> Task.Task Error SourceView
+viewOf conn roots row =
+    case provable (parseAttested row.bodyHash) of
+        Nothing ->
             Task.succeed (Stale UnverifiableHash)
 
-        Sha256 stored ->
+        Just stored ->
             case RepoPath.resolve roots row.path of
                 Err refusal ->
-                    Task.succeed (Unreadable (RepoPath.toError refusal))
+                    Task.succeed (Unreadable (PathRefused refusal))
 
                 Ok path ->
                     case spanOversize row.lineStart row.lineEnd of
@@ -779,56 +918,168 @@ viewOf roots row =
                             Task.succeed (TooLarge over)
 
                         Nothing ->
-                            File.readFileLimit path sourceCeiling
-                                |> Task.map (classifyView row.uid stored row.lineStart row.lineEnd)
-                                |> Task.onError (\e -> Task.succeed (Unreadable (readFailure row.path e)))
+                            do
+                                body <- bodyOf conn row
+                                case body of
+                                    Err over ->
+                                        Task.succeed (TooLarge over)
+
+                                    Ok covered ->
+                                        File.readFileLimit path sourceCeiling
+                                            |> Task.map (classifyView row.uid stored covered)
+                                            |> Task.onError (\_ -> unreadableAt row.path path)
 
 
--- A read error re-worded to name the stored path it came from.
-readFailure : String -> Error -> Error
-readFailure stored e =
-    Error.withMessage
-        (SafeText.toString
-            (SafeText.concat
+-- What `row`'s attestation covers, ipe-index's rule: a file unit attests its
+-- residual against the spans of every other unit of its file, read one past
+-- `childSpanCeiling` so a full read is refused rather than trusted; every
+-- other unit attests its line range.
+bodyOf : Db.Db -> RowUnit -> Task.Task Error (Result Oversize Body)
+bodyOf conn row =
+    if row.kind == fileKind then
+        Db.queryDecode conn childSpansSql [ SqlString row.path, SqlInt (childSpanCeiling + 1) ] spanDecoder
+            |> Task.map residualBody
+
+    else
+        Task.succeed (Ok (LineRange row.lineStart row.lineEnd))
+
+
+residualBody : List ( Int, Int ) -> Result Oversize Body
+residualBody spans =
+    if List.length spans > childSpanCeiling then
+        Err (ChildSpans { atLeast = List.length spans })
+
+    else
+        Ok (Residual spans)
+
+
+-- The kind ipe-index stores for a whole-file unit.
+fileKind : String
+fileKind =
+    "file"
+
+
+-- The spans ipe-index reads when it attests a file unit, on `i_units_path`.
+childSpansSql : String
+childSpansSql =
+    "SELECT line_start, line_end FROM units WHERE path = ? AND kind != 'file' LIMIT ?"
+
+
+spanDecoder : Db.Decode.Decoder ( Int, Int )
+spanDecoder =
+    Db.Decode.succeed (\first last -> ( first, last ))
+        |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
+        |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
+
+
+-- The most child spans a file unit's residual is judged against. A file
+-- within `viewLineCeiling` lines holds far fewer units; more is refused.
+childSpanCeiling : Int
+childSpanCeiling =
+    4 * viewLineCeiling
+
+
+-- Why the read of `stored`'s joined `path` failed, judged by whether
+-- anything is there. The read error's own text is never kept, so no OS
+-- wording or error number reaches the page.
+unreadableAt : String -> Path -> Task.Task Error SourceView
+unreadableAt stored path =
+    File.exists path
+        |> Task.map (failureFor stored)
+        |> Task.onError (\_ -> Task.succeed (Unreadable (CannotRead stored)))
+
+
+failureFor : String -> Bool -> SourceView
+failureFor stored present =
+    if present then
+        Unreadable (CannotRead stored)
+
+    else
+        Unreadable (NoFile stored)
+
+
+-- The one rendering of a `ReadFailure`, naming the stored path and the fix.
+readFailureText : ReadFailure -> SafeText
+readFailureText failure =
+    case failure of
+        PathRefused refusal ->
+            RepoPath.describe refusal
+
+        NoFile stored ->
+            SafeText.concat
                 [ SafeText.literal "index path "
                 , SafeText.quoted stored
-                , SafeText.literal " could not be read: "
-                , SafeText.render (Error.message e)
+                , SafeText.literal " names no file under the repository root; re-run `ipe-index index` if the file was moved or deleted"
                 ]
-            )
-        )
-        e
+
+        CannotRead stored ->
+            SafeText.concat
+                [ SafeText.literal "index path "
+                , SafeText.quoted stored
+                , SafeText.literal " exists but did not read as text: it is past the "
+                , SafeText.render (String.fromInt (ByteSize.toBytes sourceCeiling))
+                , SafeText.literal "-byte limit, not UTF-8, not a regular file, or not readable by this process"
+                ]
 
 
--- The one judgement of a unit's view, in precedence order: a span past the
+-- The one judgement of a unit's view, in precedence order: a body past the
 -- line ceiling, a range outside `text`, a view past the byte ceiling, then
--- the attestation compare. `ShownSource` is built only here, so holding one
--- proves the view is within both ceilings and re-hashes to `stored`. An
--- oversized view is never hashed: re-indexing cannot make it shown.
-classifyView : Uid -> String -> Int -> Int -> String -> SourceView
-classifyView uid stored start end text =
-    case spanOversize start end of
+-- the attestation compare. The rows drawn and the text hashed come from one
+-- `bodyRows` list, joined by `bodyText`. `ShownSource` is built only here, so
+-- holding one proves the view is within both ceilings and re-hashes to
+-- `stored`. An oversized view is never hashed: re-indexing cannot make it
+-- shown.
+classifyView : Uid -> String -> Body -> String -> SourceView
+classifyView uid stored body text =
+    let
+        lines =
+            viewLines text
+    in
+    case bodyOversize body lines of
         Just over ->
             TooLarge over
 
         Nothing ->
-            case viewText start end text of
+            case bodyRows body lines of
                 Err reason ->
                     Stale reason
 
-                Ok view ->
+                Ok rows ->
                     let
+                        view =
+                            bodyText body rows
+
                         size =
                             Bytes.length (Bytes.fromString view)
                     in
                     if size > ByteSize.toBytes viewByteCeiling then
                         TooLarge (ViewBytes { size = ByteSize.bytes size })
 
-                    else if attest view == stored then
-                        Shown (ShownSource { uid = uid, text = view, hash = stored })
+                    else if bodyAttest body view == stored then
+                        Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored })
 
                     else
                         Stale Drifted
+
+
+-- A line range past the line ceiling, or a file unit whose file is: the
+-- residual is judged over every line of the file.
+bodyOversize : Body -> List String -> Maybe Oversize
+bodyOversize body lines =
+    case body of
+        LineRange start end ->
+            spanOversize start end
+
+        Residual _ ->
+            let
+                count =
+                    List.length lines
+            in
+            if count > viewLineCeiling then
+                Just (SpanLines { lines = count })
+
+            else
+                Nothing
 
 
 -- A span of more than `viewLineCeiling` lines, judged on the indexed range
@@ -895,10 +1146,13 @@ langOf stored =
             Highlight.Unknown
 
 
--- A stored `body_hash`, parsed once: an attestation this app can re-prove,
--- or a value under any other scheme (a legacy or unknown hash).
+-- A stored `body_hash`, parsed once: an attestation this app can re-prove
+-- (a line range's under `attestScheme`, a residual's under
+-- `residualScheme`), or a value under any other scheme (a legacy or unknown
+-- hash).
 type AttestedHash
     = Sha256 String
+    | ResidualSha256 String
     | UnknownScheme String
 
 
@@ -907,8 +1161,26 @@ parseAttested stored =
     if String.startsWith attestScheme stored then
         Sha256 stored
 
+    else if String.startsWith residualScheme stored then
+        ResidualSha256 stored
+
     else
         UnknownScheme stored
+
+
+-- The stored text of an attestation this app can re-prove, or `Nothing`
+-- for any other scheme.
+provable : AttestedHash -> Maybe String
+provable attested =
+    case attested of
+        Sha256 stored ->
+            Just stored
+
+        ResidualSha256 stored ->
+            Just stored
+
+        UnknownScheme _ ->
+            Nothing
 
 
 -- The stored text, for keying review-db lookups only; never a value to
@@ -917,6 +1189,9 @@ storedHash : AttestedHash -> String
 storedHash attested =
     case attested of
         Sha256 stored ->
+            stored
+
+        ResidualSha256 stored ->
             stored
 
         UnknownScheme stored ->
@@ -937,15 +1212,18 @@ hashDigits attested =
         Sha256 stored ->
             String.dropLeft (String.length attestScheme) stored
 
+        ResidualSha256 stored ->
+            String.dropLeft (String.length residualScheme) stored
+
         UnknownScheme other ->
             other
 
 
--- Source text proved within both view ceilings and equal to its attestation.
--- Opaque: built only by `classifyView`, so holding one means the bytes were
--- measured and re-hashed.
+-- Source text proved within both view ceilings and equal to its attestation:
+-- the drawn rows and the text they join to. Opaque: built only by
+-- `classifyView`, so holding one means the bytes were measured and re-hashed.
 type ShownSource
-    = ShownSource { uid : Uid, text : String, hash : String }
+    = ShownSource { uid : Uid, rows : List SourceRow, text : String, hash : String }
 
 
 shownText : ShownSource -> String
@@ -955,14 +1233,13 @@ shownText shown =
             s.text
 
 
--- The shown view's lines numbered from the unit's first line `start`: the
--- exact lines `viewText` joined and the attestation hashed, so the drawn rows,
--- the counted rows and the hashed rows are one list.
-shownLines : ShownSource -> Int -> List ( Int, String )
-shownLines shown start =
-    shownText shown
-        |> String.split "\n"
-        |> List.indexedMap (\i line -> ( start + i, line ))
+-- The shown view's rows: the exact list `bodyText` joined and the
+-- attestation hashed, so the drawn rows and the hashed rows are one list.
+shownRows : ShownSource -> List SourceRow
+shownRows shown =
+    case shown of
+        ShownSource s ->
+            s.rows
 
 
 shownHash : ShownSource -> String
@@ -1009,7 +1286,7 @@ reverify settings shown =
                 rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql s.uid ] rowDecoder
                 case List.head rows of
                     Just row ->
-                        viewOf settings.roots row
+                        viewOf conn settings.roots row
                             |> Task.andThen (confirmShown s.uid s.hash)
 
                     Nothing ->
@@ -1058,29 +1335,82 @@ type StaleReason
 type Oversize
     = SpanLines { lines : Int }
     | ViewBytes { size : ByteSize }
+    | ChildSpans { atLeast : Int }
+
+
+-- What a unit's attestation covers: a span unit its line range (1-based,
+-- inclusive), a file unit its residual, the lines no span of another unit
+-- of the file covers.
+type Body
+    = LineRange Int Int
+    | Residual (List ( Int, Int ))
+
+
+-- One row of a view: a source line with its 1-based number, or the marker
+-- standing for one run of lines child units cover.
+type SourceRow
+    = Numbered Int String
+    | Covered
 
 
 -- What the unit page may show of a unit's source: the verified view, a
--- reason it is withheld, the error that kept it from being read, or the
+-- reason it is withheld, why it could not be read, or the
 -- ceiling it passed. Only `Shown` holds source text.
 type SourceView
     = Shown ShownSource
     | Stale StaleReason
-    | Unreadable Error
+    | Unreadable ReadFailure
     | TooLarge Oversize
 
 
--- The scheme prefix of every attestation ipe-index stores in `body_hash`.
+-- Why a unit's file was not read: its stored path was refused before any
+-- read, nothing is at the joined path, or what is there did not read as
+-- text within `sourceCeiling`. Each case but a refusal names the stored
+-- path; a refusal's `PathError` names it itself.
+type ReadFailure
+    = PathRefused PathError
+    | NoFile String
+    | CannotRead String
+
+
+-- The scheme prefix of a line range's attestation in `body_hash`.
 attestScheme : String
 attestScheme =
     "sha256:"
 
 
--- The attestation of a view: the scheme prefix and the view's lowercase hex
--- SHA-256, the exact form ipe-index stores in `units.body_hash`.
+-- The scheme prefix of a file unit's residual attestation in `body_hash`.
+-- Any text is the view of some file, so only a scheme of its own keeps a
+-- residual's hash apart from every `attestScheme` hash, the whole-file hash
+-- an older index stored for the same file unit among them.
+residualScheme : String
+residualScheme =
+    "sha256-residual:"
+
+
+-- The attestation of a line range's view: the scheme prefix and the view's
+-- lowercase hex SHA-256, the exact form ipe-index stores in
+-- `units.body_hash`.
 attest : String -> String
 attest view =
     attestScheme ++ Crypto.sha256 view
+
+
+-- The attestation of a file unit's residual, under `residualScheme`.
+attestResidual : String -> String
+attestResidual residual =
+    residualScheme ++ Crypto.sha256 residual
+
+
+-- The attestation of the text a body names, under that body's scheme.
+bodyAttest : Body -> String -> String
+bodyAttest body text =
+    case body of
+        LineRange _ _ ->
+            attest text
+
+        Residual _ ->
+            attestResidual text
 
 
 -- A file's lines under the attestation's split rule, shared with ipe-index
@@ -1103,19 +1433,166 @@ viewLines text =
 -- outside the file is refused with the file's line count, never clamped.
 viewText : Int -> Int -> String -> Result StaleReason String
 viewText start end text =
-    let
-        segments =
-            viewLines text
+    Result.map rowsText (rangeRows start end (viewLines text))
 
+
+-- A file's residual under ipe-index's rule, shared through the residual
+-- vectors file.
+residualText : List ( Int, Int ) -> String -> String
+residualText spans text =
+    residualRowsText (residualRows spans (viewLines text))
+
+
+-- The rows a body names in `lines`, the one list both drawn and hashed.
+bodyRows : Body -> List String -> Result StaleReason (List SourceRow)
+bodyRows body lines =
+    case body of
+        LineRange start end ->
+            rangeRows start end lines
+
+        Residual spans ->
+            Ok (residualRows spans lines)
+
+
+-- The attested text of the rows a body names: a line range's rows joined by
+-- `\n`, a residual's rows under `residualRowsText`.
+bodyText : Body -> List SourceRow -> String
+bodyText body rows =
+    case body of
+        LineRange _ _ ->
+            rowsText rows
+
+        Residual _ ->
+            residualRowsText rows
+
+
+-- The attested text of a line range's rows: each line joined by `\n`.
+rowsText : List SourceRow -> String
+rowsText rows =
+    String.join "\n" (List.map rowText rows)
+
+
+-- The attested text of a residual's rows: every row written as `\n` and its
+-- text, a kept line's text the line and a covered row's text empty. A kept
+-- line is never blank, so never empty, and no line holds a `\n`, so the
+-- text splits back into exactly one row list: no source line, whatever its
+-- bytes, reads as a covered row. No rows is `""`. It is attested by
+-- `attestResidual`, whose scheme no line range's or whole file's hash
+-- carries.
+residualRowsText : List SourceRow -> String
+residualRowsText rows =
+    String.concat (List.map (\row -> "\n" ++ rowText row) rows)
+
+
+rowText : SourceRow -> String
+rowText row =
+    case row of
+        Numbered _ line ->
+            line
+
+        Covered ->
+            ""
+
+
+rangeRows : Int -> Int -> List String -> Result StaleReason (List SourceRow)
+rangeRows start end lines =
+    let
         count =
-            List.length segments
+            List.length lines
     in
     if 1 <= start && start <= end && end <= count then
-        segments
+        lines
             |> List.drop (start - 1)
             |> List.take (end - start + 1)
-            |> String.join "\n"
+            |> List.indexedMap (\i line -> Numbered (start + i) line)
             |> Ok
 
     else
         Err (RangeOutOfFile { lineCount = count })
+
+
+-- The lines no span covers, blank ones dropped, each covered run between two
+-- kept lines marked by one `Covered` row. A span covers only its part inside
+-- `1..length lines`; an empty or reversed span covers nothing. Linear in the
+-- lines after one sort of the spans.
+residualRows : List ( Int, Int ) -> List String -> List SourceRow
+residualRows spans lines =
+    let
+        numbered =
+            List.indexedMap (\i line -> ( i + 1, line )) lines
+
+        flags =
+            coveredFlags (List.length lines) spans
+    in
+    List.map2 (\covered ( number, line ) -> ( covered, number, line )) flags numbered
+        |> List.foldl residualStep ( False, [] )
+        |> residualOf
+
+
+-- ( a covered run since the last kept line, the rows kept so far, last
+-- first ): consed, so the fold is linear in the lines.
+residualStep : ( Bool, Int, String ) -> ( Bool, List SourceRow ) -> ( Bool, List SourceRow )
+residualStep ( covered, number, line ) ( gap, rows ) =
+    if covered then
+        ( True, rows )
+
+    else if String.isEmpty (String.trim line) then
+        ( gap, rows )
+
+    else if gap && not (List.isEmpty rows) then
+        ( False, Numbered number line :: Covered :: rows )
+
+    else
+        ( False, Numbered number line :: rows )
+
+
+residualOf : ( Bool, List SourceRow ) -> List SourceRow
+residualOf ( _, rows ) =
+    List.reverse rows
+
+
+-- One flag per line of a `count`-line file: whether any span covers it.
+coveredFlags : Int -> List ( Int, Int ) -> List Bool
+coveredFlags count spans =
+    List.filterMap (clampSpan count) spans
+        |> List.sortBy Tuple.first
+        |> List.foldl coverRun ( 1, [] )
+        |> closeRuns count
+
+
+-- A span cut to `1..count`, or Nothing when no line of it is in range.
+clampSpan : Int -> ( Int, Int ) -> Maybe ( Int, Int )
+clampSpan count ( start, end ) =
+    let
+        first =
+            max start 1
+
+        last =
+            min end count
+    in
+    if first <= last then
+        Just ( first, last )
+
+    else
+        Nothing
+
+
+-- ( the first line no earlier span reached, the flag runs so far, last
+-- first ), over spans sorted by first line; consed, so the fold is linear
+-- in the spans.
+coverRun : ( Int, Int ) -> ( Int, List (List Bool) ) -> ( Int, List (List Bool) )
+coverRun ( first, last ) ( next, runs ) =
+    if last < next then
+        ( next, runs )
+
+    else
+        let
+            from =
+                max first next
+        in
+        ( last + 1, List.repeat (last - from + 1) True :: List.repeat (from - next) False :: runs )
+
+
+closeRuns : Int -> ( Int, List (List Bool) ) -> List Bool
+closeRuns count ( next, runs ) =
+    List.concat (List.reverse (List.repeat (count - next + 1) False :: runs))

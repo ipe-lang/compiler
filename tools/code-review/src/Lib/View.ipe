@@ -15,7 +15,7 @@ import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUni
 import Lib.Db as LibDb exposing (StoredDecision(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Token(..))
-import Lib.Index as Index exposing (Change(..), SourceView(..))
+import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
@@ -111,6 +111,9 @@ progressBar k n =
             ]
 
 
+-- The root handles every keyboard shortcut and takes focus when the page
+-- loads, so a key works before the reviewer clicks anywhere; focus inside it
+-- keeps reaching its handler, since key events bubble to the root.
 view : Model -> Ui.Element Msg
 view model =
     Ui.column
@@ -119,6 +122,7 @@ view model =
         , Background.color (Ui.rgb 16 16 22)
         , Ui.onKeyDown KeyDown
         , Ui.htmlAttribute "tabindex" "0"
+        , Ui.htmlAttribute "autofocus" ""
         ]
         [ header model
         , Ui.el
@@ -777,7 +781,7 @@ sourceBlock loaded =
             [ Ui.width Ui.fill, Ui.spacing 2 ]
             (case loaded.view of
                 Shown shown ->
-                    List.map (numberedLine loaded.unit.lang) (Index.shownLines shown loaded.unit.lineStart)
+                    List.map (sourceRow loaded.unit.lang) (Index.shownRows shown)
 
                 Stale _ ->
                     withheldSource loaded.view
@@ -801,8 +805,26 @@ withheldSource view =
             []
 
 
-numberedLine : Highlight.Lang -> ( Int, String ) -> Ui.Element Msg
-numberedLine lang ( n, line ) =
+-- One drawn row of a shown view: a numbered source line, or the marker for
+-- a run of lines other units cover, which those units' own pages show.
+sourceRow : Highlight.Lang -> SourceRow -> Ui.Element Msg
+sourceRow lang row =
+    case row of
+        Numbered n line ->
+            numberedLine lang n line
+
+        Covered ->
+            Ui.el
+                [ Ui.width Ui.fill
+                , Font.family Font.monospace
+                , Font.size 12
+                , Font.color (Ui.rgb 120 120 135)
+                ]
+                (Ui.text "... lines reviewed as their own units")
+
+
+numberedLine : Highlight.Lang -> Int -> String -> Ui.Element Msg
+numberedLine lang n line =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 8 ]
         [ Ui.el

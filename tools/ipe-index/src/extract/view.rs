@@ -1,19 +1,27 @@
 //! The canonical view of a unit's source and its attestation hash.
 //!
 //! This is the one definition of "the bytes a unit names" and of their
-//! attestation: every `body_hash` the index stores is `attest` of the text the
-//! unit reviews. For every unit but a `file` unit that text is
-//! `view_text(src, line_start, line_end)`; a `file` unit attests its residual
-//! (`extract::residual_text`), built from `view_lines`. The code-review app
-//! re-derives the hash with the same rules before showing a unit. The rules are
-//! pinned for both sides by `tests/view_hash_vectors.json` and
-//! `tests/residual_vectors.json`.
+//! attestation. Every unit but a `file` unit stores `attest` of
+//! `view_text(src, line_start, line_end)`; a `file` unit stores
+//! `attest_residual` of its residual (`extract::residual_text`), built from
+//! `view_lines`. The code-review app re-derives the hash with the same rules
+//! before showing a unit. The rules are pinned for both sides by
+//! `tests/view_hash_vectors.json` and `tests/residual_vectors.json`.
 
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
-/// The scheme prefix of every attestation hash.
+/// The scheme prefix of a line-range view's attestation.
 pub const SCHEME: &str = "sha256:";
+
+/// The scheme prefix of a `file` unit's residual attestation.
+///
+/// Any text is the view of some file, so no encoding of the residual's bytes
+/// alone keeps its hash apart from every `SCHEME` hash, among them the
+/// whole-file hash an older index stored for the same file unit and the
+/// review log still holds. The scheme does: a residual attestation never
+/// equals the attestation of any view.
+pub const RESIDUAL_SCHEME: &str = "sha256-residual:";
 
 /// The lines of `src`, split on `'\n'` exactly.
 ///
@@ -80,9 +88,19 @@ pub fn view_text(src: &str, start: i64, end: i64) -> Result<String, RangeError> 
 
 /// `SCHEME` followed by the lowercase hex SHA-256 of the UTF-8 bytes of `view`.
 pub fn attest(view: &str) -> String {
-    let digest = Sha256::digest(view.as_bytes());
-    let mut out = String::with_capacity(SCHEME.len() + 2 * digest.len());
-    out.push_str(SCHEME);
+    attest_under(SCHEME, view)
+}
+
+/// `RESIDUAL_SCHEME` followed by the lowercase hex SHA-256 of the UTF-8 bytes
+/// of `residual`: a `file` unit's attestation.
+pub fn attest_residual(residual: &str) -> String {
+    attest_under(RESIDUAL_SCHEME, residual)
+}
+
+fn attest_under(scheme: &str, text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(scheme.len() + 2 * digest.len());
+    out.push_str(scheme);
     for byte in digest {
         // Writing into a `String` cannot fail.
         let _ = write!(out, "{byte:02x}");
