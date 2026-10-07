@@ -2465,6 +2465,72 @@ mod builtin_ctor_registration_tests {
         }
     }
 
+    /// The `DbFailure` constructors, spelled bare and resolved in a fresh
+    /// environment.
+    fn db_failure_ctors(interner: &mut Interner) -> Option<(Env, Vec<ipe_intern::Symbol>)> {
+        let env = Env::initial(Vec::new(), interner).ok()?;
+        let union = crate::builtins::BUILTIN_UNIONS
+            .iter()
+            .find(|u| u.type_name == "DbFailure")?;
+        let names = union
+            .ctors
+            .iter()
+            .map(|&(name, _, _)| interner.intern(name).ok())
+            .collect::<Option<Vec<_>>>()?;
+        Some((env, names))
+    }
+
+    /// A bare `UniqueViolation` (or any `DbFailure` constructor) is not an
+    /// ambient constructor: only `Db.UniqueViolation` names it.
+    #[test]
+    fn db_failures_are_not_ambient_unqualified() {
+        let mut interner = Interner::new();
+        let built = db_failure_ctors(&mut interner);
+        assert!(built.is_some(), "the base env and the DbFailure row");
+        let Some((env, names)) = built else {
+            return;
+        };
+        assert_eq!(names.len(), 14);
+        for sym in names {
+            assert!(
+                matches!(env.module_scope.expr.resolve(sym), Resolved::Missing),
+                "{:?} must not be an ambient unqualified constructor",
+                interner.resolve(sym)
+            );
+        }
+    }
+
+    /// Every `DbFailure` constructor is pooled under the `Db` kernel module,
+    /// which an import of `Ipe.Db` installs as `Db.<Ctor>`.
+    #[test]
+    fn db_failures_resolve_qualified() {
+        let mut interner = Interner::new();
+        let built = db_failure_ctors(&mut interner);
+        assert!(built.is_some(), "the base env and the DbFailure row");
+        let Some((env, names)) = built else {
+            return;
+        };
+        let db = interner.intern("Db");
+        assert!(db.is_ok(), "{db:?}");
+        let Ok(db) = db else {
+            return;
+        };
+        let members = env
+            .kernel_module_of(db)
+            .and_then(|module| env.kernel_ctors.get(&module));
+        assert!(members.is_some(), "`Db` kernel module must carry ctors");
+        let Some(members) = members else {
+            return;
+        };
+        for sym in names {
+            assert!(
+                members.contains_key(&sym),
+                "`Db.{:?}` must resolve to a DbFailure constructor",
+                interner.resolve(sym)
+            );
+        }
+    }
+
     /// A fresh environment installs no qualifier: a spelling reaches a module
     /// only through an import.
     #[test]

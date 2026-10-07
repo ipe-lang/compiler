@@ -292,6 +292,10 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     // The JS-widget boundary `CustomElement down up`: a use resolves only through the arity gate (IPE-N0031) and the plain-value seal (IPE-N0039).
     bare("CustomElement", Reserved, Opaque).tagged(BuiltinTag::CustomElement),
     bare("Db", Reserved, Opaque).tagged(BuiltinTag::Db),
+    // `Ipe.Db`'s closed failure-cause ADT, carried by `ErrorDetails.Database`; its constructors are `Db.`-qualified.
+    bare("DbFailure", LoweredBelowGuard, Opaque)
+        .via(&["Db"])
+        .tagged(BuiltinTag::DbFailure),
     bare("Decimal", LoweredBelowGuard, Opaque).tagged(BuiltinTag::Decimal),
     bare("Decoder", Reserved, Opaque).tagged(BuiltinTag::Decoder),
     bare("Deficiency", Reserved, Opaque)

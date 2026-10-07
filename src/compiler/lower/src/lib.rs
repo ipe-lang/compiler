@@ -263,6 +263,10 @@ pub fn lower(
         ed_http_status: interner.intern("HttpStatus").map_err(homeless)?,
         ed_json_decode: interner.intern("JsonDecode").map_err(homeless)?,
         ed_custom: interner.intern("Custom").map_err(homeless)?,
+        ed_database: interner.intern("Database").map_err(homeless)?,
+        // ── DbFailure ADT ────────────────────────────────────────────────────
+        db_failure: interner.intern("DbFailure").map_err(homeless)?,
+        db_failure_ctors: lower::intern_db_failure_ctors(interner).map_err(homeless)?,
         http_method: interner.intern("HttpMethod").map_err(homeless)?,
         hm_get: interner.intern("Get").map_err(homeless)?,
         hm_post: interner.intern("Post").map_err(homeless)?,

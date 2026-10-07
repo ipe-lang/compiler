@@ -3724,6 +3724,12 @@ impl<'a> EmitCtx<'a> {
         if home.0.is_empty() && matches!(self.interner.resolve(ty), Some("RedirectPolicy")) {
             return Ok("RedirectPolicy");
         }
+        // `DbFailure` is a Prelude-built-in enum backed by the runtime
+        // `ipe_runtime::error::IpeDbFailure`, with no `EnumDef`; routed here so
+        // a `Database f` payload binder resolves in type position.
+        if home.0.is_empty() && matches!(self.interner.resolve(ty), Some("DbFailure")) {
+            return Ok("IpeDbFailure");
+        }
         self.enum_names
             .get(&(home.clone(), ty))
             .map(String::as_str)
@@ -3791,8 +3797,11 @@ impl<'a> EmitCtx<'a> {
             // `ErrorDetails` is backed by `IpeErrorDetails`. Constructor names
             // match Ipê source verbatim:
             // `FfiPanic` / `TypeMismatch` / `HttpStatus` / `JsonDecode` /
-            // `Custom`.
+            // `Custom` / `Database`.
             Some("ErrorDetails") => Some("IpeErrorDetails"),
+            // `DbFailure` is backed by `IpeDbFailure`; `Db.UniqueViolation`
+            // emits `IpeDbFailure::UniqueViolation`, variant names verbatim.
+            Some("DbFailure") => Some("IpeDbFailure"),
             // `Ipe.Cache.Cache` is backed by the non-generic runtime enum
             // `IpeCacheHandle { Cache(i64) }`. Its `EnumDef` is suppressed in
             // `ipe_lower` (no `enum_names` entry, so the guard above lets this
