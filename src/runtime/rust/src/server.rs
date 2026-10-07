@@ -2102,7 +2102,7 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         );
         let port = resolved.port;
         let Ok(port) = u16::try_from(port) else {
-            return IpeResult::Err(E::from_ipe_error(crate::IpeError::invalid_input(format!(
+            return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
                 "Server.listen: port {port} is not a TCP port"
             ))));
         };
