@@ -44,6 +44,7 @@ pins! {
     "ErrorInfo" => Value: ipe_runtime_rust::error::IpeErrorInfo;
     "PanicInfo" => Value: ipe_runtime_rust::error::IpePanicInfo;
     "TypeInfo" => Value: ipe_runtime_rust::error::IpeTypeInfo;
+    "DbFailure" => Value: ipe_runtime_rust::error::IpeDbFailure;
     "Path" => Value: ipe_runtime_rust::path::Path;
     #[cfg(feature = "url")]
     "UrlRelative" => Value: ipe_runtime_rust::url::UrlRelative;

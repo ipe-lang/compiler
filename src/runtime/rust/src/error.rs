@@ -1,9 +1,9 @@
 //! Ipe.Error: the rich, typed `Error` ADT.
 //!
 //! `Error = Error ErrorKind ErrorInfo`, an 11-variant `ErrorKind`
-//! classification, message-carrying `ErrorInfo`, and the 5-variant
+//! classification, message-carrying `ErrorInfo`, and the 6-variant
 //! `ErrorDetails` union (`FfiPanic`/`TypeMismatch`/`HttpStatus`/`JsonDecode`/
-//! `Custom`) carried optionally on `ErrorInfo.details : Maybe ErrorDetails`.
+//! `Custom`/`Database`) carried optionally on `ErrorInfo.details : Maybe ErrorDetails`.
 //!
 //! Kind-based classification (`isRetryable`, pattern matching, `toString`)
 //! and the `details` enrichment are both fully real and load-bearing today.
@@ -100,11 +100,124 @@ crate::stringify::show_row!("TypeInfo", Value, [] IpeTypeInfo, |t| format!(
     t.expected, t.actual
 ));
 
-/// Ipê's `ErrorDetails` — the 5-variant enrichment union. Constructor names
+/// Ipê's `DbFailure` — the closed classification of a database failure.
+///
+/// Spelled `Db.<Ctor>` in Ipê source and carried as `ErrorDetails.Database`.
+/// The one producer is the runtime's database classifier; a cause it does not
+/// recognise is `OtherFailure`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(u8)]
+pub enum IpeDbFailure {
+    UniqueViolation = 0,
+    ForeignKeyViolation = 1,
+    NotNullViolation = 2,
+    CheckViolation = 3,
+    TriggerRaised = 4,
+    OtherConstraint = 5,
+    Busy = 6,
+    ReadOnlyDatabase = 7,
+    AccessDenied = 8,
+    CannotOpen = 9,
+    NotADatabase = 10,
+    InvalidStatement = 11,
+    Unreachable = 12,
+    OtherFailure = 13,
+}
+
+// `ALL` spans the whole discriminant range, `OtherFailure` last.
+const _: [(); IpeDbFailure::ALL.len()] = [(); IpeDbFailure::OtherFailure as usize + 1];
+
+crate::stringify::show_row!("DbFailure", Value, [] IpeDbFailure, |f| f
+    .ctor_name()
+    .to_owned());
+
+impl IpeDbFailure {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 14] = [
+        Self::UniqueViolation,
+        Self::ForeignKeyViolation,
+        Self::NotNullViolation,
+        Self::CheckViolation,
+        Self::TriggerRaised,
+        Self::OtherConstraint,
+        Self::Busy,
+        Self::ReadOnlyDatabase,
+        Self::AccessDenied,
+        Self::CannotOpen,
+        Self::NotADatabase,
+        Self::InvalidStatement,
+        Self::Unreachable,
+        Self::OtherFailure,
+    ];
+
+    /// The Ipê constructor name, without the `Db.` qualifier.
+    #[must_use]
+    pub const fn ctor_name(self) -> &'static str {
+        match self {
+            Self::UniqueViolation => "UniqueViolation",
+            Self::ForeignKeyViolation => "ForeignKeyViolation",
+            Self::NotNullViolation => "NotNullViolation",
+            Self::CheckViolation => "CheckViolation",
+            Self::TriggerRaised => "TriggerRaised",
+            Self::OtherConstraint => "OtherConstraint",
+            Self::Busy => "Busy",
+            Self::ReadOnlyDatabase => "ReadOnlyDatabase",
+            Self::AccessDenied => "AccessDenied",
+            Self::CannotOpen => "CannotOpen",
+            Self::NotADatabase => "NotADatabase",
+            Self::InvalidStatement => "InvalidStatement",
+            Self::Unreachable => "Unreachable",
+            Self::OtherFailure => "OtherFailure",
+        }
+    }
+
+    /// The fixed human phrase an error message carries for this failure.
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::UniqueViolation => "unique constraint violated",
+            Self::ForeignKeyViolation => "foreign key constraint violated",
+            Self::NotNullViolation => "not-null constraint violated",
+            Self::CheckViolation => "check constraint violated",
+            Self::TriggerRaised => "trigger refused the statement",
+            Self::OtherConstraint => "constraint violated",
+            Self::Busy => "database busy",
+            Self::ReadOnlyDatabase => "database is read-only",
+            Self::AccessDenied => "access denied",
+            Self::CannotOpen => "cannot open database",
+            Self::NotADatabase => "file is not a database",
+            Self::InvalidStatement => "invalid statement",
+            Self::Unreachable => "database unreachable",
+            Self::OtherFailure => "database error",
+        }
+    }
+
+    /// The `ErrorKind` an error carrying this failure is classified under.
+    #[must_use]
+    pub const fn kind(self) -> IpeErrorKind {
+        match self {
+            Self::UniqueViolation
+            | Self::ForeignKeyViolation
+            | Self::NotNullViolation
+            | Self::CheckViolation
+            | Self::TriggerRaised
+            | Self::OtherConstraint => IpeErrorKind::Conflict,
+            Self::Busy | Self::Unreachable => IpeErrorKind::Unavailable,
+            Self::ReadOnlyDatabase | Self::AccessDenied => IpeErrorKind::PermissionDenied,
+            Self::CannotOpen => IpeErrorKind::NotFound,
+            Self::NotADatabase | Self::InvalidStatement | Self::OtherFailure => {
+                IpeErrorKind::Unexpected
+            }
+        }
+    }
+}
+
+/// Ipê's `ErrorDetails` — the 6-variant enrichment union. Constructor names
 /// match Ipê source verbatim
 /// (`ipe_backend_rust`'s `builtin_runtime_enum("ErrorDetails")` routes
-/// `FfiPanic` / `TypeMismatch` / `HttpStatus` / `JsonDecode` / `Custom`
-/// straight to these variants — no synthetic `EnumDef`).
+/// `FfiPanic` / `TypeMismatch` / `HttpStatus` / `JsonDecode` / `Custom` /
+/// `Database` straight to these variants — no synthetic `EnumDef`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum IpeErrorDetails {
@@ -113,6 +226,7 @@ pub enum IpeErrorDetails {
     HttpStatus(i64),
     JsonDecode(String),
     Custom(String),
+    Database(IpeDbFailure),
 }
 
 crate::stringify::show_row!("ErrorDetails", Value, [] IpeErrorDetails, |d| match d {
@@ -123,6 +237,7 @@ crate::stringify::show_row!("ErrorDetails", Value, [] IpeErrorDetails, |d| match
     IpeErrorDetails::HttpStatus(n) => format!("HttpStatus {n}"),
     IpeErrorDetails::JsonDecode(s) => format!("JsonDecode {s}"),
     IpeErrorDetails::Custom(s) => format!("Custom {s}"),
+    IpeErrorDetails::Database(f) => format!("Database {}", f.ctor_name()),
 });
 
 /// Ipê's `ErrorInfo` — `{ message : String, details : Maybe ErrorDetails }`.
@@ -216,6 +331,20 @@ impl IpeError {
         Self::with(
             IpeErrorKind::PermissionDenied,
             "permission denied".to_owned(),
+        )
+    }
+
+    /// A database failure, classified under the failure's own kind.
+    ///
+    /// Sets `details = Just (Database failure)`.
+    #[must_use]
+    pub fn database(failure: IpeDbFailure, message: String) -> Self {
+        Self::Error(
+            failure.kind(),
+            IpeErrorInfo {
+                message,
+                details: IpeMaybe::Just(IpeErrorDetails::Database(failure)),
+            },
         )
     }
 
@@ -525,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn error_details_round_trips_all_five_variants() {
+    fn error_details_round_trips_every_variant() {
         let cases = [
             IpeErrorDetails::FfiPanic(IpePanicInfo {
                 message: "panic!".to_owned(),
@@ -538,11 +667,75 @@ mod tests {
             IpeErrorDetails::HttpStatus(500),
             IpeErrorDetails::JsonDecode("unexpected token".to_owned()),
             IpeErrorDetails::Custom("custom detail".to_owned()),
+            IpeErrorDetails::Database(IpeDbFailure::UniqueViolation),
         ];
         for details in cases {
             let e = IpeError::unexpected("boom".to_owned()).with_details(details.clone());
             let IpeError::Error(_, info) = &e;
             assert_eq!(info.details, IpeMaybe::Just(details));
         }
+    }
+
+    #[test]
+    fn db_failure_kind_table_is_exact() {
+        use IpeDbFailure as F;
+        let expected = [
+            (F::UniqueViolation, IpeErrorKind::Conflict),
+            (F::ForeignKeyViolation, IpeErrorKind::Conflict),
+            (F::NotNullViolation, IpeErrorKind::Conflict),
+            (F::CheckViolation, IpeErrorKind::Conflict),
+            (F::TriggerRaised, IpeErrorKind::Conflict),
+            (F::OtherConstraint, IpeErrorKind::Conflict),
+            (F::Busy, IpeErrorKind::Unavailable),
+            (F::ReadOnlyDatabase, IpeErrorKind::PermissionDenied),
+            (F::AccessDenied, IpeErrorKind::PermissionDenied),
+            (F::CannotOpen, IpeErrorKind::NotFound),
+            (F::NotADatabase, IpeErrorKind::Unexpected),
+            (F::InvalidStatement, IpeErrorKind::Unexpected),
+            (F::Unreachable, IpeErrorKind::Unavailable),
+            (F::OtherFailure, IpeErrorKind::Unexpected),
+        ];
+        assert_eq!(expected.len(), IpeDbFailure::ALL.len());
+        for (failure, kind) in expected {
+            assert_eq!(failure.kind(), kind, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn db_failure_all_and_ctor_names_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        for (index, failure) in IpeDbFailure::ALL.into_iter().enumerate() {
+            assert_eq!(failure as usize, index, "{failure:?} out of order in ALL");
+            assert!(seen.insert(failure), "{failure:?} listed twice");
+            assert!(names.insert(failure.ctor_name()), "{failure:?} name reused");
+            assert!(!failure.phrase().is_empty(), "{failure:?} has no phrase");
+        }
+        assert_eq!(names.len(), IpeDbFailure::ALL.len());
+    }
+
+    #[test]
+    fn db_failure_ctor_names_round_trip() {
+        for failure in IpeDbFailure::ALL {
+            let back = IpeDbFailure::ALL
+                .into_iter()
+                .find(|f| f.ctor_name() == failure.ctor_name());
+            assert_eq!(back, Some(failure));
+        }
+    }
+
+    #[test]
+    fn database_constructor_derives_kind_and_details() {
+        let e = IpeError::database(
+            IpeDbFailure::ReadOnlyDatabase,
+            "db: database is read-only".to_owned(),
+        );
+        let IpeError::Error(kind, info) = &e;
+        assert_eq!(*kind, IpeErrorKind::PermissionDenied);
+        assert_eq!(
+            info.details,
+            IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::ReadOnlyDatabase))
+        );
+        assert_eq!(info.message, "db: database is read-only");
     }
 }
