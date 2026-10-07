@@ -502,12 +502,14 @@ pub fn render_page_full(
     sid: &str,
     base: &crate::encoding::MountBase,
     body: &str,
+    epoch: &RenderEpoch,
     csrf_token: &str,
 ) -> String {
-    // sid_js / base_js / csrf_js: Rust Debug ("{:?}") of a &str yields a
-    // double-quoted, properly-escaped JS string literal for plain ASCII
-    // session ids, base paths, and the hex CSRF token.
+    // sid_js / epoch_js / base_js / csrf_js: Rust Debug ("{:?}") of a &str
+    // yields a double-quoted, properly-escaped JS string literal for plain
+    // ASCII session ids, epoch tokens, base paths, and the hex CSRF token.
     let sid_js = format!("{sid:?}");
+    let epoch_js = format!("{:?}", epoch.to_token());
     let prefix = base.prefix();
     let base_js = format!("{prefix:?}");
     let csrf_js = format!("{csrf_token:?}");
@@ -528,7 +530,7 @@ pub fn render_page_full(
     let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
     let port_glue = port_glue_script(prefix);
     let tail_scripts = format!(
-        "<script>window.__IPE_SID={sid_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
+        "<script>window.__IPE_SID={sid_js};window.__IPE_EPOCH={epoch_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
          <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
          {widget_scripts}{port_glue}"
     );
@@ -567,10 +569,12 @@ fn render_page_full_with_overlay(
     sid: &str,
     base: &crate::encoding::MountBase,
     body: &str,
+    epoch: &RenderEpoch,
     csrf_token: &str,
     overlay: &str,
 ) -> String {
     let sid_js = format!("{sid:?}");
+    let epoch_js = format!("{:?}", epoch.to_token());
     let prefix = base.prefix();
     let base_js = format!("{prefix:?}");
     let csrf_js = format!("{csrf_token:?}");
@@ -584,7 +588,7 @@ fn render_page_full_with_overlay(
     let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
     let port_glue = port_glue_script(prefix);
     let tail_scripts = format!(
-        "<script>window.__IPE_SID={sid_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
+        "<script>window.__IPE_SID={sid_js};window.__IPE_EPOCH={epoch_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
          <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
          {widget_scripts}{port_glue}"
     );
@@ -611,14 +615,18 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "server")]
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-/// Per-session live state behind an `Arc<Mutex<…>>`. `index` / `last_view` are
-/// re-derived on every commit; `sse_tx` is filled when the browser attaches the
-/// SSE channel; `msg_tx` feeds the per-session driver loop.
+/// Per-session live state behind an `Arc<Mutex<…>>`. `rendered` is advanced by
+/// every commit; `sse_tx` is filled when the browser attaches the SSE channel;
+/// `msg_tx` feeds the per-session driver loop.
 #[cfg(feature = "server")]
 pub struct SessionEntry<Model, Msg> {
     pub model: Model,
-    pub last_view: Html<Msg>,
-    pub index: HandlerIndex<Msg>,
+    /// The last committed view and the handler indexes of the retained
+    /// renders, each under its epoch; an event resolves only at its own epoch.
+    pub rendered: Rendered<Msg>,
+    /// The last event seq each recent tab posted, so a duplicate is acked
+    /// without a second dispatch.
+    pub tabs: TabSeqs,
     pub seq: u64,
     pub sse_tx: Option<SseTx>,
     pub msg_tx: Sender<Msg>,
@@ -645,12 +653,105 @@ pub struct SessionEntry<Model, Msg> {
 /// `__ipeHandleResponse(undefined, _, _, globalSeq)` → `__ipeApplyPatches`.
 /// We use `globalSeq` (the server-owned broadcast counter) rather than the
 /// local `seq` so it never collides with the client's own POST-local seq gate.
+///
+/// `from` / `to` are the epochs the commit moved between: the client applies
+/// the patches only onto the DOM of `from`, then adopts `to`.
 #[derive(serde::Serialize)]
 #[cfg(feature = "server")]
 struct PatchEnvelope<'a> {
     #[serde(rename = "globalSeq")]
     global_seq: u64,
+    from: String,
+    to: String,
     patches: &'a [crate::web::diff::Patch],
+}
+
+/// Push one commit's `patches` frame, empty patches included, so the client's
+/// epoch always follows the server's.
+#[cfg(feature = "server")]
+async fn send_patches_frame(
+    sse: Option<SseTx>,
+    global_seq: u64,
+    step: EpochStep,
+    patches: &[crate::web::diff::Patch],
+) {
+    let Some(sse) = sse else {
+        return;
+    };
+    let env = PatchEnvelope {
+        global_seq,
+        from: step.from.to_token(),
+        to: step.to.to_token(),
+        patches,
+    };
+    if let Ok(json) = serde_json::to_string(&env) {
+        let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
+    }
+}
+
+/// A fresh render-history incarnation from the OS CSPRNG.
+#[cfg(feature = "server")]
+pub(crate) fn new_incarnation() -> Incarnation {
+    Incarnation::from_random_bits(uuid::Uuid::new_v4().as_u128())
+}
+
+/// The number of tabs whose last event seq a session remembers.
+#[cfg(feature = "server")]
+pub const TAB_SEQ_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(15);
+
+/// The random id a browser tab mints once per page load and echoes with its events.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TabId(u128);
+
+#[cfg(feature = "server")]
+impl TabId {
+    /// Parse exactly 32 lowercase hex characters; anything else is `None`.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        let well_formed = token.len() == 32
+            && token
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !well_formed {
+            return None;
+        }
+        u128::from_str_radix(token, 16).ok().map(Self)
+    }
+}
+
+/// The last event seq of the most recently active tabs, at most [`TAB_SEQ_CAP`].
+///
+/// An event whose seq is not above its tab's last recorded seq is a duplicate
+/// and is acked without a dispatch. An unknown or evicted tab is accepted; the
+/// render epoch, not this map, is what keeps a replay from retargeting.
+#[cfg(feature = "server")]
+#[derive(Default)]
+pub struct TabSeqs {
+    recent: std::collections::VecDeque<(TabId, u64)>,
+}
+
+#[cfg(feature = "server")]
+impl TabSeqs {
+    /// Whether `tab` already posted an event at `seq` or later.
+    #[must_use]
+    pub fn is_duplicate(&self, tab: TabId, seq: u64) -> bool {
+        self.recent.iter().any(|&(t, last)| t == tab && seq <= last)
+    }
+
+    /// Record `seq` as `tab`'s last dispatched event, making `tab` the most recent.
+    pub fn record(&mut self, tab: TabId, seq: u64) {
+        let last = self
+            .recent
+            .iter()
+            .position(|&(t, _)| t == tab)
+            .and_then(|pos| self.recent.remove(pos))
+            .map_or(seq, |(_, prev)| prev.max(seq));
+        self.recent.push_back((tab, last));
+        while self.recent.len() > TAB_SEQ_CAP.get() {
+            self.recent.pop_front();
+        }
+    }
 }
 
 /// Body for the dev-only `POST /_ipe/watch/status` endpoint.
@@ -730,6 +831,109 @@ struct EventBody {
     /// values so both shapes decode.
     #[serde(default)]
     args: Vec<serde_json::Value>,
+    /// The render epoch whose DOM the event came from; resolved only against
+    /// that render's handler index. Absent refuses.
+    #[serde(default)]
+    epoch: Option<String>,
+    /// The posting tab's id and its per-tab event seq: a repeat of a recorded
+    /// seq is acked without a second dispatch. Either absent skips that check.
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
+}
+
+/// Why `POST /_ipe/event` refuses to resolve an event.
+#[cfg(feature = "server")]
+enum EventRefusal {
+    /// The body names no render epoch.
+    Missing,
+    /// The epoch token is not well formed; an honest client never sends one.
+    Malformed(EpochParseError),
+    /// The tab id is not well formed; an honest client never sends one.
+    MalformedTab,
+    /// The epoch names no retained render of this session.
+    Stale(StaleEpoch),
+}
+
+/// The `409` stale-render refusal: the current epoch and full render, so the
+/// client replaces its DOM and never re-sends the refused event.
+#[cfg(feature = "server")]
+fn stale_render_response<Model, Msg: Clone>(
+    e: &SessionEntry<Model, Msg>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body = serde_json::json!({
+        "refused": "stale-render",
+        "epoch": e.rendered.epoch().to_token(),
+        "seq": e.seq,
+        "body": render_html(e.rendered.last_view()),
+    })
+    .to_string();
+    (
+        axum::http::StatusCode::CONFLICT,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// The HTTP answer to an [`EventRefusal`], one arm per variant.
+///
+/// A missing or stale epoch answers `409` with the current render; a
+/// malformed epoch or tab id answers `400`, like any other malformed body.
+#[cfg(feature = "server")]
+fn event_refusal_response<Model, Msg: Clone>(
+    refusal: EventRefusal,
+    e: &SessionEntry<Model, Msg>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let bad_body = || (axum::http::StatusCode::BAD_REQUEST, "bad body").into_response();
+    match refusal {
+        EventRefusal::Missing => stale_render_response(e),
+        EventRefusal::Stale(why) => {
+            crate::system::emit_runtime_log(
+                "live",
+                &format!("event_handler: render epoch refused ({why:?}); resyncing the page"),
+            );
+            stale_render_response(e)
+        }
+        EventRefusal::Malformed(why) => {
+            crate::system::emit_runtime_log(
+                "live",
+                &format!("event_handler: malformed render epoch ({why:?})"),
+            );
+            bad_body()
+        }
+        EventRefusal::MalformedTab => bad_body(),
+    }
+}
+
+/// The `200` ack of an accepted event; real patches flow over SSE.
+///
+/// `X-Ipe-Web: 1` marks a genuine Ipe.Web response: the client treats a `200`
+/// without it as a wedged-proxy signal. A duplicate is acked as such and was
+/// not dispatched a second time.
+#[cfg(feature = "server")]
+fn event_ack(seq: u64, duplicate: bool) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body = if duplicate {
+        format!("{{\"seq\":{seq},\"patches\":[],\"duplicate\":true}}")
+    } else {
+        format!("{{\"seq\":{seq},\"patches\":[]}}")
+    };
+    (
+        axum::http::StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Coerce a wire arg `Value` to the string the click/input/keydown path expects.
@@ -799,13 +1003,14 @@ pub struct EnterRequest {
     reply: tokio::sync::oneshot::Sender<EnterReply>,
 }
 
-/// The driver's answer to an [`EnterRequest`]: the committed page's rendered body.
+/// The driver's answer to an [`EnterRequest`]: the committed page's rendered body and its epoch.
 ///
-/// Only the body crosses back; the entry Cmd stays with the driver, so a
+/// Only the render crosses back; the entry Cmd stays with the driver, so a
 /// requester that stops waiting loses nothing.
 #[cfg(feature = "server")]
 pub struct EnterReply {
     body: String,
+    epoch: RenderEpoch,
 }
 
 /// Queue an entry of `path` in `mode` on the session driver behind `enter_tx`.
@@ -1246,19 +1451,30 @@ where
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
     let body = render_html(&tree);
-    {
+    let committed = {
         let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
-        e.index = build_index(&tree);
-        e.last_view = tree;
-        e.model = entered.model.clone();
-        e.entered_path = Some(path);
-    }
-    if let Err(EnterReply { body }) = reply.send(EnterReply { body }) {
+        match e.rendered.commit(tree) {
+            Ok(step) => {
+                e.model = entered.model.clone();
+                e.entered_path = Some(path);
+                Some(step.to)
+            }
+            Err(EpochExhausted) => None,
+        }
+    };
+    let Some(epoch) = committed else {
+        // The render history cannot mint another epoch: drop the session so
+        // the next request takes the session-lost path.
+        store.delete(sid).await;
+        return EntryCommit::SessionGone;
+    };
+    if let Err(EnterReply { body, epoch }) = reply.send(EnterReply { body, epoch }) {
         let (frame, sse_tx) = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
             e.seq += 1;
             (
-                serde_json::json!({ "seq": e.seq, "body": body }).to_string(),
+                serde_json::json!({ "seq": e.seq, "epoch": epoch.to_token(), "body": body })
+                    .to_string(),
                 e.sse_tx.clone(),
             )
         };
@@ -1442,9 +1658,9 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
 
-        let (patches, seq, sse, noop) = {
+        let committed = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(&e.last_view, &tree);
+            let patches = diff(e.rendered.last_view(), &tree);
             // noop. Here
             // `e.model` STILL holds the OLD model (top-of-loop cloned it OUT; the
             // store isn't updated until the assignment below), so `e.model ==
@@ -1453,16 +1669,25 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             // dispatch has no error channel, so the `err==nil` conjunct is always
             // true and is dropped.
             let noop = cmd_is_none && e.model == next;
-            // Build the handler index from the tree, then move the tree into
-            // last_view (its only remaining use), avoiding a deep VDOM clone.
-            e.index = build_index(&tree);
-            e.last_view = tree;
-            e.model = next.clone();
-            e.seq += 1;
-            #[cfg(feature = "debugger")]
-            e.history
-                .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
-            (patches, e.seq, e.sse_tx.clone(), noop)
+            // The commit builds the handler index and mints the epoch, then
+            // moves the tree into the last view, avoiding a deep VDOM clone.
+            match e.rendered.commit(tree) {
+                Ok(step) => {
+                    e.model = next.clone();
+                    e.seq += 1;
+                    #[cfg(feature = "debugger")]
+                    e.history
+                        .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
+                    Some((patches, step, e.seq, e.sse_tx.clone(), noop))
+                }
+                Err(EpochExhausted) => None,
+            }
+        };
+        let Some((patches, step, seq, sse, noop)) = committed else {
+            // The render history cannot mint another epoch: drop the session so
+            // the next request takes the session-lost path.
+            store.delete(&sid).await;
+            break;
         };
         // Msg counter. All
         // labels bounded: name = finite variant set, outcome = "ok" (this path
@@ -1478,17 +1703,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             1,
         );
 
-        if !patches.is_empty()
-            && let Some(sse) = sse
-        {
-            let env = PatchEnvelope {
-                global_seq: seq,
-                patches: &patches,
-            };
-            if let Ok(json) = serde_json::to_string(&env) {
-                let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
-            }
-        }
+        send_patches_frame(sse, seq, step, &patches).await;
 
         // Write-through: checkpoint the committed model to the store (a touch
         // for memory; a re-serialize for persistent backends) on every commit.
@@ -1697,6 +1912,7 @@ fn request_is_https(headers: &axum::http::HeaderMap) -> bool {
 fn page_response(
     sid: &str,
     body: &str,
+    epoch: &RenderEpoch,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
@@ -1704,7 +1920,7 @@ fn page_response(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let html = render_page_full(sid, &base, body, csrf_token);
+    let html = render_page_full(sid, &base, body, epoch, csrf_token);
     // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
     // when this specific request arrived over TLS at a trusted proxy
     // (`request_is_https`, opt-in via `IPE_TRUSTED_PROXY` — closes the gap where
@@ -1732,10 +1948,17 @@ fn page_response(
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
     let resp = (
         axum::http::StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/html; charset=utf-8".to_string(),
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".to_string(),
+            ),
+            // The epoch of the served render, read by client navigation.
+            (
+                axum::http::HeaderName::from_static("x-ipe-epoch"),
+                epoch.to_token(),
+            ),
+        ],
         html,
     )
         .into_response();
@@ -1748,6 +1971,7 @@ fn page_response(
 fn page_response_with_overlay(
     sid: &str,
     body: &str,
+    epoch: &RenderEpoch,
     overlay: &str,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
@@ -1756,7 +1980,7 @@ fn page_response_with_overlay(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let html = render_page_full_with_overlay(sid, &base, body, csrf_token, overlay);
+    let html = render_page_full_with_overlay(sid, &base, body, epoch, csrf_token, overlay);
     let Ok(ttl) = web_ttl() else {
         return ttl_unavailable_response();
     };
@@ -1764,10 +1988,16 @@ fn page_response_with_overlay(
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
     let resp = (
         axum::http::StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/html; charset=utf-8".to_string(),
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::HeaderName::from_static("x-ipe-epoch"),
+                epoch.to_token(),
+            ),
+        ],
         html,
     )
         .into_response();
@@ -2160,29 +2390,25 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         style_inject::apply_style_injections(&mut tree);
 
         // Commit + diff under the entry lock, mirroring the driver's commit
-        // block: diff against last_view, then advance last_view/index/seq so the
-        // client's monotonic seq gate accepts the frame and the next real Msg
-        // diffs against this rendered view. The Model is deliberately left as-is.
-        let (patches, seq, sse) = {
+        // block: diff against the last view, then commit it under a new epoch
+        // and advance seq so the client's monotonic seq gate accepts the frame
+        // and the next real Msg diffs against this rendered view. The Model is
+        // deliberately left as-is.
+        let committed = {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(&e.last_view, &tree);
-            // Index first (borrow), then move the tree into last_view — its
-            // only remaining use — instead of a deep VDOM clone.
-            e.index = build_index(&tree);
-            e.last_view = tree;
-            e.seq += 1;
-            (patches, e.seq, e.sse_tx.clone())
-        };
-        if !patches.is_empty()
-            && let Some(sse) = sse
-        {
-            let env = PatchEnvelope {
-                global_seq: seq,
-                patches: &patches,
-            };
-            if let Ok(json) = serde_json::to_string(&env) {
-                let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
+            let patches = diff(e.rendered.last_view(), &tree);
+            match e.rendered.commit(tree) {
+                Ok(step) => {
+                    e.seq += 1;
+                    Some((patches, step, e.seq, e.sse_tx.clone()))
+                }
+                // The view and its epoch stay as they were; the session's
+                // driver drops the session on its own next commit.
+                Err(EpochExhausted) => None,
             }
+        };
+        if let Some((patches, step, seq, sse)) = committed {
+            send_patches_frame(sse, seq, step, &patches).await;
         }
     }
 }
@@ -3318,7 +3544,7 @@ mod handlers {
                 let Some(reply_rx) = queue_entry(&enter_tx, path.clone(), EnterMode::Load) else {
                     return entry_unavailable();
                 };
-                let Some(EnterReply { body }) = await_entry(reply_rx).await else {
+                let Some(EnterReply { body, epoch }) = await_entry(reply_rx).await else {
                     return entry_unavailable();
                 };
                 #[cfg(feature = "debugger")]
@@ -3333,10 +3559,12 @@ mod handlers {
                         labels.len(),
                         &web_base_path(),
                     );
-                    return page_response_with_overlay(&sid, &body, &overlay, &csrf_tok, &headers);
+                    return page_response_with_overlay(
+                        &sid, &body, &epoch, &overlay, &csrf_tok, &headers,
+                    );
                 }
                 #[cfg(not(feature = "debugger"))]
-                return page_response(&sid, &body, &csrf_tok, &headers);
+                return page_response(&sid, &body, &epoch, &csrf_tok, &headers);
             }
             Some((_, store::Rejoin::Restored { claim, model })) => {
                 // A returning user with a valid sid cookie → not new attack
@@ -3420,8 +3648,9 @@ mod handlers {
         let mut tree = (st.view)(model.clone());
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let index = build_index(&tree);
         let body = render_html(&tree);
+        let rendered = Rendered::first(new_incarnation(), tree);
+        let epoch = rendered.epoch();
 
         // Bounded per-session Msg queue: cap at 1024 to prevent a fast
         // client from growing the queue without bound (per-session memory DoS).
@@ -3434,8 +3663,8 @@ mod handlers {
             crate::debugger::RecordBuffer::new(model.clone(), crate::debugger::DEFAULT_HISTORY_CAP);
         let entry = Arc::new(Mutex::new(SessionEntry {
             model,
-            last_view: tree,
-            index,
+            rendered,
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx: msg_tx.clone(),
@@ -3495,10 +3724,10 @@ mod handlers {
         {
             let base = web_base_path();
             let overlay = crate::debugger::server::overlay_html(&[], 0, &base);
-            page_response_with_overlay(&sid, &body, &overlay, &csrf_tok, &headers)
+            page_response_with_overlay(&sid, &body, &epoch, &overlay, &csrf_tok, &headers)
         }
         #[cfg(not(feature = "debugger"))]
-        page_response(&sid, &body, &csrf_tok, &headers)
+        page_response(&sid, &body, &epoch, &csrf_tok, &headers)
     }
 
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
@@ -3657,8 +3886,15 @@ mod handlers {
         let resync = {
             let mut g = entry.lock().unwrap_or_else(|e| e.into_inner());
             g.seq += 1;
-            let html = render_html(&g.last_view);
-            serde_json::json!({ "seq": g.seq, "body": html }).to_string()
+            // The current render at its current epoch: a resync re-sends the
+            // view, it mints no epoch and changes no handler index.
+            let html = render_html(g.rendered.last_view());
+            serde_json::json!({
+                "seq": g.seq,
+                "epoch": g.rendered.epoch().to_token(),
+                "body": html,
+            })
+            .to_string()
         };
         let _ = tx.send(SsePatch(sse::frame("patch", &resync))).await;
 
@@ -3807,59 +4043,70 @@ mod handlers {
             "click".to_string()
         };
 
-        let (msg, seq) = {
-            let e = entry.lock().unwrap_or_else(|e| e.into_inner());
-            if event == "submit" {
-                // args[0] is the form-data object {name: value, …}.
-                let fd: FormData = parsed
-                    .args
-                    .first()
-                    .and_then(|v| v.as_object())
-                    .map(|o| {
-                        o.iter()
-                            .map(|(k, v)| (k.clone(), value_to_string(v)))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (e.index.resolve_form(&hid, &event, fd), e.seq)
-            } else {
-                let args: Vec<String> = parsed.args.iter().map(value_to_string).collect();
-                (e.index.resolve(&hid, &event, &args), e.seq)
+        let at = parsed
+            .epoch
+            .as_deref()
+            .map_or(Err(EventRefusal::Missing), |token| {
+                RenderEpoch::parse(token).map_err(EventRefusal::Malformed)
+            });
+        let tab = parsed
+            .tab
+            .as_deref()
+            .map(|token| TabId::parse(token).ok_or(EventRefusal::MalformedTab))
+            .transpose();
+
+        // One lock covers resolve, the duplicate check, the enqueue and the
+        // seq record, so two copies of one event cannot both dispatch.
+        let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, tab) = match (at, tab) {
+            (Ok(at), Ok(tab)) => (at, tab),
+            (Err(refusal), _) | (Ok(_), Err(refusal)) => {
+                return event_refusal_response(refusal, &e);
             }
         };
-        if let Some(m) = msg {
-            let tx = {
-                entry
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .msg_tx
-                    .clone()
-            };
-            // try_send is non-blocking; on a full queue drop the event and
-            // return 429 so the client can back off (choosing 429 over silent
-            // drop so the browser retry loop fires).
-            if let Err(e) = tx.try_send(m) {
-                crate::system::emit_runtime_log(
-                    "live",
-                    &format!(
-                        "event_handler: session msg queue full or closed; dropping event ({e})"
-                    ),
-                );
-                return (StatusCode::TOO_MANY_REQUESTS, "event queue full").into_response();
-            }
+        let resolved = if event == "submit" {
+            // args[0] is the form-data object {name: value, …}.
+            let fd: FormData = parsed
+                .args
+                .first()
+                .and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), value_to_string(v)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            e.rendered.resolve_form(&at, &hid, &event, fd)
+        } else {
+            let args: Vec<String> = parsed.args.iter().map(value_to_string).collect();
+            e.rendered.resolve(&at, &hid, &event, &args)
+        };
+        let msg = match resolved {
+            Ok(msg) => msg,
+            Err(why) => return event_refusal_response(EventRefusal::Stale(why), &e),
+        };
+        let replay_key = tab.zip(parsed.seq);
+        if let Some((tab, seq)) = replay_key
+            && e.tabs.is_duplicate(tab, seq)
+        {
+            return event_ack(e.seq, true);
         }
-        // Real patches flow over SSE from the driver; ack with an empty list.
-        // X-Ipê-Web: 1 marks this as a genuine Ipe.Web response (the client
-        // treats a 200 WITHOUT it as a wedged-proxy signal).
-        (
-            StatusCode::OK,
-            [
-                (axum::http::header::CONTENT_TYPE, "application/json"),
-                (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
-            ],
-            format!("{{\"seq\":{seq},\"patches\":[]}}"),
-        )
-            .into_response()
+        // try_send is non-blocking; on a full queue drop the event and return
+        // 429 so the client can back off. The seq is not recorded, so the
+        // client's retry of the same event is not mistaken for a duplicate.
+        if let Some(m) = msg
+            && let Err(err) = e.msg_tx.try_send(m)
+        {
+            crate::system::emit_runtime_log(
+                "live",
+                &format!("event_handler: session msg queue full or closed; dropping event ({err})"),
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, "event queue full").into_response();
+        }
+        if let Some((tab, seq)) = replay_key {
+            e.tabs.record(tab, seq);
+        }
+        event_ack(e.seq, false)
     }
 
     // ── POST /_ipe/hot-appearance (dev-only) ──────────────────────────
@@ -5710,11 +5957,10 @@ mod reload_push_tests {
     fn handle_with(sse_tx: Option<SseTx>) -> SessionHandle<(), ()> {
         let (tx, _rx) = channel::<()>(1);
         let tree: Html<()> = Html::HText(String::new());
-        let index = build_index(&tree);
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            last_view: tree,
-            index,
+            rendered: Rendered::first(new_incarnation(), tree),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
             msg_tx: tx,
@@ -5815,12 +6061,11 @@ mod hot_appearance_push_tests {
         let mut tree = app_view(count);
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let index = build_index(&tree);
         let (msg_tx, _rx) = mpsc::channel::<()>(1);
         Arc::new(Mutex::new(SessionEntry {
             model: count,
-            last_view: tree,
-            index,
+            rendered: Rendered::first(new_incarnation(), tree),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
             msg_tx,
@@ -5917,6 +6162,62 @@ mod hot_appearance_push_tests {
                 .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).model)
                 .expect("session still present");
             assert_eq!(model_after, 7, "a hot-swap must not advance the Model");
+        });
+    }
+
+    /// An appearance re-render commits like any other render: it mints a new
+    /// epoch, its frame names the epochs it moved between, and the epoch the
+    /// client held stays resolvable in the history.
+    #[test]
+    #[allow(clippy::expect_used)] // the session and the frame are fixtures
+    fn patch_commit_mints_an_epoch_and_keeps_the_previous_one() {
+        with_overlay_serialised(|| async {
+            literal_table::set_dev_overlay_active_for_test(Some(true));
+            literal_table::clear_dev_overlay_for_test();
+
+            let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
+            let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
+            let handle = session_with_current_view(7, Some(sse_tx));
+            let before = handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .epoch();
+            store_impl.set("live", handle.clone()).await;
+            let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
+            let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
+
+            let defaults: Vec<String> = PADDING_DEFAULTS.iter().map(|s| (*s).to_string()).collect();
+            apply_literal_patch_to_web_sessions(
+                &store,
+                &view,
+                &defaults,
+                vec![(0, "padding: 16px".to_string())],
+            )
+            .await;
+
+            let frame = sse_rx
+                .try_recv()
+                .expect("an SSE-attached session must receive a patches frame");
+            let json = parse_patch_frame(&frame.0);
+            let e = handle.lock().unwrap_or_else(|e| e.into_inner());
+            let after = e.rendered.epoch();
+            assert_ne!(after, before, "an appearance commit must mint a new epoch");
+            let from = before.to_token();
+            let to = after.to_token();
+            assert_eq!(
+                json.get("from").and_then(serde_json::Value::as_str),
+                Some(from.as_str())
+            );
+            assert_eq!(
+                json.get("to").and_then(serde_json::Value::as_str),
+                Some(to.as_str())
+            );
+            assert_eq!(
+                e.rendered.resolve(&before, "r", "click", &[]),
+                Ok(None),
+                "the previous epoch stays in the history"
+            );
         });
     }
 
@@ -6278,8 +6579,8 @@ mod canonical_redirect_handler_tests {
 #[cfg(all(test, feature = "server"))]
 mod base_path_tests {
     use super::{
-        client_js_path, cookie_name_for, cookie_name_with, cookie_path_for, normalise_base_path,
-        render_page_full,
+        Html, RenderEpoch, Rendered, client_js_path, cookie_name_for, cookie_name_with,
+        cookie_path_for, new_incarnation, normalise_base_path, render_page_full,
     };
 
     #[test]
@@ -6367,12 +6668,19 @@ mod base_path_tests {
             "sid1",
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
+            &page_epoch(),
             "deadbeef",
         );
         assert!(root.contains("<meta name=\"ipe-base\" content=\"\">"));
         assert!(root.contains("window.__IPE_BASE=\"\""));
 
-        let sub = render_page_full("sid1", &console_base(), "<b>x</b>", "deadbeef");
+        let sub = render_page_full(
+            "sid1",
+            &console_base(),
+            "<b>x</b>",
+            &page_epoch(),
+            "deadbeef",
+        );
         assert!(sub.contains("<meta name=\"ipe-base\" content=\"/_ipe/console\">"));
         assert!(sub.contains("window.__IPE_BASE=\"/_ipe/console\""));
     }
@@ -6383,10 +6691,13 @@ mod base_path_tests {
             "sid1",
             &crate::encoding::MountBase::root(),
             "<b>x</b>",
+            &page_epoch(),
             "tok1",
         );
         // Per-session values stay inline.
         assert!(root.contains("window.__IPE_SID=\"sid1\""));
+        let epoch_global = format!("window.__IPE_EPOCH=\"{}\";", page_epoch().to_token());
+        assert!(root.contains(&epoch_global), "{root}");
         assert!(root.contains("window.__IPE_CSRF_TOKEN=\"tok1\""));
         // CLIENT_JS body must NOT be inlined.
         assert!(!root.contains("var __ipeSid = window.__IPE_SID"));
@@ -6400,9 +6711,14 @@ mod base_path_tests {
 
     #[test]
     fn render_page_sub_app_prefixes_client_src() {
-        let sub = render_page_full("sid1", &console_base(), "<b>x</b>", "tok1");
+        let sub = render_page_full("sid1", &console_base(), "<b>x</b>", &page_epoch(), "tok1");
         // External script src must carry the base prefix.
         assert!(root_or_sub_has_prefixed_client_src(&sub, "/_ipe/console"));
+    }
+
+    /// The first epoch of a fresh render history, as a page GET serves it.
+    fn page_epoch() -> RenderEpoch {
+        Rendered::first(new_incarnation(), Html::<()>::HText(String::new())).epoch()
     }
 
     #[allow(clippy::expect_used)] // a fixed literal inside the mount-base grammar
@@ -6699,13 +7015,12 @@ mod sse_reconnect_reconcile_tests {
         let route_matched = routed_lookup(routes_for_match, render);
         let model = page.clone();
         let last_view = (view)(model.clone());
-        let index = build_index(&last_view);
         let (msg_tx, _rx) = channel::<()>(1);
         let (enter_tx, enter_rx) = channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model,
-            last_view,
-            index,
+            rendered: Rendered::first(new_incarnation(), last_view),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx,
@@ -6839,7 +7154,13 @@ mod sse_reconnect_reconcile_tests {
 
     /// Helper: read the current rendered text from the session's `last_view`.
     fn rendered_text(entry: &SessionHandle<TestPage, ()>) -> String {
-        render_html(&entry.lock().unwrap_or_else(|e| e.into_inner()).last_view)
+        render_html(
+            entry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .last_view(),
+        )
     }
 
     fn model_of(entry: &SessionHandle<TestPage, ()>) -> TestPage {
@@ -6890,7 +7211,7 @@ mod sse_reconnect_reconcile_tests {
         assert_eq!(entered, 1);
 
         let g = fx.entry.lock().unwrap_or_else(|e| e.into_inner());
-        let body = render_html(&g.last_view);
+        let body = render_html(g.rendered.last_view());
         assert!(
             body.contains("data-ipe-hid=\"r\""),
             "entered resync body must stamp data-ipe-hid: {body}"
@@ -6900,8 +7221,8 @@ mod sse_reconnect_reconcile_tests {
             "entered resync body must stamp ipe-id: {body}"
         );
         assert_eq!(
-            g.index.resolve("r", "click", &[]),
-            Some(()),
+            g.rendered.resolve(&g.rendered.epoch(), "r", "click", &[]),
+            Ok(Some(())),
             "entered handler index must resolve the stamped ipe-id"
         );
         assert_eq!(g.entered_path, Some(dp("/")));
@@ -7435,11 +7756,10 @@ mod watch_status_handler_tests {
     fn make_session_handle(sse_tx: Option<SseTx>) -> store::SessionHandle<TestModel, TestMsg> {
         let (msg_tx, _rx) = mpsc::channel::<TestMsg>(1);
         let tree: Html<TestMsg> = Html::HText(String::new());
-        let index = build_index(&tree);
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            last_view: tree,
-            index,
+            rendered: Rendered::first(new_incarnation(), tree),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
             msg_tx,
@@ -9730,8 +10050,11 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             assert!(!sid.is_empty(), "GET / must set an ipe_sid cookie");
             let hid = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let epoch = epoch_of(&body).expect("the page carries its render epoch");
 
-            let event = format!(r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":""}}"#);
+            let event = format!(
+                r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":"","epoch":"{epoch}"}}"#
+            );
             let status = post_event(make_router(store.clone()), &sid, &event).await;
             assert_eq!(status, StatusCode::OK, "click event must be accepted");
 
@@ -9819,9 +10142,10 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             assert!(!sid.is_empty(), "GET / must set an ipe_sid cookie");
             let hid = hid_for_open_tag(&body, "form").expect("data-ipe-hid on <form>");
+            let epoch = epoch_of(&body).expect("the page carries its render epoch");
 
             let event = format!(
-                r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":""}}"#
+                r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":"","epoch":"{epoch}"}}"#
             );
             let status = post_event(make_router(store.clone()), &sid, &event).await;
             assert_eq!(status, StatusCode::OK, "submit event must be accepted");
@@ -9837,6 +10161,571 @@ mod emitted_router_behavior_tests {
                 body2.contains(">alice<"),
                 "re-render after submit must show the decoded username:\n{}",
                 &body2[..body2.len().min(1500)]
+            );
+        });
+    }
+
+    // ── Render epochs and per-tab replay through the production router ──────
+
+    /// A well-formed tab id, as a browser tab mints once per page load.
+    const TAB: &str = "00112233445566778899aabbccddeeff";
+
+    /// The render epoch the page embeds as `window.__IPE_EPOCH`.
+    fn epoch_of(page: &str) -> Option<String> {
+        let needle = "window.__IPE_EPOCH=\"";
+        let rest = page.get(page.find(needle)? + needle.len()..)?;
+        Some(rest.get(..rest.find('"')?)?.to_string())
+    }
+
+    /// `token` one render ahead of its own counter: an epoch never committed.
+    fn future_of(token: &str) -> Option<String> {
+        let (hex, n) = token.split_once('.')?;
+        let n: u64 = n.parse().ok()?;
+        Some(format!("{hex}.{}", n.checked_add(1)?))
+    }
+
+    /// `token` with its incarnation's first hex digit changed: another history.
+    fn foreign_of(token: &str) -> Option<String> {
+        let (hex, n) = token.split_once('.')?;
+        let first = if hex.starts_with('0') { '1' } else { '0' };
+        Some(format!("{first}{}.{n}", hex.get(1..)?))
+    }
+
+    /// A click event body on `hid`, with an optional epoch and `(tab, seq)`.
+    fn click_body(hid: &str, epoch: Option<&str>, tab: Option<(&str, u64)>) -> String {
+        let mut body = serde_json::Map::new();
+        body.insert("id".to_string(), hid.into());
+        body.insert("msg".to_string(), "click".into());
+        body.insert("args".to_string(), serde_json::Value::Array(Vec::new()));
+        if let Some(epoch) = epoch {
+            body.insert("epoch".to_string(), epoch.into());
+        }
+        if let Some((tab, seq)) = tab {
+            body.insert("tab".to_string(), tab.into());
+            body.insert("seq".to_string(), seq.into());
+        }
+        serde_json::Value::Object(body).to_string()
+    }
+
+    /// POST an event and return its status, its `X-Ipe-Web` marker and its body.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn post_event_full(
+        router: axum::Router,
+        cookie: &str,
+        body: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_ipe/event")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
+                    .body(Body::from(body.to_owned()))
+                    .expect("build POST"),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let marker = resp
+            .headers()
+            .get("x-ipe-web")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (status, marker, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// GET `path` with the session cookie; return the `X-Ipe-Epoch` header and the body.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_with_epoch(
+        router: axum::Router,
+        path: &str,
+        cookie: &str,
+    ) -> (Option<String>, String) {
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
+                    .body(Body::empty())
+                    .expect("build GET"),
+            )
+            .await
+            .expect("router responds");
+        let epoch = resp
+            .headers()
+            .get("x-ipe-epoch")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (epoch, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The session's live entry.
+    #[allow(clippy::expect_used)] // test helper — the session was just created by a GET
+    async fn session_of(store: &Arc<Store>, sid: &str) -> SessionHandle<Model, Msg> {
+        store.get(sid).await.expect("the session is live")
+    }
+
+    /// The token of the session's current render epoch.
+    async fn current_epoch(store: &Arc<Store>, sid: &str) -> String {
+        session_of(store, sid)
+            .await
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rendered
+            .epoch()
+            .to_token()
+    }
+
+    /// Route the session's dispatches into `tx`, so a test reads exactly what
+    /// `event_handler` enqueued.
+    async fn capture_dispatches(store: &Arc<Store>, sid: &str, tx: Sender<Msg>) {
+        session_of(store, sid)
+            .await
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .msg_tx = tx;
+    }
+
+    /// `view(model)` stamped exactly as the driver stamps a committed render.
+    fn stamped(mut tree: Html<Msg>) -> Html<Msg> {
+        assign_ipe_ids(&mut tree, "r");
+        style_inject::apply_style_injections(&mut tree);
+        tree
+    }
+
+    /// The counter view with its two buttons swapped: the `-` button now sits
+    /// where `+` was, so it inherits the `+` button's positional hid.
+    fn swapped_view() -> Html<Msg> {
+        use crate::html::{Attribute, Event};
+        let button = |label: &str, msg: Msg| {
+            Html::HElement(
+                "div".to_string(),
+                vec![Attribute::EventAttr(Event::OnMsg("click".to_string(), msg))],
+                vec![Html::HText(label.to_string())],
+            )
+        };
+        stamped(Html::HElement(
+            "div".to_string(),
+            vec![],
+            vec![
+                button("-", Msg::Decrement),
+                Html::HText("0".to_string()),
+                button("+", Msg::Increment),
+            ],
+        ))
+    }
+
+    /// Commit `tree` as the session's next render, as a driver commit would.
+    async fn commit_view(store: &Arc<Store>, sid: &str, tree: Html<Msg>) {
+        let step = session_of(store, sid)
+            .await
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rendered
+            .commit(tree);
+        assert!(step.is_ok(), "a fresh history mints another epoch");
+    }
+
+    /// A replayed event resolves against the render it came from: after the
+    /// `+` button's position passes to `-`, the old-epoch click still
+    /// dispatches `Increment`, while a current-epoch click on the same hid
+    /// dispatches `Decrement`.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the swapped view are fixtures
+    fn an_old_epoch_click_dispatches_the_handler_it_was_rendered_with() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let swapped = swapped_view();
+            assert_eq!(
+                hid_near_text(&render_html(&swapped), "-").as_deref(),
+                Some(plus.as_str()),
+                "the swap must hand the `+` hid to the `-` button"
+            );
+            commit_view(&store, &sid, swapped).await;
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let old = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &old).await;
+            assert_eq!(status, StatusCode::OK, "a retained epoch resolves");
+            assert!(
+                matches!(rx.try_recv(), Ok(Msg::Increment)),
+                "the old-epoch click must dispatch the handler it was rendered with"
+            );
+
+            let current = current_epoch(&store, &sid).await;
+            let now = click_body(&plus, Some(&current), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &now).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(matches!(rx.try_recv(), Ok(Msg::Decrement)));
+        });
+    }
+
+    /// An epoch evicted from the render history refuses with `409`, the
+    /// `X-Ipe-Web` marker and the current render, and dispatches nothing.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the refusal JSON are fixtures
+    fn an_evicted_epoch_refuses_with_the_current_render_and_no_dispatch() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            for _ in 0..RENDER_HISTORY_DEPTH.get() {
+                let model = Model {
+                    count: 0,
+                    last_username: String::new(),
+                };
+                commit_view(&store, &sid, stamped(view(model))).await;
+            }
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let stale = click_body(&plus, Some(&first), None);
+            let (status, marker, reply) =
+                post_event_full(make_router(store.clone()), &sid, &stale).await;
+            assert_eq!(status, StatusCode::CONFLICT, "an evicted epoch must refuse");
+            assert_eq!(
+                marker.as_deref(),
+                Some("1"),
+                "the refusal is a genuine Ipe.Web reply"
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(&reply).expect("the refusal body is JSON");
+            assert_eq!(
+                json.get("refused").and_then(serde_json::Value::as_str),
+                Some("stale-render")
+            );
+            let current = current_epoch(&store, &sid).await;
+            assert_eq!(
+                json.get("epoch").and_then(serde_json::Value::as_str),
+                Some(current.as_str())
+            );
+            assert!(json.get("seq").is_some_and(serde_json::Value::is_u64));
+            assert!(
+                json.get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|b| b.contains("data-ipe-hid")),
+                "the refusal carries the current render: {reply}"
+            );
+            assert!(rx.try_recv().is_err(), "a refused event must not dispatch");
+        });
+    }
+
+    /// An event without an epoch refuses with `409` and dispatches nothing: an
+    /// absent epoch never means the current render.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_missing_epoch_refuses_and_dispatches_nothing() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let unstamped = click_body(&plus, None, None);
+            let (status, marker, _) =
+                post_event_full(make_router(store.clone()), &sid, &unstamped).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(marker.as_deref(), Some("1"));
+            assert!(
+                rx.try_recv().is_err(),
+                "an unstamped event must not dispatch"
+            );
+        });
+    }
+
+    /// A malformed epoch or tab id is a malformed body: `400 bad body`, no dispatch.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_malformed_epoch_or_tab_is_a_bad_body_and_dispatches_nothing() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let bad_epoch = click_body(&plus, Some("not-an-epoch"), None);
+            let bad_tab = click_body(&plus, Some(&first), Some(("NOT-A-TAB", 1)));
+            for event in [bad_epoch, bad_tab] {
+                let (status, _, reply) =
+                    post_event_full(make_router(store.clone()), &sid, &event).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{event}");
+                assert_eq!(reply, "bad body");
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "a malformed event must not dispatch"
+            );
+        });
+    }
+
+    /// An epoch from the future of this history, or from another history,
+    /// refuses with `409` and dispatches nothing.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the token mutations are fixtures
+    fn a_future_or_foreign_epoch_refuses() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let future = future_of(&first).expect("a well-formed token");
+            let foreign = foreign_of(&first).expect("a well-formed token");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            for epoch in [future, foreign] {
+                let event = click_body(&plus, Some(&epoch), None);
+                let (status, marker, _) =
+                    post_event_full(make_router(store.clone()), &sid, &event).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{epoch}");
+                assert_eq!(marker.as_deref(), Some("1"));
+            }
+            assert!(rx.try_recv().is_err(), "a refused event must not dispatch");
+        });
+    }
+
+    /// A replay of a tab's recorded seq is acked as a duplicate and dispatched
+    /// once; the tab's next seq dispatches again.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_replayed_tab_seq_is_acked_as_a_duplicate_and_dispatched_once() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let event = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                !reply.contains("duplicate"),
+                "the first send is no duplicate: {reply}"
+            );
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                reply.contains("\"duplicate\":true"),
+                "the replay is a duplicate: {reply}"
+            );
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+            assert!(rx.try_recv().is_err(), "the replay must not dispatch again");
+
+            let next = click_body(&plus, Some(&first), Some((TAB, 2)));
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &next).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+        });
+    }
+
+    /// A `429` leaves the tab's seq unrecorded, so the client's retry of the
+    /// same event dispatches once the queue drains.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the one-slot channel are fixtures
+    fn a_full_queue_does_not_record_the_seq() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(1);
+            tx.try_send(Msg::Decrement).expect("the one slot is free");
+            capture_dispatches(&store, &sid, tx).await;
+
+            let event = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "a full queue answers 429"
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(Msg::Decrement)),
+                "drain the filler"
+            );
+
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                !reply.contains("duplicate"),
+                "a 429 must not burn the seq: {reply}"
+            );
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+        });
+    }
+
+    /// A driver commit and a route entry each mint a new epoch, which the page
+    /// serves in `window.__IPE_EPOCH` and `X-Ipe-Epoch`; an SSE resync carries
+    /// the current epoch without minting one.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the SSE request are fixtures
+    fn every_commit_advances_the_epoch_and_a_resync_does_not() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            assert_eq!(current_epoch(&store, &sid).await, first);
+
+            let event = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            await_model(&store, &sid, |m| m.count == 1).await;
+            let driven = current_epoch(&store, &sid).await;
+            assert_ne!(driven, first, "a driver commit must mint a new epoch");
+
+            let (header_epoch, page) = get_with_epoch(make_router(store.clone()), "/", &sid).await;
+            let entered = epoch_of(&page).expect("the page carries its render epoch");
+            assert_ne!(entered, driven, "a route entry must mint a new epoch");
+            assert_eq!(header_epoch.as_deref(), Some(entered.as_str()));
+            assert_eq!(current_epoch(&store, &sid).await, entered);
+
+            let resp = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            use futures_util::StreamExt;
+            let mut stream = resp.into_body().into_data_stream();
+            let mut bytes = Vec::new();
+            let want = format!("\"epoch\":\"{entered}\"");
+            let read = tokio::time::timeout(Duration::from_secs(5), async {
+                while bytes.len() < 256 * 1024 {
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            bytes.extend_from_slice(&chunk);
+                            if utf8_prefix(&bytes).contains(&want) {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            })
+            .await;
+            assert!(read.is_ok(), "SSE read timed out before the resync frame");
+            let acc = utf8_prefix(&bytes);
+            assert!(
+                acc.contains(&want),
+                "the resync names the current epoch:\n{acc}"
+            );
+            assert_eq!(
+                current_epoch(&store, &sid).await,
+                entered,
+                "a resync must not mint an epoch"
+            );
+        });
+    }
+
+    /// Every driver commit pushes a `patches` frame naming the epochs it moved
+    /// between, an update that changes nothing included.
+    #[test]
+    #[allow(clippy::expect_used)] // the page, the SSE channel and the frames are fixtures
+    fn a_patches_frame_names_its_epochs_even_with_no_patches() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let form = hid_for_open_tag(&body, "form").expect("data-ipe-hid on <form>");
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
+            session_of(&store, &sid)
+                .await
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sse_tx = Some(sse_tx);
+
+            // An empty sign-in leaves the model, and so the view, unchanged.
+            let unchanged = format!(
+                r#"{{"id":"{form}","event":"submit","args":[{{"username":"","password":""}}],"epoch":"{first}"}}"#
+            );
+            let (status, _, _) =
+                post_event_full(make_router(store.clone()), &sid, &unchanged).await;
+            assert_eq!(status, StatusCode::OK);
+            let frame = tokio::time::timeout(Duration::from_secs(5), sse_rx.recv())
+                .await
+                .expect("the commit pushes a frame")
+                .expect("the SSE channel is open");
+            let data = frame
+                .0
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("a frame carries a data line");
+            let json: serde_json::Value = serde_json::from_str(data).expect("the frame is JSON");
+            assert!(frame.0.starts_with("event: patches"), "{}", frame.0);
+            assert_eq!(
+                json.get("from").and_then(serde_json::Value::as_str),
+                Some(first.as_str())
+            );
+            let second = current_epoch(&store, &sid).await;
+            assert_ne!(second, first);
+            assert_eq!(
+                json.get("to").and_then(serde_json::Value::as_str),
+                Some(second.as_str())
+            );
+            assert!(
+                json.get("patches")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty),
+                "an unchanged view still pushes its epoch-only frame: {json}"
+            );
+
+            let event = click_body(&plus, Some(&second), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            let frame = tokio::time::timeout(Duration::from_secs(5), sse_rx.recv())
+                .await
+                .expect("the commit pushes a frame")
+                .expect("the SSE channel is open");
+            let data = frame
+                .0
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("a frame carries a data line");
+            let json: serde_json::Value = serde_json::from_str(data).expect("the frame is JSON");
+            assert_eq!(
+                json.get("from").and_then(serde_json::Value::as_str),
+                Some(second.as_str())
+            );
+            let third = current_epoch(&store, &sid).await;
+            assert_eq!(
+                json.get("to").and_then(serde_json::Value::as_str),
+                Some(third.as_str())
+            );
+            assert!(
+                json.get("patches")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|p| !p.is_empty()),
+                "a changed view pushes its patches: {json}"
             );
         });
     }
@@ -10091,16 +10980,25 @@ mod emitted_router_behavior_tests {
 mod page_mount_base_tests {
     use axum::http::{HeaderMap, StatusCode};
 
+    /// The first epoch of a fresh render history.
+    fn page_epoch() -> super::RenderEpoch {
+        super::Rendered::first(
+            super::new_incarnation(),
+            super::Html::<()>::HText(String::new()),
+        )
+        .epoch()
+    }
+
     /// The page under the current `IPE_WEB_BASE_PATH`.
     #[cfg(not(feature = "debugger"))]
     fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response("sid", "<p>x</p>", "tok", headers)
+        super::page_response("sid", "<p>x</p>", &page_epoch(), "tok", headers)
     }
 
     /// The page under the current `IPE_WEB_BASE_PATH`.
     #[cfg(feature = "debugger")]
     fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response_with_overlay("sid", "<p>x</p>", "", "tok", headers)
+        super::page_response_with_overlay("sid", "<p>x</p>", &page_epoch(), "", "tok", headers)
     }
 
     /// A page asked for under a base outside the mount-base grammar answers the
@@ -11027,13 +11925,12 @@ mod route_entry_cmd_tests {
             log: Vec::new(),
         };
         let last_view = view(model.clone());
-        let index = build_index(&last_view);
         let (msg_tx, _msg_rx) = mpsc::channel::<Msg>(1);
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model: model.clone(),
-            last_view,
-            index,
+            rendered: Rendered::first(new_incarnation(), last_view),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx,
