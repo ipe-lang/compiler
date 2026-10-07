@@ -20,19 +20,20 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
-import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), StoredDecision(..))
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
+import Lib.Index as Index exposing (ChainVerdict(..), Change(..), LogStatus(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -76,7 +77,7 @@ decideOutcome db found decision =
 
 countUidRows : Db -> String -> Task.Task Error Int
 countUidRows db label =
-    Db.findWhere db "review" (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql (uid label))))
+    Db.findWhere db "review_log" (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql (uid label))))
         |> Task.map List.length
 
 
@@ -713,7 +714,7 @@ drainFlow =
 
 -- The drain of a decided unit, with the queue page reloaded after it, writes
 -- the index alone: every review-database table keeps its row count, and the
--- table set is unchanged. The review table already holds the decision, so
+-- table set is unchanged. The review log already holds the decision, so
 -- nothing on the drain path has a reason to write there. Red if the drain
 -- task records anything in the review database (a drain cursor row).
 drainWritesNothingToReview : Task.Task Error Bool
@@ -735,7 +736,7 @@ drainWritesNothingToReview =
         Task.succeed
             (before
                 == after
-                && List.member ( "review", 1 ) after
+                && List.member ( "review_log", 1 ) after
                 && not (List.any (\q -> q.unit.uid == uid "u-b") page.units)
             )
 
@@ -975,11 +976,11 @@ resurfacedHead units =
             False
 
 
-resurfaced : Maybe LibDb.ReviewRow -> Bool
+resurfaced : Maybe LibDb.VerifiedRow -> Bool
 resurfaced old =
     case old of
         Just row ->
-            isStoredApproved row.decision && row.bodyHash == Index.attest viewA
+            isStoredApproved (LibDb.verifiedDecision row) && LibDb.verifiedHash row == Index.attest viewA
 
         Nothing ->
             False
@@ -1005,7 +1006,7 @@ freshAfter units =
             False
 
 
-neverSeen : Maybe LibDb.ReviewRow -> Bool
+neverSeen : Maybe LibDb.VerifiedRow -> Bool
 neverSeen old =
     case old of
         Nothing ->
@@ -1025,7 +1026,7 @@ queueStateTextsDistinct =
             Error.unexpected "boom"
 
         empty =
-            { units = [], total = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 } }
+            { units = [], total = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = Signed Intact }
 
         drained =
             { empty | total = 41000 }
@@ -1098,13 +1099,11 @@ mirrorPair indexDb label hash =
     execIndex indexDb "INSERT INTO reviewed (uid, body_hash) VALUES (?, ?)" [ Uid.toSql (uid label), SqlString hash ]
 
 
--- A review row for fixture unit `label` written straight into the review
--- table, with no drain.
+-- A signed approval for fixture unit `label` appended straight to the
+-- review log, with no drain.
 insertReviewRow : Db -> String -> String -> Task.Task Error Int
 insertReviewRow db label hash =
-    Db.exec db
-        "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)"
-        [ Uid.toSql (uid label), SqlString hash, SqlString "approve", SqlNull (SqlString ""), SqlInt 0 ]
+    appendSigned db (rawRow label hash "approve" Nothing)
 
 
 -- The bridge fixture plus an empty review database at `at`, with the
@@ -1487,35 +1486,41 @@ replacedReviewDbReopensDrained =
 
 
 -- Two freshly migrated review databases start at different genesis heads:
--- the genesis is random, never a constant every log shares. Red if the
--- migration seeds the head with a fixed value.
+-- each log's id is random, never a constant every log shares, and its head
+-- names it at entry 0. Red if the migration seeds the log id with a fixed
+-- value.
 freshReviewDbsHaveDistinctGenesis : Task.Task Error Bool
 freshReviewDbsHaveDistinctGenesis =
     do
         base <- freshDir "ipe-review-distinct-genesis"
         first <- migratedReviewAt (base ++ "/first.db")
         second <- migratedReviewAt (base ++ "/second.db")
-        firstHead <- reviewHeadOf first
-        secondHead <- reviewHeadOf second
+        firstHead <- headTextOf first
+        secondHead <- headTextOf second
+        firstId <- logIdOf first
+        secondId <- logIdOf second
         [ "/first.db", "/second.db" ]
             |> List.concatMap (\name -> [ base ++ name, base ++ name ++ "-wal", base ++ name ++ "-shm" ])
             |> List.map removeFileIfAny
             |> Task.sequence
         Task.succeed
-            (String.startsWith "genesis:" firstHead
-                && String.startsWith "genesis:" secondHead
-                && firstHead
-                /= secondHead
+            (firstHead
+                == firstId
+                ++ ":0:genesis"
+                && secondHead
+                == secondId
+                ++ ":0:genesis"
+                && firstId
+                /= secondId
             )
 
 
--- A copy stamped at one review database's genesis is rebuilt against
--- another fresh database: both logs hold only directly inserted rows, so
--- neither head has moved past its genesis, and only the random genesis
--- tells the two apart. The unit decided in the first log leaves the page,
--- then is open again once the environment names the second. Red if the
--- genesis is a constant, which would let the first log's stamp match the
--- second log's head.
+-- A copy stamped at one review database's head is rebuilt against another
+-- fresh database: both logs hold one directly appended entry at the same
+-- seq, so only the random log id tells their heads apart. The unit decided
+-- in the first log leaves the page, then is open again once the environment
+-- names the second. Red if the log id is a constant, which would let the
+-- first log's stamp match the second log's head.
 genesisStampMismatchReopens : Task.Task Error Bool
 genesisStampMismatchReopens =
     do
@@ -1533,8 +1538,8 @@ genesisStampMismatchReopens =
         cleanupProgressScratch at
         removeDbFiles second.path
         Task.succeed
-            (String.startsWith "genesis:" firstHead
-                && String.startsWith "genesis:" second.head
+            (firstHead
+                /= second.head
                 && firstStamp
                 == Just firstHead
                 && otherStamp
@@ -1731,7 +1736,7 @@ boundAccepted rows pageCeiling =
             False
 
 
--- A stored refusal whose reason no longer parses still counts as decided,
+-- A signed refusal whose reason no longer parses still counts as decided,
 -- and the load succeeds. Red if progress reads decisions through the
 -- full-row decode.
 progressIgnoresUndecodableReason : Task.Task Error Bool
@@ -1739,7 +1744,7 @@ progressIgnoresUndecodableReason =
     do
         at <- freshScratch "ipe-index-progress-bad-reason"
         db <- seedProgressScratch at
-        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString "refuse", SqlString (String.repeat (LibDb.reasonMaxChars + 1) "x"), SqlInt 0 ]
+        appendSigned db (rawRow "u-a" (Index.attest viewA) "refuse" (Just (String.repeat (LibDb.reasonMaxChars + 1) "x")))
         result <- loadPageNow Index.Start
             |> Task.map (\page -> Just page.progress.reviewed)
             |> Task.onError (\_ -> Task.succeed Nothing)
@@ -1959,6 +1964,148 @@ pageCountEqualsRowsAcrossPagesIn base =
             )
 
 
+-- ── the signed review log, end to end ───────────────────────────────────
+--
+-- True when fixture unit `label` is on the queue page.
+onPage : String -> Queue.QueuePage -> Bool
+onPage label page =
+    List.any (\q -> q.unit.uid == uid label) page.units
+
+
+-- A decided refusal flipped to an approval outside the tool stops counting:
+-- the next load, which rebuilds the copy since the decision moved the head,
+-- puts the unit back in the queue. Red if the rebuild counts a row whose mac
+-- does not verify.
+flippedRefusalBackInQueue : Task.Task Error Bool
+flippedRefusalBackInQueue =
+    do
+        at <- freshScratch "ipe-index-log-flip"
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        refusal <- refuse "not yet"
+        decideNow db (uid "u-a") refusal
+        tamperLog db "UPDATE review_log SET decision = 'approve', reason = NULL WHERE seq = 1" []
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed (onPage "u-a" page && page.progress.reviewed == 0)
+
+
+-- A forged entry for a unit, linked into the chain with the head moved to
+-- it, never takes the unit off the queue. Red if the rebuild counts a row on
+-- its chain position without verifying its mac.
+forgedEntryLeavesUnitQueued : Task.Task Error Bool
+forgedEntryLeavesUnitQueued =
+    let
+        forged =
+            String.repeat 64 "d"
+    in
+    do
+        at <- freshScratch "ipe-index-log-forged"
+        db <- seedProgressScratch at
+        Db.exec db
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, ?, 'approve', NULL, 0, 'genesis', ?)"
+            [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString forged ]
+        Db.exec db "UPDATE review_log_head SET seq = 1, head = ? WHERE one = 1" [ SqlString forged ]
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed (onPage "u-a" page && page.progress.reviewed == 0 && page.log == Signed Intact)
+
+
+-- A middle entry removed outside the tool breaks the chain at entry 2: the
+-- rebuild counts nothing, the rows before the break included; the queue
+-- and the History carry the banner naming the entry; every History entry
+-- reads `ChainBroken`; and a decision is refused, inserting nothing. Red if
+-- a broken log still counts the rows before its break, or if a decision is
+-- recorded on it.
+brokenChainCountsNothing : Task.Task Error Bool
+brokenChainCountsNothing =
+    do
+        at <- freshScratch "ipe-index-log-broken"
+        db <- seedProgressScratch at
+        insertReviewRow db "u-a" (Index.attest viewA)
+        insertReviewRow db "u-elsewhere" "h-elsewhere"
+        insertReviewRow db "u-b" (Index.attest viewB)
+        tamperLog db "DELETE FROM review_log WHERE seq = 2" []
+        copied <- resyncReviewedNow db
+        mirrored <- mirroredCount at.indexDb
+        page <- loadPageNow Index.Start
+        history <- loadHistoryPageNow HistoryStart
+        refused <- decideNow db (uid "u-a") Approved
+            |> Task.map (\_ -> False)
+            |> Task.onError (\e -> Task.succeed (String.contains "chain breaks at entry 2" (Error.message e)))
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed
+            (copied
+                == 0
+                && mirrored
+                == 0
+                && page.log
+                == Signed (BrokenAt 2)
+                && Queue.chainBanner page.log
+                == Just "The review log's chain breaks at entry 2: a decision was removed, reordered or replaced outside this tool."
+                && history.log
+                == Signed (BrokenAt 2)
+                && List.length history.rows
+                == 2
+                && List.all (\row -> whyOf row.entry == Just ChainBroken) history.rows
+                && onPage "u-a" page
+                && onPage "u-b" page
+                && refused
+                && rows
+                == 2
+            )
+
+
+whyOf : ReviewEntry -> Maybe Unverified
+whyOf entry =
+    case entry of
+        Unverified row ->
+            Just row.why
+
+        Verified _ ->
+            Nothing
+
+
+-- A server with no key records nothing and counts nothing: its decision is
+-- refused with the read-only error before any write, no log row is added,
+-- and a unit decided under the key stays queued, the log read as unsigned.
+-- Red if `decide` reaches the database without a key, or if a keyless load
+-- counts a row it cannot verify.
+readOnlyRecordsAndCountsNothing : Task.Task Error Bool
+readOnlyRecordsAndCountsNothing =
+    do
+        at <- freshScratch "ipe-index-log-read-only"
+        db <- seedProgressScratch at
+        decideNow db (uid "u-a") Approved
+        signing <- envAppSettings
+        keyless <- Task.succeed { signing | key = ReadOnly }
+        found <- loadUnitNow (uid "u-b")
+        refused <- case Maybe.andThen (\loaded -> shownOf loaded.view) found of
+            Just shown ->
+                Queue.decide ReadOnly keyless.index db shown Approved
+                    |> Task.map (\_ -> False)
+                    |> Task.onError (\e -> Task.succeed (Error.toString e == Error.toString ReviewKey.readOnlyError))
+
+            Nothing ->
+                Task.succeed False
+        rows <- logRowCount db
+        page <- Queue.loadPage keyless Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (refused
+                && Error.message ReviewKey.readOnlyError
+                == "This server is read-only: IPE_REVIEW_MAC_KEY is not set, so no decision can be signed. Restart it with the key set to record decisions."
+                && rows
+                == 1
+                && page.log
+                == Unsigned
+                && onPage "u-a" page
+                && page.progress.reviewed
+                == 0
+            )
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2001,6 +2148,10 @@ checks =
             , check "two fresh review databases start at different genesis heads" freshReviewDbsHaveDistinctGenesis
             , check "a copy stamped at another log's genesis is rebuilt and re-opens its units" genesisStampMismatchReopens
             , check "a pair decided and drained twice counts once" secondDecisionOfPairCountsOnce
+            , check "a decided refusal flipped to an approval is back in the queue" flippedRefusalBackInQueue
+            , check "a forged log entry leaves its unit queued" forgedEntryLeavesUnitQueued
+            , check "a broken chain counts nothing, shows its banner and refuses a decision" brokenChainCountsNothing
+            , check "a server with no key records and counts nothing" readOnlyRecordsAndCountsNothing
             , check "a failed drain keeps the queue row" drainIsAtomic
             , check "a progress rebuild stops at its page ceiling and rolls back" resyncStopsAtCeiling
             , check "a rebuild refused at its ceiling leaves the stamp" resyncCeilingLeavesStamp

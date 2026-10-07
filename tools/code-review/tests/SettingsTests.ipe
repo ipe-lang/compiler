@@ -28,6 +28,7 @@ import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import TestSupport exposing (tableExists, envReview, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
@@ -482,19 +483,20 @@ occurrences needle text =
 -- Each needle and, for every module admitted to name it, the exact number of
 -- times its code does. A module absent from a needle's row names it zero
 -- times. `System.` counts every qualified use of the module: `Main`'s
--- `getenv`, `getenvOr` and two `exit`s, `RepoPath`'s `cwd`. `absolute`
+-- `getenv`, `getenvOr` and three `exit`s, `RepoPath`'s `cwd`, `ReviewKey`'s
+-- one `getenv` of the review key. `absolute`
 -- counts `Path.absolute`, which resolves against the working directory, beside
 -- the message text that names the word. `Ipe.Env` reads
 -- the live environment on the native target and `Ipe.Process` can run a
 -- child that prints it, so neither is admitted anywhere.
 admittedSites : List ( String, List ( String, Int ) )
 admittedSites =
-    [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ) ] )
+    [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "Ipe.Ffi", [] )
     , ( "Ipe.Env", [] )
     , ( "Ipe.Process", [] )
-    , ( "System.", [ ( "Main.ipe", 4 ), ( "Lib/RepoPath.ipe", 1 ) ] )
-    , ( "getenv", [ ( "Main.ipe", 2 ) ] )
+    , ( "System.", [ ( "Main.ipe", 5 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
+    , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
     , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ) ] )
     , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/Settings.ipe", 3 ) ] )
@@ -503,6 +505,8 @@ admittedSites =
     , ( "parseDbLocation", [ ( "Lib/Settings.ipe", 5 ) ] )
     , ( "parseIndexSettings", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
     , ( "parseReviewDb", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "readReviewKey", [ ( "Lib/ReviewKey.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "parseMacKey", [ ( "Lib/ReviewKey.ipe", 4 ) ] )
     ]
 
 
@@ -565,6 +569,8 @@ startupScanRefusesEvasions =
                 && evaded sources "Lib/Queue.ipe" "reload = Settings.parseIndexSettings"
                 && evaded sources "Migrations.ipe" "import Ipe.System as System\nraw = System.getenvOr \"X\" \"\""
                 && evaded sources "Lib/Index.ipe" "fresh = File.isDir"
+                && evaded sources "Lib/ReviewKey.ipe" "again = System.getenv \"X\""
+                && evaded sources "Lib/Queue.ipe" "rekey = ReviewKey.readReviewKey"
                 && evaded sources "Lib/Index.ipe" "fresh = Path.absolute"
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Env as Env\nraw = Env.public \"INDEX_DB\""
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Process as Process\nraw = Process.run \"printenv\" []"
@@ -641,19 +647,21 @@ mainAdmits text =
         && mainPinned text
 
 
--- `main` opens with the two literal-key `requireEnv` reads, the settings
--- parse and the listen, in that order, so a partially applied `requireEnv`
+-- `main` opens with the two literal-key `requireEnv` reads, the review
+-- key's read, the settings parse and the listen, in that order, so a partially applied `requireEnv`
 -- that a request could run cannot take the place of either read.
 mainPinned : String -> Bool
 mainPinned text =
     case String.split "\nmain =\n    do\n" text of
         [ _, body ] ->
-            case List.take 4 (String.lines body) of
-                [ dbLine, rootLine, settingsLine, listenLine ] ->
+            case List.take 5 (String.lines body) of
+                [ dbLine, rootLine, keyLine, settingsLine, listenLine ] ->
                     String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
                         && String.startsWith "        rawRoot <- requireEnv \"IPE_INDEX_ROOT\" \"" rootLine
+                        && keyLine
+                        == "        key <- requireReviewKey"
                         && settingsLine
-                        == "        settings <- requireSettings rawDb rawRoot (System.getenvOr \"IPE_REVIEW_DB\" \"review.db\")"
+                        == "        settings <- requireSettings key rawDb rawRoot (System.getenvOr \"IPE_REVIEW_DB\" \"review.db\")"
                         && listenLine
                         == "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]"
 
@@ -959,10 +967,60 @@ typeWords line =
     String.words (List.foldl (\mark text -> String.replace mark " " text) line [ "->", "{", "}", "(", ")", "[", "]", ",", ":", "|", "=" ])
 
 
+-- The review key's one decode point refuses every value that is not
+-- exactly 64 hex digits — one short, one long, a non-hex digit, empty, and
+-- whitespace — each with the one exact `invalidInput` text, which never
+-- repeats the value; a valid key in upper and in lower case is one key,
+-- signing alike. Red if the length or the digit check is dropped, if the
+-- refusal echoes the value, or if case changes the key.
+macKeyParseRefuses : Bool
+macKeyParseRefuses =
+    let
+        valid =
+            "5c0ffee15dec1dedba5eba11c0de0f0a11c0ffee5ca1ab1e0ddba11fee1900d1"
+
+        expected =
+            "IPE_REVIEW_MAC_KEY must be exactly 64 hexadecimal characters (32 random bytes); the value set is not.\n  fix: generate one with `openssl rand -hex 32`."
+
+        refusedExactly raw =
+            case ReviewKey.parseMacKey raw of
+                Ok _ ->
+                    False
+
+                Err e ->
+                    Error.message e
+                        == expected
+                        && Error.kind e
+                        == Error.kind (Error.invalidInput "")
+                        && (String.trim raw == "" || not (String.contains raw (Error.toString e)))
+
+        signs raw =
+            Result.map (\key -> ReviewKey.sign key "message") (ReviewKey.parseMacKey raw)
+    in
+    List.all refusedExactly
+        [ String.dropRight 1 valid
+        , valid ++ "a"
+        , String.dropRight 1 valid ++ "g"
+        , ""
+        , String.repeat 64 " "
+        , " " ++ String.dropRight 1 valid
+        ]
+        && signs (String.toUpper valid)
+        == signs valid
+        && (case signs valid of
+            Ok _ ->
+                True
+
+            Err _ ->
+                False
+        )
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
         [ Task.succeed ( "db file paths escape url specials", filePathsEncodeUrlSpecials )
+        , Task.succeed ( "a review key that is not 64 hex digits is refused without echoing it", macKeyParseRefuses )
         , check "index db refusal names only the variable" dbRefusalNamesOnlyVariable
         , check "unusable index db locations refused" badIndexDbRefused
         , check "db urls carry only the app's open mode" dbUrlsCarryAppMode

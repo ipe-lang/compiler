@@ -108,6 +108,7 @@ queuePageOf units =
     , dbBytes = 2048
     , next = Nothing
     , progress = { reviewed = 0, total = List.length units }
+    , log = Index.Signed Index.Intact
     }
 
 

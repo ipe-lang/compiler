@@ -15,16 +15,16 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
 import Lib.App exposing (Model, Page(..), initialModel)
-import Lib.Db as LibDb exposing (HistoryCursor(..), StoredDecision(..))
+import Lib.Db as LibDb exposing (HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
-import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (ChainVerdict(..), Change(..), LogStatus(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
 import Lib.View as View
-import TestSupport exposing (checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText)
+import TestSupport exposing (checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
 
 
 -- Every check here renders the real `View.view` to HTML, the exact string the
@@ -73,6 +73,7 @@ queuePage units total progress =
     , dbBytes = 2048
     , next = Nothing
     , progress = progress
+    , log = Signed Intact
     }
 
 
@@ -87,10 +88,10 @@ cardModel loaded =
 
 -- The queue page whose one selected card carries a previous review of the
 -- unit, as a unit decided on an older hash resurfaces.
-changedModel : Index.UnitView -> LibDb.ReviewRow -> Model
+changedModel : Index.UnitView -> LibDb.VerifiedRow -> Model
 changedModel loaded old =
     { baseModel
-        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = old.bodyHash }, changed = Just old } ] 1 { reviewed = 0, total = 1 })
+        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = LibDb.verifiedHash old }, changed = Just old } ] 1 { reviewed = 0, total = 1 })
         , selectedView = ViewShown loaded
     }
 
@@ -121,17 +122,35 @@ historyModel : List Queue.HistoryRow -> Model
 historyModel rows =
     { baseModel
         | page = HistoryPage
-        , history = HistoryLoaded { rows = rows, at = HistoryStart, next = Nothing }
+        , history = HistoryLoaded { rows = rows, at = HistoryStart, next = Nothing, log = Signed Intact }
     }
 
 
-historyRowOf : LibDb.ReviewRow -> Queue.HistoryRow
+historyRowOf : LibDb.VerifiedRow -> Queue.HistoryRow
 historyRowOf row =
-    { uid = row.uid
-    , bodyHash = row.bodyHash
-    , decision = row.decision
-    , reviewedAt = row.reviewedAt
-    , name = Nothing
+    { entry = Verified row, name = Nothing }
+
+
+-- The queue card of `loaded` on a server whose review log reads `log`.
+cardModelUnder : LogStatus -> Index.UnitView -> Model
+cardModelUnder log loaded =
+    let
+        shown =
+            queuePage [ queued loaded ] 1 { reviewed = 0, total = 1 }
+    in
+    { baseModel
+        | queueState = Loaded { shown | log = log }
+        , selectedView = ViewShown loaded
+    }
+
+
+-- The History page of one entry that does not count, for `why`, on a log
+-- that reads `log`.
+unverifiedHistory : LogStatus -> Unverified -> Model
+unverifiedHistory log why =
+    { baseModel
+        | page = HistoryPage
+        , history = HistoryLoaded { rows = [ { entry = Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why }, name = Nothing } ], at = HistoryStart, next = Nothing, log = log }
     }
 
 
@@ -627,7 +646,19 @@ seededChecks a b =
             page (refusingModel a)
 
         hostileHistory =
-            historyModel [ { uid = a.unit.uid, bodyHash = "h", decision = StoredApproved, reviewedAt = Timestamp.fromUnixMillis 0, name = Just (SafeText.renderForeign hostileText) } ]
+            historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Just (SafeText.renderForeign hostileText) } ]
+
+        readOnlyCard =
+            page (cardModelUnder Unsigned a)
+
+        brokenCard =
+            page (cardModelUnder (Signed (BrokenAt 2)) a)
+
+        banner =
+            "The review log&#39;s chain breaks at entry 2"
+
+        everyPage =
+            [ shownCard, shownPage, opened, page hostileHistory, readOnlyCard, brokenCard, page (unverifiedHistory (Signed (BrokenAt 2)) ChainBroken) ]
     in
     [ ( "a verified source shows Approve, Refuse and its source text", button "Approve" shownCard && button "Refuse" shownCard && has sourceMarker shownCard )
     , ( "a withheld source shows its reason, no decision button and no source text, for every stale reason and an unreadable file", List.all (withheldRefuses a) withheldCases )
@@ -648,6 +679,19 @@ seededChecks a b =
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
+    , ( "a read-only server shows no decision control and says why, beside a signing server that shows them", not (button "Approve" readOnlyCard) && not (button "Refuse" readOnlyCard) && has "Read-only: IPE_REVIEW_MAC_KEY is not set, so no decision is recorded." readOnlyCard && button "Approve" shownCard && not (has "Read-only:" shownCard) )
+    , ( "a broken chain shows its banner, naming the entry, on the queue and the History, and an intact one shows none", has banner brokenCard && has banner (page (unverifiedHistory (Signed (BrokenAt 2)) ChainBroken)) && not (has "chain breaks" shownCard) && not (has "chain breaks" (page hostileHistory)) )
+    , ( "each reason an entry does not count shows its own text", List.all (\( why, text ) -> has text (page (unverifiedHistory (Signed Intact) why))) unverifiedTexts )
+    , ( "the review key never appears on any page", List.all (\html -> not (has testKeyHex html) && not (has (String.toUpper testKeyHex) html)) everyPage )
+    ]
+
+
+unverifiedTexts : List ( Unverified, String )
+unverifiedTexts =
+    [ ( Tampered, "Not counted: this row&#39;s signature does not verify" )
+    , ( Legacy, "Not counted: recorded before rows were signed" )
+    , ( NoKey, "Not counted: no key to verify it (read-only)" )
+    , ( ChainBroken, "Not counted: the log&#39;s chain breaks before this row" )
     ]
 
 
@@ -698,24 +742,27 @@ hostileSourceChecks =
 
 
 -- ── stored decisions ────────────────────────────────────────────
--- A reason one character past the bound, written to the review table as an
--- older or edited file may hold it.
+-- A reason one character past the bound, signed into the review log as an
+-- older file may hold it.
 overlongReason : String
 overlongReason =
     String.repeat (LibDb.reasonMaxChars + 1) "Q"
 
 
-insertReviewWith : Db -> String -> String -> String -> SqlValue -> Task.Task Error ()
+insertReviewWith : Db -> String -> String -> String -> Maybe String -> Task.Task Error ()
 insertReviewWith db unitLabel hash decision reason =
-    Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid unitLabel), SqlString hash, SqlString decision, reason, SqlInt 0 ]
+    appendSigned db (rawRow unitLabel hash decision reason)
         |> Task.map (\_ -> ())
 
 
-requireRow : Maybe LibDb.ReviewRow -> Task.Task Error LibDb.ReviewRow
+requireRow : Maybe ReviewEntry -> Task.Task Error LibDb.VerifiedRow
 requireRow found =
     case found of
-        Just row ->
+        Just (Verified row) ->
             Task.succeed row
+
+        Just (Unverified _) ->
+            Task.fail (Error.conflict "a fixture review row does not verify")
 
         Nothing ->
             Task.fail (Error.conflict "a fixture review row is missing")
@@ -728,12 +775,13 @@ storedChecks =
         seedIndex at.indexDb at.repo
         loaded <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
         db <- migratedReviewAt at.reviewDb
-        insertReviewWith db "u-a" "h-long" "refuse" (SqlString overlongReason)
-        insertReviewWith db "u-b" "h-ok" "refuse" (SqlString "needs a test")
-        insertReviewWith db "u-c" "h-yes" "approve" (SqlNull (SqlString ""))
-        long <- LibDb.findDecision db (uid "u-a") "h-long" |> Task.andThen requireRow
-        ok <- LibDb.findDecision db (uid "u-b") "h-ok" |> Task.andThen requireRow
-        yes <- LibDb.findDecision db (uid "u-c") "h-yes" |> Task.andThen requireRow
+        insertReviewWith db "u-a" "h-long" "refuse" (Just overlongReason)
+        insertReviewWith db "u-b" "h-ok" "refuse" (Just "needs a test")
+        insertReviewWith db "u-c" "h-yes" "approve" Nothing
+        verify <- countingVerifier
+        long <- LibDb.findDecision verify db (uid "u-a") "h-long" |> Task.andThen requireRow
+        ok <- LibDb.findDecision verify db (uid "u-b") "h-ok" |> Task.andThen requireRow
+        yes <- LibDb.findDecision verify db (uid "u-c") "h-yes" |> Task.andThen requireRow
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
         removeFileIfAny (at.reviewDb ++ "-wal")
@@ -742,7 +790,7 @@ storedChecks =
 
 
 -- The checks over rows read back from a review table.
-storedPure : Index.UnitView -> LibDb.ReviewRow -> LibDb.ReviewRow -> LibDb.ReviewRow -> List ( String, Bool )
+storedPure : Index.UnitView -> LibDb.VerifiedRow -> LibDb.VerifiedRow -> LibDb.VerifiedRow -> List ( String, Bool )
 storedPure loaded long ok yes =
     let
         lengthNote =

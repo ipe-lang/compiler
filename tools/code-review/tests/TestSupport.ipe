@@ -74,6 +74,18 @@ module TestSupport exposing
     , maybeContains
     , uid
     , resyncBoundOf
+    , testKeyHex
+    , testMacKey
+    , testReviewKey
+    , RawRow
+    , rawRow
+    , appendSigned
+    , appendSignedAs
+    , tamperLog
+    , headTextOf
+    , logIdOf
+    , logRowCount
+    , countingVerifier
     )
 
 import Ipe.ByteSize as ByteSize
@@ -107,6 +119,7 @@ import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
@@ -161,7 +174,7 @@ resyncBoundOf rows pageCeiling =
 countReviewRows : Db -> Uid -> String -> Task.Task Error Int
 countReviewRows db unit bodyHash =
     Db.findWhere db
-        "review"
+        "review_log"
         (Sql.and
             (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql unit)))
             (Sql.eq (Sql.column "body_hash") (Sql.string bodyHash))
@@ -527,7 +540,8 @@ envAppSettings =
         index <- envSettings
         review <- envReview
         epoch <- Epoch.mint
-        Task.succeed { index = index, review = review, epoch = epoch }
+        key <- testReviewKey
+        Task.succeed { index = index, review = review, key = key, epoch = epoch }
 
 
 -- Each request-time function below, run on settings resolved from the current
@@ -554,7 +568,7 @@ loadUnitViewNow unit =
 
 decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideShownNow db shown decision =
-    envSettings |> Task.andThen (\settings -> Queue.decide settings db shown decision)
+    envAppSettings |> Task.andThen (\settings -> Queue.decide settings.key settings.index db shown decision)
 
 
 drainUnitNow : Index.Attested -> Index.Written -> Task.Task Error Int
@@ -564,12 +578,12 @@ drainUnitNow attested written =
 
 resyncReviewedNow : Db -> Task.Task Error Int
 resyncReviewedNow db =
-    envSettings |> Task.andThen (\settings -> Queue.resyncReviewed settings db)
+    envAppSettings |> Task.andThen (\settings -> Queue.resyncReviewed settings.key settings.index db)
 
 
 resyncReviewedWithinNow : Queue.ResyncBound -> Db -> Task.Task Error Int
 resyncReviewedWithinNow bound db =
-    envSettings |> Task.andThen (\settings -> Queue.resyncReviewedWithin settings bound db)
+    envAppSettings |> Task.andThen (\settings -> Queue.resyncReviewedWithin settings.key settings.index bound db)
 
 
 setIndexEnv : String -> String -> Task.Task Error ()
@@ -749,10 +763,186 @@ stampOf indexDb =
         |> Task.andThen Index.readStamp
 
 
--- The review log's head as text.
+-- The stamp a rebuild under the test key writes for the review log's head
+-- on an intact chain: what a fresh `reviewed` copy must carry.
 reviewHeadOf : Db -> Task.Task Error String
 reviewHeadOf db =
+    do
+        head <- LibDb.currentHead db
+        key <- testMacKey
+        Task.succeed (Index.stampText (Index.signedStamp key head Index.Intact))
+
+
+-- The review log's head as text: its log id, seq and mac.
+headTextOf : Db -> Task.Task Error String
+headTextOf db =
     LibDb.currentHead db |> Task.map Index.chainHeadText
+
+
+-- The id of the review log, as its head row holds it.
+logIdOf : Db -> Task.Task Error String
+logIdOf db =
+    rawHead db |> Task.map .logId
+
+
+-- The number of rows in the review log.
+logRowCount : Db -> Task.Task Error Int
+logRowCount db =
+    Db.queryDecode db "SELECT COUNT(*) AS total FROM review_log" [] totalDecoder
+        |> Task.andThen (singleRow "COUNT(*) over review_log")
+
+
+singleRow : String -> List a -> Task.Task Error a
+singleRow what rows =
+    case rows of
+        [ row ] ->
+            Task.succeed row
+
+        _ ->
+            Task.fail (Error.unexpected (what ++ " did not return exactly one row"))
+
+
+-- The key every test server signs with: 64 hex digits, parsed the one way
+-- the server parses `IPE_REVIEW_MAC_KEY`.
+testKeyHex : String
+testKeyHex =
+    "5c0ffee15dec1dedba5eba11c0de0f0a11c0ffee5ca1ab1e0ddba11fee1900d1"
+
+
+testMacKey : Task.Task Error ReviewKey.MacKey
+testMacKey =
+    Task.fromResult (ReviewKey.parseMacKey testKeyHex)
+
+
+testReviewKey : Task.Task Error ReviewKey
+testReviewKey =
+    Task.map Signing testMacKey
+
+
+-- The verifier of a server holding the test key over an intact chain: the
+-- one under which a signed row counts.
+countingVerifier : Task.Task Error LibDb.Verifier
+countingVerifier =
+    testReviewKey |> Task.map (\key -> LibDb.verifier key (Index.Signed Index.Intact))
+
+
+-- One review-log row as a test writes it, column by column.
+type alias RawRow =
+    { uid : Uid
+    , bodyHash : String
+    , decision : String
+    , reason : Maybe String
+    , reviewedAt : Int
+    }
+
+
+rawRow : String -> String -> String -> Maybe String -> RawRow
+rawRow label bodyHash decision reason =
+    { uid = uid label, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = 0 }
+
+
+-- The head row read as raw columns.
+type alias RawHead =
+    { logId : String
+    , seq : Int
+    , head : String
+    }
+
+
+rawHead : Db -> Task.Task Error RawHead
+rawHead db =
+    Db.queryDecode db
+        "SELECT log_id, seq, head FROM review_log_head WHERE one = 1"
+        []
+        (Db.Decode.succeed (\logId seq head -> { logId = logId, seq = seq, head = head })
+            |> Db.Decode.required "log_id" (Db.Decode.string "log_id")
+            |> Db.Decode.required "seq" (Db.Decode.int "seq")
+            |> Db.Decode.required "head" (Db.Decode.string "head")
+        )
+        |> Task.andThen (singleRow "review_log_head")
+
+
+-- Appends `row` as the log's next entry, signed under the test key and
+-- linked to the head, and moves the head to it: the entry a decision this
+-- tool records leaves, written by raw SQL with the row's mac input spelled
+-- out here rather than taken from the tool.
+appendSigned : Db -> RawRow -> Task.Task Error Int
+appendSigned db row =
+    rawHead db |> Task.andThen (\head -> appendSignedAt db head.logId head row)
+
+
+-- `appendSigned` with the mac computed for the log `logId` instead of the
+-- database's own: a row copied from another log signed by the same key.
+appendSignedAs : Db -> String -> RawRow -> Task.Task Error Int
+appendSignedAs db logId row =
+    rawHead db |> Task.andThen (\head -> appendSignedAt db logId head row)
+
+
+appendSignedAt : Db -> String -> RawHead -> RawRow -> Task.Task Error Int
+appendSignedAt db logId head row =
+    let
+        seq =
+            head.seq + 1
+
+        mac =
+            rawMac (rawMacInput logId seq head.head row)
+    in
+    do
+        Db.exec db
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            [ SqlInt seq, Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac ]
+        Db.exec db "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1" [ SqlInt seq, SqlString mac ]
+
+
+rawReason : Maybe String -> SqlValue
+rawReason reason =
+    case reason of
+        Just r ->
+            SqlString r
+
+        Nothing ->
+            SqlNull (SqlString "")
+
+
+-- The review-row mac input of the log format, spelled independently of the
+-- tool: each field length-prefixed in order, the reason marked present or
+-- absent.
+rawMacInput : String -> Int -> String -> RawRow -> String
+rawMacInput logId seq prev row =
+    let
+        reasonPart =
+            case row.reason of
+                Just r ->
+                    "+" ++ r
+
+                Nothing ->
+                    "-"
+    in
+    [ "ipe-code-review/review-row/v1", logId, String.fromInt seq, prev, Uid.toString row.uid, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ]
+        |> List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part)
+        |> String.concat
+
+
+-- The HMAC-SHA-256 of `input` under the test key, as lowercase hex; empty,
+-- which the log's mac check refuses, if the key text were no key.
+rawMac : String -> String
+rawMac input =
+    case Crypto.keyFromString testKeyHex of
+        Just key ->
+            Crypto.macToHex (Crypto.hmacSha256 key input)
+
+        Nothing ->
+            ""
+
+
+-- An edit an attacker with write access to the review database makes:
+-- the log's append-only triggers dropped, then `sql` run.
+tamperLog : Db -> String -> List SqlValue -> Task.Task Error Int
+tamperLog db sql params =
+    do
+        Db.exec db "DROP TRIGGER IF EXISTS review_log_no_update" []
+        Db.exec db "DROP TRIGGER IF EXISTS review_log_no_delete" []
+        Db.exec db sql params
 
 
 isUnitA : PageEntry -> Bool

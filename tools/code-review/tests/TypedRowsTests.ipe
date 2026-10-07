@@ -7,13 +7,13 @@ import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Lib.Db as LibDb exposing (HistoryCursor(..), StoredDecision(..))
+import Lib.Db as LibDb exposing (HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (UnitPageState(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (check, codeText, freshDir, uid)
+import TestSupport exposing (appendSigned, check, codeText, countingVerifier, freshDir, rawRow, uid)
 
 
 -- ── unit ids ────────────────────────────────────────────────────────────
@@ -229,8 +229,9 @@ resyncBoundRefusesZeroCeiling =
 -- ── stored review rows ──────────────────────────────────────────────────
 --
 -- A review table built without the decision check, as an older or edited
--- file may be, holding `rows`. The table has no guards, so
--- only the reads run against it.
+-- file may be, holding `rows`, beside an empty review log likewise built
+-- without its checks. Neither has guards, so only the reads, and the test's
+-- own signed appends, run against them.
 uncheckedReview : String -> List (List SqlValue) -> Task.Task Error Db
 uncheckedReview name rows =
     do
@@ -238,6 +239,9 @@ uncheckedReview name rows =
         db <- Db.open "sqlite" ("sqlite://" ++ base ++ "/review.db?mode=rwc")
         Db.exec db "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" []
         Task.sequence (List.map (Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)") rows)
+        Db.exec db "CREATE TABLE review_log (seq INTEGER PRIMARY KEY, uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, prev TEXT NOT NULL, mac TEXT NOT NULL)" []
+        Db.exec db "CREATE TABLE review_log_head (one INTEGER PRIMARY KEY, log_id TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL)" []
+        Db.exec db "INSERT INTO review_log_head (one, log_id, seq, head) VALUES (1, '00112233445566778899aabbccddeeff', 0, 'genesis')" []
         Task.succeed db
 
 
@@ -257,31 +261,65 @@ failsWithout stored task =
         |> Task.onError (\e -> Task.succeed (not (String.contains stored (Error.toString e))))
 
 
--- A stored decision that is neither `approve` nor `refuse` fails every read
--- of its row with a typed error naming the row's uid, never reading as an
--- approval; a stored uid that is not a unit id fails the History page. Neither
--- error repeats the stored text.
+-- A legacy decision that is neither `approve` nor `refuse` fails every read
+-- of its row with a typed error naming the row's uid; a legacy uid that is
+-- not a unit id fails the History page. Neither error repeats the stored
+-- text. A signed log entry holding such a decision is never counted: it
+-- reads `Tampered`, and the uid has no previous review.
 -- Red if an unknown decision reads as any decision.
 unknownStoredDecisionRefused : Task.Task Error Bool
 unknownStoredDecisionRefused =
     do
+        verify <- countingVerifier
         db <- uncheckedReview "ipe-review-unknown-decision" [ [ Uid.toSql (uid "u-m"), SqlString "h", SqlString "maybe", SqlNull (SqlString ""), SqlInt 1 ] ]
-        byPair <- failsNaming (uid "u-m") "maybe" (LibDb.findDecision db (uid "u-m") "h")
-        byUid <- failsNaming (uid "u-m") "maybe" (LibDb.findLatestForUid db (uid "u-m"))
-        page <- failsNaming (uid "u-m") "maybe" (LibDb.historyPage db PageSize.history HistoryStart)
+        byPair <- failsNaming (uid "u-m") "maybe" (LibDb.findDecision verify db (uid "u-m") "h")
+        page <- failsNaming (uid "u-m") "maybe" (LibDb.historyPage verify db PageSize.history HistoryStart)
         bad <- uncheckedReview "ipe-review-bad-uid" [ [ SqlString "zz", SqlString "h", SqlString "approve", SqlNull (SqlString ""), SqlInt 1 ] ]
-        badUid <- failsWithout "zz" (LibDb.historyPage bad PageSize.history HistoryStart)
-        Task.succeed (byPair && byUid && page && badUid)
+        badUid <- failsWithout "zz" (LibDb.historyPage verify bad PageSize.history HistoryStart)
+        logged <- uncheckedReview "ipe-review-unknown-logged" []
+        appendSigned logged (rawRow "u-l" "h" "maybe" Nothing)
+        loggedPair <- LibDb.findDecision verify logged (uid "u-l") "h"
+        loggedUid <- LibDb.findLatestForUid verify logged (uid "u-l")
+        Task.succeed (byPair && page && badUid && isTampered loggedPair && loggedUid == Nothing)
 
 
--- A stored refusal with a NULL reason reads as a refusal whose reason is
--- blank, never as an approval. Red if a NULL reason drops the refusal.
+isTampered : Maybe ReviewEntry -> Bool
+isTampered found =
+    case found of
+        Just (Unverified row) ->
+            row.why == Tampered
+
+        Just (Verified _) ->
+            False
+
+        Nothing ->
+            False
+
+
+-- A signed refusal with a NULL reason, which the log's check refuses but an
+-- unchecked log holds, reads as a refusal whose reason is blank, never as
+-- an approval. Red if a NULL reason drops the refusal.
 refuseWithNullReasonIsBlank : Task.Task Error Bool
 refuseWithNullReasonIsBlank =
     do
-        db <- uncheckedReview "ipe-review-null-reason" [ [ Uid.toSql (uid "u-n"), SqlString "h", SqlString "refuse", SqlNull (SqlString ""), SqlInt 1 ] ]
-        found <- LibDb.findDecision db (uid "u-n") "h"
-        Task.succeed (Maybe.map (\row -> blankRefusal row.decision) found == Just True)
+        db <- uncheckedReview "ipe-review-null-reason" []
+        appendSigned db (rawRow "u-n" "h" "refuse" Nothing)
+        verify <- countingVerifier
+        found <- LibDb.findDecision verify db (uid "u-n") "h"
+        Task.succeed (isBlankRefusal found)
+
+
+isBlankRefusal : Maybe ReviewEntry -> Bool
+isBlankRefusal found =
+    case found of
+        Just (Verified row) ->
+            blankRefusal (LibDb.verifiedDecision row)
+
+        Just (Unverified _) ->
+            False
+
+        Nothing ->
+            False
 
 
 blankRefusal : StoredDecision -> Bool
