@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use ipe_canon::{ModuleCatalog, ModuleExports, ModuleOrigin, canonicalise_module_in_project};
-use ipe_diagnostics::{Diagnostic, NameError};
+use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
 use ipe_intern::{Interner, Symbol};
 
 const UTIL: &str = "module Lib.Util exposing (..)\n\nf : Int -> Int\nf n =\n    n\n";
@@ -133,47 +133,69 @@ fn imported_qualifier_still_suggested() {
     assert!(names.contains(&"Util"), "{names:?}");
 }
 
-/// The applicable edit and names of an unknown-module diagnostic.
-const fn unknown_module_candidates(diag: &Diagnostic) -> Option<&ipe_diagnostics::Candidates> {
+/// The module and alias an IPE-N0034 names as already imported, or `None`.
+fn imported_as(diag: &Diagnostic) -> Option<(&str, &str)> {
     match diag {
         Diagnostic::Name {
-            msg: NameError::UnknownModule { suggestions, .. },
+            msg:
+                NameError::ImportRequired {
+                    imported_as: Some(imported),
+                    ..
+                },
             ..
-        } => Some(suggestions),
+        } => Some((&*imported.module, &*imported.alias)),
         _ => None,
     }
 }
 
-/// A module imported under an alias is not missing its import: spelling its
-/// own name points at the alias, with the edit overwriting only the qualifier.
+/// The qualifier an IPE-N0034 reports as reached, or `None`.
+fn reached_qualifier(diag: &Diagnostic) -> Option<&str> {
+    match diag {
+        Diagnostic::Name {
+            msg:
+                NameError::ImportRequired {
+                    reached: StdlibReach::Qualifier(qualifier),
+                    ..
+                },
+            ..
+        } => Some(qualifier),
+        _ => None,
+    }
+}
+
+/// A module imported under an alias is reachable only under that alias:
+/// spelling its own name is IPE-N0034 naming the alias to write.
 #[test]
-fn aliased_module_spelled_by_name_points_at_the_alias() {
+fn aliased_module_spelled_by_name_names_the_alias() {
     let src =
         "module Main exposing (main)\n\nimport Lib.Util as U\n\nmain : Int\nmain =\n    Util.f 1\n";
     let diag = last_error(&[UTIL, src], &["Main", "Lib.Util"]);
-    assert_eq!(diag.code().as_str(), "IPE-N0004", "{diag:?}");
-    let candidates =
-        unknown_module_candidates(&diag).expect("expected an unknown-module diagnostic");
-    assert_eq!(&*candidates.names, &[Box::<str>::from("U")], "{diag:?}");
-    let lo = u32::try_from(src.find("Util.f").unwrap_or(0)).unwrap_or(0);
-    let token = ipe_diagnostics::Span::new(lo, lo.saturating_add(6));
-    assert_eq!(
-        candidates.region,
-        ipe_diagnostics::EditTarget::prefix(token, "Util"),
-        "{diag:?}"
-    );
-    assert!(candidates.region.is_some(), "{diag:?}");
+    assert_eq!(diag.code().as_str(), "IPE-N0034", "{diag:?}");
+    assert_eq!(reached_qualifier(&diag), Some("Util"), "{diag:?}");
+    assert_eq!(imported_as(&diag), Some(("Lib.Util", "U")), "{diag:?}");
+    assert_eq!(import_candidates(&diag), Some(vec!["Lib.Util"]), "{diag:?}");
 }
 
 /// The same holds for a gated kernel module imported under an alias.
 #[test]
-fn aliased_kernel_module_spelled_by_name_points_at_the_alias() {
+fn aliased_kernel_module_spelled_by_name_names_the_alias() {
     let src = "module Main exposing (main)\n\nimport Ipe.Crypto as C\n\nmain =\n    Crypto.sha256 \"x\"\n";
     let diag = last_error(&[src], &["Main"]);
-    assert_eq!(diag.code().as_str(), "IPE-N0004", "{diag:?}");
+    assert_eq!(diag.code().as_str(), "IPE-N0034", "{diag:?}");
+    assert_eq!(reached_qualifier(&diag), Some("Crypto"), "{diag:?}");
+    assert_eq!(imported_as(&diag), Some(("Ipe.Crypto", "C")), "{diag:?}");
+}
+
+/// A bare use with no import of the module names no alias.
+#[test]
+fn unimported_module_names_no_alias() {
+    let src = "module Main exposing (main)\n\nmain =\n    Crypto.sha256 \"x\"\n";
+    let diag = last_error(&[src], &["Main"]);
+    assert_eq!(diag.code().as_str(), "IPE-N0034", "{diag:?}");
+    assert_eq!(imported_as(&diag), None, "{diag:?}");
     assert_eq!(
-        unknown_module_suggestions(&diag),
-        Some(vec!["C"]),
+        import_candidates(&diag),
+        Some(vec!["Ipe.Crypto"]),
         "{diag:?}"
     );
 }

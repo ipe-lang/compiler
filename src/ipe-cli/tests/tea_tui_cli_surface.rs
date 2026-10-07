@@ -346,14 +346,17 @@ fn cli_sub_in_tui_app_is_rejected() -> Result<(), BoxError> {
 
 /// The shared `Ipe.Tea.Terminal.Sub` carries no input subscription.
 ///
-/// Naming `onKey` through it is an unknown member.
+/// Naming `onKey` through it under its own alias is an unknown member. Under
+/// the bare `Sub` spelling it merges into the shape's own `Sub`, which does
+/// carry `onKey`.
 #[test]
 fn terminal_sub_has_no_input_subscription() -> Result<(), BoxError> {
     let src = variant(
         TUI_APP,
         "import Ipe.Tea.Tui.Sub",
-        "import Ipe.Tea.Terminal.Sub",
+        "import Ipe.Tea.Tui.Sub\nimport Ipe.Tea.Terminal.Sub as TermSub",
     )?;
+    let src = variant(&src, "Sub.onKey onKey", "TermSub.onKey onKey")?;
     assert_rejected_code("terminal_sub_on_key", &src, "IPE-N0005")
 }
 

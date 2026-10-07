@@ -6,8 +6,9 @@ use std::rc::Rc;
 
 use ipe_diagnostics::{
     AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
-    DResult, Diagnostic, EditTarget, Located, ModulePlacementReason, ModulePlacementRejection,
-    NameError, ParseError, SealRejection, SortedNames, Span, TypeError,
+    DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
+    ModulePlacementRejection, NameError, ParseError, SealRejection, SortedNames, Span, StdlibReach,
+    TypeError,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
@@ -15,7 +16,10 @@ use ipe_syntax as src;
 use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
-use crate::env::{CtorHome, CtorIdentity, Env, VarHome};
+use crate::env::{
+    AbsentQualifier, ClaimForm, CmdOrSub, CtorHome, CtorIdentity, Env, ImportAliases,
+    ModuleIdentity, QualifierClaim, TeaShape, VarHome,
+};
 use crate::scope::{
     AliasBody, Clash, ExprTarget, Identity, ModuleScope, Origin, Resolved, Tier,
     TypeTarget as ScopeType, ValueIdentity,
@@ -415,6 +419,24 @@ struct TypeCtx<'a> {
     ann_span: Span,
 }
 
+/// The aliases each imported module is written under, keyed by its dotted
+/// path: the one table IPE-N0034 reads to name an alias to use.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if an alias symbol is not interned.
+fn import_alias_table(imports: &[src::Import], interner: &Interner) -> DResult<ImportAliases> {
+    let mut table: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
+    for import in imports {
+        if let Some(alias) = import.alias {
+            table
+                .entry(path_to_dot_string(interner, &import.name.value))
+                .or_default()
+                .insert(name_str(interner, alias)?);
+        }
+    }
+    Ok(Rc::new(table))
+}
+
 /// Canonicalise a parsed module into its name-resolved form.
 ///
 /// # Errors
@@ -429,6 +451,7 @@ struct TypeCtx<'a> {
 pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::Module> {
     let home = m.name.value.clone();
     let mut env = Env::initial(home, interner)?;
+    env.import_aliases = import_alias_table(&m.imports, interner)?;
     // Register `import Ipê.… as Alias` / `import Ipe.… as Alias` qualifiers.
     // The single-module path does no dep injection, but stdlib qualifier
     // aliases must still resolve (`import Ipe.Json.Encode as Encode` →
@@ -444,7 +467,7 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     // its `["Html"]` type home folded so a qualified `Attr.Attribute` lowers to
     // `html::Attribute`.
     let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    fold_html_stdlib_qualifier_homes(&m.imports, &mut qualifier_paths, interner)?;
+    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
     // The bare single-module entry is always ordinary USER source: the trust tag
     // can only be raised via `canonicalise_module_with_origin`.
     // The single-module entry does not build a `ModuleExports`, so the kernel-
@@ -601,16 +624,7 @@ pub fn canonicalise_module_in_project(
     let mut env = Env::initial(home.clone(), interner)?;
     env.origin = origin;
     env.module_catalog = catalog.clone();
-    let mut import_aliases: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
-    for import in &m.imports {
-        if let Some(alias) = import.alias {
-            import_aliases
-                .entry(path_to_dot_string(interner, &import.name.value))
-                .or_default()
-                .insert(name_str(interner, alias)?);
-        }
-    }
-    env.import_aliases = Rc::new(import_aliases);
+    env.import_aliases = import_alias_table(&m.imports, interner)?;
     // Fail closed at the boundary on an `Ipe.*` import that names neither a
     // kernel stdlib module nor a compiled-source dep (a typo such as
     // `Ipe.Strng`), before alias registration and the dep loop silently skip it.
@@ -727,75 +741,27 @@ pub fn canonicalise_module_in_project(
         }
     }
 
-    // Build qualifier → dep-path map so `TType(qualifier, …)` annotations in
-    // type sigs resolve `home` from the dep path, not from the bare type
-    // namespace.  Example: `import Counter` with no `exposing` clause
-    // binds no bare type, so without this map `Counter.Msg`
-    // would look up "Msg" and find the LOCAL `type Msg` instead of Counter's.
-    //
-    // Qualifier = explicit `as Alias` if present, else last segment of the
-    // module path — mirrors `inject_dep_exports`'s `env.qual_vars` logic.
-    let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    // Each qualifier's first-seen import span, so a clash (below) points back
-    // to it like `DuplicateValue`/`DuplicateType`'s `first` field.
-    let mut qualifier_first_span: BTreeMap<Symbol, Span> = BTreeMap::new();
-    for import in &m.imports {
-        let dep_path = &import.name.value;
-        // Skip stdlib kernel imports (not in `deps`).
-        if dep_path.first().copied().is_some_and(|s| s == ipe_sym) && !deps.contains_key(dep_path) {
+    // The type home and dependency aliases of each qualifier, read from the
+    // owner `Env::install_import` decided for it, so a qualified type reaches
+    // exactly the module its qualified values reach.
+    let mut qualifier_paths = source_qualifier_homes(&env);
+    for (&qualifier, path) in &qualifier_paths {
+        let Some(dep) = deps.get(path) else {
             continue;
-        }
-        // Qualifiers this import is reachable under (see `import_qualifiers`).
-        let reachable_qualifiers = import_qualifiers(import.alias, dep_path, interner)?;
-        for qualifier in reachable_qualifiers {
-            // `import App.Utils` + `import Lib.Utils` (both default to the
-            // qualifier `Utils`), or one `as` alias over two distinct dep
-            // modules, is a clash: a qualified `Utils.format` would otherwise
-            // name whichever import came last. Re-importing the SAME dep module
-            // under the same qualifier (a diamond dependency) is a no-op,
-            // matching the module scope's rule for one definition bound twice.
-            if let Some(existing_path) = qualifier_paths.get(&qualifier) {
-                if existing_path != dep_path {
-                    let qualifier_s = name_str(interner, qualifier)?;
-                    let first = qualifier_first_span
-                        .get(&qualifier)
-                        .copied()
-                        .unwrap_or(import.name.span);
-                    return Err(Diagnostic::Name {
-                        span: import.name.span,
-                        msg: NameError::DuplicateQualifier {
-                            qualifier: qualifier_s,
-                            first,
-                        },
-                    });
-                }
-                continue;
-            }
-            qualifier_paths.insert(qualifier, dep_path.clone());
-            qualifier_first_span.insert(qualifier, import.name.span);
-
-            // Register every exported alias of the dep under a synthetic
-            // `Qualifier.Name` key so a QUALIFIED annotation (`Money.Price`)
-            // expands the alias exactly as an `exposing`-injected one would —
-            // qualified access needs no exposure, and the qualified key can never
-            // collide with a bare local name (bare symbols carry no dot).
-            if let Some(dep) = deps.get(dep_path) {
-                let qualifier_s = name_str(interner, qualifier)?;
-                for (&alias_name, ea) in &dep.aliases {
-                    let alias_s = name_str(interner, alias_name)?;
-                    let key = interner.intern(&format!("{qualifier_s}.{alias_s}"))?;
-                    qualified_aliases.entry(key).or_insert_with(|| ea.clone());
-                }
-            }
+        };
+        // Every exported alias of the dep registers under a synthetic
+        // `Qualifier.Name` key so a qualified annotation (`Money.Price`)
+        // expands the alias exactly as an `exposing`-injected one would; the
+        // qualified key never collides with a bare local name (bare symbols
+        // carry no dot).
+        let qualifier_s = name_str(interner, qualifier)?;
+        for (&alias_name, ea) in &dep.aliases {
+            let alias_s = name_str(interner, alias_name)?;
+            let key = interner.intern(&format!("{qualifier_s}.{alias_s}"))?;
+            qualified_aliases.entry(key).or_insert_with(|| ea.clone());
         }
     }
-
-    // Fold Html-family STDLIB import qualifiers into `qualifier_paths` (→
-    // `["Html"]`) so a qualified `Attr.Attribute` (`import Ipe.Html.Attributes as
-    // Attr`) resolves to the `html::Attribute` home. Runs AFTER the
-    // user-dep loop so a user qualifier that also names a Html dep keeps its real
-    // dep path (`entry(..).or_insert` inside the helper is a no-op on a hit).
-    fold_html_stdlib_qualifier_homes(&m.imports, &mut qualifier_paths, interner)?;
+    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
 
     let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
         m,
@@ -1820,148 +1786,184 @@ fn reject_unknown_ipe_import_with_candidates(
     Ok(())
 }
 
-/// Register user import aliases for stdlib (`Ipê.*` / `Ipe.*`) modules.
+/// Install the qualifiers every stdlib kernel-module import brings into scope.
 ///
-/// For every stdlib import, resolve its full path to the canonical qualifier
-/// (via [`Env::canonical_stdlib_qualifier`]) and register the user's *effective*
-/// qualifier — the explicit `as Alias`, else the Elm last-segment default —
-/// against the canonical qualifier's kernel members. This is what makes
-/// `import Ipe.Json.Encode as Encode` register `Encode` → the `JsonEnc`
-/// members, and `import Ipe.Ui as U` register `U` → the `Ui` members.
+/// Each `Ipe.*` import naming a kernel module installs that module's pooled
+/// members through [`Env::install_import`], under exactly the spellings the
+/// import writes (Elm-exact):
 ///
-/// Idempotent when the effective qualifier already equals the canonical name
-/// (the common `import Ipe.Log as Log` case — `Log` is already registered).
+/// * `import Ipe.X as A` installs `A` only. An alias naming a DIFFERENT
+///   kernel module's canonical qualifier is refused, since it would hand that
+///   module's spelling to another module's members.
+/// * A bare `import Ipe.X` installs the canonical qualifier, the last segment
+///   when [`crate::env::kernel_import_binds_last_segment`] allows it, and the
+///   exact dotted path when it is a
+///   [`crate::env::DOTTED_QUALIFIER_SPELLINGS`] row.
+/// * A shape module import (any form) also installs `Cmd` and `Sub` with that
+///   shape's own members, and records the shape.
 ///
-/// A path that names no known stdlib module is left unregistered (fail-closed,
-/// per [`Env::canonical_stdlib_qualifier`]): any later `Alias.member` reference
-/// surfaces the ordinary `UnknownModule` diagnostic at its use site rather than
-/// resolving against an invented qualifier. This preserves the pre-existing
-/// behaviour for as-yet-unported stdlib modules (e.g. `Ipe.Css`).
+/// A path naming no kernel module installs nothing (fail-closed): a later
+/// `Alias.member` reference surfaces its diagnostic at the use site.
 ///
 /// # Errors
-/// [`Diagnostic::CompilerBug`] if interning `Ipe` or a canonical name
-/// exhausts the interner.
+/// [`NameError::DuplicateQualifier`] (IPE-N0027) for two explicit spellings
+/// of different modules or an alias onto a foreign canonical;
+/// [`NameError::TwoShapeImports`] / [`NameError::WrongShapeCmdSub`]
+/// (IPE-N0035) for a second shape or a `Cmd` / `Sub` module the shape does not
+/// admit; [`Diagnostic::CompilerBug`] if interning exhausts the interner.
 fn register_stdlib_import_aliases(
     imports: &[src::Import],
     env: &mut Env,
     interner: &mut Interner,
 ) -> DResult<()> {
     let ipe_sym = interner.intern("Ipe")?;
-    // Which canonical qualifier each EXPLICIT `as Alias` was registered against,
-    // plus the span of the import that first claimed it. Two stdlib imports
-    // aliased to one name (`… as J` twice) would otherwise extend-merge member
-    // tables last-wins with no diagnostic; this rejects the second with the same
-    // DuplicateQualifier the user-dep path raises. Bare imports are absent — a
-    // bare import is spoken under its CANONICAL qualifier, so two bare imports
-    // that merely share a last path segment (`Ipe.Json.Decode` + `Ipe.Db.Decode`,
-    // both segment `Decode`) do not collide and stay legitimate.
-    let mut explicit_alias_canonical: BTreeMap<Symbol, (Symbol, Span)> = BTreeMap::new();
+    let shape = record_import_shape(imports, env, interner)?;
     for import in imports {
         let dep_path = &import.name.value;
         // Only `Ipe.*` imports name compiler stdlib modules.
         if dep_path.first().copied().is_none_or(|s| s != ipe_sym) {
             continue;
         }
-        let Some(canonical) = env.canonical_stdlib_qualifier(dep_path, interner)? else {
-            // Unknown stdlib path: register nothing (fail-closed).
+        let Some(module) = env.kernel_module(dep_path, interner)? else {
             continue;
         };
-        // Elm convention: an explicit `as Alias` names the qualifier, otherwise
-        // the module is exposed under the LAST path segment.
-        let alias = import
-            .alias
-            .unwrap_or_else(|| dep_path.last().copied().unwrap_or_else(name_zero));
-        if let Some(explicit) = import.alias {
-            // Reject an explicit alias already claimed by a prior explicit alias
-            // for a DIFFERENT module (`import … as J` twice), or one that names a
-            // DIFFERENT stdlib module's canonical qualifier
-            // (`import Ipe.Json.Encode as Crypto`). Either way a silent
-            // extend-merge would resolve `Alias.member` last-wins across modules
-            // with no diagnostic, and aliasing onto a gated canonical would also
-            // unlock that canonical's must-import gate. Re-aliasing the same
-            // module under the same name stays a no-op.
-            if let Some(&(prev_canonical, first)) = explicit_alias_canonical.get(&explicit) {
-                if prev_canonical != canonical {
-                    return Err(Diagnostic::Name {
-                        span: import.name.span,
-                        msg: NameError::DuplicateQualifier {
-                            qualifier: name_str(interner, explicit)?,
-                            first,
-                        },
-                    });
-                }
-            } else if explicit != canonical
-                && crate::env::is_stdlib_canonical_qualifier(interner, explicit)
-            {
+        let span = import.name.span;
+        let canonical = module.symbol();
+        let canonical_s = name_str(interner, canonical)?;
+        if let Some((segment, family)) = crate::env::cmd_sub_module(&canonical_s)
+            && let Some((shape, _)) = shape
+            && !shape.admits_cmd_sub_of(segment)
+        {
+            return Err(wrong_shape_cmd_sub(span, segment, family, shape.surface()));
+        }
+        if let Some(alias) = import.alias {
+            if alias != canonical && crate::env::is_stdlib_canonical_qualifier(interner, alias) {
                 return Err(Diagnostic::Name {
-                    span: import.name.span,
+                    span,
                     msg: NameError::DuplicateQualifier {
-                        qualifier: name_str(interner, explicit)?,
-                        first: import.name.span,
+                        qualifier: name_str(interner, alias)?,
+                        first: span,
                     },
                 });
             }
-            explicit_alias_canonical.insert(explicit, (canonical, import.name.span));
+            env.install_kernel_import(module, ClaimForm::Alias, alias, span, interner)?;
+        } else {
+            env.install_kernel_import(module, ClaimForm::Path, canonical, span, interner)?;
+            if let Some(&last) = dep_path.last()
+                && last != canonical
+                && crate::env::kernel_import_binds_last_segment(
+                    &name_str(interner, last)?,
+                    &canonical_s,
+                )
+            {
+                env.install_kernel_import(module, ClaimForm::LastSegment, last, span, interner)?;
+            }
+            let dotted = path_to_dot_string(interner, dep_path);
+            let segments: Vec<&str> = dotted.split('.').collect();
+            if crate::env::is_dotted_qualifier_spelling(&segments) {
+                let spelling = interner.intern(&dotted)?;
+                env.install_kernel_import(module, ClaimForm::Path, spelling, span, interner)?;
+            }
         }
-        // Tier-C import gate (ADR 0001): this `import Ipe.X [as Alias]` brings the
-        // qualifier into scope under the name the user will type. Mark that name
-        // (the alias, or — via the fall-through below — the canonical) so a later
-        // `Alias.member` / `X.member` resolves instead of raising N0034. An
-        // explicit alias that collides with a gated canonical was rejected above,
-        // so marking an explicit alias here can never unlock an unrelated gate.
-        //
-        // A BARE import exposes the module under its last path segment. When that
-        // segment equals a DIFFERENT module's gated canonical qualifier
-        // (`import Ipe.Http.Stream` → segment `Stream` = server `Stream`'s
-        // canonical; `import Ipe.Server.Http` → segment `Http` = client `Http`'s
-        // canonical), marking it would unlock the foreign module's privileged
-        // kernels with no import of that module — a capability smuggle. Fail
-        // closed: skip the mark for that foreign-canonical case. The member-clone
-        // below still runs, so the bare import's own members resolve, and its
-        // canonical is still marked via the `import.alias.is_none()` branch.
-        // The same predicate decides which modules an IPE-N0034 lists for an
-        // unimported qualifier (`crate::env::bare_import_binds`).
-        let alias_is_foreign_gated_canonical = import.alias.is_none()
-            && !crate::env::kernel_import_binds_last_segment(
-                &name_str(interner, alias)?,
-                &name_str(interner, canonical)?,
-            );
-        if !alias_is_foreign_gated_canonical {
-            env.mark_stdlib_qualifier_imported(alias);
-        }
-        // A bare `import Ipe.X.Y` (no explicit `as`) also names the module under
-        // its CANONICAL qualifier — for a dotted-canonical module such as
-        // `Ipe.Db.Decode` (canonical `Db.Decode`) that is the multi-segment form
-        // the parser produces from `Db.Decode.member`, which no `as` alias can
-        // spell. Marking the canonical too keeps `X.Y.member` resolving without an
-        // alias. An explicit `as Alias` names a single qualifier on purpose, so it
-        // does not pull the canonical into scope.
-        if import.alias.is_none() {
-            env.mark_stdlib_qualifier_imported(canonical);
-        }
-        if alias == canonical {
-            // Already registered under its canonical name — nothing to clone.
-            continue;
-        }
-        // Clone the canonical qualifier's members under the alias key. The cloned
-        // `VarHome::Kernel` entries carry the CANONICAL module + name symbols, so
-        // a later `Alias.member` resolves to the same `VarKernel` a canonical
-        // reference would (the lowerer's kernel match arms are unaffected).
-        if let Some(members) = env.qual_vars.get(&canonical).cloned() {
-            std::rc::Rc::make_mut(&mut env.qual_vars)
-                .entry(alias)
-                .or_default()
-                .extend(members);
+        if let Some(shape) = TeaShape::from_canonical(&canonical_s) {
+            install_shape_cmd_sub(shape, span, env, interner)?;
         }
     }
     Ok(())
 }
 
+/// Install `Cmd` and `Sub` with the members of `shape`'s own modules.
+///
+/// # Errors
+/// As [`Env::install_import`].
+fn install_shape_cmd_sub(
+    shape: TeaShape,
+    span: Span,
+    env: &mut Env,
+    interner: &mut Interner,
+) -> DResult<()> {
+    for family in CmdOrSub::ALL {
+        let Some(module_name) = shape.cmd_sub(family) else {
+            continue;
+        };
+        let module_sym = interner.intern(module_name)?;
+        let Some(module) = env.kernel_module_of(module_sym) else {
+            continue;
+        };
+        let spelling = interner.intern(family.qualifier())?;
+        env.install_kernel_import(module, ClaimForm::Path, spelling, span, interner)?;
+    }
+    Ok(())
+}
+
+/// Record the one TEA shape module this module imports.
+///
+/// The shape is read from the module identity each import reaches, never
+/// from the import's spelling.
+///
+/// # Errors
+/// [`NameError::TwoShapeImports`] (IPE-N0035) at the first import of a
+/// second, different shape; [`Diagnostic::CompilerBug`] if interning exhausts
+/// the interner.
+fn record_import_shape(
+    imports: &[src::Import],
+    env: &mut Env,
+    interner: &mut Interner,
+) -> DResult<Option<(TeaShape, Span)>> {
+    let mut found: Option<(TeaShape, Span)> = None;
+    for import in imports {
+        let Some(module) = env.kernel_module(&import.name.value, interner)? else {
+            continue;
+        };
+        let Some(shape) = interner
+            .resolve(module.symbol())
+            .and_then(TeaShape::from_canonical)
+        else {
+            continue;
+        };
+        match found {
+            None => found = Some((shape, import.name.span)),
+            Some((first_shape, first)) if first_shape != shape => {
+                return Err(Diagnostic::Name {
+                    span: import.name.span,
+                    msg: NameError::TwoShapeImports {
+                        first_module: format!("Ipe.Tea.{}", first_shape.canonical())
+                            .into_boxed_str(),
+                        second_module: format!("Ipe.Tea.{}", shape.canonical()).into_boxed_str(),
+                        first,
+                    },
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some((shape, span)) = found {
+        env.set_cmd_sub_shape(shape, span);
+    }
+    Ok(found)
+}
+
+/// IPE-N0035 for an `Ipe.Tea.<segment>.{Cmd,Sub}` import an `app` surface does
+/// not admit.
+fn wrong_shape_cmd_sub(span: Span, segment: &str, family: CmdOrSub, app: AppSurface) -> Diagnostic {
+    let leaf = family.qualifier();
+    let app_name = app.name();
+    Diagnostic::Name {
+        span,
+        msg: NameError::WrongShapeCmdSub(Box::new(CmdSubShapeMismatch {
+            imported: format!("Ipe.Tea.{segment}.{leaf}").into_boxed_str(),
+            imported_shape: segment.into(),
+            app_shape: app_name.into(),
+            expected: format!("Ipe.Tea.{app_name}.{leaf}").into_boxed_str(),
+        })),
+    }
+}
+
 /// Bind the bare names a stdlib kernel-module import brings into scope.
 ///
 /// A kernel module (`Ipe.List`, `Ipe.Html`, …) has no `deps` entry: its members
-/// live in the canonical qualifier's tables [`Env::qual_vars`] and
-/// [`Env::qual_ctors`], installed by [`Env::initial`]. This is the kernel
+/// live in the kernel pools [`Env::kernel_members`] and [`Env::kernel_ctors`],
+/// filled by [`Env::initial`]. This is the kernel
 /// counterpart of [`inject_dep_exports`] and binds at the same tiers:
 ///
 /// * `exposing (..)` binds every value member at [`Tier::Open`].
@@ -1995,14 +1997,11 @@ fn bind_stdlib_kernel_import(
     if dep_path.first().copied().is_none_or(|s| s != ipe_sym) {
         return Ok(());
     }
-    let Some(canonical) = env.canonical_stdlib_qualifier(dep_path, interner)? else {
+    let Some(module) = env.kernel_module(dep_path, interner)? else {
         return Ok(());
     };
-    let members: Vec<(Symbol, VarHome)> = env
-        .qual_vars
-        .get(&canonical)
-        .map(|members| members.iter().map(|(&n, h)| (n, h.clone())).collect())
-        .unwrap_or_default();
+    let (member_map, ctor_map) = env.kernel_module_members(module);
+    let members: Vec<(Symbol, VarHome)> = member_map.into_iter().collect();
     match &import.exposing.value {
         src::Exposing::All => {
             for (name, home) in members {
@@ -2050,17 +2049,11 @@ fn bind_stdlib_kernel_import(
                     }
                     src::Exposed::Type(type_name, privacy) => {
                         let filter = exposed_ctor_filter(privacy);
-                        let ctors: Vec<CtorHome> = env
-                            .qual_ctors
-                            .get(&canonical)
-                            .map(|ctors| {
-                                ctors
-                                    .values()
-                                    .filter(|c| c.type_name == *type_name && filter.admits(c.name))
-                                    .cloned()
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                        let ctors: Vec<CtorHome> = ctor_map
+                            .values()
+                            .filter(|c| c.type_name == *type_name && filter.admits(c.name))
+                            .cloned()
+                            .collect();
                         for ctor in ctors {
                             let name = ctor.name;
                             let origin = imported(
@@ -2486,6 +2479,7 @@ fn bind_html_type_home(
 /// [`Diagnostic::CompilerBug`] if interning `Html` exhausts the interner.
 fn fold_html_stdlib_qualifier_homes(
     imports: &[src::Import],
+    env: &Env,
     qualifier_paths: &mut BTreeMap<Symbol, Vec<Symbol>>,
     interner: &mut Interner,
 ) -> DResult<()> {
@@ -2503,6 +2497,11 @@ fn fold_html_stdlib_qualifier_homes(
         let qualifier = import
             .alias
             .unwrap_or_else(|| dep_path.last().copied().unwrap_or_else(name_zero));
+        // The spelling must denote this import's module: one another import
+        // owns, or one left ambiguous, takes no home from this import.
+        if !owned_by_import(env, qualifier, dep_path, interner)? {
+            continue;
+        }
         // Register the qualifier's REAL dep path (or the bare `["Html"]` builtin
         // home for a builtin-only module such as `Ipe.Html` that carries no
         // compiled source). The `TType` consumer force-homes the builtin
@@ -2527,6 +2526,41 @@ fn fold_html_stdlib_qualifier_homes(
         }
     }
     Ok(())
+}
+
+/// The dependency path of every spelling a source module owns in `env`'s scope.
+///
+/// Read from [`crate::env::ImportScope::qualifier_owner`], the one record of
+/// which module each spelling denotes, so a spelling a kernel import owns or
+/// one left ambiguous carries no dependency home.
+fn source_qualifier_homes(env: &Env) -> BTreeMap<Symbol, Vec<Symbol>> {
+    env.import_scope
+        .qualifier_owner
+        .iter()
+        .filter_map(|(&spelling, claim)| match &claim.owner {
+            ModuleIdentity::Source(path) => Some((spelling, path.clone())),
+            ModuleIdentity::Kernel(_) => None,
+        })
+        .collect()
+}
+
+/// Whether `spelling` is owned in `env`'s scope by the module `dep_path` names.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if interning a canonical exhausts the interner.
+fn owned_by_import(
+    env: &Env,
+    spelling: Symbol,
+    dep_path: &[Symbol],
+    interner: &mut Interner,
+) -> DResult<bool> {
+    let Some(claim) = env.import_scope.qualifier_owner.get(&spelling) else {
+        return Ok(false);
+    };
+    Ok(match &claim.owner {
+        ModuleIdentity::Source(path) => path.as_slice() == dep_path,
+        ModuleIdentity::Kernel(module) => env.kernel_module(dep_path, interner)? == Some(*module),
+    })
 }
 
 /// The canonical module, its kernel aliases, and its own aliases resolved in its scope.
@@ -4344,12 +4378,13 @@ fn bind_dep_alias(
 ///   import (IPE-N0024 for a value or constructor, IPE-N0012 for a type).
 /// * IPE-N0022 (`NameNotExposed`) when the exposing list names a value or type
 ///   the dep does not export.
-/// * Qualifier registration (`import M as Q` or auto-qualifier = last segment).
+/// * Qualifier installation through [`Env::install_import`] (`import M as Q`,
+///   or the last segment and dotted path of a bare import).
 ///
 /// # Errors
 /// [`NameError::NameNotExposed`] / [`NameError::AmbiguousImport`] /
-/// [`NameError::DuplicateType`]; or [`Diagnostic::CompilerBug`] on an
-/// unresolvable symbol.
+/// [`NameError::DuplicateType`] / [`NameError::DuplicateQualifier`]; or
+/// [`Diagnostic::CompilerBug`] on an unresolvable symbol.
 #[allow(clippy::too_many_lines)] // declarative injection table — splitting would obscure flow
 fn inject_dep_exports(
     import: &src::Import,
@@ -4467,45 +4502,45 @@ fn inject_dep_exports(
         }
     }
 
-    // Qualifiers this import is reachable under (see `import_qualifiers`).
+    // The dep's qualified members: every exported value (a Stage-4 kernel alias
+    // resolves as its kernel, so `Alias.f` routes straight to the kernel
+    // dispatch, never to a def the alias module never emits) and every
+    // constructor, regardless of the `exposing` clause — qualified access needs
+    // no exposure.
+    let mut vars: BTreeMap<Symbol, VarHome> = BTreeMap::new();
+    for &v in &dep.values {
+        let home = dep.kernel_aliases.get(&v).map_or_else(
+            || VarHome::TopLevel(dep_path.clone()),
+            |alias| VarHome::Kernel(alias.id, alias.module, alias.function),
+        );
+        vars.insert(v, home);
+    }
+    let ctors: BTreeMap<Symbol, CtorHome> = dep
+        .ctors
+        .iter()
+        .map(|(&name, home)| (name, home.clone()))
+        .collect();
+    // Install them under every spelling this import is reachable under (see
+    // `import_qualifiers`), owned by this dep's own identity: a spelling another
+    // module already owns is decided by `Env::install_import`, never merged.
+    let forms = import_qualifier_forms(import.alias.is_some(), dep_path.len());
     let reachable_qualifiers = import_qualifiers(import.alias, dep_path, interner)?;
-    for &qualifier in &reachable_qualifiers {
-        // A user dep module whose qualifier collides with a gated stdlib short-name
-        // (e.g. a project-local `import Auth` over the stdlib `Auth`) shadows the
-        // Tier-C import gate: its members now live in `qual_vars` under that
-        // qualifier, so `Qualifier.member` must resolve against the imported local
-        // module rather than raise IPE-N0034 for the un-imported stdlib module of
-        // the same name. Marking the qualifier imported makes the gate defer here.
-        env.mark_stdlib_qualifier_imported(qualifier);
-        let qual_map = std::rc::Rc::make_mut(&mut env.qual_vars)
-            .entry(qualifier)
-            .or_default();
-        for &v in &dep.values {
-            // A dep value that is a Stage-4 kernel alias resolves as its kernel, so a
-            // qualified `Alias.f` routes straight to the kernel dispatch — never a
-            // `TopLevel(dep_path)` reference to a def the alias module never emits.
-            if let Some(alias) = dep.kernel_aliases.get(&v) {
-                qual_map.insert(v, VarHome::Kernel(alias.id, alias.module, alias.function));
-            } else {
-                qual_map.insert(v, VarHome::TopLevel(dep_path.clone()));
-            }
-        }
-        // Register qualified constructors so `Alias.CtorName` resolves correctly.
-        // Needed for compiled-source ADTs (e.g. `Money.USD` from `import Ipe.Money
-        // as Money`) where constructors are not stdlib kernels and never enter
-        // `qual_vars`.  We register ALL ctors from this dep regardless of the
-        // user's `exposing (...)` clause — qualified access does not require the
-        // name to be in the exposing list (only unqualified access does).
-        if !dep.ctors.is_empty() {
-            let qual_ctor_map = std::rc::Rc::make_mut(&mut env.qual_ctors)
-                .entry(qualifier)
-                .or_default();
-            for (ctor_sym, ctor_home) in &dep.ctors {
-                qual_ctor_map
-                    .entry(*ctor_sym)
-                    .or_insert_with(|| ctor_home.clone());
-            }
-        }
+    for (&qualifier, form) in reachable_qualifiers.iter().zip(forms) {
+        let form = match form {
+            QualifierForm::Alias => ClaimForm::Alias,
+            QualifierForm::LastSegment => ClaimForm::LastSegment,
+            QualifierForm::DottedPath => ClaimForm::Path,
+        };
+        env.install_import(
+            QualifierClaim {
+                spelling: qualifier,
+                owner: ModuleIdentity::Source(dep_path.clone()),
+                form,
+                span: import.name.span,
+            },
+            (vars.clone(), ctors.clone()),
+            interner,
+        )?;
     }
 
     Ok(())
@@ -5647,7 +5682,7 @@ fn unbound_qualifier(
     let home = path_to_dot_string(interner, &env.home);
     let modules = env.module_catalog.modules_bound_by(&qualifier_s, &home);
     if !modules.is_empty() {
-        return Ok(import_required(qualifier_s, modules, span, token, env));
+        return Ok(import_required(qualifier_s, modules, span, env));
     }
     Ok(Diagnostic::Name {
         span,
@@ -5686,51 +5721,94 @@ fn gated_import_candidates(
     modules.into_iter().collect()
 }
 
-/// The verdict for `qualifier`, which a bare `import` of each of `modules`
+/// IPE-N0034 for `qualifier`, which a bare `import` of each of `modules`
 /// (non-empty, sorted) would bind but no import in this module binds.
 ///
-/// A module already imported under an `as` alias is not missing an import: the
-/// use site spelled the module's name instead of its alias, so the verdict is
-/// IPE-N0004 offering the alias (an applicable edit only when exactly one
-/// module and one alias answer). Otherwise it is IPE-N0034 naming `modules`.
+/// A module already imported under an `as` alias is still not reachable under
+/// `qualifier` (an alias installs only itself); the diagnostic then names the
+/// alias to write instead.
 fn import_required(
     qualifier: Box<str>,
     modules: Box<[Box<str>]>,
     span: Span,
-    token: Option<Span>,
     env: &Env,
 ) -> Diagnostic {
-    let aliases: BTreeSet<&Box<str>> = modules
-        .iter()
-        .filter_map(|module| env.import_aliases.get(module))
-        .flatten()
-        .collect();
-    if aliases.is_empty() {
-        return Diagnostic::Name {
-            span,
-            msg: NameError::ImportRequired {
-                qualifier,
-                candidates: modules,
-            },
-        };
-    }
-    let region = if modules.len() == 1 && aliases.len() == 1 {
-        token.and_then(|t| EditTarget::prefix(t, &qualifier))
-    } else {
-        None
-    };
+    let imported_as = modules.iter().find_map(|module| {
+        env.import_aliases
+            .get(module)
+            .and_then(|aliases| aliases.first())
+            .map(|alias| {
+                Box::new(ImportedAs {
+                    module: module.clone(),
+                    alias: alias.clone(),
+                })
+            })
+    });
     Diagnostic::Name {
         span,
-        msg: NameError::UnknownModule {
-            suggestions: Candidates::at(region, aliases.into_iter().cloned().collect()),
-            qualifier,
+        msg: NameError::ImportRequired {
+            reached: StdlibReach::Qualifier(qualifier),
+            candidates: modules,
+            imported_as,
         },
     }
 }
 
-/// Resolve a qualified name `Qualifier.name`. Distinguishes an unknown
-/// qualifier ([`NameError::UnknownModule`]) from a known qualifier missing the
-/// member ([`NameError::NoSuchMember`]).
+/// The verdict for a qualified use of `qualifier`, which holds no members here.
+///
+/// The one reading of [`Env::classify_absent`]: a spelling two imports share
+/// is IPE-N0027 naming both; a kernel module's canonical, or `Cmd` / `Sub`,
+/// that no import installed is IPE-N0034 naming the import to add; anything
+/// else is [`unbound_qualifier`]. `token` is the `qualifier.member` source
+/// token when one exists.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `qualifier` is not interned.
+fn absent_qualifier(
+    qualifier: Symbol,
+    span: Span,
+    token: Option<Span>,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    match env.classify_absent(qualifier, interner) {
+        AbsentQualifier::Ambiguous(ambiguous) => Ok(Diagnostic::Name {
+            span: ambiguous.second,
+            msg: NameError::DuplicateQualifier {
+                qualifier: name_str(interner, qualifier)?,
+                first: ambiguous.first,
+            },
+        }),
+        AbsentQualifier::KnownStdlib(path) => {
+            let qualifier_s = name_str(interner, qualifier)?;
+            let modules = gated_import_candidates(&qualifier_s, &path, env, interner);
+            Ok(import_required(qualifier_s, modules, span, env))
+        }
+        AbsentQualifier::InternalCmdSub(_) => {
+            let modules: Box<[Box<str>]> = {
+                let mut shapes: Vec<Box<str>> = TeaShape::ALL
+                    .iter()
+                    .map(|shape| format!("Ipe.Tea.{}", shape.canonical()).into_boxed_str())
+                    .collect();
+                shapes.sort();
+                shapes.into_boxed_slice()
+            };
+            Ok(import_required(
+                name_str(interner, qualifier)?,
+                modules,
+                span,
+                env,
+            ))
+        }
+        AbsentQualifier::Unknown => unbound_qualifier(qualifier, span, token, env, interner),
+    }
+}
+
+/// Resolve a qualified name `Qualifier.name`: the one reader of the
+/// import-installed qualifier scope.
+///
+/// Distinguishes a qualifier no import installed ([`absent_qualifier`]) from
+/// an installed qualifier missing the member ([`NameError::NoSuchMember`]).
 fn resolve_qual_var(
     qualifier: Symbol,
     name: Symbol,
@@ -5795,20 +5873,12 @@ fn resolve_qual_var(
             name,
         });
     }
-    // Tier-C import gate (ADR 0001): a known stdlib qualifier used WITHOUT its
-    // import is the teachable must-import diagnostic (IPE-N0034), naming the exact
-    // `Ipe.*` module to add — NOT a silent resolve against the pre-installed
-    // catalog, and NOT the generic "unknown module" (the module is known; the
-    // import is missing). Checked before the member lookup, since the catalog
-    // members are present regardless of import.
+    // A spelling holds members only when an import of this module installed
+    // it, so the member table is the import gate: an absent spelling is
+    // classified once (IPE-N0027 / IPE-N0034 / IPE-N0004).
     let token = qualified_token(span, qualifier_text, name_text);
-    if let Some(import_path) = env.stdlib_import_required(qualifier) {
-        let qualifier_s = name_str(interner, qualifier)?;
-        let modules = gated_import_candidates(&qualifier_s, import_path, env, interner);
-        return Err(import_required(qualifier_s, modules, span, token, env));
-    }
     let Some(members) = env.qual_members(qualifier) else {
-        return Err(unbound_qualifier(qualifier, span, token, env, interner)?);
+        return Err(absent_qualifier(qualifier, span, token, env, interner)?);
     };
     match members.get(&name) {
         Some(VarHome::Kernel(id, m, f)) => Ok(canon::Expr_::VarKernel {
@@ -6582,8 +6652,8 @@ fn canonicalise_type(
                 ctx.env.home.last().copied().unwrap_or_else(name_zero)
             });
             // Tier-1 qualified-type validation: when the parser produced a
-            // non-empty qualifier (e.g. `JsonDec.Decoder`), verify it names a
-            // known module qualifier in `env.qual_vars`. Tier-2 (resolving the
+            // non-empty qualifier (e.g. `JsonDec.Decoder`), verify an import
+            // installed it. Tier-2 (resolving the
             // actual type name via a `qual_types` map) is a follow-up once the
             // multi-module import layer builds that map; for now, a valid
             // qualifier is sufficient to accept the annotation and look the type
@@ -6596,30 +6666,16 @@ fn canonicalise_type(
                 *qualifier,
                 "ipe_canon::canonicalise_type::qualifier",
             )?;
-            if !qualifier_str.is_empty() {
-                // Tier-C import gate (ADR 0001): a KNOWN stdlib module qualifier on
-                // a type (`Dict.Dict`, `JsonDec.Decoder`) used without importing it
-                // is the teachable IPE-N0034, naming the module to add — checked
-                // before the unknown-qualifier fallback, since the catalog
-                // qualifier is present in `qual_vars` regardless of import.
-                if let Some(import_path) = ctx.env.stdlib_import_required(*qualifier) {
-                    return Err(import_required(
-                        qualifier_str.into(),
-                        gated_import_candidates(qualifier_str, import_path, ctx.env, ctx.interner),
-                        ctx.ann_span,
-                        None,
-                        ctx.env,
-                    ));
-                }
-                if !ctx.env.qual_vars.contains_key(qualifier) {
-                    return Err(unbound_qualifier(
-                        *qualifier,
-                        ctx.ann_span,
-                        None,
-                        ctx.env,
-                        ctx.interner,
-                    )?);
-                }
+            if !qualifier_str.is_empty() && ctx.env.qual_members(*qualifier).is_none() {
+                // A type qualifier (`Dict.Dict`, `JsonDec.Decoder`) is installed
+                // only by an import, exactly as a value qualifier is.
+                return Err(absent_qualifier(
+                    *qualifier,
+                    ctx.ann_span,
+                    None,
+                    ctx.env,
+                    ctx.interner,
+                )?);
             }
             // `View engine msg` — the engine-tagged view carrier and SSOT view
             // surface. It canonicalises to a real 2-argument `Con(View, [engine
@@ -7218,6 +7274,28 @@ fn canonicalise_asserted_call(
     // surface spelling is the full `Rust.Ffi.call`.
     let ffi_qualifier = interner.intern("Ffi")?;
     let raw_path = path.as_str().to_owned();
+    // `Ffi` must denote the generated module itself: a spelling another import
+    // owns (`import App.Shim as Ffi`) would otherwise answer the forwarder's
+    // name with an ordinary definition of that module. Read by `lookup`, never
+    // `intern`, for the interning-sequence reason above.
+    let rust = interner.lookup("Rust");
+    let foreign_ffi = env
+        .import_scope
+        .qualifier_owner
+        .get(&ffi_qualifier)
+        .is_some_and(|claim| match (&claim.owner, rust) {
+            (ModuleIdentity::Source(owner), Some(rust)) => {
+                owner.as_slice() != [rust, ffi_qualifier].as_slice()
+            }
+            (ModuleIdentity::Source(_) | ModuleIdentity::Kernel(_), _) => true,
+        });
+    if foreign_ffi {
+        return Err(malformed(format!(
+            "`Ffi` names another module here, so `{raw_path}` has no asserted \
+             binding — a native binding resolves through the generated `Rust.Ffi` \
+             module, which no other import may spell `Ffi`"
+        )));
+    }
     let target = resolve_qual_var(ffi_qualifier, def_sym, span, env, interner).map_err(|_| {
         malformed(format!(
             "no asserted binding exists for `{raw_path}` — a native binding needs \
@@ -7838,7 +7916,8 @@ fn chunk_to_expr(
 /// Handles four shapes:
 ///   `foo`          — bare identifier → local var (or kernel if in scope)
 ///   `record.field` — field access → `Access(VarLocal(record), field)`
-///   `Module.func`  — qualified name → `VarKernel` (if known) or literal fallback
+///   `Module.func`  — qualified name → resolved through the qualified reader;
+///                    an unresolved one is refused
 ///   `func arg`     — single function call → `Call(resolve(func), [resolve(arg)])`
 /// Anything more complex falls back to a literal `{{...}}` string (clear signal
 /// to the developer that only simple expressions are interpolable).
@@ -7862,6 +7941,53 @@ fn resolve_interp_ref(
         }
     }
     resolve_simple_interp_ref(s, span, env, interner)
+}
+
+/// Resolve a qualified interpolation reference `Q.member` (`Q` may be dotted).
+///
+/// The qualifier is the maximal leading run of uppercase-initial segments and
+/// the member the one segment after it, read through [`resolve_qual_var`]
+/// exactly as a qualified reference outside an interpolation is: a qualifier
+/// no import installed, or a missing member, is refused. A reference with
+/// further segments after the member is not a simple reference and stays a
+/// literal `{{...}}` string.
+///
+/// # Errors
+/// As [`resolve_qual_var`]; [`Diagnostic::CompilerBug`] if interning exhausts
+/// the interner.
+fn resolve_interp_qualified(
+    s: &str,
+    span: Span,
+    env: &Env,
+    interner: &mut Interner,
+) -> DResult<canon::Expr> {
+    let segments: Vec<&str> = s.split('.').collect();
+    let qualifier_len = segments
+        .iter()
+        .take_while(|segment| segment.starts_with(char::is_uppercase))
+        .count();
+    let qualifier_segments = segments.get(..qualifier_len).unwrap_or_default();
+    let (Some(&member), true) = (
+        segments.get(qualifier_len),
+        segments.len() == qualifier_len + 1,
+    ) else {
+        return Ok(Located::new(
+            span,
+            canon::Expr_::Str(format!("{{{{{s}}}}}")),
+        ));
+    };
+    if qualifier_segments.is_empty() || member.is_empty() {
+        return Ok(Located::new(
+            span,
+            canon::Expr_::Str(format!("{{{{{s}}}}}")),
+        ));
+    }
+    let qualifier = interner.intern(&qualifier_segments.join("."))?;
+    let name = interner.intern(member)?;
+    Ok(Located::new(
+        span,
+        resolve_qual_var(qualifier, name, span, env, interner)?,
+    ))
 }
 
 /// Inner resolver for an interpolation reference without a space (no call form).
@@ -7916,22 +8042,8 @@ fn resolve_simple_interp_ref(
                 canon::Expr_::Str(format!("{{{{{s}}}}}")),
             ));
         }
-        let first_char = first.chars().next().unwrap_or('_');
-        if first_char.is_uppercase() {
-            // Qualified reference `Module.func`.
-            let qual_sym = interner.intern(first)?;
-            // Look up the qualifier in the current environment.
-            if let Some(members) = env.qual_vars.get(&qual_sym) {
-                let name_sym = interner.intern(rest)?;
-                if let Some(home) = members.get(&name_sym) {
-                    return Ok(Located::new(span, var_home_to_expr(name_sym, home)));
-                }
-            }
-            // Unknown module or member — literal fallback (clear signal to dev).
-            return Ok(Located::new(
-                span,
-                canon::Expr_::Str(format!("{{{{{s}}}}}")),
-            ));
+        if first.starts_with(char::is_uppercase) {
+            return resolve_interp_qualified(s, span, env, interner);
         }
         // Lowercase `record.field` → `Access(VarLocal(record), field)`.
         let rec_sym = interner.intern(first)?;

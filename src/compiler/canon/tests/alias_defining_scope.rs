@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use ipe_canon::ast::{Def, Module, Type};
 use ipe_canon::{ModuleExports, canonicalise_module};
-use ipe_diagnostics::{AliasExpansionKind, DResult, Diagnostic, NameError};
+use ipe_diagnostics::{AliasExpansionKind, DResult, Diagnostic, NameError, StdlibReach};
 use ipe_intern::{Interner, Symbol};
 
 const HIGHLIGHT: &str = "module Lib.Highlight exposing (..)\n\n\
@@ -133,7 +133,7 @@ fn naming_the_definers_private_import_directly_demands_its_import() {
         matches!(
             &result,
             Err(Diagnostic::Name {
-                msg: NameError::ImportRequired { qualifier, candidates },
+                msg: NameError::ImportRequired { reached: StdlibReach::Qualifier(qualifier), candidates, .. },
                 ..
             }) if &**qualifier == "Highlight" && **candidates == [Box::<str>::from("Lib.Highlight")]
         ),
@@ -221,7 +221,7 @@ fn an_alias_body_naming_a_module_its_definer_never_imports_is_refused_at_the_dec
         matches!(
             &result,
             Err(Diagnostic::Name {
-                msg: NameError::ImportRequired { qualifier, candidates },
+                msg: NameError::ImportRequired { reached: StdlibReach::Qualifier(qualifier), candidates, .. },
                 ..
             }) if &**qualifier == "Highlight" && **candidates == [Box::<str>::from("Lib.Highlight")]
         ),

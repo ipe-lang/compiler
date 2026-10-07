@@ -344,6 +344,58 @@ fn add_import_quick_fix_sorts_among_existing_imports() {
     );
 }
 
+/// A module already imported under an alias gets no "Add import" action: the
+/// diagnostic names the alias to write instead.
+#[test]
+fn aliased_import_offers_no_add_import_action() {
+    let src = "module Main exposing (main)\n\n\
+        import Ipe.Crypto as C\n\
+        import Ipe.System as System\n\n\
+        main = System.setenv \"KEY\" (Crypto.sha256 \"hello\")\n";
+    let db = IpeDatabase::new();
+    let entry = file(&db, &["Main"], src);
+    let root = root_of(&db, &[(&["Main"], entry)]);
+    let all = collect(&db, root, entry);
+    let diag = diags_for(&all, &["Main"])
+        .diagnostics
+        .iter()
+        .find(|d| d.code().as_str() == "IPE-N0034")
+        .expect("an IPE-N0034 diagnostic");
+    let lsp_diag = to_lsp(diag, src, PositionEncoding::Utf16);
+    assert!(
+        lsp_diag.data.is_none(),
+        "no import candidates: {lsp_diag:?}"
+    );
+    let uri = Url::from_file_path("/fake/Main.ipe").expect("uri");
+    let range = Range {
+        start: lsp_diag.range.start,
+        end: lsp_diag.range.end,
+    };
+    let actions = code_actions(
+        DbView {
+            db: &db,
+            root,
+            entry,
+        },
+        &["Main".to_owned()],
+        Document {
+            uri: &uri,
+            text: src,
+            version: None,
+        },
+        range,
+        std::slice::from_ref(&lsp_diag),
+        PositionEncoding::Utf16,
+    );
+    assert!(
+        actions.iter().all(|a| match a {
+            CodeActionOrCommand::CodeAction(action) => !action.title.starts_with("Add import"),
+            CodeActionOrCommand::Command(_) => true,
+        }),
+        "no Add import action: {actions:?}"
+    );
+}
+
 /// IPE-N0035 quick-fix: repoint a wrong-shape `Cmd` import to the app's own.
 ///
 /// A Cli app importing the Web shape's `Cmd` yields a

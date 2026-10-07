@@ -33,9 +33,10 @@ use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
     ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect, SandboxError,
-    SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion,
-    TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence, intercept_context_phrase,
+    Hint, IfDefect, ImportedAs, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect,
+    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
+    intercept_context_phrase,
 };
 use crate::span::Span;
 
@@ -443,8 +444,11 @@ fn name_prose(msg: &NameError) -> String {
         NameError::UnknownModule { qualifier, .. } => {
             format!("I can't find a module called `{qualifier}`.")
         }
-        NameError::ImportRequired { qualifier, .. } => {
-            format!("`{qualifier}` names a module you haven't imported yet.")
+        NameError::ImportRequired { reached, .. } => {
+            format!(
+                "`{}` names a module you haven't imported yet.",
+                reached.spelling()
+            )
         }
         NameError::NoSuchMember { module, member, .. } => {
             format!("`{module}` doesn't have anything called `{member}`.")
@@ -519,6 +523,9 @@ fn name_prose(msg: &NameError) -> String {
         NameError::WrongShapeCmdSub(_) => {
             "This `Cmd` / `Sub` belongs to a different app shape than the one you're building."
                 .to_string()
+        }
+        NameError::TwoShapeImports { .. } => {
+            "This module imports two app shapes, but a module builds at most one.".to_string()
         }
         NameError::DiscardedConfig => {
             "You wrote a `config` binding, but nothing uses it — its settings would just be \
@@ -1463,9 +1470,13 @@ fn name_label(msg: &NameError) -> Option<String> {
         NameError::ConstructorNotFound { .. } => Some("I don't know this constructor".to_string()),
         NameError::UnknownModule { qualifier, .. } => Some(format!("unknown module `{qualifier}`")),
         NameError::ImportRequired {
-            qualifier,
+            reached,
             candidates,
-        } => Some(import_required_label(qualifier, candidates)),
+            imported_as,
+        } => Some(imported_as.as_deref().map_or_else(
+            || import_required_label(reached.spelling(), candidates),
+            |imported| imported_as_label(reached.spelling(), imported),
+        )),
         NameError::NoSuchMember { module, member, .. } => {
             Some(format!("`{module}` has no member `{member}`"))
         }
@@ -1553,6 +1564,14 @@ fn name_label(msg: &NameError) -> Option<String> {
              — for a plain program — make `main` a `Task Error ()`"
                 .to_string(),
         ),
+        NameError::TwoShapeImports {
+            first_module,
+            second_module,
+            ..
+        } => Some(format!(
+            "this module already imports `{first_module}`, so it cannot also import \
+             `{second_module}`; keep the one shape this module builds"
+        )),
         NameError::WrongShapeCmdSub(m) => Some(format!(
             "`{}` is the {} shape's `Cmd` / `Sub`, but this \
              is a {} app; import `{}` instead",
@@ -1727,6 +1746,12 @@ fn name_label(msg: &NameError) -> Option<String> {
 }
 
 /// The IPE-N0034 label: the import to add, or every import that would bind it.
+/// The IPE-N0034 label when the module is imported under another spelling.
+fn imported_as_label(qualifier: &str, imported: &ImportedAs) -> String {
+    let ImportedAs { module, alias } = imported;
+    format!("you imported `{module}` as `{alias}`; write `{alias}.` where you wrote `{qualifier}.`")
+}
+
 fn import_required_label(qualifier: &str, candidates: &[Box<str>]) -> String {
     match candidates {
         [] => format!("`{qualifier}` names a module you haven't imported"),
