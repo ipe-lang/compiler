@@ -607,20 +607,14 @@ fn render_element_depth_in<M: Clone>(
         // normal pipeline. If a direct Rust construction routes cells here, drop
         // to empty text rather than abort — a missing subtree beats a panic.
         Element::Cells(_grid) => Html::HText(String::new()),
-        Element::Node(desc, attrs, kids) => {
-            let own_heading = match desc {
-                Description::DescHeading(level) => Some(*level),
-                _ => None,
-            };
-            render_node_as(
-                tag_for_description(desc),
-                own_heading,
-                &std::mem::take(attrs),
-                std::mem::take(kids),
-                depth,
-                parent_axis,
-            )
-        }
+        Element::Node(desc, attrs, kids) => render_node_as(
+            tag_for_description(desc),
+            desc.heading_level(),
+            &std::mem::take(attrs),
+            std::mem::take(kids),
+            depth,
+            parent_axis,
+        ),
         Element::TaggedNode(tag, _desc, attrs, kids) => render_node_as(
             &std::mem::take(tag),
             None,
@@ -1325,10 +1319,10 @@ fn render_node_as<M: Clone>(
     let tag: &str = &tag_owned;
     // A heading whose final tag is not its native `<hN>` (a level above 6, or a
     // host that is not a plain `div`) is announced through `role`/`aria-level`.
-    let heading = match &landmark {
-        Some(Description::DescHeading(level)) => Some(*level),
-        _ => own_heading,
-    };
+    let heading = landmark
+        .as_ref()
+        .and_then(Description::heading_level)
+        .or(own_heading);
 
     // Size first, so an author's raw `AttrStyle` for the same property wins.
     let mut style_str = join_style(&size_css(attrs, parent_axis), &build_style_string(attrs));

@@ -198,6 +198,26 @@ pub enum Description {
     DescParagraph,
 }
 
+impl Description {
+    /// The heading level this description requests, if it is a heading.
+    #[must_use]
+    pub const fn heading_level(&self) -> Option<HeadingLevel> {
+        match self {
+            Self::DescHeading(level) => Some(*level),
+            Self::NoDescription
+            | Self::DescMain
+            | Self::DescNavigation
+            | Self::DescContentInfo
+            | Self::DescComplementary
+            | Self::DescLabel(_)
+            | Self::DescLivePolite
+            | Self::DescLiveAssertive
+            | Self::DescButton
+            | Self::DescParagraph => None,
+        }
+    }
+}
+
 /// `Ipe.Ui.LayoutContext` — the flex direction a parent imposes on its children.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LayoutContext {
