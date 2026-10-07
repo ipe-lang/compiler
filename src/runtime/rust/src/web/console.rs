@@ -69,9 +69,9 @@ pub const CONSOLE_JS: &str = r#"
  async function j(u){try{const r=await fetch(u);return await r.json()}catch(e){return null}}
  async function ov(){const o=await j("/_ipe/console/api/overview");if(o)document.getElementById("ov").textContent=
    "requests="+o.requests+"  errors="+o.errors;}
- function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
+ function esc(s){return String(s).replace(/&/g,"&amp;").replace(/\x3c/g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
  function fmt(es){return (es||[]).map(e=>{const d=new Date(e.ts).toISOString().slice(11,19);
-   return "<span class='lvl'>"+esc(d)+" "+esc(e.level)+"</span> "+(e.level=="error"?"<span class='err'>":"")+
+   return "<span class='lvl'>"+esc(d)+" "+esc(e.level)+"<\/span> "+(e.level=="error"?"<span class='err'>":"")+
    esc(e.message)+(e.level=="error"?"<\/span>":"");}).join("\n");}
  async function refresh(){const es=await j("/_ipe/console/api/"+tab);
    document.getElementById("out").innerHTML=fmt(es);ov();}
