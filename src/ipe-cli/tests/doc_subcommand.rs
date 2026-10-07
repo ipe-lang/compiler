@@ -635,7 +635,7 @@ fn every_miss_suggests_something_and_bare_names_find_members() -> io::Result<()>
     assert!(!ok);
     let suggested = stderr.matches("ipe doc ").count();
     assert!(
-        (1..=8).contains(&suggested),
+        (1..=10).contains(&suggested),
         "a far miss still suggests a bounded list:\n{stderr}"
     );
     let (ok, _stdout, stderr) = run_in(&dir, &["doc", "unixMillis"]);
@@ -662,6 +662,120 @@ fn a_miss_under_json_is_the_machine_error_envelope() -> io::Result<()> {
         !stderr.contains("Ipê language"),
         "no human frame:\n{stderr}"
     );
+    Ok(())
+}
+
+/// Off a terminal a human miss is the numbered list and never a prompt: the
+/// run ends at once with the entries listed, each as the command that opens it.
+#[test]
+fn a_piped_miss_lists_numbered_entries_without_prompting() -> io::Result<()> {
+    let dir = fresh_dir("miss_numbered");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis"]);
+    assert!(!ok, "a miss exits non-zero");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("1. ipe doc "),
+        "the entries are numbered:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Open which entry?"),
+        "no prompt without a terminal:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// Under `--plain` a miss is one `term<TAB>kind<TAB>summary` line per closest
+/// entry on stderr, and the first field passed back to `ipe doc` opens it.
+#[test]
+fn a_plain_miss_lists_terms_that_rerun() -> io::Result<()> {
+    let dir = fresh_dir("miss_plain");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis", "--plain"]);
+    assert!(!ok, "a miss exits non-zero");
+    assert!(stdout.is_empty(), "{stdout}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!((1..=10).contains(&lines.len()), "a bounded list:\n{stderr}");
+    for line in &lines {
+        assert_eq!(
+            line.split('\t').count(),
+            3,
+            "term, kind, summary:\n{line:?}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("Ipe.Time.unixMillis\t")),
+        "the typo'd member is listed by its term:\n{stderr}"
+    );
+    for line in &lines {
+        let term = line.split('\t').next().unwrap_or_default();
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", term, "--plain"]);
+        assert!(
+            ok,
+            "listed term `{term}` must open its entry:\n{stdout}\n{stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// Under `--json` a miss carries the ranked terms in the error envelope's
+/// payload: `query`, `closeness`, `truncated`, and `results` in order.
+#[test]
+fn a_json_miss_carries_the_ranked_terms() -> io::Result<()> {
+    let dir = fresh_dir("miss_json_results");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMilis", "--json"]);
+    assert!(!ok);
+    assert!(stdout.is_empty(), "{stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .map_err(|e| io::Error::other(format!("{e}: {stderr}")))?;
+    let payload = &parsed["payload"];
+    assert_eq!(payload["kind"], "doc-not-found", "{stderr}");
+    assert_eq!(payload["query"], "unixMilis", "{stderr}");
+    assert_eq!(payload["closeness"], "match", "{stderr}");
+    assert!(payload["truncated"].is_boolean(), "{stderr}");
+    let results = payload["results"].as_array().cloned().unwrap_or_default();
+    assert!(
+        (1..=10).contains(&results.len()),
+        "a bounded list:\n{stderr}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|hit| hit["term"] == "Ipe.Time.unixMillis" && hit["kind"] == "symbol"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A `kind:key` term opens that entry directly, never a generate run.
+#[test]
+fn a_qualified_term_opens_its_entry() -> io::Result<()> {
+    let dir = fresh_dir("qualified_term");
+    fs::create_dir_all(&dir)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "construct:case", "--plain"]);
+    assert!(ok, "`construct:case` must open:\n{stdout}\n{stderr}");
+    assert!(!stdout.is_empty(), "the entry is printed:\n{stderr}");
+    Ok(())
+}
+
+/// A blank term, bare or after a `kind:` qualifier, is refused as a usage
+/// error before any lookup runs.
+#[test]
+fn a_blank_term_is_refused() -> io::Result<()> {
+    let dir = fresh_dir("blank_term");
+    fs::create_dir_all(&dir)?;
+    for term in ["", "   ", "topic:", "topic:   "] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", term]);
+        assert!(!ok, "{term:?} must be refused");
+        assert!(stdout.is_empty(), "{term:?}:\n{stdout}");
+        assert!(
+            stderr.contains("ipe doc: the term is empty"),
+            "{term:?}:\n{stderr}"
+        );
+    }
     Ok(())
 }
 
