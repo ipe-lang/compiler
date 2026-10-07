@@ -70,8 +70,10 @@ const POSTURE: &str = "Posture";
 const POSTURE_OWNER: &str = "telemetry.rs";
 
 /// Every admitted posture read outside [`POSTURE_OWNER`]: file, counted form,
-/// count. Each closes a surface rather than opening one.
+/// count. Each closes a surface or only selects wording; none opens one.
 const ADMITTED: &[(&str, &str, usize)] = &[
+    // The bind-refusal fix line names the relaunch command for the build posture.
+    ("system.rs", "BuildPosture", 6),
     // The bind default: production binds every interface, else loopback.
     ("app_config.rs", "posture_is_production", 1),
     // `gate_allows`: a production posture needs an admin credential to mount.

@@ -2640,7 +2640,7 @@ pub fn web_app<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -3204,7 +3204,7 @@ pub fn web_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPag
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -5445,7 +5445,7 @@ async fn serve_web<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
 ) -> IpeResult<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromIpeError + Send + 'static,
     // IpeStringify: required by inspect_handler for the live-datum GET
     // (`/_ipe/debug/inspect`). Generated Model types always satisfy this bound.
     Model: Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
@@ -5555,10 +5555,11 @@ where
     let addr = std::net::SocketAddr::new(host, port);
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            return IpeResult::Err(resolved.addr_in_use_message().into());
+        Err(e) => {
+            return IpeResult::Err(E::from_ipe_error(
+                resolved.bind_refusal("Web.tea", addr, &e),
+            ));
         }
-        Err(e) => return IpeResult::Err(format!("Web.tea: bind {addr}: {e}").into()),
     };
     // Bind-address line (stderr) — carries the resolved host:port.
     crate::system::emit_runtime_log("web", &format!("listening on http://{addr}"));
@@ -9604,27 +9605,83 @@ fn utf8_prefix(bytes: &[u8]) -> &str {
 
 #[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
 mod bind_error_tests {
-    /// The port-taken refusal names `IPE_WEB_PORT` when the operator or the
-    /// default chose the port, and names no operator var when a supervisor did.
+    use crate::telemetry::BuildPosture;
+
+    /// `Web.tea`'s port resolution: `relocation` over the operator's
+    /// `IPE_WEB_PORT` over the default `8000`.
+    fn resolve(relocation: Option<&str>, operator: Option<&str>) -> crate::system::ResolvedPort {
+        crate::system::resolve_listen_port(
+            relocation.map(str::to_owned),
+            (super::WEB_PORT_ENV, operator.map(str::to_owned)),
+            8000,
+        )
+    }
+
+    /// The `Web.tea` refusal of a bind that failed with `kind` under `posture`,
+    /// as the `String` sink renders it.
+    fn refusal(
+        r: crate::system::ResolvedPort,
+        posture: BuildPosture,
+        kind: std::io::ErrorKind,
+    ) -> (crate::IpeErrorKind, String) {
+        let error = r.bind_refusal_for(
+            posture,
+            "Web.tea",
+            std::net::SocketAddr::from(([127, 0, 0, 1], 8000)),
+            &std::io::Error::from(kind),
+        );
+        (
+            crate::ipe_error_kind(error.clone()),
+            <String as crate::FromIpeError>::from_ipe_error(error),
+        )
+    }
+
+    /// A port another socket holds refuses `Web.tea` as a typed `Conflict`,
+    /// never the `Unexpected` catch-all; the fix line names `IPE_WEB_PORT` and
+    /// how this build starts, and a release binary names no `ipe` verb.
     #[test]
-    fn addr_in_use_message_is_keyed_on_the_port_origin() {
-        let resolve = |relocation: Option<&str>, operator: Option<&str>| {
-            crate::system::resolve_listen_port(
-                relocation.map(str::to_owned),
-                (super::WEB_PORT_ENV, operator.map(str::to_owned)),
-                8000,
-            )
-        };
+    fn web_port_in_use_is_a_typed_conflict_with_a_posture_fix_line() {
+        use std::io::ErrorKind;
         for r in [resolve(None, None), resolve(None, Some("9200"))] {
-            let msg = r.addr_in_use_message();
-            assert!(msg.contains("IPE_WEB_PORT=8123 ipe dev run"), "{msg}");
+            for (posture, launch) in [
+                (BuildPosture::Development, "ipe dev run"),
+                (BuildPosture::Release, "./<program>"),
+            ] {
+                let (kind, text) = refusal(r, posture, ErrorKind::AddrInUse);
+                assert_eq!(kind, crate::IpeErrorKind::Conflict, "{text}");
+                assert!(text.starts_with("Conflict: port "), "{text}");
+                assert!(!text.contains("Unexpected"), "{text}");
+                assert!(
+                    text.contains(&format!("IPE_WEB_PORT=8123 {launch}"))
+                        && !text.contains("IPE_SERVER_PORT"),
+                    "{posture:?}: {text}"
+                );
+            }
+            let (_, release) = refusal(r, BuildPosture::Release, ErrorKind::AddrInUse);
+            assert!(
+                !release.contains("ipe dev"),
+                "a built binary is not started by `ipe dev run`: {release}"
+            );
         }
         let relocated = resolve(Some("9100"), Some("9200"));
         assert_eq!(relocated.port, 9100);
-        let msg = relocated.addr_in_use_message();
+        for posture in [BuildPosture::Development, BuildPosture::Release] {
+            let (kind, text) = refusal(relocated, posture, ErrorKind::AddrInUse);
+            assert_eq!(kind, crate::IpeErrorKind::Conflict, "{text}");
+            assert!(
+                !text.contains("IPE_WEB_PORT") && !text.contains("IPE_SERVER_PORT"),
+                "a supervisor-chosen port must not advise an operator var: {text}"
+            );
+        }
+        let (other_kind, other) = refusal(
+            resolve(None, None),
+            BuildPosture::Release,
+            ErrorKind::ConnectionReset,
+        );
+        assert_eq!(other_kind, crate::IpeErrorKind::Io, "{other}");
         assert!(
-            !msg.contains("IPE_WEB_PORT") && !msg.contains("IPE_SERVER_PORT"),
-            "{msg}"
+            other.starts_with("Io: Web.tea: bind 127.0.0.1:8000: "),
+            "{other}"
         );
     }
 }

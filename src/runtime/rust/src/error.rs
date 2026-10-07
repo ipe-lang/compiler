@@ -399,6 +399,29 @@ impl FromUnavailable for String {
     }
 }
 
+/// A generic error sink that keeps a classified [`IpeError`]'s kind.
+///
+/// A kernel generic over `E: From<String>` (`server_listen`) reports a typed
+/// refusal (a port in use, a bind the OS refused) through this bound instead of
+/// folding its text into `Unexpected` through the blanket `From<String>`
+/// bridge. `IpeError` keeps the error as built; a bare `String` sink, which has
+/// no kind, keeps its `Error.toString` text.
+pub trait FromIpeError {
+    fn from_ipe_error(error: IpeError) -> Self;
+}
+
+impl FromIpeError for IpeError {
+    fn from_ipe_error(error: IpeError) -> Self {
+        error
+    }
+}
+
+impl FromIpeError for String {
+    fn from_ipe_error(error: IpeError) -> Self {
+        error.to_ipe_string()
+    }
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
