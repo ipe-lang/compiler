@@ -54,7 +54,7 @@ pub struct WebViewAppCfg;
 // Bridge JS: delegated event listeners on the document forward DOM events on
 // `[ipe-id]` elements to the IPC channel as `{ipeId, event, args}`. Re-bound
 // implicitly via event delegation, so a full innerHTML swap needs no re-bind.
-#[cfg(any(feature = "webview", test))]
+#[cfg(any(feature = "webview", all(test, not(target_arch = "wasm32"))))]
 const BRIDGE_JS: &str = r#"
 (function(){
   // The document members the bridge reads, bound from the prototypes before any
