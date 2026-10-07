@@ -1221,7 +1221,22 @@ dbFailureOf e =
                 Just (Database failure) ->
                     Just failure
 
-                _ ->
+                Just (Custom _) ->
+                    Nothing
+
+                Just (FfiPanic _) ->
+                    Nothing
+
+                Just (HttpStatus _) ->
+                    Nothing
+
+                Just (JsonDecode _) ->
+                    Nothing
+
+                Just (TypeMismatch _) ->
+                    Nothing
+
+                Nothing ->
                     Nothing
 
 

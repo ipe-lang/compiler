@@ -195,7 +195,22 @@ dbRefusalOf present e =
                 Just (Database failure) ->
                     refusalOfFailure present failure
 
-                _ ->
+                Just (Custom _) ->
+                    absentOr present Unusable
+
+                Just (FfiPanic _) ->
+                    absentOr present Unusable
+
+                Just (HttpStatus _) ->
+                    absentOr present Unusable
+
+                Just (JsonDecode _) ->
+                    absentOr present Unusable
+
+                Just (TypeMismatch _) ->
+                    absentOr present Unusable
+
+                Nothing ->
                     absentOr present Unusable
 
 
