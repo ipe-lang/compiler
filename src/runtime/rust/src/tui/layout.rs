@@ -2813,6 +2813,25 @@ mod tests {
         assert!(radio_off.contains('○') && !radio_off.contains('●'));
     }
 
+    /// A checkbox with a left label stays on one terminal row, because the
+    /// `label` wrapper honours the `__row` marker. Red if `attach_label` stops
+    /// emitting the axis marker on the wrapper.
+    #[test]
+    fn label_wrapper_keeps_row_axis() {
+        use crate::ui::input::{input_checkbox_, input_label_left_};
+
+        let el: Element<()> = input_checkbox_(
+            Vec::new(),
+            std::sync::Arc::new(|_b: bool| ()),
+            std::sync::Arc::new(|_b: bool| Element::Empty),
+            true,
+            input_label_left_(Vec::new(), Element::Text("Agree".into())),
+        );
+        assert_eq!(element_to_cells_height(&el, 80), 1);
+        let frame = element_to_cells(&el, 80, 24);
+        assert!(frame.contains("Agree") && frame.contains('☑'), "{frame}");
+    }
+
     #[test]
     fn focusables_collected_in_order() {
         let t: Element<()> = node(

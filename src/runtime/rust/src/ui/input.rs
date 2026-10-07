@@ -124,6 +124,14 @@ fn is_layout_attr<M>(attr: &Attribute<M>) -> bool {
     )
 }
 
+/// Attributes that belong on the native `<input>` of a composite control.
+fn is_form_attr<M>(attr: &Attribute<M>) -> bool {
+    matches!(
+        attr,
+        Attribute::AttrAttribute(_, _) | Attribute::AttrEvent(_) | Attribute::AttrDescribe(_)
+    )
+}
+
 /// If `layout_attrs` is non-empty, return `[AttrWidth Fill, AttrHeight Fill]`
 /// so the hoisted wrapper inherits sensible defaults. Mirrors
 /// `implicitFillIfHoisted` in `Ipe.Ui.Input`.
@@ -411,16 +419,20 @@ pub fn input_checkbox_<M: Clone + Send + Sync + 'static>(
 ) -> Element<M> {
     let (layout_attrs, control_attrs) = split_layout_attrs(attrs);
     let toggle_msg = on_change(!checked);
-    let check_val = if checked { "true" } else { "false" };
     // The checkbox change event delivers a Bool; we ignore it and always
     // toggle (matches the Ipê source's `cfg.onChange (not cfg.checked)`).
-    let check_input_attrs = vec![
+    let mut check_input_attrs = vec![
         ui_html_attribute_("type".into(), "checkbox".into()),
-        ui_html_attribute_("value".into(), check_val.into()),
+        Attribute::AttrChecked(checked),
         ui_on_bool_(Arc::new(move |_b: bool| toggle_msg.clone())),
     ];
+    // Form, ARIA and event attributes name or drive the native box, so they go
+    // on the `<input>`; visual attributes style the row around it.
+    let (form_attrs, visual_attrs): (Vec<_>, Vec<_>) =
+        control_attrs.into_iter().partition(is_form_attr);
+    check_input_attrs.extend(form_attrs);
     let mut row_attrs = vec![ui_spacing_(8)];
-    row_attrs.extend(control_attrs);
+    row_attrs.extend(visual_attrs);
     row_attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
     let control = Control::Checkbox {
         input: check_input_attrs,
@@ -840,5 +852,65 @@ mod tests {
         };
         let input_style = attr(input, "style").unwrap_or_default();
         assert!(input_style.contains("background-color"), "{input_style}");
+    }
+
+    fn checkbox(attrs: Vec<Attribute<Msg>>, checked: bool) -> Html<Msg> {
+        page(input_checkbox_(
+            attrs,
+            on_flag(),
+            no_icon(),
+            checked,
+            input_label_hidden_("Agree".to_owned()),
+        ))
+    }
+
+    /// Form and ARIA attributes reach the native checkbox, not the row around it.
+    /// Red if the form/visual split in `input_checkbox_` is removed.
+    #[test]
+    fn checkbox_form_attrs_reach_the_input() {
+        let html = checkbox(
+            vec![
+                ui_html_attribute_("aria-invalid".to_owned(), "true".to_owned()),
+                ui_html_attribute_("aria-describedby".to_owned(), "err".to_owned()),
+            ],
+            false,
+        );
+        let found = find(&html, &|h| {
+            tag_of(h) == "input" && attr(h, "type") == Some("checkbox")
+        });
+        assert!(found.is_some(), "a checkbox input is rendered");
+        let Some(input) = found else {
+            return;
+        };
+        assert_eq!(attr(input, "aria-invalid"), Some("true"));
+        assert_eq!(attr(input, "aria-describedby"), Some("err"));
+        let on_others = count(&html, &|h| {
+            tag_of(h) != "input" && (has_attr(h, "aria-invalid") || has_attr(h, "aria-describedby"))
+        });
+        assert_eq!(on_others, 0, "no wrapper carries the form attributes");
+    }
+
+    /// The native box follows the model: `checked` is present only when true, and
+    /// the strings "true"/"false" never encode it. Red if checkedness returns to
+    /// a `value` attribute.
+    #[test]
+    fn checkbox_reflects_model() {
+        let on = checkbox(Vec::new(), true);
+        let found = find(&on, &is_tag("input"));
+        assert!(found.is_some(), "an input is rendered");
+        let Some(input_on) = found else {
+            return;
+        };
+        assert!(has_attr(input_on, "checked"));
+        assert_eq!(attr(input_on, "value"), None);
+
+        let off = checkbox(Vec::new(), false);
+        let found = find(&off, &is_tag("input"));
+        assert!(found.is_some(), "an input is rendered");
+        let Some(input_off) = found else {
+            return;
+        };
+        assert!(!has_attr(input_off, "checked"));
+        assert_eq!(attr(input_off, "value"), None);
     }
 }
