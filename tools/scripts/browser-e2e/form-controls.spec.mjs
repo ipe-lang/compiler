@@ -62,7 +62,9 @@ for (const name of ["addEventListener", "getAttribute", "__ipe_submit", "element
       (r) => r.method() === "POST" && new URL(r.url()).pathname === "/_ipe/event",
       { timeout: 5000 },
     );
-    await page.locator("#ipe-e2e-go").click();
+    // The harness's own actionability probe reads `getAttribute` off the form,
+    // which a control of that name shadows; the page's click is the subject.
+    await page.locator("#ipe-e2e-go").evaluate((b) => HTMLElement.prototype.click.call(b));
     const body = JSON.parse((await posted).postData() ?? "null");
     expect(body?.msg).toBe("e2e-submit");
     expect(body.args).toEqual([expect.objectContaining({ secret: "hunter2", [name]: "shadow" })]);

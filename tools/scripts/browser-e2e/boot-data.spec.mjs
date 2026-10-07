@@ -166,15 +166,17 @@ test("decoys: app elements named after document members never stand in for them"
   page,
 }) => {
   // Each named `form`/`img` shadows the document member of its name with
-  // itself; a client reading those members off the document would bind its
-  // listeners to an image, patch into the form, or throw at boot.
+  // itself (an `img` only when it also carries an `id`); a client reading those
+  // members off the document would bind its listeners to an image, patch into
+  // the form, or throw at boot. They sit beside the root, which a render
+  // replaces wholesale.
   const clobbers =
     '<form name="body"></form>' +
-    '<img name="activeElement" alt="">' +
-    '<img name="getElementById" alt="">' +
-    '<img name="addEventListener" alt="">';
+    '<img name="activeElement" id="decoy-activeElement" alt="">' +
+    '<img name="getElementById" id="decoy-getElementById" alt="">' +
+    '<img name="addEventListener" id="decoy-addEventListener" alt="">';
   const { errors } = await serveRewritten(page, (html) =>
-    html.replace(/<div id="ipe-root">/, (open) => open + clobbers),
+    html.replace(/<div id="ipe-root">/, (open) => clobbers + open),
   );
   await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
   const shadowed = await page.evaluate(() => ({
