@@ -16,7 +16,10 @@
 //! - an `env::args_os` read outside the pinned [`ARGS_OS_OWNERS`] counts;
 //! - a ban-proof naming outside the pinned [`BAN_PROOFS`] counts, and a macro
 //!   or a non-`expect` attribute in a ban-proof file;
-//! - an `env::$name` macro path, which names a reader only once expanded.
+//! - an `env::$name` macro path, which names a reader only once expanded;
+//! - an `args` or `args_os` leaf, or a `$name` leaf, on a path with a `$name`
+//!   segment other than `$crate`, since `$m::args()` and `std::$a::$b()` read
+//!   the command line once a caller passes `env` and `args`.
 //!
 //! A file whose pinned count moves, or a pinned file that no longer holds its
 //! site, goes red, so the inventory only ever shrinks to the truth. A reader
@@ -80,6 +83,24 @@ const BAN_PROOFS: &[(&str, usize, usize, &str)] = &[(
     1,
     "names both readers so the `ipe_db` ban on argument reads resolves and fires under `-D warnings`",
 )];
+
+/// The pinned sites the scan holds a tree to.
+#[derive(Clone, Copy)]
+struct Inventory<'a> {
+    /// [`ARGS_DEBT`] rows.
+    debt: &'a [(&'a str, usize)],
+    /// [`ARGS_OS_OWNERS`] rows.
+    owners: &'a [(&'a str, usize, &'a str)],
+    /// [`BAN_PROOFS`] rows.
+    proofs: &'a [(&'a str, usize, usize, &'a str)],
+}
+
+/// The inventory the checkout is held to.
+const PINNED: Inventory<'static> = Inventory {
+    debt: ARGS_DEBT,
+    owners: ARGS_OS_OWNERS,
+    proofs: BAN_PROOFS,
+};
 
 /// The tokens of `#[expect(clippy::disallowed_methods)] let _ = ::std::` that
 /// open a ban-proof naming, ahead of its `env`.
@@ -311,6 +332,36 @@ fn is_rewriter(tokens: &[Token], at: usize) -> bool {
                 && is_text(tokens.get(at + 3), "(")))
 }
 
+/// Whether the path segments before the leaf at `at` (`seg::..::leaf`)
+/// include a `$name` macro metavariable other than `$crate`.
+///
+/// A `$crate` path resolves inside the defining crate, whose imports the scan
+/// reads as written; any other metavariable stands for a caller's tokens.
+fn behind_metavariable(tokens: &[Token], at: usize) -> bool {
+    let mut leaf = at;
+    loop {
+        let Some(sep) = leaf.checked_sub(1) else {
+            return false;
+        };
+        let Some(segment) = sep.checked_sub(1) else {
+            return false;
+        };
+        if !is_text(tokens.get(sep), "::") {
+            return false;
+        }
+        let Some(Token::Ident(word)) = tokens.get(segment) else {
+            return false;
+        };
+        let dollar = segment
+            .checked_sub(1)
+            .is_some_and(|d| is_text(tokens.get(d), "$"));
+        if dollar && word != "crate" {
+            return true;
+        }
+        leaf = segment;
+    }
+}
+
 /// Apply the scan's rules to one file's tokens.
 fn findings(src: &str) -> Findings {
     let tokens = lex(src);
@@ -318,6 +369,12 @@ fn findings(src: &str) -> Findings {
     for (i, token) in tokens.iter().enumerate() {
         if is_rewriter(&tokens, i) {
             found.rewriters += 1;
+        }
+        let reader_leaf = is_ident(Some(token), "args") || is_ident(Some(token), "args_os");
+        if (reader_leaf || is_text(Some(token), "$")) && behind_metavariable(&tokens, i) {
+            found
+                .hiding
+                .push("a path through a `$` macro metavariable can name an argument reader");
         }
         if !is_ident(Some(token), "env") {
             continue;
@@ -481,17 +538,16 @@ fn every_command_line_read_goes_through_a_pinned_decode_point() {
             .all(|root| SCANNED_ROOTS.contains(&root.as_str())),
         "a top-level directory holds tracked Rust the scan skips: {tracked_rust_roots:?}"
     );
-    let violations = inventory_violations(&files);
+    let violations = inventory_violations(PINNED, &files);
     assert!(
         violations.is_empty(),
         "the command-line read inventory drifted: {violations:#?}"
     );
 }
 
-/// Every way `files` departs from the pinned inventory: [`ARGS_DEBT`],
-/// [`ARGS_OS_OWNERS`], [`BAN_PROOFS`] and the hiding rules.
-fn inventory_violations(files: &[(String, String)]) -> Vec<String> {
-    let proof_files: BTreeSet<&str> = BAN_PROOFS.iter().map(|(rel, ..)| *rel).collect();
+/// Every way `files` departs from `inventory` and the hiding rules.
+fn inventory_violations(inventory: Inventory<'_>, files: &[(String, String)]) -> Vec<String> {
+    let proof_files: BTreeSet<&str> = inventory.proofs.iter().map(|(rel, ..)| *rel).collect();
     let mut args: BTreeMap<String, usize> = BTreeMap::new();
     let mut args_os: BTreeMap<String, usize> = BTreeMap::new();
     let mut named: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -520,15 +576,18 @@ fn inventory_violations(files: &[(String, String)]) -> Vec<String> {
                 .map(|what| format!("{rel}: {what}")),
         );
     }
-    let debt: BTreeMap<String, usize> = ARGS_DEBT
+    let debt: BTreeMap<String, usize> = inventory
+        .debt
         .iter()
         .map(|(rel, n)| ((*rel).to_owned(), *n))
         .collect();
-    let owners: BTreeMap<String, usize> = ARGS_OS_OWNERS
+    let owners: BTreeMap<String, usize> = inventory
+        .owners
         .iter()
         .map(|(rel, n, _)| ((*rel).to_owned(), *n))
         .collect();
-    let proofs: BTreeMap<String, (usize, usize)> = BAN_PROOFS
+    let proofs: BTreeMap<String, (usize, usize)> = inventory
+        .proofs
         .iter()
         .map(|(rel, a, o, _)| ((*rel).to_owned(), (*a, *o)))
         .collect();
@@ -559,18 +618,18 @@ const ARGS_NAMING: &str = "#[expect(clippy::disallowed_methods)] let _ = ::std::
 /// The proof naming of `env::args_os`.
 const ARGS_OS_NAMING: &str = "#[expect(clippy::disallowed_methods)] let _ = ::std::env::args_os;";
 
-/// A tree holding exactly the pinned sites: each debt and owner file reads its
-/// pinned count, and each proof file names its pinned readers.
-fn pinned_tree() -> Vec<(String, String)> {
-    let debt = ARGS_DEBT.iter().map(|(rel, n)| {
+/// A tree holding exactly the sites `inventory` pins: each debt and owner file
+/// reads its pinned count, and each proof file names its pinned readers.
+fn pinned_tree(inventory: Inventory<'_>) -> Vec<(String, String)> {
+    let debt = inventory.debt.iter().map(|(rel, n)| {
         let body = "std::env::args();".repeat(*n);
         ((*rel).to_owned(), format!("fn f() {{ {body} }}"))
     });
-    let owners = ARGS_OS_OWNERS.iter().map(|(rel, n, _)| {
+    let owners = inventory.owners.iter().map(|(rel, n, _)| {
         let body = "std::env::args_os();".repeat(*n);
         ((*rel).to_owned(), format!("fn f() {{ {body} }}"))
     });
-    let proofs = BAN_PROOFS.iter().map(|(rel, a, o, _)| {
+    let proofs = inventory.proofs.iter().map(|(rel, a, o, _)| {
         let body = format!("{}{}", ARGS_NAMING.repeat(*a), ARGS_OS_NAMING.repeat(*o));
         ((*rel).to_owned(), format!("const _P: () = {{ {body} }};"))
     });
@@ -597,19 +656,29 @@ fn the_pinned_tree_matches_the_inventory() {
         BAN_PROOFS.iter().all(|(_, a, o, _)| a + o > 0),
         "a `BAN_PROOFS` row pins no naming"
     );
-    let violations = inventory_violations(&pinned_tree());
+    let violations = inventory_violations(PINNED, &pinned_tree(PINNED));
     assert!(
         violations.is_empty(),
         "the control tree must be clean: {violations:#?}"
     );
 }
 
+/// A ban-proof file the laundering test pins, independent of [`BAN_PROOFS`].
+const SYNTHETIC_PROOF: &str = "src/synthetic/src/ban_proof.rs";
+
 #[test]
 fn a_ban_proof_file_launders_no_read() {
-    let tree = pinned_tree();
-    let Some(&(proof, ..)) = BAN_PROOFS.first() else {
-        return;
+    let inventory = Inventory {
+        proofs: &[(SYNTHETIC_PROOF, 1, 1, "a synthetic ban proof")],
+        ..PINNED
     };
+    let tree = pinned_tree(inventory);
+    let control = inventory_violations(inventory, &tree);
+    assert!(
+        control.is_empty(),
+        "the synthetic control tree must be clean: {control:#?}"
+    );
+    let proof = SYNTHETIC_PROOF;
     let db_lib = "src/compiler/db/src/lib.rs";
     let drifts = [
         (db_lib, "fn g() { std::env::args(); }"),
@@ -625,7 +694,7 @@ fn a_ban_proof_file_launders_no_read() {
     ];
     for (rel, text) in drifts {
         assert!(
-            !inventory_violations(&appended(&tree, rel, text)).is_empty(),
+            !inventory_violations(inventory, &appended(&tree, rel, text)).is_empty(),
             "`{text}` in {rel} passed the inventory"
         );
     }
@@ -645,6 +714,7 @@ fn a_ban_naming_is_seen_only_in_its_exact_shape() {
         "#[expect(clippy::disallowed_methods)] let _ = std::env::args;",
         "let _ = ::std::env::args;",
         "const R: fn() -> std::env::Args = ::std::env::args;",
+        "#[expect(clippy::disallowed_methods)] let _ = ::std::env::args::<>;",
     ];
     for src in reads {
         let found = findings(src);
@@ -654,6 +724,9 @@ fn a_ban_naming_is_seen_only_in_its_exact_shape() {
             "a read passed as a ban naming: {src:?}"
         );
     }
+    // A raw identifier names the same item, so `r#args` is the plain naming.
+    let raw = findings("#[expect(clippy::disallowed_methods)] let _ = ::std::env::r#args;");
+    assert_eq!((raw.args_named, raw.args, raw.rewriters), (1, 0, 0));
     for src in [
         "m!(x);",
         "#[allow(dead_code)] fn f() {}",
@@ -698,6 +771,11 @@ fn every_import_that_hides_a_read_is_refused() {
         "use std::{env::{self, args}};",
         "use std::env::*;",
         "macro_rules! read { ($r:ident) => { std::env::$r() }; }",
+        "use std::env; macro_rules! r { ($m:ident) => { $m::args() } } r!(env);",
+        "macro_rules! r { ($a:ident) => { std::$a::args() } }",
+        "macro_rules! r { ($a:ident) => { ::std::$a::args_os() } }",
+        "macro_rules! r { ($a:ident, $b:ident) => { std::$a::$b() } } r!(env, args);",
+        "macro_rules! r { ($m:path) => { $m::r#args() } }",
     ];
     for src in hidden {
         assert!(
@@ -726,6 +804,18 @@ fn comments_literals_and_other_env_modules_are_not_reads() {
             findings(src),
             Findings::default(),
             "a non-read was flagged: {src:?}"
+        );
+    }
+    let macro_paths = [
+        "macro_rules! m { ($p:ident) => { $crate::stringify::ShowPolicy::$p } }",
+        "macro_rules! m { () => { $crate::cli::args() } }",
+        "macro_rules! m { ($x:expr) => { $x.args() } }",
+    ];
+    for src in macro_paths {
+        let found = findings(src);
+        assert!(
+            found.hiding.is_empty() && found.args + found.args_os == 0,
+            "a macro path naming no reader was flagged: {src:?} {found:?}"
         );
     }
 }
