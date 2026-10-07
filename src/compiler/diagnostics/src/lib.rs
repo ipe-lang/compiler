@@ -9,6 +9,7 @@ pub mod json;
 pub mod path_check;
 mod render;
 mod span;
+pub mod suggest;
 pub mod terminal;
 
 // Re-export the whole taxonomy with a glob so no downstream-nameable code can be

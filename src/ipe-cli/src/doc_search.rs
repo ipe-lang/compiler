@@ -5,22 +5,33 @@
 //! the miss list ([`crate::doc_pick`]) and the unique-exact open both read this
 //! one ranking, so they can never disagree.
 //!
+//! The typo tier and the nearest fallback rank through the shared
+//! [`ipe_diagnostics::suggest`] ranker, over every spelling the exact lookup
+//! accepts: each entry's key and each alias, an alias scoring for its
+//! canonical entry and never listed itself.
+//!
 //! Every input dimension has a declared ceiling: the query length
 //! ([`MAX_QUERY_CHARS`]), the entries scanned ([`MAX_CANDIDATES`]), the hits
 //! kept ([`RESULT_LIMIT`]), the characters of a key or title any tier reads
 //! ([`FIELD_CHARS`]), the text one edit distance compares
-//! ([`DISTANCE_CHARS`]), and a summary's width ([`SUMMARY_CHARS`]). A key or
-//! title comes from a `docs/` tree the checkout controls, so its length alone
-//! never sets the cost of one comparison.
+//! ([`suggest::DISTANCE_CHARS`]), and a summary's width ([`SUMMARY_CHARS`]). A
+//! key or title comes from a `docs/` tree the checkout controls, so its length
+//! alone never sets the cost of one comparison.
+
+use std::collections::BTreeMap;
+
+pub use ipe_diagnostics::suggest::QueryRefusal;
+use ipe_diagnostics::suggest::{self, Cap, Distance, Policy, Shape, Spelling, Threshold};
+use ipe_diagnostics::terminal::is_display_hazard;
 
 use crate::doc_bundle::{DocEntry, DocKind};
 use crate::style::TerminalLine;
 
 /// The longest query, in characters, the matcher accepts.
-pub const MAX_QUERY_CHARS: usize = 256;
+pub const MAX_QUERY_CHARS: usize = suggest::QUERY_CHARS;
 
 /// The most entries one ranking scans, in bundle (kind, key) order.
-pub const MAX_CANDIDATES: usize = 20_000;
+pub const MAX_CANDIDATES: usize = suggest::MAX_UNIVERSE;
 
 /// The most hits a ranking keeps.
 pub const RESULT_LIMIT: usize = 10;
@@ -39,9 +50,6 @@ const _: () = assert!(FIELD_CHARS > MAX_QUERY_CHARS * MAX_FOLD_EXPANSION);
 /// An upper bound on the characters [`char::to_lowercase`] yields for one character.
 const MAX_FOLD_EXPANSION: usize = 3;
 
-/// The most characters per side one edit distance compares.
-pub const DISTANCE_CHARS: usize = 64;
-
 /// The widest summary, in characters, before it is cut and marked `…`.
 pub const SUMMARY_CHARS: usize = 80;
 
@@ -51,58 +59,47 @@ pub const SUMMARY_CHARS: usize = 80;
 /// only add noise below the tiers that already matched it.
 const SUBSEQUENCE_MIN_CHARS: usize = 3;
 
-/// Why a query was turned away before any ranking ran.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryRefusal {
-    /// The query is empty or only whitespace: it names nothing.
-    Empty,
-    /// The query is longer than [`MAX_QUERY_CHARS`].
-    TooLong,
-    /// The query carries a control character, an escape sequence, or a
-    /// format/bidi hazard.
-    ControlChar,
-}
+/// How many query characters' worth of key one subsequence match may span.
+///
+/// A match scattered across a long key is not a reading of the query, so it
+/// never crowds out a typo or a closer entry.
+const SUBSEQUENCE_SPAN_FACTOR: usize = 2;
 
 /// A query proven non-empty, bounded, and free of terminal hazards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocQuery {
-    /// The trimmed query as the user wrote it.
-    text: String,
-    /// The trimmed query, case-folded.
-    folded: String,
+    /// The parsed, folded, dotted query the ranker reads.
+    query: suggest::Query,
 }
 
 impl DocQuery {
     /// Parse a raw query.
     ///
     /// The length is checked first (counting at most one character past the
-    /// ceiling), then the text must equal its own [`TerminalLine`] sanitising,
-    /// then it must hold something besides whitespace.
+    /// ceiling), then the raw text must carry no display hazard, even one
+    /// trimming would drop, so a listed term parses back unchanged, then it
+    /// must hold something besides whitespace.
     ///
     /// # Errors
     ///
     /// The [`QueryRefusal`] naming the first check the query failed.
     pub fn parse(raw: &str) -> Result<Self, QueryRefusal> {
-        if raw.chars().nth(MAX_QUERY_CHARS).is_some() {
-            return Err(QueryRefusal::TooLong);
-        }
-        if TerminalLine::sanitize(raw).as_str() != raw {
+        let parsed = suggest::Query::parse(raw, Shape::Dotted);
+        if !matches!(parsed, Err(QueryRefusal::TooLong)) && raw.chars().any(is_display_hazard) {
             return Err(QueryRefusal::ControlChar);
         }
-        let text = raw.trim();
-        if text.is_empty() {
-            return Err(QueryRefusal::Empty);
-        }
-        Ok(Self {
-            text: text.to_owned(),
-            folded: fold(text),
-        })
+        parsed.map(|query| Self { query })
     }
 
     /// The trimmed query text.
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.text
+        self.query.text()
+    }
+
+    /// The trimmed query, case-folded.
+    fn folded(&self) -> &str {
+        self.query.folded()
     }
 }
 
@@ -125,10 +122,12 @@ pub enum Tier {
     Substring,
     /// Every word of the query is a word of the key or title.
     AllWords,
-    /// The query's characters appear in order in the key.
-    Subsequence,
-    /// The key or its last segment is a small edit distance away.
+    /// A spelling that opens the entry (its key or an alias) is within the
+    /// shared ranker's typo threshold.
     Typo,
+    /// The query's characters appear in order in the key, within
+    /// [`SUBSEQUENCE_SPAN_FACTOR`] times the query's length.
+    Subsequence,
 }
 
 /// Whether a ranking found matches or fell back to the nearest entries.
@@ -191,6 +190,16 @@ impl Folded {
     }
 }
 
+/// The order a ranked entry takes among its peers: `(key length, kind, key)`.
+///
+/// Kind and key are unique together, so it names one entry.
+type Peer<'a> = (usize, DocKind, &'a str);
+
+/// The [`Peer`] order of `entry`.
+fn peer(entry: &DocEntry) -> Peer<'_> {
+    (field_len(&entry.key), entry.kind, entry.key.as_str())
+}
+
 /// The first [`FIELD_CHARS`] characters of an entry field.
 fn field(text: &str) -> &str {
     prefix_chars(text, FIELD_CHARS)
@@ -201,59 +210,97 @@ fn field_len(text: &str) -> usize {
     field(text).chars().count()
 }
 
-/// Rank `entries` against `query`.
+/// Rank `entries`, reached also through `aliases`, against `query`.
 ///
-/// Scans at most [`MAX_CANDIDATES`] entries. Matches are ordered by `(tier,
-/// secondary, key length, kind, key)`, where the secondary is the subsequence
-/// span or the edit distance (zero for every other tier); kind and key are
-/// unique together, so the order is total and every run returns the same list.
-/// The key length counts at most [`FIELD_CHARS`] characters.
+/// Scans at most [`MAX_CANDIDATES`] entries and as many aliases; an alias of
+/// an entry outside the scan is ignored, and an alias is never listed: it
+/// scores for its canonical entry. Matches are ordered by `(tier, secondary,
+/// key length, kind, key)`, where the secondary is the subsequence span or the
+/// edit distance (zero for every other tier); kind and key are unique
+/// together, so the order is total and every run returns the same list. The
+/// key length counts at most [`FIELD_CHARS`] characters.
 /// When nothing matches, the hits are the entries nearest by edit distance,
-/// ordered by `(distance, key length, kind, key)`, so a miss never dead-ends
-/// while any entry exists.
+/// within [`Distance::CEILING`], ordered by `(distance, key length, kind,
+/// key)`; every spelling no longer than the compared width is within it, so a
+/// miss does not dead-end while such an entry exists.
 #[must_use]
-pub fn rank<'a, I>(entries: I, query: &DocQuery) -> Ranked<'a>
+pub fn rank<'a, I, A>(entries: I, aliases: A, query: &DocQuery) -> Ranked<'a>
 where
     I: IntoIterator<Item = &'a DocEntry>,
+    A: IntoIterator<Item = (&'a str, &'a DocEntry)>,
 {
     let mut scan = entries.into_iter();
     let pool: Vec<&'a DocEntry> = scan.by_ref().take(MAX_CANDIDATES).collect();
     let cut = scan.next().is_some();
+    let scanned: BTreeMap<Peer<'a>, &'a DocEntry> = pool.iter().map(|e| (peer(e), *e)).collect();
+    let alias_spellings: Vec<(&'a str, Peer<'a>)> = aliases
+        .into_iter()
+        .take(MAX_CANDIDATES)
+        .filter_map(|(alias, entry)| {
+            let at = peer(entry);
+            scanned.contains_key(&at).then_some((alias, at))
+        })
+        .collect();
+    let universe = || {
+        pool.iter()
+            .map(|e| Spelling {
+                text: e.key.as_str(),
+                target: peer(e),
+            })
+            .chain(
+                alias_spellings
+                    .iter()
+                    .map(|&(text, target)| Spelling { text, target }),
+            )
+    };
+
+    let typos = suggest::rank(
+        &query.query,
+        universe(),
+        Policy {
+            cap: Cap::MAX,
+            threshold: Threshold::Relative,
+        },
+    );
+    let typo_of: BTreeMap<Peer<'a>, Distance> =
+        typos.hits.iter().map(|h| (h.target, h.distance)).collect();
+    let cut = cut || typos.truncated;
 
     let mut matched: Vec<_> = pool
         .iter()
         .filter_map(|entry| {
-            let (tier, secondary) = classify(entry, &Folded::of(entry), query)?;
-            let order = (
-                tier,
-                secondary,
-                field_len(&entry.key),
-                entry.kind,
-                entry.key.as_str(),
-            );
-            Some((order, *entry))
+            let at = peer(entry);
+            let typo = typo_of.get(&at).copied();
+            let (tier, secondary) = classify(entry, &Folded::of(entry), query, typo)?;
+            Some(((tier, secondary, at), *entry))
         })
         .collect();
 
     if matched.is_empty() {
-        let mut nearest: Vec<_> = pool
+        let nearest = suggest::rank(
+            &query.query,
+            universe(),
+            Policy {
+                cap: Cap::MAX,
+                threshold: Threshold::Nearest {
+                    max: Distance::CEILING,
+                },
+            },
+        );
+        let mut hits: Vec<(Distance, Peer<'a>)> = nearest
+            .hits
             .iter()
-            .map(|entry| {
-                let order = (
-                    nearest_distance(&Folded::of(entry), query),
-                    field_len(&entry.key),
-                    entry.kind,
-                    entry.key.as_str(),
-                );
-                (order, *entry)
-            })
+            .map(|h| (h.distance, h.target))
             .collect();
-        nearest.sort_by(|a, b| a.0.cmp(&b.0));
-        nearest.truncate(RESULT_LIMIT);
+        hits.sort_unstable();
         return Ranked {
-            entries: nearest.into_iter().map(|(_, entry)| entry).collect(),
+            entries: hits
+                .into_iter()
+                .filter_map(|(_, at)| scanned.get(&at).copied())
+                .take(RESULT_LIMIT)
+                .collect(),
             closeness: Closeness::Nearest,
-            truncated: cut,
+            truncated: cut || nearest.truncated,
         };
     }
 
@@ -280,14 +327,22 @@ where
     let mut hits = entries
         .into_iter()
         .take(MAX_CANDIDATES)
-        .filter(|entry| fold(field(&entry.key)) == query.folded);
+        .filter(|entry| fold(field(&entry.key)) == query.folded());
     let first = hits.next()?;
     hits.next().is_none().then_some(first)
 }
 
 /// The best tier `entry` matches `query` in, with its secondary order.
-fn classify(entry: &DocEntry, folded: &Folded, query: &DocQuery) -> Option<(Tier, usize)> {
-    let q = query.folded.as_str();
+///
+/// `typo` is the shared ranker's distance for the entry, when one of its
+/// spellings is within the typo threshold.
+fn classify(
+    entry: &DocEntry,
+    folded: &Folded,
+    query: &DocQuery,
+    typo: Option<Distance>,
+) -> Option<(Tier, usize)> {
+    let q = query.folded();
     let key = folded.key.as_str();
     let member = folded.member();
     let title = folded.title.as_str();
@@ -309,18 +364,18 @@ fn classify(entry: &DocEntry, folded: &Folded, query: &DocQuery) -> Option<(Tier
         Tier::Substring
     } else if all_words(q, key, title) {
         Tier::AllWords
-    } else if let Some(span) = subsequence_span(q, key) {
-        return Some((Tier::Subsequence, span));
+    } else if let Some(distance) = typo {
+        return Some((Tier::Typo, usize::from(distance.get())));
     } else {
-        return typo_distance(q, key, member).map(|distance| (Tier::Typo, distance));
+        return subsequence_span(q, key).map(|span| (Tier::Subsequence, span));
     };
     Some((tier, 0))
 }
 
-/// The Unicode case fold the matcher compares under, character by character so
+/// The Unicode case fold the matcher compares under: the shared ranker's, so
 /// the query and every field fold by the same rule.
 fn fold(text: &str) -> String {
-    text.chars().flat_map(char::to_lowercase).collect()
+    suggest::fold(text)
 }
 
 /// The last `.` segment of a key (`ipe.time.unixmillis` → `unixmillis`), or
@@ -378,10 +433,15 @@ fn all_words(q: &str, key: &str, title: &str) -> bool {
 }
 
 /// The span, in characters, of the leftmost in-order match of the query's
-/// characters in the folded key, or `None` when they do not all appear or the
-/// query is shorter than [`SUBSEQUENCE_MIN_CHARS`].
+/// characters in the folded key, or `None` when they do not all appear, the
+/// query is shorter than [`SUBSEQUENCE_MIN_CHARS`], or the span is wider than
+/// [`SUBSEQUENCE_SPAN_FACTOR`] times the query.
 fn subsequence_span(q: &str, key: &str) -> Option<usize> {
-    q.chars().nth(SUBSEQUENCE_MIN_CHARS.saturating_sub(1))?;
+    let q_len = q.chars().count();
+    if q_len < SUBSEQUENCE_MIN_CHARS {
+        return None;
+    }
+    let widest = q_len.saturating_mul(SUBSEQUENCE_SPAN_FACTOR);
     let mut wanted = q.chars().peekable();
     let mut first: Option<usize> = None;
     for (at, c) in key.chars().enumerate() {
@@ -389,45 +449,12 @@ fn subsequence_span(q: &str, key: &str) -> Option<usize> {
             wanted.next();
             let start = *first.get_or_insert(at);
             if wanted.peek().is_none() {
-                return Some(at.saturating_sub(start).saturating_add(1));
+                let span = at.saturating_sub(start).saturating_add(1);
+                return (span <= widest).then_some(span);
             }
         }
     }
     None
-}
-
-/// The smallest edit distance from the query to the folded key or its last
-/// segment, when it is within the typo threshold `max(1, chars / 3)`.
-///
-/// Neither side may exceed [`DISTANCE_CHARS`], and a field whose length alone
-/// differs by more than the threshold is skipped without a distance run.
-fn typo_distance(q: &str, key: &str, member: &str) -> Option<usize> {
-    let q_len = q.chars().count();
-    if q_len > DISTANCE_CHARS {
-        return None;
-    }
-    let threshold = (q_len / 3).max(1);
-    [key, member]
-        .into_iter()
-        .filter(|field| {
-            let len = field.chars().count();
-            len <= DISTANCE_CHARS && len.abs_diff(q_len) <= threshold
-        })
-        .map(|field| crate::driver::levenshtein(q, field))
-        .filter(|distance| *distance <= threshold)
-        .min()
-}
-
-/// The smallest edit distance from the query to the folded key, last segment,
-/// or title, each side cut to its first [`DISTANCE_CHARS`] characters.
-fn nearest_distance(folded: &Folded, query: &DocQuery) -> usize {
-    let q = prefix_chars(&query.folded, DISTANCE_CHARS);
-    let key = folded.key.as_str();
-    [key, folded.member(), folded.title.as_str()]
-        .into_iter()
-        .map(|field| crate::driver::levenshtein(q, prefix_chars(field, DISTANCE_CHARS)))
-        .min()
-        .unwrap_or(usize::MAX)
 }
 
 /// The first `n` characters of `text`, cut on a character boundary.
@@ -542,12 +569,12 @@ mod tests {
     }
 
     fn query(raw: &str) -> DocQuery {
-        let parsed = DocQuery::parse(raw);
-        assert!(parsed.is_ok(), "{raw:?} must parse: {parsed:?}");
-        parsed.unwrap_or_else(|_| DocQuery {
-            text: String::new(),
-            folded: String::new(),
-        })
+        DocQuery::parse(raw).expect("the test query parses")
+    }
+
+    /// Rank `entries` with no aliases.
+    fn plain<'a>(entries: &'a [DocEntry], q: &DocQuery) -> Ranked<'a> {
+        rank(entries, std::iter::empty(), q)
     }
 
     fn keys<'a>(ranked: &Ranked<'a>) -> Vec<&'a str> {
@@ -563,7 +590,22 @@ mod tests {
     }
 
     fn tier_of(e: &DocEntry, raw: &str) -> Option<Tier> {
-        classify(e, &Folded::of(e), &query(raw)).map(|(tier, _)| tier)
+        let q = query(raw);
+        let typo = suggest::rank(
+            &q.query,
+            [Spelling {
+                text: e.key.as_str(),
+                target: (),
+            }],
+            Policy {
+                cap: Cap::MAX,
+                threshold: Threshold::Relative,
+            },
+        )
+        .hits
+        .first()
+        .map(|h| h.distance);
+        classify(e, &Folded::of(e), &q, typo).map(|(tier, _)| tier)
     }
 
     // -- Query refusals -------------------------------------------------------
@@ -608,7 +650,7 @@ mod tests {
     fn a_query_is_trimmed_and_folded() {
         let q = query("  Ipe.List  ");
         assert_eq!(q.text(), "Ipe.List");
-        assert_eq!(q.folded, "ipe.list");
+        assert_eq!(q.folded(), "ipe.list");
     }
 
     // -- Ranking --------------------------------------------------------------
@@ -657,19 +699,19 @@ mod tests {
                 Tier::AllWords,
             ),
             (
-                entry(DocKind::Symbol, "Ipe.Time.unixMillis", "x"),
-                "uxms",
-                Tier::Subsequence,
-            ),
-            (
                 entry(DocKind::Construct, "select", "Select expression"),
                 "slect",
-                Tier::Subsequence,
+                Tier::Typo,
             ),
             (
                 entry(DocKind::Construct, "select", "Select expression"),
                 "selcet",
                 Tier::Typo,
+            ),
+            (
+                entry(DocKind::Symbol, "Ipe.Time.unixMillis", "x"),
+                "unxm",
+                Tier::Subsequence,
             ),
         ];
         for (e, raw, want) in &cases {
@@ -689,7 +731,7 @@ mod tests {
             entry(DocKind::Symbol, "Ipe.Dict.remap", "x"),
             entry(DocKind::Construct, "map", "Map"),
         ];
-        let ranked = rank(&entries, &query("map"));
+        let ranked = plain(&entries, &query("map"));
         assert_eq!(
             keys(&ranked),
             ["map", "Ipe.List.map", "Ipe.List.mapping", "Ipe.Dict.remap"]
@@ -706,7 +748,7 @@ mod tests {
             entry(DocKind::Topic, "map-a", "x"),
             entry(DocKind::Idiom, "map", "x"),
         ];
-        let ranked = rank(&entries, &query("ma"));
+        let ranked = plain(&entries, &query("ma"));
         let order: Vec<(DocKind, &str)> = ranked
             .entries
             .iter()
@@ -727,21 +769,57 @@ mod tests {
     fn the_same_query_ranks_the_same_way_every_run() {
         let entries = select_entries();
         for raw in ["e", "sel", "zzzzzzzz", "expression"] {
-            let first = keys(&rank(&entries, &query(raw)));
+            let first = keys(&plain(&entries, &query(raw)));
             let reversed: Vec<DocEntry> = entries.iter().rev().cloned().collect();
-            assert_eq!(first, keys(&rank(&entries, &query(raw))), "{raw:?}");
+            assert_eq!(first, keys(&plain(&entries, &query(raw))), "{raw:?}");
             assert_eq!(
                 first,
-                keys(&rank(&reversed, &query(raw))),
+                keys(&plain(&reversed, &query(raw))),
                 "input order never changes the ranking: {raw:?}"
             );
         }
     }
 
     #[test]
+    fn a_typo_ranks_above_a_scattered_subsequence() {
+        let entries = vec![
+            entry(DocKind::Symbol, "Ipe.List.map", "x"),
+            entry(DocKind::Symbol, "Ipe.Task.mapAlp", "x"),
+        ];
+        let ranked = plain(&entries, &query("mapp"));
+        assert_eq!(keys(&ranked), ["Ipe.List.map", "Ipe.Task.mapAlp"]);
+        assert!(
+            subsequence_span("mapp", "ipe.maybe.andthenmapping").is_none(),
+            "a match spread wider than twice the query is no subsequence hit"
+        );
+        assert_eq!(subsequence_span("unxm", "ipe.time.unixmillis"), Some(5));
+    }
+
+    #[test]
+    fn an_alias_ranks_its_canonical_entry_and_is_never_listed() {
+        let entries = vec![
+            entry(DocKind::Symbol, "Ipe.List.foldl", "x"),
+            entry(DocKind::Symbol, "Ipe.List.map", "x"),
+        ];
+        let canonical = entries.first().expect("one entry");
+        let aliases = [("Ipe.List.reduce", canonical)];
+        let ranked = rank(&entries, aliases, &query("List.redcue"));
+        assert_eq!(keys(&ranked), ["Ipe.List.foldl"]);
+        assert_eq!(ranked.closeness, Closeness::Match);
+
+        let outside = entry(DocKind::Symbol, "Ipe.Dict.foldl", "x");
+        let stray = [("Ipe.Dict.reduce", &outside)];
+        let ranked = rank(&entries, stray, &query("Dict.redcue"));
+        assert!(
+            ranked.entries.iter().all(|e| e.key != "Ipe.Dict.foldl"),
+            "an alias of an entry outside the scan is ignored"
+        );
+    }
+
+    #[test]
     fn a_typo_finds_the_intended_key() {
         let selects = select_entries();
-        let ranked = rank(&selects, &query("slect"));
+        let ranked = plain(&selects, &query("slect"));
         assert_eq!(keys(&ranked).first(), Some(&"select"));
         let entries = vec![
             entry(
@@ -752,9 +830,9 @@ mod tests {
             entry(DocKind::Symbol, "Ipe.Time.now", "Ipe.Time.now"),
             entry(DocKind::Symbol, "Ipe.List.map", "Ipe.List.map"),
         ];
-        let ranked = rank(&entries, &query("unixMilis"));
+        let ranked = plain(&entries, &query("unixMilis"));
         assert_eq!(keys(&ranked).first(), Some(&"Ipe.Time.unixMillis"));
-        let ranked = rank(&entries, &query("unixmillis"));
+        let ranked = plain(&entries, &query("unixmillis"));
         assert_eq!(keys(&ranked), ["Ipe.Time.unixMillis"]);
     }
 
@@ -765,18 +843,18 @@ mod tests {
             entry(DocKind::Topic, "日本語-text", "日本語"),
             entry(DocKind::Topic, "emoji", "🦀🦀🦀 crab"),
         ];
-        assert_eq!(keys(&rank(&entries, &query("ÜNÏCODE"))), ["ünïcode"]);
-        assert_eq!(keys(&rank(&entries, &query("straße"))), ["ünïcode"]);
+        assert_eq!(keys(&plain(&entries, &query("ÜNÏCODE"))), ["ünïcode"]);
+        assert_eq!(keys(&plain(&entries, &query("straße"))), ["ünïcode"]);
         assert_eq!(
-            keys(&rank(&entries, &query("本語"))).first(),
+            keys(&plain(&entries, &query("本語"))).first(),
             Some(&"日本語-text")
         );
         for raw in ["🦀", "🦀x", "語", "é", "ß"] {
-            let _ = rank(&entries, &query(raw));
+            let _ = plain(&entries, &query(raw));
         }
-        let long = "日".repeat(DISTANCE_CHARS.saturating_mul(3));
+        let long = "日".repeat(suggest::DISTANCE_CHARS.saturating_mul(3));
         let wide = vec![entry(DocKind::Topic, &long, &long)];
-        let ranked = rank(&wide, &query("本"));
+        let ranked = plain(&wide, &query("本"));
         assert_eq!(ranked.closeness, Closeness::Nearest);
         assert_eq!(ranked.entries.len(), 1);
     }
@@ -784,12 +862,12 @@ mod tests {
     #[test]
     fn nothing_matching_falls_back_to_the_nearest_entries() {
         let selects = select_entries();
-        let ranked = rank(&selects, &query("zzzzzzzzzzz"));
+        let ranked = plain(&selects, &query("zzzzzzzzzzz"));
         assert_eq!(ranked.closeness, Closeness::Nearest);
         assert!(!ranked.entries.is_empty(), "never a dead end");
         assert!(ranked.entries.len() <= RESULT_LIMIT);
         let empty: Vec<DocEntry> = Vec::new();
-        let ranked = rank(&empty, &query("zzz"));
+        let ranked = plain(&empty, &query("zzz"));
         assert!(ranked.entries.is_empty());
     }
 
@@ -815,9 +893,9 @@ mod tests {
         let mut reversed = entries.clone();
         reversed.reverse();
         for raw in ["a", "aaa", "huge", "zzzz", "alpha"] {
-            let first = rank(&entries, &query(raw));
-            assert_eq!(keys(&first), keys(&rank(&entries, &query(raw))), "{raw:?}");
-            let back = rank(&reversed, &query(raw));
+            let first = plain(&entries, &query(raw));
+            assert_eq!(keys(&first), keys(&plain(&entries, &query(raw))), "{raw:?}");
+            let back = plain(&reversed, &query(raw));
             assert_eq!(keys(&first), keys(&back), "{raw:?}");
             assert_eq!(kinds(&first), kinds(&back), "{raw:?}");
         }
@@ -846,17 +924,17 @@ mod tests {
         let many: Vec<DocEntry> = (0..30)
             .map(|n| entry(DocKind::Topic, &format!("pipe-{n:02}"), "Pipes"))
             .collect();
-        let ranked = rank(&many, &query("pipe"));
+        let ranked = plain(&many, &query("pipe"));
         assert_eq!(ranked.entries.len(), RESULT_LIMIT);
         assert!(ranked.truncated);
         let exact: Vec<DocEntry> = many.iter().take(RESULT_LIMIT).cloned().collect();
-        let ranked = rank(&exact, &query("pipe"));
+        let ranked = plain(&exact, &query("pipe"));
         assert_eq!(ranked.entries.len(), RESULT_LIMIT);
         assert!(!ranked.truncated, "exactly the ceiling is not a cut");
         let far: Vec<DocEntry> = (0..30)
             .map(|n| entry(DocKind::Topic, &format!("t{n:02}"), "T"))
             .collect();
-        let ranked = rank(&far, &query("zzzzzzzzzzzzz"));
+        let ranked = plain(&far, &query("zzzzzzzzzzzzz"));
         assert_eq!(ranked.closeness, Closeness::Nearest);
         assert_eq!(ranked.entries.len(), RESULT_LIMIT);
     }
@@ -867,7 +945,7 @@ mod tests {
             .map(|n| entry(DocKind::Topic, &format!("k{n}"), "T"))
             .collect();
         let last = over.last().map(|e| e.key.clone()).unwrap_or_default();
-        let ranked = rank(&over, &query(&last));
+        let ranked = plain(&over, &query(&last));
         assert!(ranked.truncated);
         assert!(
             ranked.entries.iter().all(|e| e.key != last),
@@ -899,7 +977,7 @@ mod tests {
             entry(DocKind::Topic, "pipes", "Pipes"),
             entry(DocKind::Topic, "pipes-two", "Pipes two"),
         ];
-        let ranked = rank(&entries, &query("pipes"));
+        let ranked = plain(&entries, &query("pipes"));
         let miss = DocMiss::new("pipes", &ranked, |e| {
             if e.key == "pipes" {
                 format!("topic:{}", e.key)
