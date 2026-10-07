@@ -136,9 +136,25 @@ impl<'a> Source<'a> {
     }
 }
 
-/// The response a policy guards.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Profile {
+/// Declares [`Profile`] and [`Profile::ALL`] from one variant list.
+///
+/// A variant cannot exist outside `ALL`, so no test iterating `ALL` skips one.
+macro_rules! profiles {
+    ($($(#[doc = $doc:expr])* $(#[cfg($cfg:meta)])? $variant:ident,)+) => {
+        /// The response a policy guards.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Profile {
+            $($(#[doc = $doc])* $(#[cfg($cfg)])? $variant,)+
+        }
+
+        impl Profile {
+            /// Every profile, in declaration order.
+            pub const ALL: &'static [Self] = &[$($(#[cfg($cfg)])? Self::$variant,)+];
+        }
+    };
+}
+
+profiles! {
     /// An `Ipe.Http.Server` handler response or a static file: no inline
     /// script or style element applies.
     Response,
@@ -149,23 +165,6 @@ pub enum Profile {
 }
 
 impl Profile {
-    /// Every profile, in [`Self::ordinal`] order.
-    pub const ALL: &'static [Self] = &[
-        Self::Response,
-        #[cfg(all(feature = "server", feature = "web-core"))]
-        Self::Console,
-    ];
-
-    /// The position of the profile in [`Self::ALL`].
-    #[must_use]
-    pub const fn ordinal(self) -> usize {
-        match self {
-            Self::Response => 0,
-            #[cfg(all(feature = "server", feature = "web-core"))]
-            Self::Console => 1,
-        }
-    }
-
     /// The embed list the profile's `frame-ancestors` names, given the
     /// operator's: `None` frames the response same-origin only.
     #[must_use]
@@ -338,10 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn profile_all_lists_every_profile_in_ordinal_order() {
+    fn profile_all_lists_each_variant_once() {
         for (i, p) in Profile::ALL.iter().enumerate() {
-            assert_eq!(p.ordinal(), i, "{p:?}");
+            assert_eq!(Profile::ALL.iter().position(|q| q == p), Some(i), "{p:?}");
         }
+        let declared = if cfg!(all(feature = "server", feature = "web-core")) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(Profile::ALL.len(), declared);
     }
 
     #[test]
