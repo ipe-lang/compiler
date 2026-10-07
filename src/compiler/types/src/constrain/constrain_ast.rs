@@ -11,9 +11,10 @@ use super::{
 ///
 /// Each variant identifies WHICH scheme variable a `constrain_var_kernel` tie
 /// site must bound; the concrete raw index lives in [`OBLIGATION_SLOTS`] (the
-/// `SqlParam` index differs across the `Db` family — var 0 for `exec`/`query`,
-/// var 1 for the `queryDecode` shapes that carry a decoder var ahead of the
-/// params list — so the index cannot live on the kind alone).
+/// `SqlParam` index differs across the `Db` family — var 0 for
+/// `exec`/`query`/`findProjection`/`findProjectionOrdered`, var 1 for the
+/// `queryDecode` shapes that carry a decoder var ahead of the bind list — so
+/// the index cannot live on the kind alone).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationKind {
     /// Dict/Set element-key or `Ipe.Cache` key (`comparable` / `PartialEq`).
@@ -67,11 +68,15 @@ pub const OBLIGATION_SLOTS: &[(StdlibKernel, u32, ObligationKind)] = {
         (K::CacheRemove, 0, O::Key),
         // `Set.map` result element — raw scheme-var 1.
         (K::SetMap, 1, O::SetMapResult),
-        // `Db.*` params-list element — var 0 (exec/query), var 1 (queryDecode).
+        // `Db.*` bind-list element — var 0 (exec/query/findProjection/
+        // findProjectionOrdered), var 1 (queryDecode, whose var 0 is the
+        // decoder's result type).
         (K::DbExec, 0, O::SqlParam),
         (K::DbQuery, 0, O::SqlParam),
         (K::DbQueryDecode, 1, O::SqlParam),
         (K::DbConnQueryDecode, 1, O::SqlParam),
+        (K::DbFindProjection, 0, O::SqlParam),
+        (K::DbFindProjectionOrdered, 0, O::SqlParam),
         // `Log.*With` list element / `Debug.log` value — Show, raw var 0.
         (K::LogInfoWith, 0, O::Interpolable),
         (K::LogDebugWith, 0, O::Interpolable),
@@ -103,7 +108,7 @@ pub const OBLIGATION_SLOTS: &[(StdlibKernel, u32, ObligationKind)] = {
 /// update this count — a silently dropped entry (obligation removed → hazard
 /// reopened) fails the build.
 #[cfg(test)]
-pub const EXPECTED_OBLIGATION_SLOT_COUNT: usize = 32;
+pub const EXPECTED_OBLIGATION_SLOT_COUNT: usize = 34;
 
 impl Builder<'_> {
     /// Constrain one def's body with `current_home` set to the def's module
@@ -461,8 +466,10 @@ impl Builder<'_> {
     /// [`OBLIGATION_SLOTS`] SSOT rather than an inline literal at the tie site —
     /// so a scheme-var reorder cannot leave the tie index and the scheme shape
     /// disagreeing. `None` iff the `(k, kind)` pair is not a pinned obligation —
-    /// a fail-closed miss for the exact-domain selectors (SQL-param, Web), and
-    /// the benign no-obligation case for the broad `Key` module selector.
+    /// a fail-closed miss for the exact-domain Web selectors, and the benign
+    /// no-obligation case for the broad `Key` module selector and for every
+    /// kernel without a SQL bind list (a `Db` kernel taking one cannot lack its
+    /// row: `every_db_list_var_argument_has_a_sql_param_slot` walks them all).
     fn obligation_slot(k: StdlibKernel, kind: ObligationKind) -> Option<u32> {
         OBLIGATION_SLOTS
             .iter()
@@ -730,14 +737,12 @@ impl Builder<'_> {
                 }
                 return Ok(var);
             }
-            // `Db.exec` / `Db.query` / `Db.queryDecode`: the params-LIST
-            // ELEMENT (raw scheme-var 0 for `exec`/`query`; var 1 for
-            // `queryDecode`, whose var 0 is the decoder's result type — see
-            // the scheme comments above) carries the SQL-bind-parameter
-            // obligation. Same `stdlib_scheme` + tie shape as the Set/Dict
-            // key obligation directly above: only the params-element
-            // position is bounded, so a generic wrapper around `Db.exec` /
-            // `Db.query` (`Database.exec label queryStr args` in
+            // Every kernel with a SQL bind list: the list ELEMENT (the raw
+            // scheme var `OBLIGATION_SLOTS` names for it) carries the
+            // SQL-bind-parameter obligation. Same `stdlib_scheme` + tie shape
+            // as the Set/Dict key obligation directly above: only the
+            // bind-element position is bounded, so a generic wrapper around a
+            // Db kernel (`Database.exec label queryStr args` in
             // `examples/17-ipemon`) lifts `Into<SqlParam>` onto its own
             // emitted Rust generic (closing the E0277 half), and an
             // empty-list call site whose element type is otherwise
@@ -745,23 +750,9 @@ impl Builder<'_> {
             // instead of the wildcard-`any` fallback (closing the E0283
             // half — see the `sql_param` arm of the numeric-defaulting loop
             // in `crate::lib`), rather than emitting a bare `Vec::new()`
-            // `cargo` cannot infer.
-            if matches!(
-                k,
-                StdlibKernel::DbExec
-                    | StdlibKernel::DbQuery
-                    | StdlibKernel::DbQueryDecode
-                    | StdlibKernel::DbConnQueryDecode
-            ) {
-                // The params-list element var is index 1 for both `queryDecode`
-                // shapes (they carry a decoder var 0 ahead of it), index 0 for the
-                // bare `exec`/`query` — read from `OBLIGATION_SLOTS`, not inlined.
-                let raw_idx = Self::obligation_slot(k, ObligationKind::SqlParam).ok_or(
-                    Diagnostic::Lower {
-                        span,
-                        msg: LowerError::Unsupported(Feature::Kernels),
-                    },
-                )?;
+            // `cargo` cannot infer. The kernel set is the table's rows, so a
+            // Db kernel cannot take a bind list without the bound.
+            if let Some(raw_idx) = Self::obligation_slot(k, ObligationKind::SqlParam) {
                 let ty = self.resolve_scheme(SchemeKey(k)).ok_or(Diagnostic::Lower {
                     span,
                     msg: LowerError::Unsupported(Feature::Kernels),

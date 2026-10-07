@@ -643,6 +643,86 @@ fn security_db_sql_column_still_validates_and_compiles() {
     assert_compiles("security_db_sql_column_validates", src);
 }
 
+/// Every `Db` kernel taking a SQL bind list, as `(label, imports, probe)`.
+///
+/// `probe` is one function calling the kernel with `{binds}` in the bind-list
+/// position; `imports` are the extra imports it needs.
+const DB_BIND_LIST_KERNELS: [(&str, &str, &str); 6] = [
+    (
+        "exec",
+        "import Ipe.Db as Db\n",
+        r#"probe : Db -> Task Error Int
+probe conn =
+    Db.exec conn "SELECT 1" {binds}
+"#,
+    ),
+    (
+        "unsafe_query",
+        "import Ipe.Db as Db\nimport Ipe.Db.Unsafe as Unsafe\n",
+        r#"probe : Db -> Task Error (List (Dict String String))
+probe conn =
+    Unsafe.unsafeQuery conn "SELECT 1" {binds}
+"#,
+    ),
+    (
+        "query_decode",
+        "import Ipe.Db as Db\nimport Ipe.Db.Decode\n",
+        r#"probe : Db -> Task Error (List Int)
+probe conn =
+    Db.queryDecode conn "SELECT 1" {binds} (Db.Decode.int "n")
+"#,
+    ),
+    (
+        "query_decode_on",
+        "import Ipe.Db.Dsn as Dsn exposing (Connection, ReadOnly)\nimport Ipe.Db as Db\nimport Ipe.Db.Decode\n",
+        r#"probe : Connection ReadOnly -> Task Error (List Int)
+probe conn =
+    Db.queryDecodeOn conn "SELECT 1" {binds} (Db.Decode.int "n")
+"#,
+    ),
+    (
+        "find_projection",
+        "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
+        r#"probe : Db -> Task Error (List (Dict String String))
+probe conn =
+    Db.findProjection conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] {binds}
+"#,
+    ),
+    (
+        "find_projection_ordered",
+        "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
+        r#"probe : Db -> Task Error (List (Dict String String))
+probe conn =
+    Db.findProjectionOrdered conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] {binds} "a0" "id" True
+"#,
+    ),
+];
+
+/// A program holding one probe over a `Db` kernel, with `binds` as its bind list.
+fn db_bind_list_program(imports: &str, probe: &str, binds: &str) -> String {
+    let probe = probe.replace("{binds}", binds);
+    format!(
+        "{HEAD}{imports}import Ipe.Task as Task\n\n{probe}\nmain : Task Error ()\nmain =\n    Task.succeed ()\n"
+    )
+}
+
+/// SOUNDNESS (SEAL): a bind list whose elements are not `SqlParam` is rejected at
+/// `ipe` time for every `Db` kernel that takes one. The runtime binds a
+/// `Vec<SqlParam>`, so a record or function element would otherwise pass `ipe`
+/// and fail `cargo` (E0277). Each kernel's `[ SqlInt 1 ]` control compiles, so
+/// the refusal comes from the element type alone.
+#[test]
+fn security_db_bind_list_refuses_non_sql_param_elements() {
+    for (label, imports, probe) in DB_BIND_LIST_KERNELS {
+        let control = db_bind_list_program(imports, probe, "[ SqlInt 1 ]");
+        assert_compiles(&format!("db_bind_list_{label}_control"), &control);
+        for (shape, binds) in [("record", "[ { id = 1 } ]"), ("function", r"[ \x -> x ]")] {
+            let src = db_bind_list_program(imports, probe, binds);
+            assert_rejected(&format!("db_bind_list_{label}_{shape}"), &src, "IPE-T0001");
+        }
+    }
+}
+
 /// SECURITY: the verbatim JSON-LD `<script>` hatch `unsafeJsonLd` no longer
 /// lives on the plain `Ipe.Web.Head` surface — it relocated to
 /// `Ipe.Web.Head.Unsafe`. A program that imports only `Ipe.Web.Head` and reaches
