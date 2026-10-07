@@ -179,9 +179,12 @@ file replaced by another, a decision made from another process) rebuilds the
 copy from the verified rows of the review DB before the page is read. A stamp
 of an intact chain is trusted only while the log still holds every entry up
 to the head, so an entry deleted below an unmoved head shows the banner on
-the next page load. A row
-written into `review_log` by hand, outside the app, does not move the head
-and breaks the chain. A replaced review DB has a new log id, so it re-opens
+the next page load. That check counts entries, so an entry edited in place
+reads as not counted in the history at once, but its unit, already drained,
+stays out of the queue until the copy is next rebuilt: at the next decision
+or restart. A row written into `review_log` by hand, outside the app, does
+not move the head: reads ignore it, and every new decision is refused as a
+break at its entry. A replaced review DB has a new log id, so it re-opens
 every unit the old one decided. Startup always rebuilds the copy once.
 
 The index DB is opened read-only for listing and read-write (never created) only
