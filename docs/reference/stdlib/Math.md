@@ -36,7 +36,7 @@ min : a -> a -> a
 
 `min a b` — the smaller of two comparable values.
 
-Works on any comparable type (`Int`, `Float`, `String`, …).
+Works on any comparable scalar: `Int`, `Float`, `String`, `Char`, or `Bool`.
 
 ```ipe
 Math.min 3 5 --> 3
@@ -52,7 +52,7 @@ max : a -> a -> a
 
 `max a b` — the larger of two comparable values.
 
-Works on any comparable type (`Int`, `Float`, `String`, …).
+Works on any comparable scalar: `Int`, `Float`, `String`, `Char`, or `Bool`.
 
 ```ipe
 Math.max 3 5 --> 5

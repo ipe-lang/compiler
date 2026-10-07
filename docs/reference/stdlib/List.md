@@ -36,7 +36,8 @@ Example:
 See also: `Ipe.Maybe`, `Ipe.Dict` (key-value lookup), `Ipe.Set`.
 
 The `comparable` and `number` constraints in the signatures are checked at
-each call site.
+each call site. `comparable` means a scalar: `Int`, `Float`, `String`,
+`Char`, or `Bool` — never a list, tuple, or record.
 
 ## `isEmpty`
 
@@ -424,13 +425,16 @@ sortBy : (a -> b) -> List a -> List a
 
 `sortBy key list` — stable ascending sort, comparing `key element`.
 
-The `key` function maps each element to a comparable value; elements are
+The `key` function maps each element to a value that is ordered by the
+natural order of `Int`, `Float`, `String`, `Char`, or `Bool`; elements are
 sorted by those derived values. Elements with equal keys keep their
-relative order.
+relative order. To sort pairs by one component, pass `Tuple.first` or
+`Tuple.second` as the key.
 
 ```ipe
 sortBy String.length [ "banana", "kiwi", "fig" ] --> [ "fig", "kiwi", "banana" ]
 sortBy identity [ 3, 1, 2 ] --> [ 1, 2, 3 ]
+sortBy Tuple.first [ ( 2, "b" ), ( 1, "a" ) ] --> [ ( 1, "a" ), ( 2, "b" ) ]
 ```
 
 ## `sortWith`
@@ -457,8 +461,10 @@ sort : List a -> List a
 
 `sort list` — stable ascending sort by the natural order of the elements.
 
-Requires elements to be comparable (`Int`, `Float`, `String`, `Char`,
-or a list/tuple of comparables).
+Requires elements to be one of the comparable scalars: `Int`, `Float`,
+`String`, `Char`, or `Bool`. A list, tuple, record, or function is not
+comparable, so `sort` rejects a list of pairs; sort those with `sortBy`
+(`sortBy Tuple.first`) or `sortWith`.
 
 ```ipe
 sort [ 3, 1, 4, 1, 5 ] --> [ 1, 1, 3, 4, 5 ]
@@ -504,7 +510,8 @@ maximum : List a -> Maybe a
 
 `maximum list` — `Just` the largest element, or `Nothing` for the empty list.
 
-Requires elements to be comparable.
+Requires elements to be one of the comparable scalars: `Int`, `Float`,
+`String`, `Char`, or `Bool`. A list, tuple, or record is not comparable.
 
 ```ipe
 maximum [ 3, 1, 4, 1, 5 ] --> Just 5
@@ -520,7 +527,8 @@ minimum : List a -> Maybe a
 
 `minimum list` — `Just` the smallest element, or `Nothing` for the empty list.
 
-Requires elements to be comparable.
+Requires elements to be one of the comparable scalars: `Int`, `Float`,
+`String`, `Char`, or `Bool`. A list, tuple, or record is not comparable.
 
 ```ipe
 minimum [ 3, 1, 4, 1, 5 ] --> Just 1
