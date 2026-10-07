@@ -1011,18 +1011,6 @@ fn relaunch_line(posture: crate::telemetry::BuildPosture, assignment: &str) -> S
 
 #[cfg(feature = "server")]
 impl ResolvedPort {
-    /// The refusal text for a bind that failed with `AddrInUse`.
-    ///
-    /// Its fix line is chosen by how this binary was built
-    /// ([`crate::telemetry::BuildPosture::COMPILED`]).
-    pub(crate) fn addr_in_use_message(&self) -> String {
-        self.refusal_message(
-            crate::telemetry::BuildPosture::COMPILED,
-            BindRefusal::PortInUse,
-            None,
-        )
-    }
-
     /// The typed refusal for a bind of `addr` that failed with `error`.
     ///
     /// An operator-fixable kind ([`BindRefusal`]) gets its own error kind and a
@@ -1053,7 +1041,7 @@ impl ResolvedPort {
         let Some(refusal) = BindRefusal::classify(error.kind()) else {
             return IpeError::io(format!("{surface}: bind {addr}: {error}"));
         };
-        let message = self.refusal_message(posture, refusal, Some(addr.ip()));
+        let message = self.refusal_message(posture, refusal, addr.ip());
         match refusal {
             BindRefusal::PortInUse => IpeError::conflict(message),
             BindRefusal::PortRefused => IpeError::permission_denied().with_message(message),
@@ -1069,7 +1057,7 @@ impl ResolvedPort {
         &self,
         posture: crate::telemetry::BuildPosture,
         refusal: BindRefusal,
-        host: Option<std::net::IpAddr>,
+        host: std::net::IpAddr,
     ) -> String {
         let port = self.port;
         let cause = match refusal {
@@ -1083,10 +1071,6 @@ impl ResolvedPort {
                 format!("port {port} was refused to this process by the operating system's policy.")
             }
             BindRefusal::AddressNotLocal => {
-                let host = host.as_ref().map_or_else(
-                    || "the bind address".to_owned(),
-                    std::string::ToString::to_string,
-                );
                 let var = crate::app_config::HTTP_BIND_VAR;
                 return format!(
                     "{host} is not an address of this host, so port {port} cannot be bound on it.\n\
@@ -4728,16 +4712,17 @@ mod listen_port_tests {
         }
     }
 
-    /// The compiled posture's in-use advice is the advice `addr_in_use_message`
-    /// gives.
+    /// `bind_refusal` gives the refusal of the compiled posture.
     #[test]
-    fn addr_in_use_message_follows_the_compiled_posture() {
+    fn bind_refusal_follows_the_compiled_posture() {
         for var in OPERATOR_VARS {
             let r = resolve(None, var, None);
-            assert_eq!(
-                r.addr_in_use_message(),
-                in_use_message(r, BuildPosture::COMPILED)
-            );
+            let compiled = crate::ipe_error_message(r.bind_refusal(
+                "listen",
+                std::net::SocketAddr::from(([127, 0, 0, 1], 8000)),
+                &std::io::Error::from(std::io::ErrorKind::AddrInUse),
+            ));
+            assert_eq!(compiled, in_use_message(r, BuildPosture::COMPILED));
         }
     }
 }
