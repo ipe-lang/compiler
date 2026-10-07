@@ -525,11 +525,14 @@ fn radio_group<M: Clone + Send + Sync + 'static>(
         .map(|opt| radio_option(opt, &on_change, &selected))
         .collect();
     let spacing = if row_layout { 12 } else { 6 };
+    // Beside a legend the options fill the fieldset the layout attributes size.
     let options_container = |kids: Vec<Element<M>>| {
+        let mut attrs = vec![ui_spacing_(spacing)];
+        attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
         if row_layout {
-            ui_row_(vec![ui_spacing_(spacing)], kids)
+            ui_row_(attrs, kids)
         } else {
-            ui_column_(vec![ui_spacing_(spacing)], kids)
+            ui_column_(attrs, kids)
         }
     };
 
@@ -590,8 +593,10 @@ fn radio_group<M: Clone + Send + Sync + 'static>(
             )
         }
     };
+    // The fieldset is the outermost element, so it takes the layout attributes
+    // as written and no implicit fill: a fill here would override the author's
+    // alignment and stretch the group across its parent.
     group_attrs.extend(control_attrs);
-    group_attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
     group_attrs.extend(layout_attrs);
     Element::TaggedNode(
         "fieldset".into(),
@@ -1117,5 +1122,86 @@ mod tests {
         let found = find(&html, &|h| attr(h, "aria-describedby") == Some("err"));
         assert!(found.is_some_and(|h| tag_of(h) == "fieldset"));
         assert_eq!(count(&html, &|h| has_attr(h, "aria-describedby")), 1);
+    }
+
+    /// The fieldset is the outermost element of a radio group, so a layout
+    /// attribute reaches it alone, with no implicit fill that would override the
+    /// author's alignment or stretch the group across its parent. Red if the
+    /// fieldset takes the hoisted-wrapper fill.
+    #[test]
+    fn radio_group_layout_adds_no_implicit_fill() {
+        let html = radios(
+            vec![crate::ui::helpers::ui_center_x_()],
+            input_label_hidden_("Size".to_owned()),
+        );
+        let found = find(&html, &is_tag("fieldset"));
+        assert!(found.is_some(), "a fieldset is rendered");
+        let Some(group) = found else {
+            return;
+        };
+        let style = attr(group, "style").unwrap_or_default();
+        assert!(!style.contains("100%"), "{style}");
+        assert!(!style.contains("flex-grow"), "{style}");
+        assert!(!style.contains("align-self:stretch"), "{style}");
+    }
+
+    /// Beside a legend the options container fills the fieldset that the layout
+    /// attributes size. Red if the options container loses that fill.
+    #[test]
+    fn radio_options_fill_a_sized_fieldset() {
+        let html = radios(
+            vec![ui_width_(ui_fill_())],
+            input_label_above_(Vec::new(), Element::Text("Size".to_owned())),
+        );
+        let found = find(&html, &is_tag("fieldset"));
+        assert!(found.is_some(), "a fieldset is rendered");
+        let Some(group) = found else {
+            return;
+        };
+        let options = kids_of(group).get(1);
+        assert!(options.is_some(), "the options follow the legend");
+        let style = options.and_then(|o| attr(o, "style")).unwrap_or_default();
+        assert!(style.contains("width:100%"), "{style}");
+    }
+
+    /// Through the id stamper every radio of one `Input.radio` shares one group
+    /// name, two groups in one view get distinct names, and the marker never
+    /// reaches the markup. Red if `radio_group` stops emitting the marker or the
+    /// marker is lost before the stamper reads it.
+    #[test]
+    fn stamped_radio_groups_are_named_and_unmarked() {
+        let group = || {
+            let options = vec![
+                input_option_("a".to_owned(), Element::Text("Alpha".to_owned())),
+                input_option_("b".to_owned(), Element::Text("Beta".to_owned())),
+            ];
+            input_radio_(
+                Vec::new(),
+                on_text(),
+                options,
+                "a".to_owned(),
+                input_label_hidden_("Size".to_owned()),
+            )
+        };
+        let mut html = page(crate::ui::helpers::ui_column_(
+            Vec::new(),
+            vec![group(), group()],
+        ));
+        crate::html::assign_ipe_ids(&mut html, "r");
+        let mut names: Vec<String> = Vec::new();
+        let mut stack = vec![&html];
+        while let Some(h) = stack.pop() {
+            if is_radio(h) {
+                names.push(attr(h, "name").unwrap_or_default().to_owned());
+            }
+            stack.extend(kids_of(h).iter().rev());
+        }
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert!(names.iter().all(|n| n.starts_with("ipe-rg-")), "{names:?}");
+        assert_eq!(names.first(), names.get(1), "{names:?}");
+        assert_eq!(names.get(2), names.get(3), "{names:?}");
+        assert_ne!(names.first(), names.get(2), "{names:?}");
+        let markup = crate::html::render_html(&html);
+        assert!(!markup.contains(RADIO_GROUP_MARKER), "{markup}");
     }
 }
