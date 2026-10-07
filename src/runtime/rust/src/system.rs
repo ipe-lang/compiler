@@ -3965,7 +3965,7 @@ mod getenv_kind_tests {
     #[cfg(unix)]
     #[test]
     fn a_non_unicode_environ_value_is_invalid_input() {
-        if super::read_env_var_os(NOT_UNICODE_PROBE).is_some() {
+        if std::env::var_os(NOT_UNICODE_PROBE).is_some() {
             assert!(every_kernel_fails_as(
                 NOT_UNICODE_PROBE,
                 IpeErrorKind::InvalidInput
