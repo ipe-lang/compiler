@@ -27214,6 +27214,7 @@ impl<'a> Lowerer<'a> {
                 KernelFn::CryptoKeyFromString
                 | KernelFn::CryptoKeyFromBytes
                 | KernelFn::CryptoMacToHex
+                | KernelFn::CryptoMacFromHex
                 | KernelFn::EmailAddressParse
                 | KernelFn::EmailAddressToString
                 // `Locale.fromTag`/`Locale.toTag` are arity-1.
@@ -27225,6 +27226,8 @@ impl<'a> Lowerer<'a> {
             Callee::Kernel(
                 KernelFn::CryptoHmacSha256WithKey | KernelFn::CryptoHmacSha512WithKey,
             ) => Ok(2),
+            // `Crypto.verifyHmacSha256 : Key -> String -> Mac -> Bool`.
+            Callee::Kernel(KernelFn::CryptoVerifyHmacSha256) => Ok(3),
             // ── Ipe.Color constructor kernels ──
             Callee::Kernel(
                 KernelFn::ColorWhite
@@ -32442,8 +32445,10 @@ mod tests {
         KernelFn::CryptoKeyFromString,
         KernelFn::CryptoKeyFromBytes,
         KernelFn::CryptoMacToHex,
+        KernelFn::CryptoMacFromHex,
         KernelFn::CryptoHmacSha256WithKey,
         KernelFn::CryptoHmacSha512WithKey,
+        KernelFn::CryptoVerifyHmacSha256,
         // Ipe.Email.EmailAddress — compiled-source Layer-3 module.
         KernelFn::EmailAddressParse,
         KernelFn::EmailAddressToString,

@@ -32,8 +32,10 @@ module Ipe.Crypto exposing
     , keyFromString
     , keyFromBytes
     , macToHex
+    , macFromHex
     , hmacSha256
     , hmacSha512
+    , verifyHmacSha256
     )
 
 
@@ -80,6 +82,14 @@ hmacSha256 = Kernel.kernel "Crypto_hmacSha256WithKey"
 -- | `hmacSha512 key message` — HMAC-SHA-512.  Returns a typed `Mac`.
 hmacSha512 : Key -> String -> Mac
 hmacSha512 = Kernel.kernel "Crypto_hmacSha512WithKey"
+
+-- | `verifyHmacSha256 key message mac` — `True` exactly when `mac` is the
+-- HMAC-SHA-256 tag of `message` under `key`.  The tag is recomputed and
+-- compared in constant time on the raw bytes, so a stored tag (parsed with
+-- `macFromHex`) is never trusted on its own.  An HMAC-SHA-512 `Mac` is
+-- always `False`.
+verifyHmacSha256 : Key -> String -> Mac -> Bool
+verifyHmacSha256 = Kernel.kernel "Crypto_verifyHmacSha256"
 
 
 -- ── RSA / asymmetric ─────────────────────────────────────────────────────────
@@ -156,13 +166,14 @@ randomToken = Kernel.kernel "Crypto_randomToken"
 type Key = Key
 
 -- | An opaque message authentication code (HMAC output).  Inspect via
--- `macToHex`; never compare with `==` (use `constantTimeEqual` on the
--- hex representation instead, or use a typed constant-time check).
+-- `macToHex`; check a tag against a message with `verifyHmacSha256`, which
+-- recomputes it and compares in constant time.
 type Mac = Mac
 
--- | Parse a hex-encoded or raw string into a `Key`.  Returns `Nothing`
--- for an empty key; a wrong-length key for a given algorithm fails closed
--- at that algorithm's boundary (e.g. AEAD requires a 32-byte key).
+-- | Wrap a string as a `Key`: the string's bytes are the key material as
+-- given, with no hex or other decoding.  Returns `Nothing` for an empty
+-- key; a wrong-length key for a given algorithm fails closed at that
+-- algorithm's boundary (e.g. AEAD requires a 32-byte key).
 keyFromString : String -> Maybe Key
 keyFromString = Kernel.kernel "Key_fromString"
 
@@ -173,3 +184,11 @@ keyFromBytes = Kernel.kernel "Key_fromBytes"
 -- | Render a `Mac` as a lowercase hex string for storage or display.
 macToHex : Mac -> String
 macToHex = Kernel.kernel "Mac_toHex"
+
+-- | Parse a stored hex tag back into a `Mac`: exactly 64 hex digits (an
+-- HMAC-SHA-256 tag) or 128 (HMAC-SHA-512), in upper or lower case.
+-- Returns `Nothing` for anything else — empty, odd length, another length,
+-- a non-hex digit, whitespace, or a `0x` prefix.  `macToHex` renders the
+-- result in lowercase.
+macFromHex : String -> Maybe Mac
+macFromHex = Kernel.kernel "Mac_fromHex"

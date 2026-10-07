@@ -1508,8 +1508,10 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::CryptoKeyFromString
         | KernelFn::CryptoKeyFromBytes
         | KernelFn::CryptoMacToHex
+        | KernelFn::CryptoMacFromHex
         | KernelFn::CryptoHmacSha256WithKey
         | KernelFn::CryptoHmacSha512WithKey
+        | KernelFn::CryptoVerifyHmacSha256
         | KernelFn::EmailAddressParse
         | KernelFn::EmailAddressToString
         | KernelFn::UrlFromString

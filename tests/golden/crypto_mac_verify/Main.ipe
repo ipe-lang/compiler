@@ -1,0 +1,59 @@
+module Main exposing (main)
+
+import Ipe.Char
+import Ipe.Crypto as Crypto
+import Ipe.Io as Io
+import Ipe.String
+
+-- `Crypto.macFromHex` + `Crypto.verifyHmacSha256` — RFC 4231 test case 1.
+-- key = 0x0b repeated 20 times (byte value 11 = vertical tab)
+-- msg = "Hi There"
+-- One verdict per case: the right tag, the right tag in upper case, the wrong
+-- message, a flipped last digit, an HMAC-SHA-512 tag, a `0x`-prefixed tag, and
+-- a freshly computed tag.
+
+
+rfcTag : String
+rfcTag =
+    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+
+
+flippedTag : String
+flippedTag =
+    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff8"
+
+
+verdict : Crypto.Key -> String -> String -> String
+verdict key message hex =
+    case Crypto.macFromHex hex of
+        Just mac ->
+            if Crypto.verifyHmacSha256 key message mac then
+                "valid"
+
+            else
+                "invalid"
+
+        Nothing ->
+            "unparsed"
+
+
+main =
+    let
+        rawKey = String.repeat 20 (String.fromChar (Char.fromCode 11))
+    in
+    case Crypto.keyFromBytes rawKey of
+        Nothing ->
+            Io.println "error: key construction failed"
+
+        Just key ->
+            Io.println
+                (String.join " "
+                    [ verdict key "Hi There" rfcTag
+                    , verdict key "Hi There" (String.toUpper rfcTag)
+                    , verdict key "Hi There!" rfcTag
+                    , verdict key "Hi There" flippedTag
+                    , verdict key "Hi There" (Crypto.macToHex (Crypto.hmacSha512 key "Hi There"))
+                    , verdict key "Hi There" (String.append "0x" rfcTag)
+                    , verdict key "Hi There" (Crypto.macToHex (Crypto.hmacSha256 key "Hi There"))
+                    ]
+                )

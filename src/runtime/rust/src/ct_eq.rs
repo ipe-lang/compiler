@@ -19,10 +19,11 @@ pub fn ct_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
-/// Emit a constant-time `PartialEq` impl for a `String`-backed newtype `$t`.
+/// Emit a constant-time `PartialEq` impl for a newtype `$t` whose inner field
+/// exposes `.as_bytes()` (a `String` or a `MacTag`).
 ///
 /// The generated impl delegates to [`ct_bytes_eq`] over the `.as_bytes()`
-/// of the inner `String` field (accessed as `self.0`). A type that invokes
+/// of the inner field (accessed as `self.0`). A type that invokes
 /// this macro MUST NOT also carry `#[derive(PartialEq)]`: the two impls
 /// conflict (E0119), making the timing-unsafe derive a hard compile error —
 /// the structural guarantee that the class stays closed.

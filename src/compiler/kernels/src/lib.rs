@@ -3837,10 +3837,15 @@ pub enum StdlibKernel {
     CryptoKeyFromBytes,
     /// `Mac.toHex : Mac -> String` — the single extraction boundary for MAC output.
     CryptoMacToHex,
+    /// `Mac.fromHex : String -> Maybe Mac` — the single parse boundary for a stored tag.
+    CryptoMacFromHex,
     /// `Crypto.hmacSha256WithKey : Key -> String -> Mac` — typed HMAC-SHA256.
     CryptoHmacSha256WithKey,
     /// `Crypto.hmacSha512WithKey : Key -> String -> Mac` — typed HMAC-SHA512.
     CryptoHmacSha512WithKey,
+    /// `Crypto.verifyHmacSha256 : Key -> String -> Mac -> Bool` — recompute, then
+    /// compare in constant time.
+    CryptoVerifyHmacSha256,
 
     // ── Ipe.Email.EmailAddress — typed parse-don't-validate boundary ───
     // Additive API: `EmailAddress.parse` is the only constructor; downstream
@@ -7488,6 +7493,7 @@ impl StdlibKernel {
                 IpeOrder,
             ),
             Self::CryptoMacToHex => d("Mac", "toHex", 1, Pure, "crypto_mac_to_hex", IpeOrder),
+            Self::CryptoMacFromHex => d("Mac", "fromHex", 1, Pure, "crypto_mac_from_hex", IpeOrder),
             Self::CryptoHmacSha256WithKey => d(
                 "Crypto",
                 "hmacSha256WithKey",
@@ -7502,6 +7508,14 @@ impl StdlibKernel {
                 2,
                 Pure,
                 "crypto_hmac_sha512_key",
+                IpeOrder,
+            ),
+            Self::CryptoVerifyHmacSha256 => d(
+                "Crypto",
+                "verifyHmacSha256",
+                3,
+                Pure,
+                "crypto_verify_hmac_sha256",
                 IpeOrder,
             ),
             // ── Ipe.Email.EmailAddress ─────────────────────────────────
@@ -8840,8 +8854,10 @@ impl StdlibKernel {
         Self::CryptoKeyFromString,
         Self::CryptoKeyFromBytes,
         Self::CryptoMacToHex,
+        Self::CryptoMacFromHex,
         Self::CryptoHmacSha256WithKey,
         Self::CryptoHmacSha512WithKey,
+        Self::CryptoVerifyHmacSha256,
         // ── Ipe.Email.EmailAddress ─────────────────────────────────────
         Self::EmailAddressParse,
         Self::EmailAddressToString,
@@ -10272,6 +10288,12 @@ impl StdlibKernel {
         const STRING_TO_CRYPTO_MAC: TyShape = TyShape::Fun(&STRING, &CRYPTO_MAC);
         const CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC: TyShape =
             TyShape::Fun(&CRYPTO_KEY, &STRING_TO_CRYPTO_MAC);
+        const MAYBE_CRYPTO_MAC: TyShape = TyShape::Con(BuiltinTag::Maybe, &[CRYPTO_MAC]);
+        const STRING_TO_MAYBE_CRYPTO_MAC: TyShape = TyShape::Fun(&STRING, &MAYBE_CRYPTO_MAC);
+        const CRYPTO_MAC_TO_BOOL: TyShape = TyShape::Fun(&CRYPTO_MAC, &BOOL);
+        const STRING_TO_CRYPTO_MAC_TO_BOOL: TyShape = TyShape::Fun(&STRING, &CRYPTO_MAC_TO_BOOL);
+        const CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC_TO_BOOL: TyShape =
+            TyShape::Fun(&CRYPTO_KEY, &STRING_TO_CRYPTO_MAC_TO_BOOL);
         const STRING_TO_STRING_TO_CRYPTO_KEY: TyShape =
             TyShape::Fun(&STRING, &STRING_TO_CRYPTO_KEY);
         const STRING_TO_RESULT_ERR_STRING: TyShape = TyShape::Fun(&STRING, &RESULT_ERR_STRING);
@@ -12365,6 +12387,8 @@ impl StdlibKernel {
                 Some(&STRING_TO_MAYBE_CRYPTO_KEY)
             }
             Self::CryptoMacToHex => Some(&CRYPTO_MAC_TO_STRING),
+            Self::CryptoMacFromHex => Some(&STRING_TO_MAYBE_CRYPTO_MAC),
+            Self::CryptoVerifyHmacSha256 => Some(&CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC_TO_BOOL),
             Self::CryptoHmacSha256WithKey | Self::CryptoHmacSha512WithKey => {
                 Some(&CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC)
             }
@@ -14572,8 +14596,10 @@ impl StdlibKernel {
             | Self::CryptoKeyFromString
             | Self::CryptoKeyFromBytes
             | Self::CryptoMacToHex
+            | Self::CryptoMacFromHex
             | Self::CryptoHmacSha256WithKey
             | Self::CryptoHmacSha512WithKey
+            | Self::CryptoVerifyHmacSha256
             // ── Ipe.Email.EmailAddress ─────────────────────────────────
             | Self::EmailAddressParse
             | Self::EmailAddressToString
@@ -15406,7 +15432,8 @@ impl StdlibKernel {
     /// SHA-2 hash (`sha256`/`sha512`), the HMAC family (`hmacSha256`/`hmacSha512`
     /// and their `Key`-typed `WithKey` forms), the constant-time compare, the
     /// entropy pair (`randomBytes`/`randomToken`), and the typed `Key`/`Mac`
-    /// newtype kernels (`Key.fromString` / `Key.fromBytes` / `Mac.toHex`).
+    /// newtype kernels (`Key.fromString` / `Key.fromBytes` / `Mac.toHex` /
+    /// `Mac.fromHex`), plus the typed tag check `Crypto.verifyHmacSha256`.
     ///
     /// EXCLUDES RSA sign/verify: although their emit symbols reside in
     /// `crypto_core.rs`, their bodies are `#[cfg(feature = "crypto")]` (they pull
@@ -15437,6 +15464,8 @@ impl StdlibKernel {
                 | Self::CryptoKeyFromString
                 | Self::CryptoKeyFromBytes
                 | Self::CryptoMacToHex
+                | Self::CryptoMacFromHex
+                | Self::CryptoVerifyHmacSha256
         )
     }
 

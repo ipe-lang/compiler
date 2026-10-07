@@ -521,8 +521,8 @@ pub struct Builtins {
     /// `String` coercion. Lowered to `IrType::CryptoKey`.
     pub crypto_key: Symbol,
     /// `"Mac"` — opaque role-typed MAC output (`ipe_runtime::crypto::Mac`).
-    /// Produced exclusively by `hmacSha256WithKey`/`hmacSha512WithKey`; extracted
-    /// via `Mac.toHex`.  Lowered to `IrType::CryptoMac`.
+    /// Produced by `hmacSha256WithKey`/`hmacSha512WithKey` or parsed by
+    /// `Mac.fromHex`; extracted via `Mac.toHex`.  Lowered to `IrType::CryptoMac`.
     pub crypto_mac: Symbol,
     // ── Ipe.Email.EmailAddress ──────────────────────────────────────────────
     /// `"EmailAddress"` — opaque validated email address
