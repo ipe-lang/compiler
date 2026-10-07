@@ -467,3 +467,24 @@ fn parser_operators_resolve_under_every_import_form() {
         }
     }
 }
+
+/// A user module that imports `Ipe.Parser` and uses both operators.
+const LIB_USES_PARSER: &str = "module Lib.Uses exposing (..)\n\n\
+                               import Ipe.Parser\n\n\
+                               both p q =\n    (p |= q) |. q\n";
+
+/// The import that brings `|=` and `|.` into reach is the using module's own:
+/// a dependency that imports `Ipe.Parser` (and uses the operators itself) does
+/// not lend that import to the module importing the dependency.
+#[test]
+fn parser_operators_need_the_using_modules_own_import() {
+    for operator in ["|=", "|."] {
+        let body = format!("\\p q -> p {operator} q");
+        let src = main_module("import Lib.Uses\n", &body);
+        let result = run_with_parser(&[LIB_USES_PARSER], &src, &["Main", "Lib.Uses"]);
+        assert!(
+            is_operator_import_required(&result, &src, operator),
+            "{body}: {result:?}"
+        );
+    }
+}
