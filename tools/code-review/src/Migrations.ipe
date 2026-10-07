@@ -84,6 +84,11 @@ CREATE TRIGGER review_log_no_delete BEFORE DELETE ON review_log
 BEGIN
     SELECT RAISE(ABORT, 'review_log is append-only');
 END;
+CREATE TRIGGER review_log_no_replace BEFORE INSERT ON review_log
+WHEN EXISTS (SELECT 1 FROM review_log WHERE seq = NEW.seq)
+BEGIN
+    SELECT RAISE(IGNORE);
+END;
 CREATE TABLE review_log_head (
     one    INTEGER PRIMARY KEY CHECK (one = 1),
     log_id TEXT NOT NULL CHECK (length(log_id) = 32),
