@@ -357,16 +357,16 @@ function __ipeFindPlaceholder(tmp, live) {
 //      Without this, an unfocused password field gets recreated by the
 //      innerHTML swap and the user's typed secret is blanked — see
 //      Bug 2 in docs/internals/web/architecture.md §Input preservation.
-// Used by both __ipePatch (full body) and __ipeApplyPatches (p.html
-// and large p.text patches).
+// __ipeApplyPatches (p.html and large p.text patches) parses and swaps in one
+// call; __ipePatch (full body) takes the two steps apart to pick the page
+// shell's root out of its one parse.
 function __ipeReplaceHTMLPreservingFocus(container, newHTML) {
-  var focused = document.activeElement;
-  var focusedInside = focused && focused !== document.body &&
-      container.contains(focused) &&
-      (focused.tagName === "INPUT" ||
-       focused.tagName === "TEXTAREA" ||
-       focused.tagName === "SELECT");
+  __ipeSwapPreservingFocus(container, __ipeParseFor(container, newHTML));
+}
 
+// `html` parsed into a detached holder in `container`'s namespace, by the
+// document's own parser: scripting is on, as for the markup it replaces.
+function __ipeParseFor(container, html) {
   // Parse the new HTML into a detached element so we can splice
   // preserved live nodes into it before committing.
   //
@@ -397,11 +397,23 @@ function __ipeReplaceHTMLPreservingFocus(container, newHTML) {
   if (container.namespaceURI && container.namespaceURI !== "http://www.w3.org/1999/xhtml") {
     var range = document.createRange();
     range.selectNodeContents(container);
-    tmp = range.createContextualFragment(newHTML);
+    tmp = range.createContextualFragment(html);
   } else {
     tmp = document.createElement("div");
-    tmp.innerHTML = newHTML;
+    tmp.innerHTML = html;
   }
+  return tmp;
+}
+
+// Replace `container`'s children with the parsed holder `tmp`'s, splicing the
+// live inputs described above into their placeholders.
+function __ipeSwapPreservingFocus(container, tmp) {
+  var focused = document.activeElement;
+  var focusedInside = focused && focused !== document.body &&
+      container.contains(focused) &&
+      (focused.tagName === "INPUT" ||
+       focused.tagName === "TEXTAREA" ||
+       focused.tagName === "SELECT");
 
   // Snapshot focused-state BEFORE any DOM mutation. Selection read
   // throws on some input types, so catch.
@@ -506,9 +518,9 @@ function __ipePatch(t, mode) {
   // A full page (an ipe-nav or popstate fetch) contributes only its
   // `#ipe-root` contents: its head, boot block and scripts never enter the
   // live root, where script revival would run a second client.
-  t = __ipeRootHTML(t);
+  var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);
   var scrollX = window.scrollX, scrollY = window.scrollY;
-  __ipeReplaceHTMLPreservingFocus(root, t);
+  __ipeSwapPreservingFocus(root, parsed);
   // behavior:"instant" keeps this housekeeping scroll a synchronous jump
   // even under a global `scroll-behavior: smooth`, which would otherwise
   // animate every restore and fight the caret on per-keystroke re-renders.
@@ -522,18 +534,20 @@ function __ipePatch(t, mode) {
   __ipeReviveScripts(root);
 }
 
-// The markup to splice into `#ipe-root` for the server HTML `t`. A page shell
-// opens with a doctype and its body's first element is `#ipe-root`: it is
-// parsed as an inert document and contributes that element's contents only.
-// Any other `t`, including a view that itself renders a doctype, is a body
-// fragment and is returned unchanged.
-function __ipeRootHTML(t) {
-  if (!/^\s*<!doctype/i.test(t)) return t;
-  var doc = new DOMParser().parseFromString(t, "text/html");
-  var body = __ipeDocProp(doc, "body");
-  var root = body ? body.firstElementChild : null;
-  if (!root || root.tagName !== "DIV" || root.id !== "ipe-root") return t;
-  return root.innerHTML;
+// The holder whose children are spliced into `#ipe-root` for the server HTML
+// `t`, already parsed once as `tmp`. A page shell opens with a doctype and its
+// first element after the head's is `#ipe-root`: only that element's children
+// are spliced. Any other `t`, including a view that itself renders a doctype,
+// is a body fragment and `tmp` is spliced whole. `t` is never re-serialized
+// and parsed a second time: a parser without scripting reads a `<noscript>`
+// body as markup and one with scripting reads it as text, so an attribute value
+// read on the first parse could close the element on the second.
+var __IPE_SHELL_HEAD_TAGS = ["META", "STYLE", "LINK", "TITLE", "BASE"];
+function __ipeShellRoot(tmp, t) {
+  if (!/^\s*<!doctype/i.test(t)) return tmp;
+  var el = tmp.firstElementChild;
+  while (el && __IPE_SHELL_HEAD_TAGS.indexOf(el.tagName) >= 0) el = el.nextElementSibling;
+  return el && el.tagName === "DIV" && el.id === "ipe-root" ? el : tmp;
 }
 
 // __ipeReviveScripts: browsers DO NOT execute <script> tags inserted

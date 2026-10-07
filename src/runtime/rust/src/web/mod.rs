@@ -7067,6 +7067,25 @@ mod base_path_tests {
         );
     }
 
+    /// A fetched page reaches `#ipe-root` through one parse by the document's
+    /// own parser. A `DOMParser` document has no scripting, so it reads a
+    /// `<noscript>` body as markup; re-serializing that and parsing it again
+    /// with scripting reads the body as text, and an attribute value holding
+    /// `</noscript><img onerror=…>` then closes the element and runs.
+    #[test]
+    fn client_parses_a_fetched_page_once_with_scripting() {
+        let js = super::CLIENT_JS;
+        assert!(
+            !js.contains("DOMParser") && !js.contains("parseFromString"),
+            "client.js never parses server markup in a scripting-free document"
+        );
+        assert!(
+            js.contains("__ipeSwapPreservingFocus(root, parsed)")
+                && js.contains("var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);"),
+            "__ipePatch splices the nodes of its one parse, never a re-serialized copy"
+        );
+    }
+
     /// The string items of `var {name} = [ … ];` in `js`.
     fn js_string_array(js: &str, name: &str) -> Option<Vec<String>> {
         let open = format!("var {name} = [");
