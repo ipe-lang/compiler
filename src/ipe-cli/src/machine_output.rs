@@ -149,6 +149,22 @@ impl<'a> MachineOutput<'a> {
 /// [`error_banner`]: crate::screen::error_screen
 #[must_use]
 pub fn machine_error(format: OutputFormat, command: &str, kind: &str, message: &str) -> String {
+    machine_error_with(format, command, kind, message, &[])
+}
+
+/// [`machine_error`] with `extra` payload fields after `kind` and `message`.
+///
+/// The extras ride only on `--json`, each value an already-encoded JSON
+/// fragment the caller built with [`json`]; `--plain` stays the one sanitised
+/// reason line. The field names are the caller's fixed vocabulary.
+#[must_use]
+pub fn machine_error_with(
+    format: OutputFormat,
+    command: &str,
+    kind: &str,
+    message: &str,
+    extra: &[(&str, String)],
+) -> String {
     // Sanitise first: the Display text is trusted furniture, but a diagnostic can
     // interpolate user-controlled source (a file path, an identifier), so strip
     // any ANSI/control bytes before it enters the machine stream. Defence in
@@ -158,10 +174,12 @@ pub fn machine_error(format: OutputFormat, command: &str, kind: &str, message: &
     let safe = TerminalSafe::sanitize(message);
     match format {
         OutputFormat::Json => {
-            let payload = json::object(&[
+            let mut fields = vec![
                 ("kind", json::string(kind)),
                 ("message", json::string(safe.as_str())),
-            ]);
+            ];
+            fields.extend(extra.iter().cloned());
+            let payload = json::object(&fields);
             MachineOutput {
                 schema: ERROR_SCHEMA,
                 status: MachineStatus::Error,
