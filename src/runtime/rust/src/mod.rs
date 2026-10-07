@@ -842,13 +842,30 @@ mod js_document_scan {
 
     /// `js` with each comment blanked, newlines kept.
     ///
-    /// A comment opens only at a line start or after whitespace, so a `//` or
-    /// `/*` inside a URL, a regex or a MIME pattern stays code.
+    /// A comment opens only outside a string literal, at a line start or after
+    /// whitespace, so a `//` or `/*` inside a string, a URL, a regex or a MIME
+    /// pattern stays code and the scan still reads what follows it. A quote or
+    /// apostrophe string ends at its line's end, so a quote inside a regex
+    /// literal misreads no more than the rest of its line; a template literal
+    /// may span lines.
     fn strip_comments(js: &str) -> String {
         let mut out = String::with_capacity(js.len());
         let mut prev = '\n';
+        let mut quote: Option<char> = None;
         let mut chars = js.chars().peekable();
         while let Some(c) = chars.next() {
+            if let Some(q) = quote {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if c == q || (c == '\n' && q != '`') {
+                    quote = None;
+                }
+                prev = c;
+                continue;
+            }
             let opens = prev.is_whitespace() && c == '/';
             match (opens, chars.peek().copied()) {
                 (true, Some('/')) => {
@@ -874,6 +891,9 @@ mod js_document_scan {
                     prev = ' ';
                 }
                 _ => {
+                    if matches!(c, '"' | '\'' | '`') {
+                        quote = Some(c);
+                    }
                     out.push(c);
                     prev = c;
                 }
@@ -884,8 +904,9 @@ mod js_document_scan {
 
     /// Every line of `js` that names the global `document` outside the bound table.
     ///
-    /// The two admitted forms are `typeof document` and the table's closing
-    /// `})(document)`; any other mention (`document.body`, `document["body"]`,
+    /// The two admitted forms are a bare `typeof document`, never followed by a
+    /// member access, and the table's closing `})(document)`; any other mention
+    /// (`document.body`, `document["body"]`, `typeof document.body`,
     /// `window.document`, `f(document)`) is reported with its line number.
     pub(super) fn unbound_document_reads(js: &str) -> Vec<String> {
         let code = strip_comments(js);
@@ -901,7 +922,8 @@ mod js_document_scan {
             let is_typeof = before
                 .trim_end()
                 .strip_suffix("typeof")
-                .is_some_and(|rest| !rest.chars().next_back().is_some_and(is_ident));
+                .is_some_and(|rest| !rest.chars().next_back().is_some_and(is_ident))
+                && !after.trim_start().starts_with(['.', '[', '?']);
             let is_table_close = before.ends_with("})(") && after.starts_with(')');
             if !(is_typeof || is_table_close) {
                 let line = before.matches('\n').count() + 1;
@@ -924,6 +946,12 @@ mod js_document_scan {
                 "f(document);",
                 "if (x === document) {}",
                 "var u = \"http://x\"; document.title = u;",
+                "var t = typeof document.body;",
+                "var t = typeof document[\"body\"];",
+                "var t = typeof document?.body;",
+                "var s = \" //\"; document.body;",
+                "var s = ' /*'; document.body; // */",
+                "var s = ` //`; document.body;",
             ] {
                 assert!(!unbound_document_reads(js).is_empty(), "accepted: {js}");
             }

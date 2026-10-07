@@ -345,6 +345,7 @@ mod tests {
             Vec::<String>::new(),
             "the overlay names `document` only in its bound table"
         );
+        assert_eq!(html.matches("})(document);").count(), 1);
         assert!(
             html.contains("</div><script>")
                 && html.contains("var panel=own?own.previousElementSibling:null;"),

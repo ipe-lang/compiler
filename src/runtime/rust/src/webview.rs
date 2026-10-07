@@ -92,6 +92,7 @@ mod tests {
             Vec::<String>::new(),
             "the webview bridge names `document` only in its bound table"
         );
+        assert_eq!(super::BRIDGE_JS.matches("})(document);").count(), 1);
     }
 }
 
