@@ -20,7 +20,7 @@ use crate::{
 /// 1-based inclusive line spans of the test-only items in `src`.
 ///
 /// An item is test-only as [`crate::scan_str`] judges one: a test-only
-/// `#[cfg(…)]` or, on a function, `#[test]`. Each span runs from the item's
+/// `#[cfg(…)]`; a bare `#[test]` is production. Each span runs from the item's
 /// first attribute to its closing brace or semicolon. The first line is left
 /// out when anything but whitespace precedes the attribute, and the last when
 /// anything but whitespace follows the close, so a production token sharing a
@@ -34,7 +34,7 @@ use crate::{
 /// [`syn::Error`] when `src` does not parse as a Rust file.
 pub fn test_only_item_lines(src: &str) -> Result<Vec<RangeInclusive<usize>>, syn::Error> {
     let file = syn::parse_file(src)?;
-    if attrs_test_only(&file.attrs, false) {
+    if attrs_test_only(&file.attrs) {
         let whole_file = 1..=src.lines().count().max(1);
         return Ok(vec![whole_file]);
     }
@@ -267,10 +267,7 @@ mod tests {
                    fn bare() {}\n\
                    #[cfg(any(test, feature = \"x\"))]\n\
                    fn maybe_prod() {}\n";
-        assert_eq!(
-            test_only_item_lines(src).ok(),
-            Some(vec![2..=6, 8..=9, 10..=11])
-        );
+        assert_eq!(test_only_item_lines(src).ok(), Some(vec![2..=6, 8..=9]));
     }
 
     /// Test-only impl items are spanned inside a production impl.
