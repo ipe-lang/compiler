@@ -72,7 +72,7 @@ pub const CONSOLE_JS: &str = r#"
  function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
  function fmt(es){return (es||[]).map(e=>{const d=new Date(e.ts).toISOString().slice(11,19);
    return "<span class='lvl'>"+esc(d)+" "+esc(e.level)+"</span> "+(e.level=="error"?"<span class='err'>":"")+
-   esc(e.message)+(e.level=="error"?"</span>":"");}).join("\n");}
+   esc(e.message)+(e.level=="error"?"<\/span>":"");}).join("\n");}
  async function refresh(){const es=await j("/_ipe/console/api/"+tab);
    document.getElementById("out").innerHTML=fmt(es);ov();}
  document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
@@ -80,6 +80,22 @@ pub const CONSOLE_JS: &str = r#"
    tab=t.dataset.t;refresh();});
  refresh();setInterval(refresh,2000);
 "#;
+
+/// Whether `text` holds `</` or `<!--`, either of which can end or re-mode a
+/// raw-text `<script>` or `<style>` element before its own close tag.
+const fn ends_raw_text_early(text: &str) -> bool {
+    let mut rest = text.as_bytes();
+    while let [first, tail @ ..] = rest {
+        if *first == b'<' && matches!(tail, [b'/', ..] | [b'!', b'-', b'-', ..]) {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an inline console constant could end its element early, serving bytes its policy hash does not cover [ledger #boundary]
+const _: () = assert!(!ends_raw_text_early(CONSOLE_JS) && !ends_raw_text_early(CONSOLE_CSS));
 
 /// The console page: [`CONSOLE_CSS`] and [`CONSOLE_JS`] embedded verbatim, so
 /// the policy hashes match the bytes served.
@@ -694,9 +710,17 @@ mod tests {
         seed_console_env(&[]);
     }
 
+    /// The text between the first `open` in `page` and the first `close`
+    /// after it, as a browser's raw-text element parse would end it.
+    fn element_text<'a>(page: &'a str, open: &str, close: &str) -> Option<&'a str> {
+        page.split_once(open)
+            .and_then(|(_, rest)| rest.split_once(close))
+            .map(|(inner, _)| inner)
+    }
+
     /// The console response carries the console policy, `nosniff`,
-    /// `no-store` and same-origin framing, and embeds exactly the hashed
-    /// constants as its one style and one script element.
+    /// `no-store` and same-origin framing, and the policy admits exactly the
+    /// hash of each inline element's text as served.
     #[tokio::test]
     async fn console_csp_and_headers() {
         let resp = console_html().await;
@@ -710,18 +734,48 @@ mod tests {
         let want =
             crate::csp::ContentSecurityPolicy::for_profile(crate::csp::Profile::Console, None)
                 .header_value();
-        assert_eq!(get("content-security-policy"), Some(want.clone()));
+        let served_csp = get("content-security-policy");
+        assert_eq!(served_csp, Some(want.clone()));
         assert!(want.contains("script-src 'sha256-"), "{want}");
         assert!(!want.contains("'unsafe-inline'"), "{want}");
         assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"));
         assert_eq!(get("cache-control").as_deref(), Some("no-store"));
         assert_eq!(get("x-frame-options").as_deref(), Some("SAMEORIGIN"));
         assert!(get("referrer-policy").is_some());
-        let page = console_page();
-        assert_eq!(page.matches("<script").count(), 1, "{page}");
-        assert_eq!(page.matches("<style").count(), 1, "{page}");
-        assert!(page.contains(&format!("<script>{CONSOLE_JS}</script>")));
-        assert!(page.contains(&format!("<style>{CONSOLE_CSS}</style>")));
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await;
+        assert!(body.is_ok(), "the console page fits 64 KiB");
+        let Ok(body) = body else { return };
+        let served = std::str::from_utf8(&body);
+        assert!(served.is_ok(), "the console page is UTF-8");
+        let Ok(served) = served else { return };
+        assert_eq!(served.matches("<script").count(), 1, "{served}");
+        assert_eq!(served.matches("<style").count(), 1, "{served}");
+        let csp = served_csp.unwrap_or_default();
+        for (directive, open, close, constant) in [
+            ("script-src", "<script>", "</script>", CONSOLE_JS),
+            ("style-src", "<style>", "</style>", CONSOLE_CSS),
+        ] {
+            let inner = element_text(served, open, close);
+            assert_eq!(inner, Some(constant), "{open} element text as served");
+            let Some(inner) = inner else { return };
+            let admitted = format!("{directive} {}", crate::csp::CspHash::of(inner).as_str());
+            assert!(
+                csp.split("; ").any(|d| d == admitted),
+                "{admitted} missing from {csp}"
+            );
+        }
+    }
+
+    /// `</` and `<!--` anywhere in a constant are refused; a bare `<` is not.
+    #[test]
+    fn raw_text_enders_are_detected() {
+        for text in ["</script>", "a</b", "x<!--y", "</", "<!--"] {
+            assert!(ends_raw_text_early(text), "{text:?}");
+        }
+        for text in ["", "a < b", "<\\/span>", "<!-x", "<", "<!", "<!-"] {
+            assert!(!ends_raw_text_early(text), "{text:?}");
+        }
+        assert!(!ends_raw_text_early(CONSOLE_JS) && !ends_raw_text_early(CONSOLE_CSS));
     }
 
     #[test]
