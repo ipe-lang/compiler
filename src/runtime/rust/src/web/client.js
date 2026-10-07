@@ -131,6 +131,47 @@ function __ipeAdoptFullBody(token, applyFn) {
   applyFn();
   __ipeEpoch = __ipeEpochParts(token) ? token : null;
 }
+// The newest full render the stream pushed while a <select> held focus (the
+// proxy for an open dropdown, which any DOM mutation around it collapses),
+// with its epoch gate inside `apply`. It applies once the select closes.
+// `stale` marks a patches frame that could not apply meanwhile: the screen is
+// then behind the server by more than the held render, so closing resyncs the
+// stream instead. Until then the stream stays open: a resync's first frame
+// would only be held again.
+var __ipeHeldRender = null;
+function __ipeSelectOpen() {
+  var a = __ipeDoc.active();
+  return !!a && a.tagName === "SELECT";
+}
+function __ipeHoldRender(apply) {
+  __ipeHeldRender = { apply: apply, stale: false };
+}
+function __ipeMarkHeldStale() {
+  if (__ipeHeldRender === null) __ipeHeldRender = { apply: null, stale: true };
+  else __ipeHeldRender.stale = true;
+}
+// `picked` is a committed choice: the dropdown is shut though the select
+// keeps focus.
+function __ipeReleaseHeldRender(picked) {
+  var held = __ipeHeldRender;
+  if (held === null || (!picked && __ipeSelectOpen())) return;
+  __ipeHeldRender = null;
+  if (held.stale) __ipeResyncRender();
+  else held.apply();
+}
+// A <select> closing releases the held render: on blur, and on a committed
+// pick. Deferred so the select's own handlers send first, with the epoch of
+// the DOM the user acted on.
+__ipeDoc.on("focusout", function(ev) {
+  if (ev.target && ev.target.tagName === "SELECT") {
+    setTimeout(function() { __ipeReleaseHeldRender(false); }, 0);
+  }
+}, true);
+__ipeDoc.on("change", function(ev) {
+  if (ev.target && ev.target.tagName === "SELECT") {
+    setTimeout(function() { __ipeReleaseHeldRender(true); }, 0);
+  }
+}, true);
 // Server config from the boot block (`cfg`): the `IPE_WEB_BANNER`,
 // `IPE_WEB_SWAP_TOAST` and `IPE_WEB_*` tuning settings resolve on the server
 // and reach the client only here; the boot read checked every field.
@@ -1806,23 +1847,27 @@ function __ipeOpenSSE() {
     var frame;
     try { frame = JSON.parse(e.data); } catch (_) {
       // Legacy frame (pre-v0.9.3 server) — raw HTML, no seq to gate on.
-      // Open-<select> defence (Bug 3): same-cycle as the patches path.
-      // SSE-pushed full-body re-renders during an open dropdown would
-      // collapse it; skip the body, the next user interaction triggers
-      // reconciliation. Active user paths (ipe-nav, popstate, POST
-      // text fallback) are NOT defended — those are user-initiated and
-      // dropping them would be worse UX than the dropdown collapsing.
-      if (__ipeDoc.active() && __ipeDoc.active().tagName === "SELECT") return;
-      return __ipePatch(e.data.replace(/\\n/g, "\n"));
+      // Open-<select> defence: an SSE-pushed full-body re-render during an
+      // open dropdown would collapse it, so the body is held until the
+      // select closes. Active user paths (ipe-nav, popstate, POST text
+      // fallback) are NOT defended — those are user-initiated and holding
+      // them would be worse UX than the dropdown collapsing.
+      var raw = e.data.replace(/\\n/g, "\n");
+      if (__ipeSelectOpen()) {
+        __ipeHoldRender(function() { __ipePatch(raw); });
+        return;
+      }
+      return __ipePatch(raw);
     }
     if (frame && typeof frame === "object") {
       __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
-        if (__ipeDoc.active() && __ipeDoc.active().tagName === "SELECT") return;
-        if (frame.body) {
-          __ipeAdoptFullBody(frame.epoch, function() {
-            __ipePatch(frame.body.replace(/\\n/g, "\n"));
-          });
-        }
+        if (!frame.body) return;
+        var body = frame.body.replace(/\\n/g, "\n");
+        var apply = function() {
+          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
+        };
+        if (__ipeSelectOpen()) __ipeHoldRender(apply);
+        else apply();
       }, frame.globalSeq);
     }
   });
@@ -1843,10 +1888,10 @@ function __ipeOpenSSE() {
   // patch frame, e.g. across a brief network blip) are dropped at
   // the same monotonic guard the HTTP path uses.
   //
-  // No open-<select> defence at this outer level — __ipeApplyPatches
-  // already has its own per-patch focus-restore + open-select skip
-  // (live.go:4386+); applying it twice would surface as a no-op
-  // either way, but the inner check is the canonical defence.
+  // A frame that applies goes through __ipeApplyPatches, whose per-patch
+  // focus-restore + open-select skip is the canonical defence. A frame that
+  // cannot apply while a <select> is open marks the held render stale rather
+  // than resyncing, since the resync's first frame would only be held again.
   // Focus / input-authority / dirty-input filtering all flow through
   // the same code path as the HTTP-side patches application, so
   // in-flight typing is preserved without server-side clientState
@@ -1888,7 +1933,8 @@ function __ipeOpenSSE() {
     // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
     // first frame is the full current render.
     if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
-      __ipeResyncRender();
+      if (__ipeSelectOpen() || __ipeHeldRender !== null) __ipeMarkHeldStale();
+      else __ipeResyncRender();
       return;
     }
     __ipeHandleResponse(frame.seq, frame.ackInputs, function() {

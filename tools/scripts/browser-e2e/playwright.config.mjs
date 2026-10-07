@@ -1,7 +1,7 @@
 /**
  * Playwright configuration for the browser E2E suite (geo-clipboard,
- * layout-fill, and the stale-event and boot-data refusals on the geo-clipboard
- * app).
+ * layout-fill, the stale-event and boot-data refusals and the select-hold
+ * spec on the geo-clipboard app).
  *
  * A single Chromium project — the only browser target for these tests.
  * The geo/clipboard browser APIs (navigator.geolocation,
@@ -19,6 +19,7 @@ export default {
     "layout-fill.spec.mjs",
     "stale-event.spec.mjs",
     "boot-data.spec.mjs",
+    "select-hold.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,
