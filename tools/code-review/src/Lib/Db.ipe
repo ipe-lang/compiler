@@ -391,6 +391,7 @@ appendOnlyGuards =
     [ "review_head_no_delete on review_head"
     , "review_log_head_id_fixed on review_log_head"
     , "review_log_head_no_delete on review_log_head"
+    , "review_log_head_no_insert on review_log_head"
     , "review_log_no_delete on review_log"
     , "review_log_no_replace on review_log"
     , "review_log_no_update on review_log"

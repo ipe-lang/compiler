@@ -100,6 +100,10 @@ CREATE TRIGGER review_log_head_no_delete BEFORE DELETE ON review_log_head
 BEGIN
     SELECT RAISE(ABORT, 'review_log_head is permanent');
 END;
+CREATE TRIGGER review_log_head_no_insert BEFORE INSERT ON review_log_head
+BEGIN
+    SELECT RAISE(ABORT, 'review_log_head is permanent');
+END;
 CREATE TRIGGER review_log_head_id_fixed BEFORE UPDATE OF log_id ON review_log_head
 BEGIN
     SELECT RAISE(ABORT, 'review_log_head.log_id is fixed');

@@ -152,7 +152,8 @@ in the queue.
 `review_log` is append-only: deleting or updating a row is refused, and an
 insert that would replace a row changes nothing. Each row links to the one
 before it, and `review_log_head` holds the last row's sequence number and
-signature. On every read the app walks the chain; a gap in the sequence, a
+signature; its one row can be neither deleted nor inserted again, and its
+log id never changes. On every read the app walks the chain; a gap in the sequence, a
 link that does not match, or a last row that differs from the head is a
 break. The policy on a break is strict: no row counts, the rows before the
 break included, the queue and history pages show "The review log's chain breaks at entry N:

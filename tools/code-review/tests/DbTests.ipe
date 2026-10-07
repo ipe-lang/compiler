@@ -153,13 +153,15 @@ isAlreadyDecided written =
 
 
 -- The review log is append-only: deleting or updating a log row, deleting
--- the head, and changing the log's id are each refused by a trigger, and the
--- row and the head are left as they were. Re-inserting the first entry with
+-- the head, changing the log's id, and inserting a head row (a replacing
+-- insert or an upsert, either of which would swap the log's id past the
+-- update trigger) are each refused by a trigger, and the row and the head
+-- are left as they were. Re-inserting the first entry with
 -- a replacing conflict clause (SQLite's REPLACE deletes the old row without
 -- firing a delete trigger) or an upsert changes nothing: the first decision
 -- stays. A refusal counts only as a trigger's `RAISE(ABORT)`, so a statement
 -- that fails for another reason (a typo, a missing table) is red, and a
--- rewrite either runs or is refused by a trigger. Red with any of the five
+-- rewrite either runs or is refused by a trigger. Red with any of the six
 -- log triggers dropped.
 reviewLogAppendOnly : Db -> Task.Task Error Bool
 reviewLogAppendOnly db =
@@ -176,6 +178,9 @@ reviewLogAppendOnly db =
 
         columns =
             "review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, ?, ?, ?, ?, 'genesis', ?)"
+
+        headColumns =
+            "review_log_head (one, log_id, seq, head) VALUES (1, '00000000000000000000000000000000', 0, 'genesis')"
     in
     do
         attested <- attestedFor "ipe-review-append-only-index" (uid "u-a")
@@ -190,6 +195,8 @@ reviewLogAppendOnly db =
                 , "UPDATE review_log SET body_hash = 'other'"
                 , "DELETE FROM review_log_head"
                 , "UPDATE review_log_head SET log_id = '00000000000000000000000000000000'"
+                , "INSERT OR REPLACE INTO " ++ headColumns
+                , "INSERT INTO " ++ headColumns ++ " ON CONFLICT (one) DO UPDATE SET log_id = excluded.log_id, seq = excluded.seq, head = excluded.head"
                 ]
             )
         rewrites <- Task.sequence
@@ -280,7 +287,8 @@ probeRefusesReviewWithoutHeadIn base =
 -- file passes. The refusal says the log lost a guard and how to restore it,
 -- never that the location must be writable. Red if the probe does not check
 -- the guards on their table, or the guard refusal gets the open fix; the
--- review log losing `review_log_no_update` is refused the same way.
+-- review log losing `review_log_no_update` is refused the same way, and so
+-- is its head losing `review_log_head_no_insert`.
 probeRefusesReviewWithoutGuards : Task.Task Error Bool
 probeRefusesReviewWithoutGuards =
     freshDir "ipe-review-probe-no-guards" |> Task.andThen probeRefusesReviewWithoutGuardsIn
@@ -299,12 +307,14 @@ probeRefusesReviewWithoutGuardsIn base =
         intact <- probeAfterEdits (base ++ "/intact.db") []
         droppedMessage <- probeAfterEdits dropped [ "DROP TRIGGER review_no_replace" ]
         droppedLogMessage <- probeAfterEdits (base ++ "/dropped-log.db") [ "DROP TRIGGER review_log_no_update" ]
+        droppedHeadMessage <- probeAfterEdits (base ++ "/dropped-head.db") [ "DROP TRIGGER review_log_head_no_insert" ]
         renamedMessage <- probeAfterEdits renamed [ "ALTER TABLE review RENAME TO review_old", "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" ]
         Task.succeed
             (intact
                 == Nothing
                 && probeNames "IPE_REVIEW_DB" dropped droppedMessage
                 && maybeContains "lost an append-only trigger" droppedLogMessage
+                && maybeContains "lost an append-only trigger" droppedHeadMessage
                 && probeNames "IPE_REVIEW_DB" renamed renamedMessage
                 && maybeContains "lost an append-only trigger" droppedMessage
                 && maybeContains "lost an append-only trigger" renamedMessage
