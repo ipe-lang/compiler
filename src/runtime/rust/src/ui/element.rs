@@ -165,6 +165,24 @@ impl PseudoClass {
     }
 }
 
+/// A heading level, always at least 1; 1-6 have a native tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadingLevel(i64);
+
+impl HeadingLevel {
+    /// The level for a requested `n`; `n < 1` saturates to 1.
+    #[must_use]
+    pub const fn from_requested(n: i64) -> Self {
+        Self(if n < 1 { 1 } else { n })
+    }
+
+    /// The level as a number, at least 1.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Description {
     NoDescription,
@@ -172,7 +190,7 @@ pub enum Description {
     DescNavigation,
     DescContentInfo,
     DescComplementary,
-    DescHeading(i64),
+    DescHeading(HeadingLevel),
     DescLabel(String),
     DescLivePolite,
     DescLiveAssertive,

@@ -22,7 +22,9 @@
 
 use super::super::css_safety::{CssValueOrigin, SafeCssPropertyName, SafeCssValue};
 use super::super::html::{Attribute as HtmlAttribute, Html, admit_element};
-use super::element::{Attribute, Description, Element, HAlign, Length, Location, Portion, VAlign};
+use super::element::{
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, VAlign,
+};
 
 // ── CSS boundary smart constructors ───────────────────────────────────────────
 // `SafeCssPropertyName` / `SafeCssValue` moved to the shared `css_safety` module
@@ -405,14 +407,58 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
                     Description::DescLabel(label) => {
                         out.push(HtmlAttribute::Attr("aria-label".to_owned(), label.clone()));
                     }
-                    _ => {}
+                    // Landmarks and headings are expressed by the element's tag
+                    // (or its `role`), never by a supplementary attribute here.
+                    Description::NoDescription
+                    | Description::DescMain
+                    | Description::DescNavigation
+                    | Description::DescContentInfo
+                    | Description::DescComplementary
+                    | Description::DescHeading(_)
+                    | Description::DescButton
+                    | Description::DescParagraph => {}
                 }
             }
             Attribute::AttrPseudoRule(pc, css) if !css.is_empty() => {
                 pseudo_rules.push(format!("{}|{css}", pc.wire_tag()));
             }
-            // Style and nearby handled separately.
-            _ => {}
+            // Styles and nearby elements are lowered elsewhere.
+            Attribute::NoAttribute
+            | Attribute::AttrWidth(_)
+            | Attribute::AttrHeight(_)
+            | Attribute::AttrAlignX(_)
+            | Attribute::AttrAlignY(_)
+            | Attribute::AttrNearby(_, _)
+            | Attribute::AttrPadding(..)
+            | Attribute::AttrSpacing(_)
+            | Attribute::AttrStyle(_, _)
+            | Attribute::AttrFontSize(_)
+            | Attribute::AttrFontColor(_)
+            | Attribute::AttrFontFamily(_)
+            | Attribute::AttrFontWeight(_)
+            | Attribute::AttrFontItalic
+            | Attribute::AttrFontUnderline
+            | Attribute::AttrFontDecoration(_)
+            | Attribute::AttrFontLetterSpacing(_)
+            | Attribute::AttrFontWordSpacing(_)
+            | Attribute::AttrFontAlign(_)
+            | Attribute::AttrBgColor(_)
+            | Attribute::AttrBgImage(_)
+            | Attribute::AttrBgGradient(_)
+            | Attribute::AttrBorderWidth(_)
+            | Attribute::AttrBorderWidthEach(..)
+            | Attribute::AttrBorderColor(_)
+            | Attribute::AttrBorderRounded(_)
+            | Attribute::AttrBorderStyle(_)
+            | Attribute::AttrBorderShadow(..)
+            | Attribute::AttrBorderInsetShadow(..)
+            | Attribute::AttrPointer
+            | Attribute::AttrExplain
+            | Attribute::AttrOverflow(_, _)
+            | Attribute::AttrPseudoRule(_, _)
+            | Attribute::AttrTransition(_, _)
+            | Attribute::AttrGridTracks(_, _)
+            | Attribute::AttrAnimation(..) => {}
         }
     }
     if !pseudo_rules.is_empty() {
@@ -451,6 +497,37 @@ fn render_nearby_overlays<M: Clone>(attrs: &[Attribute<M>]) -> Vec<Html<M>> {
 
 // ── Description → semantic HTML tag ──────────────────────────────────────────
 
+/// How a heading level is written in HTML.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadingMarkup {
+    /// Levels 1-6: the native `<hN>` tag.
+    Native(&'static str),
+    /// Levels above 6: `role="heading"` with `aria-level` on the host tag.
+    Aria(HeadingLevel),
+}
+
+/// The one lowering of a heading level.
+const fn heading_markup(level: HeadingLevel) -> HeadingMarkup {
+    match level.get() {
+        1 => HeadingMarkup::Native("h1"),
+        2 => HeadingMarkup::Native("h2"),
+        3 => HeadingMarkup::Native("h3"),
+        4 => HeadingMarkup::Native("h4"),
+        5 => HeadingMarkup::Native("h5"),
+        6 => HeadingMarkup::Native("h6"),
+        // The open range 7 and above; `HeadingLevel` guarantees at least 1.
+        _ => HeadingMarkup::Aria(level),
+    }
+}
+
+/// The `role` and `aria-level` attributes that make any host tag a heading.
+fn heading_role_attrs<M>(level: HeadingLevel) -> [HtmlAttribute<M>; 2] {
+    [
+        HtmlAttribute::Attr("role".to_owned(), "heading".to_owned()),
+        HtmlAttribute::Attr("aria-level".to_owned(), level.get().to_string()),
+    ]
+}
+
 /// Pick the semantic HTML tag for a layout node based on its `Description`.
 /// `NoDescription` defaults to `div`.  `TaggedNode` overrides this with an
 /// explicit user-supplied tag (already validated by the Ipê stdlib).
@@ -463,13 +540,9 @@ fn tag_for_description(desc: &Description) -> &'static str {
         Description::DescNavigation => "nav",
         Description::DescContentInfo => "footer",
         Description::DescComplementary => "aside",
-        Description::DescHeading(n) => match n {
-            1 => "h1",
-            2 => "h2",
-            3 => "h3",
-            4 => "h4",
-            5 => "h5",
-            _ => "h6",
+        Description::DescHeading(level) => match heading_markup(*level) {
+            HeadingMarkup::Native(tag) => tag,
+            HeadingMarkup::Aria(_) => "div",
         },
         Description::DescLabel(_) => "label",
         Description::DescButton => "button",
@@ -526,15 +599,23 @@ fn render_element_depth_in<M: Clone>(
         // normal pipeline. If a direct Rust construction routes cells here, drop
         // to empty text rather than abort — a missing subtree beats a panic.
         Element::Cells(_grid) => Html::HText(String::new()),
-        Element::Node(desc, attrs, kids) => render_node_as(
-            tag_for_description(desc),
-            &std::mem::take(attrs),
-            std::mem::take(kids),
-            depth,
-            parent_axis,
-        ),
+        Element::Node(desc, attrs, kids) => {
+            let own_heading = match desc {
+                Description::DescHeading(level) => Some(*level),
+                _ => None,
+            };
+            render_node_as(
+                tag_for_description(desc),
+                own_heading,
+                &std::mem::take(attrs),
+                std::mem::take(kids),
+                depth,
+                parent_axis,
+            )
+        }
         Element::TaggedNode(tag, _desc, attrs, kids) => render_node_as(
             &std::mem::take(tag),
+            None,
             &std::mem::take(attrs),
             std::mem::take(kids),
             depth,
@@ -624,7 +705,7 @@ fn render_paragraph_child<M: Clone>(child: Element<M>, depth: usize) -> Html<M> 
             // A paragraph lays its children out as inline flow, not a flex
             // main/cross axis, so alignment is inert here — `Block` is the neutral
             // parent axis (no auto-margins, no align-self, no flex sizing).
-            render_node_as("span", &attrs, kids, depth, FlexAxis::Block)
+            render_node_as("span", None, &attrs, kids, depth, FlexAxis::Block)
         }
         _ => render_element_depth(std::mem::replace(&mut child, Element::Empty), depth),
     }
@@ -1179,15 +1260,15 @@ fn landmark_tag_for(desc: &Description) -> Option<&'static str> {
         Description::DescContentInfo => Some("footer"),
         Description::DescComplementary => Some("aside"),
         Description::DescParagraph => Some("p"),
-        Description::DescHeading(n) => Some(match n {
-            1 => "h1",
-            2 => "h2",
-            3 => "h3",
-            4 => "h4",
-            5 => "h5",
-            _ => "h6",
+        Description::DescHeading(level) => Some(match heading_markup(*level) {
+            HeadingMarkup::Native(tag) => tag,
+            HeadingMarkup::Aria(_) => "div",
         }),
-        _ => None,
+        Description::NoDescription
+        | Description::DescLabel(_)
+        | Description::DescLivePolite
+        | Description::DescLiveAssertive
+        | Description::DescButton => None,
     }
 }
 
@@ -1199,12 +1280,19 @@ fn landmark_role_for(desc: &Description) -> Option<&'static str> {
         Description::DescNavigation => Some("navigation"),
         Description::DescContentInfo => Some("contentinfo"),
         Description::DescComplementary => Some("complementary"),
-        _ => None,
+        Description::NoDescription
+        | Description::DescHeading(_)
+        | Description::DescLabel(_)
+        | Description::DescLivePolite
+        | Description::DescLiveAssertive
+        | Description::DescButton
+        | Description::DescParagraph => None,
     }
 }
 
 fn render_node_as<M: Clone>(
     tag: &str,
+    own_heading: Option<HeadingLevel>,
     attrs: &[Attribute<M>],
     kids: Vec<Element<M>>,
     depth: usize,
@@ -1227,12 +1315,24 @@ fn render_node_as<M: Clone>(
         None => (tag.to_owned(), None),
     };
     let tag: &str = &tag_owned;
+    // A heading whose final tag is not its native `<hN>` (a level above 6, or a
+    // host that is not a plain `div`) is announced through `role`/`aria-level`.
+    let heading = match &landmark {
+        Some(Description::DescHeading(level)) => Some(*level),
+        _ => own_heading,
+    };
 
     // Size first, so an author's raw `AttrStyle` for the same property wins.
     let mut style_str = join_style(&size_css(attrs, parent_axis), &build_style_string(attrs));
     let mut html_attrs = collect_html_attrs(attrs);
     if let Some(role) = role_attr {
         html_attrs.push(HtmlAttribute::Attr("role".to_owned(), role.to_owned()));
+    }
+    if let Some(level) = heading {
+        let native = matches!(heading_markup(level), HeadingMarkup::Native(t) if t == tag);
+        if !native {
+            html_attrs.extend(heading_role_attrs(level));
+        }
     }
 
     // ── elm-parity layout augmentations (A1/A2/A3/A8) ────────────────────────
@@ -1773,6 +1873,91 @@ mod tests {
             s.contains("role=\"navigation\""),
             "a landmark on a non-div must emit role=: {s}"
         );
+    }
+
+    /// Levels 1-6 render the native tag, 7 and up render `role`/`aria-level`
+    /// on a `div`, and a level below 1 is level 1. Red without `heading_markup`'s
+    /// explicit 1-6 arms (an `_ => "h6"` fallback renders level 7 as `<h6>`) or
+    /// without `HeadingLevel::from_requested`'s saturation.
+    #[test]
+    fn heading_levels_lower_without_clamp() {
+        use crate::ui::helpers::ui_desc_heading_;
+
+        for n in [i64::MIN, -1, 0, 1, 2, 3, 4, 5, 6] {
+            let native = n.clamp(1, 6);
+            let el: Element<TestMsg> = Element::Node(
+                ui_desc_heading_(n),
+                Vec::new(),
+                vec![Element::Text("t".to_owned())],
+            );
+            let s = render_html(&render_element(el));
+            assert!(
+                s.starts_with(&format!("<h{native}")) && s.ends_with(&format!("</h{native}>")),
+                "level {n} must render <h{native}>: {s}"
+            );
+            assert!(!s.contains("role="), "a native heading needs no role: {s}");
+        }
+
+        for n in [7, 8, 100, i64::MAX] {
+            let el: Element<TestMsg> = Element::Node(
+                ui_desc_heading_(n),
+                Vec::new(),
+                vec![Element::Text("t".to_owned())],
+            );
+            let s = render_html(&render_element(el));
+            assert!(s.starts_with("<div"), "level {n} has no native tag: {s}");
+            assert!(
+                s.contains("role=\"heading\""),
+                "level {n} needs a role: {s}"
+            );
+            assert!(
+                s.contains(&format!("aria-level=\"{n}\"")),
+                "level {n} must keep its own aria-level: {s}"
+            );
+            assert!(!s.contains("<h6"), "level {n} must not render as <h6>: {s}");
+        }
+    }
+
+    /// A heading description on a host that is not a plain `div` keeps its tag
+    /// and is announced through `role`/`aria-level`. Red without the
+    /// non-native branch in `render_node_as`.
+    #[test]
+    fn heading_on_non_div_gets_role() {
+        let btn: Element<TestMsg> = Element::TaggedNode(
+            "button".to_owned(),
+            Description::NoDescription,
+            vec![Attribute::AttrDescribe(Description::DescHeading(
+                HeadingLevel::from_requested(2),
+            ))],
+            vec![Element::Text("b".to_owned())],
+        );
+        let s = render_html(&render_element(btn));
+        assert!(s.starts_with("<button"), "the host tag is kept: {s}");
+        assert!(s.contains("role=\"heading\""), "role is emitted: {s}");
+        assert!(s.contains("aria-level=\"2\""), "aria-level is emitted: {s}");
+
+        let high: Element<TestMsg> = Element::TaggedNode(
+            "section".to_owned(),
+            Description::NoDescription,
+            vec![Attribute::AttrDescribe(Description::DescHeading(
+                HeadingLevel::from_requested(9),
+            ))],
+            vec![Element::Text("b".to_owned())],
+        );
+        let s = render_html(&render_element(high));
+        assert!(s.starts_with("<section"), "the host tag is kept: {s}");
+        assert!(s.contains("aria-level=\"9\""), "aria-level is emitted: {s}");
+
+        let on_div: Element<TestMsg> = Element::Node(
+            Description::NoDescription,
+            vec![Attribute::AttrDescribe(Description::DescHeading(
+                HeadingLevel::from_requested(3),
+            ))],
+            vec![Element::Text("b".to_owned())],
+        );
+        let s = render_html(&render_element(on_div));
+        assert!(s.starts_with("<h3"), "a div host is retagged: {s}");
+        assert!(!s.contains("role="), "a native retag needs no role: {s}");
     }
 
     /// A8: a fixed-px-width child of a ROW emits `flex-shrink:0` (honours the
