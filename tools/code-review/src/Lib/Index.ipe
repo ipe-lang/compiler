@@ -20,7 +20,7 @@ import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap)
 import Lib.SafeText as SafeText exposing (SafeText)
-import Lib.Settings as Settings exposing (IndexSettings)
+import Lib.Settings as Settings exposing (DbRole(..), IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
 
 
@@ -317,7 +317,7 @@ probe settings =
         Db.queryDecode conn "SELECT head FROM reviewed_stamp LIMIT 0" [] stampDecoder
         Task.succeed ()
     )
-        |> Task.mapError (Settings.openFailure "IPE_INDEX_DB" (SafeText.literal "build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at an existing index") settings.db)
+        |> Task.onError (Settings.openFailure IndexDb settings.db)
 
 
 -- The startup check of `IPE_INDEX_ROOT` against the index: of the first

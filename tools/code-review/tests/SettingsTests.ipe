@@ -254,7 +254,7 @@ missingIndexProbed at =
         System.setenv "IPE_INDEX_DB" missingDb
         message <- probeMessage (envSettings |> Task.andThen Index.probe)
         created <- Task.fromResult (Path.fromString missingDb) |> Task.andThen File.exists
-        Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "ipe-index index" message && not created)
+        Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "no file is there" message && maybeContains "ipe-index index" message && not created)
 
 
 -- A SQLite file with none of the index tables is refused.
@@ -270,7 +270,7 @@ foreignDbProbed at =
         System.setenv "IPE_INDEX_DB" otherDb
         message <- probeMessage (envSettings |> Task.andThen Index.probe)
         removeFileIfAny otherDb
-        Task.succeed (probeNames "IPE_INDEX_DB" otherDb message)
+        Task.succeed (probeNames "IPE_INDEX_DB" otherDb message && maybeContains "lacks a table" message)
 
 
 -- A review location under a missing directory is refused with its own fix.
@@ -283,7 +283,64 @@ reviewProbed at =
     do
         System.setenv "IPE_REVIEW_DB" badReview
         message <- probeMessage (envReview |> Task.andThen LibDb.probe)
-        Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && not (maybeContains "ipe-index index" message))
+        Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && maybeContains "cannot be created there" message && not (maybeContains "ipe-index index" message))
+
+
+-- A driver failure is classified once, by its SQLite primary result code
+-- (an extended code by its low byte), into one typed refusal; a failure at a
+-- location with no file is the missing-file refusal whatever the driver said,
+-- and a failure no code names is `Unusable`, never a numeric code. Red if a
+-- code is read past its primary byte, or a missing file reads as anything
+-- else.
+dbFailuresClassified : Bool
+dbFailuresClassified =
+    List.all classifiedAs
+        [ ( False, "db: database error [14]", Settings.NoDatabaseFile )
+        , ( True, "db: database error [14]", Settings.NotPermitted )
+        , ( True, "db: database error [1038]", Settings.NotPermitted )
+        , ( True, "db: database error [26]", Settings.NotADatabase )
+        , ( True, "db: database error [11]", Settings.NotADatabase )
+        , ( True, "db: database error [5]", Settings.Locked )
+        , ( True, "db: database error [517]", Settings.Locked )
+        , ( True, "db: database error [6]", Settings.Locked )
+        , ( True, "db: database error [3]", Settings.NotPermitted )
+        , ( True, "db: database error [8]", Settings.NotPermitted )
+        , ( True, "db: database error [1]", Settings.MissingSchema )
+        , ( True, "db: database error [19]", Settings.Unusable )
+        , ( False, "db: database error [19]", Settings.NoDatabaseFile )
+        , ( True, "db: database error [x]", Settings.Unusable )
+        , ( True, "pool timed out", Settings.Unusable )
+        , ( False, "pool timed out", Settings.NoDatabaseFile )
+        ]
+
+
+classifiedAs : ( Bool, String, Settings.DbRefusal ) -> Bool
+classifiedAs ( present, message, expected ) =
+    Settings.dbRefusalOf present (Error.unexpected message) == expected
+
+
+-- A file that is not a SQLite database is refused as one, at either
+-- variable, with that database's own fix and no driver text. Red if an open
+-- failure reaches the operator as the driver's message or code.
+notSqliteRefused : Task.Task Error Bool
+notSqliteRefused =
+    do
+        base <- freshDir "ipe-db-not-sqlite"
+        cwd <- System.cwd ()
+        writeFileText (base ++ "/index.db") "plain text, not a database\n"
+        writeFileText (base ++ "/review.db") "plain text, not a database\n"
+        index <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd |> Task.andThen Index.probe)
+        review <- probeMessage (Settings.parseReviewDb (base ++ "/review.db") |> Task.andThen LibDb.probe)
+        removeFileIfAny (base ++ "/index.db")
+        removeFileIfAny (base ++ "/review.db")
+        Task.succeed
+            (probeNames "IPE_INDEX_DB" (base ++ "/index.db") index
+                && maybeContains "not a SQLite database" index
+                && maybeContains "ipe-index index" index
+                && probeNames "IPE_REVIEW_DB" (base ++ "/review.db") review
+                && maybeContains "not a SQLite database" review
+                && maybeContains "review database this tool created" review
+            )
 
 
 -- Each `IPE_INDEX_DB` refusal states its problem and exactly one fix. Red if
@@ -886,6 +943,8 @@ checks =
         , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
         , check "each db refusal states one fix" dbRefusalsStateOneFix
         , check "startup probes name the variable and the file" probesNameTheirVariable
+        , Task.succeed ( "a db open failure is classified by its primary result code", dbFailuresClassified )
+        , check "a file that is not a SQLite database is refused as one" notSqliteRefused
         , check "a root holding none of the index's files is refused at startup" rootProbeJoinsIndexedPath
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
         , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions

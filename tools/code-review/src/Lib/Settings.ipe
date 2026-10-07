@@ -1,7 +1,10 @@
-module Lib.Settings exposing (AppSettings, DbLocation, IndexSettings, dbFileName, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, parseReviewDb, reviewUrl)
+module Lib.Settings exposing (AppSettings, DbLocation, DbRefusal(..), DbRole(..), IndexSettings, brokenLog, dbFileName, dbRefusalOf, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, parseReviewDb, reviewUrl)
 
 import Ipe.Encoding as Encoding
 import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.List as List
+import Ipe.Maybe as Maybe
 import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
@@ -156,28 +159,210 @@ dbFix =
     "set it to a SQLite file path or a `sqlite://` URL"
 
 
--- A parsed location that failed to open or to pass its startup probe: the
--- variable, the resolved file, the cause and one fix. A parsed location is a
--- plain absolute file path (`parseDbLocation` refuses a URL with a host,
--- credentials or a query), so naming it leaks no secret; it is still
--- rendered, since it came from the environment. `var` and `fix` are this
--- tool's own text.
-openFailure : String -> SafeText -> DbLocation -> Error -> Error
-openFailure var fix loc e =
-    Error.withMessage
+-- The database a startup refusal is about, which names its variable and
+-- picks the fix that fits it.
+type DbRole
+    = IndexDb
+    | ReviewDb
+
+
+-- Why a configured database cannot be used, parsed once from the failure
+-- of its open or startup probe. The driver's numeric code is read here and
+-- nowhere else, and never shown.
+type DbRefusal
+    = NoDatabaseFile
+    | NotADatabase
+    | Locked
+    | NotPermitted
+    | MissingSchema
+    | Unusable
+
+
+-- The refusal for a failed open or probe of `loc`: whether a file is there
+-- and the failure's SQLite primary result code decide the case. A code this
+-- tool does not name is `Unusable`, never a guess at a narrower case.
+dbRefusalOf : Bool -> Error -> DbRefusal
+dbRefusalOf present e =
+    case sqliteCode (Error.message e) of
+        Just code ->
+            refusalOfCode present code
+
+        Nothing ->
+            absentOr present Unusable
+
+
+refusalOfCode : Bool -> Int -> DbRefusal
+refusalOfCode present code =
+    case code of
+        14 ->
+            absentOr present NotPermitted
+
+        26 ->
+            NotADatabase
+
+        11 ->
+            NotADatabase
+
+        5 ->
+            Locked
+
+        6 ->
+            Locked
+
+        3 ->
+            NotPermitted
+
+        8 ->
+            NotPermitted
+
+        23 ->
+            NotPermitted
+
+        1 ->
+            MissingSchema
+
+        _ ->
+            absentOr present Unusable
+
+
+-- `NoDatabaseFile` when nothing is at the location, `fallback` when a file
+-- is there.
+absentOr : Bool -> DbRefusal -> DbRefusal
+absentOr present fallback =
+    if present then
+        fallback
+
+    else
+        NoDatabaseFile
+
+
+-- The primary result code of a driver failure written `database error [N]`
+-- (an extended code keeps its primary code in the low byte).
+sqliteCode : String -> Maybe Int
+sqliteCode message =
+    case String.split "database error [" message of
+        [ _, rest ] ->
+            List.head (String.split "]" rest)
+                |> Maybe.andThen String.toInt
+                |> Maybe.map (modBy 256)
+
+        _ ->
+            Nothing
+
+
+-- A parsed location that failed to open or to pass its startup probe,
+-- refused as one `DbRefusal`: the variable, the resolved file, the problem
+-- and one fix, never the driver's own text or code. A parsed location is a
+-- plain file path (`parseDbLocation` refuses a URL with a host, credentials
+-- or a query), so naming it leaks no secret; it is still quoted, since it
+-- came from the environment.
+openFailure : DbRole -> DbLocation -> Error -> Task.Task Error a
+openFailure role loc e =
+    File.exists (locationFile loc)
+        |> Task.onError (\_ -> Task.succeed True)
+        |> Task.andThen (\present -> Task.fail (useRefusal role loc (refusalProblem role (dbRefusalOf present e))))
+
+
+-- A migrated review file that opens and reads but whose log is broken: an
+-- append-only trigger gone, or its head row missing. No change of access
+-- repairs it, so the fix is a sound copy or a fresh log.
+brokenLog : DbLocation -> String -> Error
+brokenLog loc problem =
+    useRefusal ReviewDb loc ( problem, "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log" )
+
+
+useRefusal : DbRole -> DbLocation -> ( String, String ) -> Error
+useRefusal role loc ( problem, fix ) =
+    Error.invalidInput
         (SafeText.toString
             (SafeText.concat
-                [ SafeText.literal var
-                , SafeText.literal ": cannot open "
+                [ SafeText.literal (roleVar role)
+                , SafeText.literal ": cannot use "
                 , SafeText.quoted (locationPath loc)
-                , SafeText.literal " ("
-                , SafeText.render (Error.message e)
-                , SafeText.literal "); "
-                , fix
+                , SafeText.literal ": "
+                , SafeText.literal problem
+                , SafeText.literal "; "
+                , SafeText.literal fix
                 ]
             )
         )
-        e
+
+
+roleVar : DbRole -> String
+roleVar role =
+    case role of
+        IndexDb ->
+            "IPE_INDEX_DB"
+
+        ReviewDb ->
+            "IPE_REVIEW_DB"
+
+
+-- Each refusal's problem and its one fix, per database.
+refusalProblem : DbRole -> DbRefusal -> ( String, String )
+refusalProblem role refusal =
+    case role of
+        IndexDb ->
+            case refusal of
+                NoDatabaseFile ->
+                    ( "no file is there", indexBuildFix )
+
+                NotADatabase ->
+                    ( "it is not a SQLite database, or it is damaged", indexBuildFix )
+
+                Locked ->
+                    ( "another process holds a lock on it", "let that process, such as an `ipe-index index` run, finish and start again" )
+
+                NotPermitted ->
+                    ( "this process may not open it", "grant read access to the file and its directory, or point IPE_INDEX_DB at a readable copy" )
+
+                MissingSchema ->
+                    ( "it lacks a table, view or column this tool reads", indexBuildFix )
+
+                Unusable ->
+                    ( "it could not be opened or read", indexBuildFix )
+
+        ReviewDb ->
+            case refusal of
+                NoDatabaseFile ->
+                    ( "it cannot be created there", reviewWritableFix )
+
+                NotADatabase ->
+                    ( "it is not a SQLite database, or it is damaged", reviewLogFix )
+
+                Locked ->
+                    ( "another process holds a lock on it", "stop the other code-review server using it and start again" )
+
+                NotPermitted ->
+                    ( "this process may not write it", reviewWritableFix )
+
+                MissingSchema ->
+                    ( "its tables are not this tool's review log", reviewLogFix )
+
+                Unusable ->
+                    ( "it could not be opened, migrated or read", reviewWritableFix )
+
+
+indexBuildFix : String
+indexBuildFix =
+    "build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at an existing index"
+
+
+reviewWritableFix : String
+reviewWritableFix =
+    "create its directory and grant this process write access, or point IPE_REVIEW_DB at a writable location"
+
+
+reviewLogFix : String
+reviewLogFix =
+    "point IPE_REVIEW_DB at the review database this tool created, or at a new file to start a fresh log"
+
+
+locationFile : DbLocation -> Path
+locationFile loc =
+    case loc of
+        DbFile path ->
+            path
 
 
 locationPath : DbLocation -> String

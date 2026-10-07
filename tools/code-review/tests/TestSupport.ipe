@@ -986,12 +986,18 @@ probeMessage task =
         |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
 
 
--- The probe refusal starts with the variable, names the file, and is clean.
+-- The probe refusal starts with the variable, names the file, and is clean:
+-- no driver text or numeric result code reaches it.
 probeNames : String -> String -> Maybe String -> Bool
 probeNames var file message =
     case message of
         Just m ->
-            String.startsWith (var ++ ": cannot open ") m && String.contains file m && noHazard m
+            String.startsWith (var ++ ": cannot use ") m
+                && String.contains file m
+                && noHazard m
+                && not (String.contains "database error" m)
+                && not (String.contains "[" m)
+                && not (String.contains "os error" m)
 
         Nothing ->
             False

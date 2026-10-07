@@ -264,7 +264,9 @@ probeRefusesReviewWithoutHeadIn base =
 -- A review file whose append-only guards are gone fails the startup probe,
 -- naming the variable and the file: one trigger dropped, and the log renamed
 -- away and recreated bare (its triggers follow the renamed table). An intact
--- file passes. Red if the probe does not check the guards on their table.
+-- file passes. The refusal says the log lost a guard and how to restore it,
+-- never that the location must be writable. Red if the probe does not check
+-- the guards on their table, or the guard refusal gets the open fix.
 probeRefusesReviewWithoutGuards : Task.Task Error Bool
 probeRefusesReviewWithoutGuards =
     freshDir "ipe-review-probe-no-guards" |> Task.andThen probeRefusesReviewWithoutGuardsIn
@@ -283,7 +285,15 @@ probeRefusesReviewWithoutGuardsIn base =
         intact <- probeAfterEdits (base ++ "/intact.db") []
         droppedMessage <- probeAfterEdits dropped [ "DROP TRIGGER review_no_replace" ]
         renamedMessage <- probeAfterEdits renamed [ "ALTER TABLE review RENAME TO review_old", "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" ]
-        Task.succeed (intact == Nothing && probeNames "IPE_REVIEW_DB" dropped droppedMessage && probeNames "IPE_REVIEW_DB" renamed renamedMessage)
+        Task.succeed
+            (intact
+                == Nothing
+                && probeNames "IPE_REVIEW_DB" dropped droppedMessage
+                && probeNames "IPE_REVIEW_DB" renamed renamedMessage
+                && maybeContains "lost an append-only trigger" droppedMessage
+                && maybeContains "lost an append-only trigger" renamedMessage
+                && not (maybeContains "writable" droppedMessage)
+            )
 
 
 -- The probe's refusal message on a migrated review file at `dbPath` after
