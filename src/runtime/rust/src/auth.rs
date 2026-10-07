@@ -465,13 +465,21 @@ pub fn auth_reissue_token<E: From<String>>(
 // kernel calls, which implies `uses_db = true` and `db` in default features.
 
 #[cfg(feature = "db")]
+/// The Ipê `Error` for a failed `users` statement: classified like every other
+/// statement failure, so the driver's message (which can name a column or
+/// embed a bound value) never reaches the caller.
+fn auth_db_error<E: crate::FromIpeError>(context: &str, e: &sqlx::Error) -> E {
+    crate::db::driver_error(context, crate::db::KERNEL_ENGINE, e)
+}
+
+#[cfg(feature = "db")]
 /// Idempotent `CREATE TABLE IF NOT EXISTS users (...)`. Runs at the start of
 /// register/login/setRole so the schema is always available without users
 /// having to call a separate migration. The id-column DDL is per-driver
 /// — `db_auto_id_column()` returns the right fragment for sqlite
 /// (`INTEGER PRIMARY KEY AUTOINCREMENT`), mysql (`BIGINT NOT NULL
 /// AUTO_INCREMENT PRIMARY KEY`), or postgres (`BIGSERIAL PRIMARY KEY`).
-async fn ensure_users_schema<E: From<String> + Send>(conn: &Db) -> IpeResult<E, ()> {
+async fn ensure_users_schema<E: crate::FromIpeError + Send>(conn: &Db) -> IpeResult<E, ()> {
     let schema = format!(
         "CREATE TABLE IF NOT EXISTS users (
             {},
@@ -484,14 +492,16 @@ async fn ensure_users_schema<E: From<String> + Send>(conn: &Db) -> IpeResult<E, 
     );
     match sqlx::query(&schema).execute(conn).await {
         Ok(_) => IpeResult::Ok(()),
-        Err(e) => IpeResult::Err(format!("auth.users schema: {}", e).into()),
+        Err(e) => IpeResult::Err(auth_db_error("auth.users schema: db: ", &e)),
     }
 }
 
 #[cfg(feature = "db")]
 /// Ipê `register : Db -> String -> String -> Task Error Int`.
 /// Creates a new user. Returns the new user id.
-pub fn auth_register<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn auth_register<
+    E: Send + From<String> + crate::FromUnavailable + crate::FromIpeError + 'static,
+>(
     conn: Db,
     email: String,
     password: String,
@@ -541,10 +551,17 @@ pub fn auth_register<E: Send + From<String> + crate::FromUnavailable + 'static>(
             .await;
         match result {
             Ok(res) => IpeResult::Ok(db_last_insert_id(&res)),
-            Err(sqlx::Error::Database(de)) if de.is_unique_violation() => {
-                IpeResult::Err("auth.register: email already registered".to_string().into())
+            Err(e) => {
+                let failure = crate::db::classify_failure(crate::db::KERNEL_ENGINE, &e);
+                if failure == IpeDbFailure::UniqueViolation {
+                    IpeResult::Err(E::from_ipe_error(IpeError::database(
+                        failure,
+                        "auth.register: email already registered".to_owned(),
+                    )))
+                } else {
+                    IpeResult::Err(auth_db_error("auth.register: db: ", &e))
+                }
             }
-            Err(e) => IpeResult::Err(format!("auth.register: {}", e).into()),
         }
     })
 }
@@ -554,7 +571,9 @@ pub fn auth_register<E: Send + From<String> + crate::FromUnavailable + 'static>(
 /// Authenticates the user. Returns user id on success. Does NOT leak whether
 /// the email exists vs. password was wrong — both paths return the same
 /// generic "invalid credentials" error.
-pub fn auth_login<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn auth_login<
+    E: Send + From<String> + crate::FromUnavailable + crate::FromIpeError + 'static,
+>(
     conn: Db,
     email: String,
     password: String,
@@ -617,7 +636,7 @@ pub fn auth_login<E: Send + From<String> + crate::FromUnavailable + 'static>(
                     }
                 }
             }
-            Err(e) => IpeResult::Err(format!("auth.login: {}", e).into()),
+            Err(e) => IpeResult::Err(auth_db_error("auth.login: db: ", &e)),
         }
     })
 }
@@ -625,7 +644,7 @@ pub fn auth_login<E: Send + From<String> + crate::FromUnavailable + 'static>(
 #[cfg(feature = "db")]
 /// Ipê `setRole : Db -> Int -> String -> Task Error ()`.
 /// Sets the user's role. No-op if the user doesn't exist (returns Ok).
-pub fn auth_set_role<E: Send + From<String> + 'static>(
+pub fn auth_set_role<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     user_id: i64,
     role: String,
@@ -642,7 +661,7 @@ pub fn auth_set_role<E: Send + From<String> + 'static>(
             .await
         {
             Ok(_) => IpeResult::Ok(()),
-            Err(e) => IpeResult::Err(format!("auth.setRole: {}", e).into()),
+            Err(e) => IpeResult::Err(auth_db_error("auth.setRole: db: ", &e)),
         }
     })
 }
@@ -880,6 +899,119 @@ mod tests {
             matches!(dup, IpeResult::Err(_)),
             "case-variant must not create a duplicate account"
         );
+    }
+
+    /// A pool over a fresh in-memory database whose `users` object is built by
+    /// `setup` before any kernel runs.
+    #[cfg(feature = "db")]
+    async fn pool_with(setup: &str) -> DbPool {
+        let pool = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory connect");
+        sqlx::query(setup).execute(&pool).await.expect("setup");
+        pool
+    }
+
+    /// The database failure an auth kernel's error carries, with its message.
+    #[cfg(feature = "db")]
+    fn database_failure<T: std::fmt::Debug>(r: IpeResult<IpeError, T>) -> (IpeDbFailure, String) {
+        match r {
+            IpeResult::Err(IpeError::Error(_, info)) => match info.details {
+                IpeMaybe::Just(IpeErrorDetails::Database(f)) => (f, info.message),
+                other => panic!("no Database details ({other:?}): {}", info.message),
+            },
+            IpeResult::Ok(v) => panic!("accepted: {v:?}"),
+        }
+    }
+
+    /// A duplicate registration is `Database UniqueViolation` with the fixed
+    /// message, never the driver's text.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn register_duplicate_is_classified_unique_violation() {
+        let pool = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory connect");
+        let first: IpeResult<IpeError, i64> =
+            auth_register(pool.clone(), "dup@example.com".into(), "hunter2!".into()).await;
+        assert!(
+            matches!(first, IpeResult::Ok(_)),
+            "first register: {first:?}"
+        );
+        let (failure, message) = database_failure(
+            auth_register::<IpeError>(pool, "dup@example.com".into(), "hunter2!".into()).await,
+        );
+        assert_eq!(failure, IpeDbFailure::UniqueViolation);
+        assert_eq!(message, "auth.register: email already registered");
+    }
+
+    /// Any other failed register insert is classified, and its message names
+    /// neither the table nor the column the driver's message names.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn register_driver_failure_is_classified_without_driver_text() {
+        let pool = pool_with(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at BIGINT NOT NULL,
+                nickname TEXT NOT NULL
+            )",
+        )
+        .await;
+        let (failure, message) = database_failure(
+            auth_register::<IpeError>(pool, "n@example.com".into(), "hunter2!".into()).await,
+        );
+        assert_eq!(failure, IpeDbFailure::NotNullViolation);
+        assert!(message.starts_with("auth.register: db: "), "{message}");
+        assert!(!message.contains("nickname"), "{message}");
+        assert!(!message.contains("users"), "{message}");
+    }
+
+    /// A failed login query is classified without the driver's text.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn login_driver_failure_is_classified_without_driver_text() {
+        let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
+        let (failure, message) = database_failure(
+            auth_login::<IpeError>(pool, "x@example.com".into(), "hunter2!".into()).await,
+        );
+        assert_eq!(failure, IpeDbFailure::InvalidStatement);
+        assert!(message.starts_with("auth.login: db: "), "{message}");
+        assert!(!message.contains("password_hash"), "{message}");
+        assert!(!message.contains("no such column"), "{message}");
+    }
+
+    /// A failed role update is classified without the driver's text.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn set_role_driver_failure_is_classified_without_driver_text() {
+        let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
+        let (failure, message) =
+            database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
+        assert_eq!(failure, IpeDbFailure::InvalidStatement);
+        assert!(message.starts_with("auth.setRole: db: "), "{message}");
+        assert!(!message.contains("role"), "{message}");
+        assert!(!message.contains("no such column"), "{message}");
+    }
+
+    /// A failed `users` schema statement is classified without the driver's
+    /// text: an index already named `users` refuses the table.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn users_schema_failure_is_classified_without_driver_text() {
+        let pool = pool_with("CREATE TABLE t (x INTEGER)").await;
+        sqlx::query("CREATE INDEX users ON t (x)")
+            .execute(&pool)
+            .await
+            .expect("index");
+        let (failure, message) =
+            database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
+        assert_eq!(failure, IpeDbFailure::InvalidStatement);
+        assert!(message.starts_with("auth.users schema: db: "), "{message}");
+        assert!(!message.contains("index"), "{message}");
     }
 
     #[tokio::test]

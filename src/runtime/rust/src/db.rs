@@ -258,7 +258,7 @@ impl StaticEngine for sqlx::Postgres {
 }
 
 /// The engine this build's `Db` pool speaks.
-const KERNEL_ENGINE: DbEngine = <DbDatabase as StaticEngine>::ENGINE;
+pub(crate) const KERNEL_ENGINE: DbEngine = <DbDatabase as StaticEngine>::ENGINE;
 
 /// A dedicated sqlx `Transaction`, shared across the body via `Arc<Mutex<..>>`
 /// so re-entrant body ops serialise on it (sqlx connections are `&mut`-exclusive).
