@@ -19,6 +19,10 @@ pub const PICK_ATTEMPTS: usize = 3;
 /// The most bytes one answer may carry, its newline included.
 const ANSWER_BYTES: u64 = 64;
 
+/// The most [`ANSWER_BYTES`] chunks discarded after an over-long answer before
+/// the prompt cancels.
+const DRAIN_CHUNKS: u64 = 3;
+
 /// The outcome of the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pick {
@@ -36,7 +40,9 @@ pub enum Pick {
 /// An answer is a number in `1..=count`; an empty answer, `q`, end of input,
 /// or a read error cancels. Anything else — a number out of range, a
 /// non-number, an answer longer than its byte ceiling, invalid UTF-8 — is
-/// refused with a re-prompt, at most [`PICK_ATTEMPTS`] times in all.
+/// refused with a re-prompt, at most [`PICK_ATTEMPTS`] times in all. A line
+/// still unfinished after [`DRAIN_CHUNKS`] discarded chunks cancels, so no
+/// part of it is ever read as an answer.
 pub fn pick<R: BufRead, W: Write>(reader: &mut R, out: &mut W, count: usize) -> Pick {
     let prompt = text::doc_pick_prompt(&count);
     for _ in 0..PICK_ATTEMPTS {
@@ -55,8 +61,8 @@ pub fn pick<R: BufRead, W: Write>(reader: &mut R, out: &mut W, count: usize) -> 
         if let Some(pick) = answer(&buf, count) {
             return pick;
         }
-        if !buf.ends_with(b"\n") {
-            drain_line(reader);
+        if !buf.ends_with(b"\n") && !drain_line(reader) {
+            return Pick::Cancelled;
         }
         if writeln!(out, "{}", gutter(text::doc_pick_retry())).is_err() {
             return Pick::Cancelled;
@@ -85,23 +91,25 @@ fn answer(buf: &[u8], count: usize) -> Option<Pick> {
 }
 
 /// Discard the rest of an over-long answer line, a bounded chunk at a time, so
-/// its tail is not read as the next answer.
+/// its tail is never read as the next answer.
 ///
-/// Stops at the newline, at end of input, on a read error, or after
-/// [`PICK_ATTEMPTS`] chunks — the next prompt then sees whatever remains.
-fn drain_line<R: BufRead>(reader: &mut R) {
-    for _ in 0..PICK_ATTEMPTS {
+/// `true` when the line ended (its newline, end of input, or a read error);
+/// `false` when [`DRAIN_CHUNKS`] chunks passed without one, so what remains is
+/// still the same line and the caller must not read it as an answer.
+fn drain_line<R: BufRead>(reader: &mut R) -> bool {
+    for _ in 0..DRAIN_CHUNKS {
         let mut sink = Vec::new();
         match reader
             .by_ref()
             .take(ANSWER_BYTES)
             .read_until(b'\n', &mut sink)
         {
-            Ok(0) | Err(_) => return,
-            Ok(_) if sink.ends_with(b"\n") => return,
+            Ok(0) | Err(_) => return true,
+            Ok(_) if sink.ends_with(b"\n") => return true,
             Ok(_) => {}
         }
     }
+    false
 }
 
 /// The header over a miss list.
@@ -318,17 +326,58 @@ mod tests {
         assert_eq!(out.matches("Open which entry?").count(), PICK_ATTEMPTS);
     }
 
+    /// The longest answer line the prompt reads to its end: one answer chunk
+    /// plus every drained chunk, its newline included.
+    const LONGEST_LINE: u64 = ANSWER_BYTES * (DRAIN_CHUNKS + 1);
+    const _: () = assert!(LONGEST_LINE == 256);
+
     #[test]
     fn an_over_long_answer_is_refused_and_its_tail_never_answers() {
-        let mut input = vec![b'1'; 200];
+        let mut input = vec![b'1'; 255];
         input.extend_from_slice(b"\n2\n");
-        assert_eq!(run_pick(&input, 2).0, Pick::Chosen(1));
+        assert_eq!(
+            run_pick(&input, 2).0,
+            Pick::Chosen(1),
+            "a line of exactly the drain ceiling is discarded whole, then re-prompted"
+        );
         let mut digits = vec![b' '; 62];
         digits.extend_from_slice(b"1\n");
         assert_eq!(
             run_pick(&digits, 2).0,
             Pick::Chosen(0),
             "an answer of exactly the ceiling, newline included, is read"
+        );
+    }
+
+    #[test]
+    fn a_line_longer_than_the_drain_ceiling_cancels_instead_of_answering() {
+        for junk in [256_usize, 257, 300, 1000] {
+            for tail in [&b"2\n"[..], b"     2\n"] {
+                let mut input = vec![b'x'; junk];
+                input.extend_from_slice(tail);
+                assert_eq!(
+                    run_pick(&input, 2).0,
+                    Pick::Cancelled,
+                    "{junk} junk bytes then {tail:?}"
+                );
+            }
+        }
+        let mut input = vec![b'1'; 256];
+        input.extend_from_slice(b"\n2\n");
+        assert_eq!(run_pick(&input, 2).0, Pick::Cancelled);
+    }
+
+    #[test]
+    fn an_answer_at_the_ceiling_with_no_newline_at_end_of_input_cancels() {
+        let mut at_ceiling = vec![b' '; 63];
+        at_ceiling.push(b'1');
+        assert_eq!(run_pick(&at_ceiling, 2).0, Pick::Cancelled);
+        let mut under = vec![b' '; 62];
+        under.push(b'1');
+        assert_eq!(
+            run_pick(&under, 2).0,
+            Pick::Chosen(0),
+            "one byte under the ceiling, end of input ends the line"
         );
     }
 
