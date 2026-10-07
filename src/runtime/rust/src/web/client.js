@@ -1,11 +1,60 @@
-var __ipeSid = window.__IPE_SID;
-var __ipeBase = window.__IPE_BASE || "";
-var __ipeCsrfToken = window.__IPE_CSRF_TOKEN || "";
+// Boot data: the per-session values and the client config, read once from the
+// page's inert JSON block `<script type="application/json" id="ipe-boot">`
+// before any other code here runs. A missing block, a block that is not JSON,
+// or a field of the wrong type halts the client with an `IpeBootError` and
+// shows the offline banner: the client never boots on invented defaults.
+var __IPE_TUNING_KEYS = [
+  "RETRY_BASE_MS", "RETRY_MAX_MS", "RETRY_MAX_ATTEMPTS", "RETRY_FAST_MS",
+  "RETRY_FAST_WINDOW_MS", "EVENT_QUEUE_MAX", "HELLO_TIMEOUT_MS", "HEARTBEAT_TTL_MS"
+];
+var __ipeBoot = (function() {
+  function refuse(why) {
+    __ipeShowBootFailure();
+    var err = new Error("Ipe boot data " + why);
+    err.name = "IpeBootError";
+    throw err;
+  }
+  function isObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+  function requireType(obj, key, type, where) {
+    if (typeof obj[key] !== type) refuse(where + key + " is not a " + type);
+  }
+  var node = document.getElementById("ipe-boot");
+  if (!node || node.tagName !== "SCRIPT" || node.getAttribute("type") !== "application/json") {
+    refuse("block is missing");
+  }
+  var data;
+  try { data = JSON.parse(node.textContent); } catch (_) { refuse("block is not JSON"); }
+  if (!isObject(data)) refuse("block is not an object");
+  ["sid", "epoch", "base", "csrf"].forEach(function(k) { requireType(data, k, "string", ""); });
+  var cfg = data["cfg"];
+  if (!isObject(cfg)) refuse("cfg is not an object");
+  ["bannerEnabled", "swapToast"].forEach(function(k) { requireType(cfg, k, "boolean", "cfg."); });
+  ["msgReconnecting", "msgUpdated", "msgOffline"].forEach(function(k) {
+    requireType(cfg, k, "string", "cfg.");
+  });
+  var tuning = cfg["tuning"];
+  if (!isObject(tuning)) refuse("cfg.tuning is not an object");
+  __IPE_TUNING_KEYS.forEach(function(k) {
+    var v = tuning[k];
+    if (typeof v !== "number" || !isFinite(v) || v < 0 || Math.floor(v) !== v) {
+      refuse("cfg.tuning." + k + " is not a count");
+    }
+  });
+  return data;
+})();
+// The session globals other page scripts (the debugger overlay) read.
+window.__IPE_SID = __ipeBoot["sid"];
+window.__IPE_EPOCH = __ipeBoot["epoch"];
+window.__IPE_BASE = __ipeBoot["base"];
+window.__IPE_CSRF_TOKEN = __ipeBoot["csrf"];
+var __ipeSid = __ipeBoot["sid"];
+var __ipeBase = __ipeBoot["base"];
+var __ipeCsrfToken = __ipeBoot["csrf"];
 // The render epoch of the DOM on screen. An event carries the epoch its
 // handler id was read under; the server resolves the id only against that
 // render, and a refused event is answered with the current render, never
 // re-sent.
-var __ipeEpoch = window.__IPE_EPOCH || null;
+var __ipeEpoch = __ipeBoot["epoch"] || null;
 // A random id minted once per page load. With the client seq it lets the
 // server ack a re-delivered event without dispatching it twice.
 var __ipeTabId = (function() {
@@ -42,14 +91,15 @@ function __ipeAdoptFullBody(token, applyFn) {
   applyFn();
   __ipeEpoch = __ipeEpochParts(token) ? token : null;
 }
-// Server-templated config (mod.rs render_page_full → window.__IPE_*). Each
-// reads the injected window global when present, else the hardcoded default —
-// so IPE_WEB_RETRY_* / QUEUE_MAX / HELLO_TIMEOUT_MS / HEARTBEAT_TTL_MS /
-// BANNER overrides reach the client. CSP-safe (no eval).
-var __ipeBannerEnabled = (window.__IPE_BANNER_ENABLED != null) ? window.__IPE_BANNER_ENABLED : true;
-var __ipeRetryBaseMs = (window.__IPE_RETRY_BASE_MS != null) ? window.__IPE_RETRY_BASE_MS : 500;
-var __ipeRetryMaxMs = (window.__IPE_RETRY_MAX_MS != null) ? window.__IPE_RETRY_MAX_MS : 16000;
-var __ipeRetryMaxAttempts = (window.__IPE_RETRY_MAX_ATTEMPTS != null) ? window.__IPE_RETRY_MAX_ATTEMPTS : 10;
+// Server config from the boot block (`cfg`): the `IPE_WEB_BANNER`,
+// `IPE_WEB_SWAP_TOAST` and `IPE_WEB_*` tuning settings resolve on the server
+// and reach the client only here; the boot read checked every field.
+var __ipeBootCfg = __ipeBoot["cfg"];
+var __ipeBootTuning = __ipeBootCfg["tuning"];
+var __ipeBannerEnabled = __ipeBootCfg["bannerEnabled"];
+var __ipeRetryBaseMs = __ipeBootTuning["RETRY_BASE_MS"];
+var __ipeRetryMaxMs = __ipeBootTuning["RETRY_MAX_MS"];
+var __ipeRetryMaxAttempts = __ipeBootTuning["RETRY_MAX_ATTEMPTS"];
 // Fast-reconnect front phase: for the first __ipeRetryFastWindowMs after a
 // drop, retry on a short JITTERED constant interval (~__ipeRetryFastMs) so a
 // fast server restart or a transient blip reconnects almost immediately;
@@ -58,21 +108,21 @@ var __ipeRetryMaxAttempts = (window.__IPE_RETRY_MAX_ATTEMPTS != null) ? window._
 // window must outlast the expected outage: `ipe dev watch` injects a longer one
 // (a dev rebuild takes seconds) while the default stays short so a real prod
 // outage does not draw sustained fast retries.
-var __ipeRetryFastMs = (window.__IPE_RETRY_FAST_MS != null) ? window.__IPE_RETRY_FAST_MS : 200;
-var __ipeRetryFastWindowMs = (window.__IPE_RETRY_FAST_WINDOW_MS != null) ? window.__IPE_RETRY_FAST_WINDOW_MS : 3000;
-var __ipeEventQueueMax = (window.__IPE_EVENT_QUEUE_MAX != null) ? window.__IPE_EVENT_QUEUE_MAX : 50;
-var __ipeMsgReconnecting = (window.__IPE_MSG_RECONNECTING != null) ? window.__IPE_MSG_RECONNECTING : "Reconnecting…";
-var __ipeMsgOffline = (window.__IPE_MSG_OFFLINE != null) ? window.__IPE_MSG_OFFLINE : "Connection lost — refresh to retry";
-var __ipeMsgUpdated = (window.__IPE_MSG_UPDATED != null) ? window.__IPE_MSG_UPDATED : "updated ✓";
-var __ipeHelloTimeoutMs = (window.__IPE_HELLO_TIMEOUT_MS != null) ? window.__IPE_HELLO_TIMEOUT_MS : 8000;
-var __ipeHeartbeatTtlMs = (window.__IPE_HEARTBEAT_TTL_MS != null) ? window.__IPE_HEARTBEAT_TTL_MS : 35000;
+var __ipeRetryFastMs = __ipeBootTuning["RETRY_FAST_MS"];
+var __ipeRetryFastWindowMs = __ipeBootTuning["RETRY_FAST_WINDOW_MS"];
+var __ipeEventQueueMax = __ipeBootTuning["EVENT_QUEUE_MAX"];
+var __ipeMsgReconnecting = __ipeBootCfg["msgReconnecting"];
+var __ipeMsgOffline = __ipeBootCfg["msgOffline"];
+var __ipeMsgUpdated = __ipeBootCfg["msgUpdated"];
+var __ipeHelloTimeoutMs = __ipeBootTuning["HELLO_TIMEOUT_MS"];
+var __ipeHeartbeatTtlMs = __ipeBootTuning["HEARTBEAT_TTL_MS"];
 // Dev-watch blue-green cutover mode. Set by the `ipe dev watch` blue-green server
 // (IPE_WEB_SWAP_TOAST). When on, a reconnect is an expected rebuild cutover:
 // the amber "Reconnecting…" banner is suppressed during the brief fast-window
 // drop, and a successful reconnect greets the user with a small positive
 // "updated ✓" toast instead. A release / `ipe dev run` server leaves this false,
 // so the ordinary reconnect/offline chrome is unaffected in production.
-var __ipeSwapToast = (window.__IPE_SWAP_TOAST === true);
+var __ipeSwapToast = __ipeBootCfg["swapToast"];
 // True once THIS page-life has seen a first `hello`. A later `hello` (or an
 // explicit `swapped` frame) is therefore a reconnect, not the initial open —
 // the swap toast greets only reconnects, never the first load.
@@ -1484,9 +1534,33 @@ function __ipeShowBuildOk() {
 function __ipeInjectStatusBanner() {
   if (__ipeStatusEl) return;            // idempotent
   if (!__ipeBannerEnabled) return;      // IPE_WEB_BANNER=off
+  var built = __ipeBuildStatusEl("connected");
+  document.body.appendChild(built.el);
+  __ipeStatusEl = built.el;
+  __ipeStatusMsgEl = built.msgEl;
+  // Replay current state in case it changed before DOM was ready.
+  __ipeSetStatus(__ipeStatus, "");
+}
+// Show the offline banner for a page whose boot data was refused. It runs
+// before any config is known, so it ignores the banner setting: a page that
+// cannot start always says so.
+function __ipeShowBootFailure() {
+  function show() {
+    if (document.getElementById("__ipe-status")) return;
+    var built = __ipeBuildStatusEl("offline");
+    built.msgEl.textContent = "Page failed to start — reload to retry";
+    (document.body || document.documentElement).appendChild(built.el);
+  }
+  if (document.body) show();
+  else document.addEventListener("DOMContentLoaded", show);
+}
+// The `#__ipe-status` banner element in `state`, with its message span. Its
+// state colours are the page shell's `STATUS_CSS` rules, so the client
+// creates no `<style>` element.
+function __ipeBuildStatusEl(state) {
   var el = document.createElement("div");
   el.id = "__ipe-status";
-  el.className = "ipe-status ipe-status--connected";
+  el.className = "ipe-status ipe-status--" + state;
   el.setAttribute("role", "status");
   el.setAttribute("aria-live", "polite");
   // Inline styles — no global stylesheet leak. Max z-index puts the
@@ -1507,32 +1581,10 @@ function __ipeInjectStatusBanner() {
     "transition:opacity 200ms",
     "opacity:1"
   ].join(";");
-  // State-specific styles applied via inline style overrides on
-  // each setStatus call would be cleaner, but overriding via class
-  // on a <style> tag keeps the inline cssText readable. Append a
-  // tiny <style> with the variant rules.
-  var style = document.createElement("style");
-  style.textContent = "" +
-    "#__ipe-status.ipe-status--connected{display:none}" +
-    "#__ipe-status.ipe-status--reconnecting{background:#b45309}" +
-    "#__ipe-status.ipe-status--offline{background:#b91c1c}" +
-    "#__ipe-status.ipe-status--recompiling{background:#b45309}" +
-    "#__ipe-status.ipe-status--build-ok{background:#166534}" +
-    "#__ipe-status.ipe-status--build-failed{background:#991b1b;pointer-events:auto;cursor:default}" +
-    "@media(prefers-color-scheme:dark){" +
-      "#__ipe-status.ipe-status--recompiling{background:#92400e}" +
-      "#__ipe-status.ipe-status--build-ok{background:#14532d}" +
-      "#__ipe-status.ipe-status--build-failed{background:#7f1d1d}" +
-    "}";
-  document.head.appendChild(style);
   var msgEl = document.createElement("span");
   msgEl.className = "ipe-status__msg";
   el.appendChild(msgEl);
-  document.body.appendChild(el);
-  __ipeStatusEl = el;
-  __ipeStatusMsgEl = msgEl;
-  // Replay current state in case it changed before DOM was ready.
-  __ipeSetStatus(__ipeStatus, "");
+  return { el: el, msgEl: msgEl };
 }
 // ── Swap toast (dev blue-green cutover cue) ──────────────────
 // A brief, positive, non-blocking toast shown when the `ipe dev watch` blue-green
