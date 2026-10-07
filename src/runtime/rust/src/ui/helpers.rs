@@ -13,7 +13,7 @@ use super::element::{
 };
 use crate::color::Color;
 use crate::core::IpeMaybe;
-use crate::html::{Html, admit_element};
+use crate::html::{DOCTYPE_WRAPPER_TAG, Html, admit_element};
 
 // ── Element builders ──────────────────────────────────────────────────────────
 
@@ -676,12 +676,12 @@ pub fn html_node_<M>(
 }
 
 /// `Html.doctype : List (Html msg) -> Html msg` — wraps children in the
-/// `!doctype-wrapper` pseudo-tag; `ipe_runtime::html::render_into_ctx`
-/// recognises that literal tag and emits `<!DOCTYPE html>` before the
-/// children directly.
+/// `!doctype-wrapper` pseudo-tag, which `ipe_runtime::html::admit_rendered`
+/// recognises for the render sink and the SSE diff alike: it renders as
+/// `<!DOCTYPE html>` and then the children directly.
 #[must_use]
 pub fn html_doctype_<M>(children: Vec<Html<M>>) -> Html<M> {
-    Html::HElement("!doctype-wrapper".to_owned(), Vec::new(), children)
+    Html::HElement(DOCTYPE_WRAPPER_TAG.to_owned(), Vec::new(), children)
 }
 
 /// `Html.titleNode : String -> Html msg` — wraps a raw string directly in
@@ -1816,9 +1816,43 @@ mod tag_gate_tests {
             vec![],
             vec![Element::Text("alert(document.cookie)".into())],
         );
+        // The lowered tree itself holds no script element and no script
+        // text: the render sink refuses the element again, so asserting on the
+        // rendered string alone would pass without the lowering gate.
+        let lowered = ui_layout(vec![], el.clone());
+        assert!(!has_element(&lowered, "script"), "{lowered:?}");
+        assert!(!has_text(&lowered, "alert"), "{lowered:?}");
+        assert!(has_text_exactly(&lowered, ""), "{lowered:?}");
         let out = ui_render(el);
         assert!(!out.contains("<script"), "{out}");
         assert!(!out.contains("alert"), "{out}");
+    }
+
+    /// True when `node` or a descendant is an element named `tag` (any case).
+    fn has_element(node: &Html<()>, tag: &str) -> bool {
+        match node {
+            Html::HElement(t, _, kids) => {
+                t.eq_ignore_ascii_case(tag) || kids.iter().any(|k| has_element(k, tag))
+            }
+            Html::HText(_) | Html::HRaw(_) => false,
+        }
+    }
+
+    /// True when `node` or a descendant is a text or raw node holding `needle`.
+    fn has_text(node: &Html<()>, needle: &str) -> bool {
+        match node {
+            Html::HElement(_, _, kids) => kids.iter().any(|k| has_text(k, needle)),
+            Html::HText(t) | Html::HRaw(t) => t.contains(needle),
+        }
+    }
+
+    /// True when `node` or a descendant is a text node equal to `text`.
+    fn has_text_exactly(node: &Html<()>, text: &str) -> bool {
+        match node {
+            Html::HElement(_, _, kids) => kids.iter().any(|k| has_text_exactly(k, text)),
+            Html::HText(t) => t == text,
+            Html::HRaw(_) => false,
+        }
     }
 }
 

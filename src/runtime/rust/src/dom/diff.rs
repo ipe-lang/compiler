@@ -1,4 +1,4 @@
-use crate::html::{Attribute, ElementBody, Html, admit_element};
+use crate::html::{Attribute, ElementBody, Html, admit_rendered};
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -72,7 +72,7 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
 
 /// Emit a whole-subtree innerHTML replace at `id`.
 ///
-/// `parent_body` is how `admit_element` admitted the element whose children
+/// `parent_body` is how `admit_rendered` admitted the element whose children
 /// are being replaced, so a `<script>`/`<style>` body gets the same
 /// neutralisation the first-paint renderer applies and the SSE replace cannot
 /// smuggle a raw `</script>`/`</style>` into the DOM.
@@ -90,11 +90,11 @@ fn push_html_replace<M>(
     out.push(p);
 }
 
-/// True when `node` is an element the shared tag gate refuses, so the renderer
-/// leaves it out of the page.
+/// True when `node` is an element the render sink's admission rule refuses, so
+/// the renderer leaves it out of the page.
 fn is_refused_element<M>(node: &Html<M>) -> bool {
     match node {
-        Html::HElement(tag, _, kids) => admit_element(tag, kids).is_err(),
+        Html::HElement(tag, _, kids) => admit_rendered(tag, kids).is_err(),
         Html::HText(_) | Html::HRaw(_) => false,
     }
 }
@@ -114,13 +114,16 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
         // A top-level mismatch has no parent to address, so nothing to emit.
         _ => return,
     };
-    // SECURITY: the shared tag gate. A refused element is absent from the
-    // rendered page, so neither side of a refused pair has a DOM node to patch;
-    // a parent whose child changes admission replaces its whole subtree (see
-    // the per-position loop), which re-renders through the same gate.
-    let (Ok(body), Ok(_)) = (admit_element(nt, nk), admit_element(ot, ok)) else {
+    // SECURITY: the render sink's own admission rule. A refused element is
+    // absent from the rendered page, so neither side of a refused pair has a
+    // DOM node to patch; a parent whose child changes admission replaces its
+    // whole subtree (see the per-position loop), which re-renders through the
+    // same rule. The `Html.doctype` wrapper is admitted as markup, so a view
+    // rooted at it is diffed through to its children.
+    let (Ok(new_rendered), Ok(_)) = (admit_rendered(nt, nk), admit_rendered(ot, ok)) else {
         return;
     };
+    let body = new_rendered.body();
     // Patch id targets the element currently in the DOM — the OLD tree's id
     // . Borrowed: `Patch::for_id` copies it only when
     // a Patch is actually built, so an unchanged element pair allocates
@@ -166,9 +169,15 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                     return;
                 }
             }
-            // Raw-vs-raw: changed raw content is not patched (no-op); avoid
-            // emitting a spurious replace.
-            (Html::HRaw(_), Html::HRaw(_)) => {}
+            // A changed trusted raw body (a dynamic `styleNode`, an
+            // `unsafeRaw` fragment) re-renders the parent's children through
+            // the same body class the first paint used.
+            (Html::HRaw(o), Html::HRaw(n)) => {
+                if o != n {
+                    push_html_replace(id, body, nk, out);
+                    return;
+                }
+            }
             (Html::HElement(t1, _, _), Html::HElement(t2, _, _)) if t1 == t2 => {
                 // A child that gains or loses admission appears in or vanishes
                 // from the page, so the parent's subtree is replaced.
@@ -706,5 +715,112 @@ mod tests {
             html.contains("ok</p>"),
             "admitted sibling must render; got: {html:?}"
         );
+    }
+
+    /// A view rooted at `Html.doctype` is diffed through the wrapper the render
+    /// sink admits, so a changed text deep inside it reaches the page.
+    #[test]
+    fn diff_doctype_root_patches_a_changed_text_child() {
+        let page = |text: &str| -> Html<()> {
+            let p = Html::HElement("p".into(), vec![], vec![Html::HText(text.into())]);
+            let body = Html::HElement("body".into(), vec![], vec![p]);
+            let html = Html::HElement("html".into(), vec![], vec![body]);
+            Html::HElement(crate::html::DOCTYPE_WRAPPER_TAG.into(), vec![], vec![html])
+        };
+        let mut old = page("before");
+        let mut new = page("after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_html_0_body_0_p");
+        assert_eq!(patch.text.as_deref(), Some("after"));
+    }
+
+    /// A doctype wrapper nested below the root is on the page too, so it is
+    /// not a refused child: a text change inside it patches only that text.
+    #[test]
+    fn diff_nested_doctype_is_not_a_refused_child() {
+        let tree = |text: &str| -> Html<()> {
+            let p = Html::HElement("p".into(), vec![], vec![Html::HText(text.into())]);
+            let doctype = Html::HElement(crate::html::DOCTYPE_WRAPPER_TAG.into(), vec![], vec![p]);
+            Html::HElement("div".into(), vec![], vec![doctype])
+        };
+        let mut old = tree("before");
+        let mut new = tree("after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.text.as_deref(), Some("after"));
+        assert!(
+            patch.html.is_none(),
+            "no subtree replace expected: {patch:?}"
+        );
+    }
+
+    /// A trusted raw `<style>` body that changes between renders (a dynamic
+    /// `styleNode`) re-renders the element's body through the style
+    /// neutraliser.
+    #[test]
+    fn diff_changed_trusted_style_body_replaces_it() {
+        let style = |css: &str| -> Html<()> {
+            Html::HElement("style".into(), vec![], vec![Html::HRaw(css.into())])
+        };
+        let mut old: Html<()> =
+            Html::HElement("div".into(), vec![], vec![style("p { color: red }")]);
+        let mut new: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![style("p { color: blue }</style><img src=x>")],
+        );
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(
+            patches.len(),
+            1,
+            "expected one html replace; got {patches:?}"
+        );
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_style");
+        let Some(html) = patch.html.as_deref() else {
+            assert!(patch.html.is_some(), "expected an html replace: {patch:?}");
+            return;
+        };
+        assert!(
+            html.contains("color: blue"),
+            "new body must render; got {html:?}"
+        );
+        assert!(
+            !html.contains("</style"),
+            "close tag must be neutralised; got {html:?}"
+        );
+        assert!(!html.contains("<img"), "no markup may open; got {html:?}");
+    }
+
+    /// An unchanged trusted raw body produces no patch.
+    #[test]
+    fn diff_unchanged_trusted_raw_body_is_empty() {
+        let tree = || -> Html<()> {
+            Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HRaw("<b>x</b>".into()), Html::HRaw("<i>y</i>".into())],
+            )
+        };
+        let mut old = tree();
+        let mut new = tree();
+        ids(&mut old);
+        ids(&mut new);
+        assert!(diff(&old, &new).is_empty());
     }
 }

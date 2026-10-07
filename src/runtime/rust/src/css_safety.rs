@@ -972,9 +972,11 @@ pub(crate) fn strip_style_close(s: &str) -> String {
 /// read as the start of a tag, end tag, comment or declaration (a `<` followed
 /// by an ASCII letter, `/`, `!` or `?`) gets a space inserted after it, which
 /// the tokenizer reads as plain text. CSS reads the space as whitespace, so a
-/// range media feature such as `(400px<width)` keeps its meaning; only a `<`
-/// directly before a letter inside a CSS string or comment gains a space
-/// (documented divergence: security outranks byte-for-byte).
+/// range media feature such as `(400px<width)` keeps its meaning. Inside a CSS
+/// string, a `url(...)` or a comment the space is kept and a `</style` run is
+/// gone, so `url("data:image/svg+xml,<svg ...>")` reaches CSS as `< svg`: a
+/// divergence `Ipe.Html.styleNode` documents, as security outranks
+/// byte-for-byte output.
 ///
 /// Total and a fixpoint: no output `<` is followed by a tag-opening byte.
 pub(crate) fn neutralise_style_body(css: &str) -> String {

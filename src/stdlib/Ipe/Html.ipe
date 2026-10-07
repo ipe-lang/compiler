@@ -74,7 +74,12 @@ titleNode = Kernel.kernel "Html_titleNode"
 
 
 -- | `styleNode attrs css` — a `<style>` element whose CSS body is
--- close-tag-neutralised once at construction (parse, don't validate).
+-- neutralised once at construction so it can open or close no markup: every
+-- `</style` is removed, and a space follows every `<` that comes before a
+-- letter, `/`, `!` or `?`. CSS reads that space as whitespace, but inside a
+-- CSS string or `url(...)` it is kept, so
+-- `url("data:image/svg+xml,<svg ...>")` arrives as `< svg` and a string
+-- holding `</style>` loses that run.
 styleNode : List (Attribute msg) -> String -> Html msg
 styleNode = Kernel.kernel "Html_styleNode"
 

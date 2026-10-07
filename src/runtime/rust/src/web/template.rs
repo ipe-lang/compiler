@@ -701,8 +701,31 @@ mod tests {
                     },
                 ],
             };
-            let rendered = render_html(&materialize_template::<()>(&template));
-            assert_eq!(rendered, "<div><p>ok</p></div>", "<{tag}> must be refused");
+            // The materialised node itself carries the refusal value in the
+            // refused element's place: the render sink refuses a text-bodied
+            // `<script>` again, so the rendered string alone would pass
+            // without the materialiser's gate.
+            let node = materialize_template::<()>(&template);
+            let Html::HElement(div, _, kids) = &node else {
+                assert!(matches!(node, Html::HElement(..)), "<{tag}>: {node:?}");
+                return;
+            };
+            assert_eq!(div, "div");
+            assert_eq!(kids.len(), 2, "<{tag}>: {node:?}");
+            assert_eq!(
+                kids.first(),
+                Some(&Html::HText(String::new())),
+                "<{tag}> must materialize to inert empty text: {node:?}"
+            );
+            assert!(
+                matches!(kids.get(1), Some(Html::HElement(p, _, _)) if p == "p"),
+                "<{tag}>: the admitted sibling must survive: {node:?}"
+            );
+            assert_eq!(
+                render_html(&node),
+                "<div><p>ok</p></div>",
+                "<{tag}> must be refused"
+            );
         }
     }
 
@@ -711,6 +734,9 @@ mod tests {
     fn str_materialize_refuses_a_script_element() {
         let json = r#"{"Element":{"tag":"script","attrs":[],"children":[{"Text":"alert(1)"}]}}"#;
         let out: Html<()> = materialize_template_str(json);
+        // The node, not only its rendering, is the refusal value: the render
+        // sink would drop a text-bodied `<script>` element anyway.
+        assert_eq!(out, Html::HText(String::new()));
         assert_eq!(render_html(&out), "");
     }
 
