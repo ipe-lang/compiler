@@ -1163,7 +1163,9 @@ Not limitations — the language is meant to work this way.
   defect: an HTTP handler returns a 500 with a correlation ref and the server
   survives, a live session ends and the client reconnects, a CLI exits non-zero
   with a classified message — never a whole-process crash. Raise the ceiling
-  with the `IPE_RECURSION_LIMIT` environment variable. Self-tail-recursive
+  with the `IPE_RECURSION_LIMIT` environment variable, a positive decimal
+  integer; any other value (`0` included) refuses the program at startup.
+  Self-tail-recursive
   functions the compiler rewrites into a loop run in constant stack and are
   exempt, so the limit only bounds recursion that actually grows the stack.
 

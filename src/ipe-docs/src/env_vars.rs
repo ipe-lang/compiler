@@ -562,7 +562,9 @@ pub static ENV_VARS: &[EnvVar] = &[
         purpose: "Maximum subject (input) size in bytes that any `Ipe.Regex` \
                   match/find/findAll/replace/split will scan. Past the ceiling the \
                   operation returns its safe empty result, bounding untrusted-input \
-                  work and allocation.",
+                  work and allocation. Read once, at the first `Regex.compile`; a \
+                  value that is not a positive decimal byte count (`0` included) \
+                  makes `Regex.compile` return `Err` naming the variable.",
         subsystem: Subsystem::Regex,
         class: Class::Tunable,
     },
@@ -855,7 +857,10 @@ pub static ENV_VARS: &[EnvVar] = &[
         name: "IPE_RECURSION_LIMIT",
         default: "10000",
         purpose: "Maximum Ipê call-stack depth before a recursion-limit error is \
-                  raised. Prevents stack-overflow crashes from unbounded recursion.",
+                  raised. Prevents stack-overflow crashes from unbounded recursion. \
+                  Read once, at process start; a value that is not a positive \
+                  decimal integer (`0` included) refuses the program before its \
+                  first line.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },

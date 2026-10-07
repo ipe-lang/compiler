@@ -871,8 +871,8 @@ pub fn maybe_combine<A>(maybes: Vec<IpeMaybe<A>>) -> IpeMaybe<Vec<A>> {
 //     depth-only — fail-safe, never a false trip. Compiled out on wasm32 (no
 //     native stack introspection); the depth budget remains.
 
-/// The default recursion depth budget when `IPE_RECURSION_LIMIT` is unset,
-/// unparseable, or zero. Calibrated against the 8 MiB runtime-owned stacks: at
+/// The default recursion depth budget while `IPE_RECURSION_LIMIT` is unset.
+/// Calibrated against the 8 MiB runtime-owned stacks: at
 /// ~100–800 bytes per emitted frame, 10 000 frames occupy ~1–8 MiB, so the depth
 /// budget trips deterministically for typical frames and the red-zone probe
 /// covers the fat-frame tail.
@@ -906,26 +906,55 @@ thread_local! {
     static STACK_FLOOR: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// The configured recursion depth budget, read once from `IPE_RECURSION_LIMIT`
-/// and cached for the process lifetime. Unset, unparseable, or zero falls back
-/// to [`DEFAULT_RECURSION_LIMIT`]; any positive value is accepted (the red-zone
-/// probe still backstops a value set recklessly high, so raising the env var can
-/// never reintroduce the abort).
-fn recursion_limit() -> usize {
-    use std::sync::OnceLock;
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        parse_recursion_limit(crate::system::read_env_var("IPE_RECURSION_LIMIT").ok())
-    })
+/// The recursion depth budget read from `IPE_RECURSION_LIMIT`.
+///
+/// A present value must be a positive decimal integer; anything else (`0`,
+/// padding and signs included) refuses the program at startup. Any positive
+/// value is accepted: the red-zone probe still backstops a value set recklessly
+/// high, so raising the variable can never reintroduce the abort.
+const RECURSION_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
+    "IPE_RECURSION_LIMIT",
+    DEFAULT_RECURSION_LIMIT as u64,
+    crate::system::ZeroCeiling::Refused,
+    "decimal recursion depth",
+);
+
+/// The `IPE_RECURSION_LIMIT` snapshot taken by [`recursion_startup_check`],
+/// once per process.
+static RECURSION_LIMIT: std::sync::OnceLock<Result<usize, crate::system::EnvCeilingRefusal>> =
+    std::sync::OnceLock::new();
+
+/// Parses a raw `IPE_RECURSION_LIMIT` lookup into a depth budget.
+fn settle_recursion_limit(
+    raw: Result<String, std::env::VarError>,
+) -> Result<usize, crate::system::EnvCeilingRefusal> {
+    RECURSION_CEILING.parse_as::<usize>(raw)
 }
 
-/// Interpret a raw `IPE_RECURSION_LIMIT` value into a depth budget. Unset
-/// (`None`), unparseable, or zero yields [`DEFAULT_RECURSION_LIMIT`]; any
-/// positive integer is accepted verbatim. Pure so the fallback ladder is unit
-/// tested without touching the process environment or the cached read.
-fn parse_recursion_limit(raw: Option<String>) -> usize {
-    raw.and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
+/// Snapshots `IPE_RECURSION_LIMIT` before the program's first line.
+///
+/// A later call keeps the first snapshot, and a variable set after startup
+/// (`System.setenv`) does not move it.
+///
+/// # Errors
+///
+/// The refusal naming the variable when its value is present but malformed.
+fn recursion_startup_check() -> Result<(), crate::system::EnvCeilingRefusal> {
+    RECURSION_LIMIT
+        .get_or_init(|| settle_recursion_limit(RECURSION_CEILING.lookup()))
+        .as_ref()
+        .map(|_| ())
+        .map_err(Clone::clone)
+}
+
+/// The process's recursion depth budget: the startup snapshot, or
+/// [`DEFAULT_RECURSION_LIMIT`] on an entry that runs no startup check (the wasm
+/// client, runtime unit tests), which never reads the environment.
+fn recursion_limit() -> usize {
+    RECURSION_LIMIT
+        .get()
+        .and_then(|settled| settled.as_ref().ok())
+        .copied()
         .unwrap_or(DEFAULT_RECURSION_LIMIT)
 }
 
@@ -1222,9 +1251,13 @@ pub fn panic_500_body(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// Install the classifying panic hook. Idempotent in effect (re-installing just
-/// replaces the hook). Called at the top of generated `fn main()` for non-server
-/// shapes (Ipe.Console/Tui); server/live binaries rely on the per-request
-/// `CatchPanicLayer` instead (so a handler panic returns a 500, not exit).
+/// replaces the hook). The first statement of every generated native and WASI
+/// `fn main()`; server/live handlers additionally catch a panic per request
+/// (`CatchPanicLayer`, so a handler panic returns a 500, not exit).
+///
+/// Before installing the hook it runs the runtime's startup checks: a malformed
+/// `IPE_LOG_LEVEL` or `IPE_RECURSION_LIMIT` writes its refusal to stderr and
+/// exits 1 before the program's first line.
 ///
 /// **Design note — hook logs then RESUMES the unwind (never calls exit).** Calling
 /// `process::exit(1)` from the hook would prevent `catch_unwind` anywhere in the
@@ -1253,6 +1286,11 @@ pub fn install_panic_classifier() {
     // A malformed `IPE_LOG_LEVEL` refuses the program before its first line.
     #[cfg(feature = "log")]
     if let Err(refusal) = super::log::startup_check() {
+        eprint_task_error(&refusal.to_string());
+        crate::system::system_exit(1);
+    }
+    // So does a malformed `IPE_RECURSION_LIMIT`; a well-formed one is fixed here.
+    if let Err(refusal) = recursion_startup_check() {
         eprint_task_error(&refusal.to_string());
         crate::system::system_exit(1);
     }
@@ -1724,24 +1762,56 @@ mod tests {
 mod recursion_guard_tests {
     use super::*;
 
+    // Every malformed `IPE_RECURSION_LIMIT` (zero and padding included) is a
+    // refusal naming the variable, never the default; absent is the default and
+    // a positive decimal is taken verbatim.
     #[test]
-    fn parse_recursion_limit_ladder() {
-        // Unset / unparseable / zero → default; positive → verbatim.
-        assert_eq!(parse_recursion_limit(None), DEFAULT_RECURSION_LIMIT);
+    fn recursion_ceiling_refuses_malformed() {
+        use std::env::VarError;
+        let refused = |raw: Result<String, VarError>| {
+            let shown = format!("{raw:?}");
+            let outcome = settle_recursion_limit(raw);
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|r| r.name() == "IPE_RECURSION_LIMIT"
+                        && r.to_string().starts_with("IPE_RECURSION_LIMIT")),
+                "{shown} must be refused naming the variable, got {outcome:?}"
+            );
+        };
+        for raw in [
+            "",
+            "abc",
+            "garbage",
+            "0",
+            "-5",
+            " 42",
+            "  42  ",
+            "16MiB",
+            "18446744073709551616",
+        ] {
+            refused(Ok(raw.to_owned()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            refused(Err(VarError::NotUnicode(std::ffi::OsString::from_vec(
+                vec![b'1', 0xFF],
+            ))));
+        }
+        assert_eq!(settle_recursion_limit(Ok("1".to_owned())), Ok(1));
         assert_eq!(
-            parse_recursion_limit(Some("garbage".to_string())),
-            DEFAULT_RECURSION_LIMIT
+            settle_recursion_limit(Err(VarError::NotPresent)),
+            Ok(DEFAULT_RECURSION_LIMIT)
         );
-        assert_eq!(
-            parse_recursion_limit(Some("0".to_string())),
-            DEFAULT_RECURSION_LIMIT
-        );
-        assert_eq!(
-            parse_recursion_limit(Some("-5".to_string())),
-            DEFAULT_RECURSION_LIMIT
-        );
-        assert_eq!(parse_recursion_limit(Some("  42  ".to_string())), 42);
-        assert_eq!(parse_recursion_limit(Some("1".to_string())), 1);
+        crate::system::assert_env_ceiling_contract(RECURSION_CEILING);
+    }
+
+    // The runtime's unit tests run no startup check, so the budget is the
+    // default and the environment is never read for it.
+    #[test]
+    fn recursion_limit_without_startup_is_default() {
+        assert_eq!(recursion_limit(), DEFAULT_RECURSION_LIMIT);
     }
 
     // A balanced enter/leave returns the depth counter to where it started, and a
