@@ -616,6 +616,24 @@ fn extract_hid_for_open_tag(html: &str, tag: &str) -> Option<String> {
     Some(after[..end].to_string())
 }
 
+/// A well-formed tab id, as a browser tab mints once per page load.
+const TAB: &str = "00112233445566778899aabbccddeeff";
+
+/// The render epoch the page embeds as `window.__IPE_EPOCH`.
+///
+/// An event carries it so the server resolves the handler id against the
+/// render that produced it.
+fn extract_epoch(test_name: &str, html: &str) -> Result<String, BoxError> {
+    let needle = "window.__IPE_EPOCH=\"";
+    html.find(needle)
+        .and_then(|at| html.get(at + needle.len()..))
+        .and_then(|rest| rest.get(..rest.find('"')?))
+        .map(str::to_string)
+        .ok_or_else(|| -> BoxError {
+            format!("{test_name}: no window.__IPE_EPOCH in the page").into()
+        })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// `GET /` on a Ipe.Web counter app returns an HTML page containing the
@@ -812,7 +830,10 @@ fn live_onclick_increments_counter() -> Result<(), BoxError> {
     // `msg` carries the event name (the runtime prefers `event`, then `msg`,
     // then defaults to "click").  `sessionId` is retained in the body for
     // wire-compat but ignored by the server; auth is via the Cookie header.
-    let event_body = format!(r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":""}}"#);
+    let epoch = extract_epoch(test_name, &body)?;
+    let event_body = format!(
+        r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
+    );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
         test_name,
@@ -853,6 +874,47 @@ fn live_onclick_increments_counter() -> Result<(), BoxError> {
         "{test_name}: counter not incremented to 1 after Increment click\n\
          --- first 2000 bytes of second GET / ---\n{}",
         &body2[..body2.len().min(2000)]
+    );
+
+    // ── Step 5: an event from another render history is refused ─────────────
+    //
+    // The same handler id under an epoch this server never minted must not
+    // resolve against the current render: 409 with the current render, and
+    // the counter stays at 1.
+    let foreign = format!("{:032x}.1", 0xdead_u128);
+    let stale_body = format!(
+        r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":"","epoch":"{foreign}","tab":"{TAB}","seq":2}}"#
+    );
+    let (stale_headers, stale_reply) = http_send(
+        test_name,
+        &addr,
+        "POST",
+        "/_ipe/event",
+        &[
+            ("Content-Type", "application/json"),
+            ("Cookie", &cookie_header),
+        ],
+        Some(stale_body.as_bytes()),
+    )?;
+    assert!(
+        stale_headers.starts_with("HTTP/1.1 409") && stale_reply.contains("stale-render"),
+        "{test_name}: a foreign-epoch event must be refused with 409 stale-render\n\
+         --- headers ---\n{stale_headers}\n--- body ---\n{stale_reply}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let (_, body3) = http_send(
+        test_name,
+        &addr,
+        "GET",
+        "/",
+        &[("Cookie", &cookie_header)],
+        None,
+    )?;
+    assert!(
+        body3.contains(">1<") && !body3.contains(">2<"),
+        "{test_name}: a refused event must not dispatch\n\
+         --- first 2000 bytes of third GET / ---\n{}",
+        &body3[..body3.len().min(2000)]
     );
 
     Ok(())
@@ -1347,8 +1409,9 @@ fn live_onsubmit_typed_record_dispatches_decoded_payload() -> Result<(), BoxErro
     })?;
 
     // ── Step 2: POST /_ipe/event — submit with the typed-record form data ──
+    let epoch = extract_epoch(test_name, &body)?;
     let event_body = format!(
-        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":""}}"#
+        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
     );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
@@ -1558,8 +1621,10 @@ fn live_onsubmit_bare_msg_dispatches_fixed_msg() -> Result<(), BoxError> {
     })?;
 
     // ── Step 2: POST /_ipe/event — submit with REAL (but ignored) form data ─
-    let event_body =
-        format!(r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":""}}"#);
+    let epoch = extract_epoch(test_name, &body)?;
+    let event_body = format!(
+        r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
+    );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
         test_name,
@@ -2006,8 +2071,10 @@ fn live_onsubmit_var_bound_msg_dispatches_fixed_msg() -> Result<(), BoxError> {
     })?;
 
     // ── Step 2: POST /_ipe/event — submit with REAL (but ignored) form data ─
-    let event_body =
-        format!(r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":""}}"#);
+    let epoch = extract_epoch(test_name, &body)?;
+    let event_body = format!(
+        r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
+    );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
         test_name,
@@ -2384,8 +2451,9 @@ fn live_unrouted_get_does_not_wipe_form_handlers() -> Result<(), BoxError> {
     );
 
     // ── Step 3: POST /_ipe/event — submit the typed-record form ────────────
+    let epoch = extract_epoch(test_name, &body)?;
     let event_body = format!(
-        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":""}}"#
+        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
     );
     let (_, post_body) = http_send(
         test_name,

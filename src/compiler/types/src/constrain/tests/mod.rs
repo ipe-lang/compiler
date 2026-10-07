@@ -2207,6 +2207,99 @@ mod registry_phase_c_tests {
         );
     }
 
+    /// Every `Db` kernel taking a `List a` argument carries a `SqlParam` slot on it.
+    ///
+    /// Walks `StdlibKernel::ALL`: each `Db`-qualified kernel whose scheme has an
+    /// argument shaped `List <var>` is a bind-list kernel, and that var must be a
+    /// pinned `SqlParam` slot of the kernel in `OBLIGATION_SLOTS`. The converse
+    /// holds too (a `SqlParam` row on a kernel with no such argument is stale),
+    /// and the walk must find at least one kernel, so it cannot pass vacuously.
+    /// A bind list reaching the emitted `Vec<SqlParam>` without the bound would
+    /// pass `ipe` and fail `cargo` (E0277).
+    #[test]
+    fn every_db_list_var_argument_has_a_sql_param_slot() {
+        use super::super::constrain_ast::{OBLIGATION_SLOTS, ObligationKind};
+
+        // Raw var ids of every `List <var>` argument along the arrow spine
+        // (the result type is not an argument, so `Task (List b)` is skipped).
+        fn list_var_arguments(t: &Ty, list: ipe_intern::Symbol) -> Vec<u32> {
+            let mut found = Vec::new();
+            let mut cur = t;
+            while let Ty::Fun(arg, ret) = cur {
+                if let Ty::Con { name, args, .. } = arg.as_ref()
+                    && *name == list
+                    && let [Ty::Var(n)] = args.as_slice()
+                {
+                    found.push(*n);
+                }
+                cur = ret.as_ref();
+            }
+            found
+        }
+
+        let mut interner = Interner::new();
+        let builtins = make_builder(&mut interner);
+        let list = builtins.list;
+        let mut uf = UnionFind::<Content>::new();
+        let builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+
+        let sql_param_slots = |k: StdlibKernel| -> Vec<u32> {
+            OBLIGATION_SLOTS
+                .iter()
+                .filter(|(kk, _, kind)| *kk == k && matches!(kind, ObligationKind::SqlParam))
+                .map(|(_, slot, _)| *slot)
+                .collect()
+        };
+
+        let mut bind_list_kernels: Vec<StdlibKernel> = Vec::new();
+        for &k in StdlibKernel::ALL {
+            if k.def().qualifier != "Db" {
+                continue;
+            }
+            let scheme = builder.resolve_scheme(k.def().scheme);
+            assert!(
+                scheme.is_some(),
+                "{k:?} is a Db kernel with no resolvable scheme"
+            );
+            let Some(scheme) = scheme else { continue };
+            let list_vars = list_var_arguments(&scheme, list);
+            if list_vars.is_empty() {
+                assert!(
+                    sql_param_slots(k).is_empty(),
+                    "{k:?} pins a SqlParam slot but has no `List a` argument",
+                );
+                continue;
+            }
+            bind_list_kernels.push(k);
+            let slots = sql_param_slots(k);
+            for var in list_vars {
+                assert!(
+                    slots.contains(&var),
+                    "{k:?} takes a `List` of scheme var {var} but OBLIGATION_SLOTS has \
+                     no SqlParam row for it: a record or function bind list would pass \
+                     `ipe` and fail `cargo` (E0277)",
+                );
+            }
+        }
+        // `exec`, `unsafeQuery`, `queryDecode`, `queryDecodeOn`, `findProjection`
+        // and `findProjectionOrdered`: a walk that finds fewer has stopped
+        // recognising the scheme shape.
+        assert!(
+            bind_list_kernels.len() >= 6,
+            "the walk matched only {} `Db` kernels with a `List a` argument, \
+             expected at least 6 — the detection no longer recognises the scheme shape",
+            bind_list_kernels.len(),
+        );
+        for &(k, _, kind) in OBLIGATION_SLOTS {
+            if matches!(kind, ObligationKind::SqlParam) {
+                assert!(
+                    bind_list_kernels.contains(&k),
+                    "{k:?} has a SqlParam row but was not found as a bind-list kernel",
+                );
+            }
+        }
+    }
+
     /// A stdlib record alias is expanded by `normalize_annotation_ty` keyed on
     /// the RESOLVED identity — the empty-home builtin sentinel — never a bare
     /// name string. Pins both directions of that gate for every stdlib record

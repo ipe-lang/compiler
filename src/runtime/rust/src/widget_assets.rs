@@ -364,9 +364,10 @@ function __ipeEmitWidgetUp(host, up) {
     return;
   }
   // Reuse the existing event wire: same envelope {sessionId, seq, msg, args,
-  // handlerId}, same CSRF header + session cookie. The server resolves the
-  // handler by (ipe-id, \"ipe-widget\") and runs the fail-closed seal up-decoder.
-  __ipeSend(\"ipe-widget\", [JSON.stringify(up)], hid);
+  // handlerId}, same CSRF header + session cookie. The render epoch is read with
+  // the ipe-id, so the server resolves the handler by (ipe-id, \"ipe-widget\")
+  // against the render the id came from and runs the fail-closed seal up-decoder.
+  __ipeSend(\"ipe-widget\", [JSON.stringify(up)], hid, { epoch: __ipeEpoch });
 }
 ";
 

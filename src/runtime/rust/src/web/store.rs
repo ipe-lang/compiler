@@ -1692,18 +1692,17 @@ mod format_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::{Html, build_index};
+    use crate::web::Html;
     use tokio::sync::mpsc::channel;
 
     // A minimal SessionEntry<(), ()> for exercising the store's TTL/touch logic.
     fn handle() -> SessionHandle<(), ()> {
         let (tx, _rx) = channel::<()>(1);
         let tree: Html<()> = Html::HText(String::new());
-        let index = build_index(&tree);
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            last_view: tree,
-            index,
+            rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
+            tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
@@ -1753,11 +1752,10 @@ mod tests {
     fn handle_i32(model: i32) -> SessionHandle<i32, ()> {
         let (tx, _rx) = channel::<()>(1);
         let tree: Html<()> = Html::HText(String::new());
-        let index = build_index(&tree);
         Arc::new(Mutex::new(SessionEntry {
             model,
-            last_view: tree,
-            index,
+            rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
+            tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
@@ -2922,7 +2920,6 @@ mod tests {
     fn handle_model<M: Clone + Send + 'static>(model: M) -> SessionHandle<M, ()> {
         let (tx, _rx) = channel::<()>(1);
         let tree: Html<()> = Html::HText(String::new());
-        let index = build_index(&tree);
         Arc::new(Mutex::new(SessionEntry {
             #[cfg(feature = "debugger")]
             history: crate::debugger::RecordBuffer::new(
@@ -2932,8 +2929,8 @@ mod tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             model,
-            last_view: tree,
-            index,
+            rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
+            tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx: tx,

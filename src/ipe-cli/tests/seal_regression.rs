@@ -564,6 +564,38 @@ fn sql_param_wildcard_builds_at_two_types() {
     assert_accepted("wildcard_sql_param_two_types", &src, "ok\n");
 }
 
+/// A wildcard parameter in the `Db.findProjection` bind list stays an
+/// `Into<SqlParam>` generic, so one helper binds an `Int` and a `String` and the
+/// emitted crate builds. The statement itself fails at run time (no such
+/// table); `Task.onError` absorbs it, so the program prints `ok`.
+#[test]
+fn find_projection_bind_wildcard_builds_at_two_types() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         import Ipe.Db\n\
+         import Ipe.Db.Sql as Sql\n\
+         import Ipe.Task\n\
+         projectOne : Db -> any -> Task Error ()\n\
+         projectOne conn v =\n\
+         \x20   Task.onError\n\
+         \x20       (\\_ -> Task.succeed ())\n\
+         \x20       (Task.map\n\
+         \x20           (\\_ -> ())\n\
+         \x20           (Db.findProjection conn \"t\" \"a0\" \"u\" \"a1\" (Sql.eq (Sql.column \"a0.id\") (Sql.int 1)) [] [ v ])\n\
+         \x20       )\n\
+         main =\n\
+         \x20   Task.andThen\n\
+         \x20       (\\conn ->\n\
+         \x20           do\n\
+         \x20               projectOne conn 1\n\
+         \x20               projectOne conn \"s\"\n\
+         \x20               Io.println \"ok\"\n\
+         \x20       )\n\
+         \x20       (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+    );
+    assert_accepted("find_projection_wildcard_two_types", &src, "ok\n");
+}
+
 /// `-9223372036854775808` (`i64::MIN`) is a literal in every position it can
 /// occur — a let value, a list and a tuple element, a top-level and a `Just`
 /// payload `case` arm, under unary minus (which wraps back to `i64::MIN`), and
