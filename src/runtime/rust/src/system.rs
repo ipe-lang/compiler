@@ -3965,7 +3965,9 @@ mod getenv_kind_tests {
     #[cfg(unix)]
     #[test]
     fn a_non_unicode_environ_value_is_invalid_input() {
-        if std::env::var_os(NOT_UNICODE_PROBE).is_some() {
+        #[allow(clippy::disallowed_methods)] // the raw environ itself is under test
+        let probed = std::env::var_os(NOT_UNICODE_PROBE).is_some();
+        if probed {
             assert!(every_kernel_fails_as(
                 NOT_UNICODE_PROBE,
                 IpeErrorKind::InvalidInput
