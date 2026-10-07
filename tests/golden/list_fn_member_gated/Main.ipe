@@ -3,8 +3,9 @@ module Main exposing (main)
 -- A stored `List (Int -> Int)` is `Clone` (storable, mappable, foldable), but a
 -- function value is not comparable: `Arc<dyn Fn>` is neither `PartialEq` nor
 -- `Ord`. `List.member` needs `==` on the element, so applying it to a
--- function-carrying list must fail closed at `ipe` time with IPE-L0134 (the
--- element-capability gate), never emit Rust `cargo` rejects.
+-- function-carrying list must fail closed at `ipe` time — the element's
+-- equality obligation refuses it at type-check (IPE-T0001), ahead of the
+-- element-capability gate (IPE-L0134) — never emit Rust `cargo` rejects.
 
 import Ipe.Io as Io
 import Ipe.List

@@ -2846,7 +2846,9 @@ fn lower_float_set_element() {
 
 /// `List.member` over a `List (Int -> Int)`: the element is a stored function,
 /// which is `Clone` but not `PartialEq` — membership needs `==` on the element,
-/// so it must fail closed with IPE-L0134 (the equality-requiring case).
+/// so it must fail closed. The kernel's element carries an equality obligation,
+/// so the type checker refuses the function element (IPE-T0001) before the
+/// lowering's element-capability gate (IPE-L0134) is reached.
 #[test]
 fn lower_list_member_over_function_element_gated() {
     let src = format!(
@@ -2858,7 +2860,7 @@ fn lower_list_member_over_function_element_gated() {
          \x20   in\n\
          \x20   steps\n"
     );
-    assert_rejected("lower_list_member_fn_elem", &src, "IPE-L0134");
+    assert_rejected("lower_list_member_fn_elem", &src, "IPE-T0001");
 }
 
 /// `Dict.map` over a `Dict String (Int -> Int)`: the mapper's value parameter

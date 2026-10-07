@@ -30,6 +30,8 @@ mod golden_m4d;
 mod golden_m4d_gate;
 #[path = "g_m4/golden_m4e.rs"]
 mod golden_m4e;
+#[path = "g_m4/golden_m4e_sort_by_gate.rs"]
+mod golden_m4e_sort_by_gate;
 #[path = "g_m4/golden_m4f_encoding.rs"]
 mod golden_m4f_encoding;
 #[path = "g_m4/golden_m4g_json_enc.rs"]
