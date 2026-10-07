@@ -13,5 +13,5 @@ Without a subcommand: generate docs.json + renderings for the project and stdlib
 - `[--out <dir>]` — write the documentation to <dir> (default: doc/); generate only
 - `[--write-format markdown|json|html|all]` — which renderings to write beside docs.json (default: all); generate only
 - `[--port <n>]` — pin the serve port (default: an auto-selected free one); serve only
-- `[--plain]` — bare output, one entry per line; list, <module> and <key> only; a miss lists one `term<TAB>kind<TAB>summary` line per closest entry, never a prompt
-- `[--json]` — machine-readable JSON output; list, <module> and <key> only; a miss is the error object, its `results` the closest entries' terms in order and `truncated` set when more matched
+- `[--plain]` — bare output, one entry per line; list, <module> and <key> only; a miss writes one `term<TAB>kind<TAB>summary` line per closest entry to stderr as the error output, never a prompt
+- `[--json]` — machine-readable JSON output; list, <module> and <key> only; a miss is the error object, written to stderr, its `results` the closest entries' terms in order and `truncated` set when more matched
