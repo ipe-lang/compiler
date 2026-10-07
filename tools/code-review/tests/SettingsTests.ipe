@@ -1016,12 +1016,13 @@ macKeyParseRefuses =
         )
 
 
--- Only the key variable not being set reads as read-only, recognized
--- through the runtime's own not-set failure; any other failure to read it
--- refuses with an error naming the variable and never the failure's text,
--- the not-set failure of another variable included. Red if every lookup
--- failure is read as unset, or if the runtime's not-set failure is no
--- longer recognized (an unset key would then refuse startup).
+-- Only a `NotFound` failure reads as read-only, decided by the error's kind
+-- and never its text: the runtime's unset key reads as read-only; every other
+-- kind refuses with an error naming the variable and never the failure's
+-- text, an `Unexpected` failure carrying the old not-set wording included.
+-- Red if the kind check is replaced by a text match, if any other kind is
+-- read as unset, or if `NotFound` is no longer read as unset (an unset key
+-- would then refuse startup).
 keyLookupFailsClosed : Task.Task Error Bool
 keyLookupFailsClosed =
     do
@@ -1029,8 +1030,10 @@ keyLookupFailsClosed =
         unset <- ReviewKey.readReviewKey
         Task.succeed
             (keyReadOnly (Ok unset)
+                && keyReadOnly (ReviewKey.keyFromLookup (Err (Error.notFound "")))
                 && List.all refusesNamingVar
-                    [ Error.unexpected ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not valid unicode")
+                    [ Error.invalidInput ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not valid unicode")
+                    , Error.unexpected ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not set")
                     , Error.unexpected "environment variable \"OTHER_KEY\" is not set"
                     , Error.permissionDenied
                     ]
