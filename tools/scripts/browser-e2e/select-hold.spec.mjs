@@ -12,6 +12,9 @@
  *      committed event, leave the stream open while the select is focused;
  *      closing it reopens the stream once and the page converges on the
  *      server's render and epoch.
+ *   3. No stuck hold — a select can lose focus with no `focusout` (a focused
+ *      node removed from the page): the watchdog then releases the held
+ *      render, and a patches frame that cannot apply resyncs the stream once.
  *
  * The pushed frames are dispatched on the client's own `EventSource`, so each
  * case controls exactly what the stream delivers while the select is open.
@@ -153,5 +156,53 @@ test("no reopen storm: frames that cannot apply while a select is open keep the 
   const reply = page.waitForResponse(isEventPost);
   await page.getByRole("button", { name: "Locate" }).click();
   expect((await reply).status()).toBe(200);
+  expect(errors.map(String)).toEqual([]);
+});
+
+/** Keep every `focusout` from the client, as a removed focused node does. */
+async function swallowFocusout(page) {
+  await page.evaluate(() =>
+    window.addEventListener("focusout", (e) => e.stopImmediatePropagation(), true),
+  );
+}
+
+test("no stuck hold: a select removed while open releases the held render", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  const epoch = await openSelect(page);
+  const { inc, n } = epochParts(epoch);
+  const held = `${inc}.${n + 50}`;
+  await swallowFocusout(page);
+  await pushHeldRender(page, held);
+  await expect(page.locator("#ipe-e2e-held")).toHaveCount(0);
+
+  await page.evaluate(() => document.getElementById("ipe-e2e-select").remove());
+  await expect(page.locator("#ipe-e2e-held")).toHaveCount(1, { timeout: 10000 });
+  expect(await page.evaluate(() => window.__ipeEpoch)).toBe(held);
+  expect(errors.map(String)).toEqual([]);
+});
+
+test("no stuck hold: a frame that cannot apply with no select open resyncs", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  const epoch = await openSelect(page);
+  const { inc, n } = epochParts(epoch);
+  const opened = await page.evaluate(() => window.__e2eStreams.length);
+  const held = `${inc}.${n + 50}`;
+  // Only the frame may release the hold here.
+  await page.evaluate(() => clearInterval(window.__ipeWatchdogTimer));
+  await swallowFocusout(page);
+  await pushHeldRender(page, held);
+
+  await page.evaluate(() => document.getElementById("ipe-e2e-select").remove());
+  await push(page, "patches", { patches: [], from: `${inc}.${n + 60}`, to: `${inc}.${n + 61}` });
+  await expect
+    .poll(() => page.evaluate(() => window.__e2eStreams.length), { timeout: 5000 })
+    .toBe(opened + 1);
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  await expect(page.locator("#ipe-e2e-held")).toHaveCount(0);
+  const converged = epochParts(await page.evaluate(() => window.__ipeEpoch));
+  expect(converged?.inc).toBe(inc);
+  expect(converged.n).toBeLessThan(n + 50);
   expect(errors.map(String)).toEqual([]);
 });

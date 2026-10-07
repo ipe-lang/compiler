@@ -165,7 +165,10 @@ function __ipeAdoptFullBody(token, applyFn) {
 // `stale` marks a patches frame that could not apply meanwhile: the screen is
 // then behind the server by more than the held render, so closing resyncs the
 // stream instead. Until then the stream stays open: a resync's first frame
-// would only be held again.
+// would only be held again. A select can lose focus with no `focusout` (a
+// focused node removed from the page), so a frame arriving with no select
+// open, and the watchdog, release it too: nothing stays held once no select
+// is open.
 var __ipeHeldRender = null;
 function __ipeSelectOpen() {
   var a = __ipeDoc.active();
@@ -1907,6 +1910,7 @@ function __ipeOpenSSE() {
         __ipeHoldRender(function() { __ipePatch(raw); });
         return;
       }
+      __ipeHeldRender = null;
       return __ipePatch(raw);
     }
     if (frame && typeof frame === "object") {
@@ -1917,7 +1921,11 @@ function __ipeOpenSSE() {
           __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
         };
         if (__ipeSelectOpen()) __ipeHoldRender(apply);
-        else apply();
+        else {
+          // This render supersedes any held one and any patches it missed.
+          __ipeHeldRender = null;
+          apply();
+        }
       }, frame.globalSeq);
     }
   });
@@ -1983,8 +1991,11 @@ function __ipeOpenSSE() {
     // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
     // first frame is the full current render.
     if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
-      if (__ipeSelectOpen() || __ipeHeldRender !== null) __ipeMarkHeldStale();
-      else __ipeResyncRender();
+      if (__ipeSelectOpen()) __ipeMarkHeldStale();
+      else {
+        __ipeHeldRender = null;
+        __ipeResyncRender();
+      }
       return;
     }
     __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
@@ -2210,6 +2221,7 @@ function __ipeProbeSessionLost() {
 // healed proxy reconnects automatically without a refresh.
 var __ipeServerSpeaksV2 = false;
 function __ipeWatchdog() {
+  __ipeReleaseHeldRender(false);
   // If we have no live EventSource AND no reopen scheduled, the
   // 'error' handler must have missed (rare race) or some path tore
   // it down without re-arming. Drive the reopen here so the page
