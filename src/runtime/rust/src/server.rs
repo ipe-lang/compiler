@@ -2102,7 +2102,9 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         );
         let port = resolved.port;
         let Ok(port) = u16::try_from(port) else {
-            return IpeResult::Err(format!("Server.listen: port {port} is not a TCP port").into());
+            return IpeResult::Err(E::from_ipe_error(crate::IpeError::invalid_input(format!(
+                "Server.listen: port {port} is not a TCP port"
+            ))));
         };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
         crate::telemetry::record_bind(host);
@@ -3811,6 +3813,33 @@ mod tests {
             let refused = matches!(&listened, Ok(IpeResult::Err(msg))
                 if msg.starts_with("Server.listen: IPE_HTTP_BIND must be an IP address"));
             assert!(refused, "IPE_HTTP_BIND={raw:?} must refuse the listener");
+        }
+    }
+
+    /// A program port no TCP listener can take refuses `Server.listen` as a
+    /// typed `InvalidInput` before it binds, never the `Unexpected` catch-all.
+    #[tokio::test]
+    async fn listen_on_an_out_of_range_port_is_invalid_input() {
+        crate::system::locked_remove_var(SERVER_PORT_ENV);
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        for port in [-1, 65_536, i64::MAX] {
+            let listened: Result<IpeResult<crate::IpeError, ()>, _> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(port, Vec::new()),
+            )
+            .await;
+            let Ok(IpeResult::Err(error)) = listened else {
+                panic!("port {port} must refuse the listener: {listened:?}");
+            };
+            assert_eq!(
+                crate::ipe_error_kind(error.clone()),
+                crate::IpeErrorKind::InvalidInput,
+                "{error:?}"
+            );
+            assert_eq!(
+                crate::ipe_error_message(error),
+                format!("Server.listen: port {port} is not a TCP port")
+            );
         }
     }
 
