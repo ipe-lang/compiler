@@ -731,20 +731,31 @@ fn a_json_miss_carries_the_ranked_terms() -> io::Result<()> {
     assert!(stdout.is_empty(), "{stdout}");
     let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
         .map_err(|e| io::Error::other(format!("{e}: {stderr}")))?;
-    let payload = &parsed["payload"];
-    assert_eq!(payload["kind"], "doc-not-found", "{stderr}");
-    assert_eq!(payload["query"], "unixMilis", "{stderr}");
-    assert_eq!(payload["closeness"], "match", "{stderr}");
-    assert!(payload["truncated"].is_boolean(), "{stderr}");
-    let results = payload["results"].as_array().cloned().unwrap_or_default();
+    let Some(payload) = parsed.get("payload") else {
+        return Err(io::Error::other(format!("no payload: {stderr}")));
+    };
+    let text = |field: &str| payload.get(field).and_then(serde_json::Value::as_str);
+    assert_eq!(text("kind"), Some("doc-not-found"), "{stderr}");
+    assert_eq!(text("query"), Some("unixMilis"), "{stderr}");
+    assert_eq!(text("closeness"), Some("match"), "{stderr}");
+    assert!(
+        payload
+            .get("truncated")
+            .is_some_and(serde_json::Value::is_boolean),
+        "{stderr}"
+    );
+    let Some(results) = payload.get("results").and_then(serde_json::Value::as_array) else {
+        return Err(io::Error::other(format!("no results array: {stderr}")));
+    };
     assert!(
         (1..=10).contains(&results.len()),
         "a bounded list:\n{stderr}"
     );
     assert!(
-        results
-            .iter()
-            .any(|hit| hit["term"] == "Ipe.Time.unixMillis" && hit["kind"] == "symbol"),
+        results.iter().any(|hit| {
+            hit.get("term").and_then(serde_json::Value::as_str) == Some("Ipe.Time.unixMillis")
+                && hit.get("kind").and_then(serde_json::Value::as_str) == Some("symbol")
+        }),
         "{stderr}"
     );
     Ok(())

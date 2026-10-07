@@ -137,6 +137,9 @@ pub struct DocEntry {
 /// ranked by [`crate::doc_search::rank`].
 pub struct DocBundle {
     maps: BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
+    /// Extra spellings that open an entry, per kind: alias -> canonical key.
+    /// An alias is never listed; only the canonical key is an entry.
+    aliases: BTreeMap<DocKind, BTreeMap<String, String>>,
 }
 
 impl DocBundle {
@@ -167,6 +170,7 @@ impl DocBundle {
         cli_commands: &[BundleSource],
     ) -> Result<Self, BundleError> {
         let mut maps: BTreeMap<DocKind, BTreeMap<String, DocEntry>> = BTreeMap::new();
+        let mut aliases: BTreeMap<DocKind, BTreeMap<String, String>> = BTreeMap::new();
 
         for src in modules {
             insert_entry(
@@ -187,6 +191,11 @@ impl DocBundle {
                 src.body.clone(),
                 None,
             )?;
+        }
+        for src in symbols {
+            for alias in &src.aliases {
+                insert_alias(&maps, &mut aliases, DocKind::Symbol, alias, &src.key)?;
+            }
         }
         for src in diagnostics {
             insert_entry(
@@ -233,7 +242,7 @@ impl DocBundle {
             ingest_markdown_dir_additive(&docs_root.join("guide"), DocKind::Guide, &mut maps)?;
         }
 
-        Ok(Self { maps })
+        Ok(Self { maps, aliases })
     }
 
     /// Build an empty bundle (for tests).
@@ -242,6 +251,7 @@ impl DocBundle {
     pub const fn empty() -> Self {
         Self {
             maps: BTreeMap::new(),
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -259,13 +269,21 @@ impl DocBundle {
             .ok_or_else(|| BundleError::UnknownKind(qualified.to_owned()))?;
         let kind = DocKind::from_prefix(kind_str)
             .ok_or_else(|| BundleError::UnknownKind(kind_str.to_owned()))?;
-        self.maps
-            .get(&kind)
-            .and_then(|m| m.get(key))
+        self.entry(kind, key)
             .ok_or_else(|| BundleError::UnknownKey {
                 kind,
                 key: key.to_owned(),
             })
+    }
+
+    /// The entry of `kind` that `key` opens: its own key, or an alias of it.
+    fn entry(&self, kind: DocKind, key: &str) -> Option<&DocEntry> {
+        let canonical = self
+            .aliases
+            .get(&kind)
+            .and_then(|m| m.get(key))
+            .map_or(key, String::as_str);
+        self.maps.get(&kind).and_then(|m| m.get(canonical))
     }
 
     /// All entries across all kinds, in kind + key order.
@@ -305,6 +323,8 @@ pub struct BundleSource {
     pub title: String,
     /// Raw Markdown body.
     pub body: String,
+    /// Other spellings that open this entry; never listed as entries.
+    pub aliases: Vec<String>,
 }
 
 impl BundleSource {
@@ -314,6 +334,7 @@ impl BundleSource {
             key: key.into(),
             title: title.into(),
             body: String::new(),
+            aliases: Vec::new(),
         }
     }
 
@@ -327,7 +348,15 @@ impl BundleSource {
             key: key.into(),
             title: title.into(),
             body: body.into(),
+            aliases: Vec::new(),
         }
+    }
+
+    /// The same source, also opened by each of `aliases`.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = aliases;
+        self
     }
 }
 
@@ -729,6 +758,40 @@ fn insert_entry(
     Ok(())
 }
 
+/// Record `alias` as another spelling of the `canonical` entry of `kind`.
+///
+/// Refuses an alias that names no entry, shadows an entry's own key, or is
+/// already another entry's alias: one spelling opens exactly one entry.
+fn insert_alias(
+    maps: &BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
+    aliases: &mut BTreeMap<DocKind, BTreeMap<String, String>>,
+    kind: DocKind,
+    alias: &str,
+    canonical: &str,
+) -> Result<(), BundleError> {
+    let entries = maps.get(&kind);
+    let duplicate = || BundleError::DuplicateKey {
+        kind,
+        key: alias.to_owned(),
+        source: String::from("<alias>"),
+    };
+    if !entries.is_some_and(|m| m.contains_key(canonical)) {
+        return Err(BundleError::UnknownKey {
+            kind,
+            key: canonical.to_owned(),
+        });
+    }
+    if entries.is_some_and(|m| m.contains_key(alias)) {
+        return Err(duplicate());
+    }
+    let map = aliases.entry(kind).or_default();
+    if map.contains_key(alias) {
+        return Err(duplicate());
+    }
+    map.insert(alias.to_owned(), canonical.to_owned());
+    Ok(())
+}
+
 // == Qualified key parsing ====================================================
 
 /// Split `"kind:rest"` into `("kind", "rest")`, or `None` when no `:` is present.
@@ -815,9 +878,7 @@ pub fn rewrite_refs(
                     })?;
 
                 let entry = bundle
-                    .maps
-                    .get(&kind)
-                    .and_then(|m| m.get(key))
+                    .entry(kind, key)
                     .ok_or_else(|| BundleError::UnknownRef {
                         reference: inner.to_owned(),
                         source_file: source_file.to_owned(),
@@ -827,7 +888,7 @@ pub fn rewrite_refs(
                     .filter(|d| !d.is_empty())
                     .unwrap_or(entry.title.as_str());
 
-                out.push_str(&format_ref(kind, key, display, target));
+                out.push_str(&format_ref(kind, &entry.key, display, target));
             }
         }
     }
@@ -946,6 +1007,79 @@ mod tests {
         assert!(
             matches!(err, BundleError::DuplicateKey { .. }),
             "expected DuplicateKey: {err}"
+        );
+    }
+
+    // -- Aliases --------------------------------------------------------------
+
+    fn symbol_bundle(symbols: &[BundleSource]) -> Result<DocBundle, BundleError> {
+        DocBundle::build(Path::new("/nonexistent"), &[], symbols, &[], &[])
+    }
+
+    #[test]
+    fn an_alias_opens_its_canonical_entry_and_is_never_listed() {
+        let bundle = symbol_bundle(
+            &[BundleSource::with_body("Ipe.Time.now", "Ipe.Time.now", "")
+                .with_aliases(vec!["Time.now".to_owned()])],
+        )
+        .expect("a well-formed alias builds");
+        let opened = bundle.resolve_qualified("symbol:Time.now");
+        assert!(
+            matches!(opened, Ok(e) if e.key == "Ipe.Time.now"),
+            "the alias opens the canonical entry: {opened:?}"
+        );
+        let keys: Vec<&str> = bundle
+            .entries_for_kind(DocKind::Symbol)
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(keys, ["Ipe.Time.now"], "one entry, under its canonical key");
+    }
+
+    #[test]
+    fn an_alias_that_shadows_an_entry_key_is_refused() {
+        let built = symbol_bundle(&[
+            BundleSource::with_body("Ipe.A.x", "Ipe.A.x", "")
+                .with_aliases(vec!["Ipe.B.x".to_owned()]),
+            BundleSource::with_body("Ipe.B.x", "Ipe.B.x", ""),
+        ]);
+        assert!(
+            matches!(built, Err(BundleError::DuplicateKey { ref key, .. }) if key == "Ipe.B.x"),
+            "an alias never hides another entry: {:?}",
+            built.err()
+        );
+    }
+
+    #[test]
+    fn a_cross_ref_through_an_alias_links_the_canonical_page() {
+        let bundle = symbol_bundle(
+            &[BundleSource::with_body("Ipe.Time.now", "Ipe.Time.now", "")
+                .with_aliases(vec!["Time.now".to_owned()])],
+        )
+        .expect("a well-formed alias builds");
+        let via_alias = rewrite_refs("[[symbol:Time.now]]", &bundle, RefTarget::Markdown, "a.md");
+        let via_key = rewrite_refs(
+            "[[symbol:Ipe.Time.now]]",
+            &bundle,
+            RefTarget::Markdown,
+            "a.md",
+        );
+        assert!(
+            via_alias.is_ok(),
+            "an alias reference resolves: {via_alias:?}"
+        );
+        assert_eq!(via_alias, via_key, "both spellings link the one page");
+    }
+
+    #[test]
+    fn one_alias_for_two_entries_is_refused() {
+        let built = symbol_bundle(&[
+            BundleSource::with_body("Ipe.A.x", "Ipe.A.x", "").with_aliases(vec!["x".to_owned()]),
+            BundleSource::with_body("Ipe.B.x", "Ipe.B.x", "").with_aliases(vec!["x".to_owned()]),
+        ]);
+        assert!(
+            matches!(built, Err(BundleError::DuplicateKey { ref key, .. }) if key == "x"),
+            "one spelling opens exactly one entry: {:?}",
+            built.err()
         );
     }
 
