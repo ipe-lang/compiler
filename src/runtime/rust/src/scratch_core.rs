@@ -643,8 +643,8 @@ pub fn root_within_profile(root: &Path, profile: &Path) -> Result<(), ScratchRoo
 
 /// Resolve `root` and `profile`, require the root inside the profile, and return the resolved root.
 ///
-/// `profile` is the raw value of [`PROFILE_VAR`]; an unset, empty, or relative
-/// value proves nothing and is refused. Resolution follows every link, so a
+/// `profile` is the parsed [`PROFILE_VAR`] home; an absent one proves nothing
+/// and is refused. Resolution follows every link, so a
 /// link inside the profile that points outside it is refused too. Entries must
 /// be created under the returned path, not under `root`, so that a link on
 /// `root` re-pointed after the check cannot redirect the creation.
@@ -654,14 +654,11 @@ pub fn root_within_profile(root: &Path, profile: &Path) -> Result<(), ScratchRoo
 /// resolved root lies outside the resolved profile.
 pub fn verify_root_within_profile(
     root: &Path,
-    profile: Option<&OsStr>,
+    profile: Option<&scratch_host::HomeDir>,
 ) -> Result<PathBuf, ScratchRootRefusal> {
-    let profile = profile
-        .map(Path::new)
-        .filter(|p| p.is_absolute())
-        .ok_or(ScratchRootRefusal::NoProfile)?;
+    let profile = profile.ok_or(ScratchRootRefusal::NoProfile)?;
     let root = canonical(root)?;
-    root_within_profile(&root, &canonical(profile)?)?;
+    root_within_profile(&root, &canonical(profile.as_path())?)?;
     Ok(root)
 }
 
@@ -738,7 +735,7 @@ fn trusted_base(base: &Path) -> io::Result<PathBuf> {
 #[cfg(not(unix))]
 fn trusted_base(base: &Path) -> io::Result<PathBuf> {
     let home = scratch_host::profile_dir();
-    let profile = home.as_deref().map(Path::as_os_str);
+    let profile = home.as_ref();
     let existing = base
         .ancestors()
         .find(|a| !a.as_os_str().is_empty() && a.exists())
@@ -1626,6 +1623,12 @@ mod tests {
         fn profile(&self) -> PathBuf {
             self.0.join("profile")
         }
+
+        /// The profile as the parsed home the host would hand over.
+        fn home(&self) -> io::Result<scratch_host::HomeDir> {
+            scratch_host::HomeDir::try_parse(Some(self.profile().into_os_string()))
+                .map_err(io::Error::other)
+        }
     }
 
     impl Drop for Tree {
@@ -1799,19 +1802,13 @@ mod tests {
     }
 
     #[test]
-    fn unset_empty_or_relative_profile_variable_is_refused() -> io::Result<()> {
+    fn an_absent_profile_is_refused() -> io::Result<()> {
         let tree = Tree::new("noprofile")?;
         let root = tree.profile().join("temp");
-        for profile in [
-            None,
-            Some(OsStr::new("")),
-            Some(OsStr::new("relative/profile")),
-        ] {
-            assert_eq!(
-                verify_root_within_profile(&root, profile),
-                Err(ScratchRootRefusal::NoProfile)
-            );
-        }
+        assert_eq!(
+            verify_root_within_profile(&root, None),
+            Err(ScratchRootRefusal::NoProfile)
+        );
         Ok(())
     }
 
@@ -1821,7 +1818,7 @@ mod tests {
         let profile = tree.profile();
         let resolved = std::fs::canonicalize(profile.join("temp"))?;
         assert_eq!(
-            verify_root_within_profile(&profile.join("temp"), Some(profile.as_os_str())),
+            verify_root_within_profile(&profile.join("temp"), Some(&tree.home()?)),
             Ok(resolved)
         );
         Ok(())
@@ -1836,7 +1833,7 @@ mod tests {
         let profile = tree.profile();
         let link = profile.join("temp-link");
         std::os::unix::fs::symlink(profile.join("temp"), &link)?;
-        let resolved = verify_root_within_profile(&link, Some(profile.as_os_str()));
+        let resolved = verify_root_within_profile(&link, Some(&tree.home()?));
         assert_eq!(resolved, Ok(std::fs::canonicalize(profile.join("temp"))?));
         Ok(())
     }
@@ -1844,8 +1841,7 @@ mod tests {
     #[test]
     fn shared_root_outside_profile_is_refused() -> io::Result<()> {
         let tree = Tree::new("shared")?;
-        let profile = tree.profile();
-        let refused = verify_root_within_profile(&tree.0.join("shared"), Some(profile.as_os_str()));
+        let refused = verify_root_within_profile(&tree.0.join("shared"), Some(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::OutsideProfile { .. })
@@ -1858,7 +1854,7 @@ mod tests {
         let tree = Tree::new("dotdot")?;
         let profile = tree.profile();
         let escaping = profile.join("temp").join("..").join("..").join("shared");
-        let refused = verify_root_within_profile(&escaping, Some(profile.as_os_str()));
+        let refused = verify_root_within_profile(&escaping, Some(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::OutsideProfile { .. })
@@ -1873,7 +1869,7 @@ mod tests {
         let profile = tree.profile();
         let link = profile.join("temp-link");
         std::os::unix::fs::symlink(tree.0.join("shared"), &link)?;
-        let refused = verify_root_within_profile(&link, Some(profile.as_os_str()));
+        let refused = verify_root_within_profile(&link, Some(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::OutsideProfile { .. })
@@ -1885,8 +1881,7 @@ mod tests {
     fn missing_root_is_refused() -> io::Result<()> {
         let tree = Tree::new("missing")?;
         let profile = tree.profile();
-        let refused =
-            verify_root_within_profile(&profile.join("absent"), Some(profile.as_os_str()));
+        let refused = verify_root_within_profile(&profile.join("absent"), Some(&tree.home()?));
         assert!(matches!(
             refused,
             Err(ScratchRootRefusal::Unresolvable { .. })

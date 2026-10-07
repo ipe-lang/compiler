@@ -66,7 +66,8 @@ pub fn console_bin_path() -> Option<std::path::PathBuf> {
     // sets IPE_VERSION when compiling this app, so a console binary placed for
     // one ipe version is never exec'd by an app built with another.
     let ver = option_env!("IPE_VERSION").unwrap_or("dev");
-    let pb = crate::system::home_dir()?
+    let pb = crate::system::home_dir()
+        .ok()?
         .join(".cache/ipe/rust-console")
         .join(ver)
         .join("ipe-console");

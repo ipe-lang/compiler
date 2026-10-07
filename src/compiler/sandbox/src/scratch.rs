@@ -29,6 +29,8 @@
 mod scratch_host {
     use super::scratch_core::EntropyUnavailable;
 
+    pub use crate::home::HomeDir;
+
     /// The variable naming the current user's profile directory on Windows.
     pub const PROFILE_VAR: &str = crate::home::WINDOWS_HOME_VAR;
 
@@ -45,10 +47,8 @@ mod scratch_host {
     /// The current user's profile directory, which off Unix must contain every scratch base.
     #[cfg(not(unix))]
     #[must_use]
-    pub fn profile_dir() -> Option<std::path::PathBuf> {
-        crate::home::home_dir()
-            .ok()
-            .map(crate::home::HomeDir::into_path)
+    pub fn profile_dir() -> Option<HomeDir> {
+        crate::home::home_dir().ok()
     }
 }
 

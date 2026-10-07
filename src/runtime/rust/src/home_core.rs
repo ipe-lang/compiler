@@ -113,12 +113,6 @@ impl HomeDir {
         Ok(Self(path))
     }
 
-    /// The `Option` form of [`HomeDir::try_parse`], for callers that need no reason.
-    #[must_use]
-    pub fn parse(raw: Option<std::ffi::OsString>) -> Option<Self> {
-        Self::try_parse(raw).ok()
-    }
-
     /// The verified path.
     #[must_use]
     pub fn as_path(&self) -> &std::path::Path {
@@ -132,12 +126,6 @@ impl HomeDir {
     #[must_use]
     pub fn join(&self, tail: &'static str) -> std::path::PathBuf {
         self.0.join(tail)
-    }
-
-    /// Unwrap into the verified path, for callers that hold a bare `PathBuf`.
-    #[must_use]
-    pub fn into_path(self) -> std::path::PathBuf {
-        self.0
     }
 }
 
