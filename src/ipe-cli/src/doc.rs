@@ -873,7 +873,11 @@ fn run_bundle_lookup(
             Err(CliError::Usage(text::msg::doc_unknown_kind(&prefix)))
         }
         Err(crate::doc_bundle::BundleError::UnknownKey { kind, .. }) => {
-            let ranked = crate::doc_search::rank(bundle.entries_for_kind(kind), key);
+            let ranked = crate::doc_search::rank(
+                bundle.entries_for_kind(kind),
+                bundle.aliases_for_kind(kind),
+                key,
+            );
             Err(miss_error(term.text(), &ranked, format))
         }
         Err(e) => Err(CliError::Usage(text::msg::command_refusal(&"doc", &e))),
@@ -935,7 +939,7 @@ fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(
 fn doc_miss(query: &DocQuery, bundle: &DocBundle, format: OutputFormat) -> CliError {
     miss_error(
         query.text(),
-        &crate::doc_search::rank(bundle.all_entries(), query),
+        &crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), query),
         format,
     )
 }
@@ -5632,7 +5636,7 @@ mod tests {
     fn a_miss_lists_only_rerun_terms_under_every_format() {
         let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
         let query = DocQuery::parse("pipelin").expect("a valid query");
-        let ranked = crate::doc_search::rank(bundle.all_entries(), &query);
+        let ranked = crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query);
         let err = miss_error("pipelin", &ranked, OutputFormat::Human);
         assert!(
             matches!(err, CliError::DocNotFound { .. }),
@@ -5650,6 +5654,45 @@ mod tests {
             miss_error("pipelin", &ranked, OutputFormat::Plain),
             CliError::DiagnosticJsonEmitted
         ));
+    }
+
+    /// A typo in a member or a qualifier ranks the intended stdlib symbol among
+    /// the closest entries of the real bundle, ahead of any entry that only
+    /// holds the query's characters scattered in order.
+    #[test]
+    fn a_member_or_qualifier_typo_ranks_the_intended_symbol() {
+        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let ranked = |raw: &str| {
+            let query = DocQuery::parse(raw).expect("a valid query");
+            crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query)
+        };
+        let keys =
+            |r: &Ranked<'_>| -> Vec<String> { r.entries.iter().map(|e| e.key.clone()).collect() };
+
+        for raw in ["List.mapp", "Ipe.Lsit.map"] {
+            let r = ranked(raw);
+            assert_eq!(r.closeness, crate::doc_search::Closeness::Match, "{raw:?}");
+            assert_eq!(
+                keys(&r).first().map(String::as_str),
+                Some("Ipe.List.map"),
+                "{raw:?} ranks `Ipe.List.map` first: {:?}",
+                keys(&r)
+            );
+        }
+
+        let r = ranked("mapp");
+        assert!(
+            keys(&r).iter().any(|k| k == "Ipe.List.map"),
+            "a member typo lists `Ipe.List.map`: {:?}",
+            keys(&r)
+        );
+
+        let r = ranked("lsit");
+        let listed = keys(&r);
+        assert!(
+            listed.iter().take(2).any(|k| k == "Ipe.List"),
+            "a transposed module name lists `Ipe.List` among the first two: {listed:?}"
+        );
     }
 
     /// A search entry holding `</script>`, `<!--`, `&` or U+2028 reaches the

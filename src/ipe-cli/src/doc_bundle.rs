@@ -296,6 +296,28 @@ impl DocBundle {
         self.maps.get(&kind).into_iter().flat_map(|m| m.values())
     }
 
+    /// Every alias across all kinds with the entry it opens, in kind + alias
+    /// order.
+    pub fn all_aliases(&self) -> impl Iterator<Item = (&str, &DocEntry)> {
+        self.aliases
+            .keys()
+            .flat_map(move |&kind| self.aliases_for_kind(kind))
+    }
+
+    /// Every alias of `kind` with the entry it opens, in alias order.
+    pub fn aliases_for_kind(&self, kind: DocKind) -> impl Iterator<Item = (&str, &DocEntry)> {
+        let entries = self.maps.get(&kind);
+        self.aliases
+            .get(&kind)
+            .into_iter()
+            .flat_map(|m| m.iter())
+            .filter_map(move |(alias, canonical)| {
+                entries
+                    .and_then(|e| e.get(canonical))
+                    .map(|entry| (alias.as_str(), entry))
+            })
+    }
+
     /// Insert a single entry from a pre-computed source.
     ///
     /// # Errors
