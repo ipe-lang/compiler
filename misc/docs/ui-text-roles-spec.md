@@ -10,18 +10,21 @@ exactly these surface changes:
 
 1. Add `Ui.codeBlock`, inline `Ui.code`, inline `Ui.kbd`, and a typed
    `Font.whiteSpace` over a closed union (never a `String`).
-2. Move `Ui.taggedNode` and `Ui.input` to a new `Ipe.Ui.Unsafe` module.
+2. Move `Ui.taggedNode` and `Ui.input` to a new `Ipe.Ui.Unsafe` module, as
+   `unsafeTaggedNode` and `unsafeInput`.
 3. Derive heading levels from `Ui.section` nesting depth, clamped to 6.
+   `Ui.section` takes a `{ heading, content }` record.
+4. Add a typed `Input.file`, and no other new API.
+
+`Ipe.Ui.Unsafe` members carry the `unsafe` prefix, like the other `Unsafe`
+modules (`Html.Unsafe.unsafeRaw`). `WhiteSpace` constructors are used qualified
+(`Font.Pre`).
 
 Nothing else joins the public surface. The project is pre-public, so the old
 locations (`Ui.taggedNode`, `Ui.input`) and the integer heading constructors
 (`Ui.descHeading`, `Region.heading`) are removed outright, with no shim.
 
-The third decision names `Ui.section`, but `Ui.section` does not exist on
-origin/main and is not in the addition list. Its exact shape is the first item
-under DECISIONS NEEDED. The lane that wires headings waits for that answer.
-
-Public signatures after this spec (section shape as recommended below):
+Public signatures after this spec:
 
 ```elm
 -- Ipe.Ui
@@ -35,22 +38,33 @@ type WhiteSpace = Normal | NoWrap | Pre | PreWrap | PreLine | BreakSpaces
 whiteSpace : WhiteSpace -> Attribute msg
 
 -- Ipe.Ui.Unsafe (importing it discloses `unsafe`)
-taggedNode : String -> Description -> List (Attribute msg) -> List (Element msg) -> Element msg
-input      : List (Attribute msg) -> Element msg
+unsafeTaggedNode : String -> Description -> List (Attribute msg) -> List (Element msg) -> Element msg
+unsafeInput      : List (Attribute msg) -> Element msg
+
+-- Ipe.Ui.Input (see "Input.file"; the `Picked` payload is a DECISION NEEDED)
+type FileKind = Image | Audio | Video | Pdf | PlainText | Csv
+type Accept = AnyFile | Only FileKind (List FileKind)
+type Pick msg = PickOne (Picked -> msg) | PickMany (List Picked -> msg)
+file : List (Attribute msg) -> { accept : Accept, pick : Pick msg, label : Label msg } -> Element msg
 ```
 
 ## Class-closing properties
 
 Each change closes a class, not one site.
 
-- **The Ui.Unsafe move.** No value built from the safe surface (`Ipe.Ui`,
-  `Ipe.Ui.Font`, `Ipe.Markdown`, every other non-`Unsafe` stdlib module) is an
-  `Element::TaggedNode`. Every safe-surface node gets its tag from a closed
-  `NodeTag` enum chosen by its `Description`. A free-form tag string is reachable
-  only through a module whose import discloses `unsafe`. Today `paragraph`,
-  `textColumn`, `form` and `input` are built on `taggedNode`; after this spec,
-  the only `Kernel.kernel "Ui_taggedNode"` binding in the tree is in
-  `Ipe/Ui/Unsafe.ipe`.
+- **The Ui.Unsafe move.** No tag string written in Ipê code reaches the
+  renderer from the safe surface (`Ipe.Ui`, `Ipe.Ui.Font`, `Ipe.Ui.Input`,
+  `Ipe.Markdown`, and every other non-`Unsafe` stdlib module).
+  - Safe-surface nodes built from Ipê get their tag from a closed `NodeTag`
+    enum, chosen by their `Description`.
+  - Runtime builders (`button`, `link`, `image`, the `Input` controls) still
+    build `Element::TaggedNode`, but only with `'static` literal tags. Each of
+    those literals is admitted by a test through the production sink.
+  - A tag string chosen by Ipê code is reachable only through a module whose
+    import discloses `unsafe`. Today `paragraph`, `textColumn`, `form` and
+    `input` are built on `taggedNode`. After this spec, the only
+    `Kernel.kernel "Ui_taggedNode"` binding in the tree is in
+    `Ipe/Ui/Unsafe.ipe`.
 - **Headings.** An out-of-range heading level has no representation. The level is
   a closed `HeadingLevel` (`H1`..`H6`) computed by the renderer from the number
   of enclosing section nodes, saturating at `H6`. No `Int` level exists anywhere:
@@ -84,9 +98,9 @@ Each change closes a class, not one site.
 
 - New compiled-source module `src/stdlib/Ipe/Ui/Unsafe.ipe`, registered in
   `COMPILED_STD_MODULES` (`src/stdlib/src/lib.rs`), with these members:
-  - `taggedNode = Kernel.kernel "Ui_taggedNode"`;
+  - `unsafeTaggedNode = Kernel.kernel "Ui_taggedNode"`;
   - a private `descNone = Kernel.kernel "Ui_descNone"`;
-  - `input attrs = taggedNode "input" descNone attrs []`.
+  - `unsafeInput attrs = unsafeTaggedNode "input" descNone attrs []`.
 
   The module doc states that importing it discloses `unsafe`, in the same words
   as `Ipe/Html/Unsafe.ipe`.
@@ -105,7 +119,7 @@ Each change closes a class, not one site.
   `resolve.rs`; folded in lower `link.rs`), so one such import would disclose
   `unsafe` for every Ui app. A stdlib source test pins this rule for all
   modules, not only `Ui`.
-- Kernels `source_display_name`: add `UiTaggedNode => "Ui.Unsafe.taggedNode"`,
+- Kernels `source_display_name`: add `UiTaggedNode => "Ui.Unsafe.unsafeTaggedNode"`,
   beside `HtmlScriptNode => "Html.Unsafe.unsafeScript"`.
 - The three admission boundaries for `TaggedNode` stay unchanged: construction
   in `ui_tagged_node_`, template materialisation (`template.rs` calls
@@ -116,9 +130,9 @@ Each change closes a class, not one site.
   - `tests/golden/stdui_input/Main.ipe`.
 
   The `Ui.input` idiom in `src/ipe-cli/templates/AGENTS.md.in` points
-  text, password and checkbox inputs at the typed `Ipe.Ui.Input` controls. It
-  names `Ui.Unsafe.input` only for types `Ipe.Ui.Input` lacks, such as `file`;
-  see DECISIONS NEEDED.
+  text, password, checkbox and file inputs at the typed `Ipe.Ui.Input`
+  controls (`Input.file` below). It names `UiUnsafe.unsafeInput` only for
+  input types no typed control covers.
 
 ### Runtime roles (`Description`, `NodeTag`, `HeadingLevel`, `ContentModel`)
 
@@ -150,6 +164,37 @@ Each change closes a class, not one site.
     take one `RenderCtx { depth, parent_axis, section, model }` by value, in
     place of today's `(depth, parent_axis)`. Every recursive call site
     (`render.rs` around 500, 1322, 1388, 1970) passes it.
+- **Empty headings.** A section whose heading has no content renders no `hN`
+  and does not deepen the level, so the levels that do render stay
+  contiguous and no heading is left with an empty accessible name.
+  - One total predicate, `fn has_content(&Element<M>) -> bool` in `ui/`, is
+    shared by the HTML renderer and the TUI. It is an exhaustive match over
+    every `Element` variant, with no wildcard:
+    - `Empty` (`Ui.none`) → false;
+    - a text leaf → true iff some `char` of it is not `char::is_whitespace`
+      (Unicode White_Space, so `" \t\n"` and U+00A0 count as empty);
+    - a container (`Node`, `TaggedNode`, row/column/paragraph and the other
+      container variants) → true iff some child `has_content`;
+    - a non-text leaf that renders something visible or announced (image,
+      input control, and the other leaf variants) → true.
+
+    The walk is bounded by the existing `MAX_HTML_DEPTH`. Past the ceiling it
+    returns true: the heading is kept and the render's own depth refusal
+    applies.
+  - Entering `DescSection` checks whether its first child is a
+    `DescSectionHeading` node with some child that `has_content`.
+    - If so, the section sets `section = Some(prev.map_or(H1, deeper))` and
+      renders the heading.
+    - If not, the section keeps `section = prev` and skips that heading child
+      entirely: no `hN`, no wrapper, no whitespace text. Content renders as
+      usual.
+  - The level is still derived only from sections whose headings render. For
+    example, `section(heading "a") > section(heading []) > section(heading "b")`
+    renders `h1 a`, then `h2 b`.
+  - The rule reads only structure and Unicode White_Space, so the outcome is
+    deterministic. Zero-width characters that are not White_Space (U+200B,
+    U+FEFF) count as content. See LIMIT.
+  - The `Ui.section` doc states the rule.
 - `ContentModel`:
   - Root and section content are `Flow`. Paragraph content, heading content,
     and `code`/`kbd` content are `Phrasing`.
@@ -195,7 +240,11 @@ Each change closes a class, not one site.
 
   `ui_desc_heading_` and `ui_region_heading_` are deleted.
 - TUI (`tui/layout.rs`):
-  - `DescSectionHeading` sets bold, as `DescHeading` does today.
+  - `DescSectionHeading` sets bold, as `DescHeading` does today. The TUI has
+    no heading levels, so depth only affects which headings render.
+  - The TUI applies the same `has_content` check. A heading without content
+    lays out as nothing: no bold blank row, and no spacing line reserved for
+    it. Its section's content lays out as if the heading were absent.
   - `DescCodeBlock` lays out as a block.
   - `DescCode` and `DescKbd` lay out as inline text runs. The terminal is
     already monospace, so they add no decoration.
@@ -279,6 +328,112 @@ cannot carry a source union. Following the precedent of `Ipe.Ui` itself:
   styled `Ui.el`. A document whose first heading is `###` renders it as `h1`,
   as the depth rule implies. The `Ipe.Markdown` doc says so.
 
+### Input.file
+
+**Class-closing property.** A file control built from the safe surface can only
+produce an `<input type=file>` whose attributes come from closed values. Every
+browser-supplied pick is parsed once, at the event boundary, into a bounded
+typed value before any `msg` is built. User attributes have no path onto the
+`<input>` element. Whether one or many files may be picked is a constructor of
+`Pick`, and that constructor also fixes the handler's payload type. So a
+single-file handler cannot receive a list, and a many-file handler cannot
+receive a bare value.
+
+**Home.** `Ipe.Ui.Input` is a native qualifier today (canon `env.rs` around
+lines 102 and 1416) and cannot carry source unions. It becomes the compiled
+module `src/stdlib/Ipe/Ui/Input.ipe`, the same migration `Ipe.Ui.Font` gets:
+
+- Each of its 18 existing members becomes an alias
+  `x = Kernel.kernel "Input_x"` for its unchanged `KernelFn`. Their emitted
+  calls do not change.
+- The bare builtins `Label` and `Placeholder` keep their builtin homes and are
+  only referenced from the module.
+- `Input` leaves the native tables in `env.rs` and joins `COMPILED_STD_MODULES`.
+- No name collides: none of `FileKind`, `Accept`, `Pick`, `Picked` or their
+  constructors is a reserved builtin name. The lane re-checks this with
+  `is_reserved_builtin_type_name` and the builtin constructor table.
+
+**Surface** (the one consented API, with only its parameter types):
+
+```elm
+type FileKind = Image | Audio | Video | Pdf | PlainText | Csv
+type Accept = AnyFile | Only FileKind (List FileKind)
+type Pick msg = PickOne (Picked -> msg) | PickMany (List Picked -> msg)
+
+file : List (Attribute msg) -> { accept : Accept, pick : Pick msg, label : Label msg } -> Element msg
+```
+
+- `Only` takes at least one kind, so an empty filter has no representation.
+  `AnyFile` is the explicit "no filter" case.
+- `Picked` is defined by the payload decision below, under DECISIONS NEEDED.
+  This slice is blocked on that decision.
+
+**Runtime.**
+
+- `src/runtime/rust/src/ui/input.rs` gets `input_file_`, which does not go
+  through `input_base_`.
+- The `<input>` element's attribute list is built only by the runtime:
+  - `type=file`;
+  - `accept`, from `FileKind::accept_text()`, a `const` table:
+
+    | Kind        | `accept` text            |
+    |-------------|--------------------------|
+    | `Image`     | `image/*`                |
+    | `Audio`     | `audio/*`                |
+    | `Video`     | `video/*`                |
+    | `Pdf`       | `application/pdf,.pdf`   |
+    | `PlainText` | `text/plain,.txt`        |
+    | `Csv`       | `text/csv,.csv`          |
+
+    Kinds are joined with `,`, de-duplicated in first-appearance order.
+    `AnyFile` emits no `accept`.
+  - `multiple`, present iff the pick is `PickMany`;
+  - the handler event attribute;
+  - the `id` that links the input to its label, generated the same way the
+    other labelled inputs generate it. It is never derived from user text.
+- User `attrs` are split by the existing `split_layout_attrs`. Both halves
+  apply to the label wrapper only. None reaches the `<input>`: not
+  `Ui.htmlAttribute` (`type`, `accept`, `capture`, `webkitdirectory`, `name`,
+  `form`, `formaction`, `value`), not `Ui.style`, and not a second event
+  handler such as `Ui.onFile`.
+- A new handler shape is wired under a new wire event name, `ipe-pick`. It
+  does not reuse `OnString` or `ipe-file`.
+  - `html::Event::OnPick(String, PickHandler<M>)`, where
+    `enum PickHandler<M> { One(Arc<dyn Fn(Picked) -> M>), Many(Arc<dyn Fn(Vec<Picked>) -> M>) }`.
+  - Every exhaustive match over `html::Event` (`html.rs`, `dom/dispatch.rs`,
+    `ui/render.rs`, `ui/template.rs`, `tui/focus.rs`) gains an explicit arm,
+    with no wildcard.
+- The client driver (`web/client.js`) handles `ipe-pick` beside the existing
+  `ipe-file` driver:
+  - It sends one entry per selected file, in the shape the payload decision
+    fixes, and at most `MAX_PICKED_FILES` entries. More than that clears the
+    input, sends nothing, and logs `console.warn`.
+  - This is a UX check only. The server parse below is the boundary.
+- `HandlerIndex::resolve` (`dom/dispatch.rs`) parses the wire arguments
+  (`&[String]`, one entry per file) once with
+  `parse_pick(args, &PickHandler) -> Result<M, PickRefusal>`, where
+  `PickRefusal` is a closed enum:
+  - `WrongArity`: `One` with anything but exactly one entry. Zero entries
+    dispatch nothing, because a cancelled dialog is not a pick.
+  - `TooMany`: more than `MAX_PICKED_FILES = 32`, declared once in `ui/input.rs`.
+  - `Malformed`: an entry does not have the decided shape.
+  - The per-field ceilings the payload decision names.
+
+  A refusal dispatches no `msg` and is logged as the typed refusal kind, never
+  the entry's content. The request body stays bounded by the existing
+  `IPE_WEB_MAX_BODY_BYTES` ceiling.
+- `accept` and any client-declared MIME type are advisory: a browser lets the
+  user pick "All files". The `Input.file` doc states that the kind filter is
+  not a validation of the file, and that `Picked` fields come from the client.
+  A file name is untrusted text, never a path.
+- **Template baking.** `InputFile` is not on the `emit_ui_template` allowlist,
+  so its subtree stays dynamic. This is the existing fail-closed default.
+  `emit_ui_plan` gets a row for it.
+- **TUI.** A terminal has no file picker.
+  - `Input.file` lays out its label followed by a fixed, non-focusable note.
+    The note's text is declared once beside the TUI's other fixed strings.
+  - It registers no key handler and dispatches nothing.
+
 ## Safe-surface admission rule
 
 - **Tags.** A safe-surface element's tag is a `NodeTag`. A test drives every
@@ -290,8 +445,13 @@ cannot carry a source union. Following the precedent of `Ipe.Ui` itself:
   ```
 
   No `NodeTag` is `script`, `style`, `plaintext`, `textarea`, `title`,
-  `iframe`, `noscript`, `xmp`, `template` or `svg`.
-- **Free-form tags.** These come only from `Ipe.Ui.Unsafe.taggedNode`, through
+  `iframe`, `noscript`, `xmp`, `template` or `svg`. The same test drives every
+  `'static` literal tag the runtime builders pass to `Element::TaggedNode`
+  (`button`, `a`, `img`, `input`), found by a source scan of `ui/`, so a new
+  literal cannot skip it.
+- **File input.** `Input.file` emits `input` with a closed attribute set, and
+  no user attribute reaches it (see "Input.file").
+- **Free-form tags.** These come only from `Ipe.Ui.Unsafe.unsafeTaggedNode`, through
   the existing three-boundary `admit_element` gate.
 - **Attributes.** No new HTML attribute is emitted. Keys still pass
   `SafeAttrName::parse` (a safe name, not `on*`, not `srcdoc`), and URL values
@@ -322,14 +482,15 @@ cannot carry a source union. Following the precedent of `Ipe.Ui` itself:
 - **Stdlib .ipe:**
   - new `src/stdlib/Ipe/Ui/Unsafe.ipe`;
   - new `src/stdlib/Ipe/Ui/Font.ipe`;
+  - new `src/stdlib/Ipe/Ui/Input.ipe`;
   - `src/stdlib/Ipe/Ui.ipe`;
   - `src/stdlib/Ipe/Markdown.ipe`.
-- **Stdlib registry:** `src/stdlib/src/lib.rs`. Two `include_str!` entries,
+- **Stdlib registry:** `src/stdlib/src/lib.rs`. Three `include_str!` entries,
   `COMPILED_STD_MODULES` entries (around 1866 and 1901), and the module-list
   doc near 265.
 - **Canon:**
-  - `src/compiler/canon/src/env.rs`: Font native entries removed, Region
-    `heading` removed;
+  - `src/compiler/canon/src/env.rs`: the Font and Input native entries
+    removed, Region `heading` removed;
   - `src/compiler/canon/src/lib.rs`: the new N0025 tests.
 - **Kernels registry:** `src/compiler/kernels/src/lib.rs`.
   - Add: the 7 `UiDesc*` kernels (`descSection`, `descSectionHeading`,
@@ -338,6 +499,8 @@ cannot carry a source union. Following the precedent of `Ipe.Ui` itself:
     tripwire names (variant, `d(..)` descriptor, scheme, arity, runtime path).
   - Remove: `UiDescHeading` and `RegionHeading`.
   - Add the `source_display_name` arm for `UiTaggedNode`.
+  - Add `InputFile` (`d("Input","file",2,Ui,"input_file_",IpeOrder)`) with its
+    scheme and record-field order, beside `InputCheckbox`.
 - **Types:** `src/compiler/types/src/constrain/tests/mod.rs` (kernel lists near
   791, 973, 987).
 - **Lower:**
@@ -354,25 +517,34 @@ cannot carry a source union. Following the precedent of `Ipe.Ui` itself:
   - `src/runtime/rust/src/ui/element.rs`, `ui/render.rs`, `ui/helpers.rs`,
     `ui/template.rs`;
   - `src/runtime/rust/src/tui/layout.rs`;
-  - `src/runtime/rust/src/html.rs`: tests only.
+  - `src/runtime/rust/src/html.rs`: tests, plus the `Event::OnPick` variant;
+  - `src/runtime/rust/src/ui/input.rs`: `input_file_`, `FileKind`, `Accept`,
+    `Picked`, `MAX_PICKED_FILES`;
+  - `src/runtime/rust/src/dom/dispatch.rs`: `parse_pick` and `PickRefusal`;
+  - `src/runtime/rust/src/tui/focus.rs`: the `OnPick` arm;
+  - `src/runtime/rust/src/web/client.js`: the `ipe-pick` driver.
 - **Goldens.** Regenerate with `cargo run -p regen-goldens`; never hand-edit.
-  - `tests/golden/stdui_input/Main.ipe`: `Ui.Unsafe.input`, plus one each of
+  - `tests/golden/stdui_input/Main.ipe`: `UiUnsafe.unsafeInput`, plus one each of
     `codeBlock`, `code` and `kbd`, and `Font.whiteSpace` over every
     constructor;
   - `tests/golden/region_seal/Main.ipe`: nested `Ui.section`, replacing
-    `Region.heading`;
-  - the emitted `ipe_mod_ipe_*` seal goldens, which gain `Ipe.Ui.Font`;
+    `Region.heading`, including an empty-heading section;
+  - `tests/golden/stdui_input/Main.ipe` (the `Input.file` slice): one
+    `Input.file` with `PickOne` and `Only`, and one with `PickMany` and
+    `AnyFile`;
+  - the emitted `ipe_mod_ipe_*` seal goldens, which gain `Ipe.Ui.Font` and
+    `Ipe.Ui.Input`;
   - the drivers `src/ipe-cli/tests/g_stdui/golden_stdui_input.rs` and
     `src/ipe-cli/tests/g_misc/golden_region_seal.rs`.
 - **Docs regen.** Run `gen-stdlib-docs` and `git add` the new files:
   - `docs/reference/stdlib/Ui.md` and `docs/reference/stdlib.md`;
-  - new `docs/reference/stdlib/Ui.Unsafe.md` and
-    `docs/reference/stdlib/Ui.Font.md`.
+  - new `docs/reference/stdlib/Ui.Unsafe.md`,
+    `docs/reference/stdlib/Ui.Font.md` and `docs/reference/stdlib/Ui.Input.md`.
 - **Hand-written docs:**
   - `docs/guide/accessibility.md` (line 47);
   - `docs/guide/ui.md` (line 84);
   - `src/ipe-cli/templates/AGENTS.md.in`: the input idiom (813), the upload
-    pattern (965), and a short text-roles note.
+    pattern (965, rewritten to `Input.file`), and a short text-roles note.
 - **Examples:** `examples/shapes/web/ui-layout/src/Main.ipe` (line 70,
   `Ui.describe (Ui.descHeading 1)`), which becomes a `Ui.section`.
 - **Other ipe-cli tests:**
@@ -380,6 +552,9 @@ cannot carry a source union. Following the precedent of `Ipe.Ui` itself:
   - `src/ipe-cli/tests/watch_hot_appearance.rs`: the 1437 comment.
 - **Browser e2e:**
   - new `tools/scripts/browser-e2e/ui-text-roles.spec.mjs`;
+  - new `tools/scripts/browser-e2e/ui-file-pick.spec.mjs` (the `Input.file`
+    slice), driving the `ui-layout` example's file control with Playwright
+    `setInputFiles`;
   - `tools/scripts/browser-e2e/run.sh`, which serves `ui-layout` on a third
     port;
   - the `browser-e2e` job in `.github/workflows/ci.yml`, which gains a compile,
@@ -396,14 +571,14 @@ control that runs the same input with the guarded difference removed and gets
 
 | Refusal | Where | CI job |
 |---|---|---|
-| `Ui.taggedNode` and `Ui.input` under `import Ipe.Ui as Ui` are `NameNotExposed` (IPE-N0022). Control: `UiUnsafe.taggedNode` resolves. | canon tests | `test` |
+| `Ui.taggedNode` and `Ui.input` under `import Ipe.Ui as Ui` are `NameNotExposed` (IPE-N0022). Control: `UiUnsafe.unsafeTaggedNode` and `UiUnsafe.unsafeInput` resolve. `UiUnsafe.taggedNode` and `UiUnsafe.input` (unprefixed) are also `NameNotExposed`. | canon tests | `test` |
 | `Ui.descHeading` and `Region.heading` no longer resolve, asserted by exact variant. Control: `Ui.section` resolves. | canon tests | `test` |
 | `Font.whiteSpace "pre"` (a String) is a type mismatch. Control: `Font.whiteSpace Font.Pre` type-checks. | types tests | `test` |
 | A user module named `Ipe.Ui.Unsafe`, and one named `Ipe.Ui.Font`, are `ReservedNamespace` (IPE-N0025). Control: the same source under `EmbeddedStdlib` canonicalises. | canon `lib.rs` | `test` |
 | User source `Kernel.kernel "Font_whiteSpacePre"` is `KernelAliasInUserSource` (IPE-N0042). | canon tests | `test` |
 | `import Ipe.Ui.Unsafe` discloses `unsafe`. Control: a program importing `Ipe.Ui`, `Ipe.Ui.Font` and `Ipe.Markdown` only does not. | `lower/src/capabilities.rs` | `test` |
 | No non-`Unsafe` embedded stdlib module imports an `Ipe.*.Unsafe` module, and `Kernel.kernel "Ui_taggedNode"` appears only in `Ipe/Ui/Unsafe.ipe`. The source scan iterates `COMPILED_STD_MODULES`; a planted import in a copy of the `Ui` source turns it red. | `stdlib/src/lib.rs` tests | `test` |
-| Every `NodeTag::ALL` member is admitted as `Markup` through `ui_layout` → `admit_rendered`. A denied tag through `UiUnsafe.taggedNode` still renders empty. | runtime `ui/render.rs` tests | `test` |
+| Every `NodeTag::ALL` member is admitted as `Markup` through `ui_layout` → `admit_rendered`. A denied tag through `UiUnsafe.unsafeTaggedNode` still renders empty. | runtime `ui/render.rs` tests | `test` |
 | Hostile text in `codeBlock`, `code` and `kbd` (`</code></pre><script>x</script>&`) renders escaped, contains no `<script`, and passes `admit_rendered`. | runtime tests | `test` |
 | `codeBlock [] [text "\nx"]` renders `<pre…><code>\nx</code></pre>`, so the newline is not directly after `<pre>`. The browser reads `\nx` as the `code` `textContent`. | runtime tests; `ui-text-roles.spec.mjs` | `test`; `browser-e2e` |
 | Nested sections at depths 1 to 8 give `h1`..`h6`, then `h6`, `h6` (at the ceiling and one past it). A bare `DescSectionHeading` gives `h1`. | runtime tests | `test` |
@@ -416,13 +591,25 @@ control that runs the same input with the guarded difference removed and gets
 | Backend `CompileUiDesc` JSON for every variant decodes to runtime `UiDescription` and back. | runtime `template.rs` test | `test` |
 | The seal: the golden programs (`stdui_input`, `region_seal`) build and run. | `golden_stdui_input.rs`, `golden_region_seal.rs` | `e2e` (`IPE_E2E=1`) |
 | Markdown `# a`, `## b`, `### c`, then `## d` renders nested sections `h1 > h2 > h3` with `d` at `h2`. A fence renders `<pre><code>`, and inline code renders `<code>`. | ipe-cli emit test over `Markdown.toUi` | `e2e` |
+| Empty heading: `section [] { heading = [], content = [p] }` renders `<section>` with no `h1`..`h6` element, and its content is unchanged. Control: `heading = [text "a"]` renders `h1`. | runtime `ui/render.rs` tests | `test` |
+| Headings that count as empty: `[text " \t\n"]`, `[text "\u{00A0}"]`, `[Ui.none]`, `[el [] (text " ")]`, and a heading of three nested empty containers. Each gives no `hN`. Control: `[el [] (text " x ")]` is present. | runtime tests | `test` |
+| Nested empty headings keep levels contiguous: `section "a" > section [] > section "b"` gives `h1 a`, `h2 b`, and `section [] > section [] > section "c"` gives `h1 c`. Seven present levels under two empty ones still saturate at `h6`. | runtime tests | `test` |
+| `has_content` is an exhaustive match over `Element` with no wildcard (a source-scan test over its body), and it terminates past `MAX_HTML_DEPTH` (a heading nested one past the ceiling). | runtime tests | `test` |
+| TUI: an empty-heading section lays out with no bold row and no blank row (its first line is the content's first line), and a present heading is bold. | runtime `tui/layout.rs` tests | `runtime-full-features` |
+| `Input.file` admission: hostile `attrs` (`htmlAttribute "type" "text"`, `"accept" "*/*"`, `"webkitdirectory" ""`, `"capture" "user"`, `"name" "x"`, `"formaction" "/x"`, `Ui.style "x" "y"`, `Ui.onFile F`) render on the wrapper only. The rendered `<input>` carries exactly `type`, `id`, the event attribute, and `accept`/`multiple` when they apply. Asserted on the attribute set through `ui_layout` and `admit_rendered`. | runtime `ui/input.rs` tests | `test` |
+| `accept` text: `AnyFile` gives no `accept`; `Only Image [ Pdf, Image ]` gives `image/*,application/pdf,.pdf`. `PickOne` gives no `multiple`; `PickMany` gives `multiple`. | runtime tests | `test` |
+| `Input.file [] { accept = "image/*", … }` (a String) and `Only []` are type errors. A `Pick` handler of the wrong payload type (`PickOne Got` where `Got : List Picked -> Msg`) is a type error. Control: the well-typed call type-checks. | types tests | `test` |
+| `parse_pick`: `One` with 2 entries is `WrongArity`; `One` with 0 entries dispatches nothing; `Many` with 33 entries is `TooMany` (32 is accepted); a malformed entry and each field one past its ceiling are refused with the exact `PickRefusal`. Each refusal dispatches no `msg`. Control: a valid entry dispatches the expected `msg`. | runtime `dom/dispatch.rs` tests | `test` |
+| A user module named `Ipe.Ui.Input` is `ReservedNamespace` (IPE-N0025). User `Kernel.kernel "Input_file"` is IPE-N0042. | canon tests | `test` |
+| Browser: picking one file with `PickOne` dispatches one `msg`; two files under `PickOne` are impossible (no `multiple`); 33 files under `PickMany` dispatch nothing; the `<input>` has no attribute outside the closed set. | `ui-file-pick.spec.mjs` | `browser-e2e` |
+| TUI: `Input.file` lays out its label and the fixed note, registers no focus or key handler, and dispatches nothing. | runtime `tui` tests | `runtime-full-features` |
 | Generated docs match the regenerated output. | — | `stdlib-docs-drift` |
 
 ## BUG-CLASSES.md entries touched
 
 | Class | Where it applies here | How it is closed |
 |---|---|---|
-| Refusal deferred to runtime | An invalid heading level was clamped at render time. | `HeadingLevel` is closed and derived. `Ui.Unsafe.taggedNode` literal-tag refusal stays at runtime; see LIMIT. |
+| Refusal deferred to runtime | An invalid heading level was clamped at render time. | `HeadingLevel` is closed and derived. `Ui.Unsafe.unsafeTaggedNode` literal-tag refusal stays at runtime; see LIMIT. |
 | Closed set matched on text with a default row | `tag_for_description` (`_ => "h6"`) and `landmark_tag_for` (`_ => None`). | `NodeTag` and `HeadingLevel` are exhaustive enums with `ALL`. No wildcard remains. |
 | Structural marker in the content alphabet | `__paragraph` and `__textcolumn` can be forged through public `Ui.style`. | Identity moves to `Description`. The remaining layout markers are the subject of CONSIDERATION. |
 | Builtin identity by bare name | `WhiteSpace` must not be a reserved builtin name. | It is an ordinary source union homed at `Ipe.Ui.Font`. The lane checks `is_reserved_builtin_type_name("WhiteSpace")` is false. |
@@ -434,6 +621,8 @@ control that runs the same input with the guarded difference removed and gets
 | Tests never compiled or run by CI | TUI tests are `tui`-gated. | They are named under `runtime-full-features`. |
 | Vacuous refusal test; a refusal test that matches only the error family | Every name refusal. | Exact variant plus control, as in the table above. |
 | Generated drift | New docs pages and goldens. | Regenerated, and the new files are `git add`ed. |
+| Untrusted input trusted without a typed parse | Browser-supplied file picks. | `parse_pick` is the one boundary. It produces bounded typed values or a closed `PickRefusal`, and refusals dispatch nothing. |
+| Caller attributes override a builder's fixed attributes | `Input.file`'s `<input>`. | The `<input>` attribute list is built only by the runtime, and user attrs go to the wrapper. Pre-existing: `input_base_` appends caller `control_attrs` after its fixed `type`/`value`. Browsers keep the first duplicate, but the shape is the same; the `Input.file` slice's guardian review checks it. |
 
 New class for the orchestrator to add (it is pre-existing, found here):
 **Markup the HTML parser restructures**. A renderer that emits a flow element
@@ -451,8 +640,8 @@ alone.
    - `ui/element.rs`, `ui/render.rs`, `ui/helpers.rs`, `ui/template.rs`,
      `tui/layout.rs`, `html.rs` tests;
    - additive: the new `Description` variants, `NodeTag`, `HeadingLevel`,
-     `ContentModel`, `RenderCtx`, `WhiteSpace`, `AttrFontWhiteSpace`, and the
-     new helpers;
+     `ContentModel`, `RenderCtx`, `has_content` and the empty-heading rule,
+     `WhiteSpace`, `AttrFontWhiteSpace`, and the new helpers;
    - the paragraph and text-column identity moves to `Description`.
 
    `DescHeading(i64)` and its helpers stay until the section slice, so the
@@ -471,7 +660,8 @@ alone.
    `emit_ui_plan` and `emit_ui_template` arms). It needs the runtime slice
    merged first.
 3. **Section headings and text roles wiring. Gated alone (kernels, goldens).**
-   It waits for the section-shape decision.
+   The empty-heading rule's runtime half (`has_content` and the depth skip)
+   lands in slice 1. This slice wires the Ipê side and the goldens.
    - Kernels: the 5 remaining desc kernels added, `UiDescHeading` and
      `RegionHeading` removed;
    - `emit_ui_plan`, `emit_ui_template`, `lower.rs`, the `env.rs` Region
@@ -499,13 +689,32 @@ alone.
    It is file-disjoint from the Font slice, so it can run beside it after the
    section slice. It also runs the `browser-e2e` job locally, because the
    change touches the browser runtime path.
+6. **Ipe.Ui.Input module and `Input.file`. Gated alone (kernels, goldens).**
+   SCEF: trust boundary (browser-supplied input). It is blocked on the
+   payload decision.
+   - `Ui/Input.ipe` (the 18 aliases plus the `Input.file` types);
+   - the Input entries removed from `env.rs`;
+   - `stdlib/src/lib.rs`;
+   - the `InputFile` kernel and its `emit_ui_plan` row;
+   - runtime `ui/input.rs`, `html.rs` (`OnPick`), `dom/dispatch.rs`
+     (`parse_pick`), `tui/focus.rs`, `tui/layout.rs` (the note), and
+     `web/client.js` (the `ipe-pick` driver);
+   - the `stdui_input` golden additions and regen, `Ui.Input.md` regen, the
+     `AGENTS.md.in` upload pattern;
+   - `ui-file-pick.spec.mjs`, plus a file control in the `ui-layout` example.
 
-Slices 2, 3 and 4 all edit `kernels/src/lib.rs`, `stdlib/src/lib.rs` and the
-goldens, so they are strictly sequential.
+   It runs after the Unsafe move, and after the Font slice, whose
+   native-to-compiled migration it repeats. It also runs after the browser
+   check, which first adds `ui-layout` to `run.sh` and `ci.yml`. It runs
+   `browser-e2e` locally.
+
+Slices 2, 3, 4 and 6 all edit `kernels/src/lib.rs`, `stdlib/src/lib.rs` and the
+goldens, so they are strictly sequential. Slice 1 also edits
+`tui/layout.rs`, `html.rs` and `ui/render.rs`; slice 6 starts from its merge.
 
 ## LIMIT
 
-- **Runtime-only refusal for free-form tags.** `Ui.Unsafe.taggedNode` with a
+- **Runtime-only refusal for free-form tags.** `Ui.Unsafe.unsafeTaggedNode` with a
   literal denied tag (`"script"`) is still refused only at runtime, as an empty
   element. Refusing it in `ipe` needs one tag grammar shared by the compiler and
   the vendored runtime. The runtime crate cannot depend on compiler crates, so
@@ -513,12 +722,23 @@ goldens, so they are strictly sequential.
   compiler leaf, with an equality test). It is out of this spec's consent.
 - **TUI white-space.** The TUI models wrap and newline preservation, not CSS
   space collapsing. This is documented in the `Font.whiteSpace` doc.
+- **Invisible non-White_Space characters.** A heading made only of
+  characters such as U+200B or U+FEFF counts as present and renders an `hN`
+  that looks empty. Treating them as absent would mean choosing a character
+  class beyond Unicode White_Space. No Unicode property names "invisible"
+  exactly, so the rule stays on White_Space, and the `Ui.section` doc names
+  this case.
+- **File content.** `Input.file` adds no file-content reading or upload path
+  beyond what the payload decision picks. The existing `Ui.onFile` data-URL
+  path is unchanged.
 - **`textColumn` tag.** `textColumn` keeps its `<section>` tag (no accessible
   name, so no landmark) and does not advance the heading level.
 
 ## CONSIDERATION:
 
-Typed layout markers (confidence ≥95%).
+Both items are held at ≥95% confidence and are outside this spec's scope.
+
+### Typed layout markers
 
 `Ui.row`, `Ui.column`, `Ui.wrappedRow` and `Ui.grid` mark themselves with
 `AttrStyle("__row"|"__col"|"__wrappedrow"|"__grid", "true")`. The renderer and
@@ -532,96 +752,83 @@ The structural fix is internal and adds no surface:
 - the template mirror gains `Layout` with a round-trip test.
 
 It touches the same `render.rs`, `tui/layout.rs` and `template.rs` as the
-runtime slice. Run it as the slice after the Font slice, gated alone because it
-regenerates goldens.
+runtime slice. It would be its own spec, gated alone because it regenerates
+goldens. It is not in this spec's slices.
+
+### Closed tags for runtime builders
+
+The runtime builders (`button`, `link`, `image`, the `Input` controls) build
+`Element::TaggedNode` with `'static` literal tag strings, which are only
+proven admitted by the test above. Moving them to an `Element` variant that
+carries a closed `NodeTag` would leave `Element::TaggedNode(String, …)`
+constructed only by `ui_tagged_node_`. The "safe surface never builds a
+free-form tag" property would then hold by type, not by test. That is about
+57 match sites across 8 runtime files, so it is its own runtime-only spec.
 
 ## DECISIONS NEEDED:
 
-### Shape of `Ui.section`
+### What a picked file carries (`Picked`)
 
-**What.** The heading decision needs a section constructor and a heading. The
-addition list does not name either.
+**What.** The shape of `Picked`, the value one browser-chosen file becomes
+before it reaches `msg`.
 
-**Why.** The shape decides whether a heading without a section, or a section
-without a heading, can be built.
-
-**How.** The options:
-
-- **Record (recommended).** A heading-less section and a stray heading are both
-  unrepresentable.
-
-  ```elm
-  Ui.section [] { heading = [ Ui.text "Install" ], content = [ Ui.paragraph [] [ … ] ] }
-  ```
-
-- **Separate `Ui.heading` and `Ui.section`.** Closer to HTML. A `Ui.heading`
-  outside any section must render as `h1`, and a section may lack a heading,
-  which is a screen-reader outline gap.
-
-  ```elm
-  Ui.section [] [ Ui.heading [] [ Ui.text "Install" ], Ui.paragraph [] [ … ] ]
-  ```
-
-- **Optional heading.** `{ heading : Maybe (List (Element msg)), content : … }`
-  allows a heading-less section explicitly.
-
-### Member names in `Ipe.Ui.Unsafe`
-
-**What.** The new module's member names.
-
-**Why.** Existing `Unsafe` modules prefix members (`Html.Unsafe.unsafeRaw`,
-`Secret.Unsafe.unsafeReveal`).
+**Why.** It decides what crosses the trust boundary, how much the client
+sends, and which ceilings `parse_pick` enforces. Everything else in
+`Input.file` is designed independently of this choice. Its slice waits for
+the answer.
 
 **How.** The options:
 
-- **Keep `taggedNode` and `input` (recommended).** This matches the decision's
-  wording. The module import already discloses `unsafe`.
+- **Metadata only.** `Picked` is a record of client-declared facts, with no
+  bytes.
 
   ```elm
-  UiUnsafe.taggedNode "dl" Ui.descNone [] items
+  type alias Picked = { name : String, size : Int, mime : String }
+
+  Input.file [] { accept = Input.Only Input.Pdf [], pick = Input.PickOne GotDoc, label = Input.labelAbove [] (Ui.text "Invoice") }
+  -- update: GotDoc p -> ({ model | chosen = Just p.name }, Cmd.none)
   ```
 
-- **Prefix: `unsafeTaggedNode` and `unsafeInput`.** Consistent with siblings,
-  and every call site is greppable as unsafe.
+  - The client sends `{name,size,type}` per file.
+  - `parse_pick` ceilings: `name` ≤ 255 UTF-8 bytes; `size` from 0 to
+    2^53 − 1; `mime` is empty or a `type/subtype` token pair of at most
+    127 bytes.
+  - This is the smallest boundary, and no file bytes reach the server. The
+    app can display and check a selection, but cannot read it. Reading would
+    need a later API.
+
+- **Content as a data URL.** This is the semantics `Ui.onFile` already ships,
+  typed.
 
   ```elm
-  UiUnsafe.unsafeInput [ Ui.htmlAttribute "type" "file" ]
+  type alias Picked = { name : String, mime : String, dataUrl : String }
+
+  Input.file [] { accept = Input.Only Input.Image [], pick = Input.PickMany GotPhotos, label = … }
+  -- update: GotPhotos ps -> ({ model | previews = List.map .dataUrl ps }, Cmd.none)
   ```
 
-### File inputs after the move
+  - The client uses `FileReader.readAsDataURL` per file.
+  - The whole event body stays under `IPE_WEB_MAX_BODY_BYTES` (default
+    5 MiB). The client refuses a selection whose summed size would exceed it,
+    and the server answers 413.
+  - `parse_pick` checks the `data:` prefix grammar and that the declared
+    MIME type is the one inside the URL.
+  - This is useful immediately, but every pick ships file bytes into the
+    session, and `PickMany` multiplies them.
 
-**What.** `<input type=file>` (`Ui.onFile` uploads) and `type=submit` have no
-typed `Ipe.Ui.Input` control.
-
-**Why.** After the move, every app with an upload discloses `unsafe`.
-
-**How.** The options:
-
-- **Accept the disclosure for now (recommended inside this consent).** Document
-  `UiUnsafe.input [ Ui.htmlAttribute "type" "file", Ui.onFile Picked ]`.
-- **Add a typed `Input.file`.** This is new surface and needs the maintainer's
-  consent.
+- **Opaque handle.** `Picked` is an abstract type with no accessors in this
+  API.
 
   ```elm
-  Input.file [] { onPick = Picked, accept = [ Image ] }
+  type Picked  -- opaque; nothing in this spec reads it
+
+  Input.file [] { accept = Input.AnyFile, pick = Input.PickOne Chosen, label = … }
+  -- update: Chosen handle -> ({ model | pending = Just handle }, Cmd.none)
   ```
 
-### Constructor exposure of `WhiteSpace`
-
-**What.** How users name the constructors.
-
-**Why.** Exposed unqualified, `Normal` and `Pre` would shadow user constructors
-under `exposing (..)`.
-
-**How.** The options:
-
-- **Qualified use (recommended).** Expose `WhiteSpace(..)` from `Ipe.Ui.Font`
-  and write `Font.whiteSpace Font.PreWrap`, as `Font.*` is already used
-  qualified everywhere.
-
-  ```elm
-  Ui.el [ Font.whiteSpace Font.NoWrap ] (Ui.text label)
-  ```
-
-- **Prefixed constructors** (`WsNormal`, `WsPre`, …): collision-free, but
-  noisier.
+  - The client keeps the `File` objects keyed by a random id and sends only
+    the id. The runtime holds a bounded per-session table (at most
+    `MAX_PICKED_FILES` live handles, evicted on the next pick).
+  - This keeps the door open for a later upload API that consumes handles,
+    and no bytes move now. But it adds server-side state, and the value is
+    inert until that later API exists.
