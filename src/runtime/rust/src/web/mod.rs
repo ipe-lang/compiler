@@ -240,26 +240,24 @@ pub fn render_page(body: &str) -> String {
     page_shell("", &format!("<div id=\"ipe-root\">{body}</div>"), "")
 }
 
-/// Escape a serde-serialised JSON string for safe embedding inside a
-/// `<script>` element (HTML script-data context, not attribute context).
+/// Escape a serde-serialised JSON string for embedding inside a `<script>`
+/// element.
 ///
-/// JSON alone is not sufficient: a string field containing `</script>` would
-/// end the `<script>` element, breaking out of the data island into executable
-/// script context and defeating the no-eval / no-`'unsafe-eval'` posture.
-/// The five characters below are the only ones that matter in script-data
-/// context; `serde_json`'s own output already encodes control characters, so
-/// no other escaping is required.
+/// The one JSON-in-HTML escaper: every JSON value a page carries in a
+/// `<script type="application/json">` block passes through it. JSON alone is not
+/// sufficient in HTML script-data context: a string field containing
+/// `</script>` would end the element and break out into markup, and `<!--`
+/// would switch the tokenizer into its escaped state. `serde_json`'s own output
+/// already encodes control characters, so the five characters below are the
+/// only ones left to escape.
 ///
-/// Escapes applied (JSON numeric escapes — losslessly round-trippable by any
-/// JSON parser, including `serde_json`):
-/// - U+003C `<`    → `<`  (forecloses `</script`)
-/// - U+003E `>`    → `>`  (defence-in-depth against `>` injection)
-/// - U+0026 `&`    → `&`  (forecloses HTML entity injection)
-/// - U+2028 LINE SEPARATOR   → ` `  (JSON-legal but HTML-hostile)
-/// - U+2029 PARAGRAPH SEPARATOR → ` `
-///
-/// Identical escape class as the telemetry `json_escape` U+2028/2029 gap —
-/// the island serialiser applies it here for consistency.
+/// Each becomes its JSON `\uXXXX` escape, which every JSON parser (including
+/// `serde_json` and `JSON.parse`) decodes back to the same character:
+/// - U+003C `<` (forecloses `</script` and `<!--`)
+/// - U+003E `>` (forecloses `]]>` and `-->`)
+/// - U+0026 `&` (forecloses HTML character references)
+/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR (JSON-legal but
+///   line terminators to older JavaScript parsers)
 #[cfg(feature = "server")]
 pub fn island_escape(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
@@ -274,42 +272,6 @@ pub fn island_escape(json: &str) -> String {
         }
     }
     out
-}
-
-/// Page wrap for isomorphic SSR + WASM hydration (M7 mode 2).
-///
-/// Emits a standard HTML page with:
-/// - The SSR body in `<div id="ipe-root">`.
-/// - The WASM bundle boot scripts (external JS + `hydrate(island_json)` call).
-/// - A **typed public-payload island** `<script type="application/ipe-model+json">`
-///   carrying the XSS-escaped, serde-serialised `HydrationState` JSON.
-///
-/// The island body is read by the WASM client via
-/// `document.querySelector('script[type="application/ipe-model+json"]').textContent`
-/// and passed to the emitted `hydrate(model_json)` entry — parsed with `serde_json`,
-/// never evaluated. The `island_escape` call forecloses all script-injection paths.
-///
-/// `body`        — SSR-rendered HTML (from `render_html` with ipe-ids assigned).
-/// `island_json` — serde-serialised `HydrationState` (BEFORE island_escape;
-///                 this function applies the escape internally).
-/// `pkg_base`    — URL prefix for the WASM bundle assets, e.g. `/pkg` or `./pkg`.
-#[cfg(feature = "server")]
-pub fn render_page_hydrate(body: &str, island_json: &str, pkg_base: &str) -> String {
-    let escaped = island_escape(island_json);
-    let body_inner = format!("<div id=\"ipe-root\">{body}</div>");
-    let tail_scripts = format!(
-        "<script type=\"application/ipe-model+json\">{escaped}</script>\
-<script type=\"module\">\
-import init, {{ hydrate }} from '{pkg_base}/ipe_app.js';\
-async function boot() {{\
-  await init('{pkg_base}/ipe_app_bg.wasm');\
-  const island = document.querySelector('script[type=\"application/ipe-model+json\"]');\
-  hydrate(island ? island.textContent : '');\
-}}\
-boot();\
-</script>"
-    );
-    page_shell("", &body_inner, &tail_scripts)
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -353,32 +315,9 @@ mod island_escape_tests {
     }
 }
 
-/// Full page wrap with the live client loaded as a cacheable external asset.
-/// Implements live page render
+/// The client's numeric tuning ceilings, keyed by their boot-block name.
 ///
-/// `sid`  — session id (injected into the JS via `window.__IPE_SID`).
-/// `base` — sub-app base path, e.g. "" for root-mounted apps.
-/// `body` — pre-rendered HTML body (from `render_html`).
-///
-/// Two scripts are emitted in document order (no defer/async — execution order
-/// is left-to-right by the HTML spec):
-///   1. A tiny inline `<script>` setting the three per-session window globals
-///      (`__IPE_SID`, `__IPE_BASE`, `__IPE_CSRF_TOKEN`). These MUST stay inline
-///      because they are per-session values and must never be cached.
-///   2. An external `<script src="…/_ipe/client.<hash>.js" integrity="sha256-…"
-///      crossorigin="anonymous">` loading the invariant client body. The URL is
-///      content-addressed (hash of the file) so it is safe to cache with
-///      `immutable`. The SRI `integrity` attribute lets the browser verify the
-///      file has not been tampered with before execution.
-///
-/// CSP note: the inline window-vars script still requires `script-src
-/// 'unsafe-inline'` (unchanged from the fully-inlined baseline). The external
-/// script requires no additional CSP directive beyond `script-src 'self'`
-/// (already needed for same-origin resource loading). Adding a nonce to the
-/// inline script to tighten CSP is deferred; it requires threading the nonce
-/// through the response pipeline and is outside the scope of this change.
-/// The client's numeric tuning ceilings, each with the `window.__IPE_*` global
-/// it sets. `0` passes through to the client unchanged.
+/// The client reads each under `cfg.tuning`; `0` passes through unchanged.
 #[cfg(feature = "server")]
 const CLIENT_TUNING_CEILINGS: [(&str, crate::system::EnvCeiling); 8] = {
     const fn tuning(name: &'static str, default: u64) -> crate::system::EnvCeiling {
@@ -410,60 +349,135 @@ const CLIENT_TUNING_CEILINGS: [(&str, crate::system::EnvCeiling); 8] = {
     ]
 };
 
-/// The `window.__IPE_*` numeric tuning assignments, resolved once per process.
+/// The client's numeric tuning values, keyed by their [`CLIENT_TUNING_CEILINGS`]
+/// name.
+#[cfg(feature = "server")]
+type ClientTuning = std::collections::BTreeMap<&'static str, u64>;
+
+/// The client's numeric tuning values, resolved once per process.
 ///
 /// [`build_web_router`] refuses to start on a refusal here, so every page a
-/// served app renders reads the resolved `Ok`.
+/// served app renders reads the resolved `Ok`; a render that still meets a
+/// refusal refuses the page ([`BootRefusal::TuningRefused`]).
 #[cfg(feature = "server")]
-fn client_tuning_js() -> &'static Result<String, crate::system::EnvCeilingRefusal> {
-    static TUNING: std::sync::OnceLock<Result<String, crate::system::EnvCeilingRefusal>> =
+fn client_tuning() -> &'static Result<ClientTuning, crate::system::EnvCeilingRefusal> {
+    static TUNING: std::sync::OnceLock<Result<ClientTuning, crate::system::EnvCeilingRefusal>> =
         std::sync::OnceLock::new();
     TUNING.get_or_init(|| {
-        use std::fmt::Write as _;
-        let mut out = String::new();
-        for (global, ceiling) in CLIENT_TUNING_CEILINGS {
-            let value: u64 = ceiling.read()?;
-            let _ = write!(out, "window.__IPE_{global}={value};");
-        }
-        Ok(out)
+        CLIENT_TUNING_CEILINGS
+            .into_iter()
+            .map(|(key, ceiling)| ceiling.read::<u64>().map(|value| (key, value)))
+            .collect()
     })
 }
 
-/// Server-side client-config templating: emit the `window.__IPE_*` assignments
-/// the client (`client.js`) reads, each with a hardcoded client fallback.
+/// Whether the client's connection banner is on.
+///
+/// `IPE_WEB_BANNER` set to `off`, `0` or `false` turns it off; anything else,
+/// or no value, leaves it on.
 #[cfg(feature = "server")]
-fn web_client_config_js() -> String {
-    // IPE_WEB_BANNER: off/0/false → disabled; anything else → on.
-    let banner = !matches!(
+fn web_banner_enabled() -> bool {
+    !matches!(
         crate::system::read_env_var("IPE_WEB_BANNER")
             .ok()
             .map(|s| s.trim().to_ascii_lowercase()),
         Some(ref v) if v == "off" || v == "0" || v == "false"
-    );
-    // IPE_WEB_SWAP_TOAST: set (non-empty ≠ "0") ⇒ this process runs behind the
-    // dev-watch blue-green proxy, so a reconnect is an expected rebuild cutover,
-    // not an outage. The client then greets a reconnect with a brief positive
-    // "updated ✓" toast instead of the amber "Reconnecting…" banner. Only the
-    // `ipe dev watch` blue-green path sets this; a release/`ipe dev run` server never
-    // does, so the flag defaults off there.
-    let swap_toast = matches!(
+    )
+}
+
+/// Whether this process runs behind the dev-watch blue-green proxy.
+///
+/// `IPE_WEB_SWAP_TOAST` set to a non-empty value other than `0` means a
+/// reconnect is an expected rebuild cutover, not an outage: the client then
+/// greets a reconnect with a brief "updated ✓" toast instead of the amber
+/// "Reconnecting…" banner. Only the `ipe dev watch` blue-green path sets it; a
+/// release or `ipe dev run` server never does, so it defaults off there.
+#[cfg(feature = "server")]
+fn web_swap_toast() -> bool {
+    matches!(
         crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
             .ok()
             .map(|s| s.trim().to_string()),
         Some(ref v) if !v.is_empty() && v != "0"
-    );
-    // A refused tuning value never reaches a served page (the router refused
-    // to start on it); an unserved render omits the numbers, so the client
-    // keeps its own fallbacks rather than an invented value.
-    let tuning = client_tuning_js().as_deref().unwrap_or_default();
-    format!(
-        "window.__IPE_BANNER_ENABLED={banner};\
-         window.__IPE_SWAP_TOAST={swap_toast};\
-         {tuning}\
-         window.__IPE_MSG_RECONNECTING=\"Reconnecting…\";\
-         window.__IPE_MSG_UPDATED=\"updated ✓\";\
-         window.__IPE_MSG_OFFLINE=\"Connection lost — refresh to retry\";"
     )
+}
+
+/// The client configuration a live page boots with.
+///
+/// Every field is required by the client: it refuses to boot on a missing or
+/// mistyped one, so there is no client-side default to drift from these.
+#[cfg(feature = "server")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientConfig<'a> {
+    banner_enabled: bool,
+    swap_toast: bool,
+    tuning: &'a ClientTuning,
+    msg_reconnecting: &'a str,
+    msg_updated: &'a str,
+    msg_offline: &'a str,
+}
+
+#[cfg(feature = "server")]
+impl<'a> ClientConfig<'a> {
+    /// The configuration of this process, over its resolved `tuning`.
+    fn from_env(tuning: &'a ClientTuning) -> Self {
+        Self {
+            banner_enabled: web_banner_enabled(),
+            swap_toast: web_swap_toast(),
+            tuning,
+            msg_reconnecting: "Reconnecting…",
+            msg_updated: "updated ✓",
+            msg_offline: "Connection lost — refresh to retry",
+        }
+    }
+}
+
+/// The boot data a live page hands its client, serialized as one JSON object.
+#[cfg(feature = "server")]
+#[derive(serde::Serialize)]
+struct BootConfig<'a> {
+    sid: &'a str,
+    epoch: String,
+    base: &'a str,
+    csrf: &'a str,
+    cfg: ClientConfig<'a>,
+}
+
+/// The `id` of the boot data block; `client.js` reads the element by it.
+#[cfg(feature = "server")]
+const BOOT_BLOCK_ID: &str = "ipe-boot";
+
+/// Why a live page could not be built; the page is refused with a 500.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootRefusal {
+    /// A client tuning value was refused by its ceiling.
+    TuningRefused,
+    /// The boot data did not serialize to JSON.
+    EncodeFailed,
+}
+
+/// The boot data block: `boot` as escaped JSON inside an inert data element.
+///
+/// `serde_json` writes the JSON and [`island_escape`] escapes it for script-data
+/// context, so no field value can end the element, open a comment, or change
+/// how the page parses. A `type="application/json"` script is never executed.
+#[cfg(feature = "server")]
+fn boot_block(boot: &BootConfig<'_>) -> Result<String, BootRefusal> {
+    let json = serde_json::to_string(boot).map_err(|_| BootRefusal::EncodeFailed)?;
+    let escaped = island_escape(&json);
+    Ok(format!(
+        "<script type=\"application/json\" id=\"{BOOT_BLOCK_ID}\">{escaped}</script>"
+    ))
+}
+
+/// A rendered page's boot data block, parsed as JSON.
+#[cfg(all(test, feature = "server"))]
+fn boot_json_of(html: &str) -> Option<serde_json::Value> {
+    let open = format!("<script type=\"application/json\" id=\"{BOOT_BLOCK_ID}\">");
+    let rest = html.get(html.find(&open)? + open.len()..)?;
+    serde_json::from_str(rest.get(..rest.find("</script>")?)?).ok()
 }
 
 /// Whether the dev watch/status banner endpoint should be mounted.
@@ -489,14 +503,16 @@ fn watch_banner_active_with(base: &str, dev: Option<&crate::telemetry::DevIntent
         return false;
     }
     // Banner explicitly disabled → no endpoint either.
-    !matches!(
-        crate::system::read_env_var("IPE_WEB_BANNER")
-            .ok()
-            .map(|s| s.trim().to_ascii_lowercase()),
-        Some(ref v) if v == "off" || v == "0" || v == "false"
-    )
+    web_banner_enabled()
 }
 
+/// Full live page: the SSR body, the boot data block and the external client.
+///
+/// See [`render_live_page`]; this is the shell without a debugger overlay.
+///
+/// # Errors
+///
+/// [`BootRefusal`] when the boot data cannot be built; the page is refused.
 #[cfg(feature = "server")]
 pub fn render_page_full(
     sid: &str,
@@ -504,15 +520,52 @@ pub fn render_page_full(
     body: &str,
     epoch: &RenderEpoch,
     csrf_token: &str,
-) -> String {
-    // sid_js / epoch_js / base_js / csrf_js: Rust Debug ("{:?}") of a &str
-    // yields a double-quoted, properly-escaped JS string literal for plain
-    // ASCII session ids, epoch tokens, base paths, and the hex CSRF token.
-    let sid_js = format!("{sid:?}");
-    let epoch_js = format!("{:?}", epoch.to_token());
+) -> Result<String, BootRefusal> {
+    render_live_page(
+        client_tuning().as_ref(),
+        sid,
+        base,
+        body,
+        epoch,
+        csrf_token,
+        "",
+    )
+}
+
+/// The one live-page builder every shell renders through.
+///
+/// The page carries no inline executable script. In document order its tail is:
+///   1. The boot data block ([`boot_block`]): the per-session values and the
+///      client config as inert, escaped JSON. It is never executed, so
+///      `script-src` needs no `'unsafe-inline'` and no nonce for it, and it is
+///      per-session, so it lives in the page, never in the cached client file.
+///   2. The external client, `…/_ipe/client.<hash>.js` with an SRI `integrity`.
+///      The URL is content-addressed, so it is cacheable as `immutable`; the
+///      client reads the boot block before any other of its code runs.
+///   3. The widget glue and the `Ipe.Ffi.Js` port glue, each external and
+///      SRI-pinned.
+///
+/// `tuning` is the process's resolved client tuning; a refused one refuses the
+/// page. `overlay` is raw HTML placed after `#ipe-root` (empty for none).
+#[cfg(feature = "server")]
+fn render_live_page(
+    tuning: Result<&ClientTuning, &crate::system::EnvCeilingRefusal>,
+    sid: &str,
+    base: &crate::encoding::MountBase,
+    body: &str,
+    epoch: &RenderEpoch,
+    csrf_token: &str,
+    overlay: &str,
+) -> Result<String, BootRefusal> {
     let prefix = base.prefix();
-    let base_js = format!("{prefix:?}");
-    let csrf_js = format!("{csrf_token:?}");
+    let tuning = tuning.map_err(|_| BootRefusal::TuningRefused)?;
+    let boot = boot_block(&BootConfig {
+        sid,
+        epoch: epoch.to_token(),
+        base: prefix,
+        csrf: csrf_token,
+        cfg: ClientConfig::from_env(tuning),
+    })?;
     let dev_banner = dev_console_banner(prefix);
     // Content-addressed client asset URL and SRI hash — computed once at first call.
     let (hex16, b64) = client_js_hashes();
@@ -520,9 +573,8 @@ pub fn render_page_full(
     // the parent proxy (same as /_ipe/sse, /_ipe/event, /_ipe/console).
     let client_src = format!("{prefix}/_ipe/client.{hex16}.js");
     let integrity = format!("sha256-{b64}");
-    let config_js = web_client_config_js();
     let head_extra = format!("<meta name=\"ipe-base\" content=\"{prefix}\">");
-    let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}");
+    let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}{overlay}");
     // Custom-element glue: an EXTERNAL, SRI-pinned `<script type="module">` plus a
     // `modulepreload` SRI pin per author asset. Empty when the program registers
     // no widget, so a widget-free page is byte-identical and its CSP is unchanged.
@@ -530,11 +582,11 @@ pub fn render_page_full(
     let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
     let port_glue = port_glue_script(prefix);
     let tail_scripts = format!(
-        "<script>window.__IPE_SID={sid_js};window.__IPE_EPOCH={epoch_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
+        "{boot}\
          <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
          {widget_scripts}{port_glue}"
     );
-    page_shell(&head_extra, &body_inner, &tail_scripts)
+    Ok(page_shell(&head_extra, &body_inner, &tail_scripts))
 }
 
 /// The SRI-pinned `<script>` tag that loads the `Ipe.Ffi.Js` browser port surface,
@@ -561,9 +613,11 @@ fn port_glue_script(_base: &str) -> String {
     String::new()
 }
 
-/// Same as [`render_page_full`] but appends `overlay` (raw HTML) after the
-/// `#ipe-root` div. The overlay must carry `data-ipe-debugger` so the
-/// diff/patch engine ignores it.
+/// [`render_page_full`] with `overlay` (raw HTML) appended after `#ipe-root`.
+///
+/// The overlay must carry `data-ipe-debugger` so the diff/patch engine ignores
+/// it. The shell, boot block and scripts are the ones [`render_live_page`]
+/// builds for every live page.
 #[cfg(all(feature = "server", feature = "debugger"))]
 fn render_page_full_with_overlay(
     sid: &str,
@@ -572,27 +626,16 @@ fn render_page_full_with_overlay(
     epoch: &RenderEpoch,
     csrf_token: &str,
     overlay: &str,
-) -> String {
-    let sid_js = format!("{sid:?}");
-    let epoch_js = format!("{:?}", epoch.to_token());
-    let prefix = base.prefix();
-    let base_js = format!("{prefix:?}");
-    let csrf_js = format!("{csrf_token:?}");
-    let dev_banner = dev_console_banner(prefix);
-    let (hex16, b64) = client_js_hashes();
-    let client_src = format!("{prefix}/_ipe/client.{hex16}.js");
-    let integrity = format!("sha256-{b64}");
-    let config_js = web_client_config_js();
-    let head_extra = format!("<meta name=\"ipe-base\" content=\"{prefix}\">");
-    let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}{overlay}");
-    let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
-    let port_glue = port_glue_script(prefix);
-    let tail_scripts = format!(
-        "<script>window.__IPE_SID={sid_js};window.__IPE_EPOCH={epoch_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
-         <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
-         {widget_scripts}{port_glue}"
-    );
-    page_shell(&head_extra, &body_inner, &tail_scripts)
+) -> Result<String, BootRefusal> {
+    render_live_page(
+        client_tuning().as_ref(),
+        sid,
+        base,
+        body,
+        epoch,
+        csrf_token,
+        overlay,
+    )
 }
 
 /// Floating "🔍 Console" link injected into every dev-mode page. The
@@ -1981,7 +2024,9 @@ fn page_response(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let html = render_page_full(sid, &base, body, epoch, csrf_token);
+    let Ok(html) = render_page_full(sid, &base, body, epoch, csrf_token) else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
     // when this specific request arrived over TLS at a trusted proxy
     // (`request_is_https`, opt-in via `IPE_TRUSTED_PROXY` — closes the gap where
@@ -2041,7 +2086,10 @@ fn page_response_with_overlay(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let html = render_page_full_with_overlay(sid, &base, body, epoch, csrf_token, overlay);
+    let Ok(html) = render_page_full_with_overlay(sid, &base, body, epoch, csrf_token, overlay)
+    else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let Ok(ttl) = web_ttl() else {
         return ttl_unavailable_response();
     };
@@ -5647,7 +5695,7 @@ where
     crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
-    if let Err(refusal) = client_tuning_js() {
+    if let Err(refusal) = client_tuning() {
         return Err(StartupRefusal::Ceiling(refusal.clone()));
     }
     // The framing policy every page carries is parsed here, so a value with no
@@ -6779,45 +6827,32 @@ mod base_path_tests {
     }
 
     #[test]
-    fn render_page_threads_base_into_meta_and_window_global() {
-        let root = render_page_full(
+    fn render_page_threads_base_into_meta_and_boot_block() {
+        let root = page(
             "sid1",
             &crate::encoding::MountBase::root(),
-            "<b>x</b>",
             &page_epoch(),
             "deadbeef",
         );
         assert!(root.contains("<meta name=\"ipe-base\" content=\"\">"));
-        assert!(root.contains("window.__IPE_BASE=\"\""));
+        assert_eq!(boot_str(&root, "/base").as_deref(), Some(""));
 
-        let sub = render_page_full(
-            "sid1",
-            &console_base(),
-            "<b>x</b>",
-            &page_epoch(),
-            "deadbeef",
-        );
+        let sub = page("sid1", &console_base(), &page_epoch(), "deadbeef");
         assert!(sub.contains("<meta name=\"ipe-base\" content=\"/_ipe/console\">"));
-        assert!(sub.contains("window.__IPE_BASE=\"/_ipe/console\""));
+        assert_eq!(boot_str(&sub, "/base").as_deref(), Some("/_ipe/console"));
     }
 
     #[test]
     fn render_page_emits_external_client_script_with_sri() {
         let epoch = page_epoch();
-        let root = render_page_full(
-            "sid1",
-            &crate::encoding::MountBase::root(),
-            "<b>x</b>",
-            &epoch,
-            "tok1",
-        );
-        // Per-session values stay inline.
-        assert!(root.contains("window.__IPE_SID=\"sid1\""));
-        let epoch_global = format!("window.__IPE_EPOCH=\"{}\";", epoch.to_token());
-        assert!(root.contains(&epoch_global), "{root}");
-        assert!(root.contains("window.__IPE_CSRF_TOKEN=\"tok1\""));
+        let root = page("sid1", &crate::encoding::MountBase::root(), &epoch, "tok1");
+        // Per-session values ride the boot data block, never a script literal.
+        assert_eq!(boot_str(&root, "/sid").as_deref(), Some("sid1"));
+        assert_eq!(boot_str(&root, "/epoch"), Some(epoch.to_token()));
+        assert_eq!(boot_str(&root, "/csrf").as_deref(), Some("tok1"));
+        assert!(!root.contains("window.__IPE_"), "{root}");
         // CLIENT_JS body must NOT be inlined.
-        assert!(!root.contains("var __ipeSid = window.__IPE_SID"));
+        assert!(!root.contains("var __ipeSid"));
         // External script tag with content-addressed src.
         assert!(root.contains("<script src=\"/_ipe/client."));
         assert!(root.contains(".js\" integrity=\"sha256-"));
@@ -6828,9 +6863,297 @@ mod base_path_tests {
 
     #[test]
     fn render_page_sub_app_prefixes_client_src() {
-        let sub = render_page_full("sid1", &console_base(), "<b>x</b>", &page_epoch(), "tok1");
+        let sub = page("sid1", &console_base(), &page_epoch(), "tok1");
         // External script src must carry the base prefix.
         assert!(root_or_sub_has_prefixed_client_src(&sub, "/_ipe/console"));
+    }
+
+    /// Every `<script>` the live shell emits is external or an inert JSON block.
+    #[test]
+    fn page_has_no_inline_executable_script() {
+        for base in [crate::encoding::MountBase::root(), console_base()] {
+            let html = page("sid1", &base, &page_epoch(), "tok1");
+            assert_eq!(inline_executable_scripts(&html), Vec::<String>::new());
+            assert_eq!(html.matches("type=\"application/json\"").count(), 1);
+        }
+    }
+
+    /// The debugger shell renders through the same builder: no inline script.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn page_with_overlay_has_no_inline_executable_script() {
+        let html = super::render_page_full_with_overlay(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            "<b>x</b>",
+            &page_epoch(),
+            "tok1",
+            "<div data-ipe-debugger></div>",
+        )
+        .expect("the page builds");
+        assert!(html.contains("<div data-ipe-debugger></div>"));
+        assert_eq!(inline_executable_scripts(&html), Vec::<String>::new());
+        assert_eq!(boot_str(&html, "/sid").as_deref(), Some("sid1"));
+    }
+
+    /// Text that ends a script element, opens a comment, closes a CDATA section
+    /// or terminates a JavaScript line, if it reached the page unescaped.
+    const HOSTILE: &str =
+        "</script><script>alert(1)</script><!-- ]]> --> \u{2028}\u{2029} &amp; </SCRIPT >";
+
+    /// Hostile boot values neither break out of the block nor change its value.
+    #[test]
+    #[allow(clippy::expect_used)] // a serializable struct of strings and integers
+    fn boot_block_escapes_breakout() {
+        let tuning = super::ClientTuning::from([("RETRY_BASE_MS", 1)]);
+        let block = super::boot_block(&super::BootConfig {
+            sid: HOSTILE,
+            epoch: HOSTILE.to_string(),
+            base: HOSTILE,
+            csrf: HOSTILE,
+            cfg: super::ClientConfig {
+                banner_enabled: true,
+                swap_toast: false,
+                tuning: &tuning,
+                msg_reconnecting: HOSTILE,
+                msg_updated: HOSTILE,
+                msg_offline: HOSTILE,
+            },
+        })
+        .expect("the block serializes");
+        let body = block
+            .strip_prefix(boot_open_tag().as_str())
+            .and_then(|rest| rest.strip_suffix("</script>"));
+        assert!(body.is_some(), "the block is one element: {block}");
+        let Some(body) = body else { return };
+        for raw in ["<", ">", "&", "\u{2028}", "\u{2029}"] {
+            assert!(!body.contains(raw), "{raw:?} reached the block raw: {body}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("the block is JSON");
+        for path in [
+            "/sid",
+            "/epoch",
+            "/base",
+            "/csrf",
+            "/cfg/msgReconnecting",
+            "/cfg/msgUpdated",
+            "/cfg/msgOffline",
+        ] {
+            assert_eq!(
+                parsed.pointer(path).and_then(serde_json::Value::as_str),
+                Some(HOSTILE),
+                "{path} must round-trip"
+            );
+        }
+    }
+
+    /// A refused tuning value refuses the page; it never boots on defaults.
+    #[test]
+    fn refused_tuning_refuses_the_page() {
+        let [(_, ceiling), ..] = super::CLIENT_TUNING_CEILINGS;
+        let refused = ceiling.parse(Ok("not-a-count".to_string()));
+        assert!(refused.is_err(), "a non-decimal value is refused");
+        let Err(refusal) = refused else { return };
+        let page = super::render_live_page(
+            Err(&refusal),
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            "<b>x</b>",
+            &page_epoch(),
+            "tok1",
+            "",
+        );
+        assert_eq!(page, Err(super::BootRefusal::TuningRefused));
+    }
+
+    /// A hostile sid and CSRF token leave the whole page's script set unchanged.
+    #[test]
+    fn hostile_session_values_do_not_change_page_parse() {
+        let html = page(
+            HOSTILE,
+            &crate::encoding::MountBase::root(),
+            &page_epoch(),
+            HOSTILE,
+        );
+        assert_eq!(inline_executable_scripts(&html), Vec::<String>::new());
+        assert_eq!(
+            html.matches("</script>").count(),
+            html.matches("<script").count()
+        );
+        assert_eq!(boot_str(&html, "/sid").as_deref(), Some(HOSTILE));
+        assert_eq!(boot_str(&html, "/csrf").as_deref(), Some(HOSTILE));
+    }
+
+    /// The keys `client.js` requires at each level of the boot block are exactly
+    /// the keys the server writes there.
+    ///
+    /// The client refuses to boot on a missing key, so a key the server drops
+    /// or renames while the client still requires it would refuse every page;
+    /// a key the server adds that the client never reads is dead data. Each
+    /// level is compared as a set, in both directions.
+    #[test]
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn client_requires_exactly_the_boot_fields() {
+        let js = super::CLIENT_JS;
+        let required = |name: &str| -> std::collections::BTreeSet<String> {
+            let list = js_string_array(js, name);
+            assert!(list.is_some(), "client.js declares `{name}`");
+            list.unwrap_or_default().into_iter().collect()
+        };
+        let html = page(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            &page_epoch(),
+            "t",
+        );
+        let boot = boot_of(&html).expect("the page carries a boot block");
+        let keys_at = |pointer: &str| -> std::collections::BTreeSet<String> {
+            let object = boot.pointer(pointer).and_then(serde_json::Value::as_object);
+            assert!(object.is_some(), "{pointer:?} is an object");
+            object.into_iter().flat_map(|o| o.keys().cloned()).collect()
+        };
+        let with = |mut set: std::collections::BTreeSet<String>, nested: &str| {
+            set.insert(nested.to_string());
+            set
+        };
+        assert_eq!(keys_at(""), with(required("__IPE_BOOT_STRINGS"), "cfg"));
+        let cfg_required: std::collections::BTreeSet<String> = required("__IPE_CFG_BOOLEANS")
+            .into_iter()
+            .chain(required("__IPE_CFG_STRINGS"))
+            .collect();
+        assert_eq!(keys_at("/cfg"), with(cfg_required, "tuning"));
+        let tuning_keys: std::collections::BTreeSet<String> = super::CLIENT_TUNING_CEILINGS
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
+        assert_eq!(keys_at("/cfg/tuning"), tuning_keys);
+        assert_eq!(required("__IPE_TUNING_KEYS"), tuning_keys);
+    }
+
+    /// The client takes the element right before its own tag as the boot
+    /// block, so every live shell places the block immediately before it.
+    #[test]
+    fn boot_block_immediately_precedes_the_client_script() {
+        for base in [crate::encoding::MountBase::root(), console_base()] {
+            let html = page("sid1", &base, &page_epoch(), "tok1");
+            let client = format!("<script src=\"{}/_ipe/client.", base.prefix());
+            let adjacent = boot_block_end(&html)
+                .and_then(|end| html.get(end..))
+                .is_some_and(|rest| rest.starts_with(&client));
+            assert!(adjacent, "the client tag follows the boot block: {html}");
+        }
+        let js = super::CLIENT_JS;
+        assert!(
+            js.contains(&format!("node.id !== \"{}\"", super::BOOT_BLOCK_ID)),
+            "client.js checks the block's id"
+        );
+        assert!(
+            js.contains("own.previousElementSibling")
+                && !js.contains("getElementById(\"ipe-boot\")"),
+            "client.js binds the block to its own tag, never by an id lookup"
+        );
+        // `<img name="currentScript">` in page content shadows the document's
+        // own property with itself; only the prototype getter answers for the
+        // browser.
+        assert!(
+            js.contains("__ipeDocProp(document, \"currentScript\")")
+                && !js.contains("document.currentScript"),
+            "client.js reads its own tag through the `Document.prototype` getter"
+        );
+        assert!(
+            !js.contains("getElementById(\"__ipe-status\")"),
+            "the boot-failure banner never defers to an element page content can carry"
+        );
+    }
+
+    /// A fetched page reaches `#ipe-root` through one parse by the document's
+    /// own parser. A `DOMParser` document has no scripting, so it reads a
+    /// `<noscript>` body as markup; re-serializing that and parsing it again
+    /// with scripting reads the body as text, and an attribute value holding
+    /// `</noscript><img onerror=…>` then closes the element and runs.
+    #[test]
+    fn client_parses_a_fetched_page_once_with_scripting() {
+        let js = super::CLIENT_JS;
+        assert!(
+            !js.contains("DOMParser") && !js.contains("parseFromString"),
+            "client.js never parses server markup in a scripting-free document"
+        );
+        assert!(
+            js.contains("__ipeSwapPreservingFocus(root, parsed)")
+                && js.contains("var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);"),
+            "__ipePatch splices the nodes of its one parse, never a re-serialized copy"
+        );
+    }
+
+    /// The string items of `var {name} = [ … ];` in `js`.
+    fn js_string_array(js: &str, name: &str) -> Option<Vec<String>> {
+        let open = format!("var {name} = [");
+        let rest = js.get(js.find(&open)? + open.len()..)?;
+        let body = rest.get(..rest.find("];")?)?;
+        body.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(|item| {
+                item.strip_prefix('"')
+                    .and_then(|i| i.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// The byte offset just past the boot block's closing `</script>`.
+    fn boot_block_end(html: &str) -> Option<usize> {
+        let open = boot_open_tag();
+        let at = html.find(&open)? + open.len();
+        let close = html.get(at..)?.find("</script>")?;
+        Some(at + close + "</script>".len())
+    }
+
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn page(
+        sid: &str,
+        base: &crate::encoding::MountBase,
+        epoch: &RenderEpoch,
+        csrf: &str,
+    ) -> String {
+        render_page_full(sid, base, "<b>x</b>", epoch, csrf).expect("the page builds")
+    }
+
+    fn boot_open_tag() -> String {
+        format!(
+            "<script type=\"application/json\" id=\"{}\">",
+            super::BOOT_BLOCK_ID
+        )
+    }
+
+    /// The page's boot data block, parsed as JSON.
+    fn boot_of(html: &str) -> Option<serde_json::Value> {
+        super::boot_json_of(html)
+    }
+
+    /// The string at JSON `pointer` in the page's boot data block.
+    fn boot_str(html: &str, pointer: &str) -> Option<String> {
+        boot_of(html)?
+            .pointer(pointer)?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Every `<script>` open tag with neither a `src` nor a JSON `type`.
+    fn inline_executable_scripts(html: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut rest = html;
+        while let Some(at) = rest.find("<script") {
+            let tail = rest.get(at..).unwrap_or_default();
+            let end = tail.find('>').unwrap_or(tail.len());
+            let open = tail.get(..end).unwrap_or_default();
+            if !open.contains(" src=\"") && !open.contains(" type=\"application/json\"") {
+                found.push(open.to_string());
+            }
+            rest = tail.get(end..).unwrap_or_default();
+        }
+        found
     }
 
     /// The first epoch of a fresh render history, as a page GET serves it.
@@ -10355,11 +10678,12 @@ mod emitted_router_behavior_tests {
     /// A well-formed tab id, as a browser tab mints once per page load.
     const TAB: &str = "00112233445566778899aabbccddeeff";
 
-    /// The render epoch the page embeds as `window.__IPE_EPOCH`.
+    /// The render epoch the page carries in its boot data block.
     fn epoch_of(page: &str) -> Option<String> {
-        let needle = "window.__IPE_EPOCH=\"";
-        let rest = page.get(page.find(needle)? + needle.len()..)?;
-        Some(rest.get(..rest.find('"')?)?.to_string())
+        super::boot_json_of(page)?
+            .get("epoch")?
+            .as_str()
+            .map(str::to_string)
     }
 
     /// `token` one render ahead of its own counter: an epoch never committed.
@@ -10872,7 +11196,7 @@ mod emitted_router_behavior_tests {
     }
 
     /// A driver commit and a route entry each mint a new epoch, which the page
-    /// serves in `window.__IPE_EPOCH` and `X-Ipe-Epoch`; an SSE resync carries
+    /// serves in its boot data block and `X-Ipe-Epoch`; an SSE resync carries
     /// the current epoch without minting one.
     #[test]
     #[allow(clippy::expect_used)] // the page and the SSE request are fixtures

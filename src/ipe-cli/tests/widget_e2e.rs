@@ -275,17 +275,14 @@ fn wait_until_connectable(test_name: &str, addr: &str) -> Result<(), BoxError> {
 /// A well-formed tab id, as a browser tab mints once per page load.
 const TAB: &str = "00112233445566778899aabbccddeeff";
 
-/// The render epoch the page embeds as `window.__IPE_EPOCH`; an event carries it
-/// so the server resolves the handler id against the render that produced it.
+/// The render epoch the page's boot data block carries.
+///
+/// An event carries it so the server resolves the handler id against the
+/// render that produced it.
 fn extract_epoch(test_name: &str, html: &str) -> Result<String, BoxError> {
-    let needle = "window.__IPE_EPOCH=\"";
-    html.find(needle)
-        .and_then(|at| html.get(at + needle.len()..))
-        .and_then(|rest| rest.get(..rest.find('"')?))
-        .map(str::to_string)
-        .ok_or_else(|| -> BoxError {
-            format!("{test_name}: no window.__IPE_EPOCH in the page").into()
-        })
+    e2e_support::live_page::boot_string(html, "epoch").ok_or_else(|| -> BoxError {
+        format!("{test_name}: no boot-block epoch in the page").into()
+    })
 }
 
 /// Send a raw HTTP/1.1 request; return `(raw_headers, body)`.
