@@ -450,6 +450,9 @@ fn name_prose(msg: &NameError) -> String {
                 reached.spelling()
             )
         }
+        NameError::OperatorImportRequired { operator, module } => {
+            format!("`{operator}` comes from `{module}`, which you haven't imported yet.")
+        }
         NameError::NoSuchMember { module, member, .. } => {
             format!("`{module}` doesn't have anything called `{member}`.")
         }
@@ -1476,6 +1479,9 @@ fn name_label(msg: &NameError) -> Option<String> {
         } => Some(imported_as.as_deref().map_or_else(
             || import_required_label(reached.spelling(), candidates),
             |imported| imported_as_label(reached.spelling(), imported),
+        )),
+        NameError::OperatorImportRequired { operator, module } => Some(format!(
+            "`{operator}` comes from `{module}`; add `import {module}`"
         )),
         NameError::NoSuchMember { module, member, .. } => {
             Some(format!("`{module}` has no member `{member}`"))
@@ -2791,6 +2797,29 @@ mod tests {
         assert_eq!(char_repr('\u{200b}'), "U+200B");
         assert_eq!(char_repr('\u{1b}'), "U+001B");
         assert_eq!(char_repr('$'), "`$`");
+    }
+
+    /// An operator that reaches an unimported module is IPE-N0034, naming the
+    /// operator and the one import to add, never the qualifier wording.
+    #[test]
+    fn operator_import_required_names_the_operator_and_its_import() {
+        let msg = NameError::OperatorImportRequired {
+            operator: "|=".into(),
+            module: "Ipe.Parser".into(),
+        };
+        assert_eq!(
+            name_label(&msg).as_deref(),
+            Some("`|=` comes from `Ipe.Parser`; add `import Ipe.Parser`")
+        );
+        assert_eq!(
+            name_prose(&msg),
+            "`|=` comes from `Ipe.Parser`, which you haven't imported yet."
+        );
+        let diag = Diagnostic::Name {
+            span: Span::new(0, 2),
+            msg,
+        };
+        assert_eq!(diag.code(), crate::code::IPE_N0034);
     }
 
     fn con(name: &str) -> TyDoc {

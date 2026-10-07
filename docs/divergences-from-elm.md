@@ -26,8 +26,8 @@ keeps Elm's names and semantics for `succeed`, `map`, `andThen`, `oneOf`,
   already-parsed results, so no parser holds a function value. `keep` and
   `ignore` are two-parser sequencers for punctuation (run one, keep the other's
   value), not pipeline stages. The prefix combinators are the standing form;
-  infix `|=` / `|.` aliases can be added once Ipê gains user-declarable infix
-  operators.
+  their infix aliases `|.` (`keep`) and `|=` (`ignore`) are available after
+  `import Ipe.Parser` in any form.
 
 - **No `Parser.Advanced` tier.** Elm's context stack and custom-`problem` type
   parameter are omitted; `Problem` is a fixed union.

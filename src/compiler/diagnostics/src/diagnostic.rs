@@ -478,6 +478,16 @@ pub enum NameError {
         candidates: Box<[Box<str>]>,
         imported_as: Option<Box<ImportedAs>>,
     },
+    /// An operator desugars into a call to a module the using module never
+    /// imported: `p |= q` with no `import Ipe.Parser`.
+    ///
+    /// `operator` is the spelling the use site wrote and `module` the one
+    /// module it desugars into; any import form of `module` brings `operator`
+    /// into reach. [IPE-N0034]
+    OperatorImportRequired {
+        operator: Box<str>,
+        module: Box<str>,
+    },
     /// The qualifier resolves but the member is absent. [IPE-N0005]
     NoSuchMember {
         module: Box<str>,
@@ -2554,7 +2564,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::TypeNotFound { .. } => IPE_N0002,
         NameError::ConstructorNotFound { .. } => IPE_N0003,
         NameError::UnknownModule { .. } => IPE_N0004,
-        NameError::ImportRequired { .. } => IPE_N0034,
+        NameError::ImportRequired { .. } | NameError::OperatorImportRequired { .. } => IPE_N0034,
         NameError::NoSuchMember { .. } => IPE_N0005,
         NameError::DuplicateValue { .. } => IPE_N0010,
         NameError::DuplicateConstructor { .. } => IPE_N0011,
@@ -2810,6 +2820,7 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         | NameError::TypeExpansionTooDeep { .. }
         | NameError::ProgramImportsTeaShape { .. }
         | NameError::ImportRequired { .. }
+        | NameError::OperatorImportRequired { .. }
         | NameError::RemovedSurface { .. }
         | NameError::AssertedCallMalformed { .. }
         | NameError::BoundarySealIllegal { .. }

@@ -2196,6 +2196,17 @@ mod tests {
             .collect()
     }
 
+    /// The module `|=` / `|.` desugar into is an embedded module under exactly
+    /// the name the syntax crate declares.
+    #[test]
+    fn the_parser_operator_module_is_embedded_under_its_declared_name() {
+        let declared = ipe_syntax::fixity::PARSER_OPERATOR_MODULE.dotted();
+        assert!(
+            COMPILED_STD_MODULES.iter().any(|m| m.dotted == declared),
+            "no embedded module is named {declared}"
+        );
+    }
+
     /// Every embedded `Ipe` module must PARSE with the same front end that
     /// reads user code — the proof that the compiler can read its own embedded
     /// standard library (the foundation the import resolver builds on).
