@@ -1,5 +1,5 @@
-//! Names every filesystem, environment and clock path the crate's own
-//! `clippy.toml` denies, so rustc resolves each.
+//! Names every ambient-input path the crate's own `clippy.toml` denies, so
+//! rustc resolves each.
 //!
 //! Each naming carries its own `#[expect]` of the clippy lint the entry
 //! configures, so the file also proves each ban fires: an entry clippy stops
@@ -68,6 +68,8 @@ const _STD_PATH: () = {
     let _ = ::std::path::Path::read_link;
     #[expect(clippy::disallowed_methods)]
     let _ = ::std::path::Path::canonicalize;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::std::path::absolute::<String>;
 };
 
 const _STD_ENV: () = {
@@ -81,6 +83,13 @@ const _STD_ENV: () = {
     let _ = ::std::env::args;
     #[expect(clippy::disallowed_methods)]
     let _ = ::std::env::args_os;
+};
+
+const _STD_PROCESS_IO: () = {
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::std::process::id;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::std::io::stdin;
 };
 
 const _STD_TIME: () = {

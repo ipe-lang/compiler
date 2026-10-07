@@ -41,7 +41,8 @@ disallowed-methods = [
     { path = "std::thread::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn` and route the `io::Error`" },
     { path = "std::thread::Scope::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn_scoped` and route the `io::Error`" },
 
-    # The `ipe_db` queries are pure: no filesystem, environment or clock read.
+    # The `ipe_db` queries are pure: no filesystem, working-directory,
+    # environment, process, standard-input or clock read.
     # `src/clippy_paths_resolve.rs` names each path below so a ban that stops
     # resolving or firing breaks the clippy run.
     { path = "std::fs::read", reason = "INV-1: salsa queries are pure" },
@@ -72,11 +73,14 @@ disallowed-methods = [
     { path = "std::path::Path::read_dir", reason = "INV-1: salsa queries are pure" },
     { path = "std::path::Path::read_link", reason = "INV-1: salsa queries are pure" },
     { path = "std::path::Path::canonicalize", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::absolute", reason = "INV-1: salsa queries are pure" },
     { path = "std::env::current_dir", reason = "INV-1: salsa queries are pure" },
     { path = "std::env::set_current_dir", reason = "INV-1: salsa queries are pure" },
     { path = "std::env::current_exe", reason = "INV-1: salsa queries are pure" },
     { path = "std::env::args", reason = "INV-1: salsa queries are pure" },
     { path = "std::env::args_os", reason = "INV-1: salsa queries are pure" },
+    { path = "std::process::id", reason = "INV-1: salsa queries are pure" },
+    { path = "std::io::stdin", reason = "INV-1: salsa queries are pure" },
     { path = "std::time::SystemTime::now", reason = "INV-1: salsa queries are pure" },
     { path = "std::time::SystemTime::elapsed", reason = "INV-1: salsa queries are pure" },
     { path = "std::time::Instant::now", reason = "INV-1: salsa queries are pure" },

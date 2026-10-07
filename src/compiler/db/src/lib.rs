@@ -18,10 +18,16 @@
 //! firewall — importers early-cut on dep body-only edits via salsa
 //! backdating).
 //!
-//! INV-1 (no hidden inputs): no query here reads the filesystem, the
-//! environment or the clock. The crate's `clippy.toml` bans those APIs, and
-//! the `clippy_paths_resolve` module proves each ban fires. File reading stays
-//! in the driver, which is where inputs are set.
+//! INV-1 (no hidden inputs): no query in this crate names an ambient API (the
+//! filesystem, the working directory, the environment, the process id,
+//! standard input or the clock). The crate's `clippy.toml` bans those APIs,
+//! and the `clippy_paths_resolve` module proves each ban fires. File reading
+//! stays in the driver, which is where inputs are set. The inference queries
+//! (`typecheck`, `infer_module_scoped`) and every query built on them call
+//! into `ipe_types`, which reads the `IPE_SOLVER_BUDGET` and
+//! `IPE_EXHAUST_BUDGET` step budgets from the process environment on each
+//! inference, so a memoised result holds for the budgets of the process that
+//! computed it.
 //!
 //! The interning story is the plan's Option 3a: the database owns a
 //! [`SharedInterner`] (`Arc<Mutex<ipe_intern::Interner>>`) shared with the
