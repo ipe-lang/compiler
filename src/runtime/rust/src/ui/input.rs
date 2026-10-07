@@ -10,6 +10,7 @@ use super::helpers::{
     ui_spacing_,
 };
 use crate::core::IpeMaybe;
+use crate::html::RADIO_GROUP_MARKER;
 use std::sync::Arc;
 
 // ---- Label + LabelPosition --------------------------------------------------
@@ -228,31 +229,6 @@ fn attach_label<M: Clone>(
             attrs.push(Attribute::AttrStyle(marker.to_owned(), "true".to_owned()));
             attrs.extend(layout);
             Element::TaggedNode("label".into(), Description::NoDescription, attrs, kids)
-        }
-    }
-}
-
-/// Wrap `control` in its label according to `LabelPosition`. Hidden labels
-/// emit `aria-label` on the wrapper for screen-reader access.
-fn wrap_with_label<M: Clone>(
-    lbl: Label<M>,
-    wrapper_attrs: Vec<Attribute<M>>,
-    control: Element<M>,
-) -> Element<M> {
-    match lbl {
-        Label::LabelHidden(text) => {
-            let mut attrs = wrapper_attrs;
-            attrs.insert(0, Attribute::AttrAttribute("aria-label".to_owned(), text));
-            ui_el_(attrs, control)
-        }
-        Label::Label(pos, label_attrs, label_el) => {
-            let labeled_el = ui_el_(label_attrs, label_el);
-            match pos {
-                LabelPosition::AbovePos => ui_column_(wrapper_attrs, vec![labeled_el, control]),
-                LabelPosition::BelowPos => ui_column_(wrapper_attrs, vec![control, labeled_el]),
-                LabelPosition::LeftPos => ui_row_(wrapper_attrs, vec![labeled_el, control]),
-                LabelPosition::RightPos => ui_row_(wrapper_attrs, vec![control, labeled_el]),
-            }
         }
     }
 }
@@ -498,10 +474,44 @@ pub fn input_option_<M>(value: String, label: Element<M>) -> RadioOption<M> {
     RadioOption { value, label }
 }
 
-/// Shared core for `radio` / `radioRow`. Renders a group of `<input
-/// type="radio">` controls. Each option is laid out according to `row_layout`:
-/// `false` → vertical column (spacing 6), `true` → horizontal row (spacing 12).
-fn radio_core_<M: Clone + Send + Sync + 'static>(
+/// Build one radio option: a `<label>` holding its `<input type="radio">`.
+fn radio_option<M: Clone + Send + Sync + 'static>(
+    opt: RadioOption<M>,
+    on_change: &Arc<dyn Fn(String) -> M + Send + Sync>,
+    selected: &str,
+) -> Element<M> {
+    let is_checked = opt.value == selected;
+    let wire_value = opt.value.clone();
+    let on_click_msg = on_change(opt.value);
+    let radio_attrs = vec![
+        ui_html_attribute_("type".into(), "radio".into()),
+        ui_html_attribute_("value".into(), wire_value),
+        Attribute::AttrChecked(is_checked),
+        // The bool-valued change event delivers the wire value: the closure
+        // ignores the payload and always emits the message for THIS option.
+        ui_on_bool_(Arc::new(move |_b: bool| on_click_msg.clone())),
+    ];
+    Element::TaggedNode(
+        "label".into(),
+        Description::NoDescription,
+        vec![axis_marker(true), ui_spacing_(8)],
+        vec![ui_input_(radio_attrs), opt.label],
+    )
+}
+
+/// The internal direction marker of a row (`true`) or column (`false`).
+fn axis_marker<M>(row: bool) -> Attribute<M> {
+    let key = if row { "__row" } else { "__col" };
+    Attribute::AttrStyle(key.to_owned(), "true".to_owned())
+}
+
+/// Shared core for `radio` / `radioRow`: a named `<fieldset>` of radios.
+///
+/// The group's accessible name is a first-child `<legend>` for a visible label
+/// or an `aria-label` on the fieldset for a hidden one, and each radio sits
+/// inside its own `<label>`. `row_layout` lays the options out in a row
+/// (spacing 12) rather than a column (spacing 6).
+fn radio_group<M: Clone + Send + Sync + 'static>(
     row_layout: bool,
     attrs: Vec<Attribute<M>>,
     on_change: Arc<dyn Fn(String) -> M + Send + Sync>,
@@ -510,42 +520,91 @@ fn radio_core_<M: Clone + Send + Sync + 'static>(
     label: Label<M>,
 ) -> Element<M> {
     let (layout_attrs, control_attrs) = split_layout_attrs(attrs);
-    let mut option_els: Vec<Element<M>> = Vec::with_capacity(options.len());
-    for opt in options {
-        let is_checked = opt.value == selected;
-        let check_val = if is_checked { "true" } else { "false" };
-        let wire_value = opt.value.clone();
-        let on_click_msg = on_change(opt.value);
-        let radio_attrs = vec![
-            ui_html_attribute_("type".into(), "radio".into()),
-            ui_html_attribute_("value".into(), wire_value),
-            ui_html_attribute_("checked".into(), check_val.into()),
-            // Use on_bool_ (the bool-valued change event on radio) to deliver
-            // the wire value. The closure ignores the Bool payload and always
-            // emits the message for THIS option — matches Ipê's onClick-per-label
-            // convention from AGENTS.md §Radio convention.
-            ui_on_bool_(Arc::new(move |_b: bool| on_click_msg.clone())),
-        ];
-        let radio_input = ui_input_(radio_attrs);
-        let option_row = ui_row_(vec![ui_spacing_(8)], vec![radio_input, opt.label]);
-        option_els.push(option_row);
-    }
+    let option_els: Vec<Element<M>> = options
+        .into_iter()
+        .map(|opt| radio_option(opt, &on_change, &selected))
+        .collect();
     let spacing = if row_layout { 12 } else { 6 };
-    let mut group_attrs: Vec<Attribute<M>> = vec![ui_spacing_(spacing)];
+    let options_container = |kids: Vec<Element<M>>| {
+        if row_layout {
+            ui_row_(vec![ui_spacing_(spacing)], kids)
+        } else {
+            ui_column_(vec![ui_spacing_(spacing)], kids)
+        }
+    };
+
+    // The browser's fieldset chrome is reset first so the user's attributes,
+    // which follow, win.
+    let reset = |outer_row: bool| -> Vec<Attribute<M>> {
+        let mut out = vec![axis_marker(outer_row)];
+        for (k, v) in [
+            ("border", "0"),
+            ("margin", "0"),
+            ("padding", "0"),
+            ("min-width", "0"),
+        ] {
+            out.push(Attribute::AttrStyle(k.to_owned(), v.to_owned()));
+        }
+        out.push(Attribute::AttrAttribute(
+            RADIO_GROUP_MARKER.to_owned(),
+            String::new(),
+        ));
+        out
+    };
+
+    let (mut group_attrs, kids) = match label {
+        Label::LabelHidden(text) => {
+            let mut group_attrs = reset(row_layout);
+            group_attrs.push(ui_spacing_(spacing));
+            // An empty `aria-label` names nothing, so it adds no attribute.
+            if !text.is_empty() {
+                group_attrs.insert(0, Attribute::AttrAttribute("aria-label".to_owned(), text));
+            }
+            (group_attrs, option_els)
+        }
+        Label::Label(pos, label_attrs, label_el) => {
+            let (outer_row, legend_last) = match pos {
+                LabelPosition::AbovePos => (false, false),
+                LabelPosition::BelowPos => (false, true),
+                LabelPosition::LeftPos => (true, false),
+                LabelPosition::RightPos => (true, true),
+            };
+            // A floated legend becomes an ordinary flex item of the fieldset.
+            let mut legend_attrs = vec![
+                Attribute::AttrStyle("float".to_owned(), "left".to_owned()),
+                Attribute::AttrStyle("padding".to_owned(), "0".to_owned()),
+            ];
+            if legend_last {
+                legend_attrs.push(Attribute::AttrStyle("order".to_owned(), "1".to_owned()));
+            }
+            legend_attrs.extend(label_attrs);
+            let legend = Element::TaggedNode(
+                "legend".into(),
+                Description::NoDescription,
+                legend_attrs,
+                vec![label_el],
+            );
+            (
+                reset(outer_row),
+                vec![legend, options_container(option_els)],
+            )
+        }
+    };
     group_attrs.extend(control_attrs);
     group_attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
-    let group_el = if row_layout {
-        ui_row_(group_attrs, option_els)
-    } else {
-        ui_column_(group_attrs, option_els)
-    };
-    wrap_with_label(label, layout_attrs, group_el)
+    group_attrs.extend(layout_attrs);
+    Element::TaggedNode(
+        "fieldset".into(),
+        Description::NoDescription,
+        group_attrs,
+        kids,
+    )
 }
 
 /// `Input.radio`
 ///
-/// Renders a vertical column of radio buttons (spacing 6). Each option is a
-/// row of `<input type="radio">` + label element.
+/// Renders a vertical column of radio buttons (spacing 6) in a `<fieldset>`. Each
+/// option is a `<label>` holding its `<input type="radio">` and label element.
 pub fn input_radio_<M: Clone + Send + Sync + 'static>(
     attrs: Vec<Attribute<M>>,
     on_change: Arc<dyn Fn(String) -> M + Send + Sync>,
@@ -553,7 +612,7 @@ pub fn input_radio_<M: Clone + Send + Sync + 'static>(
     selected: String,
     label: Label<M>,
 ) -> Element<M> {
-    radio_core_(false, attrs, on_change, options, selected, label)
+    radio_group(false, attrs, on_change, options, selected, label)
 }
 
 /// `Input.radioRow`
@@ -567,7 +626,7 @@ pub fn input_radio_row_<M: Clone + Send + Sync + 'static>(
     selected: String,
     label: Label<M>,
 ) -> Element<M> {
-    radio_core_(true, attrs, on_change, options, selected, label)
+    radio_group(true, attrs, on_change, options, selected, label)
 }
 
 #[cfg(test)]
@@ -912,5 +971,153 @@ mod tests {
         };
         assert!(!has_attr(input_off, "checked"));
         assert_eq!(attr(input_off, "value"), None);
+    }
+
+    fn radios(attrs: Vec<Attribute<Msg>>, label: Label<Msg>) -> Html<Msg> {
+        let options = vec![
+            input_option_("a".to_owned(), Element::Text("Alpha".to_owned())),
+            input_option_("b".to_owned(), Element::Text("Beta".to_owned())),
+        ];
+        page(input_radio_(
+            attrs,
+            on_text(),
+            options,
+            "b".to_owned(),
+            label,
+        ))
+    }
+
+    fn is_radio(h: &Html<Msg>) -> bool {
+        tag_of(h) == "input" && attr(h, "type") == Some("radio")
+    }
+
+    /// A visible label becomes the first-child `<legend>` of a `<fieldset>`, and
+    /// each radio sits inside its own `<label>`. Red if the group returns to a
+    /// plain `div` with a free-sibling label.
+    #[test]
+    fn radio_group_is_a_named_fieldset() {
+        let html = radios(
+            Vec::new(),
+            input_label_above_(Vec::new(), Element::Text("Size".to_owned())),
+        );
+        let found = find(&html, &is_tag("fieldset"));
+        assert!(found.is_some(), "a fieldset is rendered");
+        let Some(group) = found else {
+            return;
+        };
+        let first = kids_of(group).first();
+        assert!(first.is_some_and(|k| tag_of(k) == "legend"), "legend first");
+        assert!(first.is_some_and(|k| text_of(k) == "Size"));
+        assert_eq!(count(group, &is_radio), 2);
+        let own_labels = count(group, &|h| {
+            tag_of(h) == "label" && count(h, &is_radio) == 1 && kids_of(h).len() == 2
+        });
+        assert_eq!(own_labels, 2, "each radio has its own label");
+    }
+
+    /// A hidden label names the fieldset itself and emits no legend. Red if the
+    /// hidden branch of `radio_group` stops writing `aria-label` on the fieldset.
+    #[test]
+    fn radio_hidden_label_on_fieldset() {
+        let html = radios(Vec::new(), input_label_hidden_("Size".to_owned()));
+        let found = find(&html, &is_tag("fieldset"));
+        assert!(found.is_some(), "a fieldset is rendered");
+        let Some(group) = found else {
+            return;
+        };
+        assert_eq!(attr(group, "aria-label"), Some("Size"));
+        assert_eq!(count(&html, &is_tag("legend")), 0);
+        assert_eq!(count(&html, &|h| has_attr(h, "aria-label")), 1);
+
+        let unnamed = radios(Vec::new(), input_label_hidden_(String::new()));
+        assert_eq!(count(&unnamed, &|h| has_attr(h, "aria-label")), 0);
+    }
+
+    /// Below and right labels keep the legend first in document order and push it
+    /// last visually. Red if the legend is appended after the options.
+    #[test]
+    fn radio_legend_stays_first_for_below_and_right() {
+        let text = || Element::Text("Size".to_owned());
+        let cases: [(&str, Label<Msg>, bool); 4] = [
+            ("above", input_label_above_(Vec::new(), text()), false),
+            ("left", input_label_left_(Vec::new(), text()), false),
+            ("below", input_label_below_(Vec::new(), text()), true),
+            ("right", input_label_right_(Vec::new(), text()), true),
+        ];
+        for (name, label, ordered_last) in cases {
+            let html = radios(Vec::new(), label);
+            let found = find(&html, &is_tag("legend"));
+            assert!(found.is_some(), "{name}: legend rendered");
+            let Some(legend) = found else {
+                return;
+            };
+            let style = attr(legend, "style").unwrap_or_default();
+            assert_eq!(style.contains("order:1"), ordered_last, "{name}: {style}");
+            let first = find(&html, &is_tag("fieldset"))
+                .and_then(|g| kids_of(g).first())
+                .map(tag_of);
+            assert_eq!(first, Some("legend"), "{name}: legend is the first child");
+        }
+    }
+
+    /// Only the selected option is checked, as a present boolean attribute, and
+    /// no radio carries the string "false". Red if checkedness returns to a
+    /// string-valued `checked` attribute.
+    #[test]
+    fn only_selected_radio_is_checked() {
+        let html = radios(Vec::new(), input_label_hidden_("Size".to_owned()));
+        assert_eq!(count(&html, &is_radio), 2);
+        let checked = find(&html, &|h| is_radio(h) && has_attr(h, "checked"));
+        assert!(checked.is_some(), "one radio is checked");
+        assert_eq!(checked.and_then(|r| attr(r, "value")), Some("b"));
+        assert_eq!(
+            count(&html, &|h| is_radio(h) && has_attr(h, "checked")),
+            1,
+            "exactly one checked"
+        );
+        assert_eq!(count(&html, &|h| attr(h, "checked") == Some("false")), 0);
+    }
+
+    /// The fieldset reset precedes the user's padding, so the user's padding is
+    /// the last declaration and wins. Red if the reset moves after the user
+    /// attributes.
+    #[test]
+    fn fieldset_reset_does_not_override_user_padding() {
+        let html = radios(
+            vec![crate::ui::helpers::ui_padding_(7)],
+            input_label_hidden_("Size".to_owned()),
+        );
+        let found = find(&html, &is_tag("fieldset"));
+        assert!(found.is_some(), "a fieldset is rendered");
+        let Some(group) = found else {
+            return;
+        };
+        let style = attr(group, "style").unwrap_or_default();
+        let paddings: Vec<&str> = style
+            .split(';')
+            .filter(|d| d.starts_with("padding:"))
+            .collect();
+        assert_eq!(paddings.first().copied(), Some("padding:0"), "{style}");
+        assert_eq!(
+            paddings.last().copied(),
+            Some("padding:7px 7px 7px 7px"),
+            "{style}"
+        );
+    }
+
+    /// Form and ARIA attributes on a radio group land on the fieldset. Red if
+    /// they are routed to a nested container or dropped.
+    #[test]
+    fn radio_form_attrs_land_on_fieldset() {
+        let html = radios(
+            vec![ui_html_attribute_(
+                "aria-describedby".to_owned(),
+                "err".to_owned(),
+            )],
+            input_label_hidden_("Size".to_owned()),
+        );
+        let found = find(&html, &|h| attr(h, "aria-describedby") == Some("err"));
+        assert!(found.is_some_and(|h| tag_of(h) == "fieldset"));
+        assert_eq!(count(&html, &|h| has_attr(h, "aria-describedby")), 1);
     }
 }

@@ -196,6 +196,13 @@ pub fn render_html<M>(node: &Html<M>) -> String {
     s
 }
 
+/// Marker attribute on a radio group's `<fieldset>`.
+///
+/// The ipe-id stamping pass reads it to give the group's unnamed radios one
+/// shared `name`, then removes it. Forging it only names the forger's own
+/// unnamed radios.
+pub(crate) const RADIO_GROUP_MARKER: &str = "data-ipe-radio-group";
+
 /// Maximum Html nesting depth the renderer and the ipe-id stamper descend.
 /// The Html tree is produced by the Ipê `view` from Model, and Model commonly
 /// holds attacker-influenced data (nested comments / replies / a worst-case

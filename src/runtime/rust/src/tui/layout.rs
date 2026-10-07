@@ -2832,6 +2832,29 @@ mod tests {
         assert!(frame.contains("Agree") && frame.contains('☑'), "{frame}");
     }
 
+    /// A radio group draws exactly its selected option as filled, because the
+    /// typed `AttrChecked` overrides the non-empty-value heuristic. Red without
+    /// `AttrChecked` on each radio.
+    #[test]
+    fn ui_radio_draws_only_the_selected_option() {
+        use crate::ui::input::{input_label_hidden_, input_option_, input_radio_};
+
+        let options = ["a", "b", "c"]
+            .into_iter()
+            .map(|v| input_option_(v.to_owned(), Element::Text(v.to_uppercase())))
+            .collect();
+        let el: Element<()> = input_radio_(
+            Vec::new(),
+            std::sync::Arc::new(|_s: String| ()),
+            options,
+            "b".to_owned(),
+            input_label_hidden_("Pick".to_owned()),
+        );
+        let frame = element_to_cells(&el, 80, 24);
+        assert_eq!(frame.matches('●').count(), 1, "{frame}");
+        assert_eq!(frame.matches('○').count(), 2, "{frame}");
+    }
+
     #[test]
     fn focusables_collected_in_order() {
         let t: Element<()> = node(
