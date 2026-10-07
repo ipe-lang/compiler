@@ -1041,6 +1041,30 @@ decideOnBrokenChainRefused db =
         Task.succeed (refused && before == 2 && after == 2)
 
 
+-- An entry added past the head, the head left where it was, keeps the walk
+-- to the head intact but takes the seq the next decision needs: the
+-- decision is refused as a break at that entry, never as a moved head the
+-- reviewer is told to retry against, and nothing is inserted. Red if a
+-- decision ignores the entries past the head.
+decideWithEntryPastHeadRefused : Db -> Task.Task Error Bool
+decideWithEntryPastHeadRefused db =
+    do
+        appendSigned db (rawRow "past-1" "h" "approve" Nothing)
+        Db.exec db
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (2, ?, 'hX', 'approve', NULL, 0, 'genesis', ?)"
+            [ Uid.toSql (uid "past-2"), SqlString (String.repeat 64 "e") ]
+        head <- LibDb.currentHead db
+        walked <- LibDb.checkChainWithin db PageSize.pairs LibDb.logPageCeiling (Error.conflict "ceiling") head
+        before <- logRowCount db
+        attested <- attestedFor "ipe-review-past-head-decide-index" (uid "u-a")
+        key <- testMacKey
+        refused <- LibDb.insertDecision key db attested Approved
+            |> Task.map (\_ -> False)
+            |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "") && String.contains "chain breaks at entry 2" (Error.message e)))
+        after <- logRowCount db
+        Task.succeed (walked == Intact && refused && before == 2 && after == 2)
+
+
 -- Removing the log's tail and rewinding the head to the new last entry is
 -- not detected — the chain is intact again — but fails closed: the earlier
 -- entries still count and the removed decision is undecided, never
@@ -1093,6 +1117,7 @@ reviewLogChecks =
         , check "a removed entry breaks the chain and uncounts the rows before it" (onFreshReview "ipe-review-chainBreakUncounts" chainBreakUncounts)
         , check "reordered entries break the chain" (onFreshReview "ipe-review-chainReorderBreaks" chainReorderBreaks)
         , check "a decision on a broken chain is refused and inserts nothing" (onFreshReview "ipe-review-decideOnBrokenChainRefused" decideOnBrokenChainRefused)
+        , check "a decision with an entry past the head is refused as a break and inserts nothing" (onFreshReview "ipe-review-decideWithEntryPastHeadRefused" decideWithEntryPastHeadRefused)
         , check "a truncated tail fails closed" (onFreshReview "ipe-review-truncatedTailFailsClosed" truncatedTailFailsClosed)
         , check "a legacy row reads legacy and can be decided again" (onFreshReview "ipe-review-legacyRowRedecidable" legacyRowRedecidable)
         , check "a review file without its log head fails the probe" probeRefusesReviewWithoutHead

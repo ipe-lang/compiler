@@ -481,8 +481,25 @@ holdsEveryEntry db head =
     Db.queryDecode db
         "SELECT count(*) AS entries FROM review_log WHERE seq <= ?"
         [ SqlInt (Index.chainSeq head) ]
-        (Db.Decode.succeed (\entries -> entries) |> Db.Decode.required "entries" (Db.Decode.int "entries"))
+        entriesDecoder
         |> Task.map (\counts -> counts == [ Index.chainSeq head ])
+
+
+-- True when the log holds an entry past the head's seq. A decision moves the
+-- head in the transaction that inserts its entry, so such an entry was added
+-- outside this tool; the next decision's insert would collide with it.
+entriesPast : Db -> Index.ChainHead -> Task.Task Error Bool
+entriesPast db head =
+    Db.queryDecode db
+        "SELECT count(*) AS entries FROM review_log WHERE seq > ?"
+        [ SqlInt (Index.chainSeq head) ]
+        entriesDecoder
+        |> Task.map (\counts -> counts /= [ 0 ])
+
+
+entriesDecoder : Db.Decode.Decoder Int
+entriesDecoder =
+    Db.Decode.succeed (\entries -> entries) |> Db.Decode.required "entries" (Db.Decode.int "entries")
 
 
 -- The head moved from `prev` to `next` only if it still reads `prev`: a head
@@ -803,7 +820,8 @@ candidateCeiling =
 -- read-only server holds no `MacKey` and cannot call it. A refusal's reason
 -- is already a parsed `Reason`, so every decision that reaches the log is
 -- well formed. One review transaction reads the head, walks the chain to it
--- and refuses a broken one, inserting nothing; returns `AlreadyDecided` when
+-- and refuses a broken one or one with an entry past the head, inserting
+-- nothing; returns `AlreadyDecided` when
 -- a row for the pair already verifies, the first verified decision winning;
 -- otherwise appends the next entry, signed over every column and linked to
 -- the head, and moves the head to it through a compare-and-set that fails,
@@ -819,8 +837,9 @@ recordDecision : MacKey -> Db -> Attested -> Decision -> Int -> Task.Task Error 
 recordDecision key tx attested decision at =
     do
         head <- currentHead tx
-        verdict <- checkChainWithin tx PageSize.pairs logPageCeiling decideCeilingRefusal head
-        case verdict of
+        walked <- checkChainWithin tx PageSize.pairs logPageCeiling decideCeilingRefusal head
+        past <- entriesPast tx head
+        case decideVerdict head walked past of
             BrokenAt n ->
                 Task.fail (chainBrokenRefusal n)
 
@@ -832,6 +851,23 @@ recordDecision key tx attested decision at =
 
                     else
                         appendDecision key tx head attested decision at
+
+
+-- The chain a decision links onto: intact only when the walk to the head
+-- found no break and no entry sits past the head, which would take the seq
+-- the next entry needs.
+decideVerdict : Index.ChainHead -> ChainVerdict -> Bool -> ChainVerdict
+decideVerdict head walked past =
+    case walked of
+        BrokenAt n ->
+            BrokenAt n
+
+        Intact ->
+            if past then
+                BrokenAt (Index.chainSeq head + 1)
+
+            else
+                Intact
 
 
 -- True when a row for the pair, up to the head, verifies under `key`.
