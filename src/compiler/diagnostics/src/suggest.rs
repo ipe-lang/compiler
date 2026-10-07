@@ -374,7 +374,7 @@ fn score(
         } else {
             None
         };
-        let by_whole = if count == wanted {
+        let by_whole = if count == wanted && threshold == Threshold::Relative {
             None
         } else {
             whole(query_whole, threshold, work)
@@ -632,6 +632,19 @@ mod tests {
         };
         let ranked = rank(&query(&far, Shape::Flat), spellings(&[&near]), policy);
         assert_eq!(ranked.hits.len(), 1, "every spelling is within the ceiling");
+    }
+
+    #[test]
+    fn a_nearest_listing_reaches_an_equal_count_spelling() {
+        let far = format!("{}.{}", "a".repeat(40), "b".repeat(40));
+        let policy = Policy {
+            cap: Cap::MAX,
+            threshold: Threshold::Nearest {
+                max: Distance::CEILING,
+            },
+        };
+        let ranked = rank(&query(&far, Shape::Dotted), spellings(&["c.d"]), policy);
+        assert_eq!(ranked.hits.len(), 1);
     }
 
     // -- Ranking --------------------------------------------------------------

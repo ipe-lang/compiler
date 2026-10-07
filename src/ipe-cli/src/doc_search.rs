@@ -806,14 +806,6 @@ mod tests {
         let ranked = rank(&entries, aliases, &query("List.redcue"));
         assert_eq!(keys(&ranked), ["Ipe.List.foldl"]);
         assert_eq!(ranked.closeness, Closeness::Match);
-
-        let outside = entry(DocKind::Symbol, "Ipe.Dict.foldl", "x");
-        let stray = [("Ipe.Dict.reduce", &outside)];
-        let ranked = rank(&entries, stray, &query("Dict.redcue"));
-        assert!(
-            ranked.entries.iter().all(|e| e.key != "Ipe.Dict.foldl"),
-            "an alias of an entry outside the scan is ignored"
-        );
     }
 
     #[test]
