@@ -12,8 +12,10 @@
 //!
 //! A path counts however it is spelled: through a nested `use` group, an `as`
 //! alias, a crate-root re-export, a module alias, a bare call to an imported
-//! function, a `self::` / `super::` path to a private import, a raw
-//! identifier (`r#Query` is `Query`), or a `pub use` / `pub(…) use` re-export
+//! function, a `self::` / `super::` path to a private import, a `::` path
+//! from the crate root (never a same-named module of the file, and seen after
+//! a keyword: `&mut ::axum::…`, `return ::url::…`), a raw identifier
+//! (`r#Query` is `Query`), or a `pub use` / `pub(…) use` re-export
 //! (a site in its own file, and refused, since the calls it enables elsewhere
 //! name no denied path). A type alias of a denied type is a site at its
 //! definition, since clippy's `disallowed_types` matches the definition but not
@@ -26,8 +28,13 @@
 //! (a heading metavariable expanding to any proper prefix, another to one
 //! segment, a repetition to any number); a templated glob or module import is
 //! refused when an expansion may hold a denied path, and a `use` tree the parser
-//! cannot follow is refused whenever it names a denied leaf. `$crate` is the
-//! runtime crate itself, never opaque.
+//! cannot follow to its item's end is refused whenever it names a denied leaf.
+//! Segments spliced across a `::` count as one of unknown length: a `::`
+//! heading a path after no segment (`$a $(:: $rest)*`, a lone `::` token tree)
+//! stands for at least one segment before it, and a `::` ending a path for a
+//! repetition after it. In a macro defining a macro, `$d x` and `$d ( … )` are
+//! the inner macro's `$x` and `$( … )`. `$crate` is the runtime crate itself,
+//! never opaque.
 //!
 //! `src/clippy_paths_resolve.rs` names every denied path on purpose (so a stale
 //! `clippy.toml` path is an unresolved-path build error) and is checked against
@@ -149,6 +156,9 @@ const OTHER_RULE_DENIED_PATHS: &[&str] = &[
 /// The most alias hops a path is followed through before it counts as
 /// resolved.
 const MAX_ALIAS_HOPS: usize = 8;
+
+/// The first segment of a path written from the crate root (`::url::…`).
+const CRATE_ROOT: &str = "::";
 
 /// The runtime crate's directory.
 fn runtime() -> PathBuf {
@@ -348,8 +358,64 @@ enum Token {
     Punct(char),
 }
 
+/// Whether `word` is a strict or reserved Rust keyword, which no path segment
+/// can be (`self`, `Self`, `super` and `crate` can).
+fn is_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "abstract"
+            | "as"
+            | "async"
+            | "await"
+            | "become"
+            | "box"
+            | "break"
+            | "const"
+            | "continue"
+            | "do"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "final"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "macro"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "override"
+            | "priv"
+            | "pub"
+            | "ref"
+            | "return"
+            | "static"
+            | "struct"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "unsafe"
+            | "unsized"
+            | "use"
+            | "virtual"
+            | "where"
+            | "while"
+            | "yield"
+    )
+}
+
 /// The tokens of `code`, whitespace dropped; a raw identifier `r#name` is the
-/// identifier `name`.
+/// identifier `name`, unless `name` is a keyword (`r#in` names no keyword).
 fn tokens(code: &str) -> Vec<Token> {
     let chars: Vec<char> = code.chars().collect();
     let mut out = Vec::new();
@@ -365,6 +431,11 @@ fn tokens(code: &str) -> Vec<Token> {
                 i += 1;
             }
             let word: String = chars.get(start..i).unwrap_or_default().iter().collect();
+            let word = if raw && is_keyword(&word) {
+                format!("r#{word}")
+            } else {
+                word
+            };
             out.push(Token::Ident(word));
         } else if c == ':' && chars.get(i + 1) == Some(&':') {
             out.push(Token::PathSep);
@@ -393,6 +464,9 @@ enum Segment {
     Opaque(String),
     /// A `$( … )` macro repetition, standing for any number of segments.
     Repeated,
+    /// A `::` heading a path: the crate root, or the end of segments spliced
+    /// in before it (`$a $(:: $rest)*`, a lone `::` token tree).
+    Spliced,
 }
 
 impl Segment {
@@ -400,13 +474,13 @@ impl Segment {
     fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(name) => Some(name),
-            Self::Opaque(_) | Self::Repeated => None,
+            Self::Opaque(_) | Self::Repeated | Self::Spliced => None,
         }
     }
 
     /// Whether the segment is a metavariable.
     const fn is_opaque(&self) -> bool {
-        matches!(self, Self::Opaque(_) | Self::Repeated)
+        matches!(self, Self::Opaque(_) | Self::Repeated | Self::Spliced)
     }
 }
 
@@ -415,27 +489,65 @@ fn repetition_at(stream: &[Token], i: usize) -> bool {
     stream.get(i) == Some(&Token::Punct('$')) && stream.get(i + 1) == Some(&Token::Punct('('))
 }
 
-/// Whether the `$( … )` repetition opening at `i` is joined by `::`
-/// (`$( … )::*`, `$( … )::+`), so it spells path segments.
-fn path_repetition_at(stream: &[Token], i: usize) -> bool {
-    if !repetition_at(stream, i) {
-        return false;
+/// The index of the `(` of a `$( … )` repetition opening at `i`, its `$`
+/// written as `$d (` too (a macro defining a macro binds `$d` to `$`).
+fn repetition_open(stream: &[Token], i: usize) -> Option<usize> {
+    if stream.get(i) != Some(&Token::Punct('$')) {
+        return None;
     }
+    match (stream.get(i + 1), stream.get(i + 2)) {
+        (Some(Token::Punct('(')), _) => Some(i + 1),
+        (Some(Token::Ident(_)), Some(Token::Punct('('))) => Some(i + 2),
+        _ => None,
+    }
+}
+
+/// The index past the opener of the `$( … )` repetition at `i` when it is
+/// joined by `::` (`$( … )::*`, `$( … )::+`), so it spells path segments.
+fn path_repetition_at(stream: &[Token], i: usize) -> Option<usize> {
+    let open = repetition_open(stream, i)?;
     let mut depth = 0_usize;
-    for (at, tok) in stream.iter().enumerate().skip(i + 1) {
+    for (at, tok) in stream.iter().enumerate().skip(open) {
         match tok {
             Token::Punct('(' | '[' | '{') => depth += 1,
             Token::Punct(')' | ']' | '}') => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return stream.get(at + 1) == Some(&Token::PathSep)
+                    let joined = stream.get(at + 1) == Some(&Token::PathSep)
                         && matches!(stream.get(at + 2), Some(Token::Punct('*' | '+')));
+                    return joined.then_some(open + 1);
                 }
             }
             Token::Ident(_) | Token::PathSep | Token::Punct(_) => {}
         }
     }
-    false
+    None
+}
+
+/// Whether the `::` at `at` heads a path rather than joining one: it follows
+/// a keyword, an operator, a delimiter or nothing, but neither a segment, nor
+/// the `>` closing a qualified `<T>` (an `->` or `=>` arrow is no such `>`),
+/// nor the `)` of a repetition joined by it.
+fn leads_path(stream: &[Token], at: usize) -> bool {
+    let before = |back: usize| at.checked_sub(back).and_then(|p| stream.get(p));
+    let joins = match before(1) {
+        Some(Token::Ident(word)) => !is_keyword(word),
+        Some(Token::Punct('>')) => !matches!(before(2), Some(Token::Punct('-' | '='))),
+        Some(Token::Punct(')')) => matches!(stream.get(at + 1), Some(Token::Punct('*' | '+'))),
+        Some(Token::PathSep | Token::Punct(_)) | None => false,
+    };
+    !joins && !continues_without_segment(stream, at)
+}
+
+/// Whether the `::` at `at` is followed by a generic list, a `use` group or
+/// a glob rather than a segment.
+fn continues_without_segment(stream: &[Token], at: usize) -> bool {
+    matches!(stream.get(at + 1), Some(Token::Punct('<' | '{' | '*')))
+}
+
+/// Whether `at` starts a `use` item (a `use<…>` capture bound is none).
+fn is_use_item(stream: &[Token], at: usize) -> bool {
+    is_word(stream.get(at), "use") && stream.get(at + 1) != Some(&Token::Punct('<'))
 }
 
 /// The path segment starting at `i` and the index past it: an identifier, or
@@ -460,6 +572,7 @@ fn render(path: &[Segment]) -> String {
             Segment::Literal(name) => name.clone(),
             Segment::Opaque(name) => format!("${name}"),
             Segment::Repeated => "$(..)".to_owned(),
+            Segment::Spliced => String::new(),
         })
         .collect::<Vec<_>>()
         .join("::")
@@ -499,6 +612,10 @@ enum Import {
 fn use_tree(stream: &[Token], mut i: usize, prefix: &[Segment], out: &mut Vec<Import>) -> usize {
     let mut path = prefix.to_vec();
     if stream.get(i) == Some(&Token::PathSep) {
+        // `::name` is the crate `name`, never a module of this file.
+        if path.is_empty() {
+            path.push(Segment::Literal(CRATE_ROOT.to_owned()));
+        }
         i += 1;
     }
     loop {
@@ -510,7 +627,7 @@ fn use_tree(stream: &[Token], mut i: usize, prefix: &[Segment], out: &mut Vec<Im
                 );
                 return i + 1;
             }
-            _ if repetition_at(stream, i) => {
+            _ if repetition_open(stream, i).is_some() => {
                 path.push(Segment::Repeated);
                 out.push(Import::Opaque { path, local: None });
                 out.push(Import::Abandoned(Vec::new()));
@@ -544,9 +661,9 @@ fn use_group(stream: &[Token], mut i: usize, prefix: &[Segment], out: &mut Vec<I
             Some(Token::Punct(',')) => i += 1,
             Some(_) => {
                 let next = use_tree(stream, i, prefix, out);
-                if next == i {
+                if next == i || !matches!(stream.get(next), Some(Token::Punct(',' | '}'))) {
                     out.push(Import::Abandoned(Vec::new()));
-                    return i;
+                    return next;
                 }
                 i = next;
             }
@@ -597,14 +714,15 @@ fn use_item_end(stream: &[Token], at: usize) -> usize {
     stream.len()
 }
 
-/// What the `use` item at `at` binds; a tree the parser cannot follow is one
-/// `Abandoned` entry holding every identifier of the item.
+/// What the `use` item at `at` binds; a tree the parser cannot follow to the
+/// item's end is one `Abandoned` entry holding every identifier of the item.
 fn use_item(stream: &[Token], at: usize) -> Vec<Import> {
     let mut leaves = Vec::new();
-    use_tree(stream, at + 1, &[], &mut leaves);
-    let abandoned = leaves
-        .iter()
-        .any(|leaf| matches!(leaf, Import::Abandoned(_)));
+    let end = use_tree(stream, at + 1, &[], &mut leaves);
+    let abandoned = !matches!(stream.get(end), Some(Token::Punct(';' | '}')) | None)
+        || leaves
+            .iter()
+            .any(|leaf| matches!(leaf, Import::Abandoned(_)));
     leaves.retain(|leaf| !matches!(leaf, Import::Abandoned(_)));
     if abandoned {
         let idents = stream
@@ -626,7 +744,7 @@ fn use_item(stream: &[Token], at: usize) -> Vec<Import> {
 fn imports(stream: &[Token]) -> Vec<Import> {
     let mut out = Vec::new();
     for (at, tok) in stream.iter().enumerate() {
-        if is_word(Some(tok), "use") {
+        if is_use_item(stream, at) {
             out.extend(use_item(stream, at));
         } else if is_word(Some(tok), "extern")
             && is_word(stream.get(at + 1), "crate")
@@ -643,33 +761,57 @@ fn imports(stream: &[Token]) -> Vec<Import> {
     out
 }
 
-/// Every path `stream` names outside its `use` items (a `use<…>` capture bound
-/// is not one), metavariables kept: a run of segments joined by `::`, a method
-/// or field after `.` excluded; a `$( … )` repetition joined by `::` is a path
-/// of unknown segments.
+/// The first segment of a path starting at `i` and the index past it; a
+/// keyword is none, and a name right after a `$name` is a metavariable (in a
+/// macro defining a macro, `$d x` with `$d` bound to `$` is `$x`).
+fn path_head(stream: &[Token], i: usize) -> Option<(Segment, usize)> {
+    let (first, next) = segment_at(stream, i)?;
+    let before = |back: usize| i.checked_sub(back).and_then(|p| stream.get(p));
+    let escaped = matches!(
+        (before(2), before(1)),
+        (Some(Token::Punct('$')), Some(Token::Ident(_)))
+    );
+    match first {
+        Segment::Literal(name) if is_keyword(&name) => None,
+        Segment::Literal(name) if escaped && name != "crate" => Some((Segment::Opaque(name), next)),
+        segment @ (Segment::Literal(_)
+        | Segment::Opaque(_)
+        | Segment::Repeated
+        | Segment::Spliced) => Some((segment, next)),
+    }
+}
+
+/// Every path `stream` names outside its `use` items, metavariables kept: a
+/// run of segments joined by `::`, a method or field after `.` excluded. A
+/// `$( … )` repetition joined by `::` is a path of unknown segments; a `::`
+/// heading a path is `Segment::Spliced`, and a `::` ending one joins the
+/// segments spliced after it, a repetition.
 fn template_paths(stream: &[Token]) -> Vec<Vec<Segment>> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some(tok) = stream.get(i) {
-        if is_word(Some(tok), "use") && stream.get(i + 1) != Some(&Token::Punct('<')) {
+        if is_use_item(stream, i) {
             i = use_item_end(stream, i);
             continue;
         }
-        if path_repetition_at(stream, i) {
+        if let Some(body) = path_repetition_at(stream, i) {
             out.push(vec![Segment::Repeated]);
-            i += 2;
+            i = body;
             continue;
         }
-        let Some((first, next)) = segment_at(stream, i) else {
-            i += 1;
-            continue;
-        };
         let after_dot = i
             .checked_sub(1)
             .and_then(|p| stream.get(p))
             .is_some_and(|prev| *prev == Token::Punct('.'));
-        let mut path = vec![first];
-        i = next;
+        let mut path = if *tok == Token::PathSep && leads_path(stream, i) {
+            vec![Segment::Spliced]
+        } else if let Some((first, next)) = path_head(stream, i) {
+            i = next;
+            vec![first]
+        } else {
+            i += 1;
+            continue;
+        };
         while stream.get(i) == Some(&Token::PathSep) {
             if repetition_at(stream, i + 1) {
                 path.push(Segment::Repeated);
@@ -677,6 +819,10 @@ fn template_paths(stream: &[Token]) -> Vec<Vec<Segment>> {
                 break;
             }
             let Some((segment, next)) = segment_at(stream, i + 1) else {
+                if !continues_without_segment(stream, i) {
+                    path.push(Segment::Repeated);
+                    i += 1;
+                }
                 break;
             };
             path.push(segment);
@@ -690,17 +836,23 @@ fn template_paths(stream: &[Token]) -> Vec<Vec<Segment>> {
 }
 
 /// Every path `stream` names outside its `use` items, as its literal segments
-/// before any metavariable; a path that opens with one is omitted.
+/// before any metavariable, a heading `::` as `CRATE_ROOT`; a path that opens
+/// with a metavariable is omitted.
 fn code_paths(stream: &[Token]) -> Vec<Vec<String>> {
     template_paths(stream)
         .iter()
         .filter_map(|path| {
-            let literal: Vec<String> = path
+            let (root, rest) = match path.split_first() {
+                Some((Segment::Spliced, rest)) => (Some(CRATE_ROOT), rest),
+                _ => (None, path.as_slice()),
+            };
+            let literal: Vec<String> = rest
                 .iter()
                 .map_while(Segment::literal)
                 .map(str::to_owned)
                 .collect();
-            (!literal.is_empty()).then_some(literal)
+            (!literal.is_empty())
+                .then(|| root.into_iter().map(str::to_owned).chain(literal).collect())
         })
         .collect()
 }
@@ -753,7 +905,7 @@ impl Scope {
 
     /// `path` with its first segment replaced by what an import binds it to,
     /// hop by hop; a first segment naming a module the file declares resolves
-    /// under `self`.
+    /// under `self`, and a path from `CRATE_ROOT` is its crate's, as written.
     fn resolve(&self, path: &[String]) -> Vec<String> {
         // `self::name` and `super::name` reach a private import of this file
         // from the module itself and from the modules nested in it.
@@ -769,6 +921,9 @@ impl Scope {
         };
         for _ in 0..MAX_ALIAS_HOPS {
             let Some(first) = resolved.first() else { break };
+            if first == CRATE_ROOT {
+                return resolved.get(1..).unwrap_or_default().to_vec();
+            }
             if self.modules.contains(first) {
                 resolved.insert(0, "self".to_owned());
                 break;
@@ -936,8 +1091,8 @@ fn denied_re_exports(code: &str) -> Vec<String> {
     let stream = tokens(code);
     let scope = Scope::of(&stream);
     let mut out = Vec::new();
-    for (at, tok) in stream.iter().enumerate() {
-        if !is_word(Some(tok), "use") || !is_re_export(&stream, at) {
+    for at in 0..stream.len() {
+        if !is_use_item(&stream, at) || !is_re_export(&stream, at) {
             continue;
         }
         for leaf in use_item(&stream, at) {
@@ -1034,6 +1189,9 @@ fn expansion_reach(path: &[Segment], denied: &str) -> (bool, BTreeSet<usize>) {
             Segment::Repeated => depths
                 .first()
                 .map_or_else(BTreeSet::new, |&low| (low..=want.len()).collect()),
+            // Only ever a head: spliced segments before it, at least one; the
+            // crate root is the literal rest, checked on its own.
+            Segment::Spliced => (1..want.len()).collect(),
         };
     }
     names |= depths.contains(&want.len());
@@ -1079,6 +1237,11 @@ fn may_hold(path: &[Segment], methods: bool) -> bool {
 /// a denied leaf (after its owner, when it needs one), or when some expansion
 /// of the metavariables names a denied path.
 fn touches_denied(path: &[Segment]) -> bool {
+    // A literal rest after a heading `::` is a crate-root path `named_sites`
+    // resolves; its leaves are no unknown segment's.
+    if let Some((Segment::Spliced, rest)) = path.split_first() {
+        return may_name(path) || touches_denied(rest);
+    }
     let Some(first) = path.iter().position(Segment::is_opaque) else {
         return false;
     };
@@ -1342,7 +1505,12 @@ fn every_denied_path_is_named_by_the_path_seal() {
     let seal = tokens(&code_of(&read_runtime(PATH_SEAL)));
     let named: BTreeSet<String> = code_paths(&seal)
         .iter()
-        .map(|path| path.join("::"))
+        .map(|path| {
+            let from_root = path.first().is_some_and(|first| first == CRATE_ROOT);
+            path.get(usize::from(from_root)..)
+                .unwrap_or_default()
+                .join("::")
+        })
         .collect();
     let unnamed: Vec<_> = DENIED_PATHS
         .iter()
@@ -1752,6 +1920,11 @@ fn the_runtime_macro_templates_are_clean() {
         "macro_rules! m { ($t:ident) => { $t::new() } }",
         "macro_rules! m { ($t:ty) => { <$t>::from_str(s) } }",
         "macro_rules! m { ($($x:expr),*) => { f($($x),*) } }",
+        "macro_rules! m { ($ty:ty) => { impl ::std::fmt::Debug for $ty { fn fmt(&self, \
+         f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result { f.write_str(\"x\") } } } }",
+        "fn f(s: String) -> R { match ::url::Url::parse(&s) { _ => g() } }",
+        "fn f() -> Vec<u8> { Vec::<u8>::new() }",
+        "macro_rules! m { ($($t:tt)*) => { $($t)* } }",
     ] {
         assert!(
             templated_sites(&code_of(clean)).is_empty(),
@@ -1893,4 +2066,111 @@ fn a_planted_path_after_a_use_that_is_no_item_is_seen() {
     assert!(names_lenient_extractor(
         "macro_rules! m { () => { use x::y } }\nasync fn h(q: axum::extract::Query<M>) -> R { q.0 }"
     ));
+}
+
+#[test]
+fn a_planted_macro_path_spliced_across_a_separator_is_refused() {
+    for (planted, sites) in [
+        // A repetition whose body ends with `::` joins the segments after it.
+        (
+            "macro_rules! m { ($($m:ident),*) => { fn h(_: $($m::)* Query<()>) {} } }",
+            &["$m::$(..)"][..],
+        ),
+        // A repetition whose body opens with `::` continues the path before it.
+        (
+            "macro_rules! m { ($a:ident $($r:ident)*) => { fn h(_: $a $(:: $r)* <()>) {} } }",
+            &["::$r"][..],
+        ),
+        // A lone `::` handed to a macro as a token tree.
+        (
+            "m!(axum, ::, extract, ::, Query);",
+            &["::$(..)", "::$(..)"][..],
+        ),
+    ] {
+        assert_eq!(templated_sites(&code_of(planted)), sites, "{planted}");
+    }
+}
+
+#[test]
+fn a_planted_crate_root_path_is_not_a_module_of_the_file() {
+    assert_eq!(
+        query_reader_sites(&code_of(
+            "mod url; fn f(b: &[u8]) { ::url::form_urlencoded::parse(b); }"
+        )),
+        BTreeMap::from([("url::form_urlencoded::parse", 1)])
+    );
+    assert_eq!(
+        query_reader_sites(&code_of(
+            "mod url; use ::url::form_urlencoded::parse; fn f(b: &[u8]) { parse(b); }"
+        )),
+        BTreeMap::from([("url::form_urlencoded::parse", 2)])
+    );
+    assert_eq!(
+        query_reader_sites(&code_of(
+            "mod url; fn f(b: &[u8]) { match 0 { _ => ::url::form_urlencoded::parse(b) }; }"
+        )),
+        BTreeMap::from([("url::form_urlencoded::parse", 1)])
+    );
+    assert!(names_lenient_extractor(
+        "mod axum; fn h() -> ::axum::Form<M> { g() }"
+    ));
+    assert_eq!(
+        refused_globs("mod url; use ::url::form_urlencoded::*;"),
+        ["url::form_urlencoded"]
+    );
+}
+
+#[test]
+fn a_planted_crate_root_path_after_a_keyword_is_seen() {
+    assert!(names_lenient_extractor(
+        "async fn h(q: &mut ::axum::extract::Query<M>) {}"
+    ));
+    assert_eq!(
+        query_reader_sites(&code_of(
+            "fn f(s: &str) -> R { return ::serde_urlencoded::from_str(s); }"
+        )),
+        BTreeMap::from([("serde_urlencoded::from_str", 1)])
+    );
+    assert_eq!(
+        query_reader_sites(&code_of(
+            "fn f(b: &[u8]) { for p in ::url::form_urlencoded::parse(b) {} }"
+        )),
+        BTreeMap::from([("url::form_urlencoded::parse", 1)])
+    );
+    // A raw identifier spelling a keyword is a name, not the keyword.
+    assert!(names_lenient_extractor(
+        "use axum::extract as r#in; fn h(_: r#in::Query<M>) {}"
+    ));
+}
+
+#[test]
+fn a_planted_macro_defining_a_macro_is_refused() {
+    // `$d` bound to `$` spells the inner macro's metavariables and repetitions.
+    for (planted, site) in [
+        (
+            "macro_rules! outer { ($d:tt) => { macro_rules! inner { ($d x:ident) => \
+             { fn h(_: $d x::extract::Query<()>) {} } } } }",
+            "$x::extract::Query",
+        ),
+        (
+            "macro_rules! outer { ($d:tt) => { macro_rules! inner { ($d ($d s:ident),+) => \
+             { fn h(_: $d ($d s)::+ <()>) {} } } } }",
+            "$(..)",
+        ),
+        (
+            "macro_rules! outer { ($d:tt) => { use $d x::extract::Query; } }",
+            "use d x extract Query (unparsed)",
+        ),
+        (
+            "macro_rules! outer { ($d:tt) => { use $d ($d s)::+; } }",
+            "$(..)",
+        ),
+        // A `use` group the parser cannot follow to its brace.
+        (
+            "macro_rules! outer { ($d:tt) => { use self::{$d x::extract::Query}; } }",
+            "use self d x extract Query (unparsed)",
+        ),
+    ] {
+        assert_eq!(templated_sites(&code_of(planted)), [site], "{planted}");
+    }
 }
