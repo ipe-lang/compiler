@@ -5195,7 +5195,10 @@ pub fn db_conn_query_decode_params<
                     q = external_bind_sql_param(q, p);
                 }
                 match q.fetch_all(&pool).await {
-                    Ok(rows) => rows.iter().map(row_to_json).collect(),
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|row| row_to_json(row).map_err(|e| (DbEngine::Postgres, e)))
+                        .collect(),
                     Err(e) => Err((DbEngine::Postgres, e)),
                 }
             }
@@ -5205,7 +5208,10 @@ pub fn db_conn_query_decode_params<
                     q = external_bind_sql_param(q, p);
                 }
                 match q.fetch_all(&pool).await {
-                    Ok(rows) => rows.iter().map(row_to_json).collect(),
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|row| row_to_json(row).map_err(|e| (DbEngine::Sqlite, e)))
+                        .collect(),
                     Err(e) => Err((DbEngine::Sqlite, e)),
                 }
             }
