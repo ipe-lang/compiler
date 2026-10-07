@@ -1334,9 +1334,8 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     },
     // Ipe.Parser — pure-Ipê parser combinators (elm/parser parity); no kernel
     // calls. Defines and pattern-matches its own `Parser`/`Problem`/`Step` data.
-    // Its name is the one `|=` / `|.` desugar into.
     CompiledStdModule {
-        dotted: ipe_syntax::fixity::PARSER_OPERATOR_MODULE.dotted(),
+        dotted: "Ipe.Parser",
         source: PARSER,
     },
     // Ipe.Bitwise — Layer-3 source; every member is a point-free
@@ -2195,6 +2194,17 @@ mod tests {
                 dotted.split('.').map(str::to_owned).collect()
             })
             .collect()
+    }
+
+    /// The module `|=` / `|.` desugar into is an embedded module under exactly
+    /// the name the syntax crate declares.
+    #[test]
+    fn the_parser_operator_module_is_embedded_under_its_declared_name() {
+        let declared = ipe_syntax::fixity::PARSER_OPERATOR_MODULE.dotted();
+        assert!(
+            COMPILED_STD_MODULES.iter().any(|m| m.dotted == declared),
+            "no embedded module is named {declared}"
+        );
     }
 
     /// Every embedded `Ipe` module must PARSE with the same front end that
