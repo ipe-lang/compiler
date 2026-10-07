@@ -1253,6 +1253,98 @@ fn check_engine_version(engine: DbEngine, raw: &str) -> Result<EngineVersion, En
     Ok(found)
 }
 
+/// Longest driver code the classifier reads; a longer one is `OtherFailure`.
+const MAX_DB_FAILURE_CODE_LEN: usize = 16;
+
+/// A driver code in the short alphanumeric shape SQLSTATE and SQLite codes take.
+///
+/// A remote server picks the code, so an empty, overlong or otherwise shaped
+/// code is dropped rather than read.
+fn well_formed_code(code: Option<&str>) -> Option<&str> {
+    code.filter(|c| {
+        !c.is_empty()
+            && c.len() <= MAX_DB_FAILURE_CODE_LEN
+            && c.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// Classify a driver failure into the closed [`IpeDbFailure`] set.
+///
+/// The one producer of an Ipê `DbFailure` value. `engine` selects the code
+/// space, so a code from the other engine's space is `OtherFailure`, and a
+/// code that is absent, malformed or out of range never reaches a row.
+pub(crate) fn classify_failure(engine: DbEngine, e: &sqlx::Error) -> IpeDbFailure {
+    if let Some(dbe) = e.as_database_error() {
+        let code = dbe.code();
+        return match well_formed_code(code.as_deref()) {
+            None => IpeDbFailure::OtherFailure,
+            Some(code) => match engine {
+                DbEngine::Sqlite => code
+                    .parse::<i32>()
+                    .map_or(IpeDbFailure::OtherFailure, sqlite_row),
+                DbEngine::Postgres => postgres_row(code),
+            },
+        };
+    }
+    match e {
+        sqlx::Error::PoolTimedOut => IpeDbFailure::Busy,
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Configuration(_)
+        | sqlx::Error::PoolClosed => IpeDbFailure::Unreachable,
+        // `sqlx::Error` is `#[non_exhaustive]`: every other arm, present or
+        // future, is the explicit `OtherFailure` row.
+        _ => IpeDbFailure::OtherFailure,
+    }
+}
+
+/// The SQLite row for a result code: the full extended code first, then the
+/// primary code (`code & 0xFF`).
+const fn sqlite_row(code: i32) -> IpeDbFailure {
+    match code {
+        2067 | 1555 => IpeDbFailure::UniqueViolation,
+        787 => IpeDbFailure::ForeignKeyViolation,
+        1299 => IpeDbFailure::NotNullViolation,
+        275 => IpeDbFailure::CheckViolation,
+        1811 => IpeDbFailure::TriggerRaised,
+        extended => match extended & 0xFF {
+            19 => IpeDbFailure::OtherConstraint,
+            5 | 6 => IpeDbFailure::Busy,
+            8 => IpeDbFailure::ReadOnlyDatabase,
+            3 | 23 => IpeDbFailure::AccessDenied,
+            14 => IpeDbFailure::CannotOpen,
+            26 | 11 => IpeDbFailure::NotADatabase,
+            1 => IpeDbFailure::InvalidStatement,
+            _ => IpeDbFailure::OtherFailure,
+        },
+    }
+}
+
+/// The PostgreSQL row for a SQLSTATE: the exact codes first, then the
+/// two-character class of a five-character code.
+fn postgres_row(code: &str) -> IpeDbFailure {
+    match code {
+        "23505" => IpeDbFailure::UniqueViolation,
+        "23503" => IpeDbFailure::ForeignKeyViolation,
+        "23502" => IpeDbFailure::NotNullViolation,
+        "23514" => IpeDbFailure::CheckViolation,
+        "P0001" => IpeDbFailure::TriggerRaised,
+        "55P03" | "40P01" | "40001" => IpeDbFailure::Busy,
+        "25006" => IpeDbFailure::ReadOnlyDatabase,
+        "42501" => IpeDbFailure::AccessDenied,
+        "3D000" => IpeDbFailure::CannotOpen,
+        "XX001" | "XX002" => IpeDbFailure::NotADatabase,
+        sqlstate if sqlstate.len() != 5 => IpeDbFailure::OtherFailure,
+        sqlstate => match sqlstate.get(..2) {
+            Some("23") => IpeDbFailure::OtherConstraint,
+            Some("28") => IpeDbFailure::AccessDenied,
+            Some("08") => IpeDbFailure::Unreachable,
+            Some("42") => IpeDbFailure::InvalidStatement,
+            _ => IpeDbFailure::OtherFailure,
+        },
+    }
+}
+
 /// A driver failure, classified from the `sqlx::Error` variant alone.
 ///
 /// Holds no driver payload: a driver's message can echo the connection URL —
@@ -1276,24 +1368,13 @@ pub enum DbFailure {
     Other,
 }
 
-/// Longest SQLSTATE / driver code [`DbFailure`] keeps.
-const MAX_DB_FAILURE_CODE_LEN: usize = 16;
-
 impl DbFailure {
     /// Classify `e`, keeping only its variant and a well-formed error code.
     #[must_use]
     pub fn of(e: &sqlx::Error) -> Self {
         if let Some(dbe) = e.as_database_error() {
-            // A remote server picks the code; keep it only in the short
-            // alphanumeric shape SQLSTATE and SQLite result codes take.
-            let code = dbe
-                .code()
-                .filter(|c| {
-                    !c.is_empty()
-                        && c.len() <= MAX_DB_FAILURE_CODE_LEN
-                        && c.bytes().all(|b| b.is_ascii_alphanumeric())
-                })
-                .map(std::borrow::Cow::into_owned);
+            let code = dbe.code();
+            let code = well_formed_code(code.as_deref()).map(str::to_owned);
             return Self::Database { code };
         }
         match e {
@@ -6064,6 +6145,211 @@ mod tests {
         for malformed in ["", "28P01\n[forged] line", "0123456789abcdefX"] {
             assert_eq!(classify(malformed), DbFailure::Database { code: None });
         }
+    }
+
+    /// A database error carrying a chosen code and constraint name.
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: Option<&'static str>,
+        constraint: Option<&'static str>,
+    }
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("fake driver message 2067 [19] victim@example.com")
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "fake driver message 2067 [19] victim@example.com"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.constraint
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn coded(code: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError {
+            code,
+            constraint: None,
+        }))
+    }
+
+    /// Every SQLite row, exact and primary, classifies to its variant.
+    #[test]
+    fn classify_failure_sqlite_rows() {
+        use IpeDbFailure as F;
+        let rows = [
+            ("2067", F::UniqueViolation),
+            ("1555", F::UniqueViolation),
+            ("787", F::ForeignKeyViolation),
+            ("1299", F::NotNullViolation),
+            ("275", F::CheckViolation),
+            ("1811", F::TriggerRaised),
+            ("19", F::OtherConstraint),
+            ("3091", F::OtherConstraint),
+            ("5", F::Busy),
+            ("517", F::Busy),
+            ("6", F::Busy),
+            ("262", F::Busy),
+            ("8", F::ReadOnlyDatabase),
+            ("1032", F::ReadOnlyDatabase),
+            ("3", F::AccessDenied),
+            ("23", F::AccessDenied),
+            ("14", F::CannotOpen),
+            ("1038", F::CannotOpen),
+            ("26", F::NotADatabase),
+            ("11", F::NotADatabase),
+            ("1", F::InvalidStatement),
+            ("2", F::OtherFailure),
+            ("13", F::OtherFailure),
+        ];
+        for (code, expected) in rows {
+            assert_eq!(
+                classify_failure(DbEngine::Sqlite, &coded(Some(code))),
+                expected,
+                "SQLite code {code}"
+            );
+        }
+    }
+
+    /// Every PostgreSQL row, exact and class, classifies to its variant; an
+    /// exact row wins over its class.
+    #[test]
+    fn classify_failure_postgres_rows() {
+        use IpeDbFailure as F;
+        let rows = [
+            ("23505", F::UniqueViolation),
+            ("23503", F::ForeignKeyViolation),
+            ("23502", F::NotNullViolation),
+            ("23514", F::CheckViolation),
+            ("P0001", F::TriggerRaised),
+            ("23P01", F::OtherConstraint),
+            ("23000", F::OtherConstraint),
+            ("55P03", F::Busy),
+            ("40P01", F::Busy),
+            ("40001", F::Busy),
+            ("25006", F::ReadOnlyDatabase),
+            ("42501", F::AccessDenied),
+            ("28P01", F::AccessDenied),
+            ("28000", F::AccessDenied),
+            ("3D000", F::CannotOpen),
+            ("XX001", F::NotADatabase),
+            ("XX002", F::NotADatabase),
+            ("42P01", F::InvalidStatement),
+            ("42703", F::InvalidStatement),
+            ("42601", F::InvalidStatement),
+            ("42883", F::InvalidStatement),
+            ("08006", F::Unreachable),
+            ("08001", F::Unreachable),
+            ("22012", F::OtherFailure),
+            ("XX000", F::OtherFailure),
+            ("53300", F::OtherFailure),
+        ];
+        for (code, expected) in rows {
+            assert_eq!(
+                classify_failure(DbEngine::Postgres, &coded(Some(code))),
+                expected,
+                "SQLSTATE {code}"
+            );
+        }
+    }
+
+    /// The non-database `sqlx::Error` arms classify by variant.
+    #[test]
+    fn classify_failure_non_database_rows() {
+        use IpeDbFailure as F;
+        for engine in [DbEngine::Sqlite, DbEngine::Postgres] {
+            let rows = [
+                (sqlx::Error::PoolTimedOut, F::Busy),
+                (sqlx::Error::PoolClosed, F::Unreachable),
+                (sqlx::Error::Io(std::io::Error::other("io")), F::Unreachable),
+                (sqlx::Error::Tls("tls".into()), F::Unreachable),
+                (sqlx::Error::Configuration("cfg".into()), F::Unreachable),
+                (sqlx::Error::RowNotFound, F::OtherFailure),
+                (sqlx::Error::Protocol("p".to_owned()), F::OtherFailure),
+                (sqlx::Error::Decode("d".into()), F::OtherFailure),
+                (sqlx::Error::WorkerCrashed, F::OtherFailure),
+            ];
+            for (raw, expected) in rows {
+                assert_eq!(classify_failure(engine, &raw), expected, "{raw:?}");
+            }
+        }
+    }
+
+    /// A code from the other engine's space is `OtherFailure`, never a
+    /// neighbouring row.
+    #[test]
+    fn classify_failure_refuses_wrong_engine_codes() {
+        assert_eq!(
+            classify_failure(DbEngine::Postgres, &coded(Some("23505"))),
+            IpeDbFailure::UniqueViolation
+        );
+        assert_eq!(
+            classify_failure(DbEngine::Sqlite, &coded(Some("23505"))),
+            IpeDbFailure::OtherFailure
+        );
+        assert_eq!(
+            classify_failure(DbEngine::Sqlite, &coded(Some("2067"))),
+            IpeDbFailure::UniqueViolation
+        );
+        assert_eq!(
+            classify_failure(DbEngine::Postgres, &coded(Some("2067"))),
+            IpeDbFailure::OtherFailure
+        );
+    }
+
+    /// An absent, empty, non-numeric, out-of-range, overlong or oddly shaped
+    /// code is `OtherFailure`, never a primary-code match.
+    #[test]
+    fn classify_failure_refuses_malformed_codes() {
+        let seventeen = "23505234567890123";
+        assert_eq!(seventeen.len(), MAX_DB_FAILURE_CODE_LEN + 1);
+        let malformed = [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("99999999999"),
+            Some("-2067"),
+            Some(" 2067"),
+            Some("2067\n"),
+            Some("23505 "),
+            Some(seventeen),
+            Some("2350"),
+            Some("235050"),
+        ];
+        for engine in [DbEngine::Sqlite, DbEngine::Postgres] {
+            for code in malformed {
+                assert_eq!(
+                    classify_failure(engine, &coded(code)),
+                    IpeDbFailure::OtherFailure,
+                    "{engine:?} code {code:?}"
+                );
+            }
+        }
+        // The control: one step back inside the bound still reads its row.
+        assert_eq!(
+            classify_failure(DbEngine::Sqlite, &coded(Some("0000000000002067"))),
+            IpeDbFailure::UniqueViolation
+        );
     }
 
     /// A real PostgreSQL driver failure on a URL carrying credentials never
