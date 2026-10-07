@@ -59,4 +59,54 @@ BEGIN
     SELECT RAISE(IGNORE);
 END;"""
       }
+    , { name = "0007_review_log"
+      , sql = """CREATE TABLE review_log (
+    seq         INTEGER PRIMARY KEY CHECK (seq >= 1),
+    uid         TEXT NOT NULL,
+    body_hash   TEXT NOT NULL,
+    decision    TEXT NOT NULL CHECK (
+                    decision IN ('approve', 'refuse')
+                    AND (decision = 'approve'
+                         OR (reason IS NOT NULL AND length(trim(reason)) > 0))
+                ),
+    reason      TEXT,
+    reviewed_at INTEGER NOT NULL,
+    prev        TEXT NOT NULL,
+    mac         TEXT NOT NULL CHECK (length(mac) = 64)
+);
+CREATE INDEX review_log_pair ON review_log (uid, body_hash, seq);
+CREATE INDEX review_log_time ON review_log (reviewed_at DESC, seq DESC);
+CREATE TRIGGER review_log_no_update BEFORE UPDATE ON review_log
+BEGIN
+    SELECT RAISE(ABORT, 'review_log is append-only');
+END;
+CREATE TRIGGER review_log_no_delete BEFORE DELETE ON review_log
+BEGIN
+    SELECT RAISE(ABORT, 'review_log is append-only');
+END;
+CREATE TRIGGER review_log_no_replace BEFORE INSERT ON review_log
+WHEN EXISTS (SELECT 1 FROM review_log WHERE seq = NEW.seq)
+BEGIN
+    SELECT RAISE(IGNORE);
+END;
+CREATE TABLE review_log_head (
+    one    INTEGER PRIMARY KEY CHECK (one = 1),
+    log_id TEXT NOT NULL CHECK (length(log_id) = 32),
+    seq    INTEGER NOT NULL CHECK (seq >= 0),
+    head   TEXT NOT NULL CHECK (head = 'genesis' OR length(head) = 64)
+);
+INSERT INTO review_log_head (one, log_id, seq, head) VALUES (1, lower(hex(randomblob(16))), 0, 'genesis');
+CREATE TRIGGER review_log_head_no_delete BEFORE DELETE ON review_log_head
+BEGIN
+    SELECT RAISE(ABORT, 'review_log_head is permanent');
+END;
+CREATE TRIGGER review_log_head_no_insert BEFORE INSERT ON review_log_head
+BEGIN
+    SELECT RAISE(ABORT, 'review_log_head is permanent');
+END;
+CREATE TRIGGER review_log_head_id_fixed BEFORE UPDATE OF log_id ON review_log_head
+BEGIN
+    SELECT RAISE(ABORT, 'review_log_head.log_id is fixed');
+END;"""
+      }
     ]

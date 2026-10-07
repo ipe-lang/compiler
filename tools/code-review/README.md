@@ -33,8 +33,8 @@ See `tools/ipe-index/README.md` for that tool.
 
 ## Configuration
 
-The app reads three environment variables: two are **required** and one is
-optional. `main` parses all three at startup, then opens and probes each
+The app reads four environment variables: two are **required** and two are
+optional. `main` parses all four at startup, then opens and probes each
 location before it listens, and exits non-zero with a message naming the
 variable if any is unset or unusable. A misconfigured run fails closed rather
 than serving a page that later fails, opening a wrong-path database, or
@@ -45,8 +45,9 @@ joining a stored path outside the repo:
 | `IPE_INDEX_DB`   | Path or `sqlite://` URL of the `ipe-index` DB.                |
 | `IPE_INDEX_ROOT` | Repo root the index's `ipe:relative` paths join to; must be an existing directory holding the indexed files, checked at startup. |
 | `IPE_REVIEW_DB`  | Optional path or `sqlite://` URL of the review DB; defaults to `review.db`. |
+| `IPE_REVIEW_MAC_KEY` | Optional key that signs every decision: exactly 64 hex characters (32 random bytes). Unset, the server is read-only. |
 
-A relative path in any of the three resolves against the working directory. A
+A relative path in any of the three locations resolves against the working directory. A
 file path containing `?`, `#` or `%` is refused — pass such a location as a
 percent-encoded `sqlite://` URL. A `sqlite://` URL must carry no `?` query and
 must name a database: the app appends the open mode itself. A `sqlite:` or
@@ -109,23 +110,82 @@ still listed, badged UNRECORDED.
 The progress counter in the header is the index's units minus its open units,
 out of all its units. The page rows, the open count and the progress are read
 in one index transaction, so they always describe the same index state, and a
-load costs the same however large the index or the review history grows.
+load costs the same however large the index grows; against the review log it
+adds one count of the log's entries up to its head (below).
 Deciding a unit raises the first number and leaves the second unchanged, and
 a reload or a second tab shows the same numbers.
 
-The review DB's `review` table is append-only (deleting or updating a row is
-refused, and re-inserting a decided pair, `REPLACE` included, changes
-nothing), and every decision the app records moves its `review_head`, a hash
-chain over the decided pairs that starts from a random genesis. Startup
-refuses a review DB whose append-only triggers are missing. The `reviewed`
-copy is trusted only when its `reviewed_stamp` equals that head: draining a
-decision moves the stamp along with the head, and any other stamp (a decision
-whose drain failed, an index file replaced by another, a decision made from
-another process) rebuilds the copy from the review DB before the page is
-read. A row written into `review` by hand, outside the app, does not move
-the head: its unit stays listed until the next rebuild. A replaced
-review DB has a new genesis, so it re-opens every unit the old one decided.
-Startup always rebuilds the copy once.
+### The review key
+
+Every decision is a row of the review DB's `review_log`, signed with
+HMAC-SHA-256 under `IPE_REVIEW_MAC_KEY`. Generate the key once and keep it
+outside the review DB (a secret store or an env file only the operator reads),
+since anyone who can read it can sign a decision:
+
+```bash
+openssl rand -hex 32      # → IPE_REVIEW_MAC_KEY
+```
+
+The value must be exactly 64 hex characters; upper and lower case are the
+same key. Any other value set, empty or blank included, stops startup with a
+message that names the variable, never its value. The key is never logged,
+rendered or shown in an error. There is one key per review DB: a review DB
+signed under one key reads every row as unverified under another.
+
+**Read-only mode.** With `IPE_REVIEW_MAC_KEY` unset the server starts
+read-only and says so on stderr: the queue and history are shown, the Approve
+and Refuse controls are not, and a decision is refused with a typed error, so
+nothing is recorded. With no key nothing can be verified either, so no row
+counts as decided and every unit stays in the queue.
+
+### What counts as decided
+
+A row counts as a decision only when its signature verifies under the key and
+the log's chain is unbroken. The signature covers the log's random id, the
+row's sequence number, the previous row's signature, the unit's `uid` and
+`body_hash`, the decision, the reason (an absent reason and an empty one
+differ) and the review time, so an edit to any of them outside the tool, a
+forged row, or a row copied from another review DB does not verify. Such a row
+is shown in the history as not counted, with the reason, and its unit stays
+in the queue.
+
+`review_log` is append-only: deleting or updating a row is refused, and an
+insert that would replace a row changes nothing. Each row links to the one
+before it, and `review_log_head` holds the last row's sequence number and
+signature; its one row can be neither deleted nor inserted again, and its
+log id never changes. On every read the app walks the chain; a gap in the sequence, a
+link that does not match, or a last row that differs from the head is a
+break. The policy on a break is strict: no row counts, the rows before the
+break included, the queue and history pages show "The review log's chain breaks at entry N:
+a decision was removed, reordered or replaced outside this tool.", and every
+new decision is refused until the log is repaired, so nothing is appended to a
+broken chain. Startup refuses a review DB whose append-only triggers are
+missing.
+
+Removing the last rows and rewriting the head to match, or restoring an older
+copy of the whole file under the same key, cannot be told apart from a log
+that never held those rows. It fails closed: the removed decisions read as
+undecided, never as approved.
+
+**Legacy rows.** Rows of the older, unsigned `review` table still load and are
+shown in the history as recorded before rows were signed. They count as no
+decision: their units are back in the queue, and deciding one again appends a
+signed row.
+
+The index's `reviewed` copy is trusted only when its `reviewed_stamp` matches
+the log's current head and state: draining a decision moves the stamp along
+with the head, and any other stamp (a decision whose drain failed, an index
+file replaced by another, a decision made from another process) rebuilds the
+copy from the verified rows of the review DB before the page is read. A stamp
+of an intact chain is trusted only while the log still holds every entry up
+to the head, so an entry deleted below an unmoved head shows the banner on
+the next page load. That check counts entries, so an entry edited in place
+reads as not counted in the history at once, but its unit, already drained,
+stays out of the queue until the copy is next rebuilt: at the next decision
+or restart. A row written into `review_log` by hand, outside the app, does
+not move the head: reads ignore it, and every new decision is refused as a
+break at its entry. A replaced review DB has a new log id, so it re-opens
+every unit the old one decided. Startup always rebuilds the copy once.
 
 The index DB is opened read-only for listing and read-write (never created) only
 to drain a decided unit: in one transaction its pair enters `reviewed`, its
