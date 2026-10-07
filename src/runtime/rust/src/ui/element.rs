@@ -281,6 +281,14 @@ fn drain_nearby_overlays<M>(attrs: &mut Vec<Attribute<M>>, pending: &mut Vec<Ele
     }
 }
 
+impl<M> super::super::html::TrustedRawChild for Element<M> {
+    /// Only a `Ui.html` wrapper around a trusted raw `Html` node counts; every
+    /// other element is layout or text the safe surface built.
+    fn is_trusted_raw(&self) -> bool {
+        matches!(self, Element::Raw(Html::HRaw(_)))
+    }
+}
+
 impl<M> Drop for Element<M> {
     /// Dismantle the layout tree iteratively so dropping a deeply nested
     /// `Element` can never overflow the native stack. An `Element` tree's depth

@@ -1023,7 +1023,8 @@ fn materialize_at<M: Clone>(
             children,
         } => {
             let resolved_attrs = resolve_attrs(attrs, fills);
-            Element::TaggedNode(
+            // The shared tag gate runs inside `ui_tagged_node_`.
+            super::helpers::ui_tagged_node_(
                 tag.clone(),
                 desc.to_desc(),
                 resolved_attrs,
@@ -1066,7 +1067,7 @@ fn materialize_wrapper_hole<M: Clone>(
     match &wrapper {
         Some(UiTemplate::TaggedNode {
             tag, desc, attrs, ..
-        }) => Element::TaggedNode(
+        }) => super::helpers::ui_tagged_node_(
             tag.clone(),
             desc.to_desc(),
             resolve_attrs(attrs, fills),
@@ -1486,6 +1487,25 @@ mod tests {
         let subtree: Element<()> =
             Element::Raw(crate::html::Html::HRaw("<b>trusted?</b>".to_string()));
         assert_eq!(ui_template_of(&subtree), None);
+    }
+
+    /// SECURITY: a `TaggedNode` template naming a `<script>`/`<style>` with a
+    /// text body (a baked or a patched slot) materializes through
+    /// `ui_tagged_node_`, so the shared tag gate builds `Element::Empty`.
+    #[test]
+    fn tagged_script_or_style_template_materializes_empty() {
+        for tag in ["script", "STYLE", "plaintext"] {
+            let template = UiTemplate::TaggedNode {
+                tag: tag.to_string(),
+                desc: super::UiDescription::NoDescription,
+                attrs: vec![],
+                children: vec![UiTemplate::Text("alert(document.cookie)".to_string())],
+            };
+            let elem: Element<()> = materialize(&template, TemplateFills::default());
+            assert!(matches!(elem, Element::Empty), "<{tag}>: {elem:?}");
+            let rendered = render(elem);
+            assert!(!rendered.contains("alert"), "<{tag}>: {rendered}");
+        }
     }
 
     #[test]

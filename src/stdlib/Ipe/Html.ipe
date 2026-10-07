@@ -43,6 +43,9 @@ import Ipe.Ffi.Kernel as Kernel
 -- sink recognises directly.
 
 -- | `node tag attrs children` — a container element `<tag …>children</tag>`.
+-- A `script` or `style` tag renders only over trusted raw children (see
+-- `Ipe.Html.Unsafe` and `styleNode`), and `plaintext` or an unsafe tag name
+-- never renders: a refused element renders nothing.
 node : String -> List (Attribute msg) -> List (Html msg) -> Html msg
 node = Kernel.kernel "Html_node"
 
@@ -321,6 +324,9 @@ meter : List (Attribute msg) -> List (Html msg) -> Html msg
 meter = node "meter"
 
 
+-- | `script attrs children` — a `<script>` element. It renders only over a
+-- trusted body (`Ipe.Html.Unsafe.unsafeRaw`, or use `unsafeScript`); a text,
+-- element or empty body is refused and renders nothing, so data never runs.
 script : List (Attribute msg) -> List (Html msg) -> Html msg
 script = node "script"
 
