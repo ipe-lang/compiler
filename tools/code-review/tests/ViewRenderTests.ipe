@@ -256,6 +256,9 @@ oversizeCase over =
         ViewBytes _ ->
             { view = TooLarge over, reason = "past the " ++ String.fromInt (ByteSize.toBytes Index.viewByteCeiling // 1024) ++ " KiB review ceiling" }
 
+        ChildSpans { atLeast } ->
+            { view = TooLarge over, reason = "holds at least " ++ String.fromInt atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling" }
+
 
 -- Every way a source is withheld.
 withheldCases : List Withheld
@@ -266,6 +269,7 @@ withheldCases =
     , { view = Unreadable (Error.invalidInput "gone"), reason = "Source unreadable: " }
     , oversizeCase (SpanLines { lines = Index.viewLineCeiling + 1 })
     , oversizeCase (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
+    , oversizeCase (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
     ]
 
 
@@ -295,6 +299,9 @@ withheldName view =
 
         TooLarge (ViewBytes _) ->
             Just "ViewBytes"
+
+        TooLarge (ChildSpans _) ->
+            Just "ChildSpans"
 
 
 -- The constructors `type <name>` declares in `source`, read off its `=` and

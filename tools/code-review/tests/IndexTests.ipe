@@ -23,7 +23,7 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Body(..), Oversize(..), SourceRow(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
@@ -371,11 +371,14 @@ classifyRefusesPastLineCeiling =
         text =
             xLines past
     in
-    case Index.classifyView (uid "u-a") (Index.attest text) 1 past text of
+    case Index.classifyView (uid "u-a") (Index.attest text) (LineRange 1 past) text of
         TooLarge (SpanLines o) ->
             o.lines == past
 
         TooLarge (ViewBytes _) ->
+            False
+
+        TooLarge (ChildSpans _) ->
             False
 
         Shown _ ->
@@ -417,15 +420,17 @@ shownLinesAreAttestedLines =
         crView =
             String.join "\n" span
 
-        drawn start text first last =
-            Maybe.map (\shown -> Index.shownLines shown start) (shownOf (Index.classifyView (uid "u-x") (Index.attest text) first last file))
+        drawn text first last =
+            Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-x") (Index.attest text) (LineRange first last) file))
     in
     span
         == [ "a\r", "b", "", "" ]
-        && drawn 7 crView 1 4
-        == Just [ ( 7, "a\r" ), ( 8, "b" ), ( 9, "" ), ( 10, "" ) ]
-        && Maybe.map (\shown -> Index.shownLines shown 1) (shownOf (Index.classifyView (uid "u-b") (Index.attest viewB) 1 2 fixtureMainIpe))
-        == Just [ ( 1, "module Main exposing (main)" ), ( 2, "" ) ]
+        && drawn crView 1 4
+        == Just [ Numbered 1 "a\r", Numbered 2 "b", Numbered 3 "", Numbered 4 "" ]
+        && drawn "b\n" 2 3
+        == Just [ Numbered 2 "b", Numbered 3 "" ]
+        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") (Index.attest viewB) (LineRange 1 2) fixtureMainIpe))
+        == Just [ Numbered 1 "module Main exposing (main)", Numbered 2 "" ]
 
 
 -- The unit page's data path: a uid that exists loads with its source and
@@ -570,6 +575,200 @@ vectorHolds v =
 
         Err _ ->
             False
+
+
+-- One row of ipe-index's `tests/residual_vectors.json`: a source, the spans
+-- of its child units, and the residual a file unit attests with its hash.
+type alias ResidualVector =
+    { name : String
+    , src : String
+    , spans : List (List Int)
+    , residual : String
+    , hash : String
+    }
+
+
+-- Every residual vector holds on this side: `residualText` gives the shared
+-- residual and hash, and `classifyView` shows a file unit stored under that
+-- hash with exactly that text. Red if the residual rule drifts from
+-- ipe-index's, or a file unit is judged by its line range.
+residualVectors : Task.Task Error Bool
+residualVectors =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "residual_vectors.json"))
+        text <- File.readFileLimit path (ByteSize.kib 64)
+        vectors <- Task.fromResult (Decode.decodeString (Decode.list residualVectorDecoder) text)
+        Task.succeed (not (List.isEmpty vectors) && List.all residualVectorHolds vectors)
+
+
+residualVectorDecoder : Decode.Decoder ResidualVector
+residualVectorDecoder =
+    Decode.map3
+        (\name src rest ->
+            { name = name
+            , src = src
+            , spans = rest.spans
+            , residual = rest.residual
+            , hash = rest.hash
+            }
+        )
+        (Decode.field "name" Decode.string)
+        (Decode.field "src" Decode.string)
+        (Decode.map3
+            (\spans residual hash -> { spans = spans, residual = residual, hash = hash })
+            (Decode.field "spans" (Decode.list (Decode.list Decode.int)))
+            (Decode.field "residual" Decode.string)
+            (Decode.field "hash" Decode.string)
+        )
+
+
+residualVectorHolds : ResidualVector -> Bool
+residualVectorHolds v =
+    let
+        spans =
+            List.filterMap spanPair v.spans
+    in
+    List.length spans
+        == List.length v.spans
+        && Index.residualText spans v.src
+        == v.residual
+        && Index.attest v.residual
+        == v.hash
+        && shownTextOf (Index.classifyView (uid "u-file") v.hash (Residual spans) v.src)
+        == Just v.residual
+
+
+spanPair : List Int -> Maybe ( Int, Int )
+spanPair pair =
+    case pair of
+        [ first, last ] ->
+            Just ( first, last )
+
+        _ ->
+            Nothing
+
+
+-- The residual of `fixtureLibRs` beside unit `u-a` (lines 3..6), written out
+-- by hand: line 1, the covered run, lines 8..10; blank lines 2 and 7 dropped.
+libResidual : String
+libResidual =
+    "// fixture library\n\0\npub fn other() -> i32 {\n    7\n}"
+
+
+-- A file unit `u-file` over `fixtureLibRs`, stored under `hash`.
+withFileUnit : String -> Scratch -> Task.Task Error ()
+withFileUnit hash at =
+    execIndex at.indexDb
+        "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        [ Uid.toSql (uid "u-file"), SqlString "ipe:src/Lib.rs", SqlString "file", SqlString "Lib.rs", SqlString "Lib::FILE", SqlInt 1, SqlInt 10, SqlString "internal", SqlNull (SqlString ""), SqlString hash, SqlString "shaF" ]
+
+
+-- The view a file unit stored under `hash` loads with, after `mutate`.
+fileUnitView : String -> String -> (Scratch -> Task.Task Error ()) -> Task.Task Error (Maybe Index.SourceView)
+fileUnitView name hash mutate =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        withFileUnit hash at
+        mutate at
+        loaded <- loadUnitNow (uid "u-file")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (Maybe.map (\l -> l.view) loaded)
+
+
+-- A file unit loads its residual through the app's one source read: the
+-- lines no other unit of its file covers, the covered run drawn as one
+-- marker row, the uncovered lines numbered from the file. A file unit stored
+-- under its whole file's hash is drifted, never shown. Red if a file unit is
+-- judged by its line range, or its rows and its hashed text part.
+fileUnitShowsResidual : Task.Task Error Bool
+fileUnitShowsResidual =
+    do
+        residual <- fileUnitView "ipe-index-file-residual" (Index.attest libResidual) (\_ -> Task.succeed ())
+        whole <- fileUnitView "ipe-index-file-whole" (Index.attest (String.dropRight 1 fixtureLibRs)) (\_ -> Task.succeed ())
+        let
+            rows =
+                Maybe.map Index.shownRows (Maybe.andThen shownOf residual)
+        in
+        Task.succeed
+            (rows
+                == Just [ Numbered 1 "// fixture library", Covered, Numbered 8 "pub fn other() -> i32 {", Numbered 9 "    7", Numbered 10 "}" ]
+                && Maybe.andThen shownTextOf residual
+                == Just libResidual
+                && Maybe.map viewTag whole
+                == Just "drifted"
+            )
+
+
+-- A file unit whose file holds more than `childSpanCeiling` other units is
+-- withheld, never judged on a truncated span list; exactly the ceiling is
+-- judged. Red if the span read loses its ceiling or the ceiling check.
+fileUnitPastChildSpanCeiling : Task.Task Error Bool
+fileUnitPastChildSpanCeiling =
+    do
+        past <- fileUnitView "ipe-index-file-spans-past" (Index.attest libResidual) (childUnits Index.childSpanCeiling)
+        at <- fileUnitView "ipe-index-file-spans-at" (Index.attest libResidual) (childUnits (Index.childSpanCeiling - 1))
+        Task.succeed
+            (Maybe.map viewTag past
+                == Just ("too large spans " ++ String.fromInt (Index.childSpanCeiling + 1))
+                && Maybe.map viewTag at
+                == Just "shown"
+            )
+
+
+-- `count` more one-line units of `ipe:src/Lib.rs`, each on line 3, inside
+-- `u-a`'s span, so the residual is unchanged; one statement.
+childUnits : Int -> Scratch -> Task.Task Error ()
+childUnits count at =
+    execIndex at.indexDb
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) SELECT 'c-' || i, 'ipe:src/Lib.rs', 'fn', 'c' || i, 'Lib.c' || i, 3, 3, 'internal', NULL, 'sha256:0', 'shaC' FROM n"
+        [ SqlInt count ]
+
+
+-- Every `.json` file in `tools/ipe-index/tests` is read by name through
+-- `ipeIndexTestFile` in this suite's code (comment lines aside), so a shared
+-- vectors file cannot sit beside the suite unread. Red if a vectors file is
+-- added with no consumer, or a consumer stops naming it.
+everySharedVectorsFileRead : Task.Task Error Bool
+everySharedVectorsFileRead =
+    do
+        cwd <- System.cwd ()
+        names <- Task.fromResult (Path.fromString (String.dropRight 1 (ipeIndexTestFile cwd ""))) |> Task.andThen File.readDir
+        suiteNames <- Task.fromResult (Path.fromString (cwd ++ "/tests")) |> Task.andThen File.readDir
+        sources <- Task.sequence
+            (List.map
+                (\file -> Task.fromResult (Path.fromString (cwd ++ "/tests/" ++ file)) |> Task.andThen (\p -> File.readFileLimit p (ByteSize.kib 256)))
+                (List.filter (String.endsWith ".ipe") suiteNames)
+            )
+        let
+            code =
+                String.join "\n" (List.map codeLines sources)
+
+            vectors =
+                List.filter (String.endsWith ".json") names
+        in
+        Task.succeed
+            (List.member "residual_vectors.json" vectors
+                && List.member "view_hash_vectors.json" vectors
+                && allReadByName vectors code
+                && not (allReadByName (vectors ++ [ "unread_vectors.json" ]) code)
+            )
+
+
+-- True when `code` names each of `files` in an `ipeIndexTestFile` read.
+allReadByName : List String -> String -> Bool
+allReadByName files code =
+    List.all (\file -> String.contains ("ipeIndexTestFile cwd \"" ++ file ++ "\"") code) files
+
+
+-- `source` without its comment lines.
+codeLines : String -> String
+codeLines source =
+    String.lines source
+        |> List.filter (\line -> not (String.startsWith "--" (String.trim line)))
+        |> String.join "\n"
 
 
 -- ── metadata-only queue page ───────────────────────────────────────────
@@ -801,7 +1000,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "reverify", "shortHash", "shownHash", "shownLines", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "readConnection", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -854,6 +1053,10 @@ checks =
         , check "one missing file fails only its unit" oneMissingFileIsolated
         , check "source file past the read ceiling refused" oversizedSourceRefused
         , check "view and attestation match the shared ipe-index vectors" viewHashVectors
+        , check "a file unit's residual matches the shared ipe-index vectors" residualVectors
+        , check "a file unit shows and attests its residual, never its whole range" fileUnitShowsResidual
+        , check "a file unit past the child span ceiling is withheld" fileUnitPastChildSpanCeiling
+        , check "every shared ipe-index vectors file is read by name" everySharedVectorsFileRead
         , check "unit page loads by uid, names resolve" unitPageLoad
         , check "a queue page reads no source file; only a unit's view load does" pageReadsNoSource
         , check "a unit's language comes from its file's indexed language" langFromFilesTable

@@ -252,6 +252,9 @@ viewTag view =
         TooLarge (ViewBytes o) ->
             "too large bytes " ++ String.fromInt (ByteSize.toBytes o.size)
 
+        TooLarge (ChildSpans o) ->
+            "too large spans " ++ String.fromInt o.atLeast
+
 
 shownTextOf : Index.SourceView -> Maybe String
 shownTextOf view =

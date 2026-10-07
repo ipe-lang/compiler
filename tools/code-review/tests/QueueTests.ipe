@@ -793,6 +793,7 @@ unitPageStatesDistinct =
             , Unreadable (Error.conflict "boom")
             , TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 })
             , TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
+            , TooLarge (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
             ]
 
         sourceTexts =

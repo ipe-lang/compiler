@@ -754,6 +754,9 @@ sourceStatusText view =
         TooLarge (ViewBytes o) ->
             Just ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)
 
+        TooLarge (ChildSpans o) ->
+            Just ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")
+
 
 -- What a reviewer can do about a view past a ceiling.
 notShownRemedy : String
