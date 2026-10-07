@@ -35,6 +35,34 @@ var __ipeDoc = (function(doc) {
     on: method(EventTarget.prototype, "addEventListener")
   };
 })(document);
+// The element members the client calls on a node that may be a `<form>`,
+// bound from the prototypes. A form's named controls shadow its built-in
+// members with the control: `<input name="addEventListener">` makes
+// `form.addEventListener` that input, so a listener bound or an attribute read
+// through the form's own lookup throws before the submit is intercepted and
+// the browser submits the form natively, its fields in the URL.
+var __ipeNode = (function() {
+  var getAttribute = Element.prototype.getAttribute;
+  var setAttribute = Element.prototype.setAttribute;
+  var removeAttribute = Element.prototype.removeAttribute;
+  var remove = Element.prototype.remove;
+  var contains = Node.prototype.contains;
+  var on = EventTarget.prototype.addEventListener;
+  var controls = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements");
+  return {
+    attr: function(el, name) { return getAttribute.call(el, name); },
+    setAttr: function(el, name, v) { setAttribute.call(el, name, v); },
+    removeAttr: function(el, name) { removeAttribute.call(el, name); },
+    remove: function(el) { remove.call(el); },
+    contains: function(el, other) { return contains.call(el, other); },
+    on: function(el, type, fn) { on.call(el, type, fn); },
+    // A form's controls; null for any other node.
+    controls: function(el) {
+      return el instanceof HTMLFormElement && controls && controls.get
+          ? controls.get.call(el) : null;
+    }
+  };
+})();
 var __IPE_BOOT_STRINGS = ["sid", "epoch", "base", "csrf"];
 var __IPE_CFG_BOOLEANS = ["bannerEnabled", "swapToast"];
 var __IPE_CFG_STRINGS = ["msgReconnecting", "msgUpdated", "msgOffline"];
@@ -1161,7 +1189,8 @@ function __ipeApplyPatches(patches) {
     var p = patches[i];
     var el = __ipeDoc.query('[ipe-id="' + p.id.replace(/"/g, '\\"') + '"]');
     if (!el) continue;
-    if (openSel && (el === openSel || el.contains(openSel) || openSel.contains(el))) {
+    if (openSel && (el === openSel || __ipeNode.contains(el, openSel) ||
+        __ipeNode.contains(openSel, el))) {
       // Skip: any mutation here would close the dropdown mid-pick.
       continue;
     }
@@ -1212,10 +1241,10 @@ function __ipeApplyPatches(patches) {
         var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
             ? __IPE_LIVE_PROPS[k] : null;
         if (v === "") {
-          el.removeAttribute(k);
+          __ipeNode.removeAttr(el, k);
           if (prop !== null) el[prop] = false;
         } else {
-          el.setAttribute(k, v);
+          __ipeNode.setAttr(el, k, v);
           // Sync DOM properties that don't reflect from attrs.
           if (k === "value" && ("value" in el)) {
             el.value = v;
@@ -1238,7 +1267,7 @@ function __ipeApplyPatches(patches) {
         if (savedScrollTop) el.scrollTop = savedScrollTop;
       }
     }
-    if (p.remove) el.remove();
+    if (p.remove) __ipeNode.remove(el);
   }
   // Any new ipe-* attribute in the patched DOM needs a listener.
   __ipeBindEvents();
@@ -1259,7 +1288,7 @@ function __ipeContainsFocusedInput(el) {
   if (!a || a === __ipeDoc.body()) return false;
   var tag = a.tagName;
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
-  return el === a || el.contains(a);
+  return el === a || __ipeNode.contains(el, a);
 }
 
 function __ipeEscapeHTML(s) {
@@ -1309,27 +1338,32 @@ function __ipeRunPaths(root) {
   }
 }
 
+// The elements already carrying the client's listener, per event name. Kept
+// beside the elements, never on them: a form's control named after a marker
+// property would answer for it.
+var __ipeBound = Object.create(null);
 function __ipeBindOne(eventName) {
+  var bound = __ipeBound[eventName] || (__ipeBound[eventName] = new WeakSet());
   var nodes = __ipeDoc.queryAll("[ipe-" + eventName + "]");
   for (var i = 0; i < nodes.length; i++) {
     var el = nodes[i];
-    if (el["__ipe_" + eventName]) continue;
-    el["__ipe_" + eventName] = true;
-    el.addEventListener(eventName, function(ev) {
+    if (bound.has(el)) continue;
+    bound.add(el);
+    __ipeNode.on(el, eventName, function(ev) {
+      // A bound submit is the client's to send, never the browser's: it is
+      // prevented before anything here can throw.
+      if (ev.type === "submit") ev.preventDefault();
       var target = ev.currentTarget;
-      var msgName = target.getAttribute("ipe-" + ev.type);
-      var hid     = target.getAttribute("data-ipe-hid");
+      var msgName = __ipeNode.attr(target, "ipe-" + ev.type);
+      var hid     = __ipeNode.attr(target, "data-ipe-hid");
       var epoch   = __ipeEpoch;
       if (!msgName && !hid) return;
-      // Some events want preventDefault (submit, form-link navigation);
-      // click doesn't (we only intercept when the attribute is set).
-      if (ev.type === "submit") ev.preventDefault();
       var args = __ipeExtractArgs(ev);
       if (ev.type === "input") {
         // Track live value against ipe-id so the snapshot bundled in
         // the next __ipeSend reflects the user's actual DOM state,
         // and so Step 3's patch filter can recognise dirty inputs.
-        var sid = target.getAttribute("ipe-id");
+        var sid = __ipeNode.attr(target, "ipe-id");
         if (sid) {
           var e = __ipeInputEntry(sid);
           e.liveValue = args && args.length > 0 ? String(args[0]) : "";
@@ -1376,13 +1410,18 @@ function __ipeExtractArgs(ev) {
       // 2. Disabled fields are excluded by the spec — skip them
       //    too so a disabled-but-submittable field doesn't leak
       //    a stale value.
-      var data = {};
+      //
+      // The form's own members are read through `__ipeNode`: its named
+      // controls shadow them. `data` has no prototype, so a control named
+      // `__proto__` is a field like any other.
+      var data = Object.create(null);
+      var active = __ipeDoc.active();
       var submitter = ev.submitter ||
-          (__ipeDoc.active() && t && t.contains(__ipeDoc.active())
-              ? __ipeDoc.active() : null);
-      if (t && t.elements) {
-        for (var i = 0; i < t.elements.length; i++) {
-          var el = t.elements[i];
+          (active && t && __ipeNode.contains(t, active) ? active : null);
+      var controls = __ipeNode.controls(t);
+      if (controls) {
+        for (var i = 0; i < controls.length; i++) {
+          var el = controls[i];
           if (!el.name || el.disabled) continue;
           if (el.type === "submit" || el.type === "button" ||
               el.type === "image" || el.type === "reset") {
