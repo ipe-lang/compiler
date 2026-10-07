@@ -27,6 +27,7 @@ import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.ReviewKey as ReviewKey
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
@@ -682,7 +683,26 @@ failedWritesKeepTheirErrorIn base =
     let
         dbPath =
             base ++ "/review.db"
+    in
+    do
+        dir <- Task.fromResult (Path.fromString base)
+        File.mkdirAll dir
+        removeReviewFiles dbPath
+        seen <- attestedFor "ipe-review-failed-writes-index" (uid "u-a")
+        fresh <- attestedFor "ipe-review-failed-writes-index" (uid "u-b")
+        rw <- migratedReviewAt dbPath
+        key <- testMacKey
+        LibDb.insertDecision key rw seen Approved
+        head <- headTextOf rw
+        ro <- openReadOnlyAt dbPath
+        outcome <- failedWritesOutcome key rw ro seen fresh head
+        removeReviewFiles dbPath
+        Task.succeed outcome
 
+
+failedWritesOutcome : ReviewKey.MacKey -> Db.Db -> Db.Db -> Index.Attested -> Index.Attested -> String -> Task.Task Error Bool
+failedWritesOutcome key rw ro seen fresh head =
+    let
         failedReadOnly task =
             task
                 |> Task.map (\_ -> False)
@@ -694,22 +714,11 @@ failedWritesKeepTheirErrorIn base =
                 |> Task.onError (\e -> Task.succeed (Error.message e == readOnlyWriteError))
     in
     do
-        dir <- Task.fromResult (Path.fromString base)
-        File.mkdirAll dir
-        removeReviewFiles dbPath
-        seen <- attestedFor "ipe-review-failed-writes-index" (uid "u-a")
-        fresh <- attestedFor "ipe-review-failed-writes-index" (uid "u-b")
-        rw <- migratedReviewAt dbPath
-        key <- testMacKey
         verify <- countingVerifier
-        LibDb.insertDecision key rw seen Approved
-        head <- headTextOf rw
-        ro <- openReadOnlyAt dbPath
         duplicate <- recordedNothing (LibDb.insertDecision key ro seen Approved)
         freshReview <- failedReadOnly (LibDb.insertDecision key ro fresh Approved)
         kept <- LibDb.findDecision verify rw (uid "u-b") (Index.attest viewB)
         headAfter <- headTextOf rw
-        removeReviewFiles dbPath
         Task.succeed (duplicate && freshReview && not (hasDecision kept) && headAfter == head)
 
 
@@ -1019,8 +1028,8 @@ legacyRowRedecidable db =
         Task.succeed (whyOf legacy == Just Legacy && not (isAlreadyDecided written) && n == 1 && isCounted redecided)
 
 
-checks : Task.Task Error (List ( String, Bool ))
-checks =
+reviewLogChecks : Task.Task Error (List ( String, Bool ))
+reviewLogChecks =
     Task.sequence
         [ check "drain_cursor is gone after migrate" drainCursorGoneAfterMigrate
         , check "open does not migrate" openDoesNotMigrate
@@ -1039,7 +1048,18 @@ checks =
         , check "a legacy row reads legacy and can be decided again" (onFreshReview "ipe-review-legacyRowRedecidable" legacyRowRedecidable)
         , check "a review file without its log head fails the probe" probeRefusesReviewWithoutHead
         , check "a review file without its append-only guards fails the probe" probeRefusesReviewWithoutGuards
-        , check "refusal reason is non-blank and bounded" (onFreshReview "ipe-review-reasonBounded" reasonBounded)
+        ]
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.map2 List.append reviewLogChecks storedRowChecks
+
+
+storedRowChecks : Task.Task Error (List ( String, Bool ))
+storedRowChecks =
+    Task.sequence
+        [ check "refusal reason is non-blank and bounded" (onFreshReview "ipe-review-reasonBounded" reasonBounded)
         , check "a stored over-long reason decodes and shows its length" (onFreshReview "ipe-review-storedOverlongReasonDecodes" storedOverlongReasonDecodes)
         , check "a stored blank reason decodes as blank" (onFreshReview "ipe-review-storedBlankReasonDecodes" storedBlankReasonDecodes)
         , check "history pages walk every row once in order" (onFreshReview "ipe-review-historyWalkMatchesOrder" historyWalkMatchesOrder)
