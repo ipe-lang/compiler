@@ -21,13 +21,14 @@ module Main exposing (main)
 --   * a composite key: a repeated pair updates, a new pair inserts;
 --   * a `unique` column as the target of a store with no primary key;
 --   * a row that conflicts on a `UNIQUE` column other than the target is the
---     database's typed `Err`, and writes nothing;
+--     database's typed `Err` carrying `Database UniqueViolation`, and writes
+--     nothing;
 --   * a renamed key column is targeted under its current name.
 --
 -- Output: see expected.txt.
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
-import Ipe.Db as Db exposing (Db)
+import Ipe.Db as Db exposing (Db, DbFailure(..))
 import Ipe.Db.Store as Store exposing (Draft, Store)
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Db.Unsafe as Unsafe
@@ -347,8 +348,8 @@ acceptChecks conn fx =
         say (counted "unique-update" (Store.upsert conn byEmail (contact "a@x" "Ann2" "p1")))
         say (snapshot "contacts" conn byEmail [ "email", "name", "phone" ])
         say
-            (refused "other-unique-conflict"
-                "db: database error [2067]"
+            (refusedBy "other-unique-conflict"
+                UniqueViolation
                 (Store.upsert conn byEmail (contact "b@x" "Bob" "p1"))
             )
         say (snapshot "contacts-after-conflict" conn byEmail [ "email", "name", "phone" ])
@@ -392,6 +393,28 @@ refused label needle task =
 
             else
                 Task.succeed (String.concat [ label, ":FAIL-wrong-error:", Error.message e ])
+        )
+        (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) task)
+
+
+-- `label:rejected` when `task` fails with the database failure `expected` in
+-- its details; any success, other failure, or non-database error is a FAIL line.
+refusedBy : String -> DbFailure -> Task Error a -> Task Error String
+refusedBy label expected task =
+    Task.onError
+        (\e ->
+            case e of
+                Error _ info ->
+                    case info.details of
+                        Just (Database failure) ->
+                            if failure == expected then
+                                Task.succeed (String.concat [ label, ":rejected" ])
+
+                            else
+                                Task.succeed (String.concat [ label, ":FAIL-wrong-failure:", Error.message e ])
+
+                        _ ->
+                            Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
         )
         (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) task)
 
