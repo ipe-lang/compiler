@@ -2702,10 +2702,10 @@ Ipe.System -- process environment + args + termination
 |--------|----------|
 | `args` | `args ()` -- the command-line arguments after the program name. |
 | `getArg` | `getArg n` -- zero-indexed positional arg lookup over the whole |
-| `getenv` | (no summary) |
+| `getenv` | `getenv key` -- the value of the environment variable `key`. |
 | `getenvOr` | `getenvOr key default` -- returns the env value if present, |
-| `getenvInt` | (no summary) |
-| `getenvBool` | (no summary) |
+| `getenvInt` | `getenvInt key` -- the environment variable `key` as an integer. |
+| `getenvBool` | `getenvBool key` -- the environment variable `key` as a boolean. |
 | `setenv` | (no summary) |
 | `unsetenv` | (no summary) |
 | `cwd` | (no summary) |
