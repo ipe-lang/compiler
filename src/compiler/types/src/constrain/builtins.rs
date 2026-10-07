@@ -52,7 +52,7 @@ pub struct Builtins {
     pub ek_conflict: Symbol,
     pub ek_unavailable: Symbol,
     pub ek_unexpected: Symbol,
-    /// `ErrorDetails` — the 5-variant enrichment union carried on
+    /// `ErrorDetails` — the 6-variant enrichment union carried on
     /// `ErrorInfo.details`. Registered as a Prelude
     /// built-in exactly like `ErrorKind` — see `ipe_lower`'s
     /// `enum_variants`/`ctor_arity` seeding.
@@ -62,13 +62,17 @@ pub struct Builtins {
     /// Registered as a Prelude built-in; seeded by `ipe_lower`'s
     /// `enum_variants`/`ctor_arity` (via `BuiltinTag::BackoffStrategy`).
     pub backoffstrategy: Symbol,
-    /// The 5 `ErrorDetails` constructor symbols, in canon's registered index
+    /// The 6 `ErrorDetails` constructor symbols, in canon's registered index
     /// order (`crates/ipe_canon/src/env.rs`) — do not reorder.
     pub ed_ffi_panic: Symbol,
     pub ed_type_mismatch: Symbol,
     pub ed_http_status: Symbol,
     pub ed_json_decode: Symbol,
     pub ed_custom: Symbol,
+    pub ed_database: Symbol,
+    /// `DbFailure` — the closed database-failure-cause union carried by
+    /// `ErrorDetails.Database`.
+    pub db_failure: Symbol,
     /// `PanicInfo` / `TypeInfo` / `ErrorInfo` — NOMINAL type-constructor
     /// symbols (SEAL fix, see
     /// `docs/adr/0001-language-semantics-and-types.md`). The three payload
@@ -817,6 +821,8 @@ impl Builtins {
             ed_http_status: interner.intern("HttpStatus")?,
             ed_json_decode: interner.intern("JsonDecode")?,
             ed_custom: interner.intern("Custom")?,
+            ed_database: interner.intern("Database")?,
+            db_failure: interner.intern("DbFailure")?,
             panicinfo: interner.intern("PanicInfo")?,
             typeinfo: interner.intern("TypeInfo")?,
             errorinfo: interner.intern("ErrorInfo")?,
@@ -1151,6 +1157,7 @@ impl Builtins {
             "Error" => BuiltinTag::Error,
             "ErrorKind" => BuiltinTag::ErrorKind,
             "ErrorDetails" => BuiltinTag::ErrorDetails,
+            "DbFailure" => BuiltinTag::DbFailure,
             _ => return Err(payload_bug(type_name, "<union>")),
         };
         Ok((Some(tag), Vec::new()))
@@ -1191,6 +1198,23 @@ impl Builtins {
                 "ErrorKind",
                 "Io" | "Network" | "Ffi" | "Decode" | "Timeout" | "NotFound" | "PermissionDenied"
                 | "InvalidInput" | "Conflict" | "Unavailable" | "Unexpected",
+            )
+            | (
+                "DbFailure",
+                "UniqueViolation"
+                | "ForeignKeyViolation"
+                | "NotNullViolation"
+                | "CheckViolation"
+                | "TriggerRaised"
+                | "OtherConstraint"
+                | "Busy"
+                | "ReadOnlyDatabase"
+                | "AccessDenied"
+                | "CannotOpen"
+                | "NotADatabase"
+                | "InvalidStatement"
+                | "Unreachable"
+                | "OtherFailure",
             ) => Vec::new(),
             ("Maybe", "Just") | ("Result", "Ok") => vec![a()],
             ("Result", "Err") => vec![e()],
@@ -1222,6 +1246,7 @@ impl Builtins {
             ("Error", "Error") => vec![tagged(BuiltinTag::ErrorKind), untagged(self.errorinfo)],
             ("ErrorDetails", "FfiPanic") => vec![untagged(self.panicinfo)],
             ("ErrorDetails", "TypeMismatch") => vec![untagged(self.typeinfo)],
+            ("ErrorDetails", "Database") => vec![tagged(BuiltinTag::DbFailure)],
             // A stream handle is minted only by the runtime; source never names it.
             ("StreamId", "StreamId") => return Ok(CtorPayload::Sealed),
             _ => return Err(payload_bug(type_name, ctor)),

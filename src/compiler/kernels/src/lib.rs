@@ -443,6 +443,8 @@ pub enum BuiltinTag {
     HttpMethod,
     /// `RedirectPolicy` — the redirect-behaviour ADT (`NoRedirects | FollowRedirects Int`).
     RedirectPolicy,
+    /// `DbFailure` — the closed database-failure-cause ADT carried by `ErrorDetails.Database`.
+    DbFailure,
     /// `Duration` — the `Ipe.Duration.Duration` opaque non-negative time span
     /// (`Duration Int`, compiled-source), consumed by the `Http.withTimeout`
     /// kernel's typed timeout argument. Homed at `["Ipe", "Duration"]` (see

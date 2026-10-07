@@ -1,0 +1,111 @@
+module Main exposing (main)
+
+-- A database failure reaches Ipê code as a typed `DbFailure` in the error's
+-- details, never as text to parse. Against a live `sqlite::memory:` database
+-- (one transaction, so every statement shares one connection), each check
+-- triggers one real failure and prints the variant it carries:
+--
+--   * a second insert of a `UNIQUE` value is `UniqueViolation`;
+--   * an insert a `BEFORE INSERT` trigger aborts with `RAISE(ABORT, …)` is
+--     `TriggerRaised`;
+--   * a write while `PRAGMA query_only` is on is `ReadOnlyDatabase`;
+--   * the controls: an insert that violates nothing succeeds, before the
+--     failures and again once `query_only` is off.
+--
+-- Output: see expected.txt.
+
+import Ipe.Db as Db exposing (Db, DbFailure(..))
+import Ipe.Db.Unsafe as Unsafe
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+-- The constructor name of a database failure.
+failureName : DbFailure -> String
+failureName failure =
+    case failure of
+        UniqueViolation ->
+            "UniqueViolation"
+
+        ForeignKeyViolation ->
+            "ForeignKeyViolation"
+
+        NotNullViolation ->
+            "NotNullViolation"
+
+        CheckViolation ->
+            "CheckViolation"
+
+        TriggerRaised ->
+            "TriggerRaised"
+
+        OtherConstraint ->
+            "OtherConstraint"
+
+        Busy ->
+            "Busy"
+
+        ReadOnlyDatabase ->
+            "ReadOnlyDatabase"
+
+        AccessDenied ->
+            "AccessDenied"
+
+        CannotOpen ->
+            "CannotOpen"
+
+        NotADatabase ->
+            "NotADatabase"
+
+        InvalidStatement ->
+            "InvalidStatement"
+
+        Unreachable ->
+            "Unreachable"
+
+        OtherFailure ->
+            "OtherFailure"
+
+
+-- `label:<Variant>` for the database failure `task` fails with; a success is
+-- `label:ok` and a non-database error is a FAIL line.
+outcome : String -> Task Error a -> Task Error ()
+outcome label task =
+    Task.andThen Io.println
+        (Task.onError
+            (\e ->
+                case e of
+                    Error _ info ->
+                        case info.details of
+                            Just (Database failure) ->
+                                Task.succeed (String.concat [ label, ":", failureName failure ])
+
+                            _ ->
+                                Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+            )
+            (Task.map (\_ -> String.concat [ label, ":ok" ]) task)
+        )
+
+
+checks : Db -> Task Error ()
+checks conn =
+    do
+        Unsafe.unsafeExecRaw conn "CREATE TABLE users (email TEXT UNIQUE)"
+        Unsafe.unsafeExecRaw conn "CREATE TABLE audit (note TEXT)"
+        Unsafe.unsafeExecRaw conn
+            "CREATE TRIGGER audit_closed BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT, 'audit is closed'); END"
+        outcome "first-insert" (Db.exec conn "INSERT INTO users (email) VALUES (?)" [ SqlString "a@x" ])
+        outcome "unique" (Db.exec conn "INSERT INTO users (email) VALUES (?)" [ SqlString "a@x" ])
+        outcome "trigger" (Db.exec conn "INSERT INTO audit (note) VALUES (?)" [ SqlString "n" ])
+        Unsafe.unsafeExecRaw conn "PRAGMA query_only = ON"
+        outcome "read-only" (Db.exec conn "INSERT INTO users (email) VALUES (?)" [ SqlString "b@x" ])
+        Unsafe.unsafeExecRaw conn "PRAGMA query_only = OFF"
+        outcome "writable-again" (Db.exec conn "INSERT INTO users (email) VALUES (?)" [ SqlString "c@x" ])
+
+
+main =
+    Task.andThen
+        (\conn -> Db.withTransaction conn checks)
+        (Db.open "sqlite" "sqlite::memory:")
