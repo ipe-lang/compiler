@@ -1,6 +1,47 @@
 var __ipeSid = window.__IPE_SID;
 var __ipeBase = window.__IPE_BASE || "";
 var __ipeCsrfToken = window.__IPE_CSRF_TOKEN || "";
+// The render epoch of the DOM on screen. An event carries the epoch its
+// handler id was read under; the server resolves the id only against that
+// render, and a refused event is answered with the current render, never
+// re-sent.
+var __ipeEpoch = window.__IPE_EPOCH || null;
+// A random id minted once per page load. With the client seq it lets the
+// server ack a re-delivered event without dispatching it twice.
+var __ipeTabId = (function() {
+  try {
+    var b = new Uint8Array(16);
+    window.crypto.getRandomValues(b);
+    var hex = "";
+    for (var i = 0; i < b.length; i++) hex += (b[i] < 16 ? "0" : "") + b[i].toString(16);
+    return hex;
+  } catch (_) { return null; }
+})();
+// Split an epoch token "<32 hex>.<counter>" into its incarnation and counter.
+function __ipeEpochParts(token) {
+  if (typeof token !== "string" || token.indexOf(".") !== 32) return null;
+  var n = token.slice(33);
+  if (!/^[1-9][0-9]*$/.test(n)) return null;
+  return { inc: token.slice(0, 32), n: n };
+}
+// Whether a full render at epoch `token` may replace the DOM: one from another
+// render history always may; within one history only a render no older than
+// the one on screen. Counters are canonical decimals, so a longer one is larger.
+function __ipeFullBodyAdmits(token) {
+  var next = __ipeEpochParts(token);
+  var cur = __ipeEpochParts(__ipeEpoch);
+  if (!next || !cur || next.inc !== cur.inc) return true;
+  if (next.n.length !== cur.n.length) return next.n.length > cur.n.length;
+  return next.n >= cur.n;
+}
+// Apply a full render through `applyFn` when its epoch admits it, then adopt
+// that epoch. A render without a well-formed epoch leaves none, so the next
+// event is refused and answered with the current render.
+function __ipeAdoptFullBody(token, applyFn) {
+  if (!__ipeFullBodyAdmits(token)) return;
+  applyFn();
+  __ipeEpoch = __ipeEpochParts(token) ? token : null;
+}
 // Server-templated config (mod.rs render_page_full → window.__IPE_*). Each
 // reads the injected window global when present, else the hardcoded default —
 // so IPE_WEB_RETRY_* / QUEUE_MAX / HELLO_TIMEOUT_MS / HEARTBEAT_TTL_MS /
@@ -545,13 +586,14 @@ function __ipeLoaderEnd() {
 // ── Debounce ─────────────────────────────────────────────────
 var __ipeInputTimers = {};
 var __ipeInputPending = {};
-function __ipeDebouncedSend(msgName, args, hid, delay) {
+// `epoch` is the render epoch read with `hid` at the keystroke.
+function __ipeDebouncedSend(msgName, args, hid, delay, epoch) {
   var key = hid || msgName;
   clearTimeout(__ipeInputTimers[key]);
-  __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid };
+  __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid, epoch: epoch };
   __ipeInputTimers[key] = setTimeout(function() {
     delete __ipeInputPending[key];
-    __ipeSend(msgName, args, hid, { noLoader: true });
+    __ipeSend(msgName, args, hid, { noLoader: true, epoch: epoch });
   }, delay);
 }
 // Flush pending debounced input on blur (tab away / click elsewhere).
@@ -566,7 +608,7 @@ document.addEventListener("focusout", function(ev) {
     clearTimeout(__ipeInputTimers[key]);
     var p = __ipeInputPending[key];
     delete __ipeInputPending[key];
-    __ipeSend(p.msgName, p.args, p.hid, { noLoader: true });
+    __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch });
   }
 }, true);
 
@@ -596,7 +638,8 @@ function __ipeCollectPendingBatch() {
       seq: __ipeClientSeq,
       msg: p.msgName || "",
       args: p.args || [],
-      handlerId: p.hid || ""
+      handlerId: p.hid || "",
+      epoch: p.epoch
     });
   }
   return batch;
@@ -655,7 +698,7 @@ function __ipeFlushPendingSync() {
   if (!batch) return;
   for (var i = 0; i < batch.length; i++) {
     var b = batch[i];
-    __ipeSend(b.msg, b.args, b.handlerId, {noLoader: true});
+    __ipeSend(b.msg, b.args, b.handlerId, {noLoader: true, epoch: b.epoch});
   }
 }
 
@@ -689,9 +732,11 @@ window.addEventListener("pagehide", __ipeFlushPendingBeacon);
 
 // ── Core send ────────────────────────────────────────────────
 // Wire format (see docs/internals/web/input-authority-protocol.md §Request):
-//   {sessionId, seq, msg, args, handlerId, inputState?}
+//   {sessionId, seq, msg, args, handlerId, epoch?, tab?, inputState?}
 //   * seq is client-monotonic — server uses it to match responses to
-//     the inputState snapshot that produced them.
+//     the inputState snapshot that produced them; with tab it marks a
+//     re-delivered event as a duplicate.
+//   * epoch names the render handlerId was read from.
 //   * inputState carries the user's current DOM values for every
 //     dirty input so the server's diff can align against reality
 //     before emitting patches.
@@ -717,6 +762,11 @@ function __ipeSend(msgName, args, handlerId, opts) {
     args: args || [],
     handlerId: handlerId || ""
   };
+  // The epoch read with the handler id, or the current one for a caller that
+  // reads no id from the DOM. A retry re-posts this body, so it keeps the stamp.
+  var epoch = ("epoch" in opts) ? opts.epoch : __ipeEpoch;
+  if (epoch) body.epoch = epoch;
+  if (__ipeTabId) body.tab = __ipeTabId;
   if (snapshot) body.inputState = snapshot;
   __ipePostEvent(body);
 }
@@ -753,6 +803,19 @@ function __ipePostEvent(body) {
     body: JSON.stringify(body),
     credentials: "same-origin"
   }).then(function(r){
+    if (r.status === 409 && r.headers.get("X-Ipe-Web") === "1") {
+      // The server refused the event's render epoch and sent the current
+      // render. Apply it and end here: the refused event is never re-sent,
+      // since its handler id may now name another handler.
+      return r.json().then(function(data) {
+        __ipeLoaderEnd();
+        __ipeOnPostSuccess();
+        if (!data || typeof data.body !== "string") return;
+        // The epoch gate orders this render against the DOM on screen; the
+        // seq it carries is the session's, which an earlier ack may equal.
+        __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); });
+      }).catch(function() { __ipeLoaderEnd(); });
+    }
     if (!r.ok && r.status >= 500) {
       // Server is up but rejecting (502/503/504 from a deploying LB,
       // or 500 from a panic that survived the recover guard). Treat
@@ -1088,6 +1151,7 @@ function __ipeBindOne(root, eventName) {
       var target = ev.currentTarget;
       var msgName = target.getAttribute("ipe-" + ev.type);
       var hid     = target.getAttribute("data-ipe-hid");
+      var epoch   = __ipeEpoch;
       if (!msgName && !hid) return;
       // Some events want preventDefault (submit, form-link navigation);
       // click doesn't (we only intercept when the attribute is set).
@@ -1102,10 +1166,10 @@ function __ipeBindOne(root, eventName) {
           var e = __ipeInputEntry(sid);
           e.liveValue = args && args.length > 0 ? String(args[0]) : "";
         }
-        __ipeDebouncedSend(msgName, args, hid, 150);
+        __ipeDebouncedSend(msgName, args, hid, 150, epoch);
         return;
       }
-      __ipeSend(msgName, args, hid);
+      __ipeSend(msgName, args, hid, { epoch: epoch });
     });
   }
 }
@@ -1190,6 +1254,8 @@ document.addEventListener("change", function(ev) {
   var fileEv  = el.getAttribute("data-ipe-ev-ipe-file");
   var imageEv = el.getAttribute("data-ipe-ev-ipe-image");
   var hid     = el.getAttribute("data-ipe-hid");
+  // Read with the id, before the asynchronous read below.
+  var epoch   = __ipeEpoch;
   var f = el.files && el.files[0];
   if (!f) return;
   // Client-side size guard via fileMaxSize. Saves the round-trip when
@@ -1214,7 +1280,7 @@ document.addEventListener("change", function(ev) {
     // []json.RawMessage); a bare string would unmarshal-fail. Wrap
     // the data URL in a single-element array — the Ipe-side Msg
     // constructor declared as 'String -> Msg' reads args[0].
-    r.onload = function(e) { __ipeSend(fileEv, [e.target.result], hid); };
+    r.onload = function(e) { __ipeSend(fileEv, [e.target.result], hid, { epoch: epoch }); };
     r.readAsDataURL(f);
   }
   if (imageEv) {
@@ -1222,7 +1288,7 @@ document.addEventListener("change", function(ev) {
     var maxH = parseInt(el.getAttribute("data-ipe-ev-ipe-file-max-height") || "1200");
     __ipeResizeImage(f, maxW, maxH, function(dataUrl) {
       // Same wire-format reason as the onFile branch — wrap in array.
-      __ipeSend(imageEv, [dataUrl], hid);
+      __ipeSend(imageEv, [dataUrl], hid, { epoch: epoch });
     });
   }
 });
@@ -1248,7 +1314,11 @@ function __ipeResizeImage(file, maxW, maxH, cb) {
 // contract is (handlerId, value, options): a caller targets a specific
 // registered handler by id, so the id maps to __ipeSend's handlerId slot
 // (not msgName) and value maps to args.
-window.__ipe_send = function(id, value, opts) { __ipeSend("", value, id, opts); };
+// The caller reads no id from the DOM, so the event carries the epoch current
+// at the call.
+window.__ipe_send = function(id, value, opts) {
+  __ipeSend("", value, id, { noLoader: !!(opts && opts.noLoader), epoch: __ipeEpoch });
+};
 
 // Ipe.Ffi.Js inbound port seam. The port glue (window.ipe.send) stringifies
 // the developer's value and hands the raw JSON string here; this POSTs it
@@ -1316,10 +1386,11 @@ document.addEventListener("click", function(ev) {
   fetch(href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
       var url = __ipeFollowed(r, href);
-      return r.text().then(function(t) { return { t: t, url: url }; });
+      var epoch = r.headers.get("X-Ipe-Epoch");
+      return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
     })
     .then(function(res) {
-      __ipePatch(res.t, "nav");
+      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
       window.history.pushState({}, "", res.url);
       __ipeNavPath   = window.location.pathname;
       __ipeNavSearch = window.location.search;
@@ -1349,9 +1420,12 @@ window.addEventListener("popstate", function() {
         __ipeNavSearch = window.location.search;
         __ipeNavHref   = window.location.href;
       }
-      return r.text();
+      var epoch = r.headers.get("X-Ipe-Epoch");
+      return r.text().then(function(t) { return { t: t, epoch: epoch }; });
     })
-    .then(function(t) { __ipePatch(t, "nav"); });
+    .then(function(res) {
+      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
+    });
 });
 // ── Status banner (connection state) ─────────────────────────
 // Single bottom-pinned element rendered by the runtime (NOT by the
@@ -1626,7 +1700,11 @@ function __ipeOpenSSE() {
     if (frame && typeof frame === "object") {
       __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
         if (document.activeElement && document.activeElement.tagName === "SELECT") return;
-        if (frame.body) __ipePatch(frame.body.replace(/\\n/g, "\n"));
+        if (frame.body) {
+          __ipeAdoptFullBody(frame.epoch, function() {
+            __ipePatch(frame.body.replace(/\\n/g, "\n"));
+          });
+        }
       }, frame.globalSeq);
     }
   });
@@ -1688,8 +1766,16 @@ function __ipeOpenSSE() {
       return;
     }
     if (!frame || typeof frame !== "object" || !frame.patches) return;
+    // The patches diff the render `from` against `to`: they apply only onto
+    // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
+    // first frame is the full current render.
+    if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
+      __ipeResyncRender();
+      return;
+    }
     __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
       __ipeApplyPatches(frame.patches);
+      if (typeof frame.to === "string") __ipeEpoch = frame.to;
     }, frame.globalSeq);
   });
   // Ipe.Ffi.Js outbound port frame: the server's js_send delivers the seal
@@ -1789,6 +1875,19 @@ function __ipeOpenSSE() {
 // surprising on push-driven UIs like dashboards or chat). Backoff
 // matches the POST retry schedule so the user doesn't see two
 // independent timers.
+// __ipeResyncRender — the DOM on screen is not the render a patches frame was
+// diffed from. Reopen the stream at once: its first frame is the full current
+// render with its epoch.
+function __ipeResyncRender() {
+  __ipeForcedClose = true;
+  try { if (__ipeSSE) __ipeSSE.close(); } catch (_) {}
+  __ipeSSE = null;
+  if (__ipeSseReopenTimer !== null) {
+    clearTimeout(__ipeSseReopenTimer);
+    __ipeSseReopenTimer = null;
+  }
+  __ipeOpenSSE();
+}
 function __ipeForceReopenSSE() {
   __ipeForcedClose = true;
   __ipeSetLive(false);
