@@ -10,8 +10,12 @@
  *      field of the wrong shape halts the client with an `IpeBootError`, shows
  *      the offline banner, and never marks the page live.
  *   2. Decoys — an element of the app's, earlier in the page and carrying the
- *      block's id, never stands in for the block: the page still boots on the
- *      server's own values.
+ *      block's id, never stands in for the block, and an `<img
+ *      name="currentScript">` never stands in for the client's own tag: the
+ *      page still boots on the server's own values. An app element carrying
+ *      the banner's id never hides the boot failure.
+ *   3. Navigation — an `ipe-nav` fetch of a full page splices only that page's
+ *      `#ipe-root` contents, never its boot block and scripts.
  *
  * Each case serves the real page with its HTML rewritten in flight.
  *
@@ -55,7 +59,12 @@ async function serveRewritten(page, rewrite) {
       const response = await route.fetch();
       const html = await response.text();
       original.boot = bootOf(html);
-      await route.fulfill({ response, body: rewrite(html) });
+      // The rewritten body has its own length and no encoding: drop the
+      // original's framing headers so the browser reads all of it.
+      const headers = { ...response.headers() };
+      delete headers["content-length"];
+      delete headers["content-encoding"];
+      await route.fulfill({ response, headers, body: rewrite(html) });
     },
   );
   await page.goto(BASE);
@@ -91,11 +100,18 @@ const REFUSALS = [
   ],
 ];
 
+// The banner's id on an app element must not hide the refusal.
+const missing = REFUSALS[0][1];
+REFUSALS.push([
+  "the block is missing and an app element carries the banner's id",
+  (html) => missing(html).replace(/<body([^>]*)>/, (open) => open + '<div id="__ipe-status"></div>'),
+]);
+
 for (const [name, rewrite, init] of REFUSALS) {
   test(`refusal: ${name}`, async ({ page }) => {
     if (init) await page.addInitScript(init);
     const { errors } = await serveRewritten(page, rewrite);
-    const banner = page.locator("#__ipe-status");
+    const banner = page.locator("#__ipe-status.ipe-status--offline");
     await expect(banner).toHaveClass(/ipe-status--offline/, { timeout: 10000 });
     await expect(banner).toContainText("Page failed to start");
     const boot = errors.filter((e) => e.message.startsWith("Ipe boot data "));
@@ -122,4 +138,42 @@ test("decoys: an earlier element with the block's id never stands in for it", as
   const sid = await page.evaluate(() => window.__IPE_SID);
   expect(sid).toBe(original.boot.sid);
   expect(sid).not.toBe("decoy");
+});
+
+test("decoys: an <img name=currentScript> never stands in for the client's own tag", async ({
+  page,
+}) => {
+  // A complete decoy block right before the image: a client that took the
+  // document's `currentScript` property would boot on the decoy's values.
+  const { errors, original } = await serveRewritten(page, (html) => {
+    const decoy = { ...bootOf(html), sid: "decoy", csrf: "decoy" };
+    return html.replace(
+      /<body([^>]*)>/,
+      (open) => open + blockOf(decoy) + '<img name="currentScript" alt="">',
+    );
+  });
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  expect(errors.map(String)).toEqual([]);
+  const sid = await page.evaluate(() => window.__IPE_SID);
+  expect(sid).toBe(original.boot.sid);
+  expect(sid).not.toBe("decoy");
+});
+
+test("navigation: an ipe-nav fetch splices only the fetched page's root", async ({ page }) => {
+  await serveRewritten(page, (html) =>
+    html.replace("</body>", '<a ipe-nav href="/" id="ipe-e2e-nav">nav</a></body>'),
+  );
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  // A marker the splice replaces, so the assertions run after the patch.
+  await page.evaluate(() =>
+    document.getElementById("ipe-root").insertAdjacentHTML("beforeend", '<i id="ipe-e2e-stale"></i>'),
+  );
+  await page.locator("#ipe-e2e-nav").click();
+  await expect(page.locator("#ipe-e2e-stale")).toHaveCount(0, { timeout: 10000 });
+  const counts = await page.evaluate(() => ({
+    roots: document.querySelectorAll("#ipe-root").length,
+    blocks: document.querySelectorAll("#ipe-root script").length,
+    clients: document.querySelectorAll('script[src*="/_ipe/client."]').length,
+  }));
+  expect(counts).toEqual({ roots: 1, blocks: 0, clients: 1 });
 });

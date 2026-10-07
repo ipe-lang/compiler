@@ -12,14 +12,40 @@
 /// page through this module goes red if the two drift.
 pub const BOOT_BLOCK_OPEN: &str = "<script type=\"application/json\" id=\"ipe-boot\">";
 
+/// The opening of the client script tag the boot block immediately precedes.
+const CLIENT_TAG_OPEN: &str = "<script src=\"";
+
+/// The path segment of the client script's `src`.
+const CLIENT_PATH: &str = "/_ipe/client.";
+
 /// The page's boot data block, parsed as JSON.
 ///
-/// `None` when the page carries no block, the block is unclosed, or its body is
-/// not JSON.
+/// The block is the one the client binds: its element immediately precedes the
+/// client's own `<script src="…/_ipe/client.…">` tag. A block-shaped element
+/// anywhere else in the page (app markup earlier in the body) is never read.
+///
+/// `None` when the page carries no such block, carries more than one, the
+/// block is unclosed, or its body is not JSON.
 #[must_use]
 pub fn boot_data(html: &str) -> Option<serde_json::Value> {
-    let rest = html.get(html.find(BOOT_BLOCK_OPEN)? + BOOT_BLOCK_OPEN.len()..)?;
-    serde_json::from_str(rest.get(..rest.find("</script>")?)?).ok()
+    let mut bound = html.match_indices(BOOT_BLOCK_OPEN).filter_map(|(at, _)| {
+        let rest = html.get(at + BOOT_BLOCK_OPEN.len()..)?;
+        let end = rest.find("</script>")?;
+        let after = rest
+            .get(end + "</script>".len()..)?
+            .strip_prefix(CLIENT_TAG_OPEN)?;
+        let src = after.get(..after.find('"')?)?;
+        if src.contains(CLIENT_PATH) {
+            rest.get(..end)
+        } else {
+            None
+        }
+    });
+    let body = bound.next()?;
+    if bound.next().is_some() {
+        return None;
+    }
+    serde_json::from_str(body).ok()
 }
 
 /// The string field `key` at the top level of the page's boot data block.
@@ -35,8 +61,12 @@ pub fn boot_string(html: &str, key: &str) -> Option<String> {
 mod tests {
     use super::{BOOT_BLOCK_OPEN, boot_string};
 
+    const CLIENT: &str = "<script src=\"/app/_ipe/client.0123456789abcdef.js\"></script>";
+
     fn page(block_body: &str) -> String {
-        format!("<body><div id=\"ipe-root\"></div>{BOOT_BLOCK_OPEN}{block_body}</script></body>")
+        format!(
+            "<body><div id=\"ipe-root\"></div></body>{BOOT_BLOCK_OPEN}{block_body}</script>{CLIENT}"
+        )
     }
 
     #[test]
@@ -56,5 +86,25 @@ mod tests {
         assert_eq!(boot_string(&unclosed, "epoch"), None);
         let old_global = "<script>window.__IPE_EPOCH=\"e\";</script>";
         assert_eq!(boot_string(old_global, "epoch"), None);
+        let unbound = format!("<body>{BOOT_BLOCK_OPEN}{{\"epoch\":\"e\"}}</script></body>");
+        assert_eq!(boot_string(&unbound, "epoch"), None);
+        let other_script = format!(
+            "{BOOT_BLOCK_OPEN}{{\"epoch\":\"e\"}}</script><script src=\"/app.js\"></script>"
+        );
+        assert_eq!(boot_string(&other_script, "epoch"), None);
+    }
+
+    #[test]
+    fn reads_the_block_before_the_client_tag_never_an_earlier_decoy() {
+        let decoy = format!("<body>{BOOT_BLOCK_OPEN}{{\"epoch\":\"decoy\"}}</script>");
+        let html = page(r#"{"epoch":"real"}"#).replace("<body>", &decoy);
+        assert_eq!(boot_string(&html, "epoch").as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn refuses_two_blocks_bound_to_a_client_tag() {
+        let first = format!("<body>{BOOT_BLOCK_OPEN}{{\"epoch\":\"a\"}}</script>{CLIENT}");
+        let html = page(r#"{"epoch":"b"}"#).replace("<body>", &first);
+        assert_eq!(boot_string(&html, "epoch"), None);
     }
 }
