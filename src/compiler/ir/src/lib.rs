@@ -24,7 +24,8 @@ pub mod seq_clone;
 mod show_policy;
 
 pub use enum_facts::{
-    EnumTraits, FfiUnion, RuntimeBridgedEnum, home_is_ffi_interface, payload_leaf_is_clone,
+    EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS, home_is_ffi_interface,
+    is_store_row_phantom_union, payload_leaf_is_clone,
 };
 pub use held::{
     EnumPayloadTable, MAX_HELD_WALK_DEPTH, Reach, enum_payload_holds, enum_payload_table,

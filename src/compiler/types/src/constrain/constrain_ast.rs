@@ -39,6 +39,38 @@ pub enum ObligationKind {
     WebPage,
     /// `Web.route` page-builder var (per-route page witness).
     WebBuilder,
+    /// A scheme var the kernel's runtime function bounds by `PartialOrd`.
+    Ordered,
+    /// A scheme var the kernel's runtime function bounds by `PartialEq`.
+    Equatable,
+}
+
+impl ObligationKind {
+    /// The super-type bound the shared table-driven tie attaches to a slot of this kind.
+    ///
+    /// `Some` for a kind that mirrors a trait bound of the kernel's runtime
+    /// Rust function: `Builder::tie_bound_obligations` ties every such row
+    /// after any instantiation, so adding a row is all it takes to enforce it.
+    /// `None` for a kind whose own `constrain_var_kernel` arm reads its slot
+    /// (a module-selected key, a SQL bind, a stringify, a Web witness).
+    #[must_use]
+    pub const fn generic_bound(self) -> Option<TyBounds> {
+        match self {
+            Self::Ordered => Some(TyBounds::ord()),
+            Self::Equatable => Some(TyBounds::eq()),
+            Self::Key
+            | Self::SetMapResult
+            | Self::SqlParam
+            | Self::Show
+            | Self::Interpolable
+            | Self::WebModel
+            | Self::WebNotFound
+            | Self::WebMsg
+            | Self::WebCfgTail
+            | Self::WebPage
+            | Self::WebBuilder => None,
+        }
+    }
 }
 
 /// Single source of truth for every pinned kernel-obligation slot: the
@@ -100,15 +132,57 @@ pub const OBLIGATION_SLOTS: &[(StdlibKernel, u32, ObligationKind)] = {
         // `Web.route` — page var 0, builder var 1.
         (K::WebRoute, 0, O::WebPage),
         (K::WebRoute, 1, O::WebBuilder),
+        // `List.sortBy : (a -> b) -> List a -> List a` — the key `b` (raw var
+        // 1) is the runtime `list_sort_by`'s `B: PartialOrd`.
+        (K::ListSortBy, 1, O::Ordered),
+        // `List.member` / `List.unique` — the element (raw var 0) is the
+        // runtime `list_member`'s `T0: PartialEq` / `list_unique`'s
+        // `T: PartialEq`.
+        (K::ListMember, 0, O::Equatable),
+        (K::ListUnique, 0, O::Equatable),
     ]
 };
+
+/// Whether every bound-carrying [`OBLIGATION_SLOTS`] row names a var its kernel's scheme shape carries.
+///
+/// One pass over the rows: a row whose kind has an
+/// [`ObligationKind::generic_bound`] needs a [`StdlibKernel::scheme_shape`] in
+/// which [`ipe_kernels::shape_aligns_var`] finds the row's slot, otherwise the
+/// tie would miss the variable the runtime bound sits on.
+const fn bound_rows_are_aligned(rows: &[(StdlibKernel, u32, ObligationKind)]) -> bool {
+    let mut rest = rows;
+    while let Some((&(kernel, slot, kind), tail)) = rest.split_first() {
+        if kind.generic_bound().is_some() {
+            let Some(shape) = kernel.scheme_shape() else {
+                return false;
+            };
+            if slot > 0xFF {
+                return false;
+            }
+            #[allow(clippy::cast_possible_truncation)] // bounded by the check above
+            let var = slot as u8;
+            if !ipe_kernels::shape_aligns_var(shape, var) {
+                return false;
+            }
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a bound-carrying obligation row names a scheme var its kernel's scheme shape does not carry, the kernel-obligation SEAL invariant
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    bound_rows_are_aligned(OBLIGATION_SLOTS),
+    "an OBLIGATION_SLOTS row with a generic bound names a scheme var its kernel's scheme_shape does not carry at an aligned position",
+);
 
 /// The frozen size of [`OBLIGATION_SLOTS`], pinned by
 /// `obligation_slots_match_scheme_shapes` so adding/removing a pinned slot must
 /// update this count — a silently dropped entry (obligation removed → hazard
 /// reopened) fails the build.
 #[cfg(test)]
-pub const EXPECTED_OBLIGATION_SLOT_COUNT: usize = 34;
+pub const EXPECTED_OBLIGATION_SLOT_COUNT: usize = 37;
 
 impl Builder<'_> {
     /// Constrain one def's body with `current_home` set to the def's module
@@ -507,6 +581,53 @@ impl Builder<'_> {
         Ok(())
     }
 
+    /// Tie every bound-carrying [`OBLIGATION_SLOTS`] row of kernel `k` to a super-typed variable.
+    ///
+    /// A row whose kind has an [`ObligationKind::generic_bound`] names the raw
+    /// scheme variable its kernel's runtime Rust function bounds by a trait
+    /// (`list_sort_by`'s `B: PartialOrd`, `list_member`'s `T0: PartialEq`).
+    /// Tying it here, on the union-find variable minted for this reference,
+    /// makes a concrete pin that Rust cannot satisfy fail closed at type-check
+    /// and lifts the bound onto an enclosing generic's annotation skolem. A row
+    /// whose variable is absent from the instantiated scheme is a registry
+    /// drift and fails closed.
+    fn tie_bound_obligations(
+        &mut self,
+        k: StdlibKernel,
+        vars: &BTreeMap<u32, VarId>,
+        span: Span,
+    ) -> DResult<()> {
+        for &(kernel, slot, kind) in OBLIGATION_SLOTS {
+            if kernel != k {
+                continue;
+            }
+            let Some(bound) = kind.generic_bound() else {
+                continue;
+            };
+            let slot_var = *vars.get(&slot).ok_or(Diagnostic::Lower {
+                span,
+                msg: LowerError::Unsupported(Feature::Kernels),
+            })?;
+            let s = self.super_var(bound, span)?;
+            self.eq(span, slot_var, s)?;
+        }
+        Ok(())
+    }
+
+    /// Tie every scheme-declared obligation of an instantiated kernel `k`.
+    ///
+    /// The one call each instantiation site makes, so no site can tie the
+    /// callback-result restriction yet skip a table-declared bound.
+    fn tie_scheme_obligations(
+        &mut self,
+        k: StdlibKernel,
+        vars: &BTreeMap<u32, VarId>,
+        span: Span,
+    ) -> DResult<()> {
+        self.tie_hof_results(k, vars, span)?;
+        self.tie_bound_obligations(k, vars, span)
+    }
+
     /// The type of a kernel reference (`Math.min`, `Set.insert`, …).
     ///
     /// Most kernels take the declarative scheme from [`Self::resolve_scheme`] via
@@ -530,6 +651,12 @@ impl Builder<'_> {
     ///   `Hash + Eq + Ord` (Dict) onto its annotation skolem (see `bounds_for`).
     ///   This is also more conservative than Ipê's runtime, which keys a Set /
     ///   Dict on a stringified value.
+    /// * Every instantiated kernel — each [`OBLIGATION_SLOTS`] row with an
+    ///   [`ObligationKind::generic_bound`] (the `List.sortBy` key, the
+    ///   `List.member` / `List.unique` element) is tied by
+    ///   `Self::tie_bound_obligations`, so a record, custom-type, tuple or
+    ///   function key and a function-bearing element fail closed instead of
+    ///   reaching `cargo` as an unmet `PartialOrd` / `PartialEq`.
     #[allow(clippy::too_many_lines)]
     pub fn constrain_var_kernel(
         &mut self,
@@ -693,7 +820,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 // The key qualifier (`Set`/`Dict`/`Cache` in `key_obligation_for`)
                 // selects the WHOLE module. The key/element is raw scheme-var 0 by
                 // construction across every kernel in it — the convention the
@@ -758,7 +885,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let params_var = *vars.get(&raw_idx).ok_or(Diagnostic::Lower {
                     span,
                     msg: LowerError::Unsupported(Feature::Kernels),
@@ -786,7 +913,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let slot = Self::obligation_slot(k, ObligationKind::Interpolable).ok_or(
                     Diagnostic::Lower {
                         span,
@@ -814,7 +941,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let slot =
                     Self::obligation_slot(k, ObligationKind::Show).ok_or(Diagnostic::Lower {
                         span,
@@ -850,7 +977,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let model_slot = Self::obligation_slot(k, ObligationKind::WebModel).ok_or(
                     Diagnostic::Lower {
                         span,
@@ -909,7 +1036,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let page_slot =
                     Self::obligation_slot(k, ObligationKind::WebPage).ok_or(Diagnostic::Lower {
                         span,
@@ -957,7 +1084,7 @@ impl Builder<'_> {
         let ty = Self::kernel_scheme_or_unsupported(registry, None, span)?;
         let (var, vars, _) = self.instantiate_tracked(&ty)?;
         if let Some(k) = id {
-            self.tie_hof_results(k, &vars, span)?;
+            self.tie_scheme_obligations(k, &vars, span)?;
         }
         Ok(var)
     }

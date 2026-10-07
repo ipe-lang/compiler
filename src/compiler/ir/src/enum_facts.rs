@@ -170,6 +170,29 @@ pub fn home_is_ffi_interface(interner: &Interner, home: &[Symbol]) -> bool {
         .is_some_and(|s| s == "Rust")
 }
 
+/// The `Ipe.Db.Store` unions whose `row` type parameter is phantom.
+///
+/// No constructor of these unions holds a `row` value: the parameter ties a
+/// query predicate, policy, correlated-subquery leaf or projection to its
+/// store's row type at the type-checker only. Lowering drops the argument, so
+/// each emits as a non-generic enum (`IpeDbStoreCond`, `IpeDbStorePred`, …)
+/// whose construction is type-determinate, and the type checker's trait walks
+/// skip the argument because no Rust trait bound can reach it.
+pub const STORE_ROW_PHANTOM_UNIONS: [&str; 5] = ["Cond", "Policy", "Pred", "ExistsRef", "Select"];
+
+/// Is `(home, name)` one of the [`STORE_ROW_PHANTOM_UNIONS`] of `Ipe.Db.Store`?
+#[must_use]
+pub fn is_store_row_phantom_union(interner: &Interner, home: &[Symbol], name: Symbol) -> bool {
+    matches!(
+        home,
+        [a, b, c] if interner.resolve(*a) == Some("Ipe")
+            && interner.resolve(*b) == Some("Db")
+            && interner.resolve(*c) == Some("Store")
+    ) && interner
+        .resolve(name)
+        .is_some_and(|n| STORE_ROW_PHANTOM_UNIONS.contains(&n))
+}
+
 /// What a union declared under an FFI interface home lowers to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FfiUnion {

@@ -1,0 +1,31 @@
+module Main exposing (main)
+
+-- `byKey` forwards to `List.sortBy` over a generic key `b`, which inherits the
+-- ordering obligation. Instantiating it at a record key is rejected at
+-- type-check (IPE-T0014) instead of emitting an unbounded `B` `cargo` rejects.
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+type alias Doc =
+    { title : String, owner : { name : String } }
+
+
+byKey : (a -> b) -> List a -> List a
+byKey f xs =
+    List.sortBy f xs
+
+
+docs : List Doc
+docs =
+    [ { title = "b", owner = { name = "y" } }, { title = "a", owner = { name = "x" } } ]
+
+
+main =
+    let
+        _unused =
+            byKey (\d -> d.owner) docs
+    in
+    Io.println (String.fromInt 0)

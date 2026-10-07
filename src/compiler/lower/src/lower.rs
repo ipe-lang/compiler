@@ -16117,98 +16117,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// is `(module, name)` the `Ipe.Db.Store.Cond` typed-query predicate —
-    /// module `["Ipe", "Db", "Store"]`, name `Cond`? Its `row` argument is a
-    /// PHANTOM: no `Cond` constructor carries a `row` value (the parameter ties
-    /// the predicate to the store's row type at the type-checker only). It is
-    /// dropped at lowering so the emitted enum is the non-generic
-    /// `IpeDbStoreCond`; otherwise every leaf construction (`Compare …`) leaves
-    /// the enum's type argument unconstrained at the point of construction — an
-    /// uninferrable `T` (E0283), exactly as for `Ipe.Cache.Cache`.
-    fn is_cond_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Cond")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.Policy` row-security policy —
-    /// module `["Ipe", "Db", "Store"]`, name `Policy`? Its `row` argument is a
-    /// PHANTOM: no `Policy` constructor carries a `row` value (the parameter
-    /// ties the policy's accessor columns to the store's row type at the
-    /// type-checker only, via `secured : Policy a -> Store a -> …`). It is
-    /// dropped at lowering so the emitted enum is the non-generic
-    /// `IpeDbStorePolicy`; otherwise every construction (`ownerColumnNamed …`)
-    /// leaves the enum's type argument unconstrained at the point of
-    /// construction — an uninferrable `T` (E0283/E0392), exactly as for `Cond`.
-    fn is_policy_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Policy")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.Pred` row-security predicate ADT —
-    /// module `["Ipe", "Db", "Store"]`, name `Pred`? Its `row` argument is a
-    /// PHANTOM: no `Pred` constructor carries a `row` value (`PMatch` holds a
-    /// `Cond`, itself phantom-dropped; `POwner` a `String`; the boolean nodes only
-    /// nested `Pred`s). It is dropped at lowering so the emitted enum is the
-    /// non-generic `IpeDbStorePred`; otherwise every construction (`PMatch …`,
-    /// `PAll …`) leaves the enum's type argument unconstrained — an uninferrable
-    /// `T` (E0283/E0392), exactly as for `Cond` / `Policy` / `Select`.
-    fn is_pred_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Pred")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.ExistsRef` correlated-subquery leaf —
-    /// module `["Ipe", "Db", "Store"]`, name `ExistsRef`? Its `row` argument is a
-    /// PHANTOM: the `ExistsRef` constructor holds only transparent data (column
-    /// strings and a `shareRead : Pred row`, itself phantom-dropped) — never a
-    /// `row` value. It is dropped at lowering so the emitted struct is the
-    /// non-generic `IpeDbStoreExistsRef`; otherwise the `PExists (ExistsRef row)`
-    /// field reintroduces the phantom `row` as a live generic that the enclosing
-    /// (phantom-dropped, non-generic) `Pred` no longer quantifies — an
-    /// unquantified type variable at emit (`GenericScope::rust_name`), the twin of
-    /// the `Cond` / `Pred` / `Select` erasure.
-    fn is_exists_ref_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("ExistsRef")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.Select` column-projection ADT —
-    /// module `["Ipe", "Db", "Store"]`, name `Select`? Its `row` argument is a
-    /// PHANTOM: no `Select` constructor carries a `row` value (the parameter
-    /// records the projected shape so `selectToList` / `selectToMaybe` return the
-    /// typed `row`, while the runtime value holds only query data). It is dropped
-    /// at lowering so the emitted enum is the non-generic `IpeDbStoreSelect`;
-    /// otherwise every `selectNamed` construction leaves the enum's type argument
-    /// unconstrained at the point of construction — an uninferrable `T`
-    /// (E0283/E0392), exactly as for `Cond` / `Policy`.
-    fn is_select_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Select")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
+    /// is `(module, name)` an `Ipe.Db.Store` union whose `row` argument is phantom?
+    ///
+    /// The set is [`ipe_ir::STORE_ROW_PHANTOM_UNIONS`] (`Cond`, `Policy`,
+    /// `Pred`, `ExistsRef`, `Select`): no constructor carries a `row` value, so
+    /// the argument is dropped at lowering and the emitted enum is non-generic
+    /// (`IpeDbStoreCond`, `IpeDbStorePred`, …). Kept, every leaf construction
+    /// (`Compare …`, `PMatch …`, `selectNamed …`) would leave the enum's type
+    /// argument unconstrained — an uninferrable `T` (E0283/E0392), exactly as
+    /// for `Ipe.Cache.Cache` — and `PExists (ExistsRef row)` would reintroduce
+    /// `row` as a live generic the non-generic `Pred` no longer quantifies.
+    fn is_store_row_phantom_con(&self, module: &[Symbol], name: Symbol) -> bool {
+        ipe_ir::is_store_row_phantom_union(self.interner, module, name)
     }
 
     /// is `(module, name)` the `Ipe.Cache.Cache` opaque handle type?
@@ -16286,14 +16206,10 @@ impl<'a> Lowerer<'a> {
         // `Ipe.Db.Store.Cond row` carries a PHANTOM `row` (no constructor holds a
         // `row` value — it ties the predicate to the store's row at the
         // type-checker only). Emit the enum non-generic so its construction is
-        // type-determinate; the `is_cond_con` arms in `ir_type_from_ty` /
+        // type-determinate; the `is_store_row_phantom_con` arms in `ir_type_from_ty` /
         // `ir_type_from_canon` drop the matching type argument at every use site,
         // so the decl and the references agree.
-        let cond_phantom = self.is_cond_con(&u.home, u.name)
-            || self.is_policy_con(&u.home, u.name)
-            || self.is_pred_con(&u.home, u.name)
-            || self.is_exists_ref_con(&u.home, u.name)
-            || self.is_select_con(&u.home, u.name);
+        let cond_phantom = self.is_store_row_phantom_con(&u.home, u.name);
         let type_params = if cond_phantom {
             Vec::new()
         } else {
@@ -18491,11 +18407,7 @@ impl<'a> Lowerer<'a> {
                     // twin of the solved-Ty arm; see its comment for the E0283
                     // rationale.
                     let ir_args = if self.is_cache_handle_con(home, *name)
-                        || self.is_cond_con(home, *name)
-                        || self.is_policy_con(home, *name)
-                        || self.is_pred_con(home, *name)
-                        || self.is_exists_ref_con(home, *name)
-                        || self.is_select_con(home, *name)
+                        || self.is_store_row_phantom_con(home, *name)
                     {
                         Vec::new()
                     } else {
@@ -20150,11 +20062,7 @@ impl<'a> Lowerer<'a> {
                     // (Cache k v)` whose result no longer mentions them), an
                     // uninferrable `T` at the call site (E0283).
                     let ir_args = if self.is_cache_handle_con(module, *name)
-                        || self.is_cond_con(module, *name)
-                        || self.is_policy_con(module, *name)
-                        || self.is_pred_con(module, *name)
-                        || self.is_exists_ref_con(module, *name)
-                        || self.is_select_con(module, *name)
+                        || self.is_store_row_phantom_con(module, *name)
                     {
                         Vec::new()
                     } else {

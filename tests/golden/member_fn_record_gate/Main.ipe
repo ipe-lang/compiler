@@ -1,0 +1,31 @@
+module Main exposing (main)
+
+-- `List.member` compares elements with Rust `PartialEq`. A record holding a
+-- function has none, so the element obligation fails at type-check
+-- (IPE-T0014) instead of emitting a `list_member` call `cargo` cannot build.
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+type alias Step =
+    { name : String, run : Int -> Int }
+
+
+steps : List Step
+steps =
+    [ { name = "inc", run = \n -> n + 1 } ]
+
+
+probe : Step
+probe =
+    { name = "dec", run = \n -> n - 1 }
+
+
+main =
+    let
+        _unused =
+            List.member probe steps
+    in
+    Io.println (String.fromInt 0)

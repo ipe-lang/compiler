@@ -1,0 +1,30 @@
+module Main exposing (main)
+
+-- A custom-type key (`Shade`) has no ordering in Rust, so `List.sortBy` keyed
+-- on it is rejected at type-check (IPE-T0001).
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+type Shade
+    = Light
+    | Dark
+
+
+type alias Tile =
+    { label : String, shade : Shade }
+
+
+tiles : List Tile
+tiles =
+    [ { label = "b", shade = Dark }, { label = "a", shade = Light } ]
+
+
+main =
+    let
+        _unused =
+            List.sortBy (\t -> t.shade) tiles
+    in
+    Io.println (String.fromInt 0)

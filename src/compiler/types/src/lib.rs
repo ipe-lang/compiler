@@ -2247,7 +2247,7 @@ fn super_bounds_satisfied(
     let interpolable_ok = super_bounds::prim_satisfies_interpolable(prim);
     (!bounds.has_number() || number_ok)
         && (!bounds.has_ord() || ord_ok)
-        && (!bounds.has_eq() || ty_is_equatable(ty, enum_embeds))
+        && (!bounds.has_eq() || ty_is_equatable(interner, ty, enum_embeds))
         && (!bounds.has_comparable_key() || key_ok)
         // Stringify (`Debug.log` / `Error.toString`): showable iff every leaf
         // has a rendering — its own walk, not the equality rule.
@@ -2466,12 +2466,20 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 /// records, and enums all derive `PartialEq`; a function never does). A bare
 /// type variable is rejected (fail-closed): an equality obligation that escaped
 /// into an enclosing generic is not yet propagated across binding boundaries.
-fn ty_is_equatable(ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
+/// The phantom `row` argument of an [`ipe_ir::STORE_ROW_PHANTOM_UNIONS`] union
+/// is not walked: lowering erases it, so the emitted non-generic enum's
+/// `PartialEq` carries no bound on it (`dedupePreds : List (Pred row) -> …`
+/// compares `IpeDbStorePred` values whatever `row` is).
+fn ty_is_equatable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
         Ty::Var(_) | Ty::Fun(_, _) => false,
         Ty::Unit => true,
-        Ty::Tuple(elems) => elems.iter().all(|e| ty_is_equatable(e, enum_embeds)),
-        Ty::Record(fields, _) => fields.values().all(|f| ty_is_equatable(f, enum_embeds)),
+        Ty::Tuple(elems) => elems
+            .iter()
+            .all(|e| ty_is_equatable(interner, e, enum_embeds)),
+        Ty::Record(fields, _) => fields
+            .values()
+            .all(|f| ty_is_equatable(interner, f, enum_embeds)),
         // A `Ty::Con` head names a user enum (or a builtin like `Maybe`) whose
         // variant payloads are NOT in `args` — `args` carries only the applied
         // type parameters. An enum whose DEFINITION embeds a function in a
@@ -2482,7 +2490,10 @@ fn ty_is_equatable(ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
         // parameter (`Box (Int -> Int)` for `type Box a = Box a`) is caught too.
         Ty::Con { module, name, args } => {
             !enum_embeds.embeds_fn(module, *name)
-                && args.iter().all(|a| ty_is_equatable(a, enum_embeds))
+                && (ipe_ir::is_store_row_phantom_union(interner, module, *name)
+                    || args
+                        .iter()
+                        .all(|a| ty_is_equatable(interner, a, enum_embeds)))
         }
     }
 }
@@ -8031,11 +8042,46 @@ mod tests {
         let holds_fn = ty_of(&mut i, "HoldsFn");
         let holds_int = ty_of(&mut i, "HoldsInt");
         assert!(!ty_is_showable(&i, &holds_handle, &embeds));
-        assert!(ty_is_equatable(&holds_handle, &embeds));
+        assert!(ty_is_equatable(&i, &holds_handle, &embeds));
         assert!(!ty_is_showable(&i, &holds_fn, &embeds));
-        assert!(!ty_is_equatable(&holds_fn, &embeds));
+        assert!(!ty_is_equatable(&i, &holds_fn, &embeds));
         assert!(ty_is_showable(&i, &holds_int, &embeds));
-        assert!(ty_is_equatable(&holds_int, &embeds));
+        assert!(ty_is_equatable(&i, &holds_int, &embeds));
+    }
+
+    /// The phantom `row` of an `Ipe.Db.Store` predicate is not walked for equality.
+    ///
+    /// `Pred row` over a rigid `row` is equatable (the emitted `IpeDbStorePred`
+    /// is non-generic), while the same shape under any other head, or a
+    /// same-named union outside `Ipe.Db.Store`, still refuses the bare variable.
+    #[test]
+    fn a_store_row_phantom_argument_is_not_walked_for_equality() {
+        let mut i = Interner::new();
+        let embeds = EnumEmbeds::default();
+        let applied = |i: &mut Interner, home: &[&str], ty_name: &str| {
+            let Ty::Con { module, name, .. } = con_ty(i, home, ty_name) else {
+                return Ty::Unit;
+            };
+            Ty::Con {
+                module,
+                name,
+                args: vec![Ty::Var(0)],
+            }
+        };
+        for name in ipe_ir::STORE_ROW_PHANTOM_UNIONS {
+            let store = applied(&mut i, &["Ipe", "Db", "Store"], name);
+            assert!(
+                ty_is_equatable(&i, &store, &embeds),
+                "`Ipe.Db.Store.{name} row` must be equatable over a phantom `row`",
+            );
+            let user = applied(&mut i, &["Main"], name);
+            assert!(
+                !ty_is_equatable(&i, &user, &embeds),
+                "`Main.{name} a` must still refuse its bare variable argument",
+            );
+        }
+        let maybe = applied(&mut i, &[], "Maybe");
+        assert!(!ty_is_equatable(&i, &maybe, &embeds));
     }
 
     /// A union `name` under `home` with constructors `ctors`, each `(name, payloads)`.

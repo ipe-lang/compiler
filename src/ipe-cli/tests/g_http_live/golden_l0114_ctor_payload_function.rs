@@ -729,9 +729,10 @@ fn dict_fn_dispatch_accepted() {
 
 /// Narrowing regression: a function-carrying `List` element is `Clone`
 /// (storable), but not comparable — `List.member` needs `==` on the element, so
-/// it must fail closed at `ipe` time with the element-capability diagnostic
-/// (IPE-L0134), never emit Rust `cargo` rejects. Proves the storable-element
-/// carrier flip did NOT open an unsound equality path.
+/// it must fail closed at `ipe` time, never emit Rust `cargo` rejects. The
+/// kernel's equality obligation refuses the function element at type-check
+/// (IPE-T0001), ahead of the element-capability gate (IPE-L0134). Proves the
+/// storable-element carrier flip did NOT open an unsound equality path.
 #[test]
 fn list_fn_member_stays_gated() {
     let root = repo_root();
@@ -742,8 +743,8 @@ fn list_fn_member_stays_gated() {
     };
     assert_eq!(
         code,
-        Some(ipe_diagnostics::IPE_L0134),
+        Some(ipe_diagnostics::IPE_T0001),
         "`List.member` over a function-carrying element must fail closed with \
-         IPE-L0134 (a function is not comparable), got: {built:?}"
+         IPE-T0001 (a function is not equatable), got: {built:?}"
     );
 }

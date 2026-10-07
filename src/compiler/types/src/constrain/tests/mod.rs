@@ -2300,6 +2300,112 @@ mod registry_phase_c_tests {
         }
     }
 
+    /// Every bound-carrying `OBLIGATION_SLOTS` row reaches the constrained kernel reference.
+    ///
+    /// Drives the real `constrain_var_kernel` for each kernel with a row whose
+    /// kind has a `generic_bound`, finds the row's scheme var in the
+    /// instantiated structure by walking the scheme alongside it, and asserts a
+    /// recorded constraint ties that var to a super-typed var owing at least the
+    /// row's bound. A row the tie site skips fails here. The `List.sortBy` key
+    /// and the `List.member` / `List.unique` element must each be checked, so
+    /// the walk cannot pass vacuously.
+    #[test]
+    fn kernel_obligation_rows_reach_constrained_scheme() {
+        use super::super::constrain_ast::OBLIGATION_SLOTS;
+        use super::super::{FlatType, VarId};
+
+        // The instantiated var at the first aligned occurrence of `Ty::Var(slot)`.
+        fn slot_var(
+            uf: &mut UnionFind<Content>,
+            var: VarId,
+            scheme: &Ty,
+            slot: u32,
+        ) -> Option<VarId> {
+            match scheme {
+                Ty::Var(n) => (*n == slot).then_some(var),
+                Ty::Fun(arg, res) => {
+                    let root = uf.find(var).ok()?;
+                    let Content::Structure(FlatType::Fun(x, y)) = uf.content(root).ok()? else {
+                        return None;
+                    };
+                    slot_var(uf, x, arg, slot).or_else(|| slot_var(uf, y, res, slot))
+                }
+                Ty::Con { args, .. } | Ty::Tuple(args) => {
+                    let root = uf.find(var).ok()?;
+                    let Content::Structure(
+                        FlatType::Con { args: items, .. } | FlatType::Tuple(items),
+                    ) = uf.content(root).ok()?
+                    else {
+                        return None;
+                    };
+                    args.iter()
+                        .zip(items)
+                        .find_map(|(t, v)| slot_var(uf, v, t, slot))
+                }
+                Ty::Record(..) | Ty::Unit => None,
+            }
+        }
+
+        let mut interner = Interner::new();
+        let builtins = make_builder(&mut interner);
+        let dummy = interner.intern("_").expect("intern placeholder symbol");
+        let mut uf = UnionFind::<Content>::new();
+        let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        builder.current_home = crate::ModuleHome::new(vec![dummy]);
+
+        let mut checked: Vec<StdlibKernel> = Vec::new();
+        for &(k, slot, kind) in OBLIGATION_SLOTS {
+            let Some(want) = kind.generic_bound() else {
+                continue;
+            };
+            let scheme = builder.resolve_scheme(k.def().scheme);
+            assert!(
+                scheme.is_some(),
+                "{k:?} carries a {kind:?} row and must be schemed"
+            );
+            let Some(scheme) = scheme else { continue };
+            let reference = builder.constrain_var_kernel(Some(k), dummy, dummy, Span::DUMMY);
+            assert!(reference.is_ok(), "{k:?} must constrain, got {reference:?}");
+            let Ok(reference) = reference else { continue };
+            let constraints = std::mem::take(&mut builder.constraints);
+
+            let found = slot_var(builder.uf, reference, &scheme, slot);
+            assert!(
+                found.is_some(),
+                "{k:?} ({kind:?}): raw var {slot} has no aligned position in the \
+                 instantiated reference",
+            );
+            let Some(found) = found else { continue };
+            let found_root = builder.uf.find(found).expect("find slot root");
+            let tied = constraints.iter().any(|c| {
+                let lhs = builder.uf.find(c.lhs).expect("find lhs root");
+                let rhs = builder.uf.find(c.rhs).expect("find rhs root");
+                let rhs_content = builder.uf.content(rhs).expect("read rhs content");
+                lhs == found_root
+                    && matches!(
+                        rhs_content,
+                        Content::Super { bounds, .. } if bounds.union(want) == bounds
+                    )
+            });
+            assert!(
+                tied,
+                "{k:?} ({kind:?}): raw var {slot} is not tied to a super-typed var \
+                 owing {want:?} — the runtime trait bound would reach `cargo` unmet",
+            );
+            checked.push(k);
+        }
+        for k in [
+            StdlibKernel::ListSortBy,
+            StdlibKernel::ListMember,
+            StdlibKernel::ListUnique,
+        ] {
+            assert!(
+                checked.contains(&k),
+                "{k:?} must carry a checked bound-obligation row",
+            );
+        }
+    }
+
     /// A stdlib record alias is expanded by `normalize_annotation_ty` keyed on
     /// the RESOLVED identity — the empty-home builtin sentinel — never a bare
     /// name string. Pins both directions of that gate for every stdlib record
