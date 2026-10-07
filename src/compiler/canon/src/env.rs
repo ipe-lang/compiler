@@ -1040,6 +1040,9 @@ pub const PRELUDE_QUALIFIERS: &[(&str, &[&str])] = &[
                 // no separate bare-`String`-key spelling to register.
                 "hmacSha256WithKey",
                 "hmacSha512WithKey",
+                // Recomputes the HMAC-SHA-256 tag and compares it with a
+                // stored `Mac` in constant time.
+                "verifyHmacSha256",
             ],
         ),
         // `Ipe.Secret` — opaque secret-string wrapper.
@@ -2227,12 +2230,14 @@ impl Env {
         const CROSS_QUALIFIER_MEMBERS: &[(&str, &str, &str, &str)] = &[
             // (new_qualifier, member_name, canonical_qualifier, canonical_name)
             // `Crypto`'s typed-key surface: the `Key` constructors and the `Mac`
-            // extractor are canonical `Key.*` / `Mac.*` kernels, re-exported under
-            // the `Crypto` qualifier so `Crypto.keyFromBytes` / `Crypto.macToHex`
-            // resolve off a plain `import Ipe.Crypto`.
+            // extractor and parser are canonical `Key.*` / `Mac.*` kernels,
+            // re-exported under the `Crypto` qualifier so `Crypto.keyFromBytes` /
+            // `Crypto.macToHex` / `Crypto.macFromHex` resolve off a plain
+            // `import Ipe.Crypto`.
             ("Crypto", "keyFromString", "Key", "fromString"),
             ("Crypto", "keyFromBytes", "Key", "fromBytes"),
             ("Crypto", "macToHex", "Mac", "toHex"),
+            ("Crypto", "macFromHex", "Mac", "fromHex"),
             ("TeaWebPubSub", "publish", "Cmd", "publish"),
             ("TeaWebPubSub", "publishNoEcho", "Cmd", "publishNoEcho"),
             ("TeaWebPubSub", "subscribeTopic", "Sub", "subscribeTopic"),

@@ -1,0 +1,20 @@
+module Main exposing (main)
+
+import Ipe.Crypto as Crypto
+import Ipe.Io as Io
+
+-- SECURITY: `Crypto.verifyHmacSha256` takes a typed `Mac`, never a bare hex
+-- `String`. A stored tag must pass `macFromHex` first, so an unparsed string
+-- in the tag role must be a compile error, not a silent comparison.
+main : Task ()
+main =
+    case Crypto.keyFromString "s3cret-signing-key" of
+        Just key ->
+            if Crypto.verifyHmacSha256 key "message" "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7" then
+                Io.println "valid"
+
+            else
+                Io.println "invalid"
+
+        Nothing ->
+            Io.println "empty key rejected at the boundary"

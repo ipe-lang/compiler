@@ -1587,10 +1587,11 @@ pub enum IrType {
 
     /// Opaque role-typed HMAC output (`ipe_runtime::crypto::Mac`).
     ///
-    /// Produced exclusively by `hmacSha256WithKey` / `hmacSha512WithKey`.
-    /// Extracted via `Mac.toHex` — the single greppable extraction boundary.
-    /// `PartialEq` is safe (a MAC hex string is not secret); `Clone` + `Debug`.
-    /// Non-serde.
+    /// Produced by `hmacSha256WithKey` / `hmacSha512WithKey`, or parsed once by
+    /// `Mac.fromHex` (a 32- or 64-byte tag in hex). Extracted via `Mac.toHex` —
+    /// the single greppable extraction boundary. The runtime holds the raw tag
+    /// bytes tagged with their algorithm width; `PartialEq` is constant-time;
+    /// `Clone` + `Debug` (the hex tag — a MAC is not secret). Non-serde.
     CryptoMac,
 
     // ── Ipe.Email.EmailAddress ─────────────────────────────────────────────

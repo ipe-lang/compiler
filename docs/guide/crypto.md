@@ -17,12 +17,14 @@ Three knots.
   `keyFromString` (or a password-derivation function); passing a message where a
   `Key` is expected does not type-check. Key/message role confusion is
   unrepresentable.
-- **A MAC is a typed value; compare it in constant time.** `hmacSha256` returns a
-  `Mac`, not a `String`. Render it with `macToHex` for storage, but *verify* a
-  presented signature with `constantTimeEqual`, never `==`. A normal equality check
-  exits at the first differing byte, and that early exit leaks — through timing —
-  how long a prefix matched, which is enough to forge a signature one byte at a
-  time.
+- **A MAC is a typed value; verify it in constant time.** `hmacSha256` returns a
+  `Mac`, not a `String`. Render it with `macToHex` for storage; to check a stored
+  or presented tag, parse it once with `macFromHex` (exactly 64 or 128 hex digits,
+  `Nothing` otherwise) and pass the `Mac` to `verifyHmacSha256 key message mac`,
+  which recomputes the tag and compares the raw bytes in constant time — never
+  `==` on the hex. A normal equality check exits at the first differing byte, and
+  that early exit leaks — through timing — how long a prefix matched, which is
+  enough to forge a signature one byte at a time.
 - **AEAD is nonce-safe by construction; randomness is an effect.** `aesGcmEncrypt`
   and `chacha20Encrypt` generate a fresh random nonce on every call and prepend it
   to the ciphertext, so `decrypt` can recover it — you never manage a nonce, and you
@@ -87,7 +89,8 @@ reuse) is removed by never letting the caller supply one.
 - **Per-symbol reference:** `ipe doc Ipe.Crypto` — hashes, `hmacSha256` /
   `hmacSha512`, the AEAD pairs (`aesGcmEncrypt` / `aesGcmDecrypt`,
   `chacha20Encrypt` / `chacha20Decrypt`), `keyFromString` / `keyFromBytes`,
-  `constantTimeEqual`, and `randomBytes` / `randomToken`.
+  `macToHex` / `macFromHex`, `verifyHmacSha256`, `constantTimeEqual`, and
+  `randomBytes` / `randomToken`.
 - **Sibling guides:** [Text encodings](encoding.md) — hex and base64 for rendering
   digests and ciphertext. [Bytes](bytes.md) — the raw octet type. [Tasks](task.md)
   — how the randomness effects are sequenced. [Network primitives](net.md) and the

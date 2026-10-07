@@ -20,8 +20,9 @@ use super::*;
 //
 // `Key` and `Mac` make distinct cryptographic roles distinct Rust types so a
 // role-swap (passing a message where a key is expected) is a compile error, not
-// a silent wrong answer. Both wrap an opaque `String` blob — callers never
-// inspect the byte content directly; the role is what matters.
+// a silent wrong answer. `Key` wraps an opaque `String` blob; `Mac` holds the raw
+// tag bytes tagged with their algorithm width. Callers never inspect either
+// directly; the role is what matters.
 
 /// `Crypto.Key` — an opaque cryptographic key obtained from `Key.fromString`,
 /// `Key.fromBytes`, or `Crypto.aesKeyFromPassword` / `Crypto.chachaKeyFromPassword`.
@@ -48,26 +49,62 @@ impl std::fmt::Debug for Key {
 
 crate::stringify::show_row!("CryptoKey", Redacted, [] Key, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
-/// `Crypto.Mac` — an opaque message authentication code (hex-encoded) returned
-/// by `Crypto.hmacSha256` / `Crypto.hmacSha512` with the typed-key variants.
+/// `Crypto.Mac` — an opaque message authentication code returned by
+/// `Crypto.hmacSha256` / `Crypto.hmacSha512`, or parsed once by `Mac.fromHex`.
 ///
 /// Distinct from `String` so a MAC output cannot be silently passed where a
-/// key or plaintext is expected. Wraps the hex-encoded tag; `Mac.toHex` is the
-/// only extraction path so a reviewer can grep for every MAC-reveal site.
+/// key or plaintext is expected. Holds the raw tag bytes in a `MacTag` whose
+/// variant fixes the width, so a malformed or wrong-width tag has no
+/// representation; `Mac.toHex` is the only extraction path so a reviewer can
+/// grep for every MAC-reveal site.
 ///
-/// `Clone`: derived. `Debug`: hand-written (hex tag is public output, not
-/// secret material, so rendering it is safe). `PartialEq`: constant-time via
-/// [`crate::ct_eq::ct_bytes_eq`] — same posture as `Key` and `Secret`. The
-/// derived early-exit `PartialEq` is structurally excluded: adding
-/// `#[derive(PartialEq)]` alongside the `impl_ct_eq!` invocation is a
-/// hard E0119 compile error (conflicting impls), so the class is closed by
-/// construction.
-#[derive(Clone, Debug)]
-pub struct Mac(String);
+/// `Clone`: derived. `Debug`: hand-written, renders the lowercase hex tag (a
+/// tag is public output, not secret material). `PartialEq`: constant-time via
+/// [`crate::ct_eq::ct_bytes_eq`] over the raw bytes — same posture as `Key` and
+/// `Secret`. The derived early-exit `PartialEq` is structurally excluded: adding
+/// `#[derive(PartialEq)]` alongside the `impl_ct_eq!` invocation is a hard E0119
+/// compile error (conflicting impls), so the class is closed by construction.
+#[derive(Clone)]
+pub struct Mac(MacTag);
+
+/// The raw bytes of a [`Mac`], tagged with the HMAC algorithm that fixes their width.
+///
+/// Only `Clone`: equality goes through `Mac`'s constant-time `PartialEq`, never
+/// a derived early-exit compare on the bytes.
+#[derive(Clone)]
+enum MacTag {
+    /// A 32-byte HMAC-SHA-256 tag.
+    HmacSha256(hmac::digest::Output<hmac::Hmac<sha2::Sha256>>),
+    /// A 64-byte HMAC-SHA-512 tag.
+    HmacSha512(hmac::digest::Output<hmac::Hmac<sha2::Sha512>>),
+}
+
+impl MacTag {
+    /// The raw tag bytes.
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::HmacSha256(tag) => tag.as_slice(),
+            Self::HmacSha512(tag) => tag.as_slice(),
+        }
+    }
+}
+
+impl Mac {
+    /// The tag rendered as lowercase hex.
+    fn to_hex(&self) -> String {
+        hex::encode(self.0.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for Mac {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Mac").field(&self.to_hex()).finish()
+    }
+}
 
 crate::ct_eq::impl_ct_eq!(Mac);
 
-crate::stringify::show_row!("CryptoMac", Value, [] Mac, |m| m.0.clone());
+crate::stringify::show_row!("CryptoMac", Value, [] Mac, |m| m.to_hex());
 
 /// Crate-internal raw promotion of a `String` to a `Key`, with no validation.
 /// The ONLY sanctioned no-check path — the password-derivation kernels use it
@@ -100,12 +137,36 @@ pub fn crypto_key_from_bytes(s: String) -> IpeMaybe<Key> {
     crypto_key_from_string(s)
 }
 
-/// `Mac.toHex : Mac -> String` — the single extraction boundary: recover the
-/// hex-encoded tag from an opaque `Mac`. Greppable, so a reviewer can audit
+/// `Mac.toHex : Mac -> String` — the single extraction boundary: render the
+/// tag of an opaque `Mac` as lowercase hex. Greppable, so a reviewer can audit
 /// every place a raw MAC string escapes the typed wrapper.
 #[must_use]
 pub fn crypto_mac_to_hex(m: Mac) -> String {
-    m.0
+    m.to_hex()
+}
+
+/// `Mac.fromHex : String -> Maybe Mac` — the single parse boundary for a
+/// stored tag.
+///
+/// Accepts exactly 64 hex digits (an HMAC-SHA-256 tag) or exactly 128 (an
+/// HMAC-SHA-512 tag), in either case; `Mac.toHex` renders the parsed tag back
+/// in lowercase. Every other input is `Nothing`: empty, odd length, any other
+/// length, a non-hex digit, surrounding whitespace, or a `0x` prefix. The
+/// width is decided here once, so `verifyHmacSha256` never re-inspects text.
+#[must_use]
+pub fn crypto_mac_from_hex(s: String) -> IpeMaybe<Mac> {
+    use hmac::digest::generic_array::GenericArray;
+    // `decode_to_slice` refuses an odd length, a length other than twice the
+    // output buffer, and any byte outside `[0-9a-fA-F]`.
+    let mut sha256: hmac::digest::Output<hmac::Hmac<sha2::Sha256>> = GenericArray::default();
+    if hex::decode_to_slice(s.as_bytes(), sha256.as_mut_slice()).is_ok() {
+        return IpeMaybe::Just(Mac(MacTag::HmacSha256(sha256)));
+    }
+    let mut sha512: hmac::digest::Output<hmac::Hmac<sha2::Sha512>> = GenericArray::default();
+    if hex::decode_to_slice(s.as_bytes(), sha512.as_mut_slice()).is_ok() {
+        return IpeMaybe::Just(Mac(MacTag::HmacSha512(sha512)));
+    }
+    IpeMaybe::Nothing
 }
 
 /// Crate-internal `Key` unwrap — the sibling `crypto` module's typed AEAD
@@ -350,13 +411,7 @@ pub fn crypto_hmac_sha256_key(key: Key, msg: String) -> Mac {
     let mut mac =
         HmacSha256::new_from_slice(key.0.as_bytes()).expect("Hmac<Sha256> accepts any key length");
     mac.update(msg.as_bytes());
-    let hex: String = mac
-        .finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    Mac(hex)
+    Mac(MacTag::HmacSha256(mac.finalize().into_bytes()))
 }
 
 /// `Crypto.hmacSha512WithKey : Key -> String -> Mac` — typed variant.
@@ -370,13 +425,26 @@ pub fn crypto_hmac_sha512_key(key: Key, msg: String) -> Mac {
     let mut mac =
         HmacSha512::new_from_slice(key.0.as_bytes()).expect("Hmac<Sha512> accepts any key length");
     mac.update(msg.as_bytes());
-    let hex: String = mac
-        .finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    Mac(hex)
+    Mac(MacTag::HmacSha512(mac.finalize().into_bytes()))
+}
+
+/// `Crypto.verifyHmacSha256 : Key -> String -> Mac -> Bool` — recompute the
+/// HMAC-SHA-256 tag of `msg` under `key` and compare it with `mac`.
+///
+/// The supplied tag is never trusted: the tag is always recomputed here, and
+/// the 32 raw bytes are compared in constant time
+/// ([`crate::ct_eq::ct_bytes_eq`]). An HMAC-SHA-512 `Mac` is `False` without a
+/// byte compare — its width is public metadata, so refusing it reveals nothing
+/// about the expected tag.
+#[must_use]
+pub fn crypto_verify_hmac_sha256(key: Key, msg: String, mac: Mac) -> bool {
+    match mac.0 {
+        MacTag::HmacSha256(expected) => {
+            let computed = crypto_hmac_sha256_key(key, msg);
+            crate::ct_eq::ct_bytes_eq(computed.0.as_bytes(), expected.as_slice())
+        }
+        MacTag::HmacSha512(_) => false,
+    }
 }
 
 /// Ipê `rsaSha256Sign : String -> String -> Result Error String`
@@ -725,6 +793,201 @@ TsgxkiXH9sjXrPHT1hXn2tKCv9MkR8MD1Ndh6jo7inBZUK0YG7H6Jx0CAwEAAQ==
         );
     }
 
+    // ── Mac parse boundary + typed verify ────────────────────────────────────
+
+    /// A `Mac.fromHex` parse as an `Option`, so a test inspects it without a panic path.
+    fn parsed_mac(s: &str) -> Option<Mac> {
+        match crypto_mac_from_hex(s.to_string()) {
+            IpeMaybe::Just(m) => Some(m),
+            IpeMaybe::Nothing => None,
+        }
+    }
+
+    /// The RFC 4231 test-case-1 key: twenty `0x0b` bytes.
+    fn rfc4231_key() -> Key {
+        key_of(crypto_key_from_string(
+            (0..20).map(|_| '\u{000b}').collect(),
+        ))
+    }
+
+    /// The verdict of `verifyHmacSha256` on the RFC 4231 case-1 key, `msg` and
+    /// the parsed `hex` tag; `None` when `hex` does not parse.
+    fn verify_under_rfc_key(msg: &str, hex: &str) -> Option<bool> {
+        parsed_mac(hex).map(|m| crypto_verify_hmac_sha256(rfc4231_key(), msg.to_string(), m))
+    }
+
+    /// `hex` with the digit at `index` replaced by a different hex digit.
+    fn flip_digit(hex: &str, index: usize) -> String {
+        hex.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == index {
+                    if c == '0' { '1' } else { '0' }
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// Every malformed tag spelling is refused at the parse boundary: empty,
+    /// odd, one digit short or long of either width, a non-hex digit, a non-ASCII
+    /// byte, whitespace inside or around, and a `0x` prefix (including one that
+    /// keeps the total at exactly 64 characters).
+    #[test]
+    fn mac_from_hex_refuses_malformed_input() {
+        let tag = HMAC_SHA256_RFC1;
+        let short: String = tag.chars().take(63).collect();
+        let short_by_two: String = tag.chars().take(62).collect();
+        let tail: String = tag.chars().skip(1).collect();
+        let tag512 = HMAC_SHA512_RFC1;
+        let short512: String = tag512.chars().take(127).collect();
+        let refused: [String; 17] = [
+            String::new(),
+            "abc".to_string(),
+            "0".to_string(),
+            short.clone(),
+            format!("{tag}0"),
+            format!("g{tail}"),
+            format!("G{tail}"),
+            format!("{short}z"),
+            format!("\u{e9}{short_by_two}"),
+            format!(" {tag}"),
+            format!("{tag} "),
+            format!("{short}\n"),
+            format!("{short} "),
+            format!("0x{tag}"),
+            format!("0x{short_by_two}"),
+            short512,
+            format!("{tag512}0"),
+        ];
+        for input in &refused {
+            assert!(
+                parsed_mac(input).is_none(),
+                "Mac.fromHex must refuse {input:?}"
+            );
+        }
+        assert_eq!(
+            short_by_two.len() + 2,
+            64,
+            "the 0x case must be 64 bytes long"
+        );
+    }
+
+    /// `Mac.toHex` after `Mac.fromHex` is the identity on a lowercase tag of
+    /// either width, and normalises an uppercase or mixed-case tag to lowercase.
+    #[test]
+    fn mac_from_hex_round_trips_and_normalises_case() {
+        for tag in [HMAC_SHA256_RFC1, HMAC_SHA512_RFC1] {
+            assert_eq!(
+                parsed_mac(tag).map(crypto_mac_to_hex),
+                Some(tag.to_string())
+            );
+            assert_eq!(
+                parsed_mac(&tag.to_uppercase()).map(crypto_mac_to_hex),
+                Some(tag.to_string())
+            );
+            let mixed: String = tag
+                .chars()
+                .enumerate()
+                .map(|(i, c)| if i < 32 { c.to_ascii_uppercase() } else { c })
+                .collect();
+            assert_eq!(
+                parsed_mac(&mixed).map(crypto_mac_to_hex),
+                Some(tag.to_string())
+            );
+        }
+    }
+
+    /// A computed `Mac` survives `toHex` then `fromHex` as an equal `Mac`, and
+    /// its `Debug` rendering is the lowercase hex tag.
+    #[test]
+    fn computed_mac_round_trips_through_hex() {
+        let mac256 = crypto_hmac_sha256_key(rfc4231_key(), "Hi There".to_string());
+        let mac512 = crypto_hmac_sha512_key(rfc4231_key(), "Hi There".to_string());
+        assert_eq!(format!("{mac256:?}"), format!("Mac({HMAC_SHA256_RFC1:?})"));
+        assert!(parsed_mac(&crypto_mac_to_hex(mac256.clone())).is_some_and(|m| m == mac256));
+        assert!(parsed_mac(&crypto_mac_to_hex(mac512.clone())).is_some_and(|m| m == mac512));
+        assert!(
+            mac256 != mac512,
+            "tags of different widths must never compare equal"
+        );
+    }
+
+    /// `verifyHmacSha256` accepts the RFC 4231 tag, in either case, and a tag it
+    /// just computed.
+    #[test]
+    fn verify_hmac_sha256_accepts_the_right_tag() {
+        assert_eq!(
+            verify_under_rfc_key("Hi There", HMAC_SHA256_RFC1),
+            Some(true)
+        );
+        assert_eq!(
+            verify_under_rfc_key("Hi There", &HMAC_SHA256_RFC1.to_uppercase()),
+            Some(true)
+        );
+        let computed = crypto_hmac_sha256_key(rfc4231_key(), "payload".to_string());
+        assert!(crypto_verify_hmac_sha256(
+            rfc4231_key(),
+            "payload".to_string(),
+            computed
+        ));
+    }
+
+    /// A tag that differs in any single hex digit — every position, so the
+    /// first, middle and last bytes and both the high and low nibble of each —
+    /// parses and is then refused.
+    #[test]
+    fn verify_hmac_sha256_refuses_every_flipped_digit() {
+        for index in 0..HMAC_SHA256_RFC1.len() {
+            let tampered = flip_digit(HMAC_SHA256_RFC1, index);
+            assert_ne!(tampered, HMAC_SHA256_RFC1, "digit {index} must change");
+            assert_eq!(
+                verify_under_rfc_key("Hi There", &tampered),
+                Some(false),
+                "a tag flipped at digit {index} must parse and be refused"
+            );
+        }
+    }
+
+    /// The right tag under the wrong key, or for the wrong message, is refused.
+    #[test]
+    fn verify_hmac_sha256_refuses_wrong_key_and_wrong_message() {
+        let wrong_key = key_of(crypto_key_from_string(
+            (0..20).map(|_| '\u{000c}').collect(),
+        ));
+        assert!(
+            parsed_mac(HMAC_SHA256_RFC1).is_some_and(|m| !crypto_verify_hmac_sha256(
+                wrong_key,
+                "Hi There".to_string(),
+                m
+            ))
+        );
+        for msg in ["Hi There!", "hi There", "Hi Ther", ""] {
+            assert_eq!(
+                verify_under_rfc_key(msg, HMAC_SHA256_RFC1),
+                Some(false),
+                "the tag must not verify for message {msg:?}"
+            );
+        }
+    }
+
+    /// An HMAC-SHA-512 `Mac` — even the correct one for the same key and
+    /// message — is refused by the SHA-256 verifier, without a panic.
+    #[test]
+    fn verify_hmac_sha256_refuses_a_sha512_tag() {
+        assert_eq!(
+            verify_under_rfc_key("Hi There", HMAC_SHA512_RFC1),
+            Some(false)
+        );
+        let mac512 = crypto_hmac_sha512_key(rfc4231_key(), "Hi There".to_string());
+        assert!(!crypto_verify_hmac_sha256(
+            rfc4231_key(),
+            "Hi There".to_string(),
+            mac512
+        ));
+    }
+
     /// `Key` equality delegates to `ct_bytes_eq` — same-content keys compare
     /// equal, different-content keys do not.
     #[test]
@@ -737,7 +1000,8 @@ TsgxkiXH9sjXrPHT1hXn2tKCv9MkR8MD1Ndh6jo7inBZUK0YG7H6Jx0CAwEAAQ==
     }
 
     /// Source guard: a secret/tag/key newtype — a tuple struct wrapping a single
-    /// `String` or `Vec<u8>` — must never `#[derive(PartialEq)]`, whose
+    /// `String`, `Vec<u8>` or `MacTag`, or the `MacTag` byte carrier itself —
+    /// must never `#[derive(PartialEq)]`, whose
     /// early-exit compare is a timing oracle; the family opts into `impl_ct_eq!`
     /// instead. The E0119 conflicting-impl is the structural seal that makes the
     /// leaky derive unrepresentable; this test is a source-level tripwire that
@@ -752,10 +1016,18 @@ TsgxkiXH9sjXrPHT1hXn2tKCv9MkR8MD1Ndh6jo7inBZUK0YG7H6Jx0CAwEAAQ==
             ("dsn.rs", include_str!("dsn.rs")),
         ];
         let is_secret_newtype = |t: &str| {
-            t.contains("struct ")
-                && ["(String)", "(String);", "(Vec<u8>)", "(Vec<u8>);"]
-                    .iter()
-                    .any(|shape| t.contains(shape))
+            (t.contains("struct ")
+                && [
+                    "(String)",
+                    "(String);",
+                    "(Vec<u8>)",
+                    "(Vec<u8>);",
+                    "(MacTag)",
+                    "(MacTag);",
+                ]
+                .iter()
+                .any(|shape| t.contains(shape)))
+                || t.contains("enum MacTag")
         };
         let starts_item = |t: &str| {
             [

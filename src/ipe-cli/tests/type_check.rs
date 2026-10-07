@@ -105,6 +105,47 @@ fn crypto_raw_string_key_is_a_type_error() -> TestResult {
     Ok(())
 }
 
+/// SECURITY: a stored tag reaches `verifyHmacSha256` only through `macFromHex`.
+/// Passing an unparsed hex `String` where the verifier expects a `Mac` is a
+/// compile-time TYPE MISMATCH. Its positive counterpart,
+/// `crypto_parsed_tag_verify_path_type_checks`, proves both names resolve, so
+/// this rejection is the type error and not an unknown name.
+#[test]
+fn crypto_raw_hex_tag_is_a_type_error() -> TestResult {
+    let (ok, _, stderr) = run_ipe(&[
+        "type-check",
+        &fixture("crypto_raw_hex_tag_is_type_error.ipe").to_string_lossy(),
+    ])?;
+    assert!(
+        !ok,
+        "passing a bare String where a Crypto.Mac is expected must NOT type-check"
+    );
+    assert!(
+        stderr.contains("IPE-T0001") && stderr.contains("TYPE MISMATCH"),
+        "the rendered tag-role mismatch diagnostic must be shown, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// SECURITY: the parsed stored-tag path type-checks. `macFromHex` parses the
+/// stored hex once into a `Mac`, and `verifyHmacSha256` consumes that `Mac`.
+#[test]
+fn crypto_parsed_tag_verify_path_type_checks() -> TestResult {
+    let (ok, stdout, stderr) = run_ipe(&[
+        "type-check",
+        &fixture("crypto_verify_tag_ok.ipe").to_string_lossy(),
+    ])?;
+    assert!(
+        ok,
+        "the parsed-tag verify path must type-check, got stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("type-checks"),
+        "a clean check prints a friendly success message, got:\n{stdout}"
+    );
+    Ok(())
+}
+
 /// SECURITY: the typed-`Key` path type-checks. A `Key` built once at the parse
 /// boundary (`keyFromString`) flows into both `hmacSha256` and the AEAD
 /// `aesGcmEncrypt` — the only sanctioned way to supply key material. This is the

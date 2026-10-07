@@ -1287,12 +1287,14 @@ mod registry_phase_c_tests {
             K::ConfigLoadFromFile,
             // ── Ipe.Email (1) ──────────────────────────────────────────
             K::EmailSend,
-            // ── Ipe.Crypto typed-key newtypes (5) ──────────────────────
+            // ── Ipe.Crypto typed-key newtypes (7) ──────────────────────
             K::CryptoKeyFromString,
             K::CryptoKeyFromBytes,
             K::CryptoMacToHex,
+            K::CryptoMacFromHex,
             K::CryptoHmacSha256WithKey,
             K::CryptoHmacSha512WithKey,
+            K::CryptoVerifyHmacSha256,
             // ── Ipe.Email.EmailAddress (2) ──────────────────────────────
             K::EmailAddressParse,
             K::EmailAddressToString,
