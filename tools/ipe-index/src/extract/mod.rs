@@ -292,8 +292,16 @@ pub fn extract_file(
 }
 
 /// The lines of `src` no span in `spans` covers, blank lines dropped, each run
-/// of covered lines marked by one `"\0"` line: the content a `file` unit
-/// reviews beyond its children.
+/// of covered lines between two kept lines marked by one covered row: the
+/// content a `file` unit reviews beyond its children.
+///
+/// Every row is written as `'\n'` followed by its text: a kept line's text is
+/// the line, a covered row's text is empty. A kept line is never blank, so it
+/// is never empty, and no line holds a `'\n'`, so the text splits back into
+/// exactly one row list: no source line, whatever its bytes, reads as a
+/// covered row. The text of a non-empty residual starts with `'\n'`, which the
+/// text of no other residual encoding starts with, so a `body_hash` stored
+/// under another encoding never matches it. An empty residual is `""`.
 ///
 /// A file unit's `body_hash` attests it, so editing a child queues the child
 /// alone while editing an import, attribute or other top-level line queues
@@ -312,20 +320,21 @@ pub fn residual_text(src: &str, spans: &[(i64, i64)]) -> String {
             *slot = true;
         }
     }
-    let mut out: Vec<&str> = Vec::new();
+    let mut out = String::new();
     let mut gap = false;
     for (line, is_covered) in lines.into_iter().zip(covered) {
         if is_covered {
             gap = true;
         } else if !line.trim().is_empty() {
             if gap && !out.is_empty() {
-                out.push("\0");
+                out.push('\n');
             }
             gap = false;
-            out.push(line);
+            out.push('\n');
+            out.push_str(line);
         }
     }
-    out.join("\n")
+    out
 }
 
 #[cfg(test)]
@@ -345,7 +354,7 @@ mod tests {
     fn residual_text_matches_the_shared_vectors() {
         let rows: Vec<serde_json::Value> = serde_json::from_str(RESIDUAL_VECTORS).unwrap();
         assert!(
-            rows.len() >= 20,
+            rows.len() >= 27,
             "the shared residual vector file lost rows"
         );
         for row in rows {
@@ -359,6 +368,10 @@ mod tests {
                 .collect();
             let residual = row["residual"].as_str().unwrap();
             assert_eq!(residual_text(src, &spans), residual, "{name}: residual");
+            assert!(
+                residual.is_empty() || residual.starts_with('\n'),
+                "{name}: a non-empty residual starts with its first row's break"
+            );
             assert_eq!(
                 view::attest(residual),
                 row["hash"].as_str().unwrap(),
@@ -372,14 +385,15 @@ mod tests {
         let src = "use a;\n\nfn f() {\n}\nconst X: u8 = 1;\nfn g() {}\n";
         assert_eq!(
             residual_text(src, &[(3, 4), (6, 6)]),
-            "use a;\n\0\nconst X: u8 = 1;"
+            "\nuse a;\n\nconst X: u8 = 1;"
         );
-        // No spans: every non-blank line.
-        assert_eq!(residual_text(src, &[]).lines().count(), 5);
+        // No spans: every non-blank line, after the empty segment the first
+        // row's `'\n'` leaves.
+        assert_eq!(residual_text(src, &[]).lines().count(), 6);
         // Out-of-range and inverted spans cover nothing past the source.
         assert_eq!(
             residual_text("a\nb\n", &[(i64::MIN, 0), (2, i64::MAX), (5, 1)]),
-            "a"
+            "\na"
         );
     }
 
@@ -402,7 +416,7 @@ mod tests {
         let src = "use a;\n\nfn f() -> u8 {\n    1\n}\n";
         extract_file(&store, "m.rs", Lang::Rust, src, "sha").unwrap();
         let residual = residual_text(src, &store.child_spans("m.rs").unwrap());
-        assert_eq!(residual, "use a;");
+        assert_eq!(residual, "\nuse a;");
         assert_eq!(file_key(&store, "m.rs"), view::attest(&residual));
         assert_ne!(
             file_key(&store, "m.rs"),
@@ -467,7 +481,7 @@ mod tests {
             .filter(|op| op.uid == file_uid)
             .collect();
         let new_hash = after.get(&file_uid).map(|s| s.body_hash.clone()).unwrap();
-        assert_eq!(new_hash, view::attest("use a;"));
+        assert_eq!(new_hash, view::attest("\nuse a;"));
         assert_eq!(
             ops.into_iter().map(|op| op.change).collect::<Vec<_>>(),
             vec![crate::diff::Change::New { new_hash }]
@@ -688,7 +702,7 @@ mod tests {
         for (qualified, start, end, hash) in rows {
             assert!(qualified.ends_with("::FILE"), "{qualified}");
             assert_eq!((start, end), (1, 2));
-            assert_eq!(hash, view::attest("# only a comment\r\nexport X=1"));
+            assert_eq!(hash, view::attest("\n# only a comment\r\nexport X=1"));
         }
         // A file of an unknown language is not indexed, so it has no unit
         // whose hash could drift from its view.
@@ -705,8 +719,8 @@ mod tests {
         let rows = unit_rows(&store);
         let file = rows.iter().find(|r| r.0.ends_with("::FILE")).unwrap();
         assert_eq!((file.1, file.2), (1, 4));
-        assert_eq!(file.3, view::attest("use a;\r"));
-        assert_ne!(file.3, view::attest("use a;"));
+        assert_eq!(file.3, view::attest("\nuse a;\r"));
+        assert_ne!(file.3, view::attest("\nuse a;"));
     }
 
     // An empty file has an empty residual, so nothing of it is queued.

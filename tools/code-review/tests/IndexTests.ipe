@@ -624,9 +624,10 @@ type alias ResidualVector =
 
 
 -- Every residual vector holds on this side: `residualText` gives the shared
--- residual and hash, and `classifyView` shows a file unit stored under that
--- hash with exactly that text. Red if the residual rule drifts from
--- ipe-index's, or a file unit is judged by its line range.
+-- residual and hash, a non-empty residual starts with its first row's `\n`,
+-- and `classifyView` shows a file unit stored under that hash with exactly
+-- that text. Red if the residual rule drifts from ipe-index's, a source line
+-- reads as a covered row, or a file unit is judged by its line range.
 residualVectors : Task.Task Error Bool
 residualVectors =
     do
@@ -634,7 +635,7 @@ residualVectors =
         path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "residual_vectors.json"))
         text <- File.readFileLimit path (ByteSize.kib 64)
         vectors <- Task.fromResult (Decode.decodeString (Decode.list residualVectorDecoder) text)
-        Task.succeed (List.length vectors >= 20 && List.all residualVectorHolds vectors)
+        Task.succeed (List.length vectors >= 27 && List.all residualVectorHolds vectors)
 
 
 residualVectorDecoder : Decode.Decoder ResidualVector
@@ -668,6 +669,7 @@ residualVectorHolds v =
         == List.length v.spans
         && Index.residualText spans v.src
         == v.residual
+        && (String.isEmpty v.residual || String.startsWith "\n" v.residual)
         && Index.attest v.residual
         == v.hash
         && shownTextOf (Index.classifyView (uid "u-file") v.hash (Residual spans) v.src)
@@ -685,10 +687,11 @@ spanPair pair =
 
 
 -- The residual of `fixtureLibRs` beside unit `u-a` (lines 3..6), written out
--- by hand: line 1, the covered run, lines 8..10; blank lines 2 and 7 dropped.
+-- by hand: line 1, the covered run's empty row, lines 8..10, each row after
+-- a `\n`; blank lines 2 and 7 dropped.
 libResidual : String
 libResidual =
-    "// fixture library\n\0\npub fn other() -> i32 {\n    7\n}"
+    "\n// fixture library\n\npub fn other() -> i32 {\n    7\n}"
 
 
 -- A file unit `u-file` over `fixtureLibRs`, stored under `hash`.

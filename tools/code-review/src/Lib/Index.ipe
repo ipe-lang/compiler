@@ -1025,7 +1025,7 @@ readFailureText failure =
 -- The one judgement of a unit's view, in precedence order: a body past the
 -- line ceiling, a range outside `text`, a view past the byte ceiling, then
 -- the attestation compare. The rows drawn and the text hashed come from one
--- `bodyRows` list, joined by `rowsText`. `ShownSource` is built only here, so
+-- `bodyRows` list, joined by `bodyText`. `ShownSource` is built only here, so
 -- holding one proves the view is within both ceilings and re-hashes to
 -- `stored`. An oversized view is never hashed: re-indexing cannot make it
 -- shown.
@@ -1047,7 +1047,7 @@ classifyView uid stored body text =
                 Ok rows ->
                     let
                         view =
-                            rowsText rows
+                            bodyText body rows
 
                         size =
                             Bytes.length (Bytes.fromString view)
@@ -1206,7 +1206,7 @@ shownText shown =
             s.text
 
 
--- The shown view's rows: the exact list `rowsText` joined and the
+-- The shown view's rows: the exact list `bodyText` joined and the
 -- attestation hashed, so the drawn rows and the hashed rows are one list.
 shownRows : ShownSource -> List SourceRow
 shownRows shown =
@@ -1386,7 +1386,7 @@ viewText start end text =
 -- vectors file.
 residualText : List ( Int, Int ) -> String -> String
 residualText spans text =
-    rowsText (residualRows spans (viewLines text))
+    residualRowsText (residualRows spans (viewLines text))
 
 
 -- The rows a body names in `lines`, the one list both drawn and hashed.
@@ -1400,11 +1400,34 @@ bodyRows body lines =
             Ok (residualRows spans lines)
 
 
--- The attested text of `rows`: each line joined by `\n`, each covered run
--- one `"\0"` line.
+-- The attested text of the rows a body names: a line range's rows joined by
+-- `\n`, a residual's rows under `residualRowsText`.
+bodyText : Body -> List SourceRow -> String
+bodyText body rows =
+    case body of
+        LineRange _ _ ->
+            rowsText rows
+
+        Residual _ ->
+            residualRowsText rows
+
+
+-- The attested text of a line range's rows: each line joined by `\n`.
 rowsText : List SourceRow -> String
 rowsText rows =
     String.join "\n" (List.map rowText rows)
+
+
+-- The attested text of a residual's rows: every row written as `\n` and its
+-- text, a kept line's text the line and a covered row's text empty. A kept
+-- line is never blank, so never empty, and no line holds a `\n`, so the
+-- text splits back into exactly one row list: no source line, whatever its
+-- bytes, reads as a covered row. A non-empty residual's text starts with
+-- `\n`, which the text of no other residual encoding starts with, so a hash
+-- stored under another encoding never matches it. No rows is `""`.
+residualRowsText : List SourceRow -> String
+residualRowsText rows =
+    String.concat (List.map (\row -> "\n" ++ rowText row) rows)
 
 
 rowText : SourceRow -> String
@@ -1414,7 +1437,7 @@ rowText row =
             line
 
         Covered ->
-            "\0"
+            ""
 
 
 rangeRows : Int -> Int -> List String -> Result StaleReason (List SourceRow)

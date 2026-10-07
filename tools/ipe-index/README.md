@@ -242,7 +242,9 @@ ipe-index pending --limit N       # cap the output
 
 Every unit's `body_hash` is `sha256:` plus the lowercase hex SHA-256 of the
 text it reviews. For a `file` unit that is its residual (`residual_text` in
-`src/extract/mod.rs`); for every other unit it is the whole-line view: lines
+`src/extract/mod.rs`): every row written as `\n` and its text, a kept line's
+text the line, a covered run's text empty, so no source line can read as a
+covered run; for every other unit it is the whole-line view: lines
 `line_start..=line_end` of the file, split on `\n` with any `\r` kept, joined
 with `\n` (`src/extract/view.rs`). The code-review app re-derives that hash
 before it shows a unit, so the two sides share the vectors in
