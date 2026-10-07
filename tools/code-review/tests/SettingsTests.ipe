@@ -313,8 +313,10 @@ reviewProbed at =
 
 
 -- A database failure is classified once, by the typed `DbFailure` it carries,
--- into one refusal; a failure at a location with no file is the missing-file
--- refusal whatever the failure was, and a cause this tool names no narrower
+-- into one refusal. With no file at the location, a cause that names no
+-- narrower case of its own (`CannotOpen` and every `Unusable` row) is the
+-- missing-file refusal; a cause that names its own (locked, not SQLite, not
+-- permitted, missing schema) keeps it. A cause this tool names no narrower
 -- case for is `Unusable`. Every `DbFailure` has its own row, so a cause left
 -- out of the mapping cannot pass, and no row may refuse less than before.
 -- Red if any one row of the mapping changes, or a missing file reads as
@@ -322,7 +324,17 @@ reviewProbed at =
 dbFailuresClassified : Bool
 dbFailuresClassified =
     List.all classifiedAs dbFailureRows
-        && List.all (\failure -> classifiedAs ( False, failure, Settings.NoDatabaseFile )) everyDbFailure
+        && List.all classifiedAs (List.map absentRow dbFailureRows)
+
+
+-- The same row with no file at the location.
+absentRow : ( Bool, Db.DbFailure, Settings.DbRefusal ) -> ( Bool, Db.DbFailure, Settings.DbRefusal )
+absentRow ( _, failure, expected ) =
+    if failure == Db.CannotOpen || expected == Settings.Unusable then
+        ( False, failure, Settings.NoDatabaseFile )
+
+    else
+        ( False, failure, expected )
 
 
 -- Each cause with the refusal it names when a file is there.
@@ -342,27 +354,6 @@ dbFailureRows =
     , ( True, Db.OtherConstraint, Settings.Unusable )
     , ( True, Db.Unreachable, Settings.Unusable )
     , ( True, Db.OtherFailure, Settings.Unusable )
-    ]
-
-
--- Every constructor of `DbFailure`, so the missing-file rule is proved for
--- each cause and not only for those the mapping names.
-everyDbFailure : List Db.DbFailure
-everyDbFailure =
-    [ Db.UniqueViolation
-    , Db.ForeignKeyViolation
-    , Db.NotNullViolation
-    , Db.CheckViolation
-    , Db.TriggerRaised
-    , Db.OtherConstraint
-    , Db.Busy
-    , Db.ReadOnlyDatabase
-    , Db.AccessDenied
-    , Db.CannotOpen
-    , Db.NotADatabase
-    , Db.InvalidStatement
-    , Db.Unreachable
-    , Db.OtherFailure
     ]
 
 
