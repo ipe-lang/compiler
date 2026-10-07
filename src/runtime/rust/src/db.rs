@@ -1345,61 +1345,48 @@ fn postgres_row(code: &str) -> IpeDbFailure {
     }
 }
 
-/// A driver failure, classified from the `sqlx::Error` variant alone.
+/// A driver failure: its classification and its well-formed driver code.
 ///
-/// Holds no driver payload: a driver's message can echo the connection URL —
-/// host, user, password — so the payload is dropped here and can never reach a
-/// log line or an error value.
+/// Holds no driver message: a driver's message can echo the connection URL —
+/// host, user, password — so it is dropped here and can never reach a log line
+/// or an error value. `Display` renders the classification's phrase alone; the
+/// code is kept for the operator log only.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DbFailure {
-    /// The server answered with an error; `code` is its SQLSTATE / driver code.
-    Database { code: Option<String> },
-    /// The connection options were rejected.
-    Configuration,
-    /// Reaching or talking to the server failed at the I/O layer.
-    Io,
-    /// TLS negotiation failed.
-    Tls,
-    /// No pooled connection became available in time.
-    PoolTimedOut,
-    /// The pool was already closed.
-    PoolClosed,
-    /// Any other driver failure.
-    Other,
+pub struct DriverFailure {
+    failure: IpeDbFailure,
+    raw_code: Option<String>,
 }
 
-impl DbFailure {
-    /// Classify `e`, keeping only its variant and a well-formed error code.
+impl DriverFailure {
+    /// Classify `e` for `engine`, keeping only a well-formed driver code.
     #[must_use]
-    pub fn of(e: &sqlx::Error) -> Self {
-        if let Some(dbe) = e.as_database_error() {
+    pub fn of(engine: DbEngine, e: &sqlx::Error) -> Self {
+        let raw_code = e.as_database_error().and_then(|dbe| {
             let code = dbe.code();
-            let code = well_formed_code(code.as_deref()).map(str::to_owned);
-            return Self::Database { code };
+            well_formed_code(code.as_deref()).map(str::to_owned)
+        });
+        Self {
+            failure: classify_failure(engine, e),
+            raw_code,
         }
-        match e {
-            sqlx::Error::Configuration(_) => Self::Configuration,
-            sqlx::Error::Io(_) => Self::Io,
-            sqlx::Error::Tls(_) => Self::Tls,
-            sqlx::Error::PoolTimedOut => Self::PoolTimedOut,
-            sqlx::Error::PoolClosed => Self::PoolClosed,
-            _ => Self::Other,
-        }
+    }
+
+    /// The closed classification.
+    #[must_use]
+    pub const fn failure(&self) -> IpeDbFailure {
+        self.failure
+    }
+
+    /// The well-formed driver code, for the operator log only.
+    #[must_use]
+    pub fn raw_code(&self) -> Option<&str> {
+        self.raw_code.as_deref()
     }
 }
 
-impl std::fmt::Display for DbFailure {
+impl std::fmt::Display for DriverFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Database { code: Some(code) } => write!(f, "database error [{code}]"),
-            Self::Database { code: None } => f.write_str("database error"),
-            Self::Configuration => f.write_str("invalid connection configuration"),
-            Self::Io => f.write_str("connection I/O error"),
-            Self::Tls => f.write_str("TLS error"),
-            Self::PoolTimedOut => f.write_str("connection pool timed out"),
-            Self::PoolClosed => f.write_str("connection pool closed"),
-            Self::Other => f.write_str("driver error"),
-        }
+        f.write_str(self.failure.phrase())
     }
 }
 
@@ -1440,12 +1427,12 @@ pub enum DbConnectError {
     /// The SSRF gate refused a target the URL dials.
     HostRefused(crate::ssrf::SsrfRefusal),
     /// The driver could not open the pool.
-    Unreachable(DbFailure),
+    Unreachable(DriverFailure),
     /// The local relay that pins a TLS dial to its vetted address could not
     /// be opened, so the dial is refused rather than unpinned.
     RelayUnavailable,
     /// The server's version query failed.
-    VersionUnreadable(DbFailure),
+    VersionUnreadable(DriverFailure),
     /// The engine is unsupported, or its version is unparseable or too old.
     EngineRefused(EngineVersionError),
 }
@@ -1509,7 +1496,7 @@ where
     let raw: String = sqlx::query_scalar::<DB, String>(engine.version_query())
         .fetch_one(pool)
         .await
-        .map_err(|e| DbConnectError::VersionUnreadable(DbFailure::of(&e)))?;
+        .map_err(|e| DbConnectError::VersionUnreadable(DriverFailure::of(engine, &e)))?;
     check_engine_version(engine, &raw).map_err(DbConnectError::EngineRefused)
 }
 
@@ -1936,13 +1923,14 @@ where
     ///
     /// [`DbConnectError`] when a gate refuses or the driver cannot connect.
     pub async fn connect(url: &DbUrl, max_connections: u32) -> Result<Self, DbConnectError> {
+        let engine = DbEngine::for_driver::<DB>().map_err(DbConnectError::EngineRefused)?;
         let mut relay = None;
         let options = DB::gated_connect_options(url, max_connections, &mut relay).await?;
         let pool = sqlx::pool::PoolOptions::<DB>::new()
             .max_connections(max_connections)
             .connect_with(options)
             .await
-            .map_err(|e| DbConnectError::Unreachable(DbFailure::of(&e)))?;
+            .map_err(|e| DbConnectError::Unreachable(DriverFailure::of(engine, &e)))?;
         if let Err(refused) = enforce_engine_floor_on(&pool).await {
             pool.close().await;
             return Err(refused);
@@ -6075,16 +6063,16 @@ mod tests {
         let cases = [
             (
                 sqlx::Error::Configuration(boxed()),
-                "db: invalid connection configuration",
+                "db: database unreachable",
             ),
             (
                 sqlx::Error::Io(std::io::Error::other(SECRET_URL)),
-                "db: connection I/O error",
+                "db: database unreachable",
             ),
-            (sqlx::Error::Tls(boxed()), "db: TLS error"),
+            (sqlx::Error::Tls(boxed()), "db: database unreachable"),
             (
                 sqlx::Error::Protocol(SECRET_URL.to_string()),
-                "db: driver error",
+                "db: database error",
             ),
             (
                 sqlx::Error::Database(Box::new(EchoingDbError)),
@@ -6096,10 +6084,11 @@ mod tests {
                 raw.to_string().contains("s3cr3t-pw"),
                 "the raw driver error must be the leaking form this guards: {raw}"
             );
-            let refused = DbConnectError::Unreachable(DbFailure::of(&raw));
+            let refused = DbConnectError::Unreachable(DriverFailure::of(DbEngine::Postgres, &raw));
             assert_credential_free(&refused);
             assert_eq!(refused.to_string(), expected);
-            let unreadable = DbConnectError::VersionUnreadable(DbFailure::of(&raw));
+            let unreadable =
+                DbConnectError::VersionUnreadable(DriverFailure::of(DbEngine::Postgres, &raw));
             assert_credential_free(&unreadable);
         }
     }
@@ -6135,15 +6124,23 @@ mod tests {
                 sqlx::error::ErrorKind::Other
             }
         }
-        let classify = |code| DbFailure::of(&sqlx::Error::Database(Box::new(Coded(code))));
-        assert_eq!(
-            classify("28P01"),
-            DbFailure::Database {
-                code: Some("28P01".to_string())
-            }
-        );
+        let classify = |code| {
+            DriverFailure::of(
+                DbEngine::Postgres,
+                &sqlx::Error::Database(Box::new(Coded(code))),
+            )
+        };
+        let kept = classify("28P01");
+        assert_eq!(kept.raw_code(), Some("28P01"));
+        assert_eq!(kept.failure(), IpeDbFailure::AccessDenied);
         for malformed in ["", "28P01\n[forged] line", "0123456789abcdefX"] {
-            assert_eq!(classify(malformed), DbFailure::Database { code: None });
+            let dropped = classify(malformed);
+            assert_eq!(dropped.raw_code(), None, "{malformed:?}");
+            assert_eq!(
+                dropped.failure(),
+                IpeDbFailure::OtherFailure,
+                "{malformed:?}"
+            );
         }
     }
 
@@ -11000,15 +10997,21 @@ mod tests {
     /// Dial a fake TLS PostgreSQL server as `host` under `verify-full`, only
     /// through a relay pinned to the server's address.
     #[cfg(unix)]
-    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DbFailure>, Option<TlsSeen>) {
+    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DriverFailure>, Option<TlsSeen>) {
+        let io_failure = || {
+            DriverFailure::of(
+                DbEngine::Postgres,
+                &sqlx::Error::Io(std::io::Error::other("test setup")),
+            )
+        };
         use sqlx::ConnectOptions;
         let listener = std::net::TcpListener::bind("127.0.0.1:0");
         assert!(listener.is_ok(), "{:?}", listener.as_ref().err());
         let Ok(listener) = listener else {
-            return (Err(DbFailure::Io), None);
+            return (Err(io_failure()), None);
         };
         let Ok(server) = listener.local_addr() else {
-            return (Err(DbFailure::Io), None);
+            return (Err(io_failure()), None);
         };
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
@@ -11023,7 +11026,7 @@ mod tests {
         );
         assert!(relay.is_ok(), "{:?}", relay.as_ref().err());
         let Ok(relay) = relay else {
-            return (Err(DbFailure::Io), None);
+            return (Err(io_failure()), None);
         };
         let options = sqlx::postgres::PgConnectOptions::new()
             .host(host)
@@ -11037,8 +11040,11 @@ mod tests {
         let connected = tokio::time::timeout(limit, options.connect()).await;
         let outcome = match connected {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(DbFailure::of(&e)),
-            Err(_) => Err(DbFailure::PoolTimedOut),
+            Ok(Err(e)) => Err(DriverFailure::of(DbEngine::Postgres, &e)),
+            Err(_) => Err(DriverFailure::of(
+                DbEngine::Postgres,
+                &sqlx::Error::PoolTimedOut,
+            )),
         };
         let seen = tokio::time::timeout(limit, seen_rx)
             .await
@@ -11071,7 +11077,10 @@ mod tests {
     async fn relayed_tls_dial_refuses_a_certificate_for_another_name() {
         let (outcome, seen) = dial_pg_tls_through_relay("other.example.test").await;
         assert!(
-            matches!(outcome, Err(DbFailure::Tls | DbFailure::Io)),
+            matches!(
+                &outcome,
+                Err(f) if f.failure() == IpeDbFailure::Unreachable
+            ),
             "{outcome:?}"
         );
         assert!(
@@ -12093,7 +12102,10 @@ mod tests {
             pool.close().await;
             assert_eq!(
                 enforce_engine_floor_on(&pool).await,
-                Err(DbConnectError::VersionUnreadable(DbFailure::PoolClosed))
+                Err(DbConnectError::VersionUnreadable(DriverFailure::of(
+                    DbEngine::Sqlite,
+                    &sqlx::Error::PoolClosed
+                )))
             );
         }
     }
@@ -12121,9 +12133,10 @@ mod tests {
     #[test]
     fn engine_floor_query_failure_is_credential_free() {
         let raw = sqlx::Error::Io(std::io::Error::other(SECRET_URL));
-        let refused = DbConnectError::VersionUnreadable(DbFailure::of(&raw));
+        let refused =
+            DbConnectError::VersionUnreadable(DriverFailure::of(DbEngine::Postgres, &raw));
         assert_credential_free(&refused);
-        assert_eq!(refused.to_string(), "db: connection I/O error");
+        assert_eq!(refused.to_string(), "db: database unreachable");
     }
 
     /// The floors are stated once, in their consts: no doc comment in this file
