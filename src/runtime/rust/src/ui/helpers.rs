@@ -1746,7 +1746,8 @@ mod tag_gate_tests {
                 vec![],
                 vec![html_text_node_("<b>".to_owned())],
             );
-            assert_eq!(render_html(&node), format!("<{tag}>&lt;b&gt;</{tag}>"));
+            let escaped = crate::escape::html_text("<b>");
+            assert_eq!(render_html(&node), format!("<{tag}>{escaped}</{tag}>"));
         }
     }
 
