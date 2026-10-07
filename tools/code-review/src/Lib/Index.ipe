@@ -345,7 +345,7 @@ probeRoot settings =
 -- One configured root with the indexed paths sampled under its tag.
 type alias RootSample =
     { tag : Tag
-    , root : Root
+    , rootDir : Path
     , stored : List String
     }
 
@@ -367,7 +367,7 @@ rootSampleOf conn ( tag, root ) =
             RepoPath.tagName tag ++ ":"
     in
     Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] storedPathDecoder
-        |> Task.map (\stored -> { tag = tag, root = root, stored = stored })
+        |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, stored = stored })
 
 
 -- Succeeds when the sample is empty or any sampled path joins to a file
@@ -386,7 +386,7 @@ rootHolds roots sample =
                             Task.succeed ()
 
                         else
-                            Task.fail (rootMismatch (List.length sample.stored) first sample.root)
+                            Task.fail (rootMismatch (List.length sample.stored) first sample.rootDir)
                     )
 
 
@@ -425,8 +425,8 @@ presentUnder roots stored =
             Task.succeed False
 
 
-rootMismatch : Int -> String -> Root -> Error
-rootMismatch sampled first root =
+rootMismatch : Int -> String -> Path -> Error
+rootMismatch sampled first rootDir =
     Error.invalidInput
         (SafeText.toString
             (SafeText.concat
@@ -435,7 +435,7 @@ rootMismatch sampled first root =
                 , SafeText.literal " indexed files checked: index path "
                 , SafeText.quoted first
                 , SafeText.literal " is not under "
-                , SafeText.quoted (Path.toString (RepoPath.rootPath root))
+                , SafeText.quoted (Path.toString rootDir)
                 , SafeText.literal "; "
                 , RepoPath.rootFix
                 ]
