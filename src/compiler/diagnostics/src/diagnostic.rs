@@ -466,19 +466,27 @@ pub enum NameError {
     /// A qualifier names a known module the importing module never imported.
     ///
     /// `String.join` with no `import Ipe.String`, or `Util.f` with no
-    /// `import Util`, or `p |= q` with no `import Ipe.Parser`. Distinct from
-    /// [`Self::UnknownModule`] (a genuinely unknown qualifier): here the module
-    /// exists and the fix is to add its import. `reached` is how the use site
-    /// reached the module; `candidates` holds every importable module whose
-    /// bare import binds that spelling (for an operator, the module it
-    /// desugars into), sorted and deduplicated (never empty). `imported_as` is
-    /// set when one of the candidates IS imported, under an alias the use site
-    /// did not write.
+    /// `import Util`. Distinct from [`Self::UnknownModule`] (a genuinely unknown
+    /// qualifier): here the module exists and the fix is to add its import.
+    /// `reached` is how the use site reached the module; `candidates` holds
+    /// every importable module whose bare import binds that spelling, sorted
+    /// and deduplicated (never empty). `imported_as` is set when one of the
+    /// candidates IS imported, under an alias the use site did not write.
     /// [IPE-N0034]
     ImportRequired {
         reached: StdlibReach,
         candidates: Box<[Box<str>]>,
         imported_as: Option<Box<ImportedAs>>,
+    },
+    /// An operator desugars into a call to a module the using module never
+    /// imported: `p |= q` with no `import Ipe.Parser`.
+    ///
+    /// `operator` is the spelling the use site wrote and `module` the one
+    /// module it desugars into; any import form of `module` brings `operator`
+    /// into reach. [IPE-N0034]
+    OperatorImportRequired {
+        operator: Box<str>,
+        module: Box<str>,
     },
     /// The qualifier resolves but the member is absent. [IPE-N0005]
     NoSuchMember {
@@ -967,9 +975,6 @@ pub enum SealRejection {
 pub enum StdlibReach {
     /// A qualified reference `Qualifier.member`, by its qualifier spelling.
     Qualifier(Box<str>),
-    /// An operator that desugars to a call into the module, by its spelling
-    /// (`|=` reaches `Ipe.Parser`).
-    Operator(Box<str>),
 }
 
 impl StdlibReach {
@@ -977,7 +982,7 @@ impl StdlibReach {
     #[must_use]
     pub fn spelling(&self) -> &str {
         match self {
-            Self::Qualifier(spelling) | Self::Operator(spelling) => spelling,
+            Self::Qualifier(qualifier) => qualifier,
         }
     }
 }
@@ -2559,7 +2564,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::TypeNotFound { .. } => IPE_N0002,
         NameError::ConstructorNotFound { .. } => IPE_N0003,
         NameError::UnknownModule { .. } => IPE_N0004,
-        NameError::ImportRequired { .. } => IPE_N0034,
+        NameError::ImportRequired { .. } | NameError::OperatorImportRequired { .. } => IPE_N0034,
         NameError::NoSuchMember { .. } => IPE_N0005,
         NameError::DuplicateValue { .. } => IPE_N0010,
         NameError::DuplicateConstructor { .. } => IPE_N0011,
@@ -2815,6 +2820,7 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         | NameError::TypeExpansionTooDeep { .. }
         | NameError::ProgramImportsTeaShape { .. }
         | NameError::ImportRequired { .. }
+        | NameError::OperatorImportRequired { .. }
         | NameError::RemovedSurface { .. }
         | NameError::AssertedCallMalformed { .. }
         | NameError::BoundarySealIllegal { .. }

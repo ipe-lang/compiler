@@ -309,22 +309,23 @@ pub fn to_lsp(diag: &Diagnostic, text: &str, encoding: PositionEncoding) -> lsp_
 
 /// The `data` payload of an import-required diagnostic: its candidate modules.
 ///
-/// None when a candidate is already imported under an alias: the fix is to
-/// write that alias, not to import the module a second time.
+/// A name reached through an unimported qualifier carries its candidates; an
+/// operator carries the one module it desugars into. None when a candidate is
+/// already imported under an alias: the fix is to write that alias, not to
+/// import the module a second time.
 fn import_candidates_data(diag: &Diagnostic) -> Option<serde_json::Value> {
-    let Diagnostic::Name {
-        msg:
-            NameError::ImportRequired {
-                candidates,
-                imported_as: None,
-                ..
-            },
-        ..
-    } = diag
-    else {
+    let Diagnostic::Name { msg, .. } = diag else {
         return None;
     };
-    let modules: Vec<&str> = candidates.iter().map(|m| &**m).collect();
+    let modules: Vec<&str> = match msg {
+        NameError::ImportRequired {
+            candidates,
+            imported_as: None,
+            ..
+        } => candidates.iter().map(|m| &**m).collect(),
+        NameError::OperatorImportRequired { module, .. } => vec![&**module],
+        _ => return None,
+    };
     Some(serde_json::json!({ IMPORT_CANDIDATES_KEY: modules }))
 }
 

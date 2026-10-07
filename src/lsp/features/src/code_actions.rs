@@ -1158,6 +1158,24 @@ mod tests {
         );
     }
 
+    /// An operator's missing import travels as the typed payload, so the
+    /// quick fix offers exactly the module the operator desugars into.
+    #[test]
+    fn operator_import_required_carries_its_module_as_the_candidate() {
+        let diag = ipe_diagnostics::Diagnostic::Name {
+            span: ipe_diagnostics::Span::new(0, 2),
+            msg: ipe_diagnostics::NameError::OperatorImportRequired {
+                operator: "|=".into(),
+                module: "Ipe.Parser".into(),
+            },
+        };
+        let lsp_diag = crate::diagnostics::to_lsp(&diag, "|=", PositionEncoding::Utf16);
+        assert_eq!(
+            crate::diagnostics::import_candidates(&lsp_diag),
+            ["Ipe.Parser".to_owned()]
+        );
+    }
+
     /// The candidates `data` decodes to.
     fn decoded(data: &serde_json::Value) -> Vec<String> {
         let mut diag = diag_at(5, "IPE-N0034");

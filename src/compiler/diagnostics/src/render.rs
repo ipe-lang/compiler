@@ -34,9 +34,9 @@ use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
     ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
     Hint, IfDefect, ImportedAs, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect,
-    SandboxError, SealRejection, SpanRole, StdlibReach, StoreEqAccessorDefect,
-    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
-    WildcardDependence, intercept_context_phrase,
+    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
+    intercept_context_phrase,
 };
 use crate::span::Span;
 
@@ -444,19 +444,15 @@ fn name_prose(msg: &NameError) -> String {
         NameError::UnknownModule { qualifier, .. } => {
             format!("I can't find a module called `{qualifier}`.")
         }
-        NameError::ImportRequired {
-            reached,
-            candidates,
-            ..
-        } => match reached {
-            StdlibReach::Qualifier(qualifier) => {
-                format!("`{qualifier}` names a module you haven't imported yet.")
-            }
-            StdlibReach::Operator(operator) => format!(
-                "`{operator}` comes from {}, which you haven't imported yet.",
-                module_list(candidates)
-            ),
-        },
+        NameError::ImportRequired { reached, .. } => {
+            format!(
+                "`{}` names a module you haven't imported yet.",
+                reached.spelling()
+            )
+        }
+        NameError::OperatorImportRequired { operator, module } => {
+            format!("`{operator}` comes from `{module}`, which you haven't imported yet.")
+        }
         NameError::NoSuchMember { module, member, .. } => {
             format!("`{module}` doesn't have anything called `{member}`.")
         }
@@ -1480,15 +1476,13 @@ fn name_label(msg: &NameError) -> Option<String> {
             reached,
             candidates,
             imported_as,
-        } => Some(match (reached, imported_as.as_deref()) {
-            (StdlibReach::Operator(operator), _) => operator_import_label(operator, candidates),
-            (StdlibReach::Qualifier(qualifier), None) => {
-                import_required_label(qualifier, candidates)
-            }
-            (StdlibReach::Qualifier(qualifier), Some(imported)) => {
-                imported_as_label(qualifier, imported)
-            }
-        }),
+        } => Some(imported_as.as_deref().map_or_else(
+            || import_required_label(reached.spelling(), candidates),
+            |imported| imported_as_label(reached.spelling(), imported),
+        )),
+        NameError::OperatorImportRequired { operator, module } => Some(format!(
+            "`{operator}` comes from `{module}`; add `import {module}`"
+        )),
         NameError::NoSuchMember { module, member, .. } => {
             Some(format!("`{module}` has no member `{member}`"))
         }
@@ -1762,28 +1756,6 @@ fn name_label(msg: &NameError) -> Option<String> {
 fn imported_as_label(qualifier: &str, imported: &ImportedAs) -> String {
     let ImportedAs { module, alias } = imported;
     format!("you imported `{module}` as `{alias}`; write `{alias}.` where you wrote `{qualifier}.`")
-}
-
-/// The modules an operator desugars into, as backticked prose.
-fn module_list(candidates: &[Box<str>]) -> String {
-    candidates
-        .iter()
-        .map(|module| format!("`{module}`"))
-        .collect::<Vec<_>>()
-        .join(" or ")
-}
-
-/// The label for an operator whose module the use site never imported.
-///
-/// Any import form of that module brings the operator into reach.
-fn operator_import_label(operator: &str, candidates: &[Box<str>]) -> String {
-    match candidates {
-        [only] => format!("`{operator}` comes from `{only}`; add `import {only}`"),
-        many => format!(
-            "`{operator}` comes from {}; add one of their imports",
-            module_list(many)
-        ),
-    }
 }
 
 fn import_required_label(qualifier: &str, candidates: &[Box<str>]) -> String {
@@ -2827,14 +2799,13 @@ mod tests {
         assert_eq!(char_repr('$'), "`$`");
     }
 
-    /// An operator that reaches an unimported module names the operator and
-    /// the import to add, never the qualifier wording.
+    /// An operator that reaches an unimported module is IPE-N0034, naming the
+    /// operator and the one import to add, never the qualifier wording.
     #[test]
     fn operator_import_required_names_the_operator_and_its_import() {
-        let msg = NameError::ImportRequired {
-            reached: StdlibReach::Operator("|=".into()),
-            candidates: Box::from([Box::<str>::from("Ipe.Parser")]),
-            imported_as: None,
+        let msg = NameError::OperatorImportRequired {
+            operator: "|=".into(),
+            module: "Ipe.Parser".into(),
         };
         assert_eq!(
             name_label(&msg).as_deref(),
@@ -2844,6 +2815,11 @@ mod tests {
             name_prose(&msg),
             "`|=` comes from `Ipe.Parser`, which you haven't imported yet."
         );
+        let diag = Diagnostic::Name {
+            span: Span::new(0, 2),
+            msg,
+        };
+        assert_eq!(diag.code(), crate::code::IPE_N0034);
     }
 
     fn con(name: &str) -> TyDoc {

@@ -1334,8 +1334,9 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     },
     // Ipe.Parser — pure-Ipê parser combinators (elm/parser parity); no kernel
     // calls. Defines and pattern-matches its own `Parser`/`Problem`/`Step` data.
+    // Its name is the one `|=` / `|.` desugar into.
     CompiledStdModule {
-        dotted: "Ipe.Parser",
+        dotted: ipe_syntax::fixity::PARSER_OPERATOR_MODULE.dotted(),
         source: PARSER,
     },
     // Ipe.Bitwise — Layer-3 source; every member is a point-free

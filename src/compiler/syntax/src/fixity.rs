@@ -142,6 +142,44 @@ impl BinOp {
     }
 }
 
+/// A compiled-source stdlib module an operator desugars into a call to.
+///
+/// Its path segments and its dotted name are built from one list by
+/// `operator_module!`, so they cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperatorModule {
+    segments: &'static [&'static str],
+    dotted: &'static str,
+}
+
+impl OperatorModule {
+    /// The module path, one segment each (`["Ipe", "Parser"]`).
+    #[must_use]
+    pub const fn segments(self) -> &'static [&'static str] {
+        self.segments
+    }
+
+    /// The module name as an `import` writes it (`Ipe.Parser`).
+    #[must_use]
+    pub const fn dotted(self) -> &'static str {
+        self.dotted
+    }
+}
+
+/// Builds an [`OperatorModule`] from its path segments.
+macro_rules! operator_module {
+    ($first:literal $(, $rest:literal)*) => {
+        OperatorModule {
+            segments: &[$first $(, $rest)*],
+            dotted: concat!($first $(, ".", $rest)*),
+        }
+    };
+}
+
+/// The module `|=` and `|.` desugar into: the stdlib registry embeds it under
+/// this name, and name resolution calls into it by this path.
+pub const PARSER_OPERATOR_MODULE: OperatorModule = operator_module!("Ipe", "Parser");
+
 /// `const`-context byte-exact slice equality (`<[u8]>::eq` is not `const`).
 const fn bytes_eq(mut a: &[u8], mut b: &[u8]) -> bool {
     loop {
@@ -191,7 +229,7 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    use super::{Assoc, BinOp, closed_set_round_trips};
+    use super::{Assoc, BinOp, PARSER_OPERATOR_MODULE, closed_set_round_trips};
 
     #[test]
     fn core_operator_fixities() {
@@ -241,5 +279,11 @@ mod tests {
         for op in BinOp::ALL {
             assert_eq!(BinOp::from_text(op.text()), Some(op), "`{}`", op.text());
         }
+    }
+
+    #[test]
+    fn parser_operator_module_segments_spell_its_dotted_name() {
+        assert_eq!(PARSER_OPERATOR_MODULE.segments(), ["Ipe", "Parser"]);
+        assert_eq!(PARSER_OPERATOR_MODULE.dotted(), "Ipe.Parser");
     }
 }

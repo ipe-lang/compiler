@@ -13,6 +13,7 @@ use ipe_diagnostics::{
 use ipe_intern::{Interner, Symbol};
 use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
 use ipe_syntax as src;
+use ipe_syntax::fixity::{OperatorModule, PARSER_OPERATOR_MODULE};
 use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
@@ -6105,34 +6106,33 @@ fn combine_binop(
         // lhs is the left operand, rhs the right, and each combinator runs them
         // left-to-right internally via `map2`.
         //
-        // The call names `Ipe.Parser` directly, so the module must be one this
+        // The call names its module directly, so the module must be one this
         // file imports: an unimported module never reaches the dependency
         // graph, and the call would otherwise fail only after linking.
-        OpForm::ParserPipe(fn_name) => {
-            const PARSER_MODULE: &str = "Ipe.Parser";
-            let parser_module = PARSER_MODULE
-                .split('.')
+        OpForm::ModuleCall { module, func } => {
+            let module_path = module
+                .segments()
+                .iter()
                 .map(|segment| interner.intern(segment))
                 .collect::<DResult<Vec<Symbol>>>()?;
             if !env
                 .import_scope
                 .imported_modules
-                .contains(&ModuleIdentity::Source(parser_module.clone()))
+                .contains(&ModuleIdentity::Source(module_path.clone()))
             {
                 return Err(Diagnostic::Name {
                     span: op.span,
-                    msg: NameError::ImportRequired {
-                        reached: StdlibReach::Operator(op.value.text().into()),
-                        candidates: Box::from([Box::<str>::from(PARSER_MODULE)]),
-                        imported_as: None,
+                    msg: NameError::OperatorImportRequired {
+                        operator: op.value.text().into(),
+                        module: module.dotted().into(),
                     },
                 });
             }
-            let fn_sym = interner.intern(fn_name)?;
+            let fn_sym = interner.intern(func)?;
             let callee = Located::new(
                 span,
                 canon::Expr_::VarTopLevel {
-                    module: parser_module,
+                    module: module_path,
                     name: fn_sym,
                 },
             );
@@ -6196,8 +6196,11 @@ enum Toward {
 enum OpForm {
     /// `::` builds a list node.
     Cons,
-    /// `|=` / `|.` call the named `Ipe.Parser` combinator.
-    ParserPipe(&'static str),
+    /// `|=` / `|.` call the combinator `func` of `module`.
+    ModuleCall {
+        module: OperatorModule,
+        func: &'static str,
+    },
     /// `|>` / `<|` apply one operand to the other.
     Apply(Toward),
     /// `>>` / `<<` eta-expand to a composed lambda.
@@ -6212,8 +6215,14 @@ enum OpForm {
 const fn resolve_op_func(op: BinOp) -> OpForm {
     match op {
         BinOp::Cons => OpForm::Cons,
-        BinOp::ParserKeeper => OpForm::ParserPipe("ignore"),
-        BinOp::ParserIgnorer => OpForm::ParserPipe("keep"),
+        BinOp::ParserKeeper => OpForm::ModuleCall {
+            module: PARSER_OPERATOR_MODULE,
+            func: "ignore",
+        },
+        BinOp::ParserIgnorer => OpForm::ModuleCall {
+            module: PARSER_OPERATOR_MODULE,
+            func: "keep",
+        },
         BinOp::PipeRight => OpForm::Apply(Toward::Right),
         BinOp::PipeLeft => OpForm::Apply(Toward::Left),
         BinOp::ComposeRight => OpForm::Compose(Toward::Right),

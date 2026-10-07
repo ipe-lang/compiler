@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use ipe_canon::asserted::AssertedPath;
 use ipe_canon::ast::{Def, Module, Type};
 use ipe_canon::{ModuleCatalog, ModuleExports, ModuleOrigin, canonicalise_module_in_project};
-use ipe_diagnostics::{DResult, Diagnostic, NameError, StdlibReach};
+use ipe_diagnostics::{DResult, Diagnostic, NameError};
 use ipe_intern::{Interner, Symbol};
 
 const LIB_UTIL: &str = "module Lib.Util exposing (..)\n\nf : Int -> Int\nf n =\n    n\n";
@@ -419,13 +419,12 @@ fn is_operator_import_required(result: &DResult<()>, src: &str, operator: &str) 
         result,
         Err(Diagnostic::Name {
             span,
-            msg: NameError::ImportRequired {
-                reached: StdlibReach::Operator(reached),
-                candidates,
-                imported_as: None,
+            msg: NameError::OperatorImportRequired {
+                operator: reached,
+                module,
             },
         }) if &**reached == operator
-            && **candidates == [Box::<str>::from("Ipe.Parser")]
+            && &**module == "Ipe.Parser"
             && Some(span.lo) == lo
     )
 }
