@@ -72,6 +72,8 @@ module TestSupport exposing
     , probeMessage
     , probeNames
     , maybeContains
+    , carriesFailure
+    , carriesNoFailure
     , uid
     , resyncBoundOf
     , testKeyHex
@@ -1207,6 +1209,43 @@ probeNames var file message =
 
         Nothing ->
             False
+
+
+-- The `DbFailure` an error carries in its details, or `Nothing` for an error
+-- that carries none.
+dbFailureOf : Error -> Maybe Db.DbFailure
+dbFailureOf e =
+    case e of
+        Error _ info ->
+            case info.details of
+                Just (Database failure) ->
+                    Just failure
+
+                _ ->
+                    Nothing
+
+
+-- True when `e` carries exactly `expected` as its database failure; another
+-- failure, or an error that carries none, is False.
+carriesFailure : Db.DbFailure -> Error -> Bool
+carriesFailure expected e =
+    case dbFailureOf e of
+        Just failure ->
+            failure == expected
+
+        Nothing ->
+            False
+
+
+-- True when `e` carries no database failure at all.
+carriesNoFailure : Error -> Bool
+carriesNoFailure e =
+    case dbFailureOf e of
+        Just _ ->
+            False
+
+        Nothing ->
+            True
 
 
 maybeContains : String -> Maybe String -> Bool

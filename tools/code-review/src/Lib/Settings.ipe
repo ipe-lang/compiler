@@ -1,5 +1,6 @@
 module Lib.Settings exposing (AppSettings, DbLocation, DbRefusal(..), DbRole(..), IndexSettings, brokenLog, dbFileName, dbRefusalOf, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, parseReviewDb, reviewUrl)
 
+import Ipe.Db as Db exposing (DbFailure(..))
 import Ipe.Encoding as Encoding
 import Ipe.Error as Error
 import Ipe.File as File
@@ -170,12 +171,13 @@ type DbRole
     | ReviewDb
 
 
--- Why a configured database cannot be used, parsed once from the failure
--- of its open or startup probe. The driver's numeric code is read here and
--- nowhere else, and never shown.
+-- Why a configured database cannot be used, decided once from the typed
+-- `DbFailure` its open or startup probe failed with. The failure's message is
+-- never read: only the cause it carries decides the case, and no driver text
+-- or code is ever shown.
 type DbRefusal
     = NoDatabaseFile
-    | NotADatabase
+    | NotSqliteFile
     | Locked
     | NotPermitted
     | MissingSchema
@@ -183,49 +185,66 @@ type DbRefusal
 
 
 -- The refusal for a failed open or probe of `loc`: whether a file is there
--- and the failure's SQLite primary result code decide the case. A code this
--- tool does not name is `Unusable`, never a guess at a narrower case.
+-- and the `DbFailure` the error carries decide the case. An error that
+-- carries no `DbFailure` is `Unusable`, never a guess at a narrower case.
 dbRefusalOf : Bool -> Error -> DbRefusal
 dbRefusalOf present e =
-    case sqliteCode (Error.message e) of
-        Just code ->
-            refusalOfCode present code
+    case e of
+        Error _ info ->
+            case info.details of
+                Just (Database failure) ->
+                    refusalOfFailure present failure
 
-        Nothing ->
-            absentOr present Unusable
+                _ ->
+                    absentOr present Unusable
 
 
-refusalOfCode : Bool -> Int -> DbRefusal
-refusalOfCode present code =
-    case code of
-        14 ->
+-- Every `DbFailure` has its own row, so a cause the driver layer adds is a
+-- compile error here until it is given a refusal. A cause this tool names no
+-- narrower case for is `Unusable`.
+refusalOfFailure : Bool -> DbFailure -> DbRefusal
+refusalOfFailure present failure =
+    case failure of
+        CannotOpen ->
             absentOr present NotPermitted
 
-        26 ->
-            NotADatabase
+        NotADatabase ->
+            NotSqliteFile
 
-        11 ->
-            NotADatabase
-
-        5 ->
+        Busy ->
             Locked
 
-        6 ->
-            Locked
-
-        3 ->
+        AccessDenied ->
             NotPermitted
 
-        8 ->
+        ReadOnlyDatabase ->
             NotPermitted
 
-        23 ->
-            NotPermitted
-
-        1 ->
+        InvalidStatement ->
             MissingSchema
 
-        _ ->
+        UniqueViolation ->
+            absentOr present Unusable
+
+        ForeignKeyViolation ->
+            absentOr present Unusable
+
+        NotNullViolation ->
+            absentOr present Unusable
+
+        CheckViolation ->
+            absentOr present Unusable
+
+        TriggerRaised ->
+            absentOr present Unusable
+
+        OtherConstraint ->
+            absentOr present Unusable
+
+        Unreachable ->
+            absentOr present Unusable
+
+        OtherFailure ->
             absentOr present Unusable
 
 
@@ -238,20 +257,6 @@ absentOr present fallback =
 
     else
         NoDatabaseFile
-
-
--- The primary result code of a driver failure written `database error [N]`
--- (an extended code keeps its primary code in the low byte).
-sqliteCode : String -> Maybe Int
-sqliteCode message =
-    case String.split "database error [" message of
-        [ _, rest ] ->
-            List.head (String.split "]" rest)
-                |> Maybe.andThen String.toInt
-                |> Maybe.map (modBy 256)
-
-        _ ->
-            Nothing
 
 
 -- A parsed location that failed to open or to pass its startup probe,
@@ -311,7 +316,7 @@ refusalProblem role refusal =
                 NoDatabaseFile ->
                     ( "no file is there", indexBuildFix )
 
-                NotADatabase ->
+                NotSqliteFile ->
                     ( "it is not a SQLite database, or it is damaged", indexBuildFix )
 
                 Locked ->
@@ -331,7 +336,7 @@ refusalProblem role refusal =
                 NoDatabaseFile ->
                     ( "it cannot be created there", reviewWritableFix )
 
-                NotADatabase ->
+                NotSqliteFile ->
                     ( "it is not a SQLite database, or it is damaged", reviewLogFix )
 
                 Locked ->
