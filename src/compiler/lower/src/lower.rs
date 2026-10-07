@@ -31652,7 +31652,7 @@ mod tests {
         // ── DbFailure ADT ──────────────────────────────
         let ed_database = interner.intern("Database").unwrap();
         let db_failure = interner.intern("DbFailure").unwrap();
-        let db_failure_ctors = intern_db_failure_ctors(interner).unwrap();
+        let db_failure_ctors = super::intern_db_failure_ctors(interner).unwrap();
 
         BuiltinCtors {
             maybe,
