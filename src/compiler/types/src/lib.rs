@@ -7535,7 +7535,7 @@ mod tests {
         ]
         .iter()
         .filter(|name| !omit.contains(name))
-        .map(|name| format!("        {name} -> 1\n"))
+        .map(|name| ["        ", name, " -> 1\n"].concat())
         .collect();
         format!("{DB_HDR}f e =\n    case e of\n{arms}\nmain =\n    0\n")
     }
