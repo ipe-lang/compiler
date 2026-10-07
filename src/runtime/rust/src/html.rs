@@ -220,32 +220,61 @@ pub(crate) const MAX_HTML_DEPTH: usize = 1024;
 /// write every child into one shared String instead of allocating a
 /// throwaway String per child (efficiency-audit §6 medium).
 pub(crate) fn render_into<M>(node: &Html<M>, s: &mut String) {
-    render_into_ctx(node, s, None, false, 0);
+    render_into_ctx(node, s, None, 0);
 }
 
-/// Render `node` into `s` as raw text — `HText` verbatim (no HTML-escaping),
-/// `HRaw` verbatim. Used by the SSE diff when rendering the body of a
-/// `<script>` or `<style>` child list before the caller applies
-/// `neutralise_script_close` / `strip_style_close`.
+/// Render the children of an element admitted as `body` into `s`.
 ///
-/// Element nodes are rendered via the normal path (they carry their own open/close
-/// tags and their OWN children handle `<script>`/`<style>` internally).
-pub(crate) fn render_into_raw_text<M>(node: &Html<M>, s: &mut String) {
-    render_into_ctx(node, s, None, true, 0);
+/// The SSE diff's whole-subtree replace writes an element's new children
+/// through this, so a patched `<script>`/`<style>` body gets the same
+/// neutralisation the first paint applies.
+pub(crate) fn render_children_into<M>(body: ElementBody, kids: &[Html<M>], s: &mut String) {
+    render_body_into(body, kids, s, None, 0);
+}
+
+/// Render `kids`, the children of an element admitted as `body`, into `s`.
+///
+/// A `<script>` or `<style>` body is admitted only when every child is a
+/// trusted `HRaw` node, so it is gathered verbatim into a scratch buffer and
+/// neutralised as a whole: `neutralise_script_close` splits a `</script`
+/// breakout, `neutralise_style_body` removes `</style` and every other markup
+/// opener. `select_value` reaches only a `Markup` body's direct children.
+fn render_body_into<M>(
+    body: ElementBody,
+    kids: &[Html<M>],
+    s: &mut String,
+    select_value: Option<&str>,
+    depth: usize,
+) {
+    let child_depth = depth.saturating_add(1);
+    match body {
+        ElementBody::Markup => {
+            for c in kids {
+                render_into_ctx(c, s, select_value, child_depth);
+            }
+        }
+        ElementBody::Script => {
+            let mut raw = String::new();
+            for c in kids {
+                render_into_ctx(c, &mut raw, None, child_depth);
+            }
+            s.push_str(&css_safety::neutralise_script_close(&raw));
+        }
+        ElementBody::Style => {
+            let mut raw = String::new();
+            for c in kids {
+                render_into_ctx(c, &mut raw, None, child_depth);
+            }
+            s.push_str(&css_safety::neutralise_style_body(&raw));
+        }
+    }
 }
 
 // `select_value`: when this node renders as a direct child of a `<select>` that
 // carries a value, the chosen value is threaded here so the matching `<option>`
-// flips `selected`. `raw_text`: set when the parent is `<script>`/`<style>` so
-// HText children emit verbatim — see SECURITY.
+// flips `selected`.
 #[allow(clippy::too_many_lines)]
-fn render_into_ctx<M>(
-    node: &Html<M>,
-    s: &mut String,
-    select_value: Option<&str>,
-    raw_text: bool,
-    depth: usize,
-) {
+fn render_into_ctx<M>(node: &Html<M>, s: &mut String, select_value: Option<&str>, depth: usize) {
     // Bounded descent: a tree deeper than the cap is dropped here rather than
     // recursed into (see MAX_HTML_DEPTH). The parent has already emitted its
     // open tag and will emit its close tag, so the output stays well-formed.
@@ -253,24 +282,10 @@ fn render_into_ctx<M>(
         return;
     }
     match node {
-        // SECURITY: verbatim (un-escaped) text is reachable here only with
-        // raw_text=true, which is set ONLY when the parent tag is the literal
-        // "script"/"style" (see the child loop below). Ipe.Ui never produces a
-        // script/style ELEMENT — its styling flows through data-ipe-* markers
-        // consumed server-side — so the "Ipe.Ui HTML-escapes everything" contract
-        // is NOT weakened. A `<script>`/`<style>` body is NOT the last line of
-        // defence: the child loop renders it into a scratch buffer and runs
-        // `neutralise_script_close`/`strip_style_close` over the whole body, so a
-        // `</script`/`</style` breakout in verbatim text cannot terminate the
-        // element early. The only verbatim-into-`<script>` value that is trusted
-        // as code is the capability-disclosing `Ipe.Html.Unsafe.unsafeScript`.
-        Html::HText(t) => {
-            if raw_text {
-                s.push_str(t);
-            } else {
-                crate::escape::html_text_into(t, s);
-            }
-        }
+        // SECURITY: text is always entity-escaped. No element body renders a
+        // text node verbatim: a `<script>`/`<style>` whose children are not all
+        // `HRaw` is refused by `admit_element` before any byte of it is written.
+        Html::HText(t) => crate::escape::html_text_into(t, s),
         Html::HRaw(r) => s.push_str(r),
         Html::HElement(tag, attrs, kids) => {
             // Html.doctype wraps children in a pseudo-element; emit a literal
@@ -282,16 +297,18 @@ fn render_into_ctx<M>(
             if tag == "!doctype-wrapper" {
                 s.push_str("<!DOCTYPE html>");
                 for c in kids {
-                    render_into_ctx(c, s, None, false, depth.saturating_add(1));
+                    render_into_ctx(c, s, None, depth.saturating_add(1));
                 }
                 return;
             }
-            // Injection guard: an unsafe tag name (spaces / `>` / `<` …) would
-            // break out of the start tag. Drop the whole element — including its
-            // subtree — rather than emit an attacker-controlled tag.
-            if !is_safe_html_name(tag) {
+            // SECURITY: the shared tag gate, re-checked at the sink. A refused
+            // element (an unsafe tag name, an unclosable `<plaintext>`, or a
+            // `<script>`/`<style>` whose body is not trusted raw markup) is
+            // dropped with its whole subtree, so no value built on the safe
+            // surface reaches a raw-text or executable element body.
+            let Ok(body) = admit_element(tag, kids) else {
                 return;
-            }
+            };
             s.push('<');
             s.push_str(tag);
             // Collect regular + bool attrs into (key, value) pairs, then sort
@@ -458,53 +475,14 @@ fn render_into_ctx<M>(
             {
                 crate::escape::html_text_into(v, s);
             }
-            // <script>/<style> emit text children verbatim (rawBody); a
-            // <select> threads its value to option children for the `selected`
-            // flip. Both reset for deeper descendants .
-            let raw_body = tag == "script" || tag == "style";
+            // A <select> threads its value to its option children for the
+            // `selected` flip; deeper descendants reset it.
             let child_select_value = if tag == "select" {
                 textarea_value.as_deref().filter(|v| !v.is_empty())
             } else {
                 None
             };
-            if tag == "style" {
-                // SECURITY: every `<style>` body — from `Ipe.Html.styleNode`, a
-                // hand-built `Html.node "style" [] [Html.raw css]`, or a `Ipe.Css`
-                // stylesheet string — is close-tag-neutralised at THIS sink before
-                // it reaches the DOM. `styleNode` also pre-strips at construction
-                // (`html_style_node_`), so the body is gated twice (belt and
-                // braces). Rendered into a scratch buffer with raw_text=true (CSS
-                // is not HTML-decoded), then `strip_style_close` removes any
-                // `</style` breakout.
-                let mut body = String::new();
-                for c in kids {
-                    render_into_ctx(c, &mut body, None, true, depth.saturating_add(1));
-                }
-                s.push_str(&css_safety::strip_style_close(&body));
-            } else if raw_body {
-                // SECURITY: a `<script>` body reaches the browser as executable
-                // code with no HTML decoding, so verbatim text here is a breakout
-                // sink symmetric to `<style>`. The body is rendered into a scratch
-                // buffer with raw_text=true (script source is not entity-escaped)
-                // and close-tag-neutralised so no `</script` byte run survives to
-                // terminate the element early. `Ipe.Html.Unsafe.unsafeScript`
-                // already neutralises at construction, and the split is a fixpoint
-                // (`<\/script` no longer matches `</script`), so that
-                // capability-gated path is unchanged; the safe-surface
-                // `Html.script [] [ Html.text … ]` path is now closed too — the
-                // ONLY difference between the two is that `unsafeScript` discloses
-                // the `unsafe` capability, never that one can break out and the
-                // other cannot.
-                let mut body = String::new();
-                for c in kids {
-                    render_into_ctx(c, &mut body, None, true, depth.saturating_add(1));
-                }
-                s.push_str(&css_safety::neutralise_script_close(&body));
-            } else {
-                for c in kids {
-                    render_into_ctx(c, s, child_select_value, raw_body, depth.saturating_add(1));
-                }
-            }
+            render_body_into(body, kids, s, child_select_value, depth);
             s.push_str("</");
             s.push_str(tag);
             s.push('>');
@@ -527,6 +505,94 @@ fn is_safe_html_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+}
+
+/// A child node that can say whether it is trusted raw markup.
+///
+/// Only a capability-disclosing constructor (`Ipe.Html.Unsafe.unsafeRaw`,
+/// `unsafeScript`, `Ipe.Html.styleNode`) or a runtime-internal producer builds
+/// an `HRaw` node, so "every child is trusted raw" is the proof that an element
+/// body was not built from data on the safe surface. Implemented for `Html` here
+/// and for `Ipe.Ui`'s `Element` beside its definition, so both constructors run
+/// the one `admit_element` gate.
+pub(crate) trait TrustedRawChild {
+    /// True when this child is trusted raw markup.
+    fn is_trusted_raw(&self) -> bool;
+}
+
+impl<M> TrustedRawChild for Html<M> {
+    fn is_trusted_raw(&self) -> bool {
+        matches!(self, Html::HRaw(_))
+    }
+}
+
+/// How an admitted element's body is rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElementBody {
+    /// Ordinary markup: children render with full escaping and gating.
+    Markup,
+    /// A `<script>` whose body is trusted raw source, close-tag-neutralised.
+    Script,
+    /// A `<style>` whose body is trusted raw CSS, markup-opener-neutralised.
+    Style,
+}
+
+/// Why `admit_element` refused an element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElementRefusal {
+    /// The tag name carries a byte that would break out of the start tag.
+    UnsafeName,
+    /// A `<plaintext>` element: nothing can ever close it, so every later byte
+    /// of the page would render as its text.
+    Unclosable,
+    /// A `<script>` whose body is empty or holds a child that is not trusted
+    /// raw markup: its text would execute, or an empty not-yet-started script
+    /// could run a later patch's body or its `src`.
+    UntrustedScript,
+    /// A `<style>` holding a child that is not trusted raw markup: its text
+    /// would be read as CSS, a raw-text body the safe surface never builds.
+    UntrustedStyle,
+}
+
+/// Decide whether an element `tag` with children `kids` may be rendered.
+///
+/// This is the one tag gate of the safe surface: every element constructor
+/// (`Html.node`, `Ui.taggedNode`, both template materialisers, `Ipe.Ui`'s
+/// lowering) and the render sink and SSE diff all call it, so no path builds a
+/// raw-text or executable element from data. Tag names are matched without
+/// regard to ASCII case, as the HTML tokenizer lowercases them. A `<script>` or
+/// `<style>` is admitted only when its body is trusted raw markup, which only a
+/// capability-disclosing constructor produces. The other raw-text and RCDATA
+/// elements (`title`, `textarea`, `noscript`, `iframe`, `xmp`, `noembed`,
+/// `noframes`) are admitted as markup: their text children are entity-escaped
+/// and any trusted `<style>` inside them is markup-neutralised, so no child can
+/// end them early.
+pub(crate) fn admit_element<K: TrustedRawChild>(
+    tag: &str,
+    kids: &[K],
+) -> Result<ElementBody, ElementRefusal> {
+    if !is_safe_html_name(tag) {
+        return Err(ElementRefusal::UnsafeName);
+    }
+    if tag.eq_ignore_ascii_case("plaintext") {
+        return Err(ElementRefusal::Unclosable);
+    }
+    let all_trusted = kids.iter().all(TrustedRawChild::is_trusted_raw);
+    if tag.eq_ignore_ascii_case("script") {
+        return if !kids.is_empty() && all_trusted {
+            Ok(ElementBody::Script)
+        } else {
+            Err(ElementRefusal::UntrustedScript)
+        };
+    }
+    if tag.eq_ignore_ascii_case("style") {
+        return if all_trusted {
+            Ok(ElementBody::Style)
+        } else {
+            Err(ElementRefusal::UntrustedStyle)
+        };
+    }
+    Ok(ElementBody::Markup)
 }
 
 /// Attribute NAMES that execute script (or embed a scripting context) regardless
@@ -1540,21 +1606,161 @@ mod tests {
         out.to_ascii_lowercase().matches("</script").count()
     }
 
+    /// SECURITY: a `<script>` or `<style>` built on the safe surface (a text
+    /// child, a child element, a mixed body, or for `<script>` an empty body)
+    /// is refused at the render sink in every tag-name case: nothing of it
+    /// renders, so data never becomes executable code or a raw-text body.
     #[test]
-    fn safe_surface_script_text_breakout_is_neutralised() {
-        // SECURITY: the safe-surface `Html.script [] [ Html.text … ]` path (HText
-        // child, raw_text=true at the `<script>` sink) must NOT let an
-        // attacker-influenced `</script>` in the text break out of the element.
-        let node: Html<()> = Html::HElement(
-            "script".into(),
-            vec![],
-            vec![Html::HText("</script><img src=x onerror=alert(1)>".into())],
+    fn safe_surface_raw_text_element_is_refused_at_sink() {
+        let bodies: [fn() -> Vec<Html<()>>; 4] = [
+            || vec![Html::HText("alert(document.cookie)".into())],
+            || {
+                vec![Html::HElement(
+                    "b".into(),
+                    vec![],
+                    vec![Html::HText("alert(1)".into())],
+                )]
+            },
+            || vec![Html::HRaw("x()".into()), Html::HText("alert(1)".into())],
+            Vec::new,
+        ];
+        for tag in ["script", "SCRIPT", "Script", "style", "STYLE", "sTyLe"] {
+            for (n, body) in bodies.iter().enumerate() {
+                let kids = body();
+                // An empty `<style>` is admitted: it holds no body to execute.
+                if kids.is_empty() && tag.eq_ignore_ascii_case("style") {
+                    continue;
+                }
+                let node: Html<()> = Html::HElement(
+                    "div".into(),
+                    vec![],
+                    vec![Html::HElement(
+                        tag.into(),
+                        vec![Attribute::Attr("src".into(), "/x.js".into())],
+                        kids,
+                    )],
+                );
+                let out = render_html(&node);
+                assert_eq!(
+                    out, "<div></div>",
+                    "<{tag}> body {n} must be refused: {out}"
+                );
+            }
+        }
+    }
+
+    /// A `<plaintext>` element can never be closed, so it is refused in any
+    /// case; an unsafe tag name keeps being refused through the same gate.
+    #[test]
+    fn unclosable_and_unsafe_name_elements_are_refused_at_sink() {
+        for tag in [
+            "plaintext",
+            "PLAINTEXT",
+            "PlainText",
+            "div><script",
+            "a b",
+            "",
+        ] {
+            let node: Html<()> = Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HElement(
+                    tag.into(),
+                    vec![],
+                    vec![Html::HText("x".into())],
+                )],
+            );
+            assert_eq!(render_html(&node), "<div></div>", "<{tag}> must be refused");
+        }
+    }
+
+    /// The shared gate's verdict for each denied tag and for the admitted
+    /// controls, tag names matched without regard to ASCII case.
+    #[test]
+    fn admit_element_decides_every_tag_class() {
+        let text = || vec![Html::<()>::HText("t".into())];
+        let raw = || vec![Html::<()>::HRaw("r".into())];
+        let none: Vec<Html<()>> = Vec::new();
+        assert_eq!(
+            admit_element("script", &text()),
+            Err(ElementRefusal::UntrustedScript)
         );
-        let out = render_html(&node);
-        // Exactly one `</script` survives: the element's own closing tag.
-        assert_eq!(script_close_count(&out), 1, "{out}");
-        // The would-be breakout is inert code text, not a live tag sequence.
-        assert!(out.contains("<\\/script>"), "{out}");
+        assert_eq!(
+            admit_element("ScRiPt", &text()),
+            Err(ElementRefusal::UntrustedScript)
+        );
+        assert_eq!(
+            admit_element("script", &none),
+            Err(ElementRefusal::UntrustedScript)
+        );
+        assert_eq!(
+            admit_element("style", &text()),
+            Err(ElementRefusal::UntrustedStyle)
+        );
+        assert_eq!(
+            admit_element("STYLE", &text()),
+            Err(ElementRefusal::UntrustedStyle)
+        );
+        assert_eq!(
+            admit_element("plaintext", &none),
+            Err(ElementRefusal::Unclosable)
+        );
+        assert_eq!(admit_element("x y", &none), Err(ElementRefusal::UnsafeName));
+        assert_eq!(admit_element("script", &raw()), Ok(ElementBody::Script));
+        assert_eq!(admit_element("SCRIPT", &raw()), Ok(ElementBody::Script));
+        assert_eq!(admit_element("style", &raw()), Ok(ElementBody::Style));
+        assert_eq!(admit_element("style", &none), Ok(ElementBody::Style));
+        for tag in [
+            "div", "p", "title", "textarea", "noscript", "iframe", "template", "svg",
+        ] {
+            assert_eq!(
+                admit_element(tag, &text()),
+                Ok(ElementBody::Markup),
+                "<{tag}>"
+            );
+        }
+    }
+
+    /// Controls: a trusted raw `<script>`/`<style>` body still renders, in any
+    /// tag-name case, with its own close tag neutralised.
+    #[test]
+    fn trusted_raw_script_and_style_bodies_render() {
+        let script: Html<()> = Html::HElement(
+            "SCRIPT".into(),
+            vec![],
+            vec![Html::HRaw("x();</script>y".into())],
+        );
+        let out = render_html(&script);
+        assert!(
+            out.starts_with("<SCRIPT>x();<\\/script>y</SCRIPT>"),
+            "{out}"
+        );
+        let style: Html<()> = Html::HElement(
+            "style".into(),
+            vec![],
+            vec![Html::HRaw(".a{color:red}".into())],
+        );
+        assert_eq!(render_html(&style), "<style>.a{color:red}</style>");
+    }
+
+    /// A trusted `<style>` body inside an RCDATA, RAWTEXT or foreign-content
+    /// ancestor cannot end that ancestor or open a live tag.
+    #[test]
+    fn style_body_cannot_break_out_of_an_ancestor() {
+        for ancestor in [
+            "textarea", "title", "noscript", "iframe", "xmp", "svg", "math",
+        ] {
+            let css = format!("x{{}}</{ancestor}><img src=x onerror=alert(1)>");
+            let node: Html<()> = Html::HElement(
+                ancestor.into(),
+                vec![],
+                vec![html_style_node_::<()>(vec![], css)],
+            );
+            let out = render_html(&node);
+            let closes = format!("</{ancestor}");
+            assert_eq!(out.matches(closes.as_str()).count(), 1, "{out}");
+            assert!(!out.contains("<img"), "{out}");
+        }
     }
 
     #[test]
@@ -1598,7 +1804,7 @@ mod tests {
     #[test]
     fn fixture69_render_parity() {
         // <select value="b"> flips `selected` onto the matching <option>, NOT the
-        // first; <script> text child emits verbatim; ordinary text stays
+        // first; a trusted raw <script> body emits verbatim; ordinary text stays
         // entity-escaped; Html.doctype → literal <!DOCTYPE html>.
         let tree: Html<()> = Html::HElement(
             "!doctype-wrapper".into(),
@@ -1626,7 +1832,7 @@ mod tests {
                     Html::HElement(
                         "script".into(),
                         vec![],
-                        vec![Html::HText("if (1 < 2) { x = '&'; }".into())],
+                        vec![Html::HRaw("if (1 < 2) { x = '&'; }".into())],
                     ),
                     Html::HElement("div".into(), vec![], vec![Html::HText("<b>raw</b>".into())]),
                 ],

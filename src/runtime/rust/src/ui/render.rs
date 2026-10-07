@@ -21,7 +21,7 @@
 //! `rootAttrs` to the root column.
 
 use super::super::css_safety::{CssValueOrigin, SafeCssPropertyName, SafeCssValue};
-use super::super::html::{Attribute as HtmlAttribute, Html};
+use super::super::html::{Attribute as HtmlAttribute, Html, admit_element};
 use super::element::{Attribute, Description, Element, HAlign, Length, Location, Portion, VAlign};
 
 // ── CSS boundary smart constructors ───────────────────────────────────────────
@@ -1328,6 +1328,12 @@ fn render_node_as<M: Clone>(
     // positioned, so their DOM order is irrelevant for layout).
     html_kids.extend(render_nearby_overlays(attrs));
 
+    // SECURITY: the shared tag gate on the lowered children, so an element
+    // that reached the tree without `ui_tagged_node_` still cannot render a
+    // raw-text or executable body.
+    if admit_element(tag, &html_kids).is_err() {
+        return Html::HText(String::new());
+    }
     Html::HElement(tag.to_owned(), html_attrs, html_kids)
 }
 

@@ -13,7 +13,7 @@ use super::element::{
 };
 use crate::color::Color;
 use crate::core::IpeMaybe;
-use crate::html::Html;
+use crate::html::{Html, admit_element};
 
 // ── Element builders ──────────────────────────────────────────────────────────
 
@@ -38,6 +38,11 @@ pub fn ui_node_<M>(
 /// the HTML tag, role `Description`, attributes, and children. The flow builders
 /// (`paragraph` / `textColumn` / `form` / `input`) are pure Ipê over this
 /// primitive with a fixed tag + marker.
+///
+/// SECURITY: the tag runs the shared `admit_element` gate. A refused element (an
+/// unsafe tag name, `<plaintext>`, or a `<script>`/`<style>` whose children are
+/// not all `Ui.html` over trusted raw markup) is built as `Element::Empty`, so
+/// the safe surface cannot make data an executable or raw-text body.
 #[must_use]
 pub fn ui_tagged_node_<M>(
     tag: String,
@@ -45,6 +50,9 @@ pub fn ui_tagged_node_<M>(
     attrs: Vec<Attribute<M>>,
     children: Vec<Element<M>>,
 ) -> Element<M> {
+    if admit_element(&tag, &children).is_err() {
+        return Element::Empty;
+    }
     Element::TaggedNode(tag, desc, attrs, children)
 }
 
@@ -607,18 +615,19 @@ pub fn html_raw_node_<M>(s: String) -> Html<M> {
 
 /// `Html.styleNode : List (Attribute msg) -> String -> Html msg`
 ///
-/// SECURITY (F7): `styleNode` is arity-2 `(attrs, css:String)` — NOT the arity-3
-/// `html_node_`. It bakes injection safety into construction (PARSE, DON'T
-/// VALIDATE): the CSS body is close-tag-neutralised
-/// exactly once, HERE, so the `HRaw` it produces is already safe. The `<style>`
-/// render sink (`html::render_into_ctx`) strips again — defence in depth — so a
-/// `</style><script>` breakout in a `Ipe.Css` value cannot reach the DOM.
+/// SECURITY: `styleNode` is arity-2 `(attrs, css:String)`, not the arity-3
+/// `html_node_`. It bakes injection safety into construction (parse, don't
+/// validate): `neutralise_style_body` removes every `</style` and every other
+/// markup opener exactly once, HERE, so the `HRaw` it produces can end neither
+/// the `<style>` nor an RCDATA, RAWTEXT or foreign-content ancestor. The
+/// `<style>` render sink (`html::render_into_ctx`) neutralises again (defence
+/// in depth), so a breakout in a `Ipe.Css` value cannot reach the DOM.
 #[must_use]
 pub fn html_style_node_<M>(attrs: Vec<crate::html::Attribute<M>>, css: String) -> Html<M> {
     Html::HElement(
         "style".to_owned(),
         attrs,
-        vec![Html::HRaw(crate::css_safety::strip_style_close(&css))],
+        vec![Html::HRaw(crate::css_safety::neutralise_style_body(&css))],
     )
 }
 
@@ -648,12 +657,21 @@ pub fn html_script_node_<M>(body: String) -> Html<M> {
 }
 
 /// `Html.node : String -> List (Attribute msg) -> List (Html msg) -> Html msg`
+///
+/// SECURITY: the tag runs the shared `admit_element` gate. A refused element (an
+/// unsafe tag name, `<plaintext>`, or a `<script>`/`<style>` whose children are
+/// not all trusted raw markup) is built as empty text, so `Html.script [] [
+/// Html.text s ]` renders nothing instead of executing `s`. A trusted body comes
+/// only from `Ipe.Html.Unsafe` or `Ipe.Html.styleNode`.
 #[must_use]
 pub fn html_node_<M>(
     tag: String,
     attrs: Vec<crate::html::Attribute<M>>,
     children: Vec<Html<M>>,
 ) -> Html<M> {
+    if admit_element(&tag, &children).is_err() {
+        return Html::HText(String::new());
+    }
     Html::HElement(tag, attrs, children)
 }
 
@@ -1636,6 +1654,171 @@ mod script_node_tests {
             "the breakout must not survive into the render: {html}"
         );
         assert!(html.starts_with("<script>") && html.ends_with("</script>"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tag_gate_tests {
+    use super::{
+        Description, Element, html_node_, html_raw_node_, html_script_node_, html_style_node_,
+        html_text_node_, ui_html_, ui_tagged_node_,
+    };
+    use crate::html::{Attribute as HtmlAttribute, Html, render_html};
+    use crate::ui::render::ui_layout;
+
+    /// Every tag the shared gate refuses, in more than one ASCII case.
+    const REFUSED_WITH_TEXT: [&str; 9] = [
+        "script",
+        "SCRIPT",
+        "Script",
+        "style",
+        "STYLE",
+        "sTyLe",
+        "plaintext",
+        "PLAINTEXT",
+        "div><script",
+    ];
+
+    fn ui_render(el: Element<()>) -> String {
+        render_html(&ui_layout(vec![], el))
+    }
+
+    /// SECURITY: `Html.node` (and so `Html.script`) refuses a raw-text or
+    /// executable element whose body is data: the result is empty text, never
+    /// an element.
+    #[test]
+    fn html_node_refuses_every_denied_tag() {
+        for tag in REFUSED_WITH_TEXT {
+            let node: Html<()> = html_node_(
+                tag.to_owned(),
+                vec![],
+                vec![html_text_node_("alert(document.cookie)".to_owned())],
+            );
+            assert!(
+                matches!(&node, Html::HText(t) if t.is_empty()),
+                "<{tag}>: {node:?}"
+            );
+            assert_eq!(render_html(&node), "", "<{tag}>");
+        }
+        // An empty `<script>` is not started, so a later patch or its `src`
+        // could run: refused too.
+        let empty: Html<()> = html_node_(
+            "script".to_owned(),
+            vec![HtmlAttribute::Attr("src".into(), "/x.js".into())],
+            vec![],
+        );
+        assert!(
+            matches!(&empty, Html::HText(t) if t.is_empty()),
+            "{empty:?}"
+        );
+        // A child element is not trusted raw markup either.
+        let nested: Html<()> = html_node_(
+            "style".to_owned(),
+            vec![],
+            vec![html_node_("b".to_owned(), vec![], vec![])],
+        );
+        assert!(
+            matches!(&nested, Html::HText(t) if t.is_empty()),
+            "{nested:?}"
+        );
+    }
+
+    /// Controls: trusted raw bodies, `styleNode`, `unsafeScript`, an empty
+    /// `<style>` and ordinary elements are still built and rendered.
+    #[test]
+    fn html_node_admits_trusted_bodies_and_ordinary_tags() {
+        let raw_script: Html<()> = html_node_(
+            "script".to_owned(),
+            vec![],
+            vec![html_raw_node_("x()".to_owned())],
+        );
+        assert_eq!(render_html(&raw_script), "<script>x()</script>");
+        let unsafe_script: Html<()> = html_script_node_("y()".to_owned());
+        assert_eq!(render_html(&unsafe_script), "<script>y()</script>");
+        let style: Html<()> = html_style_node_(vec![], ".a{color:red}".to_owned());
+        assert_eq!(render_html(&style), "<style>.a{color:red}</style>");
+        let empty_style: Html<()> = html_node_("style".to_owned(), vec![], vec![]);
+        assert_eq!(render_html(&empty_style), "<style></style>");
+        for tag in ["div", "p", "title", "textarea", "noscript", "template"] {
+            let node: Html<()> = html_node_(
+                tag.to_owned(),
+                vec![],
+                vec![html_text_node_("<b>".to_owned())],
+            );
+            assert_eq!(render_html(&node), format!("<{tag}>&lt;b&gt;</{tag}>"));
+        }
+    }
+
+    /// SECURITY: `Ui.taggedNode` refuses the same tags: a text, element or
+    /// `Ui.html (Html.text ..)` body builds `Element::Empty` and renders no
+    /// element.
+    #[test]
+    fn ui_tagged_node_refuses_every_denied_tag() {
+        let bodies: [fn() -> Vec<Element<()>>; 3] = [
+            || vec![Element::Text("alert(document.cookie)".into())],
+            || {
+                vec![ui_html_(html_text_node_(
+                    "alert(document.cookie)".to_owned(),
+                ))]
+            },
+            || vec![Element::Node(Description::NoDescription, vec![], vec![])],
+        ];
+        for tag in REFUSED_WITH_TEXT {
+            for body in &bodies {
+                let el =
+                    ui_tagged_node_(tag.to_owned(), Description::NoDescription, vec![], body());
+                assert!(matches!(el, Element::Empty), "<{tag}>: {el:?}");
+                let out = ui_render(el);
+                assert!(
+                    !out.to_ascii_lowercase().contains("<script"),
+                    "<{tag}>: {out}"
+                );
+                assert!(!out.contains("alert"), "<{tag}>: {out}");
+            }
+        }
+        let empty = ui_tagged_node_::<()>(
+            "script".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![],
+        );
+        assert!(matches!(empty, Element::Empty), "{empty:?}");
+    }
+
+    /// Control: a `Ui.html` child over trusted raw markup is admitted.
+    #[test]
+    fn ui_tagged_node_admits_a_trusted_raw_body() {
+        let el = ui_tagged_node_::<()>(
+            "script".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![ui_html_(html_raw_node_("x()".to_owned()))],
+        );
+        assert!(
+            matches!(&el, Element::TaggedNode(t, ..) if t == "script"),
+            "{el:?}"
+        );
+        let out = ui_render(el);
+        assert!(
+            out.contains("<script") && out.contains(">x()</script>"),
+            "{out}"
+        );
+    }
+
+    /// SECURITY: an `Element::TaggedNode` that reached the tree without the
+    /// constructor is refused again when `Ipe.Ui` lowers it to `Html`.
+    #[test]
+    fn ui_render_refuses_a_hand_built_script_element() {
+        let el: Element<()> = Element::TaggedNode(
+            "script".into(),
+            Description::NoDescription,
+            vec![],
+            vec![Element::Text("alert(document.cookie)".into())],
+        );
+        let out = ui_render(el);
+        assert!(!out.contains("<script"), "{out}");
+        assert!(!out.contains("alert"), "{out}");
     }
 }
 
