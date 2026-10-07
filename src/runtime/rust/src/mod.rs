@@ -614,6 +614,10 @@ pub mod length;
 // compiled so `Ipe.Log.*` can feed it; the Ipe.Web `console` module serves it.
 pub mod telemetry;
 
+// The one typed `Content-Security-Policy` builder every HTML response's
+// security headers are assembled from.
+pub mod csp;
+
 // Ipe.Ui shared element tree — the general UI abstraction (Element/Attribute/
 // Length/Color/...). Backends (Web/Tui/WebView) each render it to their target.
 // Referenced by qualified path (`ipe_runtime::ui::*`) from generated code; NOT

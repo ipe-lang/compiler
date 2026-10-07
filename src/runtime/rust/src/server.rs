@@ -1551,7 +1551,8 @@ pub(crate) fn strict_serve_dir(
 /// Windows refusals.
 ///
 /// A request path [`static_request`] refuses is answered a bare 404 that never
-/// echoes the path, whether or not the entry exists.
+/// echoes the path, whether or not the entry exists. Every answer carries the
+/// response security headers.
 fn strict_serve_dir_with(
     dir: std::path::PathBuf,
     regime: crate::path_core::Regime,
@@ -1577,10 +1578,46 @@ fn strict_serve_dir_with(
             }
         },
     );
+    let security_gate = axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            with_security_headers(next.run(req).await, response_security_headers())
+        },
+    );
     tower::Layer::layer(
-        &axum::middleware::from_fn(refuse_malformed_url),
-        tower::Layer::layer(&static_gate, tower_http::services::ServeDir::new(dir)),
+        &security_gate,
+        tower::Layer::layer(
+            &axum::middleware::from_fn(refuse_malformed_url),
+            tower::Layer::layer(&static_gate, tower_http::services::ServeDir::new(dir)),
+        ),
     )
+}
+
+/// `resp` with each `security` header it does not already carry.
+///
+/// A refused set, a header with no representation, or a full header map
+/// answers a bare `500`: no response ships without its security headers.
+pub(crate) fn with_security_headers(
+    mut resp: axum::response::Response,
+    security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(security) = security else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    for (name, value) in security {
+        let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(&value),
+        ) else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        if !resp.headers().contains_key(&name)
+            && resp.headers_mut().try_insert(name, value).is_err()
+        {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    resp
 }
 
 /// Add the decoded cookies of one request's jar to `out`; the first value of a name wins.
@@ -1739,7 +1776,16 @@ async fn build_request(
 }
 
 fn to_axum_response(r: ServerResponse) -> axum::response::Response {
-    to_axum_response_with(r, crate::telemetry::security_headers())
+    to_axum_response_with(r, response_security_headers())
+}
+
+/// The security headers of a handler response or a static file: the
+/// [`crate::csp::Profile::Response`] policy.
+fn response_security_headers()
+-> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
+    crate::telemetry::security_headers(crate::telemetry::HeaderProfile::Policy(
+        crate::csp::Profile::Response,
+    ))
 }
 
 /// [`to_axum_response`] over the outcome of reading the security headers.
@@ -5118,6 +5164,121 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("SAMEORIGIN")
         );
+    }
+
+    /// The `content-security-policy` the `Response` profile sends under this
+    /// process's framing configuration.
+    fn response_policy() -> String {
+        crate::csp::ContentSecurityPolicy::for_profile(
+            crate::csp::Profile::Response,
+            crate::telemetry::frame_ancestors(),
+        )
+        .header_value()
+    }
+
+    /// An HTML handler response that sets no policy gets the `Response`
+    /// profile through the production header path.
+    #[test]
+    fn server_default_csp_present() {
+        let resp = to_axum_response(server_html("<p>hi</p>".to_owned()));
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let want = response_policy();
+        assert_eq!(
+            single_header(&resp, "content-security-policy"),
+            Some(want.as_str())
+        );
+        assert!(
+            want.starts_with("default-src 'none'; script-src 'self'; "),
+            "{want}"
+        );
+        assert_eq!(
+            single_header(&resp, "x-content-type-options"),
+            Some("nosniff")
+        );
+    }
+
+    /// A handler-set `content-security-policy` is kept verbatim, and no second
+    /// policy header is added beside it.
+    #[test]
+    fn server_handler_csp_wins() {
+        let own = "default-src 'self'; script-src 'self' https://cdn.example";
+        let mut r = server_html("<p>hi</p>".to_owned());
+        r.headers
+            .insert("Content-Security-Policy".to_owned(), own.to_owned());
+        let resp = to_axum_response(r);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get_all("content-security-policy")
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(single_header(&resp, "content-security-policy"), Some(own));
+    }
+
+    /// An HTML file served from a static directory carries the `Response`
+    /// profile, and so do its missing-file 404 and malformed-URL 400.
+    #[tokio::test]
+    async fn static_dir_gets_csp() {
+        use tower::ServiceExt;
+        let dir = static_fixture_dir("static-csp");
+        std::fs::write(dir.join("page.html"), "<p>hi</p>").expect("static fixture file");
+        let want = response_policy();
+        for (uri, status) in [
+            ("/static/page.html", axum::http::StatusCode::OK),
+            ("/static/missing.html", axum::http::StatusCode::NOT_FOUND),
+            ("/static/%zz", axum::http::StatusCode::BAD_REQUEST),
+        ] {
+            let app = axum::Router::new().nest_service(
+                "/static",
+                strict_serve_dir_with(dir.clone(), crate::path_core::HOST),
+            );
+            let wire = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("test request builds");
+            let resp = match app.oneshot(wire).await {
+                Ok(r) => r,
+                Err(e) => match e {},
+            };
+            assert_eq!(resp.status(), status, "{uri}");
+            assert_eq!(
+                single_header(&resp, "content-security-policy"),
+                Some(want.as_str()),
+                "{uri}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each refused framing class answers 500 on a handler response, and a
+    /// refused set never reaches a static or console response either.
+    #[test]
+    fn frame_ancestors_refusal_answers_500() {
+        for raw in ["'self'; script-src *", "a, b", "a\rb", "a\u{1}b", " \t "] {
+            let parsed = crate::telemetry::FrameAncestors::parse(raw);
+            assert!(parsed.is_err(), "{raw:?}");
+            if let Err(refusal) = parsed {
+                let resp = to_axum_response_with(server_html("<p>hi</p>".to_owned()), Err(refusal));
+                assert_eq!(
+                    resp.status(),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "{raw:?}"
+                );
+                assert!(resp.headers().get("content-security-policy").is_none());
+                let resp = with_security_headers(
+                    axum::response::IntoResponse::into_response("ok"),
+                    Err(refusal),
+                );
+                assert_eq!(
+                    resp.status(),
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "{raw:?}"
+                );
+            }
+        }
     }
 
     /// The `InvalidInput` message of a refused `Server.withHeader`, or `None`
