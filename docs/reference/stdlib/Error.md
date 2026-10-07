@@ -12,6 +12,14 @@ construction time (the `ErrorKind` tag) and carry a human-readable
 message; optional `ErrorDetails` attach structured context for logging or
 round-tripping without widening the public interface.
 
+`ErrorDetails` is `FfiPanic`, `TypeMismatch`, `HttpStatus`, `JsonDecode`,
+`Custom` or `Database`. A failed `Ipe.Db` operation carries
+`Database f`, where `f` is the closed `DbFailure` cause
+(`Db.UniqueViolation`, `Db.TriggerRaised`, `Db.ReadOnlyDatabase`, ...,
+`Db.OtherFailure`): match on it, never on the message text, which names no
+driver code. Bring the causes into bare pattern scope with
+`import Ipe.Db as Db exposing (DbFailure(..))`.
+
 Constructors fall into two groups:
 
 * **Message-carrying** — take a `String` description and produce an `Error`:
