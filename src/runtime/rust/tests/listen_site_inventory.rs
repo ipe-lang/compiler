@@ -229,10 +229,8 @@ impl<'ast> Visit<'ast> for Scan {
                     self.record(format!("impl for {name}"));
                 }
             }
-            Item::Mod(module) => {
-                if sets_a_module_path(&module.attrs) {
-                    self.record(format!("#[path] mod {}", module.ident.unraw()));
-                }
+            Item::Mod(module) if sets_a_module_path(&module.attrs) => {
+                self.record(format!("#[path] mod {}", module.ident.unraw()));
             }
             _ => {}
         }
