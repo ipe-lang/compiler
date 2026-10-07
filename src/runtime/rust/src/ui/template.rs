@@ -404,6 +404,8 @@ impl UiTemplateAttr {
             Attribute::AttrEvent(_) | Attribute::AttrNearby(..) | Attribute::AttrExplain => {
                 return None;
             }
+            // Checkedness follows the model per render; it has no static wire form.
+            Attribute::AttrChecked(_) => return None,
         })
     }
 
@@ -1550,6 +1552,21 @@ mod tests {
             vec![],
         );
         assert_eq!(ui_template_of(&subtree), None);
+    }
+
+    /// Checkedness follows the model per render and has no static wire form, so a
+    /// subtree carrying it stays compiled. Red without the `AttrChecked` refusal
+    /// arm in `from_attr`.
+    #[test]
+    fn checked_attribute_is_not_templatable() {
+        for checked in [true, false] {
+            let subtree: Element<()> = Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrChecked(checked)],
+                vec![],
+            );
+            assert_eq!(ui_template_of(&subtree), None);
+        }
     }
 
     #[test]

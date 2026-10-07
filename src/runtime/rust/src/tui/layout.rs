@@ -786,6 +786,8 @@ fn walk_attrs<M>(attrs: &[Attribute<M>], inherited: Style) -> Walked {
             Attribute::AttrEvent(_) => {}
             // HTML arbitrary attribute escape hatch; no terminal surface.
             Attribute::AttrAttribute(_, _) => {}
+            // Read by `render_input` as the checkbox/radio state.
+            Attribute::AttrChecked(_) => {}
             // CSS font-size in px — terminal cell size is fixed; ignored.
             Attribute::AttrFontSize(_) => {}
             // CSS font-family — terminal font is set by the emulator; ignored.
@@ -1091,6 +1093,7 @@ fn render_input<M: Clone>(
             | Attribute::AttrClass(_)
             | Attribute::AttrEvent(_)
             | Attribute::AttrAttribute(_, _)
+            | Attribute::AttrChecked(_)
             | Attribute::AttrFontSize(_)
             | Attribute::AttrFontFamily(_)
             | Attribute::AttrFontWeight(_)
@@ -1144,9 +1147,16 @@ fn render_input<M: Clone>(
     // `checked` attr is present OR its value is non-empty and not "false". Without
     // the radio clause the selected radio kept drawing ○ (the "radio doesn't work"
     // report — onClick fires, but there was no visual feedback).
-    let checked = attr_str(attrs, "checked").is_some()
-        || value == "true"
-        || (input_type == "radio" && !value.is_empty() && value != "false");
+    // A typed `AttrChecked` is authoritative over that heuristic.
+    let explicit_checked = attrs.iter().find_map(|a| match a {
+        Attribute::AttrChecked(b) => Some(*b),
+        _ => None,
+    });
+    let checked = explicit_checked.unwrap_or_else(|| {
+        attr_str(attrs, "checked").is_some()
+            || value == "true"
+            || (input_type == "radio" && !value.is_empty() && value != "false")
+    });
     let events = super::focus::collect_events(attrs);
 
     let idx = ctx.focusables.len();
@@ -2776,6 +2786,31 @@ mod tests {
         assert!(element_to_cells(&unchecked, 80, 24).contains('☐'));
         let checked: Element<()> = input("checkbox", "true");
         assert!(element_to_cells(&checked, 80, 24).contains('☑'));
+    }
+
+    /// A typed `AttrChecked(false)` beats the `value="true"` heuristic, and
+    /// `AttrChecked(true)` beats an empty value. Red without the override in
+    /// `render_input`.
+    #[test]
+    fn attr_checked_overrides_value_heuristic() {
+        let with = |ty: &str, value: &str, checked: bool| -> Element<()> {
+            Element::TaggedNode(
+                "input".into(),
+                Description::NoDescription,
+                vec![
+                    Attribute::AttrAttribute("type".into(), ty.into()),
+                    Attribute::AttrAttribute("value".into(), value.into()),
+                    Attribute::AttrChecked(checked),
+                ],
+                vec![],
+            )
+        };
+        let off = element_to_cells(&with("checkbox", "true", false), 80, 24);
+        assert!(off.contains('☐') && !off.contains('☑'));
+        let on = element_to_cells(&with("checkbox", "", true), 80, 24);
+        assert!(on.contains('☑') && !on.contains('☐'));
+        let radio_off = element_to_cells(&with("radio", "pick", false), 80, 24);
+        assert!(radio_off.contains('○') && !radio_off.contains('●'));
     }
 
     #[test]

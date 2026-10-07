@@ -236,6 +236,9 @@ pub enum Attribute<M> {
     /// renderer that bypasses that path would reintroduce the `onerror=` /
     /// `href="javascript:"` XSS class — do not write one.
     AttrAttribute(String, String),
+    /// Native checkedness of a checkbox or radio; constructed only by
+    /// `ui::input`, never an Ipê-visible constructor.
+    AttrChecked(bool),
     AttrFontSize(i64),
     AttrFontColor(crate::color::Color),
     AttrFontFamily(String),

@@ -346,6 +346,7 @@ pub(crate) fn build_style_string<M>(attrs: &[Attribute<M>]) -> String {
             | Attribute::AttrClass(_)
             | Attribute::AttrEvent(_)
             | Attribute::AttrAttribute(_, _)
+            | Attribute::AttrChecked(_)
             | Attribute::AttrPseudoRule(_, _) => {}
         }
     }
@@ -386,6 +387,13 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
             }
             Attribute::AttrEvent(html_attr) => {
                 out.push(html_attr.clone());
+            }
+            // Checkedness is a boolean attribute: present when true, absent when
+            // false, never the string "false".
+            Attribute::AttrChecked(checked) => {
+                if *checked {
+                    out.push(HtmlAttribute::BoolAttr("checked".to_owned(), true));
+                }
             }
             Attribute::AttrDescribe(desc) => {
                 // Emit ARIA roles / landmark attributes for semantic elements.
@@ -1958,6 +1966,31 @@ mod tests {
         let s = render_html(&render_element(on_div));
         assert!(s.starts_with("<h3"), "a div host is retagged: {s}");
         assert!(!s.contains("role="), "a native retag needs no role: {s}");
+    }
+
+    /// `AttrChecked(true)` lowers to a present `checked` attribute and
+    /// `AttrChecked(false)` to none, never to the string "false". Red without the
+    /// `AttrChecked` arm in `collect_html_attrs`.
+    #[test]
+    fn checked_attr_lowers_to_bool_attr() {
+        let input = |checked: bool| -> Element<TestMsg> {
+            Element::TaggedNode(
+                "input".to_owned(),
+                Description::NoDescription,
+                vec![
+                    Attribute::AttrAttribute("type".to_owned(), "checkbox".to_owned()),
+                    Attribute::AttrChecked(checked),
+                ],
+                Vec::new(),
+            )
+        };
+        let on = render_html(&render_element(input(true)));
+        assert!(on.contains("checked=\"true\""), "checked is present: {on}");
+        let off = render_html(&render_element(input(false)));
+        assert!(
+            !off.contains("checked"),
+            "unchecked emits no attribute: {off}"
+        );
     }
 
     /// A8: a fixed-px-width child of a ROW emits `flex-shrink:0` (honours the
