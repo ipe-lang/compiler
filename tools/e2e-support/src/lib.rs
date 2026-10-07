@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bin;
+pub mod live_page;
 
 pub use bin::{
     ProvenBin, ProvenRuntime, ResolveError, Tier, e2e_tier, require_manifest_dir, require_runtime,

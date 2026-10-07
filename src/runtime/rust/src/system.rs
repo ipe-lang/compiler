@@ -665,22 +665,33 @@ fn shown_env_value(raw: &[u8]) -> String {
 /// (`USERPROFILE` on Windows, `HOME` elsewhere), overlay-aware like
 /// [`read_env_var`]. Gated to its readers: the console proxy's cached-binary
 /// lookup, and off Unix the scratch primitive's profile-containment check.
+///
+/// # Errors
+/// The [`HomeRefusal`](super::home_core::HomeRefusal) the variable earns.
 #[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
-pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn home_dir() -> Result<super::home_core::HomeDir, super::home_core::HomeRefusal> {
     home_dir_from_var(read_env_var(super::home_core::HOME_VAR))
 }
 
-/// Parse a home read: `Some` only for a valid `HomeDir`.
+/// Parse a home read into a `HomeDir`, or the refusal it earns.
 ///
-/// Bridges the overlay's `String` result to the shared
-/// [`super::home_core::HomeDir::parse`], which owns every decision about what
-/// counts as a home directory (UTF-8, absolute, and, on Windows, not a
-/// verbatim/device-namespace prefix) — this function makes none of them
-/// itself.
+/// Hands the overlay's result to the shared
+/// [`super::home_core::HomeDir::try_parse`] undecoded (an absent variable is
+/// `None`, a non-Unicode one keeps its raw value), so that parser owns every
+/// decision about what counts as a home directory and which refusal a bad
+/// value earns; this function makes none of them itself.
 #[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
-fn home_dir_from_var(raw: Result<String, std::env::VarError>) -> Option<std::path::PathBuf> {
-    super::home_core::HomeDir::parse(raw.ok().map(std::ffi::OsString::from))
-        .map(super::home_core::HomeDir::into_path)
+fn home_dir_from_var(
+    raw: Result<String, std::env::VarError>,
+) -> Result<super::home_core::HomeDir, super::home_core::HomeRefusal> {
+    use std::env::VarError;
+    use std::ffi::OsString;
+    let raw = match raw {
+        Ok(text) => Some(OsString::from(text)),
+        Err(VarError::NotPresent) => None,
+        Err(VarError::NotUnicode(os)) => Some(os),
+    };
+    super::home_core::HomeDir::try_parse(raw)
 }
 
 /// Render a runtime status line (e.g. the HTTP `listening on` banner, or an
@@ -4217,11 +4228,28 @@ mod home_dir_tests {
     fn every_home_parse_case_matches_the_shared_table() {
         for (raw, expected) in HOME_PARSE_CASES.iter().chain(HOME_PARSE_PLATFORM_CASES) {
             assert_eq!(
-                home_dir_from_var(raw.map(str::to_owned).ok_or(VarError::NotPresent)),
+                home_dir_from_var(raw.map(str::to_owned).ok_or(VarError::NotPresent))
+                    .ok()
+                    .map(|home| home.as_path().to_path_buf()),
                 expected.map(std::path::PathBuf::from),
                 "{raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn each_refused_home_names_its_reason() {
+        for (raw, refusal) in HOME_REFUSAL_CASES.iter().chain(HOME_REFUSAL_PLATFORM_CASES) {
+            assert_eq!(
+                home_dir_from_var(raw.map(str::to_owned).ok_or(VarError::NotPresent)),
+                Err(*refusal),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            home_dir_from_var(Err(VarError::NotPresent)),
+            Err(HomeRefusal::Unset)
+        );
     }
 
     #[cfg(unix)]
@@ -4229,7 +4257,10 @@ mod home_dir_tests {
     fn a_non_utf8_home_value_is_refused() {
         use std::os::unix::ffi::OsStringExt as _;
         let raw = std::ffi::OsString::from_vec(b"/home/\xff".to_vec());
-        assert_eq!(home_dir_from_var(Err(VarError::NotUnicode(raw))), None);
+        assert_eq!(
+            home_dir_from_var(Err(VarError::NotUnicode(raw))),
+            Err(HomeRefusal::NotUtf8)
+        );
     }
 }
 

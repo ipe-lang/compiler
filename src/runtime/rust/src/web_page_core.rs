@@ -1,7 +1,7 @@
 //! The server-free HTML page scaffold shared by every render host.
 //!
-//! `page_shell` and its `BASE_CSS` reset are pure `format!` over compile-time
-//! literals — no axum, no session, no server dependency — so they belong to the
+//! `page_shell`, its `BASE_CSS` reset and its `STATUS_CSS` banner rules are pure
+//! `format!` over compile-time literals — no axum, no session, no server dependency — so they belong to the
 //! render core, not the HTTP `web` server. The full `web` module re-exports
 //! `page_shell` from here, and the lean render-core `web` shell (native
 //! `webview` + browser-WASM `wasm-client`) does too, so the ONE definition backs
@@ -47,6 +47,26 @@ const BASE_CSS: &str = concat!(
     "@media (forced-colors:active){:focus-visible{outline-color:Highlight;box-shadow:none}}",
 );
 
+/// Status-banner rules for the live client's `#__ipe-status` element.
+///
+/// A compile-time constant emitted in the page head next to [`BASE_CSS`], so the
+/// client never creates a `<style>` element and every inline style the shell
+/// carries is a fixed literal a hash can admit. The client sets the banner's
+/// base layout through CSSOM; these rules map each state class to its colour.
+const STATUS_CSS: &str = concat!(
+    "#__ipe-status.ipe-status--connected{display:none}",
+    "#__ipe-status.ipe-status--reconnecting{background:#b45309}",
+    "#__ipe-status.ipe-status--offline{background:#b91c1c}",
+    "#__ipe-status.ipe-status--recompiling{background:#b45309}",
+    "#__ipe-status.ipe-status--build-ok{background:#166534}",
+    "#__ipe-status.ipe-status--build-failed{background:#991b1b;pointer-events:auto;cursor:default}",
+    "@media(prefers-color-scheme:dark){",
+    "#__ipe-status.ipe-status--recompiling{background:#92400e}",
+    "#__ipe-status.ipe-status--build-ok{background:#14532d}",
+    "#__ipe-status.ipe-status--build-failed{background:#7f1d1d}",
+    "}",
+);
+
 /// Shared HTML page scaffold used by every render path.
 ///
 /// Emits, in order:
@@ -55,6 +75,7 @@ const BASE_CSS: &str = concat!(
 ///      - `<meta charset="utf-8">` (character encoding, always first).
 ///      - `<meta name="viewport" …>` (full-bleed on mobile and native webview).
 ///      - `<style>{BASE_CSS}</style>` (the compile-time reset; no user data).
+///      - `<style>{STATUS_CSS}</style>` (the status-banner rules; no user data).
 ///      - `head_extra` — any additional per-backend head content (empty string
 ///        for backends that need none).
 ///   3. `<body>{body_inner}</body>` — the pre-rendered HTML body.
@@ -71,6 +92,7 @@ pub fn page_shell(head_extra: &str, body_inner: &str, tail_scripts: &str) -> Str
          <meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <style>{BASE_CSS}</style>\
+         <style>{STATUS_CSS}</style>\
          {head_extra}\
          </head>\
          <body>{body_inner}</body>\
@@ -132,5 +154,19 @@ mod tests {
             html.contains(":focus-visible"),
             "page_shell output must contain the :focus-visible ring from BASE_CSS"
         );
+    }
+
+    /// `page_shell` embeds `STATUS_CSS` inside the head.
+    #[test]
+    fn page_shell_embeds_status_css_in_head() {
+        let html = page_shell("<meta name=\"x\">", "<p>hi</p>", "");
+        let status = format!("<style>{STATUS_CSS}</style>");
+        let at = html.find(&status);
+        let head_end = html.find("</head>");
+        assert!(
+            matches!((at, head_end), (Some(a), Some(h)) if a < h),
+            "STATUS_CSS must be emitted inside <head>: {html}"
+        );
+        assert!(STATUS_CSS.contains("#__ipe-status.ipe-status--offline"));
     }
 }
