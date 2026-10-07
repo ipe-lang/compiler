@@ -77,6 +77,10 @@ const _STD_ENV: () = {
     let _ = ::std::env::set_current_dir::<String>;
     #[expect(clippy::disallowed_methods)]
     let _ = ::std::env::current_exe;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::std::env::args;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::std::env::args_os;
 };
 
 const _STD_TIME: () = {

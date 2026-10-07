@@ -70,7 +70,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/sandbox/src/home.rs", 1),
     ("src/compiler/sandbox/src/host_env.rs", 1),
     ("src/compiler/sandbox/src/clippy_paths_resolve.rs", 2),
-    ("src/compiler/db/src/clippy_paths_resolve.rs", 35),
+    ("src/compiler/db/src/clippy_paths_resolve.rs", 37),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
     ("src/runtime/rust/src/clippy_paths_resolve.rs", 14),

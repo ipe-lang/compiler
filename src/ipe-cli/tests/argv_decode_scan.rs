@@ -14,13 +14,15 @@
 //!   `env::*` glob, and an `env as ..` alias, under which a read would no
 //!   longer spell `env::args`;
 //! - an `env::args_os` read outside the pinned [`ARGS_OS_OWNERS`] counts;
+//! - a ban-proof naming outside the pinned [`BAN_PROOFS`] counts, and a macro
+//!   or a non-`expect` attribute in a ban-proof file;
 //! - an `env::$name` macro path, which names a reader only once expanded.
 //!
 //! A file whose pinned count moves, or a pinned file that no longer holds its
 //! site, goes red, so the inventory only ever shrinks to the truth. A reader
 //! named only inside an external macro's own expansion is beyond a lexical scan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// The files that read the raw argument vector, with the count of
@@ -63,6 +65,42 @@ const ARGS_DEBT: &[(&str, usize)] = &[
     ("tools/panic-scan/src/main.rs", 1),
 ];
 
+/// The files that name a reader only to prove a crate's `clippy.toml` ban on
+/// it, with the `env::args` and `env::args_os` namings each holds and why.
+///
+/// A naming is exactly the statement
+/// `#[expect(clippy::disallowed_methods)] let _ = ::std::env::<reader>;`: it
+/// discards the function item and calls nothing, so it reads no argument. Any
+/// other spelling in such a file is a read and is judged as one. A listed file
+/// holds no `!` and no attribute other than `#[expect(..)]`, since a macro
+/// could rewrite a naming into a call.
+const BAN_PROOFS: &[(&str, usize, usize, &str)] = &[(
+    "src/compiler/db/src/clippy_paths_resolve.rs",
+    1,
+    1,
+    "names both readers so the `ipe_db` ban on argument reads resolves and fires under `-D warnings`",
+)];
+
+/// The tokens of `#[expect(clippy::disallowed_methods)] let _ = ::std::` that
+/// open a ban-proof naming, ahead of its `env`.
+const NAMING_HEAD: [&str; 15] = [
+    "#",
+    "[",
+    "expect",
+    "(",
+    "clippy",
+    "::",
+    "disallowed_methods",
+    ")",
+    "]",
+    "let",
+    "_",
+    "=",
+    "::",
+    "std",
+    "::",
+];
+
 /// One lexical token: an identifier or keyword, or a punctuation mark (`::`
 /// is one token).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +116,13 @@ struct Findings {
     args: usize,
     /// `env::args_os` paths.
     args_os: usize,
+    /// `env::args` paths named by a ban-proof statement.
+    args_named: usize,
+    /// `env::args_os` paths named by a ban-proof statement.
+    args_os_named: usize,
+    /// `!` marks and attributes other than `#[expect(..)]`: each may be a macro
+    /// that rewrites a naming into a read, so a ban-proof file holds none.
+    rewriters: usize,
     /// Imports or aliases that would hide a read from the path rules.
     hiding: Vec<&'static str>,
 }
@@ -128,6 +173,13 @@ fn lex(src: &str) -> Vec<Token> {
                 ',' => tokens.push(Token::Punct(",")),
                 ';' => tokens.push(Token::Punct(";")),
                 '$' => tokens.push(Token::Punct("$")),
+                '#' => tokens.push(Token::Punct("#")),
+                '!' => tokens.push(Token::Punct("!")),
+                '=' => tokens.push(Token::Punct("=")),
+                '(' => tokens.push(Token::Punct("(")),
+                ')' => tokens.push(Token::Punct(")")),
+                '[' => tokens.push(Token::Punct("[")),
+                ']' => tokens.push(Token::Punct("]")),
                 _ if !c.is_whitespace() => tokens.push(Token::Punct("other")),
                 _ => {}
             }
@@ -224,11 +276,49 @@ fn is_ident(token: Option<&Token>, name: &str) -> bool {
     matches!(token, Some(Token::Ident(word)) if word == name)
 }
 
+/// Whether `token` is the identifier or punctuation mark `text`.
+fn is_text(token: Option<&Token>, text: &str) -> bool {
+    match token {
+        Some(Token::Ident(word)) => word == text,
+        Some(Token::Punct(mark)) => *mark == text,
+        None => false,
+    }
+}
+
+/// Whether the `env` at `at` is the path of a ban-proof naming, the whole
+/// statement `#[expect(clippy::disallowed_methods)] let _ = ::std::env::<reader>;`.
+fn is_ban_naming(tokens: &[Token], at: usize) -> bool {
+    let Some(start) = at.checked_sub(NAMING_HEAD.len()) else {
+        return false;
+    };
+    NAMING_HEAD
+        .iter()
+        .enumerate()
+        .all(|(k, text)| is_text(tokens.get(start + k), text))
+        && is_text(tokens.get(at + 1), "::")
+        && is_text(tokens.get(at + 3), ";")
+}
+
+/// Whether the token at `at` may rewrite the code around it: a `!` (a macro
+/// call, or anything else a ban-proof file never needs) or a `#` that opens
+/// no `#[expect(..)]`.
+fn is_rewriter(tokens: &[Token], at: usize) -> bool {
+    let token = tokens.get(at);
+    is_text(token, "!")
+        || (is_text(token, "#")
+            && !(is_text(tokens.get(at + 1), "[")
+                && is_text(tokens.get(at + 2), "expect")
+                && is_text(tokens.get(at + 3), "(")))
+}
+
 /// Apply the scan's rules to one file's tokens.
 fn findings(src: &str) -> Findings {
     let tokens = lex(src);
     let mut found = Findings::default();
     for (i, token) in tokens.iter().enumerate() {
+        if is_rewriter(&tokens, i) {
+            found.rewriters += 1;
+        }
         if !is_ident(Some(token), "env") {
             continue;
         }
@@ -241,8 +331,13 @@ fn findings(src: &str) -> Findings {
             continue;
         }
         let item = tokens.get(i + 2);
-        if is_ident(item, "args") {
+        let named = is_ban_naming(&tokens, i);
+        if is_ident(item, "args") && named {
+            found.args_named += 1;
+        } else if is_ident(item, "args") {
             found.args += 1;
+        } else if is_ident(item, "args_os") && named {
+            found.args_os_named += 1;
         } else if is_ident(item, "args_os") {
             found.args_os += 1;
         } else if item == Some(&Token::Punct("$")) {
@@ -386,10 +481,22 @@ fn every_command_line_read_goes_through_a_pinned_decode_point() {
             .all(|root| SCANNED_ROOTS.contains(&root.as_str())),
         "a top-level directory holds tracked Rust the scan skips: {tracked_rust_roots:?}"
     );
+    let violations = inventory_violations(&files);
+    assert!(
+        violations.is_empty(),
+        "the command-line read inventory drifted: {violations:#?}"
+    );
+}
+
+/// Every way `files` departs from the pinned inventory: [`ARGS_DEBT`],
+/// [`ARGS_OS_OWNERS`], [`BAN_PROOFS`] and the hiding rules.
+fn inventory_violations(files: &[(String, String)]) -> Vec<String> {
+    let proof_files: BTreeSet<&str> = BAN_PROOFS.iter().map(|(rel, ..)| *rel).collect();
     let mut args: BTreeMap<String, usize> = BTreeMap::new();
     let mut args_os: BTreeMap<String, usize> = BTreeMap::new();
-    let mut hiding = Vec::new();
-    for (rel, text) in &files {
+    let mut named: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut violations = Vec::new();
+    for (rel, text) in files {
         let found = findings(text);
         if found.args > 0 {
             args.insert(rel.clone(), found.args);
@@ -397,7 +504,16 @@ fn every_command_line_read_goes_through_a_pinned_decode_point() {
         if found.args_os > 0 {
             args_os.insert(rel.clone(), found.args_os);
         }
-        hiding.extend(
+        if found.args_named > 0 || found.args_os_named > 0 {
+            named.insert(rel.clone(), (found.args_named, found.args_os_named));
+        }
+        if proof_files.contains(rel.as_str()) && found.rewriters > 0 {
+            violations.push(format!(
+                "{rel}: a ban-proof file holds a `!` or an attribute other than \
+                 `#[expect(..)]`, either of which can rewrite a naming into a read"
+            ));
+        }
+        violations.extend(
             found
                 .hiding
                 .into_iter()
@@ -412,20 +528,142 @@ fn every_command_line_read_goes_through_a_pinned_decode_point() {
         .iter()
         .map(|(rel, n, _)| ((*rel).to_owned(), *n))
         .collect();
-    assert_eq!(
-        args, debt,
-        "`std::env::args()` aborts on a non-UTF-8 argument; read the command line through \
-         `ipe_docs::argv::host_args` (a fixed debt site leaves `ARGS_DEBT`)"
-    );
-    assert_eq!(
-        args_os, owners,
-        "a raw `env::args_os` read outside `ARGS_OS_OWNERS`; decode through \
-         `ipe_docs::argv::host_args`"
-    );
+    let proofs: BTreeMap<String, (usize, usize)> = BAN_PROOFS
+        .iter()
+        .map(|(rel, a, o, _)| ((*rel).to_owned(), (*a, *o)))
+        .collect();
+    if args != debt {
+        violations.push(format!(
+            "`std::env::args()` aborts on a non-UTF-8 argument; read the command line through \
+             `ipe_docs::argv::host_args` (a fixed debt site leaves `ARGS_DEBT`): found {args:?}, \
+             pinned {debt:?}"
+        ));
+    }
+    if args_os != owners {
+        violations.push(format!(
+            "a raw `env::args_os` read outside `ARGS_OS_OWNERS`; decode through \
+             `ipe_docs::argv::host_args`: found {args_os:?}, pinned {owners:?}"
+        ));
+    }
+    if named != proofs {
+        violations.push(format!(
+            "a ban-proof naming outside `BAN_PROOFS`: found {named:?}, pinned {proofs:?}"
+        ));
+    }
+    violations
+}
+
+/// The proof naming of `env::args`.
+const ARGS_NAMING: &str = "#[expect(clippy::disallowed_methods)] let _ = ::std::env::args;";
+
+/// The proof naming of `env::args_os`.
+const ARGS_OS_NAMING: &str = "#[expect(clippy::disallowed_methods)] let _ = ::std::env::args_os;";
+
+/// A tree holding exactly the pinned sites: each debt and owner file reads its
+/// pinned count, and each proof file names its pinned readers.
+fn pinned_tree() -> Vec<(String, String)> {
+    let debt = ARGS_DEBT.iter().map(|(rel, n)| {
+        let body = "std::env::args();".repeat(*n);
+        ((*rel).to_owned(), format!("fn f() {{ {body} }}"))
+    });
+    let owners = ARGS_OS_OWNERS.iter().map(|(rel, n, _)| {
+        let body = "std::env::args_os();".repeat(*n);
+        ((*rel).to_owned(), format!("fn f() {{ {body} }}"))
+    });
+    let proofs = BAN_PROOFS.iter().map(|(rel, a, o, _)| {
+        let body = format!("{}{}", ARGS_NAMING.repeat(*a), ARGS_OS_NAMING.repeat(*o));
+        ((*rel).to_owned(), format!("const _P: () = {{ {body} }};"))
+    });
+    debt.chain(owners).chain(proofs).collect()
+}
+
+/// `tree` with `text` appended to the file at `rel`, which is added when absent.
+fn appended(tree: &[(String, String)], rel: &str, text: &str) -> Vec<(String, String)> {
+    let mut out = tree.to_vec();
+    if !out.iter().any(|(path, _)| path.as_str() == rel) {
+        out.push((rel.to_owned(), String::new()));
+    }
+    for (path, body) in &mut out {
+        if path.as_str() == rel {
+            body.push_str(text);
+        }
+    }
+    out
+}
+
+#[test]
+fn the_pinned_tree_matches_the_inventory() {
     assert!(
-        hiding.is_empty(),
-        "imports that hide an argument read: {hiding:?}"
+        BAN_PROOFS.iter().all(|(_, a, o, _)| a + o > 0),
+        "a `BAN_PROOFS` row pins no naming"
     );
+    let violations = inventory_violations(&pinned_tree());
+    assert!(
+        violations.is_empty(),
+        "the control tree must be clean: {violations:#?}"
+    );
+}
+
+#[test]
+fn a_ban_proof_file_launders_no_read() {
+    let tree = pinned_tree();
+    let Some(&(proof, ..)) = BAN_PROOFS.first() else {
+        return;
+    };
+    let db_lib = "src/compiler/db/src/lib.rs";
+    let drifts = [
+        (db_lib, "fn g() { std::env::args(); }"),
+        (db_lib, "fn g() { std::env::args_os(); }"),
+        (db_lib, ARGS_NAMING),
+        (db_lib, ARGS_OS_NAMING),
+        (proof, "fn g() { std::env::args(); }"),
+        (proof, "fn g() { std::env::args_os(); }"),
+        (proof, "const _Q: () = { let _ = ::std::env::args; };"),
+        (proof, ARGS_NAMING),
+        (proof, "fn g() { read!(); }"),
+        (proof, "#[allow(dead_code)] fn g() {}"),
+    ];
+    for (rel, text) in drifts {
+        assert!(
+            !inventory_violations(&appended(&tree, rel, text)).is_empty(),
+            "`{text}` in {rel} passed the inventory"
+        );
+    }
+}
+
+#[test]
+fn a_ban_naming_is_seen_only_in_its_exact_shape() {
+    let args = findings(ARGS_NAMING);
+    assert_eq!((args.args_named, args.args), (1, 0));
+    let args_os = findings(ARGS_OS_NAMING);
+    assert_eq!((args_os.args_os_named, args_os.args_os), (1, 0));
+    assert_eq!(args.rewriters + args_os.rewriters, 0);
+    let reads = [
+        "#[expect(clippy::disallowed_methods)] let _ = ::std::env::args();",
+        "#[expect(clippy::disallowed_methods)] let r = ::std::env::args;",
+        "#[expect(clippy::disallowed_types)] let _ = ::std::env::args;",
+        "#[expect(clippy::disallowed_methods)] let _ = std::env::args;",
+        "let _ = ::std::env::args;",
+        "const R: fn() -> std::env::Args = ::std::env::args;",
+    ];
+    for src in reads {
+        let found = findings(src);
+        assert_eq!(
+            (found.args, found.args_named),
+            (1, 0),
+            "a read passed as a ban naming: {src:?}"
+        );
+    }
+    for src in [
+        "m!(x);",
+        "#[allow(dead_code)] fn f() {}",
+        "#![allow(dead_code)]",
+    ] {
+        assert!(
+            findings(src).rewriters > 0,
+            "a possible rewriter went unseen: {src:?}"
+        );
+    }
 }
 
 #[test]

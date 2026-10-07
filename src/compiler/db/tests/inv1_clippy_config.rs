@@ -23,7 +23,7 @@ const TYPES_HEADER: &str = "disallowed-types = [";
 const EXPECT_METHOD: &str = "#[expect(clippy::disallowed_methods)]";
 const EXPECT_TYPE: &str = "#[expect(clippy::disallowed_types)]";
 
-/// Every path INV-1 bans in `ipe_db`: 35 methods, then 5 types.
+/// Every path INV-1 bans in `ipe_db`: 37 methods, then 5 types.
 const INV1_PATHS: &[&str] = &[
     "std::fs::read",
     "std::fs::read_to_string",
@@ -56,6 +56,8 @@ const INV1_PATHS: &[&str] = &[
     "std::env::current_dir",
     "std::env::set_current_dir",
     "std::env::current_exe",
+    "std::env::args",
+    "std::env::args_os",
     "std::time::SystemTime::now",
     "std::time::SystemTime::elapsed",
     "std::time::Instant::now",
@@ -158,8 +160,8 @@ fn a_dropped_root_line_is_reported_missing() {
 fn every_inv1_path_is_banned_and_proved() {
     assert_eq!(
         INV1_PATHS.len(),
-        40,
-        "INV-1 bans 35 methods and 5 types in `ipe_db`"
+        42,
+        "INV-1 bans 37 methods and 5 types in `ipe_db`"
     );
     let split = DB_CONFIG.split_once(TYPES_HEADER);
     assert!(

@@ -75,6 +75,8 @@ disallowed-methods = [
     { path = "std::env::current_dir", reason = "INV-1: salsa queries are pure" },
     { path = "std::env::set_current_dir", reason = "INV-1: salsa queries are pure" },
     { path = "std::env::current_exe", reason = "INV-1: salsa queries are pure" },
+    { path = "std::env::args", reason = "INV-1: salsa queries are pure" },
+    { path = "std::env::args_os", reason = "INV-1: salsa queries are pure" },
     { path = "std::time::SystemTime::now", reason = "INV-1: salsa queries are pure" },
     { path = "std::time::SystemTime::elapsed", reason = "INV-1: salsa queries are pure" },
     { path = "std::time::Instant::now", reason = "INV-1: salsa queries are pure" },
