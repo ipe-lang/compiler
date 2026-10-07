@@ -2007,7 +2007,7 @@ Ipe.Html — HTML element builders.
 | `iframe` | (no summary) |
 | `progress` | (no summary) |
 | `meter` | (no summary) |
-| `script` | (no summary) |
+| `script` | `script attrs children` — a `<script>` element. It renders only over a |
 | `h1` | (no summary) |
 | `h2` | (no summary) |
 | `h3` | (no summary) |
