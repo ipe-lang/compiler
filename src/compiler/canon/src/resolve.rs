@@ -5986,7 +5986,7 @@ fn canonicalise_binops(
             where_: "ipe_canon::canonicalise_binops",
             detail: "binop chain with operators but no operands".to_owned(),
         })?;
-    let tree = climb_binops(left, &mut operands, &mut ops, basics, interner)?;
+    let tree = climb_binops(left, &mut operands, &mut ops, basics, env, interner)?;
     Ok(tree.value)
 }
 
@@ -6011,6 +6011,7 @@ fn climb_binops(
     operands: &mut VecDeque<canon::Expr>,
     ops: &mut VecDeque<Located<BinOp>>,
     basics: Symbol,
+    env: &Env,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
     // Pending frames: left operand + operator + its precedence, awaiting their
@@ -6034,7 +6035,7 @@ fn climb_binops(
                 where_: "ipe_canon::climb_binops",
                 detail: "pending stack empty after last() confirmed non-empty".to_owned(),
             })?;
-            left = combine_binop(l, top_op, left, basics, interner)?;
+            left = combine_binop(l, top_op, left, basics, env, interner)?;
         }
         ops.pop_front();
         let next = operands
@@ -6049,7 +6050,7 @@ fn climb_binops(
     // Drain remaining pending frames right-to-left (rightmost operator was
     // pushed last; LIFO pop folds left correctly).
     while let Some((l, op, _)) = pending.pop() {
-        left = combine_binop(l, op, left, basics, interner)?;
+        left = combine_binop(l, op, left, basics, env, interner)?;
     }
     Ok(left)
 }
@@ -6077,11 +6078,16 @@ fn resolve_or_bug<'a>(
 }
 
 /// Build a single resolved binary-operation node.
+///
+/// An operator that desugars into a source module (`|=` and `|.` into
+/// `Ipe.Parser`) is reachable only when `env` imports that module, in any
+/// form; otherwise the use is IPE-N0034 at its span.
 fn combine_binop(
     lhs: canon::Expr,
     op: Located<BinOp>,
     rhs: canon::Expr,
     basics: Symbol,
+    env: &Env,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
     let span = Span::new(lhs.span.lo, rhs.span.hi);
@@ -6098,14 +6104,35 @@ fn combine_binop(
         // `keep kept dropped`, so passing (lhs, rhs) in source order is correct —
         // lhs is the left operand, rhs the right, and each combinator runs them
         // left-to-right internally via `map2`.
+        //
+        // The call names `Ipe.Parser` directly, so the module must be one this
+        // file imports: an unimported module never reaches the dependency
+        // graph, and the call would otherwise fail only after linking.
         OpForm::ParserPipe(fn_name) => {
-            let mod_ipe = interner.intern("Ipe")?;
-            let mod_parser = interner.intern("Parser")?;
+            const PARSER_MODULE: &str = "Ipe.Parser";
+            let parser_module = PARSER_MODULE
+                .split('.')
+                .map(|segment| interner.intern(segment))
+                .collect::<DResult<Vec<Symbol>>>()?;
+            if !env
+                .import_scope
+                .imported_modules
+                .contains(&ModuleIdentity::Source(parser_module.clone()))
+            {
+                return Err(Diagnostic::Name {
+                    span: op.span,
+                    msg: NameError::ImportRequired {
+                        reached: StdlibReach::Operator(op.value.text().into()),
+                        candidates: Box::from([Box::<str>::from(PARSER_MODULE)]),
+                        imported_as: None,
+                    },
+                });
+            }
             let fn_sym = interner.intern(fn_name)?;
             let callee = Located::new(
                 span,
                 canon::Expr_::VarTopLevel {
-                    module: vec![mod_ipe, mod_parser],
+                    module: parser_module,
                     name: fn_sym,
                 },
             );

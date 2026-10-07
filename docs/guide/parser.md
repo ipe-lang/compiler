@@ -73,4 +73,5 @@ should still retry the next branch.
 recorded in [`docs/divergences-from-elm.md`](../divergences-from-elm.md): record
 building uses `map2` … `map5` (and `keep` / `ignore` for punctuation) rather than
 Elm's `|=` / `|.` pipeline, and `Parser a` is a transparent `State -> PStep a`
-alias instead of an opaque wrapper.
+alias instead of an opaque wrapper. The infix aliases `|.` (`keep`) and `|=`
+(`ignore`) are available after `import Ipe.Parser` in any form.

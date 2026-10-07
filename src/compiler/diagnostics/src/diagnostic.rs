@@ -466,12 +466,14 @@ pub enum NameError {
     /// A qualifier names a known module the importing module never imported.
     ///
     /// `String.join` with no `import Ipe.String`, or `Util.f` with no
-    /// `import Util`. Distinct from [`Self::UnknownModule`] (a genuinely unknown
-    /// qualifier): here the module exists and the fix is to add its import.
-    /// `reached` is how the use site reached the module; `candidates` holds
-    /// every importable module whose bare import binds that spelling, sorted
-    /// and deduplicated (never empty). `imported_as` is set when one of the
-    /// candidates IS imported, under an alias the use site did not write.
+    /// `import Util`, or `p |= q` with no `import Ipe.Parser`. Distinct from
+    /// [`Self::UnknownModule`] (a genuinely unknown qualifier): here the module
+    /// exists and the fix is to add its import. `reached` is how the use site
+    /// reached the module; `candidates` holds every importable module whose
+    /// bare import binds that spelling (for an operator, the module it
+    /// desugars into), sorted and deduplicated (never empty). `imported_as` is
+    /// set when one of the candidates IS imported, under an alias the use site
+    /// did not write.
     /// [IPE-N0034]
     ImportRequired {
         reached: StdlibReach,
@@ -965,6 +967,9 @@ pub enum SealRejection {
 pub enum StdlibReach {
     /// A qualified reference `Qualifier.member`, by its qualifier spelling.
     Qualifier(Box<str>),
+    /// An operator that desugars to a call into the module, by its spelling
+    /// (`|=` reaches `Ipe.Parser`).
+    Operator(Box<str>),
 }
 
 impl StdlibReach {
@@ -972,7 +977,7 @@ impl StdlibReach {
     #[must_use]
     pub fn spelling(&self) -> &str {
         match self {
-            Self::Qualifier(qualifier) => qualifier,
+            Self::Qualifier(spelling) | Self::Operator(spelling) => spelling,
         }
     }
 }

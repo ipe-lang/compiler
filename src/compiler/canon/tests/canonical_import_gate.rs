@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use ipe_canon::asserted::AssertedPath;
 use ipe_canon::ast::{Def, Module, Type};
 use ipe_canon::{ModuleCatalog, ModuleExports, ModuleOrigin, canonicalise_module_in_project};
-use ipe_diagnostics::{DResult, Diagnostic, NameError};
+use ipe_diagnostics::{DResult, Diagnostic, NameError, StdlibReach};
 use ipe_intern::{Interner, Symbol};
 
 const LIB_UTIL: &str = "module Lib.Util exposing (..)\n\nf : Int -> Int\nf n =\n    n\n";
@@ -387,4 +387,83 @@ fn native_binding_never_resolves_through_a_foreign_ffi_spelling() {
         &["Main", "Rust.Ffi"],
     );
     assert!(result.is_ok(), "{:?}", result.as_ref().map(Option::is_some));
+}
+
+/// The `Ipe.Parser` combinators the parser operators desugar into.
+const PARSER_STUB: &str = "module Ipe.Parser exposing (Parser, keep, ignore)\n\n\
+                           type alias Parser a =\n    Int -> a\n\n\
+                           keep : Parser a -> Parser b -> Parser a\n\
+                           keep kept dropped =\n    kept\n\n\
+                           ignore : Parser a -> Parser b -> Parser b\n\
+                           ignore dropped kept =\n    kept\n";
+
+/// A user module an import can spell `Parser`.
+const LIB_PARSER: &str = "module Lib.Parser exposing (..)\n\nx : Int\nx =\n    1\n";
+
+/// Canonicalise the `Ipe.Parser` stub, then `others`, then `main`.
+fn run_with_parser(others: &[&str], main: &str, catalog: &[&str]) -> DResult<()> {
+    let mut sources = vec![(PARSER_STUB, ModuleOrigin::EmbeddedStdlib)];
+    sources.extend(others.iter().map(|src| (*src, ModuleOrigin::User)));
+    sources.push((main, ModuleOrigin::User));
+    run_with_origins(&sources, catalog).map(|_| ())
+}
+
+/// Whether `result` is IPE-N0034 for `operator` at its span in `src`, naming
+/// `Ipe.Parser` as the one import to add.
+fn is_operator_import_required(result: &DResult<()>, src: &str, operator: &str) -> bool {
+    let needle = format!(" {operator} ");
+    let lo = src
+        .find(needle.as_str())
+        .and_then(|at| u32::try_from(at.saturating_add(1)).ok());
+    matches!(
+        result,
+        Err(Diagnostic::Name {
+            span,
+            msg: NameError::ImportRequired {
+                reached: StdlibReach::Operator(reached),
+                candidates,
+                imported_as: None,
+            },
+        }) if &**reached == operator
+            && **candidates == [Box::<str>::from("Ipe.Parser")]
+            && Some(span.lo) == lo
+    )
+}
+
+/// `|=` and `|.` with no import of `Ipe.Parser` are IPE-N0034 at the operator.
+///
+/// They desugar into `Ipe.Parser`, so the refusal lands at ipe time, never as a
+/// link-time failure; a module an import merely spells `Parser` is not
+/// `Ipe.Parser`.
+#[test]
+fn parser_operators_require_the_parser_import() {
+    for operator in ["|=", "|."] {
+        let body = format!("\\p q -> p {operator} q");
+        for imports in ["", "import Lib.Parser as Parser\n", "import Lib.Parser\n"] {
+            let src = main_module(imports, &body);
+            let result = run_with_parser(&[LIB_PARSER], &src, &["Main", "Lib.Parser"]);
+            assert!(
+                is_operator_import_required(&result, &src, operator),
+                "{imports}{body}: {result:?}"
+            );
+        }
+    }
+}
+
+/// Every import form of `Ipe.Parser` brings `|=` and `|.` into reach.
+#[test]
+fn parser_operators_resolve_under_every_import_form() {
+    for operator in ["|=", "|."] {
+        let body = format!("\\p q -> p {operator} q");
+        for imports in [
+            "import Ipe.Parser\n",
+            "import Ipe.Parser as P\n",
+            "import Ipe.Parser exposing (..)\n",
+            "import Ipe.Parser as Parser exposing (Parser)\n",
+        ] {
+            let src = main_module(imports, &body);
+            let result = run_with_parser(&[], &src, &["Main"]);
+            assert!(result.is_ok(), "{imports}{body}: {result:?}");
+        }
+    }
 }
