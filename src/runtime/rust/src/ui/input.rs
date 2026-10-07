@@ -91,7 +91,7 @@ pub fn input_placeholder_<M>(attrs: Vec<Attribute<M>>, content: Element<M>) -> P
 // ---- Internal helpers -------------------------------------------------------
 
 /// Partition `attrs` into `(layout_attrs, control_attrs)`. Layout / size /
-/// alignment attrs hoist to the `wrap_with_label` wrapper so `Ui.width fill`
+/// alignment attrs hoist to the `attach_label` wrapper so `Ui.width fill`
 /// etc. applies to the outer container. Visual / event attrs stay on the
 /// inner `<input>` / `<textarea>`.
 fn split_layout_attrs<M: Clone>(
@@ -144,6 +144,83 @@ fn placeholder_text_of<M>(content: &Element<M>) -> Option<String> {
     match content {
         Element::Text(s) if !s.is_empty() => Some(s.clone()),
         _ => None,
+    }
+}
+
+/// A single labelable control, built only after its label is attached.
+enum Control<M> {
+    /// An `<input>`.
+    Input(Vec<Attribute<M>>),
+    /// A `<textarea>`.
+    Textarea(Vec<Attribute<M>>),
+    /// An `<input type="checkbox">` inside a row that also holds its icon.
+    Checkbox {
+        input: Vec<Attribute<M>>,
+        row: Vec<Attribute<M>>,
+        icon: Element<M>,
+    },
+}
+
+impl<M: Clone> Control<M> {
+    /// The attributes of the element a screen reader names.
+    fn labelable_attrs_mut(&mut self) -> &mut Vec<Attribute<M>> {
+        match self {
+            Self::Input(attrs) | Self::Textarea(attrs) => attrs,
+            Self::Checkbox { input, .. } => input,
+        }
+    }
+
+    fn build(self) -> Element<M> {
+        match self {
+            Self::Input(attrs) => ui_input_(attrs),
+            Self::Textarea(attrs) => {
+                Element::TaggedNode("textarea".into(), Description::NoDescription, attrs, vec![])
+            }
+            Self::Checkbox { input, row, icon } => ui_row_(row, vec![ui_input_(input), icon]),
+        }
+    }
+}
+
+/// Give `control` its accessible name, by structure.
+///
+/// A visible label is a `<label>` element that contains the control, so the
+/// pair is one clickable, named unit; a hidden label is an `aria-label` on the
+/// labelable element itself. No label is ever a free sibling of its control.
+fn attach_label<M: Clone>(
+    lbl: Label<M>,
+    layout: Vec<Attribute<M>>,
+    mut control: Control<M>,
+) -> Element<M> {
+    match lbl {
+        Label::LabelHidden(text) => {
+            // An empty `aria-label` names nothing and hides the control from
+            // name computation, so an empty text adds no attribute.
+            if !text.is_empty() {
+                control
+                    .labelable_attrs_mut()
+                    .insert(0, Attribute::AttrAttribute("aria-label".to_owned(), text));
+            }
+            ui_el_(layout, control.build())
+        }
+        Label::Label(pos, label_attrs, label_el) => {
+            let labeled = ui_el_(label_attrs, label_el);
+            let control_el = control.build();
+            let (marker, label_first) = match pos {
+                LabelPosition::AbovePos => ("__col", true),
+                LabelPosition::BelowPos => ("__col", false),
+                LabelPosition::LeftPos => ("__row", true),
+                LabelPosition::RightPos => ("__row", false),
+            };
+            let kids = if label_first {
+                vec![labeled, control_el]
+            } else {
+                vec![control_el, labeled]
+            };
+            let mut attrs = Vec::with_capacity(layout.len() + 1);
+            attrs.push(Attribute::AttrStyle(marker.to_owned(), "true".to_owned()));
+            attrs.extend(layout);
+            Element::TaggedNode("label".into(), Description::NoDescription, attrs, kids)
+        }
     }
 }
 
@@ -201,8 +278,7 @@ fn input_base_<M: Clone>(
     }
     base_attrs.extend(control_attrs);
     base_attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
-    let input_el = ui_input_(base_attrs);
-    wrap_with_label(label, layout_attrs, input_el)
+    attach_label(label, layout_attrs, Control::Input(base_attrs))
 }
 
 /// `Input.text`
@@ -320,14 +396,7 @@ pub fn input_multiline_<M: Clone>(
     }
     base_attrs.extend(control_attrs);
     base_attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
-    // Emit a `<textarea>` via `TaggedNode` -- mirrors `Ui.TaggedNode "textarea" ...`
-    let textarea_el = Element::TaggedNode(
-        "textarea".into(),
-        Description::NoDescription,
-        base_attrs,
-        vec![],
-    );
-    wrap_with_label(label, layout_attrs, textarea_el)
+    attach_label(label, layout_attrs, Control::Textarea(base_attrs))
 }
 
 // ---- Checkbox ---------------------------------------------------------------
@@ -350,13 +419,15 @@ pub fn input_checkbox_<M: Clone + Send + Sync + 'static>(
         ui_html_attribute_("value".into(), check_val.into()),
         ui_on_bool_(Arc::new(move |_b: bool| toggle_msg.clone())),
     ];
-    let check_input = ui_input_(check_input_attrs);
-    let icon_el = icon(checked);
     let mut row_attrs = vec![ui_spacing_(8)];
     row_attrs.extend(control_attrs);
     row_attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
-    let row_el = ui_row_(row_attrs, vec![check_input, icon_el]);
-    wrap_with_label(label, layout_attrs, row_el)
+    let control = Control::Checkbox {
+        input: check_input_attrs,
+        row: row_attrs,
+        icon: icon(checked),
+    };
+    attach_label(label, layout_attrs, control)
 }
 
 /// `Input.slider`
@@ -388,8 +459,7 @@ pub fn input_slider_<M: Clone>(
     ];
     base_attrs.extend(control_attrs);
     base_attrs.extend(implicit_fill_if_hoisted(&layout_attrs));
-    let input_el = ui_input_(base_attrs);
-    wrap_with_label(label, layout_attrs, input_el)
+    attach_label(label, layout_attrs, Control::Input(base_attrs))
 }
 
 // ---- Radio ------------------------------------------------------------------
@@ -486,4 +556,289 @@ pub fn input_radio_row_<M: Clone + Send + Sync + 'static>(
     label: Label<M>,
 ) -> Element<M> {
     radio_core_(true, attrs, on_change, options, selected, label)
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use crate::color::Color;
+    use crate::html::{Attribute as HtmlAttribute, Html};
+    use crate::ui::helpers::{ui_background_color_, ui_fill_, ui_width_};
+    use crate::ui::render::ui_layout;
+
+    type Msg = u8;
+    type TextHandler = Arc<dyn Fn(String) -> Msg + Send + Sync>;
+
+    fn on_text() -> TextHandler {
+        Arc::new(|_s: String| 0)
+    }
+
+    fn on_flag() -> Arc<dyn Fn(bool) -> Msg + Send + Sync> {
+        Arc::new(|_b: bool| 0)
+    }
+
+    fn no_icon() -> Arc<dyn Fn(bool) -> Element<Msg> + Send + Sync> {
+        Arc::new(|_b: bool| Element::Empty)
+    }
+
+    fn page(el: Element<Msg>) -> Html<Msg> {
+        ui_layout(Vec::new(), el)
+    }
+
+    fn tag_of(h: &Html<Msg>) -> &str {
+        match h {
+            Html::HElement(tag, _, _) => tag.as_str(),
+            Html::HText(_) | Html::HRaw(_) => "",
+        }
+    }
+
+    fn kids_of(h: &Html<Msg>) -> &[Html<Msg>] {
+        match h {
+            Html::HElement(_, _, kids) => kids.as_slice(),
+            Html::HText(_) | Html::HRaw(_) => &[],
+        }
+    }
+
+    fn attr<'a>(h: &'a Html<Msg>, name: &str) -> Option<&'a str> {
+        let Html::HElement(_, attrs, _) = h else {
+            return None;
+        };
+        attrs.iter().find_map(|a| match a {
+            HtmlAttribute::Attr(k, v) if k == name => Some(v.as_str()),
+            HtmlAttribute::Attr(..)
+            | HtmlAttribute::BoolAttr(..)
+            | HtmlAttribute::EventAttr(_)
+            | HtmlAttribute::NoAttr => None,
+        })
+    }
+
+    /// An attribute is present as a string value or as a true boolean.
+    fn has_attr(h: &Html<Msg>, name: &str) -> bool {
+        let Html::HElement(_, attrs, _) = h else {
+            return false;
+        };
+        attrs.iter().any(|a| match a {
+            HtmlAttribute::Attr(k, _) => k == name,
+            HtmlAttribute::BoolAttr(k, on) => k == name && *on,
+            HtmlAttribute::EventAttr(_) | HtmlAttribute::NoAttr => false,
+        })
+    }
+
+    fn text_of(h: &Html<Msg>) -> String {
+        match h {
+            Html::HText(t) => t.clone(),
+            Html::HElement(_, _, kids) => kids.iter().map(text_of).collect(),
+            Html::HRaw(_) => String::new(),
+        }
+    }
+
+    /// The first element (document order) for which `pred` holds.
+    fn find<'a>(h: &'a Html<Msg>, pred: &dyn Fn(&Html<Msg>) -> bool) -> Option<&'a Html<Msg>> {
+        if matches!(h, Html::HElement(..)) && pred(h) {
+            return Some(h);
+        }
+        kids_of(h).iter().find_map(|k| find(k, pred))
+    }
+
+    /// How many elements satisfy `pred`.
+    fn count(h: &Html<Msg>, pred: &dyn Fn(&Html<Msg>) -> bool) -> usize {
+        let own = usize::from(matches!(h, Html::HElement(..)) && pred(h));
+        own + kids_of(h).iter().map(|k| count(k, pred)).sum::<usize>()
+    }
+
+    fn is_tag(name: &'static str) -> impl Fn(&Html<Msg>) -> bool {
+        move |h| tag_of(h) == name
+    }
+
+    fn text_field(label: Label<Msg>) -> Element<Msg> {
+        input_text_(
+            Vec::new(),
+            on_text(),
+            String::new(),
+            IpeMaybe::Nothing,
+            label,
+        )
+    }
+
+    fn hidden() -> Label<Msg> {
+        input_label_hidden_("Name".to_owned())
+    }
+
+    fn text_kind(
+        build: fn(
+            Vec<Attribute<Msg>>,
+            TextHandler,
+            String,
+            IpeMaybe<Placeholder<Msg>>,
+            Label<Msg>,
+        ) -> Element<Msg>,
+        label: Label<Msg>,
+    ) -> Element<Msg> {
+        build(
+            Vec::new(),
+            on_text(),
+            String::new(),
+            IpeMaybe::Nothing,
+            label,
+        )
+    }
+
+    /// Every control kind built with `label`, paired with the tag that must carry
+    /// its accessible name.
+    fn every_kind(label: impl Fn() -> Label<Msg>) -> Vec<(&'static str, Element<Msg>)> {
+        vec![
+            ("input", text_kind(input_text_, label())),
+            ("input", text_kind(input_email_, label())),
+            ("input", text_kind(input_username_, label())),
+            ("input", text_kind(input_search_, label())),
+            ("input", text_kind(input_current_password_, label())),
+            ("input", text_kind(input_new_password_, label())),
+            (
+                "textarea",
+                input_multiline_(
+                    Vec::new(),
+                    on_text(),
+                    String::new(),
+                    IpeMaybe::Nothing,
+                    label(),
+                    false,
+                ),
+            ),
+            (
+                "input",
+                input_slider_(
+                    Vec::new(),
+                    on_text(),
+                    "5".to_owned(),
+                    "0".to_owned(),
+                    "10".to_owned(),
+                    "1".to_owned(),
+                    label(),
+                ),
+            ),
+            (
+                "input",
+                input_checkbox_(Vec::new(), on_flag(), no_icon(), false, label()),
+            ),
+        ]
+    }
+
+    /// The accessible name is on the labelable element, never a wrapper. Red if
+    /// `attach_label` puts `aria-label` on the wrapper element.
+    #[test]
+    fn hidden_label_names_the_input_not_the_wrapper() {
+        let html = page(text_field(input_label_hidden_("Email".to_owned())));
+        let found = find(&html, &is_tag("input"));
+        assert!(found.is_some(), "an input is rendered");
+        let Some(input) = found else {
+            return;
+        };
+        assert_eq!(attr(input, "aria-label"), Some("Email"));
+        let named_non_inputs = count(&html, &|h| {
+            tag_of(h) != "input" && has_attr(h, "aria-label")
+        });
+        assert_eq!(named_non_inputs, 0, "no wrapper carries the name");
+        assert_eq!(count(&html, &is_tag("label")), 0, "no label element");
+    }
+
+    /// Red if any control kind builds its element before the name is attached.
+    #[test]
+    fn hidden_label_on_each_control_kind() {
+        for (labelable, el) in every_kind(hidden) {
+            let html = page(el);
+            let found = find(&html, &|h| attr(h, "aria-label") == Some("Name"));
+            assert!(found.is_some(), "a {labelable} carries the name");
+            let Some(named) = found else {
+                return;
+            };
+            assert_eq!(tag_of(named), labelable);
+            assert_eq!(count(&html, &|h| has_attr(h, "aria-label")), 1);
+        }
+    }
+
+    /// An empty hidden label adds no `aria-label`, which would name nothing.
+    /// Red if the empty-text guard in `attach_label` is removed.
+    #[test]
+    fn hidden_label_empty_emits_no_aria_label() {
+        for (_, el) in every_kind(|| input_label_hidden_(String::new())) {
+            let html = page(el);
+            assert_eq!(count(&html, &|h| has_attr(h, "aria-label")), 0);
+            assert_eq!(
+                count(&html, &is_tag("input")) + count(&html, &is_tag("textarea")),
+                1
+            );
+        }
+    }
+
+    /// Each visible label wraps its control in one `<label>` that also holds the
+    /// label text, in the order the position asks for. Red if the label returns to
+    /// a free sibling of its control.
+    #[test]
+    fn visible_label_contains_its_control() {
+        let text = || Element::Text("Name".to_owned());
+        let cases: [(&str, Label<Msg>, bool); 4] = [
+            ("above", input_label_above_(Vec::new(), text()), true),
+            ("left", input_label_left_(Vec::new(), text()), true),
+            ("below", input_label_below_(Vec::new(), text()), false),
+            ("right", input_label_right_(Vec::new(), text()), false),
+        ];
+        for (name, label, label_first) in cases {
+            let html = page(text_field(label));
+            assert_eq!(count(&html, &is_tag("label")), 1, "{name}: one label");
+            let found = find(&html, &is_tag("label"));
+            assert!(found.is_some(), "{name}: label found");
+            let Some(wrapper) = found else {
+                return;
+            };
+            assert_eq!(count(wrapper, &is_tag("input")), 1, "{name}: input inside");
+            assert!(text_of(wrapper).contains("Name"), "{name}: text inside");
+            let kids = kids_of(wrapper);
+            assert_eq!(kids.len(), 2, "{name}: label text and control");
+            let holds_input: Vec<bool> = kids
+                .iter()
+                .map(|k| count(k, &is_tag("input")) == 1)
+                .collect();
+            let expected = if label_first {
+                vec![false, true]
+            } else {
+                vec![true, false]
+            };
+            assert_eq!(holds_input, expected, "{name}: order");
+        }
+    }
+
+    /// Layout attributes stay on the outermost wrapper and visual attributes on
+    /// the control. Red if the layout/control split moves.
+    #[test]
+    fn layout_attrs_still_hoist_to_the_label_wrapper() {
+        let html = page(input_text_(
+            vec![
+                ui_width_(ui_fill_()),
+                ui_background_color_(Color::rgb(10, 20, 30)),
+            ],
+            on_text(),
+            String::new(),
+            IpeMaybe::Nothing,
+            input_label_above_(Vec::new(), Element::Text("Name".to_owned())),
+        ));
+        let found = find(&html, &is_tag("label"));
+        assert!(found.is_some(), "label found");
+        let Some(wrapper) = found else {
+            return;
+        };
+        let wrapper_style = attr(wrapper, "style").unwrap_or_default();
+        assert!(wrapper_style.contains("width:100%"), "{wrapper_style}");
+        assert!(
+            !wrapper_style.contains("background-color"),
+            "{wrapper_style}"
+        );
+        let found = find(wrapper, &is_tag("input"));
+        assert!(found.is_some(), "input found");
+        let Some(input) = found else {
+            return;
+        };
+        let input_style = attr(input, "style").unwrap_or_default();
+        assert!(input_style.contains("background-color"), "{input_style}");
+    }
 }
