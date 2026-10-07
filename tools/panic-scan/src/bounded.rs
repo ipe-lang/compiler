@@ -511,8 +511,7 @@ impl Segments {
             weight: vec![0],
         };
         let mut cutter = Cutter {
-            in_use,
-            inherited_use: in_use,
+            use_scope: UseScope::of_group(in_use),
             ..Cutter::default()
         };
         for (index, tree) in trees.iter().enumerate() {
@@ -520,7 +519,7 @@ impl Segments {
                 segments.open();
                 cutter.piped = false;
             }
-            segments.in_use.push(cutter.in_use);
+            segments.in_use.push(cutter.use_scope.in_use());
             let (weight, ends) = cutter.step(tree, trees.get(index.saturating_add(1)));
             segments.add(weight);
             if ends {
@@ -594,10 +593,53 @@ struct Cutter {
     prev_joint: Option<char>,
     /// The current token is the second `:` of a joint `::`.
     colon_tail: bool,
-    /// A `use` declaration is open: its tree recurses once per `::`.
-    in_use: bool,
-    /// The group itself sits inside a `use` declaration.
-    inherited_use: bool,
+    /// Where the current token sits relative to a `use` declaration.
+    use_scope: UseScope,
+}
+
+/// Where a token sits relative to a `use` declaration, whose tree recurses
+/// once per `::`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum UseScope {
+    /// Outside any `use` declaration.
+    #[default]
+    Outside,
+    /// After a `use` of this group, up to the `;` that ends it.
+    Declaration,
+    /// Inside a group of a `use` tree: the whole group is part of the tree.
+    Tree,
+}
+
+impl UseScope {
+    /// The scope of a group's first token; `in_use` when the group sits inside
+    /// a `use` declaration.
+    const fn of_group(in_use: bool) -> Self {
+        if in_use { Self::Tree } else { Self::Outside }
+    }
+
+    /// Whether a `::` here recurses into a `use` tree.
+    const fn in_use(self) -> bool {
+        match self {
+            Self::Outside => false,
+            Self::Declaration | Self::Tree => true,
+        }
+    }
+
+    /// The scope after a `use` that opens a declaration.
+    const fn opened(self) -> Self {
+        match self {
+            Self::Outside | Self::Declaration => Self::Declaration,
+            Self::Tree => Self::Tree,
+        }
+    }
+
+    /// The scope after a `;`: a declaration of this group ends there.
+    const fn ended(self) -> Self {
+        match self {
+            Self::Outside | Self::Declaration => Self::Outside,
+            Self::Tree => Self::Tree,
+        }
+    }
 }
 
 impl Cutter {
@@ -610,7 +652,7 @@ impl Cutter {
             TokenTree::Group(_) => (1, false),
             TokenTree::Ident(ident) => {
                 if ident == "use" && !is_punct(next, '<') {
-                    self.in_use = true;
+                    self.use_scope = self.use_scope.opened();
                 }
                 (usize::from(is_keyword(ident)), false)
             }
@@ -635,14 +677,14 @@ impl Cutter {
             ';' => {
                 self.angle = 0;
                 self.piped = false;
-                self.in_use = self.inherited_use;
+                self.use_scope = self.use_scope.ended();
                 (0, true)
             }
             ',' => (0, self.angle == 0 && !self.piped),
             ':' if colon_tail => (0, false),
             ':' if punct.spacing() == Spacing::Joint && is_punct(next, ':') => {
                 self.colon_tail = true;
-                (usize::from(self.in_use), false)
+                (usize::from(self.use_scope.in_use()), false)
             }
             '|' => {
                 self.piped = true;

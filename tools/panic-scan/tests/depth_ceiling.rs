@@ -255,6 +255,87 @@ fn use_trees_fit_at_the_ceiling_and_are_refused_past_it() {
 }
 
 #[test]
+fn blocks_and_literals_fit_at_the_ceiling_and_are_refused_past_it() {
+    let cases: &[Case] = &[
+        ("nested struct literals", |n| {
+            expr(&nest(n, "a", |inner| format!("S {{ a: {inner} }}")))
+        }),
+        ("nested labeled blocks", |n| {
+            expr(&wrap(n, "'a: { ", "a", " }"))
+        }),
+        ("nested async blocks", |n| {
+            expr(&wrap(n, "async { ", "a", " }"))
+        }),
+        ("nested unsafe blocks", |n| {
+            expr(&wrap(n, "unsafe { ", "a", " }"))
+        }),
+        ("nested arrays", |n| expr(&wrap(n, "[", "a", "]"))),
+        ("nested tuples", |n| {
+            expr(&nest(n, "a", |inner| format!("({inner},)")))
+        }),
+        ("nested ranges", |n| expr(&wrap(n, "..(", "a", ")"))),
+        ("await chain", |n| expr(&format!("a{}", ".await".repeat(n)))),
+        ("index chain", |n| expr(&format!("a{}", "[0]".repeat(n)))),
+        ("call chain", |n| expr(&format!("a{}", "()".repeat(n)))),
+        ("joint reference chain", |n| {
+            expr(&format!("{}a", "&".repeat(n)))
+        }),
+        ("nested turbofish", |n| {
+            expr(&format!("f::<{}>()", wrap(n, "A<", "u8", ">")))
+        }),
+    ];
+    proves(cases);
+}
+
+#[test]
+fn bounds_and_paths_fit_at_the_ceiling_and_are_refused_past_it() {
+    let cases: &[Case] = &[
+        ("nested qualified paths", |n| {
+            ty(&nest(n, "T", |inner| format!("<{inner} as A>::B")))
+        }),
+        ("nested impl trait", |n| ty(&wrap(n, "impl A<", "u8", ">"))),
+        ("nested dyn trait", |n| ty(&wrap(n, "&dyn A<", "u8", ">"))),
+        ("nested fn trait sugar", |n| {
+            ty(&nest(n, "u8", |inner| format!("dyn Fn({inner}) -> u8")))
+        }),
+        ("nested const generic blocks", |n| {
+            ty(&nest(n, "u8", |inner| {
+                format!("A<{{ let _: {inner} = a; 1 }}>")
+            }))
+        }),
+        ("nested struct patterns", |n| {
+            pat(&nest(n, "_", |inner| format!("S {{ a: {inner} }}")))
+        }),
+        ("nested slice patterns", |n| pat(&wrap(n, "[", "_", "]"))),
+        ("reference pattern chain", |n| {
+            pat(&format!("{}_", "&".repeat(n)))
+        }),
+    ];
+    proves(cases);
+}
+
+#[test]
+fn items_and_attributes_fit_at_the_ceiling_and_are_refused_past_it() {
+    let cases: &[Case] = &[
+        ("nested modules", |n| wrap(n, "mod a { ", "", "}")),
+        ("nested functions", |n| wrap(n, "fn f() { ", "", "}")),
+        ("nested impl blocks", |n| {
+            wrap(n, "fn f() { impl S { fn g() { ", "", "} } }")
+        }),
+        ("nested use groups", |n| {
+            format!("use {};\n", wrap(n, "a::{", "a", "}"))
+        }),
+        ("nested cfg all", |n| {
+            format!("#[cfg({})]\nfn g() {{}}\n", wrap(n, "all(", "test", ")"))
+        }),
+        ("nested attribute lists", |n| {
+            format!("#[{}]\nfn g() {{}}\n", wrap(n, "a(", "b", ")"))
+        }),
+    ];
+    proves(cases);
+}
+
+#[test]
 fn a_tuple_index_pair_weighs_as_two_fields() {
     // `a.0.1` is two nested fields behind one `.`: the float `0.1` is split.
     for n in [1_usize, 64, 1024] {
