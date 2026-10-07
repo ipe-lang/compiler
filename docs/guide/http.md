@@ -96,7 +96,13 @@ full entry for any of them.
 |----------|---------|--------|
 | `IPE_HTTP_MAX_BODY_BYTES` | 33554432 (32 MiB) | Cap on outbound response bodies. |
 | `IPE_HTTP_DENY_PRIVATE` | auto (on in production) | Block SSRF-vector private/loopback targets. |
-| `IPE_HTTP_BIND` | auto | Override the server bind address: an IP address only; anything else refuses startup. |
+| `IPE_HTTP_BIND` | 127.0.0.1 | Override the server bind address: an IP address only; anything else refuses startup. |
+
+A server binds `127.0.0.1` in every build, release included, unless
+`IPE_HTTP_BIND` names another address or the app sets
+`Host.bind Host.allInterfaces`; either opt-in prints a startup warning. A
+container or PaaS deploy, which must accept other hosts, sets
+`IPE_HTTP_BIND=0.0.0.0`.
 
 All vars are in the **HTTP client** subsystem of the
 [environment variable reference](../reference/env.md#http-client).

@@ -16,13 +16,13 @@
 //! in-code setting without a rebuild; absent both, the fallback is the safe
 //! default.
 //!
-//! # Host bind — fail-closed to loopback
+//! # Host bind — loopback unless someone opts in
 //!
-//! `resolve_host_bind` is the security-critical resolution: a development
-//! build binds `127.0.0.1` (never exposed on the LAN), a production build binds
-//! all interfaces, and `IPE_HTTP_BIND` (an IP address, else startup refuses)
-//! overrides either. Absent any signal the conservative loopback is chosen —
-//! the dev console is never reachable off-box by default.
+//! `resolve_host_bind` is the security-critical resolution: absent an opt-in
+//! every build binds `127.0.0.1`, whatever its posture. Only an operator's
+//! `IPE_HTTP_BIND` (an IP address, else startup refuses) or the app's own
+//! `Host.bind Host.allInterfaces` setting exposes the listener, and the typed
+//! [`ListenHost`] carries which of the two did so that startup can warn.
 
 use std::sync::OnceLock;
 
@@ -35,7 +35,7 @@ pub enum HostMode {
     Loopback,
     /// Bind `0.0.0.0` — reachable on every interface.
     AllInterfaces,
-    /// Defer to the environment (`IPE_HTTP_BIND`, else the build-profile default).
+    /// Defer to the environment: `IPE_HTTP_BIND`, else `127.0.0.1`.
     EnvDriven,
 }
 
@@ -430,13 +430,72 @@ const HTTP_BIND_VAR: &str = "IPE_HTTP_BIND";
 #[cfg(feature = "server")]
 const HTTP_BIND_EXPECTED: &str = "an IP address (IPv4 such as 127.0.0.1, or bare IPv6 such as ::1)";
 
+/// The address an app listener binds, with who opted in when it is not
+/// loopback.
+///
+/// A non-loopback address has no representation without its [`ExposedBy`]
+/// source, and a [`LoopbackIp`] can only be built from a loopback address, so
+/// no default, posture, or fallback can stand in for an opt-in.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ListenHost {
+    /// A loopback address, never reachable off the local machine.
+    Loopback(LoopbackIp),
+    /// Any other address, reachable from other hosts, with its opt-in.
+    Exposed {
+        /// The parsed address bound.
+        ip: std::net::IpAddr,
+        /// Who opted in to the exposure.
+        by: ExposedBy,
+    },
+}
+
+#[cfg(feature = "server")]
+impl ListenHost {
+    /// The address bound.
+    pub(crate) const fn ip(self) -> std::net::IpAddr {
+        match self {
+            Self::Loopback(loopback) => loopback.0,
+            Self::Exposed { ip, .. } => ip,
+        }
+    }
+}
+
+/// A loopback address: `127.0.0.1` by default, or the loopback address an
+/// operator named in `IPE_HTTP_BIND`.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct LoopbackIp(std::net::IpAddr);
+
+#[cfg(feature = "server")]
+impl LoopbackIp {
+    /// `127.0.0.1`, the only default bind address.
+    pub(crate) const DEFAULT: Self = Self(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+    /// `ip` when it is a loopback address, else `None`.
+    const fn new(ip: std::net::IpAddr) -> Option<Self> {
+        if ip.is_loopback() {
+            Some(Self(ip))
+        } else {
+            None
+        }
+    }
+}
+
+/// Who opted an app listener in to a non-loopback address.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExposedBy {
+    /// The operator set `IPE_HTTP_BIND`.
+    EnvVar,
+    /// The app sets `Host.bind Host.allInterfaces`.
+    Setting,
+}
+
 /// Resolve the bind host, applying the one precedence: `IPE_HTTP_BIND` (env) >
-/// the installed `Host.bind` setting > the default fallback. The default is
-/// loopback unless production is explicitly declared (`ENV`/`IPE_ENV`), so a
-/// server is never reachable off-box by accident; an `EnvDriven` in-code
-/// setting defers to that same fallback. Binding all interfaces requires either
-/// an explicit `Host.bind AllInterfaces` setting, an explicit `IPE_HTTP_BIND`,
-/// or a declared-production posture.
+/// the installed `Host.bind` setting > `127.0.0.1`. The posture plays no part:
+/// a production build with neither opt-in binds loopback, and an `EnvDriven`
+/// setting with no `IPE_HTTP_BIND` does too.
 ///
 /// # Errors
 ///
@@ -444,44 +503,48 @@ const HTTP_BIND_EXPECTED: &str = "an IP address (IPv4 such as 127.0.0.1, or bare
 /// address: a hostname (`localhost` included), a socket form, brackets, a scope
 /// id, padding, or an empty value.
 #[cfg(feature = "server")]
-pub(crate) fn resolve_host_bind() -> Result<std::net::IpAddr, crate::system::EnvValueRefusal> {
+pub(crate) fn resolve_host_bind() -> Result<ListenHost, crate::system::EnvValueRefusal> {
     host_bind_from(
         crate::system::read_env_var(HTTP_BIND_VAR),
         INSTALLED.get().and_then(|c| c.host_bind),
-        crate::telemetry::posture_is_production(),
     )
 }
 
-/// Pure host-bind resolution over the raw `IPE_HTTP_BIND` lookup, the installed
-/// mode and the declared posture.
+/// Pure host-bind resolution over the raw `IPE_HTTP_BIND` lookup and the
+/// installed mode.
 #[cfg(feature = "server")]
 fn host_bind_from(
     raw: Result<String, std::env::VarError>,
     setting: Option<HostMode>,
-    production: bool,
-) -> Result<std::net::IpAddr, crate::system::EnvValueRefusal> {
+) -> Result<ListenHost, crate::system::EnvValueRefusal> {
     use std::net::{IpAddr, Ipv4Addr};
     let refuse =
         |raw: &[u8]| crate::system::EnvValueRefusal::new(HTTP_BIND_VAR, HTTP_BIND_EXPECTED, raw);
     match raw {
         Ok(value) => {
-            return value
+            let ip = value
                 .parse::<IpAddr>()
-                .map_err(|_| refuse(value.as_bytes()));
+                .map_err(|_| refuse(value.as_bytes()))?;
+            return Ok(LoopbackIp::new(ip).map_or(
+                ListenHost::Exposed {
+                    ip,
+                    by: ExposedBy::EnvVar,
+                },
+                ListenHost::Loopback,
+            ));
         }
         Err(std::env::VarError::NotUnicode(os)) => return Err(refuse(os.as_encoded_bytes())),
         Err(std::env::VarError::NotPresent) => {}
     }
-    let all_interfaces = match setting {
-        Some(HostMode::Loopback) => false,
-        Some(HostMode::AllInterfaces) => true,
-        Some(HostMode::EnvDriven) | None => production,
-    };
-    Ok(IpAddr::V4(if all_interfaces {
-        Ipv4Addr::UNSPECIFIED
-    } else {
-        Ipv4Addr::LOCALHOST
-    }))
+    Ok(match setting {
+        Some(HostMode::AllInterfaces) => ListenHost::Exposed {
+            ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            by: ExposedBy::Setting,
+        },
+        Some(HostMode::Loopback | HostMode::EnvDriven) | None => {
+            ListenHost::Loopback(LoopbackIp::DEFAULT)
+        }
+    })
 }
 
 /// The installed `Log.level` tag, if a setting set one: the middle tier of
@@ -841,13 +904,14 @@ mod tests {
         assert_eq!(installed_log_level(None), None);
     }
 
-    // ── Host bind: an IP address or a startup refusal ─────────────────────
+    // ── Host bind: loopback, an opted-in exposure, or a startup refusal ──
 
     #[cfg(feature = "server")]
     #[test]
     fn a_bind_that_is_not_exactly_an_ip_address_is_refused() {
         for refused in [
             "not-an-address",
+            "garbage",
             "localhost",
             "127.0.0.1:8080",
             "[::1]",
@@ -858,46 +922,63 @@ mod tests {
             "",
             " ",
         ] {
-            let outcome = host_bind_from(Ok(refused.to_owned()), None, false);
-            assert!(
-                outcome.as_ref().is_err_and(|r| r.name() == HTTP_BIND_VAR
-                    && r.to_string().contains("must be an IP address")),
-                "{refused:?} must be refused naming {HTTP_BIND_VAR}, got {outcome:?}"
+            for setting in [None, Some(HostMode::AllInterfaces)] {
+                let outcome = host_bind_from(Ok(refused.to_owned()), setting);
+                assert!(
+                    outcome.as_ref().is_err_and(|r| r.name() == HTTP_BIND_VAR
+                        && r.to_string().contains("must be an IP address")),
+                    "{refused:?} must be refused naming {HTTP_BIND_VAR}, got {outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn a_loopback_bind_address_is_loopback_and_any_other_is_exposed_by_the_env_var() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let bind = |raw: &str| host_bind_from(Ok(raw.to_owned()), Some(HostMode::AllInterfaces));
+        let loopback =
+            |ip: IpAddr| bind(&ip.to_string()) == Ok(ListenHost::Loopback(LoopbackIp(ip)));
+        assert!(loopback(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(loopback(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(loopback(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))));
+        for (raw, ip) in [
+            ("0.0.0.0", IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            ("::", IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            ("192.0.2.7", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+        ] {
+            assert_eq!(
+                bind(raw),
+                Ok(ListenHost::Exposed {
+                    ip,
+                    by: ExposedBy::EnvVar
+                }),
+                "IPE_HTTP_BIND={raw} must be an exposure the operator opted in to"
             );
         }
     }
 
     #[cfg(feature = "server")]
     #[test]
-    fn a_bind_ip_address_wins_over_the_setting_and_the_posture() {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-        let bind =
-            |raw: &str| host_bind_from(Ok(raw.to_owned()), Some(HostMode::AllInterfaces), true);
-        assert_eq!(bind("127.0.0.1"), Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert_eq!(bind("::1"), Ok(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert_eq!(bind("::"), Ok(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
-    }
-
-    #[cfg(feature = "server")]
-    #[test]
-    fn an_unset_bind_follows_the_setting_then_the_posture() {
+    fn an_unset_bind_is_loopback_unless_the_app_sets_all_interfaces() {
         use std::net::{IpAddr, Ipv4Addr};
         let unset = || Err(std::env::VarError::NotPresent);
-        let loopback = Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let all = Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert_eq!(host_bind_from(unset(), None, false), loopback);
-        assert_eq!(host_bind_from(unset(), None, true), all);
+        let loopback = Ok(ListenHost::Loopback(LoopbackIp::DEFAULT));
+        assert_eq!(host_bind_from(unset(), None), loopback);
+        assert_eq!(host_bind_from(unset(), Some(HostMode::EnvDriven)), loopback);
+        assert_eq!(host_bind_from(unset(), Some(HostMode::Loopback)), loopback);
         assert_eq!(
-            host_bind_from(unset(), Some(HostMode::Loopback), true),
-            loopback
+            host_bind_from(unset(), Some(HostMode::AllInterfaces)),
+            Ok(ListenHost::Exposed {
+                ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                by: ExposedBy::Setting
+            })
         );
         assert_eq!(
-            host_bind_from(unset(), Some(HostMode::AllInterfaces), false),
-            all
-        );
-        assert_eq!(
-            host_bind_from(unset(), Some(HostMode::EnvDriven), false),
-            loopback
+            LoopbackIp::DEFAULT.0,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "the only default bind address is 127.0.0.1"
         );
     }
 
@@ -906,7 +987,7 @@ mod tests {
     fn a_non_unicode_bind_is_refused() {
         use std::os::unix::ffi::OsStringExt as _;
         let raw = std::ffi::OsString::from_vec(b"127.0.0.\xFF".to_vec());
-        let outcome = host_bind_from(Err(std::env::VarError::NotUnicode(raw)), None, false);
+        let outcome = host_bind_from(Err(std::env::VarError::NotUnicode(raw)), None);
         assert!(outcome.is_err_and(|r| r.to_string().contains("\\xFF")));
     }
 

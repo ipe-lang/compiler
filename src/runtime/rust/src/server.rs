@@ -1953,6 +1953,83 @@ fn endpoint_param_refusal(routes: &[ServerRoute]) -> Option<EndpointParamRefusal
     })
 }
 
+/// An app listener's [`ListenHost`](crate::app_config::ListenHost) whose
+/// listen scope is already recorded for the process.
+///
+/// Built only by [`RecordedHost::record`] and the one input
+/// [`bind_app_listener`] takes, so no app listener binds an address whose
+/// scope the console gates have not seen.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecordedHost(crate::app_config::ListenHost);
+
+impl RecordedHost {
+    /// Record `host`'s listen scope for the process, then carry it to the bind.
+    pub(crate) fn record(host: crate::app_config::ListenHost) -> Self {
+        crate::telemetry::record_bind(host.ip());
+        Self(host)
+    }
+
+    /// The socket address this host binds on `port`.
+    pub(crate) const fn addr(self, port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(self.0.ip(), port)
+    }
+}
+
+/// Bind an app listener on `host` and `port`, then log where it listens and,
+/// for an exposed host, who exposed it.
+///
+/// The one app bind site: `Server.listen` and `serve_web` both bind through
+/// it, so neither keeps a `TcpListener::bind` of its own.
+///
+/// # Errors
+///
+/// The bind's own error, for the caller to word.
+pub(crate) async fn bind_app_listener(
+    tag: &'static str,
+    host: RecordedHost,
+    port: u16,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let addr = host.addr(port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    crate::system::emit_runtime_log(tag, &format!("listening on http://{addr}"));
+    for line in exposure_warning(host.0).iter().flatten() {
+        crate::system::emit_runtime_log(tag, line);
+    }
+    Ok(listener)
+}
+
+/// The startup warning an exposed app listener prints, one message per line;
+/// `None` for a loopback listener.
+///
+/// The address is the parsed `IpAddr`, never the raw `IPE_HTTP_BIND` text.
+pub(crate) fn exposure_warning(host: crate::app_config::ListenHost) -> Option<[String; 2]> {
+    use crate::app_config::{ExposedBy, ListenHost};
+    let ListenHost::Exposed { ip, by } = host else {
+        return None;
+    };
+    let reach = if ip.is_unspecified() {
+        format!("every interface ({ip})")
+    } else {
+        ip.to_string()
+    };
+    let (cause, keep_local) = match by {
+        ExposedBy::EnvVar => (
+            format!("IPE_HTTP_BIND={ip}"),
+            "unset IPE_HTTP_BIND (the default is 127.0.0.1)",
+        ),
+        ExposedBy::Setting => (
+            "the app sets Host.bind Host.allInterfaces".to_owned(),
+            "set Host.bind Host.loopback, or IPE_HTTP_BIND=127.0.0.1",
+        ),
+    };
+    Some([
+        format!(
+            "warning: listening on {reach} because {cause}; other hosts on the network can reach this app"
+        ),
+        format!("  to keep it local, {keep_local}"),
+    ])
+}
+
 pub fn server_listen<E: From<String> + Send + 'static>(
     port: i64,
     routes: Vec<ServerRoute>,
@@ -1971,9 +2048,8 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             return IpeResult::Err(msg.into());
         }
         // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
-        // (env) > the app's `Host.bind` setting > the posture fallback
-        // (loopback unless production). A present `IPE_HTTP_BIND` that is not
-        // an IP address refuses the listener.
+        // (env) > the app's `Host.bind` setting > `127.0.0.1`. A present
+        // `IPE_HTTP_BIND` that is not an IP address refuses the listener.
         let host = match crate::app_config::resolve_host_bind() {
             Ok(host) => host,
             Err(refusal) => return IpeResult::Err(format!("Server.listen: {refusal}").into()),
@@ -2105,16 +2181,15 @@ pub fn server_listen<E: From<String> + Send + 'static>(
             return IpeResult::Err(format!("Server.listen: port {port} is not a TCP port").into());
         };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
-        crate::telemetry::record_bind(host);
-        let addr = std::net::SocketAddr::new(host, port);
-        let listener = match tokio::net::TcpListener::bind(addr).await {
+        let host = RecordedHost::record(host);
+        let addr = host.addr(port);
+        let listener = match bind_app_listener("http.server", host, port).await {
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return IpeResult::Err(resolved.addr_in_use_message().into());
             }
             Err(e) => return IpeResult::Err(format!("Server.listen: bind {}: {}", addr, e).into()),
         };
-        crate::system::emit_runtime_log("http.server", &format!("listening on http://{addr}"));
         // with_connect_info so each request carries the peer SocketAddr —
         // populates ServerRequest.remoteAddr (also used by per-IP rate limiting).
         let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -3685,6 +3760,76 @@ mod tests {
             "{msg}"
         );
         println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
+    }
+
+    /// A loopback app listener prints no exposure warning.
+    #[test]
+    fn a_loopback_listener_prints_no_exposure_warning() {
+        use crate::app_config::{ListenHost, LoopbackIp};
+        assert_eq!(
+            exposure_warning(ListenHost::Loopback(LoopbackIp::DEFAULT)),
+            None
+        );
+    }
+
+    /// An exposure the operator opted in to warns with the parsed address and
+    /// the way back to loopback.
+    #[test]
+    fn an_env_exposure_warns_with_the_parsed_address() {
+        use crate::app_config::{ExposedBy, ListenHost};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let warn = |ip: IpAddr| {
+            exposure_warning(ListenHost::Exposed {
+                ip,
+                by: ExposedBy::EnvVar,
+            })
+        };
+        assert_eq!(
+            warn(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Some([
+                "warning: listening on every interface (0.0.0.0) because IPE_HTTP_BIND=0.0.0.0; \
+                 other hosts on the network can reach this app"
+                    .to_owned(),
+                "  to keep it local, unset IPE_HTTP_BIND (the default is 127.0.0.1)".to_owned(),
+            ])
+        );
+        // `0:0::0` parses to the unspecified IPv6 address, printed `::`.
+        let parsed: Result<IpAddr, _> = "0:0::0".parse();
+        assert_eq!(parsed, Ok(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        let Ok(parsed) = parsed else { return };
+        let first = warn(parsed).map(|[first, _]| first).unwrap_or_default();
+        assert!(
+            first.contains("every interface (::) because IPE_HTTP_BIND=::;")
+                && !first.contains("0:0::0"),
+            "{first}"
+        );
+        let first = warn(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)))
+            .map(|[first, _]| first)
+            .unwrap_or_default();
+        assert!(
+            first.starts_with("warning: listening on 192.0.2.7 because IPE_HTTP_BIND=192.0.2.7;"),
+            "{first}"
+        );
+    }
+
+    /// An exposure the app's own setting opted in to names the setting.
+    #[test]
+    fn a_setting_exposure_warns_naming_the_setting() {
+        use crate::app_config::{ExposedBy, ListenHost};
+        use std::net::{IpAddr, Ipv4Addr};
+        assert_eq!(
+            exposure_warning(ListenHost::Exposed {
+                ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                by: ExposedBy::Setting,
+            }),
+            Some([
+                "warning: listening on every interface (0.0.0.0) because the app sets \
+                 Host.bind Host.allInterfaces; other hosts on the network can reach this app"
+                    .to_owned(),
+                "  to keep it local, set Host.bind Host.loopback, or IPE_HTTP_BIND=127.0.0.1"
+                    .to_owned(),
+            ])
+        );
     }
 
     /// A present `IPE_HTTP_BIND` that is not an IP address refuses the listener

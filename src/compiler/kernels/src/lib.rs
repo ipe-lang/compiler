@@ -2978,7 +2978,7 @@ pub enum StdlibKernel {
     HostLoopback,
     /// `Host.allInterfaces : HostMode` — bind every interface. Projects to tag `1`.
     HostAllInterfaces,
-    /// `Host.envDriven : HostMode` — defer to the environment / build profile.
+    /// `Host.envDriven : HostMode` — `IPE_HTTP_BIND` if set, else `127.0.0.1`.
     /// Projects to tag `2`.
     HostEnvDriven,
     /// `Level.debug : LogLevel` — the debug severity. Projects to tag `0`.

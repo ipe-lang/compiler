@@ -723,13 +723,15 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── HTTP client ───────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_HTTP_BIND",
-        default: "unset (loopback in dev, all-interfaces in release)",
+        default: "unset: 127.0.0.1 (set 0.0.0.0 to accept other hosts; a warning is printed)",
         purpose: "Override the IP address the HTTP server binds: IPv4 such as \
                   `127.0.0.1`, or bare IPv6 such as `::1`. A hostname, a socket \
                   form (`host:port`), brackets, a scope id, padding, or an empty \
                   value refuses startup. Takes precedence over the `Host.bind` \
-                  setting and the build-profile default. The conservative loopback \
-                  default keeps a dev server off the LAN.",
+                  setting. Unset, every build (release included) binds loopback \
+                  unless the app sets `Host.bind Host.allInterfaces`; a container \
+                  or PaaS deploy sets `IPE_HTTP_BIND=0.0.0.0`. A non-loopback bind \
+                  prints a startup warning naming the address and who opted in.",
         subsystem: Subsystem::Http,
         class: Class::SecurityTunable,
     },
