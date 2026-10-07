@@ -940,16 +940,42 @@ fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliEr
 /// before the file reaches `cargo`.
 ///
 /// # Errors
-/// [`CliError::Io`] on a file-read failure; [`CliError::PackageAudit`] when
-/// the file does not parse as Rust.
+/// [`CliError::Io`] on a file-read failure; [`CliError::PackageAudit`]
+/// ([`Check::Provenance`]) when the file is over a scan ceiling (too large, too
+/// deep, too many tokens) or does not parse as Rust.
 fn first_hit(root: &Path, file: &Path) -> Result<Option<LocatedHit>, CliError> {
     let src = crate::io_bounded::read_beneath(root, file, crate::io_bounded::FFI_CACHE_CAP)?;
-    let hits = panic_scan::scan_str(&src).map_err(|_| {
+    let hits = panic_scan::scan_str(&src).map_err(|error| {
+        let why = match error {
+            panic_scan::ScanError::TooLarge { bytes, ceiling } => format!(
+                "is too large to audit (at least {bytes} bytes, over the {ceiling}-byte ceiling)"
+            ),
+            panic_scan::ScanError::TooDeep {
+                line,
+                depth,
+                ceiling,
+            } => format!(
+                "nests too deep to audit (line {line} nests {depth} units, over the ceiling of \
+                 {ceiling})"
+            ),
+            panic_scan::ScanError::TooManyTokens { count, ceiling } => {
+                format!("holds too many tokens to audit ({count}, over the ceiling of {ceiling})")
+            }
+            panic_scan::ScanError::Parse { line, source } => {
+                format!("does not parse as Rust (line {line}: {source})")
+            }
+            panic_scan::ScanError::Thread(source) => {
+                format!("could not be audited: the parse thread could not start ({source})")
+            }
+            panic_scan::ScanError::Aborted => {
+                "could not be audited: the parse thread aborted".to_owned()
+            }
+        };
         reject(
             Check::Provenance,
             format!(
-                "emitted `{}` does not parse as Rust — the no-panic audit cannot attest \
-                 its content; the file is refused rather than admitted",
+                "emitted `{}` {why} — the no-panic audit cannot attest its content; the \
+                 file is refused rather than admitted",
                 file.display()
             ),
         )
@@ -2462,6 +2488,53 @@ mod tests {
             result.unwrap().is_some(),
             "a panic-bearing file must return Ok(Some(_))"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `_bindings.rs` whose body is `n` nested `!` operators.
+    fn nested_not_bindings(n: usize) -> String {
+        format!("pub fn f() -> bool {{ {}true }}\n", "! ".repeat(n))
+    }
+
+    #[test]
+    fn first_hit_too_deep_source_is_a_provenance_refusal() {
+        // Past the scanner's depth ceiling the parse would overflow its stack;
+        // the audit must refuse with a typed reject, never crash or admit.
+        let dir = make_test_dir("first-hit-too-deep");
+        let file = dir.join("x_bindings.rs");
+        let over = panic_scan::NestDepth::CEILING.get().saturating_add(1);
+        std::fs::write(&file, nested_not_bindings(over)).expect("write deep fixture");
+        let result = super::first_hit(&dir, &file);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::PackageAudit(Rejection {
+                    check: Check::Provenance,
+                    message,
+                })) if message.contains("too deep")
+            ),
+            "{:?}",
+            result.as_ref().err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_hit_source_at_the_depth_ceiling_is_audited() {
+        // Each `!` adds one measure unit, so the base depth plus the remaining
+        // budget lands exactly on the ceiling.
+        let ceiling = panic_scan::NestDepth::CEILING.get();
+        let base = panic_scan::measure(&nested_not_bindings(0))
+            .expect("the base fixture lexes")
+            .depth;
+        let at = nested_not_bindings(ceiling.saturating_sub(base));
+        let measured = panic_scan::measure(&at).expect("the control lexes").depth;
+        assert_eq!(measured, ceiling, "the control must sit at the ceiling");
+        let dir = make_test_dir("first-hit-at-ceiling");
+        let file = dir.join("x_bindings.rs");
+        std::fs::write(&file, at).expect("write control fixture");
+        let result = super::first_hit(&dir, &file);
+        assert!(matches!(result, Ok(None)), "{:?}", result.as_ref().err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

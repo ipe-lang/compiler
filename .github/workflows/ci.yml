@@ -277,6 +277,13 @@ jobs:
         if: steps.classify.outputs.panic_scan != 'false'
         run: cargo test --manifest-path tools/panic-scan/Cargo.toml
 
+      - name: Calibrate the parse stack against the depth ceiling
+        if: steps.classify.outputs.panic_scan != 'false'
+        # Optimised, every recursive shape at the depth ceiling must parse,
+        # visit and drop on a quarter of the parse stack: the release scanner's
+        # 4x stack margin.
+        run: cargo test --release --manifest-path tools/panic-scan/Cargo.toml --test depth_ceiling
+
       - name: Build the scanner
         if: steps.classify.outputs.panic_scan != 'false'
         run: cargo build --release --manifest-path tools/panic-scan/Cargo.toml
