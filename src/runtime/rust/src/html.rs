@@ -177,16 +177,12 @@ const VOID: &[&str] = &[
     "track", "wbr",
 ];
 
-/// True for HTML void elements (no children, self-closing). Exposed for the
-/// style-injection pass, which must hoist a `<style>` to a sibling slot after a
-/// void element because `render_into` emits no children for void tags.
-/// Its sole consumer is the render-core `style_inject` pass, so it is gated on
-/// the `web-core` render floor (every render host — served web, browser-WASM,
-/// native webview — selects it); a build with no render core that gained a
-/// caller would fail loud.
-#[cfg(feature = "web-core")]
+/// True for HTML void elements (no children, self-closing), matched without
+/// regard to ASCII case as the HTML tokenizer lowercases tag names. The render
+/// sink self-closes these and the style-injection pass hoists a `<style>` to a
+/// sibling slot after them, so both read the one predicate.
 pub(crate) fn is_void(tag: &str) -> bool {
-    VOID.contains(&tag)
+    VOID.iter().any(|v| tag.eq_ignore_ascii_case(v))
 }
 
 /// Render an `Html` tree to an HTML string. Text is HTML-escaped; Raw is
@@ -457,7 +453,7 @@ fn render_into_ctx<M>(node: &Html<M>, s: &mut String, select_value: Option<&str>
                     s.push('"');
                 }
             }
-            if VOID.contains(&tag.as_str()) {
+            if is_void(tag) {
                 s.push_str(" />");
                 return;
             }
@@ -1802,6 +1798,19 @@ mod tests {
             assert_eq!(out.matches(closes.as_str()).count(), 1, "{out}");
             assert!(!out.contains("<img"), "{out}");
         }
+    }
+
+    /// A void tag in any ASCII case self-closes with no children, as the
+    /// browser's tokenizer treats it.
+    #[test]
+    fn void_tags_match_without_regard_to_ascii_case() {
+        for tag in ["br", "BR", "Img", "INPUT"] {
+            assert!(is_void(tag), "{tag}");
+            let node: Html<()> = Html::HElement(tag.into(), vec![], vec![Html::HText("x".into())]);
+            assert_eq!(render_html(&node), format!("<{tag} />"));
+        }
+        assert!(!is_void("div"));
+        assert!(!is_void("brx"));
     }
 
     /// A hand-built `<style>` over an untouched trusted raw body (not built by

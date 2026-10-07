@@ -70,13 +70,17 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
     None
 }
 
-/// Emit a whole-subtree innerHTML replace at `id`.
+/// Emit a replace of every child of the element at `id`.
 ///
-/// `parent_body` is how `admit_rendered` admitted the element whose children
-/// are being replaced, so a `<script>`/`<style>` body gets the same
-/// neutralisation the first-paint renderer applies and the SSE replace cannot
-/// smuggle a raw `</script>`/`</style>` into the DOM.
-fn push_html_replace<M>(
+/// `parent_body` is how `admit_rendered` admitted that element. A markup body
+/// is sent as `Patch.html`, which the client parses as markup. A `<script>` or
+/// `<style>` body is a raw-text body: it is sent as `Patch.text`, which the
+/// client assigns to `textContent` without parsing, so the element holds the
+/// same neutralised bytes the first paint's raw-text parse produced. Sent as
+/// `html`, the body would be parsed in a `<div>` context, where an
+/// `<img onerror>` or a `<script src>` inside it is live markup and an entity
+/// such as `&amp;` is decoded.
+fn push_children_replace<M>(
     id: &str,
     parent_body: ElementBody,
     new_kids: &[Html<M>],
@@ -86,7 +90,11 @@ fn push_html_replace<M>(
         return;
     }
     let mut p = Patch::for_id(id);
-    p.html = Some(render_children(parent_body, new_kids));
+    let body = render_children(parent_body, new_kids);
+    match parent_body {
+        ElementBody::Markup => p.html = Some(body),
+        ElementBody::Script | ElementBody::Style => p.text = Some(body),
+    }
     out.push(p);
 }
 
@@ -152,7 +160,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
 
     // Child-count change → replace the whole subtree.
     if ok.len() != nk.len() {
-        push_html_replace(id, body, nk, out);
+        push_children_replace(id, body, nk, out);
         return;
     }
 
@@ -165,7 +173,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                 // (single-text is the fast path above; anything else is a
                 // parent html-replace).
                 if o != n {
-                    push_html_replace(id, body, nk, out);
+                    push_children_replace(id, body, nk, out);
                     return;
                 }
             }
@@ -174,7 +182,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
             // the same body class the first paint used.
             (Html::HRaw(o), Html::HRaw(n)) => {
                 if o != n {
-                    push_html_replace(id, body, nk, out);
+                    push_children_replace(id, body, nk, out);
                     return;
                 }
             }
@@ -182,14 +190,14 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                 // A child that gains or loses admission appears in or vanishes
                 // from the page, so the parent's subtree is replaced.
                 if is_refused_element(oc) != is_refused_element(nc) {
-                    push_html_replace(id, body, nk, out);
+                    push_children_replace(id, body, nk, out);
                     return;
                 }
                 diff_node_depth(oc, nc, out, child_depth);
             }
             // Tag / kind mismatch → replace the subtree at the parent.
             _ => {
-                push_html_replace(id, body, nk, out);
+                push_children_replace(id, body, nk, out);
                 return;
             }
         }
@@ -587,11 +595,21 @@ mod tests {
         ids(&mut old);
         ids(&mut new);
         let p = diff(&old, &new);
-        assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
-        let html = p[0].html.as_deref().expect("expected html field on patch");
+        assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
+        let Some(patch) = p.first() else {
+            return;
+        };
         assert!(
-            !html.to_ascii_lowercase().contains("</script"),
-            "`</script` byte run must be neutralised; got: {html:?}"
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
+        );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
+        assert!(
+            !text.to_ascii_lowercase().contains("</script"),
+            "`</script` byte run must be neutralised; got: {text:?}"
         );
     }
 
@@ -615,15 +633,25 @@ mod tests {
         ids(&mut old);
         ids(&mut new);
         let p = diff(&old, &new);
-        assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
-        let html = p[0].html.as_deref().expect("expected html field on patch");
+        assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
+        let Some(patch) = p.first() else {
+            return;
+        };
         assert!(
-            !html.contains("</style"),
-            "`</style` byte run must be stripped; got: {html:?}"
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
+        );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
+        assert!(
+            !text.contains("</style"),
+            "`</style` byte run must be stripped; got: {text:?}"
         );
         assert!(
-            !html.contains("<script"),
-            "no markup may open; got: {html:?}"
+            !text.contains("<script"),
+            "no markup may open; got: {text:?}"
         );
     }
 
@@ -765,9 +793,51 @@ mod tests {
         );
     }
 
+    /// True when `s` holds a `<` the HTML tokenizer would read as the start of
+    /// a tag, end tag, comment or declaration.
+    fn has_markup_opener(s: &str) -> bool {
+        s.as_bytes().windows(2).any(|w| {
+            matches!(w, [b'<', c] if c.is_ascii_alphabetic() || matches!(*c, b'/' | b'!' | b'?'))
+        })
+    }
+
+    /// A trusted raw `<script>` body (an `unsafeJsonLd`/`unsafeScript` value
+    /// holding user data but no `</script`) that changes is sent as text, the
+    /// neutralised bytes the first paint wrote, never as html the client would
+    /// parse into a live `<img onerror>` or `<script src>`.
+    #[test]
+    fn diff_changed_trusted_script_body_is_a_text_patch() {
+        let script = |body: &str| -> Html<()> {
+            Html::HElement("script".into(), vec![], vec![Html::HRaw(body.into())])
+        };
+        let body = r#"["<script src=//e><img src=x onerror=alert(1)>"]"#;
+        let mut old: Html<()> = Html::HElement("div".into(), vec![], vec![script("null")]);
+        let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![script(body)]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        assert!(
+            patches
+                .iter()
+                .all(|p| p.html.as_deref().is_none_or(|h| !has_markup_opener(h))),
+            "no html patch may carry a markup opener: {patches:?}"
+        );
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_script");
+        assert!(patch.html.is_none(), "{patch:?}");
+        assert_eq!(patch.text.as_deref(), Some(body), "{patch:?}");
+        assert!(
+            crate::html::render_html(&new).contains(body),
+            "the text patch holds the first paint's body bytes"
+        );
+    }
+
     /// A trusted raw `<style>` body that changes between renders (a dynamic
-    /// `styleNode`) re-renders the element's body through the style
-    /// neutraliser.
+    /// `styleNode`) is sent as its neutralised text, which keeps an entity such
+    /// as `&amp;` as the bytes CSS reads instead of decoding it.
     #[test]
     fn diff_changed_trusted_style_body_replaces_it() {
         let style = |css: &str| -> Html<()> {
@@ -778,33 +848,39 @@ mod tests {
         let mut new: Html<()> = Html::HElement(
             "div".into(),
             vec![],
-            vec![style("p { color: blue }</style><img src=x>")],
+            vec![style(
+                "p::after { content: \"&amp;\"; color: blue }</style><img src=x>",
+            )],
         );
         ids(&mut old);
         ids(&mut new);
         let patches = diff(&old, &new);
-        assert_eq!(
-            patches.len(),
-            1,
-            "expected one html replace; got {patches:?}"
-        );
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         let Some(patch) = patches.first() else {
             return;
         };
         assert_eq!(patch.id, "r_0_style");
-        let Some(html) = patch.html.as_deref() else {
-            assert!(patch.html.is_some(), "expected an html replace: {patch:?}");
+        assert!(
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
+        );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
             return;
         };
         assert!(
-            html.contains("color: blue"),
-            "new body must render; got {html:?}"
+            text.contains("content: \"&amp;\"; color: blue"),
+            "new body must arrive byte for byte; got {text:?}"
         );
         assert!(
-            !html.contains("</style"),
-            "close tag must be neutralised; got {html:?}"
+            !text.contains("</style"),
+            "close tag must be neutralised; got {text:?}"
         );
-        assert!(!html.contains("<img"), "no markup may open; got {html:?}");
+        assert!(!has_markup_opener(text), "no markup may open; got {text:?}");
+        assert!(
+            crate::html::render_html(&new).contains(text),
+            "the text patch holds the first paint's body bytes"
+        );
     }
 
     /// An unchanged trusted raw body produces no patch.
