@@ -19,8 +19,14 @@
 //! - a path ending in `<type>::bind` for every type in [`BIND_TYPES`], called
 //!   or not (a call, a fn pointer), whatever its qualifying prefix;
 //! - every path segment naming [`SOCKET_BUILDER`], whose bind is a method;
-//! - a `use` renaming one of those types, recorded under its own key, so an
-//!   alias never hides the binds made through it.
+//! - a `use` renaming one of those types, a `type` alias of one, an `impl`
+//!   for one (its `Self::bind`), and a qualified `<T>::bind` self type, each
+//!   recorded under its own key, so no second name hides the binds made
+//!   through it;
+//! - inside a macro body, which is opaque, every other mention of one of those
+//!   types;
+//! - an `include!` and a `#[path]` module (bare or under `cfg_attr`), which
+//!   compile a file under a name this walk does not scan it as.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
@@ -29,8 +35,8 @@ use proc_macro2::{TokenStream, TokenTree};
 use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Expr, Field, FieldValue, ForeignItem, ImplItem, Item, Macro, Path, Stmt,
-    TraitItem, UseTree, Variant,
+    Arm, Attribute, Expr, Field, FieldValue, ForeignItem, ImplItem, Item, Macro, Meta, Path, QSelf,
+    Stmt, TraitItem, Type, UseTree, Variant,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -51,6 +57,9 @@ const SOCKET_BUILDER: &str = "TcpSocket";
 /// The enclosing name of a site outside every function.
 const MODULE_LEVEL: &str = "<module>";
 
+/// The counted form of an `include!`, whose file may lie outside the walk.
+const INCLUDE: &str = "include!";
+
 /// Every admitted bind site: file, enclosing function, counted form, count.
 const ADMITTED: &[(&str, &str, &str, usize)] = &[
     // The one app listener; its address is a resolved `ListenHost`.
@@ -65,7 +74,43 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "TcpListener::bind",
         1,
     ),
+    // A view of the in-tree `config_postgres.rs`, which the walk also reads;
+    // the module's `cfg(test)` lives on its declaration in the crate root.
+    ("config_postgres_test.rs", MODULE_LEVEL, "#[path] mod pg", 1),
 ];
+
+/// The bind type `ty` names, through any parentheses or invisible group.
+fn named_bind_type(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Paren(inner) => named_bind_type(&inner.elem),
+        Type::Group(inner) => named_bind_type(&inner.elem),
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.unraw().to_string())
+            .filter(|name| BIND_TYPES.contains(&name.as_str())),
+        _ => None,
+    }
+}
+
+/// Whether `tokens` hold the identifier `name`, at any group depth.
+fn tokens_name(tokens: TokenStream, name: &str) -> bool {
+    tokens.into_iter().any(|tree| match tree {
+        TokenTree::Group(group) => tokens_name(group.stream(), name),
+        TokenTree::Ident(id) => id.unraw() == name,
+        TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+    })
+}
+
+/// Whether `attrs` give a module a `#[path]`, bare or inside a `cfg_attr`.
+fn sets_a_module_path(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("path")
+            || (attr.path().is_ident("cfg_attr")
+                && matches!(&attr.meta, Meta::List(list) if tokens_name(list.tokens.clone(), "path")))
+    })
+}
 
 /// Every bind form in the production syntax of one file, by enclosing
 /// function and counted form.
@@ -100,6 +145,20 @@ impl Scan {
         }
     }
 
+    /// Records the bind forms in a path read from macro tokens, and every
+    /// other mention of a bind type there: in an opaque body an alias, an
+    /// `impl` or a qualified `<T>::bind` cannot be told from a plain mention.
+    fn token_segments(&mut self, names: &[String]) {
+        self.segments(names);
+        for (at, name) in names.iter().enumerate() {
+            if BIND_TYPES.contains(&name.as_str())
+                && !names.get(at.saturating_add(1)).is_some_and(|n| n == "bind")
+            {
+                self.record(format!("{name} in macro tokens"));
+            }
+        }
+    }
+
     /// Records every bind form in `tokens`, at any group depth.
     fn scan_tokens(&mut self, tokens: TokenStream) {
         let trees: Vec<TokenTree> = tokens.into_iter().collect();
@@ -107,7 +166,7 @@ impl Scan {
         for (at, tree) in trees.iter().enumerate() {
             match tree {
                 TokenTree::Group(group) => {
-                    self.segments(&std::mem::take(&mut path));
+                    self.token_segments(&std::mem::take(&mut path));
                     self.scan_tokens(group.stream());
                 }
                 TokenTree::Ident(id) => {
@@ -119,17 +178,25 @@ impl Scan {
                         )
                     });
                     if !joined {
-                        self.segments(&std::mem::take(&mut path));
+                        self.token_segments(&std::mem::take(&mut path));
+                    }
+                    if id.unraw() == "include"
+                        && matches!(
+                            trees.get(at.saturating_add(1)),
+                            Some(TokenTree::Punct(bang)) if bang.as_char() == '!'
+                        )
+                    {
+                        self.record(INCLUDE.to_owned());
                     }
                     path.push(id.unraw().to_string());
                 }
                 TokenTree::Punct(p) if p.as_char() == ':' => {}
                 TokenTree::Punct(_) | TokenTree::Literal(_) => {
-                    self.segments(&std::mem::take(&mut path));
+                    self.token_segments(&std::mem::take(&mut path));
                 }
             }
         }
-        self.segments(&path);
+        self.token_segments(&path);
     }
 
     /// Scans a function body under its name.
@@ -152,6 +219,21 @@ impl<'ast> Visit<'ast> for Scan {
                 self.within(name, |scan| visit::visit_item(scan, item));
                 return;
             }
+            Item::Type(alias) => {
+                if let Some(name) = named_bind_type(&alias.ty) {
+                    self.record(format!("type {} = {name}", alias.ident.unraw()));
+                }
+            }
+            Item::Impl(block) => {
+                if let Some(name) = named_bind_type(&block.self_ty) {
+                    self.record(format!("impl for {name}"));
+                }
+            }
+            Item::Mod(module) => {
+                if sets_a_module_path(&module.attrs) {
+                    self.record(format!("#[path] mod {}", module.ident.unraw()));
+                }
+            }
             _ => {}
         }
         visit::visit_item(self, item);
@@ -167,6 +249,11 @@ impl<'ast> Visit<'ast> for Scan {
                 let name = f.sig.ident.unraw().to_string();
                 self.within(name, |scan| visit::visit_impl_item(scan, item));
                 return;
+            }
+            ImplItem::Type(alias) => {
+                if let Some(name) = named_bind_type(&alias.ty) {
+                    self.record(format!("type {} = {name}", alias.ident.unraw()));
+                }
             }
             _ => {}
         }
@@ -251,6 +338,13 @@ impl<'ast> Visit<'ast> for Scan {
         visit::visit_path(self, path);
     }
 
+    fn visit_qself(&mut self, qself: &'ast QSelf) {
+        if let Some(name) = named_bind_type(&qself.ty) {
+            self.record(format!("<{name}>"));
+        }
+        visit::visit_qself(self, qself);
+    }
+
     fn visit_use_tree(&mut self, tree: &'ast UseTree) {
         if let UseTree::Rename(r) = tree {
             let name = r.ident.unraw().to_string();
@@ -262,6 +356,14 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
+        if mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident.unraw() == "include")
+        {
+            self.record(INCLUDE.to_owned());
+        }
         self.scan_tokens(mac.tokens.clone());
         visit::visit_macro(self, mac);
     }
@@ -334,6 +436,42 @@ fn open() {
             (MODULE_LEVEL, "use UdpSocket as U", 1),
             ("open", "TcpListener::bind", 1),
             ("open", "TcpSocket", 1),
+        ])
+    );
+}
+
+#[test]
+fn an_alias_a_qualified_self_an_impl_and_an_unscanned_source_are_counted() {
+    let src = r#"
+type Listener = (tokio::net::TcpListener);
+impl Ext for std::net::UdpSocket {
+    type Sock = UdpSocket;
+    fn make(a: A) -> Self { Self::bind(a) }
+}
+fn open() {
+    let _ = <TcpListener>::bind(addr);
+    m! { type L = TcpListener; let _ = <UdpSocket>::bind(addr); include!("x.rs"); }
+    include!("../elsewhere.rs");
+}
+#[path = "../elsewhere.rs"]
+mod hidden;
+#[cfg_attr(unix, cfg_attr(all(), path = "../unix.rs"))]
+mod hidden_unix;
+#[cfg_attr(unix, allow(dead_code))]
+mod plain;
+"#;
+    assert_eq!(
+        bind_sites("fixture", src),
+        counted(&[
+            (MODULE_LEVEL, "type Listener = TcpListener", 1),
+            (MODULE_LEVEL, "impl for UdpSocket", 1),
+            (MODULE_LEVEL, "type Sock = UdpSocket", 1),
+            (MODULE_LEVEL, "#[path] mod hidden", 1),
+            (MODULE_LEVEL, "#[path] mod hidden_unix", 1),
+            ("open", "<TcpListener>", 1),
+            ("open", "TcpListener in macro tokens", 1),
+            ("open", "UdpSocket in macro tokens", 1),
+            ("open", INCLUDE, 2),
         ])
     );
 }
