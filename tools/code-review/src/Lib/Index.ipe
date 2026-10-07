@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -20,6 +20,7 @@ import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (PathError, Root, RootMap, Tag)
+import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (DbRole(..), IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
@@ -651,11 +652,11 @@ singleInt what rows =
 -- page rows, the open count and the unit count describe the same index
 -- state and no write between two reads can make them disagree. The module
 -- exposes no other reader of the page, the counts or the size, so no
--- caller can read one of them outside this transaction. `stamp` is
--- the review-log head the `reviewed` copy was last brought up to, or
--- Nothing when the copy has never been stamped or was marked stale; the
--- caller compares it with the review database's head before trusting the
--- rest.
+-- caller can read one of them outside this transaction. `stamp` is the
+-- text stamped on the `reviewed` copy when it was last brought up to the
+-- review log, or Nothing when the copy has never been stamped or was marked
+-- stale; the caller reads it through `stampStatus` against the review
+-- database's head before trusting the rest.
 type alias Snapshot =
     { stamp : Maybe String
     , rows : List PendingRow
@@ -703,53 +704,215 @@ readStamp conn =
                 Task.fail (Error.unexpected "reviewed_stamp holds more than one row")
 
 
--- The identity of the review log: the hash-chain head after its last
--- decision. Opaque: minted only by `chainHeadDecoder` (a read of the review
--- database's `review_head`) and `chainLink` (the next link over a decided
--- pair), so a head is never built from a count or a bare string.
+-- The review log's head: the log's id, the seq of its last entry (0 while
+-- the log is empty) and that entry's mac (`genesis` while it is empty).
+-- Opaque: minted only by `chainHeadDecoder` (a read of the review
+-- database's `review_log_head`) and `chainNext` (the head after one more
+-- entry), so a head is never built from a count or a bare string.
 type ChainHead
-    = ChainHead String
+    = ChainHead { logId : String, seq : Int, mac : String }
 
 
 chainHeadDecoder : Db.Decode.Decoder ChainHead
 chainHeadDecoder =
-    Db.Decode.succeed (\head -> ChainHead head)
+    Db.Decode.succeed (\logId seq mac -> ChainHead { logId = logId, seq = seq, mac = mac })
+        |> Db.Decode.required "log_id" (Db.Decode.string "log_id")
+        |> Db.Decode.required "seq" (Db.Decode.int "seq")
         |> Db.Decode.required "head" (Db.Decode.string "head")
 
 
--- A head as it is stored and compared.
+-- The head once the entry whose mac is `mac` is appended at the next seq.
+chainNext : ChainHead -> String -> ChainHead
+chainNext head mac =
+    case head of
+        ChainHead h ->
+            ChainHead { logId = h.logId, seq = h.seq + 1, mac = mac }
+
+
+-- A head as it is stamped and compared: the log id, the seq and the mac.
 chainHeadText : ChainHead -> String
 chainHeadText head =
     case head of
-        ChainHead text ->
-            text
+        ChainHead h ->
+            h.logId ++ ":" ++ String.fromInt h.seq ++ ":" ++ h.mac
 
 
--- The head after `prev` records the decision on (uid, body_hash): the
--- SHA-256 of the three parts, each written as its decimal length, `:`, then
--- the part, so no choice of uid or hash can make two different triples hash
--- the same input.
-chainLink : ChainHead -> Uid -> String -> ChainHead
-chainLink prev uid hash =
-    ChainHead (Crypto.sha256 (lengthPrefixed [ chainHeadText prev, Uid.toString uid, hash ]))
+-- The id of the log a head belongs to; every entry's mac covers it.
+chainLogId : ChainHead -> String
+chainLogId head =
+    case head of
+        ChainHead h ->
+            h.logId
 
 
+-- The seq of the head's last entry, 0 for an empty log.
+chainSeq : ChainHead -> Int
+chainSeq head =
+    case head of
+        ChainHead h ->
+            h.seq
+
+
+-- The mac of the head's last entry, `genesis` for an empty log: the `prev`
+-- the next entry carries.
+chainMac : ChainHead -> String
+chainMac head =
+    case head of
+        ChainHead h ->
+            h.mac
+
+
+-- The parts, each written as its decimal length in code points, `:`, then
+-- the part, so no choice of parts can make two different lists produce the
+-- same text.
 lengthPrefixed : List String -> String
 lengthPrefixed parts =
     String.concat (List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part) parts)
 
 
--- What recording a decision did to the review log: a new row moved the head
--- from `prev` to `head`, or the pair was already decided and nothing moved.
+-- What a walk of the whole review log found: every entry in seq order from
+-- 1, each linking the mac before it, ending at the head; or the first entry
+-- at which that fails.
+type ChainVerdict
+    = Intact
+    | BrokenAt Int
+
+
+-- What the `reviewed` copy was rebuilt under: a signing key and the chain
+-- verdict of the log it read, or no key, under which nothing is counted.
+type LogStatus
+    = Signed ChainVerdict
+    | Unsigned
+
+
+-- The text stamped on the `reviewed` copy: the head it was brought up to
+-- and the status it was rebuilt under. Opaque: built only by `signedStamp`
+-- and `unsignedStamp`, and read back only through `stampStatus`.
+type Stamp
+    = Stamp String
+
+
+stampText : Stamp -> String
+stampText stamp =
+    case stamp of
+        Stamp text ->
+            text
+
+
+-- A stamp under `key`: its mac covers the head and the verdict, so a copy
+-- rebuilt under another key, or a verdict written by anything but this
+-- tool, never reads as current.
+signedStamp : MacKey -> ChainHead -> ChainVerdict -> Stamp
+signedStamp key head verdict =
+    let
+        word =
+            verdictWord verdict
+    in
+    Stamp (ReviewKey.sign key (stampInput head word) ++ " " ++ word ++ " " ++ chainHeadText head)
+
+
+-- The stamp of a copy rebuilt with no key: it counts nothing.
+unsignedStamp : ChainHead -> Stamp
+unsignedStamp head =
+    Stamp ("read-only " ++ chainHeadText head)
+
+
+stampInput : ChainHead -> String -> String
+stampInput head word =
+    lengthPrefixed [ "ipe-code-review/reviewed-stamp/v1", chainHeadText head, word ]
+
+
+verdictWord : ChainVerdict -> String
+verdictWord verdict =
+    case verdict of
+        Intact ->
+            "intact"
+
+        BrokenAt n ->
+            "broken-" ++ String.fromInt n
+
+
+verdictOfWord : String -> Maybe ChainVerdict
+verdictOfWord word =
+    if word == "intact" then
+        Just Intact
+
+    else if String.startsWith "broken-" word then
+        String.toInt (String.dropLeft (String.length "broken-") word)
+            |> Maybe.andThen positiveEntry
+
+    else
+        Nothing
+
+
+positiveEntry : Int -> Maybe ChainVerdict
+positiveEntry n =
+    if n >= 1 then
+        Just (BrokenAt n)
+
+    else
+        Nothing
+
+
+-- The status a stamp records, when it is the stamp `key` would write for
+-- `head`: Nothing for a missing stamp, a stamp of another head, a stamp
+-- written under another key or with no key by a signing server, and a
+-- signed stamp read by a server with no key. Its mac is parsed once and
+-- verified in constant time.
+stampStatus : ReviewKey -> ChainHead -> Maybe String -> Maybe LogStatus
+stampStatus key head stamp =
+    case stamp of
+        Nothing ->
+            Nothing
+
+        Just text ->
+            case key of
+                ReadOnly ->
+                    if text == stampText (unsignedStamp head) then
+                        Just Unsigned
+
+                    else
+                        Nothing
+
+                Signing macKey ->
+                    signedStatus macKey head text
+
+
+signedStatus : MacKey -> ChainHead -> String -> Maybe LogStatus
+signedStatus key head text =
+    case String.split " " text of
+        macHex :: word :: rest ->
+            if String.join " " rest == chainHeadText head then
+                case ( verdictOfWord word, Crypto.macFromHex macHex ) of
+                    ( Just verdict, Just mac ) ->
+                        if ReviewKey.verifies key (stampInput head word) mac then
+                            Just (Signed verdict)
+
+                        else
+                            Nothing
+
+                    _ ->
+                        Nothing
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+-- What recording a decision did to the review log: a new entry moved the
+-- head, so the copy's stamp moves from `prev` to `next`; or the pair was
+-- already decided and nothing moved.
 type Written
-    = Inserted { prev : ChainHead, head : ChainHead }
+    = Inserted { prev : Stamp, next : Stamp }
     | AlreadyDecided
 
 
 -- The review app consumes and clears explicitly: after a unit is decided,
 -- one index transaction adds the pair to the `reviewed` copy, deletes the
 -- unit's change_queue row for that hash, and moves the copy's stamp along
--- the review log. A new decision moves the stamp from `prev` to `head` only
+-- the review log. A new decision moves the stamp from `prev` to `next` only
 -- if it still reads `prev`; any other stamp means the copy missed a
 -- decision, so the stamp row is deleted and the next load rebuilds the copy
 -- rather than vouch for it. An already-decided pair leaves the stamp alone.
@@ -776,7 +939,7 @@ moveStamp conn written =
 
         Inserted link ->
             do
-                moved <- Db.exec conn "UPDATE reviewed_stamp SET head = ? WHERE one = 1 AND head = ?" [ SqlString (chainHeadText link.head), SqlString (chainHeadText link.prev) ]
+                moved <- Db.exec conn "UPDATE reviewed_stamp SET head = ? WHERE one = 1 AND head = ?" [ SqlString (stampText link.next), SqlString (stampText link.prev) ]
                 if moved == 1 then
                     Task.succeed ()
 
@@ -785,9 +948,9 @@ moveStamp conn written =
                         |> Task.map (\_ -> ())
 
 
--- A decided (uid, body_hash) pair as the review table holds it. Opaque:
--- built only by `decidedPairDecoder`, which `Lib.Db.decidedPairsAfter` runs
--- over the review table, so a refill drains only pairs read back from it.
+-- A decided (uid, body_hash) pair as the review log holds it. Opaque:
+-- built only by `decidedPairDecoder`, which `Lib.Db` runs over the log rows
+-- whose mac verifies, so a refill drains only pairs read back from them.
 type DecidedPair
     = DecidedPair { uid : Uid, hash : String }
 
@@ -840,13 +1003,12 @@ drainPair conn uid hash =
 
 -- The `reviewed` copy rebuilt in one index transaction: every row is
 -- deleted, `refill` re-adds the decided pairs through `drainDecided` on the
--- transaction's connection it is given, and the copy is stamped with `head`,
--- the review-log head the caller read before the refill began. A failed
--- refill rolls the whole rebuild back, leaving the copy and its stamp as
--- they were. The index is the one `settings` names, resolved once at
--- startup.
-rebuildReviewed : IndexSettings -> ChainHead -> (Db.Db -> Task.Task Error a) -> Task.Task Error a
-rebuildReviewed settings head refill =
+-- transaction's connection it is given and returns the stamp of what it
+-- read, and the copy is stamped with it. A failed refill rolls the whole
+-- rebuild back, leaving the copy and its stamp as they were. The index is
+-- the one `settings` names, resolved once at startup.
+rebuildReviewed : IndexSettings -> (Db.Db -> Task.Task Error ( Stamp, a )) -> Task.Task Error a
+rebuildReviewed settings refill =
     do
         conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
         Db.withTransaction conn
@@ -854,8 +1016,8 @@ rebuildReviewed settings head refill =
                 do
                     Db.exec tx "DELETE FROM reviewed" []
                     refilled <- refill tx
-                    Db.exec tx "INSERT OR REPLACE INTO reviewed_stamp (one, head) VALUES (1, ?)" [ SqlString (chainHeadText head) ]
-                    Task.succeed refilled
+                    Db.exec tx "INSERT OR REPLACE INTO reviewed_stamp (one, head) VALUES (1, ?)" [ SqlString (stampText (Tuple.first refilled)) ]
+                    Task.succeed (Tuple.second refilled)
             )
 
 

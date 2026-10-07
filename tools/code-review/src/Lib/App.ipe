@@ -461,7 +461,7 @@ decisionTask settings model uid decision =
 
 decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideOn settings shown decision =
-    LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide settings.index db shown decision)
+    LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide settings.key settings.index db shown decision)
 
 
 -- The drain loop: the decision is already saved (DecisionSaved Ok), so the
