@@ -670,7 +670,7 @@ residualVectorHolds v =
         && Index.residualText spans v.src
         == v.residual
         && (String.isEmpty v.residual || String.startsWith "\n" v.residual)
-        && Index.attest v.residual
+        && Index.attestResidual v.residual
         == v.hash
         && shownTextOf (Index.classifyView (uid "u-file") v.hash (Residual spans) v.src)
         == Just v.residual
@@ -719,13 +719,16 @@ fileUnitView name hash mutate =
 -- A file unit loads its residual through the app's one source read: the
 -- lines no other unit of its file covers, the covered run drawn as one
 -- marker row, the uncovered lines numbered from the file. A file unit stored
--- under its whole file's hash is drifted, never shown. Red if a file unit is
--- judged by its line range, or its rows and its hashed text part.
+-- under its whole file's hash, or under the line-range scheme's hash of its
+-- own residual text, is drifted, never shown. Red if a file unit is judged by
+-- its line range, its rows and its hashed text part, or its residual is
+-- attested under the line-range scheme.
 fileUnitShowsResidual : Task.Task Error Bool
 fileUnitShowsResidual =
     do
-        residual <- fileUnitView "ipe-index-file-residual" (Index.attest libResidual) (\_ -> Task.succeed ())
+        residual <- fileUnitView "ipe-index-file-residual" (Index.attestResidual libResidual) (\_ -> Task.succeed ())
         whole <- fileUnitView "ipe-index-file-whole" (Index.attest (String.dropRight 1 fixtureLibRs)) (\_ -> Task.succeed ())
+        viewScheme <- fileUnitView "ipe-index-file-view-scheme" (Index.attest libResidual) (\_ -> Task.succeed ())
         let
             rows =
                 Maybe.map Index.shownRows (Maybe.andThen shownOf residual)
@@ -737,6 +740,8 @@ fileUnitShowsResidual =
                 == Just libResidual
                 && Maybe.map viewTag whole
                 == Just "drifted"
+                && Maybe.map viewTag viewScheme
+                == Just "drifted"
             )
 
 
@@ -746,8 +751,8 @@ fileUnitShowsResidual =
 fileUnitPastChildSpanCeiling : Task.Task Error Bool
 fileUnitPastChildSpanCeiling =
     do
-        past <- fileUnitView "ipe-index-file-spans-past" (Index.attest libResidual) (childUnits Index.childSpanCeiling)
-        at <- fileUnitView "ipe-index-file-spans-at" (Index.attest libResidual) (childUnits (Index.childSpanCeiling - 1))
+        past <- fileUnitView "ipe-index-file-spans-past" (Index.attestResidual libResidual) (childUnits Index.childSpanCeiling)
+        at <- fileUnitView "ipe-index-file-spans-at" (Index.attestResidual libResidual) (childUnits (Index.childSpanCeiling - 1))
         Task.succeed
             (Maybe.map viewTag past
                 == Just ("too large spans " ++ String.fromInt (Index.childSpanCeiling + 1))
@@ -1038,7 +1043,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "Change", "Cursor", "DecidedPair", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Unit", "UnitView", "Written", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainLink", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "loadView", "nameFor", "placeholders", "probe", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "sourceCeiling", "spanOversize", "storedHash", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.

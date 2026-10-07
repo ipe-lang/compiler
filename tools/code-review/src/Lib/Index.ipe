@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, Change(..), Cursor(..), DecidedPair, Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLink, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, sourceCeiling, spanOversize, storedHash, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -903,11 +903,11 @@ nameFor conn uid =
 -- task.
 viewOf : Db.Db -> RootMap -> RowUnit -> Task.Task Error SourceView
 viewOf conn roots row =
-    case parseAttested row.bodyHash of
-        UnknownScheme _ ->
+    case provable (parseAttested row.bodyHash) of
+        Nothing ->
             Task.succeed (Stale UnverifiableHash)
 
-        Sha256 stored ->
+        Just stored ->
             case RepoPath.resolve roots row.path of
                 Err refusal ->
                     Task.succeed (Unreadable (PathRefused refusal))
@@ -1055,7 +1055,7 @@ classifyView uid stored body text =
                     if size > ByteSize.toBytes viewByteCeiling then
                         TooLarge (ViewBytes { size = ByteSize.bytes size })
 
-                    else if attest view == stored then
+                    else if bodyAttest body view == stored then
                         Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored })
 
                     else
@@ -1146,10 +1146,13 @@ langOf stored =
             Highlight.Unknown
 
 
--- A stored `body_hash`, parsed once: an attestation this app can re-prove,
--- or a value under any other scheme (a legacy or unknown hash).
+-- A stored `body_hash`, parsed once: an attestation this app can re-prove
+-- (a line range's under `attestScheme`, a residual's under
+-- `residualScheme`), or a value under any other scheme (a legacy or unknown
+-- hash).
 type AttestedHash
     = Sha256 String
+    | ResidualSha256 String
     | UnknownScheme String
 
 
@@ -1158,8 +1161,26 @@ parseAttested stored =
     if String.startsWith attestScheme stored then
         Sha256 stored
 
+    else if String.startsWith residualScheme stored then
+        ResidualSha256 stored
+
     else
         UnknownScheme stored
+
+
+-- The stored text of an attestation this app can re-prove, or `Nothing`
+-- for any other scheme.
+provable : AttestedHash -> Maybe String
+provable attested =
+    case attested of
+        Sha256 stored ->
+            Just stored
+
+        ResidualSha256 stored ->
+            Just stored
+
+        UnknownScheme _ ->
+            Nothing
 
 
 -- The stored text, for keying review-db lookups only; never a value to
@@ -1168,6 +1189,9 @@ storedHash : AttestedHash -> String
 storedHash attested =
     case attested of
         Sha256 stored ->
+            stored
+
+        ResidualSha256 stored ->
             stored
 
         UnknownScheme stored ->
@@ -1187,6 +1211,9 @@ hashDigits attested =
     case attested of
         Sha256 stored ->
             String.dropLeft (String.length attestScheme) stored
+
+        ResidualSha256 stored ->
+            String.dropLeft (String.length residualScheme) stored
 
         UnknownScheme other ->
             other
@@ -1346,17 +1373,44 @@ type ReadFailure
     | CannotRead String
 
 
--- The scheme prefix of every attestation ipe-index stores in `body_hash`.
+-- The scheme prefix of a line range's attestation in `body_hash`.
 attestScheme : String
 attestScheme =
     "sha256:"
 
 
--- The attestation of a view: the scheme prefix and the view's lowercase hex
--- SHA-256, the exact form ipe-index stores in `units.body_hash`.
+-- The scheme prefix of a file unit's residual attestation in `body_hash`.
+-- Any text is the view of some file, so only a scheme of its own keeps a
+-- residual's hash apart from every `attestScheme` hash, the whole-file hash
+-- an older index stored for the same file unit among them.
+residualScheme : String
+residualScheme =
+    "sha256-residual:"
+
+
+-- The attestation of a line range's view: the scheme prefix and the view's
+-- lowercase hex SHA-256, the exact form ipe-index stores in
+-- `units.body_hash`.
 attest : String -> String
 attest view =
     attestScheme ++ Crypto.sha256 view
+
+
+-- The attestation of a file unit's residual, under `residualScheme`.
+attestResidual : String -> String
+attestResidual residual =
+    residualScheme ++ Crypto.sha256 residual
+
+
+-- The attestation of the text a body names, under that body's scheme.
+bodyAttest : Body -> String -> String
+bodyAttest body text =
+    case body of
+        LineRange _ _ ->
+            attest text
+
+        Residual _ ->
+            attestResidual text
 
 
 -- A file's lines under the attestation's split rule, shared with ipe-index
@@ -1422,9 +1476,9 @@ rowsText rows =
 -- text, a kept line's text the line and a covered row's text empty. A kept
 -- line is never blank, so never empty, and no line holds a `\n`, so the
 -- text splits back into exactly one row list: no source line, whatever its
--- bytes, reads as a covered row. A non-empty residual's text starts with
--- `\n`, which the text of no other residual encoding starts with, so a hash
--- stored under another encoding never matches it. No rows is `""`.
+-- bytes, reads as a covered row. No rows is `""`. It is attested by
+-- `attestResidual`, whose scheme no line range's or whole file's hash
+-- carries.
 residualRowsText : List SourceRow -> String
 residualRowsText rows =
     String.concat (List.map (\row -> "\n" ++ rowText row) rows)
