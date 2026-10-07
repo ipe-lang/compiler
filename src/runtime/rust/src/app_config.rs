@@ -947,6 +947,12 @@ mod tests {
             ("0.0.0.0", IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             ("::", IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
             ("192.0.2.7", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))),
+            // An IPv4-mapped loopback is not `Ipv6Addr::is_loopback`, so it
+            // warns and the console gate treats it as exposed, both closed.
+            (
+                "::ffff:127.0.0.1",
+                IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+            ),
         ] {
             assert_eq!(
                 bind(raw),
@@ -955,6 +961,32 @@ mod tests {
                     by: ExposedBy::EnvVar
                 }),
                 "IPE_HTTP_BIND={raw} must be an exposure the operator opted in to"
+            );
+        }
+    }
+
+    /// The startup warning (a [`ListenHost`]) and the console gates (a
+    /// `ListenScope`) classify every bind address alike, so no address is
+    /// warned about but treated as loopback, or the reverse.
+    #[cfg(feature = "server")]
+    #[test]
+    fn the_listen_host_and_the_console_scope_agree_on_every_address() {
+        use crate::telemetry::ListenScope;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 255, 255, 254)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+        ] {
+            let host = host_bind_from(Ok(ip.to_string()), None);
+            assert_eq!(
+                host.map(|bound| matches!(bound, ListenHost::Loopback(_))),
+                Ok(ListenScope::of(ip) == ListenScope::Loopback),
+                "IPE_HTTP_BIND={ip}: the startup warning and the console gates disagree"
             );
         }
     }

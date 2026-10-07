@@ -1991,11 +1991,21 @@ pub(crate) async fn bind_app_listener(
 ) -> std::io::Result<tokio::net::TcpListener> {
     let addr = host.addr(port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    crate::system::emit_runtime_log(tag, &format!("listening on http://{addr}"));
-    for line in exposure_warning(host.0).iter().flatten() {
-        crate::system::emit_runtime_log(tag, line);
+    for line in startup_lines(addr, host.0) {
+        crate::system::emit_runtime_log(tag, &line);
     }
     Ok(listener)
+}
+
+/// The startup lines an app listener bound on `addr` prints, in order: where
+/// it listens, then, for an exposed host, the [`exposure_warning`].
+///
+/// One list, so the warning cannot be dropped without the `listening on`
+/// readiness line every launcher waits for.
+fn startup_lines(addr: std::net::SocketAddr, host: crate::app_config::ListenHost) -> Vec<String> {
+    let mut lines = vec![format!("listening on http://{addr}")];
+    lines.extend(exposure_warning(host).into_iter().flatten());
+    lines
 }
 
 /// The startup warning an exposed app listener prints, one message per line;
@@ -3769,6 +3779,30 @@ mod tests {
         assert_eq!(
             exposure_warning(ListenHost::Loopback(LoopbackIp::DEFAULT)),
             None
+        );
+    }
+
+    /// The lines `bind_app_listener` prints: the readiness line alone for a
+    /// loopback host, then the exposure warning for an exposed one.
+    #[test]
+    fn an_exposed_listener_prints_the_warning_after_its_readiness_line() {
+        use crate::app_config::{ExposedBy, ListenHost, LoopbackIp};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
+        assert_eq!(
+            startup_lines(loopback, ListenHost::Loopback(LoopbackIp::DEFAULT)),
+            vec!["listening on http://127.0.0.1:8000".to_owned()]
+        );
+        let exposed = ListenHost::Exposed {
+            ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            by: ExposedBy::EnvVar,
+        };
+        let mut expected = vec!["listening on http://0.0.0.0:8000".to_owned()];
+        expected.extend(exposure_warning(exposed).into_iter().flatten());
+        assert_eq!(expected.len(), 3, "an exposed host warns in two lines");
+        assert_eq!(
+            startup_lines(SocketAddr::new(exposed.ip(), 8000), exposed),
+            expected
         );
     }
 
