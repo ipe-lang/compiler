@@ -27,8 +27,8 @@ import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
-import Lib.ReviewKey as ReviewKey
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
@@ -870,24 +870,36 @@ flippedDecisionTampered db =
 
 -- Every signed column is covered by the mac: an edit outside the tool of
 -- the reason, the review time, the body hash or the uid each makes its row
--- read `Tampered` at the pair it now names. Red if any one of the four is
--- left out of the mac input.
+-- read `Tampered` at the pair it now names, while each row counts as
+-- written before its edit and an untouched row still counts after them all.
+-- The rows are signed with the mac input spelled out in the test, so the
+-- counted rows pin the tool's mac input to it: red if any one of the four
+-- is left out of the mac input (no row counts as written), or if an edit
+-- is not refused.
 fieldEditsTampered : Db -> Task.Task Error Bool
 fieldEditsTampered db =
     do
-        appendSigned db (rawRow "edit-reason" "h1" "refuse" (Just "first"))
-        appendSigned db (rawRow "edit-time" "h1" "refuse" (Just "first"))
-        appendSigned db (rawRow "edit-hash" "h1" "approve" Nothing)
-        appendSigned db (rawRow "edit-uid" "h1" "approve" Nothing)
-        tamperLog db "UPDATE review_log SET reason = 'second' WHERE seq = 1" []
-        tamperLog db "UPDATE review_log SET reviewed_at = 99 WHERE seq = 2" []
-        tamperLog db "UPDATE review_log SET body_hash = 'h2' WHERE seq = 3" []
-        tamperLog db "UPDATE review_log SET uid = ? WHERE seq = 4" [ Uid.toSql (uid "edit-other") ]
-        reason <- lookUp db "edit-reason" "h1"
-        time <- lookUp db "edit-time" "h1"
-        hash <- lookUp db "edit-hash" "h2"
-        unit <- lookUp db "edit-other" "h1"
-        Task.succeed (List.all (\found -> whyOf found == Just Tampered) [ reason, time, hash, unit ])
+        appendSigned db (rawRow "edit-control" "h1" "refuse" (Just "first"))
+        reason <- editTampers db (rawRow "edit-reason" "h1" "refuse" (Just "first")) "UPDATE review_log SET reason = 'second' WHERE uid = ?" [] "edit-reason" "h1"
+        time <- editTampers db (rawRow "edit-time" "h1" "refuse" (Just "first")) "UPDATE review_log SET reviewed_at = 99 WHERE uid = ?" [] "edit-time" "h1"
+        hash <- editTampers db (rawRow "edit-hash" "h1" "approve" Nothing) "UPDATE review_log SET body_hash = 'h2' WHERE uid = ?" [] "edit-hash" "h2"
+        unit <- editTampers db (rawRow "edit-uid" "h1" "approve" Nothing) "UPDATE review_log SET uid = ? WHERE uid = ?" [ Uid.toSql (uid "edit-other") ] "edit-other" "h1"
+        control <- lookUp db "edit-control" "h1"
+        Task.succeed (reason && time && hash && unit && isCounted control)
+
+
+-- `row` appended signed and counted as written, then `sql` run on it (its
+-- uid bound last, after `params`); True when it then reads `Tampered` at
+-- the pair `label`, `bodyHash`.
+editTampers : Db -> RawRow -> String -> List SqlValue -> String -> String -> Task.Task Error Bool
+editTampers db row sql params label bodyHash =
+    do
+        appendSigned db row
+        verify <- countingVerifier
+        before <- LibDb.findDecision verify db row.uid row.bodyHash
+        tamperLog db sql (params ++ [ Uid.toSql row.uid ])
+        after <- lookUp db label bodyHash
+        Task.succeed (isCounted before && whyOf after == Just Tampered)
 
 
 -- An absent reason and an empty one sign differently: changing an
@@ -927,14 +939,19 @@ forgedRowTampered db =
 
 
 -- A row signed by the same key for another log (another log id) does not
--- replay into this one: it reads `Tampered`. Red if the log id is left out
--- of the mac input.
+-- replay into this one: it reads `Tampered`, while the same row signed for
+-- this log counts. The counted row pins the tool's mac input to the one the
+-- test spells out, log id included: red if the log id is left out of the
+-- mac input (the row signed for this log stops counting), or if the row of
+-- the other log counts.
 crossLogReplayTampered : Db -> Task.Task Error Bool
 crossLogReplayTampered db =
     do
+        appendSigned db (rawRow "replay-control" "hR" "approve" Nothing)
+        control <- lookUp db "replay-control" "hR"
         appendSignedAs db "0123456789abcdef0123456789abcdef" (rawRow "replay-uid" "hR" "approve" Nothing)
         found <- lookUp db "replay-uid" "hR"
-        Task.succeed (whyOf found == Just Tampered)
+        Task.succeed (isCounted control && whyOf found == Just Tampered)
 
 
 -- Three signed entries, a tamper `edit` applied to them, and the verdict of
