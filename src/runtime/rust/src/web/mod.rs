@@ -2640,7 +2640,7 @@ pub fn web_app<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -2676,7 +2676,7 @@ where
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
             Err(refusal) => {
-                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
             }
         };
         let store = match store::choose_store::<Model, Msg>(
@@ -3119,6 +3119,15 @@ impl std::fmt::Display for StartupRefusal {
     }
 }
 
+/// Every startup refusal is a fault in the app's or the operator's
+/// configuration: typed `InvalidInput`, never the `Unexpected` catch-all.
+#[cfg(feature = "server")]
+impl From<StartupRefusal> for crate::error::IpeError {
+    fn from(cause: StartupRefusal) -> Self {
+        Self::invalid_input(cause.to_string())
+    }
+}
+
 /// The fixed public body of a fail-closed mount's 503. One constant for every
 /// [`StartupRefusal`], so a response never carries the operator detail.
 #[cfg(feature = "server")]
@@ -3204,7 +3213,7 @@ pub fn web_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPag
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -3247,7 +3256,7 @@ where
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
             Err(refusal) => {
-                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
             }
         };
         let store = match store::choose_store::<Model, Msg>(
@@ -5445,7 +5454,7 @@ async fn serve_web<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
 ) -> IpeResult<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromIpeError + Send + 'static,
     // IpeStringify: required by inspect_handler for the live-datum GET
     // (`/_ipe/debug/inspect`). Generated Model types always satisfy this bound.
     Model: Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
@@ -5510,7 +5519,7 @@ where
     // app listener is loopback.
     let host = match web_bind_host() {
         Ok(host) => crate::server::RecordedHost::record(host),
-        Err(cause) => return IpeResult::Err(cause.to_string().into()),
+        Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
     #[cfg(all(feature = "web", feature = "http_client"))]
     let use_console_proxy = console_proxy::ensure_console_proxy().await;
@@ -5529,11 +5538,15 @@ where
         console_proxy_flag,
     ) {
         Ok(app) => app,
-        Err(cause) => return IpeResult::Err(cause.to_string().into()),
+        Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
     let grace = match shutdown_grace() {
         Ok(grace) => grace,
-        Err(refusal) => return IpeResult::Err(format!("Web.tea: {refusal}").into()),
+        Err(refusal) => {
+            return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                format!("Web.tea: {refusal}"),
+            )));
+        }
     };
 
     // Port precedence (shared with `Ipe.Http.Server`): the supervisor's
@@ -5548,16 +5561,19 @@ where
     // (`IPE_HTTP_BIND` > `Host.bind` setting > `127.0.0.1`). `host` is the
     // value resolved and recorded above, before the console gates.
     let Ok(port) = u16::try_from(port) else {
-        return IpeResult::Err(format!("Web.tea: port {port} is not a TCP port").into());
+        return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+            format!("Web.tea: port {port} is not a TCP port"),
+        )));
     };
     let addr = host.addr(port);
     // Logs the bind-address line (stderr), and the exposure warning if any.
     let listener = match crate::server::bind_app_listener("web", host, port).await {
         Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            return IpeResult::Err(resolved.addr_in_use_message().into());
+        Err(e) => {
+            return IpeResult::Err(E::from_ipe_error(
+                resolved.bind_refusal("Web.tea", addr, &e),
+            ));
         }
-        Err(e) => return IpeResult::Err(format!("Web.tea: bind {addr}: {e}").into()),
     };
     // User-facing line on stdout.
     crate::system::write_stdout_line(&format!("Ipe.Web listening on :{port}"));
@@ -9601,27 +9617,83 @@ fn utf8_prefix(bytes: &[u8]) -> &str {
 
 #[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
 mod bind_error_tests {
-    /// The port-taken refusal names `IPE_WEB_PORT` when the operator or the
-    /// default chose the port, and names no operator var when a supervisor did.
+    use crate::telemetry::BuildPosture;
+
+    /// `Web.tea`'s port resolution: `relocation` over the operator's
+    /// `IPE_WEB_PORT` over the default `8000`.
+    fn resolve(relocation: Option<&str>, operator: Option<&str>) -> crate::system::ResolvedPort {
+        crate::system::resolve_listen_port(
+            relocation.map(str::to_owned),
+            (super::WEB_PORT_ENV, operator.map(str::to_owned)),
+            8000,
+        )
+    }
+
+    /// The `Web.tea` refusal of a bind that failed with `kind` under `posture`,
+    /// as the `String` sink renders it.
+    fn refusal(
+        r: crate::system::ResolvedPort,
+        posture: BuildPosture,
+        kind: std::io::ErrorKind,
+    ) -> (crate::IpeErrorKind, String) {
+        let error = r.bind_refusal_for(
+            posture,
+            "Web.tea",
+            std::net::SocketAddr::from(([127, 0, 0, 1], 8000)),
+            &std::io::Error::from(kind),
+        );
+        (
+            crate::ipe_error_kind(error.clone()),
+            <String as crate::FromIpeError>::from_ipe_error(error),
+        )
+    }
+
+    /// A port another socket holds refuses `Web.tea` as a typed `Conflict`,
+    /// never the `Unexpected` catch-all; the fix line names `IPE_WEB_PORT` and
+    /// how this build starts, and a release binary names no `ipe` verb.
     #[test]
-    fn addr_in_use_message_is_keyed_on_the_port_origin() {
-        let resolve = |relocation: Option<&str>, operator: Option<&str>| {
-            crate::system::resolve_listen_port(
-                relocation.map(str::to_owned),
-                (super::WEB_PORT_ENV, operator.map(str::to_owned)),
-                8000,
-            )
-        };
+    fn web_port_in_use_is_a_typed_conflict_with_a_posture_fix_line() {
+        use std::io::ErrorKind;
         for r in [resolve(None, None), resolve(None, Some("9200"))] {
-            let msg = r.addr_in_use_message();
-            assert!(msg.contains("IPE_WEB_PORT=8123 ipe dev run"), "{msg}");
+            for (posture, launch) in [
+                (BuildPosture::Development, "ipe dev run"),
+                (BuildPosture::Release, "./<program>"),
+            ] {
+                let (kind, text) = refusal(r, posture, ErrorKind::AddrInUse);
+                assert_eq!(kind, crate::IpeErrorKind::Conflict, "{text}");
+                assert!(text.starts_with("Conflict: port "), "{text}");
+                assert!(!text.contains("Unexpected"), "{text}");
+                assert!(
+                    text.contains(&format!("IPE_WEB_PORT=8123 {launch}"))
+                        && !text.contains("IPE_SERVER_PORT"),
+                    "{posture:?}: {text}"
+                );
+            }
+            let (_, release) = refusal(r, BuildPosture::Release, ErrorKind::AddrInUse);
+            assert!(
+                !release.contains("ipe dev"),
+                "a built binary is not started by `ipe dev run`: {release}"
+            );
         }
         let relocated = resolve(Some("9100"), Some("9200"));
         assert_eq!(relocated.port, 9100);
-        let msg = relocated.addr_in_use_message();
+        for posture in [BuildPosture::Development, BuildPosture::Release] {
+            let (kind, text) = refusal(relocated, posture, ErrorKind::AddrInUse);
+            assert_eq!(kind, crate::IpeErrorKind::Conflict, "{text}");
+            assert!(
+                !text.contains("IPE_WEB_PORT") && !text.contains("IPE_SERVER_PORT"),
+                "a supervisor-chosen port must not advise an operator var: {text}"
+            );
+        }
+        let (other_kind, other) = refusal(
+            resolve(None, None),
+            BuildPosture::Release,
+            ErrorKind::ConnectionReset,
+        );
+        assert_eq!(other_kind, crate::IpeErrorKind::Io, "{other}");
         assert!(
-            !msg.contains("IPE_WEB_PORT") && !msg.contains("IPE_SERVER_PORT"),
-            "{msg}"
+            other.starts_with("Io: Web.tea: bind 127.0.0.1:8000: "),
+            "{other}"
         );
     }
 }
@@ -10062,6 +10134,17 @@ mod emitted_router_behavior_tests {
                 matches!(&refused, Err(StartupRefusal::Bind(r)) if r.name() == "IPE_HTTP_BIND"),
                 "IPE_HTTP_BIND={raw:?} must refuse the app, got {refused:?}"
             );
+            let Err(cause) = refused else {
+                panic!("IPE_HTTP_BIND={raw:?} must refuse the app");
+            };
+            let shown = cause.to_string();
+            let error = crate::error::IpeError::from(cause);
+            assert_eq!(
+                crate::ipe_error_kind(error.clone()),
+                crate::IpeErrorKind::InvalidInput,
+                "an operator's malformed setting is invalid input: {error:?}"
+            );
+            assert_eq!(crate::ipe_error_message(error), shown);
         }
         crate::system::locked_set_var("IPE_HTTP_BIND", "::1");
         let bound = web_bind_host();

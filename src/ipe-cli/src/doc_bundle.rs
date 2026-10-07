@@ -1,5 +1,5 @@
 //! Unified documentation bundle: entry index, kind-qualified resolver,
-//! `[[kind:key]]` cross-reference rewriter, and fuzzy CLI search.
+//! and `[[kind:key]]` cross-reference rewriter.
 //!
 //! Every documentation entity is a [`DocEntry`] in one of eight per-kind maps
 //! inside a [`DocBundle`]. The bundle is built once per `ipe doc` invocation.
@@ -10,8 +10,8 @@
 //! A reference to an unknown kind or a missing key is a build error -- the
 //! bundle never emits a dangling or passthrough link.
 //!
-//! `ipe doc <bare-word>` calls [`fuzzy_rank`], which scores every entry
-//! against the query and returns the ranked candidates.
+//! Ranking entries against a free-text `ipe doc` term is
+//! [`crate::doc_search`]'s job; this module only holds and resolves them.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -134,9 +134,12 @@ pub struct DocEntry {
 ///
 /// Eight per-kind maps, each keyed by the canonical key string. Built once
 /// via [`DocBundle::build`]; queried via [`DocBundle::resolve_qualified`] and
-/// [`fuzzy_rank`].
+/// ranked by [`crate::doc_search::rank`].
 pub struct DocBundle {
     maps: BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
+    /// Extra spellings that open an entry, per kind: alias -> canonical key.
+    /// An alias is never listed; only the canonical key is an entry.
+    aliases: BTreeMap<DocKind, BTreeMap<String, String>>,
 }
 
 impl DocBundle {
@@ -167,6 +170,7 @@ impl DocBundle {
         cli_commands: &[BundleSource],
     ) -> Result<Self, BundleError> {
         let mut maps: BTreeMap<DocKind, BTreeMap<String, DocEntry>> = BTreeMap::new();
+        let mut aliases: BTreeMap<DocKind, BTreeMap<String, String>> = BTreeMap::new();
 
         for src in modules {
             insert_entry(
@@ -187,6 +191,11 @@ impl DocBundle {
                 src.body.clone(),
                 None,
             )?;
+        }
+        for src in symbols {
+            for alias in &src.aliases {
+                insert_alias(&maps, &mut aliases, DocKind::Symbol, alias, &src.key)?;
+            }
         }
         for src in diagnostics {
             insert_entry(
@@ -233,7 +242,7 @@ impl DocBundle {
             ingest_markdown_dir_additive(&docs_root.join("guide"), DocKind::Guide, &mut maps)?;
         }
 
-        Ok(Self { maps })
+        Ok(Self { maps, aliases })
     }
 
     /// Build an empty bundle (for tests).
@@ -242,6 +251,7 @@ impl DocBundle {
     pub const fn empty() -> Self {
         Self {
             maps: BTreeMap::new(),
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -259,13 +269,21 @@ impl DocBundle {
             .ok_or_else(|| BundleError::UnknownKind(qualified.to_owned()))?;
         let kind = DocKind::from_prefix(kind_str)
             .ok_or_else(|| BundleError::UnknownKind(kind_str.to_owned()))?;
-        self.maps
-            .get(&kind)
-            .and_then(|m| m.get(key))
+        self.entry(kind, key)
             .ok_or_else(|| BundleError::UnknownKey {
                 kind,
                 key: key.to_owned(),
             })
+    }
+
+    /// The entry of `kind` that `key` opens: its own key, or an alias of it.
+    fn entry(&self, kind: DocKind, key: &str) -> Option<&DocEntry> {
+        let canonical = self
+            .aliases
+            .get(&kind)
+            .and_then(|m| m.get(key))
+            .map_or(key, String::as_str);
+        self.maps.get(&kind).and_then(|m| m.get(canonical))
     }
 
     /// All entries across all kinds, in kind + key order.
@@ -305,6 +323,8 @@ pub struct BundleSource {
     pub title: String,
     /// Raw Markdown body.
     pub body: String,
+    /// Other spellings that open this entry; never listed as entries.
+    pub aliases: Vec<String>,
 }
 
 impl BundleSource {
@@ -314,6 +334,7 @@ impl BundleSource {
             key: key.into(),
             title: title.into(),
             body: String::new(),
+            aliases: Vec::new(),
         }
     }
 
@@ -327,7 +348,15 @@ impl BundleSource {
             key: key.into(),
             title: title.into(),
             body: body.into(),
+            aliases: Vec::new(),
         }
+    }
+
+    /// The same source, also opened by each of `aliases`.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = aliases;
+        self
     }
 }
 
@@ -729,6 +758,40 @@ fn insert_entry(
     Ok(())
 }
 
+/// Record `alias` as another spelling of the `canonical` entry of `kind`.
+///
+/// Refuses an alias that names no entry, shadows an entry's own key, or is
+/// already another entry's alias: one spelling opens exactly one entry.
+fn insert_alias(
+    maps: &BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
+    aliases: &mut BTreeMap<DocKind, BTreeMap<String, String>>,
+    kind: DocKind,
+    alias: &str,
+    canonical: &str,
+) -> Result<(), BundleError> {
+    let entries = maps.get(&kind);
+    let duplicate = || BundleError::DuplicateKey {
+        kind,
+        key: alias.to_owned(),
+        source: String::from("<alias>"),
+    };
+    if !entries.is_some_and(|m| m.contains_key(canonical)) {
+        return Err(BundleError::UnknownKey {
+            kind,
+            key: canonical.to_owned(),
+        });
+    }
+    if entries.is_some_and(|m| m.contains_key(alias)) {
+        return Err(duplicate());
+    }
+    let map = aliases.entry(kind).or_default();
+    if map.contains_key(alias) {
+        return Err(duplicate());
+    }
+    map.insert(alias.to_owned(), canonical.to_owned());
+    Ok(())
+}
+
 // == Qualified key parsing ====================================================
 
 /// Split `"kind:rest"` into `("kind", "rest")`, or `None` when no `:` is present.
@@ -815,9 +878,7 @@ pub fn rewrite_refs(
                     })?;
 
                 let entry = bundle
-                    .maps
-                    .get(&kind)
-                    .and_then(|m| m.get(key))
+                    .entry(kind, key)
                     .ok_or_else(|| BundleError::UnknownRef {
                         reference: inner.to_owned(),
                         source_file: source_file.to_owned(),
@@ -827,7 +888,7 @@ pub fn rewrite_refs(
                     .filter(|d| !d.is_empty())
                     .unwrap_or(entry.title.as_str());
 
-                out.push_str(&format_ref(kind, key, display, target));
+                out.push_str(&format_ref(kind, &entry.key, display, target));
             }
         }
     }
@@ -868,239 +929,6 @@ fn format_ref(kind: DocKind, key: &str, display: &str, target: RefTarget) -> Str
         ),
         RefTarget::Terminal => format!("{display} (ipe doc {}:{})", kind.prefix(), key),
     }
-}
-
-// == Fuzzy search =============================================================
-
-/// A ranked candidate from a fuzzy search.
-#[derive(Debug, Clone)]
-pub struct FuzzyMatch<'a> {
-    /// The matched entry.
-    pub entry: &'a DocEntry,
-    /// Score: higher is a better match. The exact value is an implementation
-    /// detail; only the ordering is meaningful to callers.
-    pub score: u32,
-}
-
-/// The score of an exact key match — the one score that names the entry the
-/// query asked for rather than a neighbour of it.
-pub const EXACT_SCORE: u32 = 1000;
-
-/// The most suggestions a miss lists: enough to cover a bare name shared by a
-/// few modules, few enough to read at a glance.
-pub const SUGGESTION_LIMIT: usize = 8;
-
-/// The longest query (in characters) the edit-distance tiers consider.
-///
-/// Longer input still ranks by exact, prefix, substring, and token match; the bound keeps a pasted
-/// blob from buying an unbounded distance computation.
-const DISTANCE_QUERY_CAP: usize = 64;
-
-/// Rank all entries in `bundle` against `query`, case-insensitively.
-///
-/// Matches each entry's key, the key's last `.` segment (a bare member name),
-/// and its title.
-///
-/// Tiers, best first: exact key ([`EXACT_SCORE`]); exact last segment; prefix;
-/// exact or prefix title; substring; every query word a word of the key or
-/// title; then a small edit distance (a typo). Returns the matching entries,
-/// best first, ties broken by kind then key so the order is deterministic.
-/// An entry that matches no tier is left out — see [`nearest`] for the
-/// always-non-empty fallback.
-#[must_use]
-pub fn fuzzy_rank<'a>(bundle: &'a DocBundle, query: &str) -> Vec<FuzzyMatch<'a>> {
-    let q = query.trim().to_lowercase();
-    let mut results: Vec<FuzzyMatch<'a>> = bundle
-        .all_entries()
-        .filter_map(|entry| {
-            let score = score_entry(entry, &q);
-            (score > 0).then_some(FuzzyMatch { entry, score })
-        })
-        .collect();
-    results.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.entry.kind.cmp(&b.entry.kind))
-            .then_with(|| a.entry.key.cmp(&b.entry.key))
-    });
-    results
-}
-
-/// The `limit` entries closest to `query` by edit distance, closest first.
-///
-/// Distance is over key, last segment, and title — the fallback that makes a
-/// miss never a dead end. Non-empty whenever the bundle is.
-#[must_use]
-pub fn nearest<'a>(bundle: &'a DocBundle, query: &str, limit: usize) -> Vec<FuzzyMatch<'a>> {
-    let q: String = query
-        .trim()
-        .to_lowercase()
-        .chars()
-        .take(DISTANCE_QUERY_CAP)
-        .collect();
-    let mut scored: Vec<(usize, &'a DocEntry)> = bundle
-        .all_entries()
-        .map(|entry| (entry_distance(entry, &q), entry))
-        .collect();
-    scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.kind.cmp(&b.1.kind))
-            .then_with(|| a.1.key.cmp(&b.1.key))
-    });
-    scored
-        .into_iter()
-        .take(limit)
-        .map(|(distance, entry)| FuzzyMatch {
-            entry,
-            score: u32::try_from(distance).map_or(0, |d| 100_u32.saturating_sub(d)),
-        })
-        .collect()
-}
-
-/// The last `.` segment of a key (`Ipe.Time.unixMillis` → `unixMillis`), or the
-/// whole key when it has none.
-fn last_segment(key: &str) -> &str {
-    key.rsplit_once('.').map_or(key, |(_, last)| last)
-}
-
-/// The words of `text`: its alphanumeric runs.
-fn words(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-}
-
-/// The smallest edit distance from `query` (already lowercased and capped) to
-/// the entry's key, last segment, or title.
-fn entry_distance(entry: &DocEntry, query: &str) -> usize {
-    let key = entry.key.to_lowercase();
-    let title = entry.title.to_lowercase();
-    [
-        crate::driver::levenshtein(query, &key),
-        crate::driver::levenshtein(query, last_segment(&key)),
-        crate::driver::levenshtein(query, &title),
-    ]
-    .into_iter()
-    .min()
-    .unwrap_or(usize::MAX)
-}
-
-/// Compute the tiered score of a lowercased query against one entry (0 = no
-/// match).
-fn score_entry(entry: &DocEntry, query: &str) -> u32 {
-    if query.is_empty() {
-        return 0;
-    }
-    let key = entry.key.to_lowercase();
-    let member = last_segment(&key);
-    let title = entry.title.to_lowercase();
-    if key == query {
-        return EXACT_SCORE;
-    }
-    if member == query {
-        return 950;
-    }
-    if key.starts_with(query) || member.starts_with(query) {
-        return 800;
-    }
-    if title == query {
-        return 750;
-    }
-    if title.starts_with(query) {
-        return 600;
-    }
-    if key.contains(query) || title.contains(query) {
-        return 500;
-    }
-    let mut query_words = words(query).peekable();
-    if query_words.peek().is_some()
-        && query_words.all(|w| words(&key).chain(words(&title)).any(|kw| kw == w))
-    {
-        return 450;
-    }
-    let length = query.chars().count();
-    if length > DISTANCE_QUERY_CAP {
-        return 0;
-    }
-    let threshold = (length / 3).max(1);
-    let distance =
-        crate::driver::levenshtein(query, &key).min(crate::driver::levenshtein(query, member));
-    if distance <= threshold {
-        let penalty = u32::try_from(distance).map_or(u32::MAX, |d| d.saturating_mul(40));
-        return 300_u32.saturating_sub(penalty).max(1);
-    }
-    0
-}
-
-/// One suggestion for a documentation miss: the exact command that shows the
-/// entry, and the entry's title.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocSuggestion {
-    /// The `ipe doc …` argument that opens the entry exactly.
-    pub key: String,
-    /// The entry's kind, for the reader's orientation.
-    pub kind: DocKind,
-    /// The entry's human title.
-    pub title: String,
-}
-
-impl DocSuggestion {
-    /// The suggestion for `entry`: a module or symbol by its own key (`ipe doc`
-    /// resolves both directly), any other kind by its `kind:key` reference.
-    #[must_use]
-    pub fn for_entry(entry: &DocEntry) -> Self {
-        let key = match entry.kind {
-            DocKind::Module | DocKind::Symbol => entry.key.clone(),
-            DocKind::Diagnostic
-            | DocKind::Construct
-            | DocKind::Idiom
-            | DocKind::Topic
-            | DocKind::Guide
-            | DocKind::Cli => format!("{}:{}", entry.kind.prefix(), entry.key),
-        };
-        Self {
-            key,
-            kind: entry.kind,
-            title: entry.title.clone(),
-        }
-    }
-}
-
-/// The lines listing `suggestions` under the doc-miss header, keys in one column.
-#[must_use]
-pub fn suggestion_lines(suggestions: &[DocSuggestion]) -> Vec<String> {
-    let width = suggestions
-        .iter()
-        .map(|s| s.key.chars().count())
-        .max()
-        .unwrap_or(0);
-    suggestions
-        .iter()
-        .map(|s| {
-            let key = format!("{:width$}", s.key);
-            String::from(crate::text::cli_doc_suggestion_line(
-                &key, &s.title, &s.kind,
-            ))
-        })
-        .collect()
-}
-
-/// The suggestions for a query that named no entry.
-///
-/// The ranked matches, or — when nothing matches any tier — the nearest entries
-/// by edit distance, so a miss always offers somewhere to go. At most
-/// [`SUGGESTION_LIMIT`].
-#[must_use]
-pub fn suggestions_for(bundle: &DocBundle, query: &str) -> Vec<DocSuggestion> {
-    let ranked = fuzzy_rank(bundle, query);
-    let chosen = if ranked.is_empty() {
-        nearest(bundle, query, SUGGESTION_LIMIT)
-    } else {
-        ranked.into_iter().take(SUGGESTION_LIMIT).collect()
-    };
-    chosen
-        .iter()
-        .map(|m| DocSuggestion::for_entry(m.entry))
-        .collect()
 }
 
 // == Tests ====================================================================
@@ -1179,6 +1007,79 @@ mod tests {
         assert!(
             matches!(err, BundleError::DuplicateKey { .. }),
             "expected DuplicateKey: {err}"
+        );
+    }
+
+    // -- Aliases --------------------------------------------------------------
+
+    fn symbol_bundle(symbols: &[BundleSource]) -> Result<DocBundle, BundleError> {
+        DocBundle::build(Path::new("/nonexistent"), &[], symbols, &[], &[])
+    }
+
+    #[test]
+    fn an_alias_opens_its_canonical_entry_and_is_never_listed() {
+        let bundle = symbol_bundle(
+            &[BundleSource::with_body("Ipe.Time.now", "Ipe.Time.now", "")
+                .with_aliases(vec!["Time.now".to_owned()])],
+        )
+        .expect("a well-formed alias builds");
+        let opened = bundle.resolve_qualified("symbol:Time.now");
+        assert!(
+            matches!(opened, Ok(e) if e.key == "Ipe.Time.now"),
+            "the alias opens the canonical entry: {opened:?}"
+        );
+        let keys: Vec<&str> = bundle
+            .entries_for_kind(DocKind::Symbol)
+            .map(|e| e.key.as_str())
+            .collect();
+        assert_eq!(keys, ["Ipe.Time.now"], "one entry, under its canonical key");
+    }
+
+    #[test]
+    fn an_alias_that_shadows_an_entry_key_is_refused() {
+        let built = symbol_bundle(&[
+            BundleSource::with_body("Ipe.A.x", "Ipe.A.x", "")
+                .with_aliases(vec!["Ipe.B.x".to_owned()]),
+            BundleSource::with_body("Ipe.B.x", "Ipe.B.x", ""),
+        ]);
+        assert!(
+            matches!(built, Err(BundleError::DuplicateKey { ref key, .. }) if key == "Ipe.B.x"),
+            "an alias never hides another entry: {:?}",
+            built.err()
+        );
+    }
+
+    #[test]
+    fn a_cross_ref_through_an_alias_links_the_canonical_page() {
+        let bundle = symbol_bundle(
+            &[BundleSource::with_body("Ipe.Time.now", "Ipe.Time.now", "")
+                .with_aliases(vec!["Time.now".to_owned()])],
+        )
+        .expect("a well-formed alias builds");
+        let via_alias = rewrite_refs("[[symbol:Time.now]]", &bundle, RefTarget::Markdown, "a.md");
+        let via_key = rewrite_refs(
+            "[[symbol:Ipe.Time.now]]",
+            &bundle,
+            RefTarget::Markdown,
+            "a.md",
+        );
+        assert!(
+            via_alias.is_ok(),
+            "an alias reference resolves: {via_alias:?}"
+        );
+        assert_eq!(via_alias, via_key, "both spellings link the one page");
+    }
+
+    #[test]
+    fn one_alias_for_two_entries_is_refused() {
+        let built = symbol_bundle(&[
+            BundleSource::with_body("Ipe.A.x", "Ipe.A.x", "").with_aliases(vec!["x".to_owned()]),
+            BundleSource::with_body("Ipe.B.x", "Ipe.B.x", "").with_aliases(vec!["x".to_owned()]),
+        ]);
+        assert!(
+            matches!(built, Err(BundleError::DuplicateKey { ref key, .. }) if key == "x"),
+            "one spelling opens exactly one entry: {:?}",
+            built.err()
         );
     }
 
@@ -1348,136 +1249,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("topic:does-not-exist"), "{msg}");
         assert!(msg.contains("myfile.md"), "{msg}");
-    }
-
-    // -- Fuzzy search ---------------------------------------------------------
-
-    fn bundle_with_select_entries() -> DocBundle {
-        let mut b = DocBundle::empty();
-        b.insert(
-            DocKind::Construct,
-            "select".to_owned(),
-            "Select expression".to_owned(),
-            String::new(),
-        )
-        .unwrap();
-        b.insert(
-            DocKind::Construct,
-            "case".to_owned(),
-            "Case expression".to_owned(),
-            String::new(),
-        )
-        .unwrap();
-        b.insert(
-            DocKind::Guide,
-            "getting-started".to_owned(),
-            "Getting started".to_owned(),
-            String::new(),
-        )
-        .unwrap();
-        b
-    }
-
-    #[test]
-    fn fuzzy_rank_typo_suggests_correct_key() {
-        let bundle = bundle_with_select_entries();
-        let results = fuzzy_rank(&bundle, "slect");
-        assert!(!results.is_empty(), "should find suggestions for 'slect'");
-        let top = results.first().expect("at least one result");
-        assert_eq!(
-            top.entry.key,
-            "select",
-            "top result is 'select': {:?}",
-            results.iter().map(|r| &r.entry.key).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn fuzzy_rank_exact_key_is_top() {
-        let bundle = bundle_with_select_entries();
-        let results = fuzzy_rank(&bundle, "case");
-        assert!(!results.is_empty());
-        let top = results.first().expect("at least one result");
-        assert_eq!(top.entry.key, "case");
-        assert_eq!(top.score, 1000);
-    }
-
-    #[test]
-    fn fuzzy_rank_no_match_returns_empty() {
-        let bundle = bundle_with_select_entries();
-        let results = fuzzy_rank(&bundle, "zzzzzzzzzzz");
-        assert!(results.is_empty(), "no match for nonsense query");
-    }
-
-    #[test]
-    fn fuzzy_rank_ambiguous_returns_multiple() {
-        let bundle = bundle_with_select_entries();
-        let results = fuzzy_rank(&bundle, "e");
-        assert!(
-            results.len() > 1,
-            "ambiguous query returns multiple: {:?}",
-            results.iter().map(|r| &r.entry.key).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn fuzzy_rank_matches_a_bare_member_name() {
-        let mut bundle = DocBundle::empty();
-        for key in ["Ipe.Time.unixMillis", "Ipe.Time.now", "Ipe.List.map"] {
-            let inserted = bundle.insert(
-                DocKind::Symbol,
-                key.to_owned(),
-                key.to_owned(),
-                String::new(),
-            );
-            assert!(inserted.is_ok(), "{inserted:?}");
-        }
-        let results = fuzzy_rank(&bundle, "unixmillis");
-        assert!(
-            matches!(results.first(), Some(m) if m.entry.key == "Ipe.Time.unixMillis"),
-            "{:?}",
-            results.iter().map(|r| &r.entry.key).collect::<Vec<_>>()
-        );
-        let typo = fuzzy_rank(&bundle, "unixMilis");
-        assert!(
-            matches!(typo.first(), Some(m) if m.entry.key == "Ipe.Time.unixMillis"),
-            "a one-letter typo still finds the member"
-        );
-    }
-
-    #[test]
-    fn a_miss_always_suggests_the_nearest_entries() {
-        let bundle = bundle_with_select_entries();
-        assert!(fuzzy_rank(&bundle, "zzzzzzzzzzz").is_empty());
-        let suggestions = suggestions_for(&bundle, "zzzzzzzzzzz");
-        assert!(!suggestions.is_empty(), "never a dead end");
-        assert!(suggestions.len() <= SUGGESTION_LIMIT);
-    }
-
-    #[test]
-    fn suggestions_are_bounded_and_deterministic() {
-        let bundle = bundle_with_select_entries();
-        let first = suggestions_for(&bundle, "e");
-        assert!(first.len() <= SUGGESTION_LIMIT);
-        assert_eq!(first, suggestions_for(&bundle, "e"));
-    }
-
-    #[test]
-    fn a_suggestion_names_an_exact_lookup() {
-        let entry = DocEntry {
-            kind: DocKind::Topic,
-            key: "pipelines".to_owned(),
-            title: "Pipelines".to_owned(),
-            body: String::new(),
-            order: None,
-        };
-        assert_eq!(DocSuggestion::for_entry(&entry).key, "topic:pipelines");
-        let symbol = DocEntry {
-            kind: DocKind::Symbol,
-            key: "Ipe.List.map".to_owned(),
-            ..entry
-        };
-        assert_eq!(DocSuggestion::for_entry(&symbol).key, "Ipe.List.map");
     }
 
     // -- No-panic witness -----------------------------------------------------

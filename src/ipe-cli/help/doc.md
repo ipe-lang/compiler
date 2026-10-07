@@ -6,12 +6,12 @@ ipe doc [list | serve | check | <key> | <Module.Name>] [<path>]
 
 ## Arguments
 
-Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), or CLI command (version); a key that names nothing lists the closest matches of every kind. `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
+Without a subcommand: generate docs.json + renderings for the project and stdlib. `<key>`: look up any entity by key — a diagnostic code (IPE-L0107), symbol (List.map), module (List), member (Ipe.Time.unixMillis), language construct (case), or CLI command (version), bare or as `kind:key` (construct:case); a key that names nothing lists up to ten of the closest entries of every kind, numbered, each as the exact term that opens it, and on a terminal asks which number to open (Enter cancels). `list`: list all stdlib + project modules (one per line; `--list` is a deprecated alias). `serve`: build the HTML site and preview it on loopback. `check`: verify doc-comment coverage for project modules (stdlib is exempt). `<Module.Name>`: show one module's types and values with signatures (e.g. `ipe doc Ipe.List`).
 
 ## Options
 
 - `[--out <dir>]` — write the documentation to <dir> (default: doc/); generate only
 - `[--write-format markdown|json|html|all]` — which renderings to write beside docs.json (default: all); generate only
 - `[--port <n>]` — pin the serve port (default: an auto-selected free one); serve only
-- `[--plain]` — bare output, one entry per line; list and <module> only
-- `[--json]` — machine-readable JSON output; list and <module> only
+- `[--plain]` — bare output, one entry per line; list, <module> and <key> only; a miss writes one `term<TAB>kind<TAB>summary` line per closest entry to stderr as the error output, never a prompt
+- `[--json]` — machine-readable JSON output; list, <module> and <key> only; a miss is the error object, written to stderr, its `results` the closest entries' terms in order and `truncated` set when more matched

@@ -10,8 +10,9 @@ A `Dict k v` maps keys of type `k` to values of type `v`. Every key is
 unique: inserting the same key twice replaces the earlier value. Looking up
 a missing key returns `Nothing`; looking up a present key returns `Just v`.
 
-At runtime the underlying store uses stringified keys, so any comparable
-type (`Int`, `Float`, `String`, …) works as a key and round-trips faithfully.
+At runtime the underlying store uses stringified keys. The key type must be
+`Int`, `Char`, `String`, or `Bool` (it round-trips faithfully); a `Float`,
+list, tuple, record, or function key is rejected.
 When the inferred key type is `Dict Int v`, the compiler routes conversion
 functions through a typed variant so integer keys stay integers after a
 `toList`/`fromList` round-trip.

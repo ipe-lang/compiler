@@ -424,7 +424,7 @@ pub fn install_web(settings: Vec<Setting>) {
 
 /// The variable that overrides the bind host.
 #[cfg(feature = "server")]
-const HTTP_BIND_VAR: &str = "IPE_HTTP_BIND";
+pub(crate) const HTTP_BIND_VAR: &str = "IPE_HTTP_BIND";
 
 /// What an `IPE_HTTP_BIND` value must be.
 #[cfg(feature = "server")]

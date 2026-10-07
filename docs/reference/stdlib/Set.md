@@ -12,8 +12,9 @@ This makes `Set` the right choice when you need fast membership checks
 or de-duplication.
 
 At runtime a `Set a` is backed by a stringified-key map (the same
-representation `Dict` uses), so any comparable type works as the element
-type and membership is O(1) amortised.
+representation `Dict` uses). The element type must be `Int`, `Char`,
+`String`, or `Bool`; a `Float`, list, tuple, record, or function element is
+rejected. Membership is O(1) amortised.
 
 Example:
 
