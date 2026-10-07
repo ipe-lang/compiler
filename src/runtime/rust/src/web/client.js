@@ -2,10 +2,21 @@
 // page's inert JSON block `<script type="application/json" id="ipe-boot">`
 // before any other code here runs. The block is the element right before this
 // script's own tag, never a lookup by id: page content can carry any id, so an
-// element of the app's earlier in the page never stands in for the block. A
+// element of the app's earlier in the page never stands in for the block. The
+// own tag is read through the `Document.prototype` getter, never off the
+// document object itself: an `<img name="currentScript">` in page content
+// shadows that property with itself, and its sibling is the app's. A
 // missing block, a block that is not JSON, or a field of the wrong type halts
 // the client with an `IpeBootError` and shows the offline banner: the client
 // never boots on invented defaults.
+// `doc`'s own `name` accessor from `Document.prototype`. A document's named
+// properties (an `img`, `form`, `embed`, `object` or `iframe` with that `name`)
+// shadow its built-in accessors, so a read whose answer must come from the
+// browser, never from page content, goes through the prototype getter.
+function __ipeDocProp(doc, name) {
+  var d = Object.getOwnPropertyDescriptor(Document.prototype, name);
+  return d && d.get ? d.get.call(doc) : null;
+}
 var __IPE_BOOT_STRINGS = ["sid", "epoch", "base", "csrf"];
 var __IPE_CFG_BOOLEANS = ["bannerEnabled", "swapToast"];
 var __IPE_CFG_STRINGS = ["msgReconnecting", "msgUpdated", "msgOffline"];
@@ -26,7 +37,7 @@ var __ipeBoot = (function() {
       refuse(where + key + " is not a " + type);
     }
   }
-  var own = document.currentScript;
+  var own = __ipeDocProp(document, "currentScript");
   var node = own ? own.previousElementSibling : null;
   if (!node || node.tagName !== "SCRIPT" || node.id !== "ipe-boot" ||
       node.getAttribute("type") !== "application/json") {
@@ -492,11 +503,10 @@ function __ipeCopyAttrsExceptAuthority(src, dst) {
 function __ipePatch(t, mode) {
   var root = document.getElementById("ipe-root");
   if (!root) return;
-  // Strip the full-document envelope when present (ipe-nav fetches
-  // return <!doctype><html>...</html>). The regex captures exactly
-  // the rendered body, same as before.
-  var m = t.match(/<div id="ipe-root">([\s\S]*?)<\/div><script>/);
-  if (m) t = m[1];
+  // A full page (an ipe-nav or popstate fetch) contributes only its
+  // `#ipe-root` contents: its head, boot block and scripts never enter the
+  // live root, where script revival would run a second client.
+  t = __ipeRootHTML(t);
   var scrollX = window.scrollX, scrollY = window.scrollY;
   __ipeReplaceHTMLPreservingFocus(root, t);
   // behavior:"instant" keeps this housekeeping scroll a synchronous jump
@@ -510,6 +520,20 @@ function __ipePatch(t, mode) {
   __ipeBindEvents(document);
   __ipeRunPaths(root);
   __ipeReviveScripts(root);
+}
+
+// The markup to splice into `#ipe-root` for the server HTML `t`. A page shell
+// opens with a doctype and its body's first element is `#ipe-root`: it is
+// parsed as an inert document and contributes that element's contents only.
+// Any other `t`, including a view that itself renders a doctype, is a body
+// fragment and is returned unchanged.
+function __ipeRootHTML(t) {
+  if (!/^\s*<!doctype/i.test(t)) return t;
+  var doc = new DOMParser().parseFromString(t, "text/html");
+  var body = __ipeDocProp(doc, "body");
+  var root = body ? body.firstElementChild : null;
+  if (!root || root.tagName !== "DIV" || root.id !== "ipe-root") return t;
+  return root.innerHTML;
 }
 
 // __ipeReviveScripts: browsers DO NOT execute <script> tags inserted
@@ -1554,10 +1578,10 @@ function __ipeInjectStatusBanner() {
 }
 // Show the offline banner for a page whose boot data was refused. It runs
 // before any config is known, so it ignores the banner setting: a page that
-// cannot start always says so.
+// cannot start always says so. It runs at most once (the refusal throws), so it
+// never looks for an existing banner: page content can carry the banner's id.
 function __ipeShowBootFailure() {
   function show() {
-    if (document.getElementById("__ipe-status")) return;
     var built = __ipeBuildStatusEl("offline");
     built.msgEl.textContent = "Page failed to start — reload to retry";
     (document.body || document.documentElement).appendChild(built.el);

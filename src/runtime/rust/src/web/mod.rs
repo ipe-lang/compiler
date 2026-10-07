@@ -7053,6 +7053,18 @@ mod base_path_tests {
                 && !js.contains("getElementById(\"ipe-boot\")"),
             "client.js binds the block to its own tag, never by an id lookup"
         );
+        // `<img name="currentScript">` in page content shadows the document's
+        // own property with itself; only the prototype getter answers for the
+        // browser.
+        assert!(
+            js.contains("__ipeDocProp(document, \"currentScript\")")
+                && !js.contains("document.currentScript"),
+            "client.js reads its own tag through the `Document.prototype` getter"
+        );
+        assert!(
+            !js.contains("getElementById(\"__ipe-status\")"),
+            "the boot-failure banner never defers to an element page content can carry"
+        );
     }
 
     /// The string items of `var {name} = [ … ];` in `js`.
