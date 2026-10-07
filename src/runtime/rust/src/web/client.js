@@ -1,8 +1,14 @@
 // Boot data: the per-session values and the client config, read once from the
 // page's inert JSON block `<script type="application/json" id="ipe-boot">`
-// before any other code here runs. A missing block, a block that is not JSON,
-// or a field of the wrong type halts the client with an `IpeBootError` and
-// shows the offline banner: the client never boots on invented defaults.
+// before any other code here runs. The block is the element right before this
+// script's own tag, never a lookup by id: page content can carry any id, so an
+// element of the app's earlier in the page never stands in for the block. A
+// missing block, a block that is not JSON, or a field of the wrong type halts
+// the client with an `IpeBootError` and shows the offline banner: the client
+// never boots on invented defaults.
+var __IPE_BOOT_STRINGS = ["sid", "epoch", "base", "csrf"];
+var __IPE_CFG_BOOLEANS = ["bannerEnabled", "swapToast"];
+var __IPE_CFG_STRINGS = ["msgReconnecting", "msgUpdated", "msgOffline"];
 var __IPE_TUNING_KEYS = [
   "RETRY_BASE_MS", "RETRY_MAX_MS", "RETRY_MAX_ATTEMPTS", "RETRY_FAST_MS",
   "RETRY_FAST_WINDOW_MS", "EVENT_QUEUE_MAX", "HELLO_TIMEOUT_MS", "HEARTBEAT_TTL_MS"
@@ -16,27 +22,32 @@ var __ipeBoot = (function() {
   }
   function isObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
   function requireType(obj, key, type, where) {
-    if (typeof obj[key] !== type) refuse(where + key + " is not a " + type);
+    if (!Object.prototype.hasOwnProperty.call(obj, key) || typeof obj[key] !== type) {
+      refuse(where + key + " is not a " + type);
+    }
   }
-  var node = document.getElementById("ipe-boot");
-  if (!node || node.tagName !== "SCRIPT" || node.getAttribute("type") !== "application/json") {
+  var own = document.currentScript;
+  var node = own ? own.previousElementSibling : null;
+  if (!node || node.tagName !== "SCRIPT" || node.id !== "ipe-boot" ||
+      node.getAttribute("type") !== "application/json") {
     refuse("block is missing");
   }
   var data;
   try { data = JSON.parse(node.textContent); } catch (_) { refuse("block is not JSON"); }
   if (!isObject(data)) refuse("block is not an object");
-  ["sid", "epoch", "base", "csrf"].forEach(function(k) { requireType(data, k, "string", ""); });
+  __IPE_BOOT_STRINGS.forEach(function(k) { requireType(data, k, "string", ""); });
+  requireType(data, "cfg", "object", "");
   var cfg = data["cfg"];
   if (!isObject(cfg)) refuse("cfg is not an object");
-  ["bannerEnabled", "swapToast"].forEach(function(k) { requireType(cfg, k, "boolean", "cfg."); });
-  ["msgReconnecting", "msgUpdated", "msgOffline"].forEach(function(k) {
-    requireType(cfg, k, "string", "cfg.");
-  });
+  __IPE_CFG_BOOLEANS.forEach(function(k) { requireType(cfg, k, "boolean", "cfg."); });
+  __IPE_CFG_STRINGS.forEach(function(k) { requireType(cfg, k, "string", "cfg."); });
+  requireType(cfg, "tuning", "object", "cfg.");
   var tuning = cfg["tuning"];
   if (!isObject(tuning)) refuse("cfg.tuning is not an object");
   __IPE_TUNING_KEYS.forEach(function(k) {
+    requireType(tuning, k, "number", "cfg.tuning.");
     var v = tuning[k];
-    if (typeof v !== "number" || !isFinite(v) || v < 0 || Math.floor(v) !== v) {
+    if (!isFinite(v) || v < 0 || Math.floor(v) !== v) {
       refuse("cfg.tuning." + k + " is not a count");
     }
   });

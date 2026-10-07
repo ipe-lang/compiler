@@ -6985,15 +6985,22 @@ mod base_path_tests {
         assert_eq!(boot_str(&html, "/csrf").as_deref(), Some(HOSTILE));
     }
 
-    /// `client.js` reads the block by its id and names every field it carries.
+    /// The keys `client.js` requires at each level of the boot block are exactly
+    /// the keys the server writes there.
     ///
-    /// The client refuses to boot on a missing field, so a field the server adds
-    /// or renames without the client reading it fails here, not in a browser.
+    /// The client refuses to boot on a missing key, so a key the server drops
+    /// or renames while the client still requires it would refuse every page;
+    /// a key the server adds that the client never reads is dead data. Each
+    /// level is compared as a set, in both directions.
     #[test]
     #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
-    fn client_reads_every_boot_field() {
+    fn client_requires_exactly_the_boot_fields() {
         let js = super::CLIENT_JS;
-        assert!(js.contains(&format!("getElementById(\"{}\")", super::BOOT_BLOCK_ID)));
+        let required = |name: &str| -> std::collections::BTreeSet<String> {
+            let list = js_string_array(js, name);
+            assert!(list.is_some(), "client.js declares `{name}`");
+            list.unwrap_or_default().into_iter().collect()
+        };
         let html = page(
             "sid1",
             &crate::encoding::MountBase::root(),
@@ -7001,26 +7008,75 @@ mod base_path_tests {
             "t",
         );
         let boot = boot_of(&html).expect("the page carries a boot block");
-        let mut keys = Vec::new();
-        for (path, value) in [
-            ("", Some(&boot)),
-            ("cfg", boot.get("cfg")),
-            ("cfg.tuning", boot.pointer("/cfg/tuning")),
-        ] {
-            let object = value.and_then(serde_json::Value::as_object);
-            assert!(object.is_some(), "{path} is an object");
-            keys.extend(object.into_iter().flat_map(|o| o.keys().cloned()));
+        let keys_at = |pointer: &str| -> std::collections::BTreeSet<String> {
+            let object = boot.pointer(pointer).and_then(serde_json::Value::as_object);
+            assert!(object.is_some(), "{pointer:?} is an object");
+            object.into_iter().flat_map(|o| o.keys().cloned()).collect()
+        };
+        let with = |mut set: std::collections::BTreeSet<String>, nested: &str| {
+            set.insert(nested.to_string());
+            set
+        };
+        assert_eq!(keys_at(""), with(required("__IPE_BOOT_STRINGS"), "cfg"));
+        let cfg_required: std::collections::BTreeSet<String> = required("__IPE_CFG_BOOLEANS")
+            .into_iter()
+            .chain(required("__IPE_CFG_STRINGS"))
+            .collect();
+        assert_eq!(keys_at("/cfg"), with(cfg_required, "tuning"));
+        let tuning_keys: std::collections::BTreeSet<String> = super::CLIENT_TUNING_CEILINGS
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
+        assert_eq!(keys_at("/cfg/tuning"), tuning_keys);
+        assert_eq!(required("__IPE_TUNING_KEYS"), tuning_keys);
+    }
+
+    /// The client takes the element right before its own tag as the boot
+    /// block, so every live shell places the block immediately before it.
+    #[test]
+    fn boot_block_immediately_precedes_the_client_script() {
+        for base in [crate::encoding::MountBase::root(), console_base()] {
+            let html = page("sid1", &base, &page_epoch(), "tok1");
+            let client = format!("<script src=\"{}/_ipe/client.", base.prefix());
+            let adjacent = boot_block_end(&html)
+                .and_then(|end| html.get(end..))
+                .is_some_and(|rest| rest.starts_with(&client));
+            assert!(adjacent, "the client tag follows the boot block: {html}");
         }
-        let tuning_keys = super::CLIENT_TUNING_CEILINGS.map(|(key, _)| key);
-        for key in tuning_keys {
-            assert!(keys.iter().any(|k| k == key), "{key} reaches the block");
-        }
-        for key in keys {
-            assert!(
-                js.contains(&format!("\"{key}\"")),
-                "client.js reads {key:?}"
-            );
-        }
+        let js = super::CLIENT_JS;
+        assert!(
+            js.contains(&format!("node.id !== \"{}\"", super::BOOT_BLOCK_ID)),
+            "client.js checks the block's id"
+        );
+        assert!(
+            js.contains("own.previousElementSibling")
+                && !js.contains("getElementById(\"ipe-boot\")"),
+            "client.js binds the block to its own tag, never by an id lookup"
+        );
+    }
+
+    /// The string items of `var {name} = [ … ];` in `js`.
+    fn js_string_array(js: &str, name: &str) -> Option<Vec<String>> {
+        let open = format!("var {name} = [");
+        let rest = js.get(js.find(&open)? + open.len()..)?;
+        let body = rest.get(..rest.find("];")?)?;
+        body.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(|item| {
+                item.strip_prefix('"')
+                    .and_then(|i| i.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// The byte offset just past the boot block's closing `</script>`.
+    fn boot_block_end(html: &str) -> Option<usize> {
+        let open = boot_open_tag();
+        let at = html.find(&open)? + open.len();
+        let close = html.get(at..)?.find("</script>")?;
+        Some(at + close + "</script>".len())
     }
 
     #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
