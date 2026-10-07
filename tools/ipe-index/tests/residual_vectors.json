@@ -13,5 +13,10 @@
   {"name": "a_trailing_covered_run_has_no_trailing_gap", "src": "a\nfn\n", "spans": [[2, 2]], "residual": "a", "hash": "sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"},
   {"name": "a_no_break_space_line_is_blank", "src": "a\n\u00a0\nb\n", "spans": [], "residual": "a\nb", "hash": "sha256:7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"},
   {"name": "an_ideographic_space_line_is_blank", "src": "a\n\u3000\u3000\nb\n", "spans": [], "residual": "a\nb", "hash": "sha256:7e18f737311b2dc3b2f269dd78396b0351f14fb66efa879f768cb23181883c78"},
-  {"name": "an_all_covered_file_has_an_empty_residual", "src": "fn f() {\n}\n", "spans": [[1, 2]], "residual": "", "hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+  {"name": "an_all_covered_file_has_an_empty_residual", "src": "fn f() {\n}\n", "spans": [[1, 2]], "residual": "", "hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+  {"name": "two_separate_covered_runs_keep_two_gaps", "src": "a\nb\nc\nd\ne\n", "spans": [[2, 2], [4, 4]], "residual": "a\n\u0000\nc\n\u0000\ne", "hash": "sha256:b785c758b67e02e9900a82c31c25afa26d562319bd671cf9398e7e7a5ca1c8b9"},
+  {"name": "adjacent_spans_make_one_covered_run", "src": "a\nb\nc\nd\ne\n", "spans": [[2, 2], [3, 4]], "residual": "a\n\u0000\ne", "hash": "sha256:8dbd16d4471938e3e23cb2a16ca9d8c0771ac73e6fcdabff7c23482dbf66af01"},
+  {"name": "a_final_line_without_a_newline_is_kept", "src": "a\nb\nc", "spans": [[2, 2]], "residual": "a\n\u0000\nc", "hash": "sha256:edf05c98fa6fe82000b113672841517675c398c7b7a0f7fb65d03238322f3d84"},
+  {"name": "an_empty_file_has_an_empty_residual", "src": "", "spans": [], "residual": "", "hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+  {"name": "spans_out_of_order_cover_their_union", "src": "a\nb\nc\nd\ne\n", "spans": [[4, 4], [2, 2]], "residual": "a\n\u0000\nc\n\u0000\ne", "hash": "sha256:b785c758b67e02e9900a82c31c25afa26d562319bd671cf9398e7e7a5ca1c8b9"}
 ]

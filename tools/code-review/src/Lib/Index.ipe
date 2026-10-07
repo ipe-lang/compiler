@@ -19,7 +19,7 @@ import Ipe.Tuple as Tuple
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
-import Lib.RepoPath as RepoPath exposing (PathError, RootMap)
+import Lib.RepoPath as RepoPath exposing (PathError, Root, RootMap, Tag)
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (DbRole(..), IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
@@ -321,49 +321,91 @@ probe settings =
         |> Task.onError (Settings.openFailure IndexDb settings.db)
 
 
--- The startup check of `IPE_INDEX_ROOT` against the index: of the first
--- `rootSample` distinct indexed paths, those a configured root binds, at
--- least one must exist beneath it. A root other than the tree the index was
--- built from holds none of them and is refused naming the variable, the
--- first sampled path and where it was looked for; a file or two deleted
--- since the last index run does not refuse a right root while another
--- sampled file remains. An index with no bound path has nothing to check.
+-- The startup check of `IPE_INDEX_ROOT` against the index, per configured
+-- root: of the first `rootSample` distinct indexed paths under the root's
+-- tag, at least one must join to a file that exists beneath it. A root
+-- other than the tree the index was built from holds none of them and is
+-- refused naming the variable, the first sampled path and the root; a file
+-- or two deleted since the last index run does not refuse a right root
+-- while another sampled file remains. An index holding units, none under a
+-- configured tag, is refused too: none of its units could be read. Only an
+-- empty index has nothing to check.
 probeRoot : IndexSettings -> Task.Task Error ()
 probeRoot settings =
-    do
+    (do
         conn <- readConnection settings
-        stored <- Db.queryDecode conn indexedPathsSql [ SqlInt rootSample ] storedPathDecoder
-        anyPresent (List.filterMap (boundPath settings.roots) stored)
+        samples <- Task.sequence (List.map (rootSampleOf conn) (RepoPath.boundRoots settings.roots))
+        anyUnit <- Db.queryDecode conn anyPathSql [] storedPathDecoder
+        Task.succeed ( samples, anyUnit )
+    )
+        |> Task.onError (Settings.openFailure IndexDb settings.db)
+        |> Task.andThen (\( samples, anyUnit ) -> rootsHold settings.roots samples anyUnit)
 
 
--- Succeeds when `bound` is empty or any of its files exists.
-anyPresent : List ( String, Path ) -> Task.Task Error ()
-anyPresent bound =
-    case List.head bound of
+-- One configured root with the indexed paths sampled under its tag.
+type alias RootSample =
+    { tag : Tag
+    , root : Root
+    , stored : List String
+    }
+
+
+rootsHold : RootMap -> List RootSample -> List String -> Task.Task Error ()
+rootsHold roots samples anyUnit =
+    if List.all (\sample -> List.isEmpty sample.stored) samples && not (List.isEmpty anyUnit) then
+        Task.fail (noTaggedPath (List.map (\sample -> sample.tag) samples))
+
+    else
+        Task.sequence (List.map (rootHolds roots) samples)
+            |> Task.map (\_ -> ())
+
+
+rootSampleOf : Db.Db -> ( Tag, Root ) -> Task.Task Error RootSample
+rootSampleOf conn ( tag, root ) =
+    let
+        prefix =
+            RepoPath.tagName tag ++ ":"
+    in
+    Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] storedPathDecoder
+        |> Task.map (\stored -> { tag = tag, root = root, stored = stored })
+
+
+-- Succeeds when the sample is empty or any sampled path joins to a file
+-- that exists; a path the map refuses counts as absent.
+rootHolds : RootMap -> RootSample -> Task.Task Error ()
+rootHolds roots sample =
+    case List.head sample.stored of
         Nothing ->
             Task.succeed ()
 
-        Just ( first, firstPath ) ->
-            Task.sequence (List.map presentAt bound)
+        Just first ->
+            Task.sequence (List.map (presentUnder roots) sample.stored)
                 |> Task.andThen
                     (\present ->
                         if List.member True present then
                             Task.succeed ()
 
                         else
-                            Task.fail (rootMismatch (List.length bound) first firstPath)
+                            Task.fail (rootMismatch (List.length sample.stored) first sample.root)
                     )
 
 
--- How many distinct indexed paths the root check samples.
+-- How many distinct indexed paths the root check samples per root.
 rootSample : Int
 rootSample =
     16
 
 
-indexedPathsSql : String
-indexedPathsSql =
-    "SELECT DISTINCT path FROM units LIMIT ?"
+-- The distinct paths under one tag: the stored path starts with `tag:`,
+-- compared by `substr`, so no character of the tag is a pattern.
+taggedPathsSql : String
+taggedPathsSql =
+    "SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? LIMIT ?"
+
+
+anyPathSql : String
+anyPathSql =
+    "SELECT path FROM units LIMIT 1"
 
 
 storedPathDecoder : Db.Decode.Decoder String
@@ -372,24 +414,19 @@ storedPathDecoder =
         |> Db.Decode.required "path" (Db.Decode.string "path")
 
 
--- A stored path with the file it joins to, when a configured root binds it.
-boundPath : RootMap -> String -> Maybe ( String, Path )
-boundPath roots stored =
+-- Whether `stored` joins under its root to something that exists.
+presentUnder : RootMap -> String -> Task.Task Error Bool
+presentUnder roots stored =
     case RepoPath.resolve roots stored of
         Ok path ->
-            Just ( stored, path )
+            File.exists path |> Task.onError (\_ -> Task.succeed False)
 
         Err _ ->
-            Nothing
+            Task.succeed False
 
 
-presentAt : ( String, Path ) -> Task.Task Error Bool
-presentAt ( _, path ) =
-    File.exists path |> Task.onError (\_ -> Task.succeed False)
-
-
-rootMismatch : Int -> String -> Path -> Error
-rootMismatch sampled first path =
+rootMismatch : Int -> String -> Root -> Error
+rootMismatch sampled first root =
     Error.invalidInput
         (SafeText.toString
             (SafeText.concat
@@ -397,10 +434,23 @@ rootMismatch sampled first path =
                 , SafeText.render (String.fromInt sampled)
                 , SafeText.literal " indexed files checked: index path "
                 , SafeText.quoted first
-                , SafeText.literal " is not at "
-                , SafeText.quoted (Path.toString path)
+                , SafeText.literal " is not under "
+                , SafeText.quoted (Path.toString (RepoPath.rootPath root))
                 , SafeText.literal "; "
                 , RepoPath.rootFix
+                ]
+            )
+        )
+
+
+noTaggedPath : List Tag -> Error
+noTaggedPath tags =
+    Error.invalidInput
+        (SafeText.toString
+            (SafeText.concat
+                [ SafeText.literal "IPE_INDEX_DB holds units, but no index path starts with a configured repo tag ("
+                , SafeText.concat (List.intersperse (SafeText.literal ", ") (List.map (\tag -> SafeText.quoted (RepoPath.tagName tag ++ ":")) tags))
+                , SafeText.literal "); build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at the index of this repository"
                 ]
             )
         )
@@ -1401,7 +1451,8 @@ residualRows spans lines =
         |> residualOf
 
 
--- ( a covered run since the last kept line, the rows kept so far ).
+-- ( a covered run since the last kept line, the rows kept so far, last
+-- first ): consed, so the fold is linear in the lines.
 residualStep : ( Bool, Int, String ) -> ( Bool, List SourceRow ) -> ( Bool, List SourceRow )
 residualStep ( covered, number, line ) ( gap, rows ) =
     if covered then
@@ -1411,15 +1462,15 @@ residualStep ( covered, number, line ) ( gap, rows ) =
         ( gap, rows )
 
     else if gap && not (List.isEmpty rows) then
-        ( False, rows ++ [ Covered, Numbered number line ] )
+        ( False, Numbered number line :: Covered :: rows )
 
     else
-        ( False, rows ++ [ Numbered number line ] )
+        ( False, Numbered number line :: rows )
 
 
 residualOf : ( Bool, List SourceRow ) -> List SourceRow
 residualOf ( _, rows ) =
-    rows
+    List.reverse rows
 
 
 -- One flag per line of a `count`-line file: whether any span covers it.
@@ -1448,8 +1499,9 @@ clampSpan count ( start, end ) =
         Nothing
 
 
--- ( the first line no earlier span reached, the flag runs so far ), over
--- spans sorted by first line.
+-- ( the first line no earlier span reached, the flag runs so far, last
+-- first ), over spans sorted by first line; consed, so the fold is linear
+-- in the spans.
 coverRun : ( Int, Int ) -> ( Int, List (List Bool) ) -> ( Int, List (List Bool) )
 coverRun ( first, last ) ( next, runs ) =
     if last < next then
@@ -1460,9 +1512,9 @@ coverRun ( first, last ) ( next, runs ) =
             from =
                 max first next
         in
-        ( last + 1, runs ++ [ List.repeat (from - next) False, List.repeat (last - from + 1) True ] )
+        ( last + 1, List.repeat (last - from + 1) True :: List.repeat (from - next) False :: runs )
 
 
 closeRuns : Int -> ( Int, List (List Bool) ) -> List Bool
 closeRuns count ( next, runs ) =
-    List.concat (runs ++ [ List.repeat (count - next + 1) False ])
+    List.concat (List.reverse (List.repeat (count - next + 1) False :: runs))

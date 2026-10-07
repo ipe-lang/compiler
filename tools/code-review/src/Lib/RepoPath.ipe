@@ -1,4 +1,4 @@
-module Lib.RepoPath exposing (PathError(..), Root, RootMap, Tag, absolutize, describe, maxRoots, parseRoot, parseTag, resolve, rootFix, rootMap, rootPath, tagName, toError)
+module Lib.RepoPath exposing (PathError(..), Root, RootMap, Tag, absolutize, boundRoots, describe, maxRoots, parseRoot, parseTag, resolve, rootFix, rootMap, rootPath, tagName, toError)
 
 import Ipe.Error as Error
 import Ipe.File as File
@@ -239,6 +239,14 @@ rootPath root =
     case root of
         Root path ->
             path
+
+
+-- Each tag the map binds with its root, in binding order.
+boundRoots : RootMap -> List ( Tag, Root )
+boundRoots roots =
+    case roots of
+        RootMap bound ->
+            List.map (\binding -> ( binding.tag, binding.root )) bound
 
 
 -- A configured path made absolute: an absolute value is taken as-is, a

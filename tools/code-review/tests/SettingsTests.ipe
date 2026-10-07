@@ -242,6 +242,31 @@ rootProbeJoinsIndexedPath =
             )
 
 
+-- An index whose units all carry a tag no configured root binds is refused
+-- at startup naming the configured tag, even though the root exists: none
+-- of its units could be read. An index with no units passes. Red if the
+-- root check samples only bound paths and passes when that sample is empty.
+rootProbeRefusesUntaggedIndex : Task.Task Error Bool
+rootProbeRefusesUntaggedIndex =
+    do
+        at <- freshScratch "ipe-index-root-untagged"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "UPDATE units SET path = 'other:' || substr(path, 5)" []
+        untagged <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        execIndex at.indexDb "DELETE FROM units" []
+        emptied <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (Maybe.map (String.startsWith "IPE_INDEX_DB ") untagged
+                == Just True
+                && maybeContains "no index path starts with a configured repo tag" untagged
+                && maybeContains "\"ipe:\"" untagged
+                && emptied
+                == Nothing
+            )
+
+
 -- A nonexistent index is refused with the build hint and is not created.
 missingIndexProbed : Scratch -> Task.Task Error Bool
 missingIndexProbed at =
@@ -946,6 +971,7 @@ checks =
         , Task.succeed ( "a db open failure is classified by its primary result code", dbFailuresClassified )
         , check "a file that is not a SQLite database is refused as one" notSqliteRefused
         , check "a root holding none of the index's files is refused at startup" rootProbeJoinsIndexedPath
+        , check "an index with no unit under a configured tag is refused at startup" rootProbeRefusesUntaggedIndex
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
         , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
         , check "no session state type carries the startup settings" settingsNeverInSessionState
