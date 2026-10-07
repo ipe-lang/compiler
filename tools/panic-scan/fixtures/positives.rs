@@ -84,5 +84,8 @@ macro_rules! renames_in_body {
         use std::process as body_alias; //@HIT
         use std::process::{exit as body_leave}; //@HIT
         fn body_exit() { $p::exit(0); } //@HIT
+        fn body_templated() { std::process::$f(0); } //@HIT
+        fn body_repeated() { $($s::)+exit(0); } //@HIT
+        fn body_method(o: Option<u8>) { o.$m(); } //@HIT
     };
 }

@@ -11,7 +11,10 @@
 //! An exemption or ban is never keyed on a name the program can rebind: a
 //! renamed `process` module or `std` crate root is itself a hit. Macro bodies have no
 //! syntax tree; their tokens are scanned flat, where a test-only attribute
-//! exempts only a whole item it parses as.
+//! exempts only a whole item it parses as, and a callee the macro's caller
+//! names (`process::$f`, `$m::$f`, `.$m()`, `$m!()`, a `$( … )` path prefix
+//! before a banned leaf) is a hit, since it can expand to a banned call the
+//! body never spells.
 //!
 //! Scope: it finds every *authored, syntax-detectable* abrupt-failure construct.
 //! Indexing (`a[i]`) and arithmetic overflow are deliberately out of scope —
@@ -399,11 +402,44 @@ fn flat_exported(toks: &[TokenTree], at: usize) -> bool {
     }
 }
 
-/// Whether `toks[at]` directly follows a metavariable (`$p`), a path segment
-/// whose module only the macro's caller names.
-fn follows_metavariable(toks: &[TokenTree], at: usize) -> bool {
-    let before = |back: usize| at.checked_sub(back).and_then(|k| toks.get(k));
-    matches!(before(1), Some(TokenTree::Ident(_))) && before(2).is_some_and(|t| is_punct(t, '$'))
+/// Whether `toks[at]` is the `*`, `+` or `?` closing a `$( … )` repetition,
+/// with at most a two-token separator (`$( … )::+`) between.
+fn ends_repetition(toks: &[TokenTree], at: usize) -> bool {
+    let operator = toks
+        .get(at)
+        .is_some_and(|t| is_punct(t, '*') || is_punct(t, '+') || is_punct(t, '?'));
+    operator
+        && (1..=3_usize).any(|back| {
+            let Some(group_at) = at.checked_sub(back) else {
+                return false;
+            };
+            let group = matches!(
+                toks.get(group_at),
+                Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis
+            );
+            let dollar = group_at
+                .checked_sub(1)
+                .and_then(|d| toks.get(d))
+                .is_some_and(|t| is_punct(t, '$'));
+            let separator = toks.get(group_at.saturating_add(1)..at).is_some_and(|sep| {
+                sep.iter()
+                    .all(|t| !matches!(t, TokenTree::Group(_)) && !is_punct(t, '$'))
+            });
+            group && dollar && separator
+        })
+}
+
+/// Whether the path segment before the `::` starting at `toks[colon]` is one
+/// only the macro's caller names: a metavariable (`$p::`) or a repetition
+/// (`$($s)::+::`).
+fn templated_segment_before(toks: &[TokenTree], colon: usize) -> bool {
+    let before = |back: usize| colon.checked_sub(back).and_then(|k| toks.get(k));
+    let metavariable = matches!(before(1), Some(TokenTree::Ident(_)))
+        && before(2).is_some_and(|t| is_punct(t, '$'));
+    metavariable
+        || colon
+            .checked_sub(1)
+            .is_some_and(|op| ends_repetition(toks, op))
 }
 
 /// Visitor state for one file.
@@ -577,38 +613,20 @@ impl Scanner {
                     }
                 }
                 TokenTree::Punct(p) if p.as_char() == '.' => {
-                    if let Some(TokenTree::Ident(m)) = toks.get(next) {
-                        let name = name_of(m);
-                        if METHODS.contains(&name.as_str())
-                            && opens_call(toks.get(next.saturating_add(1)))
-                        {
-                            self.hit(line_of(m), format!(".{name}()"));
-                        }
-                    }
+                    self.flat_method(&toks, i);
                     next
                 }
                 TokenTree::Punct(p) if p.as_char() == ':' => {
-                    let colon = toks.get(next).is_some_and(|t| is_punct(t, ':'));
-                    if let (true, Some(TokenTree::Ident(m))) =
-                        (colon, toks.get(next.saturating_add(1)))
-                    {
-                        let name = name_of(m);
-                        if METHODS.contains(&name.as_str())
-                            && opens_call(toks.get(next.saturating_add(2)))
-                        {
-                            self.hit(line_of(m), format!("::{name}()"));
-                        } else if PROCESS_FNS.contains(&name.as_str())
-                            && follows_metavariable(&toks, i)
-                        {
-                            // `$p::exit` reaches `process::exit` when the
-                            // caller binds `$p` to the `process` module.
-                            self.hit(line_of(m), format!("$…::{name}"));
-                        }
-                    }
+                    self.flat_path_leaf(&toks, i);
+                    next
+                }
+                TokenTree::Punct(p) if p.as_char() == '$' => {
+                    self.flat_metavariable_macro(&toks, next);
                     next
                 }
                 TokenTree::Punct(_) | TokenTree::Literal(_) => next,
                 TokenTree::Ident(id) => self.flat_declaration(id, &toks, i).unwrap_or_else(|| {
+                    self.flat_repeated_leaf(id, &toks, i);
                     self.flat_ident(id, &toks, next);
                     next
                 }),
@@ -617,6 +635,103 @@ impl Scanner {
                     next
                 }
             };
+        }
+    }
+
+    /// Check the method a flat `.` at `toks[dot]` calls.
+    ///
+    /// A metavariable method (`.$m()`) is a hit: the caller may bind it to
+    /// `unwrap`, which this body never spells.
+    fn flat_method(&mut self, toks: &[TokenTree], dot: usize) {
+        let next = dot.saturating_add(1);
+        let after = |ahead: usize| toks.get(next.saturating_add(ahead));
+        match toks.get(next) {
+            Some(TokenTree::Ident(m)) => {
+                let name = name_of(m);
+                if METHODS.contains(&name.as_str()) && opens_call(after(1)) {
+                    self.hit(line_of(m), format!(".{name}()"));
+                }
+            }
+            Some(dollar) if is_punct(dollar, '$') => {
+                let range = dot
+                    .checked_sub(1)
+                    .and_then(|k| toks.get(k))
+                    .is_some_and(|t| is_punct(t, '.'));
+                if let Some(TokenTree::Ident(m)) = after(1)
+                    && !range
+                    && opens_call(after(2))
+                {
+                    self.hit(line_of(m), ".$…()".to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check the path leaf after a flat `::` starting at `toks[colon]`.
+    ///
+    /// A banned leaf behind a caller-named segment (`$p::exit`,
+    /// `$($s)::+::abort`) reaches `process::exit` when the caller binds the
+    /// segment to `std::process`. A caller-named leaf (`process::$f`,
+    /// `$m::$f`) is a hit when its module is `process` or caller-named too.
+    fn flat_path_leaf(&mut self, toks: &[TokenTree], colon: usize) {
+        let next = colon.saturating_add(1);
+        if !toks.get(next).is_some_and(|t| is_punct(t, ':')) {
+            return;
+        }
+        let leaf_at = next.saturating_add(1);
+        match toks.get(leaf_at) {
+            Some(TokenTree::Ident(m)) => {
+                let name = name_of(m);
+                if METHODS.contains(&name.as_str())
+                    && opens_call(toks.get(leaf_at.saturating_add(1)))
+                {
+                    self.hit(line_of(m), format!("::{name}()"));
+                } else if PROCESS_FNS.contains(&name.as_str())
+                    && templated_segment_before(toks, colon)
+                {
+                    self.hit(line_of(m), format!("$…::{name}"));
+                }
+            }
+            Some(leaf) if is_punct(leaf, '$') => {
+                let process = matches!(
+                    colon.checked_sub(1).and_then(|k| toks.get(k)),
+                    Some(TokenTree::Ident(m)) if name_of(m) == PROCESS_MODULE
+                );
+                if process || templated_segment_before(toks, colon) {
+                    self.hit(leaf.span().start().line, "…::$…".to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Flag a metavariable macro (`$m!(…)`) whose name starts at `toks[at]`:
+    /// the caller may bind it to `panic`, which this body never spells.
+    fn flat_metavariable_macro(&mut self, toks: &[TokenTree], at: usize) {
+        let after = |ahead: usize| toks.get(at.saturating_add(ahead));
+        if let Some(TokenTree::Ident(m)) = toks.get(at)
+            && after(1).is_some_and(|t| is_punct(t, '!'))
+            && matches!(after(2), Some(TokenTree::Group(_)))
+        {
+            self.hit(line_of(m), "$…!".to_owned());
+        }
+    }
+
+    /// Flag a banned leaf a `$( … )` repetition directly precedes
+    /// (`$($s::)+exit`): the repetition expands to a path prefix only the
+    /// caller names.
+    fn flat_repeated_leaf(&mut self, id: &Ident, toks: &[TokenTree], at: usize) {
+        let name = name_of(id);
+        let called = opens_call(toks.get(at.saturating_add(1)));
+        let banned =
+            PROCESS_FNS.contains(&name.as_str()) || (called && METHODS.contains(&name.as_str()));
+        if banned
+            && at
+                .checked_sub(1)
+                .is_some_and(|op| ends_repetition(toks, op))
+        {
+            self.hit(line_of(id), format!("$(…){name}"));
         }
     }
 
@@ -1451,6 +1566,37 @@ fn f() {
         assert!(scan_source(&private).is_ok_and(|scan| scan.test_path_includes.is_empty()));
         let exported = body("pub use core::include;");
         assert!(scan_source(&exported).is_ok_and(|scan| scan.test_path_includes.len() == 1));
+    }
+
+    /// A macro-body callee the caller names (a metavariable leaf, method or
+    /// macro, or a repetition prefix) can expand to a banned call the body
+    /// never spells, so it is a hit.
+    #[test]
+    fn macro_body_caller_named_callees_are_hits() {
+        let body =
+            |stmt: &str| format!("macro_rules! m {{\n    () => {{\n        {stmt}\n    }};\n}}\n");
+        for stmt in [
+            "fn f() { std::process::$f(0); }",
+            "fn f() { std::$m::$f(0); }",
+            "fn f() { $($s::)+exit(0); }",
+            "fn f() { $($s)::+::abort(); }",
+            "fn f() { $($s::)*unwrap(o); }",
+            "fn f() { o.$m(); }",
+            "fn f() { $m!(); }",
+        ] {
+            assert_eq!(hit_lines(&body(stmt)), vec![3], "missed:\n{stmt}");
+        }
+        for stmt in [
+            "fn f() { Self::$v; super::$name(); self.$i.show(); }",
+            "fn f() { if $a != (b) {} a..$f(1); g($($x),*); }",
+            "fn f() { $($s::)+read(0); $crate::g(); }",
+        ] {
+            assert_eq!(
+                hit_lines(&body(stmt)),
+                Vec::<usize>::new(),
+                "not a hit:\n{stmt}"
+            );
+        }
     }
 
     /// A macro-body `mod` named by a metavariable resolves to a file only at
