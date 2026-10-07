@@ -2676,7 +2676,7 @@ where
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
             Err(refusal) => {
-                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
             }
         };
         let store = match store::choose_store::<Model, Msg>(
@@ -3119,6 +3119,15 @@ impl std::fmt::Display for StartupRefusal {
     }
 }
 
+/// Every startup refusal is a fault in the app's or the operator's
+/// configuration: typed `InvalidInput`, never the `Unexpected` catch-all.
+#[cfg(feature = "server")]
+impl From<StartupRefusal> for crate::error::IpeError {
+    fn from(cause: StartupRefusal) -> Self {
+        Self::invalid_input(cause.to_string())
+    }
+}
+
 /// The fixed public body of a fail-closed mount's 503. One constant for every
 /// [`StartupRefusal`], so a response never carries the operator detail.
 #[cfg(feature = "server")]
@@ -3247,7 +3256,7 @@ where
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
             Err(refusal) => {
-                return IpeResult::Err(StartupRefusal::Ceiling(refusal).to_string().into());
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
             }
         };
         let store = match store::choose_store::<Model, Msg>(
@@ -5426,14 +5435,14 @@ mod handlers {
 const WEB_PORT_ENV: &str = "IPE_WEB_PORT";
 
 /// The address a standalone web app binds, under `IPE_HTTP_BIND` > `Host.bind`
-/// > the posture default.
+/// > `127.0.0.1`.
 ///
 /// # Errors
 ///
 /// [`StartupRefusal::Bind`] when `IPE_HTTP_BIND` is present but not an IP
 /// address.
 #[cfg(feature = "server")]
-fn web_bind_host() -> Result<std::net::IpAddr, StartupRefusal> {
+fn web_bind_host() -> Result<crate::app_config::ListenHost, StartupRefusal> {
     crate::app_config::resolve_host_bind().map_err(StartupRefusal::Bind)
 }
 
@@ -5509,10 +5518,9 @@ where
     // before any console gate reads it: a dev surface exists only while every
     // app listener is loopback.
     let host = match web_bind_host() {
-        Ok(host) => host,
-        Err(cause) => return IpeResult::Err(cause.to_string().into()),
+        Ok(host) => crate::server::RecordedHost::record(host),
+        Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
-    crate::telemetry::record_bind(host);
     #[cfg(all(feature = "web", feature = "http_client"))]
     let use_console_proxy = console_proxy::ensure_console_proxy().await;
 
@@ -5530,11 +5538,15 @@ where
         console_proxy_flag,
     ) {
         Ok(app) => app,
-        Err(cause) => return IpeResult::Err(cause.to_string().into()),
+        Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
     let grace = match shutdown_grace() {
         Ok(grace) => grace,
-        Err(refusal) => return IpeResult::Err(format!("Web.tea: {refusal}").into()),
+        Err(refusal) => {
+            return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                format!("Web.tea: {refusal}"),
+            )));
+        }
     };
 
     // Port precedence (shared with `Ipe.Http.Server`): the supervisor's
@@ -5545,15 +5557,17 @@ where
         8000,
     );
     let port = resolved.port;
-    // Honour the same host-bind precedence as the Ipe.Http.Server path
-    // (`IPE_HTTP_BIND` > `Host.bind` setting > loopback-unless-production), so
-    // an explicit loopback setting is never overridden into all-interfaces.
-    // `host` is the value resolved above, before the console gates.
+    // The same host-bind precedence and bind site as the Ipe.Http.Server path
+    // (`IPE_HTTP_BIND` > `Host.bind` setting > `127.0.0.1`). `host` is the
+    // value resolved and recorded above, before the console gates.
     let Ok(port) = u16::try_from(port) else {
-        return IpeResult::Err(format!("Web.tea: port {port} is not a TCP port").into());
+        return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+            format!("Web.tea: port {port} is not a TCP port"),
+        )));
     };
-    let addr = std::net::SocketAddr::new(host, port);
-    let listener = match tokio::net::TcpListener::bind(addr).await {
+    let addr = host.addr(port);
+    // Logs the bind-address line (stderr), and the exposure warning if any.
+    let listener = match crate::server::bind_app_listener("web", host, port).await {
         Ok(l) => l,
         Err(e) => {
             return IpeResult::Err(E::from_ipe_error(
@@ -5561,8 +5575,6 @@ where
             ));
         }
     };
-    // Bind-address line (stderr) — carries the resolved host:port.
-    crate::system::emit_runtime_log("web", &format!("listening on http://{addr}"));
     // User-facing line on stdout.
     crate::system::write_stdout_line(&format!("Ipe.Web listening on :{port}"));
     // Graceful shutdown: trap SIGINT/SIGTERM,
@@ -10122,13 +10134,25 @@ mod emitted_router_behavior_tests {
                 matches!(&refused, Err(StartupRefusal::Bind(r)) if r.name() == "IPE_HTTP_BIND"),
                 "IPE_HTTP_BIND={raw:?} must refuse the app, got {refused:?}"
             );
+            let Err(cause) = refused else {
+                panic!("IPE_HTTP_BIND={raw:?} must refuse the app");
+            };
+            let shown = cause.to_string();
+            let error = crate::error::IpeError::from(cause);
+            assert_eq!(
+                crate::ipe_error_kind(error.clone()),
+                crate::IpeErrorKind::InvalidInput,
+                "an operator's malformed setting is invalid input: {error:?}"
+            );
+            assert_eq!(crate::ipe_error_message(error), shown);
         }
         crate::system::locked_set_var("IPE_HTTP_BIND", "::1");
         let bound = web_bind_host();
         crate::system::locked_remove_var("IPE_HTTP_BIND");
         assert!(
-            matches!(bound, Ok(ip) if ip == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
-            "a bare IPv6 address is bound as given, got {bound:?}"
+            matches!(bound, Ok(host @ crate::app_config::ListenHost::Loopback(_))
+                if host.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            "a bare IPv6 loopback address is bound as given, got {bound:?}"
         );
     }
 

@@ -299,8 +299,9 @@ static PROCESS_SCOPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8:
 
 /// Record an app listener's bind address before it binds, returning its scope.
 ///
-/// Every app bind path (`serve_web`, `Server.listen`) calls this, so the
-/// process scope is the join of all of them.
+/// Every app bind path (`serve_web`, `Server.listen`) calls this through
+/// `server::RecordedHost::record`, the one input `server::bind_app_listener`
+/// takes, so the process scope is the join of all of them.
 pub fn record_bind(host: std::net::IpAddr) -> ListenScope {
     let scope = ListenScope::of(host);
     let byte = ProcessScope::Unbound.join(scope).to_byte();
@@ -468,20 +469,6 @@ pub(crate) const fn test_dev_surface() -> DevSurface {
     DevSurface {
         _intent: DevIntent(()),
     }
-}
-
-/// Whether the process posture is production, for closing-direction reads only.
-///
-/// A dev-only relaxation never negates this: it takes a [`DevIntent`] or
-/// [`DevSurface`]. The source inventory `tests/posture_read_inventory.rs`
-/// admits every caller by name.
-#[cfg(any(
-    feature = "server",
-    all(test, not(target_arch = "wasm32"), not(feature = "dev-posture"))
-))]
-#[must_use]
-pub(crate) fn posture_is_production() -> bool {
-    Posture::from_env() == Posture::Production
 }
 
 /// The resolved `IPE_CONSOLE_AUTH` setting for the console + metrics surface.
@@ -1826,7 +1813,6 @@ mod tests {
         assert_eq!(Posture::from_env(), Posture::Production);
         assert!(dev_intent_from_env().is_none());
         assert!(dev_surface_from_env().is_none());
-        assert!(posture_is_production());
         crate::system::locked_remove_var("ENV");
         crate::system::locked_remove_var("IPE_ENV");
     }

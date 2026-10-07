@@ -159,6 +159,10 @@ not a decimal port in `1..=65535` (empty, non-numeric, signed, `0`, or too
 large) is ignored and `8000` is used. `ipe type-check` runs a fast check with
 no runtime, and `ipe dev build` compiles to a native binary.
 
+The server binds `127.0.0.1` only, so other machines cannot reach it; to
+serve it on the LAN, set `IPE_HTTP_BIND` (e.g. `IPE_HTTP_BIND=0.0.0.0`), which
+prints a startup warning.
+
 Both are development builds: with `IPE_CONSOLE_AUTH` unset, the embedded
 console at `/_ipe/console` is open only while the server binds loopback, and on
 an exposed bind (`IPE_HTTP_BIND=0.0.0.0`) it requires the admin token. An

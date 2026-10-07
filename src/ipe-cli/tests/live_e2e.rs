@@ -466,7 +466,7 @@ fn spawn_and_wait_ready(
                 );
             }
             Ok(_) => {
-                // The web runtime emits: `[ipe.web] listening on http://0.0.0.0:<port>`
+                // The web runtime emits: `[ipe.web] listening on http://127.0.0.1:<port>`
                 if line.contains("[ipe.web] listening on") {
                     return Ok(ProcessGuard(child));
                 }

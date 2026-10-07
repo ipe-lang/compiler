@@ -74,8 +74,6 @@ const POSTURE_OWNER: &str = "telemetry.rs";
 const ADMITTED: &[(&str, &str, usize)] = &[
     // The bind-refusal fix line names the relaunch command for the build posture.
     ("system.rs", "BuildPosture", 6),
-    // The bind default: production binds every interface, else loopback.
-    ("app_config.rs", "posture_is_production", 1),
     // `gate_allows`: a production posture needs an admin credential to mount.
     ("web/console.rs", "Posture", 1),
     ("web/console.rs", "Posture::Production", 1),
