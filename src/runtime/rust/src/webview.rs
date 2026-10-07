@@ -82,7 +82,7 @@ const BRIDGE_JS: &str = r#"
 })();
 "#;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     /// The bridge reads no document member through the document's own lookup.
     #[test]

@@ -1516,6 +1516,7 @@ mod tests {
     use super::*;
 
     /// The glue reads no document member through the document's own lookup.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn glue_reads_the_document_only_through_the_bound_table() {
         let js = port_glue_js();

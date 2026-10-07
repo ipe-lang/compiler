@@ -833,7 +833,7 @@ const _WASI_TIME_FLOOR_SEAL: () = {
 };
 
 /// Source scan for client JavaScript that reads the global `document` directly.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod js_document_scan {
     /// Whether `c` can continue a JavaScript identifier.
     const fn is_ident(c: char) -> bool {
@@ -912,7 +912,6 @@ mod js_document_scan {
         found
     }
 
-    #[cfg(test)]
     mod tests {
         use super::unbound_document_reads;
 
