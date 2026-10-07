@@ -405,7 +405,36 @@ currentStatus key conn db =
     do
         head <- LibDb.currentHead db
         stamp <- Index.readStamp conn
-        Task.succeed (Index.stampStatus key head stamp)
+        confirmedStatus db head (Index.stampStatus key head stamp)
+
+
+-- A stamp's status kept only while the log still bears it out: a stamp of
+-- an intact chain counts only when the log holds every entry up to the
+-- head, so an entry removed below an unmoved head sends the copy to a
+-- rebuild, whose walk names the break. A broken or unsigned status is
+-- kept as read: it counts nothing.
+confirmedStatus : Db.Db -> Index.ChainHead -> Maybe LogStatus -> Task.Task Error (Maybe LogStatus)
+confirmedStatus db head status =
+    case status of
+        Just (Signed Intact) ->
+            LibDb.holdsEveryEntry db head
+                |> Task.map
+                    (\whole ->
+                        if whole then
+                            status
+
+                        else
+                            Nothing
+                    )
+
+        Just (Signed (BrokenAt _)) ->
+            Task.succeed status
+
+        Just Unsigned ->
+            Task.succeed status
+
+        Nothing ->
+            Task.succeed Nothing
 
 
 stillBehind : Error
@@ -997,13 +1026,15 @@ freshSnapshot settings conn db cursor =
 -- would write for the review log's current head, with the status it
 -- records. The head is read first: a decision recorded after it moves the
 -- head on, so a match proves the copy holds every counted decision up to a
--- head the log really had.
+-- head the log really had; an intact status also needs the log to still
+-- hold every entry up to that head.
 currentSnapshot : ReviewKey -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error (Maybe ( LogStatus, Index.Snapshot ))
 currentSnapshot key conn db cursor =
     do
         head <- LibDb.currentHead db
         snap <- Index.readSnapshot conn cursor
-        Task.succeed (Maybe.map (\status -> ( status, snap )) (Index.stampStatus key head snap.stamp))
+        status <- confirmedStatus db head (Index.stampStatus key head snap.stamp)
+        Task.succeed (Maybe.map (\confirmed -> ( confirmed, snap )) status)
 
 
 -- A decided unit drained from the index, then the queue page at `cursor`

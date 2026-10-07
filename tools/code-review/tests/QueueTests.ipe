@@ -2057,6 +2057,46 @@ brokenChainCountsNothing =
             )
 
 
+-- An entry removed below an unmoved head is seen on the next page load, with
+-- no rebuild asked for: two units decided and drained through the tool, so
+-- the copy's stamp is current for an intact chain, then the first entry
+-- deleted outside it; the queue page then carries the banner naming entry
+-- 1 and lists both units again. Red if a stamp of an intact chain is
+-- trusted without checking that the log still holds every entry up to its
+-- head.
+removedEntryBelowHeadSeenOnLoad : Task.Task Error Bool
+removedEntryBelowHeadSeenOnLoad =
+    do
+        at <- freshScratch "ipe-index-log-removed-below-head"
+        db <- seedProgressScratch at
+        decideAndDrain db "u-a"
+        decideAndDrain db "u-b"
+        before <- loadPageNow Index.Start
+        tamperLog db "DELETE FROM review_log WHERE seq = 1" []
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed (decidedThenReopened before page)
+
+
+decideAndDrain : Db -> String -> Task.Task Error Int
+decideAndDrain db label =
+    decideNow db (uid label) Approved |> Task.andThen (\( attested, written ) -> drainUnitNow attested written)
+
+
+decidedThenReopened : Queue.QueuePage -> Queue.QueuePage -> Bool
+decidedThenReopened before page =
+    before.log
+        == Signed Intact
+        && not (onPage "u-a" before)
+        && not (onPage "u-b" before)
+        && page.log
+        == Signed (BrokenAt 1)
+        && Queue.chainBanner page.log
+        == Just "The review log's chain breaks at entry 1: a decision was removed, reordered or replaced outside this tool."
+        && onPage "u-a" page
+        && onPage "u-b" page
+
+
 whyOf : ReviewEntry -> Maybe Unverified
 whyOf entry =
     case entry of
@@ -2151,6 +2191,7 @@ checks =
             , check "a decided refusal flipped to an approval is back in the queue" flippedRefusalBackInQueue
             , check "a forged log entry leaves its unit queued" forgedEntryLeavesUnitQueued
             , check "a broken chain counts nothing, shows its banner and refuses a decision" brokenChainCountsNothing
+            , check "an entry removed below an unmoved head is seen on the next page load" removedEntryBelowHeadSeenOnLoad
             , check "a server with no key records and counts nothing" readOnlyRecordsAndCountsNothing
             , check "a failed drain keeps the queue row" drainIsAtomic
             , check "a progress rebuild stops at its page ceiling and rolls back" resyncStopsAtCeiling

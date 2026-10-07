@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), HistoryCursor(..), HistoryRows, LogRow, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, checkChainWithin, countedRows, currentHead, findDecision, findLatestForUid, historyPage, historyPlan, insertDecision, lastSeq, logPageCeiling, logRowsAfter, openAt, parseReason, probe, reasonMaxChars, reasonText, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier)
+module Lib.Db exposing (Decision(..), HistoryCursor(..), HistoryRows, LogRow, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, checkChainWithin, countedRows, currentHead, holdsEveryEntry, findDecision, findLatestForUid, historyPage, historyPlan, insertDecision, lastSeq, logPageCeiling, logRowsAfter, openAt, parseReason, probe, reasonMaxChars, reasonText, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -468,6 +468,20 @@ oneHead rows =
 
         _ ->
             Task.fail (Error.unexpected "review_log_head did not return exactly one row")
+
+
+-- True when the log holds one entry for every seq from 1 to the head's:
+-- the seq is the table's key and at least 1, so a count of entries up to
+-- the head's seq equal to that seq leaves no gap. The cheap check a page
+-- load makes before it trusts a stamp of an intact chain, so an entry
+-- removed below an unmoved head is seen without waiting for a rebuild.
+holdsEveryEntry : Db -> Index.ChainHead -> Task.Task Error Bool
+holdsEveryEntry db head =
+    Db.queryDecode db
+        "SELECT count(*) AS entries FROM review_log WHERE seq <= ?"
+        [ SqlInt (Index.chainSeq head) ]
+        (Db.Decode.succeed (\entries -> entries) |> Db.Decode.required "entries" (Db.Decode.int "entries"))
+        |> Task.map (\counts -> counts == [ Index.chainSeq head ])
 
 
 -- The head moved from `prev` to `next` only if it still reads `prev`: a head

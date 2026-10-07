@@ -110,7 +110,8 @@ still listed, badged UNRECORDED.
 The progress counter in the header is the index's units minus its open units,
 out of all its units. The page rows, the open count and the progress are read
 in one index transaction, so they always describe the same index state, and a
-load costs the same however large the index or the review history grows.
+load costs the same however large the index grows; against the review log it
+adds one count of the log's entries up to its head (below).
 Deciding a unit raises the first number and leaves the second unchanged, and
 a reload or a second tab shows the same numbers.
 
@@ -174,7 +175,10 @@ The index's `reviewed` copy is trusted only when its `reviewed_stamp` matches
 the log's current head and state: draining a decision moves the stamp along
 with the head, and any other stamp (a decision whose drain failed, an index
 file replaced by another, a decision made from another process) rebuilds the
-copy from the verified rows of the review DB before the page is read. A row
+copy from the verified rows of the review DB before the page is read. A stamp
+of an intact chain is trusted only while the log still holds every entry up
+to the head, so an entry deleted below an unmoved head shows the banner on
+the next page load. A row
 written into `review_log` by hand, outside the app, does not move the head
 and breaks the chain. A replaced review DB has a new log id, so it re-opens
 every unit the old one decided. Startup always rebuilds the copy once.
