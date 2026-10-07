@@ -832,6 +832,116 @@ const _WASI_TIME_FLOOR_SEAL: () = {
     let _ = crate::time::time_sleep::<E>;
 };
 
+/// Source scan for client JavaScript that reads the global `document` directly.
+#[cfg(test)]
+mod js_document_scan {
+    /// Whether `c` can continue a JavaScript identifier.
+    const fn is_ident(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    }
+
+    /// `js` with each comment blanked, newlines kept.
+    ///
+    /// A comment opens only at a line start or after whitespace, so a `//` or
+    /// `/*` inside a URL, a regex or a MIME pattern stays code.
+    fn strip_comments(js: &str) -> String {
+        let mut out = String::with_capacity(js.len());
+        let mut prev = '\n';
+        let mut chars = js.chars().peekable();
+        while let Some(c) = chars.next() {
+            let opens = prev.is_whitespace() && c == '/';
+            match (opens, chars.peek().copied()) {
+                (true, Some('/')) => {
+                    while chars.peek().is_some_and(|n| *n != '\n') {
+                        chars.next();
+                    }
+                    out.push(' ');
+                    prev = ' ';
+                }
+                (true, Some('*')) => {
+                    chars.next();
+                    let mut star = false;
+                    for n in chars.by_ref() {
+                        if n == '\n' {
+                            out.push('\n');
+                        }
+                        if star && n == '/' {
+                            break;
+                        }
+                        star = n == '*';
+                    }
+                    out.push(' ');
+                    prev = ' ';
+                }
+                _ => {
+                    out.push(c);
+                    prev = c;
+                }
+            }
+        }
+        out
+    }
+
+    /// Every line of `js` that names the global `document` outside the bound table.
+    ///
+    /// The two admitted forms are `typeof document` and the table's closing
+    /// `})(document)`; any other mention (`document.body`, `document["body"]`,
+    /// `window.document`, `f(document)`) is reported with its line number.
+    pub(super) fn unbound_document_reads(js: &str) -> Vec<String> {
+        let code = strip_comments(js);
+        let mut found = Vec::new();
+        for (at, _) in code.match_indices("document") {
+            let before = code.get(..at).unwrap_or_default();
+            let after = code.get(at + "document".len()..).unwrap_or_default();
+            if before.chars().next_back().is_some_and(is_ident)
+                || after.chars().next().is_some_and(is_ident)
+            {
+                continue;
+            }
+            let is_typeof = before
+                .trim_end()
+                .strip_suffix("typeof")
+                .is_some_and(|rest| !rest.chars().next_back().is_some_and(is_ident));
+            let is_table_close = before.ends_with("})(") && after.starts_with(')');
+            if !(is_typeof || is_table_close) {
+                let line = before.matches('\n').count() + 1;
+                let text = code.lines().nth(line - 1).unwrap_or_default().trim();
+                found.push(format!("line {line}: {text}"));
+            }
+        }
+        found
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::unbound_document_reads;
+
+        #[test]
+        fn the_scan_refuses_every_direct_document_read() {
+            for js in [
+                "var b = document.body;",
+                "var b = document[\"body\"];",
+                "var b = window.document.body;",
+                "f(document);",
+                "if (x === document) {}",
+                "var u = \"http://x\"; document.title = u;",
+            ] {
+                assert!(!unbound_document_reads(js).is_empty(), "accepted: {js}");
+            }
+        }
+
+        #[test]
+        fn the_scan_admits_the_table_and_typeof_and_comments() {
+            let js = "var t = (function(doc) {\n  return doc;\n})(document);\n\
+                      if (typeof document === \"undefined\") {}\n\
+                      // document.body is never read\n\
+                      x(); /* document.body\n  either */\n\
+                      var r = \"documentElement\"; input.accept = \"image/*\";\n";
+            assert_eq!(unbound_document_reads(js), Vec::<String>::new());
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod control_surface_absence {

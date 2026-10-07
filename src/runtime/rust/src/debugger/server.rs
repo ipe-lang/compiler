@@ -168,15 +168,25 @@ pub fn overlay_html(labels: &[String], total: usize, scrub_base: &str) -> String
     )
 }
 
-/// Emit the inline `<script>` block that wires the scrubber, row-click, and
-/// reset button to their respective endpoints. The script runs in a
-/// self-calling function to avoid polluting the page's global scope.
+/// Emit the inline `<script>` block that wires the scrubber, row-click, and reset button.
+///
+/// The script runs in a self-calling function to avoid polluting the page's
+/// global scope. It binds the panel as its own tag's previous sibling and reads
+/// the document only through members bound from the prototypes, so app markup
+/// carrying `data-ipe-debugger`, or an `img`/`form` named after a document
+/// member, never stands in for the panel or the page root.
 fn build_overlay_script(scrub_url_js: &str, reset_url_js: &str, selected_bg: &str) -> String {
     format!(
         "<script>\n\
 (function(){{\n\
-  var panel=document.querySelector('[data-ipe-debugger]');\n\
-  if(!panel)return;\n\
+  var doc=(function(d){{\n\
+    var cur=Object.getOwnPropertyDescriptor(Document.prototype,'currentScript');\n\
+    return {{script:function(){{return cur&&cur.get?cur.get.call(d):null;}},\n\
+      byId:Document.prototype.getElementById.bind(d)}};\n\
+  }})(document);\n\
+  var own=doc.script();\n\
+  var panel=own?own.previousElementSibling:null;\n\
+  if(!panel||!panel.hasAttribute('data-ipe-debugger'))return;\n\
   var scrubber=panel.querySelector('input[type=range]');\n\
   var list=panel.querySelector('[data-ipe-dbg-list]');\n\
   var resetBtn=panel.querySelector('[data-ipe-dbg-reset]');\n\
@@ -201,7 +211,7 @@ fn build_overlay_script(scrub_url_js: &str, reset_url_js: &str, selected_bg: &st
         try{{\n\
           var d=JSON.parse(xhr.responseText);\n\
           if(d&&d.body){{\n\
-            var root=document.getElementById('ipe-root');\n\
+            var root=doc.byId('ipe-root');\n\
             if(root){{root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'?d.epoch:null;}}\n\
           }}\n\
         }}catch(e){{}}\n\
@@ -323,6 +333,22 @@ mod tests {
         assert!(
             html.contains("root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'"),
             "a scrubbed render must replace the client's render epoch with its own"
+        );
+    }
+
+    /// The overlay script reads no document member through the document's own lookup.
+    #[test]
+    fn overlay_reads_the_document_only_through_the_bound_table() {
+        let html = overlay_html(&["Add(1)".to_owned()], 1, "");
+        assert_eq!(
+            crate::js_document_scan::unbound_document_reads(&html),
+            Vec::<String>::new(),
+            "the overlay names `document` only in its bound table"
+        );
+        assert!(
+            html.contains("</div><script>")
+                && html.contains("var panel=own?own.previousElementSibling:null;"),
+            "the overlay script binds the panel it directly follows"
         );
     }
 
