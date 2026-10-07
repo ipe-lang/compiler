@@ -968,25 +968,146 @@ pub(crate) struct ResolvedPort {
     pub(crate) operator_var: &'static str,
 }
 
+/// An operator-fixable reason the OS refused a listener bind.
+///
+/// Classified once from the bind's `io::ErrorKind`; any other kind stays an
+/// unclassified I/O failure.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindRefusal {
+    /// Another process is bound to the port (`AddrInUse`).
+    PortInUse,
+    /// The OS refused this process the port (`PermissionDenied`).
+    PortRefused,
+    /// The bind address is not an address of this host (`AddrNotAvailable`).
+    AddressNotLocal,
+}
+
+#[cfg(feature = "server")]
+impl BindRefusal {
+    /// The operator-fixable refusal behind `kind`, or `None` for any other kind.
+    pub(crate) const fn classify(kind: std::io::ErrorKind) -> Option<Self> {
+        match kind {
+            std::io::ErrorKind::AddrInUse => Some(Self::PortInUse),
+            std::io::ErrorKind::PermissionDenied => Some(Self::PortRefused),
+            std::io::ErrorKind::AddrNotAvailable => Some(Self::AddressNotLocal),
+            _ => None,
+        }
+    }
+}
+
+/// The relaunch line a fix suggests: `assignment` before the command that
+/// starts this program again.
+///
+/// A dev-loop build is started by `ipe dev run`; a release binary is started
+/// directly, so its line names no `ipe` verb.
+#[cfg(feature = "server")]
+fn relaunch_line(posture: crate::telemetry::BuildPosture, assignment: &str) -> String {
+    match posture {
+        crate::telemetry::BuildPosture::Development => format!("{assignment} ipe dev run"),
+        crate::telemetry::BuildPosture::Release => format!("{assignment} ./<program>"),
+    }
+}
+
 #[cfg(feature = "server")]
 impl ResolvedPort {
     /// The refusal text for a bind that failed with `AddrInUse`.
     ///
+    /// Its fix line is chosen by how this binary was built
+    /// ([`crate::telemetry::BuildPosture::COMPILED`]).
+    pub(crate) fn addr_in_use_message(&self) -> String {
+        self.refusal_message(
+            crate::telemetry::BuildPosture::COMPILED,
+            BindRefusal::PortInUse,
+            None,
+        )
+    }
+
+    /// The typed refusal for a bind of `addr` that failed with `error`.
+    ///
+    /// An operator-fixable kind ([`BindRefusal`]) gets its own error kind and a
+    /// fix line chosen by how this binary was built; any other kind is an `Io`
+    /// error naming `surface` and the address.
+    pub(crate) fn bind_refusal(
+        &self,
+        surface: &str,
+        addr: std::net::SocketAddr,
+        error: &std::io::Error,
+    ) -> IpeError {
+        self.bind_refusal_for(
+            crate::telemetry::BuildPosture::COMPILED,
+            surface,
+            addr,
+            error,
+        )
+    }
+
+    /// [`Self::bind_refusal`] under an explicit build `posture`.
+    pub(crate) fn bind_refusal_for(
+        &self,
+        posture: crate::telemetry::BuildPosture,
+        surface: &str,
+        addr: std::net::SocketAddr,
+        error: &std::io::Error,
+    ) -> IpeError {
+        let Some(refusal) = BindRefusal::classify(error.kind()) else {
+            return IpeError::io(format!("{surface}: bind {addr}: {error}"));
+        };
+        let message = self.refusal_message(posture, refusal, Some(addr.ip()));
+        match refusal {
+            BindRefusal::PortInUse => IpeError::conflict(message),
+            BindRefusal::PortRefused => IpeError::permission_denied().with_message(message),
+            BindRefusal::AddressNotLocal => IpeError::invalid_input(message),
+        }
+    }
+
+    /// The text of `refusal`: what failed, then the fix line.
+    ///
     /// A port a supervisor chose names the supervisor, never the operator var
     /// the supervisor outranks; any other port advises the operator var.
-    pub(crate) fn addr_in_use_message(&self) -> String {
+    fn refusal_message(
+        &self,
+        posture: crate::telemetry::BuildPosture,
+        refusal: BindRefusal,
+        host: Option<std::net::IpAddr>,
+    ) -> String {
         let port = self.port;
+        let cause = match refusal {
+            BindRefusal::PortInUse => {
+                format!("port {port} is already in use — another application is bound to it.")
+            }
+            BindRefusal::PortRefused if port < 1024 => format!(
+                "port {port} was refused to this process — ports below 1024 need elevated privileges."
+            ),
+            BindRefusal::PortRefused => {
+                format!("port {port} was refused to this process by the operating system's policy.")
+            }
+            BindRefusal::AddressNotLocal => {
+                let host = host.map_or_else(
+                    || "the bind address".to_owned(),
+                    std::string::ToString::to_string,
+                );
+                let var = crate::app_config::HTTP_BIND_VAR;
+                return format!(
+                    "{host} is not an address of this host, so port {port} cannot be bound on it.\n\
+                     Set {var} to one of this host's addresses, e.g.:\n\
+                     {}",
+                    relaunch_line(posture, &format!("{var}=127.0.0.1"))
+                );
+            }
+        };
         let var = self.operator_var;
         match self.origin {
             PortOrigin::Relocated => format!(
-                "port {port} is already in use — another application is bound to it.\n\
+                "{cause}\n\
                  The port was chosen by the supervisor (`ipe dev watch` or the dev console); \
                  restart it to pick a free port."
             ),
             PortOrigin::Operator | PortOrigin::Source => format!(
-                "port {port} is already in use — another application is bound to it.\n\
+                "{cause}\n\
                  Set a different port with the {var} environment variable, e.g.:\n\
-                 {var}=8123 ipe dev run"
+                 {}",
+                relaunch_line(posture, &format!("{var}=8123"))
             ),
         }
     }
@@ -4466,6 +4587,7 @@ mod descriptor_floor_tests {
 #[cfg(all(test, feature = "server"))]
 mod listen_port_tests {
     use super::{PortOrigin, ResolvedPort, resolve_listen_port};
+    use crate::telemetry::BuildPosture;
 
     /// Every value that is not a bindable `1..=65535` port.
     const GARBAGE: [&str; 15] = [
@@ -4555,15 +4677,27 @@ mod listen_port_tests {
         }
     }
 
+    /// The message of an `AddrInUse` bind refusal under `posture`.
+    fn in_use_message(r: ResolvedPort, posture: BuildPosture) -> String {
+        crate::ipe_error_message(r.bind_refusal_for(
+            posture,
+            "listen",
+            std::net::SocketAddr::from(([127, 0, 0, 1], 8000)),
+            &std::io::Error::from(std::io::ErrorKind::AddrInUse),
+        ))
+    }
+
     #[test]
     fn relocated_bind_failure_advises_no_operator_var() {
         for var in OPERATOR_VARS {
-            let msg = resolve(Some("9100"), var, Some("9200")).addr_in_use_message();
-            assert!(
-                OPERATOR_VARS.iter().all(|v| !msg.contains(v)),
-                "a supervisor-chosen port must not advise an operator var: {msg}"
-            );
-            assert!(msg.contains("9100") && msg.contains("supervisor"), "{msg}");
+            for posture in [BuildPosture::Development, BuildPosture::Release] {
+                let msg = in_use_message(resolve(Some("9100"), var, Some("9200")), posture);
+                assert!(
+                    OPERATOR_VARS.iter().all(|v| !msg.contains(v)),
+                    "a supervisor-chosen port must not advise an operator var: {msg}"
+                );
+                assert!(msg.contains("9100") && msg.contains("supervisor"), "{msg}");
+            }
         }
     }
 
@@ -4571,16 +4705,39 @@ mod listen_port_tests {
     fn operator_and_source_bind_failure_names_the_runtime_var() {
         for var in OPERATOR_VARS {
             for r in [resolve(None, var, Some("9200")), resolve(None, var, None)] {
-                let msg = r.addr_in_use_message();
+                for (posture, launch) in [
+                    (BuildPosture::Development, "ipe dev run"),
+                    (BuildPosture::Release, "./<program>"),
+                ] {
+                    let msg = in_use_message(r, posture);
+                    assert!(
+                        msg.contains(&format!("{var}=8123 {launch}")),
+                        "the advice must name {var} and how {posture:?} starts: {msg}"
+                    );
+                    assert!(
+                        OPERATOR_VARS.iter().filter(|v| msg.contains(*v)).count() == 1,
+                        "the advice names only this runtime's var: {msg}"
+                    );
+                }
+                let release = in_use_message(r, BuildPosture::Release);
                 assert!(
-                    msg.contains(&format!("{var}=8123 ipe dev run")),
-                    "the advice must name {var}: {msg}"
-                );
-                assert!(
-                    OPERATOR_VARS.iter().filter(|v| msg.contains(*v)).count() == 1,
-                    "the advice names only this runtime's var: {msg}"
+                    !release.contains("ipe dev"),
+                    "a release binary is not started by `ipe dev run`: {release}"
                 );
             }
+        }
+    }
+
+    /// The compiled posture's in-use advice is the advice `addr_in_use_message`
+    /// gives.
+    #[test]
+    fn addr_in_use_message_follows_the_compiled_posture() {
+        for var in OPERATOR_VARS {
+            let r = resolve(None, var, None);
+            assert_eq!(
+                r.addr_in_use_message(),
+                in_use_message(r, BuildPosture::COMPILED)
+            );
         }
     }
 }
