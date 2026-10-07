@@ -1,0 +1,23 @@
+module Main exposing (main)
+
+import Ipe.Crypto as Crypto
+import Ipe.Io as Io
+
+-- SECURITY: the message slot of `Crypto.verifyHmacSha256` takes a `String`. A
+-- `Mac` in that slot must be a compile error.
+main : Task ()
+main =
+    case Crypto.keyFromString "s3cret-signing-key" of
+        Just key ->
+            let
+                mac =
+                    Crypto.hmacSha256 key "message"
+            in
+            if Crypto.verifyHmacSha256 key mac mac then
+                Io.println "valid"
+
+            else
+                Io.println "invalid"
+
+        Nothing ->
+            Io.println "empty key rejected at the boundary"

@@ -988,6 +988,19 @@ TsgxkiXH9sjXrPHT1hXn2tKCv9MkR8MD1Ndh6jo7inBZUK0YG7H6Jx0CAwEAAQ==
         ));
     }
 
+    /// A 64-byte tag whose first 32 bytes are the correct HMAC-SHA-256 tag is
+    /// refused: the verifier compares the whole tag, never a prefix.
+    #[test]
+    fn verify_hmac_sha256_refuses_a_correct_prefix_with_a_longer_tail() {
+        let padded = format!("{HMAC_SHA256_RFC1}{}", "0".repeat(64));
+        assert_eq!(padded.len(), 128);
+        assert_eq!(verify_under_rfc_key("Hi There", &padded), Some(false));
+        assert_eq!(
+            verify_under_rfc_key("Hi There", HMAC_SHA256_RFC1),
+            Some(true)
+        );
+    }
+
     /// `Key` equality delegates to `ct_bytes_eq` — same-content keys compare
     /// equal, different-content keys do not.
     #[test]

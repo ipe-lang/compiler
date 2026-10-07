@@ -127,6 +127,25 @@ fn crypto_raw_hex_tag_is_a_type_error() -> TestResult {
     Ok(())
 }
 
+/// SECURITY: the verifier's three slots are three distinct roles. A `Key` in
+/// the tag slot and a `Mac` in the message slot are each a compile-time TYPE
+/// MISMATCH, so a secret cannot stand in for a tag nor a tag for a message.
+#[test]
+fn crypto_verify_slot_roles_are_not_interchangeable() -> TestResult {
+    for fixture_name in [
+        "crypto_key_in_tag_slot_is_type_error.ipe",
+        "crypto_mac_in_message_slot_is_type_error.ipe",
+    ] {
+        let (ok, _, stderr) = run_ipe(&["type-check", &fixture(fixture_name).to_string_lossy()])?;
+        assert!(!ok, "{fixture_name} must NOT type-check");
+        assert!(
+            stderr.contains("IPE-T0001") && stderr.contains("TYPE MISMATCH"),
+            "{fixture_name}: the role-mismatch diagnostic must be shown, got:\n{stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// SECURITY: the parsed stored-tag path type-checks. `macFromHex` parses the
 /// stored hex once into a `Mac`, and `verifyHmacSha256` consumes that `Mac`.
 #[test]
