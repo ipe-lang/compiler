@@ -272,6 +272,22 @@ fn wait_until_connectable(test_name: &str, addr: &str) -> Result<(), BoxError> {
     }
 }
 
+/// A well-formed tab id, as a browser tab mints once per page load.
+const TAB: &str = "00112233445566778899aabbccddeeff";
+
+/// The render epoch the page embeds as `window.__IPE_EPOCH`; an event carries it
+/// so the server resolves the handler id against the render that produced it.
+fn extract_epoch(test_name: &str, html: &str) -> Result<String, BoxError> {
+    let needle = "window.__IPE_EPOCH=\"";
+    html.find(needle)
+        .and_then(|at| html.get(at + needle.len()..))
+        .and_then(|rest| rest.get(..rest.find('"')?))
+        .map(str::to_string)
+        .ok_or_else(|| -> BoxError {
+            format!("{test_name}: no window.__IPE_EPOCH in the page").into()
+        })
+}
+
 /// Send a raw HTTP/1.1 request; return `(raw_headers, body)`.
 fn http_send(
     test_name: &str,
@@ -526,8 +542,9 @@ fn ui_widget_serves_sri_glue_and_round_trips_up_event() -> Result<(), BoxError> 
     // up-decoder. `Bumped 3` folds +3 into the count.
     let cookie_header = format!("ipe_sid={sid}");
     let up_valid = r#"{"Bumped":3}"#;
+    let epoch = extract_epoch(test_name, &body)?;
     let event_body = format!(
-        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":""}}"#,
+        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#,
         up = serde_json::to_string(up_valid).expect("string always serializes")
     );
     let (_, post_body) = http_send(
@@ -569,8 +586,9 @@ fn ui_widget_serves_sri_glue_and_round_trips_up_event() -> Result<(), BoxError> 
     // A payload that does not decode to the declared `up` type must be dropped
     // whole by the WP4 seal decoder — the model must NOT move off 3.
     let up_bogus = r#"{"Nonexistent":true}"#;
+    let epoch = extract_epoch(test_name, &body_after_valid)?;
     let bogus_body = format!(
-        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":""}}"#,
+        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":2}}"#,
         up = serde_json::to_string(up_bogus).expect("string always serializes")
     );
     let _ = http_send(
