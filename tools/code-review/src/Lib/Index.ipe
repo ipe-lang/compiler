@@ -15,6 +15,7 @@ import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
+import Ipe.Tuple as Tuple
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
@@ -1425,7 +1426,7 @@ residualOf ( _, rows ) =
 coveredFlags : Int -> List ( Int, Int ) -> List Bool
 coveredFlags count spans =
     List.filterMap (clampSpan count) spans
-        |> List.sort
+        |> List.sortBy Tuple.first
         |> List.foldl coverRun ( 1, [] )
         |> closeRuns count
 
