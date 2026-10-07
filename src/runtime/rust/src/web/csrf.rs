@@ -77,11 +77,18 @@ pub fn csrf_enabled() -> bool {
     })
 }
 
-// `frame_ancestors` + `security_headers` were relocated to the always-compiled
-// `telemetry` module so the Ipe.Http.Server path can share them (the `live`
-// module is DCE'd out of server-only builds). Re-exported here so existing
-// `csrf::frame_ancestors` / `csrf::security_headers` call sites keep resolving.
-pub use crate::telemetry::{frame_ancestors, security_headers};
+pub use crate::telemetry::frame_ancestors;
+
+/// The security headers of an `Ipe.Web` page response.
+///
+/// # Errors
+///
+/// The [`crate::telemetry::FrameAncestorsRefusal`] of a refused
+/// `IPE_WEB_FRAME_ANCESTORS`: the page answers `500`.
+pub fn security_headers()
+-> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
+    crate::telemetry::security_headers(crate::telemetry::HeaderProfile::WebPageFrameOnly)
+}
 
 /// Whether to mark cookies `Secure`: [`cookies_secure_with`] over the process.
 ///
@@ -288,9 +295,6 @@ pub async fn csrf_middleware(
     }
     next.run(req).await
 }
-
-// `security_headers` now lives in `telemetry` (re-exported at the top of this
-// module) so the Ipe.Http.Server path can share it.
 
 #[cfg(test)]
 mod tests {

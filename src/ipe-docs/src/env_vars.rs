@@ -1018,8 +1018,9 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_FRAME_ANCESTORS",
         default: "unset (no embedding allowed)",
-        purpose: "Space-separated `Content-Security-Policy: frame-ancestors` allow-list, \
-                  e.g. `https://app.example.com`. Enables embedding this app in a \
+        purpose: "Space-separated `frame-ancestors` sources of the default \
+                  `Content-Security-Policy` sent on HTML responses, e.g. \
+                  `https://app.example.com`. Enables embedding this app in a \
                   third-party iframe; also sets `SameSite=None; Secure` on session \
                   cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
                   or only whitespace refuses to start the server.",
