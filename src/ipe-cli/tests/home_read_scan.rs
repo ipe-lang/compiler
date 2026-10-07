@@ -58,7 +58,8 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// count and fails the scan like an allow anywhere else. The sites are the
 /// [`ENV_ALLOW_FILES`] readers (`ipe_env`'s `var`/`var_os`/`vars_os`, the
 /// sandbox home reader, the jail passthrough); the sandbox's thread-spawn ban
-/// proofs; the dev-only temp-root test reader; and in the runtime crate, which has its own `clippy.toml`, the build
+/// proofs; the database crate's filesystem, environment and clock ban proofs;
+/// the dev-only temp-root test reader; and in the runtime crate, which has its own `clippy.toml`, the build
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
 /// crate-private accessor, the ban proofs, the one blocking-pool start, the one
@@ -69,6 +70,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/sandbox/src/home.rs", 1),
     ("src/compiler/sandbox/src/host_env.rs", 1),
     ("src/compiler/sandbox/src/clippy_paths_resolve.rs", 2),
+    ("src/compiler/db/src/clippy_paths_resolve.rs", 35),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
     ("src/runtime/rust/src/clippy_paths_resolve.rs", 14),

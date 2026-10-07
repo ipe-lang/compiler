@@ -1,0 +1,91 @@
+# Allow unwrap/expect in test code (integration tests and #[cfg(test)] blocks).
+# The runtime crate has strict deny of these in production paths; the exemption
+# lets test assertions stay readable without #[allow] noise at every call site.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Abrupt-failure constructs that have no dedicated clippy lint. Denying them by
+# path closes the gaps left by the `unwrap_used`/`expect_used`/`panic` denies in
+# Cargo.toml's [workspace.lints]. See docs/internals/rust-abrupt-failure-ledger.md.
+disallowed-methods = [
+    { path = "core::option::Option::unwrap_unchecked", reason = "UB on None; return a Result or model the invariant in a type" },
+    { path = "core::result::Result::unwrap_unchecked", reason = "UB on Err; return a Result or model the invariant in a type" },
+    { path = "std::process::abort", reason = "abrupt termination that skips Drop; return a Result to the CLI boundary" },
+    { path = "std::panic::panic_any", reason = "a panic; return a Result or emit a diagnostic" },
+    { path = "core::hint::unreachable_unchecked", reason = "UB; model the invariant in a type instead" },
+    { path = "std::env::home_dir", reason = "an unvalidated home; read it through `ipe_sandbox::home::home_dir` (absolute or nothing)" },
+    # The process environment is read only by audited readers: `ipe_env` (refuses
+    # every home name), `ipe_sandbox::home` (the sole home reader, absolute or
+    # nothing), and `ipe_sandbox::host_env` (verbatim jail passthrough). The
+    # `home_read_scan` test pins which files may carry the per-site allow.
+    { path = "std::env::var", reason = "read through `ipe_env::var` (home names refused; the home is `ipe_sandbox::home::home_dir`)" },
+    { path = "std::env::var_os", reason = "read through `ipe_env::var_os` (home names refused; the home is `ipe_sandbox::home::home_dir`)" },
+    { path = "std::env::vars", reason = "a whole-environment iterator hands the home out under its own name; read named keys through `ipe_env`" },
+    { path = "std::env::vars_os", reason = "a whole-environment iterator hands the home out under its own name; read named keys through `ipe_env`" },
+    # The OS temp root is a base other local users can write. Production code
+    # creates temporary entries only through `ipe_sandbox::scratch`, which
+    # verifies the base and creates exclusively under it; test code reads the
+    # root through the dev-only `ipe_test_temp::temp_root`. `allow-invalid`
+    # keeps the `tempfile` entries quiet in crates that do not depend on it.
+    { path = "std::env::temp_dir", reason = "a base other users can write; use `ipe_sandbox::scratch` (tests: `ipe_test_temp::temp_root`)" },
+    { path = "tempfile::tempdir", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchDir` (tests: `tempfile::tempdir_in(ipe_test_temp::temp_root())`)", allow-invalid = true },
+    { path = "tempfile::tempfile", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchFile`", allow-invalid = true },
+    { path = "tempfile::TempDir::new", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchDir` (tests: `tempfile::TempDir::new_in(ipe_test_temp::temp_root())`)", allow-invalid = true },
+    { path = "tempfile::TempDir::with_prefix", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchDir`", allow-invalid = true },
+    { path = "tempfile::NamedTempFile::new", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchFile`", allow-invalid = true },
+    { path = "tempfile::NamedTempFile::with_prefix", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchFile`", allow-invalid = true },
+    { path = "tempfile::Builder::tempdir", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchDir` or `Builder::tempdir_in`", allow-invalid = true },
+    { path = "tempfile::Builder::tempfile", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchFile` or `Builder::tempfile_in`", allow-invalid = true },
+    # A refused OS thread must come back as an error the caller routes, never
+    # a panic: every thread starts through `std::thread::Builder`.
+    { path = "std::thread::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn` and route the `io::Error`" },
+    { path = "std::thread::Scope::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn_scoped` and route the `io::Error`" },
+
+    # The `ipe_db` queries are pure: no filesystem, environment or clock read.
+    # `src/clippy_paths_resolve.rs` names each path below so a ban that stops
+    # resolving or firing breaks the clippy run.
+    { path = "std::fs::read", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::read_to_string", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::read_dir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::read_link", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::metadata", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::symlink_metadata", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::canonicalize", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::exists", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::write", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::create_dir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::create_dir_all", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::remove_file", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::remove_dir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::remove_dir_all", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::rename", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::copy", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::hard_link", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::set_permissions", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::exists", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::try_exists", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::is_file", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::is_dir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::is_symlink", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::metadata", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::symlink_metadata", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::read_dir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::read_link", reason = "INV-1: salsa queries are pure" },
+    { path = "std::path::Path::canonicalize", reason = "INV-1: salsa queries are pure" },
+    { path = "std::env::current_dir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::env::set_current_dir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::env::current_exe", reason = "INV-1: salsa queries are pure" },
+    { path = "std::time::SystemTime::now", reason = "INV-1: salsa queries are pure" },
+    { path = "std::time::SystemTime::elapsed", reason = "INV-1: salsa queries are pure" },
+    { path = "std::time::Instant::now", reason = "INV-1: salsa queries are pure" },
+    { path = "std::time::Instant::elapsed", reason = "INV-1: salsa queries are pure" },
+]
+
+# The same purity rule for the types that open or walk the filesystem.
+disallowed-types = [
+    { path = "std::fs::File", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::OpenOptions", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::DirBuilder", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::ReadDir", reason = "INV-1: salsa queries are pure" },
+    { path = "std::fs::DirEntry", reason = "INV-1: salsa queries are pure" },
+]

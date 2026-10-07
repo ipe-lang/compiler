@@ -18,8 +18,10 @@
 //! firewall — importers early-cut on dep body-only edits via salsa
 //! backdating).
 //!
-//! INV-1 (no hidden inputs): no query here touches `std::fs`, `std::env`, or
-//! the clock. File reading stays in the driver, which is where inputs are set.
+//! INV-1 (no hidden inputs): no query here reads the filesystem, the
+//! environment or the clock. The crate's `clippy.toml` bans those APIs, and
+//! the `clippy_paths_resolve` module proves each ban fires. File reading stays
+//! in the driver, which is where inputs are set.
 //!
 //! The interning story is the plan's Option 3a: the database owns a
 //! [`SharedInterner`] (`Arc<Mutex<ipe_intern::Interner>>`) shared with the
@@ -38,6 +40,7 @@
 //! LSP session never reaches emission (diagnostics-only), so the byte-level
 //! hazard this gate guards does not apply to it.
 
+mod clippy_paths_resolve;
 mod metadata;
 
 use std::collections::{BTreeMap, BTreeSet};
