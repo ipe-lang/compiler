@@ -777,26 +777,36 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
         .collect();
 
     // Symbols: sourced from the ipe_docs index (already built from parsed
-    // stdlib source).
-    let mut symbol_sources: Vec<BundleSource> = Vec::new();
-    {
-        use ipe_docs::IndexBuilder;
-        let mut builder = IndexBuilder::new();
-        let _ = builder.add_stdlib();
-        let _ = builder.add_compiled_stdlib();
-        let idx = builder.finish();
+    // stdlib source). The index files each symbol under several spellings; the
+    // bundle carries ONE entry per symbol, keyed by the index's canonical
+    // `source_key` (the key a lookup of any spelling reports), with the other
+    // spellings as aliases that open it but are never listed.
+    // The index is the one `build_index` lookups resolve against, so a listed
+    // key and a resolved key come from the same producer.
+    let symbol_sources: Vec<BundleSource> = {
+        let idx = build_index()?;
+        let mut by_canonical: std::collections::BTreeMap<&str, (&str, Vec<String>)> =
+            std::collections::BTreeMap::new();
         for key in idx.keys() {
             if let Some(entry) = idx.resolve(key)
                 && matches!(entry.kind, ipe_docs::EntryKind::Symbol)
             {
-                symbol_sources.push(BundleSource::with_body(
-                    key.to_owned(),
-                    key.to_owned(),
-                    entry.text.clone(),
-                ));
+                let slot = by_canonical
+                    .entry(entry.source_key.as_str())
+                    .or_insert_with(|| (entry.text.as_str(), Vec::new()));
+                if key != entry.source_key {
+                    slot.1.push(key.to_owned());
+                }
             }
         }
-    }
+        by_canonical
+            .into_iter()
+            .map(|(canonical, (body, mut aliases))| {
+                aliases.sort_unstable();
+                BundleSource::with_body(canonical, canonical, body).with_aliases(aliases)
+            })
+            .collect()
+    };
 
     // Diagnostics: from the embedded explain pages. The title is the page's
     // human heading (never the code repeated), so a list reads
@@ -5509,8 +5519,13 @@ mod tests {
         let index = build_index().expect("the doc index builds");
         let modules = stdlib_module_names();
         let mut checked = 0_usize;
+        let mut listed = std::collections::BTreeSet::new();
         for entry in bundle.all_entries() {
             let term = rerun_term(entry, &modules);
+            assert!(
+                listed.insert(term.clone()),
+                "{term:?} is listed for two entries; a term opens exactly one"
+            );
             let parsed = parse_doc(&s(&[term.as_str(), "--json"]));
             assert!(parsed.is_ok(), "{term:?} parsed to {parsed:?}");
             let Ok(mode) = parsed else {
@@ -5569,6 +5584,48 @@ mod tests {
             checked = checked.saturating_add(1);
         }
         assert!(checked > 0, "the bundle holds entries to walk");
+        assert_eq!(
+            checked,
+            bundle.all_entries().count(),
+            "every entry is walked; none skipped"
+        );
+    }
+
+    /// Every spelling the index files a stdlib symbol under opens, as
+    /// `symbol:<spelling>`, the one bundle entry keyed by the index's canonical
+    /// `source_key`, never a second entry for the same symbol.
+    #[test]
+    fn every_symbol_spelling_opens_its_one_canonical_entry() {
+        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let index = build_index().expect("the doc index builds");
+        let mut spellings = 0_usize;
+        for key in index.keys() {
+            let Some(found) = index.resolve(key) else {
+                continue;
+            };
+            if !matches!(found.kind, ipe_docs::EntryKind::Symbol) {
+                continue;
+            }
+            let opened = bundle.resolve_qualified(&format!("symbol:{key}")).ok();
+            assert_eq!(
+                opened.map(|e| e.key.as_str()),
+                Some(found.source_key.as_str()),
+                "`symbol:{key}` opens the canonical entry"
+            );
+            spellings = spellings.saturating_add(1);
+        }
+        let entries = bundle.entries_for_kind(DocKind::Symbol).count();
+        assert!(entries > 0, "the bundle holds symbols");
+        assert!(
+            spellings > entries,
+            "aliases fold into fewer entries: {spellings} spellings, {entries} entries"
+        );
+        assert!(
+            bundle
+                .entries_for_kind(DocKind::Symbol)
+                .all(|e| index.resolve(&e.key).is_some_and(|i| i.source_key == e.key)),
+            "every symbol entry is keyed by its own canonical key"
+        );
     }
 
     #[test]
