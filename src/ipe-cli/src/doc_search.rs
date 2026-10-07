@@ -7,8 +7,11 @@
 //!
 //! Every input dimension has a declared ceiling: the query length
 //! ([`MAX_QUERY_CHARS`]), the entries scanned ([`MAX_CANDIDATES`]), the hits
-//! kept ([`RESULT_LIMIT`]), the text one edit distance compares
-//! ([`DISTANCE_CHARS`]), and a summary's width ([`SUMMARY_CHARS`]).
+//! kept ([`RESULT_LIMIT`]), the characters of a key or title any tier reads
+//! ([`FIELD_CHARS`]), the text one edit distance compares
+//! ([`DISTANCE_CHARS`]), and a summary's width ([`SUMMARY_CHARS`]). A key or
+//! title comes from a `docs/` tree the checkout controls, so its length alone
+//! never sets the cost of one comparison.
 
 use crate::doc_bundle::{DocEntry, DocKind};
 use crate::style::TerminalLine;
@@ -21,6 +24,20 @@ pub const MAX_CANDIDATES: usize = 20_000;
 
 /// The most hits a ranking keeps.
 pub const RESULT_LIMIT: usize = 10;
+
+/// The most characters of an entry's key or title the matcher reads.
+///
+/// A longer field is judged by its first `FIELD_CHARS` characters. It exceeds
+/// the longest case-folded query (a character folds to at most three), so a
+/// cut field, which folds to at least `FIELD_CHARS` characters, never equals
+/// a query: cutting never fabricates an exact match.
+pub const FIELD_CHARS: usize = 1024;
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the field ceiling drops to zero or to a length a folded query could equal [ledger #boundary]
+const _: () = assert!(FIELD_CHARS > MAX_QUERY_CHARS * MAX_FOLD_EXPANSION);
+
+/// An upper bound on the characters [`char::to_lowercase`] yields for one character.
+const MAX_FOLD_EXPANSION: usize = 3;
 
 /// The most characters per side one edit distance compares.
 pub const DISTANCE_CHARS: usize = 64;
@@ -145,19 +162,43 @@ pub struct Ranked<'a> {
     pub truncated: bool,
 }
 
-/// One entry's case-folded key and title.
+/// One entry's key and title, each cut to [`FIELD_CHARS`] and case-folded.
 struct Folded {
     key: String,
+    /// Whether the key was cut, so its last `.` segment is not the key's own.
+    key_cut: bool,
     title: String,
 }
 
 impl Folded {
     fn of(entry: &DocEntry) -> Self {
+        let key = field(&entry.key);
         Self {
-            key: fold(&entry.key),
-            title: fold(&entry.title),
+            key: fold(key),
+            key_cut: key.len() < entry.key.len(),
+            title: fold(field(&entry.title)),
         }
     }
+
+    /// The key's last `.` segment, or the whole cut key when the cut hid the
+    /// real last segment.
+    fn member(&self) -> &str {
+        if self.key_cut {
+            self.key.as_str()
+        } else {
+            last_segment(&self.key)
+        }
+    }
+}
+
+/// The first [`FIELD_CHARS`] characters of an entry field.
+fn field(text: &str) -> &str {
+    prefix_chars(text, FIELD_CHARS)
+}
+
+/// The length, in characters, of an entry field as the matcher reads it.
+fn field_len(text: &str) -> usize {
+    field(text).chars().count()
 }
 
 /// Rank `entries` against `query`.
@@ -166,6 +207,7 @@ impl Folded {
 /// secondary, key length, kind, key)`, where the secondary is the subsequence
 /// span or the edit distance (zero for every other tier); kind and key are
 /// unique together, so the order is total and every run returns the same list.
+/// The key length counts at most [`FIELD_CHARS`] characters.
 /// When nothing matches, the hits are the entries nearest by edit distance,
 /// ordered by `(distance, key length, kind, key)`, so a miss never dead-ends
 /// while any entry exists.
@@ -185,7 +227,7 @@ where
             let order = (
                 tier,
                 secondary,
-                entry.key.chars().count(),
+                field_len(&entry.key),
                 entry.kind,
                 entry.key.as_str(),
             );
@@ -199,7 +241,7 @@ where
             .map(|entry| {
                 let order = (
                     nearest_distance(&Folded::of(entry), query),
-                    entry.key.chars().count(),
+                    field_len(&entry.key),
                     entry.kind,
                     entry.key.as_str(),
                 );
@@ -228,7 +270,8 @@ where
 /// The one entry whose key equals `query` case-insensitively, or `None` when
 /// none or several do.
 ///
-/// Scans at most [`MAX_CANDIDATES`] entries.
+/// Scans at most [`MAX_CANDIDATES`] entries and reads at most [`FIELD_CHARS`]
+/// characters of each key; a cut key never equals a query.
 #[must_use]
 pub fn unique_exact<'a, I>(entries: I, query: &DocQuery) -> Option<&'a DocEntry>
 where
@@ -237,7 +280,7 @@ where
     let mut hits = entries
         .into_iter()
         .take(MAX_CANDIDATES)
-        .filter(|entry| fold(&entry.key) == query.folded);
+        .filter(|entry| fold(field(&entry.key)) == query.folded);
     let first = hits.next()?;
     hits.next().is_none().then_some(first)
 }
@@ -246,7 +289,7 @@ where
 fn classify(entry: &DocEntry, folded: &Folded, query: &DocQuery) -> Option<(Tier, usize)> {
     let q = query.folded.as_str();
     let key = folded.key.as_str();
-    let member = last_segment(key);
+    let member = folded.member();
     let title = folded.title.as_str();
     let tier = if key == q {
         Tier::ExactKey
@@ -258,7 +301,9 @@ fn classify(entry: &DocEntry, folded: &Folded, query: &DocQuery) -> Option<(Tier
         Tier::Prefix
     } else if title.starts_with(q) {
         Tier::TitlePrefix
-    } else if segment_starts_with(&entry.key, q) || segment_starts_with(&entry.title, q) {
+    } else if segment_starts_with(field(&entry.key), q)
+        || segment_starts_with(field(&entry.title), q)
+    {
         Tier::Segment
     } else if key.contains(q) || title.contains(q) {
         Tier::Substring
@@ -336,12 +381,7 @@ fn all_words(q: &str, key: &str, title: &str) -> bool {
 /// characters in the folded key, or `None` when they do not all appear or the
 /// query is shorter than [`SUBSEQUENCE_MIN_CHARS`].
 fn subsequence_span(q: &str, key: &str) -> Option<usize> {
-    if q.chars()
-        .nth(SUBSEQUENCE_MIN_CHARS.saturating_sub(1))
-        .is_none()
-    {
-        return None;
-    }
+    q.chars().nth(SUBSEQUENCE_MIN_CHARS.saturating_sub(1))?;
     let mut wanted = q.chars().peekable();
     let mut first: Option<usize> = None;
     for (at, c) in key.chars().enumerate() {
@@ -383,7 +423,7 @@ fn typo_distance(q: &str, key: &str, member: &str) -> Option<usize> {
 fn nearest_distance(folded: &Folded, query: &DocQuery) -> usize {
     let q = prefix_chars(&query.folded, DISTANCE_CHARS);
     let key = folded.key.as_str();
-    [key, last_segment(key), folded.title.as_str()]
+    [key, folded.member(), folded.title.as_str()]
         .into_iter()
         .map(|field| crate::driver::levenshtein(q, prefix_chars(field, DISTANCE_CHARS)))
         .min()
@@ -700,7 +740,8 @@ mod tests {
 
     #[test]
     fn a_typo_finds_the_intended_key() {
-        let ranked = rank(&select_entries(), &query("slect"));
+        let selects = select_entries();
+        let ranked = rank(&selects, &query("slect"));
         assert_eq!(keys(&ranked).first(), Some(&"select"));
         let entries = vec![
             entry(
@@ -742,13 +783,62 @@ mod tests {
 
     #[test]
     fn nothing_matching_falls_back_to_the_nearest_entries() {
-        let ranked = rank(&select_entries(), &query("zzzzzzzzzzz"));
+        let selects = select_entries();
+        let ranked = rank(&selects, &query("zzzzzzzzzzz"));
         assert_eq!(ranked.closeness, Closeness::Nearest);
         assert!(!ranked.entries.is_empty(), "never a dead end");
         assert!(ranked.entries.len() <= RESULT_LIMIT);
         let empty: Vec<DocEntry> = Vec::new();
         let ranked = rank(&empty, &query("zzz"));
         assert!(ranked.entries.is_empty());
+    }
+
+    #[test]
+    fn a_field_longer_than_its_ceiling_is_cut_and_the_ranking_stays_total() {
+        fn kinds(ranked: &Ranked<'_>) -> Vec<DocKind> {
+            ranked.entries.iter().map(|e| e.kind).collect()
+        }
+        let huge = "a".repeat(1 << 20);
+        let cut = Folded::of(&entry(DocKind::Topic, "huge", &huge));
+        assert_eq!(cut.title.chars().count(), FIELD_CHARS);
+        let long_key = Folded::of(&entry(DocKind::Topic, &huge, "t"));
+        assert_eq!(long_key.key.chars().count(), FIELD_CHARS);
+        assert!(long_key.key_cut);
+        assert!(!Folded::of(&entry(DocKind::Topic, "huge", "t")).key_cut);
+
+        let entries = vec![
+            entry(DocKind::Topic, "huge", &huge),
+            entry(DocKind::Guide, "huge", &huge),
+            entry(DocKind::Topic, &huge, &huge),
+            entry(DocKind::Topic, "alpha", "Alpha"),
+        ];
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        for raw in ["a", "aaa", "huge", "zzzz", "alpha"] {
+            let first = rank(&entries, &query(raw));
+            assert_eq!(keys(&first), keys(&rank(&entries, &query(raw))), "{raw:?}");
+            let back = rank(&reversed, &query(raw));
+            assert_eq!(keys(&first), keys(&back), "{raw:?}");
+            assert_eq!(kinds(&first), kinds(&back), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_cut_field_never_matches_exactly() {
+        let at_ceiling = "a".repeat(MAX_QUERY_CHARS);
+        let title = "a".repeat(FIELD_CHARS.saturating_add(1));
+        let e = entry(DocKind::Topic, "k", &title);
+        assert_eq!(tier_of(&e, &at_ceiling), Some(Tier::TitlePrefix));
+
+        let mut key = "x".repeat(FIELD_CHARS.saturating_sub(4));
+        key.push_str(".mappings");
+        let e = entry(DocKind::Symbol, &key, "t");
+        assert_ne!(
+            tier_of(&e, "map"),
+            Some(Tier::ExactMember),
+            "the cut hid the real last segment"
+        );
+        assert!(unique_exact(std::slice::from_ref(&e), &query("map")).is_none());
     }
 
     #[test]
