@@ -58,7 +58,8 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// count and fails the scan like an allow anywhere else. The sites are the
 /// [`ENV_ALLOW_FILES`] readers (`ipe_env`'s `var`/`var_os`/`vars_os`, the
 /// sandbox home reader, the jail passthrough); the sandbox's thread-spawn ban
-/// proofs; the dev-only temp-root test reader; and in the runtime crate, which has its own `clippy.toml`, the build
+/// proofs; the database crate's ambient-input ban proofs;
+/// the dev-only temp-root test reader; and in the runtime crate, which has its own `clippy.toml`, the build
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
 /// crate-private accessor, the ban proofs, the one blocking-pool start, the one
@@ -69,6 +70,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/sandbox/src/home.rs", 1),
     ("src/compiler/sandbox/src/host_env.rs", 1),
     ("src/compiler/sandbox/src/clippy_paths_resolve.rs", 2),
+    ("src/compiler/db/src/clippy_paths_resolve.rs", 40),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
     ("src/runtime/rust/src/clippy_paths_resolve.rs", 14),
@@ -488,6 +490,99 @@ fn inner_disallowed_methods_allow(src: &str) -> bool {
         })
 }
 
+/// The database crate's sources, held to INV-1 by its own `clippy.toml`.
+const DB_ROOT: &str = "src/compiler/db/";
+
+/// `(workspace-relative file, attribute count)` of every attribute in
+/// [`DB_ROOT`] that names `clippy::disallowed_types`: the ban proofs' five
+/// expectations. Any other naming, an `allow` on a type alias included, would
+/// let an ambient type through the crate's ban.
+const DB_TYPE_BAN_SITES: &[(&str, usize)] = &[("src/compiler/db/src/clippy_paths_resolve.rs", 5)];
+
+/// The lint names that silence a `disallowed_*` ban as a group member.
+const DB_BAN_GROUPS: &[&str] = &["warnings", "clippy::all", "clippy::style"];
+
+/// The attributes (`#[..]` and `#![..]`) of `src`'s code, each with whether it
+/// is inner.
+fn attributes(src: &str) -> Vec<(bool, String)> {
+    let code = code_only(src);
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices('#') {
+        let Some(rest) = code.get(at + 1..) else {
+            continue;
+        };
+        let inner = rest.starts_with('!');
+        let rest = rest.strip_prefix('!').unwrap_or(rest);
+        if !rest.starts_with('[') {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (k, c) in rest.char_indices() {
+            if c == '[' {
+                depth += 1;
+            } else if c == ']' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end = k + 1;
+                    break;
+                }
+            }
+        }
+        out.push((inner, rest.get(..end).unwrap_or(rest).to_owned()));
+    }
+    out
+}
+
+/// Whether `code` names the lint `name` as a whole path, so `clippy::all`
+/// is not found in `clippy::all_x` and `warnings` not in `my_warnings`.
+fn names_lint(code: &str, name: &str) -> bool {
+    code.match_indices(name)
+        .any(|(at, _)| !ident_before(code, at) && !ident_after(code, at + name.len()))
+}
+
+/// Every way the database sources in `files` silence the crate's type or
+/// method bans past [`DB_TYPE_BAN_SITES`].
+fn db_ban_violations(files: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (rel, text) in files.iter().filter(|(rel, _)| rel.starts_with(DB_ROOT)) {
+        let attrs = attributes(text);
+        let types = attrs
+            .iter()
+            .filter(|(_, attr)| names_lint(attr, "clippy::disallowed_types"))
+            .count();
+        let pinned = DB_TYPE_BAN_SITES
+            .iter()
+            .find(|(file, _)| *file == rel.as_str())
+            .map_or(0, |(_, count)| *count);
+        if types != pinned {
+            violations.push(format!(
+                "{rel}: {types} attributes name `clippy::disallowed_types`, pinned {pinned}"
+            ));
+        }
+        for (inner, attr) in &attrs {
+            if *inner && names_lint(attr, "clippy::disallowed_types") {
+                violations.push(format!("{rel}: a module-wide `{attr}`"));
+            }
+            for group in DB_BAN_GROUPS {
+                if names_lint(attr, group) {
+                    violations.push(format!(
+                        "{rel}: `{attr}` names `{group}`, which silences the INV-1 bans"
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// `files` with a file at `rel` holding `text` added.
+fn appended(files: &[(String, String)], rel: &str, text: &str) -> Vec<(String, String)> {
+    let mut out = files.to_vec();
+    out.push((rel.to_owned(), text.to_owned()));
+    out
+}
+
 /// The pinned allow count for workspace-relative `rel` (0 when unlisted).
 fn pinned_allows(rel: &str) -> usize {
     ESCAPE_HATCH_SITES
@@ -799,6 +894,88 @@ fn the_env_escape_hatch_is_pinned_to_the_audited_readers() {
             "pinned escape-hatch file `{file}` ({pinned}) is not scanned"
         );
     }
+}
+
+#[test]
+fn the_database_crate_silences_no_ban_past_its_proofs() {
+    let files = workspace_sources(true);
+    for (file, _) in DB_TYPE_BAN_SITES {
+        assert!(
+            files.iter().any(|(rel, _)| rel == file),
+            "pinned type-ban file `{file}` is not scanned"
+        );
+    }
+    let violations = db_ban_violations(&files);
+    assert!(
+        violations.is_empty(),
+        "the database crate silences an INV-1 ban: {violations:#?}"
+    );
+}
+
+#[test]
+fn a_planted_database_ban_silencer_is_detected() {
+    let proof = "src/compiler/db/src/clippy_paths_resolve.rs";
+    let pinned = "#[expect(clippy::disallowed_types)] type T = u8;".repeat(5);
+    let control = vec![(proof.to_owned(), pinned.clone())];
+    assert!(
+        db_ban_violations(&control).is_empty(),
+        "the control tree must be clean"
+    );
+    let other = "src/compiler/db/src/planted.rs";
+    let planted = [
+        (
+            other,
+            "#[allow(clippy::disallowed_types)] type Clock = std::time::Instant;",
+        ),
+        (
+            other,
+            "#[expect(clippy :: disallowed_types)] type Clock = std::time::Instant;",
+        ),
+        (other, "#![allow(clippy::disallowed_types)]"),
+        (other, "#[allow(clippy::style)] fn f() {}"),
+        (other, "#[allow(clippy::all)] fn f() {}"),
+        (other, "#[expect(warnings)] fn f() {}"),
+        (other, "#![cfg_attr(test, allow(dead_code, warnings))]"),
+        (
+            "src/compiler/db/tests/planted.rs",
+            "#[allow(clippy::disallowed_types)] type Clock = std::time::Instant;",
+        ),
+        (
+            proof,
+            "#[allow(clippy::disallowed_types)] type Clock = std::time::Instant;",
+        ),
+    ];
+    for (rel, text) in planted {
+        let tree = if rel == proof {
+            vec![(proof.to_owned(), format!("{pinned}{text}"))]
+        } else {
+            appended(&control, rel, text)
+        };
+        assert!(
+            !db_ban_violations(&tree).is_empty(),
+            "a planted ban silencer in {rel} went unseen: {text:?}"
+        );
+    }
+    let clean = [
+        "#[allow(dead_code)] fn f() { let warnings = 1; }",
+        "// #[allow(clippy::all)]",
+        "const S: &str = \"#[allow(warnings)]\";",
+        "#[allow(clippy::all_like_this)] fn f() {}",
+    ];
+    for text in clean {
+        assert!(
+            db_ban_violations(&appended(&control, other, text)).is_empty(),
+            "a non-silencer was flagged: {text:?}"
+        );
+    }
+    let outside = vec![(
+        "src/compiler/types/src/planted.rs".to_owned(),
+        "#[allow(clippy::disallowed_types)] type T = u8;".to_owned(),
+    )];
+    assert!(
+        db_ban_violations(&outside).is_empty(),
+        "a crate outside the database root is held to its own policy"
+    );
 }
 
 #[test]
