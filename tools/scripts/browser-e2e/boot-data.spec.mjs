@@ -13,7 +13,10 @@
  *      block's id, never stands in for the block, and an `<img
  *      name="currentScript">` never stands in for the client's own tag: the
  *      page still boots on the server's own values. An app element carrying
- *      the banner's id never hides the boot failure.
+ *      the banner's id never hides the boot failure. App elements named after
+ *      document members (`<form name="body">`, `<img name="addEventListener">`)
+ *      never stand in for those members: the page boots, an event commits,
+ *      and its patch lands.
  *   3. Navigation — an `ipe-nav` fetch of a full page splices only that page's
  *      `#ipe-root` contents, never its boot block and scripts.
  *
@@ -157,6 +160,41 @@ test("decoys: an <img name=currentScript> never stands in for the client's own t
   const sid = await page.evaluate(() => window.__IPE_SID);
   expect(sid).toBe(original.boot.sid);
   expect(sid).not.toBe("decoy");
+});
+
+test("decoys: app elements named after document members never stand in for them", async ({
+  page,
+}) => {
+  // Each named `form`/`img` shadows the document member of its name with
+  // itself (an `img` only when it also carries an `id`); a client reading those
+  // members off the document would bind its listeners to an image, patch into
+  // the form, or throw at boot. They sit beside the root, which a render
+  // replaces wholesale.
+  const clobbers =
+    '<form name="body"></form>' +
+    '<img name="activeElement" id="decoy-activeElement" alt="">' +
+    '<img name="getElementById" id="decoy-getElementById" alt="">' +
+    '<img name="addEventListener" id="decoy-addEventListener" alt="">';
+  const { errors } = await serveRewritten(page, (html) =>
+    html.replace(/<div id="ipe-root">/, (open) => clobbers + open),
+  );
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  const shadowed = await page.evaluate(() => ({
+    body: document.body instanceof HTMLFormElement,
+    active: document.activeElement instanceof HTMLImageElement,
+    byId: document.getElementById instanceof HTMLImageElement,
+    on: document.addEventListener instanceof HTMLImageElement,
+  }));
+  expect(shadowed, "the page's own lookup answers with the app's elements").toEqual({
+    body: true,
+    active: true,
+    byId: true,
+    on: true,
+  });
+  await expect(page.getByText("location: unknown")).toBeVisible();
+  await page.getByRole("button", { name: "Locate" }).click();
+  await expect(page.getByText(/location: error:/)).toBeVisible({ timeout: 10000 });
+  expect(errors.map(String)).toEqual([]);
 });
 
 test("navigation: an ipe-nav fetch splices only the fetched page's root", async ({ page }) => {

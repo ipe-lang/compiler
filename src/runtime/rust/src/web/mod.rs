@@ -7057,13 +7057,34 @@ mod base_path_tests {
         // own property with itself; only the prototype getter answers for the
         // browser.
         assert!(
-            js.contains("__ipeDocProp(document, \"currentScript\")")
-                && !js.contains("document.currentScript"),
+            js.contains("script: prop(\"currentScript\")")
+                && js.contains("var own = __ipeDoc.script();"),
             "client.js reads its own tag through the `Document.prototype` getter"
         );
         assert!(
             !js.contains("getElementById(\"__ipe-status\")"),
             "the boot-failure banner never defers to an element page content can carry"
+        );
+    }
+
+    /// The client reads no document member through the document's own lookup.
+    ///
+    /// Page content names a document property with an `img`, `form`, `embed`,
+    /// `object` or `iframe`, and that element then answers `document.body`,
+    /// `document.activeElement` or `document.addEventListener`; only the
+    /// prototype-bound table answers for the browser.
+    #[test]
+    fn client_reads_the_document_only_through_the_bound_table() {
+        let js = super::CLIENT_JS;
+        assert_eq!(
+            crate::js_document_scan::unbound_document_reads(js),
+            Vec::<String>::new(),
+            "client.js names `document` only in the `__ipeDoc` table"
+        );
+        assert_eq!(
+            js.matches("})(document);").count(),
+            1,
+            "client.js binds one document table"
         );
     }
 

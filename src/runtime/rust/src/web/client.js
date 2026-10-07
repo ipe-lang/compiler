@@ -2,21 +2,67 @@
 // page's inert JSON block `<script type="application/json" id="ipe-boot">`
 // before any other code here runs. The block is the element right before this
 // script's own tag, never a lookup by id: page content can carry any id, so an
-// element of the app's earlier in the page never stands in for the block. The
-// own tag is read through the `Document.prototype` getter, never off the
-// document object itself: an `<img name="currentScript">` in page content
-// shadows that property with itself, and its sibling is the app's. A
+// element of the app's earlier in the page never stands in for the block. A
 // missing block, a block that is not JSON, or a field of the wrong type halts
 // the client with an `IpeBootError` and shows the offline banner: the client
 // never boots on invented defaults.
-// `doc`'s own `name` accessor from `Document.prototype`. A document's named
-// properties (an `img`, `form`, `embed`, `object` or `iframe` with that `name`)
-// shadow its built-in accessors, so a read whose answer must come from the
-// browser, never from page content, goes through the prototype getter.
+// `doc`'s own `name` accessor from `Document.prototype`.
 function __ipeDocProp(doc, name) {
   var d = Object.getOwnPropertyDescriptor(Document.prototype, name);
   return d && d.get ? d.get.call(doc) : null;
 }
+// The document members the client reads, bound from the prototypes before any
+// page content is consulted. A document's named properties (an `img`, `form`,
+// `embed`, `object` or `iframe` with that `name`) shadow its built-in members
+// with the element, so no read whose answer must come from the browser resolves
+// through the document object's own lookup: `<img name="currentScript">` would
+// hand the client the app's sibling, `<form name="body">` the app's form.
+var __ipeDoc = (function(doc) {
+  function prop(name) { return function() { return __ipeDocProp(doc, name); }; }
+  function method(proto, name) { return proto[name].bind(doc); }
+  return {
+    script: prop("currentScript"),
+    body: prop("body"),
+    root: prop("documentElement"),
+    active: prop("activeElement"),
+    visibility: prop("visibilityState"),
+    readyState: prop("readyState"),
+    byId: method(Document.prototype, "getElementById"),
+    create: method(Document.prototype, "createElement"),
+    range: method(Document.prototype, "createRange"),
+    query: method(Document.prototype, "querySelector"),
+    queryAll: method(Document.prototype, "querySelectorAll"),
+    on: method(EventTarget.prototype, "addEventListener")
+  };
+})(document);
+// The element members the client calls on a node that may be a `<form>`,
+// bound from the prototypes. A form's named controls shadow its built-in
+// members with the control: `<input name="addEventListener">` makes
+// `form.addEventListener` that input, so a listener bound or an attribute read
+// through the form's own lookup throws before the submit is intercepted and
+// the browser submits the form natively, its fields in the URL.
+var __ipeNode = (function() {
+  var getAttribute = Element.prototype.getAttribute;
+  var setAttribute = Element.prototype.setAttribute;
+  var removeAttribute = Element.prototype.removeAttribute;
+  var remove = Element.prototype.remove;
+  var contains = Node.prototype.contains;
+  var on = EventTarget.prototype.addEventListener;
+  var controls = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements");
+  return {
+    attr: function(el, name) { return getAttribute.call(el, name); },
+    setAttr: function(el, name, v) { setAttribute.call(el, name, v); },
+    removeAttr: function(el, name) { removeAttribute.call(el, name); },
+    remove: function(el) { remove.call(el); },
+    contains: function(el, other) { return contains.call(el, other); },
+    on: function(el, type, fn) { on.call(el, type, fn); },
+    // A form's controls; null for any other node.
+    controls: function(el) {
+      return el instanceof HTMLFormElement && controls && controls.get
+          ? controls.get.call(el) : null;
+    }
+  };
+})();
 var __IPE_BOOT_STRINGS = ["sid", "epoch", "base", "csrf"];
 var __IPE_CFG_BOOLEANS = ["bannerEnabled", "swapToast"];
 var __IPE_CFG_STRINGS = ["msgReconnecting", "msgUpdated", "msgOffline"];
@@ -37,7 +83,7 @@ var __ipeBoot = (function() {
       refuse(where + key + " is not a " + type);
     }
   }
-  var own = __ipeDocProp(document, "currentScript");
+  var own = __ipeDoc.script();
   var node = own ? own.previousElementSibling : null;
   if (!node || node.tagName !== "SCRIPT" || node.id !== "ipe-boot" ||
       node.getAttribute("type") !== "application/json") {
@@ -113,6 +159,50 @@ function __ipeAdoptFullBody(token, applyFn) {
   applyFn();
   __ipeEpoch = __ipeEpochParts(token) ? token : null;
 }
+// The newest full render the stream pushed while a <select> held focus (the
+// proxy for an open dropdown, which any DOM mutation around it collapses),
+// with its epoch gate inside `apply`. It applies once the select closes.
+// `stale` marks a patches frame that could not apply meanwhile: the screen is
+// then behind the server by more than the held render, so closing resyncs the
+// stream instead. Until then the stream stays open: a resync's first frame
+// would only be held again. A select can lose focus with no `focusout` (a
+// focused node removed from the page), so a frame arriving with no select
+// open, and the watchdog, release it too: nothing stays held once no select
+// is open.
+var __ipeHeldRender = null;
+function __ipeSelectOpen() {
+  var a = __ipeDoc.active();
+  return !!a && a.tagName === "SELECT";
+}
+function __ipeHoldRender(apply) {
+  __ipeHeldRender = { apply: apply, stale: false };
+}
+function __ipeMarkHeldStale() {
+  if (__ipeHeldRender === null) __ipeHeldRender = { apply: null, stale: true };
+  else __ipeHeldRender.stale = true;
+}
+// `picked` is a committed choice: the dropdown is shut though the select
+// keeps focus.
+function __ipeReleaseHeldRender(picked) {
+  var held = __ipeHeldRender;
+  if (held === null || (!picked && __ipeSelectOpen())) return;
+  __ipeHeldRender = null;
+  if (held.stale) __ipeResyncRender();
+  else held.apply();
+}
+// A <select> closing releases the held render: on blur, and on a committed
+// pick. Deferred so the select's own handlers send first, with the epoch of
+// the DOM the user acted on.
+__ipeDoc.on("focusout", function(ev) {
+  if (ev.target && ev.target.tagName === "SELECT") {
+    setTimeout(function() { __ipeReleaseHeldRender(false); }, 0);
+  }
+}, true);
+__ipeDoc.on("change", function(ev) {
+  if (ev.target && ev.target.tagName === "SELECT") {
+    setTimeout(function() { __ipeReleaseHeldRender(true); }, 0);
+  }
+}, true);
 // Server config from the boot block (`cfg`): the `IPE_WEB_BANNER`,
 // `IPE_WEB_SWAP_TOAST` and `IPE_WEB_*` tuning settings resolve on the server
 // and reach the client only here; the boot read checked every field.
@@ -215,7 +305,7 @@ function __ipeIsDirty(el) {
   if (!el || el.nodeType !== 1) return false;
   var tag = el.tagName;
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
-  if (el === document.activeElement) return true;
+  if (el === __ipeDoc.active()) return true;
   var hid = el.getAttribute && el.getAttribute("data-ipe-hid");
   if (hid && __ipeInputPending[hid]) return true;
   var sid = el.getAttribute && el.getAttribute("ipe-id");
@@ -372,7 +462,7 @@ function __ipeParseFor(container, html) {
   //
   // Namespace correctness: when the container element is in a foreign-
   // content namespace (SVG or MathML), parsing the new HTML via a
-  // plain document.createElement("div") + .innerHTML = ... uses the
+  // plain detached `div` + .innerHTML = ... uses the
   // HTML insertion mode, so element names like <g>, <rect>, <text>
   // (which the diff emits as direct children when it replaces the
   // children of an <svg> element) end up in the XHTML namespace
@@ -395,11 +485,11 @@ function __ipeParseFor(container, html) {
   // inline-SVG icon <path> children are the common victims.
   var tmp;
   if (container.namespaceURI && container.namespaceURI !== "http://www.w3.org/1999/xhtml") {
-    var range = document.createRange();
+    var range = __ipeDoc.range();
     range.selectNodeContents(container);
     tmp = range.createContextualFragment(html);
   } else {
-    tmp = document.createElement("div");
+    tmp = __ipeDoc.create("div");
     tmp.innerHTML = html;
   }
   return tmp;
@@ -408,8 +498,8 @@ function __ipeParseFor(container, html) {
 // Replace `container`'s children with the parsed holder `tmp`'s, splicing the
 // live inputs described above into their placeholders.
 function __ipeSwapPreservingFocus(container, tmp) {
-  var focused = document.activeElement;
-  var focusedInside = focused && focused !== document.body &&
+  var focused = __ipeDoc.active();
+  var focusedInside = focused && focused !== __ipeDoc.body() &&
       container.contains(focused) &&
       (focused.tagName === "INPUT" ||
        focused.tagName === "TEXTAREA" ||
@@ -513,7 +603,7 @@ function __ipeCopyAttrsExceptAuthority(src, dst) {
 // offset; a navigation to a new page starts at the top. Pass
 // mode === "nav" for the navigation case; the default preserves scroll.
 function __ipePatch(t, mode) {
-  var root = document.getElementById("ipe-root");
+  var root = __ipeDoc.byId("ipe-root");
   if (!root) return;
   // A full page (an ipe-nav or popstate fetch) contributes only its
   // `#ipe-root` contents: its head, boot block and scripts never enter the
@@ -529,7 +619,7 @@ function __ipePatch(t, mode) {
   } else {
     window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
   }
-  __ipeBindEvents(document);
+  __ipeBindEvents();
   __ipeRunPaths(root);
   __ipeReviveScripts(root);
 }
@@ -622,7 +712,7 @@ function __ipeReviveScripts(root) {
       } catch (_) {}
       continue;
     }
-    var fresh = document.createElement("script");
+    var fresh = __ipeDoc.create("script");
     // Copy ONLY allowlisted attributes. Event-handler attrs (anything
     // starting with "on…") and any non-allowlisted attribute are
     // silently dropped — see __ipeScriptAttrAllowlist.
@@ -670,7 +760,7 @@ function __ipeReviveScripts(root) {
 var __ipeLoaderEl = null;
 var __ipeLoaderTimer = null;
 function __ipeLoaderStart() {
-  __ipeLoaderEl = __ipeLoaderEl || document.getElementById("ipe-loader");
+  __ipeLoaderEl = __ipeLoaderEl || __ipeDoc.byId("ipe-loader");
   if (!__ipeLoaderEl) return;
   clearTimeout(__ipeLoaderTimer);
   __ipeLoaderTimer = setTimeout(function() {
@@ -698,7 +788,7 @@ function __ipeDebouncedSend(msgName, args, hid, delay, epoch) {
 // Flush pending debounced input on blur (tab away / click elsewhere).
 // Without this, typing fast then tabbing loses the last keystrokes
 // because the debounce hasn't fired yet.
-document.addEventListener("focusout", function(ev) {
+__ipeDoc.on("focusout", function(ev) {
   var t = ev.target;
   if (!t) return;
   var hid = t.getAttribute("data-ipe-hid");
@@ -806,10 +896,10 @@ function __ipeFlushPendingSync() {
 // typed value reaches the server in the same origin as the
 // outgoing navigation. Beacon path handles cross-page; sync path
 // handles SPA-style internal routing.
-document.addEventListener("click", function(ev) {
+__ipeDoc.on("click", function(ev) {
   var a = ev.target && ev.target.closest && ev.target.closest("a[href]");
   if (!a) return;
-  var root = document.getElementById("ipe-root");
+  var root = __ipeDoc.byId("ipe-root");
   if (!root || !root.contains(a)) return;
   var href = a.getAttribute("href") || "";
   // External or cross-origin → beacon (browser will tear down the
@@ -1076,6 +1166,15 @@ function __ipeDrainQueue() {
 // input (same DOM node, same .value, same IME/composition state)
 // through the new HTML so it's never destroyed. Per-attr and
 // textContent updates are fine as-is — they don't regenerate nodes.
+// Attributes a patch mirrors onto a live property, by attribute name. Once the
+// user or the client sets `checked` or `selected` the property stops following
+// its attribute, so a patch writes the property beside the attribute on every
+// set and every removal: a removed attribute clears its property.
+var __IPE_LIVE_PROPS = Object.freeze({
+  checked: "checked",
+  selected: "selected",
+  disabled: "disabled"
+});
 function __ipeApplyPatches(patches) {
   if (!patches || patches.length === 0) return;
   // Open <select> defence: native dropdowns close on ANY DOM mutation
@@ -1087,13 +1186,14 @@ function __ipeApplyPatches(patches) {
   // triggers a fresh response and reconciliation. Sibling subtrees
   // and unrelated parts of the DOM apply normally — the dropdown is
   // unaffected. See Bug 3 in docs/internals/web/architecture.md.
-  var openSel = (document.activeElement && document.activeElement.tagName === "SELECT")
-      ? document.activeElement : null;
+  var openSel = (__ipeDoc.active() && __ipeDoc.active().tagName === "SELECT")
+      ? __ipeDoc.active() : null;
   for (var i = 0; i < patches.length; i++) {
     var p = patches[i];
-    var el = document.querySelector('[ipe-id="' + p.id.replace(/"/g, '\\"') + '"]');
+    var el = __ipeDoc.query('[ipe-id="' + p.id.replace(/"/g, '\\"') + '"]');
     if (!el) continue;
-    if (openSel && (el === openSel || el.contains(openSel) || openSel.contains(el))) {
+    if (openSel && (el === openSel || __ipeNode.contains(el, openSel) ||
+        __ipeNode.contains(openSel, el))) {
       // Skip: any mutation here would close the dropdown mid-pick.
       continue;
     }
@@ -1122,7 +1222,7 @@ function __ipeApplyPatches(patches) {
       // the cursor jumps to the end mid-edit. Clamping handles
       // shorter new values (selectionStart > newLen -> newLen).
       var isInputLike = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
-      var hadFocus = isInputLike && el === document.activeElement;
+      var hadFocus = isInputLike && el === __ipeDoc.active();
       var savedSelStart = null, savedSelEnd = null, savedScrollTop = 0;
       if (hadFocus) {
         try {
@@ -1141,17 +1241,19 @@ function __ipeApplyPatches(patches) {
         if (dirty && (k === "value" || k === "checked" || k === "selected")) {
           continue;
         }
-        if (v === "") { el.removeAttribute(k); }
-        else {
-          el.setAttribute(k, v);
+        var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
+            ? __IPE_LIVE_PROPS[k] : null;
+        if (v === "") {
+          __ipeNode.removeAttr(el, k);
+          if (prop !== null) el[prop] = false;
+        } else {
+          __ipeNode.setAttr(el, k, v);
           // Sync DOM properties that don't reflect from attrs.
           if (k === "value" && ("value" in el)) {
             el.value = v;
             valueChanged = true;
           }
-          if (k === "checked") el.checked = v !== "" && v !== "false";
-          if (k === "selected") el.selected = v !== "" && v !== "false";
-          if (k === "disabled") el.disabled = v !== "" && v !== "false";
+          if (prop !== null) el[prop] = v !== "false";
         }
       }
       // Restore selection on focused input/textarea after a value
@@ -1168,32 +1270,32 @@ function __ipeApplyPatches(patches) {
         if (savedScrollTop) el.scrollTop = savedScrollTop;
       }
     }
-    if (p.remove) el.remove();
+    if (p.remove) __ipeNode.remove(el);
   }
   // Any new ipe-* attribute in the patched DOM needs a listener.
-  __ipeBindEvents(document);
+  __ipeBindEvents();
   // After SSE-driven patches the URL also needs reconciling — without
   // this, programmatic Navigate Msgs would only update the in-memory
   // model and leave the address bar pointing at the previous page.
-  __ipeRunPaths(document);
+  __ipeRunPaths();
   // Any <script> in newly-patched HTML wouldn't execute via innerHTML
   // — revive them so JS bundles (e.g. ipe-editor) bootstrap correctly
   // when their host element first appears via a patch (not the initial
   // SSR).  See __ipeReviveScripts above for the full rationale.
-  var ipeRootForPatches = document.getElementById("ipe-root");
+  var ipeRootForPatches = __ipeDoc.byId("ipe-root");
   if (ipeRootForPatches) __ipeReviveScripts(ipeRootForPatches);
 }
 
 function __ipeContainsFocusedInput(el) {
-  var a = document.activeElement;
-  if (!a || a === document.body) return false;
+  var a = __ipeDoc.active();
+  if (!a || a === __ipeDoc.body()) return false;
   var tag = a.tagName;
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
-  return el === a || el.contains(a);
+  return el === a || __ipeNode.contains(el, a);
 }
 
 function __ipeEscapeHTML(s) {
-  var d = document.createElement("div");
+  var d = __ipeDoc.create("div");
   d.textContent = s == null ? "" : String(s);
   return d.innerHTML;
 }
@@ -1202,13 +1304,12 @@ function __ipeEscapeHTML(s) {
 // Walks the DOM for ipe-<event> attributes and binds a native listener
 // that extracts args and dispatches through the TEA update cycle.
 // Re-run after every DOM patch because new ipe-* attrs may have appeared.
-function __ipeBindEvents(root) {
-  root = root || document;
+function __ipeBindEvents() {
   var events = ["click", "dblclick", "input", "change", "submit", "focus", "blur",
                 "keydown", "keyup", "keypress", "mouseover", "mouseout",
                 "mousedown", "mouseup"];
   for (var i = 0; i < events.length; i++) {
-    __ipeBindOne(root, events[i]);
+    __ipeBindOne(events[i]);
   }
 }
 
@@ -1227,7 +1328,8 @@ function __ipeBindEvents(root) {
 // silently skip. The path-check makes the call idempotent, so leaving
 // the element in place is cheap — at most one comparison per patch.
 function __ipeRunPaths(root) {
-  var els = (root || document).querySelectorAll("[data-ipe-path]");
+  var sel = "[data-ipe-path]";
+  var els = root ? root.querySelectorAll(sel) : __ipeDoc.queryAll(sel);
   for (var i = 0; i < els.length; i++) {
     var p = els[i].getAttribute("data-ipe-path");
     if (!p) continue;
@@ -1239,28 +1341,32 @@ function __ipeRunPaths(root) {
   }
 }
 
-function __ipeBindOne(root, eventName) {
-  var selector = "[ipe-" + eventName + "]";
-  var nodes = root.querySelectorAll(selector);
+// The elements already carrying the client's listener, per event name. Kept
+// beside the elements, never on them: a form's control named after a marker
+// property would answer for it.
+var __ipeBound = Object.create(null);
+function __ipeBindOne(eventName) {
+  var bound = __ipeBound[eventName] || (__ipeBound[eventName] = new WeakSet());
+  var nodes = __ipeDoc.queryAll("[ipe-" + eventName + "]");
   for (var i = 0; i < nodes.length; i++) {
     var el = nodes[i];
-    if (el["__ipe_" + eventName]) continue;
-    el["__ipe_" + eventName] = true;
-    el.addEventListener(eventName, function(ev) {
+    if (bound.has(el)) continue;
+    bound.add(el);
+    __ipeNode.on(el, eventName, function(ev) {
+      // A bound submit is the client's to send, never the browser's: it is
+      // prevented before anything here can throw.
+      if (ev.type === "submit") ev.preventDefault();
       var target = ev.currentTarget;
-      var msgName = target.getAttribute("ipe-" + ev.type);
-      var hid     = target.getAttribute("data-ipe-hid");
+      var msgName = __ipeNode.attr(target, "ipe-" + ev.type);
+      var hid     = __ipeNode.attr(target, "data-ipe-hid");
       var epoch   = __ipeEpoch;
       if (!msgName && !hid) return;
-      // Some events want preventDefault (submit, form-link navigation);
-      // click doesn't (we only intercept when the attribute is set).
-      if (ev.type === "submit") ev.preventDefault();
       var args = __ipeExtractArgs(ev);
       if (ev.type === "input") {
         // Track live value against ipe-id so the snapshot bundled in
         // the next __ipeSend reflects the user's actual DOM state,
         // and so Step 3's patch filter can recognise dirty inputs.
-        var sid = target.getAttribute("ipe-id");
+        var sid = __ipeNode.attr(target, "ipe-id");
         if (sid) {
           var e = __ipeInputEntry(sid);
           e.liveValue = args && args.length > 0 ? String(args[0]) : "";
@@ -1302,18 +1408,23 @@ function __ipeExtractArgs(ev) {
       //    earlier ones, so the LAST button name=action wins
       //    regardless of which the user clicked. Honour
       //    ev.submitter (modern browsers; falls back to
-      //    document.activeElement for old Safari).
+      //    the active element for old Safari).
       //
       // 2. Disabled fields are excluded by the spec — skip them
       //    too so a disabled-but-submittable field doesn't leak
       //    a stale value.
-      var data = {};
+      //
+      // The form's own members are read through `__ipeNode`: its named
+      // controls shadow them. `data` has no prototype, so a control named
+      // `__proto__` is a field like any other.
+      var data = Object.create(null);
+      var active = __ipeDoc.active();
       var submitter = ev.submitter ||
-          (document.activeElement && t && t.contains(document.activeElement)
-              ? document.activeElement : null);
-      if (t && t.elements) {
-        for (var i = 0; i < t.elements.length; i++) {
-          var el = t.elements[i];
+          (active && t && __ipeNode.contains(t, active) ? active : null);
+      var controls = __ipeNode.controls(t);
+      if (controls) {
+        for (var i = 0; i < controls.length; i++) {
+          var el = controls[i];
           if (!el.name || el.disabled) continue;
           if (el.type === "submit" || el.type === "button" ||
               el.type === "image" || el.type === "reset") {
@@ -1344,7 +1455,7 @@ function __ipeExtractArgs(ev) {
 // onFile / onImage register via data-ipe-ev-ipe-file / -ipe-image
 // attributes. The client reads the chosen file, optionally resizes
 // (for images), and sends a base64 data URL as the event value.
-document.addEventListener("change", function(ev) {
+__ipeDoc.on("change", function(ev) {
   var el = ev.target;
   if (!el || el.tagName !== "INPUT" || el.type !== "file") return;
   // The data-attr value is the EVENT NAME (ipe-file / ipe-image); the
@@ -1400,7 +1511,7 @@ function __ipeResizeImage(file, maxW, maxH, cb) {
     var w = img.width, h = img.height;
     if (w > maxW) { h = Math.round(h * maxW / w); w = maxW; }
     if (h > maxH) { w = Math.round(w * maxH / h); h = maxH; }
-    var canvas = document.createElement("canvas");
+    var canvas = __ipeDoc.create("canvas");
     canvas.width = w; canvas.height = h;
     canvas.getContext("2d").drawImage(img, 0, 0, w, h);
     cb(canvas.toDataURL("image/jpeg", 0.85));
@@ -1466,7 +1577,7 @@ function __ipeFollowed(r, fallback) {
     return u.pathname + u.search + hash;
   } catch (_) { return fallback; }
 }
-document.addEventListener("click", function(ev) {
+__ipeDoc.on("click", function(ev) {
   if (ev.defaultPrevented) return;
   if (ev.button !== 0) return;
   if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
@@ -1584,7 +1695,7 @@ function __ipeInjectStatusBanner() {
   if (__ipeStatusEl) return;            // idempotent
   if (!__ipeBannerEnabled) return;      // IPE_WEB_BANNER=off
   var built = __ipeBuildStatusEl("connected");
-  document.body.appendChild(built.el);
+  __ipeDoc.body().appendChild(built.el);
   __ipeStatusEl = built.el;
   __ipeStatusMsgEl = built.msgEl;
   // Replay current state in case it changed before DOM was ready.
@@ -1598,16 +1709,16 @@ function __ipeShowBootFailure() {
   function show() {
     var built = __ipeBuildStatusEl("offline");
     built.msgEl.textContent = "Page failed to start — reload to retry";
-    (document.body || document.documentElement).appendChild(built.el);
+    (__ipeDoc.body() || __ipeDoc.root()).appendChild(built.el);
   }
-  if (document.body) show();
-  else document.addEventListener("DOMContentLoaded", show);
+  if (__ipeDoc.body()) show();
+  else __ipeDoc.on("DOMContentLoaded", show);
 }
 // The `#__ipe-status` banner element in `state`, with its message span. Its
 // state colours are the page shell's `STATUS_CSS` rules, so the client
 // creates no `<style>` element.
 function __ipeBuildStatusEl(state) {
-  var el = document.createElement("div");
+  var el = __ipeDoc.create("div");
   el.id = "__ipe-status";
   el.className = "ipe-status ipe-status--" + state;
   el.setAttribute("role", "status");
@@ -1630,7 +1741,7 @@ function __ipeBuildStatusEl(state) {
     "transition:opacity 200ms",
     "opacity:1"
   ].join(";");
-  var msgEl = document.createElement("span");
+  var msgEl = __ipeDoc.create("span");
   msgEl.className = "ipe-status__msg";
   el.appendChild(msgEl);
   return { el: el, msgEl: msgEl };
@@ -1646,10 +1757,10 @@ var __ipeSwapToastEl = null;
 var __ipeSwapToastTimer = null;
 function __ipeShowSwapToast() {
   if (!__ipeBannerEnabled) return;
-  if (!document.body) return;
+  if (!__ipeDoc.body()) return;
   var el = __ipeSwapToastEl;
   if (!el) {
-    el = document.createElement("div");
+    el = __ipeDoc.create("div");
     el.id = "__ipe-swap-toast";
     el.setAttribute("role", "status");
     el.setAttribute("aria-live", "polite");
@@ -1669,7 +1780,7 @@ function __ipeShowSwapToast() {
       "transition:opacity 200ms",
       "opacity:0"
     ].join(";");
-    document.body.appendChild(el);
+    __ipeDoc.body().appendChild(el);
     __ipeSwapToastEl = el;
   }
   el.textContent = __ipeMsgUpdated;
@@ -1713,7 +1824,7 @@ var __ipeForcedClose = false; // true while we're tearing down to reopen
 // landed. A driver (test, health check) that waits for data-ipe-live="1"
 // before dispatching such a Cmd observes a bound sink, never a dropped frame.
 function __ipeSetLive(on) {
-  try { document.documentElement.setAttribute("data-ipe-live", on ? "1" : "0"); } catch (_) {}
+  try { __ipeDoc.root().setAttribute("data-ipe-live", on ? "1" : "0"); } catch (_) {}
 }
 __ipeSetLive(false);
 function __ipeOpenSSE() {
@@ -1789,22 +1900,31 @@ function __ipeOpenSSE() {
     var frame;
     try { frame = JSON.parse(e.data); } catch (_) {
       // Legacy frame (pre-v0.9.3 server) — raw HTML, no seq to gate on.
-      // Open-<select> defence (Bug 3): same-cycle as the patches path.
-      // SSE-pushed full-body re-renders during an open dropdown would
-      // collapse it; skip the body, the next user interaction triggers
-      // reconciliation. Active user paths (ipe-nav, popstate, POST
-      // text fallback) are NOT defended — those are user-initiated and
-      // dropping them would be worse UX than the dropdown collapsing.
-      if (document.activeElement && document.activeElement.tagName === "SELECT") return;
-      return __ipePatch(e.data.replace(/\\n/g, "\n"));
+      // Open-<select> defence: an SSE-pushed full-body re-render during an
+      // open dropdown would collapse it, so the body is held until the
+      // select closes. Active user paths (ipe-nav, popstate, POST text
+      // fallback) are NOT defended — those are user-initiated and holding
+      // them would be worse UX than the dropdown collapsing.
+      var raw = e.data.replace(/\\n/g, "\n");
+      if (__ipeSelectOpen()) {
+        __ipeHoldRender(function() { __ipePatch(raw); });
+        return;
+      }
+      __ipeHeldRender = null;
+      return __ipePatch(raw);
     }
     if (frame && typeof frame === "object") {
       __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
-        if (document.activeElement && document.activeElement.tagName === "SELECT") return;
-        if (frame.body) {
-          __ipeAdoptFullBody(frame.epoch, function() {
-            __ipePatch(frame.body.replace(/\\n/g, "\n"));
-          });
+        if (!frame.body) return;
+        var body = frame.body.replace(/\\n/g, "\n");
+        var apply = function() {
+          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
+        };
+        if (__ipeSelectOpen()) __ipeHoldRender(apply);
+        else {
+          // This render supersedes any held one and any patches it missed.
+          __ipeHeldRender = null;
+          apply();
         }
       }, frame.globalSeq);
     }
@@ -1826,10 +1946,10 @@ function __ipeOpenSSE() {
   // patch frame, e.g. across a brief network blip) are dropped at
   // the same monotonic guard the HTTP path uses.
   //
-  // No open-<select> defence at this outer level — __ipeApplyPatches
-  // already has its own per-patch focus-restore + open-select skip
-  // (live.go:4386+); applying it twice would surface as a no-op
-  // either way, but the inner check is the canonical defence.
+  // A frame that applies goes through __ipeApplyPatches, whose per-patch
+  // focus-restore + open-select skip is the canonical defence. A frame that
+  // cannot apply while a <select> is open marks the held render stale rather
+  // than resyncing, since the resync's first frame would only be held again.
   // Focus / input-authority / dirty-input filtering all flow through
   // the same code path as the HTTP-side patches application, so
   // in-flight typing is preserved without server-side clientState
@@ -1871,7 +1991,11 @@ function __ipeOpenSSE() {
     // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
     // first frame is the full current render.
     if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
-      __ipeResyncRender();
+      if (__ipeSelectOpen()) __ipeMarkHeldStale();
+      else {
+        __ipeHeldRender = null;
+        __ipeResyncRender();
+      }
       return;
     }
     __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
@@ -2097,6 +2221,7 @@ function __ipeProbeSessionLost() {
 // healed proxy reconnects automatically without a refresh.
 var __ipeServerSpeaksV2 = false;
 function __ipeWatchdog() {
+  __ipeReleaseHeldRender(false);
   // If we have no live EventSource AND no reopen scheduled, the
   // 'error' handler must have missed (rare race) or some path tore
   // it down without re-arming. Drive the reopen here so the page
@@ -2149,18 +2274,18 @@ __ipeWatchdogTimer = setInterval(__ipeWatchdog, 5000);
 // resumes from background the OS may have torn down the underlying
 // TCP, but EventSource sometimes lags in detecting it. Eager check
 // avoids the user staring at a stale UI for the full watchdog cycle.
-document.addEventListener("visibilitychange", function() {
-  if (document.visibilityState === "visible") {
+__ipeDoc.on("visibilitychange", function() {
+  if (__ipeDoc.visibility() === "visible") {
     __ipeWatchdog();
   }
 });
 
 // ── Init ─────────────────────────────────────────────────────
 // Bind initial DOM event listeners + inject the status banner once
-// the HTML is parsed. Banner needs document.body to exist, so it
+// the HTML is parsed. Banner needs the body to exist, so it
 // goes through the same gate as event binding.
 function __ipeInit() {
-  __ipeBindEvents(document);
+  __ipeBindEvents();
   __ipeInjectStatusBanner();
   // After a dev-mode session-recovery reload, show the green build-ok toast.
   try {
@@ -2170,8 +2295,8 @@ function __ipeInit() {
     }
   } catch(_) {}
 }
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", __ipeInit);
+if (__ipeDoc.readyState() === "loading") {
+  __ipeDoc.on("DOMContentLoaded", __ipeInit);
 } else {
   __ipeInit();
 }
