@@ -288,26 +288,24 @@ fn render_into_ctx<M>(node: &Html<M>, s: &mut String, select_value: Option<&str>
         Html::HText(t) => crate::escape::html_text_into(t, s),
         Html::HRaw(r) => s.push_str(r),
         Html::HElement(tag, attrs, kids) => {
-            // Html.doctype wraps children in a pseudo-element; emit a literal
-            // `<!DOCTYPE html>` then the children directly.
-            // Handled BEFORE the name gate because `!doctype-wrapper` contains a
-            // `!`. The doctype string is a fixed literal and the wrapper's own
-            // tag/attrs are never interpolated → not an injection vector; the
-            // children keep full name/attr/text gating via render_into_ctx.
-            if tag == "!doctype-wrapper" {
-                s.push_str("<!DOCTYPE html>");
-                for c in kids {
-                    render_into_ctx(c, s, None, depth.saturating_add(1));
-                }
-                return;
-            }
             // SECURITY: the shared tag gate, re-checked at the sink. A refused
             // element (an unsafe tag name, an unclosable `<plaintext>`, or a
             // `<script>`/`<style>` whose body is not trusted raw markup) is
             // dropped with its whole subtree, so no value built on the safe
             // surface reaches a raw-text or executable element body.
-            let Ok(body) = admit_element(tag, kids) else {
+            let Ok(rendered) = admit_rendered(tag, kids) else {
                 return;
+            };
+            let body = match rendered {
+                // The doctype string is a fixed literal and the wrapper's own
+                // tag/attrs are never written; its children render as markup
+                // with full name/attr/text gating.
+                RenderedElement::Doctype => {
+                    s.push_str("<!DOCTYPE html>");
+                    render_body_into(ElementBody::Markup, kids, s, None, depth);
+                    return;
+                }
+                RenderedElement::Element(body) => body,
             };
             s.push('<');
             s.push_str(tag);
@@ -593,6 +591,49 @@ pub(crate) fn admit_element<K: TrustedRawChild>(
         };
     }
     Ok(ElementBody::Markup)
+}
+
+/// The `Html.doctype` pseudo-tag.
+///
+/// It renders as `<!DOCTYPE html>` and then its children, with no element of
+/// its own.
+pub(crate) const DOCTYPE_WRAPPER_TAG: &str = "!doctype-wrapper";
+
+/// How a rendered `Html` element node reaches the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderedElement {
+    /// The `Html.doctype` wrapper: a literal `<!DOCTYPE html>`, then the
+    /// children as markup.
+    Doctype,
+    /// An element admitted by `admit_element`, rendered with this body class.
+    Element(ElementBody),
+}
+
+impl RenderedElement {
+    /// The body class the node's children render with.
+    pub(crate) const fn body(self) -> ElementBody {
+        match self {
+            Self::Doctype => ElementBody::Markup,
+            Self::Element(body) => body,
+        }
+    }
+}
+
+/// Decide how an `Html` element node `tag` with children `kids` is rendered.
+///
+/// This is the one admission rule of every rendered-tree walker (the render
+/// sink and the SSE diff), so the two cannot disagree on which nodes are on
+/// the page: the `Html.doctype` wrapper is recognised by its exact pseudo-tag,
+/// before the name gate its `!` fails, and every other tag runs
+/// `admit_element`.
+pub(crate) fn admit_rendered<M>(
+    tag: &str,
+    kids: &[Html<M>],
+) -> Result<RenderedElement, ElementRefusal> {
+    if tag == DOCTYPE_WRAPPER_TAG {
+        return Ok(RenderedElement::Doctype);
+    }
+    admit_element(tag, kids).map(RenderedElement::Element)
 }
 
 /// Attribute NAMES that execute script (or embed a scripting context) regardless
@@ -1760,6 +1801,24 @@ mod tests {
             let closes = format!("</{ancestor}");
             assert_eq!(out.matches(closes.as_str()).count(), 1, "{out}");
             assert!(!out.contains("<img"), "{out}");
+        }
+    }
+
+    /// A hand-built `<style>` over an untouched trusted raw body (not built by
+    /// `styleNode`, which neutralises at construction) is neutralised by the
+    /// render sink itself, so it cannot end a `<textarea>` or open a tag inside
+    /// `<svg>`.
+    #[test]
+    fn hand_built_style_body_is_neutralised_at_the_sink() {
+        for ancestor in ["textarea", "svg"] {
+            let css = format!("x{{}}</{ancestor}><img src=x onerror=alert(1)>");
+            let style: Html<()> = Html::HElement("style".into(), vec![], vec![Html::HRaw(css)]);
+            let node: Html<()> = Html::HElement(ancestor.into(), vec![], vec![style]);
+            let out = render_html(&node);
+            let closes = format!("</{ancestor}");
+            assert_eq!(out.matches(closes.as_str()).count(), 1, "{out}");
+            assert!(!out.contains("<img"), "{out}");
+            assert!(out.contains("< /"), "close tag must be split: {out}");
         }
     }
 
