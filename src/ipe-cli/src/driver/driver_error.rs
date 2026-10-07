@@ -161,12 +161,9 @@ pub enum CliError {
     },
     /// `ipe doc <query>` named no documentation entry.
     ///
-    /// Carries the query and the closest entries of any kind (ranked, bounded, never empty while
-    /// any documentation exists), so a miss always points somewhere.
-    DocNotFound {
-        query: String,
-        suggestions: Vec<crate::doc_bundle::DocSuggestion>,
-    },
+    /// Carries the shown query and the ranked entries to offer instead (bounded, never empty
+    /// while any documentation exists), each as the exact term that opens it.
+    DocNotFound { miss: crate::doc_search::DocMiss },
     /// A static-build request was refused (typed reason — see
     /// [`build_plan::Refusal`]). Refusal means NO artifact: the build asked
     /// to be static is never silently degraded to a dynamic one.
@@ -597,6 +594,13 @@ pub fn emit_machine_error(
         CliError::Pipeline { file, src, diag } if format == OutputFormat::Json => {
             render_json(diag, &file.to_string_lossy(), src)
         }
+        CliError::DocNotFound { miss } => crate::doc_pick::machine_miss(
+            format,
+            command,
+            err.machine_kind(),
+            &text::cli_doc_not_found(&miss.query),
+            miss,
+        ),
         _ => machine_output::machine_error(format, command, err.machine_kind(), &err.to_string()),
     };
     // Best-effort write; if stderr is closed we still exit non-zero.
@@ -909,16 +913,7 @@ impl std::fmt::Display for CliError {
                 expected,
                 actual,
             )),
-            Self::DocNotFound { query, suggestions } => {
-                f.write_str(&text::cli_doc_not_found(query))?;
-                if !suggestions.is_empty() {
-                    write!(f, "\n{}", text::cli_doc_suggestions_header())?;
-                    for line in crate::doc_bundle::suggestion_lines(suggestions) {
-                        write!(f, "\n{line}")?;
-                    }
-                }
-                Ok(())
-            }
+            Self::DocNotFound { miss } => f.write_str(&crate::doc_pick::miss_text(miss)),
             Self::UnknownCode { input, suggestions } => {
                 f.write_str(&text::cli_unknown_code(input))?;
                 match suggestions.split_first() {

@@ -30,7 +30,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::CliError;
-use crate::doc_bundle::DocSuggestion;
+use crate::doc_search::DocMiss;
 use crate::style::{self, GUTTER, Palette, REPORT_BUGS_PHRASE, TerminalSafe};
 
 /// The semantic role of a piece of human output, which fixes its colour.
@@ -422,8 +422,8 @@ pub fn error_screen(err: &CliError, color: bool) -> Option<Screen> {
     }
     let fault = err.fault();
     let mut screen = Screen::with_color(Stream::Stderr, color);
-    if let CliError::DocNotFound { query, suggestions } = err {
-        doc_not_found(&mut screen, query, suggestions);
+    if let CliError::DocNotFound { miss } = err {
+        doc_not_found(&mut screen, miss);
     } else if err.renders_own_screen() {
         // A self-rendering error (a help page, a gate report) is styled by
         // ipe's own renderers with the stderr palette, so its escapes pass
@@ -438,18 +438,23 @@ pub fn error_screen(err: &CliError, color: bool) -> Option<Screen> {
     Some(screen)
 }
 
-/// The `ipe doc` miss: the query in the user-error tone, then each suggestion
-/// as the exact command that opens it, with its title as auxiliary text.
-fn doc_not_found(screen: &mut Screen, query: &str, suggestions: &[DocSuggestion]) {
-    screen.line(Tone::UserError, &crate::text::cli_doc_not_found(&query));
-    if suggestions.is_empty() {
+/// The `ipe doc` miss: the query in the user-error tone, then the numbered
+/// entries, each as the exact command that opens it.
+fn doc_not_found(screen: &mut Screen, miss: &DocMiss) {
+    screen.line(
+        Tone::UserError,
+        &crate::text::cli_doc_not_found(&miss.query),
+    );
+    if miss.hits.is_empty() {
         return;
     }
-    screen
-        .blank()
-        .line(Tone::Text, crate::text::cli_doc_suggestions_header());
-    for line in crate::doc_bundle::suggestion_lines(suggestions) {
+    let (header, more) = crate::doc_pick::human_parts(miss);
+    screen.blank().line(Tone::Text, header);
+    for line in crate::doc_pick::human_lines(miss) {
         screen.line(Tone::Text, &line);
+    }
+    if let Some(more) = more {
+        screen.line(Tone::Aux, more);
     }
 }
 
@@ -620,12 +625,16 @@ mod tests {
     #[test]
     fn a_doc_miss_lists_its_suggestions_as_commands() {
         let err = CliError::DocNotFound {
-            query: "pipeline".to_owned(),
-            suggestions: vec![DocSuggestion {
-                key: "topic:pipelines".to_owned(),
-                kind: crate::doc_bundle::DocKind::Topic,
-                title: "Pipelines".to_owned(),
-            }],
+            miss: DocMiss {
+                query: style::TerminalLine::sanitize("pipeline"),
+                hits: vec![crate::doc_search::DocHit {
+                    term: style::TerminalLine::sanitize("topic:pipelines"),
+                    kind: crate::doc_bundle::DocKind::Topic,
+                    summary: style::TerminalLine::sanitize("Pipelines"),
+                }],
+                closeness: crate::doc_search::Closeness::Match,
+                truncated: true,
+            },
         };
         let out = error_screen(&err, false)
             .map(|s| s.render(Header::Omitted))
@@ -635,7 +644,11 @@ mod tests {
             "{out:?}"
         );
         assert!(
-            out.contains("    ipe doc topic:pipelines  Pipelines (topic)"),
+            out.contains("    1. ipe doc topic:pipelines  Pipelines (topic)"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("  More entries match; refine the term."),
             "{out:?}"
         );
         assert!(!out.contains(REPORT_BUGS_PHRASE), "{out:?}");

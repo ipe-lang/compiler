@@ -35,6 +35,8 @@ pub mod delivery_set;
 pub mod diff;
 pub mod doc;
 pub mod doc_bundle;
+pub mod doc_pick;
+pub mod doc_search;
 pub mod doc_type_search;
 pub mod env_dir;
 pub mod ffi;

@@ -881,8 +881,12 @@ messages! {
     cli_doc_not_found(query) = "cli-doc-not-found";
     /// The header over a doc-not-found suggestion list.
     cli_doc_suggestions_header = "cli-doc-suggestions-header";
-    /// One suggested documentation entry.
-    cli_doc_suggestion_line(key, title, kind) = "cli-doc-suggestion-line";
+    /// One numbered documentation entry of a doc-not-found list.
+    cli_doc_suggestion_line(index, term, summary, kind) = "cli-doc-suggestion-line";
+    /// The header over a doc-not-found list when nothing matched closely.
+    cli_doc_nearest_header = "cli-doc-nearest-header";
+    /// The note under a doc-not-found list the result ceiling cut.
+    cli_doc_more_matches = "cli-doc-more-matches";
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     cli_unknown_code(input) = "cli-unknown-code";
     /// The first suggested code for an unknown-code error.
@@ -1245,8 +1249,18 @@ messages! {
     doc_bundle_build_error(detail) = "doc-bundle-build-error";
     /// An `ipe doc <kind>:<key>` query named an unknown kind.
     doc_unknown_kind(prefix) = "doc-unknown-kind";
-    /// An `ipe doc <kind>:<key>` query named no entry of that kind.
-    doc_no_entry_for_key(kind, key, nearby: &crate::text::TerminalBlock) = "doc-no-entry-for-key";
+    /// An `ipe doc` term was empty or only whitespace.
+    doc_query_empty = "doc-query-empty";
+    /// An `ipe doc` term was longer than the query ceiling.
+    doc_query_too_long(max) = "doc-query-too-long";
+    /// An `ipe doc` term carried a control character or escape sequence.
+    doc_query_control = "doc-query-control";
+    /// The prompt asking which listed `ipe doc` entry to open.
+    doc_pick_prompt(count) = "doc-pick-prompt";
+    /// The answer to the `ipe doc` prompt named no listed entry.
+    doc_pick_retry = "doc-pick-retry";
+    /// The `ipe doc` prompt ended without opening an entry.
+    doc_pick_none = "doc-pick-none";
     /// An `ipe doc <query>` short name matched more than one stdlib module.
     doc_ambiguous_module(query, candidates: &crate::text::TerminalBlock) = "doc-ambiguous-module";
     /// `ipe doc --type` matched no symbol.
@@ -2049,9 +2063,9 @@ mod tests {
         );
         assert!(!filled.contains('\u{1b}'), "{filled:?}");
         let near = TerminalBlock::lines(["  fn:map", "  fn:x\rerror: forged"]);
-        let filled = doc_no_entry_for_key(&"fn", &"mapp", &near);
+        let filled = doc_ambiguous_module(&"fn", &near);
         assert!(
-            filled.ends_with("Nearby keys:\n  fn:map\n  fn:xerror: forged"),
+            filled.ends_with("stdlib module\n  fn:map\n  fn:xerror: forged"),
             "{filled:?}"
         );
     }

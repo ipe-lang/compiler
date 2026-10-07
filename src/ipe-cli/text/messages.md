@@ -570,7 +570,15 @@ Closest matches:
 
 ## cli-doc-suggestion-line
 
-  ipe doc {key}  {title} ({kind})
+  {index}. ipe doc {term}  {summary} ({kind})
+
+## cli-doc-nearest-header
+
+No close match; the nearest entries:
+
+## cli-doc-more-matches
+
+More entries match; refine the term.
 
 ## cli-unknown-code
 
@@ -1404,11 +1412,29 @@ ipe doc: bundle build error: {detail}
 ipe doc: `{prefix}` is not a known documentation kind
 Known kinds: module, symbol, diagnostic, construct, idiom, topic, guide, cli
 
-## doc-no-entry-for-key
+## doc-query-empty
 
-ipe doc: no `{kind}` entry for key `{key}`
-Nearby keys:
-{nearby}
+ipe doc: the term is empty; name a module, symbol, or `kind:key` entry
+
+## doc-query-too-long
+
+ipe doc: the term is longer than {max} characters
+
+## doc-query-control
+
+ipe doc: the term contains a control character or escape sequence
+
+## doc-pick-prompt
+
+Open which entry? [1-{count}, Enter to cancel]
+
+## doc-pick-retry
+
+Not a listed number.
+
+## doc-pick-none
+
+ipe doc: no entry opened
 
 ## doc-ambiguous-module
 
