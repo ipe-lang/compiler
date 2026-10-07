@@ -3921,15 +3921,21 @@ mod tests {
         }
         // A listener that got past the refusal would bind and serve forever;
         // the timeout turns that regression into a failure instead of a hang.
-        let listened: IpeResult<String, ()> = tokio::time::timeout(
+        let listened: IpeResult<crate::IpeError, ()> = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             server_listen(0, Vec::new()),
         )
         .await
         .expect("a refused framing policy must return before binding, not serve");
-        let IpeResult::Err(msg) = listened else {
+        let IpeResult::Err(error) = listened else {
             panic!("a `;` in IPE_WEB_FRAME_ANCESTORS must refuse the listener");
         };
+        assert_eq!(
+            crate::ipe_error_kind(error.clone()),
+            crate::IpeErrorKind::InvalidInput,
+            "{error:?}"
+        );
+        let msg = crate::ipe_error_message(error);
         assert!(
             msg.starts_with("Server.listen: IPE_WEB_FRAME_ANCESTORS holds `;`"),
             "{msg}"
