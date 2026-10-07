@@ -784,12 +784,28 @@ group name task =
         |> Task.onError (\e -> checkReporting Io.println name (Task.fail e) |> Task.map (\failed -> [ failed ]))
 
 
+-- The element that carries the shortcut handler's `tabindex` also carries
+-- `autofocus`, and it is the page's only autofocused element, so keys work
+-- from page load. Red if the root stops taking focus, or focus is claimed by
+-- another element first.
+shortcutRootAutofocused : Bool
+shortcutRootAutofocused =
+    let
+        html =
+            page baseModel
+    in
+    List.any (\tag -> has "tabindex=\"0\"" tag && has "autofocus" tag) (String.split "<" html)
+        && List.length (String.split "autofocus" html)
+        == 2
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
         [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b)))
         , group "hostile source fixture" hostileSourceChecks
         , group "stored decision fixture" storedChecks
+        , Task.succeed [ ( "the shortcut root takes focus on page load", shortcutRootAutofocused ) ]
         , group "withheld constructors" (everyWithheldConstructorRendered |> Task.map (\ok -> [ ( "every withheld source constructor Lib.Index declares is rendered", ok ) ]))
         ]
         |> Task.map List.concat
