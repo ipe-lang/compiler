@@ -28,10 +28,13 @@ const ROOTS: &[&str] = &[
     "../../ipe-cli/src",
 ];
 
-/// The only production lines that may name the spelling, by exact trimmed
-/// text. Every other line carrying the literal (in any letter case) or the
-/// constant is refused, whatever it does with it: an alias, an import rename,
-/// or a case-folded compare re-reads the spelling just as an `==` does.
+/// The only production lines that may name the spelling, each keyed by the
+/// file it lives in (a path suffix) and its exact trimmed text, and each
+/// required exactly once. Every other line carrying the literal (in any letter
+/// case) or the constant is refused, whatever it does with it: an alias, an
+/// import rename, or a case-folded compare re-reads the spelling just as an
+/// `==` does. A copy of an allowed line in another file, or a second copy in
+/// its own file, is refused too.
 ///
 /// - the constant's definition and its one read in `is_wildcard_spelling`;
 /// - the renderings of the variant back to its source spelling;
@@ -39,21 +42,60 @@ const ROOTS: &[&str] = &[
 ///   never a type variable): their registry rows, callee tuples, and the
 ///   `Server` module's export list;
 /// - the manifest's `Any` screen orientation, an unrelated word.
-const ALLOWED: &[&str] = &[
-    r#"pub const WILDCARD_SPELLING: &str = "any";"#,
-    "interner.resolve(v) == Some(canon::WILDCARD_SPELLING)",
-    "canon::Type::Wildcard => canon::WILDCARD_SPELLING.into(),",
-    "Ty::Wildcard => Ok(TyDoc::Var(canon::WILDCARD_SPELLING.into())),",
-    "canon::Type::Wildcard => Ok(TyDoc::Var(canon::WILDCARD_SPELLING.into())),",
-    "Type::Wildcard => Ok(ipe_canon::ast::WILDCARD_SPELLING.to_owned()),",
-    r#"Self::StringAny => d("String", "any", 2, Pure, "string_any", IpeOrder),"#,
-    r#"Self::ListAny => d("List", "any", 2, Pure, "list_any", IpeOrder),"#,
-    r#"Self::ServerAny => d("Server", "any", 2, Server, "server_any", IpeOrder),"#,
-    r#"("String", "any") => Ok(Callee::Kernel(KernelFn::StringAny)),"#,
-    r#"("List", "any") => Ok(Callee::Kernel(KernelFn::ListAny)),"#,
-    r#"("Server", "any") => Ok(Callee::Kernel(KernelFn::ServerAny)),"#,
-    r#""any","#,
-    r#""Any" => Ok(ScreenOrientation::Any),"#,
+const ALLOWED: &[(&str, &str)] = &[
+    (
+        "canon/src/ast.rs",
+        r#"pub const WILDCARD_SPELLING: &str = "any";"#,
+    ),
+    (
+        "canon/src/resolve.rs",
+        "interner.resolve(v) == Some(canon::WILDCARD_SPELLING)",
+    ),
+    (
+        "canon/src/resolve.rs",
+        "canon::Type::Wildcard => canon::WILDCARD_SPELLING.into(),",
+    ),
+    (
+        "types/src/doc.rs",
+        "Ty::Wildcard => Ok(TyDoc::Var(canon::WILDCARD_SPELLING.into())),",
+    ),
+    (
+        "types/src/doc.rs",
+        "canon::Type::Wildcard => Ok(TyDoc::Var(canon::WILDCARD_SPELLING.into())),",
+    ),
+    (
+        "ipe-cli/src/api_surface.rs",
+        "Type::Wildcard => Ok(ipe_canon::ast::WILDCARD_SPELLING.to_owned()),",
+    ),
+    (
+        "kernels/src/lib.rs",
+        r#"Self::StringAny => d("String", "any", 2, Pure, "string_any", IpeOrder),"#,
+    ),
+    (
+        "kernels/src/lib.rs",
+        r#"Self::ListAny => d("List", "any", 2, Pure, "list_any", IpeOrder),"#,
+    ),
+    (
+        "kernels/src/lib.rs",
+        r#"Self::ServerAny => d("Server", "any", 2, Server, "server_any", IpeOrder),"#,
+    ),
+    (
+        "lower/src/lower.rs",
+        r#"("String", "any") => Ok(Callee::Kernel(KernelFn::StringAny)),"#,
+    ),
+    (
+        "lower/src/lower.rs",
+        r#"("List", "any") => Ok(Callee::Kernel(KernelFn::ListAny)),"#,
+    ),
+    (
+        "lower/src/lower.rs",
+        r#"("Server", "any") => Ok(Callee::Kernel(KernelFn::ServerAny)),"#,
+    ),
+    ("canon/src/env.rs", r#""any","#),
+    (
+        "ipe-cli/src/package_manifest.rs",
+        r#""Any" => Ok(ScreenOrientation::Any),"#,
+    ),
 ];
 
 /// Whether `line` names the wildcard's spelling: the string literal in any
@@ -123,21 +165,15 @@ fn production_lines(text: &str) -> Option<Vec<(usize, &str)>> {
     skip_until.is_none().then_some(out)
 }
 
-#[test]
-fn wildcard_spelling_is_read_once() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    for root in ROOTS {
-        let dir = manifest.join(root);
-        assert!(dir.is_dir(), "scan root `{root}` must exist");
-        rust_sources(&dir, &mut files).expect("every directory under a scan root must be readable");
-    }
-    let mut offending = Vec::new();
-    let mut seen_allowed = vec![false; ALLOWED.len()];
-    for file in &files {
-        let text = std::fs::read_to_string(file).expect("read a scanned source");
-        let Some(lines) = production_lines(&text) else {
-            offending.push(format!(
+/// Every problem the scan finds in `files` (path, text): an unallowed spelling
+/// read, a test module that never closes, or an allowlisted line not seen
+/// exactly once in its own file.
+fn audit(files: &[(PathBuf, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut seen = vec![0_usize; ALLOWED.len()];
+    for (file, text) in files {
+        let Some(lines) = production_lines(text) else {
+            problems.push(format!(
                 "{}: a `#[cfg(test)]` module never closes at its own indentation",
                 file.display()
             ));
@@ -147,30 +183,105 @@ fn wildcard_spelling_is_read_once() {
             if !reads_spelling(line) {
                 continue;
             }
-            match ALLOWED.iter().position(|a| *a == line.trim()) {
-                Some(k) => {
-                    if let Some(seen) = seen_allowed.get_mut(k) {
-                        *seen = true;
-                    }
-                }
-                None => offending.push(format!("{}:{n}: {}", file.display(), line.trim())),
+            let allowed = ALLOWED
+                .iter()
+                .position(|(home, text)| file.ends_with(home) && *text == line.trim());
+            match allowed.and_then(|k| seen.get_mut(k)) {
+                Some(count) => *count = count.saturating_add(1),
+                None => problems.push(format!("{}:{n}: {}", file.display(), line.trim())),
             }
         }
     }
+    for ((home, text), count) in ALLOWED.iter().zip(&seen) {
+        if *count != 1 {
+            problems.push(format!(
+                "allowlisted line must occur exactly once in `{home}`, found {count}: {text}"
+            ));
+        }
+    }
+    problems
+}
+
+#[test]
+fn wildcard_spelling_is_read_once() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    for root in ROOTS {
+        let dir = manifest.join(root);
+        assert!(dir.is_dir(), "scan root `{root}` must exist");
+        rust_sources(&dir, &mut paths).expect("every directory under a scan root must be readable");
+    }
+    let files: Vec<(PathBuf, String)> = paths
+        .into_iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(&p).expect("read a scanned source");
+            (p, text)
+        })
+        .collect();
+    let problems = audit(&files);
     assert!(
-        offending.is_empty(),
+        problems.is_empty(),
         "the wildcard spelling `any` is read only by canon's `is_wildcard_spelling`; \
          match `Type::Wildcard` / `Ty::Wildcard` instead:\n{}",
-        offending.join("\n")
+        problems.join("\n")
     );
-    let stale: Vec<&str> = ALLOWED
-        .iter()
-        .zip(&seen_allowed)
-        .filter_map(|(a, seen)| (!seen).then_some(*a))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "allowlisted lines no longer exist: {stale:?}"
+}
+
+/// A synthetic tree holding exactly the allowlisted lines, each in its own
+/// file.
+fn allowed_files() -> Vec<(PathBuf, String)> {
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    for (home, text) in ALLOWED {
+        let path = PathBuf::from("src/compiler").join(home);
+        match files.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, body)) => {
+                body.push_str(text);
+                body.push('\n');
+            }
+            None => files.push((path, format!("{text}\n"))),
+        }
+    }
+    files
+}
+
+#[test]
+fn an_allowed_line_is_allowed_only_once_in_its_own_file() {
+    assert_eq!(audit(&allowed_files()), Vec::<String>::new());
+
+    // The one spelling read copied into another crate is a second read.
+    let mut moved = allowed_files();
+    moved.push((
+        PathBuf::from("src/compiler/lower/src/lower.rs"),
+        "    interner.resolve(v) == Some(canon::WILDCARD_SPELLING)\n".to_owned(),
+    ));
+    assert_eq!(
+        audit(&moved).len(),
+        1,
+        "a copy in another file must be refused"
+    );
+
+    // A second copy in its own file is a second read too.
+    let mut doubled = allowed_files();
+    let resolve = doubled
+        .iter_mut()
+        .find(|(p, _)| p.ends_with("canon/src/resolve.rs"))
+        .expect("the allowlist names canon's resolver");
+    resolve
+        .1
+        .push_str("    interner.resolve(v) == Some(canon::WILDCARD_SPELLING)\n");
+    assert_eq!(
+        audit(&doubled).len(),
+        1,
+        "a second copy in the same file must be refused"
+    );
+
+    // A removed allowed line is a stale entry.
+    let mut missing = allowed_files();
+    missing.retain(|(p, _)| !p.ends_with("canon/src/ast.rs"));
+    assert_eq!(
+        audit(&missing).len(),
+        1,
+        "a vanished allowed line must be reported"
     );
 }
 
