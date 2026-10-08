@@ -73,7 +73,7 @@ verdict label result =
         Ok claims ->
             label ++ ": valid " ++ Maybe.withDefault "?" (Dict.get "sub" claims)
 
-        Err Auth.Expired ->
+        Err Expired ->
             label ++ ": Expired"
 
         Err err ->

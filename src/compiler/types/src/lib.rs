@@ -7647,7 +7647,7 @@ mod tests {
         let program = |arm: &str| {
             [
                 "module Main exposing (check)\n\n\
-                 import Ipe.Auth as Auth\n\
+                 import Ipe.Auth as Auth exposing (AuthError(..))\n\
                  import Ipe.Secret as Secret\n\n\
                  check : String -> Int\n\
                  check token =\n    \
@@ -7658,12 +7658,12 @@ mod tests {
             ]
             .concat()
         };
-        let typed = program("Err Auth.Expired");
+        let typed = program("Err Expired");
         let (m, mut i) = canon_src(&typed).expect("the AuthError-arm fixture must canonicalise");
         let solved = infer(&m, &mut i);
         assert!(
             solved.is_ok(),
-            "an `Err Auth.Expired` arm must type-check: {solved:?}"
+            "an `Err Expired` arm must type-check: {solved:?}"
         );
 
         let text = program("Err \"text\"");
