@@ -47,14 +47,22 @@ var __ipeNode = (function() {
   var removeAttribute = Element.prototype.removeAttribute;
   var remove = Element.prototype.remove;
   var contains = Node.prototype.contains;
+  var removeChild = Node.prototype.removeChild;
+  var appendChild = Node.prototype.appendChild;
+  var replaceChild = Node.prototype.replaceChild;
+  var queryAll = Element.prototype.querySelectorAll;
   var on = EventTarget.prototype.addEventListener;
   var controls = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements");
   function getter(proto, name) { return Object.getOwnPropertyDescriptor(proto, name).get; }
   var parentElement = getter(Node.prototype, "parentElement");
+  var parentNode = getter(Node.prototype, "parentNode");
+  var firstChild = getter(Node.prototype, "firstChild");
+  var textContent = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set;
   var firstElementChild = getter(Element.prototype, "firstElementChild");
   var nextElementSibling = getter(Element.prototype, "nextElementSibling");
   var previousElementSibling = getter(Element.prototype, "previousElementSibling");
   var tagName = getter(Element.prototype, "tagName");
+  var namespaceURI = getter(Element.prototype, "namespaceURI");
   var queryOne = Element.prototype.querySelector;
   var focusHtml = HTMLElement.prototype.focus;
   var focusSvg = SVGElement.prototype.focus;
@@ -71,7 +79,17 @@ var __ipeNode = (function() {
           ? controls.get.call(el) : null;
     },
     parent: function(el) { return parentElement.call(el); },
+    parentNode: function(el) { return parentNode.call(el); },
+    firstChild: function(el) { return firstChild.call(el); },
+    firstElement: function(el) { return firstElementChild.call(el); },
+    next: function(el) { return nextElementSibling.call(el); },
+    removeChild: function(el, child) { removeChild.call(el, child); },
+    append: function(el, child) { appendChild.call(el, child); },
+    replaceChild: function(el, fresh, old) { replaceChild.call(el, fresh, old); },
+    queryAll: function(el, sel) { return queryAll.call(el, sel); },
+    setText: function(el, text) { textContent.call(el, text); },
     tag: function(el) { return tagName.call(el); },
+    ns: function(el) { return namespaceURI.call(el); },
     // The child-element indices leading from `root` down to `el`; null when
     // `el` is not below `root`.
     pathFrom: function(root, el) {
@@ -89,16 +107,18 @@ var __ipeNode = (function() {
       }
       return node === root ? path.reverse() : null;
     },
-    // The element below `root` at `path`, or its deepest ancestor that exists.
+    // The element below `root` at `path`, or its deepest ancestor that
+    // exists, with its depth below `root` (0 for `root` itself).
     resolve: function(root, path) {
       var node = root;
-      for (var i = 0; i < path.length; i++) {
+      var depth = 0;
+      for (; depth < path.length; depth++) {
         var child = firstElementChild.call(node);
-        for (var k = 0; child && k < path[i]; k++) child = nextElementSibling.call(child);
+        for (var k = 0; child && k < path[depth]; k++) child = nextElementSibling.call(child);
         if (!child) break;
         node = child;
       }
-      return node;
+      return {node: node, depth: depth};
     },
     firstAutofocus: function(root) { return queryOne.call(root, "[autofocus]"); },
     // Whether `el` took focus: a node that cannot be focused stays unfocused.
@@ -219,7 +239,7 @@ function __ipeAdoptFullBody(token, applyFn) {
 var __ipeHeldRender = null;
 function __ipeSelectOpen() {
   var a = __ipeDoc.active();
-  return !!a && a.tagName === "SELECT";
+  return !!a && __ipeNode.tag(a) === "SELECT";
 }
 function __ipeHoldRender(apply) {
   __ipeHeldRender = { apply: apply, stale: false };
@@ -241,12 +261,12 @@ function __ipeReleaseHeldRender(picked) {
 // pick. Deferred so the select's own handlers send first, with the epoch of
 // the DOM the user acted on.
 __ipeDoc.on("focusout", function(ev) {
-  if (ev.target && ev.target.tagName === "SELECT") {
+  if (ev.target && __ipeNode.tag(ev.target) === "SELECT") {
     setTimeout(function() { __ipeReleaseHeldRender(false); }, 0);
   }
 }, true);
 __ipeDoc.on("change", function(ev) {
-  if (ev.target && ev.target.tagName === "SELECT") {
+  if (ev.target && __ipeNode.tag(ev.target) === "SELECT") {
     setTimeout(function() { __ipeReleaseHeldRender(true); }, 0);
   }
 }, true);
@@ -350,7 +370,7 @@ function __ipeInputsSnapshot() {
 // data-ipe-hid, or an unacked typed value at the input's ipe-id.
 function __ipeIsDirty(el) {
   if (!el || el.nodeType !== 1) return false;
-  var tag = el.tagName;
+  var tag = __ipeNode.tag(el);
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
   if (el === __ipeDoc.active()) return true;
   var hid = el.getAttribute && el.getAttribute("data-ipe-hid");
@@ -531,7 +551,8 @@ function __ipeParseFor(container, html) {
   // namespaced children. Drawing tools, charts, and apps that swap
   // inline-SVG icon <path> children are the common victims.
   var tmp;
-  if (container.namespaceURI && container.namespaceURI !== "http://www.w3.org/1999/xhtml") {
+  var ns = __ipeNode.ns(container);
+  if (ns && ns !== "http://www.w3.org/1999/xhtml") {
     var range = __ipeDoc.range();
     range.selectNodeContents(container);
     tmp = range.createContextualFragment(html);
@@ -546,11 +567,12 @@ function __ipeParseFor(container, html) {
 // live inputs described above into their placeholders.
 //
 // A swap never moves keyboard focus. Focus on any node inside `container` is
-// recorded as the node's child-element path and the `ipe-id`s of it and its
-// ancestors, and put back once the commit lands on the nearest node on that
-// path carrying one of those `ipe-id`s (see `__ipeRestoreFocus`); a live field
-// keeps its own node, value and selection (below). Focus outside `container`
-// is not read or written.
+// recorded as the node's child-element path and the `ipe-id` of it and of
+// each ancestor at its depth, and put back once the commit lands on the
+// nearest node on that path carrying the `ipe-id` recorded for its depth (see
+// `__ipeRestoreFocus`); a live field keeps its own node, value and selection
+// (below). Focus outside `container` is not read or written. Every member read
+// on `container` goes through `__ipeNode`: it may be a `<form>`.
 function __ipeSwapPreservingFocus(container, tmp) {
   var focused = __ipeDoc.active();
   var inside = focused && focused !== __ipeDoc.body() &&
@@ -559,12 +581,16 @@ function __ipeSwapPreservingFocus(container, tmp) {
   var focusTag = inside ? __ipeNode.tag(focused) : "";
   var focusedInside = inside &&
       (focusTag === "INPUT" || focusTag === "TEXTAREA" || focusTag === "SELECT");
-  // The server's identities (`ipe-id`: path, tag and key) of the focused node
-  // and of its ancestors below `container`.
+  // The focused node and each of its ancestors below `container`, by depth:
+  // entry `d - 1` holds the server identity (`ipe-id`: path, tag and key, null
+  // when absent) and the tag of the node `d` levels below `container`.
   var focusIds = [];
-  for (var at = inside ? focused : null; at && at !== container; at = __ipeNode.parent(at)) {
-    var atId = __ipeNode.attr(at, "ipe-id");
-    if (atId !== null) focusIds.push(atId);
+  if (focusPath) {
+    var at = focused;
+    for (var d = focusPath.length; d > 0; d--) {
+      focusIds[d - 1] = {id: __ipeNode.attr(at, "ipe-id"), tag: __ipeNode.tag(at)};
+      at = __ipeNode.parent(at);
+    }
   }
 
   // Snapshot focused-state BEFORE any DOM mutation. Selection read
@@ -584,7 +610,7 @@ function __ipeSwapPreservingFocus(container, tmp) {
   // server-side placeholder is uncontrolled (no value/checked/
   // selected) — i.e. user state is canonical.
   var preservedFocus = null;
-  var liveNodes = container.querySelectorAll("input, textarea, select");
+  var liveNodes = __ipeNode.queryAll(container, "input, textarea, select");
   for (var i = 0; i < liveNodes.length; i++) {
     var live = liveNodes[i];
     var placeholder = __ipeFindPlaceholder(tmp, live);
@@ -606,15 +632,17 @@ function __ipeSwapPreservingFocus(container, tmp) {
     // slot; the container still references it too (until the swap
     // below). DOM trees are tolerant of this — the upcoming
     // removeChild + appendChild commit moves it cleanly.
-    placeholder.parentNode.replaceChild(live, placeholder);
+    __ipeNode.replaceChild(__ipeNode.parentNode(placeholder), live, placeholder);
     if (isFocused) preservedFocus = live;
   }
 
   // Commit: throw away container's current children (those we didn't
   // splice are stale; spliced ones already moved into tmp), then
   // attach tmp's children. Done.
-  while (container.firstChild) container.removeChild(container.firstChild);
-  while (tmp.firstChild) container.appendChild(tmp.firstChild);
+  var gone;
+  while ((gone = __ipeNode.firstChild(container))) __ipeNode.removeChild(container, gone);
+  var moved;
+  while ((moved = __ipeNode.firstChild(tmp))) __ipeNode.append(container, moved);
 
   // Focus restoration on the SAME node — so .value, IME state,
   // composition buffer survive untouched. removeChild + appendChild
@@ -637,20 +665,23 @@ function __ipeSwapPreservingFocus(container, tmp) {
 // below `container`, else to its nearest ancestor, that takes focus, walking
 // from the path's deepest surviving node upward past `container`: a key
 // handler bound on an ancestor keeps receiving keys. A node the swap created
-// is a candidate only when its `ipe-id` is one of `ids`, the focused node's
-// and its ancestors' before the swap; any other node at the path is another
-// control, and a node without an `ipe-id` (raw markup) is never one.
-// `container` and the nodes above it are the ones the swap kept. Focus that is
-// already somewhere is left where it is.
+// is a candidate only when it carries the `ipe-id` and tag recorded for its
+// own depth in `ids`, the focused node's and its ancestors' before the swap;
+// any other node at the path is another control, even one whose id matches a
+// node at another depth (a key can spell a former descendant's id), and a node
+// without an `ipe-id` (raw markup) is never one. `container` and the nodes
+// above it are the ones the swap kept. Focus that is already somewhere is left
+// where it is. A kept ancestor bound to `onFocus` delivers that message once.
 function __ipeRestoreFocus(container, path, ids) {
   var now = __ipeDoc.active();
   if (now && now !== __ipeDoc.body()) return;
-  var node = __ipeNode.resolve(container, path);
-  while (node) {
-    var kept = node === container;
-    var own = kept ? null : __ipeNode.attr(node, "ipe-id");
-    if ((kept || (own !== null && ids.indexOf(own) !== -1)) && __ipeNode.focus(node)) return;
-    if (kept) break;
+  var found = __ipeNode.resolve(container, path);
+  var node = found.node;
+  for (var depth = found.depth; depth > 0; depth--) {
+    var was = ids[depth - 1];
+    var own = __ipeNode.attr(node, "ipe-id");
+    if (was && own !== null && own === was.id && __ipeNode.tag(node) === was.tag &&
+        __ipeNode.focus(node)) return;
     node = __ipeNode.parent(node);
   }
   while (node) {
@@ -739,9 +770,9 @@ function __ipePatch(t, mode) {
 var __IPE_SHELL_HEAD_TAGS = ["META", "STYLE", "LINK", "TITLE", "BASE"];
 function __ipeShellRoot(tmp, t) {
   if (!/^\s*<!doctype/i.test(t)) return tmp;
-  var el = tmp.firstElementChild;
-  while (el && __IPE_SHELL_HEAD_TAGS.indexOf(el.tagName) >= 0) el = el.nextElementSibling;
-  return el && el.tagName === "DIV" && el.id === "ipe-root" ? el : tmp;
+  var el = __ipeNode.firstElement(tmp);
+  while (el && __IPE_SHELL_HEAD_TAGS.indexOf(__ipeNode.tag(el)) >= 0) el = __ipeNode.next(el);
+  return el && __ipeNode.tag(el) === "DIV" && __ipeNode.attr(el, "id") === "ipe-root" ? el : tmp;
 }
 
 // __ipeReviveScripts: browsers DO NOT execute <script> tags inserted
@@ -1291,8 +1322,7 @@ function __ipeApplyPatches(patches) {
   // triggers a fresh response and reconciliation. Sibling subtrees
   // and unrelated parts of the DOM apply normally — the dropdown is
   // unaffected. See Bug 3 in docs/internals/web/architecture.md.
-  var openSel = (__ipeDoc.active() && __ipeDoc.active().tagName === "SELECT")
-      ? __ipeDoc.active() : null;
+  var openSel = __ipeSelectOpen() ? __ipeDoc.active() : null;
   for (var i = 0; i < patches.length; i++) {
     var p = patches[i];
     var el = __ipeDoc.query('[ipe-id="' + p.id.replace(/"/g, '\\"') + '"]');
@@ -1309,7 +1339,7 @@ function __ipeApplyPatches(patches) {
       if (__ipeContainsFocus(el)) {
         __ipeReplaceHTMLPreservingFocus(el, __ipeEscapeHTML(p.text));
       } else {
-        el.textContent = p.text;
+        __ipeNode.setText(el, p.text);
       }
     }
     if (p.html !== undefined && p.html !== null) {
@@ -1326,7 +1356,8 @@ function __ipeApplyPatches(patches) {
       // the server pushes a fresh value via SSE. Without this,
       // the cursor jumps to the end mid-edit. Clamping handles
       // shorter new values (selectionStart > newLen -> newLen).
-      var isInputLike = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
+      var elTag = __ipeNode.tag(el);
+      var isInputLike = elTag === "INPUT" || elTag === "TEXTAREA";
       var hadFocus = isInputLike && el === __ipeDoc.active();
       var savedSelStart = null, savedSelEnd = null, savedScrollTop = 0;
       if (hadFocus) {
@@ -1398,7 +1429,7 @@ function __ipeContainsFocus(el) {
   if (!a || a === __ipeDoc.body()) return false;
   if (!__ipeNode.contains(el, a)) return false;
   if (el !== a) return true;
-  var tag = a.tagName;
+  var tag = __ipeNode.tag(a);
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 }
 
@@ -1690,7 +1721,9 @@ __ipeDoc.on("click", function(ev) {
   if (ev.button !== 0) return;
   if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
   var el = ev.target;
-  while (el && el.tagName !== "A") el = el.parentElement;
+  // Bound reads: a `<form>` with a control named `parentElement` answers that
+  // read with the control, whose parent is the form again, so the walk loops.
+  while (el && __ipeNode.tag(el) !== "A") el = __ipeNode.parent(el);
   if (!el) return;
   if (!el.hasAttribute("ipe-nav")) return;
   var href = el.getAttribute("href");

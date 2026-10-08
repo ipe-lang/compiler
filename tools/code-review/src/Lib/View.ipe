@@ -114,9 +114,9 @@ progressBar k n =
 
 
 -- The root handles every keyboard shortcut. The client focuses it on first
--- mount (`autofocus`) and keeps focus on the same control across patches, so a
--- key reaches the handler before and after any click, since key events bubble
--- to the root.
+-- mount (`autofocus`) and, across patches, keeps focus on the same control, or
+-- its nearest focusable ancestor when the control is gone, so a key reaches the
+-- handler before and after any click, since key events bubble to the root.
 view : Model -> Ui.Element Msg
 view model =
     Ui.column
