@@ -14134,17 +14134,18 @@ mod web_revocation_tests {
     /// page load mints a new sid and re-runs `init`.
     #[cfg(feature = "db")]
     #[test]
+    #[allow(clippy::expect_used)] // test: a scratch SQLite store that cannot open is a broken test environment, never a pass
     fn restored_row_rechecks_persisted_bindings() {
         run(false, || async {
             let path = scratch_path("restore.db");
-            let Some(p) = path.to_str() else { return };
+            let p = path.to_str().expect("a UTF-8 scratch path");
             let open = || async {
                 store::SqliteStore::<Model, Msg>::new(p, Duration::from_secs(60), TAG)
                     .await
-                    .ok()
                     .map(Arc::new)
+                    .expect("open the scratch SQLite store")
             };
-            let Some(first) = open().await else { return };
+            let first = open().await;
             let opened = open_session(
                 &router_over(first as Arc<dyn store::SessionStore<Model, Msg>>),
                 "persist-subject",
@@ -14153,7 +14154,7 @@ mod web_revocation_tests {
             )
             .await;
             assert!(opened.body.contains("authed=true"), "{}", opened.body);
-            let Some(second) = open().await else { return };
+            let second = open().await;
             let (answered, _) = reload(
                 &router_over(second as Arc<dyn store::SessionStore<Model, Msg>>),
                 &opened.sid,
@@ -14167,7 +14168,7 @@ mod web_revocation_tests {
             assert!(
                 crate::revocation::revoke_subject_unannounced("persist-subject".to_owned()).is_ok()
             );
-            let Some(third) = open().await else { return };
+            let third = open().await;
             let (answered, body) = reload(
                 &router_over(third as Arc<dyn store::SessionStore<Model, Msg>>),
                 &opened.sid,
@@ -14179,7 +14180,7 @@ mod web_revocation_tests {
                 "a revoked row is a miss with a new sid"
             );
             assert!(body.contains("authed=false"), "`init` re-ran: {body}");
-            let Some(fourth) = open().await else { return };
+            let fourth = open().await;
             assert!(
                 !cold_row_restores(fourth.as_ref(), &opened.sid).await,
                 "the revoked row is deleted"
