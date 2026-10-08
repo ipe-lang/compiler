@@ -161,13 +161,15 @@ log id never changes. Every page load and every decision walk the whole
 chain under the key, and both act on that one verdict; a gap in the
 sequence, a link that does not match, a row whose signature does not verify,
 or a last row that differs from the head is a break, and so is any row past
-the head. The policy on a break is strict: no row counts, the rows before the
-break included, the queue and history pages show "The review log's chain
-breaks at entry N: a decision was removed, reordered or replaced outside this
-tool." (or, for rows past the head, "The review log holds N entries past its
-head: a decision was added outside this tool."), and every new decision is
-refused until the log is repaired, so nothing is appended to a broken chain. Startup refuses a review DB whose append-only triggers are
-missing.
+the head or below the first entry. The policy on a break is strict: no row
+counts, the rows before the break included, the queue and history pages show
+"The review log's chain breaks at entry N: a decision was removed, reordered
+or replaced outside this tool." (or, for rows past the head or below the
+first entry, "The review log holds N entries past its head" or "before its
+first", then ": a decision was added outside this tool."), the queue page
+offers no Approve or Refuse, and every new decision is refused until the log
+is repaired, so nothing is appended to a broken chain. Startup refuses a
+review DB whose append-only triggers are missing.
 
 Removing the last rows and rewriting the head to match, or restoring an older
 copy of the whole file under the same key, cannot be told apart from a log

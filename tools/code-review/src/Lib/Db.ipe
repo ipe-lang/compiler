@@ -193,12 +193,14 @@ verifiedPair row =
             r.pair
 
 
--- Where the review log fails its walk: at an entry (`BreaksAt`), or with
--- `n` entries past its head (`PastHead n`), which a decision, moving the
--- head in the transaction that inserts its entry, never leaves.
+-- Where the review log fails its walk: at an entry (`BreaksAt`), with `n`
+-- entries past its head (`PastHead n`), which a decision, moving the head in
+-- the transaction that inserts its entry, never leaves, or with `n` entries
+-- before its first (`BeforeFirst n`), a seq below 1 no decision writes.
 type BreakAt
     = BreaksAt Int
     | PastHead Int
+    | BeforeFirst Int
 
 
 -- A head the walk proved under the running key: every entry from 1 to it
@@ -292,6 +294,9 @@ copyStatus state =
 
                 Broken (PastHead _) ->
                     Signed (BrokenAt (Index.chainSeq s.head + 1))
+
+                Broken (BeforeFirst _) ->
+                    Signed (BrokenAt 1)
 
                 KeyMismatch ->
                     Signed (BrokenAt 1)
@@ -752,6 +757,16 @@ entriesPast db head =
         |> Task.andThen oneCount
 
 
+-- How many entries the log holds below seq 1, where the walk starts.
+entriesBefore : Db -> Task.Task Error Int
+entriesBefore db =
+    Db.queryDecode db
+        "SELECT count(*) AS entries FROM review_log WHERE seq < 1"
+        []
+        entriesDecoder
+        |> Task.andThen oneCount
+
+
 oneCount : List Int -> Task.Task Error Int
 oneCount counts =
     case counts of
@@ -1032,7 +1047,8 @@ type alias ChainWalk =
 
 -- The whole review log walked under `key`: every entry from 1 must follow
 -- the one before it, link its mac and verify under the key; the last must be
--- the head's seq and mac; and no entry may sit past the head. Only then is
+-- the head's seq and mac; and no entry may sit past the head or below 1.
+-- Only then is
 -- the head `Proven`. At most `ceiling` pages of `size` entries are read; a
 -- longer log fails with `refusal`.
 walkVerdict : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> Task.Task Error LogVerdict
@@ -1045,8 +1061,12 @@ walkVerdict key db size ceiling refusal head =
 
             Intact ->
                 do
+                    before <- entriesBefore db
                     past <- entriesPast db head
-                    if past > 0 then
+                    if before > 0 then
+                        Task.succeed (Broken (BeforeFirst before))
+
+                    else if past > 0 then
                         Task.succeed (Broken (PastHead past))
 
                     else
@@ -1140,6 +1160,13 @@ brokenRefusal at =
                 ("the review log holds "
                     ++ entriesText n
                     ++ " past its head: a decision was added outside this tool, so no decision is recorded until the log is restored"
+                )
+
+        BeforeFirst n ->
+            Error.conflict
+                ("the review log holds "
+                    ++ entriesText n
+                    ++ " before its first: a decision was added outside this tool, so no decision is recorded until the log is restored"
                 )
 
 

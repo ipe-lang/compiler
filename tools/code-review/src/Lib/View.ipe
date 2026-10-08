@@ -282,30 +282,39 @@ hintLine records =
         )
 
 
--- A server with no key records no decision, so its queue page carries no
--- decision control and no decision shortcut; `update` refuses on its own.
+-- Only a proven log under the server's key records a decision, so a queue
+-- page over a broken log, a log another key signed, or a server with no key
+-- carries no decision control and no decision shortcut; the save path
+-- refuses on its own.
 recordsDecisions : Model -> Bool
 recordsDecisions model =
     case model.queueState of
         Loaded page ->
-            case page.log of
-                ShownProven ->
-                    True
-
-                ShownBroken _ ->
-                    True
-
-                ShownKeyMismatch ->
-                    True
-
-                ShownUnkeyed ->
-                    False
+            noDecisionReason page.log == Nothing
 
         Loading ->
             False
 
         Failed _ ->
             False
+
+
+-- Why a queue page over this log records no decision; Nothing for a proven
+-- log, the only one that records.
+noDecisionReason : LogShown -> Maybe String
+noDecisionReason shown =
+    case shown of
+        ShownProven ->
+            Nothing
+
+        ShownBroken _ ->
+            Just "The review log is not intact, so no decision is recorded until it is restored."
+
+        ShownKeyMismatch ->
+            Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ", so no decision is recorded.")
+
+        ShownUnkeyed ->
+            Just ("Read-only: " ++ ReviewKey.keyVar ++ " is not set, so no decision is recorded.")
 
 
 -- The log banner of a loaded queue or history page; no banner while the
@@ -773,11 +782,20 @@ decisionButtons model loaded =
             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text why)
 
         Nothing ->
-            if recordsDecisions model then
-                verifiedDecisionButtons model loaded.unit
+            case model.queueState of
+                Loaded page ->
+                    case noDecisionReason page.log of
+                        Nothing ->
+                            verifiedDecisionButtons model loaded.unit
 
-            else
-                Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text ("Read-only: " ++ ReviewKey.keyVar ++ " is not set, so no decision is recorded."))
+                        Just why ->
+                            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text why)
+
+                Loading ->
+                    Ui.none
+
+                Failed _ ->
+                    Ui.none
 
 
 verifiedDecisionButtons : Model -> Index.Unit -> Ui.Element Msg

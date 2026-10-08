@@ -94,6 +94,7 @@ module TestSupport exposing
     , otherKeyHex
     , otherMacKey
     , appendSignedPastHead
+    , appendSignedBeforeFirst
     , rawKeyCheck
     , rawKeyCheckFor
     , isRefusal
@@ -926,6 +927,24 @@ appendSignedClaiming db claim row =
 appendSignedPastHead : Db -> RawRow -> Task.Task Error Int
 appendSignedPastHead db row =
     rawHead db |> Task.andThen (\head -> insertClaimed db head.logId head head row)
+
+
+-- A row stored at seq 0, below the first entry the walk reads, signed as
+-- the entry after a genesis head at seq -1 so its own mac verifies; the
+-- schema's seq CHECK is off on the one connection that writes it, as an
+-- attacker who rewrote the table's schema could, and the head is not touched.
+appendSignedBeforeFirst : Db -> RawRow -> Task.Task Error ()
+appendSignedBeforeFirst db row =
+    do
+        head <- rawHead db
+        Db.withTransaction db
+            (\tx ->
+                do
+                    Db.exec tx "PRAGMA ignore_check_constraints = ON" []
+                    insertClaimed tx head.logId { logId = head.logId, seq = -1, head = "genesis" } { logId = head.logId, seq = -1, head = "genesis" } row
+                    Db.exec tx "PRAGMA ignore_check_constraints = OFF" []
+                    Task.succeed ()
+            )
 
 
 appendSignedAt : Db -> String -> RawHead -> RawRow -> Task.Task Error Int

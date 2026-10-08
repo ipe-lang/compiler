@@ -2101,9 +2101,9 @@ editedRowBelowHeadBreaksPerLoad =
         Task.succeed (verdict == LibDb.Broken (BreaksAt 1) && decidedThenReopened before page)
 
 
--- Entries removed below an unmoved head, with as many rows left in the log
--- as the head's seq (the first removed, one appended past the head), never
--- read as intact on an equal count: the next page load shows the break at
+-- The first entry replaced by a forged one at the same seq, so the log
+-- holds every seq up to an unmoved head and as many rows as its seq, never
+-- reads as intact on that equal count: the next page load shows the break at
 -- entry 1, its banner, and both units again. Red if a load or the verdict
 -- counts the log's rows instead of walking them.
 countingOnlyIntactIsGone : Task.Task Error Bool
@@ -2116,7 +2116,7 @@ countingOnlyIntactIsGone =
         before <- loadPageNow Index.Start
         tamperLog db "DELETE FROM review_log WHERE seq = 1" []
         Db.exec db
-            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (3, ?, ?, 'approve', NULL, 0, 'genesis', ?)"
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, ?, 'approve', NULL, 0, 'genesis', ?)"
             [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString (String.repeat 64 "d") ]
         rows <- logRowCount db
         verdict <- logVerdictOf db

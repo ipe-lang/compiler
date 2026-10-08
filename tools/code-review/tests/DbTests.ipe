@@ -32,7 +32,7 @@ import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, rawKeyCheck, refusedWith)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, appendSignedBeforeFirst, rawKeyCheck, refusedWith)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -1197,6 +1197,29 @@ rowAppendedPastHeadNeverVerified db =
         Task.succeed (verdict == Broken (PastHead 1) && whyOf found == Just ChainBroken && latest == Nothing)
 
 
+-- An entry stored below seq 1, signed so its own mac verifies, sits where
+-- the walk never reads, so the verdict is `Broken (BeforeFirst 1)`: the
+-- entry and the proven ones above it read `ChainBroken`, and a decision is
+-- refused with that break, inserting nothing. Red if the verdict counts only
+-- the entries past the head, leaving a counting reader to count it.
+rowBeforeFirstNeverVerified : Db -> Task.Task Error Bool
+rowBeforeFirstNeverVerified db =
+    do
+        appendSigned db (rawRow "first-1" "h" "approve" Nothing)
+        appendSignedBeforeFirst db (rawRow "before-uid" "hB" "approve" Nothing)
+        verdict <- logVerdictOf db
+        found <- lookUp db "before-uid" "hB"
+        first <- lookUp db "first-1" "h"
+        verify <- countingVerifier db
+        latest <- LibDb.findLatestForUid verify db (uid "before-uid")
+        before <- logRowCount db
+        attested <- attestedFor "ipe-review-before-first-index" (uid "u-a")
+        macKey <- testMacKey
+        refused <- refusedWith (LibDb.brokenRefusal (BeforeFirst 1)) (LibDb.insertDecision macKey db attested Approved)
+        after <- logRowCount db
+        Task.succeed (verdict == Broken (BeforeFirst 1) && whyOf found == Just ChainBroken && whyOf first == Just ChainBroken && latest == Nothing && refused && after == before)
+
+
 -- One tamper fixture: its name, the edits made after three signed entries,
 -- and the break the log must read as.
 type alias TamperFixture =
@@ -1287,9 +1310,9 @@ wrongKeyCannotAppend db =
 -- A head with no key check, as a log written before the check had: after
 -- startup it reads `KeyMismatch`, never proven; the probe binds it to the
 -- running key only when the walk proves every entry under that key. An
--- intact log is bound, and then proven; a log with one edited entry, or an
--- intact log probed under another key, is refused with the key-mismatch
--- refusal and keeps no key check. Red if a head with no check is read as
+-- intact log is bound, and then proven; a log with one edited entry, a log
+-- with an entry past its head, or an intact log probed under another key, is
+-- refused with the key-mismatch refusal and keeps no key check. Red if a head with no check is read as
 -- matching, or bound without a walk proving it.
 legacyHeadAdoptsOnlyOnProof : Task.Task Error Bool
 legacyHeadAdoptsOnlyOnProof =
@@ -1302,6 +1325,7 @@ legacyHeadAdoptsOnlyOnProofIn base =
         intact <- legacyProbe (base ++ "/intact.db") [] testReviewKey
         tampered <- legacyProbe (base ++ "/tampered.db") [ "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" ] testReviewKey
         otherKey <- legacyProbe (base ++ "/other-key.db") [] (Task.map ReviewKey.Signing otherMacKey)
+        pastHead <- legacyProbe (base ++ "/past-head.db") [ "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (3, 'x', 'hX', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')" ] testReviewKey
         Task.succeed
             (intact.unbound
                 == KeyMismatch
@@ -1317,6 +1341,10 @@ legacyHeadAdoptsOnlyOnProofIn base =
                 && otherKey.refusal
                 == Just (Error.message LibDb.keyMismatchRefusal)
                 && otherKey.check
+                == Nothing
+                && pastHead.refusal
+                == Just (Error.message LibDb.keyMismatchRefusal)
+                && pastHead.check
                 == Nothing
             )
 
@@ -1456,6 +1484,7 @@ reviewLogChecks =
         , check "a head rolled back below its rows is broken past the head" (onFreshReview "ipe-review-headRolledBackBelowRowsIsPastHead" headRolledBackBelowRowsIsPastHead)
         , check "a head reset to the genesis with rows is broken past the head" (onFreshReview "ipe-review-headResetToGenesisWithRowsIsPastHead" headResetToGenesisWithRowsIsPastHead)
         , check "a signed row appended past the head never counts" (onFreshReview "ipe-review-rowAppendedPastHeadNeverVerified" rowAppendedPastHeadNeverVerified)
+        , check "a signed row stored below the first entry never counts" (onFreshReview "ipe-review-rowBeforeFirstNeverVerified" rowBeforeFirstNeverVerified)
         , check "the save gate and the read path read every tamper alike" saveGateAndReadPathAgree
         , check "a different key is refused at startup" wrongKeyRefusesStartup
         , check "a different key cannot append" (onFreshReview "ipe-review-wrongKeyCannotAppend" wrongKeyCannotAppend)

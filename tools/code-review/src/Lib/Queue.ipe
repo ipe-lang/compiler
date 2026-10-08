@@ -436,6 +436,9 @@ chainBanner shown =
         ShownBroken (PastHead n) ->
             Just ("The review log holds " ++ pastHeadText n ++ " past its head: a decision was added outside this tool.")
 
+        ShownBroken (BeforeFirst n) ->
+            Just ("The review log holds " ++ pastHeadText n ++ " before its first: a decision was added outside this tool.")
+
         ShownKeyMismatch ->
             Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts.")
 

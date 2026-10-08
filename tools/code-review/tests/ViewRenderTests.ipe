@@ -663,8 +663,14 @@ seededChecks a b =
         keyMismatchCard =
             page (cardModelUnder ShownKeyMismatch a)
 
+        beforeFirstCard =
+            page (cardModelUnder (ShownBroken (BeforeFirst 1)) a)
+
+        noControl html =
+            not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
+
         everyPage =
-            [ shownCard, shownPage, opened, page hostileHistory, readOnlyCard, brokenCard, pastHeadCard, keyMismatchCard, page (unverifiedHistory (ShownBroken (BreaksAt 2)) ChainBroken) ]
+            [ shownCard, shownPage, opened, page hostileHistory, readOnlyCard, brokenCard, pastHeadCard, keyMismatchCard, beforeFirstCard, page (unverifiedHistory (ShownBroken (BreaksAt 2)) ChainBroken) ]
     in
     [ ( "a verified source shows Approve, Refuse and its source text", button "Approve" shownCard && button "Refuse" shownCard && has sourceMarker shownCard )
     , ( "a withheld source shows its reason, no decision button and no source text, for every stale reason and an unreadable file", List.all (withheldRefuses a) withheldCases )
@@ -692,6 +698,19 @@ seededChecks a b =
             && not (has "chain breaks" pastHeadCard)
             && has "The review log was signed by a different IPE_REVIEW_MAC_KEY: no decision in it counts." keyMismatchCard
             && not (has "chain breaks" keyMismatchCard)
+            && has "The review log holds 1 entry before its first: a decision was added outside this tool." beforeFirstCard
+            && not (has "past its head" beforeFirstCard)
+      )
+    , ( "a log not proven under the server's key shows no decision control or shortcut and says why, beside a proven one that shows them"
+      , List.all noControl [ brokenCard, pastHeadCard, beforeFirstCard, keyMismatchCard ]
+            && has "The review log is not intact, so no decision is recorded until it is restored." brokenCard
+            && has "The review log is not intact, so no decision is recorded until it is restored." pastHeadCard
+            && has "The review log is not intact, so no decision is recorded until it is restored." beforeFirstCard
+            && has "The review log was signed by a different IPE_REVIEW_MAC_KEY, so no decision is recorded." keyMismatchCard
+            && not (has "Read-only:" brokenCard)
+            && not (has "Read-only:" keyMismatchCard)
+            && button "Approve" shownCard
+            && has "a approve" shownCard
       )
     , ( "each reason an entry does not count shows its own text", List.all (\( why, text ) -> has text (page (unverifiedHistory ShownProven why))) unverifiedTexts )
     , ( "the review key never appears on any page", List.all (\html -> not (has testKeyHex html) && not (has (String.toUpper testKeyHex) html)) everyPage )
