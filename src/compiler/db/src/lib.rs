@@ -907,6 +907,7 @@ pub fn normalize_module_types(types: ModuleTypes) -> ModuleTypes {
         };
         match ty {
             Ty::Var(raw) => Ty::Var(fresh(*raw, map)),
+            Ty::Wildcard => Ty::Wildcard,
             Ty::Unit => Ty::Unit,
             Ty::Fun(a, b) => Ty::Fun(Box::new(renumber(a, map)), Box::new(renumber(b, map))),
             Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| renumber(e, map)).collect()),

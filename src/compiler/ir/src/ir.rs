@@ -1069,12 +1069,12 @@ pub enum IrType {
     /// checker gives every `any` occurrence in an annotation its own fresh flex
     /// UV ("fresh flex UV per occurrence" — `ipe_types::constrain`), so two
     /// `any` params in one signature can be pinned to two DIFFERENT concrete
-    /// types by the body. `split_typed_sig` (AUD-01 seal fix) resolves each
+    /// types by the body. `split_typed_sig` resolves each
     /// param-position `any` from the def's solved env type, per occurrence, to
     /// its concrete `IrType` whenever that solved type is available — a shared
     /// `Generic(any_sym)` here would collapse distinct occurrences onto ONE
-    /// Rust generic (exit-0-then-cargo-fail). A `Generic` carrying the interned
-    /// `"any"` symbol therefore still appears ONLY as the fallback when the
+    /// Rust generic (exit-0-then-cargo-fail). A `Generic` carrying the lowering's
+    /// private wildcard marker therefore still appears ONLY as the fallback when the
     /// solved type genuinely could not be resolved (should not occur for a
     /// well-formed `Def::Typed` post-solve) — it is not the steady-state
     /// representation the way it is for a genuine type parameter.

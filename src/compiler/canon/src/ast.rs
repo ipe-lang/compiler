@@ -401,14 +401,22 @@ impl Pattern_ {
     }
 }
 
+/// The source spelling of the wildcard type, used to render [`Type::Wildcard`].
+pub const WILDCARD_SPELLING: &str = "any";
+
 /// Canonical type. Mirrors `Can.Type` narrowed to arrows, type
 /// variables, and constructor applications.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Type {
     /// An arrow `A -> B`.
     Lambda(Box<Self>, Box<Self>),
-    /// A type variable.
+    /// A type variable: a binder-bound parameter or a variable the binding quantifies.
     Var(Symbol),
+    /// The wildcard `any`: an unbound `any` in an annotation.
+    ///
+    /// Each occurrence is an independent unknown, never a named variable; a
+    /// declared parameter spelled `any` is a [`Self::Var`].
+    Wildcard,
     /// A type-constructor application. `home` is the defining module (empty for
     /// built-ins like `Int`); `name` the type name; `args` its arguments.
     Con {

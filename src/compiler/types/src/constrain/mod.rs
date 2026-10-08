@@ -32,65 +32,52 @@ pub use std::rc::Rc;
 /// `where_` tag for any `CompilerBug` raised during constraint generation.
 pub const STAGE: &str = "ipe_types::constrain";
 
-/// Recursively replace every `Ty::Var(v)` where `v` resolves to the `"any"`
-/// wildcard AND `v` is NOT one of the union's declared type parameters with
-/// `Dict String String` — the concrete pub/sub wire carrier.
+/// Replace every [`Ty::Wildcard`] with `Dict String String`, the concrete pub/sub wire carrier.
 ///
-/// Mirrors the reference's `any`-wildcard semantics for union-ctor field types:
-/// the the compiler/the backend carries `any` payloads as dynamic `interface{}`; the
-/// Rust backend pins them to `Dict String String`, the sole concrete carrier that
-/// satisfies `Clone + Debug + PartialEq + Serialize + DeserializeOwned`.
-pub fn pin_any_in_ty(
-    ty: Ty,
-    union_vars: &[Symbol],
-    interner: &Interner,
-    dict: Symbol,
-    string: Symbol,
-) -> Ty {
+/// A union constructor field written `any` that no declared parameter binds is
+/// a wildcard; a declared parameter spelled `any` is a [`Ty::Var`] and is left
+/// alone. Mirrors the reference's `any`-wildcard semantics for union-ctor
+/// field types: the Rust backend pins them to `Dict String String`, the sole
+/// concrete carrier that satisfies `Clone + Debug + PartialEq + Serialize +
+/// DeserializeOwned`.
+pub fn pin_any_in_ty(ty: Ty, dict: Symbol, string: Symbol) -> Ty {
     match ty {
-        Ty::Var(v) => {
-            let is_any = interner
-                .resolve(Symbol::from_raw(v))
-                .is_some_and(|n| n == "any");
-            let is_declared = union_vars.iter().any(|uv| uv.as_raw() == v);
-            if is_any && !is_declared {
-                let mk_str = || Ty::Con {
-                    module: Vec::new(),
-                    name: string,
-                    args: Vec::new(),
-                };
-                Ty::Con {
-                    module: Vec::new(),
-                    name: dict,
-                    args: vec![mk_str(), mk_str()],
-                }
-            } else {
-                Ty::Var(v)
+        Ty::Wildcard => {
+            let mk_str = || Ty::Con {
+                module: Vec::new(),
+                name: string,
+                args: Vec::new(),
+            };
+            Ty::Con {
+                module: Vec::new(),
+                name: dict,
+                args: vec![mk_str(), mk_str()],
             }
         }
+        Ty::Var(v) => Ty::Var(v),
         Ty::Fun(a, b) => Ty::Fun(
-            Box::new(pin_any_in_ty(*a, union_vars, interner, dict, string)),
-            Box::new(pin_any_in_ty(*b, union_vars, interner, dict, string)),
+            Box::new(pin_any_in_ty(*a, dict, string)),
+            Box::new(pin_any_in_ty(*b, dict, string)),
         ),
         Ty::Con { module, name, args } => Ty::Con {
             module,
             name,
             args: args
                 .into_iter()
-                .map(|a| pin_any_in_ty(a, union_vars, interner, dict, string))
+                .map(|a| pin_any_in_ty(a, dict, string))
                 .collect(),
         },
         Ty::Unit => Ty::Unit,
         Ty::Tuple(elems) => Ty::Tuple(
             elems
                 .into_iter()
-                .map(|e| pin_any_in_ty(e, union_vars, interner, dict, string))
+                .map(|e| pin_any_in_ty(e, dict, string))
                 .collect(),
         ),
         Ty::Record(fields, tail) => Ty::Record(
             fields
                 .into_iter()
-                .map(|(k, v)| (k, pin_any_in_ty(v, union_vars, interner, dict, string)))
+                .map(|(k, v)| (k, pin_any_in_ty(v, dict, string)))
                 .collect(),
             tail,
         ),

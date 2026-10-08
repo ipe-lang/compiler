@@ -944,7 +944,9 @@ fn scrutinee_union<'a>(scrut: &canon::Expr, ctx: &'a Ctx<'_>) -> DResult<Option<
         // An unsolved scrutinee (`Var`): its domain is unknown, so no catch-all
         // can be proven to swallow a constructor. The structural types carry no
         // constructors at all.
-        Ty::Var(_) | Ty::Fun(..) | Ty::Unit | Ty::Tuple(_) | Ty::Record(..) => return Ok(None),
+        Ty::Var(_) | Ty::Wildcard | Ty::Fun(..) | Ty::Unit | Ty::Tuple(_) | Ty::Record(..) => {
+            return Ok(None);
+        }
         Ty::Con { module, name, .. } => (module, *name),
     };
     let lookup = |key: &TyId| {

@@ -95,6 +95,7 @@ pub fn ty_to_doc(ty: &Ty, interner: &Interner, namer: &mut VarNamer) -> DResult<
     match ty {
         Ty::Unit => Ok(TyDoc::Unit),
         Ty::Var(id) => Ok(TyDoc::Var(namer.name(*id))),
+        Ty::Wildcard => Ok(TyDoc::Var(canon::WILDCARD_SPELLING.into())),
         Ty::Fun(a, b) => {
             let a = ty_to_doc(a, interner, namer)?;
             let b = ty_to_doc(b, interner, namer)?;
@@ -156,6 +157,7 @@ pub fn canon_type_to_doc(t: &canon::Type, interner: &Interner) -> DResult<TyDoc>
             Ok(TyDoc::Fun(Box::new(a), Box::new(b)))
         }
         canon::Type::Var(s) => Ok(TyDoc::Var(resolve(interner, *s)?)),
+        canon::Type::Wildcard => Ok(TyDoc::Var(canon::WILDCARD_SPELLING.into())),
         canon::Type::Con { home, name, args } => {
             let module = resolve_module(interner, home)?;
             let name = resolve(interner, *name)?;
