@@ -468,7 +468,7 @@ fn presents_itself<M>(tag: &str, attrs: &[Attribute<M>]) -> bool {
             }
             _ => None,
         });
-        return !input_type.is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden"));
+        return !input_type.is_some_and(|t| t.eq_ignore_ascii_case("hidden"));
     }
     SELF_PRESENTING_TAGS
         .iter()
@@ -481,8 +481,6 @@ const fn description_is_inert(desc: &Description) -> bool {
     match desc {
         Description::NoDescription
         | Description::DescHeading(_)
-        | Description::DescLivePolite
-        | Description::DescLiveAssertive
         | Description::DescParagraph
         | Description::DescSection
         | Description::DescSectionHeading
@@ -491,7 +489,9 @@ const fn description_is_inert(desc: &Description) -> bool {
         | Description::DescKbd
         | Description::DescTextColumn
         | Description::DescForm => true,
-        Description::DescMain
+        Description::DescLivePolite
+        | Description::DescLiveAssertive
+        | Description::DescMain
         | Description::DescNavigation
         | Description::DescContentInfo
         | Description::DescComplementary

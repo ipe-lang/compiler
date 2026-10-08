@@ -534,7 +534,8 @@ fn render_nearby_overlays<M: Clone>(attrs: &mut [Attribute<M>], ctx: RenderCtx) 
 ///
 /// `Flow` content may hold block boxes; `Phrasing` content holds only inline
 /// runs. A flow element written below a phrasing ancestor is restructured by
-/// the browser's HTML parser, so the renderer never emits one there.
+/// the browser's HTML parser, so the safe surface never emits one there. A tag
+/// the author writes is placed as written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContentModel {
     Flow,
@@ -4186,6 +4187,18 @@ mod text_role_tests {
             (
                 role(Description::DescNavigation, vec![]),
                 Presence::Unannounced,
+            ),
+            (
+                role(Description::DescLivePolite, vec![]),
+                Presence::Unannounced,
+            ),
+            (
+                role(Description::DescLiveAssertive, vec![]),
+                Presence::Unannounced,
+            ),
+            (
+                tagged_with("input", vec![("type", " hidden")]),
+                Presence::Announced,
             ),
             (
                 with(Attribute::AttrAttribute("id".to_owned(), "top".to_owned())),
