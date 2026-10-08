@@ -157,7 +157,12 @@ test("focus-across-patch: a node whose key spells a former descendant identity n
 test("focus-across-patch: a form whose controls shadow DOM members keeps its fields across a patch", async ({ page }) => {
   await open(page);
   const field = page.locator("#typed");
-  await field.click();
+  // Playwright's own actionability check walks `parentElement` up from the
+  // field, and the form's `parentElement` control shadows it there, so the
+  // pointer is driven by coordinates instead.
+  const box = await field.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
   await page.keyboard.type("abc");
   // Let the debounced input event settle before the patch under test.
   await page.waitForTimeout(500);
