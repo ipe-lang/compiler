@@ -4228,7 +4228,9 @@ mod handlers {
         // that admission and the driver's start still wakes the driver.
         let revocation = RevocationWatch::subscribe();
         // The scope a claimed rejoin's lazy `init` ran in: the credentials it
-        // admitted stay bound to the session the claim publishes.
+        // admitted stay bound to the session the claim publishes. A restored or
+        // rebuilt row always has one once proved; absent, the entry is refused
+        // rather than entered with its bindings dropped.
         let mut claim_scope = None;
         let hit = match cookie_key {
             Some(key) if !reset_state_from_env() => 'rejoin: {
@@ -4351,13 +4353,13 @@ mod handlers {
                 // volume, so NOT rejected; but count its driver. The slot is
                 // taken at once, so the count is given back on every exit,
                 // a cancelled request included.
+                let Some(scope) = claim_scope.take() else {
+                    return entry_unavailable();
+                };
                 st.session_count.fetch_add(1, Ordering::SeqCst);
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let scope = claim_scope
-                    .take()
-                    .unwrap_or_else(|| pubsub::SessionScope::new(claim.key().as_str().to_owned()));
                 let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, &path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
@@ -4372,13 +4374,13 @@ mod handlers {
             )) => {
                 // Returning user, same slot pairing as `Restored`; the rebuilt
                 // model's `init` Cmd runs first, exactly as on a new session.
+                let Some(scope) = claim_scope.take() else {
+                    return entry_unavailable();
+                };
                 st.session_count.fetch_add(1, Ordering::SeqCst);
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let scope = claim_scope
-                    .take()
-                    .unwrap_or_else(|| pubsub::SessionScope::new(claim.key().as_str().to_owned()));
                 let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, &path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
