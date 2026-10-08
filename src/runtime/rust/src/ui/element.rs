@@ -426,19 +426,46 @@ pub enum Element<M> {
     Cells(Vec<Vec<char>>),
 }
 
-/// Tagged elements that present a box of their own with no child content: a
-/// form control or an embedded document, media or gauge.
-const SELF_PRESENTING_TAGS: [&str; 9] = [
-    "textarea", "select", "iframe", "object", "canvas", "video", "audio", "progress", "meter",
+/// Tagged elements that present a box of their own with no child content: an
+/// image, a rule, a form control, or an embedded document, video or gauge.
+/// `input` and `audio` are judged by `presents_itself`, and the other void
+/// tags (`br`, `wbr`, and the metadata and table-column tags) present nothing.
+const SELF_PRESENTING_TAGS: [&str; 12] = [
+    "img", "hr", "embed", "textarea", "select", "iframe", "object", "canvas", "video", "progress",
+    "meter", "input",
 ];
+
+/// True when a tagged element presents a box of its own whatever its children:
+/// a `SELF_PRESENTING_TAGS` member, except an `input` whose first `type`
+/// attribute is `hidden`, and an `audio` only when it carries `controls` (an
+/// `audio` without them renders nothing).
+fn presents_itself<M>(tag: &str, attrs: &[Attribute<M>]) -> bool {
+    if tag.eq_ignore_ascii_case("audio") {
+        return attrs.iter().any(|a| {
+            matches!(a, Attribute::AttrAttribute(name, _) if name.eq_ignore_ascii_case("controls"))
+        });
+    }
+    if tag.eq_ignore_ascii_case("input") {
+        let input_type = attrs.iter().find_map(|a| match a {
+            Attribute::AttrAttribute(name, value) if name.eq_ignore_ascii_case("type") => {
+                Some(value.as_str())
+            }
+            _ => None,
+        });
+        return !input_type.is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden"));
+    }
+    SELF_PRESENTING_TAGS
+        .iter()
+        .any(|t| tag.eq_ignore_ascii_case(t))
+}
 
 /// True when an element renders something visible or announced.
 ///
 /// An empty element, a text leaf of Unicode `White_Space` only, and a
-/// container whose every child is itself empty have no content. A void tagged
-/// leaf (an image, an input control), a self-presenting tagged element (a
-/// `textarea`, a `select`, embedded media), a node carrying an `AttrNearby`
-/// overlay, raw markup and a cell grid have content. The walk is iterative and
+/// container whose every child is itself empty have no content. A tagged
+/// element that presents itself (`presents_itself`: an image, a visible input
+/// control, a `textarea`, a `select`, embedded media), a node carrying an
+/// `AttrNearby` overlay, raw markup and a cell grid have content. The walk is iterative and
 /// stops at `MAX_HTML_DEPTH`, where it answers true so the render's own depth
 /// ceiling decides.
 #[must_use]
@@ -463,12 +490,7 @@ pub fn has_content<M>(elem: &Element<M>) -> bool {
                 pending.extend(kids.iter().map(|k| (k, below)));
             }
             Element::TaggedNode(tag, _, attrs, kids) => {
-                if crate::html::is_void(tag)
-                    || SELF_PRESENTING_TAGS
-                        .iter()
-                        .any(|t| tag.eq_ignore_ascii_case(t))
-                    || has_overlay(attrs)
-                {
+                if presents_itself(tag, attrs) || has_overlay(attrs) {
                     return true;
                 }
                 pending.extend(kids.iter().map(|k| (k, below)));
@@ -502,7 +524,15 @@ pub enum SectionHead {
 }
 
 /// Classify a node's first child as its section heading. HTML and the terminal
-/// share this one rule, so only a section's first child is ever its heading.
+/// share this one rule, so only a section's first child is ever its heading,
+/// and only a `Node` heading: a `TaggedNode` renders its written tag and ranks
+/// nothing below it.
+///
+/// Cost: each call walks the first child's subtree once (`has_content`, which
+/// stops at the first content). A node lies inside at most `MAX_HTML_DEPTH / 2`
+/// enclosing first-child headings, since a section and its heading take two
+/// levels and both renderers stop at a depth of 1024, so a render walks each
+/// node at most 512 times beyond its own visit.
 #[must_use]
 pub fn section_head<M>(desc: &Description, kids: &[Element<M>]) -> SectionHead {
     if !matches!(desc, Description::DescSection) {
@@ -512,8 +542,7 @@ pub fn section_head<M>(desc: &Description, kids: &[Element<M>]) -> SectionHead {
         return SectionHead::NoHeading;
     };
     match first {
-        Element::Node(Description::DescSectionHeading, _, _)
-        | Element::TaggedNode(_, Description::DescSectionHeading, _, _) => {
+        Element::Node(Description::DescSectionHeading, _, _) => {
             if has_content(first) {
                 SectionHead::Present
             } else {

@@ -646,6 +646,13 @@ impl NodeTag {
     }
 
     /// The content model the element's children obey.
+    ///
+    /// `Label` and `Button` admit flow children here although HTML allows
+    /// them only phrasing content, so a row or column inside a button keeps
+    /// its block layout. The parser still builds the rendered tree: a flow
+    /// start tag closes only an open `p` (in button scope), a `button` bounds
+    /// that scope, and a `label` reaches flow context only with no `p`
+    /// ancestor, since below a phrasing ancestor every child stays phrasing.
     const fn content(self) -> ContentModel {
         match self {
             Self::Div
@@ -692,6 +699,18 @@ impl SectionLevel {
             Self::H3 => Self::H4,
             Self::H4 => Self::H5,
             Self::H5 | Self::H6 => Self::H6,
+        }
+    }
+
+    /// The level as a heading number, 1 for `H1`.
+    const fn number(self) -> i64 {
+        match self {
+            Self::H1 => 1,
+            Self::H2 => 2,
+            Self::H3 => 3,
+            Self::H4 => 4,
+            Self::H5 => 5,
+            Self::H6 => 6,
         }
     }
 
@@ -1530,23 +1549,32 @@ fn render_node_as<M: Clone>(
         Attribute::AttrDescribe(d) => landmark_tag_for(d).map(|t| (t, landmark_role_for(d), d)),
         _ => None,
     });
-    // A heading whose final tag is not its native `<hN>` (a level above 6, or a
-    // host that is not a plain `div`) is announced through `role`/`aria-level`.
-    // A `TaggedNode`'s own description never names its heading level.
-    let own_heading = if written.is_none() {
-        desc.heading_level()
-    } else {
+    // A heading whose final tag is not its native `<hN>` (a level above 6, a
+    // host that is not a plain `div`, or a demoted `span`) is announced through
+    // `role`/`aria-level`. A section heading's level is its section rank. A
+    // `TaggedNode`'s own description never names its heading level.
+    let own_heading = if written.is_some() {
         None
+    } else if matches!(desc, Description::DescSectionHeading) {
+        Some(HeadingLevel::from_requested(
+            ctx.section.map_or(1, SectionLevel::number),
+        ))
+    } else {
+        desc.heading_level()
     };
     let heading = landmark
         .and_then(|(_, _, d)| d.heading_level())
         .or(own_heading);
     let own = tag_for_description(desc, ctx.section);
     // A node demoted to a `span` loses its landmark tag, so it announces the
-    // landmark through `role`: the `describe` landmark first, else its own.
-    let demoted_role = landmark
-        .and_then(|(_, role, _)| role)
-        .or_else(|| landmark_role_for(desc));
+    // landmark through `role`: the `describe` landmark first, else its own. A
+    // `describe` heading claims the one `role` as `heading`, so the node's own
+    // landmark yields to it.
+    let demoted_role = match landmark {
+        Some((_, _, d)) if d.heading_level().is_some() => None,
+        Some((_, role, _)) => role.or_else(|| landmark_role_for(desc)),
+        None => landmark_role_for(desc),
+    };
     let (resolved, role_attr): (ResolvedTag, Option<&'static str>) = match (written, landmark) {
         (None, Some((retag, _, _))) if own == NodeTag::Div => (ResolvedTag::Typed(retag), None),
         (None, Some((_, role, _))) => (ResolvedTag::Typed(own), role),
@@ -1618,9 +1646,11 @@ fn render_node_as<M: Clone>(
     if let Some(role) = role_attr {
         html_attrs.push(HtmlAttribute::Attr("role".to_owned(), role.to_owned()));
     }
+    // An element carries one `role`: a landmark role already set wins over the
+    // heading role.
     if let Some(level) = heading {
         let native = matches!(heading_markup(level), HeadingMarkup::Native(t) if t.as_str() == tag);
-        if !native {
+        if !native && role_attr.is_none() {
             html_attrs.extend(heading_role_attrs(level));
         }
     }
@@ -4024,12 +4054,16 @@ mod text_role_tests {
     }
 
     /// Rendering an overlay chain far past the depth ceiling returns: the
-    /// overlay subtree is moved into the bounded render, never cloned (a
-    /// derived `Clone` of the chain recurses once per level and overflows the
-    /// stack). The shallow chain is the control (CI job `test`).
+    /// overlay subtree is moved into the bounded render, never cloned. A
+    /// derived `Clone` of the chain recurses through `Element`, its attribute
+    /// `Vec` and `Attribute` once per level, at least 80 bytes of frames per
+    /// level, so a million levels need more than the 48 MiB the depth-bounded
+    /// render itself requires in a debug build; a smaller stack would overflow
+    /// in that render, not in the clone. The shallow chain is the control (CI
+    /// job `test`).
     #[test]
     fn deep_overlay_chain_does_not_overflow() {
-        const DEPTH: usize = 400_000;
+        const DEPTH: usize = 1_000_000;
         let rendered = std::thread::Builder::new()
             .stack_size(48 * 1024 * 1024)
             .spawn(|| {
@@ -4048,9 +4082,14 @@ mod text_role_tests {
     /// empty `div` (the control) has none and is skipped (CI job `test`).
     #[test]
     fn self_presenting_heading_content_is_kept() {
-        let tagged = |tag: &str| -> E {
-            Element::TaggedNode(tag.to_owned(), Description::NoDescription, vec![], vec![])
+        let tagged_with = |tag: &str, attrs: Vec<(&str, &str)>| -> E {
+            let attrs = attrs
+                .into_iter()
+                .map(|(n, v)| Attribute::AttrAttribute(n.to_owned(), v.to_owned()))
+                .collect();
+            Element::TaggedNode(tag.to_owned(), Description::NoDescription, attrs, vec![])
         };
+        let tagged = |tag: &str| tagged_with(tag, vec![]);
         let overlay_only: E = Element::Node(
             Description::NoDescription,
             vec![Attribute::AttrNearby(Location::Below, text("tip"))],
@@ -4060,12 +4099,147 @@ mod text_role_tests {
             (tagged("textarea"), true),
             (tagged("select"), true),
             (overlay_only, true),
+            (tagged("img"), true),
+            (tagged_with("input", vec![("type", "text")]), true),
+            (tagged("input"), true),
+            (tagged_with("audio", vec![("controls", "")]), true),
             (tagged("div"), false),
+            (tagged("br"), false),
+            (tagged("wbr"), false),
+            (tagged("audio"), false),
+            (tagged_with("input", vec![("type", "Hidden")]), false),
+            (
+                tagged_with("input", vec![("type", "hidden"), ("type", "text")]),
+                false,
+            ),
         ] {
             let head = heading(vec![inner]);
             assert_eq!(has_content(&head), kept);
             let tree = section(head, text("body"));
             assert_eq!(headings_of(tree).len(), usize::from(kept));
         }
+    }
+
+    /// A demoted node carries one `role`: a heading with a `describe`
+    /// navigation landmark announces the landmark, and a main landmark with a
+    /// `describe` heading announces the heading. In flow (the control) the
+    /// first keeps its native `h2` with the landmark role and the second its
+    /// `main` with the heading role (CI job `test`).
+    #[test]
+    fn demotion_emits_one_role() {
+        let level = HeadingLevel::from_requested(2);
+        let nav_heading = || -> E {
+            Element::Node(
+                Description::DescHeading(level),
+                vec![Attribute::AttrDescribe(Description::DescNavigation)],
+                vec![text("a")],
+            )
+        };
+        let main_heading = || -> E {
+            Element::Node(
+                Description::DescMain,
+                vec![Attribute::AttrDescribe(Description::DescHeading(level))],
+                vec![text("b")],
+            )
+        };
+        let roles = |s: &str| s.matches("role=").count();
+
+        let nav = html_of(ui_paragraph_(vec![], vec![nav_heading()]));
+        assert_eq!(roles(&nav), 1, "{nav}");
+        assert!(nav.contains("role=\"navigation\""), "{nav}");
+        assert!(!nav.contains("aria-level") && !nav.contains("<h2"), "{nav}");
+        let main = html_of(ui_paragraph_(vec![], vec![main_heading()]));
+        assert_eq!(roles(&main), 1, "{main}");
+        assert!(main.contains("role=\"heading\""), "{main}");
+        assert!(main.contains("aria-level=\"2\""), "{main}");
+        assert!(!main.contains("<main"), "{main}");
+
+        let nav_flow = html_of(role(Description::NoDescription, vec![nav_heading()]));
+        assert_eq!(roles(&nav_flow), 1, "{nav_flow}");
+        assert!(
+            nav_flow.contains("<h2") && nav_flow.contains("role=\"navigation\""),
+            "{nav_flow}"
+        );
+        let main_flow = html_of(role(Description::NoDescription, vec![main_heading()]));
+        assert_eq!(roles(&main_flow), 1, "{main_flow}");
+        assert!(main_flow.contains("<main"), "{main_flow}");
+        assert!(main_flow.contains("role=\"heading\""), "{main_flow}");
+        assert!(main_flow.contains("aria-level=\"2\""), "{main_flow}");
+    }
+
+    /// A section heading demoted to a `span` below a paragraph keeps its rank
+    /// as `role="heading"` with the section's `aria-level`; the same heading in
+    /// flow (the control) is its native `h2` with no `role` (CI job `test`).
+    #[test]
+    fn demoted_section_heading_keeps_its_rank() {
+        let tree = |inner: E| -> E {
+            section(
+                heading(vec![text("A")]),
+                section(heading(vec![text("B")]), inner),
+            )
+        };
+        let ranked = |elem: E| -> Vec<(String, String)> { headings_of(elem) };
+        let expected = |tags: &[(&str, &str)]| -> Vec<(String, String)> {
+            tags.iter()
+                .map(|(t, x)| ((*t).to_owned(), (*x).to_owned()))
+                .collect()
+        };
+
+        let demoted = || tree(ui_paragraph_(vec![], vec![heading(vec![text("C")])]));
+        let s = html_of(demoted());
+        assert_eq!(s.matches("role=").count(), 1, "{s}");
+        assert!(s.contains("role=\"heading\""), "{s}");
+        assert!(s.contains("aria-level=\"2\""), "{s}");
+        assert_eq!(ranked(demoted()), expected(&[("h1", "A"), ("h2", "B")]));
+
+        let flow = || tree(heading(vec![text("C")]));
+        let f = html_of(flow());
+        assert!(!f.contains("role="), "{f}");
+        assert_eq!(
+            ranked(flow()),
+            expected(&[("h1", "A"), ("h2", "B"), ("h2", "C")])
+        );
+    }
+
+    /// Only a `Node` heading is a section's heading: a `TaggedNode` heading
+    /// renders its written tag and ranks nothing, so it is never skipped and
+    /// its section's descendants are not ranked deeper. A `Node` heading (the
+    /// control) is `Empty` without content and `Present` with it (CI job
+    /// `test`).
+    #[test]
+    fn a_tagged_heading_is_no_section_head() {
+        let tagged = |kids: Vec<E>| -> E {
+            Element::TaggedNode(
+                "h2".to_owned(),
+                Description::DescSectionHeading,
+                vec![],
+                kids,
+            )
+        };
+        let sec = Description::DescSection;
+        assert_eq!(
+            section_head(&sec, &[tagged(vec![])]),
+            SectionHead::NoHeading
+        );
+        assert_eq!(
+            section_head(&sec, &[tagged(vec![text("T")])]),
+            SectionHead::NoHeading
+        );
+        assert_eq!(section_head(&sec, &[heading(vec![])]), SectionHead::Empty);
+        assert_eq!(
+            section_head(&sec, &[heading(vec![text("T")])]),
+            SectionHead::Present
+        );
+        let tree = section(
+            tagged(vec![text("T")]),
+            section(heading(vec![text("B")]), text("body")),
+        );
+        assert_eq!(
+            headings_of(tree),
+            vec![
+                ("h2".to_owned(), "T".to_owned()),
+                ("h1".to_owned(), "B".to_owned())
+            ]
+        );
     }
 }
