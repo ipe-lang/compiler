@@ -109,6 +109,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::RuntimeMaterializeFailed { .. }
         | CliError::RuntimeVersionMismatch { .. }
         | CliError::EmittedBuildFailed { .. }
+        | CliError::CargoBuildTimedOut { .. }
         | CliError::UnknownCode { .. }
         | CliError::DocNotFound { .. }
         | CliError::StaticRefusal(_)

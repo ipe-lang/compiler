@@ -314,7 +314,7 @@ impl Renumbering {
     fn ty(&mut self, home: u32, ty: &mut Ty) -> Result<(), CanonicalizeError> {
         match ty {
             Ty::Var(raw) => *raw = self.raw(home, *raw)?,
-            Ty::Unit => {}
+            Ty::Wildcard | Ty::Unit => {}
             Ty::Fun(arg, result) => {
                 self.ty(home, arg)?;
                 self.ty(home, result)?;
@@ -1065,12 +1065,6 @@ fn infer_core(
                 .or_default()
                 .push(&app.vars);
         }
-        // The wildcard `any` -- a bare `Html` / `Attribute` annotation the parser
-        // arity-fills to `Html any` -- is NOT a defaulting candidate: it has its
-        // own resolution (the lowerer substitutes its concrete type from the
-        // body's solved region, e.g. a `view` whose body pins the msg via an
-        // event handler), which defaulting to `Unit` would clobber.
-        let any_sym = interner.intern("any").map_err(InferError::unsited)?;
         for (key, ty) in &generated.top_level {
             let mut ui_msg_vars = BTreeSet::new();
             let mut other_vars = BTreeSet::new();
@@ -1091,7 +1085,6 @@ fn infer_core(
                 .into_iter()
                 .filter(|v| !other_vars.contains(v))
                 .filter(|v| !param_msg_vars.contains(v))
-                .filter(|v| *v != any_sym)
                 .collect();
             if candidates.is_empty() {
                 continue;
@@ -1561,7 +1554,11 @@ fn collect_ui_msg_and_other_vars(
                 collect_ui_msg_and_other_vars(v, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
             }
         }
-        Ty::Unit => {}
+        // The wildcard `any` -- a bare `Html` / `Attribute` annotation is
+        // arity-filled to `Html any` -- names no variable, so it is never a
+        // defaulting candidate: the lowerer substitutes its concrete type from
+        // the body's solved region, which defaulting to `Unit` would clobber.
+        Ty::Wildcard | Ty::Unit => {}
     }
 }
 
@@ -1838,7 +1835,7 @@ fn collect_ui_msg_concrete_cons(
     out: &mut BTreeSet<MsgConId>,
 ) {
     match ty {
-        Ty::Var(_) | Ty::Unit => {}
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => {}
         Ty::Fun(a, b) => {
             collect_ui_msg_concrete_cons(a, ui_msg_cons, in_ui_msg, out);
             collect_ui_msg_concrete_cons(b, ui_msg_cons, in_ui_msg, out);
@@ -2031,7 +2028,7 @@ fn check_wildcard_pins(
 #[must_use]
 pub fn ty_is_ground(ty: &Ty) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Record(_, RowTail::Open(_)) => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Record(_, RowTail::Open(_)) => false,
         Ty::Unit => true,
         Ty::Record(fields, RowTail::Closed) => fields.values().all(ty_is_ground),
         Ty::Fun(a, b) => ty_is_ground(a) && ty_is_ground(b),
@@ -2236,7 +2233,7 @@ fn super_bounds_satisfied(
     // documented loss every sibling bound accepts; genuine cross-binding
     // obligation propagation is a follow-up design for ALL bounds at once — see
     // `docs/adr/0001-language-semantics-and-types.md` §6.
-    let not_curried_ok = !matches!(ty, Ty::Fun(_, _) | Ty::Var(_));
+    let not_curried_ok = !matches!(ty, Ty::Fun(_, _) | Ty::Var(_) | Ty::Wildcard);
     // SQL-bind-parameter obligation: satisfied by exactly the Ipê types the
     // runtime has a `From<T> for SqlParam` impl for — the bare scalars
     // `ipe_runtime::db` binds directly, plus the `SqlValue` ADT itself.
@@ -2286,7 +2283,7 @@ pub(crate) fn concrete_super_ok(
 fn canon_type_embeds_lambda(t: &canon::Type) -> bool {
     match t {
         canon::Type::Lambda(_, _) => true,
-        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
         canon::Type::Tuple(elems) => elems.iter().any(canon_type_embeds_lambda),
         canon::Type::Con { args, .. } => args.iter().any(canon_type_embeds_lambda),
         canon::Type::Record(fields) => fields.iter().any(|(_, f)| canon_type_embeds_lambda(f)),
@@ -2337,7 +2334,7 @@ fn canon_type_embeds_opaque_handle(
     let walk = |t: &canon::Type| canon_type_embeds_opaque_handle(interner, embeds, t);
     match t {
         canon::Type::Lambda(a, b) => walk(a) || walk(b),
-        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
         canon::Type::Tuple(elems) => elems.iter().any(walk),
         canon::Type::Con { home, name, args } => {
             embeds.is_opaque_handle(interner, home, *name) || args.iter().any(walk)
@@ -2440,7 +2437,7 @@ pub const MAX_SHOWN_TUPLE_ARITY: usize = 12;
 /// shown like any user union. Every type argument is walked.
 fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Fun(_, _) => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) => false,
         Ty::Unit => true,
         Ty::Tuple(elems) => {
             elems.len() <= MAX_SHOWN_TUPLE_ARITY
@@ -2472,7 +2469,7 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 /// compares `IpeDbStorePred` values whatever `row` is).
 fn ty_is_equatable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Fun(_, _) => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) => false,
         Ty::Unit => true,
         Ty::Tuple(elems) => elems
             .iter()
@@ -7879,6 +7876,25 @@ mod tests {
         }
     }
 
+    /// The wildcard is no known type, so it satisfies no obligation at either
+    /// site: a bound left open on it would reach `cargo` unchecked.
+    #[test]
+    fn every_bound_bit_rejects_the_wildcard_at_both_sites() {
+        let i = Interner::new();
+        let no_fn_enums = EnumEmbeds::default();
+        for &bit in TyBounds::ALL_BITS {
+            for site in [
+                super_bounds::BoundSite::EmittedGeneric,
+                super_bounds::BoundSite::ConcretePin,
+            ] {
+                assert!(
+                    !super_bounds_satisfied(&i, bit, &Ty::Wildcard, site, &no_fn_enums),
+                    "obligation bit {bit:?} must reject the wildcard at {site:?}"
+                );
+            }
+        }
+    }
+
     /// A `Show`-bounded generic instantiated to a FUNCTION must be REJECTED by
     /// the shared use-site gate. The obligation models `describe : a -> String`
     /// with `describe x = Debug.log "x" x` — a `Stringify` obligation on `a` —
@@ -8662,6 +8678,49 @@ h x =
             }) => Some((*parameter, dependence)),
             _ => None,
         }
+    }
+
+    /// A union parameter declared as `any` links its field to the applied type.
+    ///
+    /// `type Box any = Box any` declares `any` as the parameter, so `Box Int`'s
+    /// field is `Int`; returning it as a `String` is a mismatch at the arm
+    /// body, never an accepted program whose emitted Rust fails to build.
+    #[test]
+    fn declared_any_param_links_field_and_result() {
+        let src = format!(
+            "{M2C_HDR}type Box any\n    = Box any\n\n\
+             unbox : Box Int -> String\nunbox b =\n    case b of\n        Box x ->\n            x\n\n\
+             main =\n    unbox (Box 1)\n"
+        );
+        let (solved, _i, _m) = infer_src(&src);
+        let span = match &solved {
+            Err(Diagnostic::Type {
+                span,
+                msg: TypeError::TypeMismatch { .. },
+            }) => Some(*span),
+            _ => None,
+        };
+        let case_at = src.find("case b of").and_then(|o| u32::try_from(o).ok());
+        let body_at = src
+            .rfind("            x")
+            .and_then(|o| u32::try_from(o.saturating_add(12)).ok());
+        assert!(
+            matches!((span, case_at, body_at), (Some(sp), Some(lo), Some(hi)) if lo <= sp.lo && sp.lo <= hi),
+            "a field of declared parameter `any` returned as `String` must be IPE-T0001 \
+             inside `unbox`'s body: {solved:?}"
+        );
+    }
+
+    /// Each wildcard occurrence is its own unknown, so distinct argument types are accepted.
+    #[test]
+    fn wildcard_occurrences_stay_independent() {
+        let src =
+            format!("{M2C_HDR}f : any -> any -> Int\nf x y =\n    0\n\nmain =\n    f \"s\" 1\n");
+        let (solved, _i, _m) = infer_src(&src);
+        assert!(
+            solved.is_ok(),
+            "two wildcard parameters must admit unrelated argument types: {solved:?}"
+        );
     }
 
     /// A parameter wildcard the body unifies with a signature type variable is

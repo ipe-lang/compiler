@@ -2024,7 +2024,7 @@ mod registry_phase_c_tests {
                         collect(f, found);
                     }
                 }
-                Ty::Var(_) | Ty::Unit => {}
+                Ty::Var(_) | Ty::Wildcard | Ty::Unit => {}
             }
         }
         fn oracle(scheme: &Ty, arity: u8) -> BTreeSet<u32> {
@@ -2170,7 +2170,7 @@ mod registry_phase_c_tests {
                         out.insert(*n);
                     }
                 }
-                Ty::Unit => {}
+                Ty::Wildcard | Ty::Unit => {}
             }
         }
 
@@ -2342,7 +2342,7 @@ mod registry_phase_c_tests {
                         .zip(items)
                         .find_map(|(t, v)| slot_var(uf, v, t, slot))
                 }
-                Ty::Record(..) | Ty::Unit => None,
+                Ty::Wildcard | Ty::Record(..) | Ty::Unit => None,
             }
         }
 
@@ -2473,8 +2473,8 @@ mod registry_phase_c_tests {
 }
 
 #[cfg(test)]
-mod aud13_solver_var_tag_tests {
-    use super::super::{Builder, Builtins, Content, Interner, Ty, UnionFind};
+mod wildcard_instantiation_tests {
+    use super::super::{Builder, Builtins, Content, Interner, Ty, UnionFind, from_canon};
     use crate::ty::tag_solver_var;
     use std::collections::BTreeMap;
 
@@ -2482,15 +2482,13 @@ mod aud13_solver_var_tag_tests {
         Builtins::new(interner).expect("Builtins::new must not fail in tests")
     }
 
-    /// AUD-13 regression: `instantiate_in`'s wildcard-`"any"` check must not
-    /// misfire on a solver-representative id that happens to numerically
-    /// equal the interned raw of the string `"any"`. Constructs the exact
-    /// collision by reusing `any`'s own raw, tagged as solver-space —
-    /// `zonk` (see `constrain.rs`'s `Content::Flex | Rigid | Super` arm)
-    /// tags every surviving `VarId` this way before it can ever reach
-    /// `instantiate_in` again.
+    /// A variable spelled `any` is an ordinary variable: every occurrence shares one unknown.
+    ///
+    /// Only [`Ty::Wildcard`] instantiates fresh per occurrence, so an
+    /// annotation-space raw equal to the interned `any` symbol, and a tagged
+    /// solver raw with the same numeric value, both share through `vars`.
     #[test]
-    fn tagged_solver_var_sharing_any_raw_is_not_treated_as_wildcard_any() {
+    fn var_spelled_any_shares_one_variable() {
         let mut interner = Interner::new();
         let any_sym = interner
             .intern("any")
@@ -2501,54 +2499,86 @@ mod aud13_solver_var_tag_tests {
         let mut uf = UnionFind::<Content>::new();
         let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
 
-        // Tagged: the SAME raw as `any`'s interned symbol, but marked
-        // solver-space. Two references through one `vars` map must resolve
-        // to the SAME variable (ordinary shared-var behavior) — if the tag
-        // were ignored, the wildcard-`any` path would instead mint a FRESH
-        // flex var per occurrence.
-        let tagged = Ty::Var(tag_solver_var(any_raw));
-        let mut vars = BTreeMap::new();
-        let first = builder
-            .instantiate_in(&tagged, &mut vars, false)
-            .expect("instantiate_in must not fail");
-        let second = builder
-            .instantiate_in(&tagged, &mut vars, false)
-            .expect("instantiate_in must not fail");
-        assert_eq!(
-            first, second,
-            "a tagged solver-var raw sharing any's numeric value must still \
-             share ONE variable across occurrences, proving it was NOT \
-             routed through the wildcard-any fresh-per-occurrence path",
-        );
+        for ty in [Ty::Var(any_raw), Ty::Var(tag_solver_var(any_raw))] {
+            let mut vars = BTreeMap::new();
+            let first = builder
+                .instantiate_in(&ty, &mut vars, false)
+                .expect("instantiate_in must not fail");
+            let second = builder
+                .instantiate_in(&ty, &mut vars, false)
+                .expect("instantiate_in must not fail");
+            assert_eq!(
+                first, second,
+                "{ty:?} names a variable and must share ONE unknown across occurrences",
+            );
+        }
     }
 
-    /// Control: the SAME raw value, untagged, is genuine annotation-space
-    /// `"any"` and must keep its documented wildcard semantics — each
-    /// occurrence gets an independent fresh flex variable.
+    /// The wildcard instantiates to an independent fresh unknown per occurrence.
     #[test]
-    fn untagged_any_raw_still_gets_wildcard_semantics() {
+    fn wildcard_gets_a_fresh_variable_per_occurrence() {
         let mut interner = Interner::new();
-        let any_sym = interner
-            .intern("any")
-            .expect("interning \"any\" must not fail");
-        let any_raw = any_sym.as_raw();
-
         let builtins = make_builder(&mut interner);
         let mut uf = UnionFind::<Content>::new();
         let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
 
-        let untagged = Ty::Var(any_raw);
         let mut vars = BTreeMap::new();
         let first = builder
-            .instantiate_in(&untagged, &mut vars, false)
+            .instantiate_in(&Ty::Wildcard, &mut vars, false)
             .expect("instantiate_in must not fail");
         let second = builder
-            .instantiate_in(&untagged, &mut vars, false)
+            .instantiate_in(&Ty::Wildcard, &mut vars, false)
             .expect("instantiate_in must not fail");
         assert_ne!(
             first, second,
-            "untagged \"any\" must keep independent-fresh-var-per-occurrence \
-             wildcard semantics",
+            "the wildcard must keep independent-fresh-var-per-occurrence semantics",
+        );
+        assert!(vars.is_empty(), "the wildcard must never enter `vars`");
+    }
+
+    /// A union parameter declared as `any` is one variable in the field and the result.
+    ///
+    /// `type Box any = Box any`'s constructor scheme is `any -> Box any` with
+    /// both `any`s the declared parameter, so one instantiation map links the
+    /// field to the result's argument.
+    #[test]
+    fn declared_any_param_ctor_scheme_shares_one_var() {
+        let mut interner = Interner::new();
+        let src =
+            "module Main exposing (main)\n\ntype Box any\n    = Box any\n\nmain =\n    Box 1\n";
+        let parsed = ipe_parse::parse_module(src, &mut interner).expect("fixture must parse");
+        let module =
+            ipe_canon::canonicalise(&parsed, &mut interner).expect("fixture must canonicalise");
+        let union = module.unions.first().expect("fixture declares one union");
+        let field = union
+            .ctors
+            .first()
+            .and_then(|c| c.args.first())
+            .map(from_canon)
+            .expect("fixture's constructor has one field");
+        let result_arg = union
+            .vars
+            .first()
+            .map(|v| Ty::Var(v.as_raw()))
+            .expect("fixture's union declares one parameter");
+        assert_eq!(
+            field, result_arg,
+            "a field written as the declared parameter `any` must be that parameter",
+        );
+
+        let builtins = make_builder(&mut interner);
+        let mut uf = UnionFind::<Content>::new();
+        let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        let mut vars = BTreeMap::new();
+        let field_var = builder
+            .instantiate_in(&field, &mut vars, false)
+            .expect("instantiate_in must not fail");
+        let result_var = builder
+            .instantiate_in(&result_arg, &mut vars, false)
+            .expect("instantiate_in must not fail");
+        assert_eq!(
+            field_var, result_var,
+            "the constructor's field and result argument must share one unknown",
         );
     }
 }

@@ -16,7 +16,7 @@ use super::is_opaque_boxed_wrapper;
 /// where the type variable still has a source [`Symbol`] to name the generic.
 pub(super) fn ty_contains_var(ty: &Ty) -> bool {
     match ty {
-        Ty::Var(_) => true,
+        Ty::Var(_) | Ty::Wildcard => true,
         Ty::Unit => false,
         Ty::Fun(a, b) => ty_contains_var(a) || ty_contains_var(b),
         Ty::Tuple(elems) => elems.iter().any(ty_contains_var),
@@ -34,7 +34,7 @@ pub(super) fn ty_contains_var(ty: &Ty) -> bool {
 pub(super) fn ty_contains_fun(ty: &Ty) -> bool {
     match ty {
         Ty::Fun(_, _) => true,
-        Ty::Var(_) | Ty::Unit => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
         Ty::Tuple(elems) => elems.iter().any(ty_contains_fun),
         Ty::Con { args, .. } => args.iter().any(ty_contains_fun),
         Ty::Record(fields, _) => fields.values().any(ty_contains_fun),
@@ -56,7 +56,7 @@ pub(super) fn ty_contains_fun(ty: &Ty) -> bool {
 /// `Arc`-promote.
 pub(super) fn ty_has_fun_in_derive_carrier(interner: &Interner, ty: &Ty) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Unit => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
         // A bare arrow at the top of the walk is a direct position, not a
         // carrier field; recurse its own operand/result so a carrier nested
         // inside an arrow type is still seen.
@@ -91,7 +91,7 @@ pub(super) fn ty_has_fun_in_derive_carrier(interner: &Interner, ty: &Ty) -> bool
 pub(super) fn generic_binding_breaks_clone(interner: &Interner, ty: &Ty) -> bool {
     match ty {
         Ty::Fun(_, _) => true,
-        Ty::Var(_) | Ty::Unit => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
         Ty::Tuple(elems) => elems
             .iter()
             .any(|e| generic_binding_breaks_clone(interner, e)),
@@ -134,7 +134,7 @@ pub(super) fn ty_covers_as_template(
     match (template, concrete) {
         // A template variable instantiates to any concrete type; unit matches
         // unit — both admit their concrete unconditionally.
-        (Ty::Var(_), _) | (Ty::Unit, Ty::Unit) => true,
+        (Ty::Var(_) | Ty::Wildcard, _) | (Ty::Unit, Ty::Unit) => true,
         (Ty::Record(tf, _), Ty::Record(cf, _)) => {
             tf.len() == cf.len()
                 && tf.iter().all(|(k, tv)| {
@@ -194,7 +194,7 @@ pub(super) fn ty_contains_record_key_set(
         Ty::Con { args, .. } => args
             .iter()
             .any(|a| ty_contains_record_key_set(a, lit_fields, lowering)),
-        Ty::Var(_) | Ty::Unit => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
     }
 }
 
@@ -210,7 +210,7 @@ pub(super) fn canon_covers_as_template(
     lowering: &dyn EmittedHeads,
 ) -> bool {
     match (template, concrete) {
-        (canon::Type::Var(_), _) | (canon::Type::Unit, Ty::Unit) => true,
+        (canon::Type::Var(_) | canon::Type::Wildcard, _) | (canon::Type::Unit, Ty::Unit) => true,
         (canon::Type::Lambda(tp, tr), Ty::Fun(cp, cr)) => {
             canon_covers_as_template(tp, cp, lowering) && canon_covers_as_template(tr, cr, lowering)
         }
@@ -305,7 +305,7 @@ pub(super) fn canon_type_contains_record_key_set(
                     .iter()
                     .any(|(_, ft)| canon_type_contains_record_key_set(ft, lit_fields, lowering))
         }
-        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
     }
 }
 
@@ -335,6 +335,8 @@ pub(super) fn match_signature_template(
         (Ty::Var(v), _) => {
             subst.entry(*v).or_insert_with(|| concrete.clone());
         }
+        // A wildcard names no variable, so it binds nothing.
+        (Ty::Wildcard, _) => {}
         (Ty::Record(tf, _), Ty::Record(cf, _)) => {
             for (k, tv) in tf {
                 if let Some(cv) = cf.get(k) {

@@ -201,7 +201,7 @@ pub fn paired_ty_children<'a>(
                 .map(seq_only),
             _ => None,
         },
-        Ty::Var(_) | Ty::Unit | Ty::Record(..) => None,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit | Ty::Record(..) => None,
     }
 }
 
