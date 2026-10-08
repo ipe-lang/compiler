@@ -935,6 +935,8 @@ messages! {
     cli_local_limit_exceeded(source, limit) = "cli-local-limit-exceeded";
     /// A local git query ran past its wall-time ceiling.
     cli_local_timed_out(source, limit) = "cli-local-timed-out";
+    /// A `cargo build` ran past its wall and was stopped.
+    cli_cargo_build_timed_out(wall) = "cli-cargo-build-timed-out";
     /// A local walk met an entry it refuses by its shape.
     cli_local_tree_refused(source, shape) = "cli-local-tree-refused";
     /// A finished child's output pipe stayed open past the grace.

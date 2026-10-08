@@ -152,6 +152,11 @@ pub enum CliError {
         /// caller resolved one — named in a runtime-feature-gap message.
         runtime: Option<RuntimeContext>,
     },
+    /// A `cargo build` ran past its wall and was stopped with every process it started.
+    CargoBuildTimedOut {
+        /// The wall the build ran past.
+        wall: remote_ingest::LocalWall,
+    },
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     /// Carries the (trimmed) input and a deterministic did-you-mean list over
     /// the known codes, ranked by `(Levenshtein, code)`.
@@ -673,6 +678,7 @@ impl CliError {
             Self::RuntimeMaterializeFailed { .. } => "runtime-materialize-failed",
             Self::RuntimeVersionMismatch { .. } => "runtime-version-mismatch",
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
+            Self::CargoBuildTimedOut { .. } => "cargo-build-timed-out",
             Self::UnknownCode { .. } => "unknown-code",
             Self::DocNotFound { .. } => "doc-not-found",
             Self::StaticRefusal(_) => "static-refusal",
@@ -791,6 +797,7 @@ impl CliError {
             | Self::FmtOutputTooLarge { .. }
             | Self::RemoteIngestExceeded(_)
             | Self::LocalLimitExceeded(_)
+            | Self::CargoBuildTimedOut { .. }
             | Self::ChildPipeHeld(_)
             | Self::ThreadRefused { .. }
             | Self::ChildPipeUnread(..)
@@ -1066,6 +1073,9 @@ impl std::fmt::Display for CliError {
             }
             Self::RemoteIngestExceeded(refusal) => refusal.fmt(f),
             Self::LocalLimitExceeded(refusal) => refusal.fmt(f),
+            Self::CargoBuildTimedOut { wall } => f.write_str(&text::cli_cargo_build_timed_out(
+                &remote_ingest::IngestLimit::Time(wall.limit()),
+            )),
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
             Self::ThreadRefused { role, source } => {
                 f.write_str(&text::cli_thread_refused(role, &source.kind()))
