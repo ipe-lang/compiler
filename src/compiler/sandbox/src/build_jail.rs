@@ -351,6 +351,12 @@ pub fn build_in_jail(
     if let Err(outcome) = recheck_mounts(mounts) {
         return outcome;
     }
+    // The process cap must count only the jail's tasks; its canary jails run
+    // before the seccomp fd below turns inheritable.
+    let scope = match crate::run_jail::prove(tools) {
+        Ok(scope) => scope,
+        Err(defect) => return JailOutcome::Unavailable { defect },
+    };
     let Some(program) = seccomp::subprocess_deny_program(profile.subprocess) else {
         return JailOutcome::Unavailable {
             defect: RunJailDefect::UnsupportedPlatform {
@@ -387,7 +393,14 @@ pub fn build_in_jail(
     };
 
     let host_env = crate::host_env::granted;
-    let argv = match run_jail_argv(tools, profile, mounts, Some(seccomp_fd), &host_env, payload) {
+    let argv = match run_jail_argv(
+        &scope,
+        profile,
+        mounts,
+        Some(seccomp_fd),
+        &host_env,
+        payload,
+    ) {
         Ok(argv) => argv,
         Err(e) => {
             return JailOutcome::Unavailable {

@@ -12,7 +12,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use super::{
-    JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber, run_jail_argv,
+    JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber, prove, run_jail_argv,
     run_jail_argv_with_delivery,
 };
 use crate::seccomp;
@@ -127,6 +127,9 @@ pub fn exec_in_run_jail(
     app: &Path,
     app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
+    // The process cap must count only the jail's tasks; its canary jails run
+    // before any descriptor below turns inheritable.
+    let scope = prove(tools)?;
     // Resolve every path once: the app the payload execs and the dirs it is
     // handed are exactly the paths the jail binds.
     let scoped_tmp = CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?;
@@ -160,7 +163,7 @@ pub fn exec_in_run_jail(
 
     let host_env = crate::host_env::granted;
     let argv = run_jail_argv(
-        tools,
+        &scope,
         profile,
         &mounts,
         Some(seccomp_fd),
@@ -199,6 +202,8 @@ pub fn exec_embedded_in_run_jail(
     app: &SealedApp,
     app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
+    // As in `exec_in_run_jail`: proven before any descriptor turns inheritable.
+    let scope = prove(tools)?;
     let scoped_tmp = CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?;
     let working_tree = CanonicalPath::resolve(working_tree).map_err(RunJailDefect::Path)?;
     let mounts = JailMounts::of_invoker(scoped_tmp, working_tree, Vec::new())
@@ -230,7 +235,7 @@ pub fn exec_embedded_in_run_jail(
     // `scoped_tmp`, so no copy of the app reaches the host directory.
     let host_env = crate::host_env::granted;
     let argv = run_jail_argv_with_delivery(
-        tools,
+        &scope,
         profile,
         &mounts,
         Some(seccomp_fd),
@@ -361,16 +366,19 @@ fn write_frozen_memfd(
 /// ```compile_fail,E0505
 /// # use std::ffi::OsString;
 /// # use std::path::Path;
-/// # use ipe_sandbox::run_jail::{RunJailTools, SandboxProfile, run_jail_argv, write_seccomp_memfd};
+/// # use ipe_sandbox::run_jail::{
+/// #     RunJailTools, SandboxProfile, prove, run_jail_argv, write_seccomp_memfd,
+/// # };
 /// # use ipe_sandbox::{CanonicalPath, JailMounts};
 /// # fn stale() -> Option<usize> {
 /// # let tools = RunJailTools { bwrap: "bwrap".into(), prlimit: "prlimit".into(), timeout: None };
+/// # let scope = prove(&tools).ok()?;
 /// # let root = CanonicalPath::resolve(Path::new("/")).ok()?;
 /// # let mounts = JailMounts::of_invoker(root.clone(), root, Vec::new()).ok()?;
 /// # let no_env = |_: &str| None;
 /// let sealed = write_seccomp_memfd(b"filter").ok()?;
 /// let argv = run_jail_argv(
-///     &tools,
+///     &scope,
 ///     &SandboxProfile::maximally_isolated(),
 ///     &mounts,
 ///     Some(sealed.make_inheritable().ok()?),

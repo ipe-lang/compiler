@@ -150,6 +150,26 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         JAIL_ABSENT,
     ),
     (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "nproc_scope_is_proven_on_this_host",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_canary_with_prlimit_outside_the_namespace_is_refused",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_busy_user_does_not_starve_a_granted_jail",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/compiler/sandbox/tests/run_jail_e2e.rs",
+        "a_fork_bomb_is_bounded_in_a_granted_jail",
+        JAIL_ABSENT,
+    ),
+    (
         "src/compiler/sandbox/tests/run_jail_windows_e2e.rs",
         "a_child_spawn_is_denied_under_a_subprocess_withholding_job_but_succeeds_under_control",
         CONTROL_INCONCLUSIVE,
