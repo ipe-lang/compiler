@@ -2080,9 +2080,9 @@ mod tests {
         for (segment_json, token, expected) in cases {
             let carried = token.split('.').any(|part| {
                 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-                URL_SAFE_NO_PAD
-                    .decode(part)
-                    .is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(MARKER))
+                URL_SAFE_NO_PAD.decode(part).is_ok_and(|bytes| {
+                    std::str::from_utf8(&bytes).is_ok_and(|text| text.contains(MARKER))
+                })
             });
             assert!(carried, "the marker is in the token: {segment_json}");
             let refusal = verify_token_under(None, SECRET, &token).err();

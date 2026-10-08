@@ -273,7 +273,8 @@ mod nullary_union_tests {
     /// Every drift the build-time assertion exists to catch is a disagreement.
     #[test]
     fn every_drift_disagrees() {
-        let cases: [(&[BuiltinUnion], &[(&str, usize)], &str); 6] = [
+        type Drift<'a> = (&'a [BuiltinUnion], &'a [(&'a str, usize)], &'a str);
+        let cases: [Drift; 6] = [
             (
                 &[union(&[("Second", 0, 0), ("First", 1, 0)])],
                 &ROWS,
