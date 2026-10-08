@@ -1854,11 +1854,13 @@ mod tests {
         };
         let mut bindings = SessionBindings::default();
         for n in 0..MAX_SESSION_CREDENTIALS {
-            bindings.credentials.push(SessionCredential {
-                subject: Subject(field(n)),
-                session: SessionJti(field(n)),
-                deadline: UnixSecs(i64::MIN),
-            });
+            let credential = serde_json::from_value::<SessionCredential>(serde_json::json!({
+                "sub": field(n),
+                "jti": field(n),
+                "deadline": i64::MIN,
+            }))
+            .expect("a credential of the largest admissible fields decodes");
+            bindings.credentials.push(credential);
         }
         let encoded = encode_bindings(&bindings);
         assert!(

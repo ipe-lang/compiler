@@ -3640,7 +3640,7 @@ fn standalone_web_tea_session_ends_at_cap() -> Result<(), BoxError> {
         std::thread::sleep(Duration::from_millis(250));
         let (raw_headers, body) = post_click(test_name, &addr, "/_ipe/event", &restored, seq)?;
         if is_session_lost(&raw_headers, &body) {
-            return Ok(());
+            break;
         }
         // Before the cap an event is acknowledged, or refused as stale once
         // its render leaves the retained history; anything else is a fault.
@@ -3660,4 +3660,5 @@ fn standalone_web_tea_session_ends_at_cap() -> Result<(), BoxError> {
         }
         seq += 1;
     }
+    Ok(())
 }
