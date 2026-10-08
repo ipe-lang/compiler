@@ -16,9 +16,7 @@
 pub use crate::doc::{VarNamer, canon_type_to_doc, ty_to_doc};
 pub use crate::homed::{InferError, ModuleHome};
 pub use crate::solve::{Budget, Constraint};
-pub use crate::ty::{
-    Content, FlatType, RowTail, Ty, TyBounds, from_canon, is_solver_var, tag_solver_var,
-};
+pub use crate::ty::{Content, FlatType, RowTail, Ty, TyBounds, from_canon, tag_solver_var};
 pub use crate::unify::unify_at;
 pub use crate::unionfind::{UnionFind, VarId};
 pub use ipe_canon::ast as canon;

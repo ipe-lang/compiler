@@ -6577,13 +6577,13 @@ fn canonicalise_type(
             // is renamed to its slot and never enters `free_vars`. An unbound
             // `any` is the wildcard, which no binder quantifies. Any other
             // variable is genuinely free and is quantified by the binding.
-            if let Some(slot) = params.slot(*v) {
-                Ok(canon::Type::Var(slot))
-            } else if is_wildcard_spelling(*v, ctx.interner) {
-                Ok(canon::Type::Wildcard)
-            } else {
-                free_vars.insert(*v);
-                Ok(canon::Type::Var(*v))
+            match params.slot(*v) {
+                Some(slot) => Ok(canon::Type::Var(slot)),
+                None if is_wildcard_spelling(*v, ctx.interner) => Ok(canon::Type::Wildcard),
+                None => {
+                    free_vars.insert(*v);
+                    Ok(canon::Type::Var(*v))
+                }
             }
         }
         src::TypeAnnotation::TUnit => Ok(canon::Type::Unit),
