@@ -23,7 +23,8 @@
 use super::super::css_safety::{CssValueOrigin, SafeCssPropertyName, SafeCssValue};
 use super::super::html::{Attribute as HtmlAttribute, Html, admit_element};
 use super::element::{
-    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, VAlign,
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, SectionHead,
+    VAlign, section_head,
 };
 
 // ── CSS boundary smart constructors ───────────────────────────────────────────
@@ -115,18 +116,11 @@ pub(crate) fn build_style_string<M>(attrs: &[Attribute<M>]) -> String {
                     "__grid" => {
                         decl!("display:grid");
                     }
-                    "__paragraph" => {
-                        // A `Ui.paragraph` `<p>`: its element children flow as
-                        // inline runs, so the block itself needs no flex/grid —
-                        // but an explicit `display:block` keeps it a block box
-                        // even when nested inside another inline-block context.
-                        decl!("display:block");
-                    }
                     "__inline" => {
-                        // Injected by `render_paragraph_child` onto a `Ui.el`
-                        // child of a paragraph so its styled run flows inline
-                        // with the surrounding text instead of breaking to its
-                        // own line.
+                        // Injected by `demote_attrs` onto a flow node rendered
+                        // below a phrasing ancestor so its styled run flows
+                        // inline with the surrounding text instead of breaking
+                        // to its own line.
                         decl!("display:inline-block");
                         decl!("vertical-align:baseline");
                     }
@@ -339,6 +333,10 @@ pub(crate) fn build_style_string<M>(attrs: &[Attribute<M>]) -> String {
                     decl!("animation:{}", v.as_str());
                 }
             }
+            // A closed keyword: no author text reaches the style sink.
+            Attribute::AttrFontWhiteSpace(ws) => {
+                decl!("white-space:{}", ws.css());
+            }
             // Non-style attrs handled in `collect_html_attrs` below.
             Attribute::NoAttribute
             | Attribute::AttrNearby(_, _)
@@ -424,7 +422,14 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
                     | Description::DescComplementary
                     | Description::DescHeading(_)
                     | Description::DescButton
-                    | Description::DescParagraph => {}
+                    | Description::DescParagraph
+                    | Description::DescSection
+                    | Description::DescSectionHeading
+                    | Description::DescCodeBlock
+                    | Description::DescCode
+                    | Description::DescKbd
+                    | Description::DescTextColumn
+                    | Description::DescForm => {}
                 }
             }
             Attribute::AttrPseudoRule(pc, css) if !css.is_empty() => {
@@ -466,7 +471,8 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
             | Attribute::AttrPseudoRule(_, _)
             | Attribute::AttrTransition(_, _)
             | Attribute::AttrGridTracks(_, _)
-            | Attribute::AttrAnimation(..) => {}
+            | Attribute::AttrAnimation(..)
+            | Attribute::AttrFontWhiteSpace(_) => {}
         }
     }
     if !pseudo_rules.is_empty() {
@@ -480,9 +486,22 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
 
 /// Nearby overlays (`AttrNearby(Location, Element)`) are rendered as absolutely-
 /// positioned child elements.  Returns a vec of `Html<M>` overlay nodes.
-fn render_nearby_overlays<M: Clone>(attrs: &[Attribute<M>]) -> Vec<Html<M>> {
+///
+/// `ctx` is the context the overlays render in: the host node's children's
+/// context. Under a phrasing ancestor the positioned wrapper is a `span`
+/// (absolute positioning blockifies it, so it lays out as the `div` would) and
+/// the overlay content stays phrasing.
+///
+/// Each overlay's `Element` is moved out of its attribute (left `Empty`), never
+/// cloned: a clone of a deep overlay subtree recurses without a bound, while
+/// the move hands the subtree to the depth-bounded render.
+fn render_nearby_overlays<M: Clone>(attrs: &mut [Attribute<M>], ctx: RenderCtx) -> Vec<Html<M>> {
+    let wrapper = match ctx.model {
+        ContentModel::Flow => NodeTag::Div,
+        ContentModel::Phrasing => NodeTag::Span,
+    };
     let mut overlays: Vec<Html<M>> = Vec::new();
-    for attr in attrs {
+    for attr in attrs.iter_mut() {
         if let Attribute::AttrNearby(loc, child_elem) = attr {
             let position_style = match loc {
                 Location::Above => "position:absolute;bottom:100%;left:0;right:0",
@@ -492,9 +511,15 @@ fn render_nearby_overlays<M: Clone>(attrs: &[Attribute<M>]) -> Vec<Html<M>> {
                 Location::InFront => "position:absolute;top:0;left:0;right:0;bottom:0",
                 Location::Behind => "position:absolute;top:0;left:0;right:0;bottom:0;z-index:-1",
             };
-            let overlay_node = render_element(child_elem.clone());
+            let overlay_ctx = RenderCtx {
+                depth: ctx.depth.saturating_add(1),
+                parent_axis: FlexAxis::Block,
+                ..ctx
+            };
+            let overlay = std::mem::replace(child_elem, Element::Empty);
+            let overlay_node = render_element_depth_in(overlay, overlay_ctx);
             overlays.push(Html::HElement(
-                "div".into(),
+                wrapper.as_str().into(),
                 vec![HtmlAttribute::Attr("style".into(), position_style.into())],
                 vec![overlay_node],
             ));
@@ -503,13 +528,235 @@ fn render_nearby_overlays<M: Clone>(attrs: &[Attribute<M>]) -> Vec<Html<M>> {
     overlays
 }
 
+// ── Closed node tags, heading levels and the content model ──────────────────
+
+/// The HTML content category of an element, or the model its children obey.
+///
+/// `Flow` content may hold block boxes; `Phrasing` content holds only inline
+/// runs. A flow element written below a phrasing ancestor is restructured by
+/// the browser's HTML parser, so the safe surface never emits one there. A tag
+/// the author writes is placed as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentModel {
+    Flow,
+    Phrasing,
+}
+
+/// Every tag the safe surface renders a layout node with.
+///
+/// A `Description` or a landmark retag chooses the tag; no tag string written
+/// in Ipê code reaches this set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeTag {
+    Div,
+    Main,
+    Nav,
+    Footer,
+    Aside,
+    P,
+    Label,
+    Button,
+    Section,
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+    Pre,
+    Code,
+    Kbd,
+    Span,
+    Form,
+}
+
+impl NodeTag {
+    /// Every tag, in declaration order.
+    #[cfg(test)]
+    const ALL: [Self; 20] = [
+        Self::Div,
+        Self::Main,
+        Self::Nav,
+        Self::Footer,
+        Self::Aside,
+        Self::P,
+        Self::Label,
+        Self::Button,
+        Self::Section,
+        Self::H1,
+        Self::H2,
+        Self::H3,
+        Self::H4,
+        Self::H5,
+        Self::H6,
+        Self::Pre,
+        Self::Code,
+        Self::Kbd,
+        Self::Span,
+        Self::Form,
+    ];
+
+    /// The HTML tag name.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Div => "div",
+            Self::Main => "main",
+            Self::Nav => "nav",
+            Self::Footer => "footer",
+            Self::Aside => "aside",
+            Self::P => "p",
+            Self::Label => "label",
+            Self::Button => "button",
+            Self::Section => "section",
+            Self::H1 => "h1",
+            Self::H2 => "h2",
+            Self::H3 => "h3",
+            Self::H4 => "h4",
+            Self::H5 => "h5",
+            Self::H6 => "h6",
+            Self::Pre => "pre",
+            Self::Code => "code",
+            Self::Kbd => "kbd",
+            Self::Span => "span",
+            Self::Form => "form",
+        }
+    }
+
+    /// The content category the element itself belongs to.
+    const fn category(self) -> ContentModel {
+        match self {
+            Self::Div
+            | Self::Main
+            | Self::Nav
+            | Self::Footer
+            | Self::Aside
+            | Self::P
+            | Self::Section
+            | Self::H1
+            | Self::H2
+            | Self::H3
+            | Self::H4
+            | Self::H5
+            | Self::H6
+            | Self::Pre
+            | Self::Form => ContentModel::Flow,
+            Self::Label | Self::Button | Self::Code | Self::Kbd | Self::Span => {
+                ContentModel::Phrasing
+            }
+        }
+    }
+
+    /// The content model the element's children obey.
+    ///
+    /// `Label` and `Button` admit flow children here although HTML allows
+    /// them only phrasing content, so a row or column inside a button keeps
+    /// its block layout. The parser still builds the rendered tree: a flow
+    /// start tag closes only an open `p` (in button scope), a `button` bounds
+    /// that scope, and a `label` reaches flow context only with no `p`
+    /// ancestor, since below a phrasing ancestor every child stays phrasing.
+    const fn content(self) -> ContentModel {
+        match self {
+            Self::Div
+            | Self::Main
+            | Self::Nav
+            | Self::Footer
+            | Self::Aside
+            | Self::Label
+            | Self::Button
+            | Self::Section
+            | Self::Form => ContentModel::Flow,
+            Self::P
+            | Self::H1
+            | Self::H2
+            | Self::H3
+            | Self::H4
+            | Self::H5
+            | Self::H6
+            | Self::Pre
+            | Self::Code
+            | Self::Kbd
+            | Self::Span => ContentModel::Phrasing,
+        }
+    }
+}
+
+/// The rank of a section heading, `H1` outermost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SectionLevel {
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+}
+
+impl SectionLevel {
+    /// The level one section deeper, saturating at `H6`.
+    const fn deeper(self) -> Self {
+        match self {
+            Self::H1 => Self::H2,
+            Self::H2 => Self::H3,
+            Self::H3 => Self::H4,
+            Self::H4 => Self::H5,
+            Self::H5 | Self::H6 => Self::H6,
+        }
+    }
+
+    /// The level as a heading number, 1 for `H1`.
+    const fn number(self) -> i64 {
+        match self {
+            Self::H1 => 1,
+            Self::H2 => 2,
+            Self::H3 => 3,
+            Self::H4 => 4,
+            Self::H5 => 5,
+            Self::H6 => 6,
+        }
+    }
+
+    /// The heading tag of this level.
+    const fn tag(self) -> NodeTag {
+        match self {
+            Self::H1 => NodeTag::H1,
+            Self::H2 => NodeTag::H2,
+            Self::H3 => NodeTag::H3,
+            Self::H4 => NodeTag::H4,
+            Self::H5 => NodeTag::H5,
+            Self::H6 => NodeTag::H6,
+        }
+    }
+}
+
+/// Where a node renders: its depth, its parent's flex axis, the level of its
+/// innermost rendered section heading, and the content model it must obey.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderCtx {
+    depth: usize,
+    parent_axis: FlexAxis,
+    section: Option<SectionLevel>,
+    model: ContentModel,
+}
+
+impl RenderCtx {
+    /// The context of a root element laid out along `parent_axis`.
+    const fn root(parent_axis: FlexAxis) -> Self {
+        Self {
+            depth: 0,
+            parent_axis,
+            section: None,
+            model: ContentModel::Flow,
+        }
+    }
+}
+
 // ── Description → semantic HTML tag ──────────────────────────────────────────
 
 /// How a heading level is written in HTML.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeadingMarkup {
     /// Levels 1-6: the native `<hN>` tag.
-    Native(&'static str),
+    Native(NodeTag),
     /// Levels above 6: `role="heading"` with `aria-level` on the host tag.
     Aria(HeadingLevel),
 }
@@ -517,12 +764,12 @@ enum HeadingMarkup {
 /// The one lowering of a heading level.
 const fn heading_markup(level: HeadingLevel) -> HeadingMarkup {
     match level.get() {
-        1 => HeadingMarkup::Native("h1"),
-        2 => HeadingMarkup::Native("h2"),
-        3 => HeadingMarkup::Native("h3"),
-        4 => HeadingMarkup::Native("h4"),
-        5 => HeadingMarkup::Native("h5"),
-        6 => HeadingMarkup::Native("h6"),
+        1 => HeadingMarkup::Native(NodeTag::H1),
+        2 => HeadingMarkup::Native(NodeTag::H2),
+        3 => HeadingMarkup::Native(NodeTag::H3),
+        4 => HeadingMarkup::Native(NodeTag::H4),
+        5 => HeadingMarkup::Native(NodeTag::H5),
+        6 => HeadingMarkup::Native(NodeTag::H6),
         // The open range 7 and above; `HeadingLevel` guarantees at least 1.
         _ => HeadingMarkup::Aria(level),
     }
@@ -536,36 +783,44 @@ fn heading_role_attrs<M>(level: HeadingLevel) -> [HtmlAttribute<M>; 2] {
     ]
 }
 
-/// Pick the semantic HTML tag for a layout node based on its `Description`.
-/// `NoDescription` defaults to `div`.  `TaggedNode` overrides this with an
-/// explicit user-supplied tag (already validated by the Ipê stdlib).
-fn tag_for_description(desc: &Description) -> &'static str {
+/// Pick the tag of a layout node from its `Description`.
+///
+/// `section` is the level of the innermost rendered section heading, which
+/// ranks a `DescSectionHeading`; with none it is `h1`.
+fn tag_for_description(desc: &Description, section: Option<SectionLevel>) -> NodeTag {
     match desc {
         Description::NoDescription
         | Description::DescLivePolite
-        | Description::DescLiveAssertive => "div",
-        Description::DescMain => "main",
-        Description::DescNavigation => "nav",
-        Description::DescContentInfo => "footer",
-        Description::DescComplementary => "aside",
+        | Description::DescLiveAssertive => NodeTag::Div,
+        Description::DescMain => NodeTag::Main,
+        Description::DescNavigation => NodeTag::Nav,
+        Description::DescContentInfo => NodeTag::Footer,
+        Description::DescComplementary => NodeTag::Aside,
         Description::DescHeading(level) => match heading_markup(*level) {
             HeadingMarkup::Native(tag) => tag,
-            HeadingMarkup::Aria(_) => "div",
+            HeadingMarkup::Aria(_) => NodeTag::Div,
         },
-        Description::DescLabel(_) => "label",
-        Description::DescButton => "button",
-        Description::DescParagraph => "p",
+        Description::DescLabel(_) => NodeTag::Label,
+        Description::DescButton => NodeTag::Button,
+        Description::DescParagraph => NodeTag::P,
+        Description::DescSection | Description::DescTextColumn => NodeTag::Section,
+        Description::DescSectionHeading => section.map_or(NodeTag::H1, SectionLevel::tag),
+        Description::DescCodeBlock => NodeTag::Pre,
+        Description::DescCode => NodeTag::Code,
+        Description::DescKbd => NodeTag::Kbd,
+        Description::DescForm => NodeTag::Form,
     }
 }
 
 // ── Element → Html (recursive) ───────────────────────────────────────────────
 
-/// Depth-0 entry point. All callers outside this module use this wrapper.
+/// Depth-0 entry point for a bare element, laid out along the block axis.
+#[cfg(test)]
 fn render_element<M: Clone>(elem: Element<M>) -> Html<M> {
-    render_element_depth(elem, 0)
+    render_element_depth_in(elem, RenderCtx::root(FlexAxis::Block))
 }
 
-/// Recursively convert a `Ipe.Ui` `Element<M>` to `Html<M>`.
+/// Recursively convert a `Ipe.Ui` `Element<M>` to `Html<M>` in context `ctx`.
 ///
 /// Security: all attribute values flow through `build_style_string` /
 /// `size_css` (which
@@ -577,20 +832,12 @@ fn render_element<M: Clone>(elem: Element<M>) -> Html<M> {
 /// node) rather than recursed into — a truncated render is strictly better than
 /// overflowing the thread stack. Same ceiling as `html.rs::render_into_ctx` and
 /// `html.rs::assign_ipe_ids_depth`.
-fn render_element_depth<M: Clone>(elem: Element<M>, depth: usize) -> Html<M> {
-    render_element_depth_in(elem, depth, FlexAxis::Block)
-}
-
-/// As `render_element_depth`, but told the flex direction its PARENT lays it out
-/// along (`parent_axis`). A node uses this to emit its own size CSS
-/// (`size_css`) and child-alignment CSS (`alignment_css`), both of which depend
-/// on whether a dimension is the parent's main or cross axis.
-fn render_element_depth_in<M: Clone>(
-    elem: Element<M>,
-    depth: usize,
-    parent_axis: FlexAxis,
-) -> Html<M> {
-    if depth >= crate::html::MAX_HTML_DEPTH {
+///
+/// `ctx.parent_axis` is the flex direction the PARENT lays this node out
+/// along: a node emits its own size CSS (`size_css`) and child-alignment CSS
+/// (`alignment_css`) from it.
+fn render_element_depth_in<M: Clone>(elem: Element<M>, ctx: RenderCtx) -> Html<M> {
+    if ctx.depth >= crate::html::MAX_HTML_DEPTH {
         return Html::HText(String::new());
     }
     // `Element` owns an iterative destructor (bounded teardown of a deep tree),
@@ -607,109 +854,49 @@ fn render_element_depth_in<M: Clone>(
         // normal pipeline. If a direct Rust construction routes cells here, drop
         // to empty text rather than abort — a missing subtree beats a panic.
         Element::Cells(_grid) => Html::HText(String::new()),
-        Element::Node(desc, attrs, kids) => render_node_as(
-            tag_for_description(desc),
-            desc.heading_level(),
-            &std::mem::take(attrs),
+        Element::Node(desc, attrs, kids) => {
+            render_node_as(None, desc, std::mem::take(attrs), std::mem::take(kids), ctx)
+        }
+        Element::TaggedNode(tag, desc, attrs, kids) => render_node_as(
+            Some(std::mem::take(tag)),
+            desc,
+            std::mem::take(attrs),
             std::mem::take(kids),
-            depth,
-            parent_axis,
-        ),
-        Element::TaggedNode(tag, _desc, attrs, kids) => render_node_as(
-            &std::mem::take(tag),
-            None,
-            &std::mem::take(attrs),
-            std::mem::take(kids),
-            depth,
-            parent_axis,
+            ctx,
         ),
     }
 }
 
-/// Build a single `HElement` from a tag name, attribute slice, and children,
-/// weaving together the `style=""` attribute, class/event HTML attributes, and
-/// any `AttrNearby` overlay children.
+/// Rewrite the attributes of a flow node rendered as a phrasing `span`.
 ///
-/// The structure is:
-///
-/// ```html
-/// <{tag} style="{css}" {html_attrs}...>
-///   {rendered children}
-///   {nearby overlays (position:absolute)}
-/// </{tag}>
-/// ```
-/// True when a node carries the `__paragraph` marker (`Ui.paragraph`), meaning
-/// its element children must flow inline rather than as block boxes.
-fn has_paragraph_marker<M>(attrs: &[Attribute<M>]) -> bool {
-    attrs
-        .iter()
-        .any(|a| matches!(a, Attribute::AttrStyle(k, _) if k == "__paragraph"))
-}
-
-/// Render one child of a `Ui.paragraph`.
-///
-/// All `Element::Node(NoDescription, …)` children must render inline — a block
-/// child inside `<p>` causes the HTML parser to auto-close the `<p>` and hoist
-/// the block out, breaking the highlight-a-phrase pattern.
-///
-/// The adaptation depends on whether the child carries a flex-direction marker:
-///
-/// - Plain `Ui.el` (no `__row`/`__col`): becomes a `<span>` with `__inline`
-///   (`display:inline-block`), so its styled run (e.g. `Font.bold`) flows
-///   inline with the surrounding text.
-///
-/// - `Ui.row` (carries `__row`): `__row` is replaced by `__inline_row`
-///   (`display:inline-flex;flex-direction:row`). The flex container stays
-///   inline, preserving its internal row layout without breaking out of `<p>`.
-///
-/// - `Ui.column` (carries `__col`): `__col` is replaced by `__inline_col`
-///   (`display:inline-flex;flex-direction:column`). Same rationale as row.
-///
-/// Every other child kind (text, `Ui.link`, `TaggedNode`, raw HTML) renders
-/// unchanged via the normal path — they are already inline-compatible.
-fn render_paragraph_child<M: Clone>(child: Element<M>, depth: usize) -> Html<M> {
-    // `Element` owns an iterative destructor, so its fields cannot be moved out
-    // by a by-value match; take them from a mutable binding and let the emptied
-    // node drop trivially.
-    let mut child = child;
-    match &mut child {
-        Element::Node(Description::NoDescription, attrs, kids) => {
-            let (mut attrs, kids) = (std::mem::take(attrs), std::mem::take(kids));
-            // Replace any flex-direction marker with its inline-flex equivalent.
-            // A node carries at most one direction marker, always at position 0
-            // (inserted by `ui_row_` / `ui_column_`). Mutating in place is safe
-            // because `attrs` is owned (moved out of the `Element`).
-            let made_inline_flex = attrs.iter_mut().any(|a| {
-                if let Attribute::AttrStyle(k, _) = a {
-                    match k.as_str() {
-                        "__row" => {
-                            *k = "__inline_row".to_owned();
-                            true
-                        }
-                        "__col" => {
-                            *k = "__inline_col".to_owned();
-                            true
-                        }
-                        _ => false,
-                    }
-                } else {
-                    false
+/// A row or column marker becomes its inline-flex equivalent, so the box keeps
+/// its internal layout; any other node gets the `__inline` marker
+/// (`display:inline-block`), so its styled run flows with the surrounding text.
+fn demote_attrs<M>(attrs: &mut Vec<Attribute<M>>) {
+    // A node carries at most one direction marker, always at position 0
+    // (inserted by `ui_row_` / `ui_column_`).
+    let made_inline_flex = attrs.iter_mut().any(|a| {
+        if let Attribute::AttrStyle(k, _) = a {
+            match k.as_str() {
+                "__row" => {
+                    *k = "__inline_row".to_owned();
+                    true
                 }
-            });
-            // Plain `Ui.el` has no flex-direction marker; give it `__inline` so
-            // the span flows inline with the surrounding text.
-            if !made_inline_flex {
-                attrs.insert(
-                    0,
-                    Attribute::AttrStyle("__inline".to_owned(), "true".to_owned()),
-                );
+                "__col" => {
+                    *k = "__inline_col".to_owned();
+                    true
+                }
+                _ => false,
             }
-            // A paragraph lays its children out as inline flow, not a flex
-            // main/cross axis, so alignment is inert here — `Block` is the neutral
-            // parent axis (no auto-margins, no align-self, no flex sizing).
-            render_node_as("span", None, &attrs, kids, depth, FlexAxis::Block)
+        } else {
+            false
         }
-        _ => render_element_depth(std::mem::replace(&mut child, Element::Empty), depth),
+    });
+    if !made_inline_flex {
+        attrs.insert(
+            0,
+            Attribute::AttrStyle("__inline".to_owned(), "true".to_owned()),
+        );
     }
 }
 
@@ -734,7 +921,7 @@ fn inject_explain<M: Clone>(mut elem: Element<M>) -> Element<M> {
 /// `__wrappedrow`) prepended by `ui_row_` / `ui_column_` / `ui_wrapped_row_`.
 /// A node without a marker (a plain `Ui.el`, a paragraph span) is `Block`: it
 /// is not a flex container, so its children have no flex main axis.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlexAxis {
     Row,
     Column,
@@ -942,7 +1129,7 @@ fn has_explicit_position<M>(attrs: &[Attribute<M>]) -> bool {
 }
 
 /// True when a node carries a paragraph-inline direction marker (`__inline`,
-/// `__inline_row`, `__inline_col`) injected by `render_paragraph_child`. Such a
+/// `__inline_row`, `__inline_col`) injected by `demote_attrs`. Such a
 /// box is already inline / inline-flex and content-sizes on its own, so A1's
 /// `width:fit-content` is redundant on it.
 fn is_inline_marked<M>(attrs: &[Attribute<M>]) -> bool {
@@ -1253,30 +1440,37 @@ fn explain_overlay_css<M>(
 
 /// A6: the native landmark tag for a `Description` carried by an `AttrDescribe`,
 /// when one exists. Returns `None` for descriptions with no landmark tag
-/// (labels, live regions, headings-are-handled-elsewhere) so the caller can fall
-/// back to a `role="…"` attribute instead.
-fn landmark_tag_for(desc: &Description) -> Option<&'static str> {
+/// (labels, live regions, the structural roles a node's own `Description`
+/// carries) so the caller can fall back to a `role="…"` attribute instead.
+const fn landmark_tag_for(desc: &Description) -> Option<NodeTag> {
     match desc {
-        Description::DescMain => Some("main"),
-        Description::DescNavigation => Some("nav"),
-        Description::DescContentInfo => Some("footer"),
-        Description::DescComplementary => Some("aside"),
-        Description::DescParagraph => Some("p"),
+        Description::DescMain => Some(NodeTag::Main),
+        Description::DescNavigation => Some(NodeTag::Nav),
+        Description::DescContentInfo => Some(NodeTag::Footer),
+        Description::DescComplementary => Some(NodeTag::Aside),
+        Description::DescParagraph => Some(NodeTag::P),
         Description::DescHeading(level) => Some(match heading_markup(*level) {
             HeadingMarkup::Native(tag) => tag,
-            HeadingMarkup::Aria(_) => "div",
+            HeadingMarkup::Aria(_) => NodeTag::Div,
         }),
         Description::NoDescription
         | Description::DescLabel(_)
         | Description::DescLivePolite
         | Description::DescLiveAssertive
-        | Description::DescButton => None,
+        | Description::DescButton
+        | Description::DescSection
+        | Description::DescSectionHeading
+        | Description::DescCodeBlock
+        | Description::DescCode
+        | Description::DescKbd
+        | Description::DescTextColumn
+        | Description::DescForm => None,
     }
 }
 
 /// A6: the ARIA landmark role for a `Description` with no native tag equivalent
 /// available in the current retag (used as the `role="…"` fallback).
-fn landmark_role_for(desc: &Description) -> Option<&'static str> {
+const fn landmark_role_for(desc: &Description) -> Option<&'static str> {
     match desc {
         Description::DescMain => Some("main"),
         Description::DescNavigation => Some("navigation"),
@@ -1288,18 +1482,93 @@ fn landmark_role_for(desc: &Description) -> Option<&'static str> {
         | Description::DescLivePolite
         | Description::DescLiveAssertive
         | Description::DescButton
-        | Description::DescParagraph => None,
+        | Description::DescParagraph
+        | Description::DescSection
+        | Description::DescSectionHeading
+        | Description::DescCodeBlock
+        | Description::DescCode
+        | Description::DescKbd
+        | Description::DescTextColumn
+        | Description::DescForm => None,
     }
 }
 
+/// A `describe` landmark: its native tag, its `role`, and the description.
+type Landmark<'a> = (NodeTag, Option<&'static str>, &'a Description);
+
+/// The one precedence between a heading and a `describe` landmark, in flow and
+/// demoted alike: a node that is a heading, by its own description or by a
+/// `describe`, is announced as that heading, so a `describe` landmark that is
+/// not itself a heading neither retags the node nor gives it a `role`.
+fn landmark_beside_heading(
+    landmark: Option<Landmark<'_>>,
+    heading: Option<HeadingLevel>,
+) -> Option<Landmark<'_>> {
+    landmark.filter(|(_, _, d)| heading.is_none() || d.heading_level().is_some())
+}
+
+/// Set an attribute the node emits itself, removing every author attribute of
+/// the same name (ASCII case-insensitive, as HTML compares names), so the
+/// element carries it once and with the emitted value.
+fn claim_attr<M>(html_attrs: &mut Vec<HtmlAttribute<M>>, attr: HtmlAttribute<M>) {
+    if let HtmlAttribute::Attr(name, _) = &attr {
+        html_attrs.retain(|a| match a {
+            HtmlAttribute::Attr(k, _) | HtmlAttribute::BoolAttr(k, _) => {
+                !k.trim().eq_ignore_ascii_case(name)
+            }
+            HtmlAttribute::EventAttr(_) | HtmlAttribute::NoAttr => true,
+        });
+    }
+    html_attrs.push(attr);
+}
+
+/// The tag a node renders with: a closed `NodeTag`, or the tag a
+/// `TaggedNode` carries as written.
+enum ResolvedTag {
+    Typed(NodeTag),
+    Written(String),
+}
+
+impl ResolvedTag {
+    /// The HTML tag name.
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Typed(tag) => tag.as_str(),
+            Self::Written(tag) => tag,
+        }
+    }
+}
+
+/// Build a single `HElement` for a layout node in context `ctx`.
+///
+/// `written` is a `TaggedNode`'s tag, rendered as written; a `Node` (`None`)
+/// takes its `NodeTag` from `desc`. The node weaves together the `style=""`
+/// attribute, class/event HTML attributes, and any `AttrNearby` overlay
+/// children:
+///
+/// ```html
+/// <{tag} style="{css}" {html_attrs}...>
+///   {rendered children}
+///   {nearby overlays (position:absolute)}
+/// </{tag}>
+/// ```
+///
+/// Content model: a flow `NodeTag` under a phrasing ancestor renders as a
+/// `span` laid out inline (`demote_attrs`), and every descendant of a phrasing
+/// element stays phrasing, so the browser's parser builds the tree rendered
+/// here. Sections: a `DescSection` whose first child is a heading with
+/// announced content ranks its descendants' headings one level deeper; an
+/// inert first heading is skipped, and any other first heading renders; both
+/// keep the level.
+#[allow(clippy::too_many_lines)] // one linear pass: tag, style, children, gate
 fn render_node_as<M: Clone>(
-    tag: &str,
-    own_heading: Option<HeadingLevel>,
-    attrs: &[Attribute<M>],
+    written: Option<String>,
+    desc: &Description,
+    attrs: Vec<Attribute<M>>,
     kids: Vec<Element<M>>,
-    depth: usize,
-    parent_axis: FlexAxis,
+    ctx: RenderCtx,
 ) -> Html<M> {
+    let mut attrs = attrs;
     // ── A6: `describe descMain`/`descNavigation`/… applies a landmark ────────
     // A landmark `AttrDescribe` on a plain `div` retags it to the semantic
     // element (`<main>`/`<nav>`/`<footer>`/`<aside>`/`<hN>`). A non-`div` tag
@@ -1308,42 +1577,130 @@ fn render_node_as<M: Clone>(
     // emitted so the landmark is still announced. `descLabel` → `aria-label`
     // continues to flow through `collect_html_attrs` untouched.
     let landmark = attrs.iter().find_map(|a| match a {
-        Attribute::AttrDescribe(d) if landmark_tag_for(d).is_some() => Some(d.clone()),
+        Attribute::AttrDescribe(d) => landmark_tag_for(d).map(|t| (t, landmark_role_for(d), d)),
         _ => None,
     });
-    let (tag_owned, role_attr): (String, Option<&'static str>) = match &landmark {
-        Some(desc) if tag == "div" => (landmark_tag_for(desc).unwrap_or("div").to_owned(), None),
-        Some(desc) => (tag.to_owned(), landmark_role_for(desc)),
-        None => (tag.to_owned(), None),
+    // A heading whose final tag is not its native `<hN>` (a level above 6, a
+    // host that is not a plain `div`, or a demoted `span`) is announced through
+    // `role`/`aria-level`. A section heading's level is its section rank. A
+    // `TaggedNode`'s own description never names its heading level.
+    let own_heading = if written.is_some() {
+        None
+    } else if matches!(desc, Description::DescSectionHeading) {
+        Some(HeadingLevel::from_requested(
+            ctx.section.map_or(1, SectionLevel::number),
+        ))
+    } else {
+        desc.heading_level()
     };
-    let tag: &str = &tag_owned;
-    // A heading whose final tag is not its native `<hN>` (a level above 6, or a
-    // host that is not a plain `div`) is announced through `role`/`aria-level`.
     let heading = landmark
-        .as_ref()
-        .and_then(Description::heading_level)
+        .and_then(|(_, _, d)| d.heading_level())
         .or(own_heading);
+    let landmark = landmark_beside_heading(landmark, heading);
+    let own = tag_for_description(desc, ctx.section);
+    // A node demoted to a `span` loses its landmark tag, so a node that is no
+    // heading announces its landmark through `role`: the `describe` landmark
+    // first, else its own. A heading announces only the heading.
+    let demoted_role = if heading.is_some() {
+        None
+    } else {
+        landmark
+            .and_then(|(_, role, _)| role)
+            .or_else(|| landmark_role_for(desc))
+    };
+    let (resolved, role_attr): (ResolvedTag, Option<&'static str>) = match (written, landmark) {
+        (None, Some((retag, _, _))) if own == NodeTag::Div => (ResolvedTag::Typed(retag), None),
+        (None, Some((_, role, _))) => (ResolvedTag::Typed(own), role),
+        (None, None) => (ResolvedTag::Typed(own), None),
+        (Some(tag), Some((retag, _, _))) if tag == "div" => (ResolvedTag::Typed(retag), None),
+        (Some(tag), Some((_, role, _))) => (ResolvedTag::Written(tag), role),
+        (Some(tag), None) => (ResolvedTag::Written(tag), None),
+    };
+
+    // ── Content model: a flow tag below a phrasing ancestor becomes a span ──
+    let demoted = ctx.model == ContentModel::Phrasing
+        && matches!(&resolved, ResolvedTag::Typed(t) if t.category() == ContentModel::Flow);
+    let (resolved, role_attr) = if demoted {
+        demote_attrs(&mut attrs);
+        (ResolvedTag::Typed(NodeTag::Span), demoted_role)
+    } else {
+        (resolved, role_attr)
+    };
+    let child_model = match (ctx.model, &resolved) {
+        (ContentModel::Phrasing, _) => ContentModel::Phrasing,
+        (ContentModel::Flow, ResolvedTag::Typed(t)) => t.content(),
+        (ContentModel::Flow, ResolvedTag::Written(_)) => own.content(),
+    };
+    let code_block = matches!(desc, Description::DescCodeBlock)
+        && matches!(&resolved, ResolvedTag::Typed(NodeTag::Pre | NodeTag::Span));
+    let tag: &str = resolved.as_str();
+
+    // ── Sections: the level is the count of enclosing rendered headings ──────
+    let head = section_head(desc, &kids);
+    let skip_heading = head == SectionHead::Empty;
+    let child_section = if head == SectionHead::Present && !demoted {
+        Some(ctx.section.map_or(SectionLevel::H1, SectionLevel::deeper))
+    } else {
+        ctx.section
+    };
+
+    // The role's own display, ahead of the author's declarations so an
+    // explicit style still wins: a paragraph stays a block box even inside an
+    // inline-block context, and a demoted code block keeps `pre` white-space.
+    let role_css = match desc {
+        Description::DescParagraph if !demoted => "display:block",
+        Description::DescCodeBlock if demoted => "white-space:pre",
+        Description::NoDescription
+        | Description::DescMain
+        | Description::DescNavigation
+        | Description::DescContentInfo
+        | Description::DescComplementary
+        | Description::DescHeading(_)
+        | Description::DescLabel(_)
+        | Description::DescLivePolite
+        | Description::DescLiveAssertive
+        | Description::DescButton
+        | Description::DescParagraph
+        | Description::DescSection
+        | Description::DescSectionHeading
+        | Description::DescCodeBlock
+        | Description::DescCode
+        | Description::DescKbd
+        | Description::DescTextColumn
+        | Description::DescForm => "",
+    };
 
     // Size first, so an author's raw `AttrStyle` for the same property wins.
-    let mut style_str = join_style(&size_css(attrs, parent_axis), &build_style_string(attrs));
-    let mut html_attrs = collect_html_attrs(attrs);
+    let mut style_str = join_style(
+        &size_css(&attrs, ctx.parent_axis),
+        &join_style(role_css, &build_style_string(&attrs)),
+    );
+    let mut html_attrs = collect_html_attrs(&attrs);
+    // An element carries one `role`, the one it emits: a landmark role for a
+    // node that is no heading, else the heading role, each replacing an
+    // author's `role` of its own.
     if let Some(role) = role_attr {
-        html_attrs.push(HtmlAttribute::Attr("role".to_owned(), role.to_owned()));
+        claim_attr(
+            &mut html_attrs,
+            HtmlAttribute::Attr("role".to_owned(), role.to_owned()),
+        );
     }
     if let Some(level) = heading {
-        let native = matches!(heading_markup(level), HeadingMarkup::Native(t) if t == tag);
+        let native = matches!(heading_markup(level), HeadingMarkup::Native(t) if t.as_str() == tag);
         if !native {
-            html_attrs.extend(heading_role_attrs(level));
+            for attr in heading_role_attrs(level) {
+                claim_attr(&mut html_attrs, attr);
+            }
         }
     }
 
     // ── elm-parity layout augmentations (A1/A2/A3/A8) ────────────────────────
     // Node-level (A1 shrink / A2 overlay-host / A3 el-container) plus this
     // node's OWN alignment relative to its parent's direction (A3 child align).
-    let axis = flex_axis_of(attrs);
-    let augment = node_augmentations(attrs, axis, &kids);
-    let align = alignment_css(attrs, parent_axis);
-    let overconstrain_flag = !overconstrain_css(attrs, parent_axis).is_empty();
+    let axis = flex_axis_of(&attrs);
+    let augment = node_augmentations(&attrs, axis, &kids);
+    let align = alignment_css(&attrs, ctx.parent_axis);
+    let overconstrain_flag = !overconstrain_css(&attrs, ctx.parent_axis).is_empty();
     let overconstrain = if overconstrain_flag {
         "flex-shrink:0".to_owned()
     } else {
@@ -1357,7 +1714,7 @@ fn render_node_as<M: Clone>(
     // A7: the depth-/node-aware debug overlay for the explained subtree. An
     // over-constrained (fixed-width row child) node gets the red overflow edge.
     let explain = if explain_active {
-        explain_overlay_css(attrs, depth, axis, overconstrain_flag)
+        explain_overlay_css(&attrs, ctx.depth, axis, overconstrain_flag)
     } else {
         String::new()
     };
@@ -1391,17 +1748,10 @@ fn render_node_as<M: Clone>(
             "{} · w {} · pad {}",
             explain_type_tag(axis, tag),
             w,
-            max_padding(attrs)
+            max_padding(&attrs)
         );
         html_attrs.push(HtmlAttribute::Attr("title".to_owned(), title));
     }
-
-    // A `Ui.paragraph` node's element children must flow inline: a bare
-    // `Ui.el` lowers to `Element::Node(NoDescription, …)` (a block `<div>`),
-    // which both breaks onto its own line and — as a `<div>` inside a `<p>` —
-    // is invalid HTML5 that a browser auto-closes the `<p>` around. Inside a
-    // paragraph, render each such child as an inline `<span>`.
-    let inside_paragraph = has_paragraph_marker(attrs);
 
     // The flex direction THIS node imposes on its children is its own `axis`,
     // except that an aligned-child-promoted `el` (single aligned child ⇒ `display:flex`,
@@ -1411,24 +1761,38 @@ fn render_node_as<M: Clone>(
     } else {
         axis
     };
-    // Rendered children in source order, each one level deeper.
-    let child_depth = depth.saturating_add(1);
+    let child_ctx = RenderCtx {
+        depth: ctx.depth.saturating_add(1),
+        parent_axis: child_axis,
+        section: child_section,
+        model: child_model,
+    };
+    // Rendered children in source order, each one level deeper. An empty
+    // first heading of a section renders nothing at all.
     let mut html_kids: Vec<Html<M>> = kids
         .into_iter()
+        .skip(usize::from(skip_heading))
         .map(|k| {
             // Propagate explain to children by injecting the attr.
             let k = if explain_active { inject_explain(k) } else { k };
-            if inside_paragraph {
-                render_paragraph_child(k, child_depth)
-            } else {
-                render_element_depth_in(k, child_depth, child_axis)
-            }
+            render_element_depth_in(k, child_ctx)
         })
         .collect();
 
+    // A code block's text sits in an attribute-free `code` inside its `pre`,
+    // so a leading newline of the author's text is never the one the parser
+    // strips directly after `<pre>`.
+    if code_block {
+        let code = NodeTag::Code.as_str();
+        if admit_element(code, &html_kids).is_err() {
+            return Html::HText(String::new());
+        }
+        html_kids = vec![Html::HElement(code.to_owned(), Vec::new(), html_kids)];
+    }
+
     // Nearby overlays appended after the regular children (they are absolutely
     // positioned, so their DOM order is irrelevant for layout).
-    html_kids.extend(render_nearby_overlays(attrs));
+    html_kids.extend(render_nearby_overlays(&mut attrs, child_ctx));
 
     // SECURITY: the shared tag gate on the lowered children, so an element
     // that reached the tree without `ui_tagged_node_` still cannot render a
@@ -1478,8 +1842,8 @@ fn column_child_style<M>(attrs: &[Attribute<M>]) -> String {
 /// Both runtime-inserted divs carry a definite size on both axes, so the
 /// author's root sits inside an unbroken size chain.
 fn layout_shell<M: Clone>(
-    wrapper_attrs: &[Attribute<M>],
-    root_attrs: &[Attribute<M>],
+    wrapper_attrs: &mut [Attribute<M>],
+    root_attrs: &mut [Attribute<M>],
     elem: Element<M>,
 ) -> Html<M> {
     // The wrapper is the root div's column parent.
@@ -1487,8 +1851,14 @@ fn layout_shell<M: Clone>(
     let mut root_html_attrs = collect_html_attrs(root_attrs);
     root_html_attrs.insert(0, HtmlAttribute::Attr("style".to_owned(), root_style));
     // The root div is a flex column, so the author's element is its column child.
-    let mut root_kids: Vec<Html<M>> = vec![render_element_depth_in(elem, 0, FlexAxis::Column)];
-    root_kids.extend(render_nearby_overlays(root_attrs));
+    let mut root_kids: Vec<Html<M>> = vec![render_element_depth_in(
+        elem,
+        RenderCtx::root(FlexAxis::Column),
+    )];
+    root_kids.extend(render_nearby_overlays(
+        root_attrs,
+        RenderCtx::root(FlexAxis::Block),
+    ));
     let root_div = Html::HElement("div".to_owned(), root_html_attrs, root_kids);
 
     // `#ipe-root` (`web_page_core::BASE_CSS`) is the wrapper's column parent.
@@ -1496,7 +1866,10 @@ fn layout_shell<M: Clone>(
     let mut wrapper_html_attrs = collect_html_attrs(wrapper_attrs);
     wrapper_html_attrs.insert(0, HtmlAttribute::Attr("style".to_owned(), wrapper_style));
     let mut wrapper_kids: Vec<Html<M>> = vec![root_div];
-    wrapper_kids.extend(render_nearby_overlays(wrapper_attrs));
+    wrapper_kids.extend(render_nearby_overlays(
+        wrapper_attrs,
+        RenderCtx::root(FlexAxis::Block),
+    ));
     Html::HElement("div".to_owned(), wrapper_html_attrs, wrapper_kids)
 }
 
@@ -1506,7 +1879,8 @@ fn layout_shell<M: Clone>(
 /// the root element with the given root attributes applied.
 #[must_use]
 pub fn ui_layout<M: Clone>(attrs: Vec<Attribute<M>>, elem: Element<M>) -> Html<M> {
-    layout_shell(&[], &attrs, elem)
+    let mut attrs = attrs;
+    layout_shell(&mut [], &mut attrs, elem)
 }
 
 /// `Ui.layoutWith : { wrapperAttrs : List (Attribute msg), rootAttrs : List
@@ -1533,7 +1907,8 @@ pub fn ui_layout_with_vecs<M: Clone>(
     root_attrs: Vec<Attribute<M>>,
     elem: Element<M>,
 ) -> Html<M> {
-    layout_shell(&wrapper_attrs, &root_attrs, elem)
+    let (mut wrapper_attrs, mut root_attrs) = (wrapper_attrs, root_attrs);
+    layout_shell(&mut wrapper_attrs, &mut root_attrs, elem)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2179,7 +2554,7 @@ mod tests {
 
     /// Style of the first child of `parent [] [child]` rendered as a top node.
     fn first_child_style(parent: Element<TestMsg>) -> String {
-        let html = render_element_depth_in(parent, 0, FlexAxis::Block);
+        let html = render_element_depth_in(parent, RenderCtx::root(FlexAxis::Block));
         child_of(&html, 0)
             .and_then(style_of)
             .unwrap_or_default()
@@ -3318,5 +3693,769 @@ mod tests {
             .join()
             .expect("thread did not panic");
         assert!(is_valid, "render_element must return a valid Html variant");
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod text_role_tests {
+    use super::*;
+    use crate::html::{ElementBody, RenderedElement, admit_rendered, render_html};
+    use crate::ui::element::{Presence, WhiteSpace, presence};
+    use crate::ui::helpers::{ui_column_, ui_el_, ui_paragraph_, ui_row_};
+
+    type E = Element<()>;
+
+    fn text(s: &str) -> E {
+        Element::Text(s.to_owned())
+    }
+
+    fn role(desc: Description, kids: Vec<E>) -> E {
+        Element::Node(desc, vec![], kids)
+    }
+
+    fn heading(kids: Vec<E>) -> E {
+        role(Description::DescSectionHeading, kids)
+    }
+
+    fn section(head: E, body: E) -> E {
+        role(Description::DescSection, vec![head, body])
+    }
+
+    fn html_of(elem: E) -> String {
+        render_html(&render_element(elem))
+    }
+
+    /// The text content of a rendered subtree.
+    fn text_of(h: &Html<()>) -> String {
+        match h {
+            Html::HText(s) | Html::HRaw(s) => s.clone(),
+            Html::HElement(_, _, kids) => kids.iter().map(text_of).collect(),
+        }
+    }
+
+    /// Every `(heading tag, text)` pair of a rendered tree, in document order.
+    fn headings(h: &Html<()>, out: &mut Vec<(String, String)>) {
+        if let Html::HElement(tag, _, kids) = h {
+            if matches!(tag.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+                out.push((tag.clone(), text_of(h)));
+            }
+            for k in kids {
+                headings(k, out);
+            }
+        }
+    }
+
+    fn headings_of(elem: E) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        headings(&render_element(elem), &mut out);
+        out
+    }
+
+    /// True when a flow `NodeTag` sits below a phrasing ancestor.
+    fn flow_below_phrasing(h: &Html<()>, under_phrasing: bool) -> bool {
+        let Html::HElement(tag, _, kids) = h else {
+            return false;
+        };
+        let typed = NodeTag::ALL.iter().find(|t| t.as_str() == tag.as_str());
+        if under_phrasing && typed.is_some_and(|t| t.category() == ContentModel::Flow) {
+            return true;
+        }
+        let below = under_phrasing || typed.is_some_and(|t| t.content() == ContentModel::Phrasing);
+        kids.iter().any(|k| flow_below_phrasing(k, below))
+    }
+
+    /// True when every element of a rendered tree is admitted as markup.
+    fn all_admitted(h: &Html<()>) -> bool {
+        let Html::HElement(tag, _, kids) = h else {
+            return true;
+        };
+        matches!(
+            admit_rendered(tag, kids),
+            Ok(RenderedElement::Element(ElementBody::Markup))
+        ) && kids.iter().all(all_admitted)
+    }
+
+    /// Every tag the safe surface renders a node with is admitted as markup by
+    /// the shared gate (CI job `test`).
+    #[test]
+    fn every_node_tag_is_admitted_as_markup() {
+        for tag in NodeTag::ALL {
+            assert!(
+                matches!(
+                    admit_rendered::<()>(tag.as_str(), &[]),
+                    Ok(RenderedElement::Element(ElementBody::Markup))
+                ),
+                "{tag:?}"
+            );
+        }
+    }
+
+    /// Every text role renders through `ui_layout` to admitted markup; a denied
+    /// tag (the control) renders nothing (CI job `test`).
+    #[test]
+    fn text_roles_render_admitted_markup_and_a_denied_tag_renders_nothing() {
+        let roles = [
+            Description::DescSection,
+            Description::DescSectionHeading,
+            Description::DescCodeBlock,
+            Description::DescCode,
+            Description::DescKbd,
+            Description::DescTextColumn,
+            Description::DescForm,
+            Description::DescParagraph,
+        ];
+        for desc in roles {
+            let page = ui_layout(vec![], role(desc, vec![text("x")]));
+            assert!(all_admitted(&page));
+        }
+        let denied: E = Element::TaggedNode(
+            "script".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![text("alert(1)")],
+        );
+        let page = ui_layout(vec![], denied);
+        assert!(all_admitted(&page));
+        assert!(!render_html(&page).contains("<script"));
+        assert!(!matches!(
+            admit_rendered::<()>("script", &[Html::HText("alert(1)".to_owned())]),
+            Ok(RenderedElement::Element(ElementBody::Markup))
+        ));
+    }
+
+    /// Author text inside a code role is escaped: it can neither close the
+    /// code element nor open a script (CI job `test`).
+    #[test]
+    fn hostile_text_in_code_roles_is_escaped() {
+        let hostile = "</code></pre><script>x</script>&";
+        for desc in [
+            Description::DescCodeBlock,
+            Description::DescCode,
+            Description::DescKbd,
+        ] {
+            let page = ui_layout(vec![], role(desc, vec![text(hostile)]));
+            assert!(all_admitted(&page));
+            let s = render_html(&page);
+            assert!(!s.contains("<script"), "{s}");
+            assert!(s.contains("&lt;script&gt;"), "{s}");
+            assert!(s.contains("&amp;"), "{s}");
+            assert!(s.matches("</pre>").count() <= 1, "{s}");
+        }
+    }
+
+    /// A code block wraps its text in an attribute-free `code` inside `pre`,
+    /// so a leading newline of the text survives the parser (CI job `test`).
+    #[test]
+    fn code_block_keeps_a_leading_newline_inside_code() {
+        let s = html_of(role(Description::DescCodeBlock, vec![text("\nx")]));
+        assert!(s.starts_with("<pre"), "{s}");
+        assert!(s.ends_with("<code>\nx</code></pre>"), "{s}");
+    }
+
+    /// A code block under a phrasing ancestor renders as a `span` that keeps
+    /// `pre` white-space (CI job `test`).
+    #[test]
+    fn demoted_code_block_keeps_pre_white_space() {
+        let s = html_of(ui_paragraph_(
+            vec![],
+            vec![role(Description::DescCodeBlock, vec![text("a")])],
+        ));
+        assert!(!s.contains("<pre"), "{s}");
+        assert!(s.contains("white-space:pre"), "{s}");
+        assert!(s.contains("<code>a</code>"), "{s}");
+    }
+
+    /// Nested sections rank their headings `h1`..`h6`, saturating at `h6`; a
+    /// bare heading is `h1` (CI job `test`).
+    #[test]
+    fn section_depth_ranks_headings_and_saturates() {
+        let mut tree = text("body");
+        for i in (1..=8).rev() {
+            tree = section(heading(vec![text(&format!("T{i}"))]), tree);
+        }
+        let expected: Vec<(String, String)> = (1..=8)
+            .map(|i: usize| (format!("h{}", i.min(6)), format!("T{i}")))
+            .collect();
+        assert_eq!(headings_of(tree), expected);
+        assert_eq!(
+            headings_of(heading(vec![text("t")])),
+            vec![("h1".to_owned(), "t".to_owned())]
+        );
+    }
+
+    /// A heading with no visible content renders nothing; one with content
+    /// (the control) renders its heading (CI job `test`).
+    #[test]
+    fn empty_section_heading_renders_nothing() {
+        let empties: Vec<Vec<E>> = vec![
+            vec![],
+            vec![text(" \t\n")],
+            vec![text("\u{a0}")],
+            vec![Element::Empty],
+            vec![ui_el_(vec![], text(" "))],
+            vec![ui_el_(
+                vec![],
+                ui_el_(vec![], ui_el_(vec![], Element::Empty)),
+            )],
+        ];
+        for kids in empties {
+            let s = html_of(section(heading(kids), text("body")));
+            assert!(!s.contains("<h"), "{s}");
+            assert!(s.contains("body"), "{s}");
+        }
+        let present = headings_of(section(
+            heading(vec![ui_el_(vec![], text(" x "))]),
+            text("b"),
+        ));
+        assert_eq!(present.len(), 1);
+        assert!(present.first().is_some_and(|(tag, _)| tag == "h1"));
+    }
+
+    /// An empty section keeps the level, so the rendered levels stay
+    /// contiguous (CI job `test`).
+    #[test]
+    fn empty_sections_keep_levels_contiguous() {
+        let h = |s: &str| heading(vec![text(s)]);
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        let a_empty_b = section(h("a"), section(heading(vec![]), section(h("b"), text("z"))));
+        assert_eq!(
+            headings_of(a_empty_b),
+            vec![pair("h1", "a"), pair("h2", "b")]
+        );
+        let empty_empty_c = section(
+            heading(vec![]),
+            section(heading(vec![]), section(h("c"), text("z"))),
+        );
+        assert_eq!(headings_of(empty_empty_c), vec![pair("h1", "c")]);
+        let mut tree = text("z");
+        for i in (1..=7).rev() {
+            tree = section(h(&format!("T{i}")), tree);
+        }
+        let tree = section(heading(vec![]), section(heading(vec![]), tree));
+        let expected: Vec<(String, String)> = (1..=7)
+            .map(|i: usize| (format!("h{}", i.min(6)), format!("T{i}")))
+            .collect();
+        assert_eq!(headings_of(tree), expected);
+    }
+
+    /// No flow element is ever rendered below a phrasing ancestor, at any
+    /// nesting depth or through an overlay; the walker itself flags a real
+    /// `<p><div>` (the control) (CI job `test`).
+    #[test]
+    fn no_flow_tag_below_a_phrasing_ancestor() {
+        let overlay_host: E = Element::Node(
+            Description::NoDescription,
+            vec![Attribute::AttrNearby(
+                Location::Below,
+                ui_el_(vec![], text("tip")),
+            )],
+            vec![text("host")],
+        );
+        let shapes: Vec<E> = vec![
+            ui_paragraph_(vec![], vec![ui_el_(vec![], ui_el_(vec![], text("x")))]),
+            ui_paragraph_(
+                vec![],
+                vec![ui_row_(vec![], vec![ui_column_(vec![], vec![text("x")])])],
+            ),
+            role(
+                Description::DescHeading(HeadingLevel::from_requested(2)),
+                vec![ui_el_(
+                    vec![],
+                    role(Description::DescSection, vec![text("x")]),
+                )],
+            ),
+            ui_paragraph_(vec![], vec![overlay_host]),
+            role(
+                Description::DescCode,
+                vec![role(Description::DescCodeBlock, vec![text("x")])],
+            ),
+        ];
+        for shape in shapes {
+            let h = render_element(shape);
+            assert!(!flow_below_phrasing(&h, false), "{}", render_html(&h));
+        }
+        let flow = render_element(role(
+            Description::NoDescription,
+            vec![ui_el_(vec![], ui_el_(vec![], text("x")))],
+        ));
+        assert!(render_html(&flow).contains("<div"));
+        assert!(!flow_below_phrasing(&flow, false));
+        let p_div: Html<()> = Html::HElement(
+            "p".to_owned(),
+            vec![],
+            vec![Html::HElement("div".to_owned(), vec![], vec![])],
+        );
+        assert!(flow_below_phrasing(&p_div, false));
+    }
+
+    /// Every white-space mode has its own keyword and reaches the style as
+    /// that keyword (CI job `test`).
+    #[test]
+    fn white_space_keywords_are_distinct_and_rendered() {
+        for (i, a) in WhiteSpace::ALL.iter().enumerate() {
+            for b in WhiteSpace::ALL.iter().skip(i + 1) {
+                assert_ne!(a.css(), b.css());
+            }
+        }
+        let s = html_of(ui_el_(
+            vec![Attribute::AttrFontWhiteSpace(WhiteSpace::PreWrap)],
+            text("x"),
+        ));
+        assert!(s.contains("white-space:pre-wrap"), "{s}");
+    }
+
+    /// `presence` and its inertness tables match every `Element`,
+    /// `Description` and `Attribute` shape explicitly: no body holds a
+    /// wildcard arm, so a new variant must be classified (CI job `test`).
+    #[test]
+    fn presence_has_no_wildcard_arm() {
+        let source = include_str!("element.rs");
+        for (head, marker) in [
+            ("pub fn presence", "Element::Empty"),
+            ("const fn description_is_inert", "Description::DescButton"),
+            ("fn attribute_is_inert", "Attribute::AttrAnimation"),
+        ] {
+            let body = source
+                .split_once(head)
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .map_or("", |(body, _)| body);
+            assert!(body.contains(marker), "the scan found {head}");
+            assert!(!body.contains("_ =>"), "{body}");
+        }
+    }
+
+    /// `presence` stops one past the depth ceiling and fails closed (a
+    /// too-deep subtree counts as announced, so it is kept); a shallow empty
+    /// chain (the control) is inert (CI job `test`).
+    #[test]
+    fn presence_is_bounded_and_fails_closed() {
+        let mut deep: E = Element::Empty;
+        for _ in 0..=crate::html::MAX_HTML_DEPTH {
+            deep = Element::Node(Description::NoDescription, vec![], vec![deep]);
+        }
+        assert_eq!(presence(&deep), Presence::Announced);
+        let mut shallow: E = text(" ");
+        for _ in 0..10 {
+            shallow = Element::Node(Description::NoDescription, vec![], vec![shallow]);
+        }
+        assert_eq!(presence(&shallow), Presence::Inert);
+    }
+
+    /// A landmark demoted to a `span` below a paragraph keeps its `role`,
+    /// whether it comes from `describe` or from the node's own description;
+    /// under a flow parent (the control) each keeps its native tag and needs
+    /// no `role` (CI job `test`).
+    #[test]
+    fn demoted_landmark_keeps_its_role() {
+        let described = || -> E {
+            Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrDescribe(Description::DescNavigation)],
+                vec![text("x")],
+            )
+        };
+        let own = || role(Description::DescMain, vec![text("y")]);
+        let s = html_of(ui_paragraph_(vec![], vec![described(), own()]));
+        assert!(s.contains("role=\"navigation\""), "{s}");
+        assert!(s.contains("role=\"main\""), "{s}");
+        assert!(!s.contains("<nav") && !s.contains("<main"), "{s}");
+        let flow = html_of(role(Description::NoDescription, vec![described(), own()]));
+        assert!(flow.contains("<nav") && flow.contains("<main"), "{flow}");
+        assert!(!flow.contains("role="), "{flow}");
+    }
+
+    /// A chain of `n` nodes, each carrying the next as its only overlay; the
+    /// last holds the text `leaf`.
+    fn overlay_chain(n: usize) -> E {
+        let mut elem = text("leaf");
+        for _ in 0..n {
+            elem = Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrNearby(Location::Below, elem)],
+                vec![],
+            );
+        }
+        elem
+    }
+
+    /// An overlay renders one level below its host, so an overlay chain past
+    /// `MAX_HTML_DEPTH` is truncated by the render's depth ceiling; a shallow
+    /// chain (the control) renders its leaf (CI job `test`).
+    #[test]
+    fn overlay_chain_is_depth_bounded() {
+        let leaf_shown = std::thread::Builder::new()
+            .stack_size(48 * 1024 * 1024)
+            .spawn(|| {
+                let deep = text_of(&render_element(overlay_chain(
+                    crate::html::MAX_HTML_DEPTH + 2,
+                )));
+                let shallow = text_of(&render_element(overlay_chain(10)));
+                (deep.contains("leaf"), shallow.contains("leaf"))
+            })
+            .expect("spawn thread")
+            .join()
+            .expect("thread did not panic");
+        assert_eq!(leaf_shown, (false, true));
+    }
+
+    /// Rendering an overlay chain far past the depth ceiling returns: the
+    /// overlay subtree is moved into the bounded render, never cloned. A
+    /// derived `Clone` of the chain recurses through `Element`, its attribute
+    /// `Vec` and `Attribute` once per level, at least 80 bytes of frames per
+    /// level, so a million levels need more than the 48 MiB the depth-bounded
+    /// render itself requires in a debug build; a smaller stack would overflow
+    /// in that render, not in the clone. The shallow chain is the control (CI
+    /// job `test`).
+    #[test]
+    fn deep_overlay_chain_does_not_overflow() {
+        const DEPTH: usize = 1_000_000;
+        let rendered = std::thread::Builder::new()
+            .stack_size(48 * 1024 * 1024)
+            .spawn(|| {
+                let deep = render_element(overlay_chain(DEPTH));
+                let shallow = text_of(&render_element(overlay_chain(3)));
+                (matches!(deep, Html::HElement(_, _, _)), shallow)
+            })
+            .expect("spawn thread")
+            .join()
+            .expect("thread did not panic");
+        assert_eq!(rendered, (true, "leaf".to_owned()));
+    }
+
+    /// A heading is dropped only when nothing is lost: a heading of an empty
+    /// `div`, `span`, `p`, `br` or `wbr`, or of text-styled empty nodes, is
+    /// skipped. Self-presenting content (a `textarea`, a `select`, an overlay,
+    /// an image, a visible input, `audio` with controls) is announced and
+    /// ranks; a hidden input, an `audio` without controls, a `meta`, a
+    /// `source`, an empty landmark and an attribute-bearing empty box announce
+    /// nothing yet render with their heading, never dropped (CI job `test`).
+    #[test]
+    fn heading_is_dropped_only_when_inert() {
+        let tagged_with = |tag: &str, attrs: Vec<(&str, &str)>| -> E {
+            let attrs = attrs
+                .into_iter()
+                .map(|(n, v)| Attribute::AttrAttribute(n.to_owned(), v.to_owned()))
+                .collect();
+            Element::TaggedNode(tag.to_owned(), Description::NoDescription, attrs, vec![])
+        };
+        let tagged = |tag: &str| tagged_with(tag, vec![]);
+        let overlay_only: E = Element::Node(
+            Description::NoDescription,
+            vec![Attribute::AttrNearby(Location::Below, text("tip"))],
+            vec![],
+        );
+        let with = |attr: Attribute<()>| -> E {
+            Element::Node(Description::NoDescription, vec![attr], vec![])
+        };
+        for (inner, expected) in [
+            (tagged("textarea"), Presence::Announced),
+            (tagged("select"), Presence::Announced),
+            (overlay_only, Presence::Announced),
+            (tagged("img"), Presence::Announced),
+            (
+                tagged_with("input", vec![("type", "text")]),
+                Presence::Announced,
+            ),
+            (tagged("input"), Presence::Announced),
+            (
+                tagged_with("audio", vec![("controls", "")]),
+                Presence::Announced,
+            ),
+            (tagged("div"), Presence::Inert),
+            (tagged("SPAN"), Presence::Inert),
+            (tagged("p"), Presence::Inert),
+            (tagged("br"), Presence::Inert),
+            (tagged("wbr"), Presence::Inert),
+            (with(Attribute::AttrFontSize(20)), Presence::Inert),
+            (ui_row_(vec![], vec![]), Presence::Inert),
+            (tagged("audio"), Presence::Unannounced),
+            (
+                tagged_with("audio", vec![("autoplay", "")]),
+                Presence::Unannounced,
+            ),
+            (
+                tagged_with("input", vec![("type", "Hidden")]),
+                Presence::Unannounced,
+            ),
+            (
+                tagged_with("input", vec![("type", "hidden"), ("type", "text")]),
+                Presence::Unannounced,
+            ),
+            (tagged("meta"), Presence::Unannounced),
+            (tagged("source"), Presence::Unannounced),
+            (
+                role(Description::DescNavigation, vec![]),
+                Presence::Unannounced,
+            ),
+            (
+                role(Description::DescLivePolite, vec![]),
+                Presence::Unannounced,
+            ),
+            (
+                role(Description::DescLiveAssertive, vec![]),
+                Presence::Unannounced,
+            ),
+            (
+                tagged_with("input", vec![("type", " hidden")]),
+                Presence::Announced,
+            ),
+            (
+                with(Attribute::AttrAttribute("id".to_owned(), "top".to_owned())),
+                Presence::Unannounced,
+            ),
+            (
+                with(Attribute::AttrClass("icon".to_owned())),
+                Presence::Unannounced,
+            ),
+        ] {
+            let head = heading(vec![inner]);
+            assert_eq!(presence(&head), expected);
+            let s = html_of(section(head, text("body")));
+            assert_eq!(s.contains("<h1"), expected != Presence::Inert, "{s}");
+            assert!(s.contains("body"), "{s}");
+        }
+    }
+
+    /// A heading holding only a hidden input or an autoplaying `audio` without
+    /// controls renders, and the element with it; an empty-`div` heading (the
+    /// control) is dropped. Such a heading announces nothing, so it ranks
+    /// nothing below it (CI job `test`).
+    #[test]
+    fn functional_heading_content_is_never_dropped() {
+        let hidden: E = Element::TaggedNode(
+            "input".to_owned(),
+            Description::NoDescription,
+            vec![
+                Attribute::AttrAttribute("type".to_owned(), "hidden".to_owned()),
+                Attribute::AttrAttribute("name".to_owned(), "csrf".to_owned()),
+            ],
+            vec![],
+        );
+        let audio: E = Element::TaggedNode(
+            "audio".to_owned(),
+            Description::NoDescription,
+            vec![
+                Attribute::AttrAttribute("autoplay".to_owned(), String::new()),
+                Attribute::AttrAttribute("src".to_owned(), "/a.ogg".to_owned()),
+            ],
+            vec![],
+        );
+        let inner = |head: E| section(head, section(heading(vec![text("B")]), text("body")));
+        let s = html_of(inner(heading(vec![hidden])));
+        assert!(s.contains("<input") && s.contains("csrf"), "{s}");
+        let a = html_of(inner(heading(vec![audio])));
+        assert!(a.contains("<audio") && a.contains("a.ogg"), "{a}");
+        let ranks = headings_of(inner(heading(vec![Element::TaggedNode(
+            "audio".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![],
+        )])));
+        assert_eq!(
+            ranks,
+            vec![
+                ("h1".to_owned(), String::new()),
+                ("h1".to_owned(), "B".to_owned())
+            ]
+        );
+        let dropped = html_of(inner(heading(vec![Element::TaggedNode(
+            "div".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![],
+        )])));
+        assert_eq!(dropped.matches("<h1").count(), 1, "{dropped}");
+    }
+
+    /// A node carries one `role` and one winner in every context: a heading,
+    /// by its own description or by a `describe`, is announced as that heading
+    /// over any `describe` landmark, in flow and demoted below a paragraph
+    /// alike. A level-2 heading with a navigation `describe` is a native `h2`
+    /// in flow and `role="heading"` with `aria-level="2"` demoted; a level-7
+    /// one is `role="heading"` with `aria-level="7"` in both; a main landmark
+    /// with a `describe` heading announces the heading. A landmark with no
+    /// heading (the control) keeps its landmark role when demoted (CI job
+    /// `test`).
+    #[test]
+    fn heading_wins_over_landmark_in_every_context() {
+        let nav_heading = |n: i64| -> E {
+            Element::Node(
+                Description::DescHeading(HeadingLevel::from_requested(n)),
+                vec![Attribute::AttrDescribe(Description::DescNavigation)],
+                vec![text("a")],
+            )
+        };
+        let main_heading = || -> E {
+            Element::Node(
+                Description::DescMain,
+                vec![Attribute::AttrDescribe(Description::DescHeading(
+                    HeadingLevel::from_requested(2),
+                ))],
+                vec![text("b")],
+            )
+        };
+        let roles = |s: &str| s.matches("role=").count();
+        let flow = |e: E| html_of(role(Description::NoDescription, vec![e]));
+        let demoted = |e: E| html_of(ui_paragraph_(vec![], vec![e]));
+
+        for s in [flow(nav_heading(2)), demoted(nav_heading(2))] {
+            assert!(!s.contains("navigation") && !s.contains("<nav"), "{s}");
+            assert!(roles(&s) <= 1, "{s}");
+        }
+        let f2 = flow(nav_heading(2));
+        assert!(f2.contains("<h2") && roles(&f2) == 0, "{f2}");
+        let d2 = demoted(nav_heading(2));
+        assert_eq!(roles(&d2), 1, "{d2}");
+        assert!(
+            d2.contains("role=\"heading\"") && d2.contains("aria-level=\"2\""),
+            "{d2}"
+        );
+
+        for s in [flow(nav_heading(7)), demoted(nav_heading(7))] {
+            assert_eq!(roles(&s), 1, "{s}");
+            assert!(s.contains("role=\"heading\""), "{s}");
+            assert!(s.contains("aria-level=\"7\""), "{s}");
+            assert!(!s.contains("navigation") && !s.contains("<nav"), "{s}");
+        }
+
+        for s in [flow(main_heading()), demoted(main_heading())] {
+            assert_eq!(roles(&s), 1, "{s}");
+            assert!(s.contains("role=\"heading\""), "{s}");
+            assert!(s.contains("aria-level=\"2\""), "{s}");
+        }
+
+        let nav = || -> E {
+            Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrDescribe(Description::DescNavigation)],
+                vec![text("n")],
+            )
+        };
+        let d = demoted(nav());
+        assert_eq!(roles(&d), 1, "{d}");
+        assert!(d.contains("role=\"navigation\""), "{d}");
+    }
+
+    /// An author `role` (any ASCII case) yields to the role a node emits, so
+    /// the element carries one `role`, the emitted one: a demoted landmark, a
+    /// level-7 heading and its `aria-level`. A node that emits no role (the
+    /// control) keeps the author's (CI job `test`).
+    #[test]
+    fn author_role_yields_to_the_emitted_role() {
+        let author = |n: &str, v: &str| Attribute::AttrAttribute(n.to_owned(), v.to_owned());
+        let roles = |s: &str| s.to_ascii_lowercase().matches("role=").count();
+        let landmark: E = Element::Node(
+            Description::NoDescription,
+            vec![
+                author("role", "button"),
+                Attribute::AttrDescribe(Description::DescNavigation),
+            ],
+            vec![text("n")],
+        );
+        let s = html_of(ui_paragraph_(vec![], vec![landmark]));
+        assert_eq!(roles(&s), 1, "{s}");
+        assert!(
+            s.contains("role=\"navigation\"") && !s.contains("button"),
+            "{s}"
+        );
+
+        let deep: E = Element::Node(
+            Description::DescHeading(HeadingLevel::from_requested(7)),
+            vec![author("ROLE", "presentation"), author("aria-level", "1")],
+            vec![text("h")],
+        );
+        let h = html_of(deep);
+        assert_eq!(roles(&h), 1, "{h}");
+        assert!(
+            h.contains("role=\"heading\"") && !h.contains("presentation"),
+            "{h}"
+        );
+        assert_eq!(h.matches("aria-level").count(), 1, "{h}");
+        assert!(h.contains("aria-level=\"7\""), "{h}");
+
+        let plain: E = Element::Node(
+            Description::NoDescription,
+            vec![author("role", "status")],
+            vec![text("p")],
+        );
+        let p = html_of(plain);
+        assert!(p.contains("role=\"status\""), "{p}");
+    }
+
+    /// A section heading demoted to a `span` below a paragraph keeps its rank
+    /// as `role="heading"` with the section's `aria-level`; the same heading in
+    /// flow (the control) is its native `h2` with no `role` (CI job `test`).
+    #[test]
+    fn demoted_section_heading_keeps_its_rank() {
+        let tree = |inner: E| -> E {
+            section(
+                heading(vec![text("A")]),
+                section(heading(vec![text("B")]), inner),
+            )
+        };
+        let ranked = |elem: E| -> Vec<(String, String)> { headings_of(elem) };
+        let expected = |tags: &[(&str, &str)]| -> Vec<(String, String)> {
+            tags.iter()
+                .map(|(t, x)| ((*t).to_owned(), (*x).to_owned()))
+                .collect()
+        };
+
+        let demoted = || tree(ui_paragraph_(vec![], vec![heading(vec![text("C")])]));
+        let s = html_of(demoted());
+        assert_eq!(s.matches("role=").count(), 1, "{s}");
+        assert!(s.contains("role=\"heading\""), "{s}");
+        assert!(s.contains("aria-level=\"2\""), "{s}");
+        assert_eq!(ranked(demoted()), expected(&[("h1", "A"), ("h2", "B")]));
+
+        let flow = || tree(heading(vec![text("C")]));
+        let f = html_of(flow());
+        assert!(!f.contains("role="), "{f}");
+        assert_eq!(
+            ranked(flow()),
+            expected(&[("h1", "A"), ("h2", "B"), ("h2", "C")])
+        );
+    }
+
+    /// Only a `Node` heading is a section's heading: a `TaggedNode` heading
+    /// renders its written tag and ranks nothing, so it is never skipped and
+    /// its section's descendants are not ranked deeper. A `Node` heading (the
+    /// control) is `Empty` without content and `Present` with it (CI job
+    /// `test`).
+    #[test]
+    fn a_tagged_heading_is_no_section_head() {
+        let tagged = |kids: Vec<E>| -> E {
+            Element::TaggedNode(
+                "h2".to_owned(),
+                Description::DescSectionHeading,
+                vec![],
+                kids,
+            )
+        };
+        let sec = Description::DescSection;
+        assert_eq!(
+            section_head(&sec, &[tagged(vec![])]),
+            SectionHead::NoHeading
+        );
+        assert_eq!(
+            section_head(&sec, &[tagged(vec![text("T")])]),
+            SectionHead::NoHeading
+        );
+        assert_eq!(section_head(&sec, &[heading(vec![])]), SectionHead::Empty);
+        assert_eq!(
+            section_head(&sec, &[heading(vec![text("T")])]),
+            SectionHead::Present
+        );
+        let tree = section(
+            tagged(vec![text("T")]),
+            section(heading(vec![text("B")]), text("body")),
+        );
+        assert_eq!(
+            headings_of(tree),
+            vec![
+                ("h2".to_owned(), "T".to_owned()),
+                ("h1".to_owned(), "B".to_owned())
+            ]
+        );
     }
 }

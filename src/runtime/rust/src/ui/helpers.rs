@@ -10,7 +10,7 @@
 
 use super::element::{
     Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, PseudoClass,
-    VAlign,
+    VAlign, WhiteSpace,
 };
 use crate::color::Color;
 use crate::core::IpeMaybe;
@@ -1271,20 +1271,91 @@ pub fn ui_desc_label_(s: String) -> Description {
     Description::DescLabel(s)
 }
 
+/// The `DescSection` role — a document section.
+#[must_use]
+pub fn ui_desc_section_() -> Description {
+    Description::DescSection
+}
+
+/// The `DescSectionHeading` role — the heading of the enclosing section.
+#[must_use]
+pub fn ui_desc_section_heading_() -> Description {
+    Description::DescSectionHeading
+}
+
+/// The `DescCodeBlock` role — a preformatted block of code.
+#[must_use]
+pub fn ui_desc_code_block_() -> Description {
+    Description::DescCodeBlock
+}
+
+/// The `DescCode` role — an inline run of code.
+#[must_use]
+pub fn ui_desc_code_() -> Description {
+    Description::DescCode
+}
+
+/// The `DescKbd` role — an inline run of keyboard input.
+#[must_use]
+pub fn ui_desc_kbd_() -> Description {
+    Description::DescKbd
+}
+
+/// The `DescTextColumn` role — a column of text blocks.
+#[must_use]
+pub fn ui_desc_text_column_() -> Description {
+    Description::DescTextColumn
+}
+
+/// The `DescForm` role — a form that groups input controls.
+#[must_use]
+pub fn ui_desc_form_() -> Description {
+    Description::DescForm
+}
+
+/// `Font.whiteSpace Font.Normal`
+#[must_use]
+pub const fn ui_font_white_space_normal_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::Normal)
+}
+
+/// `Font.whiteSpace Font.NoWrap`
+#[must_use]
+pub const fn ui_font_white_space_no_wrap_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::NoWrap)
+}
+
+/// `Font.whiteSpace Font.Pre`
+#[must_use]
+pub const fn ui_font_white_space_pre_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::Pre)
+}
+
+/// `Font.whiteSpace Font.PreWrap`
+#[must_use]
+pub const fn ui_font_white_space_pre_wrap_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::PreWrap)
+}
+
+/// `Font.whiteSpace Font.PreLine`
+#[must_use]
+pub const fn ui_font_white_space_pre_line_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::PreLine)
+}
+
+/// `Font.whiteSpace Font.BreakSpaces`
+#[must_use]
+pub const fn ui_font_white_space_break_spaces_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::BreakSpaces)
+}
+
 /// `Ui.paragraph : List (Attribute msg) -> List (Element msg) -> Element msg`
 ///
-/// Mirrors `paragraph` in `Ipe/Ui.ipe`: a `<p>`-tagged node carrying
-/// `DescParagraph` plus the `__paragraph` marker (matching `paragraphMarker`),
-/// so text children wrap as inline flow.
+/// Mirrors `paragraph` in `Ipe/Ui.ipe`: a `<p>`-tagged node whose
+/// `DescParagraph` role makes its children flow inline.
 #[must_use]
 pub fn ui_paragraph_<M: Clone>(attrs: Vec<Attribute<M>>, children: Vec<Element<M>>) -> Element<M> {
-    let mut full = Vec::with_capacity(attrs.len() + 1);
-    full.push(Attribute::AttrStyle(
-        "__paragraph".to_owned(),
-        "true".to_owned(),
-    ));
-    full.extend(attrs);
-    Element::TaggedNode("p".to_owned(), Description::DescParagraph, full, children)
+    Element::TaggedNode("p".to_owned(), Description::DescParagraph, attrs, children)
 }
 
 // ── Form ─────────────────────────────────────────────────────────────────────
@@ -1928,5 +1999,38 @@ mod link_tests {
         let attrs = link_attrs(&el);
         assert_eq!(rel_count(attrs), 1);
         assert!(has_attr(attrs, "rel", "noopener"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod white_space_helper_tests {
+    use super::{
+        ui_font_white_space_break_spaces_, ui_font_white_space_no_wrap_,
+        ui_font_white_space_normal_, ui_font_white_space_pre_, ui_font_white_space_pre_line_,
+        ui_font_white_space_pre_wrap_,
+    };
+    use crate::ui::element::{Attribute, WhiteSpace};
+
+    /// Each `Font.whiteSpace` helper carries a distinct keyword and together
+    /// they cover `WhiteSpace::ALL` in order (CI job `test`).
+    #[test]
+    fn white_space_helpers_map_one_to_one_onto_all() {
+        let helpers: [Attribute<()>; 6] = [
+            ui_font_white_space_normal_(),
+            ui_font_white_space_no_wrap_(),
+            ui_font_white_space_pre_(),
+            ui_font_white_space_pre_wrap_(),
+            ui_font_white_space_pre_line_(),
+            ui_font_white_space_break_spaces_(),
+        ];
+        let carried: Vec<WhiteSpace> = helpers
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::AttrFontWhiteSpace(ws) => Some(*ws),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carried, WhiteSpace::ALL.to_vec());
     }
 }

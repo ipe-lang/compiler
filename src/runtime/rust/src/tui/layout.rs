@@ -18,7 +18,8 @@
 
 use super::super::html::Html;
 use super::super::ui::{
-    Attribute, Description, Element, HAlign, Length, Location, Portion, VAlign,
+    Attribute, Description, Element, HAlign, Length, Location, Portion, SectionHead, VAlign,
+    WhiteSpace, section_head,
 };
 use super::cell::sanitize_rune;
 use super::focus::{Focusable, InputRegistry};
@@ -131,6 +132,8 @@ struct Style {
     overline: bool,
     strike: bool,
     reverse: bool,
+    /// `Font.whiteSpace` — how a text run wraps and keeps its newlines.
+    white_space: WhiteSpace,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -186,8 +189,9 @@ struct Walked {
     /// `__grid` marker present (`Ui.grid`). Children flow row-major into auto-flow
     /// columns sized off `grid_min_px` (`Ui.gridColumns`).
     is_grid: bool,
-    /// `__paragraph` / `__textcolumn` marker (`Ui.paragraph` / `Ui.textColumn`).
-    /// Text children are joined + word-wrapped to the available width.
+    /// The `DescParagraph` / `DescTextColumn` role (`Ui.paragraph` /
+    /// `Ui.textColumn`) or the `__textcolumn` marker. Text children are joined
+    /// and word-wrapped to the available width.
     is_paragraph: bool,
     is_text_column: bool,
     /// `__gridMin` value — the minimum column WIDTH in logical px (set by
@@ -695,7 +699,6 @@ fn walk_attrs<M>(attrs: &[Attribute<M>], inherited: Style) -> Walked {
                     w.grid_cols = tracks;
                 }
             }
-            Attribute::AttrStyle(k, _) if k == "__paragraph" => w.is_paragraph = true,
             Attribute::AttrStyle(k, _) if k == "__textcolumn" => w.is_text_column = true,
             Attribute::AttrStyle(k, v) if k == "__gridMin" => {
                 w.grid_min_px = v.trim().parse().unwrap_or(0);
@@ -708,6 +711,7 @@ fn walk_attrs<M>(attrs: &[Attribute<M>], inherited: Style) -> Walked {
                 w.pad_left = *l;
             }
             Attribute::AttrFontColor(c) => w.style.fg = Some(color_of(c)),
+            Attribute::AttrFontWhiteSpace(ws) => w.style.white_space = *ws,
             Attribute::AttrBgColor(c) => w.style.bg = bg_of(c),
             Attribute::AttrFontWeight(n) if *n >= 600 => w.style.bold = true,
             // Typography SGR .
@@ -1118,7 +1122,8 @@ fn render_input<M: Clone>(
             | Attribute::AttrPseudoRule(_, _)
             | Attribute::AttrTransition(_, _)
             | Attribute::AttrGridTracks(_, _)
-            | Attribute::AttrAnimation(_, _, _, _) => {}
+            | Attribute::AttrAnimation(_, _, _, _)
+            | Attribute::AttrFontWhiteSpace(_) => {}
         }
     }
     // A `<textarea>` carries no `type` attr; mark it "textarea" so the cursor
@@ -1476,9 +1481,23 @@ fn render_node<M: Clone>(
             hits: vec![],
         },
         Element::Text(t) => {
-            let clean: String = t.chars().map(sanitize_rune).collect();
+            let block = if inherited.white_space.preserves_newlines() {
+                Block {
+                    lines: t
+                        .split('\n')
+                        .map(|line| {
+                            vec![Run {
+                                text: line.chars().map(sanitize_rune).collect(),
+                                style: inherited,
+                            }]
+                        })
+                        .collect(),
+                }
+            } else {
+                Block::single(t.chars().map(sanitize_rune).collect(), inherited)
+            };
             Rendered {
-                block: Block::single(clean, inherited),
+                block,
                 hits: vec![],
             }
         }
@@ -1581,13 +1600,48 @@ fn render_node<M: Clone>(
             padded.hits.insert(0, (idx, 0, 0, bw, h));
             padded
         }
-        Element::Node(_d, attrs, kids) | Element::TaggedNode(_, _d, attrs, kids) => {
-            let mut w = walk_attrs(attrs, inherited);
-            // Region.heading → bold (the heading text reads as a heading; was
-            // visually indistinct from body text — audit #8). The style cascades
-            // to the heading's text children via `w.style`.
-            if matches!(_d, Description::DescHeading(_)) {
-                w.style.bold = true;
+        Element::Node(desc, attrs, kids) | Element::TaggedNode(_, desc, attrs, kids) => {
+            // A section whose first child is an inert heading lays that
+            // heading out as nothing, so an absent title leaves neither a bold
+            // run nor a blank row (the rule HTML applies).
+            let kids: &[Element<M>] = match section_head(desc, kids) {
+                SectionHead::Empty => kids.get(1..).unwrap_or_default(),
+                SectionHead::NoHeading | SectionHead::Unannounced | SectionHead::Present => kids,
+            };
+            // A code block keeps its newlines and spaces unless the author
+            // sets another `Font.whiteSpace` on it.
+            let base = if matches!(desc, Description::DescCodeBlock) {
+                Style {
+                    white_space: WhiteSpace::Pre,
+                    ..inherited
+                }
+            } else {
+                inherited
+            };
+            let mut w = walk_attrs(attrs, base);
+            // The node's role: a heading reads bold (the style cascades to its
+            // text children via `w.style`); a paragraph / text column joins and
+            // wraps its text content.
+            match desc {
+                Description::DescHeading(_) | Description::DescSectionHeading => {
+                    w.style.bold = true;
+                }
+                Description::DescParagraph => w.is_paragraph = true,
+                Description::DescTextColumn => w.is_text_column = true,
+                Description::NoDescription
+                | Description::DescMain
+                | Description::DescNavigation
+                | Description::DescContentInfo
+                | Description::DescComplementary
+                | Description::DescLabel(_)
+                | Description::DescLivePolite
+                | Description::DescLiveAssertive
+                | Description::DescButton
+                | Description::DescSection
+                | Description::DescCodeBlock
+                | Description::DescCode
+                | Description::DescKbd
+                | Description::DescForm => {}
             }
             let content_avail = node_content_avail(avail_w, &w, ctx.canvas);
             // Paragraph / textColumn: join the element's text content and
@@ -1596,13 +1650,15 @@ fn render_node<M: Clone>(
             // Text run; textColumn inserts a blank line between child paragraphs.
             let mut inner = if w.is_paragraph || w.is_text_column {
                 let wrap_w = content_avail.max(1);
+                let ws = w.style.white_space;
+                let keep = ws.preserves_newlines();
                 let mut lines: Vec<Vec<Run>> = Vec::new();
                 if w.is_text_column {
                     for (i, k) in kids.iter().enumerate() {
                         if i > 0 {
                             lines.push(Vec::new());
                         }
-                        for l in wrap_text(&extract_text(k), wrap_w) {
+                        for l in layout_text(&extract_text(k, keep), wrap_w, ws) {
                             lines.push(vec![Run {
                                 text: l,
                                 style: w.style,
@@ -1610,8 +1666,12 @@ fn render_node<M: Clone>(
                         }
                     }
                 } else {
-                    let joined = kids.iter().map(extract_text).collect::<Vec<_>>().join(" ");
-                    for l in wrap_text(&joined, wrap_w) {
+                    let joined = kids
+                        .iter()
+                        .map(|k| extract_text(k, keep))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for l in layout_text(&joined, wrap_w, ws) {
                         lines.push(vec![Run {
                             text: l,
                             style: w.style,
@@ -1810,9 +1870,11 @@ fn html_text<M>(h: &Html<M>) -> String {
     }
 }
 
-/// Extract the concatenated text content of an element subtree: flattens
-/// every `Text` leaf, space-joining nested ones.
-fn extract_text<M>(el: &Element<M>) -> String {
+/// Extract the concatenated text content of an element subtree.
+///
+/// Flattens every `Text` leaf, space-joining nested ones. `keep_newlines`
+/// keeps a `'\n'` as a line break; every other control becomes a space.
+fn extract_text<M>(el: &Element<M>, keep_newlines: bool) -> String {
     let _depth = match DepthGuard::enter() {
         Some(g) => g,
         None => return String::new(),
@@ -1821,11 +1883,37 @@ fn extract_text<M>(el: &Element<M>) -> String {
         // Sanitize: paragraph/textColumn text flows here to the terminal stream;
         // an unescaped `\x1b` would inject ANSI/OSC sequences (same vector as the
         // Element::Text render path, which already sanitizes).
-        Element::Text(t) => t.chars().map(sanitize_rune).collect(),
-        Element::Node(_, _, kids) | Element::TaggedNode(_, _, _, kids) => {
-            kids.iter().map(extract_text).collect::<Vec<_>>().join(" ")
-        }
+        Element::Text(t) => t
+            .chars()
+            .map(|c| {
+                if keep_newlines && c == '\n' {
+                    c
+                } else {
+                    sanitize_rune(c)
+                }
+            })
+            .collect(),
+        Element::Node(_, _, kids) | Element::TaggedNode(_, _, _, kids) => kids
+            .iter()
+            .map(|k| extract_text(k, keep_newlines))
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => String::new(),
+    }
+}
+
+/// Lay `text` out as lines under the white-space mode `ws`.
+///
+/// A wrapping mode word-wraps to `width` cells; a non-wrapping mode that keeps
+/// newlines (`Pre`) keeps each line verbatim; `NoWrap` collapses whitespace
+/// onto one line.
+fn layout_text(text: &str, width: usize, ws: WhiteSpace) -> Vec<String> {
+    if ws.wraps() {
+        wrap_text(text, width)
+    } else if ws.preserves_newlines() {
+        text.split('\n').map(str::to_owned).collect()
+    } else {
+        vec![text.split_whitespace().collect::<Vec<_>>().join(" ")]
     }
 }
 
@@ -2744,6 +2832,10 @@ mod tests {
     fn node<M>(attrs: Vec<Attribute<M>>, kids: Vec<Element<M>>) -> Element<M> {
         Element::Node(Description::NoDescription, attrs, kids)
     }
+    /// A `Ui.paragraph`-shaped node: `<p>` carrying the `DescParagraph` role.
+    fn para<M>(attrs: Vec<Attribute<M>>, kids: Vec<Element<M>>) -> Element<M> {
+        Element::TaggedNode("p".into(), Description::DescParagraph, attrs, kids)
+    }
     fn input<M>(ty: &str, value: &str) -> Element<M> {
         Element::TaggedNode(
             "input".into(),
@@ -3123,8 +3215,8 @@ mod tests {
     #[test]
     fn paragraph_word_wraps() {
         // A paragraph node carrying long text wraps to the canvas width.
-        let t: Element<()> = node(
-            vec![Attribute::AttrStyle("__paragraph".into(), "true".into())],
+        let t: Element<()> = para(
+            vec![],
             vec![Element::Text(
                 "alpha beta gamma delta epsilon zeta eta theta iota".into(),
             )],
@@ -3397,11 +3489,8 @@ mod tests {
     fn paragraph_bg_fills_wrap_width() {
         // A bg-carrying paragraph paints every wrapped line out to the wrap width
         // (the paragraph box width = wrapW), not just to the text.
-        let t: Element<()> = node(
-            vec![
-                Attribute::AttrStyle("__paragraph".into(), "true".into()),
-                Attribute::AttrBgColor(rgb(35, 40, 55)),
-            ],
+        let t: Element<()> = para(
+            vec![Attribute::AttrBgColor(rgb(35, 40, 55))],
             vec![Element::Text("alpha beta gamma delta epsilon".into())],
         );
         let frame = cells_true(&t, 20, 6);
@@ -3559,5 +3648,172 @@ mod tests {
             reverse.contains('7'),
             "reverse style must emit SGR 7, got {reverse:?}"
         );
+    }
+
+    fn role<M>(desc: Description, attrs: Vec<Attribute<M>>, kids: Vec<Element<M>>) -> Element<M> {
+        Element::Node(desc, attrs, kids)
+    }
+
+    fn ws_para(ws: WhiteSpace, text: &str) -> Element<()> {
+        para(
+            vec![Attribute::AttrFontWhiteSpace(ws)],
+            vec![Element::Text(text.into())],
+        )
+    }
+
+    /// `NoWrap` keeps a paragraph on one row; `Normal` (the control) wraps it.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn nowrap_paragraph_stays_on_one_row() {
+        let text = "alpha beta gamma delta epsilon";
+        assert_eq!(
+            element_to_cells_height(&ws_para(WhiteSpace::NoWrap, text), 12),
+            1
+        );
+        assert!(element_to_cells_height(&ws_para(WhiteSpace::Normal, text), 12) > 1);
+    }
+
+    /// `Pre` keeps a newline as a row break; `Normal` (the control) folds it.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn pre_paragraph_keeps_newlines_and_normal_folds_them() {
+        assert_eq!(
+            element_to_cells_height(&ws_para(WhiteSpace::Pre, "a\nb"), 20),
+            2
+        );
+        assert_eq!(
+            element_to_cells_height(&ws_para(WhiteSpace::PreWrap, "a\nb"), 20),
+            2
+        );
+        assert_eq!(
+            element_to_cells_height(&ws_para(WhiteSpace::Normal, "a\nb"), 20),
+            1
+        );
+    }
+
+    /// A code block keeps its newlines by default; a plain node (the control)
+    /// folds them, and no control byte reaches the frame.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn code_block_keeps_newlines_by_default() {
+        let kids = || vec![Element::Text("a\nb\x1b[31m".into())];
+        let code: Element<()> = role(Description::DescCodeBlock, vec![], kids());
+        let plain: Element<()> = role(Description::NoDescription, vec![], kids());
+        assert_eq!(element_to_cells_height(&code, 20), 2);
+        assert_eq!(element_to_cells_height(&plain, 20), 1);
+        assert!(!cells_true(&code, 20, 4).contains("\x1b[31m"));
+    }
+
+    /// A section heading reads bold; plain text (the control) does not.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn section_heading_is_bold() {
+        let heading: Element<()> = role(
+            Description::DescSectionHeading,
+            vec![],
+            vec![Element::Text("Title".into())],
+        );
+        let plain: Element<()> = node(vec![], vec![Element::Text("Title".into())]);
+        assert!(cells_true(&heading, 20, 2).contains("\x1b[1m"));
+        assert!(!cells_true(&plain, 20, 2).contains("\x1b[1m"));
+    }
+
+    /// A section whose heading has no visible content shows neither a bold run
+    /// nor a blank row; a heading with content (the control) takes its row.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn empty_section_heading_lays_out_as_nothing() {
+        let section = |title: &str| -> Element<()> {
+            role(
+                Description::DescSection,
+                vec![],
+                vec![
+                    role(
+                        Description::DescSectionHeading,
+                        vec![],
+                        vec![Element::Text(title.into())],
+                    ),
+                    Element::Text("body".into()),
+                ],
+            )
+        };
+        let empty = section(" \t\n");
+        assert_eq!(element_to_cells_height(&empty, 20), 1);
+        assert!(!cells_true(&empty, 20, 2).contains("\x1b[1m"));
+        assert_eq!(element_to_cells_height(&section("Title"), 20), 2);
+    }
+
+    /// Only a section's first child is its heading: an empty heading anywhere
+    /// else lays out as the node HTML renders, taking its row; the same heading
+    /// as the first child (the control) takes none.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn empty_heading_off_a_section_head_lays_out() {
+        let empty_heading =
+            || -> Element<()> { role(Description::DescSectionHeading, vec![], vec![]) };
+        let body = || -> Element<()> { Element::Text("body".into()) };
+        let later: Element<()> = role(
+            Description::DescSection,
+            vec![],
+            vec![body(), empty_heading()],
+        );
+        assert_eq!(element_to_cells_height(&later, 20), 2);
+        let bare: Element<()> = node(vec![], vec![body(), empty_heading()]);
+        assert_eq!(element_to_cells_height(&bare, 20), 2);
+        let first: Element<()> = role(
+            Description::DescSection,
+            vec![],
+            vec![empty_heading(), body()],
+        );
+        assert_eq!(element_to_cells_height(&first, 20), 1);
+    }
+
+    /// A section heading holding only a hidden input or an `audio` without
+    /// controls is laid out exactly as the same heading off a section head,
+    /// never dropped, since dropping it loses the element; a heading of an
+    /// empty `div` (the control) lays out as nothing, a row fewer.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn functional_heading_content_is_laid_out() {
+        let tagged = |tag: &str, attrs: Vec<Attribute<()>>| -> Element<()> {
+            Element::TaggedNode(tag.into(), Description::NoDescription, attrs, vec![])
+        };
+        let kids_of = |inner: Element<()>| -> Vec<Element<()>> {
+            vec![
+                role(Description::DescSectionHeading, vec![], vec![inner]),
+                Element::Text("body".into()),
+            ]
+        };
+        let as_section = |inner: Element<()>| -> usize {
+            element_to_cells_height(&role(Description::DescSection, vec![], kids_of(inner)), 20)
+        };
+        let as_bare = |inner: Element<()>| -> usize {
+            element_to_cells_height(&node(vec![], kids_of(inner)), 20)
+        };
+        let hidden = || {
+            tagged(
+                "input",
+                vec![Attribute::AttrAttribute("type".into(), "hidden".into())],
+            )
+        };
+        let audio = || {
+            tagged(
+                "audio",
+                vec![Attribute::AttrAttribute("autoplay".into(), String::new())],
+            )
+        };
+        assert_eq!(as_section(hidden()), as_bare(hidden()));
+        assert!(as_section(hidden()) >= 2);
+        assert_eq!(as_section(audio()), as_bare(audio()));
+        let div = || tagged("div", vec![]);
+        assert_eq!(as_section(div()), 1);
+        assert!(as_section(div()) < as_bare(div()));
     }
 }
