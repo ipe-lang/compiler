@@ -88,6 +88,9 @@ macro_rules! on_jailed_target {
 pub(crate) mod profile;
 pub use profile::*;
 
+pub(crate) mod nproc_scope;
+pub use nproc_scope::{CanaryExit, NprocScope, SCOPE_SCRIPT, Scope, TEETH_SCRIPT, classify, prove};
+
 pub(crate) mod linux;
 #[cfg(all(
     target_os = "linux",
@@ -252,19 +255,30 @@ pub struct RunJailTools {
 /// (`PATH`, `TMPDIR`, `LANG`) plus the profile's `env_allowlist` re-enter. There
 /// is NO shell token anywhere in the result.
 ///
+/// `scope` is the proof that the tools it carries jail with a process cap
+/// counting only the jail's own tasks; the argv names those tools.
+///
 /// # Errors
 /// Any error of [`crate::WritableTree::parse`] when the profile grants the
 /// working tree: its version-control metadata cannot be carved, or the
 /// configuration that metadata holds names code inside a writable grant.
 pub fn run_jail_argv<'fd>(
-    tools: &RunJailTools,
+    scope: &NprocScope,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     seccomp_fd: Option<SealedFdNumber<'fd>>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
 ) -> Result<JailArgv<'fd>, JailPathError> {
-    jail_argv(tools, profile, mounts, seccomp_fd, None, host_env, payload)
+    jail_argv_unproven(
+        scope.tools(),
+        profile,
+        mounts,
+        seccomp_fd,
+        None,
+        host_env,
+        payload,
+    )
 }
 
 /// The directory, under the scoped tempdir, the delivered app is materialised in.
@@ -301,7 +315,7 @@ pub fn delivered_app_path(mounts: &JailMounts) -> PathBuf {
 /// # Errors
 /// As [`run_jail_argv`].
 pub fn run_jail_argv_with_delivery<'fd>(
-    tools: &RunJailTools,
+    scope: &NprocScope,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     seccomp_fd: Option<SealedFdNumber<'fd>>,
@@ -312,8 +326,8 @@ pub fn run_jail_argv_with_delivery<'fd>(
     let mut payload: Vec<OsString> = Vec::with_capacity(app_args.len().saturating_add(1));
     payload.push(delivered_app_path(mounts).into_os_string());
     payload.extend(app_args.iter().cloned());
-    jail_argv(
-        tools,
+    jail_argv_unproven(
+        scope.tools(),
         profile,
         mounts,
         seccomp_fd,
@@ -325,7 +339,11 @@ pub fn run_jail_argv_with_delivery<'fd>(
 
 /// The one run-jail argv builder behind [`run_jail_argv`] and
 /// [`run_jail_argv_with_delivery`].
-fn jail_argv<'fd>(
+///
+/// It takes bare tools rather than an [`NprocScope`] because the canary that
+/// mints the proof runs through it; every other caller goes through the two
+/// builders above.
+fn jail_argv_unproven<'fd>(
     tools: &RunJailTools,
     profile: &SandboxProfile,
     mounts: &JailMounts,
@@ -352,11 +370,14 @@ fn jail_argv<'fd>(
     // cgroup are unconditionally unshared (SysV shmem / abstract sockets are
     // covert channels that ride IPC independent of the network axis). PID is
     // unconditionally unshared (no host-PID visibility even when subprocess is
-    // granted).
+    // granted). The user namespace is requested explicitly: the `--nproc` cap
+    // counts per namespace only inside it, so a `bwrap` that cannot create one
+    // must fail the spawn rather than run under a user-wide count.
     if !profile.network {
         argv.push("--unshare-net".into());
     }
     for flag in [
+        "--unshare-user",
         "--unshare-pid",
         "--unshare-uts",
         "--unshare-ipc",
@@ -508,6 +529,12 @@ pub enum RunJailDefect {
     /// A path the jail would mount or hand to the payload could not be
     /// resolved, or a home it must mask is unknown.
     Path(JailPathError),
+    /// The process cap was measured not to count only the jail's own tasks, so
+    /// it cannot bound a fork bomb inside the jail.
+    ProcCapUnscoped {
+        /// What the cap counts instead.
+        reason: Scope,
+    },
 }
 
 impl RunJailDefect {
@@ -516,39 +543,48 @@ impl RunJailDefect {
     pub const fn code(&self) -> Code {
         IPE_F4413
     }
-}
 
-impl From<RunJailDefect> for SandboxError {
-    fn from(d: RunJailDefect) -> Self {
-        let detail = match &d {
-            RunJailDefect::PrimitiveUnavailable { missing } => format!(
+    /// The refusal's rendered cause and remedy, without the code.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::PrimitiveUnavailable { missing } => format!(
                 "cannot establish a runtime jail around the app — missing {} — refusing to run \
                  a capability-bearing program unconfined; install bubblewrap (bwrap) and \
                  util-linux (prlimit)",
                 missing.join(", ")
             ),
-            RunJailDefect::UnsupportedPlatform { reason } => format!(
+            Self::UnsupportedPlatform { reason } => format!(
                 "no runtime jail can be built on this platform ({reason}); refusing to run a \
                  native-capability program unconfined"
             ),
-            RunJailDefect::Profile(e) => e.to_string(),
-            RunJailDefect::Spawn { detail } => {
+            Self::Profile(e) => e.to_string(),
+            Self::Spawn { detail } => {
                 format!("failed to spawn the jailed app: {detail}")
             }
-            RunJailDefect::MountFailed { target, detail } => format!(
+            Self::MountFailed { target, detail } => format!(
                 "could not establish the jail-root mount at {} ({detail}); refusing to run the \
                  untrusted payload against an incompletely-mounted root",
                 target.display()
             ),
-            RunJailDefect::ProfileWeakerThanFloor => {
+            Self::ProfileWeakerThanFloor => {
                 "the artifact's ipe.profile requests less isolation than the capability floor \
                  embedded in the binary — refusing to run under a weakened profile"
                     .to_owned()
             }
-            RunJailDefect::Path(e) => e.to_string(),
-        };
+            Self::Path(e) => e.to_string(),
+            Self::ProcCapUnscoped { reason } => format!(
+                "refusing to run without a process cap that counts only the jail: {}",
+                reason.remedy()
+            ),
+        }
+    }
+}
+
+impl From<RunJailDefect> for SandboxError {
+    fn from(d: RunJailDefect) -> Self {
         Self::RunJail {
-            detail: detail.into(),
+            detail: d.detail().into(),
         }
     }
 }
@@ -1151,12 +1187,12 @@ mod tests {
         assert!(subset.is_at_least_as_isolated_as(&floor));
     }
 
-    fn tools() -> RunJailTools {
-        RunJailTools {
+    fn scope() -> NprocScope {
+        NprocScope::for_test(RunJailTools {
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             prlimit: PathBuf::from("/usr/bin/prlimit"),
             timeout: Some(PathBuf::from("/usr/bin/timeout")),
-        }
+        })
     }
 
     /// Mounts over paths that need not exist, checked against a cargo home
@@ -1189,7 +1225,7 @@ mod tests {
     fn rendered(profile: &SandboxProfile, seccomp_fd: Option<SealedFdNumber<'_>>) -> Vec<String> {
         let no_env = |_: &str| None;
         run_jail_argv(
-            &tools(),
+            &scope(),
             profile,
             &work_mounts(),
             seccomp_fd,
@@ -1227,7 +1263,7 @@ mod tests {
             HomeMasks::resolve(Ok(&crate::home::test_home(&user_home)), None).expect("homes"),
         );
         let argv: Vec<String> = run_jail_argv(
-            &tools(),
+            &scope(),
             &profile,
             &mounts,
             None,
@@ -1293,7 +1329,7 @@ mod tests {
                 HomeMasks::unmasked(),
             );
             let argv: Vec<String> = run_jail_argv(
-                &tools(),
+                &scope(),
                 &profile,
                 &mounts,
                 None,
@@ -1323,6 +1359,47 @@ mod tests {
     #[allow(clippy::expect_used)] // a test host with no `/dev/null` cannot build the fixture
     fn stand_in_fd() -> std::fs::File {
         std::fs::File::open("/dev/null").expect("open /dev/null")
+    }
+
+    /// Both Linux argv builders request the user namespace the per-jail process count rests on.
+    #[test]
+    fn jail_argv_unshares_the_user_namespace() {
+        let unshares_user = |argv: &[String]| {
+            argv.iter()
+                .take_while(|a| a.as_str() != "--")
+                .any(|a| a == "--unshare-user")
+        };
+        let granted = SandboxProfile {
+            network: true,
+            subprocess: true,
+            ..SandboxProfile::maximally_isolated()
+        };
+        for profile in [SandboxProfile::maximally_isolated(), granted] {
+            let argv = rendered(&profile, None);
+            assert!(unshares_user(&argv), "run jail: {argv:?}");
+        }
+        let spec = crate::JailSpec {
+            network: crate::NetworkPolicy::Denied,
+            scoped_tmp: CanonicalPath::assumed("/work/tmp-1"),
+            registry_cache: None,
+            toolchain: None,
+            toolchain_ro_binds: Vec::new(),
+            path_prepend: Vec::new(),
+            rustup_home: None,
+            homes: HomeMasks::unmasked(),
+            limits: crate::ResourceLimits::default(),
+        };
+        let build: Vec<String> = crate::bwrap_argv(
+            &scope(),
+            Path::new("/usr/bin/timeout"),
+            &spec,
+            &[OsString::from("cargo")],
+        )
+        .expect("the build argv builds")
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        assert!(unshares_user(&build), "build jail: {build:?}");
     }
 
     #[cfg(unix)]
@@ -1394,7 +1471,7 @@ mod tests {
         let mounts = work_mounts();
         let dest = delivered_app_path(&mounts);
         let argv: Vec<String> = run_jail_argv_with_delivery(
-            &tools(),
+            &scope(),
             &SandboxProfile::maximally_isolated(),
             &mounts,
             Some(SealedFdNumber::for_test(filter.as_fd())),
@@ -1504,7 +1581,7 @@ mod tests {
         );
         let no_env = |_: &str| None;
         let joined = run_jail_argv(
-            &tools(),
+            &scope(),
             &p,
             &mounts,
             None,
@@ -1560,7 +1637,7 @@ mod tests {
                 profile.filesystem == FilesystemScope::WorkingTreeReadWrite
             );
             let argv: Vec<OsString> = run_jail_argv(
-                &tools(),
+                &scope(),
                 &profile,
                 &mounts,
                 None,
@@ -1609,7 +1686,7 @@ mod tests {
             }
         };
         let argv = run_jail_argv(
-            &tools(),
+            &scope(),
             &p,
             &work_mounts(),
             None,
@@ -2097,7 +2174,7 @@ mod tests {
             };
             let no_env = |_: &str| None;
             run_jail_argv(
-                &tools(),
+                &scope(),
                 &profile,
                 &mounts,
                 None,
@@ -2170,7 +2247,7 @@ mod tests {
         };
         let no_env = |_: &str| None;
         run_jail_argv(
-            &tools(),
+            &scope(),
             &profile,
             mounts,
             None,

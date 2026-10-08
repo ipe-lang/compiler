@@ -38,7 +38,8 @@ use std::path::Path;
 use std::process::Command;
 
 use ipe_sandbox::run_jail::{
-    FilesystemScope, RunJailTools, RunResourceLimits, SandboxProfile, run_jail_argv,
+    CanaryExit, FilesystemScope, ProcCap, RunJailDefect, RunJailTools, RunResourceLimits,
+    SCOPE_SCRIPT, SandboxProfile, Scope, TEETH_SCRIPT, classify, prove, run_jail_argv,
 };
 use ipe_sandbox::{CanonicalPath, JailMounts};
 
@@ -68,6 +69,24 @@ fn e2e_tools() -> Option<RunJailTools> {
         prlimit,
         timeout: caps.timeout,
     };
+    // The proof's canaries spawn children, so they run under the lock that
+    // keeps every inheritable memfd to its one jail.
+    let proven = {
+        let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        prove(&tools)
+    };
+    // A host whose jail can boot but whose cap counts the whole user (or no
+    // one) is exactly the host production refuses: a real failure here.
+    assert!(
+        !matches!(proven, Err(RunJailDefect::ProcCapUnscoped { .. })),
+        "the jail's process cap is not scoped to the jail on this host: {proven:?}"
+    );
+    if let Err(defect) = proven {
+        eprintln!(
+            "run_jail_e2e: skipping — the process-cap canary jail cannot run here: {defect:?}"
+        );
+        return None;
+    }
     if !jail_can_establish(&tools) {
         return None;
     }
@@ -198,7 +217,8 @@ fn run_jailed_inner(
     // `ipe_env` matches the launcher's crate-private passthrough for every name
     // but a home variable, and no profile in this file grants one.
     let host_env = |k: &str| ipe_env::var_os(k);
-    let argv = run_jail_argv(tools, profile, &mounts, Some(fd), &host_env, payload)
+    let scope = prove(tools).expect("the process cap is proven scoped to the jail");
+    let argv = run_jail_argv(&scope, profile, &mounts, Some(fd), &host_env, payload)
         .expect("the argv builds");
     let (prog, rest) = argv.args().split_first().expect("non-empty argv");
     let mut cmd = Command::new(prog);
@@ -510,4 +530,125 @@ fn canary_gates_skip_on_any_establishment_failure() {
         "a non-zero bwrap setup exit is a skip"
     );
     assert!(!established(None), "a signalled process is a skip");
+}
+
+#[test]
+fn nproc_scope_is_proven_on_this_host() {
+    let Some(tools) = e2e_tools() else { return };
+    let proven = prove(&tools);
+    assert!(
+        proven.as_ref().is_ok_and(|scope| scope.tools() == &tools),
+        "the proof must succeed and carry the tools it measured: {proven:?}"
+    );
+}
+
+/// A `/bin/sh -c script` jail with `prlimit` OUTSIDE `bwrap`, so the cap is set
+/// in the invoker's namespace and counts every task the user owns.
+fn user_wide_canary(tools: &RunJailTools, script: &str) -> CanaryExit {
+    let status = Command::new(&tools.prlimit)
+        .arg(format!("--nproc={}", ProcCap::CANARY.get()))
+        .arg("--")
+        .arg(&tools.bwrap)
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn the user-wide canary");
+    if status.success() {
+        CanaryExit::Succeeded
+    } else {
+        CanaryExit::Failed
+    }
+}
+
+#[test]
+fn a_canary_with_prlimit_outside_the_namespace_is_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    // The discriminator must tell the two scopes apart on a real kernel: the
+    // same scripts under a user-wide count classify as a refusal.
+    let scope_run = user_wide_canary(&tools, SCOPE_SCRIPT);
+    let teeth_run = user_wide_canary(&tools, TEETH_SCRIPT);
+    assert_eq!(
+        classify(scope_run, teeth_run),
+        Err(Scope::UserWide),
+        "a cap counting the whole user must be refused (scope {scope_run:?}, teeth {teeth_run:?})"
+    );
+}
+
+/// Host children that are killed and reaped when the guard drops.
+struct HostSleepers(Vec<std::process::Child>);
+
+impl Drop for HostSleepers {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn a_busy_user_does_not_starve_a_granted_jail() {
+    let Some(tools) = e2e_tools() else { return };
+    // The invoker already owns more tasks than the jail's cap; a cap counting
+    // only the jail still admits the jail's own fork.
+    let sleepers = HostSleepers(
+        (0..ProcCap::CANARY.get() + 8)
+            .map(|_| {
+                Command::new("sleep")
+                    .arg("5")
+                    .spawn()
+                    .expect("spawn a host sleeper")
+            })
+            .collect(),
+    );
+    let mut profile = subprocess_granted();
+    profile.limits.proc_cap = ProcCap::of::<8>();
+    let payload: Vec<OsString> = ["/bin/sh", "-c", SCOPE_SCRIPT]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let code = run_jailed(&tools, &profile, &payload);
+    drop(sleepers);
+    assert_eq!(
+        code,
+        Some(0),
+        "the invoker's other tasks must not count against the jail's cap"
+    );
+}
+
+#[test]
+fn a_fork_bomb_is_bounded_in_a_granted_jail() {
+    let Some(tools) = e2e_tools() else { return };
+    let mut profile = subprocess_granted();
+    profile.limits.proc_cap = ProcCap::of::<8>();
+    let payload: Vec<OsString> = [
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 32 ]; do sleep 1 & i=$((i+1)); done; wait",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    let code = run_jailed(&tools, &profile, &payload);
+    assert_ne!(
+        code,
+        Some(0),
+        "a jail forking past its cap must be refused the excess forks"
+    );
 }
