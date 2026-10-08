@@ -8546,11 +8546,14 @@ mod tests {
                 panic!("an authed request carries its binding set");
             };
             let mut peer = serve_ws(credentials, gate).await;
-            let poisoned = std::thread::spawn(move || {
+            let poisoner = std::thread::Builder::new().spawn(move || {
                 let _held = bindings.lock();
                 panic!("poison the binding set");
-            })
-            .join();
+            });
+            let Ok(poisoner) = poisoner else {
+                panic!("the OS refused the poisoning thread");
+            };
+            let poisoned = poisoner.join();
             assert!(poisoned.is_err(), "the binding set is poisoned");
             let text = axum::extract::ws::Message::Text("after".to_string());
             assert!(peer.to_server.send(text).is_ok());
