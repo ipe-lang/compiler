@@ -334,10 +334,14 @@ impl ServerPendingStream {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, tx);
 
-        // Drive the handler in its own task; on completion drop the sender so
-        // the body stream terminates even if the handler forgot to call `finish`.
+        // Drive the handler in its own task, inside the request's binding set
+        // so a token it verifies binds to this stream; on completion drop the
+        // sender so the body stream terminates even if the handler forgot to
+        // call `finish`.
         tokio::spawn(async move {
-            handler(StreamWriter::StreamWriter(id)).await;
+            credentials
+                .scoped(|| handler(StreamWriter::StreamWriter(id)))
+                .await;
             stream_senders()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -346,15 +350,20 @@ impl ServerPendingStream {
 
         // Receiver to byte stream: unfold yields each chunk; `None` ends the
         // body once every sender has dropped (finish / handler exit), or once
-        // the gate denies, which drops the receiver.
+        // the gate denies, which drops the receiver. A chunk is written only
+        // after the gate settles, so a credential the handler bound, or a
+        // revocation already due, is proved before the chunk leaves.
         let body_stream =
             futures_util::stream::unfold((rx, gate), |(mut rx, mut gate)| async move {
                 tokio::select! {
                     biased;
                     () = crate::server::channel_denial(&mut gate) => None,
-                    chunk = rx.recv() => {
-                        chunk.map(|chunk| (Ok::<String, std::io::Error>(chunk), (rx, gate)))
-                    }
+                    chunk = rx.recv() => match chunk {
+                        Some(chunk) if !crate::server::channel_unsettled(&mut gate) => {
+                            Some((Ok::<String, std::io::Error>(chunk), (rx, gate)))
+                        }
+                        Some(_) | None => None,
+                    },
                 }
             });
         head.into_response(axum::body::Body::from_stream(body_stream))
