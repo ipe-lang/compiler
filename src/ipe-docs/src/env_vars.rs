@@ -862,7 +862,8 @@ pub static ENV_VARS: &[EnvVar] = &[
                   raised. Prevents stack-overflow crashes from unbounded recursion. \
                   Read once, at process start; a value that is not a positive \
                   decimal integer (`0` included) refuses the program before its \
-                  first line.",
+                  first line. On wasm32 the maximum is `10000`: a larger value is \
+                  refused too, lowering stays possible.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
@@ -936,9 +937,11 @@ pub static ENV_VARS: &[EnvVar] = &[
                   `Server.deleteAuthed`). `store` or `1` checks each request against the \
                   in-process list of revoked token IDs and denies on any store error; \
                   `off` or `0` or unset leaves the mode `Server.withRevocation` chose. It \
-                  only ever arms the check, never disarms an in-code `Store`. A token \
-                  a handler verifies itself with `Auth.verifyToken` is not checked. Any \
-                  other value refuses `Server.listen` and `Web` startup. A `Web` app has \
+                  only ever arms the check, never disarms an in-code `Store`. Armed, \
+                  `Auth.verifyToken` checks the token against the same store and \
+                  refuses with `Auth.Revoked`, `Auth.RevocationUnavailable`, \
+                  `Auth.MissingClaim` or `Auth.TooManyCredentials`. Any other value \
+                  refuses `Server.listen` and `Web` startup. A `Web` app has \
                   no revocation check, so `store` (or `Web.withRevocation` `Store`) \
                   refuses its startup; guard its routes with `Server.withRevocation` \
                   instead.",

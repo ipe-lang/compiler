@@ -1706,9 +1706,10 @@ mod tests {
     }
 
     #[test]
-    fn keyed_items_keep_id_across_reorder() {
-        // Two keyed <li> swapped: each keeps its `:{key}` id so the diff can
-        // target the moved element instead of replacing the whole list.
+    fn keyed_item_id_carries_position_and_key() {
+        // Two keyed <li> swapped: the stamped id carries both the position and
+        // the key, so a moved item's id changes and the diff replaces the list
+        // rather than patching one item in place under the other's id.
         let li = |k: &str| -> Html<()> {
             Html::HElement(
                 "li".into(),
@@ -1722,7 +1723,7 @@ mod tests {
         assign_ipe_ids(&mut b, "r");
         let ids_a = collect_ids(&a);
         let ids_b = collect_ids(&b);
-        // alpha keeps the same id in both renders even though its position moved.
+        // alpha's id changes with its position; the key stays in it.
         assert!(ids_a.contains(&"r_0_li:alpha".to_string()), "{ids_a:?}");
         assert!(ids_b.contains(&"r_1_li:alpha".to_string()), "{ids_b:?}");
         // The key disambiguator is present, sanitised.

@@ -249,18 +249,24 @@ pub fn jwt_encode_hs256<E: From<String>>(
     IpeResult::Ok(format!("{}.{}", signing_input, sig))
 }
 
-/// The refusal text of a failed `Jwt.decode` signature check, named by what
-/// `jsonwebtoken` refused. The error's own text is never echoed: a `serde`
-/// message can quote attacker-chosen token bytes.
-fn verify_refusal(e: &jsonwebtoken::errors::Error) -> &'static str {
+/// What `jsonwebtoken` refused, as a fixed phrase. The error's own text is
+/// never echoed: a `serde` message can quote attacker-chosen token bytes.
+fn decode_refusal_phrase(e: &jsonwebtoken::errors::Error) -> &'static str {
     match e.kind() {
-        jsonwebtoken::errors::ErrorKind::InvalidSignature => "jwt-decode: invalid signature",
+        jsonwebtoken::errors::ErrorKind::InvalidSignature => "invalid signature",
+        jsonwebtoken::errors::ErrorKind::ExpiredSignature => "token has expired",
+        jsonwebtoken::errors::ErrorKind::ImmatureSignature => "token is not yet valid",
         // `ErrorKind` is `#[non_exhaustive]`. Every other kind refuses the token
         // without a signature mismatch: a header or claims set that does not
         // parse (a date claim written as an array or object included), or an
         // algorithm the key does not serve.
-        _ => "jwt-decode: malformed token (header, claims set, or algorithm)",
+        _ => "malformed token (header, claims set, or algorithm)",
     }
+}
+
+/// The refusal text of a failed decode under the decoder named by `prefix`.
+fn verify_refusal(prefix: &'static str, e: &jsonwebtoken::errors::Error) -> String {
+    format!("{prefix}: {}", decode_refusal_phrase(e))
 }
 
 /// Ipê `Jwt_decodeHs256 : String -> String -> Result Error String`
@@ -321,7 +327,7 @@ pub fn jwt_decode_hs256<E: From<String>>(secret: String, token: String) -> IpeRe
                 Err(e) => IpeResult::Err(format!("jwt-decode: re-encode claims: {}", e).into()),
             },
         },
-        Err(e) => IpeResult::Err(format!("jwt-decode: {}", e).into()),
+        Err(e) => IpeResult::Err(verify_refusal("jwt-decode", &e).into()),
     }
 }
 
@@ -409,7 +415,7 @@ pub fn jwt_decode_rs256<E: From<String>>(key_pem: String, token: String) -> IpeR
                 Err(e) => IpeResult::Err(format!("jwt-decode-rs: re-encode: {}", e).into()),
             },
         },
-        Err(e) => IpeResult::Err(format!("jwt-decode-rs: {}", e).into()),
+        Err(e) => IpeResult::Err(verify_refusal("jwt-decode-rs", &e).into()),
     }
 }
 
@@ -641,7 +647,7 @@ pub fn ipe_jwt_decode(
         val.required_spec_claims = HashSet::new();
         val.validate_aud = false;
         if let Err(e) = decode::<JsonValue>(&token, &key, &val) {
-            return IpeResult::Err(verify_refusal(&e).into());
+            return IpeResult::Err(verify_refusal("jwt-decode", &e).into());
         }
     } else if let Some(pem) = algorithm_descriptor.strip_prefix("RS256:") {
         let key = match DecodingKey::from_rsa_pem(pem.as_bytes()) {
@@ -654,7 +660,7 @@ pub fn ipe_jwt_decode(
         val.required_spec_claims = HashSet::new();
         val.validate_aud = false;
         if let Err(e) = decode::<JsonValue>(&token, &key, &val) {
-            return IpeResult::Err(verify_refusal(&e).into());
+            return IpeResult::Err(verify_refusal("jwt-decode", &e).into());
         }
     } else {
         // See `ipe_jwt_encode`'s matching arm: never byte-slice or echo the
@@ -1330,6 +1336,58 @@ mod tests {
                 msg.ends_with("jwt-decode: malformed token (header, claims set, or algorithm)"),
                 "{claims}: {msg}"
             );
+        }
+    }
+
+    /// A token whose header carries attacker text is refused by every decoder
+    /// with a fixed phrase: the verifier's own message, which quotes that text,
+    /// never reaches the error.
+    #[test]
+    fn decode_refusals_never_echo_token_text() {
+        const MARKER: &str = "LEAKMARKER-7f3a";
+        let header = b64u(br#"{"alg":"\u001b[31mLEAKMARKER-7f3a","typ":"JWT"}"#);
+        let token = format!("{header}.{}.AAAA", b64u(br#"{"sub":"x"}"#));
+        match jsonwebtoken::decode_header(&token) {
+            Err(e) => assert!(
+                e.to_string().contains(MARKER),
+                "the fixture's header text reaches the verifier's message: {e}"
+            ),
+            Ok(h) => panic!("the fixture header must not parse: {h:?}"),
+        }
+        let rs = jwt_decode_rs256::<String>(RS256_PUB_PEM.to_string(), token.clone());
+        let builder_rs = ipe_jwt_decode(
+            crate::secret::secret_from_string(format!("RS256:{RS256_PUB_PEM}")),
+            500,
+            token.clone(),
+        );
+        for (decoder, msg, expected) in [
+            (
+                "flat HS256",
+                refusal(flat_hs256(token.clone())),
+                "jwt-decode: malformed token (header, claims set, or algorithm)",
+            ),
+            (
+                "flat RS256",
+                refusal(rs),
+                "jwt-decode-rs: malformed token (header, claims set, or algorithm)",
+            ),
+            (
+                "builder HS256",
+                refusal(builder_hs256(500, token.clone())),
+                "jwt-decode: malformed token (header, claims set, or algorithm)",
+            ),
+            (
+                "builder RS256",
+                refusal(builder_rs),
+                "jwt-decode: malformed token (header, claims set, or algorithm)",
+            ),
+        ] {
+            assert!(!msg.contains(MARKER), "{decoder} echoed token text: {msg}");
+            assert!(
+                !msg.contains('\u{1b}'),
+                "{decoder} echoed a control byte: {msg}"
+            );
+            assert!(msg.ends_with(expected), "{decoder}: {msg}");
         }
     }
 

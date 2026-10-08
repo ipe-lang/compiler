@@ -151,6 +151,20 @@ impl IpeDbFailure {
         Self::OtherFailure,
     ];
 
+    /// Every variant as its `(constructor name, discriminant)` row, in
+    /// declaration order.
+    pub const ROWS: [(&'static str, usize); 14] = {
+        let mut rows = [("", 0_usize); 14];
+        let mut out: &mut [(&str, usize)] = &mut rows;
+        let mut all: &[Self] = &Self::ALL;
+        while let ([failure, all_rest @ ..], [slot, out_rest @ ..]) = (all, out) {
+            *slot = (failure.ctor_name(), *failure as usize);
+            all = all_rest;
+            out = out_rest;
+        }
+        rows
+    };
+
     /// The Ipê constructor name, without the `Db.` qualifier.
     #[must_use]
     pub const fn ctor_name(self) -> &'static str {
@@ -209,6 +223,96 @@ impl IpeDbFailure {
             Self::NotADatabase | Self::InvalidStatement | Self::OtherFailure => {
                 IpeErrorKind::Unexpected
             }
+        }
+    }
+}
+
+/// Ipê's `AuthError` — the closed, payload-free reason `Auth.verifyToken`
+/// refused a token.
+///
+/// Spelled `Auth.<Ctor>` in Ipê source. No variant carries the token, the key
+/// or a parser's text, so a refusal has nothing to leak. `Expired` and
+/// `NotYetValid` are judged before the signature check: they do not prove the
+/// token was authentic, so a client must never see them as different from
+/// `BadSignature`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum IpeAuthError {
+    Malformed = 0,
+    BadSignature = 1,
+    Expired = 2,
+    NotYetValid = 3,
+    MissingClaim = 4,
+    Revoked = 5,
+    RevocationUnavailable = 6,
+    TooManyCredentials = 7,
+    SecretTooShort = 8,
+}
+
+// `ALL` spans the whole discriminant range, `SecretTooShort` last.
+const _: [(); IpeAuthError::ALL.len()] = [(); IpeAuthError::SecretTooShort as usize + 1];
+
+crate::stringify::show_row!("AuthError", Value, [] IpeAuthError, |e| e
+    .ctor_name()
+    .to_owned());
+
+impl IpeAuthError {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 9] = [
+        Self::Malformed,
+        Self::BadSignature,
+        Self::Expired,
+        Self::NotYetValid,
+        Self::MissingClaim,
+        Self::Revoked,
+        Self::RevocationUnavailable,
+        Self::TooManyCredentials,
+        Self::SecretTooShort,
+    ];
+
+    /// Every variant as its `(constructor name, discriminant)` row, in
+    /// declaration order.
+    pub const ROWS: [(&'static str, usize); 9] = {
+        let mut rows = [("", 0_usize); 9];
+        let mut out: &mut [(&str, usize)] = &mut rows;
+        let mut all: &[Self] = &Self::ALL;
+        while let ([refusal, all_rest @ ..], [slot, out_rest @ ..]) = (all, out) {
+            *slot = (refusal.ctor_name(), *refusal as usize);
+            all = all_rest;
+            out = out_rest;
+        }
+        rows
+    };
+
+    /// The Ipê constructor name, without the `Auth.` qualifier.
+    #[must_use]
+    pub const fn ctor_name(self) -> &'static str {
+        match self {
+            Self::Malformed => "Malformed",
+            Self::BadSignature => "BadSignature",
+            Self::Expired => "Expired",
+            Self::NotYetValid => "NotYetValid",
+            Self::MissingClaim => "MissingClaim",
+            Self::Revoked => "Revoked",
+            Self::RevocationUnavailable => "RevocationUnavailable",
+            Self::TooManyCredentials => "TooManyCredentials",
+            Self::SecretTooShort => "SecretTooShort",
+        }
+    }
+
+    /// The fixed human phrase for this refusal; it names no token content.
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Self::Malformed => "token is malformed",
+            Self::BadSignature => "token signature does not verify",
+            Self::Expired => "token has expired",
+            Self::NotYetValid => "token is not yet valid",
+            Self::MissingClaim => "token lacks a required claim",
+            Self::Revoked => "credential revoked",
+            Self::RevocationUnavailable => "revocation store unavailable",
+            Self::TooManyCredentials => "too many credentials bound to this channel",
+            Self::SecretTooShort => "token key is shorter than the minimum",
         }
     }
 }
@@ -721,6 +825,47 @@ mod tests {
                 .into_iter()
                 .find(|f| f.ctor_name() == failure.ctor_name());
             assert_eq!(back, Some(failure));
+        }
+    }
+
+    #[test]
+    fn auth_error_all_and_ctor_names_are_in_declaration_order() {
+        use IpeAuthError as A;
+        let expected = [
+            (A::Malformed, "Malformed"),
+            (A::BadSignature, "BadSignature"),
+            (A::Expired, "Expired"),
+            (A::NotYetValid, "NotYetValid"),
+            (A::MissingClaim, "MissingClaim"),
+            (A::Revoked, "Revoked"),
+            (A::RevocationUnavailable, "RevocationUnavailable"),
+            (A::TooManyCredentials, "TooManyCredentials"),
+            (A::SecretTooShort, "SecretTooShort"),
+        ];
+        assert_eq!(expected.len(), IpeAuthError::ALL.len());
+        let mut names = std::collections::HashSet::new();
+        for (index, ((variant, name), listed)) in
+            expected.into_iter().zip(IpeAuthError::ALL).enumerate()
+        {
+            assert_eq!(variant, listed, "{variant:?} out of order in ALL");
+            assert_eq!(variant as usize, index, "{variant:?} discriminant");
+            assert_eq!(variant.ctor_name(), name);
+            assert!(names.insert(name), "{variant:?} name reused");
+            assert!(!variant.phrase().is_empty(), "{variant:?} has no phrase");
+        }
+    }
+
+    #[test]
+    fn nullary_rows_mirror_all() {
+        assert_eq!(IpeAuthError::ROWS.len(), IpeAuthError::ALL.len());
+        for ((name, index), variant) in IpeAuthError::ROWS.into_iter().zip(IpeAuthError::ALL) {
+            assert_eq!(name, variant.ctor_name());
+            assert_eq!(index, variant as usize);
+        }
+        assert_eq!(IpeDbFailure::ROWS.len(), IpeDbFailure::ALL.len());
+        for ((name, index), failure) in IpeDbFailure::ROWS.into_iter().zip(IpeDbFailure::ALL) {
+            assert_eq!(name, failure.ctor_name());
+            assert_eq!(index, failure as usize);
         }
     }
 

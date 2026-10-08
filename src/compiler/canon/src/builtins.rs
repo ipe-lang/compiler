@@ -2,6 +2,7 @@
 //! constructor that resolves without a user `type` declaration.
 //!
 //! `Maybe`/`Result`/`Bool`/`Order`, the Db `SqlValue`/`SqlField`/`DbFailure` ADTs, the
+//! Auth `AuthError` ADT, the
 //! `Ipe.Http.Stream` `ChunkEvent`/`StreamId` ADTs, and the `Error`/`ErrorKind`/
 //! `ErrorDetails` ADTs all appear in typed Ipê code as if declared, but carry no
 //! `type` decl in any Ipê source file. Three stages must agree on their exact
@@ -230,6 +231,16 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
         exhaust_union: true,
         qualified_home: Some("Db"),
     },
+    // ── AuthError (Ipe.Auth) ───────────────────────────────────────────────
+    // The closed set of `Auth.verifyToken` refusals. Qualified-only
+    // (`Auth.Expired`), so a user's own same-spelled constructor is never
+    // shadowed. Index order matches the runtime's `IpeAuthError` enum.
+    BuiltinUnion {
+        type_name: "AuthError",
+        ctors: AUTH_ERROR_CTORS,
+        exhaust_union: true,
+        qualified_home: Some("Auth"),
+    },
 ];
 
 /// The `DbFailure` constructors, in the runtime `IpeDbFailure` declaration order.
@@ -248,6 +259,19 @@ const DB_FAILURE_CTORS: &[(&str, usize, usize)] = &[
     ("InvalidStatement", 11, 0),
     ("Unreachable", 12, 0),
     ("OtherFailure", 13, 0),
+];
+
+/// The `AuthError` constructors, in the runtime `IpeAuthError` declaration order.
+const AUTH_ERROR_CTORS: &[(&str, usize, usize)] = &[
+    ("Malformed", 0, 0),
+    ("BadSignature", 1, 0),
+    ("Expired", 2, 0),
+    ("NotYetValid", 3, 0),
+    ("MissingClaim", 4, 0),
+    ("Revoked", 5, 0),
+    ("RevocationUnavailable", 6, 0),
+    ("TooManyCredentials", 7, 0),
+    ("SecretTooShort", 8, 0),
 ];
 
 /// Whether `union` may name `row`: the row's role admits constructors, and a
@@ -395,7 +419,10 @@ pub fn intern_builtins(interner: &mut Interner) -> DResult<InternedBuiltins> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILTIN_UNIONS, BuiltinUnion, DB_FAILURE_CTORS, intern_builtins, unions_agree};
+    use super::{
+        AUTH_ERROR_CTORS, BUILTIN_UNIONS, BuiltinUnion, DB_FAILURE_CTORS, intern_builtins,
+        unions_agree,
+    };
     use ipe_intern::Interner;
     use ipe_kernels::BUILTIN_TYPES;
 
@@ -419,6 +446,7 @@ mod tests {
                 stub_union("HttpMethod", Some("Http")),
                 stub_union("RedirectPolicy", None),
                 stub_union("DbFailure", Some("Db")),
+                stub_union("AuthError", Some("Auth")),
             ],
             BUILTIN_TYPES
         ));
@@ -497,6 +525,28 @@ mod tests {
             ]
         );
         assert!(DB_FAILURE_CTORS.iter().all(|&(_, _, arity)| arity == 0));
+    }
+
+    /// The `AuthError` row lists the runtime `IpeAuthError` variants by name,
+    /// in declaration order, every one nullary.
+    #[test]
+    fn auth_error_row_names_the_runtime_variants() {
+        let names: Vec<&str> = AUTH_ERROR_CTORS.iter().map(|&(name, _, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "Malformed",
+                "BadSignature",
+                "Expired",
+                "NotYetValid",
+                "MissingClaim",
+                "Revoked",
+                "RevocationUnavailable",
+                "TooManyCredentials",
+                "SecretTooShort",
+            ]
+        );
+        assert!(AUTH_ERROR_CTORS.iter().all(|&(_, _, arity)| arity == 0));
     }
 
     /// No two builtin constructors share a name, across every union.
