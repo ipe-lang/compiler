@@ -862,7 +862,8 @@ pub static ENV_VARS: &[EnvVar] = &[
                   raised. Prevents stack-overflow crashes from unbounded recursion. \
                   Read once, at process start; a value that is not a positive \
                   decimal integer (`0` included) refuses the program before its \
-                  first line.",
+                  first line. On wasm32 the maximum is `10000`: a larger value is \
+                  refused too, lowering stays possible.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
