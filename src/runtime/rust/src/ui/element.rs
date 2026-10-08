@@ -522,7 +522,7 @@ fn attribute_is_inert<M>(attr: &Attribute<M>) -> bool {
         | Attribute::AttrFontWhiteSpace(_)
         | Attribute::AttrPointer
         | Attribute::AttrTransition(_, _) => true,
-        Attribute::AttrStyle(key, _) => LAYOUT_MARKERS.iter().any(|m| *m == key.as_str()),
+        Attribute::AttrStyle(key, _) => LAYOUT_MARKERS.contains(&key.as_str()),
         Attribute::AttrDescribe(desc) => description_is_inert(desc),
         Attribute::AttrWidth(_)
         | Attribute::AttrHeight(_)
