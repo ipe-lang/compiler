@@ -196,6 +196,20 @@ pub enum Description {
     DescLiveAssertive,
     DescButton,
     DescParagraph,
+    /// A document section; its first child may be its heading.
+    DescSection,
+    /// The heading of the enclosing section, ranked by section depth.
+    DescSectionHeading,
+    /// A preformatted block of code.
+    DescCodeBlock,
+    /// An inline run of code.
+    DescCode,
+    /// An inline run of keyboard input.
+    DescKbd,
+    /// A column of text blocks.
+    DescTextColumn,
+    /// A form that groups input controls.
+    DescForm,
 }
 
 impl Description {
@@ -213,10 +227,113 @@ impl Description {
             | Self::DescLivePolite
             | Self::DescLiveAssertive
             | Self::DescButton
-            | Self::DescParagraph => None,
+            | Self::DescParagraph
+            | Self::DescSection
+            | Self::DescSectionHeading
+            | Self::DescCodeBlock
+            | Self::DescCode
+            | Self::DescKbd
+            | Self::DescTextColumn
+            | Self::DescForm => None,
         }
     }
 }
+
+/// How a text box treats white-space and line breaks.
+///
+/// The CSS `white-space` keyword of each mode is its `css()` text; the terminal
+/// renderer reads the same mode through `wraps()` and `preserves_newlines()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum WhiteSpace {
+    #[default]
+    Normal,
+    NoWrap,
+    Pre,
+    PreWrap,
+    PreLine,
+    BreakSpaces,
+}
+
+impl WhiteSpace {
+    /// Every mode, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::Normal,
+        Self::NoWrap,
+        Self::Pre,
+        Self::PreWrap,
+        Self::PreLine,
+        Self::BreakSpaces,
+    ];
+
+    /// The CSS `white-space` keyword of this mode.
+    #[must_use]
+    pub const fn css(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::NoWrap => "nowrap",
+            Self::Pre => "pre",
+            Self::PreWrap => "pre-wrap",
+            Self::PreLine => "pre-line",
+            Self::BreakSpaces => "break-spaces",
+        }
+    }
+
+    /// True when a line longer than its box wraps.
+    #[must_use]
+    pub const fn wraps(self) -> bool {
+        match self {
+            Self::Normal | Self::PreWrap | Self::PreLine | Self::BreakSpaces => true,
+            Self::NoWrap | Self::Pre => false,
+        }
+    }
+
+    /// True when a newline in the text starts a new line.
+    #[must_use]
+    pub const fn preserves_newlines(self) -> bool {
+        match self {
+            Self::Pre | Self::PreWrap | Self::PreLine | Self::BreakSpaces => true,
+            Self::Normal | Self::NoWrap => false,
+        }
+    }
+}
+
+/// True when two ASCII keywords are byte-equal.
+const fn same_keyword(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.split_first(), b.split_first()) {
+            (None, None) => return true,
+            (Some((x, a_rest)), Some((y, b_rest))) => {
+                if *x != *y {
+                    return false;
+                }
+                a = a_rest;
+                b = b_rest;
+            }
+            (Some(_), None) | (None, Some(_)) => return false,
+        }
+    }
+}
+
+/// True when the `css()` texts of `WhiteSpace::ALL` are pairwise distinct.
+const fn white_space_texts_distinct() -> bool {
+    let mut rest: &[WhiteSpace] = &WhiteSpace::ALL;
+    while let Some((head, tail)) = rest.split_first() {
+        let mut others = tail;
+        while let Some((other, more)) = others.split_first() {
+            if same_keyword(head.css(), other.css()) {
+                return false;
+            }
+            others = more;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if two `WhiteSpace` modes share a CSS keyword [ledger #boundary]
+const _: () = assert!(white_space_texts_distinct());
 
 /// `Ipe.Ui.LayoutContext` — the flex direction a parent imposes on its children.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -289,6 +406,8 @@ pub enum Attribute<M> {
     AttrTransition(String, bool),
     AttrGridTracks(String, String),
     AttrAnimation(String, String, String, bool),
+    /// `Font.whiteSpace` — the closed white-space mode of a text box.
+    AttrFontWhiteSpace(WhiteSpace),
 }
 
 /// `Ipe.Ui.Element msg` — the layout tree. Variant order matches
@@ -305,6 +424,256 @@ pub enum Element<M> {
     /// verbatim by the terminal backend and embeddable as an island inside an
     /// otherwise-structured `Ipe.Ui` view under `Tui.tea`.
     Cells(Vec<Vec<char>>),
+}
+
+/// Tagged elements that present a box of their own with no child content: an
+/// image, a rule, a form control, or an embedded document, video or gauge.
+/// `input` and `audio` are judged by `presents_itself`.
+const SELF_PRESENTING_TAGS: [&str; 12] = [
+    "img", "hr", "embed", "textarea", "select", "iframe", "object", "canvas", "video", "progress",
+    "meter", "input",
+];
+
+/// Tags that hold nothing of their own: a generic container, or a line or word
+/// break. Every other tag may carry behaviour without a visible box (a hidden
+/// input, an autoplaying `audio`, a `meta`, `link` or `source`), so dropping it
+/// would lose something.
+const INERT_TAGS: [&str; 5] = ["div", "span", "p", "br", "wbr"];
+
+/// The internal direction markers `ui_row_` / `ui_column_` and the content
+/// model place as `AttrStyle` keys: each only lays out children.
+const LAYOUT_MARKERS: [&str; 6] = [
+    "__row",
+    "__col",
+    "__inline",
+    "__inline_row",
+    "__inline_col",
+    "__wrappedrow",
+];
+
+/// True when a tagged element presents a box of its own whatever its children:
+/// a `SELF_PRESENTING_TAGS` member, except an `input` whose first `type`
+/// attribute is `hidden`, and an `audio` only when it carries `controls` (an
+/// `audio` without them renders nothing).
+fn presents_itself<M>(tag: &str, attrs: &[Attribute<M>]) -> bool {
+    if tag.eq_ignore_ascii_case("audio") {
+        return attrs.iter().any(|a| {
+            matches!(a, Attribute::AttrAttribute(name, _) if name.eq_ignore_ascii_case("controls"))
+        });
+    }
+    if tag.eq_ignore_ascii_case("input") {
+        let input_type = attrs.iter().find_map(|a| match a {
+            Attribute::AttrAttribute(name, value) if name.eq_ignore_ascii_case("type") => {
+                Some(value.as_str())
+            }
+            _ => None,
+        });
+        return !input_type.is_some_and(|t| t.eq_ignore_ascii_case("hidden"));
+    }
+    SELF_PRESENTING_TAGS
+        .iter()
+        .any(|t| tag.eq_ignore_ascii_case(t))
+}
+
+/// True when a description adds nothing to an element with no content. A
+/// landmark, a label and a button are announced or focusable even when empty.
+const fn description_is_inert(desc: &Description) -> bool {
+    match desc {
+        Description::NoDescription
+        | Description::DescHeading(_)
+        | Description::DescParagraph
+        | Description::DescSection
+        | Description::DescSectionHeading
+        | Description::DescCodeBlock
+        | Description::DescCode
+        | Description::DescKbd
+        | Description::DescTextColumn
+        | Description::DescForm => true,
+        Description::DescLivePolite
+        | Description::DescLiveAssertive
+        | Description::DescMain
+        | Description::DescNavigation
+        | Description::DescContentInfo
+        | Description::DescComplementary
+        | Description::DescLabel(_)
+        | Description::DescButton => false,
+    }
+}
+
+/// True when an attribute adds nothing to an element with no content: text
+/// styling, alignment, a cursor, a transition, or a layout marker. A size, a
+/// box decoration, a class, an author HTML attribute, an event or an overlay
+/// may each make an empty element visible, announced or interactive.
+fn attribute_is_inert<M>(attr: &Attribute<M>) -> bool {
+    match attr {
+        Attribute::NoAttribute
+        | Attribute::AttrAlignX(_)
+        | Attribute::AttrAlignY(_)
+        | Attribute::AttrFontSize(_)
+        | Attribute::AttrFontColor(_)
+        | Attribute::AttrFontFamily(_)
+        | Attribute::AttrFontWeight(_)
+        | Attribute::AttrFontItalic
+        | Attribute::AttrFontUnderline
+        | Attribute::AttrFontDecoration(_)
+        | Attribute::AttrFontLetterSpacing(_)
+        | Attribute::AttrFontWordSpacing(_)
+        | Attribute::AttrFontAlign(_)
+        | Attribute::AttrFontWhiteSpace(_)
+        | Attribute::AttrPointer
+        | Attribute::AttrTransition(_, _) => true,
+        Attribute::AttrStyle(key, _) => LAYOUT_MARKERS.contains(&key.as_str()),
+        Attribute::AttrDescribe(desc) => description_is_inert(desc),
+        Attribute::AttrWidth(_)
+        | Attribute::AttrHeight(_)
+        | Attribute::AttrNearby(_, _)
+        | Attribute::AttrPadding(..)
+        | Attribute::AttrSpacing(_)
+        | Attribute::AttrClass(_)
+        | Attribute::AttrEvent(_)
+        | Attribute::AttrAttribute(_, _)
+        | Attribute::AttrChecked(_)
+        | Attribute::AttrBgColor(_)
+        | Attribute::AttrBgImage(_)
+        | Attribute::AttrBgGradient(_)
+        | Attribute::AttrBorderWidth(_)
+        | Attribute::AttrBorderWidthEach(..)
+        | Attribute::AttrBorderColor(_)
+        | Attribute::AttrBorderRounded(_)
+        | Attribute::AttrBorderStyle(_)
+        | Attribute::AttrBorderShadow(..)
+        | Attribute::AttrBorderInsetShadow(..)
+        | Attribute::AttrExplain
+        | Attribute::AttrOverflow(_, _)
+        | Attribute::AttrPseudoRule(_, _)
+        | Attribute::AttrGridTracks(_, _)
+        | Attribute::AttrAnimation(..) => false,
+    }
+}
+
+/// True when a node's own description and attributes add nothing.
+fn shell_is_inert<M>(desc: &Description, attrs: &[Attribute<M>]) -> bool {
+    description_is_inert(desc) && attrs.iter().all(attribute_is_inert)
+}
+
+/// What an element's subtree holds, judged in one walk by `presence`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// Nothing at all, so dropping the subtree loses nothing: empty elements,
+    /// text of Unicode `White_Space` only, and `Node`s or `INERT_TAGS`
+    /// elements whose description and attributes are inert.
+    Inert,
+    /// Something a drop would lose (a hidden input, an attribute-bearing box,
+    /// an empty landmark) but no visible or announced content.
+    Unannounced,
+    /// Visible or announced content: non-`White_Space` text, a tagged element
+    /// that presents itself (`presents_itself`), an `AttrNearby` overlay, raw
+    /// markup, or a cell grid.
+    Announced,
+}
+
+/// Classify an element's subtree in one walk that stops at the first announced
+/// content. The walk is iterative and stops at `MAX_HTML_DEPTH`, where it
+/// answers `Announced`, so the subtree is kept and the render's own depth
+/// ceiling decides.
+#[must_use]
+pub fn presence<M>(elem: &Element<M>) -> Presence {
+    let mut pending: Vec<(&Element<M>, usize)> = vec![(elem, 0)];
+    let mut lossy = false;
+    while let Some((node, depth)) = pending.pop() {
+        if depth >= crate::html::MAX_HTML_DEPTH {
+            return Presence::Announced;
+        }
+        let below = depth.saturating_add(1);
+        match node {
+            Element::Empty => {}
+            Element::Text(s) => {
+                if s.chars().any(|c| !c.is_whitespace()) {
+                    return Presence::Announced;
+                }
+            }
+            Element::Node(desc, attrs, kids) => {
+                if has_overlay(attrs) {
+                    return Presence::Announced;
+                }
+                lossy = lossy || !shell_is_inert(desc, attrs);
+                pending.extend(kids.iter().map(|k| (k, below)));
+            }
+            Element::TaggedNode(tag, desc, attrs, kids) => {
+                if presents_itself(tag, attrs) || has_overlay(attrs) {
+                    return Presence::Announced;
+                }
+                lossy = lossy
+                    || !INERT_TAGS.iter().any(|t| tag.eq_ignore_ascii_case(t))
+                    || !shell_is_inert(desc, attrs);
+                pending.extend(kids.iter().map(|k| (k, below)));
+            }
+            Element::Raw(_) | Element::Cells(_) => return Presence::Announced,
+        }
+    }
+    if lossy {
+        Presence::Unannounced
+    } else {
+        Presence::Inert
+    }
+}
+
+/// True when a node carries an `AttrNearby` overlay, which renders whatever
+/// the node's own children are.
+fn has_overlay<M>(attrs: &[Attribute<M>]) -> bool {
+    attrs
+        .iter()
+        .any(|a| matches!(a, Attribute::AttrNearby(_, _)))
+}
+
+/// What the first child of a node contributes as a section heading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionHead {
+    /// The node is not a `DescSection`, or its first child is not a
+    /// `DescSectionHeading`.
+    NoHeading,
+    /// The section's first child is an inert heading (`Presence::Inert`): it
+    /// renders nothing and the heading level is kept.
+    Empty,
+    /// The section's first child is a heading that announces nothing but holds
+    /// something a drop would lose: it renders and the heading level is kept.
+    Unannounced,
+    /// The section's first child is a heading with announced content: the
+    /// section's descendants rank one level deeper.
+    Present,
+}
+
+/// Classify a node's first child as its section heading. HTML and the terminal
+/// share this one rule, so only a section's first child is ever its heading,
+/// and only a `Node` heading: a `TaggedNode` renders its written tag and ranks
+/// nothing below it.
+///
+/// Cost: each call walks the first child's subtree once (`presence`, which
+/// stops at the first announced content). A node lies inside at most
+/// `MAX_HTML_DEPTH / 2` enclosing first-child headings, since a section and its
+/// heading take two levels and both renderers stop at a depth of 1024, so a
+/// render walks each node at most 512 times beyond its own visit.
+#[must_use]
+pub fn section_head<M>(desc: &Description, kids: &[Element<M>]) -> SectionHead {
+    if !matches!(desc, Description::DescSection) {
+        return SectionHead::NoHeading;
+    }
+    let Some(first) = kids.first() else {
+        return SectionHead::NoHeading;
+    };
+    match first {
+        Element::Node(Description::DescSectionHeading, _, _) => match presence(first) {
+            Presence::Inert => SectionHead::Empty,
+            Presence::Unannounced => SectionHead::Unannounced,
+            Presence::Announced => SectionHead::Present,
+        },
+        Element::Node(_, _, _)
+        | Element::TaggedNode(_, _, _, _)
+        | Element::Empty
+        | Element::Text(_)
+        | Element::Raw(_)
+        | Element::Cells(_) => SectionHead::NoHeading,
+    }
 }
 
 /// Move every `Element` nested inside a node's attributes (an `AttrNearby`

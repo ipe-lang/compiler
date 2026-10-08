@@ -19,7 +19,7 @@
 //! deserialization, by which a `UiTemplate` yields a handler or unescaped HTML.
 
 use super::element::{
-    Attribute, Description, Element, HAlign, HeadingLevel, Length, PseudoClass, VAlign,
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, PseudoClass, VAlign, WhiteSpace,
 };
 use crate::color::Color;
 use crate::html::{Attribute as HtmlAttribute, Event};
@@ -223,6 +223,13 @@ pub enum UiDescription {
     DescLiveAssertive,
     DescButton,
     DescParagraph,
+    DescSection,
+    DescSectionHeading,
+    DescCodeBlock,
+    DescCode,
+    DescKbd,
+    DescTextColumn,
+    DescForm,
 }
 
 impl UiDescription {
@@ -239,6 +246,13 @@ impl UiDescription {
             Description::DescLiveAssertive => Self::DescLiveAssertive,
             Description::DescButton => Self::DescButton,
             Description::DescParagraph => Self::DescParagraph,
+            Description::DescSection => Self::DescSection,
+            Description::DescSectionHeading => Self::DescSectionHeading,
+            Description::DescCodeBlock => Self::DescCodeBlock,
+            Description::DescCode => Self::DescCode,
+            Description::DescKbd => Self::DescKbd,
+            Description::DescTextColumn => Self::DescTextColumn,
+            Description::DescForm => Self::DescForm,
         }
     }
 
@@ -255,6 +269,13 @@ impl UiDescription {
             Self::DescLiveAssertive => Description::DescLiveAssertive,
             Self::DescButton => Description::DescButton,
             Self::DescParagraph => Description::DescParagraph,
+            Self::DescSection => Description::DescSection,
+            Self::DescSectionHeading => Description::DescSectionHeading,
+            Self::DescCodeBlock => Description::DescCodeBlock,
+            Self::DescCode => Description::DescCode,
+            Self::DescKbd => Description::DescKbd,
+            Self::DescTextColumn => Description::DescTextColumn,
+            Self::DescForm => Description::DescForm,
         }
     }
 }
@@ -309,6 +330,7 @@ pub enum UiTemplateAttr {
     Transition(String, bool),
     GridTracks(String, String),
     Animation(String, String, String, bool),
+    FontWhiteSpace(WhiteSpace),
     /// A model-dependent event handler reduced to an opaque HOLE (issue #1668):
     /// only the DOM event name and a compile-time-stable hole id, NEVER the
     /// `Msg` or a closure. The concrete `Msg` is resolved per render from a
@@ -398,6 +420,7 @@ impl UiTemplateAttr {
             Attribute::AttrAnimation(n, tail, body, respect) => {
                 Self::Animation(n.clone(), tail.clone(), body.clone(), *respect)
             }
+            Attribute::AttrFontWhiteSpace(ws) => Self::FontWhiteSpace(*ws),
             // Logic (a handler), a nested sub-view overlay, or the debug-only
             // outline toggle — not inert static attribute data. Refuse: keep the
             // subtree compiled.
@@ -538,6 +561,7 @@ impl UiTemplateAttr {
             Self::Animation(n, tail, body, respect) => {
                 Attribute::AttrAnimation(n.clone(), tail.clone(), body.clone(), *respect)
             }
+            Self::FontWhiteSpace(ws) => Attribute::AttrFontWhiteSpace(*ws),
             // A handler hole with NO resolution map cannot reconstruct a live
             // handler (it carries no `Msg`), so it drops to `NoAttribute` —
             // fail-closed by construction. [`Self::to_attr_resolved`] is the path
@@ -3053,5 +3077,75 @@ mod tests {
             Description::DescHeading(HeadingLevel::from_requested(1))
         );
         assert!(serde_json::from_str::<UiDescription>(r#"{"DescHeading":"2"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod text_role_tests {
+    use super::{UiDescription, UiTemplateAttr};
+    use crate::ui::element::{Attribute, Description, HeadingLevel, WhiteSpace};
+
+    /// Every `Description` survives the inert template form unchanged.
+    ///
+    /// The text roles included (CI job `test`).
+    #[test]
+    fn every_description_round_trips_through_the_template_form() {
+        let all = [
+            Description::NoDescription,
+            Description::DescMain,
+            Description::DescNavigation,
+            Description::DescContentInfo,
+            Description::DescComplementary,
+            Description::DescHeading(HeadingLevel::from_requested(3)),
+            Description::DescLabel("l".to_owned()),
+            Description::DescLivePolite,
+            Description::DescLiveAssertive,
+            Description::DescButton,
+            Description::DescParagraph,
+            Description::DescSection,
+            Description::DescSectionHeading,
+            Description::DescCodeBlock,
+            Description::DescCode,
+            Description::DescKbd,
+            Description::DescTextColumn,
+            Description::DescForm,
+        ];
+        for desc in all {
+            assert_eq!(UiDescription::from_desc(&desc).to_desc(), desc);
+        }
+    }
+
+    /// Every white-space keyword survives the inert template form unchanged.
+    ///
+    /// CI job `test`.
+    #[test]
+    fn every_white_space_round_trips_through_the_template_form() {
+        for ws in WhiteSpace::ALL {
+            let attr: Attribute<()> = Attribute::AttrFontWhiteSpace(ws);
+            let inert = UiTemplateAttr::from_attr(&attr);
+            assert_eq!(inert, Some(UiTemplateAttr::FontWhiteSpace(ws)));
+            let back: Option<Attribute<()>> = inert.map(|a| a.to_attr());
+            assert!(matches!(back, Some(Attribute::AttrFontWhiteSpace(w)) if w == ws));
+        }
+    }
+
+    /// A text role decodes from the unit-variant JSON the template carries.
+    ///
+    /// A keyword outside the closed set is refused (CI job `test`).
+    #[cfg(feature = "json")]
+    #[test]
+    fn text_roles_decode_from_unit_json_and_unknown_keywords_refuse() {
+        let desc: Result<UiDescription, _> = serde_json::from_str(r#""DescCodeBlock""#);
+        assert!(matches!(desc, Ok(UiDescription::DescCodeBlock)));
+        let attr: Result<UiTemplateAttr, _> =
+            serde_json::from_str(r#"{"FontWhiteSpace":"PreWrap"}"#);
+        assert!(matches!(
+            attr,
+            Ok(UiTemplateAttr::FontWhiteSpace(WhiteSpace::PreWrap))
+        ));
+        let refused: Result<UiTemplateAttr, _> =
+            serde_json::from_str(r#"{"FontWhiteSpace":"pre;color:red"}"#);
+        assert!(refused.is_err());
     }
 }
