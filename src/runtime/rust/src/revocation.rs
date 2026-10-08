@@ -615,10 +615,16 @@ pub const MAX_SESSION_CREDENTIALS: usize = 8;
 
 /// The credentials a channel owner (a Web session, a `Server` request) is bound
 /// to; at most [`MAX_SESSION_CREDENTIALS`], one per session id.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionBindings {
     credentials: Vec<SessionCredential>,
 }
+
+// The held credentials name callers and sessions, so `Debug` masks the set.
+crate::redact::redacting_debug!(SessionBindings {
+    shown: [],
+    masked: [credentials],
+});
 
 impl SessionBindings {
     /// Bind `credential`. A credential of a session id already held keeps one
