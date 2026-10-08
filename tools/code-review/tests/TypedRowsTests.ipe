@@ -13,7 +13,7 @@ import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (UnitPageState(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (appendSigned, check, codeText, countingVerifier, freshDir, rawRow, uid)
+import TestSupport exposing (appendSigned, check, codeText, countingVerifier, freshDir, rawKeyCheckFor, rawRow, uid)
 
 
 -- ── unit ids ────────────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ resyncBoundRefusesZeroCeiling =
 -- A review table built without the decision check, as an older or edited
 -- file may be, holding `rows`, beside an empty review log likewise built
 -- without its checks. Neither has guards, so only the reads, and the test's
--- own signed appends, run against them.
+-- own signed appends, run against them. Its head is bound to the test key.
 uncheckedReview : String -> List (List SqlValue) -> Task.Task Error Db
 uncheckedReview name rows =
     do
@@ -240,9 +240,14 @@ uncheckedReview name rows =
         Db.exec db "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" []
         Task.sequence (List.map (Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)") rows)
         Db.exec db "CREATE TABLE review_log (seq INTEGER PRIMARY KEY, uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, prev TEXT NOT NULL, mac TEXT NOT NULL)" []
-        Db.exec db "CREATE TABLE review_log_head (one INTEGER PRIMARY KEY, log_id TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL)" []
-        Db.exec db "INSERT INTO review_log_head (one, log_id, seq, head) VALUES (1, '00112233445566778899aabbccddeeff', 0, 'genesis')" []
+        Db.exec db "CREATE TABLE review_log_head (one INTEGER PRIMARY KEY, log_id TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL, key_check TEXT)" []
+        Db.exec db "INSERT INTO review_log_head (one, log_id, seq, head, key_check) VALUES (1, ?, 0, 'genesis', ?)" [ SqlString uncheckedLogId, SqlString (rawKeyCheckFor uncheckedLogId) ]
         Task.succeed db
+
+
+uncheckedLogId : String
+uncheckedLogId =
+    "00112233445566778899aabbccddeeff"
 
 
 -- True when `task` fails with an error that names `unit`.
@@ -270,16 +275,18 @@ failsWithout stored task =
 unknownStoredDecisionRefused : Task.Task Error Bool
 unknownStoredDecisionRefused =
     do
-        verify <- countingVerifier
         db <- uncheckedReview "ipe-review-unknown-decision" [ [ Uid.toSql (uid "u-m"), SqlString "h", SqlString "maybe", SqlNull (SqlString ""), SqlInt 1 ] ]
+        verify <- countingVerifier db
         byPair <- failsNaming (uid "u-m") "maybe" (LibDb.findDecision verify db (uid "u-m") "h")
         page <- failsNaming (uid "u-m") "maybe" (LibDb.historyPage verify db PageSize.history HistoryStart)
         bad <- uncheckedReview "ipe-review-bad-uid" [ [ SqlString "zz", SqlString "h", SqlString "approve", SqlNull (SqlString ""), SqlInt 1 ] ]
-        badUid <- failsWithout "zz" (LibDb.historyPage verify bad PageSize.history HistoryStart)
+        badVerify <- countingVerifier bad
+        badUid <- failsWithout "zz" (LibDb.historyPage badVerify bad PageSize.history HistoryStart)
         logged <- uncheckedReview "ipe-review-unknown-logged" []
         appendSigned logged (rawRow "u-l" "h" "maybe" Nothing)
-        loggedPair <- LibDb.findDecision verify logged (uid "u-l") "h"
-        loggedUid <- LibDb.findLatestForUid verify logged (uid "u-l")
+        loggedVerify <- countingVerifier logged
+        loggedPair <- LibDb.findDecision loggedVerify logged (uid "u-l") "h"
+        loggedUid <- LibDb.findLatestForUid loggedVerify logged (uid "u-l")
         Task.succeed (byPair && page && badUid && isTampered loggedPair && loggedUid == Nothing)
 
 
@@ -304,7 +311,7 @@ refuseWithNullReasonIsBlank =
     do
         db <- uncheckedReview "ipe-review-null-reason" []
         appendSigned db (rawRow "u-n" "h" "refuse" Nothing)
-        verify <- countingVerifier
+        verify <- countingVerifier db
         found <- LibDb.findDecision verify db (uid "u-n") "h"
         Task.succeed (isBlankRefusal found)
 

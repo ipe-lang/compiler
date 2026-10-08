@@ -129,8 +129,12 @@ openssl rand -hex 32      # → IPE_REVIEW_MAC_KEY
 The value must be exactly 64 hex characters; upper and lower case are the
 same key. Any other value set, empty or blank included, stops startup with a
 message that names the variable, never its value. The key is never logged,
-rendered or shown in an error. There is one key per review DB: a review DB
-signed under one key reads every row as unverified under another.
+rendered or shown in an error. There is one key per review DB: its log head
+holds a key check made with that key, and startup under any other key stops
+with "the review log was signed by a different `IPE_REVIEW_MAC_KEY`", naming
+the variable, never a key. A review DB with no key check yet is bound to the
+running key at startup only when every row of its log verifies under it;
+otherwise startup stops with the same message.
 
 **Read-only mode.** With `IPE_REVIEW_MAC_KEY` unset the server starts
 read-only and says so on stderr: the queue and history are shown, the Approve
@@ -153,14 +157,19 @@ in the queue.
 insert that would replace a row changes nothing. Each row links to the one
 before it, and `review_log_head` holds the last row's sequence number and
 signature; its one row can be neither deleted nor inserted again, and its
-log id never changes. On every read the app walks the chain; a gap in the sequence, a
-link that does not match, or a last row that differs from the head is a
-break. The policy on a break is strict: no row counts, the rows before the
-break included, the queue and history pages show "The review log's chain breaks at entry N:
-a decision was removed, reordered or replaced outside this tool.", and every
-new decision is refused until the log is repaired, so nothing is appended to a
-broken chain. Startup refuses a review DB whose append-only triggers are
-missing.
+log id never changes. Every page load and every decision walk the whole
+chain under the key, and both act on that one verdict; a gap in the
+sequence, a link that does not match, a row whose signature does not verify,
+or a last row that differs from the head is a break, and so is any row past
+the head or below the first entry. The policy on a break is strict: no row
+counts, the rows before the break included, the queue and history pages show
+"The review log's chain breaks at entry N: a decision was removed, reordered
+or replaced outside this tool." (or, for rows past the head or below the
+first entry, "The review log holds N entries past its head" or "before its
+first", then ": a decision was added outside this tool."), the queue page
+offers no Approve or Refuse, and every new decision is refused until the log
+is repaired, so nothing is appended to a broken chain. Startup refuses a
+review DB whose append-only triggers are missing.
 
 Removing the last rows and rewriting the head to match, or restoring an older
 copy of the whole file under the same key, cannot be told apart from a log
@@ -176,15 +185,11 @@ The index's `reviewed` copy is trusted only when its `reviewed_stamp` matches
 the log's current head and state: draining a decision moves the stamp along
 with the head, and any other stamp (a decision whose drain failed, an index
 file replaced by another, a decision made from another process) rebuilds the
-copy from the verified rows of the review DB before the page is read. A stamp
-of an intact chain is trusted only while the log still holds every entry up
-to the head, so an entry deleted below an unmoved head shows the banner on
-the next page load. That check counts entries, so an entry edited in place
-reads as not counted in the history at once, but its unit, already drained,
-stays out of the queue until the copy is next rebuilt: at the next decision
-or restart. A row written into `review_log` by hand, outside the app, does
-not move the head: reads ignore it, and every new decision is refused as a
-break at its entry. A replaced review DB has a new log id, so it re-opens
+copy from the verified rows of the review DB before the page is read. The
+stamp records the walk's verdict, so an entry deleted, edited or added
+outside the app, below the head or past it, changes the verdict at the next
+page load: the copy is rebuilt from it, the banner shows, and a unit whose
+decision no longer counts is back in the queue. A replaced review DB has a new log id, so it re-opens
 every unit the old one decided. Startup always rebuilds the copy once.
 
 The index DB is opened read-only for listing and read-write (never created) only
