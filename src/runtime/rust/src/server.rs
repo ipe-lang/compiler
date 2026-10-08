@@ -8261,6 +8261,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn token_verified_in_a_parallel_task_binds_to_the_request() {
+            crate::revocation::arm_process();
+            let cap = crate::jwt::now_unix_seconds() + 7200;
+            let token = hs256(&session_claims("parallel-subject", "parallel-jti", cap));
+            let bound = in_request_scope(async move {
+                let verify: IpeTask<String, bool> = Box::pin(async move {
+                    ok_res::<String, _>(matches!(
+                        crate::auth::auth_verify_token::<String>(SECRET.to_string(), token),
+                        IpeResult::Ok(_)
+                    ))
+                });
+                let verified = crate::task::task_parallel(vec![verify]).await;
+                assert!(
+                    matches!(verified, IpeResult::Ok(ref all) if all.as_slice() == [true]),
+                    "the armed kernel admits the token"
+                );
+                request_bindings()
+                    .and_then(|bindings| bindings.lock().ok().map(|held| held.len()))
+                    .unwrap_or_default()
+            })
+            .await;
+            assert_eq!(
+                bound, 1,
+                "a token a Task.parallel branch verified binds to the request"
+            );
+        }
+
+        #[tokio::test]
+        async fn ffi_spawned_task_inside_a_request_keeps_its_scope() {
+            let seen = in_request_scope(async {
+                let outer = request_bindings();
+                crate::task::ffi_spawn_guarded(async move {
+                    matches!(
+                        (request_bindings(), outer),
+                        (Some(inner), Some(outer)) if Arc::ptr_eq(&inner, &outer)
+                    )
+                })
+                .await
+            })
+            .await;
+            assert!(
+                matches!(seen, Ok(true)),
+                "a guarded foreign task binds into the request that spawned it"
+            );
+        }
+
+        #[tokio::test]
         async fn armed_channel_opened_outside_any_request_is_refused() {
             crate::revocation::arm_process();
             assert!(
