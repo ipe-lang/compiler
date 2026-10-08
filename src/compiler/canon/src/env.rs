@@ -2465,13 +2465,16 @@ mod builtin_ctor_registration_tests {
         }
     }
 
-    /// The `DbFailure` constructors, spelled bare and resolved in a fresh
-    /// environment.
-    fn db_failure_ctors(interner: &mut Interner) -> Option<(Env, Vec<ipe_intern::Symbol>)> {
+    /// The constructors of the builtin union `type_name`, spelled bare and
+    /// resolved in a fresh environment.
+    fn union_ctors(
+        interner: &mut Interner,
+        type_name: &str,
+    ) -> Option<(Env, Vec<ipe_intern::Symbol>)> {
         let env = Env::initial(Vec::new(), interner).ok()?;
         let union = crate::builtins::BUILTIN_UNIONS
             .iter()
-            .find(|u| u.type_name == "DbFailure")?;
+            .find(|u| u.type_name == type_name)?;
         let names = union
             .ctors
             .iter()
@@ -2485,7 +2488,7 @@ mod builtin_ctor_registration_tests {
     #[test]
     fn db_failures_are_not_ambient_unqualified() {
         let mut interner = Interner::new();
-        let built = db_failure_ctors(&mut interner);
+        let built = union_ctors(&mut interner, "DbFailure");
         assert!(built.is_some(), "the base env and the DbFailure row");
         let Some((env, names)) = built else {
             return;
@@ -2505,7 +2508,7 @@ mod builtin_ctor_registration_tests {
     #[test]
     fn db_failures_resolve_qualified() {
         let mut interner = Interner::new();
-        let built = db_failure_ctors(&mut interner);
+        let built = union_ctors(&mut interner, "DbFailure");
         assert!(built.is_some(), "the base env and the DbFailure row");
         let Some((env, names)) = built else {
             return;
@@ -2526,6 +2529,57 @@ mod builtin_ctor_registration_tests {
             assert!(
                 members.contains_key(&sym),
                 "`Db.{:?}` must resolve to a DbFailure constructor",
+                interner.resolve(sym)
+            );
+        }
+    }
+
+    /// A bare `Expired` (or any `AuthError` constructor) is not an ambient
+    /// constructor: only `Auth.Expired` names it.
+    #[test]
+    fn auth_errors_are_not_ambient_unqualified() {
+        let mut interner = Interner::new();
+        let built = union_ctors(&mut interner, "AuthError");
+        assert!(built.is_some(), "the base env and the AuthError row");
+        let Some((env, names)) = built else {
+            return;
+        };
+        assert_eq!(names.len(), 9);
+        for sym in names {
+            assert!(
+                matches!(env.module_scope.expr.resolve(sym), Resolved::Missing),
+                "{:?} must not be an ambient unqualified constructor",
+                interner.resolve(sym)
+            );
+        }
+    }
+
+    /// Every `AuthError` constructor is pooled under the `Auth` kernel module,
+    /// which an import of `Ipe.Auth` installs as `Auth.<Ctor>`.
+    #[test]
+    fn auth_errors_resolve_qualified() {
+        let mut interner = Interner::new();
+        let built = union_ctors(&mut interner, "AuthError");
+        assert!(built.is_some(), "the base env and the AuthError row");
+        let Some((env, names)) = built else {
+            return;
+        };
+        let auth = interner.intern("Auth");
+        assert!(auth.is_ok(), "{auth:?}");
+        let Ok(auth) = auth else {
+            return;
+        };
+        let members = env
+            .kernel_module_of(auth)
+            .and_then(|module| env.kernel_ctors.get(&module));
+        assert!(members.is_some(), "`Auth` kernel module must carry ctors");
+        let Some(members) = members else {
+            return;
+        };
+        for sym in names {
+            assert!(
+                members.contains_key(&sym),
+                "`Auth.{:?}` must resolve to an AuthError constructor",
                 interner.resolve(sym)
             );
         }

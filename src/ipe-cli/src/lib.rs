@@ -178,26 +178,42 @@ const fn names_eq(a: &[&str], b: &[&str]) -> bool {
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the canon DbFailure row drifts from the runtime IpeDbFailure variants, the database-failure SEAL [ledger #boundary]
 #[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
 const _: () = assert!(
-    db_failure_eq(
+    nullary_union_eq(
         ipe_canon::builtins::BUILTIN_UNIONS,
-        &ipe_runtime_rust::IpeDbFailure::ALL,
+        b"DbFailure",
+        &ipe_runtime_rust::IpeDbFailure::ROWS,
     ),
     "the canon DbFailure row must match the runtime IpeDbFailure variants"
 );
 
-/// Whether the `DbFailure` row of `unions` lists `runtime`'s variants in
-/// order, each nullary, with its declaration index and its discriminant both
-/// equal to its position.
-const fn db_failure_eq(
+// The same agreement for the `Auth.verifyToken` refusal union: the resolver's
+// `AuthError` row and the runtime's `IpeAuthError` name the same nullary
+// constructors at the same dense indices.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the canon AuthError row drifts from the runtime IpeAuthError variants, the token-refusal SEAL [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    nullary_union_eq(
+        ipe_canon::builtins::BUILTIN_UNIONS,
+        b"AuthError",
+        &ipe_runtime_rust::IpeAuthError::ROWS,
+    ),
+    "the canon AuthError row must match the runtime IpeAuthError variants"
+);
+
+/// Whether the `type_name` row of `unions` lists `runtime`'s
+/// `(constructor name, discriminant)` rows in order, each nullary, with its
+/// declaration index and its discriminant both equal to its position.
+const fn nullary_union_eq(
     unions: &[ipe_canon::builtins::BuiltinUnion],
-    runtime: &[ipe_runtime_rust::IpeDbFailure],
+    type_name: &[u8],
+    runtime: &[(&str, usize)],
 ) -> bool {
     let mut unions = unions;
     let ctors = loop {
         match unions {
             [] => return false,
             [union, rest @ ..] => {
-                if text::bytes_eq(union.type_name.as_bytes(), b"DbFailure") {
+                if text::bytes_eq(union.type_name.as_bytes(), type_name) {
                     break union.ctors;
                 }
                 unions = rest;
@@ -208,10 +224,13 @@ const fn db_failure_eq(
     loop {
         match (left, right) {
             ([], []) => return true,
-            ([(name, index, arity), left_rest @ ..], [failure, right_rest @ ..]) => {
-                if !text::bytes_eq(name.as_bytes(), failure.ctor_name().as_bytes())
+            (
+                [(name, index, arity), left_rest @ ..],
+                [(variant, discriminant), right_rest @ ..],
+            ) => {
+                if !text::bytes_eq(name.as_bytes(), variant.as_bytes())
                     || *index != position
-                    || *failure as usize != position
+                    || *discriminant != position
                     || *arity != 0
                 {
                     return false;
@@ -225,6 +244,74 @@ const fn db_failure_eq(
             }
             _ => return false,
         }
+    }
+}
+
+#[cfg(test)]
+mod nullary_union_tests {
+    use super::nullary_union_eq;
+    use ipe_canon::builtins::BuiltinUnion;
+
+    const fn union(ctors: &'static [(&'static str, usize, usize)]) -> BuiltinUnion {
+        BuiltinUnion {
+            type_name: "Pair",
+            ctors,
+            exhaust_union: true,
+            qualified_home: None,
+        }
+    }
+
+    const ROWS: [(&str, usize); 2] = [("First", 0), ("Second", 1)];
+
+    /// The control: a row naming the runtime variants in order agrees.
+    #[test]
+    fn a_matching_row_agrees() {
+        let unions = [union(&[("First", 0, 0), ("Second", 1, 0)])];
+        assert!(nullary_union_eq(&unions, b"Pair", &ROWS));
+    }
+
+    /// Every drift the build-time assertion exists to catch is a disagreement.
+    #[test]
+    fn every_drift_disagrees() {
+        let cases: [(&[BuiltinUnion], &[(&str, usize)], &str); 6] = [
+            (
+                &[union(&[("Second", 0, 0), ("First", 1, 0)])],
+                &ROWS,
+                "a reordered row",
+            ),
+            (
+                &[union(&[("First", 0, 0), ("Other", 1, 0)])],
+                &ROWS,
+                "a renamed constructor",
+            ),
+            (&[union(&[("First", 0, 0)])], &ROWS, "a shorter canon row"),
+            (
+                &[union(&[("First", 0, 0), ("Second", 1, 0)])],
+                &[("First", 0)],
+                "a shorter runtime row",
+            ),
+            (
+                &[union(&[("First", 0, 0), ("Second", 1, 1)])],
+                &ROWS,
+                "a constructor with a payload",
+            ),
+            (
+                &[union(&[("First", 0, 0), ("Second", 1, 0)])],
+                &[("First", 0), ("Second", 2)],
+                "a discriminant off its position",
+            ),
+        ];
+        for (unions, runtime, why) in cases {
+            assert!(!nullary_union_eq(unions, b"Pair", runtime), "{why}");
+        }
+    }
+
+    /// A type name no row carries is a disagreement, never a vacuous match.
+    #[test]
+    fn an_absent_type_name_disagrees() {
+        let unions = [union(&[("First", 0, 0), ("Second", 1, 0)])];
+        assert!(!nullary_union_eq(&unions, b"Absent", &ROWS));
+        assert!(!nullary_union_eq(&[], b"Pair", &[]));
     }
 }
 

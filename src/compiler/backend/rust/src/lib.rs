@@ -3740,6 +3740,12 @@ impl<'a> EmitCtx<'a> {
         if home.0.is_empty() && matches!(self.interner.resolve(ty), Some("DbFailure")) {
             return Ok("IpeDbFailure");
         }
+        // `AuthError` is a Prelude-built-in enum backed by the runtime
+        // `ipe_runtime::error::IpeAuthError`, with no `EnumDef`; routed here so
+        // an annotation or an `Err e` binder resolves in type position.
+        if home.0.is_empty() && matches!(self.interner.resolve(ty), Some("AuthError")) {
+            return Ok("IpeAuthError");
+        }
         self.enum_names
             .get(&(home.clone(), ty))
             .map(String::as_str)
@@ -3812,6 +3818,9 @@ impl<'a> EmitCtx<'a> {
             // `DbFailure` is backed by `IpeDbFailure`; `Db.UniqueViolation`
             // emits `IpeDbFailure::UniqueViolation`, variant names verbatim.
             Some("DbFailure") => Some("IpeDbFailure"),
+            // `AuthError` is backed by `IpeAuthError`; `Auth.Expired` emits
+            // `IpeAuthError::Expired`, variant names verbatim.
+            Some("AuthError") => Some("IpeAuthError"),
             // `Ipe.Cache.Cache` is backed by the non-generic runtime enum
             // `IpeCacheHandle { Cache(i64) }`. Its `EnumDef` is suppressed in
             // `ipe_lower` (no `enum_names` entry, so the guard above lets this

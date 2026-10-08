@@ -268,6 +268,10 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("Attribute", Reserved, View).tagged(BuiltinTag::UiAttribute),
     // `Ipe.Server`'s authed-route descriptors: `AuthConfig` carries the token-verification `Secret`.
     bare("AuthConfig", Reserved, Opaque).tagged(BuiltinTag::AuthConfig),
+    // `Ipe.Auth`'s closed token-refusal ADT, the error of `Auth.verifyToken`; its constructors are `Auth.`-qualified.
+    bare("AuthError", LoweredBelowGuard, Opaque)
+        .via(&["Auth"])
+        .tagged(BuiltinTag::AuthError),
     bare("Bool", Reserved, Plain).tagged(BuiltinTag::Bool),
     bare("Bytes", Reserved, Plain).tagged(BuiltinTag::Bytes),
     bare("Cells", Reserved, Opaque),
