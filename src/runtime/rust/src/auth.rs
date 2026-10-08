@@ -10,6 +10,7 @@
 
 use super::*;
 use std::collections::HashMap;
+#[cfg(feature = "db")]
 use std::sync::OnceLock;
 
 /// A fixed, valid cost-12 bcrypt hash used ONLY to make the unknown-email login
@@ -867,6 +868,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_email_normalized_case_insensitive() {
         let pool = match DbPool::connect("sqlite::memory:").await {
@@ -1014,6 +1016,7 @@ mod tests {
         assert!(!message.contains("index"), "{message}");
     }
 
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_register_login_flow() {
         let pool = DbPool::connect("sqlite::memory:").await.expect("connect");
@@ -1062,6 +1065,7 @@ mod tests {
         assert!(matches!(token2, IpeResult::Err(_)));
     }
 
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_login_id_decode_failure_yields_err_not_user_zero() {
         let pool = match DbPool::connect("sqlite::memory:").await {
