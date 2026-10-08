@@ -249,6 +249,20 @@ pub fn jwt_encode_hs256<E: From<String>>(
     IpeResult::Ok(format!("{}.{}", signing_input, sig))
 }
 
+/// The refusal text of a failed `Jwt.decode` signature check, named by what
+/// `jsonwebtoken` refused. The error's own text is never echoed: a `serde`
+/// message can quote attacker-chosen token bytes.
+fn verify_refusal(e: &jsonwebtoken::errors::Error) -> &'static str {
+    match e.kind() {
+        jsonwebtoken::errors::ErrorKind::InvalidSignature => "jwt-decode: invalid signature",
+        // `ErrorKind` is `#[non_exhaustive]`. Every other kind refuses the token
+        // without a signature mismatch: a header or claims set that does not
+        // parse (a date claim written as an array or object included), or an
+        // algorithm the key does not serve.
+        _ => "jwt-decode: malformed token (header, claims set, or algorithm)",
+    }
+}
+
 /// Ipê `Jwt_decodeHs256 : String -> String -> Result Error String`
 pub fn jwt_decode_hs256<E: From<String>>(secret: String, token: String) -> IpeResult<E, String> {
     // Reject verification under a sub-32-byte HMAC key — see jwt_encode_hs256.
@@ -626,8 +640,8 @@ pub fn ipe_jwt_decode(
         val.validate_nbf = false;
         val.required_spec_claims = HashSet::new();
         val.validate_aud = false;
-        if decode::<JsonValue>(&token, &key, &val).is_err() {
-            return IpeResult::Err("jwt-decode: invalid signature".into());
+        if let Err(e) = decode::<JsonValue>(&token, &key, &val) {
+            return IpeResult::Err(verify_refusal(&e).into());
         }
     } else if let Some(pem) = algorithm_descriptor.strip_prefix("RS256:") {
         let key = match DecodingKey::from_rsa_pem(pem.as_bytes()) {
@@ -639,8 +653,8 @@ pub fn ipe_jwt_decode(
         val.validate_nbf = false;
         val.required_spec_claims = HashSet::new();
         val.validate_aud = false;
-        if decode::<JsonValue>(&token, &key, &val).is_err() {
-            return IpeResult::Err("jwt-decode: invalid signature".into());
+        if let Err(e) = decode::<JsonValue>(&token, &key, &val) {
+            return IpeResult::Err(verify_refusal(&e).into());
         }
     } else {
         // See `ipe_jwt_encode`'s matching arm: never byte-slice or echo the
@@ -1049,10 +1063,29 @@ mod tests {
         let tok = make_token_with_time(Some(9999999999), None);
         let desc =
             crate::secret::secret_from_string("HS256:wrong-secret-key-0123456789abcde".to_string());
-        assert!(
-            matches!(ipe_jwt_decode(desc, 500, tok), IpeResult::Err(_)),
-            "wrong key must be rejected"
-        );
+        match ipe_jwt_decode(desc, 500, tok) {
+            IpeResult::Err(e) => assert!(
+                e.to_string().ends_with("jwt-decode: invalid signature"),
+                "wrong key must be refused as a signature mismatch: {e}"
+            ),
+            IpeResult::Ok(p) => panic!("wrong key must be rejected, got Ok({p})"),
+        }
+    }
+
+    /// A token whose algorithm the key does not serve is refused as malformed,
+    /// never reported as a signature mismatch.
+    #[test]
+    fn ipe_jwt_decode_algorithm_mismatch_refused() {
+        let tok = make_token_with_time(Some(9999999999), None);
+        let desc = crate::secret::secret_from_string(format!("RS256:{RS256_PUB_PEM}"));
+        match ipe_jwt_decode(desc, 500, tok) {
+            IpeResult::Err(e) => assert!(
+                e.to_string()
+                    .ends_with("jwt-decode: malformed token (header, claims set, or algorithm)"),
+                "HS256 token under an RS256 key: {e}"
+            ),
+            IpeResult::Ok(p) => panic!("algorithm mismatch must be rejected, got Ok({p})"),
+        }
     }
 
     /// Return value is the payload JSON string (verified base64url-decode).
@@ -1284,8 +1317,8 @@ mod tests {
     }
 
     /// An array or object date claim never reaches the date reader:
-    /// `jsonwebtoken` cannot read the claim set, so the decode is refused
-    /// with the signature-path refusal.
+    /// `jsonwebtoken` cannot read the claim set, so the decode is refused as
+    /// a malformed token, never as a signature mismatch.
     #[test]
     fn builder_structured_date_claims_refused() {
         for claims in [
@@ -1293,7 +1326,10 @@ mod tests {
             r#"{"sub":"x","nbf":{"at":1000}}"#,
         ] {
             let msg = refusal(builder_hs256(500, hs256_token(claims)));
-            assert!(msg.ends_with("invalid signature"), "{claims}: {msg}");
+            assert!(
+                msg.ends_with("jwt-decode: malformed token (header, claims set, or algorithm)"),
+                "{claims}: {msg}"
+            );
         }
     }
 
