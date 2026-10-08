@@ -768,6 +768,54 @@ fn composed_full_modset_is_closed() {
     assert_mask_closed(&runtime_root, &interner, main, all, &mut dep_cache);
 }
 
+/// A vendored `revocation` module publishes on `tokio::sync::watch` whenever the
+/// `tokio` feature is on, so every emitted manifest that declares the module and
+/// enables `tokio` must extend the `tokio` dependency with `"sync"`. Checked on
+/// the featureless base, every singleton, and the all-on mask.
+#[test]
+fn declared_revocation_module_implies_tokio_sync() {
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    let all: u32 = (1u32 << FLAG_COUNT) - 1;
+    let masks = std::iter::once(0u32)
+        .chain((0..FLAG_COUNT).map(|bit| 1u32 << bit))
+        .chain(std::iter::once(all));
+    let mut revocation_cases = 0usize;
+    for mask in masks {
+        let prog = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            modules: vec![module_for_mask(main, mask)],
+        };
+        let emitted = RustBackend::new(&interner)
+            .emit(&prog)
+            .expect("emit must succeed for a body-free program");
+        let mod_rs = emitted.files.get("src/ipe_runtime/mod.rs").expect("mod.rs");
+        let cargo = &emitted.cargo_toml;
+        let tokio_on = cargo
+            .lines()
+            .any(|l| l.starts_with("default = [") && l.contains("\"tokio\""));
+        if !declared_modules(mod_rs).contains("revocation") || !tokio_on {
+            continue;
+        }
+        revocation_cases += 1;
+        let tokio_dep = cargo
+            .lines()
+            .find(|l| l.starts_with("tokio = {"))
+            .expect("a manifest with the tokio feature on must declare the tokio dependency");
+        assert!(
+            tokio_dep.contains("\"sync\""),
+            "SEAL breach: `revocation` is declared with the tokio feature on, but the \
+             tokio dependency lacks `sync` (`tokio::sync::watch` would not compile) \
+             - flag mask {mask:#019b}: {tokio_dep}"
+        );
+    }
+    assert!(
+        revocation_cases > 0,
+        "no sampled mask declared `revocation` on a tokio runtime - the check proved nothing"
+    );
+}
+
 // ── the sampled full-mask backstop (redundancy, not the proof) ──────────────
 
 /// A bounded, deterministic sample of full masks run through the whole per-mask
