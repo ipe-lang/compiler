@@ -820,13 +820,19 @@ pub(crate) fn env_revocation_floor() -> RevocationMode {
 
 /// The installed `Web.withRevocation` mode; `Off` when none is installed or
 /// this build compiles no reader for it.
-#[cfg(feature = "jwt")]
+#[cfg(all(feature = "jwt", feature = "web-core", feature = "server"))]
 pub(crate) fn installed_revocation_mode() -> RevocationMode {
-    #[cfg(all(feature = "web-core", feature = "server"))]
-    let installed = INSTALLED.get().and_then(|c| c.auth_revocation_mode);
-    #[cfg(not(all(feature = "web-core", feature = "server")))]
-    let installed: Option<RevocationMode> = None;
-    installed.unwrap_or(RevocationMode::Off)
+    INSTALLED
+        .get()
+        .and_then(|c| c.auth_revocation_mode)
+        .unwrap_or(RevocationMode::Off)
+}
+
+/// The installed `Web.withRevocation` mode; `Off` when none is installed or
+/// this build compiles no reader for it.
+#[cfg(all(feature = "jwt", not(all(feature = "web-core", feature = "server"))))]
+pub(crate) const fn installed_revocation_mode() -> RevocationMode {
+    RevocationMode::Off
 }
 
 /// Why a `Web` app cannot start under the auth configuration it was given.
