@@ -11177,13 +11177,32 @@ fn promote_fn_field_value_carrier(value: Expr) -> Expr {
 /// [`Diagnostic::CompilerBug`] if the shared table has no `DbFailure` row, or
 /// the interner is exhausted.
 pub fn intern_db_failure_ctors(interner: &mut Interner) -> DResult<Vec<Symbol>> {
+    intern_builtin_union_ctors(interner, "DbFailure", "ipe_lower::intern_db_failure_ctors")
+}
+
+/// The `AuthError` constructor symbols, in the shared builtin table's order.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if the shared table has no `AuthError` row, or
+/// the interner is exhausted.
+pub fn intern_auth_error_ctors(interner: &mut Interner) -> DResult<Vec<Symbol>> {
+    intern_builtin_union_ctors(interner, "AuthError", "ipe_lower::intern_auth_error_ctors")
+}
+
+/// The constructor symbols of the shared builtin union `type_name`, in table
+/// order; `where_` names the caller in the refusal.
+fn intern_builtin_union_ctors(
+    interner: &mut Interner,
+    type_name: &str,
+    where_: &'static str,
+) -> DResult<Vec<Symbol>> {
     let union = ipe_canon::builtins::BUILTIN_UNIONS
         .iter()
-        .find(|u| u.type_name == "DbFailure")
+        .find(|u| u.type_name == type_name)
         .ok_or_else(|| {
             bug(
-                "ipe_lower::intern_db_failure_ctors",
-                "the shared builtin table has no `DbFailure` row",
+                where_,
+                format!("the shared builtin table has no `{type_name}` row"),
             )
         })?;
     union
@@ -11280,6 +11299,11 @@ pub struct BuiltinCtors {
     // its nullary constructors in the shared builtin table's order.
     pub db_failure: Symbol,
     pub db_failure_ctors: Vec<Symbol>,
+    // ── AuthError ADT ─────────────────────────────────
+    // The closed `Auth.verifyToken` refusal union; its nullary constructors in
+    // the shared builtin table's order.
+    pub auth_error: Symbol,
+    pub auth_error_ctors: Vec<Symbol>,
     // ── HttpMethod ADT ──────────────────────────────────
     // `HttpMethod` has 7 nullary verb constructors.
     pub http_method: Symbol,
@@ -12837,6 +12861,15 @@ impl<'a> Lowerer<'a> {
             builtins.db_failure_ctors.clone(),
         );
         for &ctor in &builtins.db_failure_ctors {
+            ctor_arity.insert((prelude_home.clone(), ctor), 0);
+        }
+        // ── AuthError ADT ──────────────────────────────────
+        // Nullary `Auth.`-qualified constructors, seeded like `DbFailure`.
+        enum_variants.insert(
+            (prelude_home.clone(), builtins.auth_error),
+            builtins.auth_error_ctors.clone(),
+        );
+        for &ctor in &builtins.auth_error_ctors {
             ctor_arity.insert((prelude_home.clone(), ctor), 0);
         }
         // ── HttpMethod ADT ─────────────────────────────────
@@ -31693,6 +31726,9 @@ mod tests {
         let ed_database = interner.intern("Database").unwrap();
         let db_failure = interner.intern("DbFailure").unwrap();
         let db_failure_ctors = super::intern_db_failure_ctors(interner).unwrap();
+        // ── AuthError ADT ──────────────────────────────
+        let auth_error = interner.intern("AuthError").unwrap();
+        let auth_error_ctors = super::intern_auth_error_ctors(interner).unwrap();
 
         BuiltinCtors {
             maybe,
@@ -31778,6 +31814,9 @@ mod tests {
             ed_database,
             db_failure,
             db_failure_ctors,
+            // ── AuthError ─────────────────────────
+            auth_error,
+            auth_error_ctors,
             kernel_types: ipe_types::Builtins::new(interner).unwrap(),
         }
     }

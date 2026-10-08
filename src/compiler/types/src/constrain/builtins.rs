@@ -73,6 +73,9 @@ pub struct Builtins {
     /// `DbFailure` — the closed database-failure-cause union carried by
     /// `ErrorDetails.Database`.
     pub db_failure: Symbol,
+    /// `AuthError` — the closed, payload-free refusal union of
+    /// `Auth.verifyToken`.
+    pub auth_error: Symbol,
     /// `PanicInfo` / `TypeInfo` / `ErrorInfo` — NOMINAL type-constructor
     /// symbols (SEAL fix, see
     /// `docs/adr/0001-language-semantics-and-types.md`). The three payload
@@ -823,6 +826,7 @@ impl Builtins {
             ed_custom: interner.intern("Custom")?,
             ed_database: interner.intern("Database")?,
             db_failure: interner.intern("DbFailure")?,
+            auth_error: interner.intern("AuthError")?,
             panicinfo: interner.intern("PanicInfo")?,
             typeinfo: interner.intern("TypeInfo")?,
             errorinfo: interner.intern("ErrorInfo")?,
@@ -1158,6 +1162,7 @@ impl Builtins {
             "ErrorKind" => BuiltinTag::ErrorKind,
             "ErrorDetails" => BuiltinTag::ErrorDetails,
             "DbFailure" => BuiltinTag::DbFailure,
+            "AuthError" => BuiltinTag::AuthError,
             _ => return Err(payload_bug(type_name, "<union>")),
         };
         Ok((Some(tag), Vec::new()))
@@ -1215,6 +1220,18 @@ impl Builtins {
                 | "InvalidStatement"
                 | "Unreachable"
                 | "OtherFailure",
+            )
+            | (
+                "AuthError",
+                "Malformed"
+                | "BadSignature"
+                | "Expired"
+                | "NotYetValid"
+                | "MissingClaim"
+                | "Revoked"
+                | "RevocationUnavailable"
+                | "TooManyCredentials"
+                | "SecretTooShort",
             ) => Vec::new(),
             ("Maybe", "Just") | ("Result", "Ok") => vec![a()],
             ("Result", "Err") => vec![e()],

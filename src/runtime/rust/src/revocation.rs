@@ -451,6 +451,34 @@ impl std::fmt::Display for Denial {
 
 impl std::error::Error for Denial {}
 
+impl Denial {
+    /// Every variant, in declaration order.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 7] = [
+        Self::SubjectAbsent,
+        Self::SessionIdAbsent,
+        Self::NoDeadline,
+        Self::Revoked,
+        Self::StoreUnavailable,
+        Self::PastDeadline,
+        Self::BindingsFull,
+    ];
+
+    /// The `Auth.verifyToken` refusal this denial surfaces as.
+    #[must_use]
+    pub const fn auth_error(self) -> IpeAuthError {
+        match self {
+            Self::SubjectAbsent | Self::SessionIdAbsent | Self::NoDeadline => {
+                IpeAuthError::MissingClaim
+            }
+            Self::Revoked => IpeAuthError::Revoked,
+            Self::StoreUnavailable => IpeAuthError::RevocationUnavailable,
+            Self::PastDeadline => IpeAuthError::Expired,
+            Self::BindingsFull => IpeAuthError::TooManyCredentials,
+        }
+    }
+}
+
 /// The denial a store verdict carries, if any.
 const fn verdict_denial(verdict: Verdict) -> Result<(), Denial> {
     match verdict {
@@ -922,6 +950,27 @@ mod tests {
     // capacity bound operate on a local RevocationStore directly.
 
     const FAR_FUTURE: i64 = i64::MAX / 2;
+
+    #[test]
+    fn every_denial_maps_to_its_auth_error() {
+        let expected = [
+            (Denial::SubjectAbsent, IpeAuthError::MissingClaim),
+            (Denial::SessionIdAbsent, IpeAuthError::MissingClaim),
+            (Denial::NoDeadline, IpeAuthError::MissingClaim),
+            (Denial::Revoked, IpeAuthError::Revoked),
+            (
+                Denial::StoreUnavailable,
+                IpeAuthError::RevocationUnavailable,
+            ),
+            (Denial::PastDeadline, IpeAuthError::Expired),
+            (Denial::BindingsFull, IpeAuthError::TooManyCredentials),
+        ];
+        assert_eq!(expected.len(), Denial::ALL.len());
+        for ((denial, error), listed) in expected.into_iter().zip(Denial::ALL) {
+            assert_eq!(denial, listed, "{denial:?} out of order in ALL");
+            assert_eq!(denial.auth_error(), error, "{denial:?}");
+        }
+    }
 
     #[test]
     fn a_refused_capacity_builds_no_store_and_names_its_variable() {
@@ -1464,6 +1513,13 @@ mod tests {
         assert_eq!(
             gate().admit_in(&refused, &claims, "sub"),
             Err(Denial::StoreUnavailable)
+        );
+        assert_eq!(
+            gate()
+                .admit_in(&refused, &claims, "sub")
+                .map_err(Denial::auth_error),
+            Err(IpeAuthError::RevocationUnavailable),
+            "`Auth.verifyToken` surfaces an unanswerable store as its own refusal"
         );
         assert_eq!(
             gate().recheck_in(&refused, &credential, 0),

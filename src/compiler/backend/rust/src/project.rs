@@ -1349,7 +1349,8 @@ const TEA_TYPE_ALIASES: &str = "pub type IpeCmd<M> = ipe_runtime::tea::IpeCmd<M>
 /// Concrete wrappers appended to `main.rs` when the program uses Ipe.Auth
 /// kernels.  Each wrapper specialises the generic `E` type parameter to
 /// `IpeError` so call sites in user function bodies compile without requiring
-/// a turbofish annotation.
+/// a turbofish annotation. `auth_verify_token` is the exception: its error is
+/// the closed, payload-free `ipe_runtime::IpeAuthError`.
 ///
 /// `auth_sign_token` / `auth_verify_token` take a Ipê-typed
 /// `ipe_runtime::secret::Secret` (not `String`) at this boundary — "secrets
@@ -1385,7 +1386,7 @@ pub fn auth_sign_token(\n    \
 ) -> IpeResult<IpeError, String> {\n    \
     ipe_runtime::auth::auth_sign_token(ipe_runtime::secret::secret_reveal(secret), claims, expiry_seconds)\n\
 }\n\n\
-pub fn auth_verify_token(secret: ipe_runtime::secret::Secret, token: String) -> IpeResult<IpeError, HashMap<String, String>> {\n    \
+pub fn auth_verify_token(secret: ipe_runtime::secret::Secret, token: String) -> IpeResult<ipe_runtime::IpeAuthError, HashMap<String, String>> {\n    \
     ipe_runtime::auth::auth_verify_token(ipe_runtime::secret::secret_reveal(secret), token)\n\
 }\n\n\
 #[cfg(feature = \"db\")]\n\

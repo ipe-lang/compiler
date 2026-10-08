@@ -41,12 +41,142 @@ pub fn auth_hash_password<E: From<String>>(pw: String) -> IpeResult<E, String> {
     auth_hash_password_cost(pw, 12)
 }
 
+/// The lowest bcrypt cost the library accepts.
+const BCRYPT_COST_MIN: u32 = 4;
+
+/// The highest bcrypt cost hashed or verified: each +1 doubles the work, so a
+/// cost past this ceiling (~1–2 s/hash) is a CPU-exhaustion vector.
+const BCRYPT_COST_MAX: u32 = 15;
+
+/// A bcrypt work factor inside `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BcryptCost(u32);
+
+/// Why a stored hash was refused before bcrypt ran on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredHashRefusal {
+    /// The hash is not a `$2[abxy]$NN$<salt><digest>` hash bcrypt verifies.
+    NotBcrypt,
+    /// The hash's cost field is above [`BCRYPT_COST_MAX`].
+    CostOverCeiling,
+}
+
+impl StoredHashRefusal {
+    /// The fixed message an `Auth.verifyPassword` refusal carries; it never
+    /// names the hash.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::NotBcrypt => "auth.verifyPassword: stored hash is not a bcrypt hash",
+            Self::CostOverCeiling => "auth.verifyPassword: stored hash cost exceeds the ceiling",
+        }
+    }
+}
+
+impl BcryptCost {
+    /// The `requested` cost clamped into the accepted range.
+    fn clamped(requested: i64) -> Self {
+        let clamped = requested.clamp(i64::from(BCRYPT_COST_MIN), i64::from(BCRYPT_COST_MAX));
+        Self(u32::try_from(clamped).unwrap_or(BCRYPT_COST_MAX))
+    }
+
+    /// The cost field of the bcrypt `hash`, read from its `$2[abxy]$NN$`
+    /// prefix.
+    fn of_hash(hash: &str) -> Result<Self, StoredHashRefusal> {
+        let [b'$', b'2', variant, b'$', tens, ones, b'$', ..] = hash.as_bytes() else {
+            return Err(StoredHashRefusal::NotBcrypt);
+        };
+        if !matches!(variant, b'a' | b'b' | b'x' | b'y') {
+            return Err(StoredHashRefusal::NotBcrypt);
+        }
+        let (Some(tens), Some(ones)) = (
+            char::from(*tens).to_digit(10),
+            char::from(*ones).to_digit(10),
+        ) else {
+            return Err(StoredHashRefusal::NotBcrypt);
+        };
+        let cost = tens.saturating_mul(10).saturating_add(ones);
+        if cost < BCRYPT_COST_MIN {
+            Err(StoredHashRefusal::NotBcrypt)
+        } else if cost > BCRYPT_COST_MAX {
+            Err(StoredHashRefusal::CostOverCeiling)
+        } else {
+            Ok(Self(cost))
+        }
+    }
+
+    /// The work factor bcrypt runs at.
+    const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The byte length of a bcrypt hash's `$2[abxy]$NN$` prefix.
+const BCRYPT_PREFIX_LEN: usize = 7;
+
+/// The salt's length in bcrypt base64 characters.
+const BCRYPT_SALT_CHARS: usize = 22;
+
+/// The salt and digest's length in bcrypt base64 characters.
+const BCRYPT_BODY_CHARS: usize = 53;
+
+/// The salt's length in bytes.
+const BCRYPT_SALT_BYTES: usize = 16;
+
+/// The stored digest's length in bytes.
+const BCRYPT_DIGEST_BYTES: usize = 23;
+
+/// The base64 engine bcrypt encodes its salt and digest with: its own
+/// alphabet, no padding, canonical trailing bits.
+const BCRYPT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::BCRYPT,
+    base64::engine::general_purpose::NO_PAD,
+);
+
+/// A stored hash bcrypt verifies without refusing it: the exact
+/// `$2[abxy]$NN$<salt><digest>` shape, its cost inside
+/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]`, salt and digest each decoding to its
+/// full length. Verifying one always runs the KDF, at a bounded cost.
+#[derive(Clone, Copy)]
+struct StoredHash<'a> {
+    /// The hash text, proven to have that shape.
+    text: &'a str,
+}
+
+impl<'a> StoredHash<'a> {
+    /// The stored hash `text`, admitted only in the shape bcrypt verifies.
+    fn parse(text: &'a str) -> Result<Self, StoredHashRefusal> {
+        use base64::Engine as _;
+        BcryptCost::of_hash(text)?;
+        let decodes_to = |part: &str, len: usize| {
+            BCRYPT_BASE64
+                .decode(part)
+                .is_ok_and(|bytes| bytes.len() == len)
+        };
+        let body = text.get(BCRYPT_PREFIX_LEN..).unwrap_or_default();
+        match body.split_at_checked(BCRYPT_SALT_CHARS) {
+            Some((salt, digest))
+                if body.len() == BCRYPT_BODY_CHARS
+                    && decodes_to(salt, BCRYPT_SALT_BYTES)
+                    && decodes_to(digest, BCRYPT_DIGEST_BYTES) =>
+            {
+                Ok(Self { text })
+            }
+            _ => Err(StoredHashRefusal::NotBcrypt),
+        }
+    }
+
+    /// Whether `password` hashes to this hash.
+    fn verifies(self, password: &str) -> Result<bool, StoredHashRefusal> {
+        bcrypt::verify(password, self.text).map_err(|_| StoredHashRefusal::NotBcrypt)
+    }
+}
+
 /// Ipê `hashPasswordCost : String -> Int -> Result Error String`. Clamps cost to
-/// [4, 15] (4 = fast for tests, 12 = production default, 14–15 = high security).
-/// The bcrypt VALID range is [4, 31], but cost is caller-controlled: each +1
-/// DOUBLES the work, so cost 31 is a single-call CPU-exhaustion DoS (~years per
-/// hash). 15 (~1–2 s/hash) is a generous operational ceiling; higher is always a
-/// self-DoS, so it is clamped down rather than honoured.
+/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]` = [4, 15] (4 = fast for tests, 12 =
+/// production default, 14–15 = high security). The bcrypt VALID range is
+/// [4, 31], but cost is caller-controlled: each +1 DOUBLES the work, so cost 31
+/// is a single-call CPU-exhaustion DoS (~years per hash). Higher than the
+/// ceiling is always a self-DoS, so it is clamped down rather than honoured.
 pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeResult<E, String> {
     if pw.chars().count() < 8 {
         return IpeResult::Err("password must be at least 8 characters".to_string().into());
@@ -58,8 +188,7 @@ pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeRes
                 .into(),
         );
     }
-    let clamped = cost.clamp(4, 15) as u32;
-    match bcrypt::hash(&pw, clamped) {
+    match bcrypt::hash(&pw, BcryptCost::clamped(cost).get()) {
         Ok(h) => IpeResult::Ok(h),
         Err(e) => IpeResult::Err(format!("bcrypt: {}", e).into()),
     }
@@ -67,11 +196,17 @@ pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeRes
 
 /// Ipê `verifyPassword : String -> String -> Result Error Bool`.
 /// `verifyPassword candidate hash` — true if candidate hashes to the same hash.
-pub fn auth_verify_password<E: From<String>>(pw: String, hash: String) -> IpeResult<E, bool> {
-    match bcrypt::verify(&pw, &hash) {
-        Ok(b) => IpeResult::Ok(b),
-        Err(e) => IpeResult::Err(format!("bcrypt verify: {}", e).into()),
-    }
+///
+/// A hash that is not a [`StoredHash`] (not a bcrypt hash, or its cost above
+/// [`BCRYPT_COST_MAX`]) is refused before the KDF runs, with a fixed
+/// `InvalidInput` message that never names the hash.
+pub fn auth_verify_password(pw: String, hash: String) -> IpeResult<IpeError, bool> {
+    StoredHash::parse(&hash)
+        .and_then(|stored| stored.verifies(&pw))
+        .map_or_else(
+            |refusal| IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned())),
+            IpeResult::Ok,
+        )
 }
 
 /// Ipê `passwordStrength : String -> Result Error String`. Validates length
@@ -238,53 +373,85 @@ pub fn auth_sign_token<E: From<String>>(
 }
 
 /// Why `verify_claims` refused a token.
-#[derive(Debug)]
+///
+/// No variant carries the token, the secret or the verifier's error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenRefusal {
     /// The HS256 secret is shorter than the floor.
-    ShortSecret {
-        /// The secret's length in bytes.
-        len: usize,
-    },
+    ShortSecret,
     /// The token is at or past its `exp`.
     Expired,
     /// The token is before its `nbf`.
     NotYetValid,
     /// The token is at or past its absolute lifetime `cap`.
     PastCap,
-    /// A time claim (`nbf`, `cap`) is present but not a JSON number, so no
-    /// check could read it.
-    NonNumericDate {
-        /// The claim's name.
-        claim: &'static str,
-    },
-    /// The signature does not verify under the secret.
-    BadSignature(jsonwebtoken::errors::Error),
-    /// Any other refusal by the verifier: a malformed token, a missing or
-    /// non-numeric `exp`, a claim outside the validation window.
-    Malformed(jsonwebtoken::errors::Error),
+    /// A time claim (`exp`, `nbf`, `cap`) is present but not a JSON number, so
+    /// no check could read it.
+    NonNumericDate,
+    /// The signature does not verify under the secret, or the header names
+    /// another algorithm or key family.
+    BadSignature,
+    /// The token is not a well-formed HS256 JWT.
+    Malformed,
+    /// A claim the verifier requires (`exp`) is absent.
+    MissingClaim,
 }
 
-impl std::fmt::Display for TokenRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl TokenRefusal {
+    /// Every variant, in declaration order.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::ShortSecret,
+        Self::Expired,
+        Self::NotYetValid,
+        Self::PastCap,
+        Self::NonNumericDate,
+        Self::BadSignature,
+        Self::Malformed,
+        Self::MissingClaim,
+    ];
+
+    /// The `Auth.verifyToken` refusal this surfaces as.
+    #[must_use]
+    pub const fn auth_error(self) -> IpeAuthError {
         match self {
-            Self::ShortSecret { len } => f.write_str(&crate::jwt::hs256_short_secret_msg(
-                "auth.verifyToken",
-                *len,
-            )),
-            Self::Expired => f.write_str("auth.verifyToken: token has expired"),
-            Self::NotYetValid => f.write_str("auth.verifyToken: token is not yet valid"),
-            Self::PastCap => {
-                f.write_str("auth.verifyToken: token has exceeded its absolute lifetime cap")
-            }
-            Self::NonNumericDate { claim } => {
-                write!(f, "auth.verifyToken: token `{claim}` is not a NumericDate")
-            }
-            Self::BadSignature(e) | Self::Malformed(e) => write!(f, "jwt verify: {e}"),
+            Self::ShortSecret => IpeAuthError::SecretTooShort,
+            Self::Expired | Self::PastCap => IpeAuthError::Expired,
+            Self::NotYetValid => IpeAuthError::NotYetValid,
+            Self::NonNumericDate | Self::Malformed => IpeAuthError::Malformed,
+            Self::BadSignature => IpeAuthError::BadSignature,
+            Self::MissingClaim => IpeAuthError::MissingClaim,
         }
     }
 }
 
-impl std::error::Error for TokenRefusal {}
+/// The refusal a `jsonwebtoken` decode failure of `kind` stands for.
+fn classify_jwt(kind: &jsonwebtoken::errors::ErrorKind) -> TokenRefusal {
+    use jsonwebtoken::errors::ErrorKind as K;
+    match kind {
+        K::InvalidSignature
+        | K::InvalidAlgorithm
+        | K::InvalidAlgorithmName
+        | K::InvalidKeyFormat => TokenRefusal::BadSignature,
+        K::ExpiredSignature => TokenRefusal::Expired,
+        K::ImmatureSignature => TokenRefusal::NotYetValid,
+        K::MissingRequiredClaim(_) => TokenRefusal::MissingClaim,
+        K::InvalidToken
+        | K::Base64(_)
+        | K::Json(_)
+        | K::Utf8(_)
+        | K::InvalidIssuer
+        | K::InvalidAudience
+        | K::InvalidSubject
+        | K::InvalidEcdsaKey
+        | K::InvalidRsaKey(_)
+        | K::RsaFailedSigning
+        | K::MissingAlgorithm
+        | K::Crypto(_) => TokenRefusal::Malformed,
+        // foreign non_exhaustive: unknown kinds refuse as Malformed
+        _ => TokenRefusal::Malformed,
+    }
+}
 
 /// The claims of a token whose signature, `exp`, `nbf` and `cap` verified, each
 /// value coerced to a string.
@@ -379,20 +546,21 @@ const DATE_CLAIMS: [&str; 2] = ["nbf", "cap"];
 /// A [`TokenRefusal`] naming the check the token failed.
 pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims, TokenRefusal> {
     if secret.len() < crate::jwt::HS256_MIN_SECRET_BYTES {
-        return Err(TokenRefusal::ShortSecret { len: secret.len() });
+        return Err(TokenRefusal::ShortSecret);
     }
+    let unverified = crate::jwt::decode_payload(token);
     // Pre-reject on the full RFC 7519 NumericDate domain (negative, fractional,
     // integer) before jsonwebtoken's `exp - 1` u64 subtraction can underflow.
     // Mirrors jwt.rs's `jwt_decode_hs256` pre-reject; see that function's
     // comment for the detailed rationale.
-    if let Some(payload) = crate::jwt::decode_payload(token) {
+    if let Some(payload) = &unverified {
         let now = crate::jwt::now_unix_seconds();
-        if let Some(exp) = crate::jwt::numeric_date(&payload, "exp")
+        if let Some(exp) = crate::jwt::numeric_date(payload, "exp")
             && now >= exp
         {
             return Err(TokenRefusal::Expired);
         }
-        if let Some(nbf) = crate::jwt::numeric_date(&payload, "nbf")
+        if let Some(nbf) = crate::jwt::numeric_date(payload, "nbf")
             && now < nbf
         {
             return Err(TokenRefusal::NotYetValid);
@@ -403,7 +571,7 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
         // below is still required, but there is no point decoding claims we will
         // discard). Legacy tokens without a `cap` are not pre-rejected here — the
         // `exp` gate above is their sole bound.
-        if let Some(cap) = crate::jwt::numeric_date(&payload, "cap")
+        if let Some(cap) = crate::jwt::numeric_date(payload, "cap")
             && now >= cap
         {
             return Err(TokenRefusal::PastCap);
@@ -436,20 +604,27 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
     validation.validate_aud = false;
     let parsed =
         jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation).map_err(|e| {
-            if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::InvalidSignature) {
-                TokenRefusal::BadSignature(e)
-            } else {
-                TokenRefusal::Malformed(e)
+            match classify_jwt(e.kind()) {
+                // jsonwebtoken reports an `exp` it cannot read as absent; the
+                // signature already verified, so the payload says which.
+                TokenRefusal::MissingClaim
+                    if unverified
+                        .as_ref()
+                        .is_some_and(|payload| payload.get("exp").is_some()) =>
+                {
+                    TokenRefusal::NonNumericDate
+                }
+                refusal => refusal,
             }
         })?;
     // A time claim the checks cannot read is refused, never skipped: both the
     // pre-reject above and jsonwebtoken pass over a non-number `nbf` or `cap`,
     // which would otherwise verify a token before its start or past its cap.
-    if let Some(claim) = DATE_CLAIMS
+    if DATE_CLAIMS
         .into_iter()
-        .find(|claim| parsed.claims.get(*claim).is_some_and(|v| !v.is_number()))
+        .any(|claim| parsed.claims.get(claim).is_some_and(|v| !v.is_number()))
     {
-        return Err(TokenRefusal::NonNumericDate { claim });
+        return Err(TokenRefusal::NonNumericDate);
     }
     // Re-check the absolute cap on the signature-verified claims. The pre-reject
     // above already denies past-cap tokens before the signature decode, but this
@@ -482,23 +657,25 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
     Ok(VerifiedClaims { claims, coerced })
 }
 
-/// Ipê `verifyToken : String -> String -> Result Error a`. Verifies the token
-/// (`verify_claims`) and returns its claims as a `HashMap<String, String>`
-/// (Ipê-side resolves polymorphic `a` to this shape at the FFI boundary).
+/// Ipê `verifyToken : Secret -> String -> Result AuthError (Dict String String)`.
+/// Verifies the token (`verify_claims`) and returns its claims as a
+/// `HashMap<String, String>`.
 ///
 /// When the process revocation mode is `Store`
 /// ([`process_mode`](crate::revocation::process_mode)), the token must also
 /// pass the revocation gate: a revoked token, a token the store cannot judge,
 /// and a token with no `sub`, no `jti` or no lifetime bound are refused. Inside
 /// a `Server` request the admitted credential is bound to that request.
-pub fn auth_verify_token<E: From<String>>(
+///
+/// Every refusal is a payload-free [`IpeAuthError`].
+pub fn auth_verify_token(
     secret: String,
     token: String,
-) -> IpeResult<E, HashMap<String, String>> {
+) -> IpeResult<IpeAuthError, HashMap<String, String>> {
     let gate = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode());
     match verify_token_under(gate, &secret, &token) {
         Ok(claims) => IpeResult::Ok(claims),
-        Err(refusal) => IpeResult::Err(refusal.into()),
+        Err(refusal) => IpeResult::Err(refusal),
     }
 }
 
@@ -526,10 +703,10 @@ fn verify_token_under(
     gate: Option<crate::revocation::ArmedGate>,
     secret: &str,
     token: &str,
-) -> Result<HashMap<String, String>, String> {
-    let claims = verify_claims(secret, token).map_err(|refusal| refusal.to_string())?;
+) -> Result<HashMap<String, String>, IpeAuthError> {
+    let claims = verify_claims(secret, token).map_err(TokenRefusal::auth_error)?;
     if let Some(gate) = gate {
-        let refuse = |denial: crate::revocation::Denial| format!("auth.verifyToken: {denial}");
+        let refuse = crate::revocation::Denial::auth_error;
         let credential = gate.admit(&claims, "sub").map_err(refuse)?;
         match bind_target() {
             #[cfg(feature = "server")]
@@ -776,6 +953,21 @@ pub fn auth_register<
 }
 
 #[cfg(feature = "db")]
+/// Whether `password` verifies against the `stored` hash a login read.
+///
+/// A stored hash that is not a [`StoredHash`] never verifies, and bcrypt runs
+/// on `decoy` instead: a cost above the ceiling never reaches the KDF, and a
+/// hash bcrypt would refuse before hashing costs what a wrong password costs.
+fn login_hash_verifies(password: &str, stored: &str, decoy: &str) -> bool {
+    let parsed = StoredHash::parse(stored);
+    let verified = parsed.map_or_else(
+        |_| bcrypt::verify(password, decoy).unwrap_or(false),
+        |hash| hash.verifies(password).unwrap_or(false),
+    );
+    parsed.is_ok() && verified
+}
+
+#[cfg(feature = "db")]
 /// Ipê `login : Db -> String -> String -> Task Error Int`.
 /// Authenticates the user. Returns user id on success. Does NOT leak whether
 /// the email exists vs. password was wrong — both paths return the same
@@ -813,7 +1005,7 @@ pub fn auth_login<
                 // A refused thread is `Unavailable` on both email paths alike; a
                 // panicked verify fails closed as invalid credentials.
                 let verified = crate::threads::join_blocking("auth.login", move || {
-                    bcrypt::verify(&password, &hash).unwrap_or(false)
+                    login_hash_verifies(&password, &hash, dummy_bcrypt_hash())
                 })
                 .await;
                 match verified {
@@ -890,9 +1082,9 @@ mod tests {
             IpeResult::Ok(h) => h,
             _ => panic!("hash"),
         };
-        let ok: IpeResult<String, bool> = auth_verify_password("password123".into(), h.clone());
+        let ok: IpeResult<IpeError, bool> = auth_verify_password("password123".into(), h.clone());
         assert!(matches!(ok, IpeResult::Ok(true)));
-        let bad: IpeResult<String, bool> = auth_verify_password("wrongpass".into(), h);
+        let bad: IpeResult<IpeError, bool> = auth_verify_password("wrongpass".into(), h);
         assert!(matches!(bad, IpeResult::Ok(false)));
     }
 
@@ -936,7 +1128,8 @@ mod tests {
             IpeResult::Ok(t) => t,
             _ => panic!("sign"),
         };
-        let verified: IpeResult<String, HashMap<String, String>> = auth_verify_token(secret, t);
+        let verified: IpeResult<IpeAuthError, HashMap<String, String>> =
+            auth_verify_token(secret, t);
         match verified {
             IpeResult::Ok(m) => {
                 assert_eq!(m.get("sub").unwrap(), "user-123");
@@ -1044,9 +1237,10 @@ mod tests {
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         let key = jsonwebtoken::EncodingKey::from_secret(secret.as_bytes());
         let token = jsonwebtoken::encode(&header, &claims, &key).expect("encode");
-        let verified: IpeResult<String, HashMap<String, String>> = auth_verify_token(secret, token);
+        let verified: IpeResult<IpeAuthError, HashMap<String, String>> =
+            auth_verify_token(secret, token);
         assert!(
-            matches!(verified, IpeResult::Err(_)),
+            matches!(verified, IpeResult::Err(IpeAuthError::Expired)),
             "an Auth token expired 30s ago must be rejected (no clock-skew leeway)"
         );
     }
@@ -1067,12 +1261,13 @@ mod tests {
             IpeResult::Ok(t) => t,
             IpeResult::Err(e) => panic!("sign: {e}"),
         };
-        let verified: IpeResult<String, HashMap<String, String>> = auth_verify_token(secret, t);
+        let verified: IpeResult<IpeAuthError, HashMap<String, String>> =
+            auth_verify_token(secret, t);
         match verified {
             IpeResult::Ok(m) => {
                 assert_eq!(m.get("aud").map(String::as_str), Some("my-service"));
             }
-            IpeResult::Err(e) => panic!("verify must accept aud-bearing claims: {e}"),
+            IpeResult::Err(e) => panic!("verify must accept aud-bearing claims: {e:?}"),
         }
     }
 
@@ -1312,6 +1507,95 @@ mod tests {
         );
     }
 
+    /// A login against a stored hash whose cost is above the ceiling, or that
+    /// is not a bcrypt hash at all, is refused as invalid credentials without
+    /// running the KDF at that cost.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn login_refuses_a_stored_hash_above_the_cost_ceiling() {
+        let pool = match DbPool::connect("sqlite::memory:").await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let IpeResult::Ok(()) = ensure_users_schema::<IpeError>(&pool).await else {
+            panic!("users schema");
+        };
+        let at_floor = bcrypt::hash("hunter2!", BCRYPT_COST_MIN).expect("hash");
+        let over_ceiling = at_floor.replacen("$04$", "$31$", 1);
+        assert_ne!(over_ceiling, at_floor, "the fixture raised the cost field");
+        // A cost-12 prefix whose digest is one character short: bcrypt refuses
+        // it before hashing.
+        let at_default = at_floor.replacen("$04$", "$12$", 1);
+        let (malformed, _) = at_default
+            .split_at_checked(at_default.len() - 1)
+            .expect("a full hash");
+        assert!(bcrypt::verify("hunter2!", malformed).is_err());
+        for (email, stored) in [
+            ("floor@example.com", at_floor.as_str()),
+            ("over@example.com", over_ceiling.as_str()),
+            ("malformed@example.com", malformed),
+            ("plain@example.com", "hunter2!"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (email, password_hash, role, created_at) \
+                 VALUES (?, ?, 'user', 0)",
+            )
+            .bind(email)
+            .bind(stored)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        let login = |email: &str| {
+            auth_login::<IpeError>(pool.clone(), email.to_owned(), "hunter2!".to_owned())
+        };
+        assert!(
+            matches!(login("floor@example.com").await, IpeResult::Ok(_)),
+            "the control: a hash inside the ceiling still logs in"
+        );
+        let started = std::time::Instant::now();
+        let over = login("over@example.com").await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                &over,
+                IpeResult::Err(IpeError::Error(_, info))
+                    if info.message == "auth.login: invalid credentials"
+            ),
+            "{over:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(120),
+            "no cost-31 KDF ran: {elapsed:?}"
+        );
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            bcrypt::verify("hunter2!", dummy_bcrypt_hash()),
+            Ok(false)
+        ));
+        let decoy_kdf = started.elapsed();
+        let started = std::time::Instant::now();
+        let malformed = login("malformed@example.com").await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                &malformed,
+                IpeResult::Err(IpeError::Error(_, info))
+                    if info.message == "auth.login: invalid credentials"
+            ),
+            "{malformed:?}"
+        );
+        assert!(
+            elapsed >= decoy_kdf / 10,
+            "a stored hash bcrypt refuses before hashing costs a decoy KDF: \
+             {elapsed:?} vs {decoy_kdf:?}"
+        );
+        assert!(
+            matches!(login("plain@example.com").await, IpeResult::Err(_)),
+            "a plaintext stored password never logs in"
+        );
+    }
+
     // ── Absolute lifetime cap (P1) ────────────────────────────────────────────
 
     const SECRET: &str = "a-test-secret-of-32-bytes-padding";
@@ -1334,10 +1618,10 @@ mod tests {
             "exp": now + 3600,
             "cap": now - 1,
         }));
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), token);
         assert!(
-            matches!(result, IpeResult::Err(_)),
+            matches!(result, IpeResult::Err(IpeAuthError::Expired)),
             "a session past its absolute cap must be rejected even if exp is still future"
         );
     }
@@ -1360,9 +1644,9 @@ mod tests {
         let original_cap = crate::jwt::numeric_date(&payload, "cap").expect("cap in first token");
         // Simulate a re-issue: extract all claims and pass them (including cap) back.
         let verified: HashMap<String, String> =
-            match auth_verify_token::<String>(SECRET.to_string(), first_token) {
+            match auth_verify_token(SECRET.to_string(), first_token) {
                 IpeResult::Ok(m) => m,
-                IpeResult::Err(e) => panic!("first verify: {e}"),
+                IpeResult::Err(e) => panic!("first verify: {e:?}"),
             };
         // Re-issue by signing with the original claims (including cap).
         let reissued_token: String =
@@ -1432,10 +1716,10 @@ mod tests {
         let tampered_payload_json = serde_json::to_string(&payload).expect("serialise");
         let tampered_payload_seg = URL_SAFE_NO_PAD.encode(tampered_payload_json.as_bytes());
         let forged_token = format!("{header_seg}.{tampered_payload_seg}.{sig_seg}");
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), forged_token);
         assert!(
-            matches!(result, IpeResult::Err(_)),
+            matches!(result, IpeResult::Err(IpeAuthError::BadSignature)),
             "a token with a client-mutated cap must fail signature verification"
         );
     }
@@ -1452,7 +1736,7 @@ mod tests {
             "exp": now + 3600,
             // deliberately no `cap` claim
         }));
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), token);
         assert!(
             matches!(result, IpeResult::Ok(_)),
@@ -1471,10 +1755,10 @@ mod tests {
             "exp": now - 1,
             // no `cap` claim
         }));
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), token);
         assert!(
-            matches!(result, IpeResult::Err(_)),
+            matches!(result, IpeResult::Err(IpeAuthError::Expired)),
             "a legacy token without cap must be rejected when exp is past"
         );
     }
@@ -1687,27 +1971,30 @@ mod tests {
     #[test]
     fn verify_claims_refuses_non_numeric_time_claims() {
         let now = now_unix();
-        let refused = |claims: serde_json::Value| match verify_claims(SECRET, &raw_hs256(&claims)) {
-            Err(TokenRefusal::NonNumericDate { claim }) => Some(claim),
-            _ => None,
+        let refused = |claims: serde_json::Value| {
+            matches!(
+                verify_claims(SECRET, &raw_hs256(&claims)),
+                Err(TokenRefusal::NonNumericDate)
+            )
         };
-        assert_eq!(
+        assert!(
             refused(
                 serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": (now - 10).to_string() })
             ),
-            Some("cap"),
             "a past `cap` written as text is refused, not skipped"
         );
-        assert_eq!(
+        assert!(
             refused(
                 serde_json::json!({ "sub": "u", "exp": now + 3600, "nbf": (now + 3600).to_string() })
             ),
-            Some("nbf"),
             "a future `nbf` written as text is refused, not skipped"
         );
-        assert_eq!(
-            refused(serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": null })),
-            Some("cap")
+        assert!(refused(
+            serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": null })
+        ));
+        assert!(
+            refused(serde_json::json!({ "sub": "u", "exp": (now + 3600).to_string() })),
+            "an `exp` written as text is refused as unreadable, not as absent"
         );
         assert!(matches!(
             verify_claims(
@@ -1790,6 +2077,327 @@ mod tests {
         );
     }
 
+    // ── Typed verifyToken refusals ────────────────────────────────────────────
+
+    /// The base64url segment of `json`.
+    fn segment(json: &str) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD.encode(json.as_bytes())
+    }
+
+    /// A token for `claims` with an `alg` header, signed under `key`.
+    fn signed_under(key: &str, alg: jsonwebtoken::Algorithm, claims: &serde_json::Value) -> String {
+        let header = jsonwebtoken::Header::new(alg);
+        let key = jsonwebtoken::EncodingKey::from_secret(key.as_bytes());
+        jsonwebtoken::encode(&header, claims, &key).expect("encode")
+    }
+
+    /// `token` with the first byte of its signature segment changed.
+    fn flip_signature(token: &str) -> String {
+        let Some((message, signature)) = token.rsplit_once('.') else {
+            return String::new();
+        };
+        let mut chars = signature.chars();
+        let flipped = match chars.next() {
+            Some('A') => 'B',
+            _ => 'A',
+        };
+        format!("{message}.{flipped}{}", chars.as_str())
+    }
+
+    #[test]
+    fn verify_token_refusals_are_their_exact_auth_error() {
+        let now = now_unix();
+        let live = serde_json::json!({ "sub": "t-sub", "exp": now + 3600 });
+        let refused = |secret: &str, token: &str| verify_token_under(None, secret, token).err();
+        let cases: [(&str, String, String, IpeAuthError); 12] = [
+            (
+                "short key",
+                "short".to_owned(),
+                raw_hs256(&live),
+                IpeAuthError::SecretTooShort,
+            ),
+            (
+                "expired",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": now - 30 })),
+                IpeAuthError::Expired,
+            ),
+            (
+                "nbf in the future",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": now + 7200, "nbf": now + 3600 })),
+                IpeAuthError::NotYetValid,
+            ),
+            (
+                "past cap",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": now + 3600, "cap": now - 1 })),
+                IpeAuthError::Expired,
+            ),
+            (
+                "non-numeric exp",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": "tomorrow" })),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "flipped signature byte",
+                SECRET.to_owned(),
+                flip_signature(&raw_hs256(&live)),
+                IpeAuthError::BadSignature,
+            ),
+            (
+                "wrong key",
+                SECRET.to_owned(),
+                signed_under(
+                    "another-test-secret-of-32-bytes-pad",
+                    jsonwebtoken::Algorithm::HS256,
+                    &live,
+                ),
+                IpeAuthError::BadSignature,
+            ),
+            (
+                "HS512 header",
+                SECRET.to_owned(),
+                signed_under(SECRET, jsonwebtoken::Algorithm::HS512, &live),
+                IpeAuthError::BadSignature,
+            ),
+            (
+                "alg none",
+                SECRET.to_owned(),
+                format!(
+                    "{}.{}.",
+                    segment(r#"{"alg":"none","typ":"JWT"}"#),
+                    segment(&live.to_string())
+                ),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "truncated token",
+                SECRET.to_owned(),
+                raw_hs256(&live)
+                    .rsplit_once('.')
+                    .map(|(message, _)| message.to_owned())
+                    .unwrap_or_default(),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "base64 garbage",
+                SECRET.to_owned(),
+                "!!!.###.$$$".to_owned(),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "missing exp",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t" })),
+                IpeAuthError::MissingClaim,
+            ),
+        ];
+        for (label, secret, token, expected) in cases {
+            assert!(!token.is_empty(), "{label}: the fixture built a token");
+            assert_eq!(refused(&secret, &token), Some(expected), "{label}");
+        }
+        assert_eq!(
+            refused(SECRET, &raw_hs256(&live)),
+            None,
+            "the unaltered token verifies"
+        );
+    }
+
+    #[test]
+    fn verify_token_refusal_carries_no_token_text() {
+        const MARKER: &str = "LEAKMARKER-7f3a";
+        let now = now_unix();
+        let alg_header = format!(r#"{{"alg":"\u001b[31m{MARKER}","typ":"JWT"}}"#);
+        let alg_token = format!(
+            "{}.{}.c2ln",
+            segment(&alg_header),
+            segment(&serde_json::json!({ "exp": now + 3600 }).to_string())
+        );
+        let cases = [
+            (
+                alg_header.clone(),
+                alg_token.clone(),
+                IpeAuthError::Malformed,
+            ),
+            (
+                serde_json::json!({ "exp": MARKER }).to_string(),
+                raw_hs256(&serde_json::json!({ "exp": MARKER })),
+                IpeAuthError::Malformed,
+            ),
+            (
+                serde_json::json!({ "x": format!("\u{1b}[31m{MARKER}"), "exp": now + 3600 })
+                    .to_string(),
+                signed_under(
+                    "another-test-secret-of-32-bytes-pad",
+                    jsonwebtoken::Algorithm::HS256,
+                    &serde_json::json!({ "x": format!("\u{1b}[31m{MARKER}"), "exp": now + 3600 }),
+                ),
+                IpeAuthError::BadSignature,
+            ),
+        ];
+        for (segment_json, token, expected) in cases {
+            let carried = token.split('.').any(|part| {
+                use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+                URL_SAFE_NO_PAD.decode(part).is_ok_and(|bytes| {
+                    std::str::from_utf8(&bytes).is_ok_and(|text| text.contains(MARKER))
+                })
+            });
+            assert!(carried, "the marker is in the token: {segment_json}");
+            let refusal = verify_token_under(None, SECRET, &token).err();
+            assert_eq!(refusal, Some(expected), "{segment_json}");
+            let Some(refusal) = refusal else { return };
+            assert!(!refusal.phrase().contains(MARKER));
+            assert!(!format!("{refusal:?}").contains(MARKER));
+        }
+    }
+
+    #[test]
+    fn every_token_refusal_maps_to_its_auth_error() {
+        let expected = [
+            (TokenRefusal::ShortSecret, IpeAuthError::SecretTooShort),
+            (TokenRefusal::Expired, IpeAuthError::Expired),
+            (TokenRefusal::NotYetValid, IpeAuthError::NotYetValid),
+            (TokenRefusal::PastCap, IpeAuthError::Expired),
+            (TokenRefusal::NonNumericDate, IpeAuthError::Malformed),
+            (TokenRefusal::BadSignature, IpeAuthError::BadSignature),
+            (TokenRefusal::Malformed, IpeAuthError::Malformed),
+            (TokenRefusal::MissingClaim, IpeAuthError::MissingClaim),
+        ];
+        assert_eq!(expected.len(), TokenRefusal::ALL.len());
+        for ((refusal, error), listed) in expected.into_iter().zip(TokenRefusal::ALL) {
+            assert_eq!(refusal, listed, "{refusal:?} out of order in ALL");
+            assert_eq!(refusal.auth_error(), error, "{refusal:?}");
+        }
+    }
+
+    // ── verifyPassword stored-hash refusals ───────────────────────────────────
+
+    /// A cost-15 bcrypt hash of `password123`.
+    const COST_15_HASH: &str = "$2b$15$v81ksFestWCfPXD9cGDMfeV2hI.YAhbV1wPHNRmEiDgXR9O6lROsq";
+
+    /// The kind and message of a refused `verifyPassword`.
+    fn password_refusal(result: IpeResult<IpeError, bool>) -> Option<(IpeErrorKind, String)> {
+        match result {
+            IpeResult::Err(IpeError::Error(kind, info)) => Some((kind, info.message)),
+            IpeResult::Ok(_) => None,
+        }
+    }
+
+    #[test]
+    fn verify_password_refuses_a_cost_above_the_ceiling_without_hashing() {
+        let started = std::time::Instant::now();
+        let at_ceiling = auth_verify_password("password123".into(), COST_15_HASH.to_owned());
+        let one_hash = started.elapsed();
+        assert!(
+            matches!(at_ceiling, IpeResult::Ok(true)),
+            "a cost-15 hash still verifies"
+        );
+        let over = COST_15_HASH.replacen("$15$", "$31$", 1);
+        let started = std::time::Instant::now();
+        let refused = password_refusal(auth_verify_password("password123".into(), over));
+        let refusal_time = started.elapsed();
+        assert_eq!(
+            refused,
+            Some((
+                IpeErrorKind::InvalidInput,
+                "auth.verifyPassword: stored hash cost exceeds the ceiling".to_owned()
+            ))
+        );
+        assert!(
+            refusal_time < one_hash / 100,
+            "the refusal ran no KDF: {refusal_time:?} vs {one_hash:?}"
+        );
+    }
+
+    #[test]
+    fn verify_password_refuses_a_non_bcrypt_hash_without_echoing_it() {
+        for stored in [
+            "plain-stored-LEAKMARKER-7f3a".to_owned(),
+            "$2b$12$LEAKMARKER-7f3a-not-a-valid-salt-or-digest".to_owned(),
+        ] {
+            let refused =
+                password_refusal(auth_verify_password("password123".into(), stored.clone()));
+            assert_eq!(
+                refused,
+                Some((
+                    IpeErrorKind::InvalidInput,
+                    "auth.verifyPassword: stored hash is not a bcrypt hash".to_owned()
+                )),
+                "{stored}"
+            );
+            let Some((_, message)) = refused else { return };
+            assert!(stored.contains("LEAKMARKER"));
+            assert!(!message.contains("LEAKMARKER"), "{message}");
+        }
+    }
+
+    /// A stored hash bcrypt would turn back before hashing, or read in another
+    /// shape than it writes, is refused by the parse, so every admitted hash
+    /// runs the KDF; a hash bcrypt wrote is admitted and verifies.
+    #[test]
+    fn stored_hash_admits_only_the_shape_bcrypt_writes() {
+        let valid = bcrypt::hash("password123", BCRYPT_COST_MIN).expect("hash");
+        assert_eq!(
+            StoredHash::parse(&valid).map(|stored| stored.verifies("password123")),
+            Ok(Ok(true)),
+            "the control: a hash bcrypt wrote verifies"
+        );
+        let (head, _) = valid
+            .split_at_checked(valid.len() - 1)
+            .expect("a full hash");
+        let (prefix, body) = valid.split_at_checked(BCRYPT_PREFIX_LEN).expect("a prefix");
+        let (salt, digest) = body.split_at_checked(BCRYPT_SALT_CHARS).expect("a salt");
+        let (salt_head, _) = salt
+            .split_at_checked(BCRYPT_SALT_CHARS - 1)
+            .expect("a salt");
+        let refused = [
+            (head.to_owned(), "a digest one character short"),
+            (format!("{valid}."), "a digest one character long"),
+            (format!("{valid}$"), "a trailing `$` bcrypt's split skips"),
+            (format!("{prefix}${body}"), "an empty `$` segment"),
+            (format!("{head}/"), "digest trailing bits set"),
+            (
+                format!("{prefix}{salt_head}/{digest}"),
+                "salt trailing bits set",
+            ),
+            (format!("{head}+"), "a character outside bcrypt's alphabet"),
+            (format!("{head}\u{e9}"), "a multibyte character"),
+            (format!("{prefix}{salt}"), "a salt without a digest"),
+            (prefix.to_owned(), "a prefix alone"),
+        ];
+        for (stored, why) in refused {
+            assert_eq!(
+                StoredHash::parse(&stored).err(),
+                Some(StoredHashRefusal::NotBcrypt),
+                "{why}: {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn bcrypt_cost_parses_only_a_bcrypt_prefix_within_range() {
+        assert_eq!(BcryptCost::of_hash("$2b$04$"), Ok(BcryptCost(4)));
+        assert_eq!(BcryptCost::of_hash("$2y$15$"), Ok(BcryptCost(15)));
+        assert_eq!(BcryptCost::of_hash(COST_15_HASH), Ok(BcryptCost(15)));
+        assert_eq!(
+            BcryptCost::of_hash("$2b$16$"),
+            Err(StoredHashRefusal::CostOverCeiling)
+        );
+        for refused in ["$2b$3$", "$2b$03$", "$2c$10$", "$2b$1x$", "", "$2b"] {
+            assert_eq!(
+                BcryptCost::of_hash(refused),
+                Err(StoredHashRefusal::NotBcrypt),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(BcryptCost::clamped(-5), BcryptCost(BCRYPT_COST_MIN));
+        assert_eq!(BcryptCost::clamped(12), BcryptCost(12));
+        assert_eq!(BcryptCost::clamped(i64::MAX), BcryptCost(BCRYPT_COST_MAX));
+    }
+
     // ── Armed revocation gate ─────────────────────────────────────────────────
 
     /// The armed gate.
@@ -1826,10 +2434,8 @@ mod tests {
             &session_token("k1-live-subject", "k1-revoked-jti"),
         )
         .expect_err("a revoked session is refused");
-        for message in [by_subject, by_session] {
-            assert_eq!(message, "auth.verifyToken: credential revoked");
-            assert!(!message.contains("k1-"), "{message}");
-        }
+        assert_eq!(by_subject, IpeAuthError::Revoked);
+        assert_eq!(by_session, IpeAuthError::Revoked);
     }
 
     #[test]
@@ -1868,23 +2474,21 @@ mod tests {
             verify_token_under(armed(), SECRET, &raw_hs256(claims))
                 .expect_err("an incomplete token is refused when armed")
         };
-        let session_absent = "auth.verifyToken: token carries no session id (`jti`)";
-        let subject_absent = "auth.verifyToken: token carries no subject";
         assert_eq!(
             refused(&serde_json::json!({ "sub": "k8-subject", "exp": now + 60 })),
-            session_absent
+            IpeAuthError::MissingClaim
         );
         assert_eq!(
             refused(&serde_json::json!({ "sub": "k8-subject", "jti": "", "exp": now + 60 })),
-            session_absent
+            IpeAuthError::MissingClaim
         );
         assert_eq!(
             refused(&serde_json::json!({ "jti": "k8-jti", "exp": now + 60 })),
-            subject_absent
+            IpeAuthError::MissingClaim
         );
         assert_eq!(
             refused(&serde_json::json!({ "sub": "", "jti": "k8-jti", "exp": now + 60 })),
-            subject_absent
+            IpeAuthError::MissingClaim
         );
     }
 
@@ -1927,7 +2531,7 @@ mod tests {
         .await;
         assert_eq!(
             ninth.expect_err("a full set refuses the next session"),
-            "auth.verifyToken: too many credentials bound to this channel"
+            IpeAuthError::TooManyCredentials
         );
         let bindings = bindings.expect("a request scope carries a binding set");
         let held = bindings.lock().expect("bindings lock");

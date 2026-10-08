@@ -1,0 +1,39 @@
+module Describe exposing (describe)
+
+-- Names `AuthError` in a type annotation and matches every constructor bare,
+-- without calling `Auth.verifyToken`: the type alone must resolve and the
+-- emitted project must build.
+
+import Ipe.Auth exposing (AuthError(..))
+
+
+-- The constructor name of a token refusal.
+describe : AuthError -> String
+describe err =
+    case err of
+        Malformed ->
+            "Malformed"
+
+        BadSignature ->
+            "BadSignature"
+
+        Expired ->
+            "Expired"
+
+        NotYetValid ->
+            "NotYetValid"
+
+        MissingClaim ->
+            "MissingClaim"
+
+        Revoked ->
+            "Revoked"
+
+        RevocationUnavailable ->
+            "RevocationUnavailable"
+
+        TooManyCredentials ->
+            "TooManyCredentials"
+
+        SecretTooShort ->
+            "SecretTooShort"
