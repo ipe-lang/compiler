@@ -2440,6 +2440,7 @@ pub(crate) fn request_bindings() -> Option<Arc<Mutex<crate::revocation::SessionB
 ///
 /// One recheck per interval answers any number of revocations, so a party
 /// that can trigger revocations cannot amplify the recheck cost.
+#[cfg(feature = "jwt")]
 pub(crate) const RECHECK_COALESCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The close reason a gated channel sends once its credentials no longer hold.
