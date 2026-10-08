@@ -815,7 +815,7 @@ fn tag_for_description(desc: &Description, section: Option<SectionLevel>) -> Nod
 // ── Element → Html (recursive) ───────────────────────────────────────────────
 
 /// Depth-0 entry point for a bare element, laid out along the block axis.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn render_element<M: Clone>(elem: Element<M>) -> Html<M> {
     render_element_depth_in(elem, RenderCtx::root(FlexAxis::Block))
 }
@@ -3838,8 +3838,7 @@ mod text_role_tests {
             assert!(all_admitted(&page));
             let s = render_html(&page);
             assert!(!s.contains("<script"), "{s}");
-            assert!(s.contains("&lt;script&gt;"), "{s}");
-            assert!(s.contains("&amp;"), "{s}");
+            assert!(s.contains(&crate::escape::html_text(hostile)), "{s}");
             assert!(s.matches("</pre>").count() <= 1, "{s}");
         }
     }
