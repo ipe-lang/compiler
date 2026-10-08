@@ -483,6 +483,13 @@ impl SessionCredential {
     pub const fn deadline(&self) -> UnixSecs {
         self.deadline
     }
+
+    /// Whether `other` names the same subject and session id. Neither alone
+    /// identifies a credential: a caller-chosen `jti` can repeat across
+    /// subjects, and a subject holds many sessions.
+    fn same_identity(&self, other: &Self) -> bool {
+        self.subject == other.subject && self.session == other.session
+    }
 }
 
 /// The persisted form of a [`SessionCredential`].
@@ -614,7 +621,7 @@ impl ArmedGate {
 pub const MAX_SESSION_CREDENTIALS: usize = 8;
 
 /// The credentials a channel owner (a Web session, a `Server` request) is bound
-/// to; at most [`MAX_SESSION_CREDENTIALS`], one per session id.
+/// to; at most [`MAX_SESSION_CREDENTIALS`], one per subject and session id.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionBindings {
     credentials: Vec<SessionCredential>,
@@ -627,8 +634,9 @@ crate::redact::redacting_debug!(SessionBindings {
 });
 
 impl SessionBindings {
-    /// Bind `credential`. A credential of a session id already held keeps one
-    /// entry with the earlier deadline.
+    /// Bind `credential`. A credential whose subject and session id are both
+    /// already held keeps one entry with the earlier deadline; any other is a
+    /// new entry, so every bound subject stays rechecked.
     ///
     /// # Errors
     ///
@@ -637,7 +645,7 @@ impl SessionBindings {
         if let Some(held) = self
             .credentials
             .iter_mut()
-            .find(|held| held.session == credential.session)
+            .find(|held| held.same_identity(&credential))
         {
             held.deadline = held.deadline.min(credential.deadline);
             return Ok(());
@@ -708,8 +716,8 @@ pub enum BindingsDecodeRefusal {
     Malformed,
     /// The list holds more than [`MAX_SESSION_CREDENTIALS`] credentials.
     TooMany,
-    /// Two credentials share a session id.
-    DuplicateSession,
+    /// Two credentials share a subject and a session id.
+    DuplicateCredential,
 }
 
 impl std::fmt::Display for BindingsDecodeRefusal {
@@ -717,7 +725,7 @@ impl std::fmt::Display for BindingsDecodeRefusal {
         f.write_str(match self {
             Self::Malformed => "persisted credentials are malformed",
             Self::TooMany => "persisted credentials exceed the per-channel bound",
-            Self::DuplicateSession => "persisted credentials repeat a session id",
+            Self::DuplicateCredential => "persisted credentials repeat a credential",
         })
     }
 }
@@ -748,9 +756,9 @@ pub fn decode_bindings(bytes: &[u8]) -> Result<SessionBindings, BindingsDecodeRe
         if bindings
             .credentials
             .iter()
-            .any(|held| held.session == credential.session)
+            .any(|held| held.same_identity(&credential))
         {
-            return Err(BindingsDecodeRefusal::DuplicateSession);
+            return Err(BindingsDecodeRefusal::DuplicateCredential);
         }
         bindings.credentials.push(credential);
     }
@@ -1517,13 +1525,14 @@ mod tests {
 
     #[test]
     fn admit_refuses_no_deadline() {
-        // A verified token always carries `exp`, so the reachable no-deadline
-        // case is an unreadable `cap`, which `exp` never stands in for.
+        // A verified token always carries `exp` and a numeric `cap`, so the
+        // reachable no-deadline case is a fractional `cap`, which `exp` never
+        // stands in for.
         let claims = claims_of(&serde_json::json!({
             "sub": "g3-subject",
             "jti": "g3-jti",
             "exp": LIVE_UNTIL,
-            "cap": "soon",
+            "cap": 9_999_999_999.5_f64,
         }));
         assert_eq!(
             gate().admit_in(&healthy_store(), &claims, "sub"),
@@ -1668,9 +1677,40 @@ mod tests {
         );
         assert_eq!(
             decode_bindings(&wire_of(&["g9-twice".to_owned(), "g9-twice".to_owned()])),
-            Err(BindingsDecodeRefusal::DuplicateSession)
+            Err(BindingsDecodeRefusal::DuplicateCredential)
         );
         assert_eq!(decode_bindings(b""), Err(BindingsDecodeRefusal::Malformed));
+    }
+
+    #[test]
+    fn bind_keeps_every_subject_of_a_repeated_jti() {
+        let store = healthy_store();
+        let mut bindings = SessionBindings::default();
+        bindings
+            .bind(admitted("g9-first-subject", "g9-shared-jti"))
+            .expect("bind");
+        bindings
+            .bind(admitted("g9-second-subject", "g9-shared-jti"))
+            .expect("bind");
+        assert_eq!(
+            bindings.len(),
+            2,
+            "a repeated jti of another subject is kept"
+        );
+        revoke_subject_in(&store, "g9-second-subject".to_owned()).expect("revoke");
+        assert_eq!(
+            bindings
+                .credentials
+                .iter()
+                .try_for_each(|held| gate().recheck_in(&store, held, 0)),
+            Err(Denial::Revoked),
+            "revoking the second subject fails the set's recheck"
+        );
+        assert_eq!(
+            decode_bindings(&encode_bindings(&bindings)),
+            Ok(bindings),
+            "the set round-trips"
+        );
     }
 
     #[test]
