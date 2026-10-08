@@ -3060,24 +3060,44 @@ mod ws_adapter_tests {
         );
     }
 
-    /// Zero is rejected and the default is used.
-    #[test]
-    fn ws_heartbeat_zero_falls_back_to_default() {
-        let result: u64 = Some("0".to_string())
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(30);
-        assert_eq!(result, 30);
+    /// Reads the heartbeat ceiling with `IPE_WS_HEARTBEAT` set to `raw`, or unset.
+    fn read_heartbeat(raw: Option<&str>) -> Result<u64, crate::system::EnvCeilingRefusal> {
+        raw.map_or_else(
+            || crate::system::locked_remove_var("IPE_WS_HEARTBEAT"),
+            |value| crate::system::locked_set_var("IPE_WS_HEARTBEAT", value),
+        );
+        let read = WS_HEARTBEAT_CEILING.read::<u64>();
+        crate::system::locked_remove_var("IPE_WS_HEARTBEAT");
+        read
     }
 
-    /// Non-numeric input is rejected and the default is used.
     #[test]
-    fn ws_heartbeat_non_numeric_falls_back_to_default() {
-        let result: u64 = Some("not-a-number".to_string())
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(30);
-        assert_eq!(result, 30);
+    fn a_zero_ws_heartbeat_ceiling_refuses() {
+        let refused = read_heartbeat(Some("0"));
+        assert!(
+            refused.is_err_and(|r| r.name() == "IPE_WS_HEARTBEAT"
+                && r.defect() == crate::system::CeilingDefect::Zero),
+            "a zero heartbeat must be refused, never replaced by the default"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_ws_heartbeat_ceiling_refuses() {
+        let refused = read_heartbeat(Some("not-a-number"));
+        assert!(
+            refused.is_err_and(|r| r.name() == "IPE_WS_HEARTBEAT"
+                && r.defect() == crate::system::CeilingDefect::NotDecimal),
+            "a non-numeric heartbeat must be refused, never replaced by the default"
+        );
+    }
+
+    #[test]
+    fn a_valid_ws_heartbeat_ceiling_is_read_and_an_unset_one_takes_the_default() {
+        assert_eq!(read_heartbeat(Some("45")).ok(), Some(45));
+        assert_eq!(
+            read_heartbeat(None).ok(),
+            Some(WS_HEARTBEAT_CEILING.default_value())
+        );
     }
 }
 
