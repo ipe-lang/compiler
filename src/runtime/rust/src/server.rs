@@ -2436,6 +2436,241 @@ pub(crate) fn request_bindings() -> Option<Arc<Mutex<crate::revocation::SessionB
     SERVER_REQUEST.try_with(Arc::clone).ok()
 }
 
+/// How long a gated channel waits after a revocation before it re-proves.
+///
+/// One recheck per interval answers any number of revocations, so a party
+/// that can trigger revocations cannot amplify the recheck cost.
+pub(crate) const RECHECK_COALESCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The close reason a gated channel sends once its credentials no longer hold.
+const CHANNEL_DENIED_REASON: &str = "credential revoked";
+
+/// Why a gated channel ends.
+#[cfg(feature = "jwt")]
+pub(crate) type ChannelDenial = crate::revocation::Denial;
+
+/// Why a gated channel ends; without `jwt` no channel is gated.
+#[cfg(not(feature = "jwt"))]
+pub(crate) enum ChannelDenial {}
+
+/// The credentials a channel opened by the current `Server` request inherits.
+#[cfg(feature = "jwt")]
+pub(crate) struct ChannelCredentials(Option<Arc<Mutex<crate::revocation::SessionBindings>>>);
+
+/// The credentials a channel inherits; without `jwt` there are none.
+#[cfg(not(feature = "jwt"))]
+pub(crate) struct ChannelCredentials;
+
+impl ChannelCredentials {
+    /// The binding set of the `Server` request the current task handles.
+    #[cfg(feature = "jwt")]
+    pub(crate) fn of_request() -> Self {
+        Self(request_bindings())
+    }
+
+    /// No binding set exists without `jwt`.
+    #[cfg(not(feature = "jwt"))]
+    pub(crate) const fn of_request() -> Self {
+        Self
+    }
+}
+
+/// The revocation gate of one long-lived channel (a WebSocket, a stream).
+///
+/// It holds the binding set of the request that opened the channel and
+/// re-proves every bound credential on a revocation (coalesced over
+/// [`RECHECK_COALESCE`]), at the earliest deadline, and whenever the channel
+/// asks before it commits an action.
+#[cfg(feature = "jwt")]
+pub(crate) struct ChannelGate {
+    gate: crate::revocation::ArmedGate,
+    bindings: Arc<Mutex<crate::revocation::SessionBindings>>,
+    generation: tokio::sync::watch::Receiver<u64>,
+    /// When the coalesced recheck a seen revocation owes is due.
+    recheck_at: Option<tokio::time::Instant>,
+    last_recheck: tokio::time::Instant,
+    /// When the earliest bound credential reaches its deadline.
+    deadline_at: Option<tokio::time::Instant>,
+    opened_unix: i64,
+    opened_at: tokio::time::Instant,
+}
+
+#[cfg(feature = "jwt")]
+impl ChannelGate {
+    /// The gate of a channel bound to `credentials`, re-proved once now.
+    ///
+    /// `None` when the process is unarmed or the request bound nothing: such
+    /// a channel was opened on behalf of no credential.
+    ///
+    /// # Errors
+    ///
+    /// The [`ChannelDenial`] of the opening recheck; a poisoned binding set is
+    /// [`crate::revocation::Denial::StoreUnavailable`].
+    pub(crate) fn open(credentials: ChannelCredentials) -> Result<Option<Self>, ChannelDenial> {
+        use crate::revocation::{ArmedGate, Denial, process_mode, subscribe};
+        // Subscribed before the opening recheck: a revocation that lands after
+        // the recheck read the store is still seen as a generation change.
+        let generation = subscribe();
+        let Some(gate) = ArmedGate::resolve(process_mode()) else {
+            return Ok(None);
+        };
+        let Some(bindings) = credentials.0 else {
+            return Ok(None);
+        };
+        if bindings
+            .lock()
+            .map_err(|_| Denial::StoreUnavailable)?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let now = tokio::time::Instant::now();
+        let mut channel = Self {
+            gate,
+            bindings,
+            generation,
+            recheck_at: None,
+            last_recheck: now,
+            deadline_at: None,
+            opened_unix: crate::jwt::now_unix_seconds(),
+            opened_at: now,
+        };
+        channel.recheck()?;
+        Ok(Some(channel))
+    }
+
+    /// The current Unix second: the wall clock, never behind the monotonic
+    /// time elapsed since the channel opened.
+    fn now_unix(&self) -> i64 {
+        let elapsed = i64::try_from(self.opened_at.elapsed().as_secs()).unwrap_or(i64::MAX);
+        crate::jwt::now_unix_seconds().max(self.opened_unix.saturating_add(elapsed))
+    }
+
+    /// Re-prove every bound credential now, and re-arm the deadline.
+    ///
+    /// Every generation already observed is marked seen BEFORE the store is
+    /// read, so a revocation that lands after the read is a later change.
+    ///
+    /// # Errors
+    ///
+    /// The first [`ChannelDenial`] of any bound credential; a poisoned binding
+    /// set is [`crate::revocation::Denial::StoreUnavailable`].
+    pub(crate) fn recheck(&mut self) -> Result<(), ChannelDenial> {
+        self.generation.mark_unchanged();
+        self.recheck_at = None;
+        let now = tokio::time::Instant::now();
+        self.last_recheck = now;
+        let now_unix = self.now_unix();
+        let held = self
+            .bindings
+            .lock()
+            .map_err(|_| crate::revocation::Denial::StoreUnavailable)?;
+        held.recheck_all(self.gate, now_unix)?;
+        self.deadline_at = held.earliest_deadline().and_then(|deadline| {
+            let left = u64::try_from(deadline.get().saturating_sub(now_unix)).unwrap_or(0);
+            now.checked_add(std::time::Duration::from_secs(left))
+        });
+        Ok(())
+    }
+
+    /// Wait until the channel owes a recheck: `Ok` once a coalesced revocation
+    /// recheck is due, a denial once the earliest deadline is reached.
+    ///
+    /// Cancel-safe: the owed recheck is kept in the gate, never in the future.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::revocation::Denial::PastDeadline`] at the deadline;
+    /// [`crate::revocation::Denial::StoreUnavailable`] when the generation can
+    /// no longer be observed.
+    pub(crate) async fn due(&mut self) -> Result<(), ChannelDenial> {
+        use crate::revocation::Denial;
+        loop {
+            if let Some(at) = self.recheck_at {
+                tokio::select! {
+                    () = tokio::time::sleep_until(at) => return Ok(()),
+                    () = deadline_sleep(self.deadline_at) => return Err(Denial::PastDeadline),
+                }
+            }
+            tokio::select! {
+                changed = self.generation.changed() => {
+                    changed.map_err(|_| Denial::StoreUnavailable)?;
+                    let now = tokio::time::Instant::now();
+                    self.recheck_at = Some(
+                        self.last_recheck
+                            .checked_add(RECHECK_COALESCE)
+                            .map_or(now, |at| at.max(now)),
+                    );
+                }
+                () = deadline_sleep(self.deadline_at) => return Err(Denial::PastDeadline),
+            }
+        }
+    }
+}
+
+/// Sleep until `at`; forever when there is no deadline.
+#[cfg(feature = "jwt")]
+async fn deadline_sleep(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The revocation gate of a long-lived channel; without `jwt` no channel is
+/// gated, so no gate exists.
+#[cfg(not(feature = "jwt"))]
+pub(crate) enum ChannelGate {}
+
+#[cfg(not(feature = "jwt"))]
+impl ChannelGate {
+    /// No channel is gated without `jwt`.
+    #[allow(clippy::unnecessary_wraps)] // the `jwt` build's signature, which can refuse
+    pub(crate) const fn open(
+        _credentials: ChannelCredentials,
+    ) -> Result<Option<Self>, ChannelDenial> {
+        Ok(None)
+    }
+
+    /// Uninhabited: no gate exists to recheck.
+    pub(crate) fn recheck(&mut self) -> Result<(), ChannelDenial> {
+        match *self {}
+    }
+
+    /// Uninhabited: no gate exists to wait on.
+    pub(crate) fn due(&mut self) -> std::future::Ready<Result<(), ChannelDenial>> {
+        match *self {}
+    }
+}
+
+/// Wait until `gate` denies: each owed recheck that passes keeps waiting, and
+/// an ungated channel waits forever.
+///
+/// Cancel-safe, as [`ChannelGate::due`] is.
+pub(crate) async fn channel_denial(gate: &mut Option<ChannelGate>) {
+    let Some(gate) = gate.as_mut() else {
+        return std::future::pending().await;
+    };
+    loop {
+        if gate.due().await.and_then(|()| gate.recheck()).is_err() {
+            return;
+        }
+    }
+}
+
+/// Whether `gate` refuses the action the channel is about to commit.
+fn channel_refuses(gate: &mut Option<ChannelGate>) -> bool {
+    gate.as_mut().is_some_and(|gate| gate.recheck().is_err())
+}
+
+/// The close frame a gated WebSocket sends once its credentials no longer hold.
+fn ws_denied_close() -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Close(Some(axum::extract::ws::CloseFrame {
+        code: axum::extract::ws::close_code::POLICY,
+        reason: CHANNEL_DENIED_REASON.into(),
+    }))
+}
+
 tokio::task_local! {
     // The axum upgrader for the in-flight request (Some only on a WS upgrade).
     static WS_UPGRADER: std::cell::Cell<Option<axum::extract::ws::WebSocketUpgrade>>;
@@ -2459,13 +2694,26 @@ fn ws_max_message_bytes(max_message_bytes: i64) -> usize {
     }
 }
 
-async fn ws_loop<E: From<String> + Send + 'static>(
-    mut socket: axum::extract::ws::WebSocket,
+/// Serve one upgraded WebSocket until either side closes it.
+///
+/// A gated socket (`gate` is `Some`) re-proves its credentials before
+/// `onConnect`, before each inbound frame reaches `onMessage`, and on every
+/// heartbeat; it also ends on a coalesced revocation and at the earliest
+/// deadline. A denial sends close code 1008 and ends the loop.
+async fn ws_loop<E, S>(
+    mut socket: S,
     cfg: WsServerCfg<E>,
     id: i64,
     ceilings: WsCeilings,
-) {
+    mut gate: Option<ChannelGate>,
+) where
+    E: From<String> + Send + 'static,
+    S: futures_util::Stream<Item = Result<axum::extract::ws::Message, axum::Error>>
+        + futures_util::Sink<axum::extract::ws::Message>
+        + Unpin,
+{
     use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
     let max_bytes: usize = ws_max_message_bytes(cfg.maxMessageBytes);
     // Framing-layer enforcement lives on the `WebSocketUpgrade` builder, applied
@@ -2474,6 +2722,12 @@ async fn ws_loop<E: From<String> + Send + 'static>(
     // rejected by tokio-tungstenite before it reaches this loop. The Text/Binary
     // size checks below are application-layer defense in depth (belt-and-braces
     // against a future axum/tungstenite version silently dropping the cap).
+    // A credential revoked between the upgrade and now opens nothing: no
+    // registration, no `onConnect`.
+    if channel_refuses(&mut gate) {
+        let _ = socket.send(ws_denied_close()).await;
+        return;
+    }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ceilings.send_buffer);
     // Live-peer ceiling, application-layer defense in depth: the upgrade gate in
     // `server_web_socket_upgrade` is the primary check, but under high
@@ -2505,10 +2759,14 @@ async fn ws_loop<E: From<String> + Send + 'static>(
     heartbeat.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
-            incoming = socket.recv() => match incoming {
+            incoming = socket.next() => match incoming {
                 Some(Ok(Message::Text(t))) => {
                     if t.len() > max_bytes {
                         let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    if channel_refuses(&mut gate) {
+                        let _ = socket.send(ws_denied_close()).await;
                         break;
                     }
                     let _ = (cfg.onMessage)(WsHandle::WebSocketServer(id), t).await;
@@ -2516,6 +2774,10 @@ async fn ws_loop<E: From<String> + Send + 'static>(
                 Some(Ok(Message::Binary(b))) => {
                     if b.len() > max_bytes {
                         let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    if channel_refuses(&mut gate) {
+                        let _ = socket.send(ws_denied_close()).await;
                         break;
                     }
                     // Convert binary frame bytes to String via UTF-8 (lossy): Ipê's
@@ -2545,11 +2807,19 @@ async fn ws_loop<E: From<String> + Send + 'static>(
                 None => break,
             },
             _ = heartbeat.tick() => {
+                if channel_refuses(&mut gate) {
+                    let _ = socket.send(ws_denied_close()).await;
+                    break;
+                }
                 // Send a Ping frame; if the peer has gone away the send will
                 // fail and we break, triggering onClose cleanup.
                 if socket.send(Message::Ping(vec![])).await.is_err() {
                     break;
                 }
+            },
+            () = channel_denial(&mut gate) => {
+                let _ = socket.send(ws_denied_close()).await;
+                break;
             },
         }
     }
@@ -2715,6 +2985,11 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
         let Ok(ceilings) = ws_ceilings() else {
             return ok_res(ws_resp(503, "websocket: server ceiling misconfigured"));
         };
+        // The socket inherits every credential this request bound; a gate
+        // that cannot prove them now refuses the upgrade (fail closed).
+        let Some(gate) = ChannelGate::open(ChannelCredentials::of_request()).ok() else {
+            return ok_res(ws_resp(401, "unauthorized"));
+        };
         {
             let live = ws_registry()
                 .lock()
@@ -2733,7 +3008,7 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
                 // the limit holds even before `ws_loop`'s in-loop check runs.
                 let max_bytes = ws_max_message_bytes(cfg.maxMessageBytes);
                 let up = up.max_message_size(max_bytes).max_frame_size(max_bytes);
-                let resp = up.on_upgrade(move |socket| ws_loop(socket, cfg, id, ceilings));
+                let resp = up.on_upgrade(move |socket| ws_loop(socket, cfg, id, ceilings, gate));
                 let _ = WS_RESPONSE.try_with(|c| c.set(Some(resp)));
                 // Sentinel — method_router returns WS_RESPONSE instead of this.
                 ok_res(ServerResponse {
@@ -7334,6 +7609,351 @@ mod tests {
             assert!(
                 !cookie.contains("; Secure"),
                 "reissue over plain HTTP must NOT carry Secure: {cookie}"
+            );
+        }
+
+        // ── revocation-gated channels ────────────────────────────────────
+
+        /// An in-memory WebSocket: the test feeds `inbound` and reads what the
+        /// loop sends from `outbound`.
+        struct MemSocket {
+            inbound: tokio::sync::mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+            outbound: tokio::sync::mpsc::UnboundedSender<axum::extract::ws::Message>,
+        }
+
+        impl futures_util::Stream for MemSocket {
+            type Item = Result<axum::extract::ws::Message, axum::Error>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.get_mut()
+                    .inbound
+                    .poll_recv(cx)
+                    .map(|frame| frame.map(Ok))
+            }
+        }
+
+        impl futures_util::Sink<axum::extract::ws::Message> for MemSocket {
+            type Error = tokio::sync::mpsc::error::SendError<axum::extract::ws::Message>;
+
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn start_send(
+                self: Pin<&mut Self>,
+                item: axum::extract::ws::Message,
+            ) -> Result<(), Self::Error> {
+                self.get_mut().outbound.send(item)
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        /// The test's end of a socket `ws_loop` serves.
+        struct WsPeer {
+            to_server: tokio::sync::mpsc::UnboundedSender<axum::extract::ws::Message>,
+            from_server: tokio::sync::mpsc::UnboundedReceiver<axum::extract::ws::Message>,
+            /// Every text `onMessage` was handed.
+            delivered: tokio::sync::mpsc::UnboundedReceiver<String>,
+        }
+
+        /// Serve an in-memory socket under `gate` and wait until `onConnect`
+        /// ran, so the loop is idle in its select when this returns.
+        async fn serve_ws(gate: Option<ChannelGate>) -> WsPeer {
+            let (to_server, inbound) = tokio::sync::mpsc::unbounded_channel();
+            let (outbound, from_server) = tokio::sync::mpsc::unbounded_channel();
+            let (seen, delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (connected_tx, mut connected) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let cfg = WsServerCfg {
+                onConnect: Arc::new(move |_: WsHandle| {
+                    let _ = connected_tx.send(());
+                    Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
+                }),
+                onMessage: Arc::new(move |_: WsHandle, text: String| {
+                    let _ = seen.send(text);
+                    Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
+                }),
+                ..ws_server_default_cfg::<String>()
+            };
+            let ceilings = WsCeilings {
+                send_buffer: 16,
+                max_connections: usize::MAX,
+                heartbeat_secs: 30,
+            };
+            let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let socket = MemSocket { inbound, outbound };
+            tokio::spawn(ws_loop(socket, cfg, id, ceilings, gate));
+            let opened = tokio::time::timeout(RECHECK_COALESCE, connected.recv()).await;
+            assert!(matches!(opened, Ok(Some(()))), "the socket must connect");
+            WsPeer {
+                to_server,
+                from_server,
+                delivered,
+            }
+        }
+
+        /// Whether `frame` is the close a gated socket sends on a denial.
+        fn is_denied_close(frame: Option<&axum::extract::ws::Message>) -> bool {
+            matches!(
+                frame,
+                Some(axum::extract::ws::Message::Close(Some(close)))
+                    if close.code == axum::extract::ws::close_code::POLICY
+                        && close.reason == "credential revoked"
+            )
+        }
+
+        /// The next frame the server sends within `wait`, if any.
+        async fn next_frame(
+            peer: &mut WsPeer,
+            wait: std::time::Duration,
+        ) -> Option<axum::extract::ws::Message> {
+            tokio::time::timeout(wait, peer.from_server.recv())
+                .await
+                .ok()
+                .flatten()
+        }
+
+        /// Claims for a fresh session of `subject`, whose deadline is `cap`.
+        fn session_claims(subject: &str, jti: &str, cap: i64) -> serde_json::Value {
+            let now = crate::jwt::now_unix_seconds();
+            serde_json::json!({
+                "sub": subject,
+                "jti": jti,
+                "iat": now,
+                "exp": now + 3600,
+                "cap": cap,
+            })
+        }
+
+        /// The channel gate a socket opened by an armed authed route would
+        /// carry, for a request bearing `claims`.
+        async fn gate_of_authed_request(claims: &serde_json::Value) -> Option<ChannelGate> {
+            let slot: Arc<Mutex<Option<ChannelGate>>> = Arc::default();
+            let sink = Arc::clone(&slot);
+            let route = server_get_authed::<String, _>(
+                "/ws".to_string(),
+                server_with_revocation(1, bearer_cfg()),
+                move |_req, _p| {
+                    let opened = ChannelGate::open(ChannelCredentials::of_request())
+                        .ok()
+                        .flatten();
+                    if let Ok(mut held) = sink.lock() {
+                        *held = opened;
+                    }
+                    Box::pin(std::future::ready(ok_res(server_text(String::new()))))
+                },
+            );
+            let RouteTarget::Handler(h) = route.target else {
+                return None;
+            };
+            let admitted = in_request_scope(h(bearer_req(claims)))
+                .await
+                .map_or(500, |resp| resp.status);
+            assert_eq!(admitted, 200, "the armed route admits the token");
+            slot.lock().ok().and_then(|mut held| held.take())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ws_closes_1008_after_revoke_session() {
+            let cap = crate::jwt::now_unix_seconds() + 7200;
+            let claims = session_claims("ws-revoke-subject", "ws-revoke-jti", cap);
+            let gate = gate_of_authed_request(&claims).await;
+            assert!(gate.is_some(), "a socket of an armed authed route is gated");
+            let mut peer = serve_ws(gate).await;
+            crate::revocation::revoke_session("ws-revoke-jti".to_string(), cap).expect("revoke");
+            let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
+            assert!(
+                is_denied_close(frame.as_ref()),
+                "an idle socket closes 1008 within the coalesce bound: {frame:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ws_inbound_frame_after_revoke_never_reaches_handler() {
+            let cap = crate::jwt::now_unix_seconds() + 7200;
+            let claims = session_claims("ws-inbound-subject", "ws-inbound-jti", cap);
+            let gate = gate_of_authed_request(&claims).await;
+            assert!(gate.is_some(), "a socket of an armed authed route is gated");
+            let mut peer = serve_ws(gate).await;
+            let before = axum::extract::ws::Message::Text("before".to_string());
+            assert!(peer.to_server.send(before).is_ok());
+            let delivered = tokio::time::timeout(RECHECK_COALESCE, peer.delivered.recv()).await;
+            assert!(
+                matches!(delivered, Ok(Some(ref text)) if text == "before"),
+                "a frame before the revocation reaches the handler"
+            );
+            crate::revocation::revoke_session("ws-inbound-jti".to_string(), cap).expect("revoke");
+            let after = axum::extract::ws::Message::Text("after".to_string());
+            assert!(peer.to_server.send(after).is_ok());
+            let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
+            assert!(
+                is_denied_close(frame.as_ref()),
+                "the socket closes 1008: {frame:?}"
+            );
+            assert!(
+                peer.delivered.try_recv().is_err(),
+                "a frame after the revocation never reaches the handler"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ws_closes_at_credential_deadline() {
+            let cap = crate::jwt::now_unix_seconds() + 3;
+            let claims = session_claims("ws-deadline-subject", "ws-deadline-jti", cap);
+            let gate = gate_of_authed_request(&claims).await;
+            assert!(gate.is_some(), "a socket of an armed authed route is gated");
+            let mut peer = serve_ws(gate).await;
+            let frame = next_frame(&mut peer, std::time::Duration::from_secs(10)).await;
+            assert!(
+                is_denied_close(frame.as_ref()),
+                "the socket closes 1008 at its deadline, before any heartbeat: {frame:?}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_ends_after_revoke_and_emit_reports_closed() {
+            use futures_util::StreamExt;
+            type Emits = (IpeResult<String, ()>, IpeResult<String, ()>);
+            let cap = crate::jwt::now_unix_seconds() + 7200;
+            let claims = session_claims("stream-revoke-subject", "stream-revoke-jti", cap);
+            let (emits_tx, mut emits) = tokio::sync::mpsc::unbounded_channel::<Emits>();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let release_in = Arc::clone(&release);
+            let route = server_get_authed::<String, _>(
+                "/stream".to_string(),
+                server_with_revocation(1, bearer_cfg()),
+                move |_req, _p| {
+                    let emits_tx = emits_tx.clone();
+                    let release = Arc::clone(&release_in);
+                    crate::server_stream::server_stream_stream::<String, _>(
+                        "text/plain".to_string(),
+                        move |writer| {
+                            let emits_tx = emits_tx.clone();
+                            let release = Arc::clone(&release);
+                            Box::pin(async move {
+                                let first = crate::server_stream::server_stream_emit::<String>(
+                                    "first".to_string(),
+                                    writer,
+                                )
+                                .await;
+                                release.notified().await;
+                                let late = crate::server_stream::server_stream_emit::<String>(
+                                    "late".to_string(),
+                                    writer,
+                                )
+                                .await;
+                                let _ = emits_tx.send((first, late));
+                                ok_res(())
+                            }) as IpeTask<String, ()>
+                        },
+                    )
+                },
+            );
+            assert!(matches!(route.target, RouteTarget::Handler(_)));
+            let RouteTarget::Handler(h) = route.target else {
+                return;
+            };
+            let resp = in_request_scope(h(bearer_req(&claims)))
+                .await
+                .expect("the stream handler answers");
+            let streamed = to_axum_response(resp);
+            assert_eq!(streamed.status(), axum::http::StatusCode::OK);
+            let mut body = streamed.into_body().into_data_stream();
+            let first = tokio::time::timeout(RECHECK_COALESCE, body.next()).await;
+            assert!(
+                matches!(first, Ok(Some(Ok(ref chunk))) if chunk.to_vec() == b"first"),
+                "a chunk before the revocation reaches the client"
+            );
+            crate::revocation::revoke_session("stream-revoke-jti".to_string(), cap)
+                .expect("revoke");
+            let ended = tokio::time::timeout(2 * RECHECK_COALESCE, body.next()).await;
+            assert!(
+                matches!(ended, Ok(None)),
+                "the body ends within the coalesce bound"
+            );
+            release.notify_one();
+            let reported = tokio::time::timeout(RECHECK_COALESCE, emits.recv()).await;
+            assert!(
+                matches!(
+                    reported,
+                    Ok(Some((IpeResult::Ok(()), IpeResult::Err(ref late))))
+                        if late == "server.stream emit: client disconnected"
+                ),
+                "the handler's next emit reports the client gone"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unauthed_ws_has_no_gate() {
+            crate::revocation::arm_process();
+            let opened =
+                in_request_scope(async { ChannelGate::open(ChannelCredentials::of_request()) })
+                    .await;
+            assert!(
+                matches!(opened, Ok(None)),
+                "a request that bound nothing opens an ungated socket"
+            );
+            let mut peer = serve_ws(None).await;
+            crate::revocation::revoke_session(
+                "ws-unauthed-jti".to_string(),
+                crate::jwt::now_unix_seconds() + 7200,
+            )
+            .expect("revoke");
+            let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
+            assert!(frame.is_none(), "an ungated socket stays open: {frame:?}");
+            let text = axum::extract::ws::Message::Text("still-open".to_string());
+            assert!(peer.to_server.send(text).is_ok());
+            let delivered = tokio::time::timeout(RECHECK_COALESCE, peer.delivered.recv()).await;
+            assert!(
+                matches!(delivered, Ok(Some(ref text)) if text == "still-open"),
+                "an ungated socket keeps delivering frames"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn public_route_ws_after_verify_token_closes_on_revoke() {
+            crate::revocation::arm_process();
+            let cap = crate::jwt::now_unix_seconds() + 7200;
+            let token = hs256(&session_claims("ws-public-subject", "ws-public-jti", cap));
+            let gate = in_request_scope(async move {
+                let verified = crate::auth::auth_verify_token::<String>(SECRET.to_string(), token);
+                assert!(
+                    matches!(verified, IpeResult::Ok(_)),
+                    "the armed kernel admits the token"
+                );
+                ChannelGate::open(ChannelCredentials::of_request())
+                    .ok()
+                    .flatten()
+            })
+            .await;
+            assert!(
+                gate.is_some(),
+                "a public route that verified a token gates its socket"
+            );
+            let mut peer = serve_ws(gate).await;
+            crate::revocation::revoke_subject("ws-public-subject".to_string()).expect("revoke");
+            let frame = next_frame(&mut peer, 2 * RECHECK_COALESCE).await;
+            assert!(
+                is_denied_close(frame.as_ref()),
+                "revoking the verified token closes the socket 1008: {frame:?}"
             );
         }
     }
