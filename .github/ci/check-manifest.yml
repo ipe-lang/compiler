@@ -113,7 +113,7 @@ checks:
           env:
             IPE_E2E: "1"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
-    aggregates: [test-prep, test-run, wasi-run]
+    aggregates: [test-prep, test-run, wasi-run, windows-test]
   - context: artifact-guard
     disposition: gate
     producer: ci.yml

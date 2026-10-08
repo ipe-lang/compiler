@@ -245,16 +245,40 @@ const fn opener_argv(platform: Platform, url: &BrowserUrl) -> (&'static str, [&s
 /// the call returns, so it never holds the caller. A caller prints the URL
 /// whenever the outcome is not [`OpenOutcome::Opened`]. Call it from a thread
 /// that outlives the opener: a spawning thread's exit signals the opener.
+///
+/// On Windows, once the CLI has joined its own kill-on-close job, the opener
+/// breaks away from it, so the browser outlives the CLI; where a job the CLI
+/// was started in forbids breaking away, the opener starts inside the CLI's job.
 pub fn open_url(url: &BrowserUrl) -> OpenOutcome {
     let (program, args) = opener_argv(Platform::HOST, url);
-    let mut command = Command::new(program);
-    command.args(args);
-    run_opener(
-        command,
-        Platform::HOST.exit_status_is_verdict(),
-        OPENER_GRACE,
-    )
+    let opener = || {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    };
+    let exit_is_verdict = Platform::HOST.exit_status_is_verdict();
+    #[cfg(windows)]
+    if crate::remote_ingest::cli_job_joined() {
+        use std::os::windows::process::CommandExt as _;
+        let mut command = opener();
+        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+        let outcome = run_opener(command, exit_is_verdict, OPENER_GRACE);
+        // Refused before it started: a job the CLI was started in forbids breaking away.
+        let breakaway_refused = matches!(
+            &outcome,
+            OpenOutcome::Spawn(SpawnRefusal::Spawn(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+        );
+        if !breakaway_refused {
+            return outcome;
+        }
+    }
+    run_opener(opener(), exit_is_verdict, OPENER_GRACE)
 }
+
+/// The `CreateProcess` flag that starts a child outside every job its parent is in.
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Start `command` hardened with null stdio and watch it for at most `grace`.
 fn run_opener(mut command: Command, exit_is_verdict: bool, grace: Duration) -> OpenOutcome {

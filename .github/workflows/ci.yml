@@ -12,7 +12,7 @@ name: Build & test
 #     first-party check-floor + shapes build gate, wasm-floor, editors-configure.
 #     A pull request runs only this phase.
 #   • TESTS (`tests`: merge queue, dispatch) — test (nextest, with the `ipe`
-#     feature job wasi-run), the 14-shard e2e
+#     feature job wasi-run and the Windows job windows-test), the 14-shard e2e
 #     SEAL and seal-slice's coverage proof, seal-smoke, seal-modset (vendored),
 #     the runtime feature-combo / full-feature builds, registry-admission, the
 #     release-target checks, the Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
@@ -305,8 +305,8 @@ jobs:
   # directory handles, reparse-point refusal, the Windows jail and tool-name
   # checks) never compiles on a Linux runner, so a cfg(windows)
   # break would otherwise surface only at release. Type-checks the crates and
-  # their tests for Windows on every code change; the Windows test suites do
-  # not run in CI.
+  # their tests for Windows on every code change; `windows-test` runs the
+  # transfer-containment tests on Windows.
   windows-check:
     runs-on: windows-latest
     needs: changes
@@ -833,13 +833,35 @@ jobs:
           IPE_E2E: "1"
         run: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
 
+  # A Git or Curl transfer on Windows runs in its own kill-on-close job object
+  # inside the CLI's own job, and a transfer that cannot be contained is refused
+  # with its child killed and reaped. Those refusals and the job teardown of a
+  # lingering grandchild exist only on Windows, so this job runs the
+  # `remote_ingest` tests of `ipe` there.
+  windows-test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Test the transfer containment on Windows
+        shell: bash
+        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::)'
+
   # Required aggregation gate for `test`: green only when every shard, the
-  # doctest job (in test-prep) and the feature job `wasi-run` passed. Branch protection lists this job, so a
+  # doctest job (in test-prep), the feature job `wasi-run` and the Windows job
+  # `windows-test` passed. Branch protection lists this job, so a
   # matrix expansion never silently drops a required check. The `always()` guard
   # makes a skipped/failed dependency a FAILURE here, never a false green.
   test:
     runs-on: ubuntu-latest
-    needs: [changes, test-prep, test-run, wasi-run]
+    needs: [changes, test-prep, test-run, wasi-run, windows-test]
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -854,6 +876,7 @@ jobs:
             test-prep=${{ needs.test-prep.result }}
             test-run=${{ needs.test-run.result }}
             wasi-run=${{ needs.wasi-run.result }}
+            windows-test=${{ needs.windows-test.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
