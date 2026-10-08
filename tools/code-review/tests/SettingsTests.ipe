@@ -21,6 +21,7 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.EnvLookup as EnvLookup
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
@@ -1016,12 +1017,13 @@ macKeyParseRefuses =
         )
 
 
--- Only the key variable not being set reads as read-only, recognized
--- through the runtime's own not-set failure; any other failure to read it
--- refuses with an error naming the variable and never the failure's text,
--- the not-set failure of another variable included. Red if every lookup
--- failure is read as unset, or if the runtime's not-set failure is no
--- longer recognized (an unset key would then refuse startup).
+-- Only a `NotFound` failure reads as read-only, decided by the error's kind
+-- and never its text: the runtime's unset key reads as read-only; every other
+-- kind refuses with an error naming the variable and never the failure's
+-- text, an `Unexpected` failure carrying the old not-set wording included.
+-- Red if the kind check is replaced by a text match, if any other kind is
+-- read as unset, or if `NotFound` is no longer read as unset (an unset key
+-- would then refuse startup).
 keyLookupFailsClosed : Task.Task Error Bool
 keyLookupFailsClosed =
     do
@@ -1029,12 +1031,56 @@ keyLookupFailsClosed =
         unset <- ReviewKey.readReviewKey
         Task.succeed
             (keyReadOnly (Ok unset)
+                && keyReadOnly (ReviewKey.keyFromLookup (Err Error.notFound))
                 && List.all refusesNamingVar
-                    [ Error.unexpected ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not valid unicode")
+                    [ Error.invalidInput ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not valid unicode")
+                    , Error.unexpected ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not set")
                     , Error.unexpected "environment variable \"OTHER_KEY\" is not set"
                     , Error.permissionDenied
                     ]
             )
+
+
+-- A required variable's startup refusal says which way its read failed by
+-- the failure's kind, never its text: `NotFound` reads as not set; every
+-- other kind, an `Unexpected` failure carrying the not-set wording included,
+-- reads as could not be read. Each names the variable, ends with its fix and
+-- repeats no byte of the failure. Red if the refusal ignores the kind (a
+-- variable set to a value that is not valid Unicode then reads as unset) or
+-- echoes the failure.
+requiredVarRefusalByKind : Bool
+requiredVarRefusalByKind =
+    let
+        unset =
+            EnvLookup.requiredVarRefusal "IPE_INDEX_DB" "fix: set it" Error.notFound
+    in
+    namesVarAndFix unset
+        && String.contains "IPE_INDEX_DB is not set." unset
+        && not (String.contains "could not be read" unset)
+        && List.all unreadableRefusal
+            [ Error.invalidInput "environment variable \"IPE_INDEX_DB\" is set to zq9, not valid Unicode"
+            , Error.unexpected "environment variable \"IPE_INDEX_DB\" is not set zq9"
+            , Error.withMessage "zq9" Error.permissionDenied
+            ]
+
+
+unreadableRefusal : Error -> Bool
+unreadableRefusal failure =
+    let
+        refusal =
+            EnvLookup.requiredVarRefusal "IPE_INDEX_DB" "fix: set it" failure
+    in
+    namesVarAndFix refusal
+        && String.contains "IPE_INDEX_DB could not be read from the environment." refusal
+        && not (String.contains "is not set" refusal)
+
+
+namesVarAndFix : String -> Bool
+namesVarAndFix refusal =
+    String.startsWith "code-review: required environment variable IPE_INDEX_DB " refusal
+        && String.endsWith "\n  fix: set it" refusal
+        && not (String.contains "zq9" refusal)
+        && not (String.contains "Unicode" refusal)
 
 
 keyReadOnly : Result Error ReviewKey -> Bool
@@ -1068,6 +1114,7 @@ checks =
         [ Task.succeed ( "db file paths escape url specials", filePathsEncodeUrlSpecials )
         , Task.succeed ( "a review key that is not 64 hex digits is refused without echoing it", macKeyParseRefuses )
         , check "only an unset review key reads as read-only; any other read failure refuses" keyLookupFailsClosed
+        , Task.succeed ( "a required variable's refusal says by kind whether it is unset or unreadable, never echoing", requiredVarRefusalByKind )
         , check "index db refusal names only the variable" dbRefusalNamesOnlyVariable
         , check "unusable index db locations refused" badIndexDbRefused
         , check "db urls carry only the app's open mode" dbUrlsCarryAppMode

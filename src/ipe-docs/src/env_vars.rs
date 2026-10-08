@@ -1269,6 +1269,12 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_E2E_STATIC",          // CI gate for static-binary e2e tests
     "IPE_FUZZ_ITERS",          // fuzz template harness: random-run iteration count
     "IPE_FUZZ_SEED",           // fuzz template harness: random-run seed
+    "IPE_GETENV_KIND_ABSENT", // runtime getenv failure-kind tests: a fixed name, never read in production
+    "IPE_GETENV_KIND_BAD_BOOL", // runtime getenv failure-kind tests: a fixed name, never read in production
+    "IPE_GETENV_KIND_BAD_INT", // runtime getenv failure-kind tests: a fixed name, never read in production
+    "IPE_GETENV_KIND_NOT_UNICODE", // runtime getenv failure-kind tests: a fixed name, never read in production
+    "IPE_GETENV_KIND_READABLE", // runtime getenv failure-kind tests: a fixed name, never read in production
+    "IPE_GETENV_NOT_UNICODE_PROBE", // runtime getenv failure-kind tests: selects the non-Unicode re-exec probe
     "IPE_HOST_ENV_TEST_UNSET_7F3A9C21D84E", // sandbox host_env test: a name no host sets
     "IPE_HTTP_TEST_URL",
     "IPE_INDEX_EXTRACTOR", // ipe-index build script: extractor digest handed to the crate at compile time

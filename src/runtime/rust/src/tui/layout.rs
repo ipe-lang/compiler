@@ -786,6 +786,8 @@ fn walk_attrs<M>(attrs: &[Attribute<M>], inherited: Style) -> Walked {
             Attribute::AttrEvent(_) => {}
             // HTML arbitrary attribute escape hatch; no terminal surface.
             Attribute::AttrAttribute(_, _) => {}
+            // Read by `render_input` as the checkbox/radio state.
+            Attribute::AttrChecked(_) => {}
             // CSS font-size in px — terminal cell size is fixed; ignored.
             Attribute::AttrFontSize(_) => {}
             // CSS font-family — terminal font is set by the emulator; ignored.
@@ -1091,6 +1093,7 @@ fn render_input<M: Clone>(
             | Attribute::AttrClass(_)
             | Attribute::AttrEvent(_)
             | Attribute::AttrAttribute(_, _)
+            | Attribute::AttrChecked(_)
             | Attribute::AttrFontSize(_)
             | Attribute::AttrFontFamily(_)
             | Attribute::AttrFontWeight(_)
@@ -1144,9 +1147,16 @@ fn render_input<M: Clone>(
     // `checked` attr is present OR its value is non-empty and not "false". Without
     // the radio clause the selected radio kept drawing ○ (the "radio doesn't work"
     // report — onClick fires, but there was no visual feedback).
-    let checked = attr_str(attrs, "checked").is_some()
-        || value == "true"
-        || (input_type == "radio" && !value.is_empty() && value != "false");
+    // A typed `AttrChecked` is authoritative over that heuristic.
+    let explicit_checked = attrs.iter().find_map(|a| match a {
+        Attribute::AttrChecked(b) => Some(*b),
+        _ => None,
+    });
+    let checked = explicit_checked.unwrap_or_else(|| {
+        attr_str(attrs, "checked").is_some()
+            || value == "true"
+            || (input_type == "radio" && !value.is_empty() && value != "false")
+    });
     let events = super::focus::collect_events(attrs);
 
     let idx = ctx.focusables.len();
@@ -2776,6 +2786,73 @@ mod tests {
         assert!(element_to_cells(&unchecked, 80, 24).contains('☐'));
         let checked: Element<()> = input("checkbox", "true");
         assert!(element_to_cells(&checked, 80, 24).contains('☑'));
+    }
+
+    /// A typed `AttrChecked(false)` beats the `value="true"` heuristic, and
+    /// `AttrChecked(true)` beats an empty value. Red without the override in
+    /// `render_input`.
+    #[test]
+    fn attr_checked_overrides_value_heuristic() {
+        let with = |ty: &str, value: &str, checked: bool| -> Element<()> {
+            Element::TaggedNode(
+                "input".into(),
+                Description::NoDescription,
+                vec![
+                    Attribute::AttrAttribute("type".into(), ty.into()),
+                    Attribute::AttrAttribute("value".into(), value.into()),
+                    Attribute::AttrChecked(checked),
+                ],
+                vec![],
+            )
+        };
+        let off = element_to_cells(&with("checkbox", "true", false), 80, 24);
+        assert!(off.contains('☐') && !off.contains('☑'));
+        let on = element_to_cells(&with("checkbox", "", true), 80, 24);
+        assert!(on.contains('☑') && !on.contains('☐'));
+        let radio_off = element_to_cells(&with("radio", "pick", false), 80, 24);
+        assert!(radio_off.contains('○') && !radio_off.contains('●'));
+    }
+
+    /// A checkbox with a left label stays on one terminal row, because the
+    /// `label` wrapper honours the `__row` marker. Red if `attach_label` stops
+    /// emitting the axis marker on the wrapper.
+    #[test]
+    fn label_wrapper_keeps_row_axis() {
+        use crate::ui::input::{input_checkbox_, input_label_left_};
+
+        let el: Element<()> = input_checkbox_(
+            Vec::new(),
+            std::sync::Arc::new(|_b: bool| ()),
+            std::sync::Arc::new(|_b: bool| Element::Empty),
+            true,
+            input_label_left_(Vec::new(), Element::Text("Agree".into())),
+        );
+        assert_eq!(element_to_cells_height(&el, 80), 1);
+        let frame = element_to_cells(&el, 80, 24);
+        assert!(frame.contains("Agree") && frame.contains('☑'), "{frame}");
+    }
+
+    /// A radio group draws exactly its selected option as filled, because the
+    /// typed `AttrChecked` overrides the non-empty-value heuristic. Red without
+    /// `AttrChecked` on each radio.
+    #[test]
+    fn ui_radio_draws_only_the_selected_option() {
+        use crate::ui::input::{input_label_hidden_, input_option_, input_radio_};
+
+        let options = ["a", "b", "c"]
+            .into_iter()
+            .map(|v| input_option_(v.to_owned(), Element::Text(v.to_uppercase())))
+            .collect();
+        let el: Element<()> = input_radio_(
+            Vec::new(),
+            std::sync::Arc::new(|_s: String| ()),
+            options,
+            "b".to_owned(),
+            input_label_hidden_("Pick".to_owned()),
+        );
+        let frame = element_to_cells(&el, 80, 24);
+        assert_eq!(frame.matches('●').count(), 1, "{frame}");
+        assert_eq!(frame.matches('○').count(), 2, "{frame}");
     }
 
     #[test]

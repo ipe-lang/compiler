@@ -10,6 +10,7 @@ import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Db as LibDb
+import Lib.EnvLookup as EnvLookup
 import Lib.Epoch as Epoch
 import Lib.Index as Index
 import Lib.Queue as Queue
@@ -46,17 +47,18 @@ reviewApp settings =
 
 
 -- Require an environment variable, failing closed with an actionable message
--- when it is unset. `System.getenv` errors on a missing var; the recovery
--- branch names the variable and that variable's own fix, then exits
+-- when it cannot be read. The recovery branch names the variable, says by
+-- the failure's kind whether it is not set or could not be read, never
+-- repeats the failure's text, adds that variable's own fix, then exits
 -- non-zero. The app never falls back to a silent default that would surface
 -- later as an opaque SQLITE_CANTOPEN when the index db is not where a bare
 -- default points. `key` and `fix` are this tool's own text.
 requireEnv : String -> String -> Task Error String
 requireEnv key fix =
     Task.onError
-        (\_ ->
+        (\e ->
             do
-                Io.eprintln ("code-review: required environment variable " ++ key ++ " is not set.\n  " ++ fix)
+                Io.eprintln (EnvLookup.requiredVarRefusal key fix e)
                 System.exit 1
         )
         (System.getenv key)

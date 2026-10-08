@@ -831,6 +831,25 @@ view model =
    fills parent, and `Background.color (Ui.rgb 240 240 240)` colours
    textarea itself.
 
+   The label names the control by structure. A visible label makes the
+   wrapper a `<label>` that contains the control, so clicking the label text
+   focuses or toggles it; `Input.labelHidden "Name"` puts `aria-label` on the
+   control itself (an empty text names nothing). A radio group is a
+   `<fieldset>` whose first child is the label as a `<legend>` (hidden label:
+   `aria-label` on the fieldset), and each radio sits inside its own `<label>`.
+   Form, ARIA and event attrs reach the `<input>` for every kind, checkbox
+   included; on a radio group they land on the `<fieldset>`. To tie an error
+   message to a field:
+
+   ```elm
+   Input.text [ Ui.ariaInvalid Ui.InvalidTrue, Ui.ariaDescribedby "email-err" ] ...
+   Ui.el [ Ui.id "email-err" ] (Ui.text "Not an email address")
+   ```
+
+   A checkbox `icon` is visual only: the whole `<label>` toggles the box, so
+   an icon must not carry its own click handler. In the terminal UI a radio
+   group's legend is always drawn first, even for `labelBelow` / `labelRight`.
+
 ### `Ui.fill` semantics
 
 `Ui.fill` lowers asymmetrically per parent's flex direction: main-axis fill

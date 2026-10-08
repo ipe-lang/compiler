@@ -763,6 +763,10 @@ descLiveAssertive : Description
 descHeading : Int -> Description
 ```
 
+`descHeading n` — a heading of level `n`. Levels 1–6 render `<h1>`–`<h6>`;
+a level above 6 renders `role="heading"` with `aria-level`; a level below 1
+is level 1.
+
 ## `descLabel`
 
 ```ipe

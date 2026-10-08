@@ -18,7 +18,9 @@
 //! exactly as it does a compiled literal. There is no code path, including
 //! deserialization, by which a `UiTemplate` yields a handler or unescaped HTML.
 
-use super::element::{Attribute, Description, Element, HAlign, Length, PseudoClass, VAlign};
+use super::element::{
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, PseudoClass, VAlign,
+};
 use crate::color::Color;
 use crate::html::{Attribute as HtmlAttribute, Event};
 
@@ -231,7 +233,7 @@ impl UiDescription {
             Description::DescNavigation => Self::DescNavigation,
             Description::DescContentInfo => Self::DescContentInfo,
             Description::DescComplementary => Self::DescComplementary,
-            Description::DescHeading(n) => Self::DescHeading(*n),
+            Description::DescHeading(l) => Self::DescHeading(l.get()),
             Description::DescLabel(s) => Self::DescLabel(s.clone()),
             Description::DescLivePolite => Self::DescLivePolite,
             Description::DescLiveAssertive => Self::DescLiveAssertive,
@@ -247,7 +249,7 @@ impl UiDescription {
             Self::DescNavigation => Description::DescNavigation,
             Self::DescContentInfo => Description::DescContentInfo,
             Self::DescComplementary => Description::DescComplementary,
-            Self::DescHeading(n) => Description::DescHeading(*n),
+            Self::DescHeading(n) => Description::DescHeading(HeadingLevel::from_requested(*n)),
             Self::DescLabel(s) => Description::DescLabel(s.clone()),
             Self::DescLivePolite => Description::DescLivePolite,
             Self::DescLiveAssertive => Description::DescLiveAssertive,
@@ -402,6 +404,8 @@ impl UiTemplateAttr {
             Attribute::AttrEvent(_) | Attribute::AttrNearby(..) | Attribute::AttrExplain => {
                 return None;
             }
+            // Checkedness follows the model per render; it has no static wire form.
+            Attribute::AttrChecked(_) => return None,
         })
     }
 
@@ -1548,6 +1552,21 @@ mod tests {
             vec![],
         );
         assert_eq!(ui_template_of(&subtree), None);
+    }
+
+    /// Checkedness follows the model per render and has no static wire form, so a
+    /// subtree carrying it stays compiled. Red without the `AttrChecked` refusal
+    /// arm in `from_attr`.
+    #[test]
+    fn checked_attribute_is_not_templatable() {
+        for checked in [true, false] {
+            let subtree: Element<()> = Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrChecked(checked)],
+                vec![],
+            );
+            assert_eq!(ui_template_of(&subtree), None);
+        }
     }
 
     #[test]
@@ -3001,5 +3020,38 @@ mod tests {
                 "float_attr_fills=[] must not perturb a template with no AttrHoleFloat"
             );
         }
+    }
+
+    /// A heading level crosses the template wire as a plain `i64`; a level
+    /// below 1 comes back as level 1 and a high level is kept as written.
+    #[test]
+    fn desc_heading_round_trips_through_template() {
+        use super::UiDescription;
+        use crate::ui::element::HeadingLevel;
+        let low = UiDescription::DescHeading(0).to_desc();
+        assert_eq!(
+            low,
+            Description::DescHeading(HeadingLevel::from_requested(1))
+        );
+        let high = Description::DescHeading(HeadingLevel::from_requested(7));
+        assert_eq!(
+            UiDescription::from_desc(&high),
+            UiDescription::DescHeading(7)
+        );
+        assert_eq!(UiDescription::DescHeading(7).to_desc(), high);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn desc_heading_wire_stays_an_integer() {
+        use super::UiDescription;
+        use crate::ui::element::HeadingLevel;
+        let decoded: UiDescription =
+            serde_json::from_str(r#"{"DescHeading":0}"#).expect("integer level decodes");
+        assert_eq!(
+            decoded.to_desc(),
+            Description::DescHeading(HeadingLevel::from_requested(1))
+        );
+        assert!(serde_json::from_str::<UiDescription>(r#"{"DescHeading":"2"}"#).is_err());
     }
 }

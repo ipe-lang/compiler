@@ -7,6 +7,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
+import Lib.EnvLookup as EnvLookup
 
 
 -- The key that signs and verifies review-log rows. Opaque: built only by
@@ -63,10 +64,10 @@ readReviewKey =
         |> Task.andThen (\lookup -> Task.fromResult (keyFromLookup lookup))
 
 
--- The key from the outcome of reading its variable: only the variable not
--- being set is `ReadOnly`; a set value, empty or blank included, must
--- parse; any other failure to read it refuses startup, naming the variable
--- and never the failure's own text.
+-- The key from the outcome of reading its variable: only a `NotFound`
+-- failure, the variable not being set, is `ReadOnly`; a set value, empty or
+-- blank included, must parse; any other failure to read it, whatever its
+-- text, refuses startup, naming the variable and never the failure's own text.
 keyFromLookup : Result Error String -> Result Error ReviewKey
 keyFromLookup lookup =
     case lookup of
@@ -74,20 +75,11 @@ keyFromLookup lookup =
             Result.map Signing (parseMacKey raw)
 
         Err e ->
-            if isUnset e then
+            if EnvLookup.isUnset e then
                 Ok ReadOnly
 
             else
                 Err unreadableKey
-
-
--- The one failure `System.getenv` reports for a variable that is not set.
-isUnset : Error -> Bool
-isUnset e =
-    Error.kind e
-        == Error.kind (Error.unexpected "")
-        && Error.message e
-        == ("environment variable \"" ++ keyVar ++ "\" is not set")
 
 
 unreadableKey : Error

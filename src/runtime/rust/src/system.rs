@@ -2995,75 +2995,97 @@ pub fn system_exit(code: i64) -> ! {
 }
 
 /// `Ipe.System.getenv key : String -> Task Error String` — the env var as a
-/// Task, or `Err` when unset. Returning a `IpeTask` (not a bare `String`) is
-/// required for parity: `getenv` is Task-typed in the stdlib, so a bare `String`
-/// fails to type-check in any `Task.andThen`/`Task.run` position. Returning `Err`
-/// on unset (rather than `Ok("")`) fails the Task at the call site, so a
-/// chained `Task.andThen` short-circuits on a missing variable. The error is
-/// string-based — the generic `E` bound can only build `From<String>`, so the
-/// error kind is a plain string. NOTE: `getenvOr` stays a bare
-/// `String` (the default plugs the missing case at the call site).
+/// `Task`, failing when it cannot be read.
+///
+/// Returning a `IpeTask` (not a bare `String`) keeps `getenv` usable in a
+/// `Task.andThen`/`Task.run` position, and an unset variable fails the task
+/// (never `Ok("")`) so a chained `Task.andThen` short-circuits. The failure
+/// carries its kind: `NotFound` for an absent variable or a temp-root key,
+/// `InvalidInput` for a variable set to a value that is not valid Unicode. The
+/// message names the key, never the value. `getenvOr` stays a bare `String`:
+/// its default answers every failure.
 #[must_use]
-pub fn system_getenv<E: Send + From<String> + 'static>(key: String) -> IpeTask<E, String> {
+pub fn system_getenv<E: Send + From<IpeError> + 'static>(key: String) -> IpeTask<E, String> {
     Box::pin(async move {
-        if let Ok(v) = read_env_var(&key) {
-            ok_res(v)
-        } else {
-            let msg = format!("environment variable {key:?} is not set");
-            IpeResult::Err(str_err(&msg))
+        match getenv_text(&key, read_env_var(&key)) {
+            Ok(v) => ok_res(v),
+            Err(e) => IpeResult::Err(e.into()),
         }
     })
 }
-/// `Ipe.System.getenvOr key default` — the env var, or `default` when unset.
+
+/// `Ipe.System.getenvOr key default` — the env var, or `default` when it cannot
+/// be read.
+///
+/// A variable set to a value that is not valid Unicode answers `default`, the
+/// same as an absent one: the bare `String` return has no failure channel.
 #[must_use]
 pub fn system_getenv_or(key: String, default: String) -> String {
     read_env_var(&key).unwrap_or(default)
 }
 
-/// `System.getenvInt key : String -> Task Error Int`. Unset → `Err` (variable not
-/// set); set-but-not-an-int → `Err` (parse failure). The string-based error
-/// follows the generic-`E` convention (shared with `getenv`/`cwd`).
+/// `System.getenvInt key : String -> Task Error Int`.
+///
+/// Fails `NotFound` when the variable is unset and `InvalidInput` when it is not
+/// valid Unicode or does not parse as an integer.
 #[must_use]
-pub fn system_getenv_int<E: Send + From<String> + 'static>(key: String) -> IpeTask<E, i64> {
+pub fn system_getenv_int<E: Send + From<IpeError> + 'static>(key: String) -> IpeTask<E, i64> {
     Box::pin(async move {
-        let r: Result<i64, String> = match read_env_var(&key) {
-            Err(_) => Err(format!("environment variable {key:?} is not set")),
-            Ok(v) => v
-                .trim()
-                .parse::<i64>()
-                // Do NOT echo the env var VALUE into the Ipê-propagated error
-                // string: env vars are a primary secret store and this message
-                // flows out via Task Error → Error.toString → operator logs /
-                // user surface. Mirror system_getenv (key only).
-                .map_err(|_| format!("env {key}: not a valid int")),
-        };
-        match r {
+        match getenv_int_value(&key, read_env_var(&key)) {
             Ok(n) => ok_res(n),
-            Err(m) => IpeResult::Err(str_err(&m)),
+            Err(e) => IpeResult::Err(e.into()),
         }
     })
 }
 
-/// `System.getenvBool key : String -> Task Error Bool`. Accepted truthy values:
-/// `true/yes/1/on/y/t` → true; `false/no/0/off/n/f`/empty → false; unset →
-/// `Err` (variable not set); anything else → `Err` (not a valid bool).
+/// `System.getenvBool key : String -> Task Error Bool`.
+///
+/// Accepted truthy values: `true/yes/1/on/y/t` → true; `false/no/0/off/n/f`/empty
+/// → false. Fails `NotFound` when the variable is unset and `InvalidInput` when
+/// it is not valid Unicode or is anything else.
 #[must_use]
-pub fn system_getenv_bool<E: Send + From<String> + 'static>(key: String) -> IpeTask<E, bool> {
+pub fn system_getenv_bool<E: Send + From<IpeError> + 'static>(key: String) -> IpeTask<E, bool> {
     Box::pin(async move {
-        let r: Result<bool, String> = match read_env_var(&key) {
-            Err(_) => Err(format!("environment variable {key:?} is not set")),
-            Ok(v) => match v.trim().to_lowercase().as_str() {
-                "true" | "yes" | "1" | "on" | "y" | "t" => Ok(true),
-                "false" | "no" | "0" | "off" | "n" | "f" | "" => Ok(false),
-                // Key only — never echo the env var VALUE (secret-store leak).
-                _ => Err(format!("env {key}: not a valid bool")),
-            },
-        };
-        match r {
+        match getenv_bool_value(&key, read_env_var(&key)) {
             Ok(b) => ok_res(b),
-            Err(m) => IpeResult::Err(str_err(&m)),
+            Err(e) => IpeResult::Err(e.into()),
         }
     })
+}
+
+/// The text of one environment read, or the error naming which way it failed.
+///
+/// Absent → `NotFound`; set to non-Unicode bytes → `InvalidInput`. The message
+/// names the key only, never the value.
+fn getenv_text(key: &str, raw: Result<String, std::env::VarError>) -> Result<String, IpeError> {
+    match raw {
+        Ok(v) => Ok(v),
+        Err(std::env::VarError::NotPresent) => {
+            Err(IpeError::not_found()
+                .with_message(format!("environment variable {key:?} is not set")))
+        }
+        Err(std::env::VarError::NotUnicode(_)) => Err(IpeError::invalid_input(format!(
+            "environment variable {key:?} is set to a value that is not valid Unicode"
+        ))),
+    }
+}
+
+/// The integer one environment read holds, or the error naming why it has none.
+fn getenv_int_value(key: &str, raw: Result<String, std::env::VarError>) -> Result<i64, IpeError> {
+    getenv_text(key, raw)?.trim().parse::<i64>().map_err(|_| {
+        IpeError::invalid_input(format!("environment variable {key:?} is not a valid int"))
+    })
+}
+
+/// The boolean one environment read holds, or the error naming why it has none.
+fn getenv_bool_value(key: &str, raw: Result<String, std::env::VarError>) -> Result<bool, IpeError> {
+    match getenv_text(key, raw)?.trim().to_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" | "y" | "t" => Ok(true),
+        "false" | "no" | "0" | "off" | "n" | "f" | "" => Ok(false),
+        _ => Err(IpeError::invalid_input(format!(
+            "environment variable {key:?} is not a valid bool"
+        ))),
+    }
 }
 
 /// `System.getArg n : Int -> Task Error (Maybe String)`. Indexes the FULL arg
@@ -3781,6 +3803,196 @@ mod temp_root_env_tests {
                 "{key:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod getenv_kind_tests {
+    use super::{
+        locked_remove_var, locked_set_var, system_getenv, system_getenv_bool, system_getenv_int,
+    };
+    use crate::error::{IpeError, IpeErrorKind};
+    use crate::{IpeResult, IpeTask};
+
+    /// Marker bytes no failure message may carry, as ASCII or as a lossy rendering.
+    const SECRET_MARKER: &str = "zq9";
+
+    /// The variable the re-exec of the non-Unicode environ test is started with.
+    #[cfg(unix)]
+    const NOT_UNICODE_PROBE: &str = "IPE_GETENV_NOT_UNICODE_PROBE";
+
+    /// A non-Unicode value that holds the marker.
+    #[cfg(unix)]
+    fn not_unicode_value() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+        std::ffi::OsString::from_vec(vec![0xFF, b'z', b'q', b'9', 0xFE])
+    }
+
+    #[allow(clippy::expect_used)] // test harness: a runtime that cannot start is an environment issue
+    fn block<T: Send + 'static>(task: IpeTask<IpeError, T>) -> IpeResult<IpeError, T> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        rt.block_on(task)
+    }
+
+    /// The kind and message of a failed task; `None` for a success.
+    fn failure<T>(result: IpeResult<IpeError, T>) -> Option<(IpeErrorKind, String)> {
+        match result {
+            IpeResult::Err(IpeError::Error(kind, info)) => Some((kind, info.message)),
+            IpeResult::Ok(_) => None,
+        }
+    }
+
+    /// Whether `result` failed with `kind` and a message that names `key` and
+    /// carries no byte of the value.
+    fn fails_as<T>(result: IpeResult<IpeError, T>, kind: IpeErrorKind, key: &str) -> bool {
+        failure(result).is_some_and(|(got, message)| {
+            got == kind
+                && message.contains(key)
+                && !message.contains(SECRET_MARKER)
+                && !message.contains('\u{FFFD}')
+        })
+    }
+
+    /// Whether every `getenv*` kernel fails on `key` as `kind`.
+    fn every_kernel_fails_as(key: &str, kind: IpeErrorKind) -> bool {
+        fails_as(block(system_getenv::<IpeError>(key.to_owned())), kind, key)
+            && fails_as(
+                block(system_getenv_int::<IpeError>(key.to_owned())),
+                kind,
+                key,
+            )
+            && fails_as(
+                block(system_getenv_bool::<IpeError>(key.to_owned())),
+                kind,
+                key,
+            )
+    }
+
+    /// An absent variable is `NotFound` from every `getenv*` kernel.
+    #[test]
+    fn an_absent_key_is_not_found() {
+        let key = "IPE_GETENV_KIND_ABSENT";
+        locked_remove_var(key);
+        assert!(every_kernel_fails_as(key, IpeErrorKind::NotFound));
+    }
+
+    /// A temp-root key is `NotFound`, even when the program set it.
+    #[test]
+    fn a_temp_root_key_is_not_found() {
+        for key in ["TMPDIR", "TMP", "TEMP", "tmpdir"] {
+            locked_set_var(key, "/attacker/base");
+            assert!(
+                every_kernel_fails_as(key, IpeErrorKind::NotFound),
+                "{key:?}"
+            );
+            locked_remove_var(key);
+        }
+    }
+
+    /// A value that is not Unicode is `InvalidInput`, never absence, and its
+    /// bytes reach no message.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_value_is_invalid_input_without_echo() {
+        use super::{getenv_bool_value, getenv_int_value, getenv_text};
+        use std::env::VarError;
+        let key = "IPE_GETENV_KIND_NOT_UNICODE";
+        let raw = || Err::<String, _>(VarError::NotUnicode(not_unicode_value()));
+        let failures = [
+            getenv_text(key, raw()).err(),
+            getenv_int_value(key, raw()).err(),
+            getenv_bool_value(key, raw()).err(),
+        ];
+        for failed in failures {
+            let result: IpeResult<IpeError, ()> = failed.map_or(IpeResult::Ok(()), IpeResult::Err);
+            assert!(fails_as(result, IpeErrorKind::InvalidInput, key), "{key:?}");
+        }
+    }
+
+    /// A value that does not parse is `InvalidInput`, and the value is not echoed.
+    #[test]
+    fn an_unparsable_value_is_invalid_input_without_echo() {
+        let int_key = "IPE_GETENV_KIND_BAD_INT";
+        locked_set_var(int_key, "abc-zq9");
+        assert!(fails_as(
+            block(system_getenv_int::<IpeError>(int_key.to_owned())),
+            IpeErrorKind::InvalidInput,
+            int_key
+        ));
+        let bool_key = "IPE_GETENV_KIND_BAD_BOOL";
+        locked_set_var(bool_key, "maybe-zq9");
+        assert!(fails_as(
+            block(system_getenv_bool::<IpeError>(bool_key.to_owned())),
+            IpeErrorKind::InvalidInput,
+            bool_key
+        ));
+        locked_remove_var(int_key);
+        locked_remove_var(bool_key);
+    }
+
+    /// A readable value still answers, so the kinds above are the only failures.
+    #[test]
+    fn a_readable_value_still_answers() {
+        let key = "IPE_GETENV_KIND_READABLE";
+        locked_set_var(key, " 42 ");
+        assert!(matches!(
+            block(system_getenv_int::<IpeError>(key.to_owned())),
+            IpeResult::Ok(42)
+        ));
+        locked_set_var(key, "Yes");
+        assert!(matches!(
+            block(system_getenv_bool::<IpeError>(key.to_owned())),
+            IpeResult::Ok(true)
+        ));
+        assert!(matches!(
+            block(system_getenv::<IpeError>(key.to_owned())),
+            IpeResult::Ok(v) if v == "Yes"
+        ));
+        locked_remove_var(key);
+    }
+
+    /// The real environ read fails `InvalidInput` for a non-Unicode value, and
+    /// `getenvOr` answers its default.
+    ///
+    /// The value is set at spawn on a re-exec of this test binary that must run
+    /// and pass this one test: the overlay holds only Unicode and the process
+    /// environ is never mutated. The re-exec sees the probe and checks the
+    /// kernels; the parent, without it, starts the re-exec.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_environ_value_is_invalid_input() {
+        #[allow(clippy::disallowed_methods)] // the raw environ itself is under test
+        let probed = std::env::var_os(NOT_UNICODE_PROBE).is_some();
+        if probed {
+            assert!(every_kernel_fails_as(
+                NOT_UNICODE_PROBE,
+                IpeErrorKind::InvalidInput
+            ));
+            assert_eq!(
+                super::system_getenv_or(NOT_UNICODE_PROBE.to_owned(), "fallback".to_owned()),
+                "fallback",
+                "`getenvOr` answers its default for a non-Unicode value"
+            );
+            return;
+        }
+        let module = module_path!();
+        let name = format!(
+            "{}::a_non_unicode_environ_value_is_invalid_input",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
+        let rerun = e2e_support::rerun_this_test_exact(&name, |cmd| {
+            cmd.arg("--test-threads=1")
+                .env(NOT_UNICODE_PROBE, not_unicode_value())
+                .stdin(std::process::Stdio::null());
+        });
+        assert!(
+            rerun.is_ok(),
+            "the non-Unicode re-exec did not pass: {rerun:?}"
+        );
     }
 }
 
