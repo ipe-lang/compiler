@@ -113,9 +113,10 @@ progressBar k n =
             ]
 
 
--- The root handles every keyboard shortcut and takes focus when the page
--- loads, so a key works before the reviewer clicks anywhere; focus inside it
--- keeps reaching its handler, since key events bubble to the root.
+-- The root handles every keyboard shortcut. The client focuses it on first
+-- mount (`autofocus`) and keeps focus on the same control across patches, so a
+-- key reaches the handler before and after any click, since key events bubble
+-- to the root.
 view : Model -> Ui.Element Msg
 view model =
     Ui.column

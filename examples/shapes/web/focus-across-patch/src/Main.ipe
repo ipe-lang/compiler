@@ -1,0 +1,122 @@
+module Main exposing (main)
+
+-- | focus-across-patch — a patch never moves keyboard focus.
+--
+-- The root column takes focus when the page loads and handles every key, so a
+-- key works wherever focus sits below it. `add` appends a row and `drop`
+-- removes itself, each changing the panel's children (the client swaps the
+-- panel); `Escape` toggles the row from the keyboard. The note field sits
+-- ahead of the row so its position survives either change.
+--
+-- Co-located, no capabilities, no JS ports.
+
+
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+import Ipe.Ui.Input as Input
+
+
+type alias Model =
+    { keys : String
+    , row : Bool
+    , drop : Bool
+    , note : String
+    }
+
+
+type Msg
+    = KeyDown String
+    | AddRow
+    | DropButton
+    | Note String
+    | NoOp
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { keys = "", row = False, drop = True, note = "" }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        KeyDown key ->
+            if key == "Escape" then
+                ( { model | keys = key, row = not model.row }, Cmd.none )
+
+            else
+                ( { model | keys = key }, Cmd.none )
+
+        AddRow ->
+            ( { model | row = True }, Cmd.none )
+
+        DropButton ->
+            ( { model | drop = False }, Cmd.none )
+
+        Note text ->
+            ( { model | note = text }, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+panelRow : Model -> List (Ui.Element Msg)
+panelRow model =
+    if model.row then
+        [ Ui.el [ Ui.id "row" ] (Ui.text "row") ]
+
+    else
+        []
+
+
+panelDrop : Model -> List (Ui.Element Msg)
+panelDrop model =
+    if model.drop then
+        [ Ui.button [ Ui.id "drop" ] { onPress = Just DropButton, label = Ui.text "drop" } ]
+
+    else
+        []
+
+
+view : Model -> Ui.Element Msg
+view model =
+    Ui.column
+        [ Ui.id "root"
+        , Ui.onKeyDown KeyDown
+        , Ui.htmlAttribute "tabindex" "0"
+        , Ui.htmlAttribute "autofocus" ""
+        ]
+        [ Ui.el [ Ui.id "keys" ] (Ui.text ("keys: " ++ model.keys))
+        , Ui.column
+            [ Ui.id "panel" ]
+            ([ Ui.button [ Ui.id "add" ] { onPress = Just AddRow, label = Ui.text "add" }
+             , Input.text
+                [ Ui.id "note" ]
+                { label = Input.labelHidden "Note"
+                , text = model.note
+                , onChange = Note
+                , placeholder = Nothing
+                }
+             ]
+                ++ panelRow model
+                ++ panelDrop model
+            )
+        ]
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = NoOp
+        }
