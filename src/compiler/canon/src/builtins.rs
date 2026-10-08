@@ -1,7 +1,7 @@
 //! The Prelude built-in unions — the SINGLE source of truth for every
 //! constructor that resolves without a user `type` declaration.
 //!
-//! `Maybe`/`Result`/`Bool`/`Order`, the Db `SqlValue`/`SqlField` ADTs, the
+//! `Maybe`/`Result`/`Bool`/`Order`, the Db `SqlValue`/`SqlField`/`DbFailure` ADTs, the
 //! `Ipe.Http.Stream` `ChunkEvent`/`StreamId` ADTs, and the `Error`/`ErrorKind`/
 //! `ErrorDetails` ADTs all appear in typed Ipê code as if declared, but carry no
 //! `type` decl in any Ipê source file. Three stages must agree on their exact
@@ -202,7 +202,7 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
         exhaust_union: true,
         qualified_home: None,
     },
-    // `ErrorDetails` — the 5-variant enrichment union carried on
+    // `ErrorDetails` — the 6-variant enrichment union carried on
     // `ErrorInfo.details : Maybe ErrorDetails`. Index order matches
     // `ipe_types::constrain`'s ctor scheme registration and the runtime's
     // `IpeErrorDetails` enum.
@@ -214,10 +214,40 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
             ("HttpStatus", 2, 1),
             ("JsonDecode", 3, 1),
             ("Custom", 4, 1),
+            ("Database", 5, 1),
         ],
         exhaust_union: true,
         qualified_home: None,
     },
+    // ── DbFailure (Ipe.Db) ─────────────────────────────────────────────────
+    // The closed set of database failure causes, carried as
+    // `ErrorDetails.Database`. Qualified-only (`Db.UniqueViolation`), so a
+    // user's own same-spelled constructor is never shadowed. Index order
+    // matches the runtime's `IpeDbFailure` enum.
+    BuiltinUnion {
+        type_name: "DbFailure",
+        ctors: DB_FAILURE_CTORS,
+        exhaust_union: true,
+        qualified_home: Some("Db"),
+    },
+];
+
+/// The `DbFailure` constructors, in the runtime `IpeDbFailure` declaration order.
+const DB_FAILURE_CTORS: &[(&str, usize, usize)] = &[
+    ("UniqueViolation", 0, 0),
+    ("ForeignKeyViolation", 1, 0),
+    ("NotNullViolation", 2, 0),
+    ("CheckViolation", 3, 0),
+    ("TriggerRaised", 4, 0),
+    ("OtherConstraint", 5, 0),
+    ("Busy", 6, 0),
+    ("ReadOnlyDatabase", 7, 0),
+    ("AccessDenied", 8, 0),
+    ("CannotOpen", 9, 0),
+    ("NotADatabase", 10, 0),
+    ("InvalidStatement", 11, 0),
+    ("Unreachable", 12, 0),
+    ("OtherFailure", 13, 0),
 ];
 
 /// Whether `union` may name `row`: the row's role admits constructors, and a
@@ -365,7 +395,7 @@ pub fn intern_builtins(interner: &mut Interner) -> DResult<InternedBuiltins> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILTIN_UNIONS, BuiltinUnion, intern_builtins, unions_agree};
+    use super::{BUILTIN_UNIONS, BuiltinUnion, DB_FAILURE_CTORS, intern_builtins, unions_agree};
     use ipe_intern::Interner;
     use ipe_kernels::BUILTIN_TYPES;
 
@@ -387,7 +417,8 @@ mod tests {
         assert!(unions_agree(
             &[
                 stub_union("HttpMethod", Some("Http")),
-                stub_union("RedirectPolicy", None)
+                stub_union("RedirectPolicy", None),
+                stub_union("DbFailure", Some("Db")),
             ],
             BUILTIN_TYPES
         ));
@@ -439,6 +470,53 @@ mod tests {
             "every built-in constructor must intern to a distinct symbol — a duplicate name across \
              unions would silently collapse two entries"
         );
+    }
+
+    /// The `DbFailure` row lists the runtime `IpeDbFailure` variants by name,
+    /// in declaration order, every one nullary.
+    #[test]
+    fn db_failure_row_names_the_runtime_variants() {
+        let names: Vec<&str> = DB_FAILURE_CTORS.iter().map(|&(name, _, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "UniqueViolation",
+                "ForeignKeyViolation",
+                "NotNullViolation",
+                "CheckViolation",
+                "TriggerRaised",
+                "OtherConstraint",
+                "Busy",
+                "ReadOnlyDatabase",
+                "AccessDenied",
+                "CannotOpen",
+                "NotADatabase",
+                "InvalidStatement",
+                "Unreachable",
+                "OtherFailure",
+            ]
+        );
+        assert!(DB_FAILURE_CTORS.iter().all(|&(_, _, arity)| arity == 0));
+    }
+
+    /// No two builtin constructors share a name, across every union.
+    #[test]
+    fn builtin_ctor_names_are_globally_distinct() {
+        let mut seen = std::collections::BTreeMap::new();
+        for union in BUILTIN_UNIONS {
+            for &(name, _, _) in union.ctors {
+                let earlier = seen.insert(name, union.type_name);
+                assert!(
+                    earlier.is_none(),
+                    "`{name}` is a constructor of both {earlier:?} and {}",
+                    union.type_name
+                );
+            }
+        }
+        // The control: the `ErrorKind` and `DbFailure` names nearest a clash are each present.
+        for name in ["PermissionDenied", "Unavailable", "AccessDenied", "Busy"] {
+            assert!(seen.contains_key(name), "{name}");
+        }
     }
 
     #[test]

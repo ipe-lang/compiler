@@ -7511,6 +7511,74 @@ mod tests {
         );
     }
 
+    /// The `Ipe.Db` import that brings `DbFailure`'s constructors into bare scope.
+    const DB_HDR: &str = "module Main exposing (main)\n\n\
+                          import Ipe.Db as Db exposing (DbFailure(..))\n\n";
+
+    /// The `DbFailure` arms of a `case`, every constructor but those in `omit`.
+    fn db_failure_case(omit: &[&str]) -> String {
+        let arms: String = [
+            "UniqueViolation",
+            "ForeignKeyViolation",
+            "NotNullViolation",
+            "CheckViolation",
+            "TriggerRaised",
+            "OtherConstraint",
+            "Busy",
+            "ReadOnlyDatabase",
+            "AccessDenied",
+            "CannotOpen",
+            "NotADatabase",
+            "InvalidStatement",
+            "Unreachable",
+            "OtherFailure",
+        ]
+        .iter()
+        .filter(|name| !omit.contains(name))
+        .map(|name| ["        ", name, " -> 1\n"].concat())
+        .collect();
+        format!("{DB_HDR}f e =\n    case e of\n{arms}\nmain =\n    0\n")
+    }
+
+    /// A `case` over `DbFailure` that omits `OtherFailure` is IPE-T0010 naming it.
+    ///
+    /// The union is closed: a new runtime cause cannot fall through a match
+    /// silently. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn db_failure_case_must_be_exhaustive() {
+        let (r, _, _) = infer_src(&db_failure_case(&["OtherFailure"]));
+        assert!(
+            matches!(
+                r,
+                Err(Diagnostic::Type {
+                    msg: TypeError::NonExhaustiveCase { .. },
+                    ..
+                })
+            ),
+            "expected NonExhaustiveCase, got {r:?}"
+        );
+        let Err(Diagnostic::Type {
+            msg: TypeError::NonExhaustiveCase { missing },
+            ..
+        }) = r
+        else {
+            return;
+        };
+        let names: Vec<&str> = missing.iter().map(AsRef::as_ref).collect();
+        assert_eq!(names, vec!["OtherFailure"]);
+    }
+
+    /// The control: a `case` naming every `DbFailure` constructor type-checks.
+    #[test]
+    fn db_failure_total_case_ok() {
+        let (r, _, _) = infer_src(&db_failure_case(&[]));
+        assert!(
+            r.is_ok(),
+            "a total DbFailure match must type-check, got bug={:?}",
+            bug_site(&r)
+        );
+    }
+
     /// The `ConstructorNotFound` name and suggestion count of `r`, if any.
     fn ctor_not_found(r: &DResult<SolvedTypes>) -> Option<(&str, usize, Span)> {
         match r {

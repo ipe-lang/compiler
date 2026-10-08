@@ -52,11 +52,13 @@ pub enum RuntimeBridgedEnum {
     StreamId,
     /// The builtin `RedirectPolicy` — the runtime `http_client::RedirectPolicy`.
     RedirectPolicy,
+    /// The builtin `DbFailure` — the runtime `error::IpeDbFailure`.
+    DbFailure,
 }
 
 impl RuntimeBridgedEnum {
     /// Every runtime-bridged enum.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::CacheHandle,
         Self::ConfigDecoder,
         Self::PubSubTopic,
@@ -64,6 +66,7 @@ impl RuntimeBridgedEnum {
         Self::ChunkEvent,
         Self::StreamId,
         Self::RedirectPolicy,
+        Self::DbFailure,
     ];
 
     /// The home module path segments the enum is declared under.
@@ -74,7 +77,7 @@ impl RuntimeBridgedEnum {
             Self::ConfigDecoder => &["Ipe", "Config"],
             Self::PubSubTopic => &["Ipe", "PubSub"],
             Self::EmailProvider => &["Ipe", "Email"],
-            Self::ChunkEvent | Self::StreamId | Self::RedirectPolicy => &[],
+            Self::ChunkEvent | Self::StreamId | Self::RedirectPolicy | Self::DbFailure => &[],
         }
     }
 
@@ -89,6 +92,7 @@ impl RuntimeBridgedEnum {
             Self::ChunkEvent => "ChunkEvent",
             Self::StreamId => "StreamId",
             Self::RedirectPolicy => "RedirectPolicy",
+            Self::DbFailure => "DbFailure",
         }
     }
 
@@ -102,7 +106,7 @@ impl RuntimeBridgedEnum {
             Self::CacheHandle | Self::ConfigDecoder | Self::PubSubTopic | Self::EmailProvider => {
                 true
             }
-            Self::ChunkEvent | Self::StreamId | Self::RedirectPolicy => false,
+            Self::ChunkEvent | Self::StreamId | Self::RedirectPolicy | Self::DbFailure => false,
         }
     }
 
@@ -110,9 +114,10 @@ impl RuntimeBridgedEnum {
     #[must_use]
     pub const fn traits(self) -> EnumTraits {
         match self {
-            // `IpeStreamId`, `ChunkEvent<IpeError>` and the `String` a topic
-            // lowers to all derive `Clone`, `Debug`, `PartialEq` and serde.
-            Self::StreamId | Self::ChunkEvent | Self::PubSubTopic => EnumTraits {
+            // `IpeStreamId`, `ChunkEvent<IpeError>`, `IpeDbFailure` and the
+            // `String` a topic lowers to all derive `Clone`, `Debug`,
+            // `PartialEq` and serde.
+            Self::StreamId | Self::ChunkEvent | Self::PubSubTopic | Self::DbFailure => EnumTraits {
                 clone: true,
                 derivable: true,
                 serde: true,
@@ -145,6 +150,7 @@ impl RuntimeBridgedEnum {
             Self::ChunkEvent => show_leaf::CHUNK_EVENT,
             Self::StreamId => show_leaf::STREAM_ID,
             Self::RedirectPolicy => show_leaf::REDIRECT_POLICY,
+            Self::DbFailure => show_leaf::DB_FAILURE,
         }
     }
 

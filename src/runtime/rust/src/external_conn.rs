@@ -30,7 +30,7 @@
 
 use super::IpeResult;
 use crate::core::{IpeTask, ok_res, str_err};
-use crate::db::{DbConnectError, DbUrl, VettedPool};
+use crate::db::{DbConnectError, DbEngine, DbUrl, VettedPool, connect_refusal, driver_error};
 use crate::dsn::{Dsn, DsnDriver};
 use crate::ssrf::VettedDial;
 
@@ -70,12 +70,23 @@ impl std::fmt::Debug for ExternalConnection {
 /// `open` calls cannot exhaust a foreign server's connection limit.
 const EXTERNAL_POOL_MAX_CONNECTIONS: u32 = 8;
 
-/// The Ipê `Error` for a refused external connect.
+/// The Ipê `Error` for a refused external connect to `engine`.
 ///
 /// A [`DbConnectError`] holds no driver payload, so this never carries the URL
-/// or a credential.
-fn connect_err<E: From<String>>(refused: &DbConnectError) -> E {
-    str_err(&format!("external connect: {refused}"))
+/// or a credential; a driver failure keeps its classification.
+fn connect_err<E: From<String> + crate::FromIpeError>(
+    engine: DbEngine,
+    refused: &DbConnectError,
+) -> E {
+    connect_refusal("external connect: ", engine, refused)
+}
+
+/// The engine a parsed `Dsn` driver dials.
+const fn dsn_engine(driver: DsnDriver) -> DbEngine {
+    match driver {
+        DsnDriver::Postgres => DbEngine::Postgres,
+        DsnDriver::Sqlite => DbEngine::Sqlite,
+    }
 }
 
 /// Open an external connection from a parsed, validated [`Dsn`]. The `Dsn` is a
@@ -88,12 +99,13 @@ fn connect_err<E: From<String>>(refused: &DbConnectError) -> E {
 /// failure, or an engine below its version floor all surface as a typed `Err`
 /// that carries no credential. The pool is independent (never a shared
 /// URL-keyed cache) and bounded.
-async fn open_external<E: Send + From<String> + 'static>(
+async fn open_external<E: Send + From<String> + crate::FromIpeError + 'static>(
     dsn: Dsn,
 ) -> IpeResult<E, ExternalConnection> {
+    let engine = dsn_engine(dsn.driver());
     let url = match DbUrl::parse(&dsn.connection_url()) {
         Ok(url) => url,
-        Err(refused) => return IpeResult::Err(connect_err(&refused)),
+        Err(refused) => return IpeResult::Err(connect_err(engine, &refused)),
     };
     match dsn.driver() {
         DsnDriver::Postgres => {
@@ -108,13 +120,13 @@ async fn open_external<E: Send + From<String> + 'static>(
             }
             match VettedPool::<sqlx::Postgres>::connect(&url, EXTERNAL_POOL_MAX_CONNECTIONS).await {
                 Ok(vetted) => ok_res(ExternalConnection::Postgres(vetted.into_pool())),
-                Err(refused) => IpeResult::Err(connect_err(&refused)),
+                Err(refused) => IpeResult::Err(connect_err(engine, &refused)),
             }
         }
         DsnDriver::Sqlite => {
             match VettedPool::<sqlx::Sqlite>::connect(&url, EXTERNAL_POOL_MAX_CONNECTIONS).await {
                 Ok(vetted) => ok_res(ExternalConnection::Sqlite(vetted.into_pool())),
-                Err(refused) => IpeResult::Err(connect_err(&refused)),
+                Err(refused) => IpeResult::Err(connect_err(engine, &refused)),
             }
         }
     }
@@ -124,7 +136,9 @@ async fn open_external<E: Send + From<String> + 'static>(
 /// The `Dsn` arrived through a validating parse, so no unchecked string reaches
 /// the connector. Discloses `network` (the enforceable egress axis).
 #[must_use]
-pub fn db_conn_open<E: Send + From<String> + 'static>(dsn: Dsn) -> IpeTask<E, ExternalConnection> {
+pub fn db_conn_open<E: Send + From<String> + crate::FromIpeError + 'static>(
+    dsn: Dsn,
+) -> IpeTask<E, ExternalConnection> {
     Box::pin(open_external(dsn))
 }
 
@@ -149,34 +163,30 @@ pub fn db_conn_close<E: Send + From<String> + 'static>(conn: ExternalConnection)
 /// `unsafe` (raw SQL) by its `Ipe.Db.Unsafe` home; returns the rows-affected
 /// count.
 #[must_use]
-pub fn db_conn_unsafe_exec_raw_on<E: Send + From<String> + 'static>(
+pub fn db_conn_unsafe_exec_raw_on<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: ExternalConnection,
     sql: String,
 ) -> IpeTask<E, i64> {
     Box::pin(async move {
         // Each dialect's `execute` yields a distinct `QueryResult`; reduce each to
         // the shared `u64` rows-affected in-arm so the match unifies on one type.
-        let affected: Result<u64, sqlx::Error> = match &conn {
+        let affected: Result<u64, (DbEngine, sqlx::Error)> = match &conn {
             ExternalConnection::Postgres(pool) => sqlx::query(&sql)
                 .execute(pool)
                 .await
-                .map(|d| d.rows_affected()),
+                .map(|d| d.rows_affected())
+                .map_err(|e| (DbEngine::Postgres, e)),
             ExternalConnection::Sqlite(pool) => sqlx::query(&sql)
                 .execute(pool)
                 .await
-                .map(|d| d.rows_affected()),
+                .map(|d| d.rows_affected())
+                .map_err(|e| (DbEngine::Sqlite, e)),
         };
         match affected {
             // A real affected-row count never exceeds `i64::MAX`; an out-of-range
             // value clamps rather than wrapping.
             Ok(rows) => ok_res(i64::try_from(rows).unwrap_or(i64::MAX)),
-            Err(e) => IpeResult::Err(str_err(&format!(
-                "external exec: {}",
-                match &e {
-                    sqlx::Error::Database(_) => "database error",
-                    _ => "execution failed",
-                }
-            ))),
+            Err((engine, e)) => IpeResult::Err(driver_error("external exec: db: ", engine, &e)),
         }
     })
 }
@@ -185,6 +195,44 @@ pub fn db_conn_unsafe_exec_raw_on<E: Send + From<String> + 'static>(
 mod tests {
     use super::*;
     use crate::dsn::dsn_parse;
+    use crate::{IpeDbFailure, IpeError, IpeErrorDetails, IpeErrorKind, IpeMaybe};
+
+    /// A failed raw statement on an external connection is classified like any
+    /// other driver failure; a statement that succeeds is the control.
+    #[tokio::test]
+    async fn unsafe_exec_raw_on_classifies_the_driver_failure() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await;
+        assert!(pool.is_ok(), "{:?}", pool.as_ref().err());
+        let Ok(pool) = pool else {
+            return;
+        };
+        let conn = ExternalConnection::Sqlite(pool);
+        let run = |sql: &str| db_conn_unsafe_exec_raw_on::<IpeError>(conn.clone(), sql.to_owned());
+        assert_eq!(
+            run("CREATE TABLE t (k TEXT UNIQUE)").await,
+            IpeResult::Ok(0)
+        );
+        assert_eq!(
+            run("INSERT INTO t (k) VALUES ('a')").await,
+            IpeResult::Ok(1)
+        );
+        let duplicate = run("INSERT INTO t (k) VALUES ('a')").await;
+        assert!(
+            matches!(&duplicate, IpeResult::Err(IpeError::Error(IpeErrorKind::Conflict, info))
+                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::UniqueViolation))
+                    && info.message.starts_with("external exec: db: unique constraint violated")),
+            "{duplicate:?}"
+        );
+        let malformed = run("NOT A STATEMENT").await;
+        assert!(
+            matches!(&malformed, IpeResult::Err(IpeError::Error(IpeErrorKind::Unexpected, info))
+                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::InvalidStatement))),
+            "{malformed:?}"
+        );
+    }
 
     /// Parse a Postgres DSN and check the SSRF gate that `open_external` would
     /// apply — without attempting any real network dial.  Mirrors the guard

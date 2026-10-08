@@ -11166,6 +11166,28 @@ fn promote_fn_field_value_carrier(value: Expr) -> Expr {
     }
 }
 
+/// The `DbFailure` constructor symbols, in the shared builtin table's order.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if the shared table has no `DbFailure` row, or
+/// the interner is exhausted.
+pub fn intern_db_failure_ctors(interner: &mut Interner) -> DResult<Vec<Symbol>> {
+    let union = ipe_canon::builtins::BUILTIN_UNIONS
+        .iter()
+        .find(|u| u.type_name == "DbFailure")
+        .ok_or_else(|| {
+            bug(
+                "ipe_lower::intern_db_failure_ctors",
+                "the shared builtin table has no `DbFailure` row",
+            )
+        })?;
+    union
+        .ctors
+        .iter()
+        .map(|&(name, _, _)| interner.intern(name))
+        .collect()
+}
+
 /// The interned symbols of the built-in `Maybe` / `Result` types and their
 /// constructors, minted by [`crate::lower`] through its owned `&mut Interner`.
 ///
@@ -11240,13 +11262,19 @@ pub struct BuiltinCtors {
     pub ek_unavailable: Symbol,
     pub ek_unexpected: Symbol,
     // ── ErrorDetails ADT ──────────────────────────────
-    // `ErrorDetails` has 5 constructors, each arity 1.
+    // `ErrorDetails` has 6 constructors, each arity 1.
     pub errordetails: Symbol,
     pub ed_ffi_panic: Symbol,
     pub ed_type_mismatch: Symbol,
     pub ed_http_status: Symbol,
     pub ed_json_decode: Symbol,
     pub ed_custom: Symbol,
+    pub ed_database: Symbol,
+    // ── DbFailure ADT ─────────────────────────────────
+    // The closed database-failure-cause union carried by `ErrorDetails.Database`;
+    // its nullary constructors in the shared builtin table's order.
+    pub db_failure: Symbol,
+    pub db_failure_ctors: Vec<Symbol>,
     // ── HttpMethod ADT ──────────────────────────────────
     // `HttpMethod` has 7 nullary verb constructors.
     pub http_method: Symbol,
@@ -12748,7 +12776,7 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.ek_unavailable), 0);
         ctor_arity.insert((prelude_home.clone(), builtins.ek_unexpected), 0);
         // ── ErrorDetails ADT ─────────────────────────────
-        // 5-variant enrichment union carried on `ErrorInfo.details`. Same
+        // 6-variant enrichment union carried on `ErrorInfo.details`. Same
         // registration recipe as `ErrorKind` above — seeding here lets
         // `case d of FfiPanic info -> …` / `HttpStatus code -> …` validate and
         // lower past the `Match::new` enum-cover check.
@@ -12760,6 +12788,7 @@ impl<'a> Lowerer<'a> {
                 builtins.ed_http_status,
                 builtins.ed_json_decode,
                 builtins.ed_custom,
+                builtins.ed_database,
             ],
         );
         ctor_arity.insert((prelude_home.clone(), builtins.ed_ffi_panic), 1); // FfiPanic(PanicInfo)
@@ -12767,6 +12796,18 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.ed_http_status), 1); // HttpStatus(Int)
         ctor_arity.insert((prelude_home.clone(), builtins.ed_json_decode), 1); // JsonDecode(String)
         ctor_arity.insert((prelude_home.clone(), builtins.ed_custom), 1); // Custom(String)
+        ctor_arity.insert((prelude_home.clone(), builtins.ed_database), 1); // Database(DbFailure)
+        // ── DbFailure ADT ──────────────────────────────────
+        // Nullary `Db.`-qualified constructors; seeding here lets
+        // `case f of Db.UniqueViolation -> …` validate and lower past the
+        // enum-cover check.
+        enum_variants.insert(
+            (prelude_home.clone(), builtins.db_failure),
+            builtins.db_failure_ctors.clone(),
+        );
+        for &ctor in &builtins.db_failure_ctors {
+            ctor_arity.insert((prelude_home.clone(), ctor), 0);
+        }
         // ── HttpMethod ADT ─────────────────────────────────
         // 7 nullary HTTP-verb constructors. Prelude built-in (no user `type`),
         // reachable through `Ipe.Http`; seeding here lets `case m of Get -> …`
@@ -17881,7 +17922,7 @@ impl<'a> Lowerer<'a> {
                 // longer merged with `String`. `ErrorKind` mirrors `Order`.
                 "Error" => Ok(IrType::Error),
                 "ErrorKind" => Ok(IrType::ErrorKind),
-                // `ErrorDetails` — the 5-variant enrichment union carried on
+                // `ErrorDetails` — the 6-variant enrichment union carried on
                 // `ErrorInfo.details : Maybe ErrorDetails`. Backed by
                 // `ipe_runtime::error::IpeErrorDetails`.
                 "ErrorDetails" => Ok(IrType::ErrorDetails),
@@ -31608,6 +31649,10 @@ mod tests {
         let redirect_policy = interner.intern("RedirectPolicy").unwrap();
         let no_redirects = interner.intern("NoRedirects").unwrap();
         let follow_redirects = interner.intern("FollowRedirects").unwrap();
+        // ── DbFailure ADT ──────────────────────────────
+        let ed_database = interner.intern("Database").unwrap();
+        let db_failure = interner.intern("DbFailure").unwrap();
+        let db_failure_ctors = super::intern_db_failure_ctors(interner).unwrap();
 
         BuiltinCtors {
             maybe,
@@ -31689,6 +31734,10 @@ mod tests {
             redirect_policy,
             no_redirects,
             follow_redirects,
+            // ── DbFailure ─────────────────────────
+            ed_database,
+            db_failure,
+            db_failure_ctors,
             kernel_types: ipe_types::Builtins::new(interner).unwrap(),
         }
     }

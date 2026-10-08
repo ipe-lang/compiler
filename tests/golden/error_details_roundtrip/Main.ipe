@@ -41,6 +41,9 @@ describeDetails maybeDetails =
         Just (TypeMismatch typeInfo) ->
             "TypeMismatch " ++ typeInfo.expected
 
+        Just (Database _) ->
+            "Database"
+
 
 describe : Error -> String
 describe err =

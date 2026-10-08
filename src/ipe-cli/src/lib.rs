@@ -170,6 +170,64 @@ const fn names_eq(a: &[&str], b: &[&str]) -> bool {
     }
 }
 
+// The resolver's `DbFailure` row and the runtime's `IpeDbFailure` name the
+// same nullary constructors at the same dense indices: a constructor the type
+// checker accepts in a `case` is a variant the emitted match can name, and a
+// drift on either side breaks this crate's build instead of reaching an
+// emitted `cargo` E0599 or E0004.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the canon DbFailure row drifts from the runtime IpeDbFailure variants, the database-failure SEAL [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    db_failure_eq(
+        ipe_canon::builtins::BUILTIN_UNIONS,
+        &ipe_runtime_rust::IpeDbFailure::ALL,
+    ),
+    "the canon DbFailure row must match the runtime IpeDbFailure variants"
+);
+
+/// Whether the `DbFailure` row of `unions` lists `runtime`'s variants in
+/// order, each nullary, with its declaration index and its discriminant both
+/// equal to its position.
+const fn db_failure_eq(
+    unions: &[ipe_canon::builtins::BuiltinUnion],
+    runtime: &[ipe_runtime_rust::IpeDbFailure],
+) -> bool {
+    let mut unions = unions;
+    let ctors = loop {
+        match unions {
+            [] => return false,
+            [union, rest @ ..] => {
+                if text::bytes_eq(union.type_name.as_bytes(), b"DbFailure") {
+                    break union.ctors;
+                }
+                unions = rest;
+            }
+        }
+    };
+    let (mut left, mut right, mut position) = (ctors, runtime, 0_usize);
+    loop {
+        match (left, right) {
+            ([], []) => return true,
+            ([(name, index, arity), left_rest @ ..], [failure, right_rest @ ..]) => {
+                if !text::bytes_eq(name.as_bytes(), failure.ctor_name().as_bytes())
+                    || *index != position
+                    || *failure as usize != position
+                    || *arity != 0
+                {
+                    return false;
+                }
+                position = match position.checked_add(1) {
+                    Some(next) => next,
+                    None => return false,
+                };
+                left = left_rest;
+                right = right_rest;
+            }
+            _ => return false,
+        }
+    }
+}
+
 mod driver;
 
 pub use driver::{

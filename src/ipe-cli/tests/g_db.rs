@@ -8,6 +8,8 @@ mod support;
 mod golden_app_settings_front_door;
 #[path = "g_db/golden_authed_store_query_seal.rs"]
 mod golden_authed_store_query_seal;
+#[path = "g_db/golden_db_failure_typed.rs"]
+mod golden_db_failure_typed;
 #[path = "g_db/golden_db_get_alias_row.rs"]
 mod golden_db_get_alias_row;
 #[path = "g_db/golden_db_get_iperow_bound.rs"]

@@ -32,7 +32,7 @@ import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -159,22 +159,22 @@ isAlreadyDecided written =
 -- are left as they were. Re-inserting the first entry with
 -- a replacing conflict clause (SQLite's REPLACE deletes the old row without
 -- firing a delete trigger) or an upsert changes nothing: the first decision
--- stays. A refusal counts only as a trigger's `RAISE(ABORT)`, so a statement
--- that fails for another reason (a typo, a missing table) is red, and a
--- rewrite either runs or is refused by a trigger. Red with any of the six
--- log triggers dropped.
+-- stays. A refusal counts only as a trigger's `RAISE(ABORT)`, which fails as
+-- `Db.TriggerRaised`, so a statement that fails for another reason (a typo, a
+-- missing table, a constraint) is red, and a rewrite either runs or is refused
+-- by a trigger. Red with any of the six log triggers dropped.
 reviewLogAppendOnly : Db -> Task.Task Error Bool
 reviewLogAppendOnly db =
     let
         refused sql =
             Db.exec db sql []
                 |> Task.map (\_ -> False)
-                |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
+                |> Task.onError (\e -> Task.succeed (carriesFailure Db.TriggerRaised e))
 
         rewrite sql =
             Db.exec db sql [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString "refuse", SqlString "rewritten", SqlInt 0, SqlString (String.repeat 64 "a") ]
                 |> Task.map (\_ -> True)
-                |> Task.onError (\e -> Task.succeed (Error.message e == triggerAbortError))
+                |> Task.onError (\e -> Task.succeed (carriesFailure Db.TriggerRaised e))
 
         columns =
             "review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, ?, ?, ?, ?, 'genesis', ?)"
@@ -219,16 +219,6 @@ reviewLogAppendOnly db =
             )
 
 
--- The error a trigger's `RAISE(ABORT, ...)` surfaces as: SQLite's extended
--- code `SQLITE_CONSTRAINT_TRIGGER` (1811). The runtime keeps a database
--- error's code and never its driver text, so the trigger's own message is
--- not observable and the code is what tells its refusal from any other
--- failure.
-triggerAbortError : String
-triggerAbortError =
-    "db: database error [1811]"
-
-
 -- The head moves only from the head it was read as: a compare-and-set from a
 -- head that is not current fails with a typed conflict, and the log row
 -- written in the same transaction is rolled back with it, so a decision can
@@ -256,7 +246,7 @@ staleCasRefused db stale =
                 LibDb.advanceHead tx stale (Index.chainNext stale (String.repeat 64 "c"))
         )
         |> Task.map (\_ -> False)
-        |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "")))
+        |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "") && carriesNoFailure e))
 
 
 -- A review file whose log head is gone fails the startup probe, naming the
@@ -690,10 +680,9 @@ loadTicketsSettleLatest =
 
 
 -- A write that fails keeps its own error: a read-only connection makes a
--- new decision fail with SQLite's read-only result code (`SQLITE_READONLY`,
--- 8). A pair that already has a verified row records nothing either way:
--- it is `AlreadyDecided` or the same read-only error. Nothing is recorded
--- and the log's head does not move.
+-- new decision fail as `Db.ReadOnlyDatabase`. A pair that already has a
+-- verified row records nothing either way: it is `AlreadyDecided` or the same
+-- read-only error. Nothing is recorded and the log's head does not move.
 failedWritesKeepTheirError : Task.Task Error Bool
 failedWritesKeepTheirError =
     freshDir "ipe-review-failed-writes" |> Task.andThen failedWritesKeepTheirErrorIn
@@ -727,12 +716,12 @@ failedWritesOutcome key rw ro seen fresh head =
         failedReadOnly task =
             task
                 |> Task.map (\_ -> False)
-                |> Task.onError (\e -> Task.succeed (Error.message e == readOnlyWriteError))
+                |> Task.onError (\e -> Task.succeed (carriesFailure Db.ReadOnlyDatabase e))
 
         recordedNothing task =
             task
                 |> Task.map isAlreadyDecided
-                |> Task.onError (\e -> Task.succeed (Error.message e == readOnlyWriteError))
+                |> Task.onError (\e -> Task.succeed (carriesFailure Db.ReadOnlyDatabase e))
     in
     do
         verify <- countingVerifier
@@ -741,11 +730,6 @@ failedWritesOutcome key rw ro seen fresh head =
         kept <- LibDb.findDecision verify rw (uid "u-b") (Index.attest viewB)
         headAfter <- headTextOf rw
         Task.succeed (duplicate && freshReview && not (hasDecision kept) && headAfter == head)
-
-
-readOnlyWriteError : String
-readOnlyWriteError =
-    "db: database error [8]"
 
 
 hasDecision : Maybe ReviewEntry -> Bool

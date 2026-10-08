@@ -798,7 +798,7 @@ pub enum StoreOpenError {
     Connect(crate::db::DbConnectError),
     /// Creating the session table failed.
     #[cfg(feature = "db")]
-    Schema(crate::db::DbFailure),
+    Schema(crate::db::DriverFailure),
     /// The Redis client could not connect or answer `PING`.
     #[cfg(feature = "redis_store")]
     Redis(redis::ErrorKind),
@@ -942,7 +942,12 @@ impl<Model, Msg> SqliteStore<Model, Msg> {
         )
         .execute(&pool)
         .await
-        .map_err(|e| StoreOpenError::Schema(crate::db::DbFailure::of(&e)))?;
+        .map_err(|e| {
+            StoreOpenError::Schema(crate::db::DriverFailure::of(
+                crate::db::DbEngine::Sqlite,
+                &e,
+            ))
+        })?;
         Ok(SqliteStore {
             pool,
             mem_cache: RwLock::new(HashMap::new()),
@@ -1127,7 +1132,12 @@ impl<Model, Msg> PostgresStore<Model, Msg> {
         )
         .execute(&pool)
         .await
-        .map_err(|e| StoreOpenError::Schema(crate::db::DbFailure::of(&e)))?;
+        .map_err(|e| {
+            StoreOpenError::Schema(crate::db::DriverFailure::of(
+                crate::db::DbEngine::Postgres,
+                &e,
+            ))
+        })?;
         Ok(PostgresStore {
             pool,
             mem_cache: RwLock::new(HashMap::new()),
@@ -1858,13 +1868,24 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn transient_store_failures_are_not_policy_refusals() {
-        use crate::db::{DbConnectError, DbEngine, DbFailure, EngineVersion, EngineVersionError};
+        use crate::db::{
+            DbConnectError, DbEngine, DriverFailure, EngineVersion, EngineVersionError,
+        };
         use crate::ssrf::{BlockedHost, BlockedRange, HostShown, SsrfRefusal};
         use std::net::{IpAddr, Ipv4Addr};
         let transient = [
-            StoreOpenError::Connect(DbConnectError::Unreachable(DbFailure::Io)),
-            StoreOpenError::Connect(DbConnectError::VersionUnreadable(DbFailure::PoolTimedOut)),
-            StoreOpenError::Schema(DbFailure::Other),
+            StoreOpenError::Connect(DbConnectError::Unreachable(DriverFailure::of(
+                DbEngine::Sqlite,
+                &sqlx::Error::Io(std::io::Error::other("io")),
+            ))),
+            StoreOpenError::Connect(DbConnectError::VersionUnreadable(DriverFailure::of(
+                DbEngine::Sqlite,
+                &sqlx::Error::PoolTimedOut,
+            ))),
+            StoreOpenError::Schema(DriverFailure::of(
+                DbEngine::Sqlite,
+                &sqlx::Error::RowNotFound,
+            )),
         ];
         for e in &transient {
             assert!(!e.is_policy_refusal(), "{e} must fall back, not refuse");

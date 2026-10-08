@@ -313,37 +313,77 @@ reviewProbed at =
         Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && maybeContains "cannot be created there" message && not (maybeContains "ipe-index index" message))
 
 
--- A driver failure is classified once, by its SQLite primary result code
--- (an extended code by its low byte), into one typed refusal; a failure at a
--- location with no file is the missing-file refusal whatever the driver said,
--- and a failure no code names is `Unusable`, never a numeric code. Red if a
--- code is read past its primary byte, or a missing file reads as anything
--- else.
+-- A database failure is classified once, by the typed `DbFailure` it carries,
+-- into one refusal. With no file at the location, a cause that names no
+-- narrower case of its own (`CannotOpen` and every `Unusable` row) is the
+-- missing-file refusal; a cause that names its own (locked, not SQLite, not
+-- permitted, missing schema) keeps it. A cause this tool names no narrower
+-- case for is `Unusable`. Every `DbFailure` has its own row, so a cause left
+-- out of the mapping cannot pass, and no row may refuse less than before.
+-- Red if any one row of the mapping changes, or a missing file reads as
+-- anything else.
 dbFailuresClassified : Bool
 dbFailuresClassified =
-    List.all classifiedAs
-        [ ( False, "db: database error [14]", Settings.NoDatabaseFile )
-        , ( True, "db: database error [14]", Settings.NotPermitted )
-        , ( True, "db: database error [1038]", Settings.NotPermitted )
-        , ( True, "db: database error [26]", Settings.NotADatabase )
-        , ( True, "db: database error [11]", Settings.NotADatabase )
-        , ( True, "db: database error [5]", Settings.Locked )
-        , ( True, "db: database error [517]", Settings.Locked )
-        , ( True, "db: database error [6]", Settings.Locked )
-        , ( True, "db: database error [3]", Settings.NotPermitted )
-        , ( True, "db: database error [8]", Settings.NotPermitted )
-        , ( True, "db: database error [1]", Settings.MissingSchema )
-        , ( True, "db: database error [19]", Settings.Unusable )
-        , ( False, "db: database error [19]", Settings.NoDatabaseFile )
-        , ( True, "db: database error [x]", Settings.Unusable )
-        , ( True, "pool timed out", Settings.Unusable )
-        , ( False, "pool timed out", Settings.NoDatabaseFile )
-        ]
+    List.all classifiedAs dbFailureRows
+        && List.all classifiedAs (List.map absentRow dbFailureRows)
 
 
-classifiedAs : ( Bool, String, Settings.DbRefusal ) -> Bool
-classifiedAs ( present, message, expected ) =
-    Settings.dbRefusalOf present (Error.unexpected message) == expected
+-- The same row with no file at the location.
+absentRow : ( Bool, Db.DbFailure, Settings.DbRefusal ) -> ( Bool, Db.DbFailure, Settings.DbRefusal )
+absentRow ( _, failure, expected ) =
+    if failure == Db.CannotOpen || expected == Settings.Unusable then
+        ( False, failure, Settings.NoDatabaseFile )
+
+    else
+        ( False, failure, expected )
+
+
+-- Each cause with the refusal it names when a file is there.
+dbFailureRows : List ( Bool, Db.DbFailure, Settings.DbRefusal )
+dbFailureRows =
+    [ ( True, Db.CannotOpen, Settings.NotPermitted )
+    , ( True, Db.NotADatabase, Settings.NotSqliteFile )
+    , ( True, Db.Busy, Settings.Locked )
+    , ( True, Db.AccessDenied, Settings.NotPermitted )
+    , ( True, Db.ReadOnlyDatabase, Settings.NotPermitted )
+    , ( True, Db.InvalidStatement, Settings.MissingSchema )
+    , ( True, Db.UniqueViolation, Settings.Unusable )
+    , ( True, Db.ForeignKeyViolation, Settings.Unusable )
+    , ( True, Db.NotNullViolation, Settings.Unusable )
+    , ( True, Db.CheckViolation, Settings.Unusable )
+    , ( True, Db.TriggerRaised, Settings.Unusable )
+    , ( True, Db.OtherConstraint, Settings.Unusable )
+    , ( True, Db.Unreachable, Settings.Unusable )
+    , ( True, Db.OtherFailure, Settings.Unusable )
+    ]
+
+
+classifiedAs : ( Bool, Db.DbFailure, Settings.DbRefusal ) -> Bool
+classifiedAs ( present, failure, expected ) =
+    Settings.dbRefusalOf present (Error.withDetails (Database failure) (Error.unexpected "db failed")) == expected
+
+
+-- Only the typed cause decides the refusal, never the message: an error that
+-- carries no `DbFailure` is `Unusable` (`NoDatabaseFile` with no file), and a
+-- message that spells another cause, or a driver code, changes nothing. Red
+-- if the message is read, or an error with no `DbFailure` reads as a
+-- narrower case.
+dbRefusalIgnoresMessage : Bool
+dbRefusalIgnoresMessage =
+    Settings.dbRefusalOf True (Error.unexpected "db: database error [5]")
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "db: database error [14]")
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "pool timed out")
+        == Settings.Unusable
+        && Settings.dbRefusalOf False (Error.unexpected "pool timed out")
+        == Settings.NoDatabaseFile
+        && Settings.dbRefusalOf True (Error.withDetails (Custom "Busy") (Error.unexpected "db failed"))
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.OtherFailure) (Error.unexpected "db: database error [5]"))
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.CannotOpen) (Error.unexpected "pool timed out"))
+        == Settings.NotPermitted
 
 
 -- A file that is not a SQLite database is refused as one, at either
@@ -1120,7 +1160,8 @@ checks =
         , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
         , check "each db refusal states one fix" dbRefusalsStateOneFix
         , check "startup probes name the variable and the file" probesNameTheirVariable
-        , Task.succeed ( "a db open failure is classified by its primary result code", dbFailuresClassified )
+        , Task.succeed ( "a db open failure is classified by its typed failure", dbFailuresClassified )
+        , Task.succeed ( "a db refusal never reads the failure's message", dbRefusalIgnoresMessage )
         , check "a file that is not a SQLite database is refused as one" notSqliteRefused
         , check "a root holding none of the index's files is refused at startup" rootProbeJoinsIndexedPath
         , check "an index with no unit under a configured tag is refused at startup" rootProbeRefusesUntaggedIndex
