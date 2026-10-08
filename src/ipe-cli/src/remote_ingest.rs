@@ -238,11 +238,12 @@ impl WallBudget {
 
 /// Ceiling on every wall-time ceiling of a local child, in seconds.
 ///
-/// No local child may run longer than one hour. The jailed FFI inspector
-/// allows 900 seconds and a self-run of `ipe dev run` contains a full cargo build,
-/// so a local wall may exceed [`MAX_WALL_SECS`]; this is the type's ceiling,
-/// not a default.
-pub const MAX_LOCAL_WALL_SECS: u64 = 3600;
+/// The longest local child is a self-run of `ipe dev run`, which contains a
+/// full cargo build: the cargo build wall plus [`SELF_RUN_MARGIN_SECS`]. The
+/// jailed FFI inspector allows 900 seconds, so a local wall may exceed
+/// [`MAX_WALL_SECS`]; this is the type's ceiling, not a default.
+pub const MAX_LOCAL_WALL_SECS: u64 =
+    crate::cargo_step::CARGO_BUILD_WALL_SECS + SELF_RUN_MARGIN_SECS;
 
 // Every remote wall fits a local one, so a remote wall reused as a local
 // ceiling is in range by construction.
@@ -279,7 +280,7 @@ impl WallSecs {
 /// ```
 ///
 /// ```compile_fail,E0080
-/// let _ = ipe::remote_ingest::LocalWall::of_secs::<3601>();
+/// let _ = ipe::remote_ingest::LocalWall::of_secs::<3661>();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalWall(NonZeroU64);
@@ -315,17 +316,6 @@ impl LocalWall {
     #[must_use]
     pub const fn limit(self) -> WallSecs {
         WallSecs(self.0)
-    }
-
-    /// This ceiling lengthened by `secs` seconds, held to [`MAX_LOCAL_WALL_SECS`].
-    #[must_use]
-    pub const fn extended_by(self, secs: u64) -> Self {
-        let longer = self.0.saturating_add(secs);
-        if longer.get() > MAX_LOCAL_WALL_SECS {
-            Self::of_secs::<MAX_LOCAL_WALL_SECS>()
-        } else {
-            Self(longer)
-        }
     }
 }
 
@@ -569,22 +559,23 @@ pub const WASM_TOOL_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
 });
 
 /// The seconds a self-run of this CLI may take beyond the `cargo build` it contains.
-const SELF_RUN_MARGIN_SECS: u64 = 60;
+pub const SELF_RUN_MARGIN_SECS: u64 = 60;
 
 /// The wall of a self-run of this CLI: the cargo build wall plus
-/// [`SELF_RUN_MARGIN_SECS`], held to [`MAX_LOCAL_WALL_SECS`].
+/// [`SELF_RUN_MARGIN_SECS`].
 const SELF_RUN_WALL: LocalWall =
-    crate::cargo_step::CARGO_BUILD_WALL.extended_by(SELF_RUN_MARGIN_SECS);
+    LocalWall::of_secs::<{ crate::cargo_step::CARGO_BUILD_WALL_SECS + SELF_RUN_MARGIN_SECS }>();
 
-// A self-run contains a full cargo build, so its wall never cuts the build
-// short of the build's own wall.
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the self-run wall drops below the cargo build wall it contains [ledger #boundary]
-const _: () = assert!(SELF_RUN_WALL.secs() >= crate::cargo_step::CARGO_BUILD_WALL.secs());
+// A self-run contains a full cargo build, so its wall outlasts the build's own
+// wall: a hung build is refused by the build's typed timeout, never cut short
+// by the self-run wall first.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the self-run wall does not outlast the cargo build wall it contains [ledger #boundary]
+const _: () = assert!(SELF_RUN_WALL.secs() > crate::cargo_step::CARGO_BUILD_WALL.secs());
 
 /// The ceilings of a self-run of this CLI (`ipe dev run <snippet>`), which contains a full cargo build.
 ///
 /// Its stdout (the snippet's output) is held to 1 MiB and its run to the
-/// cargo build wall plus a margin, never past [`MAX_LOCAL_WALL_SECS`].
+/// cargo build wall plus [`SELF_RUN_MARGIN_SECS`].
 pub const SELF_RUN_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     stdout_bytes: ByteBudget::of::<MIB>(),
     wall: SELF_RUN_WALL,
@@ -4741,5 +4732,16 @@ mod tests {
                 GITHUB_API.wall.secs().to_string(),
             ]
         );
+    }
+
+    /// A self-run outlasts the cargo build it contains by its whole margin, so a
+    /// hung build is refused as the build's typed timeout, never cut first by
+    /// the self-run wall.
+    #[test]
+    fn a_self_run_outlasts_its_cargo_build_wall_by_the_whole_margin() {
+        let build = crate::cargo_step::CARGO_BUILD_WALL.secs();
+        let self_run = super::SELF_RUN_LIMITS.wall().secs();
+        assert_eq!(self_run, build + super::SELF_RUN_MARGIN_SECS);
+        assert!(self_run <= super::MAX_LOCAL_WALL_SECS);
     }
 }

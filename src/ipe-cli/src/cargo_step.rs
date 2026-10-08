@@ -43,7 +43,10 @@ use crate::{CliError, RuntimeContext, text};
 ///
 /// A build still running at the wall is stopped with every process it
 /// started and refused as [`CliError::CargoBuildTimedOut`].
-pub const CARGO_BUILD_WALL: LocalWall = LocalWall::of_secs::<3600>();
+pub const CARGO_BUILD_WALL: LocalWall = LocalWall::of_secs::<CARGO_BUILD_WALL_SECS>();
+
+/// The seconds of [`CARGO_BUILD_WALL`].
+pub const CARGO_BUILD_WALL_SECS: u64 = 3600;
 
 /// How often a build's waiter checks for its exit and its wall.
 pub const BUILD_POLL: Duration = Duration::from_millis(30);
