@@ -2214,7 +2214,7 @@ mod group {
 
     use win32job::{ExtendedLimitInfo, Job};
 
-    use super::containment::{ContainmentRefusal, ContainmentStep, Jobs, contain};
+    use super::containment::{ContainmentRefusal, ContainmentStep, Jobs, spawn_contained};
 
     /// A live transfer's ID: its child's process ID.
     ///
@@ -2275,9 +2275,12 @@ mod group {
     /// killed and reaped first); a containment failure carries a
     /// `ContainmentRefusal`.
     pub fn spawn_detached(command: Command) -> std::io::Result<(Child, Option<GroupId>)> {
-        join_cli()?;
-        let child = ipe_runtime_rust::system::spawn_hardened(command)?;
-        let (child, job) = contain(child, transfer_job, assign)?;
+        let (child, job) = spawn_contained(
+            join_cli,
+            || ipe_runtime_rust::system::spawn_hardened(command).map_err(std::io::Error::from),
+            transfer_job,
+            assign,
+        )?;
         let id = GroupId(child.id());
         JOBS.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2412,6 +2415,26 @@ mod containment {
         }
     }
 
+    /// Join the CLI's own job, start the child, then contain it.
+    ///
+    /// The order is the guarantee: nothing starts before the CLI is in its own
+    /// job, and no job is made for a child that never started.
+    ///
+    /// # Errors
+    /// `join` refused (nothing is started), `start` failed, or [`contain`]
+    /// refused (the child is killed and reaped first); a containment failure
+    /// carries a [`ContainmentRefusal`].
+    pub fn spawn_contained<J>(
+        join: impl FnOnce() -> Result<(), ContainmentRefusal>,
+        start: impl FnOnce() -> std::io::Result<Child>,
+        create: impl FnOnce() -> std::io::Result<J>,
+        assign: impl FnOnce(&J, &Child) -> std::io::Result<()>,
+    ) -> std::io::Result<(Child, J)> {
+        join()?;
+        let child = start()?;
+        Ok(contain(child, create, assign)?)
+    }
+
     /// The live transfers' jobs, keyed by their child's process ID.
     pub struct Jobs<J> {
         live: BTreeMap<u32, J>,
@@ -2440,12 +2463,12 @@ mod containment {
 
     #[cfg(test)]
     mod tests {
-        use std::process::{Child, Command};
-        use std::sync::Arc;
+        use std::process::{Child, Command, Stdio};
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
         use std::time::{Duration, Instant};
 
-        use super::{ContainmentRefusal, ContainmentStep, Jobs, contain};
+        use super::{ContainmentRefusal, ContainmentStep, Jobs, contain, spawn_contained};
 
         /// A job stand-in counting how often it was closed.
         struct Counted(Arc<AtomicUsize>);
@@ -2469,65 +2492,167 @@ mod containment {
             }
         }
 
-        /// Contain a live sleeper with `create` and `assign`, and time the call.
+        /// What [`contain`] did with a live sleeper.
+        struct Contained {
+            /// The refusal, or whether the handed-back child was still running.
+            result: Result<bool, ContainmentRefusal>,
+            /// How long the call took.
+            took: Duration,
+            /// On a refusal: the sleeper's stdout reached its end within 5 s
+            /// of the call, so the sleeper was dead when the call returned.
+            ended: bool,
+            /// On a refusal: no process with the sleeper's ID is left, not
+            /// even an unreaped one (Linux only; elsewhere `true`).
+            reaped: bool,
+        }
+
+        /// Whether no process `pid` is left, not even an unreaped one.
+        fn no_process_left(pid: u32) -> bool {
+            !cfg!(target_os = "linux") || !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+
+        /// Contain a live sleeper with `create` and `assign`.
         ///
         /// A contained sleeper is killed and reaped before this returns.
         #[allow(clippy::expect_used)] // a host that cannot start the sleeper cannot run the test
         fn contain_sleeper(
             create: impl FnOnce() -> std::io::Result<()>,
             assign: impl FnOnce(&(), &Child) -> std::io::Result<()>,
-        ) -> (Result<(), ContainmentRefusal>, Duration) {
-            let child = ipe_runtime_rust::system::spawn_hardened(sleeper()).expect("spawn sleeper");
+        ) -> Contained {
+            let mut command = sleeper();
+            command.stdout(Stdio::piped());
+            let mut child =
+                ipe_runtime_rust::system::spawn_hardened(command).expect("spawn sleeper");
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let pid = child.id();
+            let (tx, rx) = mpsc::channel();
+            // The reader ends when the sleeper does: at its kill, or after 30 s.
+            std::thread::Builder::new()
+                .name("ipe-test-sleeper-stdout".to_owned())
+                .spawn(move || {
+                    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+                    let _ = tx.send(());
+                })
+                .expect("start the stdout reader");
             let started = Instant::now();
             let contained = contain(child, create, assign);
             let took = started.elapsed();
+            let refused = contained.is_err();
+            let ended = refused && rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let reaped = refused && no_process_left(pid);
             let result = contained.map(|(mut child, ())| {
+                let running = matches!(child.try_wait(), Ok(None));
                 let _ = child.kill();
                 let _ = child.wait();
+                running
             });
-            (result, took)
+            Contained {
+                result,
+                took,
+                ended,
+                reaped,
+            }
         }
 
         fn os_error(code: i32) -> std::io::Error {
             std::io::Error::from_raw_os_error(code)
         }
 
+        /// A refusal left the sleeper neither running nor unreaped, and did not wait it out.
+        fn assert_killed_and_reaped(contained: &Contained) {
+            assert!(
+                contained.took < Duration::from_secs(10),
+                "the child was waited on, not killed"
+            );
+            assert!(contained.ended, "the refused child was left running");
+            assert!(contained.reaped, "the refused child was left unreaped");
+        }
+
         #[test]
         fn a_job_that_cannot_be_made_refuses_the_spawn_and_reaps_the_child() {
-            let (result, took) = contain_sleeper(|| Err(os_error(8)), |(), _| Ok(()));
+            let contained = contain_sleeper(|| Err(os_error(8)), |(), _| Ok(()));
             assert_eq!(
-                result,
+                contained.result,
                 Err(ContainmentRefusal::at(
                     ContainmentStep::CreateTransferJob,
                     &os_error(8)
                 ))
             );
-            assert!(
-                took < Duration::from_secs(10),
-                "the child was waited on, not killed"
-            );
+            assert_killed_and_reaped(&contained);
         }
 
         #[test]
         fn a_child_that_cannot_join_its_job_is_refused_and_reaped() {
-            let (result, took) = contain_sleeper(|| Ok(()), |(), _| Err(os_error(5)));
+            let contained = contain_sleeper(|| Ok(()), |(), _| Err(os_error(5)));
             assert_eq!(
-                result,
+                contained.result,
                 Err(ContainmentRefusal::at(
                     ContainmentStep::AssignTransfer,
                     &os_error(5)
                 ))
             );
-            assert!(
-                took < Duration::from_secs(10),
-                "the child was waited on, not killed"
-            );
+            assert_killed_and_reaped(&contained);
         }
 
         #[test]
-        fn a_contained_child_is_handed_back_with_its_job() {
-            let (result, _) = contain_sleeper(|| Ok(()), |(), _| Ok(()));
-            assert_eq!(result, Ok(()));
+        fn a_contained_child_is_handed_back_running_with_its_job() {
+            let contained = contain_sleeper(|| Ok(()), |(), _| Ok(()));
+            assert_eq!(contained.result, Ok(true));
+        }
+
+        /// A CLI that cannot join its own job starts nothing and makes no transfer job.
+        #[test]
+        fn a_cli_that_cannot_join_its_job_starts_nothing() {
+            let calls = AtomicUsize::new(0);
+            let refusal = ContainmentRefusal::at(ContainmentStep::JoinCli, &os_error(5));
+            let result = spawn_contained(
+                || Err(refusal),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::ErrorKind::Other.into())
+                },
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |(), _| Ok(()),
+            );
+            let error = result.expect_err("a CLI outside its own job started a transfer");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a step ran after the refusal"
+            );
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ContainmentRefusal>()),
+                Some(carried) if *carried == refusal
+            ));
+        }
+
+        /// A child that never started gets no job, and its spawn error is its own.
+        #[test]
+        fn a_failed_start_makes_no_job() {
+            let made = AtomicUsize::new(0);
+            let result = spawn_contained(
+                || Ok(()),
+                || Err(std::io::ErrorKind::NotFound.into()),
+                || {
+                    made.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |(), _| Ok(()),
+            );
+            assert!(
+                matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+                "{result:?}"
+            );
+            assert_eq!(
+                made.load(Ordering::SeqCst),
+                0,
+                "a job was made for no child"
+            );
         }
 
         #[test]

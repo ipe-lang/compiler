@@ -259,19 +259,15 @@ pub fn open_url(url: &BrowserUrl) -> OpenOutcome {
     let exit_is_verdict = Platform::HOST.exit_status_is_verdict();
     #[cfg(windows)]
     if crate::remote_ingest::cli_job_joined() {
-        use std::os::windows::process::CommandExt as _;
-        let mut command = opener();
-        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
-        let outcome = run_opener(command, exit_is_verdict, OPENER_GRACE);
-        // Refused before it started: a job the CLI was started in forbids breaking away.
-        let breakaway_refused = matches!(
-            &outcome,
-            OpenOutcome::Spawn(SpawnRefusal::Spawn(e))
-                if e.kind() == std::io::ErrorKind::PermissionDenied
+        return open_breaking_away(
+            || {
+                use std::os::windows::process::CommandExt as _;
+                let mut command = opener();
+                command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+                run_opener(command, exit_is_verdict, OPENER_GRACE)
+            },
+            || run_opener(opener(), exit_is_verdict, OPENER_GRACE),
         );
-        if !breakaway_refused {
-            return outcome;
-        }
     }
     run_opener(opener(), exit_is_verdict, OPENER_GRACE)
 }
@@ -279,6 +275,25 @@ pub fn open_url(url: &BrowserUrl) -> OpenOutcome {
 /// The `CreateProcess` flag that starts a child outside every job its parent is in.
 #[cfg(windows)]
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// Open through `breakaway`; only when a job forbade breaking away, so no
+/// opener started, open through `inside` instead.
+///
+/// Any other outcome, a started opener's included, is final: one URL starts
+/// at most one opener.
+#[cfg(any(windows, test))]
+fn open_breaking_away(
+    breakaway: impl FnOnce() -> OpenOutcome,
+    inside: impl FnOnce() -> OpenOutcome,
+) -> OpenOutcome {
+    let outcome = breakaway();
+    let breakaway_refused = matches!(
+        &outcome,
+        OpenOutcome::Spawn(SpawnRefusal::Spawn(e))
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    if breakaway_refused { inside() } else { outcome }
+}
 
 /// Start `command` hardened with null stdio and watch it for at most `grace`.
 fn run_opener(mut command: Command, exit_is_verdict: bool, grace: Duration) -> OpenOutcome {
@@ -567,6 +582,46 @@ mod tests {
     fn a_failing_status_without_a_verdict_is_opened() {
         let outcome = run_opener(sh("exit 1"), false, Duration::from_secs(30));
         assert!(matches!(outcome, OpenOutcome::Opened), "{outcome}");
+    }
+
+    /// A breakaway outcome and whether the inside opener then ran.
+    fn breaking_away(first: OpenOutcome) -> (OpenOutcome, bool) {
+        let inside_ran = std::cell::Cell::new(false);
+        let outcome = open_breaking_away(
+            || first,
+            || {
+                inside_ran.set(true);
+                OpenOutcome::Opened
+            },
+        );
+        (outcome, inside_ran.get())
+    }
+
+    #[test]
+    fn a_refused_breakaway_opens_inside_the_job() {
+        let refused = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (outcome, inside_ran) = breaking_away(OpenOutcome::Spawn(SpawnRefusal::Spawn(refused)));
+        assert!(inside_ran, "a refused breakaway opened nothing");
+        assert!(matches!(outcome, OpenOutcome::Opened), "{outcome}");
+    }
+
+    /// One URL starts at most one opener: only a breakaway refused before
+    /// the start is retried.
+    #[test]
+    fn any_other_breakaway_outcome_is_final() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let finals = [
+            OpenOutcome::Opened,
+            OpenOutcome::OpenerMissing,
+            OpenOutcome::Spawn(SpawnRefusal::Spawn(not_found)),
+            OpenOutcome::WaitFailed(std::io::ErrorKind::PermissionDenied),
+        ];
+        for first in finals {
+            let shown = first.to_string();
+            let (outcome, inside_ran) = breaking_away(first);
+            assert!(!inside_ran, "a second opener started after: {shown}");
+            assert_eq!(outcome.to_string(), shown);
+        }
     }
 
     #[test]
