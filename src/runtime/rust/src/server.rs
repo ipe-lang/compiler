@@ -1417,17 +1417,6 @@ fn parse_query(q: Option<&str>) -> Result<HashMap<String, String>, crate::encodi
     q.map_or_else(|| Ok(HashMap::new()), crate::encoding::decode_form_query)
 }
 
-/// A request URI parsed once by the strict core: its path split and decoded
-/// segment by segment, its query decoded under the form grammar.
-#[cfg(feature = "web")]
-pub(crate) struct StrictUrl {
-    /// The decoded request path; every route matcher reads this, never the raw
-    /// path text.
-    pub(crate) path: crate::encoding::DecodedPath,
-    /// The decoded query.
-    pub(crate) query: HashMap<String, String>,
-}
-
 /// Parse a request URI once, refusing it whole when its path or query is not
 /// well-formed.
 ///
@@ -1444,11 +1433,16 @@ pub(crate) struct StrictUrl {
 /// This is the one gate every HTTP entry point (Ipe.Server handlers, every
 /// Ipe.Web route, the static file mounts) passes before any handler or file
 /// service sees the URI.
+///
+/// Returns the decoded path; the query is proven well-formed and dropped, for an
+/// entry point that matches on the path alone.
 #[cfg(feature = "web")]
-pub(crate) fn strict_url(uri: &axum::http::Uri) -> Result<StrictUrl, RequestRejection> {
+pub(crate) fn strict_url(
+    uri: &axum::http::Uri,
+) -> Result<crate::encoding::DecodedPath, RequestRejection> {
     let path = strict_path(uri)?;
-    let query = strict_query(uri)?;
-    Ok(StrictUrl { path, query })
+    strict_query(uri)?;
+    Ok(path)
 }
 
 /// The strict path parse shared by every entry point.

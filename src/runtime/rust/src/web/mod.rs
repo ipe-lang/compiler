@@ -3511,7 +3511,7 @@ mod handlers {
         // this is the second, independent boundary before any session work.
         // The path is parsed here once; every route resolver below reads it.
         let path = match crate::server::strict_url(&uri) {
-            Ok(url) => url.path,
+            Ok(path) => path,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         let lookup = (st.route_matched)(&path);
@@ -5004,7 +5004,7 @@ mod handlers {
         // path the clean-reinit miss takes — so the reset session holds exactly
         // what a cold-start visit would have produced.
         let path = match crate::server::strict_url(&uri) {
-            Ok(url) => url.path,
+            Ok(path) => path,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         let params = (st.param_resolver)(&path);
@@ -5137,7 +5137,7 @@ mod handlers {
         // WebReq from the current request context so route-aware apps get the
         // correct initial state.
         let path = match crate::server::strict_url(&uri) {
-            Ok(url) => url.path,
+            Ok(path) => path,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         let params = (st.param_resolver)(&path);
@@ -10553,7 +10553,8 @@ mod emitted_router_behavior_tests {
         });
         let observed = out.as_ref().is_ok_and(|out| {
             out.status.success()
-                && String::from_utf8_lossy(&out.stdout).contains(INSTALL_CHILD_REFUSED)
+                && std::str::from_utf8(&out.stdout)
+                    .is_ok_and(|text| text.contains(INSTALL_CHILD_REFUSED))
         });
         assert!(observed, "the child must observe the refusal: {out:?}");
     }
