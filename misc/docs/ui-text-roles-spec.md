@@ -20,7 +20,11 @@ exactly these surface changes:
 modules (`Html.Unsafe.unsafeRaw`). `WhiteSpace` constructors are used qualified
 (`Font.Pre`).
 
-Nothing else joins the public surface. The project is pre-public, so the old
+Nothing else joins the public surface. The typed layout attribute (see
+"Typed layout attribute") changes no public signature: `Ui.style` keeps
+`String -> String -> Attribute msg`, and the layout builders keep theirs.
+
+The project is pre-public, so the old
 locations (`Ui.taggedNode`, `Ui.input`) and the integer heading constructors
 (`Ui.descHeading`, `Region.heading`) are removed outright, with no shim.
 
@@ -41,7 +45,8 @@ whiteSpace : WhiteSpace -> Attribute msg
 unsafeTaggedNode : String -> Description -> List (Attribute msg) -> List (Element msg) -> Element msg
 unsafeInput      : List (Attribute msg) -> Element msg
 
--- Ipe.Ui.Input (see "Input.file"; the `Picked` payload is a DECISION NEEDED)
+-- Ipe.Ui.Input (see "Input.file")
+type alias Picked = { name : String, size : Int, mime : String }
 type FileKind = Image | Audio | Video | Pdf | PlainText | Csv
 type Accept = AnyFile | Only FileKind (List FileKind)
 type Pick msg = PickOne (Picked -> msg) | PickMany (List Picked -> msg)
@@ -79,6 +84,13 @@ Each change closes a class, not one site.
   `Attribute::AttrFontWhiteSpace(WhiteSpace)`. The CSS text comes from a
   `const` table, so no string reaches the style sink. The TUI reads the same
   value through two total predicates, `wraps()` and `preserves_newlines()`.
+- **Typed layout.** Layout identity is never read from a style key. Whether a
+  node is a row, a column, a wrapped row or a grid is a closed
+  `LayoutKind` carried by `Attribute::AttrLayout`, set only by the layout
+  builders. Whether a box flows inline is a fact of the render context, not
+  of an attribute. Every `AttrStyle` key reaches the renderer only through
+  `SafeCssPropertyName`, whose grammar has no `_`, so `Ui.style "__row" "true"`
+  is a refused CSS property and changes nothing.
 - **Parse-stable markup.** This is pre-existing and fixed here because the new
   block roles widen it. Every element the safe surface renders under a
   phrasing ancestor renders with a phrasing tag. The renderer threads a closed
@@ -233,7 +245,7 @@ Each change closes a class, not one site.
 
   `ui_paragraph_` in `helpers.rs` stops pushing the marker. A user
   `Ui.style "__paragraph" "true"` then no longer changes layout. The other
-  layout markers are the subject of CONSIDERATION.
+  layout markers move to a typed attribute in "Typed layout attribute".
 - New helpers in `ui/helpers.rs`:
   - one nullary `ui_desc_<role>_` per new description;
   - one nullary `ui_font_white_space_<mode>_` per `WhiteSpace` variant.
@@ -365,8 +377,24 @@ file : List (Attribute msg) -> { accept : Accept, pick : Pick msg, label : Label
 
 - `Only` takes at least one kind, so an empty filter has no representation.
   `AnyFile` is the explicit "no filter" case.
-- `Picked` is defined by the payload decision below, under DECISIONS NEEDED.
-  This slice is blocked on that decision.
+- `Picked` is metadata only:
+
+  ```elm
+  type alias Picked = { name : String, size : Int, mime : String }
+  ```
+
+  No file bytes cross the wire, and the runtime keeps no per-session handle
+  table. The app can show and check a selection; reading file content stays
+  with the existing `Ui.onFile`. Every field is client-declared, and the
+  `Input.file` doc says so.
+
+  | Field  | Accepted values (anything else is refused) |
+  |--------|--------------------------------------------|
+  | `name` | 1 to 255 UTF-8 bytes (`MAX_PICKED_NAME_BYTES = 255`). |
+  | `size` | ASCII decimal digits, no sign, no leading zero except `0` itself, at most 16 digits, value 0 to 2^53 − 1 (`MAX_PICKED_SIZE`, the largest integer a browser `Number` holds exactly). |
+  | `mime` | Empty (the browser knows no type, and `File.type` is `""`), or `type/subtype` of at most 127 bytes (`MAX_PICKED_MIME_BYTES = 127`): exactly one `/`, each side non-empty, starting with an ASCII letter or digit and continuing with `[A-Za-z0-9!#$&^_.+-]` (the RFC 6838 restricted-name set). Parameters (`;`), spaces and any other byte are refused. |
+
+  The four constants are declared once in `ui/input.rs`.
 
 **Runtime.**
 
@@ -405,19 +433,30 @@ file : List (Attribute msg) -> { accept : Accept, pick : Pick msg, label : Label
     with no wildcard.
 - The client driver (`web/client.js`) handles `ipe-pick` beside the existing
   `ipe-file` driver:
-  - It sends one entry per selected file, in the shape the payload decision
-    fixes, and at most `MAX_PICKED_FILES` entries. More than that clears the
-    input, sends nothing, and logs `console.warn`.
+  - It sends three wire arguments per selected file, in order: `File.name`,
+    `String(File.size)` and `File.type`. It reads no file content. It sends
+    at most `MAX_PICKED_FILES` files; more than that clears the input, sends
+    nothing, and logs `console.warn`.
   - This is a UX check only. The server parse below is the boundary.
 - `HandlerIndex::resolve` (`dom/dispatch.rs`) parses the wire arguments
-  (`&[String]`, one entry per file) once with
-  `parse_pick(args, &PickHandler) -> Result<M, PickRefusal>`, where
-  `PickRefusal` is a closed enum:
-  - `WrongArity`: `One` with anything but exactly one entry. Zero entries
-    dispatch nothing, because a cancelled dialog is not a pick.
-  - `TooMany`: more than `MAX_PICKED_FILES = 32`, declared once in `ui/input.rs`.
-  - `Malformed`: an entry does not have the decided shape.
-  - The per-field ceilings the payload decision names.
+  (`&[String]`, three per file) once with
+  `parse_pick(args, &PickHandler) -> Result<Option<M>, PickRefusal>`, where
+  `PickRefusal` is a closed enum. The count checks run first, in O(1), before
+  any field is read:
+  - `Malformed`: the argument count is not a multiple of 3.
+  - `TooMany`: more than `MAX_PICKED_FILES = 32` files, declared once in
+    `ui/input.rs`.
+  - `WrongArity`: `One` with more than one file. Zero files give `Ok(None)`
+    for both shapes and dispatch nothing, because a cancelled dialog is not a
+    pick.
+  - `NameEmpty`, `NameTooLong`: the `name` rule in the table above.
+  - `SizeMalformed` (not the decimal grammar), `SizeOutOfRange` (above
+    `MAX_PICKED_SIZE`): the `size` rule. A negative or fractional size is
+    `SizeMalformed`, because `-` and `.` are outside the grammar.
+  - `MimeTooLong`, `MimeMalformed`: the `mime` rule.
+
+  Each field is parsed into its typed value exactly once here. A `Picked`
+  exists only as the output of this parse.
 
   A refusal dispatches no `msg` and is logged as the typed refusal kind, never
   the entry's content. The request body stays bounded by the existing
@@ -433,6 +472,113 @@ file : List (Attribute msg) -> { accept : Accept, pick : Pick msg, label : Label
   - `Input.file` lays out its label followed by a fixed, non-focusable note.
     The note's text is declared once beside the TUI's other fixed strings.
   - It registers no key handler and dispatches nothing.
+
+### Typed layout attribute
+
+**Class-closing property.** No reader of layout looks at an `AttrStyle` key.
+Layout identity has its own closed type, and the style key space carries only
+CSS property names. So no value of `Ui.style`'s arguments, and no attribute
+list a program builds from the safe surface, can change a node's layout kind,
+its flex axis, or whether it flows inline.
+
+**Today.** `Ui.row`, `Ui.column`, `Ui.wrappedRow` and `Ui.grid` mark
+themselves with `AttrStyle("__row"|"__col"|"__wrappedrow"|"__grid", "true")`
+(`Ui.ipe` around 1339-1357; runtime writers `ui_row_`, `ui_column_`,
+`ui_wrapped_row_` in `ui/helpers.rs`, `cells_row_`, `cells_column_` and
+`cli_lines_` in `tui/mod.rs`). Readers match the key text before the CSS gate:
+the `AttrStyle` arm of the style collector and `flex_axis_of` in
+`ui/render.rs`, and `walk_attrs` in `tui/layout.rs`.
+`render_paragraph_child` rewrites `__row` to `__inline_row` and `__col` to
+`__inline_col`, and inserts `__inline`, all in the same key space, read back
+by the collector and `is_inline_marked`. `walk_attrs` also reads
+`__gridMin` and parses its value with `unwrap_or(0)`; nothing writes
+`__gridMin`, so only a forged `Ui.style` reaches it. Any of these keys can be
+forged: `Ui.el [ Ui.style "__row" "true" ] …` lays out as a row.
+
+**Design.**
+
+- `ui/element.rs` gains
+
+  ```rust
+  pub enum LayoutKind { Row, Column, WrappedRow, Grid }
+  impl LayoutKind { pub const ALL: [LayoutKind; 4] = [...]; }
+  ```
+
+  and `Attribute::AttrLayout(LayoutKind)`. Paragraph and text column are not
+  layout kinds; they are `Description`s (see "Runtime roles").
+- Writers. `Ui.ipe` row, column, wrappedRow and grid prepend a private
+  attribute alias instead of `style "__…" "true"`:
+
+  ```elm
+  layoutRow : Attribute msg
+  layoutRow =
+      Kernel.kernel "Ui_layoutRow"
+
+  row attrs children =
+      node descNone (layoutRow :: attrs) children
+  ```
+
+  The four aliases (`layoutRow`, `layoutColumn`, `layoutWrappedRow`,
+  `layoutGrid`) are not in `Ipe.Ui`'s `exposing` list, and user
+  `Kernel.kernel "Ui_layout…"` is `KernelAliasInUserSource` (IPE-N0042), so
+  no user code can produce an `AttrLayout`. Four nullary kernels
+  (`UiLayoutRow`, `UiLayoutColumn`, `UiLayoutWrappedRow`, `UiLayoutGrid`)
+  map to `ui_layout_row_()` and its siblings, each returning
+  `Attribute::AttrLayout(..)`. The runtime writers in `ui/helpers.rs` and
+  `tui/mod.rs` push `AttrLayout` directly.
+- Inline flow is a render-context fact. `render_paragraph_child` no longer
+  rewrites attributes. It renders with a closed
+  `enum Flow { Block, InlineRun }` set to `InlineRun`, threaded beside the
+  `ContentModel` that slice 1 introduces. The CSS comes from one total
+  function with an exhaustive match and no wildcard:
+
+  ```rust
+  fn layout_decls(kind: Option<LayoutKind>, flow: Flow) -> &'static [&'static str]
+  ```
+
+  | `kind` \ `flow` | `Block` | `InlineRun` |
+  |---|---|---|
+  | `Some(Row)` | `display:flex`, `flex-direction:row` | `display:inline-flex`, `flex-direction:row` |
+  | `Some(Column)` | `display:flex`, `flex-direction:column` | `display:inline-flex`, `flex-direction:column` |
+  | `Some(WrappedRow)` | `display:flex`, `flex-direction:row`, `flex-wrap:wrap` | `display:inline-flex`, `flex-direction:row`, `flex-wrap:wrap` |
+  | `Some(Grid)` | `display:grid` | `display:inline-grid` |
+  | `None` | none | `display:inline-block`, `vertical-align:baseline` |
+
+  These are today's outputs for every pair the current code reaches. The
+  `WrappedRow` and `Grid` cells under `InlineRun` are new: today a wrapped row
+  or grid in a paragraph keeps its block display and breaks the `<p>`, which
+  is the parse-stability defect the content-model rule closes.
+  `flex_axis_of` matches `AttrLayout`, and `is_inline_marked` becomes a read
+  of `flow`.
+- The `AttrStyle` arm of the style collector has exactly one path:
+  `SafeCssPropertyName::parse` on the key and `SafeCssValue::parse_reporting`
+  on the value. Its grammar, `[A-Za-z0-9-]+`, has no `_`, so every `__…` key
+  is refused there. The key gains `SafeCssPropertyName::parse_reporting`
+  with the same `DeveloperLiteral` origin, so a refused key such as `__row`
+  names itself in the developer diagnostic instead of vanishing silently.
+- `tui/layout.rs` `walk_attrs` matches `AttrLayout` for direction and grid.
+  The `__paragraph` and `__textcolumn` arms are gone after slice 1. The
+  `__gridMin` arm is deleted, because it has no producer. If `grid_min_px`
+  is then never written, the field and its branch go too, not kept as dead
+  state. The only `AttrStyle` key the TUI still reads is `border-style`, a
+  real CSS property.
+- `ui/widget.rs`: the `__raw` assertion becomes "every `AttrStyle` key the
+  widget emits parses as `SafeCssPropertyName`".
+- Template mirror. `ui/template.rs` `UiAttribute` gains
+  `Layout(LayoutKind)`, and backend `emit_ui_template.rs` `CompileUiAttr`
+  gains `Layout(&'static str)`, its tag written by `tagged_enum_static_str`.
+  `compile_attr` maps `(KernelFn::UiLayoutRow, [])` and its siblings to
+  `Layout`. The four lowered wrapper bodies (`node descNone (layoutRow ::
+  attrs) children`) templatize as the `style "__row" "true"` prepend does
+  today. The tests at 2128-2213 and 3108-3203 are rewritten over the new
+  body. A literal `Ui.style "__row" "true"` still bakes as `Style`, and the
+  runtime gate refuses it at render.
+- `Ui.style` keeps `String -> String -> Attribute msg`. A typed
+  `CssProperty` union would need hundreds of constructors and a release per
+  CSS property. It would add no security, because the key already meets its
+  single parse at the style sink, and that parse refuses every non-CSS
+  name. Once no reader decodes structure from the key space, a refused key
+  is a dropped declaration, not a forged layout.
 
 ## Safe-surface admission rule
 
@@ -560,6 +706,28 @@ file : List (Attribute msg) -> { accept : Accept, pick : Pick msg, label : Label
   - the `browser-e2e` job in `.github/workflows/ci.yml`, which gains a compile,
     spawn and wait step for `ui-layout`. The status context is unchanged, so
     `check-manifest.yml` is unchanged.
+- **Typed layout attribute slice:**
+  - `src/stdlib/Ipe/Ui.ipe`: the four private `layout*` aliases and the
+    row, column, wrappedRow and grid bodies;
+  - `src/compiler/kernels/src/lib.rs`: `UiLayoutRow`, `UiLayoutColumn`,
+    `UiLayoutWrappedRow` and `UiLayoutGrid` at every mirrored site;
+  - `src/compiler/backend/rust/src/emit_ui_plan.rs`: their plan rows;
+  - `src/compiler/backend/rust/src/emit_ui_template.rs`: `CompileUiAttr::Layout`,
+    the `compile_attr` arms, and the wrapper-body tests;
+  - `src/compiler/types/src/constrain/tests/mod.rs`: the kernel lists;
+  - runtime `ui/element.rs` (`LayoutKind`, `AttrLayout`), `ui/render.rs`
+    (`layout_decls`, `Flow`, `flex_axis_of`, `is_inline_marked`,
+    `render_paragraph_child`, the `AttrStyle` arm), `ui/helpers.rs`
+    (`ui_layout_*_`, `ui_row_`, `ui_column_`, `ui_wrapped_row_`),
+    `ui/template.rs` (`UiAttribute::Layout`, the round-trip tests at 1385-1440),
+    `ui/widget.rs` (the assertion), `tui/mod.rs` (`cells_row_`,
+    `cells_column_`, `cli_lines_`), `tui/layout.rs` (`walk_attrs` and its tests
+    near 2924, 2985, 3050, 3077, 3304 and 3325), and `css_safety.rs`
+    (`SafeCssPropertyName::parse_reporting`);
+  - every exhaustive match over `Attribute` gains an explicit `AttrLayout`
+    arm, with no wildcard (the lane lists them with
+    `tools/scripts/ipe-index rdeps Attribute`);
+  - goldens regenerated (every golden that uses a layout builder).
 - **tools/code-review.** No change. `Lib/View.ipe` uses only `Ui.html` and
   `Font.*`, and `Font.*` keeps every member name.
 
@@ -599,10 +767,23 @@ control that runs the same input with the guarded difference removed and gets
 | `Input.file` admission: hostile `attrs` (`htmlAttribute "type" "text"`, `"accept" "*/*"`, `"webkitdirectory" ""`, `"capture" "user"`, `"name" "x"`, `"formaction" "/x"`, `Ui.style "x" "y"`, `Ui.onFile F`) render on the wrapper only. The rendered `<input>` carries exactly `type`, `id`, the event attribute, and `accept`/`multiple` when they apply. Asserted on the attribute set through `ui_layout` and `admit_rendered`. | runtime `ui/input.rs` tests | `test` |
 | `accept` text: `AnyFile` gives no `accept`; `Only Image [ Pdf, Image ]` gives `image/*,application/pdf,.pdf`. `PickOne` gives no `multiple`; `PickMany` gives `multiple`. | runtime tests | `test` |
 | `Input.file [] { accept = "image/*", … }` (a String) and `Only []` are type errors. A `Pick` handler of the wrong payload type (`PickOne Got` where `Got : List Picked -> Msg`) is a type error. Control: the well-typed call type-checks. | types tests | `test` |
-| `parse_pick`: `One` with 2 entries is `WrongArity`; `One` with 0 entries dispatches nothing; `Many` with 33 entries is `TooMany` (32 is accepted); a malformed entry and each field one past its ceiling are refused with the exact `PickRefusal`. Each refusal dispatches no `msg`. Control: a valid entry dispatches the expected `msg`. | runtime `dom/dispatch.rs` tests | `test` |
+| `parse_pick` counts: 4 arguments is `Malformed`; `One` with 2 files is `WrongArity`; 0 files is `Ok(None)` for `One` and `Many`; `Many` with 33 files is `TooMany`, and 32 is accepted. Each refusal dispatches no `msg`. Control: one valid file dispatches the expected `msg` with the exact `Picked`. | runtime `dom/dispatch.rs` tests | `test` |
+| `parse_pick` `name`: `""` is `NameEmpty`; 256 bytes is `NameTooLong`, and 255 bytes is accepted; a 255-byte name ending in a multi-byte character is accepted and a 254-byte prefix plus a 2-byte character (256 bytes) is refused, so the count is bytes, not characters. | runtime `dom/dispatch.rs` tests | `test` |
+| `parse_pick` `size`: `"9007199254740992"` (2^53) is `SizeOutOfRange`, and `"9007199254740991"` is accepted; `"-1"`, `"1.5"`, `"1e3"`, `"+1"`, `"01"`, `" 1"`, `""` and a 17-digit string are `SizeMalformed`; `"0"` is accepted. | runtime `dom/dispatch.rs` tests | `test` |
+| `parse_pick` `mime`: 128 bytes is `MimeTooLong`, and a 127-byte `type/subtype` is accepted; `"text"`, `"/plain"`, `"text/"`, `"a/b/c"`, `"text/plain; charset=utf-8"`, `"text/pla in"` and a non-ASCII byte are `MimeMalformed`; `""` is accepted and yields `mime = ""`. | runtime `dom/dispatch.rs` tests | `test` |
+| A refusal carries no input: `PickRefusal` is a fieldless enum with `ALL`, and a test drives each variant with a name and mime holding a marker string and checks the marker is absent from the refusal's `Display`. | runtime `dom/dispatch.rs` tests | `test` |
 | A user module named `Ipe.Ui.Input` is `ReservedNamespace` (IPE-N0025). User `Kernel.kernel "Input_file"` is IPE-N0042. | canon tests | `test` |
 | Browser: picking one file with `PickOne` dispatches one `msg`; two files under `PickOne` are impossible (no `multiple`); 33 files under `PickMany` dispatch nothing; the `<input>` has no attribute outside the closed set. | `ui-file-pick.spec.mjs` | `browser-e2e` |
 | TUI: `Input.file` lays out its label and the fixed note, registers no focus or key handler, and dispatches nothing. | runtime `tui` tests | `runtime-full-features` |
+| Layout forging: `Ui.el [ Ui.style k "true" ] [ a, b ]` for every former marker `k` (`__row`, `__col`, `__wrappedrow`, `__grid`, `__paragraph`, `__textcolumn`, `__inline`, `__inline_row`, `__inline_col`, `__gridMin`, `__raw`) renders with no `display:flex`, `display:grid`, `inline-flex` or `inline-block` declaration, emits no `k:` declaration, and reports the refused key through the developer diagnostic. Control: `Ui.row [] [ a, b ]` renders `display:flex;flex-direction:row`. Driven through `ui_layout` and `admit_rendered`. | runtime `ui/render.rs` tests | `test` |
+| TUI layout forging: the same forged `Ui.el` lays out its children stacked (the default direction), not side by side, and a forged `__gridMin` leaves the grid at its default columns. Control: `cells_row_` lays them side by side. | runtime `tui/layout.rs` tests (`tui` feature) | `runtime-full-features` |
+| `layout_decls` over every `(LayoutKind::ALL ∪ None) × Flow` pair gives the table in "Typed layout attribute", one assertion per cell. A wrapped row, a grid, a row and a column inside `Ui.paragraph` each render inline (`inline-flex` or `inline-grid`), and the paragraph-nesting walker finds no block display below the `<p>`. | runtime `ui/render.rs` tests | `test` |
+| No layout reader decodes a style key: a source scan of `src/runtime/rust/src/ui/` and `src/runtime/rust/src/tui/` finds no string literal starting with `__` other than the `__ipe` page names, and no `AttrStyle` key comparison other than `"position"` and `"border-style"`; a scan of `src/stdlib/Ipe/` finds no `style "__`. A planted `"__row"` in a copy of `render.rs` turns it red. | runtime tests | `test` |
+| `SafeCssPropertyName::parse_reporting` refuses `__row`, `_x`, `a_b`, `a:b`, `a;b`, `""` and `" "`, each with the developer diagnostic; it accepts `color`, `--ipe-grid-columns` and `margin-top`. | runtime `css_safety.rs` tests | `test` |
+| User `Kernel.kernel "Ui_layoutRow"` is IPE-N0042, and `Ui.layoutRow` under `import Ipe.Ui as Ui` is `NameNotExposed` (IPE-N0022). Control: `Ui.row` resolves. | canon tests | `test` |
+| Template mirror: `CompileUiAttr::Layout` JSON for every `LayoutKind::ALL` member decodes to the runtime `UiAttribute::Layout` and back, byte-identical. The `Ui.row` and `Ui.column` wrapper bodies over the new `layoutRow` prepend templatize. | backend `emit_ui_template.rs` and runtime `template.rs` tests | `test` |
+| Every new layout kernel has a `UiEmitPlan` (the existing `exhaustiveness_partition`). | backend tests | `test` |
+| The seal: the goldens that use layout builders build and run after regeneration. | golden drivers | `e2e` (`IPE_E2E=1`) |
 | Generated docs match the regenerated output. | — | `stdlib-docs-drift` |
 
 ## BUG-CLASSES.md entries touched
@@ -611,7 +792,9 @@ control that runs the same input with the guarded difference removed and gets
 |---|---|---|
 | Refusal deferred to runtime | An invalid heading level was clamped at render time. | `HeadingLevel` is closed and derived. `Ui.Unsafe.unsafeTaggedNode` literal-tag refusal stays at runtime; see LIMIT. |
 | Closed set matched on text with a default row | `tag_for_description` (`_ => "h6"`) and `landmark_tag_for` (`_ => None`). | `NodeTag` and `HeadingLevel` are exhaustive enums with `ALL`. No wildcard remains. |
-| Structural marker in the content alphabet | `__paragraph` and `__textcolumn` can be forged through public `Ui.style`. | Identity moves to `Description`. The remaining layout markers are the subject of CONSIDERATION. |
+| Structural marker in the content alphabet | Every `__row`/`__col`/`__wrappedrow`/`__grid`/`__paragraph`/`__textcolumn`/`__gridMin` marker can be forged through public `Ui.style`, and the `__inline*` markers are synthesised into the same key space. | Paragraph and text-column identity moves to `Description`. Row, column, wrapped row and grid move to `AttrLayout(LayoutKind)`. Inline flow becomes a render-context fact. `__gridMin`, which has no producer, loses its reader. No reader of layout looks at an `AttrStyle` key afterwards, which a source scan pins. |
+| Closed set matched on text with a default row (layout) | `render.rs` and `tui/layout.rs` decode layout with `match k.as_str()` over marker text, where the default arm is "user CSS". | `LayoutKind` is an exhaustive enum with `ALL`. Its CSS comes from one total function over `(LayoutKind, Flow)`, and no wildcard remains in either reader. |
+| Runtime struct reshaped under a compiler mirror (layout) | `UiAttribute` (runtime) mirrors `CompileUiAttr` (backend). | Both gain `Layout` in the same slice, with a round-trip test over `LayoutKind::ALL`. |
 | Builtin identity by bare name | `WhiteSpace` must not be a reserved builtin name. | It is an ordinary source union homed at `Ipe.Ui.Font`. The lane checks `is_reserved_builtin_type_name("WhiteSpace")` is false. |
 | Runtime struct reshaped under a compiler mirror | `UiDescription` mirrors backend `CompileUiDesc`. | Both change in one slice, with a full-variant round-trip test. |
 | Page-config node found by a name page content can carry | Text roles near trusted page nodes. | The roles emit no `id` or `name`, and no id is derived from text. |
@@ -621,7 +804,8 @@ control that runs the same input with the guarded difference removed and gets
 | Tests never compiled or run by CI | TUI tests are `tui`-gated. | They are named under `runtime-full-features`. |
 | Vacuous refusal test; a refusal test that matches only the error family | Every name refusal. | Exact variant plus control, as in the table above. |
 | Generated drift | New docs pages and goldens. | Regenerated, and the new files are `git add`ed. |
-| Untrusted input trusted without a typed parse | Browser-supplied file picks. | `parse_pick` is the one boundary. It produces bounded typed values or a closed `PickRefusal`, and refusals dispatch nothing. |
+| Untrusted input trusted without a typed parse | Browser-supplied file picks. | `parse_pick` is the one boundary. It produces bounded typed `Picked` values or a closed `PickRefusal`, and refusals dispatch nothing. |
+| Unbounded resource a remote party chooses | The file count and each `Picked` field. | `MAX_PICKED_FILES`, `MAX_PICKED_NAME_BYTES`, `MAX_PICKED_SIZE` and `MAX_PICKED_MIME_BYTES`, each with a one-past-the-ceiling refusal test. The count is checked before any field is read. |
 | Caller attributes override a builder's fixed attributes | `Input.file`'s `<input>`. | The `<input>` attribute list is built only by the runtime, and user attrs go to the wrapper. Pre-existing: `input_base_` appends caller `control_attrs` after its fixed `type`/`value`. Browsers keep the first duplicate, but the shape is the same; the `Input.file` slice's guardian review checks it. |
 
 New class for the orchestrator to add (it is pre-existing, found here):
@@ -690,8 +874,7 @@ alone.
    section slice. It also runs the `browser-e2e` job locally, because the
    change touches the browser runtime path.
 6. **Ipe.Ui.Input module and `Input.file`. Gated alone (kernels, goldens).**
-   SCEF: trust boundary (browser-supplied input). It is blocked on the
-   payload decision.
+   SCEF: trust boundary (browser-supplied input).
    - `Ui/Input.ipe` (the 18 aliases plus the `Input.file` types);
    - the Input entries removed from `env.rs`;
    - `stdlib/src/lib.rs`;
@@ -708,8 +891,20 @@ alone.
    check, which first adds `ui-layout` to `run.sh` and `ci.yml`. It runs
    `browser-e2e` locally.
 
-Slices 2, 3, 4 and 6 all edit `kernels/src/lib.rs`, `stdlib/src/lib.rs` and the
-goldens, so they are strictly sequential. Slice 1 also edits
+7. **Typed layout attribute. Gated alone (kernels, goldens, template
+   mirror).** SCEF: correctness (forged structure).
+   - the files under "Typed layout attribute slice" in "Files touched";
+   - the goldens regenerated with `cargo run -p regen-goldens`.
+
+   It runs after slice 1, which introduces `Flow`'s neighbour
+   `ContentModel` and removes the paragraph and text-column markers, and
+   after slice 6, the last slice that edits `kernels/src/lib.rs`, `Ui.ipe`
+   and the goldens. It shares `ui/render.rs`, `tui/layout.rs` and
+   `ui/template.rs` with slice 1 and `kernels/src/lib.rs` with slices 2, 3,
+   4 and 6, so it is file-disjoint from none of them.
+
+Slices 2, 3, 4, 6 and 7 all edit `kernels/src/lib.rs` and the goldens, so they
+are strictly sequential. Slice 1 also edits
 `tui/layout.rs`, `html.rs` and `ui/render.rs`; slice 6 starts from its merge.
 
 ## LIMIT
@@ -728,32 +923,26 @@ goldens, so they are strictly sequential. Slice 1 also edits
   class beyond Unicode White_Space. No Unicode property names "invisible"
   exactly, so the rule stays on White_Space, and the `Ui.section` doc names
   this case.
-- **File content.** `Input.file` adds no file-content reading or upload path
-  beyond what the payload decision picks. The existing `Ui.onFile` data-URL
-  path is unchanged.
+- **File content.** `Input.file` delivers metadata only; it adds no
+  file-content reading or upload path. The existing `Ui.onFile` data-URL path
+  is unchanged. A later API that reads picked files is a new surface and
+  needs its own consent.
+- **Client-declared metadata.** `name`, `size` and `mime` are what the
+  browser reports. The parse bounds and shapes them; it cannot prove them
+  true.
+- **`Ui.gridColumns` in the TUI.** `ui_grid_columns_` writes
+  `--ipe-grid-columns`, which the TUI never reads, and the TUI's `__gridMin`
+  reader has no producer. So `Ui.gridColumns n` has no TUI effect today. The
+  layout slice deletes the forge-only reader. Making `Ui.gridColumns` drive
+  the TUI grid means giving column count its own typed attribute read by both
+  renderers. That changes `Ui.gridColumns`'s meaning in the TUI, so it is a
+  separate fidelity change, not part of the forging fix.
 - **`textColumn` tag.** `textColumn` keeps its `<section>` tag (no accessible
   name, so no landmark) and does not advance the heading level.
 
 ## CONSIDERATION:
 
-Both items are held at ≥95% confidence and are outside this spec's scope.
-
-### Typed layout markers
-
-`Ui.row`, `Ui.column`, `Ui.wrappedRow` and `Ui.grid` mark themselves with
-`AttrStyle("__row"|"__col"|"__wrappedrow"|"__grid", "true")`. The renderer and
-the TUI decode layout from those keys. Public `Ui.style` can forge any of them
-(`Ui.el [ Ui.style "__row" "true" ] …`), so content alphabet decides structure.
-
-The structural fix is internal and adds no surface:
-
-- a closed `Attribute::AttrLayout(LayoutKind)` set by the builder kernels;
-- `Ui.style` refuses keys starting with `__`, as a typed refusal;
-- the template mirror gains `Layout` with a round-trip test.
-
-It touches the same `render.rs`, `tui/layout.rs` and `template.rs` as the
-runtime slice. It would be its own spec, gated alone because it regenerates
-goldens. It is not in this spec's slices.
+This item is held at ≥95% confidence and is outside this spec's scope.
 
 ### Closed tags for runtime builders
 
@@ -767,68 +956,4 @@ free-form tag" property would then hold by type, not by test. That is about
 
 ## DECISIONS NEEDED:
 
-### What a picked file carries (`Picked`)
-
-**What.** The shape of `Picked`, the value one browser-chosen file becomes
-before it reaches `msg`.
-
-**Why.** It decides what crosses the trust boundary, how much the client
-sends, and which ceilings `parse_pick` enforces. Everything else in
-`Input.file` is designed independently of this choice. Its slice waits for
-the answer.
-
-**How.** The options:
-
-- **Metadata only.** `Picked` is a record of client-declared facts, with no
-  bytes.
-
-  ```elm
-  type alias Picked = { name : String, size : Int, mime : String }
-
-  Input.file [] { accept = Input.Only Input.Pdf [], pick = Input.PickOne GotDoc, label = Input.labelAbove [] (Ui.text "Invoice") }
-  -- update: GotDoc p -> ({ model | chosen = Just p.name }, Cmd.none)
-  ```
-
-  - The client sends `{name,size,type}` per file.
-  - `parse_pick` ceilings: `name` ≤ 255 UTF-8 bytes; `size` from 0 to
-    2^53 − 1; `mime` is empty or a `type/subtype` token pair of at most
-    127 bytes.
-  - This is the smallest boundary, and no file bytes reach the server. The
-    app can display and check a selection, but cannot read it. Reading would
-    need a later API.
-
-- **Content as a data URL.** This is the semantics `Ui.onFile` already ships,
-  typed.
-
-  ```elm
-  type alias Picked = { name : String, mime : String, dataUrl : String }
-
-  Input.file [] { accept = Input.Only Input.Image [], pick = Input.PickMany GotPhotos, label = … }
-  -- update: GotPhotos ps -> ({ model | previews = List.map .dataUrl ps }, Cmd.none)
-  ```
-
-  - The client uses `FileReader.readAsDataURL` per file.
-  - The whole event body stays under `IPE_WEB_MAX_BODY_BYTES` (default
-    5 MiB). The client refuses a selection whose summed size would exceed it,
-    and the server answers 413.
-  - `parse_pick` checks the `data:` prefix grammar and that the declared
-    MIME type is the one inside the URL.
-  - This is useful immediately, but every pick ships file bytes into the
-    session, and `PickMany` multiplies them.
-
-- **Opaque handle.** `Picked` is an abstract type with no accessors in this
-  API.
-
-  ```elm
-  type Picked  -- opaque; nothing in this spec reads it
-
-  Input.file [] { accept = Input.AnyFile, pick = Input.PickOne Chosen, label = … }
-  -- update: Chosen handle -> ({ model | pending = Just handle }, Cmd.none)
-  ```
-
-  - The client keeps the `File` objects keyed by a random id and sends only
-    the id. The runtime holds a bounded per-session table (at most
-    `MAX_PICKED_FILES` live handles, evicted on the next pick).
-  - This keeps the door open for a later upload API that consumes handles,
-    and no bytes move now. But it adds server-side state, and the value is
-    inert until that later API exists.
+None.
