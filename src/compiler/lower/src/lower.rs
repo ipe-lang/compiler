@@ -310,7 +310,7 @@ const fn mapper_param_binds_fn_element(
 /// The walk is bounded by the solved type's own depth.
 fn ty_has_type_var(t: &Ty) -> bool {
     match t {
-        Ty::Var(_) => true,
+        Ty::Var(_) | Ty::Wildcard => true,
         Ty::Fun(a, b) => ty_has_type_var(a) || ty_has_type_var(b),
         Ty::Con { args, .. } | Ty::Tuple(args) => args.iter().any(ty_has_type_var),
         Ty::Record(fields, tail) => {
@@ -874,7 +874,7 @@ fn retry_policy_concrete_ir(interner: &Interner, ty: &Ty) -> Option<IrType> {
 
 fn embeds_nonderivable_function(interner: &Interner, ty: &Ty) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Unit => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
         Ty::Fun(a, b) => {
             embeds_nonderivable_function(interner, a) || embeds_nonderivable_function(interner, b)
         }
@@ -967,7 +967,9 @@ fn collect_type_vars(t: &canon::Type, out: &mut BTreeSet<Symbol>) {
         canon::Type::Var(s) => {
             out.insert(*s);
         }
-        canon::Type::Unit => {}
+        // The wildcard is no type variable: a union field `any` is the pub/sub
+        // carrier, never a parameter the union must declare.
+        canon::Type::Wildcard | canon::Type::Unit => {}
         canon::Type::Lambda(a, b) => {
             collect_type_vars(a, out);
             collect_type_vars(b, out);
@@ -1009,7 +1011,7 @@ fn collect_type_vars(t: &canon::Type, out: &mut BTreeSet<Symbol>) {
 fn canon_type_has_open_row(t: &canon::Type) -> bool {
     match t {
         canon::Type::RecordOpen(_, _) => true,
-        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
         canon::Type::Lambda(a, b) => canon_type_has_open_row(a) || canon_type_has_open_row(b),
         canon::Type::Tuple(elems) => elems.iter().any(canon_type_has_open_row),
         canon::Type::Con { args, .. } => args.iter().any(canon_type_has_open_row),
@@ -1113,7 +1115,7 @@ fn canon_sig_unsupported_inner(sig: &canon::Type, arg_row_vars: &BTreeSet<Symbol
 /// Complements [`escapes`], which answers the same question at the
 /// IR-expression level for function bodies.
 const fn ty_can_satisfy_row_witness(ty: &Ty) -> bool {
-    !matches!(ty, Ty::Var(_))
+    !matches!(ty, Ty::Var(_) | Ty::Wildcard)
 }
 
 /// A short plain-English name for a solved [`Ty`], used in error messages when
@@ -1131,7 +1133,7 @@ fn ty_short_name(ty: &Ty, interner: &Interner) -> Box<str> {
         Ty::Tuple(_) => "tuple".into(),
         Ty::Unit => "unit".into(),
         Ty::Record(_, _) => "record".into(),
-        Ty::Var(_) => "unknown".into(),
+        Ty::Var(_) | Ty::Wildcard => "unknown".into(),
     }
 }
 
@@ -9854,7 +9856,7 @@ fn projection_ty_label(ty: &Ty, interner: &Interner) -> Box<str> {
         Ty::Record(_, _) => "record".into(),
         Ty::Fun(_, _) => "function".into(),
         Ty::Unit => "()".into(),
-        Ty::Var(_) => "type variable".into(),
+        Ty::Var(_) | Ty::Wildcard => "type variable".into(),
     }
 }
 
@@ -10763,16 +10765,19 @@ pub struct Lowerer<'a> {
     /// advances; overrun fails closed as a [`bug`] (never an index panic). Interior
     /// mutability so the lowering walk stays over a shared `&self`.
     param_cursor: Cell<usize>,
-    /// Fresh symbols for the per-occurrence `any`-in-param-position seal fix
-    /// (AUD-01). Sized by [`count_any_param_sites`], pre-interned through the
+    /// Fresh symbols for the per-occurrence `any`-in-param-position
+    /// substitution. Sized by [`count_any_param_sites`], pre-interned through the
     /// owned `&mut Interner` before this immutably-borrowed `Lowerer` is
     /// constructed (the interner is frozen by lowering time — a symbol cannot
     /// be minted from inside `&self`). Each bare param-position `any`
     /// occurrence in `split_typed_sig` gets ONE of these instead of sharing the
-    /// single interned `"any"` Symbol, so two `any` params pinned by the body
+    /// one wildcard marker, so two `any` params pinned by the body
     /// to two DIFFERENT concrete types emit as two DISTINCT Rust generics
     /// (`fn f<T1, T2>(a:T1, b:T2)`) rather than colliding onto one shared `T1`.
     any_param_binders: Vec<Symbol>,
+    /// The symbol of this lowering's [`WildcardMarker`]: every wildcard `any`
+    /// lowers to `IrType::Generic(wildcard_marker)` until freshened or pinned.
+    wildcard_marker: Symbol,
     /// Monotonic cursor into [`Self::any_param_binders`], mirroring
     /// [`Self::param_cursor`]'s shape exactly.
     any_param_cursor: Cell<usize>,
@@ -11651,9 +11656,11 @@ pub fn count_projection_decode_sites(m: &canon::Module, interner: &Interner) -> 
 /// Each `any` occurrence — whether a bare `any` param or an `any` nested
 /// inside `List any`, `Maybe any`, `Result e any`, a tuple/record/fn field,
 /// etc. — needs its OWN fresh symbol so independent occurrences lower to
-/// distinct generics (see AUD-01 and [`Lowerer::split_typed_sig`]).
+/// distinct generics (see [`Lowerer::split_typed_sig`]).
 ///
-/// Only `any` gets a fresh UV per occurrence in the checker; genuine named
+/// Only the wildcard [`canon::Type::Wildcard`] gets a fresh unknown per
+/// occurrence in the checker; a declared parameter spelled `any` and every
+/// other genuine named
 /// type variables share one symbol and are fine. Bare or `Ui`-wrapped `any`
 /// in return position is handled by the region-based substitution in
 /// `lower_def` (which replaces the whole return with the body's solved type).
@@ -11664,26 +11671,17 @@ pub fn count_projection_decode_sites(m: &canon::Module, interner: &Interner) -> 
 /// Over-counting is harmless (a few unused interned symbols); under-counting
 /// would let [`Lowerer::fresh_any_param_symbol`]'s cursor overrun, which
 /// fails closed as a [`bug`] — never an index panic, never a silent reuse.
-pub fn count_any_param_sites(m: &canon::Module, interner: &Interner) -> usize {
-    fn count_any_in_type(t: &canon::Type, interner: &Interner) -> usize {
+pub fn count_any_param_sites(m: &canon::Module) -> usize {
+    fn count_any_in_type(t: &canon::Type) -> usize {
         match t {
-            canon::Type::Var(v) => usize::from(interner.resolve(*v) == Some("any")),
-            canon::Type::Con { args, .. } => {
-                args.iter().map(|a| count_any_in_type(a, interner)).sum()
+            canon::Type::Wildcard => 1,
+            canon::Type::Var(_) | canon::Type::Unit => 0,
+            canon::Type::Con { args, .. } => args.iter().map(count_any_in_type).sum(),
+            canon::Type::Lambda(arg, rest) => count_any_in_type(arg) + count_any_in_type(rest),
+            canon::Type::Tuple(elems) => elems.iter().map(count_any_in_type).sum(),
+            canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => {
+                fields.iter().map(|(_, f)| count_any_in_type(f)).sum()
             }
-            canon::Type::Lambda(arg, rest) => {
-                count_any_in_type(arg, interner) + count_any_in_type(rest, interner)
-            }
-            canon::Type::Tuple(elems) => elems.iter().map(|e| count_any_in_type(e, interner)).sum(),
-            canon::Type::Record(fields) => fields
-                .iter()
-                .map(|(_, f)| count_any_in_type(f, interner))
-                .sum(),
-            canon::Type::RecordOpen(_, fields) => fields
-                .iter()
-                .map(|(_, f)| count_any_in_type(f, interner))
-                .sum(),
-            canon::Type::Unit => 0,
         }
     }
     m.defs
@@ -11700,11 +11698,11 @@ pub fn count_any_param_sites(m: &canon::Module, interner: &Interner) -> usize {
             let mut cur = ty;
             let mut n = 0;
             while let canon::Type::Lambda(arg, rest) = cur {
-                n += count_any_in_type(arg, interner);
+                n += count_any_in_type(arg);
                 cur = rest.as_ref();
             }
             // `cur` is now the trailing return type; count its `any`s.
-            n += count_any_in_type(cur, interner);
+            n += count_any_in_type(cur);
             n
         })
         .sum()
@@ -12559,6 +12557,36 @@ fn mapper_wrap_eta_demand(body: &canon::Expr, home: &[Symbol], types: &SolvedTyp
     total
 }
 
+/// The one symbol that stands for the wildcard `any` in lowered types.
+///
+/// Minted fresh per lowering through [`Interner::fresh_symbols`], so no
+/// source identifier can spell it: a declared type parameter named `any` is a
+/// separate symbol and never reaches a wildcard-only path. The field is
+/// private, so a marker comes only from [`Self::mint`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WildcardMarker(Symbol);
+
+impl WildcardMarker {
+    /// Mint the marker for one lowering.
+    ///
+    /// # Errors
+    ///
+    /// An interner diagnostic when the fresh symbol cannot be interned.
+    pub fn mint(interner: &mut Interner) -> DResult<Self> {
+        interner
+            .fresh_symbols("anyw_", 1)?
+            .first()
+            .copied()
+            .map(Self)
+            .ok_or_else(|| bug("ipe_lower::WildcardMarker::mint", "no fresh symbol minted"))
+    }
+
+    /// The marker's symbol, as it appears in an [`IrType::Generic`].
+    pub const fn symbol(self) -> Symbol {
+        self.0
+    }
+}
+
 /// Every pre-minted, collision-free synthetic-symbol pool [`Lowerer::new`]
 /// needs — bundled into one argument so the constructor stays under
 /// clippy's arg-count ceiling. Each field is documented at its matching
@@ -12577,11 +12605,13 @@ pub struct SymbolPools {
     /// scrutinee — sized by [`module_symbol_pool_counts`] and consumed via
     /// [`Lowerer::tuple_elem_binders`].
     pub tuple_elem_binders: Vec<Symbol>,
+    /// The symbol every wildcard `any` lowers to before it is freshened.
+    pub wildcard_marker: WildcardMarker,
 }
 
 /// `(params, prologue, ret, any_syms_minted, row_params, wildcard_bounds)` —
 /// [`Lowerer::split_typed_sig`]'s return shape, named so the signature stays
-/// under clippy's type-complexity ceiling. `any_syms_minted` (AUD-01 seal fix)
+/// under clippy's type-complexity ceiling. `any_syms_minted`
 /// lists every fresh symbol handed out by [`Lowerer::fresh_any_param_symbol`]
 /// for THIS call — the caller must union these into whatever set gates
 /// `type_params` (they are NOT in [`canon::Def::Typed::free_vars`], since they
@@ -12662,6 +12692,7 @@ impl<'a> Lowerer<'a> {
             nested_cons_binders,
             nested_strlit_binders,
             tuple_elem_binders,
+            wildcard_marker,
         } = pools;
         let mut func_ids = BTreeMap::new();
         for (idx, def) in m.defs.iter().enumerate() {
@@ -12880,6 +12911,7 @@ impl<'a> Lowerer<'a> {
             param_cursor: Cell::new(0),
             any_param_binders,
             any_param_cursor: Cell::new(0),
+            wildcard_marker: wildcard_marker.symbol(),
             projection_decode_binders,
             projection_decode_cursor: Cell::new(0),
             destructure_thunk_binders,
@@ -13013,7 +13045,7 @@ impl<'a> Lowerer<'a> {
 
     /// Hand out the next globally-unique fresh symbol from
     /// [`Self::any_param_binders`] for the per-occurrence `any`-in-param-
-    /// position seal fix (AUD-01). Mirrors [`Self::fresh_param_binder`]
+    /// position substitution. Mirrors [`Self::fresh_param_binder`]
     /// exactly; sized by [`count_any_param_sites`], so an overrun is an
     /// internal invariant violation, never an index panic.
     fn fresh_any_param_symbol(&self) -> DResult<Symbol> {
@@ -13028,20 +13060,18 @@ impl<'a> Lowerer<'a> {
         Ok(sym)
     }
 
-    /// Walk `ty` and replace every `IrType::Generic(s)` where `s` resolves to
-    /// `"any"` with a fresh, distinct symbol from the `any_param_binders` pool.
-    /// Push each minted symbol into `minted` so the caller can extend
-    /// `any_syms_minted` and surface the new generics in the function's
-    /// `type_params`.
+    /// Replace every wildcard `IrType::Generic(wildcard_marker)` in `ty` with a fresh symbol.
     ///
-    /// This closes the AUD-01 class for NESTED `any` occurrences (e.g.
-    /// `List any`, `Maybe any`, `Result e any`, a tuple/record/fn with `any`).
-    /// The top-level bare-`any` case is the same structural form, so the walk
-    /// handles both uniformly — `split_typed_sig` no longer needs a separate
-    /// outer-only check.
+    /// Each occurrence draws a distinct symbol from the `any_param_binders`
+    /// pool and pushes it into `minted`, so the caller can extend
+    /// `any_syms_minted` and surface the new generics in the function's
+    /// `type_params`. A declared parameter spelled `any` is a different symbol
+    /// and is left alone. Bare and nested occurrences (`List any`,
+    /// `Maybe any`, `Result e any`, a tuple/record/fn with `any`) share this
+    /// one walk.
     fn freshen_any_generics(&self, ty: IrType, minted: &mut Vec<Symbol>) -> DResult<IrType> {
         Self::map_ir_generics(ty, &mut |sym| {
-            if self.interner.resolve(sym) != Some("any") {
+            if sym != self.wildcard_marker {
                 return Ok(None);
             }
             let fresh = self.fresh_any_param_symbol()?;
@@ -13115,8 +13145,8 @@ impl<'a> Lowerer<'a> {
             // A UI carrier's message slot can embed a nested `any`
             // (`Html (List any)`), so it must freshen like any other container
             // — otherwise two independent Ui-nested `any`s in return position
-            // collapse onto the shared interned `"any"` symbol and emit one
-            // generic where two are required (SEAL break, E0308).
+            // collapse onto the one wildcard marker and emit one generic where
+            // two are required (SEAL break, E0308).
             IrType::Ui { ctor, msg } => Ok(IrType::Ui {
                 ctor,
                 msg: Box::new(Self::map_ir_generics(*msg, f)?),
@@ -16101,7 +16131,7 @@ impl<'a> Lowerer<'a> {
             canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => fields
                 .iter()
                 .find_map(|(_, ty)| self.task_arity_in_canon(ty)),
-            canon::Type::Var(_) | canon::Type::Unit => None,
+            canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => None,
         }
     }
 
@@ -16281,16 +16311,13 @@ impl<'a> Lowerer<'a> {
                 }
                 // Gate 1: every field type variable must be one the union
                 // quantifies, so it resolves to a Rust generic by position.
-                // Exception: `any` wildcard is the pub/sub wire-carrier pin
-                // (Dict String String) — excluded from the bound check,
-                // mirroring the reference's `(/= "any") freeVars` filter
-                // (DeclaredArityHelperSpec.hs:43). `ir_type_from_canon` maps
-                // it to the concrete IrType::Dict(Str, Str) below.
+                // The wildcard `any` is the pub/sub wire-carrier pin
+                // (Dict String String): it is no type variable, so
+                // `collect_type_vars` never yields it, and `ir_type_from_canon`
+                // maps it to the concrete IrType::Dict(Str, Str) below.
                 let mut vars = BTreeSet::new();
                 collect_type_vars(arg, &mut vars);
-                if !vars.iter().all(|v| {
-                    gate_params.contains(v) || self.interner.resolve(*v).is_some_and(|n| n == "any")
-                }) {
+                if !vars.iter().all(|v| gate_params.contains(v)) {
                     return Err(unsupported(ctor.span, Feature::Polymorphism));
                 }
                 let ir = self.ir_type_from_canon(arg, &gate_params)?;
@@ -16431,7 +16458,7 @@ impl<'a> Lowerer<'a> {
                     self.collect_records_in_ty(a, out, seen)?;
                 }
             }
-            Ty::Var(_) | Ty::Unit => {}
+            Ty::Var(_) | Ty::Wildcard | Ty::Unit => {}
         }
         Ok(())
     }
@@ -16594,7 +16621,15 @@ impl<'a> Lowerer<'a> {
                                 sig,
                                 bounds: self.types.bounds.get(&key),
                             });
-                    self.split_typed_sig(ty, patterns, free_vars, sig_span, solved)?
+                    // The wildcard marker is a generic of every typed signature:
+                    // `split_typed_sig` freshens each param-position occurrence and
+                    // the return-position substitution below resolves the rest.
+                    let sig_generics: Vec<Symbol> = free_vars
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(self.wildcard_marker))
+                        .collect();
+                    self.split_typed_sig(ty, patterns, &sig_generics, sig_span, solved)?
                 };
                 // Unconstrained UI-msg defaulting: the type checker records
                 // (`msg_defaulted_vars`) each annotation variable whose only role
@@ -16627,7 +16662,7 @@ impl<'a> Lowerer<'a> {
                 // `FView: Fn(Model) -> Html<Msg>` bound (E0271).
                 //
                 // Detection: if the annotation return is `IrType::Generic(sym)`
-                // where `sym` resolves to "any" AND the body region is a
+                // where `sym` is the wildcard marker AND the body region is a
                 // `Ty::Con` with exactly one arg that is a bare `Ty::Var`,
                 // record `(uv_rep, any_sym)` for injection in the poly_tvars
                 // installation block below.
@@ -16638,7 +16673,7 @@ impl<'a> Lowerer<'a> {
                 // correct current_poly_tvars.
                 let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> =
                     if let IrType::Generic(sym) = &ret {
-                        if self.interner.resolve(*sym) == Some("any") {
+                        if *sym == self.wildcard_marker {
                             self.types
                                 .regions
                                 .get(&(def.home().to_vec(), body.span))
@@ -16686,12 +16721,12 @@ impl<'a> Lowerer<'a> {
                 if !default_to_unit.is_empty() {
                     poly.retain(|_, sym| !default_to_unit.contains(sym));
                 }
-                // Wildcard-`any` return-type fix: `view : Model -> any` makes
-                // `any` appear in `free_vars` (the canon free-var collector treats
-                // it uniformly alongside genuine type parameters).  But `any` is NOT
-                // a real type parameter — it is a return-type wildcard whose concrete
-                // type is resolved by the HM solver from the body.  When
-                // `split_typed_sig` returns `IrType::Generic(any_sym)` for the
+                // Wildcard-`any` return type: `view : Model -> any` lowers its
+                // return to the wildcard marker, which `split_typed_sig` admits as
+                // a generic.  But `any` is NOT a real type parameter — it is a
+                // return-type wildcard whose concrete type is resolved by the HM
+                // solver from the body.  When `split_typed_sig` returns
+                // `IrType::Generic(wildcard_marker)` for the
                 // return position, substitute the body's solved concrete type from
                 // `self.types.regions` instead.  Without this substitution the
                 // emitted Rust function gains a spurious `<T1: Clone>` generic
@@ -16706,29 +16741,27 @@ impl<'a> Lowerer<'a> {
                 //
                 // Why regions, not env? `SolvedTypes::env` for TYPED bindings
                 // stores the annotation type verbatim (`generated.top_level`), which
-                // still has `Ty::Var(any_sym)` in the return position — the any UV
+                // still has `Ty::Wildcard` in the return position — the any UV
                 // was never zonked back there.  `self.types.regions[(home, body.span)]`
                 // is the body expression's solved type, which IS the concrete return
                 // type after solving.
                 //
-                // The analogous gate in the reference compiler: `Instantiate.fromAnnotation`
-                // filters `"any"` out before treating free vars as polymorphic;
-                // `buildEnv` gives each `any` occurrence a fresh flex UV that the body
-                // constrains to a concrete type.  The Rust port must do the same.
+                // The checker gives each wildcard occurrence a fresh flex UV that
+                // the body constrains to a concrete type.
                 // A return whose type is (or wraps) the `any` wildcard is resolved
                 // from the body's SOLVED type, never emitted as a spurious generic.
-                //  * `view : Model -> any` → `ret` is `IrType::Generic(any)`.
+                //  * `view : Model -> any` → `ret` is `IrType::Generic(marker)`.
                 //  * `view : Model -> Html` → canon arity-fills to `Html any`, so
-                //    `ret` is `IrType::Ui { msg: Generic(any) }` (the msg slot
+                //    `ret` is `IrType::Ui { msg: Generic(marker) }` (the msg slot
                 //    carries the wildcard, produced by `ir_ui_msg_from_canon`).
                 // Both cases substitute the whole return with the body's region
                 // type: `Html<Msg>` concrete, not `Html<()>`, `Html<T1>`, or the
                 // pub/sub `Html<HashMap<String,String>>` carrier.
                 let ret_is_any_wildcard = match &ret {
-                    IrType::Generic(sym) => self.interner.resolve(*sym) == Some("any"),
+                    IrType::Generic(sym) => *sym == self.wildcard_marker,
                     IrType::Ui { msg, .. } => {
                         matches!(msg.as_ref(), IrType::Generic(sym)
-                            if self.interner.resolve(*sym) == Some("any"))
+                            if *sym == self.wildcard_marker)
                     }
                     _ => false,
                 };
@@ -16752,7 +16785,7 @@ impl<'a> Lowerer<'a> {
                     } else {
                         // A nested `any` in return position (e.g. `foo : X -> List any`)
                         // is not covered by the bare-wildcard region substitution above.
-                        // Freshen every `Generic("any")` node in the return type so each
+                        // Freshen every wildcard-marker generic in the return type so each
                         // occurrence becomes a distinct fresh symbol — the same treatment
                         // `split_typed_sig` applies to param-position `any`s.
                         //
@@ -17026,21 +17059,13 @@ impl<'a> Lowerer<'a> {
                 // body-imposed super-type obligations require (empty for a
                 // structurally-parametric variable — a bare `T{n}`).
                 //
-                // Bug-28 fix (`init : any -> (Model, Cmd Msg)`): `any` in PARAM
-                // position is a legitimate type parameter — `IrType::Generic(any_sym)`
-                // appears in `params` and must be in `type_params` so the backend
-                // can map it to a Rust generic `T{n}`.  The old filter
-                // (`resolve(v) != "any"`) was correct for RETURN-position `any`
-                // (resolved away above) but over-removed `any_sym` when `any` is
-                // structurally used in `params`.
-                //
-                // Principled rule: include `v` in `type_params` iff
-                // `IrType::Generic(v)` structurally appears in the RESOLVED
-                // `params` or `ret`.  This naturally:
-                //   - INCLUDES `any_sym` when `any` is in param position (Generic stays).
-                //   - EXCLUDES `any_sym` when `any` is in return position (resolved away).
-                //   - INCLUDES `any_sym` when `any` is the injected UI msg generic
-                //     (`view : Model -> any`, Bug-29) because `ret = Html<Generic(any_sym)>`.
+                // Include `v` in `type_params` iff `IrType::Generic(v)`
+                // structurally appears in the RESOLVED `params` or `ret`. For the
+                // wildcard marker this:
+                //   - EXCLUDES it when `any` is in return position (resolved away).
+                //   - INCLUDES it when `any` is the injected UI msg generic
+                //     (`view : Model -> any`) because `ret = Html<Generic(marker)>`.
+                // A param-position `any` was already freshened to a minted symbol.
                 let used_generics: BTreeSet<Symbol> = {
                     let mut s = BTreeSet::new();
                     for (_, ty) in &params {
@@ -17052,7 +17077,7 @@ impl<'a> Lowerer<'a> {
                 // (AUD-05) keyed by (home, name) — see the `bounds` field doc
                 // on `SolvedTypes` for why a bare-name lookup is unsound here.
                 let var_bounds = self.types.bounds.get(&(def.home().to_vec(), name));
-                // AUD-01 seal fix: `any_syms_minted` holds every fresh symbol
+                // `any_syms_minted` holds every fresh symbol
                 // `split_typed_sig` handed out for a per-occurrence `any`
                 // param-position substitution — these are, by construction,
                 // NOT in `free_vars` (canon never saw them; they're minted at
@@ -17069,6 +17094,7 @@ impl<'a> Lowerer<'a> {
                 let type_params: Vec<(Symbol, BoundSet)> = free_vars
                     .iter()
                     .copied()
+                    .chain(std::iter::once(self.wildcard_marker))
                     .filter(|v| used_generics.contains(v))
                     .chain(any_syms_minted.iter().copied())
                     .map(|v| {
@@ -17534,20 +17560,20 @@ impl<'a> Lowerer<'a> {
             } else {
                 self.ir_type_from_canon(arg, generics)?
             };
-            // Per-occurrence `any` seal fix (AUD-01 — structural fix): every
-            // `any` occurrence — bare (`any`) OR nested inside a container
-            // (`List any`, `Maybe any`, `Result e any`, a tuple/record/fn
-            // argument with `any`) — lowers to `IrType::Generic(any_sym)` with
-            // the SAME interned Symbol for every occurrence.  Two independent
+            // Per-occurrence `any`: every wildcard occurrence — bare (`any`)
+            // OR nested inside a container (`List any`, `Maybe any`,
+            // `Result e any`, a tuple/record/fn argument with `any`) — lowers
+            // to `IrType::Generic(wildcard_marker)`, the SAME symbol for every
+            // occurrence.  Two independent
             // `any` occurrences collapsing to one generic means
             // `f : List any -> Maybe any` emits `fn f<T>(a:Vec<T>) -> Option<T>`
             // instead of `fn f<T0,T1>(a:Vec<T0>) -> Option<T1>`, making a
             // well-typed call fail cargo E0308 (SEAL break).
             //
             // Fix (structural — closes the whole class): walk the full `IrType`
-            // tree and replace every `Generic("any")` node with a fresh, distinct
+            // tree and replace every wildcard-marker generic with a fresh, distinct
             // symbol from the `any_param_binders` pool.  `count_any_param_sites`
-            // now recursively counts ALL `any` occurrences (bare and nested), so
+            // recursively counts ALL `any` occurrences (bare and nested), so
             // the pool is always large enough.  The backend positions each
             // `Generic` by its index in `Func::type_params`, not by spelling, so
             // a distinctly-named symbol per occurrence gives the correct
@@ -17805,22 +17831,18 @@ impl<'a> Lowerer<'a> {
     /// Lower the message-type argument of a UI constructor (`Html msg`,
     /// `Element msg`, `Attribute msg`, `Event msg`) from a canon annotation.
     ///
-    /// Identical to [`Self::ir_type_from_canon`] except for the arity-fill
-    /// wildcard: canon fills a bare `Html` / `Element` / `Attribute` annotation
-    /// to `Html any` using the `any` wildcard variable, and that variable is
-    /// deliberately NOT in the binding's `free_vars`. The plain
-    /// `ir_type_from_canon` `Var` arm maps an out-of-scope `any` to the pub/sub
+    /// Identical to [`Self::ir_type_from_canon`] except for the wildcard:
+    /// canon fills a bare `Html` / `Element` / `Attribute` annotation to
+    /// `Html any` with [`canon::Type::Wildcard`]. Outside a typed signature the
+    /// plain `ir_type_from_canon` maps the wildcard to the pub/sub
     /// `Dict String String` carrier — correct for a union-ctor wire field, wrong
-    /// for a UI message slot. Here the `any` wildcard instead lowers to
-    /// `IrType::Generic(any)`, preserving the marker that the return-type
+    /// for a UI message slot. Here the wildcard always lowers to
+    /// `IrType::Generic(wildcard_marker)`, the marker the return-type
     /// substitution in `lower_def` keys on to swap in the body's SOLVED concrete
     /// message type (`Html<Msg>`), never `Html<()>` or `Html<HashMap<..>>`.
     fn ir_ui_msg_from_canon(&self, t: &canon::Type, generics: &[Symbol]) -> DResult<IrType> {
-        if let canon::Type::Var(v) = t
-            && self.interner.resolve(*v).is_some_and(|n| n == "any")
-            && !generics.contains(v)
-        {
-            return Ok(IrType::Generic(*v));
+        if matches!(t, canon::Type::Wildcard) {
+            return Ok(IrType::Generic(self.wildcard_marker));
         }
         self.ir_type_from_canon(t, generics)
     }
@@ -18285,7 +18307,7 @@ impl<'a> Lowerer<'a> {
                     },
                     // A shape-generic annotation (`Program shape msg`) names no
                     // single app leaf to emit; this arm carries no span.
-                    Some(canon::Type::Var(_)) => {
+                    Some(canon::Type::Var(_) | canon::Type::Wildcard) => {
                         Err(unsupported(Span::DUMMY, Feature::Polymorphism))
                     }
                     _ => Err(bug(
@@ -18555,17 +18577,7 @@ impl<'a> Lowerer<'a> {
             // construction, so a variable absent from `generics` here means canon
             // failed to collect the binding's complete free-variable set — a
             // violated invariant, not a user-reachable feature gap.
-            //
-            // Exception: `any` wildcard in a union-ctor field (e.g.
-            // `| CartTopicReceived any`) is the pub/sub wire carrier, pinned to
-            // `Dict String String` by the solver (constrain.rs `pin_any_in_ty`).
-            // The gate-1 check in `lower_enum` already skips these vars; here we
-            // emit the matching concrete IR type so the emitted Rust is a
-            // `HashMap<String, String>` field — no free generic, no `dyn Any`.
             canon::Type::Var(v) => {
-                if self.interner.resolve(*v).is_some_and(|n| n == "any") && !generics.contains(v) {
-                    return Ok(IrType::Dict(Box::new(IrType::Str), Box::new(IrType::Str)));
-                }
                 if generics.contains(v) {
                     Ok(IrType::Generic(*v))
                 } else {
@@ -18573,6 +18585,20 @@ impl<'a> Lowerer<'a> {
                         "ipe_lower::ir_type_from_canon",
                         "annotation type variable not in the binding's free-variable set",
                     ))
+                }
+            }
+            // The wildcard `any`. Inside a typed signature (whose generics carry
+            // the marker) it is the marker generic, freshened per occurrence by
+            // `split_typed_sig`. In a union-ctor field (e.g.
+            // `| CartTopicReceived any`) it is the pub/sub wire carrier, pinned
+            // to `Dict String String` by the solver (`pin_any_in_ty`); emit the
+            // matching concrete IR type so the emitted Rust is a
+            // `HashMap<String, String>` field — no free generic, no `dyn Any`.
+            canon::Type::Wildcard => {
+                if generics.contains(&self.wildcard_marker) {
+                    Ok(IrType::Generic(self.wildcard_marker))
+                } else {
+                    Ok(IrType::Dict(Box::new(IrType::Str), Box::new(IrType::Str)))
                 }
             }
             // The unit type `()` in an annotation (`f : () -> Int`).
@@ -18757,14 +18783,14 @@ impl<'a> Lowerer<'a> {
         pinned: &mut bool,
     ) -> Option<Ty> {
         match ty {
-            Ty::Var(v) if self.poly_tvar_symbol(*v).is_none() => {
+            Ty::Var(_) | Ty::Wildcard if self.ty_is_unbound_free(ty) => {
                 if no_default {
                     return None;
                 }
                 *pinned = true;
                 Some(carrier.clone())
             }
-            Ty::Var(_) | Ty::Unit => Some(ty.clone()),
+            Ty::Var(_) | Ty::Wildcard | Ty::Unit => Some(ty.clone()),
             Ty::Fun(arg, res) => Some(Ty::Fun(
                 Box::new(self.pin_phantom_vars(arg, carrier, true, pinned)?),
                 Box::new(self.pin_phantom_vars(res, carrier, true, pinned)?),
@@ -20200,7 +20226,9 @@ impl<'a> Lowerer<'a> {
                             format!("Program carrier with unknown shape tag `{other}`"),
                         )),
                     },
-                    Some(Ty::Var(_)) => Err(unsupported(span, Feature::Polymorphism)),
+                    Some(Ty::Var(_) | Ty::Wildcard) => {
+                        Err(unsupported(span, Feature::Polymorphism))
+                    }
                     _ => Err(bug(
                         "ipe_lower::ir_type_from_ty",
                         "Program carrier without a settled shape tag",
@@ -20459,6 +20487,8 @@ impl<'a> Lowerer<'a> {
                 || Err(unsupported(span, Feature::Polymorphism)),
                 |sym| Ok(IrType::Generic(sym)),
             ),
+            // An unpinned wildcard names no generic of the enclosing def.
+            Ty::Wildcard => Err(unsupported(span, Feature::Polymorphism)),
         }
     }
 
@@ -20505,6 +20535,8 @@ impl<'a> Lowerer<'a> {
             Ty::Var(v) => self
                 .poly_tvar_symbol(*v)
                 .map_or(Ok(IrType::Unit), |sym| Ok(IrType::Generic(sym))),
+            // A wildcard names no enclosing generic: a message-free subtree.
+            Ty::Wildcard => Ok(IrType::Unit),
             // All other forms delegate to the strict helper — a concrete `Msg`
             // type becomes `IrType::Enum(Msg)`, `()` becomes `IrType::Unit`, etc.
             _ => self.ir_type_from_ty(t, span),
@@ -20552,6 +20584,7 @@ impl<'a> Lowerer<'a> {
             Ty::Var(v) => self
                 .poly_tvar_symbol(*v)
                 .map_or(Ok(IrType::Json), |sym| Ok(IrType::Generic(sym))),
+            Ty::Wildcard => Ok(IrType::Json),
             // Recursively handle compound types so embedded `Ty::Var`s also
             // map to `IrType::Json`.
             Ty::Tuple(elems) => {
@@ -20605,7 +20638,7 @@ impl<'a> Lowerer<'a> {
                         // `result_and_map_fn_payload` positive-path
                         // fixture). One defaulting policy, both sides.
                         let err_ty = args.first().ok_or_else(result_arg_bug)?;
-                        let err = if matches!(err_ty, Ty::Var(_)) {
+                        let err = if matches!(err_ty, Ty::Var(_) | Ty::Wildcard) {
                             IrType::Error
                         } else {
                             self.ir_type_from_ty_json(err_ty, span)?
@@ -22883,7 +22916,11 @@ impl<'a> Lowerer<'a> {
     /// A free var bound by the enclosing signature returns `false`: rustc binds
     /// it through the function's own generic, so no pin is needed OR wanted.
     fn ty_is_unbound_free(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Var(raw) if self.poly_tvar_symbol(*raw).is_none())
+        match ty {
+            Ty::Var(raw) => self.poly_tvar_symbol(*raw).is_none(),
+            Ty::Wildcard => true,
+            Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
+        }
     }
 
     /// The turbofish pin for a polymorphic kernel whose free result type
@@ -24032,7 +24069,10 @@ impl<'a> Lowerer<'a> {
             // A declared arrow OR a bare type variable is a DIRECT fn position; a
             // concrete non-arrow, non-var param (a record/enum that STORES the fn)
             // is a fill slot the promoters own — never demoted.
-            let direct_fn_slot = matches!(param_tpl.as_ref(), Ty::Fun(_, _) | Ty::Var(_));
+            let direct_fn_slot = matches!(
+                param_tpl.as_ref(),
+                Ty::Fun(_, _) | Ty::Var(_) | Ty::Wildcard
+            );
             if direct_fn_slot
                 && !is_direct_closure(slot)
                 && let Some((params, ret)) = self.shared_fn_read_carrier(slot).or_else(|| {
@@ -27263,7 +27303,7 @@ impl<'a> Lowerer<'a> {
         match self.region_ty(span) {
             Some(Ty::Con { name, args, .. }) => {
                 self.resolve(*name).is_ok_and(|n| n == "Result")
-                    && matches!(args.first(), Some(Ty::Var(_)))
+                    && matches!(args.first(), Some(Ty::Var(_) | Ty::Wildcard))
             }
             _ => false,
         }
@@ -27576,6 +27616,7 @@ impl<'a> Lowerer<'a> {
     fn first_poly_tvar(&self, t: &Ty) -> Option<Symbol> {
         match t {
             Ty::Var(v) => self.poly_tvar_symbol(*v),
+            Ty::Wildcard | Ty::Unit => None,
             Ty::Fun(a, b) => self.first_poly_tvar(a).or_else(|| self.first_poly_tvar(b)),
             Ty::Con { args, .. } | Ty::Tuple(args) => {
                 args.iter().find_map(|a| self.first_poly_tvar(a))
@@ -27584,7 +27625,6 @@ impl<'a> Lowerer<'a> {
                 .values()
                 .find_map(|f| self.first_poly_tvar(f))
                 .or_else(|| self.row_tail_poly_tvar(tail)),
-            Ty::Unit => None,
         }
     }
 
@@ -27674,6 +27714,7 @@ impl<'a> Lowerer<'a> {
     fn ty_mentions_poly_tvar(&self, t: &Ty, tv: Symbol) -> bool {
         match t {
             Ty::Var(v) => self.poly_tvar_symbol(*v) == Some(tv),
+            Ty::Wildcard | Ty::Unit => false,
             Ty::Fun(a, b) => self.ty_mentions_poly_tvar(a, tv) || self.ty_mentions_poly_tvar(b, tv),
             Ty::Con { args, .. } | Ty::Tuple(args) => {
                 args.iter().any(|a| self.ty_mentions_poly_tvar(a, tv))
@@ -27682,7 +27723,6 @@ impl<'a> Lowerer<'a> {
                 self.row_tail_poly_tvar(tail) == Some(tv)
                     || fields.values().any(|f| self.ty_mentions_poly_tvar(f, tv))
             }
-            Ty::Unit => false,
         }
     }
 
@@ -31992,6 +32032,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -32223,6 +32264,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -32562,6 +32604,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -32698,6 +32741,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -35490,14 +35534,15 @@ mod tests {
         );
     }
 
-    /// Per-occurrence `any` freshening covers NESTED occurrences (lower-1):
-    /// `freshen_any_generics` must replace EVERY `Generic("any")` in a tree
-    /// with a distinct fresh symbol, not just the outermost one.
+    /// Per-occurrence `any` freshening covers NESTED occurrences.
     ///
-    /// Two independent `List any` / `Maybe any` param types share the same
-    /// interned `any_sym` before freshening — after freshening each must
-    /// carry a distinct generic, or the emitted Rust would collapse them to
-    /// one type parameter (SEAL break: E0308).
+    /// `freshen_any_generics` must replace EVERY wildcard-marker generic in a
+    /// tree with a distinct fresh symbol, not just the outermost one. Two
+    /// independent `List any` / `Maybe any` param types share the one marker
+    /// before freshening — after freshening each must carry a distinct
+    /// generic, or the emitted Rust would collapse them to one type parameter
+    /// (SEAL break: E0308). A generic whose symbol merely spells `any` (a
+    /// declared parameter) is left alone.
     #[test]
     #[allow(clippy::panic)] // let-else in test code; panic on unexpected shape is intentional
     fn nested_any_produces_distinct_generics() {
@@ -35508,9 +35553,11 @@ mod tests {
         let fresh0 = interner.intern("__any_test0").unwrap();
         let fresh1 = interner.intern("__any_test1").unwrap();
 
-        // `any_sym` is the shared interned symbol that both `List any` and
-        // `Maybe any` carry before freshening.
-        let any_sym = interner.intern("any").unwrap();
+        // The wildcard marker both `List any` and `Maybe any` carry before
+        // freshening, and a declared parameter that merely spells `any`.
+        let marker = super::WildcardMarker::mint(&mut interner).unwrap();
+        let any_sym = marker.symbol();
+        let declared_any = interner.intern("any").unwrap();
 
         let shared = ipe_canon::builtins::intern_builtins(&mut interner)
             .expect("intern shared built-in table");
@@ -35539,16 +35586,32 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: marker,
             },
             &builtins,
             "",
             "",
         );
 
+        // A declared parameter spelled `any` is not the wildcard: no mint.
+        let mut minted_declared: Vec<ipe_intern::Symbol> = Vec::new();
+        let declared_ir = ipe_ir::IrType::List(Box::new(ipe_ir::IrType::Generic(declared_any)));
+        let kept = lowerer
+            .freshen_any_generics(declared_ir.clone(), &mut minted_declared)
+            .expect("freshen a declared `any` generic");
+        assert_eq!(
+            kept, declared_ir,
+            "a declared `any` generic must stay unchanged"
+        );
+        assert!(
+            minted_declared.is_empty(),
+            "a declared `any` generic must mint nothing"
+        );
+
         // Build the two IR types that would come from lowering:
-        //   `List any` → List(Generic(any_sym))
-        //   `Maybe any` → Maybe(Generic(any_sym))
-        // Both carry the SAME any_sym before freshening.
+        //   `List any` → List(Generic(marker))
+        //   `Maybe any` → Maybe(Generic(marker))
+        // Both carry the SAME marker before freshening.
         let list_ir = ipe_ir::IrType::List(Box::new(ipe_ir::IrType::Generic(any_sym)));
         let maybe_ir = ipe_ir::IrType::Maybe(Box::new(ipe_ir::IrType::Generic(any_sym)));
 
@@ -35608,16 +35671,15 @@ mod tests {
     #[test]
     fn count_any_param_sites_includes_return_position() {
         let mut interner = Interner::new();
-        let any_sym = interner.intern("any").unwrap();
         let list_sym = interner.intern("List").unwrap();
         let int_sym = interner.intern("Int").unwrap();
 
         // Canonical type for `foo : Int -> List any`:
-        //   Lambda(Con { name: Int, args: [] }, Con { name: List, args: [Var(any)] })
+        //   Lambda(Con { name: Int, args: [] }, Con { name: List, args: [Wildcard] })
         let list_any = ipe_canon::ast::Type::Con {
             home: vec![],
             name: list_sym,
-            args: vec![ipe_canon::ast::Type::Var(any_sym)],
+            args: vec![ipe_canon::ast::Type::Wildcard],
         };
         let ty = ipe_canon::ast::Type::Lambda(
             Box::new(ipe_canon::ast::Type::Con {
@@ -35640,12 +35702,12 @@ mod tests {
                     ipe_diagnostics::Span::DUMMY,
                     ipe_canon::ast::Expr_::Unit,
                 ),
-                free_vars: vec![any_sym],
+                free_vars: vec![],
                 home: vec![],
             }],
         };
 
-        let count = super::count_any_param_sites(&module, &interner);
+        let count = super::count_any_param_sites(&module);
         assert_eq!(
             count, 1,
             "return-position `any` in `Int -> List any` must be counted \
@@ -35758,7 +35820,7 @@ mod tests {
     /// generic (SEAL break, E0308).
     ///
     /// This test constructs, for each container variant, the shallowest tree
-    /// that holds exactly one `Generic("any")` under that variant, runs
+    /// that holds exactly one wildcard-marker generic under that variant, runs
     /// `freshen_any_generics`, and asserts it mints exactly one fresh symbol.
     ///
     /// The exhaustive `match` below has NO wildcard arm, so adding a new
@@ -35772,9 +35834,10 @@ mod tests {
         let mut interner = Interner::new();
         let builtins = build_test_builtin_ctors(&mut interner);
 
-        // Pre-intern the "any" symbol and one fresh pool symbol per container
+        // Mint the wildcard marker and one fresh pool symbol per container
         // variant under test — each freshen call consumes exactly one slot.
-        let any_sym = interner.intern("any").unwrap();
+        let marker = super::WildcardMarker::mint(&mut interner).unwrap();
+        let any_sym = marker.symbol();
         // 17 container variants: List, Dict, Set, Maybe, Result, Task,
         // Tuple, Record, Fun, SharedFun, FnOnceChain, Decoder, Cmd, Sub,
         // Enum, Ui, WebRoute.
@@ -35813,6 +35876,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: marker,
             },
             &builtins,
             "",
@@ -35916,7 +35980,7 @@ mod tests {
         }
 
         // One representative per container variant: the shallowest tree
-        // embedding exactly one `Generic("any")`.
+        // embedding exactly one wildcard-marker generic.
         let containers: Vec<ipe_ir::IrType> = vec![
             ipe_ir::IrType::List(Box::new(any())),
             ipe_ir::IrType::Dict(Box::new(any()), Box::new(ipe_ir::IrType::Int)),
@@ -36730,6 +36794,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             builtins,
             "",

@@ -40,22 +40,17 @@ pub enum Ty {
     /// spaces (AUD-13):
     ///
     /// 1. **Annotation-symbol space** — [`ipe_intern::Symbol::as_raw`] of a
-    ///    source-level type-variable name (`a`, `msg`, `any`, a kernel
-    ///    scheme's `tv_a`/`tv_e` placeholder, a declared ADT type param).
-    ///    Every `Ty` built from a canonicalized annotation
+    ///    source-level type-variable name (`a`, `msg`, a kernel scheme's
+    ///    `tv_a`/`tv_e` placeholder, a declared ADT type param, including one
+    ///    spelled `any`). Every `Ty` built from a canonicalized annotation
     ///    ([`crate::ty::from_canon`], ctor schemes, kernel schemes) lives
-    ///    here. [`crate::constrain::Builder::instantiate_in`]'s wildcard-
-    ///    `"any"` detection is sound ONLY for ids from this space — it
-    ///    resolves the raw through the interner and compares the string.
+    ///    here. The wildcard is never a `Var`: it is [`Ty::Wildcard`].
     /// 2. **Solver-representative space** — a [`crate::unionfind::VarId`]
     ///    (itself a bare `u32` alias, see `unionfind.rs`) surviving past
     ///    [`crate::constrain::zonk`]. These ids are tagged with
-    ///    [`SOLVER_VAR_TAG`] before being stored here specifically so they
-    ///    can NEVER numerically collide with an annotation-symbol raw and
-    ///    misfire the wildcard-`any` check — both spaces are independent
-    ///    small sequential counters starting at 0, so an untagged collision
-    ///    is not just theoretical, it is a near-certainty on any
-    ///    sufficiently large compiled program.
+    ///    [`SOLVER_VAR_TAG`] before being stored here so they can never
+    ///    numerically collide with an annotation-symbol raw: both spaces are
+    ///    independent small sequential counters starting at 0.
     ///
     /// A `Ty` containing a tagged (solver-space) `Var` must never be fed to
     /// `instantiate_in`/`instantiate_tracked`/`instantiate_logging_wildcards` — those
@@ -64,6 +59,12 @@ pub enum Ty {
     /// readers compare it whole and never recover the bare
     /// [`crate::unionfind::VarId`].
     Var(u32),
+    /// The wildcard `any` of an annotation.
+    ///
+    /// Each occurrence instantiates to its own fresh unknown; it names no
+    /// variable, so no other occurrence and no declared parameter shares it.
+    /// Only annotation-built types carry it; a solved type never does.
+    Wildcard,
     /// A function `arg -> result`.
     Fun(Box<Self>, Box<Self>),
     /// A type-constructor application. `module` is the defining module (empty
@@ -105,8 +106,7 @@ const _: () = assert!(SOLVER_VAR_TAG.is_power_of_two() && SOLVER_VAR_TAG > 0);
 /// Tag a solver [`VarId`] for storage in a [`Ty::Var`].
 ///
 /// Marks it as solver-representative space (from [`crate::constrain::zonk`])
-/// so `instantiate_in`'s wildcard-`"any"` check cannot misinterpret it as an
-/// annotation symbol.
+/// so no reader can misinterpret it as an annotation symbol.
 #[must_use]
 pub const fn tag_solver_var(id: VarId) -> u32 {
     id | SOLVER_VAR_TAG
@@ -115,10 +115,9 @@ pub const fn tag_solver_var(id: VarId) -> u32 {
 /// True iff a [`Ty::Var`] raw is solver-representative space.
 ///
 /// I.e. tagged by [`tag_solver_var`] rather than an annotation-symbol raw.
-/// Callers that resolve a `Ty::Var` raw through the interner (e.g. the
-/// wildcard-`"any"` check) MUST skip that resolution when this returns
-/// true — a tagged raw is structurally guaranteed to never be a real
-/// interned symbol. Every table keyed by solver variables
+/// Callers that resolve a `Ty::Var` raw through the interner MUST skip
+/// that resolution when this returns true — a tagged raw is structurally
+/// guaranteed to never be a real interned symbol. Every table keyed by solver variables
 /// (`SolvedTypes::poly_var_map`) stores the tagged form only, so a reader
 /// answers for a tagged raw by exact lookup and for an untagged raw (an
 /// annotation symbol) not at all; probing both forms would match a symbol
@@ -620,6 +619,7 @@ pub fn from_canon(t: &canon::Type) -> Ty {
     match t {
         canon::Type::Lambda(a, b) => Ty::Fun(Box::new(from_canon(a)), Box::new(from_canon(b))),
         canon::Type::Var(s) => Ty::Var(s.as_raw()),
+        canon::Type::Wildcard => Ty::Wildcard,
         canon::Type::Con { home, name, args } => Ty::Con {
             module: home.clone(),
             name: *name,

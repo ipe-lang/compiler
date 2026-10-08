@@ -297,7 +297,7 @@ impl Builder<'_> {
                         &mut wildcards,
                     )?;
                     param_counts.push(wildcards.len().saturating_sub(before));
-                    bare_params.push(self.is_wildcard_any_ty(&arg));
+                    bare_params.push(Self::is_wildcard_any_ty(&arg));
                     self.constrain_pattern(&mut local, pat, arg_var)?;
                     // Record the param pattern's region so the lowerer can read the
                     // solved param type (record-param field-set completion, IPE-T0015
@@ -332,7 +332,7 @@ impl Builder<'_> {
                 // (`alias : Model -> any; alias = view`, zero written patterns)
                 // leaves `ret_ty` as the whole `Model -> any` arrow, which the
                 // tie peels along with the use — so both def forms are recorded.
-                if self.annotation_returns_wildcard_any(&ret_ty) {
+                if Self::annotation_returns_wildcard_any(&ret_ty) {
                     self.wildcard_any_return_bodies
                         .insert((self.home()?.into_path(), name.value), body_var);
                 }

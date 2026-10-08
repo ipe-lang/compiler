@@ -147,17 +147,15 @@ pub fn lower(
     let param_binders = interner
         .fresh_symbols("arg_", pool_counts.destructure_param_sites)
         .map_err(homeless)?;
-    // AUD-01 seal fix: one fresh symbol per bare `any`-in-param-position
-    // occurrence, so `split_typed_sig` never shares the single interned
-    // `"any"` Symbol across two occurrences the checker independently pinned
-    // to different concrete types. The count (an immutable borrow of
-    // `interner`) is computed in its OWN statement, ahead of and separate
-    // from the `fresh_symbols` mutable-mint call — the two borrows would
-    // otherwise conflict within one expression.
-    let any_param_site_count = lower::count_any_param_sites(m, interner);
+    // One fresh symbol per wildcard `any` occurrence in a typed signature, so
+    // `split_typed_sig` never shares one symbol across two occurrences the
+    // checker independently pinned to different concrete types.
     let any_param_binders = interner
-        .fresh_symbols("anyp_", any_param_site_count)
+        .fresh_symbols("anyp_", lower::count_any_param_sites(m))
         .map_err(homeless)?;
+    // The symbol every wildcard `any` lowers to before it is freshened or
+    // pinned; no source identifier can spell it.
+    let wildcard_marker = lower::WildcardMarker::mint(interner).map_err(homeless)?;
     // One bounded group of fresh binders per `Store.selectToList` /
     // `Store.selectToMaybe` call site, for the concrete per-column decode the
     // intercept emits there.
@@ -301,6 +299,7 @@ pub fn lower(
             nested_cons_binders,
             nested_strlit_binders,
             tuple_elem_binders,
+            wildcard_marker,
         },
         &builtins,
         source_path,
@@ -1117,39 +1116,22 @@ mod tests {
         );
     }
 
-    /// Regression: `init : any -> Model` (any in PARAM position).
+    /// A wildcard `any` in PARAM position (`wrap : any -> Int`) is one declared generic.
     ///
-    /// Filtering the `any` symbol from `type_params` causes the backend's
-    /// `GenericScope::rust_name` to ICE (IPE-I0001) because `params` still holds
-    /// `IrType::Generic(any_sym)` while `type_params` is empty.
-    ///
-    /// The principled fix computes `type_params` from the structurally-used
-    /// `IrType::Generic` set of the solved `params + ret`.  For `any` in param
-    /// position the generic is structurally present → included in `type_params`.
-    ///
-    /// AUD-01 note: a SINGLE `any`-in-param occurrence now ALSO goes through
-    /// the per-occurrence fresh-symbol substitution (`split_typed_sig`) — a
-    /// lone occurrence isn't the AUD-01 bug (nothing to collide with), but the
-    /// substitution applies uniformly regardless of occurrence count, so the
-    /// `type_param`'s symbol is a synthetic `anyp_N` name here, not the
-    /// literal `"any"` interned symbol. The backend renders `Generic` by
-    /// TYPE-PARAM POSITION, not spelling (see `ipe_ir::ir`'s `Generic` doc
-    /// comment), so this is not a behavior change worth asserting against —
-    /// only that exactly one `type_param` exists and the param's `IrType`
-    /// matches it.
+    /// `type_params` is computed from the structurally-used `IrType::Generic`
+    /// set of the solved `params + ret`, so the param's generic is declared and
+    /// the backend's `GenericScope::rust_name` never meets an unknown one
+    /// (IPE-I0001). The wildcard marker is freshened per occurrence by
+    /// `split_typed_sig`, so the declared symbol is a minted `anyp_N` name,
+    /// never the marker itself. The backend renders `Generic` by TYPE-PARAM
+    /// POSITION, not spelling (see `ipe_ir::ir`'s `Generic` doc comment).
     #[test]
     fn any_in_param_position_lowers_without_ice() {
-        // `wrap : any -> Int` — `any` is in parameter position.
-        // Before Bug-28 fix this would ICE (IPE-I0001 / CompilerBug via the
-        // backend's GenericScope::rust_name); with the fix it must lower.
         let opt = lower_func(
             "module Main exposing (wrap)\nwrap : any -> Int\nwrap _ =\n    42\n",
             "wrap",
         );
-        assert!(
-            opt.is_some(),
-            "wrap : any -> Int must lower without ICE (Bug-28 regression)"
-        );
+        assert!(opt.is_some(), "wrap : any -> Int must lower without ICE");
         let Some((func, i)) = opt else { return };
 
         // Exactly one type_param.
@@ -1175,29 +1157,29 @@ mod tests {
             matches!(param_ty, IrType::Generic(s) if *s == *any_sym),
             "param type must be Generic(any_sym), got {param_ty:?}"
         );
+        assert!(
+            i.resolve(*any_sym).is_some_and(|n| n.starts_with("anyp_")),
+            "the wildcard's generic must be a freshened `anyp_N` symbol, got {:?}",
+            i.resolve(*any_sym)
+        );
 
         // Return type is Int (the annotation's explicit return).
         assert_eq!(func.ret, IrType::Int, "return type must be Int");
     }
 
-    /// Regression for AUD-01 (seal): TWO `any` occurrences in one param-position
-    /// annotation must lower to TWO DISTINCT `Generic` symbols, each declared
-    /// in `type_params` — not collapse onto one shared `Generic(any_sym)`.
+    /// Two wildcard `any` params lower to two DISTINCT declared `Generic` symbols.
     ///
     /// The checker gives every `any` occurrence a fresh flex UV per occurrence
     /// (`ipe_types::constrain`), so `f : any -> any -> Int` called `f "x" 3` is
-    /// well-typed and `ipe` accepts it. Pre-fix, BOTH params lowered to the
-    /// SAME `IrType::Generic(any_sym)` (the interned `"any"` Symbol is shared),
-    /// so the backend emitted `fn main_f<T1>(a: T1, b: T1) -> i64` — a call
-    /// passing a `String` and an `Int` at the two positions failed `cargo build`
-    /// with E0308 despite `ipe` having accepted the program
-    /// (exit-0-then-cargo-fail). Post-fix, `split_typed_sig` gives each
-    /// occurrence its OWN fresh symbol from `any_param_binders`, and
-    /// `type_params` includes both (unioned in alongside `free_vars`) — the
-    /// backend renders `IrType::Generic` by TYPE-PARAM POSITION, not by symbol
-    /// spelling, so two distinct symbols is sufficient for two distinct Rust
-    /// generics (`fn f<T1, T2>(a: T1, b: T2)`), each independently
-    /// monomorphized at the call site by rustc.
+    /// well-typed and `ipe` accepts it. Both params lower to the one wildcard
+    /// marker, and `split_typed_sig` gives each occurrence its OWN fresh symbol
+    /// from `any_param_binders`; `type_params` includes both (unioned in
+    /// alongside `free_vars`). One shared generic would emit
+    /// `fn main_f<T1>(a: T1, b: T1) -> i64`, and a call passing a `String` and
+    /// an `Int` would fail `cargo build` with E0308 despite `ipe` having
+    /// accepted the program. The backend renders `IrType::Generic` by
+    /// TYPE-PARAM POSITION, not by symbol spelling, so two distinct symbols
+    /// give two distinct Rust generics (`fn f<T1, T2>(a: T1, b: T2)`).
     #[test]
     fn any_params_get_distinct_generics_not_a_shared_one() {
         let opt = lower_func(
@@ -1226,8 +1208,8 @@ mod tests {
         };
         assert_ne!(
             a_sym, b_sym,
-            "the two `any` occurrences must NOT share one Generic symbol — \
-             a shared symbol is exactly the AUD-01 bug (fn f<T1>(a:T1,b:T1))"
+            "the two `any` occurrences must NOT share one Generic symbol \
+             (fn f<T1>(a:T1,b:T1))"
         );
 
         // Both fresh symbols must be DECLARED in `type_params` — an emitted
@@ -1246,6 +1228,50 @@ mod tests {
             declared.iter().map(|s| i.resolve(*s)).collect::<Vec<_>>()
         );
         assert_eq!(func.ret, IrType::Int, "return type must be Int");
+    }
+
+    /// A union parameter declared as `any` is the enum's own generic, never the wildcard.
+    ///
+    /// `type Box any = Box any` declares `any`, so the variant's field is
+    /// `Generic` of the enum's one type parameter — not the pub/sub
+    /// `Dict String String` carrier the wildcard pins to, and not a symbol the
+    /// wildcard freshening would rename.
+    #[test]
+    fn declared_any_generic_is_not_freshened() {
+        let mut i = Interner::new();
+        let source = "module Main exposing (b)\n\ntype Box any\n    = Box any\n\nb : Box Int\nb =\n    Box 1\n";
+        let lowered = (|| {
+            let src = ipe_parse::parse_module(source, &mut i).ok()?;
+            let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
+            let types = ipe_types::infer(&m, &mut i).ok()?;
+            lower(&m, &types, &mut i, "", "").ok()
+        })();
+        let enum_def = lowered
+            .and_then(|p| p.modules.into_iter().next())
+            .and_then(|m| {
+                m.types
+                    .into_iter()
+                    .map(|TypeDef::Enum(e)| e)
+                    .find(|e| i.resolve(e.name) == Some("Box"))
+            });
+        let Some(enum_def) = enum_def else {
+            assert!(
+                false_marker(),
+                "`type Box any = Box any` must lower to an enum"
+            );
+            return;
+        };
+        let declared = enum_def.type_params.first().copied();
+        assert_eq!(
+            declared.and_then(|s| i.resolve(s)),
+            Some("any"),
+            "the enum's one type parameter is the declared `any`"
+        );
+        let field = enum_def.variants.first().and_then(|v| v.fields.first());
+        assert!(
+            matches!((field, declared), (Some(IrType::Generic(f)), Some(d)) if *f == d),
+            "the field must be Generic of the declared parameter, got {field:?}"
+        );
     }
 
     // ── Wildcard-`any` row-containment guard ──────────────────────────────────

@@ -169,7 +169,9 @@ fn boundary_seal_rejection(ty: &canon::Type, interner: &Interner) -> Option<Seal
     match ty {
         // The seal is monomorphic and concrete: a type variable has no single
         // codec, and an open row is not a closed value type.
-        canon::Type::Var(_) | canon::Type::RecordOpen(_, _) => Some(SealRejection::NonConcrete),
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::RecordOpen(_, _) => {
+            Some(SealRejection::NonConcrete)
+        }
         // A function is not a plain value and is not serialisable.
         canon::Type::Lambda(_, _) => Some(SealRejection::Function),
         // Unit, tuples, and closed records are plain when every element is.
@@ -215,6 +217,7 @@ fn boundary_seal_rejection(ty: &canon::Type, interner: &Interner) -> Option<Seal
 fn canon_type_display(ty: &canon::Type, interner: &Interner) -> Box<str> {
     match ty {
         canon::Type::Var(v) => interner.resolve(*v).unwrap_or("_").into(),
+        canon::Type::Wildcard => canon::WILDCARD_SPELLING.into(),
         canon::Type::Lambda(_, _) => "a function type".into(),
         canon::Type::Unit => "()".into(),
         canon::Type::Tuple(_) => "a tuple type".into(),
@@ -407,14 +410,6 @@ struct TypeCtx<'a> {
     /// The dependency aliases reachable as `Q.Name`.
     qualified_aliases: &'a QualifiedAliases,
     interner: &'a Interner,
-    /// The interned `"any"` wildcard type-variable symbol. A bare builtin
-    /// parametric UI annotation (`view : Html`, `attr : Attribute`) is
-    /// arity-filled to `Html any` / `Attribute any` at the [`src::TypeAnnotation::TType`]
-    /// arm using this symbol, so its lone message parameter is inferred rather
-    /// than reaching the lowerer as a zero-arg `Html` (IPE-I0001). Pre-interned
-    /// by the module entry point (where the interner is mutable); the `TType` arm
-    /// runs under an immutable interner and cannot mint it.
-    ui_wildcard_msg: Symbol,
     /// Span of the enclosing value annotation, used as the location for an
     /// alias-arity error (the type AST itself carries no inner spans).
     ann_span: Span,
@@ -2617,12 +2612,6 @@ fn canonicalise_with_env(
     // the `unsafe` fact above, computed here where the source import list survives.
     let imported_web_capabilities = imported_web_capabilities_of(&m.imports, interner);
 
-    // The `"any"` wildcard symbol used to arity-fill a bare builtin parametric
-    // UI annotation (`view : Html` → `view : Html any`). Interned once here where
-    // the interner is mutable; the deeper `canonicalise_type` TType arm runs under
-    // an immutable `&Interner` and threads this symbol via `TypeCtx`.
-    let ui_wildcard_msg = interner.intern("any")?;
-
     // Bind this module's own unions and their constructors at the local tier,
     // rejecting a duplicate type or constructor name, and a name an explicit
     // import already binds. The canonical `canon::Union` records (with their
@@ -2680,15 +2669,8 @@ fn canonicalise_with_env(
 
     // Each own alias body resolved once, in this module's scope: the form an
     // importer receives through `ModuleExports::aliases`.
-    let own_aliases = resolve_own_aliases(
-        m,
-        &slots,
-        env,
-        qualifier_paths,
-        qualified_aliases,
-        interner,
-        ui_wildcard_msg,
-    )?;
+    let own_aliases =
+        resolve_own_aliases(m, &slots, env, qualifier_paths, qualified_aliases, interner)?;
 
     // Second union pass: now that aliases are collected, canonicalise every
     // constructor's payload field types (a field may reference an alias or
@@ -2701,7 +2683,6 @@ fn canonicalise_with_env(
             qualifier_paths,
             qualified_aliases,
             interner,
-            ui_wildcard_msg,
         )?);
     }
 
@@ -2726,7 +2707,6 @@ fn canonicalise_with_env(
         qualified_aliases,
         &user_value_names,
         interner,
-        ui_wildcard_msg,
     )?;
 
     // Bind every top-level value name at the local tier so bindings can be
@@ -2779,14 +2759,8 @@ fn canonicalise_with_env(
     // witness's fields at its call site by lookup alone. Built here — the single
     // point where the module's values, aliases, imports, and type context all
     // coexist — and stored on the env, which every value body's resolution clones.
-    let codec_auto = build_codec_auto_context(
-        m,
-        env,
-        qualifier_paths,
-        qualified_aliases,
-        interner,
-        ui_wildcard_msg,
-    )?;
+    let codec_auto =
+        build_codec_auto_context(m, env, qualifier_paths, qualified_aliases, interner)?;
     env.codec_auto = Rc::new(codec_auto);
 
     // Canonicalise each value declaration. A kernel alias has no runtime body —
@@ -2803,7 +2777,6 @@ fn canonicalise_with_env(
             qualifier_paths,
             qualified_aliases,
             interner,
-            ui_wildcard_msg,
         )?);
     }
     // The synthesized constructor defs are already fully canonical.
@@ -2843,7 +2816,6 @@ fn resolve_own_aliases(
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<BTreeMap<Symbol, crate::ExportedAlias>> {
     let mut resolved = BTreeMap::new();
     for a in &m.aliases {
@@ -2856,7 +2828,6 @@ fn resolve_own_aliases(
             qualifier_paths,
             qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann_span: decl.body.span,
         };
         let param_slots: Vec<Symbol> = params.iter().map(|&(_, slot)| slot).collect();
@@ -2895,8 +2866,8 @@ fn resolve_own_aliases(
 
 /// Check that every variable a resolved alias body mentions is one of its slots or left free.
 ///
-/// Each `Var` and each open record's row must be a parameter slot, a variable
-/// the body leaves free (quantified at a use site), or the `any` wildcard. A
+/// Each `Var` and each open record's row must be a parameter slot or a variable
+/// the body leaves free (quantified at a use site); a `Wildcard` names none. A
 /// body holding any other variable would carry a name no use site binds, so it
 /// fails closed here, at the declaration. The walk uses an explicit stack and
 /// spends one node of `budget` per body node.
@@ -2911,8 +2882,7 @@ fn refuse_unbound_alias_body_vars(
     ctx: &TypeCtx,
     budget: &mut u32,
 ) -> DResult<()> {
-    let bound =
-        |v: &Symbol| param_slots.contains(v) || free_vars.contains(v) || *v == ctx.ui_wildcard_msg;
+    let bound = |v: &Symbol| param_slots.contains(v) || free_vars.contains(v);
     let mut pending = vec![body];
     while let Some(node) = pending.pop() {
         spend_budget_node(ctx, budget)?;
@@ -2935,7 +2905,7 @@ fn refuse_unbound_alias_body_vars(
                 pending.extend(args);
                 None
             }
-            canon::Type::Unit => None,
+            canon::Type::Unit | canon::Type::Wildcard => None,
         };
         if let Some(v) = var.filter(|v| !bound(v)) {
             return Err(Diagnostic::CompilerBug {
@@ -3032,6 +3002,7 @@ fn instantiate_alias(
             Some(arg) => copy_substituted_arg(arg, ctx, budget)?,
             None => canon::Type::Var(*v),
         },
+        canon::Type::Wildcard => canon::Type::Wildcard,
         canon::Type::Unit => canon::Type::Unit,
         canon::Type::Lambda(a, b) => canon::Type::Lambda(
             Box::new(instantiate_alias(alias, a, args, ctx, budget, next)?),
@@ -3115,6 +3086,7 @@ fn extend_row(
             join_row_fields(alias, fields, own, ctx)?,
         )),
         found @ (canon::Type::Unit
+        | canon::Type::Wildcard
         | canon::Type::Tuple(_)
         | canon::Type::Lambda(..)
         | canon::Type::Con { .. }) => Err(alias_row_refusal(
@@ -3337,7 +3309,7 @@ fn field_type_nonderivable(interner: &Interner, t: &canon::Type) -> bool {
         canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => fields
             .iter()
             .any(|(_, f)| field_type_nonderivable(interner, f)),
-        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
     }
 }
 
@@ -3363,7 +3335,6 @@ fn build_codec_auto_context(
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &mut Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<crate::env::CodecAutoContext> {
     // Qualifiers bound to `Ipe.Codec`: any import qualifier whose resolved path
     // is exactly `["Ipe", "Codec"]`. A compiled-source stdlib module is a build
@@ -3393,7 +3364,6 @@ fn build_codec_auto_context(
             qualifier_paths,
             qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann.span,
         )? {
             witness_records.insert(v.value.name.value, fields);
@@ -3418,7 +3388,6 @@ fn witness_record_fields(
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
     ann_span: Span,
 ) -> DResult<Option<Vec<(Symbol, canon::Type)>>> {
     let ctx = TypeCtx {
@@ -3426,7 +3395,6 @@ fn witness_record_fields(
         qualifier_paths,
         qualified_aliases,
         interner,
-        ui_wildcard_msg,
         ann_span,
     };
     // The source-level fields to canonicalise, and the alias name (if any) to
@@ -4128,7 +4096,6 @@ fn synthesize_record_alias_ctors(
     qualified_aliases: &QualifiedAliases,
     user_value_names: &BTreeSet<Symbol>,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<Vec<canon::Def>> {
     let mut synth = Vec::new();
     for a in &m.aliases {
@@ -4160,7 +4127,6 @@ fn synthesize_record_alias_ctors(
             qualifier_paths,
             qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann_span: a.value.body.span,
         };
         let no_params = ParamSlots::empty();
@@ -4835,10 +4801,13 @@ fn canonicalise_union(
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<canon::Union> {
     let type_name = u.name.value;
     let vars: Vec<Symbol> = u.vars.iter().map(|v| v.value).collect();
+    // Each declared parameter is in scope under its own name, so a parameter
+    // spelled `any` is a bound `Type::Var`, never the wildcard.
+    let identity: Vec<(Symbol, Symbol)> = vars.iter().map(|&v| (v, v)).collect();
+    let declared = ParamSlots::new(&identity);
     let mut ctors = Vec::with_capacity(u.ctors.len());
     for (index, c) in u.ctors.iter().enumerate() {
         let name = c.value.name;
@@ -4848,24 +4817,22 @@ fn canonicalise_union(
             qualifier_paths,
             qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann_span: c.span,
         };
         let mut args = Vec::with_capacity(c.value.args.len());
         for a in &c.value.args {
-            // A constructor field type is canonicalised with no alias
-            // parameters in scope: each free type variable it mentions is one of the
-            // union's `vars` and resolves to a `Type::Var`. The `free_vars` set is
-            // local (the union's quantification, not a binding's), so it is
-            // discarded — the declared `vars` are the authoritative parameter list.
+            // A constructor field type is canonicalised with the union's
+            // declared `vars` in scope, each bound to itself. The `free_vars`
+            // set is local (the union's quantification, not a binding's), so it
+            // is discarded: the declared `vars` are the authoritative parameter
+            // list.
             let mut free_vars = BTreeSet::new();
             let mut visited = Vec::new();
-            let no_params = ParamSlots::empty();
             let mut budget = TYPE_EXPANSION_NODE_LIMIT;
             args.push(canonicalise_type(
                 a,
                 &ctx,
-                &no_params,
+                &declared,
                 &mut free_vars,
                 &mut visited,
                 &mut budget,
@@ -4896,21 +4863,15 @@ fn canonicalise_value(
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &mut Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<canon::Def> {
     // The reserved `CustomElement.fromFile "<js-path>"` constructor is recognised BEFORE
     // the body is canonicalised: its qualified head is otherwise an unknown member,
     // and only this position (the whole body of a `CustomElement`-annotated
     // binding) is legal. A malformed use fails closed here (IPE-N0044); any other
     // appearance of the qualified name is rejected downstream by `resolve_qual_var`.
-    if let Some(def) = detect_custom_element_constructor(
-        val,
-        env,
-        qualifier_paths,
-        qualified_aliases,
-        interner,
-        ui_wildcard_msg,
-    )? {
+    if let Some(def) =
+        detect_custom_element_constructor(val, env, qualifier_paths, qualified_aliases, interner)?
+    {
         return Ok(def);
     }
 
@@ -4942,7 +4903,6 @@ fn canonicalise_value(
                 qualifier_paths,
                 qualified_aliases,
                 interner,
-                ui_wildcard_msg,
                 ann_span: ann.span,
             };
             let no_params = ParamSlots::empty();
@@ -6479,7 +6439,7 @@ fn copy_substituted_arg(
     while let Some(node) = pending.pop() {
         spend_budget_node(ctx, budget)?;
         match node {
-            canon::Type::Var(_) | canon::Type::Unit => {}
+            canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => {}
             canon::Type::Lambda(a, b) => {
                 pending.push(a);
                 pending.push(b);
@@ -6548,6 +6508,14 @@ fn alias_lookup_key(
         .filter(|sym| aliases.contains_key(sym)))
 }
 
+/// Whether a type variable no binder binds is spelled as the wildcard `any`.
+///
+/// The one place the compiler reads the wildcard's spelling: every later
+/// stage sees [`canon::Type::Wildcard`], never a name.
+fn is_wildcard_spelling(v: Symbol, interner: &Interner) -> bool {
+    interner.resolve(v) == Some(canon::WILDCARD_SPELLING)
+}
+
 /// Canonicalise a type annotation. Supported subset of `Canonicalise.Type`, extended
 /// with `type alias` expansion (non-parametric and parametric): a `TType`
 /// whose unqualified name registers as an alias is replaced in place by its
@@ -6605,13 +6573,18 @@ fn canonicalise_type(
             )?),
         )),
         src::TypeAnnotation::TVar(v) => {
-            // An alias parameter is renamed to its slot and never enters
-            // `free_vars`: the use site's argument replaces it. Any other
+            // A parameter in scope (an alias slot, a declared union parameter)
+            // is renamed to its slot and never enters `free_vars`. An unbound
+            // `any` is the wildcard, which no binder quantifies. Any other
             // variable is genuinely free and is quantified by the binding.
-            Ok(canon::Type::Var(params.slot(*v).unwrap_or_else(|| {
-                free_vars.insert(*v);
-                *v
-            })))
+            match params.slot(*v) {
+                Some(slot) => Ok(canon::Type::Var(slot)),
+                None if is_wildcard_spelling(*v, ctx.interner) => Ok(canon::Type::Wildcard),
+                None => {
+                    free_vars.insert(*v);
+                    Ok(canon::Type::Var(*v))
+                }
+            }
         }
         src::TypeAnnotation::TUnit => Ok(canon::Type::Unit),
         src::TypeAnnotation::TTuple(elems) => {
@@ -6835,7 +6808,7 @@ fn canonicalise_type(
                         budget,
                         depth.saturating_add(1),
                     )?,
-                    None => canon::Type::Var(ctx.ui_wildcard_msg),
+                    None => canon::Type::Wildcard,
                 };
                 return Ok(canon::Type::Con {
                     home: Vec::new(),
@@ -6990,7 +6963,7 @@ fn canonicalise_type(
                         detail: "a terminal attribute builtin name is not interned".into(),
                     })?;
                 let args = if can_args.is_empty() {
-                    vec![canon::Type::Var(ctx.ui_wildcard_msg)]
+                    vec![canon::Type::Wildcard]
                 } else {
                     can_args
                 };
@@ -7091,7 +7064,7 @@ fn canonicalise_type(
                 && can_args.is_empty()
                 && matches!(ctx.interner.resolve(name), Some("Html" | "Attribute"))
             {
-                vec![canon::Type::Var(ctx.ui_wildcard_msg)]
+                vec![canon::Type::Wildcard]
             } else {
                 can_args
             };
@@ -7441,7 +7414,6 @@ fn detect_custom_element_constructor(
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
     qualified_aliases: &QualifiedAliases,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<Option<canon::Def>> {
     // Peel the outermost application head. The constructor head is the qualified
     // `CustomElement.fromFile` member (reached through `import
@@ -7510,7 +7482,6 @@ fn detect_custom_element_constructor(
         qualifier_paths,
         qualified_aliases,
         interner,
-        ui_wildcard_msg,
         ann_span: ann.span,
     };
     let no_params = ParamSlots::empty();
@@ -9496,5 +9467,49 @@ mod closed_operator_set_tests {
                 "`{text}` must be a compiler bug, never a default-fixity operator: {result:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod wildcard_spelling_tests {
+    //! The spelling `any` is the wildcard only where nothing declares it.
+
+    use super::*;
+
+    /// The first constructor's field types of the union named `name`.
+    fn ctor_fields(source: &str, name: &str) -> Vec<canon::Type> {
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(source, &mut i).expect("parse");
+        let module = canonicalise(&parsed, &mut i).expect("canonicalise");
+        module
+            .unions
+            .iter()
+            .find(|u| i.resolve(u.name) == Some(name))
+            .and_then(|u| u.ctors.first())
+            .map(|c| c.args.clone())
+            .expect("the union and its first constructor")
+    }
+
+    #[test]
+    fn declared_any_canonicalises_to_var_undeclared_to_wildcard() {
+        // A union parameter spelled `any` is declared: the field is that
+        // parameter, an ordinary type variable.
+        let declared = ctor_fields(
+            "module Main exposing (Box)\n\ntype Box any\n    = Box any\n",
+            "Box",
+        );
+        assert!(
+            matches!(declared.as_slice(), [canon::Type::Var(_)]),
+            "a declared `any` must canonicalise to `Type::Var`, got {declared:?}"
+        );
+        // An undeclared `any` beside a declared `a` is the wildcard.
+        let undeclared = ctor_fields(
+            "module Main exposing (Box)\n\ntype Box a\n    = Box any\n",
+            "Box",
+        );
+        assert!(
+            matches!(undeclared.as_slice(), [canon::Type::Wildcard]),
+            "an undeclared `any` must canonicalise to `Type::Wildcard`, got {undeclared:?}"
+        );
     }
 }

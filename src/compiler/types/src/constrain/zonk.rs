@@ -22,7 +22,7 @@ use super::{
 /// home module's boundary-discharge step.
 ///
 /// `quantified` maps each generalized `Flex` root to its synthesized name
-/// (`"a"`, `"b"`, …, never `"any"`). Only plain, obligation-free `Flex` roots
+/// (`"a"`, `"b"`, …). Only plain, obligation-free `Flex` roots
 /// are quantified in phase 1 — `Super`-bounded and `Rigid`-contaminated roots
 /// stay shared program-wide (Divergences D2/D3 in the spec); a residual root
 /// still reachable from a pending field-access / record-update / route
@@ -279,8 +279,7 @@ pub fn reachable_flex_roots(
 }
 
 /// Mint a fresh, source-collision-free type-variable name (`"a"`, `"b"`, …,
-/// `"z"`, `"a1"`, …) for a generalized untyped-def scheme — never `"any"`
-/// (AUD-13's wildcard sentinel is reserved). `next` is the caller's shared
+/// `"z"`, `"a1"`, …) for a generalized untyped-def scheme. `next` is the caller's shared
 /// naming cursor, threaded across every quantified var of every scheme in one
 /// `promote_untyped_boundaries` run so names stay distinct program-wide (not
 /// required for soundness — each scheme's names only need to be distinct
@@ -687,9 +686,9 @@ fn zonk_visit(
         // super-typed variable is still a variable; its obligations are read
         // separately when generalising — see [`crate::SolvedTypes::bounds`].)
         Content::Flex | Content::Rigid | Content::Super { .. } => {
-            // AUD-13: tag so this solver-representative id can never be mistaken
-            // for an annotation-symbol raw by `instantiate_in`'s wildcard-`"any"`
-            // check if this zonked `Ty` is ever fed back through it.
+            // Tag so this solver-representative id can never be mistaken for an
+            // annotation-symbol raw if this zonked `Ty` is ever fed back
+            // through instantiation.
             let ty = Ty::Var(tag_solver_var(root));
             memo.insert(root, ty.clone());
             results.push(ty);
