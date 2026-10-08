@@ -896,6 +896,20 @@ pub fn auth_register<
 }
 
 #[cfg(feature = "db")]
+/// Whether `password` verifies against the `stored` hash a login read.
+///
+/// A stored hash that is not a bcrypt hash inside
+/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]` never verifies, and bcrypt runs on
+/// `decoy` instead: a cost above the ceiling never reaches the KDF, and the
+/// refusal costs what a wrong password costs.
+fn login_hash_verifies(password: &str, stored: &str, decoy: &str) -> bool {
+    let admissible = BcryptCost::of_hash(stored).is_ok();
+    let checked = if admissible { stored } else { decoy };
+    let verified = bcrypt::verify(password, checked).unwrap_or(false);
+    admissible && verified
+}
+
+#[cfg(feature = "db")]
 /// Ipê `login : Db -> String -> String -> Task Error Int`.
 /// Authenticates the user. Returns user id on success. Does NOT leak whether
 /// the email exists vs. password was wrong — both paths return the same
@@ -933,7 +947,7 @@ pub fn auth_login<
                 // A refused thread is `Unavailable` on both email paths alike; a
                 // panicked verify fails closed as invalid credentials.
                 let verified = crate::threads::join_blocking("auth.login", move || {
-                    bcrypt::verify(&password, &hash).unwrap_or(false)
+                    login_hash_verifies(&password, &hash, dummy_bcrypt_hash())
                 })
                 .await;
                 match verified {
@@ -1432,6 +1446,65 @@ mod tests {
         assert!(
             matches!(login, IpeResult::Err(_)),
             "a failed id-column decode must yield Err, never Ok(0)"
+        );
+    }
+
+    /// A login against a stored hash whose cost is above the ceiling, or that
+    /// is not a bcrypt hash at all, is refused as invalid credentials without
+    /// running the KDF at that cost.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn login_refuses_a_stored_hash_above_the_cost_ceiling() {
+        let pool = match DbPool::connect("sqlite::memory:").await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let IpeResult::Ok(()) = ensure_users_schema::<IpeError>(&pool).await else {
+            panic!("users schema");
+        };
+        let at_floor = bcrypt::hash("hunter2!", BCRYPT_COST_MIN).expect("hash");
+        let over_ceiling = at_floor.replacen("$04$", "$31$", 1);
+        assert_ne!(over_ceiling, at_floor, "the fixture raised the cost field");
+        for (email, stored) in [
+            ("floor@example.com", at_floor.as_str()),
+            ("over@example.com", over_ceiling.as_str()),
+            ("plain@example.com", "hunter2!"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (email, password_hash, role, created_at) \
+                 VALUES (?, ?, 'user', 0)",
+            )
+            .bind(email)
+            .bind(stored)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        let login = |email: &str| {
+            auth_login::<IpeError>(pool.clone(), email.to_owned(), "hunter2!".to_owned())
+        };
+        assert!(
+            matches!(login("floor@example.com").await, IpeResult::Ok(_)),
+            "the control: a hash inside the ceiling still logs in"
+        );
+        let started = std::time::Instant::now();
+        let over = login("over@example.com").await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                &over,
+                IpeResult::Err(IpeError::Error(_, info))
+                    if info.message == "auth.login: invalid credentials"
+            ),
+            "{over:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(120),
+            "no cost-31 KDF ran: {elapsed:?}"
+        );
+        assert!(
+            matches!(login("plain@example.com").await, IpeResult::Err(_)),
+            "a plaintext stored password never logs in"
         );
     }
 

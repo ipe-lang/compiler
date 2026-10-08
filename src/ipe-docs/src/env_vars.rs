@@ -940,7 +940,8 @@ pub static ENV_VARS: &[EnvVar] = &[
                   only ever arms the check, never disarms an in-code `Store`. Armed, \
                   `Auth.verifyToken` checks the token against the same store and \
                   refuses with `Auth.Revoked`, `Auth.RevocationUnavailable`, \
-                  `Auth.MissingClaim` or `Auth.TooManyCredentials`. Any other value refuses `Server.listen` and `Web` startup. A `Web` app has \
+                  `Auth.MissingClaim` or `Auth.TooManyCredentials`. Any other value \
+                  refuses `Server.listen` and `Web` startup. A `Web` app has \
                   no revocation check, so `store` (or `Web.withRevocation` `Store`) \
                   refuses its startup; guard its routes with `Server.withRevocation` \
                   instead.",
