@@ -294,6 +294,13 @@ fn revoke_subject_in(store: &StoreSlot, subject: String) -> Result<(), Revocatio
     outcome
 }
 
+/// [`revoke_subject`] without the generation bump: no subscriber wakes, so
+/// only a check that reads the store sees the revocation.
+#[cfg(all(test, feature = "web", feature = "jwt"))]
+pub(crate) fn revoke_subject_unannounced(subject: String) -> Result<(), RevocationError> {
+    record_subject(store(), subject)
+}
+
 /// Record the subject revocation in `store`, without the generation bump.
 fn record_subject(store: &StoreSlot, subject: String) -> Result<(), RevocationError> {
     let mut guard = guard_of(store)?;
@@ -433,6 +440,9 @@ pub enum Denial {
     PastDeadline,
     /// The channel already holds [`MAX_SESSION_CREDENTIALS`] credentials.
     BindingsFull,
+    /// No `Web` session or `Server` request owns the call while a `Web` app
+    /// serves in this process, so no channel exists that a revocation closes.
+    Unscoped,
 }
 
 impl std::fmt::Display for Denial {
@@ -445,6 +455,7 @@ impl std::fmt::Display for Denial {
             Self::StoreUnavailable => "revocation store unavailable",
             Self::PastDeadline => "credential past its lifetime bound",
             Self::BindingsFull => "too many credentials bound to this channel",
+            Self::Unscoped => "no Web session or Server request owns this call",
         })
     }
 }

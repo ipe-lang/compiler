@@ -521,10 +521,6 @@ enum BindTarget {
     Outside,
 }
 
-/// The refusal for an armed `verifyToken` no session or request owns.
-#[cfg(all(feature = "web-core", feature = "server"))]
-const UNSCOPED_REFUSAL: &str = "auth.verifyToken: no Web session or Server request owns this call";
-
 /// The channel owner the current task runs on behalf of, in this process.
 fn bind_target() -> BindTarget {
     bind_target_in(web_serving())
@@ -595,7 +591,9 @@ fn verify_token_bound(
                 crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
             }
             #[cfg(all(feature = "web-core", feature = "server"))]
-            BindTarget::Unscoped => return Err(UNSCOPED_REFUSAL.to_owned()),
+            BindTarget::Unscoped => {
+                return Err(refuse(crate::revocation::Denial::Unscoped));
+            }
             // Admitted; no channel exists to bind.
             BindTarget::Outside => drop(credential),
         }
@@ -2010,7 +2008,10 @@ mod tests {
         let token = session_token("k3-subject", "k3-jti");
         assert_eq!(
             verify_token_bound(armed(), || bind_target_in(true), SECRET, &token),
-            Err(UNSCOPED_REFUSAL.to_owned()),
+            Err(format!(
+                "auth.verifyToken: {}",
+                crate::revocation::Denial::Unscoped
+            )),
             "an unscoped call while a Web app serves is refused"
         );
         assert!(

@@ -771,12 +771,15 @@ const fn recheck_scope(_scope: &pubsub::SessionScope, _at_least: Option<i64>) ->
     Standing::Live
 }
 
-/// End session `sid`: drop it from the store, flip its closer, detach its SSE sender.
+/// End session `sid`: flip its closer, detach its SSE sender, drop it from the store.
 ///
-/// The store delete removes the live entry and the persisted row on every
-/// backend, so the next request for the sid takes the session-lost path. The
-/// closer ends the SSE stream and its heartbeat although they still hold
-/// sender clones. Idempotent: a second close finds nothing left to end.
+/// The closer ends the SSE stream and its heartbeat although they still hold
+/// sender clones. The store delete removes the live entry and the persisted
+/// row on every backend, so the next request for the sid takes the
+/// session-lost path. The closer flips before the delete, so a
+/// [`checkpoint`] racing this close either sees it and undoes its write, or
+/// writes before the delete runs. Idempotent: a second close finds nothing
+/// left to end.
 #[cfg(feature = "server")]
 async fn close_session<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
@@ -786,13 +789,53 @@ async fn close_session<Model, Msg>(
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    store.delete(sid).await;
     if let Some(entry) = entry {
         let mut e = entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         e.liveness.closer.send_replace(true);
         e.sse_tx = None;
+    }
+    store.delete(sid).await;
+}
+
+/// Whether a [`checkpoint`] left the session in the store.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Checkpoint {
+    /// The session is stored and open.
+    Stored,
+    /// The session was closed; the write is undone.
+    Closed,
+}
+
+/// Write session `sid` through to the store, unless it was closed meanwhile.
+///
+/// The closer is read after the write: a [`close_session`] that flipped it
+/// before this read has its delete repeated here, and one that flips it after
+/// deletes this write itself. A closed session is never stored again.
+#[cfg(feature = "server")]
+async fn checkpoint<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    entry: &store::SessionHandle<Model, Msg>,
+) -> Checkpoint
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    store.set(sid, Arc::clone(entry)).await;
+    let closed = *entry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .liveness
+        .closer
+        .borrow();
+    if closed {
+        store.delete(sid).await;
+        Checkpoint::Closed
+    } else {
+        Checkpoint::Stored
     }
 }
 
@@ -1933,8 +1976,8 @@ async fn commit_entry<Model, Msg, FView>(
     scope: &pubsub::SessionScope,
 ) -> EntryCommit<Model, Msg>
 where
-    Model: Clone,
-    Msg: Clone,
+    Model: Clone + Send + 'static,
+    Msg: Clone + Send + 'static,
     FView: Fn(Model) -> Html<Msg> + ?Sized,
 {
     let Some(strong) = entry.upgrade() else {
@@ -1958,6 +2001,12 @@ where
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
     let body = render_html(&tree);
+    // Re-prove after user code ran: a revocation that landed meanwhile drops
+    // the entry, its reply and its Cmd.
+    if recheck_scope(scope, None) == Standing::Revoked {
+        close_session(store, sid, Some(&strong)).await;
+        return EntryCommit::SessionGone;
+    }
     let committed = {
         let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
         match e.rendered.commit(tree) {
@@ -1989,8 +2038,10 @@ where
             let _ = sse_tx.send(SsePatch(sse::frame("patch", &frame))).await;
         }
     }
-    store.set(sid, strong).await;
-    EntryCommit::Entered(entered.model, entered.cmd)
+    match checkpoint(store, sid, &strong).await {
+        Checkpoint::Stored => EntryCommit::Entered(entered.model, entered.cmd),
+        Checkpoint::Closed => EntryCommit::SessionGone,
+    }
 }
 
 /// The per-session driver: folds each Msg through `update`, diffs the new view
@@ -2204,6 +2255,13 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
 
+        // Re-prove after user code ran: a revocation that landed meanwhile
+        // drops this Msg's commit and its Cmd.
+        if recheck_scope(&scope, None) == Standing::Revoked {
+            close_session(&store, &sid, Some(&strong)).await;
+            break;
+        }
+
         let committed = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
             let patches = diff(e.rendered.last_view(), &tree);
@@ -2259,7 +2317,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // intended: a session that processes a Msg is
         // alive. `strong` is dropped at the end of this iteration (block scope),
         // before the next select! park — never held across the await loop.
-        store.set(&sid, strong.clone()).await;
+        // A session a request closed meanwhile is not stored again, and its
+        // Cmd never runs.
+        if checkpoint(&store, &sid, &strong).await == Checkpoint::Closed {
+            break;
+        }
 
         pubsub::with_session(&scope, || {
             run_cmd(cmd, &msg_tx, &scope);
@@ -13402,7 +13464,13 @@ mod web_revocation_tests {
     //! Every test arms the process through the `Server` floor
     //! ([`crate::revocation::arm_process`]): the startup refusal still refuses
     //! the installed and environment arming, and the floor is the arming a
-    //! `Web` app mounted under an armed `Server` route runs with.
+    //! `Web` app mounted under an armed `Server` route runs with. Neither the
+    //! arming nor the serving flag the router sets is ever cleared, as in
+    //! production, so the suite runs one process per test (nextest).
+    //!
+    //! A test that covers a request-side or driver-side check revokes through
+    //! [`crate::revocation::revoke_subject_unannounced`]: no generation bump
+    //! wakes the driver, so only the check under test can see the revocation.
 
     use super::*;
     use crate::web::req::WebReq;
@@ -13470,10 +13538,26 @@ mod web_revocation_tests {
         (model, IpeCmd::None)
     }
 
+    /// Times `update` ran a `Msg::Bump`, read as a before and after delta.
+    static BUMPS: AtomicUsize = AtomicUsize::new(0);
+    /// Times a Cmd that user code returned while revoking its own session ran.
+    static REVOKED_CMDS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A Cmd that counts its own dispatch in [`REVOKED_CMDS`].
+    fn revoked_cmd() -> IpeCmd<Msg> {
+        IpeCmd::Perform(Box::new(|| {
+            Box::pin(async {
+                REVOKED_CMDS.fetch_add(1, Ordering::Relaxed);
+                Msg::Bump
+            })
+        }))
+    }
+
     fn update(msg: Msg, model: Model) -> (Model, IpeCmd<Msg>) {
         match msg {
             Msg::RevokeSelf => {
-                let revoked = crate::revocation::revoke_subject(model.sub.clone()).is_ok();
+                let revoked =
+                    crate::revocation::revoke_subject_unannounced(model.sub.clone()).is_ok();
                 let n = model.n + 1;
                 (
                     Model {
@@ -13481,10 +13565,11 @@ mod web_revocation_tests {
                         revoked,
                         ..model
                     },
-                    IpeCmd::None,
+                    revoked_cmd(),
                 )
             }
             Msg::Bump => {
+                BUMPS.fetch_add(1, Ordering::Relaxed);
                 let n = model.n + 1;
                 (Model { n, ..model }, IpeCmd::None)
             }
@@ -13718,7 +13803,7 @@ mod web_revocation_tests {
                 StatusCode::NOT_FOUND,
                 "a live session is found"
             );
-            assert!(crate::revocation::revoke_subject("w1-subject".to_owned()).is_ok());
+            assert!(crate::revocation::revoke_subject_unannounced("w1-subject".to_owned()).is_ok());
             let after = send(
                 &router,
                 "POST",
@@ -13731,9 +13816,26 @@ mod web_revocation_tests {
         });
     }
 
-    /// A Msg queued behind the one that revokes the session is never applied.
+    /// The message sender of the live session `handle`.
+    fn msg_tx_of(handle: &store::SessionHandle<Model, Msg>) -> tokio::sync::mpsc::Sender<Msg> {
+        handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .msg_tx
+            .clone()
+    }
+
+    /// Let every ready task run.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A Msg whose `update` revokes its own session commits nothing and
+    /// dispatches no Cmd, and the Msg queued behind it never runs.
     #[test]
-    fn queued_msg_after_revoke_is_not_applied() {
+    fn revoking_msg_commits_nothing_and_queued_msg_never_runs() {
         run(false, || async {
             let store = Arc::new(Store::new(Duration::from_secs(60)));
             let router = make_router(&store);
@@ -13741,22 +13843,220 @@ mod web_revocation_tests {
             let handle = entry_of(&store, &opened.sid).await;
             assert!(handle.is_some(), "the page load stored a live session");
             let Some(handle) = handle else { return };
-            let msg_tx = handle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .msg_tx
-                .clone();
+            let bumps = BUMPS.load(Ordering::Relaxed);
+            let cmds = REVOKED_CMDS.load(Ordering::Relaxed);
+            let msg_tx = msg_tx_of(&handle);
             assert!(msg_tx.try_send(Msg::RevokeSelf).is_ok());
             assert!(msg_tx.try_send(Msg::Bump).is_ok());
             assert!(closes_within(&handle, Duration::from_secs(5)).await);
+            settle().await;
             let model = handle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .model
                 .clone();
-            assert!(model.revoked, "the first Msg revoked the subject");
-            assert_eq!(model.n, 1, "the Msg behind the revocation was not applied");
+            assert_eq!(model.n, 0, "the revoking Msg's model is never committed");
+            assert_eq!(
+                REVOKED_CMDS.load(Ordering::Relaxed),
+                cmds,
+                "the revoking Msg's Cmd is never dispatched"
+            );
+            assert_eq!(
+                BUMPS.load(Ordering::Relaxed),
+                bumps,
+                "the Msg behind it never reaches `update`"
+            );
             assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// A Msg for a session whose subject was revoked never reaches `update`.
+    #[test]
+    fn msg_after_revoke_never_reaches_update() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w2b-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let bumps = BUMPS.load(Ordering::Relaxed);
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w2b-subject".to_owned()).is_ok()
+            );
+            assert!(msg_tx_of(&handle).try_send(Msg::Bump).is_ok());
+            assert!(closes_within(&handle, Duration::from_secs(5)).await);
+            assert_eq!(
+                BUMPS.load(Ordering::Relaxed),
+                bumps,
+                "`update` never runs for a revoked session"
+            );
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// A URL entry whose route code revokes its own session commits nothing
+    /// and dispatches no Cmd.
+    #[test]
+    fn revoking_entry_commits_nothing() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w2c-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let route_entry: RouteEntry<Model, Msg> =
+                Arc::new(|model: Model, _path: &route::DecodedPath| {
+                    let revoked =
+                        crate::revocation::revoke_subject_unannounced(model.sub.clone()).is_ok();
+                    route::Entered {
+                        model: Model { revoked, ..model },
+                        cmd: revoked_cmd(),
+                    }
+                });
+            let path = route::DecodedPath::parse("/other").ok();
+            assert!(path.is_some(), "`/other` decodes");
+            let Some(path) = path else { return };
+            let (reply, replied) = tokio::sync::oneshot::channel();
+            let request = EnterRequest {
+                path,
+                mode: EnterMode::Load,
+                reply,
+            };
+            let dyn_store = Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>;
+            let commit = commit_entry(
+                &Arc::downgrade(&handle),
+                request,
+                &route_entry,
+                &view,
+                &dyn_store,
+                &scope,
+            )
+            .await;
+            assert!(
+                matches!(commit, EntryCommit::SessionGone),
+                "the revoking entry ends its session"
+            );
+            assert!(replied.await.is_err(), "the entry is never answered");
+            let model = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model
+                .clone();
+            assert!(!model.revoked, "the entered model is never committed");
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// A checkpoint of a session closed meanwhile undoes its own write, and a
+    /// checkpoint of an open session stores it.
+    #[test]
+    fn checkpoint_never_stores_a_closed_session() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let dyn_store = Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>;
+            let closed = open_session(&router, "w17-closed-subject", 7200, "").await;
+            let handle = entry_of(&store, &closed.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .closer
+                .send_replace(true);
+            store.delete(&closed.sid).await;
+            assert_eq!(
+                checkpoint(&dyn_store, &closed.sid, &handle).await,
+                Checkpoint::Closed
+            );
+            assert!(
+                entry_of(&store, &closed.sid).await.is_none(),
+                "a closed session is never stored again"
+            );
+
+            let open = open_session(&router, "w17-open-subject", 7200, "").await;
+            let handle = entry_of(&store, &open.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            store.delete(&open.sid).await;
+            assert_eq!(
+                checkpoint(&dyn_store, &open.sid, &handle).await,
+                Checkpoint::Stored
+            );
+            assert!(entry_of(&store, &open.sid).await.is_some());
+        });
+    }
+
+    /// A memory store that records, at each delete, whether `watched` was already closed.
+    struct DeleteProbe {
+        inner: Store,
+        watched: store::SessionHandle<Model, Msg>,
+        closed_at_delete: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl store::SessionStore<Model, Msg> for DeleteProbe {
+        async fn get(&self, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(&self, sid: &str, handle: store::SessionHandle<Model, Msg>) {
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            let closed = *self
+                .watched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .closer
+                .borrow();
+            self.closed_at_delete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(closed);
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// Closing a session flips its closer before the store delete runs, so a
+    /// racing checkpoint always sees one or the other.
+    #[test]
+    fn close_session_flips_closer_before_delete() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w18-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let probe = Arc::new(DeleteProbe {
+                inner: Store::new(Duration::from_secs(60)),
+                watched: Arc::clone(&handle),
+                closed_at_delete: Mutex::new(Vec::new()),
+            });
+            let dyn_probe = Arc::clone(&probe) as Arc<dyn store::SessionStore<Model, Msg>>;
+            close_session(&dyn_probe, &opened.sid, Some(&handle)).await;
+            let seen = probe
+                .closed_at_delete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert_eq!(seen, vec![true], "the closer is set when the delete runs");
         });
     }
 
@@ -13804,7 +14104,9 @@ mod web_revocation_tests {
             let store = Arc::new(Store::new(Duration::from_secs(60)));
             let router = make_router(&store);
             let sse = open_session(&router, "w5-sse-subject", 7200, "").await;
-            assert!(crate::revocation::revoke_subject("w5-sse-subject".to_owned()).is_ok());
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-sse-subject".to_owned()).is_ok()
+            );
             let resp = send(&router, "GET", "/_ipe/sse", &sid_cookie(&sse.sid), "").await;
             assert!(
                 is_session_lost(resp).await,
@@ -13818,7 +14120,9 @@ mod web_revocation_tests {
                 StatusCode::NOT_FOUND,
                 "a live session is found"
             );
-            assert!(crate::revocation::revoke_subject("w5-port-subject".to_owned()).is_ok());
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-port-subject".to_owned()).is_ok()
+            );
             let after = send(&router, "POST", "/_ipe/port", &sid_cookie(&port.sid), "{}").await;
             assert!(
                 is_session_lost(after).await,
@@ -13838,7 +14142,10 @@ mod web_revocation_tests {
             let cookie = sid_cookie(&inspect.sid);
             let before = send(&router, "GET", "/_ipe/debug/inspect", &cookie, "").await;
             assert_eq!(before.status(), StatusCode::OK);
-            assert!(crate::revocation::revoke_subject("w5-inspect-subject".to_owned()).is_ok());
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-inspect-subject".to_owned())
+                    .is_ok()
+            );
             let after = send(&router, "GET", "/_ipe/debug/inspect", &cookie, "").await;
             assert!(
                 is_session_lost(after).await,
@@ -13846,7 +14153,10 @@ mod web_revocation_tests {
             );
 
             let export = open_session(&router, "w5-export-subject", 7200, "").await;
-            assert!(crate::revocation::revoke_subject("w5-export-subject".to_owned()).is_ok());
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-export-subject".to_owned())
+                    .is_ok()
+            );
             let resp = send(
                 &router,
                 "GET",
@@ -13871,7 +14181,7 @@ mod web_revocation_tests {
             let router = make_router(&store);
             let opened = open_session(&router, "w6-subject", 7200, "").await;
             assert!(!opened.sid.is_empty());
-            assert!(crate::revocation::revoke_subject("w6-subject".to_owned()).is_ok());
+            assert!(crate::revocation::revoke_subject_unannounced("w6-subject".to_owned()).is_ok());
             let cookies = format!("{}; {}", sid_cookie(&opened.sid), opened.cookies);
             let resp = send(&router, "GET", "/", &cookies, "").await;
             let fresh = minted_sid(&resp);
@@ -13980,7 +14290,7 @@ mod web_revocation_tests {
                 break;
             };
             let predicate = code.get(at + 6..close).unwrap_or_default();
-            if predicate != "test" && !predicate.starts_with("all(test") {
+            if !test_only(predicate) {
                 continue;
             }
             let mut item = close + 2;
@@ -14021,6 +14331,89 @@ mod web_revocation_tests {
             from = end;
         }
         out
+    }
+
+    /// Whether a `cfg` predicate holds only under `test`: `test` itself, or an
+    /// `all(..)` with `test` among its top-level terms.
+    fn test_only(predicate: &str) -> bool {
+        let predicate = predicate.trim();
+        if predicate == "test" {
+            return true;
+        }
+        let Some(terms) = predicate
+            .strip_prefix("all(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            return false;
+        };
+        let mut depth = 0_usize;
+        let mut start = 0;
+        let mut found = false;
+        for (k, c) in terms.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    found |= terms.get(start..k).is_some_and(|t| t.trim() == "test");
+                    start = k + 1;
+                }
+                _ => {}
+            }
+        }
+        found || terms.get(start..).is_some_and(|t| t.trim() == "test")
+    }
+
+    /// Every position in `code` of a `receiver.method(` call, whitespace allowed
+    /// around the dot.
+    fn calls(code: &str, receiver: &str, method: &str) -> Vec<usize> {
+        let call = format!("{method}(");
+        code.match_indices(call.as_str())
+            .filter_map(|(pos, _)| {
+                let head = code
+                    .get(..pos)?
+                    .trim_end()
+                    .strip_suffix('.')?
+                    .trim_end()
+                    .strip_suffix(receiver)?;
+                let bounded = head
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                bounded.then_some(pos)
+            })
+            .collect()
+    }
+
+    /// The enclosing named function of every `receiver.method(` call in `code`.
+    fn call_owners(
+        code: &str,
+        bodies: &[(String, std::ops::Range<usize>)],
+        receiver: &str,
+        method: &str,
+    ) -> Vec<Option<String>> {
+        calls(code, receiver, method)
+            .into_iter()
+            .map(|pos| enclosing_fn(bodies, pos))
+            .collect()
+    }
+
+    /// The scan helpers find calls across line breaks and blank every
+    /// test-only `cfg` form.
+    #[test]
+    fn scan_helpers_see_through_layout() {
+        let code =
+            "fn a() { st.store\n    .get(x); store . set(y); restore.get(z); store.try_get(w); }";
+        assert_eq!(calls(code, "store", "get").len(), 1);
+        assert_eq!(calls(code, "store", "set").len(), 1);
+        assert!(test_only("test"));
+        assert!(test_only("all(test, feature = \"server\")"));
+        assert!(test_only("all(feature = \"server\", test)"));
+        assert!(!test_only("all(not(test), feature = \"server\")"));
+        assert!(!test_only("feature = \"server\""));
+        let blanked =
+            production_only("#[cfg(all(feature = \"web\", test))]\nmod t { fn x() {} }\nfn y() {}");
+        assert!(!blanked.contains("fn x"), "{blanked}");
+        assert!(blanked.contains("fn y"), "{blanked}");
     }
 
     /// The index just past the brace closing the one at `open`.
@@ -14121,10 +14514,7 @@ mod web_revocation_tests {
             "every task `run_cmd` spawns is session-scoped"
         );
 
-        let owners: Vec<Option<String>> = code
-            .match_indices("store.get(")
-            .map(|(pos, _)| enclosing_fn(&bodies, pos))
-            .collect();
+        let owners = call_owners(&code, &bodies, "store", "get");
         let resolver = owners
             .iter()
             .filter(|o| o.as_deref() == Some("lookup_session"))
@@ -14135,6 +14525,45 @@ mod web_revocation_tests {
                 .iter()
                 .all(|o| matches!(o.as_deref(), Some("lookup_session" | "page"))),
             "a live entry is read only by the resolver and the page rejoin it admits: {owners:?}"
+        );
+
+        let rejoins = call_owners(&code, &bodies, "store", "get_reconstructing");
+        assert!(
+            !rejoins.is_empty() && rejoins.iter().all(|o| o.as_deref() == Some("page")),
+            "a session is reconstructed only by the page rejoin: {rejoins:?}"
+        );
+        let writes = call_owners(&code, &bodies, "store", "set");
+        let checkpoints = writes
+            .iter()
+            .filter(|o| o.as_deref() == Some("checkpoint"))
+            .count();
+        assert_eq!(checkpoints, 1, "one checkpoint writes a session back");
+        assert!(
+            writes
+                .iter()
+                .all(|o| matches!(o.as_deref(), Some("checkpoint" | "page"))),
+            "an open session is written back only through the checkpoint: {writes:?}"
+        );
+        let sweeps = call_owners(&code, &bodies, "store", "web_sessions");
+        assert!(
+            sweeps.iter().all(|o| matches!(
+                o.as_deref(),
+                Some(
+                    "push_reload_to_web_sessions"
+                        | "watch_status_handler"
+                        | "apply_literal_patch_to_web_sessions"
+                )
+            )),
+            "a sweep over live sessions sends a fixed frame or re-proves first: {sweeps:?}"
+        );
+        let patch_sweep: String = bodies
+            .iter()
+            .filter(|(name, _)| name == "apply_literal_patch_to_web_sessions")
+            .filter_map(|(_, span)| code.get(span.clone()))
+            .collect();
+        assert!(
+            patch_sweep.contains("recheck_scope("),
+            "the sweep that runs `view` re-proves each session first"
         );
     }
 
@@ -14270,7 +14699,9 @@ mod web_revocation_tests {
             );
             let opened = open_session(&router, "w16-subject", 7200, "").await;
             assert!(opened.body.contains("authed=true"), "{}", opened.body);
-            assert!(crate::revocation::revoke_subject("w16-subject".to_owned()).is_ok());
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w16-subject".to_owned()).is_ok()
+            );
             let after = send(
                 &router,
                 "POST",
