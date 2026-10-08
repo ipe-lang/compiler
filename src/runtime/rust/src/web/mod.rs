@@ -13528,6 +13528,14 @@ mod web_revocation_tests {
     }
 
     type Store = MemoryStore<Model, Msg>;
+    type RouterState = WebState<
+        Model,
+        Msg,
+        fn(WebReq) -> (Model, IpeCmd<Msg>),
+        fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+        fn(Model) -> Html<Msg>,
+        fn(Model) -> IpeSub<Msg>,
+    >;
 
     fn param_resolver(_path: &crate::web::route::DecodedPath) -> crate::dict::IpeDict<String> {
         crate::dict::dict_empty()
@@ -13540,14 +13548,7 @@ mod web_revocation_tests {
     /// The production router over `store`.
     #[allow(clippy::expect_used)] // test helper: the Server floor arming never trips the startup refusal
     fn make_router(store: &Arc<Store>) -> axum::Router {
-        let state: WebState<
-            Model,
-            Msg,
-            fn(WebReq) -> (Model, IpeCmd<Msg>),
-            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
-            fn(Model) -> Html<Msg>,
-            fn(Model) -> IpeSub<Msg>,
-        > = WebState {
+        let state: RouterState = WebState {
             store: Arc::clone(store) as Arc<dyn store::SessionStore<Model, Msg>>,
             init: Arc::new(init),
             update: Arc::new(update),
@@ -13641,11 +13642,11 @@ mod web_revocation_tests {
             .to_owned()
     }
 
-    /// The whole body of `resp`, lossily decoded.
+    /// The whole body of `resp`, empty when it is not UTF-8.
     async fn text(resp: Response) -> String {
         axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
-            .map(|bytes| String::from_utf8_lossy(bytes.as_ref()).into_owned())
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap_or_default())
             .unwrap_or_default()
     }
 
