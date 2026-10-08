@@ -32,7 +32,7 @@ import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, appendSignedBeforeFirst, rawKeyCheck, refusedWith)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, appendSignedBeforeFirst, appendSignedWithUidText, rawKeyCheck, refusedWith)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -1220,6 +1220,26 @@ rowBeforeFirstNeverVerified db =
         Task.succeed (verdict == Broken (BeforeFirst 1) && whyOf found == Just ChainBroken && whyOf first == Just ChainBroken && latest == Nothing && refused && after == before)
 
 
+-- An entry whose uid column holds text that is no unit id, signed so its
+-- own mac and link verify, breaks the chain at its seq: the walk reads it
+-- and returns `Broken (BreaksAt 2)` rather than failing, and a decision is
+-- refused with that break, inserting nothing. Red if the walk decodes the
+-- stored uid as a unit id (the walk fails instead of breaking), or checks
+-- only the link and the mac (the log reads proven).
+storedUidNotAUnitIdBreaksAtItsSeq : Db -> Task.Task Error Bool
+storedUidNotAUnitIdBreaksAtItsSeq db =
+    do
+        appendSigned db (rawRow "first-1" "h" "approve" Nothing)
+        appendSignedWithUidText db "not-a-unit-id" (rawRow "second-2" "h2" "approve" Nothing)
+        verdict <- logVerdictOf db
+        before <- logRowCount db
+        attested <- attestedFor "ipe-review-stored-uid-index" (uid "u-a")
+        macKey <- testMacKey
+        refused <- refusedWith (LibDb.brokenRefusal (BreaksAt 2)) (LibDb.insertDecision macKey db attested Approved)
+        after <- logRowCount db
+        Task.succeed (verdict == Broken (BreaksAt 2) && refused && before == 2 && after == before)
+
+
 -- One tamper fixture: its name, the edits made after three signed entries,
 -- and the break the log must read as.
 type alias TamperFixture =
@@ -1486,6 +1506,7 @@ reviewLogChecks =
         , check "a head reset to the genesis with rows is broken past the head" (onFreshReview "ipe-review-headResetToGenesisWithRowsIsPastHead" headResetToGenesisWithRowsIsPastHead)
         , check "a signed row appended past the head never counts" (onFreshReview "ipe-review-rowAppendedPastHeadNeverVerified" rowAppendedPastHeadNeverVerified)
         , check "a signed row stored below the first entry never counts" (onFreshReview "ipe-review-rowBeforeFirstNeverVerified" rowBeforeFirstNeverVerified)
+        , check "a stored uid that is no unit id breaks the chain at its seq" (onFreshReview "ipe-review-storedUidNotAUnitIdBreaksAtItsSeq" storedUidNotAUnitIdBreaksAtItsSeq)
         , check "the save gate and the read path read every tamper alike" saveGateAndReadPathAgree
         , check "a different key is refused at startup" wrongKeyRefusesStartup
         , check "a different key cannot append" (onFreshReview "ipe-review-wrongKeyCannotAppend" wrongKeyCannotAppend)

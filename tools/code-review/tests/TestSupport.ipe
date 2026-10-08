@@ -95,6 +95,7 @@ module TestSupport exposing
     , otherMacKey
     , appendSignedPastHead
     , appendSignedBeforeFirst
+    , appendSignedWithUidText
     , rawKeyCheck
     , rawKeyCheckFor
     , isRefusal
@@ -947,6 +948,20 @@ appendSignedBeforeFirst db row =
             )
 
 
+-- `row` stored and signed as the next entry with `uidText` in its uid
+-- column in place of its unit id, the head moved onto it: a correctly
+-- signed entry whose uid is no unit id, written outside the tool.
+appendSignedWithUidText : Db -> String -> RawRow -> Task.Task Error Int
+appendSignedWithUidText db uidText row =
+    do
+        head <- rawHead db
+        mac <- Task.succeed (rawMac (rawMacInputWith head.logId (head.seq + 1) head.head uidText row))
+        Db.exec db
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            [ SqlInt (head.seq + 1), SqlString uidText, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac ]
+        Db.exec db "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1" [ SqlInt (head.seq + 1), SqlString mac ]
+
+
 appendSignedAt : Db -> String -> RawHead -> RawRow -> Task.Task Error Int
 appendSignedAt db logId head row =
     appendClaimedAt db logId head head row
@@ -1012,6 +1027,12 @@ rawReason reason =
 -- absent.
 rawMacInput : String -> Int -> String -> RawRow -> String
 rawMacInput logId seq prev row =
+    rawMacInputWith logId seq prev (Uid.toString row.uid) row
+
+
+-- `rawMacInput` with `uidText` as the uid field.
+rawMacInputWith : String -> Int -> String -> String -> RawRow -> String
+rawMacInputWith logId seq prev uidText row =
     let
         reasonPart =
             case row.reason of
@@ -1021,7 +1042,7 @@ rawMacInput logId seq prev row =
                 Nothing ->
                     "-"
     in
-    [ "ipe-code-review/review-row/v1", logId, String.fromInt seq, prev, Uid.toString row.uid, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ]
+    [ "ipe-code-review/review-row/v1", logId, String.fromInt seq, prev, uidText, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ]
         |> List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part)
         |> String.concat
 

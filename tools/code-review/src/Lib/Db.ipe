@@ -814,18 +814,48 @@ headMoved =
     Error.conflict "the review log's head moved while a decision was recorded; decide again"
 
 
+-- A `uid` column as stored: the signer writes a unit id's text, while the
+-- walk reads whatever text the row holds. A type of its own, so the mac
+-- input's uid can be neither the link, the body hash nor the decision.
+type StoredUid
+    = StoredUid String
+
+
+storedUid : Uid -> StoredUid
+storedUid uid =
+    StoredUid (Uid.toString uid)
+
+
+storedUidText : StoredUid -> String
+storedUidText stored =
+    case stored of
+        StoredUid text ->
+            text
+
+
+-- True exactly when the stored text is a unit id the signer could write.
+storedIsUnitId : StoredUid -> Bool
+storedIsUnitId stored =
+    case Uid.parse (storedUidText stored) of
+        Ok _ ->
+            True
+
+        Err _ ->
+            False
+
+
 -- What a row's mac covers: a domain tag, the log it belongs to, its place in
 -- the chain, and every column it records. A NULL reason (`-`) and an empty
 -- one (`+`) differ, and `Index.lengthPrefixed` keeps any two field lists
 -- apart, so no edit of any column keeps the mac.
-macInput : String -> Int -> String -> String -> String -> String -> Maybe String -> Int -> String
+macInput : String -> Int -> String -> StoredUid -> String -> String -> Maybe String -> Int -> String
 macInput logId seq prev uid bodyHash decision reason reviewedAt =
     Index.lengthPrefixed
         [ "ipe-code-review/review-row/v1"
         , logId
         , String.fromInt seq
         , prev
-        , uid
+        , storedUidText uid
         , bodyHash
         , decision
         , reasonField reason
@@ -886,7 +916,7 @@ rowVerifies key logId row =
                 ( uid, bodyHash ) =
                     Index.decidedPairKey r.pair
             in
-            signedBy key (macInput logId r.seq r.prev (Uid.toString uid) bodyHash r.decision r.reason r.reviewedAt) r.mac
+            signedBy key (macInput logId r.seq r.prev (storedUid uid) bodyHash r.decision r.reason r.reviewedAt) r.mac
 
 
 -- A row's decision column parsed: Nothing for any text but `approve` or
@@ -1013,7 +1043,7 @@ verdictOf key tx size ceiling refusal head =
 -- seq rather than failing the walk.
 type alias WalkRow =
     { seq : Int
-    , uid : String
+    , uid : StoredUid
     , bodyHash : String
     , decision : String
     , reason : Maybe String
@@ -1025,7 +1055,7 @@ type alias WalkRow =
 
 walkRowDecoder : Db.Decode.Decoder WalkRow
 walkRowDecoder =
-    Db.Decode.succeed (\seq uid bodyHash decision reason reviewedAt prev mac -> { seq = seq, uid = uid, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac })
+    Db.Decode.succeed (\seq uid bodyHash decision reason reviewedAt prev mac -> { seq = seq, uid = StoredUid uid, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac })
         |> Db.Decode.required "seq" (Db.Decode.int "seq")
         |> Db.Decode.required "uid" (Db.Decode.string "uid")
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
@@ -1101,8 +1131,9 @@ walkStep key db size ceiling refusal head walk =
 
 -- One page of rows followed from the expected seq and mac: the seq and mac
 -- after the page, or the first entry the chain breaks at. A missing entry
--- breaks at its seq; an entry linking another mac, or whose own mac does not
--- verify under the key, breaks at its own.
+-- breaks at its seq; an entry linking another mac, holding a uid that is not
+-- a unit id, or whose own mac does not verify under the key, breaks at its
+-- own.
 followRows : MacKey -> String -> Int -> String -> List WalkRow -> Result Int ( Int, String )
 followRows key logId nextSeq prev rows =
     List.foldl
@@ -1115,7 +1146,7 @@ followRows key logId nextSeq prev rows =
                     if row.seq /= expected then
                         Err expected
 
-                    else if Crypto.constantTimeEqual row.prev mac && signedBy key (macInput logId row.seq row.prev row.uid row.bodyHash row.decision row.reason row.reviewedAt) row.mac then
+                    else if Crypto.constantTimeEqual row.prev mac && storedIsUnitId row.uid && signedBy key (macInput logId row.seq row.prev row.uid row.bodyHash row.decision row.reason row.reviewedAt) row.mac then
                         Ok ( expected + 1, row.mac )
 
                     else
@@ -1284,7 +1315,7 @@ appendDecision key tx head attested decision at =
             Index.chainMac head
 
         mac =
-            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev (Uid.toString uid) bodyHash decisionText reason at)
+            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev (storedUid uid) bodyHash decisionText reason at)
 
         next =
             Index.chainNext head mac
