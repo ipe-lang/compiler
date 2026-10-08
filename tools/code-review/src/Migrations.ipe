@@ -109,4 +109,7 @@ BEGIN
     SELECT RAISE(ABORT, 'review_log_head.log_id is fixed');
 END;"""
       }
+    , { name = "0008_review_log_key_check"
+      , sql = """ALTER TABLE review_log_head ADD COLUMN key_check TEXT CHECK (key_check IS NULL OR length(key_check) = 64);"""
+      }
     ]
