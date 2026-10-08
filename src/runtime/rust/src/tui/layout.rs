@@ -18,8 +18,8 @@
 
 use super::super::html::Html;
 use super::super::ui::{
-    Attribute, Description, Element, HAlign, Length, Location, Portion, VAlign, WhiteSpace,
-    has_content,
+    Attribute, Description, Element, HAlign, Length, Location, Portion, SectionHead, VAlign,
+    WhiteSpace, section_head,
 };
 use super::cell::sanitize_rune;
 use super::focus::{Focusable, InputRegistry};
@@ -190,7 +190,8 @@ struct Walked {
     /// columns sized off `grid_min_px` (`Ui.gridColumns`).
     is_grid: bool,
     /// The `DescParagraph` / `DescTextColumn` role (`Ui.paragraph` /
-    /// `Ui.textColumn`; the latter also by its `__textcolumn` marker). Text children are joined + word-wrapped to the available width.
+    /// `Ui.textColumn`) or the `__textcolumn` marker. Text children are joined
+    /// and word-wrapped to the available width.
     is_paragraph: bool,
     is_text_column: bool,
     /// `__gridMin` value — the minimum column WIDTH in logical px (set by
@@ -1600,14 +1601,13 @@ fn render_node<M: Clone>(
             padded
         }
         Element::Node(desc, attrs, kids) | Element::TaggedNode(_, desc, attrs, kids) => {
-            // A section heading with no visible content lays out as nothing, so
-            // an absent title leaves neither a bold run nor a blank row.
-            if matches!(desc, Description::DescSectionHeading) && !has_content(node) {
-                return Rendered {
-                    block: Block::default(),
-                    hits: vec![],
-                };
-            }
+            // A section whose first child is a heading with no visible content
+            // lays that heading out as nothing, so an absent title leaves
+            // neither a bold run nor a blank row (the rule HTML applies).
+            let kids: &[Element<M>] = match section_head(desc, kids) {
+                SectionHead::Empty => kids.get(1..).unwrap_or_default(),
+                SectionHead::NoHeading | SectionHead::Present => kids,
+            };
             // A code block keeps its newlines and spaces unless the author
             // sets another `Font.whiteSpace` on it.
             let base = if matches!(desc, Description::DescCodeBlock) {
@@ -3746,5 +3746,31 @@ mod tests {
         assert_eq!(element_to_cells_height(&empty, 20), 1);
         assert!(!cells_true(&empty, 20, 2).contains("\x1b[1m"));
         assert_eq!(element_to_cells_height(&section("Title"), 20), 2);
+    }
+
+    /// Only a section's first child is its heading: an empty heading anywhere
+    /// else lays out as the node HTML renders, taking its row; the same heading
+    /// as the first child (the control) takes none.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn empty_heading_off_a_section_head_lays_out() {
+        let empty_heading =
+            || -> Element<()> { role(Description::DescSectionHeading, vec![], vec![]) };
+        let body = || -> Element<()> { Element::Text("body".into()) };
+        let later: Element<()> = role(
+            Description::DescSection,
+            vec![],
+            vec![body(), empty_heading()],
+        );
+        assert_eq!(element_to_cells_height(&later, 20), 2);
+        let bare: Element<()> = node(vec![], vec![body(), empty_heading()]);
+        assert_eq!(element_to_cells_height(&bare, 20), 2);
+        let first: Element<()> = role(
+            Description::DescSection,
+            vec![],
+            vec![empty_heading(), body()],
+        );
+        assert_eq!(element_to_cells_height(&first, 20), 1);
     }
 }

@@ -426,13 +426,21 @@ pub enum Element<M> {
     Cells(Vec<Vec<char>>),
 }
 
+/// Tagged elements that present a box of their own with no child content: a
+/// form control or an embedded document, media or gauge.
+const SELF_PRESENTING_TAGS: [&str; 9] = [
+    "textarea", "select", "iframe", "object", "canvas", "video", "audio", "progress", "meter",
+];
+
 /// True when an element renders something visible or announced.
 ///
 /// An empty element, a text leaf of Unicode `White_Space` only, and a
 /// container whose every child is itself empty have no content. A void tagged
-/// leaf (an image, an input control), raw markup and a cell grid have content.
-/// The walk is iterative and stops at `MAX_HTML_DEPTH`, where it answers true
-/// so the render's own depth ceiling decides.
+/// leaf (an image, an input control), a self-presenting tagged element (a
+/// `textarea`, a `select`, embedded media), a node carrying an `AttrNearby`
+/// overlay, raw markup and a cell grid have content. The walk is iterative and
+/// stops at `MAX_HTML_DEPTH`, where it answers true so the render's own depth
+/// ceiling decides.
 #[must_use]
 pub fn has_content<M>(elem: &Element<M>) -> bool {
     let mut pending: Vec<(&Element<M>, usize)> = vec![(elem, 0)];
@@ -448,9 +456,19 @@ pub fn has_content<M>(elem: &Element<M>) -> bool {
                     return true;
                 }
             }
-            Element::Node(_, _, kids) => pending.extend(kids.iter().map(|k| (k, below))),
-            Element::TaggedNode(tag, _, _, kids) => {
-                if crate::html::is_void(tag) {
+            Element::Node(_, attrs, kids) => {
+                if has_overlay(attrs) {
+                    return true;
+                }
+                pending.extend(kids.iter().map(|k| (k, below)));
+            }
+            Element::TaggedNode(tag, _, attrs, kids) => {
+                if crate::html::is_void(tag)
+                    || SELF_PRESENTING_TAGS
+                        .iter()
+                        .any(|t| tag.eq_ignore_ascii_case(t))
+                    || has_overlay(attrs)
+                {
                     return true;
                 }
                 pending.extend(kids.iter().map(|k| (k, below)));
@@ -459,6 +477,56 @@ pub fn has_content<M>(elem: &Element<M>) -> bool {
         }
     }
     false
+}
+
+/// True when a node carries an `AttrNearby` overlay, which renders whatever
+/// the node's own children are.
+fn has_overlay<M>(attrs: &[Attribute<M>]) -> bool {
+    attrs
+        .iter()
+        .any(|a| matches!(a, Attribute::AttrNearby(_, _)))
+}
+
+/// What the first child of a node contributes as a section heading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionHead {
+    /// The node is not a `DescSection`, or its first child is not a
+    /// `DescSectionHeading`.
+    NoHeading,
+    /// The section's first child is a heading with no content: it renders
+    /// nothing and the heading level is kept.
+    Empty,
+    /// The section's first child is a heading with content: the section's
+    /// descendants rank one level deeper.
+    Present,
+}
+
+/// Classify a node's first child as its section heading. HTML and the terminal
+/// share this one rule, so only a section's first child is ever its heading.
+#[must_use]
+pub fn section_head<M>(desc: &Description, kids: &[Element<M>]) -> SectionHead {
+    if !matches!(desc, Description::DescSection) {
+        return SectionHead::NoHeading;
+    }
+    let Some(first) = kids.first() else {
+        return SectionHead::NoHeading;
+    };
+    match first {
+        Element::Node(Description::DescSectionHeading, _, _)
+        | Element::TaggedNode(_, Description::DescSectionHeading, _, _) => {
+            if has_content(first) {
+                SectionHead::Present
+            } else {
+                SectionHead::Empty
+            }
+        }
+        Element::Node(_, _, _)
+        | Element::TaggedNode(_, _, _, _)
+        | Element::Empty
+        | Element::Text(_)
+        | Element::Raw(_)
+        | Element::Cells(_) => SectionHead::NoHeading,
+    }
 }
 
 /// Move every `Element` nested inside a node's attributes (an `AttrNearby`

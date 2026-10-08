@@ -23,8 +23,8 @@
 use super::super::css_safety::{CssValueOrigin, SafeCssPropertyName, SafeCssValue};
 use super::super::html::{Attribute as HtmlAttribute, Html, admit_element};
 use super::element::{
-    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, VAlign,
-    has_content,
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, SectionHead,
+    VAlign, section_head,
 };
 
 // ── CSS boundary smart constructors ───────────────────────────────────────────
@@ -491,13 +491,17 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
 /// context. Under a phrasing ancestor the positioned wrapper is a `span`
 /// (absolute positioning blockifies it, so it lays out as the `div` would) and
 /// the overlay content stays phrasing.
-fn render_nearby_overlays<M: Clone>(attrs: &[Attribute<M>], ctx: RenderCtx) -> Vec<Html<M>> {
+///
+/// Each overlay's `Element` is moved out of its attribute (left `Empty`), never
+/// cloned: a clone of a deep overlay subtree recurses without a bound, while
+/// the move hands the subtree to the depth-bounded render.
+fn render_nearby_overlays<M: Clone>(attrs: &mut [Attribute<M>], ctx: RenderCtx) -> Vec<Html<M>> {
     let wrapper = match ctx.model {
         ContentModel::Flow => NodeTag::Div,
         ContentModel::Phrasing => NodeTag::Span,
     };
     let mut overlays: Vec<Html<M>> = Vec::new();
-    for attr in attrs {
+    for attr in attrs.iter_mut() {
         if let Attribute::AttrNearby(loc, child_elem) = attr {
             let position_style = match loc {
                 Location::Above => "position:absolute;bottom:100%;left:0;right:0",
@@ -512,7 +516,8 @@ fn render_nearby_overlays<M: Clone>(attrs: &[Attribute<M>], ctx: RenderCtx) -> V
                 parent_axis: FlexAxis::Block,
                 ..ctx
             };
-            let overlay_node = render_element_depth_in(child_elem.clone(), overlay_ctx);
+            let overlay = std::mem::replace(child_elem, Element::Empty);
+            let overlay_node = render_element_depth_in(overlay, overlay_ctx);
             overlays.push(Html::HElement(
                 wrapper.as_str().into(),
                 vec![HtmlAttribute::Attr("style".into(), position_style.into())],
@@ -839,34 +844,6 @@ fn render_element_depth_in<M: Clone>(elem: Element<M>, ctx: RenderCtx) -> Html<M
             std::mem::take(kids),
             ctx,
         ),
-    }
-}
-
-/// True when `elem` is a section heading with no content.
-fn is_empty_section_heading<M>(elem: &Element<M>) -> bool {
-    match elem {
-        Element::Node(Description::DescSectionHeading, _, _)
-        | Element::TaggedNode(_, Description::DescSectionHeading, _, _) => !has_content(elem),
-        Element::Node(_, _, _)
-        | Element::TaggedNode(_, _, _, _)
-        | Element::Empty
-        | Element::Text(_)
-        | Element::Raw(_)
-        | Element::Cells(_) => false,
-    }
-}
-
-/// True when `elem` is a section heading with content.
-fn is_present_section_heading<M>(elem: &Element<M>) -> bool {
-    match elem {
-        Element::Node(Description::DescSectionHeading, _, _)
-        | Element::TaggedNode(_, Description::DescSectionHeading, _, _) => has_content(elem),
-        Element::Node(_, _, _)
-        | Element::TaggedNode(_, _, _, _)
-        | Element::Empty
-        | Element::Text(_)
-        | Element::Raw(_)
-        | Element::Cells(_) => false,
     }
 }
 
@@ -1565,6 +1542,11 @@ fn render_node_as<M: Clone>(
         .and_then(|(_, _, d)| d.heading_level())
         .or(own_heading);
     let own = tag_for_description(desc, ctx.section);
+    // A node demoted to a `span` loses its landmark tag, so it announces the
+    // landmark through `role`: the `describe` landmark first, else its own.
+    let demoted_role = landmark
+        .and_then(|(_, role, _)| role)
+        .or_else(|| landmark_role_for(desc));
     let (resolved, role_attr): (ResolvedTag, Option<&'static str>) = match (written, landmark) {
         (None, Some((retag, _, _))) if own == NodeTag::Div => (ResolvedTag::Typed(retag), None),
         (None, Some((_, role, _))) => (ResolvedTag::Typed(own), role),
@@ -1579,7 +1561,7 @@ fn render_node_as<M: Clone>(
         && matches!(&resolved, ResolvedTag::Typed(t) if t.category() == ContentModel::Flow);
     let (resolved, role_attr) = if demoted {
         demote_attrs(&mut attrs);
-        (ResolvedTag::Typed(NodeTag::Span), None)
+        (ResolvedTag::Typed(NodeTag::Span), demoted_role)
     } else {
         (resolved, role_attr)
     };
@@ -1593,14 +1575,13 @@ fn render_node_as<M: Clone>(
     let tag: &str = resolved.as_str();
 
     // ── Sections: the level is the count of enclosing rendered headings ──────
-    let is_section = matches!(desc, Description::DescSection);
-    let skip_heading = is_section && kids.first().is_some_and(is_empty_section_heading);
-    let child_section =
-        if is_section && !demoted && kids.first().is_some_and(is_present_section_heading) {
-            Some(ctx.section.map_or(SectionLevel::H1, SectionLevel::deeper))
-        } else {
-            ctx.section
-        };
+    let head = section_head(desc, &kids);
+    let skip_heading = head == SectionHead::Empty;
+    let child_section = if head == SectionHead::Present && !demoted {
+        Some(ctx.section.map_or(SectionLevel::H1, SectionLevel::deeper))
+    } else {
+        ctx.section
+    };
 
     // The role's own display, ahead of the author's declarations so an
     // explicit style still wins: a paragraph stays a block box even inside an
@@ -1742,7 +1723,7 @@ fn render_node_as<M: Clone>(
 
     // Nearby overlays appended after the regular children (they are absolutely
     // positioned, so their DOM order is irrelevant for layout).
-    html_kids.extend(render_nearby_overlays(&attrs, child_ctx));
+    html_kids.extend(render_nearby_overlays(&mut attrs, child_ctx));
 
     // SECURITY: the shared tag gate on the lowered children, so an element
     // that reached the tree without `ui_tagged_node_` still cannot render a
@@ -1792,8 +1773,8 @@ fn column_child_style<M>(attrs: &[Attribute<M>]) -> String {
 /// Both runtime-inserted divs carry a definite size on both axes, so the
 /// author's root sits inside an unbroken size chain.
 fn layout_shell<M: Clone>(
-    wrapper_attrs: &[Attribute<M>],
-    root_attrs: &[Attribute<M>],
+    wrapper_attrs: &mut [Attribute<M>],
+    root_attrs: &mut [Attribute<M>],
     elem: Element<M>,
 ) -> Html<M> {
     // The wrapper is the root div's column parent.
@@ -1829,7 +1810,8 @@ fn layout_shell<M: Clone>(
 /// the root element with the given root attributes applied.
 #[must_use]
 pub fn ui_layout<M: Clone>(attrs: Vec<Attribute<M>>, elem: Element<M>) -> Html<M> {
-    layout_shell(&[], &attrs, elem)
+    let mut attrs = attrs;
+    layout_shell(&mut [], &mut attrs, elem)
 }
 
 /// `Ui.layoutWith : { wrapperAttrs : List (Attribute msg), rootAttrs : List
@@ -1856,7 +1838,8 @@ pub fn ui_layout_with_vecs<M: Clone>(
     root_attrs: Vec<Attribute<M>>,
     elem: Element<M>,
 ) -> Html<M> {
-    layout_shell(&wrapper_attrs, &root_attrs, elem)
+    let (mut wrapper_attrs, mut root_attrs) = (wrapper_attrs, root_attrs);
+    layout_shell(&mut wrapper_attrs, &mut root_attrs, elem)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3649,7 +3632,7 @@ mod tests {
 mod text_role_tests {
     use super::*;
     use crate::html::{ElementBody, RenderedElement, admit_rendered, render_html};
-    use crate::ui::element::WhiteSpace;
+    use crate::ui::element::{WhiteSpace, has_content};
     use crate::ui::helpers::{ui_column_, ui_el_, ui_paragraph_, ui_row_};
 
     type E = Element<()>;
@@ -3981,5 +3964,108 @@ mod text_role_tests {
             shallow = Element::Node(Description::NoDescription, vec![], vec![shallow]);
         }
         assert!(!has_content(&shallow));
+    }
+
+    /// A landmark demoted to a `span` below a paragraph keeps its `role`,
+    /// whether it comes from `describe` or from the node's own description;
+    /// under a flow parent (the control) each keeps its native tag and needs
+    /// no `role` (CI job `test`).
+    #[test]
+    fn demoted_landmark_keeps_its_role() {
+        let described = || -> E {
+            Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrDescribe(Description::DescNavigation)],
+                vec![text("x")],
+            )
+        };
+        let own = || role(Description::DescMain, vec![text("y")]);
+        let s = html_of(ui_paragraph_(vec![], vec![described(), own()]));
+        assert!(s.contains("role=\"navigation\""), "{s}");
+        assert!(s.contains("role=\"main\""), "{s}");
+        assert!(!s.contains("<nav") && !s.contains("<main"), "{s}");
+        let flow = html_of(role(Description::NoDescription, vec![described(), own()]));
+        assert!(flow.contains("<nav") && flow.contains("<main"), "{flow}");
+        assert!(!flow.contains("role="), "{flow}");
+    }
+
+    /// A chain of `n` nodes, each carrying the next as its only overlay; the
+    /// last holds the text `leaf`.
+    fn overlay_chain(n: usize) -> E {
+        let mut elem = text("leaf");
+        for _ in 0..n {
+            elem = Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrNearby(Location::Below, elem)],
+                vec![],
+            );
+        }
+        elem
+    }
+
+    /// An overlay renders one level below its host, so an overlay chain past
+    /// `MAX_HTML_DEPTH` is truncated by the render's depth ceiling; a shallow
+    /// chain (the control) renders its leaf (CI job `test`).
+    #[test]
+    fn overlay_chain_is_depth_bounded() {
+        let leaf_shown = std::thread::Builder::new()
+            .stack_size(48 * 1024 * 1024)
+            .spawn(|| {
+                let deep = text_of(&render_element(overlay_chain(
+                    crate::html::MAX_HTML_DEPTH + 2,
+                )));
+                let shallow = text_of(&render_element(overlay_chain(10)));
+                (deep.contains("leaf"), shallow.contains("leaf"))
+            })
+            .expect("spawn thread")
+            .join()
+            .expect("thread did not panic");
+        assert_eq!(leaf_shown, (false, true));
+    }
+
+    /// Rendering an overlay chain far past the depth ceiling returns: the
+    /// overlay subtree is moved into the bounded render, never cloned (a
+    /// derived `Clone` of the chain recurses once per level and overflows the
+    /// stack). The shallow chain is the control (CI job `test`).
+    #[test]
+    fn deep_overlay_chain_does_not_overflow() {
+        const DEPTH: usize = 400_000;
+        let rendered = std::thread::Builder::new()
+            .stack_size(48 * 1024 * 1024)
+            .spawn(|| {
+                let deep = render_element(overlay_chain(DEPTH));
+                let shallow = text_of(&render_element(overlay_chain(3)));
+                (matches!(deep, Html::HElement(_, _, _)), shallow)
+            })
+            .expect("spawn thread")
+            .join()
+            .expect("thread did not panic");
+        assert_eq!(rendered, (true, "leaf".to_owned()));
+    }
+
+    /// A `textarea`, a `select` and an overlay-only node present content with
+    /// no child text, so a section heading holding one is kept; a heading of an
+    /// empty `div` (the control) has none and is skipped (CI job `test`).
+    #[test]
+    fn self_presenting_heading_content_is_kept() {
+        let tagged = |tag: &str| -> E {
+            Element::TaggedNode(tag.to_owned(), Description::NoDescription, vec![], vec![])
+        };
+        let overlay_only: E = Element::Node(
+            Description::NoDescription,
+            vec![Attribute::AttrNearby(Location::Below, text("tip"))],
+            vec![],
+        );
+        for (inner, kept) in [
+            (tagged("textarea"), true),
+            (tagged("select"), true),
+            (overlay_only, true),
+            (tagged("div"), false),
+        ] {
+            let head = heading(vec![inner]);
+            assert_eq!(has_content(&head), kept);
+            let tree = section(head, text("body"));
+            assert_eq!(headings_of(tree).len(), usize::from(kept));
+        }
     }
 }
