@@ -689,6 +689,405 @@ pub struct SessionEntry<Model, Msg> {
     /// committed by `step_to`/`back`/`forward`. Reset to `None` on `reset`.
     #[cfg(feature = "debugger")]
     pub debug_cursor: Option<usize>,
+    /// The session's credential scope and the switch that ends its channels.
+    pub liveness: SessionLiveness,
+}
+
+/// A live session's credential scope and the switch that ends its channels.
+#[cfg(feature = "server")]
+pub struct SessionLiveness {
+    /// The scope every call into user code on behalf of the session runs in;
+    /// it carries the session's bound credentials.
+    pub scope: pubsub::SessionScope,
+    /// Set to `true` by [`close_session`]; the SSE stream and its heartbeat end
+    /// on it even while other senders on the channel are still held.
+    pub closer: tokio::sync::watch::Sender<bool>,
+    /// Revocation rechecks the driver ran, read by the coalescing test.
+    #[cfg(test)]
+    pub rechecks: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "server")]
+impl SessionLiveness {
+    /// The liveness of an open session running under `scope`.
+    #[must_use]
+    pub fn new(scope: pubsub::SessionScope) -> Self {
+        Self {
+            scope,
+            closer: tokio::sync::watch::Sender::new(false),
+            #[cfg(test)]
+            rechecks: Arc::default(),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+impl Default for SessionLiveness {
+    fn default() -> Self {
+        Self::new(pubsub::SessionScope::new(String::new()))
+    }
+}
+
+/// Whether a session's bound credentials still stand.
+// Without `jwt` no gate exists, so nothing ever constructs `Revoked`.
+#[cfg_attr(not(feature = "jwt"), allow(dead_code))]
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+enum Standing {
+    /// Every bound credential re-proved, or no gate is armed.
+    Live,
+    /// A credential is revoked, past its deadline, or cannot be proved.
+    Revoked,
+}
+
+/// Re-prove the credentials bound in `scope` now, and never earlier than `at_least`.
+///
+/// The gate is resolved at the check and never cached, so the kernel that
+/// binds and every point that enforces read one source. Unarmed, it costs one
+/// branch. A poisoned credential lock proves nothing, so it is `Revoked`.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn recheck_scope(scope: &pubsub::SessionScope, at_least: Option<i64>) -> Standing {
+    let Some(gate) = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
+    else {
+        return Standing::Live;
+    };
+    let now = crate::jwt::now_unix_seconds();
+    let now = at_least.map_or(now, |floor| now.max(floor));
+    let proved = scope
+        .bindings()
+        .lock()
+        .is_ok_and(|held| held.recheck_all(gate, now).is_ok());
+    if proved {
+        Standing::Live
+    } else {
+        Standing::Revoked
+    }
+}
+
+/// Without `jwt` no credential is ever bound, so every session stands.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+const fn recheck_scope(_scope: &pubsub::SessionScope, _at_least: Option<i64>) -> Standing {
+    Standing::Live
+}
+
+/// End session `sid`: drop it from the store, flip its closer, detach its SSE sender.
+///
+/// The store delete removes the live entry and the persisted row on every
+/// backend, so the next request for the sid takes the session-lost path. The
+/// closer ends the SSE stream and its heartbeat although they still hold
+/// sender clones. Idempotent: a second close finds nothing left to end.
+#[cfg(feature = "server")]
+async fn close_session<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    entry: Option<&store::SessionHandle<Model, Msg>>,
+) where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    store.delete(sid).await;
+    if let Some(entry) = entry {
+        let mut e = entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        e.liveness.closer.send_replace(true);
+        e.sse_tx = None;
+    }
+}
+
+/// A session a request resolved whose credentials re-proved.
+#[cfg(feature = "server")]
+struct LiveSession<Model, Msg> {
+    /// The sid the session is stored under.
+    sid: String,
+    handle: store::SessionHandle<Model, Msg>,
+    scope: pubsub::SessionScope,
+}
+
+/// What a sid resolves to in this process.
+#[cfg(feature = "server")]
+enum SessionLookup<Model, Msg> {
+    /// The session is live and its credentials re-proved.
+    Live(LiveSession<Model, Msg>),
+    /// No live session holds the sid.
+    Absent,
+    /// The session's credentials no longer stand; the lookup closed it.
+    Closed,
+}
+
+/// The session-lost answer: 404, `X-Ipê-Web: 1` and [`SESSION_LOST_BODY`].
+///
+/// The client reloads on exactly this shape.
+#[cfg(feature = "server")]
+struct SessionLost;
+
+#[cfg(feature = "server")]
+impl axum::response::IntoResponse for SessionLost {
+    fn into_response(self) -> axum::response::Response {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
+            SESSION_LOST_BODY,
+        )
+            .into_response()
+    }
+}
+
+/// Re-prove the credentials of a live `handle` stored under `sid`.
+///
+/// `None` when they no longer stand: the session is closed here and never
+/// handed to the caller.
+#[cfg(feature = "server")]
+async fn admit_live<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    handle: store::SessionHandle<Model, Msg>,
+) -> Option<LiveSession<Model, Msg>>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let scope = handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .liveness
+        .scope
+        .clone();
+    match recheck_scope(&scope, None) {
+        Standing::Live => Some(LiveSession {
+            sid: sid.to_owned(),
+            handle,
+            scope,
+        }),
+        Standing::Revoked => {
+            close_session(store, sid, Some(&handle)).await;
+            None
+        }
+    }
+}
+
+/// Resolve `sid` to its live session; the one place a sid becomes a live entry.
+#[cfg(feature = "server")]
+async fn lookup_session<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+) -> SessionLookup<Model, Msg>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let Some(handle) = store.get(sid).await else {
+        return SessionLookup::Absent;
+    };
+    admit_live(store, sid, handle)
+        .await
+        .map_or(SessionLookup::Closed, SessionLookup::Live)
+}
+
+/// Resolve `sid` to a live session, or the session-lost answer.
+#[cfg(feature = "server")]
+async fn live_session_for<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+) -> Result<LiveSession<Model, Msg>, SessionLost>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    match lookup_session(store, sid).await {
+        SessionLookup::Live(live) => Ok(live),
+        SessionLookup::Absent | SessionLookup::Closed => Err(SessionLost),
+    }
+}
+
+/// Resolve the request's session cookie to a live session, or the session-lost answer.
+#[cfg(feature = "server")]
+async fn live_session<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    headers: &axum::http::HeaderMap,
+) -> Result<LiveSession<Model, Msg>, SessionLost>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let sid = sid_from_cookie(headers).ok_or(SessionLost)?;
+    live_session_for(store, &sid).await
+}
+
+/// Resolve once the session's closer reads `true`.
+///
+/// A dropped closer counts as closed: its session entry is gone.
+#[cfg(feature = "server")]
+async fn session_closed(closer: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = closer.wait_for(|closed| *closed).await;
+}
+
+/// How long a session waits after a revocation before it re-proves its credentials.
+///
+/// A burst of revocations inside one interval costs each open session at most
+/// one recheck beyond the first, whatever the burst size, so a party that can
+/// trigger revocations cannot amplify the recheck rate.
+#[cfg(all(feature = "server", feature = "jwt"))]
+const RECHECK_COALESCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Why a session driver woke to re-prove its credentials.
+// Without `jwt` the watch never wakes, so nothing constructs a variant.
+#[cfg_attr(not(feature = "jwt"), allow(dead_code))]
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wake {
+    /// A revocation landed; recheck at the current time.
+    Revocation,
+    /// The earliest bound deadline (Unix seconds) passed; recheck no earlier than it.
+    Deadline(i64),
+    /// The revocation generation can no longer be observed.
+    Lost,
+}
+
+/// A session driver's view of the revocation generation and its credential deadline.
+///
+/// Subscribed before the session's first credential is admitted, so a
+/// revocation landing between that admission and the driver's start still
+/// wakes the driver.
+#[cfg(all(feature = "server", feature = "jwt"))]
+struct RevocationWatch {
+    generation: tokio::sync::watch::Receiver<u64>,
+    /// When the last coalesced revocation recheck ran.
+    last_recheck: Option<tokio::time::Instant>,
+    /// When the pending coalesced recheck runs; the generation is not polled meanwhile.
+    recheck_due: Option<tokio::time::Instant>,
+    /// The earliest bound deadline, as a timer instant and as Unix seconds.
+    deadline: Option<(tokio::time::Instant, i64)>,
+    /// The generation sender is gone; no further revocation can be observed.
+    lost: bool,
+}
+
+#[cfg(all(feature = "server", feature = "jwt"))]
+impl RevocationWatch {
+    /// Subscribe to the revocation generation.
+    fn subscribe() -> Self {
+        Self {
+            generation: crate::revocation::subscribe(),
+            last_recheck: None,
+            recheck_due: None,
+            deadline: None,
+            lost: false,
+        }
+    }
+
+    /// Wait for the next reason to recheck.
+    ///
+    /// A generation change schedules one recheck at most [`RECHECK_COALESCE`]
+    /// after the previous one; every change before it fires folds into it. Each
+    /// branch updates state synchronously, so dropping the future mid-wait (the
+    /// driver's `select!`) loses nothing.
+    async fn wait(&mut self) -> Wake {
+        loop {
+            let now = tokio::time::Instant::now();
+            let recheck_due = self.recheck_due;
+            let deadline = self.deadline;
+            tokio::select! {
+                changed = self.generation.changed(), if recheck_due.is_none() && !self.lost => {
+                    if changed.is_err() {
+                        self.lost = true;
+                        return Wake::Lost;
+                    }
+                    self.recheck_due = Some(
+                        self.last_recheck
+                            .and_then(|last| last.checked_add(RECHECK_COALESCE))
+                            .map_or(now, |due| due.max(now)),
+                    );
+                }
+                () = sleep_until_opt(recheck_due) => {
+                    // Seen before the recheck reads the store: a revocation
+                    // written after this point bumps the generation again.
+                    self.generation.mark_unchanged();
+                    self.recheck_due = None;
+                    self.last_recheck = Some(tokio::time::Instant::now());
+                    return Wake::Revocation;
+                }
+                () = sleep_until_opt(deadline.map(|(at, _)| at)) => {
+                    return Wake::Deadline(deadline.map_or(i64::MIN, |(_, unix)| unix));
+                }
+            }
+        }
+    }
+
+    /// Re-arm the deadline timer from the credentials bound in `scope`.
+    ///
+    /// Run after every action, because the action may have bound a credential.
+    /// Unarmed, no timer runs. A poisoned credential lock arms an immediate
+    /// timer, whose recheck then refuses.
+    fn rearm(&mut self, scope: &pubsub::SessionScope) {
+        self.deadline = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
+            .and_then(|_| {
+                scope.bindings().lock().map_or(Some(i64::MIN), |held| {
+                    held.earliest_deadline()
+                        .map(crate::revocation::UnixSecs::get)
+                })
+            })
+            .and_then(|unix| deadline_instant(unix).map(|at| (at, unix)));
+    }
+}
+
+/// The timer instant at Unix second `unix`; `None` past the representable range.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn deadline_instant(unix: i64) -> Option<tokio::time::Instant> {
+    let wait = u64::try_from(unix.saturating_sub(crate::jwt::now_unix_seconds())).unwrap_or(0);
+    tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(wait))
+}
+
+/// Sleep until `at`, or forever when it is `None`.
+#[cfg(all(feature = "server", feature = "jwt"))]
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The standing a [`Wake`] leaves `scope` in.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn standing_after(scope: &pubsub::SessionScope, wake: Wake) -> Standing {
+    match wake {
+        Wake::Revocation => recheck_scope(scope, None),
+        Wake::Deadline(unix) => recheck_scope(scope, Some(unix)),
+        // Revocations can no longer be observed: an armed session cannot stay open.
+        Wake::Lost => {
+            if crate::revocation::ArmedGate::resolve(crate::revocation::process_mode()).is_some() {
+                Standing::Revoked
+            } else {
+                Standing::Live
+            }
+        }
+    }
+}
+
+/// Without `jwt` there is no revocation generation; the watch never wakes.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+struct RevocationWatch;
+
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+impl RevocationWatch {
+    /// A watch that never wakes.
+    const fn subscribe() -> Self {
+        Self
+    }
+
+    /// Pend forever.
+    async fn wait(&mut self) -> Wake {
+        std::future::pending().await
+    }
+
+    /// No deadline exists to arm.
+    const fn rearm(&mut self, _scope: &pubsub::SessionScope) {}
+}
+
+/// Without `jwt` every session stands.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing {
+    Standing::Live
 }
 
 /// SSE patches envelope. The browser client (`live/client.js`) consumes the
@@ -1057,22 +1456,22 @@ fn value_to_string(v: &serde_json::Value) -> String {
 type RouteEntry<Model, Msg> =
     Arc<dyn Fn(Model, &route::DecodedPath) -> route::Entered<Model, IpeCmd<Msg>> + Send + Sync>;
 
-/// Enters `path` for a new driver of session `sid`, running `seed_cmd` before the entry Cmd.
+/// Enters `path` for a new driver of the session `scope` names, running `seed_cmd` before the entry Cmd.
 ///
 /// Every page-handler arm that builds a driver (miss, restored, rebuilt) goes
-/// through here, so the order `[seed, entry]` and the sid scope live in one
-/// place. Relies on one invariant: constructing an `IpeCmd` performs no
+/// through here, so the order `[seed, entry]` and the session scope live in
+/// one place. Relies on one invariant: constructing an `IpeCmd` performs no
 /// effect, only `run_cmd` does, so a seed built for a session that is then
 /// discarded never fires.
 #[cfg(feature = "server")]
 fn enter_session<Model, Msg>(
     route_entry: &RouteEntry<Model, Msg>,
-    sid: &str,
+    scope: &pubsub::SessionScope,
     model: Model,
     seed_cmd: IpeCmd<Msg>,
     path: &route::DecodedPath,
 ) -> (Model, IpeCmd<Msg>) {
-    let entered = pubsub::with_session_sid(sid.to_owned(), || route_entry(model, path));
+    let entered = pubsub::with_session(scope, || route_entry(model, path));
     (entered.model, IpeCmd::Batch(vec![seed_cmd, entered.cmd]))
 }
 
@@ -1452,18 +1851,21 @@ impl SessionOwner {
 
 /// Fire a `Cmd`: None/Batch recurse; Perform spawns the composed task→Msg thunk
 /// and pushes the result back into the per-session loop.
+///
+/// The spawned task runs inside `scope` across every poll, so a credential the
+/// task admits binds to the session that dispatched it.
 #[cfg(feature = "server")]
-fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, sid: &str) {
+fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, scope: &pubsub::SessionScope) {
     match cmd {
         IpeCmd::None => {}
         IpeCmd::Batch(items) => {
             for c in items {
-                run_cmd(c, tx, sid);
+                run_cmd(c, tx, scope);
             }
         }
         IpeCmd::Perform(thunk) => {
             let tx = tx.clone();
-            tokio::spawn(async move {
+            tokio::spawn(scope.clone().scoped(async move {
                 let m = thunk().await;
                 // Bounded send: drop the Msg and warn if the session queue is
                 // full (a stalled driver or a burst of fast Perform tasks).
@@ -1473,12 +1875,12 @@ fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, sid: &str) {
                         "run_cmd: session msg channel closed; dropping Perform result",
                     );
                 }
-            });
+            }));
         }
         IpeCmd::Publish(thunk) => {
             // Inject this session's sid as the broadcast origin (
             // liveApp.Publish sets Origin = session.sid). Fire-and-forget.
-            let _ = thunk(sid);
+            let _ = thunk(scope.sid());
         }
     }
 }
@@ -1516,7 +1918,7 @@ enum EntryCommit<Model, Msg> {
 /// A [`EnterMode::Reconcile`] request whose path equals the session's
 /// `entered_path` is dropped unanswered here, on the driver, so the check and
 /// the commit that follows cannot interleave with another entry. Otherwise
-/// enters `request.path` under the session's sid, renders, commits model, view,
+/// enters `request.path` under the session's scope, renders, commits model, view,
 /// index and `entered_path`, then replies with the rendered body. A requester
 /// that stopped waiting gets the committed page as a full resync frame over
 /// the attached SSE channel instead, so the browser never keeps a DOM the
@@ -1528,7 +1930,7 @@ async fn commit_entry<Model, Msg, FView>(
     route_entry: &RouteEntry<Model, Msg>,
     view: &FView,
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
-    sid: &str,
+    scope: &pubsub::SessionScope,
 ) -> EntryCommit<Model, Msg>
 where
     Model: Clone,
@@ -1550,8 +1952,9 @@ where
         }
         g.model.clone()
     };
-    let entered = pubsub::with_session_sid(sid.to_owned(), || route_entry(model, &path));
-    let mut tree = view(entered.model.clone());
+    let sid = scope.sid();
+    let entered = pubsub::with_session(scope, || route_entry(model, &path));
+    let mut tree = pubsub::with_session(scope, || view(entered.model.clone()));
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
     let body = render_html(&tree);
@@ -1596,9 +1999,9 @@ where
 ///
 /// URL entries arrive on `enter_rx` and are committed by the same loop, so an
 /// entry and an in-flight `update` never overwrite each other's model.
-// Ten distinct per-session runtime handles (entry, both Msg channel ends, the
+// Eleven distinct per-session runtime handles (entry, both Msg channel ends, the
 // entry queue, the three Arc'd TEA callbacks, the route entry, the store, the
-// sid) — bundling them into a struct purely to satisfy the 7-arg heuristic
+// session scope, the revocation watch) — bundling them into a struct purely to satisfy the 7-arg heuristic
 // would add indirection without clarifying anything.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "server")]
@@ -1617,7 +2020,10 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     subs: Arc<FSubs>,
     route_entry: RouteEntry<Model, Msg>,
     store: Arc<dyn store::SessionStore<Model, Msg>>,
-    sid: String,
+    scope: pubsub::SessionScope,
+    // Subscribed by the page handler before the session's first credential was
+    // admitted, so no revocation between that admission and this start is missed.
+    mut revocation: RevocationWatch,
     // Admission-control slot: decrements WebState::session_count on driver exit.
     _slot: SessionSlot,
 ) where
@@ -1632,6 +2038,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
 {
+    let sid = scope.sid().to_owned();
     // One keyed subscription runtime per session: a re-evaluation keeps a
     // still-requested `Sub.every` timer and its phase.
     let mut sub_runtime = SubRuntime::new(msg_tx.clone());
@@ -1665,7 +2072,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // Register initial subscriptions at session creation, before the first
     // event. Without this a watch-only session never subscribes until it
     // dispatches its own Msg, so a pub/sub broadcast (or a Sub.every ticker)
-    // would never reach a freshly loaded session. Wrapped in the session-sid
+    // would never reach a freshly loaded session. Wrapped in the session
     // scope so SkipOrigin filtering binds the right owner.
     {
         // Upgrade transiently; if the session is already gone there is nothing to drive.
@@ -1679,10 +2086,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                 .model
                 .clone()
         };
-        pubsub::with_session_sid(sid.clone(), || {
+        pubsub::with_session(&scope, || {
             sub_runtime.reconcile(subs(model0));
         });
     }
+    revocation.rearm(&scope);
     // Periodic liveness check: the driver holds only a Weak ref, but it also holds
     // its own `msg_tx` clone, so `recv()` alone never returns None. The tick
     // upgrades the Weak — once the store has evicted the session AND no SSE
@@ -1701,16 +2109,44 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                 let Some(request) = maybe else {
                     break;
                 };
+                // Re-prove the credentials before the entry runs; a refused
+                // entry's request is dropped, so its requester answers 503.
+                if recheck_scope(&scope, None) == Standing::Revoked {
+                    close_session(&store, &sid, entry.upgrade().as_ref()).await;
+                    break;
+                }
                 let (next, cmd) =
-                    match commit_entry(&entry, request, &route_entry, &*view, &store, &sid).await {
+                    match commit_entry(&entry, request, &route_entry, &*view, &store, &scope).await {
                         EntryCommit::Entered(next, cmd) => (next, cmd),
                         EntryCommit::AlreadyEntered => continue,
                         EntryCommit::SessionGone => break,
                     };
-                pubsub::with_session_sid(sid.clone(), || run_cmd(cmd, &msg_tx, &sid));
-                pubsub::with_session_sid(sid.clone(), || {
+                pubsub::with_session(&scope, || {
+                    run_cmd(cmd, &msg_tx, &scope);
                     sub_runtime.reconcile(subs(next));
                 });
+                revocation.rearm(&scope);
+                continue;
+            }
+            wake = revocation.wait() => {
+                #[cfg(test)]
+                if wake == Wake::Revocation
+                    && let Some(strong) = entry.upgrade()
+                {
+                    let rechecks = Arc::clone(
+                        &strong
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .liveness
+                            .rechecks,
+                    );
+                    rechecks.fetch_add(1, Ordering::Relaxed);
+                }
+                if standing_after(&scope, wake) == Standing::Revoked {
+                    close_session(&store, &sid, entry.upgrade().as_ref()).await;
+                    break;
+                }
+                revocation.rearm(&scope);
                 continue;
             }
             _ = liveness.tick() => {
@@ -1726,6 +2162,12 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         let Some(strong) = entry.upgrade() else {
             break;
         };
+        // Re-prove the credentials before the Msg runs: a revoked session
+        // applies no further action.
+        if recheck_scope(&scope, None) == Standing::Revoked {
+            close_session(&store, &sid, Some(&strong)).await;
+            break;
+        }
         // Clone the model under a short lock, release before update.
         let model = {
             strong
@@ -1742,13 +2184,13 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         #[cfg(feature = "debugger")]
         let msg_for_history = msg.clone();
         let msg_started = std::time::Instant::now();
-        // Run `update` inside the session-sid scope: a `Task` it returns (e.g.
+        // Run `update` inside the session scope: a `Task` it returns (e.g.
         // `Geo.current`, `Clipboard.read`) captures the owning session's sid at
         // construction time via `scope_sid()`, so its outbound `Ipe.Ffi.Js` port
         // frame addresses THIS session's SSE sink. Without the scope the sid is
         // unset and a port-using Task's outbound frame reaches no sink — the
         // request never leaves the server and the awaited reply never arrives.
-        let (next, cmd) = pubsub::with_session_sid(sid.clone(), || update(msg, model));
+        let (next, cmd) = pubsub::with_session(&scope, || update(msg, model));
         crate::telemetry::metric_observe(
             "ipe_web_msg_seconds",
             &[("name", &msg_name)],
@@ -1758,7 +2200,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // run_cmd later. Part of the `noop` signal below.
         let cmd_is_none = matches!(cmd, IpeCmd::None);
 
-        let mut tree = view(next.clone());
+        let mut tree = pubsub::with_session(&scope, || view(next.clone()));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
 
@@ -1780,8 +2222,10 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                     e.model = next.clone();
                     e.seq += 1;
                     #[cfg(feature = "debugger")]
-                    e.history
-                        .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
+                    pubsub::with_session(&scope, || {
+                        e.history
+                            .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
+                    });
                     Some((patches, step, e.seq, e.sse_tx.clone(), noop))
                 }
                 Err(EpochExhausted) => None,
@@ -1817,10 +2261,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // before the next select! park — never held across the await loop.
         store.set(&sid, strong.clone()).await;
 
-        pubsub::with_session_sid(sid.clone(), || run_cmd(cmd, &msg_tx, &sid));
-        pubsub::with_session_sid(sid.clone(), || {
+        pubsub::with_session(&scope, || {
+            run_cmd(cmd, &msg_tx, &scope);
             sub_runtime.reconcile(subs(next.clone()));
         });
+        revocation.rearm(&scope);
     }
     drop(sub_runtime);
 }
@@ -2487,14 +2932,16 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         // A hot-swap NEVER runs `update`, so the Model is carried through
         // unchanged — this feeds the render its current input, it does not
         // advance the app's state.
-        let model = {
-            handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .model
-                .clone()
+        let (model, scope) = {
+            let e = handle.lock().unwrap_or_else(|e| e.into_inner());
+            (e.model.clone(), e.liveness.scope.clone())
         };
-        let mut tree = view(model);
+        // A session whose credentials no longer stand renders nothing more.
+        if recheck_scope(&scope, None) == Standing::Revoked {
+            close_session(store, scope.sid(), Some(&handle)).await;
+            continue;
+        }
+        let mut tree = pubsub::with_session(&scope, || view(model));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
 
@@ -3601,6 +4048,13 @@ mod handlers {
         // publish the session and then joins it live. A refused claim is the
         // 503 a busy session or a full process already answers with.
         let cookie_key = cookie_sid.as_deref().and_then(store::SessionKey::parse);
+        // Subscribed before any credential this request admits (in `init`,
+        // the route entry or the first view), so a revocation landing between
+        // that admission and the driver's start still wakes the driver.
+        let revocation = RevocationWatch::subscribe();
+        // The scope a claimed rejoin's lazy `init` ran in: the credentials it
+        // admitted stay bound to the session the claim publishes.
+        let mut claim_scope = None;
         let hit = match cookie_key {
             Some(key) if !reset_state_from_env() => 'rejoin: {
                 // A live session never contends for the claim table: the
@@ -3618,17 +4072,31 @@ mod handlers {
                     Err(store::ClaimRefusal::Saturated) => return at_capacity(),
                 };
                 let sid = claim.key().as_str().to_owned();
+                let scope = pubsub::SessionScope::new(sid.clone());
                 let make_init = || {
-                    pubsub::with_session_sid(sid.clone(), || {
+                    pubsub::with_session(&scope, || {
                         let params = (st.param_resolver)(&path);
                         let req = req::web_req(&method, &uri, &headers, params);
                         (st.init)(req)
                     })
                 };
                 let rejoin = st.store.get_reconstructing(claim, &make_init).await;
+                claim_scope = Some(scope);
                 Some((sid, rejoin))
             }
             Some(_) | None => None,
+        };
+        // A live session joins only while its credentials re-prove; one whose
+        // credentials no longer stand is closed here and this GET takes the
+        // miss path, minting a fresh sid.
+        let hit = match hit {
+            Some((sid, store::Rejoin::Live(handle))) => {
+                Some(match admit_live(&st.store, &sid, handle).await {
+                    Some(live) => (live.sid, store::Rejoin::Live(live.handle)),
+                    None => (sid, store::Rejoin::Miss),
+                })
+            }
+            other => other,
         };
 
         //
@@ -3650,7 +4118,7 @@ mod handlers {
             return (StatusCode::NOT_FOUND, "404 page not found").into_response();
         }
 
-        let (owner, slot, model, cmd0) = match hit {
+        let (owner, scope, slot, model, cmd0) = match hit {
             Some((sid, store::Rejoin::Live(handle))) => {
                 // sid is carried from the cookie lookup; the "hit but no sid"
                 // state is unrepresentable. The live driver enters the path,
@@ -3696,14 +4164,11 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(
-                    &st.route_entry,
-                    claim.key().as_str(),
-                    model,
-                    IpeCmd::None,
-                    &path,
-                );
-                (SessionOwner::Rejoined(claim), slot, m, c)
+                let scope = claim_scope
+                    .take()
+                    .unwrap_or_else(|| pubsub::SessionScope::new(claim.key().as_str().to_owned()));
+                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, &path);
+                (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((
                 _,
@@ -3719,14 +4184,11 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(
-                    &st.route_entry,
-                    claim.key().as_str(),
-                    model,
-                    init_cmd,
-                    &path,
-                );
-                (SessionOwner::Rejoined(claim), slot, m, c)
+                let scope = claim_scope
+                    .take()
+                    .unwrap_or_else(|| pubsub::SessionScope::new(claim.key().as_str().to_owned()));
+                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, &path);
+                (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((_, store::Rejoin::Miss)) | None => {
                 // Admission control (cookieless = brand-new session = the
@@ -3758,15 +4220,21 @@ mod handlers {
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
                 // Minted first so `init` and the entry run under it.
-                let s = new_sid();
-                let (m, init_cmd) = pubsub::with_session_sid(s.clone(), || (st.init)(req));
-                let (m, c) = enter_session(&st.route_entry, &s, m, init_cmd, &path);
-                (SessionOwner::Minted(s), slot, m, c)
+                let scope = pubsub::SessionScope::new(new_sid());
+                let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
+                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, &path);
+                (
+                    SessionOwner::Minted(scope.sid().to_owned()),
+                    scope,
+                    slot,
+                    m,
+                    c,
+                )
             }
         };
         let sid = owner.sid().to_owned();
 
-        let mut tree = (st.view)(model.clone());
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model.clone()));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let body = render_html(&tree);
@@ -3795,6 +4263,7 @@ mod handlers {
             history: history_init,
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: SessionLiveness::new(scope.clone()),
         }));
 
         // Publishing the session is one task the request cannot cancel: the
@@ -3822,11 +4291,12 @@ mod handlers {
                 subs,
                 route_entry,
                 store.clone(),
-                sid.to_owned(),
+                scope.clone(),
+                revocation,
                 slot,
             ));
             // Fire the entry Cmd into the loop (batched after init's on a miss).
-            pubsub::with_session_sid(sid.to_owned(), || run_cmd(cmd0, &msg_tx, sid));
+            pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope));
             drop(owner);
         });
         if let Err(failed) = commit.await {
@@ -3882,24 +4352,15 @@ mod handlers {
             Ok(route) => route.flatten(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let sid = sid_from_cookie(&headers);
-        let entry = match &sid {
-            Some(s) => st.store.get(s).await,
-            None => None,
-        };
-        let entry = match entry {
-            Some(e) => e,
-            // X-Ipê-Web: 1 lets the client distinguish a genuine session-lost
-            // 404 (reload to recover) from a wedged proxy (client.js probes for
-            // exactly this header — l1481/l1530).
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
+        // X-Ipê-Web: 1 on the session-lost 404 lets the client distinguish a
+        // genuine lost session (reload to recover) from a wedged proxy.
+        let LiveSession {
+            sid,
+            handle: entry,
+            scope: _,
+        } = match live_session(&st.store, &headers).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
 
         // Reconnect reconciliation: the client sends
@@ -3924,9 +4385,13 @@ mod handlers {
         let Ok((tx, rx)) = sse::channel() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
-        {
-            entry.lock().unwrap_or_else(|e| e.into_inner()).sse_tx = Some(tx.clone());
-        }
+        // Attached and subscribed under one lock: a close that lands after
+        // the lookup has already set the closer, so the stream ends at once.
+        let closer = {
+            let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+            e.sse_tx = Some(tx.clone());
+            e.liveness.closer.subscribe()
+        };
 
         // Bind this session's `Ipe.Ffi.Js` outbound port sink to THIS SSE
         // connection: every `js_send` whose origin is this sid is forwarded to
@@ -3939,7 +4404,7 @@ mod handlers {
         // drops the one frame rather than blocking the dispatch loop, the same
         // fire-and-forget contract the port carries client-side.
         #[cfg(all(feature = "json", feature = "tokio"))]
-        if let Some(port_sid) = sid.as_deref().and_then(crate::js_port::SessionId::parse) {
+        if let Some(port_sid) = crate::js_port::SessionId::parse(&sid) {
             let port_tx = tx.clone();
             crate::js_port::register_out_sink_for(
                 &port_sid,
@@ -3961,12 +4426,11 @@ mod handlers {
         let _ = tx
             .send(SsePatch(format!(": {}\n\n", " ".repeat(2048))))
             .await;
-        // Hello payload: `{"v":1,"sid":...,"ts":<ms>}`.
-        // Reaching here means `entry` exists ⇒ the cookie sid was a live session,
-        // so `sid` is Some; the impossible None degrades to an empty sid (the
-        // client already holds its sid via window.__IPE_SID — the body is
-        // confirmatory). The sid is hex (new_sid) ⇒ JSON-safe without escaping.
-        let hello_sid = sid.as_deref().unwrap_or("");
+        // Hello payload: `{"v":1,"sid":...,"ts":<ms>}`. The sid is the live
+        // session's (the client already holds it via window.__IPE_SID — the
+        // body is confirmatory). A live session is stored only under a minted
+        // or `SessionKey`-parsed hex sid ⇒ JSON-safe without escaping.
+        let hello_sid = sid.as_str();
         let hello_ts = chrono::Utc::now().timestamp_millis();
         let _ = tx
             .send(SsePatch(sse::frame(
@@ -4040,9 +4504,15 @@ mod handlers {
 
         {
             let tx = tx.clone();
+            let mut closer = closer.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    // A closed session stops its heartbeat: the sender clone
+                    // held here must not outlive the session it keeps alive.
+                    tokio::select! {
+                        () = session_closed(&mut closer) => break,
+                        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    }
                     if tx
                         .send(SsePatch(sse::frame("heartbeat", "{}")))
                         .await
@@ -4073,13 +4543,20 @@ mod handlers {
         // would exit mid-stream. Holding the strong Arc here keeps it (and its
         // driver) alive exactly as long as the client stays connected; on
         // disconnect axum drops the body → this Arc releases.
+        // The closer ends the stream when the session is closed, although
+        // the driver, Cmd tasks and the heartbeat may still hold senders.
         let body_stream = futures_util::stream::unfold(
-            (rx, SessionGauge, entry),
-            |(mut rx, guard, entry)| async move {
-                rx.recv().await.map(|SsePatch(s)| {
+            (rx, SessionGauge, entry, closer),
+            |(mut rx, guard, entry, mut closer)| async move {
+                let frame = tokio::select! {
+                    biased;
+                    () = session_closed(&mut closer) => None,
+                    frame = rx.recv() => frame,
+                };
+                frame.map(|SsePatch(s)| {
                     (
                         Ok::<_, std::io::Error>(axum::body::Bytes::from(s)),
-                        (rx, guard, entry),
+                        (rx, guard, entry, closer),
                     )
                 })
             },
@@ -4121,32 +4598,16 @@ mod handlers {
         // ANY session by naming it (an auth-bypass that, paired with a
         // guessable sid, was a hijack path). A legitimate browser always has
         // the HttpOnly session cookie by the time an event fires (the page
-        // GET set it). No cookie → no session.
+        // GET set it). No cookie → no session. A session whose credentials
+        // no longer stand is closed by the lookup and answers session-lost.
         let _ = &parsed.session_id; // body field retained for wire-compat; not trusted for auth
-        let sid = match sid_from_cookie(&headers) {
-            Some(s) => s,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
-        };
-        let entry = match st.store.get(&sid).await {
-            Some(e) => e,
-            // X-Ipê-Web: 1 lets the client distinguish a genuine session-lost
-            // 404 (reload to recover) from a wedged proxy (client.js probes for
-            // exactly this header — l1481/l1530).
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
+        let LiveSession {
+            handle: entry,
+            scope,
+            ..
+        } = match live_session(&st.store, &headers).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
 
         let hid = if !parsed.handler_id.is_empty() {
@@ -4197,10 +4658,10 @@ mod handlers {
                         .collect()
                 })
                 .unwrap_or_default();
-            e.rendered.resolve_form(&at, &hid, &event, fd)
+            pubsub::with_session(&scope, || e.rendered.resolve_form(&at, &hid, &event, fd))
         } else {
             let args: Vec<String> = parsed.args.iter().map(value_to_string).collect();
-            e.rendered.resolve(&at, &hid, &event, &args)
+            pubsub::with_session(&scope, || e.rendered.resolve(&at, &hid, &event, &args))
         };
         let msg = match resolved {
             Ok(msg) => msg,
@@ -4841,16 +5302,11 @@ mod handlers {
                     .into_response();
             }
         };
-        // The session must exist (a live Web session) for the frame to have a
-        // destination; an unknown sid is the same session-lost 404 the event
-        // path returns.
-        if st.store.get(&sid).await.is_none() {
-            return (
-                StatusCode::NOT_FOUND,
-                [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                SESSION_LOST_BODY,
-            )
-                .into_response();
+        // The session must be live with its credentials standing for the
+        // frame to have a destination; anything else is the same session-lost
+        // 404 the event path returns.
+        if let Err(lost) = live_session_for(&st.store, &sid).await {
+            return lost.into_response();
         }
         // Fail-closed boundary gate: reject an oversized / malformed /
         // over-nested frame BEFORE delivering it. A rejected frame is dropped
@@ -4920,11 +5376,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let requested_n = body
             .get("index")
@@ -4935,7 +5389,9 @@ mod handlers {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
             let total = e.history.len();
             let n = requested_n.min(total.saturating_sub(1));
-            e.history.reconstruct(n, &|m, mdl| (*st.update)(m, mdl))
+            e.history.reconstruct(n, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            })
         };
         let model = match model_at_n {
             Some(m) => m,
@@ -4943,7 +5399,7 @@ mod handlers {
                 return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
             }
         };
-        let mut tree = (st.view)(model);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
@@ -4994,11 +5450,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         // Build a fresh init model from the current request context — the same
         // path the clean-reinit miss takes — so the reset session holds exactly
@@ -5009,7 +5463,7 @@ mod handlers {
         };
         let params = (st.param_resolver)(&path);
         let req = req::web_req(&method, &uri, &headers, params);
-        let (init_model, _cmd) = (st.init)(req);
+        let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
         {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
             e.model = init_model.clone();
@@ -5056,11 +5510,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
-            }
+        let LiveSession { handle, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let json_bytes = {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -5127,11 +5579,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         // Derive the init model the same way reset_handler does: build a
         // WebReq from the current request context so route-aware apps get the
@@ -5142,15 +5592,16 @@ mod handlers {
         };
         let params = (st.param_resolver)(&path);
         let req = req::web_req(&method, &uri, &headers, params);
-        let (init_model, _cmd) = (st.init)(req);
+        let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
 
         // Replay the imported log from the init model. Fail-closed: any
         // malformed, oversized, or type-mismatched blob yields None.
         let update = st.update.clone();
+        let replay_scope = scope.clone();
         let imported = crate::debugger::import_msgs::<Msg, Model, _>(
             &body,
             init_model,
-            move |msg, model| (*update)(msg, model),
+            move |msg, model| pubsub::with_session(&replay_scope, || (*update)(msg, model)),
             crate::debugger::DEFAULT_HISTORY_CAP,
         );
 
@@ -5172,7 +5623,7 @@ mod handlers {
             let update = st.update.clone();
             imported_buf
                 .reconstruct(imported_buf.len() - 1, &move |msg, model| {
-                    (*update)(msg, model)
+                    pubsub::with_session(&scope, || (*update)(msg, model))
                 })
                 .unwrap_or_else(|| imported_buf.base().clone())
         };
@@ -5217,11 +5668,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let requested_n = match body.get("index").and_then(|v| v.as_u64()) {
             Some(n) => n as usize,
@@ -5232,9 +5681,9 @@ mod handlers {
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
             let total = e.history.len();
-            let stepped = e
-                .history
-                .step_to(requested_n, &|m, mdl| (*st.update)(m, mdl));
+            let stepped = e.history.step_to(requested_n, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            });
             match stepped {
                 Some(m) => {
                     e.model = m.clone();
@@ -5247,7 +5696,7 @@ mod handlers {
                 }
             }
         };
-        let mut tree = (st.view)(model_at_n);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
@@ -5297,11 +5746,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -5312,7 +5759,9 @@ mod handlers {
             // Cursor starts at the last retained step when not yet set.
             let current = e.debug_cursor.unwrap_or(len - 1);
             let target = current.saturating_sub(1);
-            match e.history.step_to(target, &|m, mdl| (*st.update)(m, mdl)) {
+            match e.history.step_to(target, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            }) {
                 Some(m) => {
                     e.model = m.clone();
                     e.debug_cursor = Some(target);
@@ -5324,7 +5773,7 @@ mod handlers {
                 }
             }
         };
-        let mut tree = (st.view)(model_at_n);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
@@ -5378,11 +5827,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -5393,7 +5840,9 @@ mod handlers {
             let current = e.debug_cursor.unwrap_or(len - 1);
             // Clamp: cannot go past the last retained step.
             let target = (current + 1).min(len - 1);
-            match e.history.step_to(target, &|m, mdl| (*st.update)(m, mdl)) {
+            match e.history.step_to(target, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            }) {
                 Some(m) => {
                     e.model = m.clone();
                     e.debug_cursor = Some(target);
@@ -5405,7 +5854,7 @@ mod handlers {
                 }
             }
         };
-        let mut tree = (st.view)(model_at_n);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
@@ -5461,11 +5910,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(h) => h,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
-            }
+        let LiveSession { handle, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let rendered = {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -5696,8 +6143,9 @@ where
     let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
     #[cfg(feature = "jwt")]
     crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
-    // The `Web` request path has no revocation gate: a requested one refuses
-    // the router rather than serving revoked sessions as live.
+    // A requested revocation gate still refuses the router: a session restored
+    // from a persistent store comes back without the credentials it bound, so
+    // its live requests would run unchecked against them.
     crate::app_config::refuse_unenforced_web_revocation().map_err(StartupRefusal::Auth)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
@@ -6100,7 +6548,22 @@ where
         .with_state(state);
 
     pubsub::mark_web_running();
+    WEB_SERVING.store(true, std::sync::atomic::Ordering::Release);
     Ok(app)
+}
+
+/// Set once a `Web` router passed its startup checks in this process; never cleared.
+#[cfg(feature = "server")]
+static WEB_SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `Web` app serves in this process.
+///
+/// While it does, an armed `Auth.verifyToken` that no session or request owns
+/// is refused: the credential would bind to nothing a revocation could close.
+#[cfg(feature = "server")]
+#[must_use]
+pub fn web_serving() -> bool {
+    WEB_SERVING.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Read the session cookie from request headers. Uses the base-path-aware
@@ -6140,6 +6603,7 @@ mod reload_push_tests {
             history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -6248,6 +6712,7 @@ mod hot_appearance_push_tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -7497,6 +7962,7 @@ mod sse_reconnect_reconcile_tests {
             history: crate::debugger::RecordBuffer::new(page, crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }));
         Fixture {
             entry,
@@ -7517,7 +7983,7 @@ mod sse_reconnect_reconcile_tests {
             &fx.route_entry,
             &*fx.view,
             &fx.store,
-            "sid-test",
+            &pubsub::SessionScope::new("sid-test".to_owned()),
         )
         .await;
         assert!(
@@ -8236,6 +8702,7 @@ mod watch_status_handler_tests {
             history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -10488,8 +10955,9 @@ mod emitted_router_behavior_tests {
         .err()
     }
 
-    /// The `Web` request path has no revocation gate, so a request for one
-    /// refuses the router instead of serving revoked sessions as live.
+    /// A session restored from a persisted row comes back without its bound
+    /// credentials, so a requested gate refuses the router instead of
+    /// serving a restored session unchecked.
     #[tokio::test]
     async fn web_revocation_store_refuses_startup() {
         for armed in ["store", "STORE", "1"] {
@@ -12727,6 +13195,7 @@ mod route_entry_cmd_tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }));
         store.set(&sid, entry).await;
         (sid, enter_rx)
@@ -12923,5 +13392,893 @@ mod tab_seq_window_tests {
             seqs.record(TabId(u128::try_from(k).unwrap_or(u128::MAX)), 1);
         }
         assert!(!seqs.is_duplicate(TAB, 1), "the oldest tab was evicted");
+    }
+}
+
+#[cfg(all(test, feature = "web", feature = "jwt"))]
+mod web_revocation_tests {
+    //! A revoked or expired credential ends the `Web` session it is bound to.
+    //!
+    //! Every test arms the process through the `Server` floor
+    //! ([`crate::revocation::arm_process`]): the startup refusal still refuses
+    //! the installed and environment arming, and the floor is the arming a
+    //! `Web` app mounted under an armed `Server` route runs with.
+
+    use super::*;
+    use crate::web::req::WebReq;
+    use crate::web::store::{MemoryStore, SessionStore};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::response::Response;
+    use serde::{Deserialize, Serialize};
+    use std::time::Duration;
+    use tower::ServiceExt; // oneshot
+
+    const SECRET: &str = "a-web-revocation-test-secret-of-32-bytes";
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct Model {
+        sub: String,
+        authed: bool,
+        n: i64,
+        revoked: bool,
+        view_token: String,
+        task_token: String,
+        task_ok: Option<bool>,
+    }
+
+    impl crate::stringify::IpeStringify for Model {
+        fn ipe_show(&self) -> String {
+            format!("{self:?}")
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    enum Msg {
+        RevokeSelf,
+        Bump,
+        RunTask,
+        TaskDone(bool),
+    }
+
+    impl crate::stringify::IpeStringify for Msg {
+        fn ipe_show(&self) -> String {
+            format!("{self:?}")
+        }
+    }
+
+    /// Whether `Auth.verifyToken` admits `token` where it is called.
+    fn verifies(token: &str) -> bool {
+        matches!(
+            crate::auth::auth_verify_token::<String>(SECRET.to_owned(), token.to_owned()),
+            crate::IpeResult::Ok(_)
+        )
+    }
+
+    fn init(req: WebReq) -> (Model, IpeCmd<Msg>) {
+        let cookie = |name: &str| req.cookies.get(name).cloned().unwrap_or_default();
+        let token = cookie("tok");
+        let model = Model {
+            sub: cookie("sub"),
+            authed: !token.is_empty() && verifies(&token),
+            n: 0,
+            revoked: false,
+            view_token: cookie("vtok"),
+            task_token: cookie("ttok"),
+            task_ok: None,
+        };
+        (model, IpeCmd::None)
+    }
+
+    fn update(msg: Msg, model: Model) -> (Model, IpeCmd<Msg>) {
+        match msg {
+            Msg::RevokeSelf => {
+                let revoked = crate::revocation::revoke_subject(model.sub.clone()).is_ok();
+                let n = model.n + 1;
+                (
+                    Model {
+                        n,
+                        revoked,
+                        ..model
+                    },
+                    IpeCmd::None,
+                )
+            }
+            Msg::Bump => {
+                let n = model.n + 1;
+                (Model { n, ..model }, IpeCmd::None)
+            }
+            Msg::RunTask => {
+                let token = model.task_token.clone();
+                let task: IpeCmd<Msg> = IpeCmd::Perform(Box::new(move || {
+                    Box::pin(async move { Msg::TaskDone(verifies(&token)) })
+                }));
+                (model, task)
+            }
+            Msg::TaskDone(ok) => (
+                Model {
+                    task_ok: Some(ok),
+                    ..model
+                },
+                IpeCmd::None,
+            ),
+        }
+    }
+
+    fn view(model: Model) -> Html<Msg> {
+        let verdict = if model.view_token.is_empty() {
+            "view-none"
+        } else if verifies(&model.view_token) {
+            "view-authed"
+        } else {
+            "view-refused"
+        };
+        Html::HElement(
+            "div".to_owned(),
+            vec![],
+            vec![Html::HText(format!(
+                "authed={} n={} {verdict}",
+                model.authed, model.n
+            ))],
+        )
+    }
+
+    fn subs(_model: Model) -> IpeSub<Msg> {
+        IpeSub::None
+    }
+
+    type Store = MemoryStore<Model, Msg>;
+
+    fn param_resolver(_path: &crate::web::route::DecodedPath) -> crate::dict::IpeDict<String> {
+        crate::dict::dict_empty()
+    }
+
+    fn route_matched(p: &crate::web::route::DecodedPath) -> crate::web::RouteLookup {
+        crate::web::RouteLookup::single_page(p)
+    }
+
+    /// The production router over `store`.
+    #[allow(clippy::expect_used)] // test helper: the Server floor arming never trips the startup refusal
+    fn make_router(store: &Arc<Store>) -> axum::Router {
+        let state: WebState<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        > = WebState {
+            store: Arc::clone(store) as Arc<dyn store::SessionStore<Model, Msg>>,
+            init: Arc::new(init),
+            update: Arc::new(update),
+            view: Arc::new(view),
+            subs: Arc::new(subs),
+            route_entry: Arc::new(|model, _path| route::Entered {
+                model,
+                cmd: IpeCmd::None,
+            }),
+            param_resolver: Arc::new(param_resolver),
+            route_matched: Arc::new(route_matched),
+            session_count: Arc::new(AtomicUsize::new(0)),
+            watch_build_status: Arc::new(Mutex::new(None)),
+        };
+        build_web_router(state, false).expect("a router armed through the Server floor builds")
+    }
+
+    /// Arm the process through the `Server` floor, then run `body` on a
+    /// current-thread runtime, its clock paused when `paused`, with CSRF off.
+    #[allow(clippy::expect_used)] // test helper: runtime build failure is a test environment issue
+    fn run<F: std::future::Future<Output = ()>>(paused: bool, body: impl FnOnce() -> F) {
+        let _g = crate::web::literal_table::overlay_test_lock();
+        crate::system::locked_set_var("IPE_CSRF", "off");
+        crate::revocation::arm_process();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(paused)
+            .build()
+            .expect("current-thread runtime")
+            .block_on(body());
+        crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// An `HS256` token for `sub`, live for an hour, capped `cap_in` seconds from now.
+    #[allow(clippy::expect_used)] // test helper: encoding a fixed claim set cannot fail
+    fn token(sub: &str, jti: Option<&str>, cap_in: i64) -> String {
+        let now = crate::jwt::now_unix_seconds();
+        let mut claims = serde_json::json!({
+            "sub": sub,
+            "iat": now,
+            "exp": now + 3600,
+            "cap": now + cap_in,
+        });
+        if let (Some(jti), Some(map)) = (jti, claims.as_object_mut()) {
+            map.insert("jti".to_owned(), serde_json::Value::from(jti));
+        }
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let key = jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes());
+        jsonwebtoken::encode(&header, &claims, &key).expect("encode a test token")
+    }
+
+    /// The session cookie pair for `sid`.
+    fn sid_cookie(sid: &str) -> String {
+        format!("{}={sid}", cookie_name_for(""))
+    }
+
+    /// Send one request through `router`.
+    #[allow(clippy::expect_used)] // test helper: a fixed request always builds and the router always answers
+    async fn send(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        cookies: &str,
+        body: &str,
+    ) -> Response {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::COOKIE, cookies)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("build a request");
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers")
+    }
+
+    /// The session sid a response sets, or empty when it sets none.
+    fn minted_sid(resp: &Response) -> String {
+        let prefix = format!("{}=", cookie_name_for(""));
+        resp.headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| value.strip_prefix(prefix.as_str()))
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    /// The whole body of `resp`, lossily decoded.
+    async fn text(resp: Response) -> String {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .map(|bytes| String::from_utf8_lossy(bytes.as_ref()).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Whether `resp` is the session-lost answer the client reloads on.
+    async fn is_session_lost(resp: Response) -> bool {
+        let shape = resp.status() == StatusCode::NOT_FOUND
+            && resp
+                .headers()
+                .get("x-ipe-web")
+                .is_some_and(|value| value == "1");
+        shape && text(resp).await.contains(SESSION_LOST_BODY)
+    }
+
+    /// A session opened by a page load.
+    struct Opened {
+        sid: String,
+        /// The credential cookies the page load carried, without the sid.
+        cookies: String,
+        body: String,
+    }
+
+    /// Load the page with a token for `sub` capped `cap_in` seconds from now,
+    /// plus the cookies in `extra`.
+    async fn open_session(router: &axum::Router, sub: &str, cap_in: i64, extra: &str) -> Opened {
+        let jti = format!("{sub}-jti");
+        let cookies = format!("sub={sub}; tok={}{extra}", token(sub, Some(&jti), cap_in));
+        let resp = send(router, "GET", "/", &cookies, "").await;
+        let sid = minted_sid(&resp);
+        let body = text(resp).await;
+        Opened { sid, cookies, body }
+    }
+
+    /// The live entry of `sid` in `store`.
+    async fn entry_of(store: &Arc<Store>, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+        store.get(sid).await
+    }
+
+    /// Whether the session `handle` closes within `within`.
+    async fn closes_within(handle: &store::SessionHandle<Model, Msg>, within: Duration) -> bool {
+        let mut closer = handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .liveness
+            .closer
+            .subscribe();
+        tokio::time::timeout(within, closer.wait_for(|closed| *closed))
+            .await
+            .is_ok_and(|seen| seen.is_ok())
+    }
+
+    /// An event for a session whose subject is revoked gets the session-lost answer.
+    #[test]
+    fn event_after_revoke_is_session_lost() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w1-subject", 7200, "").await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            let before = send(
+                &router,
+                "POST",
+                "/_ipe/event",
+                &sid_cookie(&opened.sid),
+                "{}",
+            )
+            .await;
+            assert_ne!(
+                before.status(),
+                StatusCode::NOT_FOUND,
+                "a live session is found"
+            );
+            assert!(crate::revocation::revoke_subject("w1-subject".to_owned()).is_ok());
+            let after = send(
+                &router,
+                "POST",
+                "/_ipe/event",
+                &sid_cookie(&opened.sid),
+                "{}",
+            )
+            .await;
+            assert!(is_session_lost(after).await, "a revoked session is lost");
+        });
+    }
+
+    /// A Msg queued behind the one that revokes the session is never applied.
+    #[test]
+    fn queued_msg_after_revoke_is_not_applied() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w2-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let msg_tx = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .msg_tx
+                .clone();
+            assert!(msg_tx.try_send(Msg::RevokeSelf).is_ok());
+            assert!(msg_tx.try_send(Msg::Bump).is_ok());
+            assert!(closes_within(&handle, Duration::from_secs(5)).await);
+            let model = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model
+                .clone();
+            assert!(model.revoked, "the first Msg revoked the subject");
+            assert_eq!(model.n, 1, "the Msg behind the revocation was not applied");
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// An idle SSE stream ends once its session's subject is revoked, with no
+    /// request arriving to notice.
+    #[test]
+    fn idle_sse_stream_ends_after_revoke() {
+        run(true, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w3-subject", 7200, "").await;
+            let stream = send(&router, "GET", "/_ipe/sse", &sid_cookie(&opened.sid), "").await;
+            assert_eq!(stream.status(), StatusCode::OK);
+            assert!(crate::revocation::revoke_subject("w3-subject".to_owned()).is_ok());
+            let ended = tokio::time::timeout(
+                RECHECK_COALESCE * 2,
+                axum::body::to_bytes(stream.into_body(), usize::MAX),
+            )
+            .await;
+            assert!(ended.is_ok(), "the stream of a revoked session ends");
+        });
+    }
+
+    /// A session ends when its bound credential's deadline passes, with no
+    /// revocation and no request.
+    #[test]
+    fn session_ends_at_credential_deadline() {
+        run(true, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w4-subject", 2, "").await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            assert!(closes_within(&handle, Duration::from_secs(10)).await);
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// The SSE and port routes answer a revoked session with session-lost.
+    #[test]
+    fn sse_and_port_after_revoke_are_session_lost() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let sse = open_session(&router, "w5-sse-subject", 7200, "").await;
+            assert!(crate::revocation::revoke_subject("w5-sse-subject".to_owned()).is_ok());
+            let resp = send(&router, "GET", "/_ipe/sse", &sid_cookie(&sse.sid), "").await;
+            assert!(
+                is_session_lost(resp).await,
+                "SSE of a revoked session is lost"
+            );
+
+            let port = open_session(&router, "w5-port-subject", 7200, "").await;
+            let before = send(&router, "POST", "/_ipe/port", &sid_cookie(&port.sid), "{}").await;
+            assert_ne!(
+                before.status(),
+                StatusCode::NOT_FOUND,
+                "a live session is found"
+            );
+            assert!(crate::revocation::revoke_subject("w5-port-subject".to_owned()).is_ok());
+            let after = send(&router, "POST", "/_ipe/port", &sid_cookie(&port.sid), "{}").await;
+            assert!(
+                is_session_lost(after).await,
+                "a port frame of a revoked session is lost"
+            );
+        });
+    }
+
+    /// The debugger routes answer a revoked session with session-lost.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn debugger_routes_after_revoke_are_session_lost() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let inspect = open_session(&router, "w5-inspect-subject", 7200, "").await;
+            let cookie = sid_cookie(&inspect.sid);
+            let before = send(&router, "GET", "/_ipe/debug/inspect", &cookie, "").await;
+            assert_eq!(before.status(), StatusCode::OK);
+            assert!(crate::revocation::revoke_subject("w5-inspect-subject".to_owned()).is_ok());
+            let after = send(&router, "GET", "/_ipe/debug/inspect", &cookie, "").await;
+            assert!(
+                is_session_lost(after).await,
+                "inspect of a revoked session is lost"
+            );
+
+            let export = open_session(&router, "w5-export-subject", 7200, "").await;
+            assert!(crate::revocation::revoke_subject("w5-export-subject".to_owned()).is_ok());
+            let resp = send(
+                &router,
+                "GET",
+                "/_ipe/debug/export",
+                &sid_cookie(&export.sid),
+                "",
+            )
+            .await;
+            assert!(
+                is_session_lost(resp).await,
+                "export of a revoked session is lost"
+            );
+        });
+    }
+
+    /// A page load naming a revoked session never rejoins it: it mints a fresh
+    /// sid, re-runs `init`, and the old session is gone.
+    #[test]
+    fn page_live_after_revoke_reinits_with_new_sid() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w6-subject", 7200, "").await;
+            assert!(!opened.sid.is_empty());
+            assert!(crate::revocation::revoke_subject("w6-subject".to_owned()).is_ok());
+            let cookies = format!("{}; {}", sid_cookie(&opened.sid), opened.cookies);
+            let resp = send(&router, "GET", "/", &cookies, "").await;
+            let fresh = minted_sid(&resp);
+            let body = text(resp).await;
+            assert!(!fresh.is_empty(), "a fresh session is minted");
+            assert_ne!(fresh, opened.sid, "the revoked sid is never rejoined");
+            assert!(
+                body.contains("authed=false"),
+                "init re-ran and refused: {body}"
+            );
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// `s` with every comment and string or char literal blanked, newlines kept.
+    fn code_only(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(chars.len());
+        let mut i = 0;
+        while let Some(&c) = chars.get(i) {
+            if let Some(end) = literal_end(&chars, i) {
+                let span = chars.get(i..end).unwrap_or_default();
+                out.extend(span.iter().map(|&x| if x == '\n' { '\n' } else { ' ' }));
+                i = end;
+            } else {
+                out.push(if c.is_ascii() { c } else { ' ' });
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The end of the comment or literal starting at `i`, if one starts there.
+    fn literal_end(chars: &[char], i: usize) -> Option<usize> {
+        let at = |k: usize| chars.get(k).copied();
+        let len = chars.len();
+        let after_ident = i
+            .checked_sub(1)
+            .and_then(at)
+            .is_some_and(|p| p.is_alphanumeric() || p == '_');
+        match (at(i)?, at(i + 1)) {
+            ('/', Some('/')) => Some((i..len).find(|&k| at(k) == Some('\n')).unwrap_or(len)),
+            ('/', Some('*')) => {
+                let mut depth = 0_usize;
+                let mut k = i;
+                while k < len {
+                    match (at(k), at(k + 1)) {
+                        (Some('/'), Some('*')) => {
+                            depth += 1;
+                            k += 2;
+                        }
+                        (Some('*'), Some('/')) => {
+                            depth = depth.saturating_sub(1);
+                            k += 2;
+                            if depth == 0 {
+                                return Some(k);
+                            }
+                        }
+                        _ => k += 1,
+                    }
+                }
+                Some(len)
+            }
+            ('"', _) => {
+                let mut k = i + 1;
+                loop {
+                    match at(k) {
+                        None => return Some(len),
+                        Some('\\') => k += 2,
+                        Some('"') => return Some(k + 1),
+                        Some(_) => k += 1,
+                    }
+                }
+            }
+            ('r', Some('"' | '#')) if !after_ident => {
+                let hashes = (i + 1..len).take_while(|&k| at(k) == Some('#')).count();
+                let open = i + 1 + hashes;
+                if at(open) != Some('"') {
+                    return None;
+                }
+                let close = (open + 1..len)
+                    .find(|&k| at(k) == Some('"') && (1..=hashes).all(|h| at(k + h) == Some('#')));
+                Some(close.map_or(len, |k| k + 1 + hashes))
+            }
+            ('\'', Some('\\')) => (i + 3..len).find(|&k| at(k) == Some('\'')).map(|k| k + 1),
+            ('\'', Some(_)) if at(i + 2) == Some('\'') => Some(i + 3),
+            _ => None,
+        }
+    }
+
+    /// `code` with every test-only module, function and impl blanked.
+    fn production_only(code: &str) -> String {
+        let mut out = code.to_owned();
+        let mut from = 0;
+        while let Some(at) = code
+            .get(from..)
+            .and_then(|rest| rest.find("#[cfg("))
+            .map(|o| from + o)
+        {
+            from = at + 1;
+            let Some(close) = code
+                .get(at..)
+                .and_then(|rest| rest.find(")]"))
+                .map(|o| at + o)
+            else {
+                break;
+            };
+            let predicate = code.get(at + 6..close).unwrap_or_default();
+            if predicate != "test" && !predicate.starts_with("all(test") {
+                continue;
+            }
+            let mut item = close + 2;
+            loop {
+                let rest = code.get(item..).unwrap_or_default();
+                let trimmed = rest.trim_start();
+                item += rest.len() - trimmed.len();
+                if !trimmed.starts_with("#[") {
+                    break;
+                }
+                item += trimmed.find(']').map_or(trimmed.len(), |o| o + 1);
+            }
+            let head = code.get(item..).unwrap_or_default();
+            let head = ["pub(crate) ", "pub(super) ", "pub ", "async "]
+                .iter()
+                .fold(head, |h, prefix| h.strip_prefix(prefix).unwrap_or(h));
+            if !["mod ", "fn ", "impl"]
+                .iter()
+                .any(|kw| head.starts_with(kw))
+            {
+                continue;
+            }
+            let Some(open) = code
+                .get(item..)
+                .and_then(|rest| rest.find('{'))
+                .map(|o| item + o)
+            else {
+                break;
+            };
+            let end = matching_brace(code, open);
+            let blanked: String = code
+                .get(at..end)
+                .unwrap_or_default()
+                .chars()
+                .map(|c| if c == '\n' { '\n' } else { ' ' })
+                .collect();
+            out.replace_range(at..end, &blanked);
+            from = end;
+        }
+        out
+    }
+
+    /// The index just past the brace closing the one at `open`.
+    fn matching_brace(code: &str, open: usize) -> usize {
+        let mut depth = 0_usize;
+        for (k, b) in code.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return k + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        code.len()
+    }
+
+    /// Every named function in `code` with the span of its body.
+    fn fn_bodies(code: &str) -> Vec<(String, std::ops::Range<usize>)> {
+        let bytes = code.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut bodies = Vec::new();
+        let mut stack: Vec<Option<(String, usize)>> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut nest = 0_i64;
+        let mut i = 0;
+        while let Some(&b) = bytes.get(i) {
+            let word_start = i
+                .checked_sub(1)
+                .and_then(|p| bytes.get(p))
+                .is_none_or(|p| !ident(*p));
+            if word_start && code.get(i..).is_some_and(|rest| rest.starts_with("fn ")) {
+                let name: String = code
+                    .get(i + 3..)
+                    .unwrap_or_default()
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    pending = Some(name);
+                    nest = 0;
+                }
+                i += 3;
+                continue;
+            }
+            match b {
+                b'(' | b'[' => nest += 1,
+                b')' | b']' => nest -= 1,
+                b';' if nest == 0 => pending = None,
+                b'{' => stack.push(pending.take().map(|name| (name, i))),
+                b'}' => {
+                    if let Some(Some((name, start))) = stack.pop() {
+                        bodies.push((name, start..i + 1));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        bodies
+    }
+
+    /// The innermost named function whose body holds `pos`.
+    fn enclosing_fn(bodies: &[(String, std::ops::Range<usize>)], pos: usize) -> Option<String> {
+        bodies
+            .iter()
+            .filter(|(_, span)| span.contains(&pos))
+            .min_by_key(|(_, span)| span.len())
+            .map(|(name, _)| name.clone())
+    }
+
+    /// Every task `run_cmd` spawns runs in the session's scope, and a sid
+    /// becomes a live entry only through the resolver.
+    #[test]
+    fn cmd_dispatch_spawns_are_session_scoped() {
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        let bodies = fn_bodies(&code);
+        let run_cmd: Vec<_> = bodies
+            .iter()
+            .filter(|(name, _)| name == "run_cmd")
+            .collect();
+        assert_eq!(run_cmd.len(), 1, "one `run_cmd` in production code");
+        let body: String = run_cmd
+            .first()
+            .and_then(|(_, span)| code.get(span.clone()))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        let spawns = body.matches("spawn").count();
+        let scoped = body.matches("tokio::spawn(scope.clone().scoped(").count();
+        assert!(scoped >= 1, "`run_cmd` spawns its Perform task");
+        assert_eq!(
+            spawns, scoped,
+            "every task `run_cmd` spawns is session-scoped"
+        );
+
+        let owners: Vec<Option<String>> = code
+            .match_indices("store.get(")
+            .map(|(pos, _)| enclosing_fn(&bodies, pos))
+            .collect();
+        let resolver = owners
+            .iter()
+            .filter(|o| o.as_deref() == Some("lookup_session"))
+            .count();
+        assert_eq!(resolver, 1, "the resolver reads the store once");
+        assert!(
+            owners
+                .iter()
+                .all(|o| matches!(o.as_deref(), Some("lookup_session" | "page"))),
+            "a live entry is read only by the resolver and the page rejoin it admits: {owners:?}"
+        );
+    }
+
+    /// A `Perform` task's `verifyToken` binds to the session that ran the Cmd.
+    #[test]
+    fn perform_task_verify_binds_to_its_session() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let task_token = token("w10-subject", Some("w10-task-jti"), 7200);
+            let extra = format!("; ttok={task_token}");
+            let opened = open_session(&router, "w10-subject", 7200, &extra).await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let msg_tx = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .msg_tx
+                .clone();
+            assert!(msg_tx.try_send(Msg::RunTask).is_ok());
+            let mut task_ok = None;
+            for _ in 0..200 {
+                task_ok = handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .model
+                    .task_ok;
+                if task_ok.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                task_ok,
+                Some(true),
+                "the task's verify ran in the session scope"
+            );
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let bound = scope
+                .bindings()
+                .lock()
+                .is_ok_and(|held| held.binds_session("w10-task-jti"));
+            assert!(bound, "the task's credential is bound to its session");
+        });
+    }
+
+    /// A burst of revocations costs an open session at most two rechecks.
+    #[test]
+    fn revocation_burst_is_coalesced() {
+        run(true, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w12-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let rechecks = Arc::clone(
+                &handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .liveness
+                    .rechecks,
+            );
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            for n in 0..512 {
+                assert!(crate::revocation::revoke_subject(format!("w12-other-{n}")).is_ok());
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(RECHECK_COALESCE * 3).await;
+            let ran = rechecks.load(Ordering::Relaxed);
+            assert!(
+                (1..=2).contains(&ran),
+                "a burst costs one or two rechecks, ran {ran}"
+            );
+            assert!(
+                entry_of(&store, &opened.sid).await.is_some(),
+                "other subjects' revocations leave the session live"
+            );
+        });
+    }
+
+    /// `verifyToken` in `view` binds to the session it renders for.
+    #[test]
+    fn verify_token_in_view_binds_not_unscoped() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let view_token = token("w13-subject", Some("w13-view-jti"), 7200);
+            let extra = format!("; vtok={view_token}");
+            let opened = open_session(&router, "w13-subject", 7200, &extra).await;
+            assert!(opened.body.contains("view-authed"), "{}", opened.body);
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let bound = scope
+                .bindings()
+                .lock()
+                .is_ok_and(|held| held.binds_session("w13-view-jti"));
+            assert!(bound, "the view's credential is bound to its session");
+        });
+    }
+
+    /// A `Web` app under an armed `Server` route enforces the gate: a token
+    /// with no session id is refused, a revoked session ends.
+    #[test]
+    fn mounted_web_under_armed_server_route_enforces() {
+        run(false, || async {
+            assert!(matches!(
+                crate::revocation::process_mode(),
+                crate::app_config::RevocationMode::Store
+            ));
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let no_jti = format!("sub=w16-subject; tok={}", token("w16-subject", None, 7200));
+            let refused = text(send(&router, "GET", "/", &no_jti, "").await).await;
+            assert!(
+                refused.contains("authed=false"),
+                "a token with no jti is refused: {refused}"
+            );
+            let opened = open_session(&router, "w16-subject", 7200, "").await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            assert!(crate::revocation::revoke_subject("w16-subject".to_owned()).is_ok());
+            let after = send(
+                &router,
+                "POST",
+                "/_ipe/event",
+                &sid_cookie(&opened.sid),
+                "{}",
+            )
+            .await;
+            assert!(is_session_lost(after).await, "a revoked session is lost");
+        });
     }
 }

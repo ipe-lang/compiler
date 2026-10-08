@@ -24,7 +24,7 @@
 //!   sink, held in a registry keyed by the session's sid. A `js_subscribe` reads the
 //!   owning session's sid from the same task-local scope the pub/sub broker uses
 //!   (`pubsub::current_session_sid`, read synchronously while the driver's
-//!   `with_session_sid` scope is active) and drains ONLY that session's inbound
+//!   `with_session` scope is active) and drains ONLY that session's inbound
 //!   channel; a `js_send` delivers ONLY to the origin session's outbound sink (the
 //!   origin sid the dispatch loop supplies). The server's inbound route
 //!   (`/_ipe/port`) authenticates by session cookie + CSRF, decodes the body
@@ -288,7 +288,7 @@ mod native {
 
     /// The sid of the session whose subscriptions/commands are being materialised
     /// in the current scope. Under the `web` server this reads the same task-local
-    /// the pub/sub broker sets (via `pubsub::with_session_sid`), so a `js_subscribe`
+    /// the pub/sub broker sets (via `pubsub::with_session`), so a `js_subscribe`
     /// binds to the OWNING session. Outside a live server (e.g. a `tokio`-only test
     /// build with no `web` feature) there is no session scope, so it returns `None`
     /// and callers fall back to an inert private channel.
@@ -530,7 +530,7 @@ mod native {
     /// `to_msg(a)` on a clean decode. A rejected payload is dropped whole.
     ///
     /// The owning session's sid is read SYNCHRONOUSLY here (while the driver's
-    /// `with_session_sid` scope is active), then moved into the spawned task, so
+    /// `with_session` scope is active), then moved into the spawned task, so
     /// the recv loop drains exactly that session's channel and can never observe
     /// another session's inbound frames. A subscription materialised with no
     /// session sid in scope (no valid [`SessionId`]) binds an inert per-call
@@ -1537,14 +1537,14 @@ mod tests {
     // The native port transport binds each `js_subscribe`/`js_send` to the OWNING
     // session's channel, read from the pub/sub session-sid task-local. These tests
     // drive that real scope, so they compile only under `web` (which provides
-    // `pubsub::with_session_sid`).
+    // `pubsub::with_session`).
     #[cfg(feature = "web")]
     mod per_session {
         use super::super::*;
         use crate::IpeResult;
         use crate::error::IpeError;
         use crate::json::{Decoder, JsonVal, json_decode_int};
-        use crate::web::pubsub::with_session_sid;
+        use crate::web::pubsub::{SessionScope, with_session};
         use std::sync::{Arc, Mutex};
 
         fn int_decoder() -> Decoder<IpeError, i64> {
@@ -1567,7 +1567,7 @@ mod tests {
         }
 
         // Materialise a `js_subscribe` Source the way the Web driver does —
-        // INSIDE `with_session_sid(sid, …)`, so the subscription binds `sid`'s
+        // INSIDE `with_session(scope, …)`, so the subscription binds `sid`'s
         // inbound channel — and collect the emitted Msgs.
         fn collect_for(
             sid: &SessionId,
@@ -1577,7 +1577,7 @@ mod tests {
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
                 Arc::new(move |m| got2.lock().unwrap_or_else(|e| e.into_inner()).push(m));
-            let sub = with_session_sid(sid.to_string(), || {
+            let sub = with_session(&SessionScope::new(sid.to_string()), || {
                 js_subscribe::<i64, i64, _>(decoder, |a| a)
             });
             let handle = match sub {
@@ -1727,7 +1727,7 @@ mod tests {
 
             // Open a session INSIDE the sid scope so `js_close_session` finds a
             // live stream to install its terminal waiter on.
-            let handle = match with_session_sid(sid.to_string(), || {
+            let handle = match with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -1739,7 +1739,7 @@ mod tests {
             // Reopen window: no out-sink bound. Fire the close Cmd — its future
             // awaits the terminal, so drive it on a spawned task; we only need it
             // to reach the outbound-delivery step, then observe the buffered frame.
-            let close_fut = with_session_sid(sid.to_string(), || {
+            let close_fut = with_session(&SessionScope::new(sid.to_string()), || {
                 js_close_session::<i64, i64>(handle, 1_i64, int_decoder())
             });
             let task = tokio::spawn(close_fut);
@@ -1896,7 +1896,7 @@ mod tests {
         async fn unscoped_subscription_receives_nothing() {
             let sid = test_sid("a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2");
             session_open(&sid);
-            // NOTE: materialised OUTSIDE with_session_sid → owner sid is absent.
+            // NOTE: materialised OUTSIDE with_session → owner sid is absent.
             let got = Arc::new(Mutex::new(Vec::<i64>::new()));
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
@@ -1936,7 +1936,7 @@ mod tests {
                     intercept(s);
                 }),
             );
-            with_session_sid(sid.to_string(), || {
+            with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -2010,7 +2010,7 @@ mod tests {
                     }
                 }),
             );
-            let result = with_session_sid(sid.to_string(), || {
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2043,7 +2043,7 @@ mod tests {
                 }
             }
             // The next request must be refused immediately.
-            let result = with_session_sid(sid.to_string(), || {
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2092,10 +2092,10 @@ mod tests {
             );
 
             let (ra, rb) = tokio::join!(
-                with_session_sid(sid_a.to_string(), || {
+                with_session(&SessionScope::new(sid_a.to_string()), || {
                     js_request::<i64, i64>(0_i64, int_decoder())
                 }),
-                with_session_sid(sid_b.to_string(), || {
+                with_session(&SessionScope::new(sid_b.to_string()), || {
                     js_request::<i64, i64>(0_i64, int_decoder())
                 }),
             );
@@ -2131,7 +2131,7 @@ mod tests {
                     }
                 }),
             );
-            let result = with_session_sid(sid.to_string(), || {
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2174,7 +2174,7 @@ mod tests {
                         .push(s.to_string());
                 }),
             );
-            let handle = match with_session_sid(sid.to_string(), || {
+            let handle = match with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -2195,7 +2195,7 @@ mod tests {
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
                 Arc::new(move |m| got2.lock().unwrap_or_else(|e| e.into_inner()).push(m));
-            let sub = with_session_sid(sid.to_string(), || {
+            let sub = with_session(&SessionScope::new(sid.to_string()), || {
                 js_session_frames::<i64, i64, _>(handle, int_decoder(), |a| a)
             });
             let h = match sub {
@@ -2272,7 +2272,7 @@ mod tests {
             session_open(&sid);
             // Mint a session directly and shrink its remaining budget to 0 so the
             // NEXT frame overflows (driving 100k frames in a unit test is wasteful).
-            let handle = match with_session_sid(sid.to_string(), || {
+            let handle = match with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -2292,9 +2292,10 @@ mod tests {
             // Park a close waiter, then push the overflowing frame; the close Task
             // must resolve Err (session terminated, not a silent drop).
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session_sid(sid.to_string(), move || {
-                js_close_session::<i64, i64>(handle, 0_i64, int_decoder())
-            }));
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,
@@ -2316,7 +2317,7 @@ mod tests {
             session_open(&sid);
             register_out_sink_for(&sid, Arc::new(|_s: &str| {}));
             for _ in 0..MAX_OPEN_SESSIONS {
-                let r = with_session_sid(sid.to_string(), || {
+                let r = with_session(&SessionScope::new(sid.to_string()), || {
                     js_open_session::<i64, i64>(0_i64, int_decoder())
                 })
                 .await;
@@ -2325,7 +2326,7 @@ mod tests {
                     "under ceiling must open"
                 );
             }
-            let over = with_session_sid(sid.to_string(), || {
+            let over = with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2343,9 +2344,10 @@ mod tests {
             session_open(&sid);
             let (handle, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session_sid(sid.to_string(), move || {
-                js_close_session::<i64, i64>(handle, 0_i64, int_decoder())
-            }));
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,
@@ -2367,9 +2369,10 @@ mod tests {
             session_open(&sid);
             let (handle, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session_sid(sid.to_string(), move || {
-                js_close_session::<i64, i64>(handle, 0_i64, int_decoder())
-            }));
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,

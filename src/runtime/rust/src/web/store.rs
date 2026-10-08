@@ -1722,6 +1722,7 @@ mod tests {
             history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -1778,6 +1779,7 @@ mod tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -2949,6 +2951,7 @@ mod tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
             model,
             rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
             tabs: crate::web::TabSeqs::default(),

@@ -490,7 +490,9 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
 /// ([`process_mode`](crate::revocation::process_mode)), the token must also
 /// pass the revocation gate: a revoked token, a token the store cannot judge,
 /// and a token with no `sub`, no `jti` or no lifetime bound are refused. Inside
-/// a `Server` request the admitted credential is bound to that request.
+/// a `Web` session the admitted credential is bound to that session, inside a
+/// `Server` request to that request; while a `Web` app serves, a call neither
+/// owns is refused.
 pub fn auth_verify_token<E: From<String>>(
     secret: String,
     token: String,
@@ -504,19 +506,61 @@ pub fn auth_verify_token<E: From<String>>(
 
 /// Where an armed `Auth.verifyToken` binds the credential it admits.
 enum BindTarget {
+    /// The credential set of the `Web` session user code runs on behalf of.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    Session(std::sync::Arc<std::sync::Mutex<crate::revocation::SessionBindings>>),
     /// The binding set of the `Server` request being handled.
     #[cfg(feature = "server")]
     ServerRequest(std::sync::Arc<std::sync::Mutex<crate::revocation::SessionBindings>>),
+    /// No channel owner while a `Web` app serves in this process: a task the
+    /// runtime spawned without its session's scope. Refused, never admitted
+    /// unbound, because the session it acts for could not be closed on revoke.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    Unscoped,
     /// No channel owner: a script, a CLI program or a background task.
     Outside,
 }
 
-/// The channel owner the current task runs on behalf of.
+/// The refusal for an armed `verifyToken` no session or request owns.
+#[cfg(all(feature = "web-core", feature = "server"))]
+const UNSCOPED_REFUSAL: &str = "auth.verifyToken: no Web session or Server request owns this call";
+
+/// The channel owner the current task runs on behalf of, in this process.
 fn bind_target() -> BindTarget {
+    bind_target_in(web_serving())
+}
+
+/// Whether a `Web` app serves in this process.
+#[cfg(all(feature = "web-core", feature = "server"))]
+fn web_serving() -> bool {
+    crate::web::web_serving()
+}
+
+/// Without the `Web` server no `Web` app can serve.
+#[cfg(not(all(feature = "web-core", feature = "server")))]
+const fn web_serving() -> bool {
+    false
+}
+
+/// The channel owner the current task runs on behalf of, given whether a `Web` app serves.
+///
+/// The `Web` session scope wins over the `Server` request: a `Web` router
+/// mounted in a `Server` sees both, and the session is the long-lived owner.
+fn bind_target_in(web_serving: bool) -> BindTarget {
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    if let Some(bindings) = crate::web::pubsub::session_bindings() {
+        return BindTarget::Session(bindings);
+    }
     #[cfg(feature = "server")]
     if let Some(bindings) = crate::server::request_bindings() {
         return BindTarget::ServerRequest(bindings);
     }
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    if web_serving {
+        return BindTarget::Unscoped;
+    }
+    #[cfg(not(all(feature = "web-core", feature = "server")))]
+    let _ = web_serving;
     BindTarget::Outside
 }
 
@@ -527,15 +571,31 @@ fn verify_token_under(
     secret: &str,
     token: &str,
 ) -> Result<HashMap<String, String>, String> {
+    verify_token_bound(gate, bind_target, secret, token)
+}
+
+/// [`verify_token_under`] with the channel owner read from `target`, only once armed.
+fn verify_token_bound(
+    gate: Option<crate::revocation::ArmedGate>,
+    target: impl FnOnce() -> BindTarget,
+    secret: &str,
+    token: &str,
+) -> Result<HashMap<String, String>, String> {
     let claims = verify_claims(secret, token).map_err(|refusal| refusal.to_string())?;
     if let Some(gate) = gate {
         let refuse = |denial: crate::revocation::Denial| format!("auth.verifyToken: {denial}");
         let credential = gate.admit(&claims, "sub").map_err(refuse)?;
-        match bind_target() {
+        match target() {
+            #[cfg(all(feature = "web-core", feature = "server"))]
+            BindTarget::Session(bindings) => {
+                crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
+            }
             #[cfg(feature = "server")]
             BindTarget::ServerRequest(bindings) => {
                 crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
             }
+            #[cfg(all(feature = "web-core", feature = "server"))]
+            BindTarget::Unscoped => return Err(UNSCOPED_REFUSAL.to_owned()),
             // Admitted; no channel exists to bind.
             BindTarget::Outside => drop(credential),
         }
@@ -1856,8 +1916,14 @@ mod tests {
             crate::server::request_bindings().is_none(),
             "a script runs outside any request scope"
         );
-        let claims = verify_token_under(armed(), SECRET, &session_token("k4-subject", "k4-jti"))
-            .expect("an armed gate admits a live token outside a request");
+        // A script process serves no `Web` app.
+        let claims = verify_token_bound(
+            armed(),
+            || bind_target_in(false),
+            SECRET,
+            &session_token("k4-subject", "k4-jti"),
+        )
+        .expect("an armed gate admits a live token outside a request");
         assert_eq!(claims.get("jti").map(String::as_str), Some("k4-jti"));
     }
 
@@ -1934,6 +2000,47 @@ mod tests {
         assert_eq!(held.len(), bound);
         assert!((0..bound).all(|n| held.binds_session(&format!("k5-jti-{n}"))));
         assert!(!held.binds_session("k5-jti-ninth"));
+    }
+
+    /// While a `Web` app serves, an armed `verifyToken` no session or request
+    /// owns is refused; unarmed, the same call is admitted.
+    #[cfg(feature = "web")]
+    #[test]
+    fn verify_token_armed_outside_scope_on_web_process_refuses() {
+        let token = session_token("k3-subject", "k3-jti");
+        assert_eq!(
+            verify_token_bound(armed(), || bind_target_in(true), SECRET, &token),
+            Err(UNSCOPED_REFUSAL.to_owned()),
+            "an unscoped call while a Web app serves is refused"
+        );
+        assert!(
+            verify_token_bound(None, || bind_target_in(true), SECRET, &token).is_ok(),
+            "an unarmed gate never asks for an owner"
+        );
+        assert!(
+            verify_token_bound(armed(), || bind_target_in(false), SECRET, &token).is_ok(),
+            "with no Web app serving, an unscoped call is a script and is admitted"
+        );
+    }
+
+    /// Inside a `Web` session scope an armed `verifyToken` binds to that
+    /// session, even while a `Web` app serves.
+    #[cfg(feature = "web")]
+    #[test]
+    fn verify_token_armed_in_web_session_binds_session_set() {
+        let scope = crate::web::pubsub::SessionScope::new("k3-session".to_owned());
+        let admitted = crate::web::pubsub::with_session(&scope, || {
+            verify_token_bound(
+                armed(),
+                || bind_target_in(true),
+                SECRET,
+                &session_token("k3-subject", "k3-bound-jti"),
+            )
+        });
+        assert!(admitted.is_ok(), "{admitted:?}");
+        let held = scope.bindings().lock().expect("bindings lock");
+        assert_eq!(held.len(), 1);
+        assert!(held.binds_session("k3-bound-jti"));
     }
 
     // ── Construction scan ─────────────────────────────────────────────────────
