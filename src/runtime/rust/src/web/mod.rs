@@ -10520,9 +10520,51 @@ mod emitted_router_behavior_tests {
         );
     }
 
+    /// Set on the child process [`web_revocation_installed_store_refuses_startup`]
+    /// spawns; its child half is a no-op without it.
+    const INSTALL_CHILD_MARKER: &str = "IPE_REVOCATION_INSTALL_CHILD";
+
+    /// Printed by the child half once it has observed both refusals.
+    const INSTALL_CHILD_REFUSED: &str = "installed revocation store refusal observed";
+
     /// `Web.withRevocation` `Store` installed in code refuses the router too.
+    ///
+    /// `install_web` fills a process-wide `OnceLock` that the first install
+    /// wins, so the install runs in a child process: here it would arm every
+    /// other router test of the binary, and an earlier install would mask it.
+    #[test]
+    fn web_revocation_installed_store_refuses_startup() {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::web_revocation_installed_store_child");
+        let out = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    filter.as_str(),
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(INSTALL_CHILD_MARKER, "1")
+                .env_remove("IPE_AUTH_REVOCATION")
+                .stdin(std::process::Stdio::null())
+                .output()
+        });
+        let observed = out.as_ref().is_ok_and(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains(INSTALL_CHILD_REFUSED)
+        });
+        assert!(observed, "the child must observe the refusal: {out:?}");
+    }
+
+    /// The child half of [`web_revocation_installed_store_refuses_startup`].
     #[tokio::test]
-    async fn web_revocation_installed_store_refuses_startup() {
+    #[ignore = "run as a child process by web_revocation_installed_store_refuses_startup"]
+    async fn web_revocation_installed_store_child() {
+        if crate::system::read_env_var(INSTALL_CHILD_MARKER).as_deref() != Ok("1") {
+            return;
+        }
         crate::app_config::install_web(vec![
             crate::app_config::ipe_setting_web_auth_revocation_mode(1),
         ]);
@@ -10548,6 +10590,7 @@ mod emitted_router_behavior_tests {
             ),
             "the env cannot disarm an installed Store mode, got {env_off:?}"
         );
+        println!("\n{INSTALL_CHILD_REFUSED}");
     }
 
     /// An `Off` or absent mode asks for no gate, so the router starts.

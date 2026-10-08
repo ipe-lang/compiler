@@ -2131,14 +2131,12 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
             }
         };
         // A revocation mode the env names but the runtime cannot parse refuses
-        // the listener; the routes already treat it as armed.
-        #[cfg(feature = "jwt")]
-        {
-            if let Err(refusal) = crate::app_config::revocation_env() {
-                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
-                    "Server.listen: {refusal}"
-                ))));
-            }
+        // the listener in every build, so an operator's typo is never accepted;
+        // the authed routes already treat it as armed.
+        if let Err(refusal) = crate::app_config::revocation_env() {
+            return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                "Server.listen: {refusal}"
+            ))));
         }
         // The framing policy every response carries is parsed before bind, so
         // a value with no header representation refuses the listener.
@@ -3771,6 +3769,36 @@ mod revocation_env_tests {
             401,
             "a value the runtime cannot parse is never read as the permissive one"
         );
+    }
+
+    /// A present `IPE_AUTH_REVOCATION` that names no mode refuses the listener
+    /// before it binds, naming the variable.
+    #[tokio::test]
+    async fn listen_refuses_an_unknown_revocation_mode() {
+        for raw in ["stroe", "on", "2"] {
+            crate::system::locked_set_var(ENV, raw);
+            // A listener that got past the refusal would bind and serve forever;
+            // the timeout turns that regression into a failure instead of a hang.
+            let listened: Result<IpeResult<crate::IpeError, ()>, _> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(0, Vec::new()),
+            )
+            .await;
+            crate::system::locked_remove_var(ENV);
+            let refusal = match listened {
+                Ok(IpeResult::Err(error)) => Some(error),
+                Ok(IpeResult::Ok(())) | Err(_) => None,
+            };
+            assert!(
+                refusal.as_ref().is_some_and(|error| {
+                    crate::ipe_error_kind(error.clone()) == crate::IpeErrorKind::InvalidInput
+                        && crate::ipe_error_message(error.clone())
+                            .starts_with("Server.listen: IPE_AUTH_REVOCATION must be")
+                }),
+                "IPE_AUTH_REVOCATION={raw:?} must refuse the listener as invalid input \
+                 naming the variable, got {refusal:?}"
+            );
+        }
     }
 }
 

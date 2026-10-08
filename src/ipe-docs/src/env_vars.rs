@@ -931,14 +931,17 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_AUTH_REVOCATION",
         default: "unset (Off)",
-        purpose: "Arms the per-request session revocation check on authenticated \
-                  `Server` routes. `store` or `1` checks each request against the \
+        purpose: "Arms the per-request session revocation check on the authed \
+                  `Server` routes (`Server.getAuthed`, `Server.postAuthed`, `Server.putAuthed`, \
+                  `Server.deleteAuthed`). `store` or `1` checks each request against the \
                   in-process list of revoked token IDs and denies on any store error; \
                   `off` or `0` or unset leaves the mode `Server.withRevocation` chose. It \
-                  only ever arms the check, never disarms an in-code `Store`. Any other \
-                  value refuses startup. A `Web` app has no revocation check, so \
-                  `store` (or `Web.withRevocation` `Store`) refuses its startup; guard \
-                  its routes with `Server.withRevocation` instead.",
+                  only ever arms the check, never disarms an in-code `Store`. A token \
+                  a handler verifies itself with `Auth.verifyToken` is not checked. Any \
+                  other value refuses `Server.listen` and `Web` startup. A `Web` app has \
+                  no revocation check, so `store` (or `Web.withRevocation` `Store`) \
+                  refuses its startup; guard its routes with `Server.withRevocation` \
+                  instead.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1286,6 +1289,7 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
     "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
+    "IPE_REVOCATION_INSTALL_CHILD", // runtime Web revocation test: marks the install re-exec
     "IPE_RUN_WITH_TEST_VAR",
     "IPE_SECRET_E2E",                   // Windows jail e2e test sentinel
     "IPE_SMOKE_ASKPASS_USER", // registry smoke: git askpass helper's internal user-name channel

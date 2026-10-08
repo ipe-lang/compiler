@@ -755,11 +755,11 @@ fn slide_window_from(
 }
 
 /// The variable that arms the per-request revocation gate.
-#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+#[cfg(feature = "server")]
 const REVOCATION_VAR: &str = "IPE_AUTH_REVOCATION";
 
 /// What an `IPE_AUTH_REVOCATION` value must be.
-#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+#[cfg(feature = "server")]
 const REVOCATION_EXPECTED: &str = "`store`, `1`, `off` or `0`";
 
 /// The mode `IPE_AUTH_REVOCATION` names, if the operator set one.
@@ -771,13 +771,13 @@ const REVOCATION_EXPECTED: &str = "`store`, `1`, `off` or `0`";
 ///
 /// A refusal naming `IPE_AUTH_REVOCATION` for any other value, so a typo never
 /// leaves the process serving under a mode the operator did not choose.
-#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+#[cfg(feature = "server")]
 pub(crate) fn revocation_env() -> Result<Option<RevocationMode>, crate::system::EnvValueRefusal> {
     revocation_from(crate::system::read_env_var(REVOCATION_VAR))
 }
 
 /// Pure `IPE_AUTH_REVOCATION` parse over the raw lookup.
-#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+#[cfg(feature = "server")]
 fn revocation_from(
     raw: Result<String, std::env::VarError>,
 ) -> Result<Option<RevocationMode>, crate::system::EnvValueRefusal> {
@@ -1439,7 +1439,7 @@ mod tests {
         assert_eq!(resolve_revocation_capacity(), Ok(REVOCATION_STORE_CAPACITY));
     }
 
-    #[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+    #[cfg(feature = "server")]
     #[test]
     fn revocation_env_unknown_value_refuses() {
         let name = "IPE_AUTH_REVOCATION";
@@ -1455,7 +1455,7 @@ mod tests {
         assert_eq!(revocation_env(), Ok(None), "an absent value names no mode");
     }
 
-    #[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+    #[cfg(feature = "server")]
     #[test]
     fn revocation_env_parses_the_closed_value_set() {
         let value = |raw: &str| revocation_from(Ok(raw.to_owned()));
@@ -1477,7 +1477,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(unix, feature = "server", any(feature = "jwt", feature = "web-core")))]
+    #[cfg(all(unix, feature = "server"))]
     #[test]
     fn revocation_env_non_unicode_value_refuses() {
         use std::os::unix::ffi::OsStringExt as _;
