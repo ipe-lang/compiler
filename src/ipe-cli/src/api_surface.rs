@@ -363,6 +363,7 @@ fn canon_type_to_string(
     };
     match ty {
         Type::Var(sym) => Ok(vars.name_of(*sym)),
+        Type::Wildcard => Ok(ipe_canon::ast::WILDCARD_SPELLING.to_owned()),
         Type::Con { home, name, args } => {
             let mut head = String::new();
             for seg in home {

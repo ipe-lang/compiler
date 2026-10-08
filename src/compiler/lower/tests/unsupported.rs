@@ -360,20 +360,19 @@ fn parametric_annotation_lowers_to_generic_func() -> DResult<()> {
 fn return_only_wildcard_any_is_rejected() -> DResult<()> {
     let mut i = Interner::new();
     let foo = i.intern("foo")?;
-    let any = i.intern("any")?;
     let list = i.intern("List")?;
     let sig_span = Span::new(10, 13);
     // foo : Int -> List any ; foo _ = []
     let list_any = canon::Type::Con {
         home: vec![],
         name: list,
-        args: vec![canon::Type::Var(any)],
+        args: vec![canon::Type::Wildcard],
     };
     let ty = canon::Type::Lambda(Box::new(con_int(&mut i)?), Box::new(list_any));
     let def = canon::Def::Typed {
         home: vec![],
         name: Located::new(sig_span, foo),
-        free_vars: vec![any],
+        free_vars: Vec::new(),
         patterns: vec![Located::new(Span::new(14, 15), canon::Pattern_::PAnything)],
         body: Located::new(Span::new(20, 22), canon::Expr_::List(Vec::new())),
         ty,
@@ -402,8 +401,8 @@ fn return_only_wildcard_any_is_rejected() -> DResult<()> {
 /// is genuine rank-1 polymorphism, not a wildcard `any` — every caller
 /// instantiates it independently, and it is carried by a parameter. It must
 /// lower cleanly to a generic function quantifying `[a]`, never tripping the
-/// return-`any` gate (which fires only on the interned `any` symbol, never a
-/// named variable).
+/// return-`any` gate (which fires only on the wildcard, never a named
+/// variable).
 #[test]
 fn named_type_var_in_nested_return_lowers_cleanly() -> DResult<()> {
     let mut i = Interner::new();
@@ -446,7 +445,7 @@ fn named_type_var_in_nested_return_lowers_cleanly() -> DResult<()> {
     regions.insert(Span::new(49, 50), Ty::Var(0));
     let res = run_with_regions(Vec::new(), vec![def], BTreeMap::new(), regions, &mut i);
     // The named-var return must NOT trip the wildcard-`any` gate — that gate keys
-    // on the interned `any` symbol, which a named variable is not.
+    // on the wildcard, which a named variable is not.
     assert!(
         !matches!(
             res,
@@ -484,7 +483,6 @@ fn named_type_var_in_nested_return_lowers_cleanly() -> DResult<()> {
 fn threaded_param_wildcard_any_concretizes_from_region() -> DResult<()> {
     let mut i = Interner::new();
     let thread = i.intern("thread")?;
-    let any = i.intern("any")?;
     let x = i.intern("x")?;
     let string = i.intern("String")?;
     let sig_span = Span::new(10, 16);
@@ -492,13 +490,13 @@ fn threaded_param_wildcard_any_concretizes_from_region() -> DResult<()> {
     let body_span = Span::new(24, 25);
     // thread : any -> any ; thread x = x
     let ty = canon::Type::Lambda(
-        Box::new(canon::Type::Var(any)),
-        Box::new(canon::Type::Var(any)),
+        Box::new(canon::Type::Wildcard),
+        Box::new(canon::Type::Wildcard),
     );
     let def = canon::Def::Typed {
         home: vec![],
         name: Located::new(sig_span, thread),
-        free_vars: vec![any],
+        free_vars: Vec::new(),
         patterns: vec![Located::new(param_span, canon::Pattern_::PVar(x))],
         body: Located::new(body_span, canon::Expr_::VarLocal(x)),
         ty,
@@ -543,20 +541,19 @@ fn threaded_param_wildcard_any_concretizes_from_region() -> DResult<()> {
 fn unthreaded_param_wildcard_any_stays_generic() -> DResult<()> {
     let mut i = Interner::new();
     let const_fn = i.intern("constFn")?;
-    let any = i.intern("any")?;
     let x = i.intern("x")?;
     let sig_span = Span::new(10, 17);
     let param_span = Span::new(20, 21);
     let body_span = Span::new(24, 28);
     // constFn : any -> any ; constFn x = "hi"
     let ty = canon::Type::Lambda(
-        Box::new(canon::Type::Var(any)),
-        Box::new(canon::Type::Var(any)),
+        Box::new(canon::Type::Wildcard),
+        Box::new(canon::Type::Wildcard),
     );
     let def = canon::Def::Typed {
         home: vec![],
         name: Located::new(sig_span, const_fn),
-        free_vars: vec![any],
+        free_vars: Vec::new(),
         patterns: vec![Located::new(param_span, canon::Pattern_::PVar(x))],
         body: Located::new(body_span, canon::Expr_::Str("hi".to_string())),
         ty,

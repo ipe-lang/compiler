@@ -70,8 +70,10 @@
 //!
 //! `cargo build` cancellation (never overlapping cargo builds) uses the
 //! portable equivalent for a plain OS process: the
-//! orchestrator holds the `Child` handle directly and supersedes it (records
-//! the kill, then `.kill()`s) on a superseding batch; a dedicated per-build
+//! orchestrator holds the build's process-group handle directly and supersedes
+//! it (records the kill, then kills the group) on a superseding batch, and a
+//! rebuild still running at the cargo build wall is killed the same way and
+//! reported red; a dedicated per-build
 //! "waiter" thread polls for exit and reports completion (or, when the
 //! orchestrator recorded the kill, "superseded, not a real failure") through the
 //! SAME unified event channel, tagged with a generation counter so a stale
@@ -883,15 +885,15 @@ enum CargoOutcome {
 /// out-of-memory kill, or (off unix) an ordinary compile error, and treating
 /// any of those as superseded would silently drop a real failure.
 struct CargoChild {
-    child: Child,
+    child: crate::remote_ingest::GroupedChild,
     superseded: bool,
 }
 
 impl CargoChild {
-    /// Record that the orchestrator is ending this build, then kill it.
+    /// Record that the orchestrator is ending this build, then kill its whole group.
     fn supersede(&mut self) {
         self.superseded = true;
-        let _ = self.child.kill();
+        self.child.kill();
     }
 }
 
@@ -1724,6 +1726,7 @@ fn run_inner(
                             generation,
                             evt_tx.clone(),
                             opts.quiet,
+                            crate::cargo_step::CARGO_BUILD_WALL,
                         ) {
                             Ok(child) => {
                                 cargo_child = Some(child);
@@ -3239,10 +3242,13 @@ fn env_flag_on(name: &str) -> bool {
 /// orchestrator can `.kill()` from a DIFFERENT thread while the waiter is
 /// concurrently polling it — see the module doc's cancellation section.
 ///
+/// The rebuild is held to `wall`: still running there, its whole process group
+/// is killed and the cycle is reported red with the wall's refusal.
+///
 /// The returned handle is wrapped in `Arc<Mutex<..>>` rather than handed
-/// out as a bare `Child` because BOTH the orchestrator (kill-on-supersede)
+/// out as a bare child because BOTH the orchestrator (kill-on-supersede)
 /// and this function's own waiter thread (exit detection) need independent
-/// access; the waiter deliberately uses `try_wait` in a short poll loop
+/// access; the waiter deliberately polls for the exit in a short loop
 /// rather than a blocking `wait()` so it never holds the lock across a
 /// call that could block for the build's entire duration — holding the
 /// lock there would make the orchestrator's `.kill()` block on the very
@@ -3258,6 +3264,7 @@ fn spawn_cargo_build(
     generation: u64,
     evt_tx: mpsc::Sender<OrchestratorEvent>,
     quiet: bool,
+    wall: crate::remote_ingest::LocalWall,
 ) -> std::io::Result<Arc<std::sync::Mutex<CargoChild>>> {
     let accel = choose_build_accel(krate.path(), target_dir, env_flag_on(NO_INCREMENTAL_ENV));
     let build = crate::cargo_step::WatchBuild {
@@ -3281,32 +3288,42 @@ fn spawn_cargo_build(
     let waiter = threads::spawn_os(ThreadRole::WatchCargoWaiter, move || {
         // Both pipes drain on threads scoped to this waiter while it polls, so
         // the drains end with the build and are joined before the event goes out.
+        let mut timed_out = false;
         let drained = pipes.drain_while(|| {
             loop {
-                match shared_for_waiter.lock() {
-                    // A poisoned lock means the orchestrator thread panicked while
-                    // holding it; the exit status can no longer be observed, so
-                    // stop polling rather than spin forever.
-                    Err(_) => break None,
-                    Ok(mut guard) => {
+                // A poisoned lock means the orchestrator thread panicked while
+                // holding it; its guard still owns the child, so the waiter
+                // keeps killing and reaping it.
+                let mut guard = shared_for_waiter
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match guard.child.exited() {
+                    Ok(true) => {
                         let superseded = guard.superseded;
-                        let polled = guard.child.try_wait();
-                        drop(guard);
-                        match polled {
-                            Ok(Some(status)) => break Some((status, superseded)),
-                            Ok(None) => {}
-                            // A persistent `try_wait` error can never resolve by
-                            // retrying, so stop rather than poll forever.
-                            Err(_) => break None,
-                        }
+                        break guard.child.reap().ok().map(|status| (status, superseded));
+                    }
+                    Ok(false) => {}
+                    // A persistent read error can never resolve by retrying,
+                    // so the build is stopped rather than polled forever.
+                    Err(_) => {
+                        guard.child.kill();
+                        let _ = guard.child.finish();
+                        break None;
                     }
                 }
-                thread::sleep(Duration::from_millis(30));
+                if !timed_out && !guard.superseded && cargo_started.elapsed() >= wall.limit().get()
+                {
+                    timed_out = true;
+                    guard.child.kill();
+                }
+                drop(guard);
+                thread::sleep(crate::cargo_step::BUILD_POLL);
             }
         });
         let out_buf = drained.stdout.text;
         let err_buf = drained.stderr.text;
         let outcome = match (drained.waited, drained.stdout.error) {
+            _ if timed_out => CargoOutcome::Red(CliError::CargoBuildTimedOut { wall }.to_string()),
             (None, _) => CargoOutcome::Red("cargo build: could not observe exit status".to_owned()),
             // A refused artifact stream (past its ceiling, not UTF-8, or a read
             // error) is never searched for an executable.
@@ -3335,8 +3352,8 @@ fn spawn_cargo_build(
         // No waiter would ever reap the build, so it is stopped and reaped
         // here before the refusal goes back.
         let mut cargo = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = cargo.child.kill();
-        let _ = cargo.child.wait();
+        cargo.child.kill();
+        let _ = cargo.child.finish();
         drop(cargo);
         return Err(refused);
     }
@@ -4257,6 +4274,20 @@ mod tests {
         cargo: &Path,
         before_exit: impl FnOnce(&std::sync::Mutex<super::CargoChild>),
     ) -> Option<super::CargoOutcome> {
+        cargo_outcome_within(
+            cargo,
+            crate::remote_ingest::LocalWall::of_secs::<20>(),
+            before_exit,
+        )
+    }
+
+    /// [`cargo_outcome`] with the rebuild held to `wall`.
+    #[cfg(unix)]
+    fn cargo_outcome_within(
+        cargo: &Path,
+        wall: crate::remote_ingest::LocalWall,
+        before_exit: impl FnOnce(&std::sync::Mutex<super::CargoChild>),
+    ) -> Option<super::CargoOutcome> {
         let out_dir = cargo.parent().expect("fake cargo has a parent dir");
         let (tx, rx) = mpsc::channel();
         let child = super::spawn_cargo_build(
@@ -4266,6 +4297,7 @@ mod tests {
             1,
             tx,
             true,
+            wall,
         )
         .expect("spawn fake cargo");
         before_exit(child.as_ref());
@@ -4305,6 +4337,58 @@ mod tests {
         );
     }
 
+    /// A rebuild past its wall is red with the wall's refusal, and every
+    /// process it started is killed.
+    #[cfg(unix)]
+    #[test]
+    fn a_rebuild_past_its_wall_is_red_and_its_group_killed() {
+        let cargo = fake_cargo(
+            "wall",
+            "sleep 30 &\necho $! > \"$(dirname \"$0\")/grandchild\"\nexec sleep 30",
+        );
+        let grandchild = cargo.with_file_name("grandchild");
+        let started = std::time::Instant::now();
+        let mut seen = None;
+        let outcome = cargo_outcome_within(
+            &cargo,
+            crate::remote_ingest::LocalWall::of_secs::<1>(),
+            |_| {
+                // The pid file is read before `cargo_outcome_within` removes the directory.
+                let waited = std::time::Instant::now();
+                while seen.is_none() && waited.elapsed() < Duration::from_secs(10) {
+                    seen = std::fs::read_to_string(&grandchild)
+                        .ok()
+                        .and_then(|raw| raw.trim().parse::<i32>().ok())
+                        .and_then(rustix::process::Pid::from_raw);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            },
+        );
+        let wall_text = crate::CliError::CargoBuildTimedOut {
+            wall: crate::remote_ingest::LocalWall::of_secs::<1>(),
+        }
+        .to_string();
+        assert!(
+            matches!(&outcome, Some(super::CargoOutcome::Red(text)) if *text == wall_text),
+            "a rebuild past its wall must report the wall's refusal"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the refusal lands at the wall, not when the build ends"
+        );
+        let pid = seen.expect("the fake cargo records its background process");
+        let waited = std::time::Instant::now();
+        while rustix::process::test_kill_process(pid).is_ok()
+            && waited.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "every process the rebuild started is killed at the wall"
+        );
+    }
+
     /// A build whose waiter thread the OS refuses is an error, and the build
     /// it had started is killed and reaped before that error goes back.
     #[cfg(unix)]
@@ -4321,6 +4405,7 @@ mod tests {
             1,
             tx,
             true,
+            crate::cargo_step::CARGO_BUILD_WALL,
         );
         let left = rustix::process::waitpid(None, rustix::process::WaitOptions::NOHANG);
         let _ = std::fs::remove_dir_all(out_dir);

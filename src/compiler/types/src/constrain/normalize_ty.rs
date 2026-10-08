@@ -4,27 +4,22 @@ use super::{
 };
 
 impl Builder<'_> {
-    /// Whether `ty` is the bare wildcard `any` annotation type — a `Ty::Var`
-    /// whose interned symbol resolves to `"any"`. Mirrors the `Ty::Var` "any"
-    /// arm in [`Self::instantiate_in`]: `any` is Ipê's wildcard type-variable
-    /// name, distinct from a genuine named parameter (`a`, `msg`).
-    pub fn is_wildcard_any_ty(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Var(id) if self
-            .interner
-            .resolve(Symbol::from_raw(*id))
-            .is_some_and(|name| name == "any"))
+    /// Whether `ty` is the bare wildcard `any` annotation type.
+    pub const fn is_wildcard_any_ty(ty: &Ty) -> bool {
+        matches!(ty, Ty::Wildcard)
     }
 
-    /// Whether an annotation type's final RETURN (after peeling every leading
-    /// `_ -> _` arrow) is the bare wildcard `any`. Such a binding's body is
-    /// severed from its uses by the wildcard and must be re-tied — see
-    /// [`Self::tie_wildcard_any_uses_to_bodies`].
-    pub fn annotation_returns_wildcard_any(&self, ty: &Ty) -> bool {
+    /// Whether an annotation type's final RETURN is the bare wildcard `any`.
+    ///
+    /// The return is what remains after peeling every leading `_ -> _` arrow.
+    /// Such a binding's body is severed from its uses by the wildcard and must
+    /// be re-tied — see [`Self::tie_wildcard_any_uses_to_bodies`].
+    pub fn annotation_returns_wildcard_any(ty: &Ty) -> bool {
         let mut cur = ty;
         while let Ty::Fun(_, ret) = cur {
             cur = ret;
         }
-        self.is_wildcard_any_ty(cur)
+        Self::is_wildcard_any_ty(cur)
     }
 
     /// Reduce a 2-arg `Task Error a` annotation type to the internal unary
@@ -291,7 +286,7 @@ impl Builder<'_> {
                 Ok(Ty::Record(fields, tail))
             }
             // Leaf types: pass through unchanged.
-            other @ (Ty::Var(_) | Ty::Unit) => Ok(other),
+            other @ (Ty::Var(_) | Ty::Wildcard | Ty::Unit) => Ok(other),
         }
     }
 

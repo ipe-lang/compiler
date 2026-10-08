@@ -4,7 +4,7 @@ use super::{
     BTreeMap, BTreeSet, BinopClass, Builder, Builtins, Constraint, Content, CtorScheme, DResult,
     Diagnostic, FlatType, Generated, InferError, Interner, ModuleHome, Rc, RefCell, RowTail,
     SchemeSlot, Span, StdlibKernel, SuperVar, Symbol, Ty, TyBounds, UnionFind, VarId, canon,
-    classify_binop, from_canon, is_solver_var, pin_any_in_ty,
+    classify_binop, from_canon, pin_any_in_ty,
 };
 
 impl<'a> Builder<'a> {
@@ -121,17 +121,11 @@ impl<'a> Builder<'a> {
                     let normalized = builder
                         .normalize_annotation_ty(from_canon(ct), ctor.span)
                         .map_err(|d| InferError::sited_at_path(d, &union.home))?;
-                    // Pin `any` wildcard fields to Dict String String so every
+                    // Pin wildcard fields to Dict String String so every
                     // instantiation site (pattern binder, ctor-as-value,
                     // Sub.subscribeTopic) sees the concrete carrier, never a
-                    // free Ty::Var that the lowerer would reject (IPE-L0102).
-                    arg_tys.push(pin_any_in_ty(
-                        normalized,
-                        &union.vars,
-                        builder.interner,
-                        dict_sym,
-                        string_sym,
-                    ));
+                    // free unknown that the lowerer would reject (IPE-L0102).
+                    arg_tys.push(pin_any_in_ty(normalized, dict_sym, string_sym));
                 }
                 builder.ctors.insert(
                     (union.home.clone(), union.name, ctor.name),
@@ -209,7 +203,7 @@ impl<'a> Builder<'a> {
                     // severs the body from every use (see
                     // [`Builder::tie_wildcard_any_uses_to_bodies`]); record the
                     // binding so each reference is tied back to its body.
-                    if builder.annotation_returns_wildcard_any(&normalized) {
+                    if Builder::annotation_returns_wildcard_any(&normalized) {
                         builder
                             .wildcard_any_return_bindings
                             .insert((home_key.clone(), name.value));
@@ -688,38 +682,24 @@ impl<'a> Builder<'a> {
                 };
                 self.structure(FlatType::Record(field_vars, ext))
             }
-            Ty::Var(id) => {
-                // `any` is Ipê's wildcard type-variable name. In annotations it
-                // means "I don't care about this type" — each occurrence is an
-                // INDEPENDENT fresh flex UV, NOT a shared rigid skolem. Sharing
-                // would force all occurrences to the same type; rigid would
-                // prevent the body from assigning a concrete type.  Mirrors the
-                // the compiler compiler's `Instantiate.fromAnnotation` filtering
-                // `"any"` out of the skolem set and `buildEnv` giving each
-                // occurrence its own fresh UF var.
-                // AUD-13: a solver-representative id (tagged by `zonk`) is
-                // structurally never an annotation symbol — skip the
-                // interner resolution entirely rather than risk a spurious
-                // numeric collision with the interned "any" string.
-                let is_any = !is_solver_var(*id)
-                    && self
-                        .interner
-                        .resolve(ipe_intern::Symbol::from_raw(*id))
-                        .is_some_and(|name| name == "any");
-                if is_any {
-                    // Fresh flex UV per occurrence — intentionally NOT inserted
-                    // into `vars` so the next occurrence also gets its own UV.
-                    // A signature's own wildcard (`rigid`) is a generic
-                    // parameter defaulting must leave alone.
-                    let v = self.flex()?;
-                    if rigid {
-                        self.signature_wildcards.push(v);
-                    }
-                    if let Some(log) = self.wildcard_log.as_mut() {
-                        log.push(v);
-                    }
-                    return Ok(v);
+            Ty::Wildcard => {
+                // The wildcard `any`: each occurrence is an INDEPENDENT fresh
+                // flex, never a shared rigid skolem, and never entered into
+                // `vars`, so the next occurrence gets its own. Sharing would
+                // force every occurrence to one type; rigid would forbid the
+                // body from assigning a concrete type. A signature's own
+                // wildcard (`rigid`) is a generic parameter defaulting must
+                // leave alone.
+                let v = self.flex()?;
+                if rigid {
+                    self.signature_wildcards.push(v);
                 }
+                if let Some(log) = self.wildcard_log.as_mut() {
+                    log.push(v);
+                }
+                Ok(v)
+            }
+            Ty::Var(id) => {
                 if let Some(v) = vars.get(id).copied() {
                     return Ok(v);
                 }

@@ -200,6 +200,8 @@ fn row_param_non_record_arg_refused() {
         "Named ( Int, Int )",
         "Named (Int -> Int)",
         "Named (Maybe Int)",
+        // The wildcard is no record, so it has no row to extend.
+        "Named any",
     ] {
         let (local_result, _) = canonicalise_chain(&[&local(ann)]);
         assert!(

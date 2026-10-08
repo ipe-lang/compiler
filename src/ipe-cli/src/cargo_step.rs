@@ -17,24 +17,39 @@
 //!
 //! Every cargo child starts through `spawn_cargo`, so a build script never
 //! inherits a descriptor the CLI holds open and, on Linux, never outlives the
-//! CLI. A `cargo build` carries no wall: it runs as long as the user's build
-//! takes.
+//! CLI. A `cargo build` leads its own process group and is held to
+//! [`CARGO_BUILD_WALL`] in every profile and in every watch rebuild: at the
+//! wall the whole group (cargo, rustc, every build script) is killed and the
+//! build is refused, naming the wall.
 
 use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use ipe_backend_rust::static_build::StaticTriple;
 
 use crate::output_dir::OwnedDir;
 use crate::remote_ingest::{
-    LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal, LocalSource,
-    METADATA_LIMITS, RunError, run_local,
+    GroupedChild, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal, LocalSource,
+    LocalWall, METADATA_LIMITS, RunError, run_local,
 };
 use crate::style::TerminalSafe;
 use crate::toolchain::CargoBin;
 use crate::watch::{BuildAccel, apply_build_accel_env};
 use crate::{CliError, RuntimeContext, text};
+
+/// The wall of every `cargo build`, in every profile and in every watch rebuild.
+///
+/// A build still running at the wall is stopped with every process it
+/// started and refused as [`CliError::CargoBuildTimedOut`].
+pub const CARGO_BUILD_WALL: LocalWall = LocalWall::of_secs::<CARGO_BUILD_WALL_SECS>();
+
+/// The seconds of [`CARGO_BUILD_WALL`].
+pub const CARGO_BUILD_WALL_SECS: u64 = 3600;
+
+/// How often a build's waiter checks for its exit and its wall.
+pub const BUILD_POLL: Duration = Duration::from_millis(30);
 
 /// Bytes of a build's `--message-format=json` stdout kept; a longer stream
 /// fails the build, since the stream is the record of the artifacts cargo wrote.
@@ -234,9 +249,16 @@ impl CargoBuild<'_> {
     ///   its artifact stream passes [`ARTIFACT_STREAM_CAP`].
     /// - [`CliError::EmittedBuildFailed`] if the resolve or the build exits
     ///   non-zero.
+    /// - [`CliError::CargoBuildTimedOut`] if the build runs past
+    ///   [`CARGO_BUILD_WALL`]; every process it started is killed.
     /// - [`CliError::OutputRefused`] if an [`CargoCrate::Emitted`] directory
     ///   was replaced before or while cargo ran.
     pub fn run(&self) -> Result<String, CliError> {
+        self.run_within(CARGO_BUILD_WALL)
+    }
+
+    /// [`Self::run`] with the build held to `wall`.
+    fn run_within(&self, wall: LocalWall) -> Result<String, CliError> {
         if let CargoCrate::Emitted(dir) = self.krate {
             dir.verify()?;
         }
@@ -250,7 +272,7 @@ impl CargoBuild<'_> {
             lock_dependencies(&cmd, dir, self.output.verbosity())?;
         }
         cmd.arg("--locked");
-        let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP).map_err(io_err)?;
+        let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP, wall).map_err(io_err)?;
         let stdout = self.verdict(drained)?;
         if let CargoCrate::Emitted(dir) = self.krate {
             dir.verify()?;
@@ -260,17 +282,22 @@ impl CargoBuild<'_> {
 
     /// The build's captured stdout, or why the drained build failed.
     ///
-    /// A stderr that could not be read outranks a non-zero exit, so a partial
-    /// stderr is never rendered as the build's diagnostic.
-    fn verdict(&self, drained: Drained<ExitStatus>) -> Result<String, CliError> {
+    /// A build stopped at its wall outranks every other failure, since its
+    /// exit and its streams were cut by the stop. A stderr that could not be
+    /// read outranks a non-zero exit, so a partial stderr is never rendered as
+    /// the build's diagnostic.
+    fn verdict(&self, drained: Drained<BuildExit>) -> Result<String, CliError> {
         let io_err = |source: std::io::Error| CliError::Io {
             path: self.dir().to_path_buf(),
             source,
         };
+        let status = match drained.waited {
+            BuildExit::Exited(status) => status,
+            BuildExit::TimedOut(wall) => return Err(CliError::CargoBuildTimedOut { wall }),
+        };
         if let Some(e) = drained.stderr.error {
             return Err(io_err(e));
         }
-        let status = drained.waited;
         if !status.success() {
             return Err(CliError::EmittedBuildFailed {
                 what: self.what,
@@ -368,10 +395,12 @@ impl WatchBuild<'_> {
 
     /// Spawn the rebuild, its pipes taken for [`CargoPipes::drain_while`].
     ///
+    /// The caller holds the rebuild to [`CARGO_BUILD_WALL`].
+    ///
     /// # Errors
     /// The spawn error when cargo cannot be started, or the refusal of
     /// `spawn_cargo`.
-    pub fn spawn(&self) -> std::io::Result<(Child, CargoPipes)> {
+    pub fn spawn(&self) -> std::io::Result<(GroupedChild, CargoPipes)> {
         let mut child = spawn_cargo(self.command())?;
         let pipes = CargoPipes::take(&mut child, ARTIFACT_STREAM_CAP);
         Ok((child, pipes))
@@ -388,7 +417,9 @@ fn build_command(
     output: CargoOutput,
 ) -> Command {
     let mut cmd = Command::new(cargo);
-    cmd.arg("build").current_dir(dir);
+    // Outside the terminal's foreground group a terminal read would stop the
+    // build, so stdin is the null device.
+    cmd.arg("build").current_dir(dir).stdin(Stdio::null());
     if profile == CargoProfile::Release {
         cmd.arg("--release");
     }
@@ -417,33 +448,82 @@ fn build_command(
     cmd
 }
 
-/// Start a `cargo build` child through the runtime's hardened spawner.
+/// Start a `cargo build` child as the leader of its own process group.
 ///
-/// The child inherits no descriptor beyond its three standard streams and, on
-/// Linux, dies with the CLI. No wall is set.
+/// The child starts through the runtime's hardened spawner, so it inherits no
+/// descriptor beyond its three standard streams and, on Linux, dies with the
+/// CLI. The group lets the wall stop every process the build started.
 ///
 /// # Errors
 /// The spawn refusal, as an I/O error, when the spawner is unavailable, this
-/// host does not list its open descriptors, or cargo cannot be started.
-fn spawn_cargo(cmd: Command) -> std::io::Result<Child> {
-    ipe_runtime_rust::system::spawn_hardened(cmd).map_err(std::io::Error::from)
+/// host does not list its open descriptors, a signal ended every detached
+/// group, or cargo cannot be started.
+fn spawn_cargo(cmd: Command) -> std::io::Result<GroupedChild> {
+    GroupedChild::spawn(cmd)
 }
 
-/// Spawn `cmd`, drain its pipes while waiting on it, and return its exit
-/// status with both drains; the child is reaped before this returns.
-fn run_to_exit(cmd: Command, stdout_cap: usize) -> std::io::Result<Drained<ExitStatus>> {
+/// How a waited `cargo build` ended.
+#[derive(Debug)]
+pub enum BuildExit {
+    /// cargo exited on its own, with this status.
+    Exited(ExitStatus),
+    /// cargo was still running at this wall; every process of its group was killed.
+    TimedOut(LocalWall),
+}
+
+/// Spawn `cmd`, drain its pipes while waiting on it under `wall`, and return
+/// how it ended with both drains; the child is reaped before this returns.
+fn run_to_exit(
+    cmd: Command,
+    stdout_cap: usize,
+    wall: LocalWall,
+) -> std::io::Result<Drained<BuildExit>> {
     let mut child = spawn_cargo(cmd)?;
     let pipes = CargoPipes::take(&mut child, stdout_cap);
+    let started = Instant::now();
     let Drained {
         waited,
         stdout,
         stderr,
-    } = pipes.drain_while(|| child.wait());
+    } = pipes.drain_while(|| wait_within(&mut child, started, wall));
     Ok(Drained {
         waited: waited?,
         stdout,
         stderr,
     })
+}
+
+/// Wait for `child` to exit, killing its whole group once `wall` has passed since `started`.
+///
+/// The child is reaped before this returns, on every path, so the pipe drains
+/// reach end-of-stream.
+///
+/// # Errors
+/// The child's state could not be read or it could not be reaped, or a
+/// signal ended every detached group.
+fn wait_within(
+    child: &mut GroupedChild,
+    started: Instant,
+    wall: LocalWall,
+) -> std::io::Result<BuildExit> {
+    loop {
+        match child.exited() {
+            Ok(true) => return child.reap().map(BuildExit::Exited),
+            Ok(false) => {}
+            Err(e) => {
+                child.kill();
+                // The read error is the outcome; the stop only reaps.
+                let _ = child.finish();
+                return Err(e);
+            }
+        }
+        if started.elapsed() >= wall.limit().get() {
+            child.kill();
+            child.finish()?;
+            return Ok(BuildExit::TimedOut(wall));
+        }
+        std::thread::sleep(BUILD_POLL);
+    }
 }
 
 /// Resolve the crate's dependency graph once into its own `Cargo.lock`, with
@@ -627,11 +707,12 @@ impl std::error::Error for PipeOverflow {}
 
 impl CargoPipes {
     /// Take both pipes off `child`.
-    const fn take(child: &mut Child, stdout_cap: usize) -> Self {
+    fn take(child: &mut GroupedChild, stdout_cap: usize) -> Self {
+        let (stdout, stderr) = child.take_pipes();
         Self {
-            stdout: child.stdout.take(),
+            stdout,
             stdout_cap,
-            stderr: child.stderr.take(),
+            stderr,
         }
     }
 
@@ -1396,12 +1477,15 @@ mod tests {
                 verbosity: Verbosity::Quiet,
             };
             let (mut child, pipes) = watch.spawn().expect("spawn the watch build");
-            let drained = pipes.drain_while(|| child.wait());
+            let drained = pipes.drain_while(|| {
+                super::super::wait_within(
+                    &mut child,
+                    std::time::Instant::now(),
+                    LocalWall::of_secs::<30>(),
+                )
+            });
             assert!(
-                drained
-                    .waited
-                    .as_ref()
-                    .is_ok_and(std::process::ExitStatus::success),
+                matches!(&drained.waited, Ok(super::super::BuildExit::Exited(status)) if status.success()),
                 "{:?}",
                 drained.waited
             );
@@ -1421,7 +1505,7 @@ mod tests {
             let cargo = stub(&base, "exit 0");
             let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
             let drained = super::super::Drained {
-                waited: std::process::ExitStatus::from_raw(7 << 8),
+                waited: super::super::BuildExit::Exited(std::process::ExitStatus::from_raw(7 << 8)),
                 stdout: super::super::Drain::default(),
                 stderr: super::super::Drain {
                     text: "partial".to_owned(),
@@ -1443,6 +1527,110 @@ mod tests {
                 "an unread stderr is an I/O failure, never a partial build diagnostic, got {verdict:?}"
             );
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A stub cargo that resolves its lock at once and, for `build`, starts
+        /// a background `sleep` (its pid in `base/grandchild`), records its own
+        /// pid in `base/pid`, then sleeps far past the test wall.
+        fn hanging_build_stub(base: &Path) -> CargoBin {
+            stub(
+                base,
+                &format!(
+                    "[ \"$1\" = build ] || exit 0\nsleep 30 &\necho $! > '{}'\necho $$ > '{}'\nexec sleep 30",
+                    base.join("grandchild").display(),
+                    base.join("pid").display()
+                ),
+            )
+        }
+
+        /// Run a quiet build of `krate` held to a one-second wall, timing it.
+        fn build_within_a_second(
+            cargo: &CargoBin,
+            krate: CargoCrate<'_>,
+        ) -> (Result<String, CliError>, Duration) {
+            let started = std::time::Instant::now();
+            let built = CargoBuild {
+                cargo,
+                krate,
+                profile: CargoProfile::Dev,
+                target: CargoTarget::Host,
+                output: CargoOutput::JsonStream(Verbosity::Quiet),
+                what: "the stub build",
+                runtime: None,
+            }
+            .run_within(LocalWall::of_secs::<1>());
+            (built, started.elapsed())
+        }
+
+        #[test]
+        fn an_emitted_build_past_its_wall_is_refused_and_its_group_killed() {
+            let base = scratch("build-wall");
+            let cargo = hanging_build_stub(&base);
+            let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            let (built, took) = build_within_a_second(&cargo, CargoCrate::Emitted(&crate_dir));
+            let wall = LocalWall::of_secs::<1>();
+            assert!(
+                matches!(&built, Err(CliError::CargoBuildTimedOut { wall: w }) if *w == wall),
+                "a build past its wall is refused naming the wall, got {built:?}"
+            );
+            assert!(
+                took < Duration::from_secs(20),
+                "the refusal lands at the wall, not when the build ends: {took:?}"
+            );
+            assert!(gone_soon(&base.join("pid")), "the build leader is killed");
+            assert!(
+                gone_soon(&base.join("grandchild")),
+                "every process the build started is killed"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_wrapper_build_past_its_wall_is_refused_and_its_group_killed() {
+            let base = scratch("wrapper-wall");
+            let cargo = hanging_build_stub(&base);
+            let source = crate::wrapper_source::WrapperSource::unverified_for_test(&base);
+            let (built, took) = build_within_a_second(
+                &cargo,
+                CargoCrate::ReleaseWrapper {
+                    source: &source,
+                    embed: None,
+                },
+            );
+            assert!(
+                matches!(&built, Err(CliError::CargoBuildTimedOut { .. })),
+                "a wrapper build past its wall is refused, got {built:?}"
+            );
+            assert!(took < Duration::from_secs(20), "{took:?}");
+            assert!(gone_soon(&base.join("pid")), "the build leader is killed");
+            assert!(
+                gone_soon(&base.join("grandchild")),
+                "every process the build started is killed"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_build_within_its_wall_is_not_refused() {
+            let base = scratch("build-in-wall");
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            let (built, _) = build_within_a_second(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(
+                built.is_ok(),
+                "a build that ends inside its wall passes, got {built:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn the_build_wall_refusal_names_the_wall_and_the_way_to_find_the_stuck_step() {
+            let shown = CliError::CargoBuildTimedOut {
+                wall: super::super::CARGO_BUILD_WALL,
+            }
+            .to_string();
+            assert!(shown.contains("3600 seconds"), "{shown}");
+            assert!(shown.contains("cargo build -vv"), "{shown}");
         }
 
         #[test]
