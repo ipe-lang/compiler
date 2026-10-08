@@ -1492,6 +1492,35 @@ const fn landmark_role_for(desc: &Description) -> Option<&'static str> {
     }
 }
 
+/// A `describe` landmark: its native tag, its `role`, and the description.
+type Landmark<'a> = (NodeTag, Option<&'static str>, &'a Description);
+
+/// The one precedence between a heading and a `describe` landmark, in flow and
+/// demoted alike: a node that is a heading, by its own description or by a
+/// `describe`, is announced as that heading, so a `describe` landmark that is
+/// not itself a heading neither retags the node nor gives it a `role`.
+fn landmark_beside_heading(
+    landmark: Option<Landmark<'_>>,
+    heading: Option<HeadingLevel>,
+) -> Option<Landmark<'_>> {
+    landmark.filter(|(_, _, d)| heading.is_none() || d.heading_level().is_some())
+}
+
+/// Set an attribute the node emits itself, removing every author attribute of
+/// the same name (ASCII case-insensitive, as HTML compares names), so the
+/// element carries it once and with the emitted value.
+fn claim_attr<M>(html_attrs: &mut Vec<HtmlAttribute<M>>, attr: HtmlAttribute<M>) {
+    if let HtmlAttribute::Attr(name, _) = &attr {
+        html_attrs.retain(|a| match a {
+            HtmlAttribute::Attr(k, _) | HtmlAttribute::BoolAttr(k, _) => {
+                !k.trim().eq_ignore_ascii_case(name)
+            }
+            HtmlAttribute::EventAttr(_) | HtmlAttribute::NoAttr => true,
+        });
+    }
+    html_attrs.push(attr);
+}
+
 /// The tag a node renders with: a closed `NodeTag`, or the tag a
 /// `TaggedNode` carries as written.
 enum ResolvedTag {
@@ -1526,9 +1555,10 @@ impl ResolvedTag {
 /// Content model: a flow `NodeTag` under a phrasing ancestor renders as a
 /// `span` laid out inline (`demote_attrs`), and every descendant of a phrasing
 /// element stays phrasing, so the browser's parser builds the tree rendered
-/// here. Sections: a `DescSection` whose first child is a heading with content
-/// ranks its descendants' headings one level deeper; a first heading with no
-/// content is skipped and the level is kept.
+/// here. Sections: a `DescSection` whose first child is a heading with
+/// announced content ranks its descendants' headings one level deeper; an
+/// inert first heading is skipped, and any other first heading renders; both
+/// keep the level.
 #[allow(clippy::too_many_lines)] // one linear pass: tag, style, children, gate
 fn render_node_as<M: Clone>(
     written: Option<String>,
@@ -1565,15 +1595,17 @@ fn render_node_as<M: Clone>(
     let heading = landmark
         .and_then(|(_, _, d)| d.heading_level())
         .or(own_heading);
+    let landmark = landmark_beside_heading(landmark, heading);
     let own = tag_for_description(desc, ctx.section);
-    // A node demoted to a `span` loses its landmark tag, so it announces the
-    // landmark through `role`: the `describe` landmark first, else its own. A
-    // `describe` heading claims the one `role` as `heading`, so the node's own
-    // landmark yields to it.
-    let demoted_role = match landmark {
-        Some((_, _, d)) if d.heading_level().is_some() => None,
-        Some((_, role, _)) => role.or_else(|| landmark_role_for(desc)),
-        None => landmark_role_for(desc),
+    // A node demoted to a `span` loses its landmark tag, so a node that is no
+    // heading announces its landmark through `role`: the `describe` landmark
+    // first, else its own. A heading announces only the heading.
+    let demoted_role = if heading.is_some() {
+        None
+    } else {
+        landmark
+            .and_then(|(_, role, _)| role)
+            .or_else(|| landmark_role_for(desc))
     };
     let (resolved, role_attr): (ResolvedTag, Option<&'static str>) = match (written, landmark) {
         (None, Some((retag, _, _))) if own == NodeTag::Div => (ResolvedTag::Typed(retag), None),
@@ -1643,15 +1675,21 @@ fn render_node_as<M: Clone>(
         &join_style(role_css, &build_style_string(&attrs)),
     );
     let mut html_attrs = collect_html_attrs(&attrs);
+    // An element carries one `role`, the one it emits: a landmark role for a
+    // node that is no heading, else the heading role, each replacing an
+    // author's `role` of its own.
     if let Some(role) = role_attr {
-        html_attrs.push(HtmlAttribute::Attr("role".to_owned(), role.to_owned()));
+        claim_attr(
+            &mut html_attrs,
+            HtmlAttribute::Attr("role".to_owned(), role.to_owned()),
+        );
     }
-    // An element carries one `role`: a landmark role already set wins over the
-    // heading role.
     if let Some(level) = heading {
         let native = matches!(heading_markup(level), HeadingMarkup::Native(t) if t.as_str() == tag);
-        if !native && role_attr.is_none() {
-            html_attrs.extend(heading_role_attrs(level));
+        if !native {
+            for attr in heading_role_attrs(level) {
+                claim_attr(&mut html_attrs, attr);
+            }
         }
     }
 
@@ -3662,7 +3700,7 @@ mod tests {
 mod text_role_tests {
     use super::*;
     use crate::html::{ElementBody, RenderedElement, admit_rendered, render_html};
-    use crate::ui::element::{WhiteSpace, has_content};
+    use crate::ui::element::{Presence, WhiteSpace, presence};
     use crate::ui::helpers::{ui_column_, ui_el_, ui_paragraph_, ui_row_};
 
     type E = Element<()>;
@@ -3966,34 +4004,41 @@ mod text_role_tests {
         assert!(s.contains("white-space:pre-wrap"), "{s}");
     }
 
-    /// `has_content` matches every `Element` shape explicitly: its body holds
-    /// no wildcard arm (CI job `test`).
+    /// `presence` and its inertness tables match every `Element`,
+    /// `Description` and `Attribute` shape explicitly: no body holds a
+    /// wildcard arm, so a new variant must be classified (CI job `test`).
     #[test]
-    fn has_content_has_no_wildcard_arm() {
+    fn presence_has_no_wildcard_arm() {
         let source = include_str!("element.rs");
-        let body = source
-            .split_once("pub fn has_content")
-            .and_then(|(_, rest)| rest.split_once("\n}\n"))
-            .map_or("", |(body, _)| body);
-        assert!(body.contains("Element::Empty"), "the scan found the body");
-        assert!(!body.contains("_ =>"), "{body}");
+        for (head, marker) in [
+            ("pub fn presence", "Element::Empty"),
+            ("const fn description_is_inert", "Description::DescButton"),
+            ("fn attribute_is_inert", "Attribute::AttrAnimation"),
+        ] {
+            let body = source
+                .split_once(head)
+                .and_then(|(_, rest)| rest.split_once("\n}\n"))
+                .map_or("", |(body, _)| body);
+            assert!(body.contains(marker), "the scan found {head}");
+            assert!(!body.contains("_ =>"), "{body}");
+        }
     }
 
-    /// `has_content` stops one past the depth ceiling and fails closed (a
-    /// too-deep subtree counts as content); a shallow empty chain (the
-    /// control) has none (CI job `test`).
+    /// `presence` stops one past the depth ceiling and fails closed (a
+    /// too-deep subtree counts as announced, so it is kept); a shallow empty
+    /// chain (the control) is inert (CI job `test`).
     #[test]
-    fn has_content_is_bounded_and_fails_closed() {
+    fn presence_is_bounded_and_fails_closed() {
         let mut deep: E = Element::Empty;
         for _ in 0..=crate::html::MAX_HTML_DEPTH {
             deep = Element::Node(Description::NoDescription, vec![], vec![deep]);
         }
-        assert!(has_content(&deep));
+        assert_eq!(presence(&deep), Presence::Announced);
         let mut shallow: E = text(" ");
         for _ in 0..10 {
             shallow = Element::Node(Description::NoDescription, vec![], vec![shallow]);
         }
-        assert!(!has_content(&shallow));
+        assert_eq!(presence(&shallow), Presence::Inert);
     }
 
     /// A landmark demoted to a `span` below a paragraph keeps its `role`,
@@ -4077,11 +4122,15 @@ mod text_role_tests {
         assert_eq!(rendered, (true, "leaf".to_owned()));
     }
 
-    /// A `textarea`, a `select` and an overlay-only node present content with
-    /// no child text, so a section heading holding one is kept; a heading of an
-    /// empty `div` (the control) has none and is skipped (CI job `test`).
+    /// A heading is dropped only when nothing is lost: a heading of an empty
+    /// `div`, `span`, `p`, `br` or `wbr`, or of text-styled empty nodes, is
+    /// skipped. Self-presenting content (a `textarea`, a `select`, an overlay,
+    /// an image, a visible input, `audio` with controls) is announced and
+    /// ranks; a hidden input, an `audio` without controls, a `meta`, a
+    /// `source`, an empty landmark and an attribute-bearing empty box announce
+    /// nothing yet render with their heading, never dropped (CI job `test`).
     #[test]
-    fn self_presenting_heading_content_is_kept() {
+    fn heading_is_dropped_only_when_inert() {
         let tagged_with = |tag: &str, attrs: Vec<(&str, &str)>| -> E {
             let attrs = attrs
                 .into_iter()
@@ -4095,42 +4144,131 @@ mod text_role_tests {
             vec![Attribute::AttrNearby(Location::Below, text("tip"))],
             vec![],
         );
-        for (inner, kept) in [
-            (tagged("textarea"), true),
-            (tagged("select"), true),
-            (overlay_only, true),
-            (tagged("img"), true),
-            (tagged_with("input", vec![("type", "text")]), true),
-            (tagged("input"), true),
-            (tagged_with("audio", vec![("controls", "")]), true),
-            (tagged("div"), false),
-            (tagged("br"), false),
-            (tagged("wbr"), false),
-            (tagged("audio"), false),
-            (tagged_with("input", vec![("type", "Hidden")]), false),
+        let with = |attr: Attribute<()>| -> E {
+            Element::Node(Description::NoDescription, vec![attr], vec![])
+        };
+        for (inner, expected) in [
+            (tagged("textarea"), Presence::Announced),
+            (tagged("select"), Presence::Announced),
+            (overlay_only, Presence::Announced),
+            (tagged("img"), Presence::Announced),
+            (
+                tagged_with("input", vec![("type", "text")]),
+                Presence::Announced,
+            ),
+            (tagged("input"), Presence::Announced),
+            (
+                tagged_with("audio", vec![("controls", "")]),
+                Presence::Announced,
+            ),
+            (tagged("div"), Presence::Inert),
+            (tagged("SPAN"), Presence::Inert),
+            (tagged("p"), Presence::Inert),
+            (tagged("br"), Presence::Inert),
+            (tagged("wbr"), Presence::Inert),
+            (with(Attribute::AttrFontSize(20)), Presence::Inert),
+            (ui_row_(vec![], vec![]), Presence::Inert),
+            (tagged("audio"), Presence::Unannounced),
+            (
+                tagged_with("audio", vec![("autoplay", "")]),
+                Presence::Unannounced,
+            ),
+            (
+                tagged_with("input", vec![("type", "Hidden")]),
+                Presence::Unannounced,
+            ),
             (
                 tagged_with("input", vec![("type", "hidden"), ("type", "text")]),
-                false,
+                Presence::Unannounced,
+            ),
+            (tagged("meta"), Presence::Unannounced),
+            (tagged("source"), Presence::Unannounced),
+            (
+                role(Description::DescNavigation, vec![]),
+                Presence::Unannounced,
+            ),
+            (
+                with(Attribute::AttrAttribute("id".to_owned(), "top".to_owned())),
+                Presence::Unannounced,
+            ),
+            (
+                with(Attribute::AttrClass("icon".to_owned())),
+                Presence::Unannounced,
             ),
         ] {
             let head = heading(vec![inner]);
-            assert_eq!(has_content(&head), kept);
-            let tree = section(head, text("body"));
-            assert_eq!(headings_of(tree).len(), usize::from(kept));
+            assert_eq!(presence(&head), expected);
+            let s = html_of(section(head, text("body")));
+            assert_eq!(s.contains("<h1"), expected != Presence::Inert, "{s}");
+            assert!(s.contains("body"), "{s}");
         }
     }
 
-    /// A demoted node carries one `role`: a heading with a `describe`
-    /// navigation landmark announces the landmark, and a main landmark with a
-    /// `describe` heading announces the heading. In flow (the control) the
-    /// first keeps its native `h2` with the landmark role and the second its
-    /// `main` with the heading role (CI job `test`).
+    /// A heading holding only a hidden input or an autoplaying `audio` without
+    /// controls renders, and the element with it; an empty-`div` heading (the
+    /// control) is dropped. Such a heading announces nothing, so it ranks
+    /// nothing below it (CI job `test`).
     #[test]
-    fn demotion_emits_one_role() {
-        let level = HeadingLevel::from_requested(2);
-        let nav_heading = || -> E {
+    fn functional_heading_content_is_never_dropped() {
+        let hidden: E = Element::TaggedNode(
+            "input".to_owned(),
+            Description::NoDescription,
+            vec![
+                Attribute::AttrAttribute("type".to_owned(), "hidden".to_owned()),
+                Attribute::AttrAttribute("name".to_owned(), "csrf".to_owned()),
+            ],
+            vec![],
+        );
+        let audio: E = Element::TaggedNode(
+            "audio".to_owned(),
+            Description::NoDescription,
+            vec![
+                Attribute::AttrAttribute("autoplay".to_owned(), String::new()),
+                Attribute::AttrAttribute("src".to_owned(), "/a.ogg".to_owned()),
+            ],
+            vec![],
+        );
+        let inner = |head: E| section(head, section(heading(vec![text("B")]), text("body")));
+        let s = html_of(inner(heading(vec![hidden])));
+        assert!(s.contains("<input") && s.contains("csrf"), "{s}");
+        let a = html_of(inner(heading(vec![audio])));
+        assert!(a.contains("<audio") && a.contains("a.ogg"), "{a}");
+        let ranks = headings_of(inner(heading(vec![Element::TaggedNode(
+            "audio".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![],
+        )])));
+        assert_eq!(
+            ranks,
+            vec![
+                ("h1".to_owned(), String::new()),
+                ("h1".to_owned(), "B".to_owned())
+            ]
+        );
+        let dropped = html_of(inner(heading(vec![Element::TaggedNode(
+            "div".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![],
+        )])));
+        assert_eq!(dropped.matches("<h1").count(), 1, "{dropped}");
+    }
+
+    /// A node carries one `role` and one winner in every context: a heading,
+    /// by its own description or by a `describe`, is announced as that heading
+    /// over any `describe` landmark, in flow and demoted below a paragraph
+    /// alike. A level-2 heading with a navigation `describe` is a native `h2`
+    /// in flow and `role="heading"` with `aria-level="2"` demoted; a level-7
+    /// one is `role="heading"` with `aria-level="7"` in both; a main landmark
+    /// with a `describe` heading announces the heading. A landmark with no
+    /// heading (the control) keeps its landmark role when demoted (CI job
+    /// `test`).
+    #[test]
+    fn heading_wins_over_landmark_in_every_context() {
+        let nav_heading = |n: i64| -> E {
             Element::Node(
-                Description::DescHeading(level),
+                Description::DescHeading(HeadingLevel::from_requested(n)),
                 vec![Attribute::AttrDescribe(Description::DescNavigation)],
                 vec![text("a")],
             )
@@ -4138,33 +4276,98 @@ mod text_role_tests {
         let main_heading = || -> E {
             Element::Node(
                 Description::DescMain,
-                vec![Attribute::AttrDescribe(Description::DescHeading(level))],
+                vec![Attribute::AttrDescribe(Description::DescHeading(
+                    HeadingLevel::from_requested(2),
+                ))],
                 vec![text("b")],
             )
         };
         let roles = |s: &str| s.matches("role=").count();
+        let flow = |e: E| html_of(role(Description::NoDescription, vec![e]));
+        let demoted = |e: E| html_of(ui_paragraph_(vec![], vec![e]));
 
-        let nav = html_of(ui_paragraph_(vec![], vec![nav_heading()]));
-        assert_eq!(roles(&nav), 1, "{nav}");
-        assert!(nav.contains("role=\"navigation\""), "{nav}");
-        assert!(!nav.contains("aria-level") && !nav.contains("<h2"), "{nav}");
-        let main = html_of(ui_paragraph_(vec![], vec![main_heading()]));
-        assert_eq!(roles(&main), 1, "{main}");
-        assert!(main.contains("role=\"heading\""), "{main}");
-        assert!(main.contains("aria-level=\"2\""), "{main}");
-        assert!(!main.contains("<main"), "{main}");
-
-        let nav_flow = html_of(role(Description::NoDescription, vec![nav_heading()]));
-        assert_eq!(roles(&nav_flow), 1, "{nav_flow}");
+        for s in [flow(nav_heading(2)), demoted(nav_heading(2))] {
+            assert!(!s.contains("navigation") && !s.contains("<nav"), "{s}");
+            assert!(roles(&s) <= 1, "{s}");
+        }
+        let f2 = flow(nav_heading(2));
+        assert!(f2.contains("<h2") && roles(&f2) == 0, "{f2}");
+        let d2 = demoted(nav_heading(2));
+        assert_eq!(roles(&d2), 1, "{d2}");
         assert!(
-            nav_flow.contains("<h2") && nav_flow.contains("role=\"navigation\""),
-            "{nav_flow}"
+            d2.contains("role=\"heading\"") && d2.contains("aria-level=\"2\""),
+            "{d2}"
         );
-        let main_flow = html_of(role(Description::NoDescription, vec![main_heading()]));
-        assert_eq!(roles(&main_flow), 1, "{main_flow}");
-        assert!(main_flow.contains("<main"), "{main_flow}");
-        assert!(main_flow.contains("role=\"heading\""), "{main_flow}");
-        assert!(main_flow.contains("aria-level=\"2\""), "{main_flow}");
+
+        for s in [flow(nav_heading(7)), demoted(nav_heading(7))] {
+            assert_eq!(roles(&s), 1, "{s}");
+            assert!(s.contains("role=\"heading\""), "{s}");
+            assert!(s.contains("aria-level=\"7\""), "{s}");
+            assert!(!s.contains("navigation") && !s.contains("<nav"), "{s}");
+        }
+
+        for s in [flow(main_heading()), demoted(main_heading())] {
+            assert_eq!(roles(&s), 1, "{s}");
+            assert!(s.contains("role=\"heading\""), "{s}");
+            assert!(s.contains("aria-level=\"2\""), "{s}");
+        }
+
+        let nav = || -> E {
+            Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrDescribe(Description::DescNavigation)],
+                vec![text("n")],
+            )
+        };
+        let d = demoted(nav());
+        assert_eq!(roles(&d), 1, "{d}");
+        assert!(d.contains("role=\"navigation\""), "{d}");
+    }
+
+    /// An author `role` (any ASCII case) yields to the role a node emits, so
+    /// the element carries one `role`, the emitted one: a demoted landmark, a
+    /// level-7 heading and its `aria-level`. A node that emits no role (the
+    /// control) keeps the author's (CI job `test`).
+    #[test]
+    fn author_role_yields_to_the_emitted_role() {
+        let author = |n: &str, v: &str| Attribute::AttrAttribute(n.to_owned(), v.to_owned());
+        let roles = |s: &str| s.to_ascii_lowercase().matches("role=").count();
+        let landmark: E = Element::Node(
+            Description::NoDescription,
+            vec![
+                author("role", "button"),
+                Attribute::AttrDescribe(Description::DescNavigation),
+            ],
+            vec![text("n")],
+        );
+        let s = html_of(ui_paragraph_(vec![], vec![landmark]));
+        assert_eq!(roles(&s), 1, "{s}");
+        assert!(
+            s.contains("role=\"navigation\"") && !s.contains("button"),
+            "{s}"
+        );
+
+        let deep: E = Element::Node(
+            Description::DescHeading(HeadingLevel::from_requested(7)),
+            vec![author("ROLE", "presentation"), author("aria-level", "1")],
+            vec![text("h")],
+        );
+        let h = html_of(deep);
+        assert_eq!(roles(&h), 1, "{h}");
+        assert!(
+            h.contains("role=\"heading\"") && !h.contains("presentation"),
+            "{h}"
+        );
+        assert_eq!(h.matches("aria-level").count(), 1, "{h}");
+        assert!(h.contains("aria-level=\"7\""), "{h}");
+
+        let plain: E = Element::Node(
+            Description::NoDescription,
+            vec![author("role", "status")],
+            vec![text("p")],
+        );
+        let p = html_of(plain);
+        assert!(p.contains("role=\"status\""), "{p}");
     }
 
     /// A section heading demoted to a `span` below a paragraph keeps its rank

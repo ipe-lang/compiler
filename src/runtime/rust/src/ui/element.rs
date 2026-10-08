@@ -428,11 +428,27 @@ pub enum Element<M> {
 
 /// Tagged elements that present a box of their own with no child content: an
 /// image, a rule, a form control, or an embedded document, video or gauge.
-/// `input` and `audio` are judged by `presents_itself`, and the other void
-/// tags (`br`, `wbr`, and the metadata and table-column tags) present nothing.
+/// `input` and `audio` are judged by `presents_itself`.
 const SELF_PRESENTING_TAGS: [&str; 12] = [
     "img", "hr", "embed", "textarea", "select", "iframe", "object", "canvas", "video", "progress",
     "meter", "input",
+];
+
+/// Tags that hold nothing of their own: a generic container, or a line or word
+/// break. Every other tag may carry behaviour without a visible box (a hidden
+/// input, an autoplaying `audio`, a `meta`, `link` or `source`), so dropping it
+/// would lose something.
+const INERT_TAGS: [&str; 5] = ["div", "span", "p", "br", "wbr"];
+
+/// The internal direction markers `ui_row_` / `ui_column_` and the content
+/// model place as `AttrStyle` keys: each only lays out children.
+const LAYOUT_MARKERS: [&str; 6] = [
+    "__row",
+    "__col",
+    "__inline",
+    "__inline_row",
+    "__inline_col",
+    "__wrappedrow",
 ];
 
 /// True when a tagged element presents a box of its own whatever its children:
@@ -459,46 +475,147 @@ fn presents_itself<M>(tag: &str, attrs: &[Attribute<M>]) -> bool {
         .any(|t| tag.eq_ignore_ascii_case(t))
 }
 
-/// True when an element renders something visible or announced.
-///
-/// An empty element, a text leaf of Unicode `White_Space` only, and a
-/// container whose every child is itself empty have no content. A tagged
-/// element that presents itself (`presents_itself`: an image, a visible input
-/// control, a `textarea`, a `select`, embedded media), a node carrying an
-/// `AttrNearby` overlay, raw markup and a cell grid have content. The walk is iterative and
-/// stops at `MAX_HTML_DEPTH`, where it answers true so the render's own depth
+/// True when a description adds nothing to an element with no content. A
+/// landmark, a label and a button are announced or focusable even when empty.
+const fn description_is_inert(desc: &Description) -> bool {
+    match desc {
+        Description::NoDescription
+        | Description::DescHeading(_)
+        | Description::DescLivePolite
+        | Description::DescLiveAssertive
+        | Description::DescParagraph
+        | Description::DescSection
+        | Description::DescSectionHeading
+        | Description::DescCodeBlock
+        | Description::DescCode
+        | Description::DescKbd
+        | Description::DescTextColumn
+        | Description::DescForm => true,
+        Description::DescMain
+        | Description::DescNavigation
+        | Description::DescContentInfo
+        | Description::DescComplementary
+        | Description::DescLabel(_)
+        | Description::DescButton => false,
+    }
+}
+
+/// True when an attribute adds nothing to an element with no content: text
+/// styling, alignment, a cursor, a transition, or a layout marker. A size, a
+/// box decoration, a class, an author HTML attribute, an event or an overlay
+/// may each make an empty element visible, announced or interactive.
+fn attribute_is_inert<M>(attr: &Attribute<M>) -> bool {
+    match attr {
+        Attribute::NoAttribute
+        | Attribute::AttrAlignX(_)
+        | Attribute::AttrAlignY(_)
+        | Attribute::AttrFontSize(_)
+        | Attribute::AttrFontColor(_)
+        | Attribute::AttrFontFamily(_)
+        | Attribute::AttrFontWeight(_)
+        | Attribute::AttrFontItalic
+        | Attribute::AttrFontUnderline
+        | Attribute::AttrFontDecoration(_)
+        | Attribute::AttrFontLetterSpacing(_)
+        | Attribute::AttrFontWordSpacing(_)
+        | Attribute::AttrFontAlign(_)
+        | Attribute::AttrFontWhiteSpace(_)
+        | Attribute::AttrPointer
+        | Attribute::AttrTransition(_, _) => true,
+        Attribute::AttrStyle(key, _) => LAYOUT_MARKERS.iter().any(|m| *m == key.as_str()),
+        Attribute::AttrDescribe(desc) => description_is_inert(desc),
+        Attribute::AttrWidth(_)
+        | Attribute::AttrHeight(_)
+        | Attribute::AttrNearby(_, _)
+        | Attribute::AttrPadding(..)
+        | Attribute::AttrSpacing(_)
+        | Attribute::AttrClass(_)
+        | Attribute::AttrEvent(_)
+        | Attribute::AttrAttribute(_, _)
+        | Attribute::AttrChecked(_)
+        | Attribute::AttrBgColor(_)
+        | Attribute::AttrBgImage(_)
+        | Attribute::AttrBgGradient(_)
+        | Attribute::AttrBorderWidth(_)
+        | Attribute::AttrBorderWidthEach(..)
+        | Attribute::AttrBorderColor(_)
+        | Attribute::AttrBorderRounded(_)
+        | Attribute::AttrBorderStyle(_)
+        | Attribute::AttrBorderShadow(..)
+        | Attribute::AttrBorderInsetShadow(..)
+        | Attribute::AttrExplain
+        | Attribute::AttrOverflow(_, _)
+        | Attribute::AttrPseudoRule(_, _)
+        | Attribute::AttrGridTracks(_, _)
+        | Attribute::AttrAnimation(..) => false,
+    }
+}
+
+/// True when a node's own description and attributes add nothing.
+fn shell_is_inert<M>(desc: &Description, attrs: &[Attribute<M>]) -> bool {
+    description_is_inert(desc) && attrs.iter().all(attribute_is_inert)
+}
+
+/// What an element's subtree holds, judged in one walk by `presence`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// Nothing at all, so dropping the subtree loses nothing: empty elements,
+    /// text of Unicode `White_Space` only, and `Node`s or `INERT_TAGS`
+    /// elements whose description and attributes are inert.
+    Inert,
+    /// Something a drop would lose (a hidden input, an attribute-bearing box,
+    /// an empty landmark) but no visible or announced content.
+    Unannounced,
+    /// Visible or announced content: non-`White_Space` text, a tagged element
+    /// that presents itself (`presents_itself`), an `AttrNearby` overlay, raw
+    /// markup, or a cell grid.
+    Announced,
+}
+
+/// Classify an element's subtree in one walk that stops at the first announced
+/// content. The walk is iterative and stops at `MAX_HTML_DEPTH`, where it
+/// answers `Announced`, so the subtree is kept and the render's own depth
 /// ceiling decides.
 #[must_use]
-pub fn has_content<M>(elem: &Element<M>) -> bool {
+pub fn presence<M>(elem: &Element<M>) -> Presence {
     let mut pending: Vec<(&Element<M>, usize)> = vec![(elem, 0)];
+    let mut lossy = false;
     while let Some((node, depth)) = pending.pop() {
         if depth >= crate::html::MAX_HTML_DEPTH {
-            return true;
+            return Presence::Announced;
         }
         let below = depth.saturating_add(1);
         match node {
             Element::Empty => {}
             Element::Text(s) => {
                 if s.chars().any(|c| !c.is_whitespace()) {
-                    return true;
+                    return Presence::Announced;
                 }
             }
-            Element::Node(_, attrs, kids) => {
+            Element::Node(desc, attrs, kids) => {
                 if has_overlay(attrs) {
-                    return true;
+                    return Presence::Announced;
                 }
+                lossy = lossy || !shell_is_inert(desc, attrs);
                 pending.extend(kids.iter().map(|k| (k, below)));
             }
-            Element::TaggedNode(tag, _, attrs, kids) => {
+            Element::TaggedNode(tag, desc, attrs, kids) => {
                 if presents_itself(tag, attrs) || has_overlay(attrs) {
-                    return true;
+                    return Presence::Announced;
                 }
+                lossy = lossy
+                    || !INERT_TAGS.iter().any(|t| tag.eq_ignore_ascii_case(t))
+                    || !shell_is_inert(desc, attrs);
                 pending.extend(kids.iter().map(|k| (k, below)));
             }
-            Element::Raw(_) | Element::Cells(_) => return true,
+            Element::Raw(_) | Element::Cells(_) => return Presence::Announced,
         }
     }
-    false
+    if lossy {
+        Presence::Unannounced
+    } else {
+        Presence::Inert
+    }
 }
 
 /// True when a node carries an `AttrNearby` overlay, which renders whatever
@@ -515,11 +632,14 @@ pub enum SectionHead {
     /// The node is not a `DescSection`, or its first child is not a
     /// `DescSectionHeading`.
     NoHeading,
-    /// The section's first child is a heading with no content: it renders
-    /// nothing and the heading level is kept.
+    /// The section's first child is an inert heading (`Presence::Inert`): it
+    /// renders nothing and the heading level is kept.
     Empty,
-    /// The section's first child is a heading with content: the section's
-    /// descendants rank one level deeper.
+    /// The section's first child is a heading that announces nothing but holds
+    /// something a drop would lose: it renders and the heading level is kept.
+    Unannounced,
+    /// The section's first child is a heading with announced content: the
+    /// section's descendants rank one level deeper.
     Present,
 }
 
@@ -528,11 +648,11 @@ pub enum SectionHead {
 /// and only a `Node` heading: a `TaggedNode` renders its written tag and ranks
 /// nothing below it.
 ///
-/// Cost: each call walks the first child's subtree once (`has_content`, which
-/// stops at the first content). A node lies inside at most `MAX_HTML_DEPTH / 2`
-/// enclosing first-child headings, since a section and its heading take two
-/// levels and both renderers stop at a depth of 1024, so a render walks each
-/// node at most 512 times beyond its own visit.
+/// Cost: each call walks the first child's subtree once (`presence`, which
+/// stops at the first announced content). A node lies inside at most
+/// `MAX_HTML_DEPTH / 2` enclosing first-child headings, since a section and its
+/// heading take two levels and both renderers stop at a depth of 1024, so a
+/// render walks each node at most 512 times beyond its own visit.
 #[must_use]
 pub fn section_head<M>(desc: &Description, kids: &[Element<M>]) -> SectionHead {
     if !matches!(desc, Description::DescSection) {
@@ -542,13 +662,11 @@ pub fn section_head<M>(desc: &Description, kids: &[Element<M>]) -> SectionHead {
         return SectionHead::NoHeading;
     };
     match first {
-        Element::Node(Description::DescSectionHeading, _, _) => {
-            if has_content(first) {
-                SectionHead::Present
-            } else {
-                SectionHead::Empty
-            }
-        }
+        Element::Node(Description::DescSectionHeading, _, _) => match presence(first) {
+            Presence::Inert => SectionHead::Empty,
+            Presence::Unannounced => SectionHead::Unannounced,
+            Presence::Announced => SectionHead::Present,
+        },
         Element::Node(_, _, _)
         | Element::TaggedNode(_, _, _, _)
         | Element::Empty

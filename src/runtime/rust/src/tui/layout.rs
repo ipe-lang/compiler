@@ -1601,12 +1601,12 @@ fn render_node<M: Clone>(
             padded
         }
         Element::Node(desc, attrs, kids) | Element::TaggedNode(_, desc, attrs, kids) => {
-            // A section whose first child is a heading with no visible content
-            // lays that heading out as nothing, so an absent title leaves
-            // neither a bold run nor a blank row (the rule HTML applies).
+            // A section whose first child is an inert heading lays that
+            // heading out as nothing, so an absent title leaves neither a bold
+            // run nor a blank row (the rule HTML applies).
             let kids: &[Element<M>] = match section_head(desc, kids) {
                 SectionHead::Empty => kids.get(1..).unwrap_or_default(),
-                SectionHead::NoHeading | SectionHead::Present => kids,
+                SectionHead::NoHeading | SectionHead::Unannounced | SectionHead::Present => kids,
             };
             // A code block keeps its newlines and spaces unless the author
             // sets another `Font.whiteSpace` on it.
@@ -3772,5 +3772,48 @@ mod tests {
             vec![empty_heading(), body()],
         );
         assert_eq!(element_to_cells_height(&first, 20), 1);
+    }
+
+    /// A section heading holding only a hidden input or an `audio` without
+    /// controls is laid out exactly as the same heading off a section head,
+    /// never dropped, since dropping it loses the element; a heading of an
+    /// empty `div` (the control) lays out as nothing, a row fewer.
+    ///
+    /// CI job `runtime-full-features`.
+    #[test]
+    fn functional_heading_content_is_laid_out() {
+        let tagged = |tag: &str, attrs: Vec<Attribute<()>>| -> Element<()> {
+            Element::TaggedNode(tag.into(), Description::NoDescription, attrs, vec![])
+        };
+        let kids_of = |inner: Element<()>| -> Vec<Element<()>> {
+            vec![
+                role(Description::DescSectionHeading, vec![], vec![inner]),
+                Element::Text("body".into()),
+            ]
+        };
+        let as_section = |inner: Element<()>| -> usize {
+            element_to_cells_height(&role(Description::DescSection, vec![], kids_of(inner)), 20)
+        };
+        let as_bare = |inner: Element<()>| -> usize {
+            element_to_cells_height(&node(vec![], kids_of(inner)), 20)
+        };
+        let hidden = || {
+            tagged(
+                "input",
+                vec![Attribute::AttrAttribute("type".into(), "hidden".into())],
+            )
+        };
+        let audio = || {
+            tagged(
+                "audio",
+                vec![Attribute::AttrAttribute("autoplay".into(), String::new())],
+            )
+        };
+        assert_eq!(as_section(hidden()), as_bare(hidden()));
+        assert!(as_section(hidden()) >= 2);
+        assert_eq!(as_section(audio()), as_bare(audio()));
+        let div = || tagged("div", vec![]);
+        assert_eq!(as_section(div()), 1);
+        assert!(as_section(div()) < as_bare(div()));
     }
 }
