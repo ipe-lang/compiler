@@ -64,6 +64,7 @@ var __ipeNode = (function() {
   var tagName = getter(Element.prototype, "tagName");
   var namespaceURI = getter(Element.prototype, "namespaceURI");
   var queryOne = Element.prototype.querySelector;
+  var closest = Element.prototype.closest;
   var focusHtml = HTMLElement.prototype.focus;
   var focusSvg = SVGElement.prototype.focus;
   return {
@@ -87,6 +88,7 @@ var __ipeNode = (function() {
     append: function(el, child) { appendChild.call(el, child); },
     replaceChild: function(el, fresh, old) { replaceChild.call(el, fresh, old); },
     queryAll: function(el, sel) { return queryAll.call(el, sel); },
+    closest: function(el, sel) { return closest.call(el, sel); },
     setText: function(el, text) { textContent.call(el, text); },
     tag: function(el) { return tagName.call(el); },
     ns: function(el) { return namespaceURI.call(el); },
@@ -569,10 +571,11 @@ function __ipeParseFor(container, html) {
 // A swap never moves keyboard focus. Focus on any node inside `container` is
 // recorded as the node's child-element path and the `ipe-id` of it and of
 // each ancestor at its depth, and put back once the commit lands on the
-// nearest node on that path carrying the `ipe-id` recorded for its depth (see
-// `__ipeRestoreFocus`); a live field keeps its own node, value and selection
-// (below). Focus outside `container` is not read or written. Every member read
-// on `container` goes through `__ipeNode`: it may be a `<form>`.
+// nearest node on that path whose chain from `container` carries the recorded
+// `ipe-id` and tag at every depth (see `__ipeRestoreFocus`); a live field
+// keeps its own node, value and selection (below). Focus outside `container`
+// is not read or written. Every member read on `container` goes through
+// `__ipeNode`: it may be a `<form>`.
 function __ipeSwapPreservingFocus(container, tmp) {
   var focused = __ipeDoc.active();
   var inside = focused && focused !== __ipeDoc.body() &&
@@ -665,28 +668,41 @@ function __ipeSwapPreservingFocus(container, tmp) {
 // below `container`, else to its nearest ancestor, that takes focus, walking
 // from the path's deepest surviving node upward past `container`: a key
 // handler bound on an ancestor keeps receiving keys. A node the swap created
-// is a candidate only when it carries the `ipe-id` and tag recorded for its
-// own depth in `ids`, the focused node's and its ancestors' before the swap;
-// any other node at the path is another control, even one whose id matches a
-// node at another depth (a key can spell a former descendant's id), and a node
-// without an `ipe-id` (raw markup) is never one. `container` and the nodes
-// above it are the ones the swap kept. Focus that is already somewhere is left
-// where it is. A kept ancestor bound to `onFocus` delivers that message once.
+// is a candidate only when it and every node above it on the path, down from
+// `container`, carry the `ipe-id` and tag recorded for their own depth in
+// `ids`. One `ipe-id` alone does not name a node: a key may contain `_` and
+// spell the next segment, so a node whose chain differs higher up can carry
+// the same id at the same depth. The matched chain fixes every segment's
+// index, tag and key, so the id then names one node. Any other node at the
+// path is another control, and a node without an `ipe-id` (raw markup) is
+// never one. `container` and the nodes above it are the ones the swap kept.
+// Focus that is already somewhere is left where it is. A kept ancestor bound
+// to `onFocus` delivers that message once.
 function __ipeRestoreFocus(container, path, ids) {
   var now = __ipeDoc.active();
   if (now && now !== __ipeDoc.body()) return;
   var found = __ipeNode.resolve(container, path);
-  var node = found.node;
-  for (var depth = found.depth; depth > 0; depth--) {
-    var was = ids[depth - 1];
-    var own = __ipeNode.attr(node, "ipe-id");
-    if (was && own !== null && own === was.id && __ipeNode.tag(node) === was.tag &&
-        __ipeNode.focus(node)) return;
-    node = __ipeNode.parent(node);
+  // The resolved nodes by depth: entry `d - 1` is the node at depth `d`.
+  var chain = [];
+  var at = found.node;
+  for (var d = found.depth; d > 0; d--) {
+    chain[d - 1] = at;
+    at = __ipeNode.parent(at);
   }
-  while (node) {
-    if (__ipeNode.focus(node)) return;
-    node = __ipeNode.parent(node);
+  // The deepest depth whose whole prefix, from depth 1, matches `ids`.
+  var matched = 0;
+  while (matched < chain.length) {
+    var was = ids[matched];
+    var node = chain[matched];
+    var own = __ipeNode.attr(node, "ipe-id");
+    if (!was || own === null || own !== was.id || __ipeNode.tag(node) !== was.tag) break;
+    matched++;
+  }
+  for (var m = matched; m > 0; m--) {
+    if (__ipeNode.focus(chain[m - 1])) return;
+  }
+  for (var up = container; up; up = __ipeNode.parent(up)) {
+    if (__ipeNode.focus(up)) return;
   }
 }
 
@@ -884,7 +900,9 @@ function __ipeReviveScripts(root) {
     // Replacing the old node with the fresh one triggers script
     // execution (for src= it fetches + runs; for inline it runs
     // the body).
-    old.parentNode.replaceChild(fresh, old);
+    // Bound reads: the script's parent may be a `<form>`, whose control named
+    // `replaceChild` (or `parentNode`) would answer for the member.
+    __ipeNode.replaceChild(__ipeNode.parentNode(old), fresh, old);
   }
 }
 
@@ -925,9 +943,10 @@ function __ipeDebouncedSend(msgName, args, hid, delay, epoch) {
 // because the debounce hasn't fired yet.
 __ipeDoc.on("focusout", function(ev) {
   var t = ev.target;
-  if (!t) return;
-  var hid = t.getAttribute("data-ipe-hid");
-  var key = hid || t.getAttribute("ipe-input");
+  // A focusable `<form>` loses focus too; its controls shadow `getAttribute`.
+  if (!(t instanceof Element)) return;
+  var hid = __ipeNode.attr(t, "data-ipe-hid");
+  var key = hid || __ipeNode.attr(t, "ipe-input");
   if (key && __ipeInputPending[key]) {
     clearTimeout(__ipeInputTimers[key]);
     var p = __ipeInputPending[key];
@@ -1032,7 +1051,8 @@ function __ipeFlushPendingSync() {
 // outgoing navigation. Beacon path handles cross-page; sync path
 // handles SPA-style internal routing.
 __ipeDoc.on("click", function(ev) {
-  var a = ev.target && ev.target.closest && ev.target.closest("a[href]");
+  // The target may be a `<form>`, whose control named `closest` would answer.
+  var a = ev.target instanceof Element ? __ipeNode.closest(ev.target, "a[href]") : null;
   if (!a) return;
   var root = __ipeDoc.byId("ipe-root");
   if (!root || !root.contains(a)) return;

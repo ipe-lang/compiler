@@ -6,8 +6,9 @@
  * a key handler bound on an ancestor no longer receives keys. The client
  * records the focused node's position and the server identity (`ipe-id`) of
  * it and of each ancestor at its depth, puts focus back on the nearest node on
- * that path carrying the identity recorded for its own depth once the swap
- * lands, else on its nearest focusable ancestor, and never reads or writes
+ * that path whose whole chain from the container carries the identities and
+ * tags recorded for each depth once the swap lands, else on its nearest
+ * focusable ancestor, and never reads or writes
  * focus that sits outside the swapped container.
  *
  * Every test drives a real pointer click and a real key press; none sets focus
@@ -175,6 +176,28 @@ test("focus-across-patch: a click inside a form whose control is named parentEle
   // The click handler walks up from the target to find a link; through the
   // form, `parentElement` is the `parentElement` control.
   await page.click("#formlabel");
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+});
+
+test("focus-across-patch: a node whose own id matches under a different chain never takes focus", async ({ page }) => {
+  await open(page);
+  await page.click("#xdeep");
+  // The column gained a sibling: its items were swapped. `#ydeep` sits at the
+  // clicked node's path with its id and tag; the item above it does not match.
+  await expect(page.locator("#deeptail")).toHaveCount(1);
+  await expect(page.locator("#ydeep")).toHaveCount(1);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+});
+
+test("focus-across-patch: a node with the focused id under another tag never takes focus", async ({ page }) => {
+  await open(page);
+  await page.click("#tbutton");
+  // A `button:x` element now holds the id the `button` named `x` held.
+  await expect(page.locator("#tspoof")).toHaveCount(1);
   await expect.poll(() => focusedId(page)).toBe("root");
   await page.keyboard.press("j");
   await expect(page.locator("#keys")).toHaveText("keys: j");
