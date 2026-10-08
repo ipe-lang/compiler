@@ -2581,7 +2581,7 @@ const MOD_APPENDS: &[ModAppend] = &[
         append: RUNTIME_MOD_RS_PRINCIPAL_APPEND,
     },
     ModAppend {
-        gate: |ctx| ctx.uses_principal || ctx.reaches_jwt(),
+        gate: |ctx| ctx.declares_revocation(),
         append: RUNTIME_MOD_RS_REVOCATION_APPEND,
     },
     ModAppend {
@@ -3194,8 +3194,9 @@ fn assemble_project_text(
         cargo_toml
     };
     // TEA runtime: `tea.rs` drives its event loop over a `tokio::sync::mpsc`
-    // channel, so any program that pulls the `tea` module needs tokio's `"sync"`
-    // feature. The union mirrors the `tea` mod.rs append below (a `Cmd`/`Sub`
+    // channel, and `revocation.rs` publishes on a `tokio::sync::watch` channel,
+    // so any program that pulls either module on a tokio runtime needs tokio's
+    // `"sync"` feature. The union mirrors the `tea` mod.rs append below (a `Cmd`/`Sub`
     // kernel, or a surface whose runtime module imports `IpeCmd`/`IpeSub`).
     // Runs AFTER the server/web/tui/webview steps, which perform their own tokio
     // feature surgery against the base line — `tea_cargo_toml` is idempotent
@@ -3207,6 +3208,7 @@ fn assemble_project_text(
         || ctx.uses_web
         || ctx.uses_tui
         || ctx.uses_webview
+        || (ctx.uses_async_runtime && ctx.declares_revocation())
     {
         tea_cargo_toml(&cargo_toml)?
     } else {

@@ -544,12 +544,16 @@ fn reissue_set_cookie_with(
 /// `Principal` — dispatching to the handler only on full success, and answering
 /// `401` at the first failing step. This is the sole site that mints a `Principal`.
 ///
-/// Revocation gate (when `RevocationMode::Store`): the store is queried AFTER
-/// signature + expiry verification and BEFORE the `Principal` is minted. Deny
-/// on `Verdict::Revoked`, on `Verdict::Unknown`, and on any store error
-/// (fail-closed). Only `Verdict::Active` allows the request through. The mode
-/// is the stricter of the config's and `IPE_AUTH_REVOCATION`'s, read once when
-/// the route is built: the env arms the gate and never disarms it.
+/// Revocation gate (when `RevocationMode::Store`): the verified claims pass
+/// [`ArmedGate::admit`](crate::revocation::ArmedGate::admit) AFTER signature +
+/// expiry verification and BEFORE the `Principal` is minted, and the admitted
+/// credential is bound to the request. A token with no `jti` or no lifetime
+/// bound, a revoked token, a store that cannot answer, and a full binding set
+/// all answer `401`. The mode is the stricter of the config's and
+/// `IPE_AUTH_REVOCATION`'s, read once when the route is built: the env arms the
+/// gate and never disarms it. Building an armed route arms the whole process
+/// ([`arm_process`](crate::revocation::arm_process)), so `Auth.verifyToken`
+/// checks the store too.
 ///
 /// Sliding re-issue: for cookie-based token sources, when the verified token is
 /// past its re-issue threshold (`exp - slide_window/2`) and the absolute cap has
@@ -565,12 +569,13 @@ where
         + 'static,
 {
     let handler = Arc::new(handler);
-    let cfg = AuthConfig {
-        revocation_mode: cfg
-            .revocation_mode
+    let route_gate = crate::revocation::ArmedGate::resolve(
+        cfg.revocation_mode
             .stricter(crate::app_config::env_revocation_floor()),
-        ..cfg
-    };
+    );
+    if route_gate.is_some() {
+        crate::revocation::arm_process();
+    }
     let guarded = move |req: ServerRequest| -> IpeTask<E, ServerResponse> {
         // Snapshot the request-scoped TLS signal BEFORE `req` is moved into
         // the async block — same technique as `middleware_with_csrf`. The bool
@@ -583,26 +588,25 @@ where
                 return ok_res(unauthorized());
             };
             let secret = crate::secret::secret_reveal(cfg.secret.clone());
-            let claims: HashMap<String, String> =
-                match crate::auth::auth_verify_token::<String>(secret.clone(), token) {
-                    IpeResult::Ok(c) => c,
-                    IpeResult::Err(_) => return ok_res(unauthorized()),
-                };
+            let Ok(claims) = crate::auth::verify_claims(&secret, &token) else {
+                return ok_res(unauthorized());
+            };
             let Some(subject) = claims.get(&cfg.subject_claim).filter(|s| !s.is_empty()) else {
                 return ok_res(unauthorized());
             };
 
-            // Revocation gate — consulted only when the mode is `Store`.
-            // Runs AFTER token verification and BEFORE `Principal` mint.
-            // Fail-closed: deny on Revoked, Unknown, and any store error.
-            if cfg.revocation_mode == crate::app_config::RevocationMode::Store {
-                let jti = claims.get("jti").map(String::as_str).unwrap_or("");
-                match crate::revocation::is_revoked(subject, jti) {
-                    crate::revocation::Verdict::Active => {}
-                    // Revoked or Unknown both deny — fail-closed.
-                    crate::revocation::Verdict::Revoked | crate::revocation::Verdict::Unknown => {
-                        return ok_res(unauthorized());
-                    }
+            // Revocation gate — only when armed. Runs AFTER token verification
+            // and BEFORE `Principal` mint; every denial answers `401`, and so
+            // does a dispatch with no request binding set to hold the credential.
+            if let Some(gate) = route_gate {
+                let Ok(credential) = gate.admit(&claims, &cfg.subject_claim) else {
+                    return ok_res(unauthorized());
+                };
+                let Some(bindings) = request_bindings() else {
+                    return ok_res(unauthorized());
+                };
+                if crate::revocation::bind_shared(&bindings, credential).is_err() {
+                    return ok_res(unauthorized());
                 }
             }
 
@@ -613,8 +617,11 @@ where
             // presented — so nothing new is exposed. `BTreeMap` keeps the
             // read-back deterministic.
             let principal = crate::principal::principal_mint_with_claims(
-                subject.clone(),
-                claims.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                subject.to_owned(),
+                claims
+                    .iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
             );
 
             // Sliding re-issue — cookie-source only (bearer tokens are API
@@ -647,13 +654,9 @@ where
                                 .filter(|(k, _)| {
                                     // Time anchors and session-identity fields come from
                                     // ReissueContext verbatim; skip them in extra_claims.
-                                    *k != "exp"
-                                        && *k != "iat"
-                                        && *k != "cap"
-                                        && *k != "jti"
-                                        && *k != "sub"
+                                    !["exp", "iat", "cap", "jti", "sub"].contains(k)
                                 })
-                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
                                 .collect();
                             match crate::auth::auth_reissue_token::<String>(
                                 &secret, &ctx, extra, slide_i64,
@@ -1866,7 +1869,7 @@ fn method_router(method: &str, h: ErasedHandler) -> axum::routing::MethodRouter 
                 .scope(std::cell::Cell::new(upgrader), async move {
                     WS_RESPONSE
                         .scope(std::cell::Cell::new(None), async move {
-                            let result = h(ipe_req).await;
+                            let result = in_request_scope(h(ipe_req)).await;
                             if let Some(ws_resp) = WS_RESPONSE.with(|c| c.take()) {
                                 return ws_resp;
                             }
@@ -2405,6 +2408,33 @@ fn ws_registry() -> &'static Mutex<HashMap<i64, tokio::sync::mpsc::Sender<WsOut>
 }
 
 static WS_NEXT_ID: AtomicI64 = AtomicI64::new(1);
+
+#[cfg(feature = "jwt")]
+tokio::task_local! {
+    // The credentials the in-flight request is bound to; fresh and empty per
+    // dispatch.
+    static SERVER_REQUEST: Arc<Mutex<crate::revocation::SessionBindings>>;
+}
+
+/// Run `request` as one `Server` dispatch, inside a fresh, empty binding set.
+#[cfg(feature = "jwt")]
+pub(crate) async fn in_request_scope<F: Future>(request: F) -> F::Output {
+    SERVER_REQUEST.scope(Arc::default(), request).await
+}
+
+/// Run `request` as one `Server` dispatch; without `jwt` no credential exists
+/// to bind.
+#[cfg(not(feature = "jwt"))]
+async fn in_request_scope<F: Future>(request: F) -> F::Output {
+    request.await
+}
+
+/// The binding set of the `Server` request the current task handles, or
+/// `None` outside any dispatch.
+#[cfg(feature = "jwt")]
+pub(crate) fn request_bindings() -> Option<Arc<Mutex<crate::revocation::SessionBindings>>> {
+    SERVER_REQUEST.try_with(Arc::clone).ok()
+}
 
 tokio::task_local! {
     // The axum upgrader for the in-flight request (Some only on a WS upgrade).
@@ -3749,7 +3779,9 @@ mod revocation_env_tests {
             cookies: HashMap::new(),
             remoteAddr: String::new(),
         };
-        handler(req).await.map_or(500, |resp| resp.status)
+        in_request_scope(handler(req))
+            .await
+            .map_or(500, |resp| resp.status)
     }
 
     #[tokio::test]
@@ -6897,7 +6929,154 @@ mod tests {
             let RouteTarget::Handler(h) = route.target else {
                 panic!("authed route must carry a handler");
             };
-            h(req).await.expect("guarded handler never returns Err")
+            in_request_scope(h(req))
+                .await
+                .expect("guarded handler never returns Err")
+        }
+
+        // ── armed revocation gate ─────────────────────────────────────────
+
+        /// A bearer request carrying `claims`.
+        fn bearer_req(claims: &serde_json::Value) -> ServerRequest {
+            let token = hs256(claims);
+            req_with(&[("authorization", &format!("Bearer {token}"))], &[])
+        }
+
+        /// The response of an authed route under `cfg` whose handler answers
+        /// how many credentials its request is bound to.
+        async fn run_counting_bindings(cfg: AuthConfig, req: ServerRequest) -> ServerResponse {
+            let route = server_get_authed::<String, _>("/me".to_string(), cfg, |_req, _p| {
+                let bound = request_bindings()
+                    .and_then(|bindings| bindings.lock().ok().map(|held| held.len()))
+                    .unwrap_or_default();
+                Box::pin(std::future::ready(ok_res(server_text(bound.to_string()))))
+            });
+            let RouteTarget::Handler(h) = route.target else {
+                return plain_resp(500, "no handler", &[]);
+            };
+            in_request_scope(h(req))
+                .await
+                .expect("guarded handler never returns Err")
+        }
+
+        #[tokio::test]
+        async fn authed_route_armed_refuses_jti_less_token() {
+            let claims = serde_json::json!({ "sub": "s1-subject", "exp": 9_999_999_999i64 });
+            let armed = server_with_revocation(1, bearer_cfg());
+            assert_eq!(
+                run(armed, bearer_req(&claims)).await.status,
+                401,
+                "an armed route refuses a token it cannot revoke by session"
+            );
+            assert_eq!(
+                run(bearer_cfg(), bearer_req(&claims)).await.status,
+                200,
+                "an unarmed route admits the same token"
+            );
+        }
+
+        #[tokio::test]
+        async fn authed_route_routes_through_armed_gate() {
+            let claims = serde_json::json!({
+                "sub": "s2-subject",
+                "jti": "s2-jti",
+                "exp": 9_999_999_999i64,
+            });
+            let armed = || server_with_revocation(1, bearer_cfg());
+            let admitted = run_counting_bindings(armed(), bearer_req(&claims)).await;
+            assert_eq!(admitted.status, 200);
+            assert_eq!(
+                admitted.body, "1",
+                "the admitted credential is bound to the request"
+            );
+            crate::revocation::revoke_subject("s2-subject".to_string()).expect("revoke");
+            assert_eq!(
+                run_counting_bindings(armed(), bearer_req(&claims))
+                    .await
+                    .status,
+                401,
+                "a revoked subject is refused"
+            );
+            crate::revocation::restore_subject("s2-subject").expect("restore");
+            assert_eq!(
+                run_counting_bindings(armed(), bearer_req(&claims))
+                    .await
+                    .status,
+                200,
+                "a restored subject is admitted again"
+            );
+        }
+
+        /// Set on the child process [`server_route_arms_process_mode`] spawns;
+        /// its child half is a no-op without it.
+        const ARMS_CHILD_MARKER: &str = "IPE_SERVER_ARMS_PROCESS_CHILD";
+
+        /// Printed by the child half once it has observed both modes.
+        const ARMS_CHILD_OBSERVED: &str = "server route process arming observed";
+
+        /// Building an armed route arms the process mode; an unarmed one does
+        /// not.
+        ///
+        /// The arming is process-wide and never cleared, so it runs in a child
+        /// process: here it would arm every other test of the binary.
+        #[test]
+        fn server_route_arms_process_mode() {
+            let module = module_path!();
+            let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+            let filter = format!("{module}::server_route_arms_process_mode_child");
+            let out = std::env::current_exe().and_then(|exe| {
+                std::process::Command::new(exe)
+                    .args([
+                        "--exact",
+                        filter.as_str(),
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(ARMS_CHILD_MARKER, "1")
+                    .env_remove("IPE_AUTH_REVOCATION")
+                    .stdin(std::process::Stdio::null())
+                    .output()
+            });
+            let observed = out.as_ref().is_ok_and(|out| {
+                out.status.success()
+                    && std::str::from_utf8(&out.stdout)
+                        .is_ok_and(|text| text.contains(ARMS_CHILD_OBSERVED))
+            });
+            assert!(observed, "the child must observe the arming: {out:?}");
+        }
+
+        /// The child half of [`server_route_arms_process_mode`].
+        #[test]
+        #[ignore = "run as a child process by server_route_arms_process_mode"]
+        fn server_route_arms_process_mode_child() {
+            use crate::app_config::RevocationMode;
+            if crate::system::read_env_var(ARMS_CHILD_MARKER).as_deref() != Ok("1") {
+                return;
+            }
+            let handler = |_req: ServerRequest, _p: crate::principal::Principal| {
+                Box::pin(std::future::ready(ok_res::<String, _>(server_text(
+                    String::new(),
+                )))) as IpeTask<String, ServerResponse>
+            };
+            assert_eq!(crate::revocation::process_mode(), RevocationMode::Off);
+            let _unarmed = server_get_authed("/off".to_string(), bearer_cfg(), handler);
+            assert_eq!(
+                crate::revocation::process_mode(),
+                RevocationMode::Off,
+                "an unarmed route leaves the process unarmed"
+            );
+            let _armed = server_get_authed(
+                "/store".to_string(),
+                server_with_revocation(1, bearer_cfg()),
+                handler,
+            );
+            assert_eq!(
+                crate::revocation::process_mode(),
+                RevocationMode::Store,
+                "an armed route arms the process"
+            );
+            println!("\n{ARMS_CHILD_OBSERVED}");
         }
 
         fn bearer_cfg() -> AuthConfig {

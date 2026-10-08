@@ -59,7 +59,7 @@ pub enum RevocationMode {
 
 impl RevocationMode {
     /// The stricter of two modes: `Store` wins over `Off`.
-    #[cfg(all(feature = "jwt", feature = "server"))]
+    #[cfg(feature = "jwt")]
     pub(crate) const fn stricter(self, other: Self) -> Self {
         match (self, other) {
             (Self::Off, Self::Off) => Self::Off,
@@ -755,11 +755,11 @@ fn slide_window_from(
 }
 
 /// The variable that arms the per-request revocation gate.
-#[cfg(feature = "server")]
+#[cfg(any(feature = "server", feature = "jwt"))]
 const REVOCATION_VAR: &str = "IPE_AUTH_REVOCATION";
 
 /// What an `IPE_AUTH_REVOCATION` value must be.
-#[cfg(feature = "server")]
+#[cfg(any(feature = "server", feature = "jwt"))]
 const REVOCATION_EXPECTED: &str = "`store`, `1`, `off` or `0`";
 
 /// The mode `IPE_AUTH_REVOCATION` names, if the operator set one.
@@ -771,13 +771,13 @@ const REVOCATION_EXPECTED: &str = "`store`, `1`, `off` or `0`";
 ///
 /// A refusal naming `IPE_AUTH_REVOCATION` for any other value, so a typo never
 /// leaves the process serving under a mode the operator did not choose.
-#[cfg(feature = "server")]
+#[cfg(any(feature = "server", feature = "jwt"))]
 pub(crate) fn revocation_env() -> Result<Option<RevocationMode>, crate::system::EnvValueRefusal> {
     revocation_from(crate::system::read_env_var(REVOCATION_VAR))
 }
 
 /// Pure `IPE_AUTH_REVOCATION` parse over the raw lookup.
-#[cfg(feature = "server")]
+#[cfg(any(feature = "server", feature = "jwt"))]
 fn revocation_from(
     raw: Result<String, std::env::VarError>,
 ) -> Result<Option<RevocationMode>, crate::system::EnvValueRefusal> {
@@ -802,19 +802,37 @@ fn revocation_from(
     }
 }
 
-/// The least strict mode an authed `Server` route runs under, from the env.
+/// The least strict mode an authed `Server` route and the `Auth.verifyToken`
+/// kernel run under, from the env.
 ///
 /// The env only ever arms the gate: `store` gives [`RevocationMode::Store`];
 /// `off` and an absent value give [`RevocationMode::Off`], which never lowers a
 /// mode written in code. A value [`revocation_env`] refuses arms the gate too,
 /// so a refused value is never re-read as the permissive one; `Server.listen`
 /// reports the refusal itself.
-#[cfg(all(feature = "jwt", feature = "server"))]
+#[cfg(feature = "jwt")]
 pub(crate) fn env_revocation_floor() -> RevocationMode {
     match revocation_env() {
         Ok(Some(RevocationMode::Store)) | Err(_) => RevocationMode::Store,
         Ok(Some(RevocationMode::Off) | None) => RevocationMode::Off,
     }
+}
+
+/// The installed `Web.withRevocation` mode; `Off` when none is installed or
+/// this build compiles no reader for it.
+#[cfg(all(feature = "jwt", feature = "web-core", feature = "server"))]
+pub(crate) fn installed_revocation_mode() -> RevocationMode {
+    INSTALLED
+        .get()
+        .and_then(|c| c.auth_revocation_mode)
+        .unwrap_or(RevocationMode::Off)
+}
+
+/// The installed `Web.withRevocation` mode; `Off` when none is installed or
+/// this build compiles no reader for it.
+#[cfg(all(feature = "jwt", not(all(feature = "web-core", feature = "server"))))]
+pub(crate) const fn installed_revocation_mode() -> RevocationMode {
+    RevocationMode::Off
 }
 
 /// Why a `Web` app cannot start under the auth configuration it was given.

@@ -2722,6 +2722,16 @@ impl<'a> EmitCtx<'a> {
         self.uses_jwt || self.uses_auth
     }
 
+    /// `true` when the emitted crate declares the `revocation` runtime module.
+    ///
+    /// `revocation.rs` publishes its generation channel on `tokio::sync::watch`
+    /// whenever the `tokio` feature is on, so the same predicate that declares
+    /// the module in `mod.rs` also extends the `tokio` dependency with `"sync"`
+    /// — the two can never disagree.
+    pub(crate) const fn declares_revocation(&self) -> bool {
+        self.uses_principal || self.reaches_jwt()
+    }
+
     /// `true` when the emitted crate names the `Value` (`JsonVal`) or `Decoder<T>`
     /// type — so [`crate::project::assemble_project_files`] keeps the two fixed
     /// prelude aliases (`type Value = JsonVal;` and `pub type Decoder<T> = …`) and
