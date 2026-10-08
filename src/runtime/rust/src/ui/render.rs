@@ -471,7 +471,8 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
             | Attribute::AttrPseudoRule(_, _)
             | Attribute::AttrTransition(_, _)
             | Attribute::AttrGridTracks(_, _)
-            | Attribute::AttrAnimation(..) => {}
+            | Attribute::AttrAnimation(..)
+            | Attribute::AttrFontWhiteSpace(_) => {}
         }
     }
     if !pseudo_rules.is_empty() {
@@ -788,7 +789,8 @@ fn tag_for_description(desc: &Description, section: Option<SectionLevel>) -> Nod
 
 // ── Element → Html (recursive) ───────────────────────────────────────────────
 
-/// Depth-0 entry point. All callers outside this module use this wrapper.
+/// Depth-0 entry point for a bare element, laid out along the block axis.
+#[cfg(test)]
 fn render_element<M: Clone>(elem: Element<M>) -> Html<M> {
     render_element_depth_in(elem, RenderCtx::root(FlexAxis::Block))
 }
