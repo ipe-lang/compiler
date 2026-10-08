@@ -1,0 +1,8 @@
+own key: valid alice
+other key: BadSignature
+spliced payload: BadSignature
+zero lifetime: Expired
+future nbf: NotYetValid
+not a token: Malformed
+short key: SecretTooShort
+constructed: Revoked

@@ -1471,6 +1471,7 @@ mod show_pin_agreement {
         ("HttpMethod", "ipe_runtime::http_client::HttpMethod"),
         ("RedirectPolicy", "ipe_runtime::http_client::RedirectPolicy"),
         ("IpeDbFailure", "ipe_runtime::error::IpeDbFailure"),
+        ("IpeAuthError", "ipe_runtime::error::IpeAuthError"),
         (
             "ProcessRunWithCfg",
             "ipe_runtime::system::ProcessRunWithCfg",
@@ -1659,6 +1660,7 @@ mod show_pin_agreement {
             RuntimeBridgedEnum::StreamId,
             RuntimeBridgedEnum::RedirectPolicy,
             RuntimeBridgedEnum::DbFailure,
+            RuntimeBridgedEnum::AuthError,
         ]
         .into_iter()
         .map(|bridged| {

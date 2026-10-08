@@ -862,7 +862,8 @@ pub static ENV_VARS: &[EnvVar] = &[
                   raised. Prevents stack-overflow crashes from unbounded recursion. \
                   Read once, at process start; a value that is not a positive \
                   decimal integer (`0` included) refuses the program before its \
-                  first line.",
+                  first line. On wasm32 the maximum is `10000`: a larger value is \
+                  refused too, lowering stays possible.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
@@ -937,7 +938,10 @@ pub static ENV_VARS: &[EnvVar] = &[
                   in-process list of revoked token IDs and denies on any store error; \
                   `off` or `0` or unset leaves the mode `Server.withRevocation` or \
                   `Web.withRevocation` chose. It only ever arms the check, never disarms \
-                  an in-code `Store`. Any other value also arms it, and refuses \
+                  an in-code `Store`. Armed, `Auth.verifyToken` checks the token \
+                  against the same store and refuses with `Auth.Revoked`, \
+                  `Auth.RevocationUnavailable`, `Auth.MissingClaim` or \
+                  `Auth.TooManyCredentials`. Any other value also arms it, and refuses \
                   `Server.listen` and `Web` startup. Armed, a `Web` session, or a \
                   `Server` request and the WebSocket or stream it opens, is bound to \
                   every token `Auth.verifyToken` admitted inside it, and ends once one \

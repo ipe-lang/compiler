@@ -7576,6 +7576,105 @@ mod tests {
         );
     }
 
+    /// The `Ipe.Auth` import that brings `AuthError`'s constructors into bare scope.
+    const AUTH_HDR: &str = "module Main exposing (main)\n\n\
+                            import Ipe.Auth as Auth exposing (AuthError(..))\n\n";
+
+    /// The `AuthError` arms of a `case`, every constructor but those in `omit`.
+    fn auth_error_case(omit: &[&str]) -> String {
+        let arms: String = [
+            "Malformed",
+            "BadSignature",
+            "Expired",
+            "NotYetValid",
+            "MissingClaim",
+            "Revoked",
+            "RevocationUnavailable",
+            "TooManyCredentials",
+            "SecretTooShort",
+        ]
+        .iter()
+        .filter(|name| !omit.contains(name))
+        .map(|name| ["        ", name, " -> 1\n"].concat())
+        .collect();
+        format!("{AUTH_HDR}f e =\n    case e of\n{arms}\nmain =\n    0\n")
+    }
+
+    /// A `case` over `AuthError` that omits `Revoked` is IPE-T0010 naming it.
+    ///
+    /// The union is closed: a new token refusal cannot fall through a match
+    /// silently. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn auth_error_case_must_be_exhaustive() {
+        let (r, _, _) = infer_src(&auth_error_case(&["Revoked"]));
+        assert!(
+            matches!(
+                r,
+                Err(Diagnostic::Type {
+                    msg: TypeError::NonExhaustiveCase { .. },
+                    ..
+                })
+            ),
+            "expected NonExhaustiveCase, got {r:?}"
+        );
+        let Err(Diagnostic::Type {
+            msg: TypeError::NonExhaustiveCase { missing },
+            ..
+        }) = r
+        else {
+            return;
+        };
+        let names: Vec<&str> = missing.iter().map(AsRef::as_ref).collect();
+        assert_eq!(names, vec!["Revoked"]);
+    }
+
+    /// The control: a `case` naming every `AuthError` constructor type-checks.
+    #[test]
+    fn auth_error_total_case_ok() {
+        let (r, _, _) = infer_src(&auth_error_case(&[]));
+        assert!(
+            r.is_ok(),
+            "a total AuthError match must type-check, got bug={:?}",
+            bug_site(&r)
+        );
+    }
+
+    /// `Auth.verifyToken`'s error is the closed `AuthError`, not text: matching
+    /// its `Err` against a `String` literal is a type error, and the
+    /// constructor match is the control. CI job: `test` (nextest `ipe_types`).
+    #[test]
+    fn verify_token_error_is_auth_error_not_text() {
+        let program = |arm: &str| {
+            [
+                "module Main exposing (check)\n\n\
+                 import Ipe.Auth as Auth exposing (AuthError(..))\n\
+                 import Ipe.Secret as Secret\n\n\
+                 check : String -> Int\n\
+                 check token =\n    \
+                 case Auth.verifyToken (Secret.fromString \"s\") token of\n        \
+                 Ok _ -> 0\n        ",
+                arm,
+                " -> 1\n        _ -> 2\n",
+            ]
+            .concat()
+        };
+        let typed = program("Err Expired");
+        let (m, mut i) = canon_src(&typed).expect("the AuthError-arm fixture must canonicalise");
+        let solved = infer(&m, &mut i);
+        assert!(
+            solved.is_ok(),
+            "an `Err Expired` arm must type-check: {solved:?}"
+        );
+
+        let text = program("Err \"text\"");
+        let (m2, mut i2) = canon_src(&text).expect("the text-arm fixture must canonicalise");
+        let solved = infer(&m2, &mut i2);
+        assert!(
+            matches!(solved, Err(Diagnostic::Type { .. })),
+            "an `Err \"text\"` arm against `Auth.verifyToken` must be a type error: {solved:?}"
+        );
+    }
+
     /// The `ConstructorNotFound` name and suggestion count of `r`, if any.
     fn ctor_not_found(r: &DResult<SolvedTypes>) -> Option<(&str, usize, Span)> {
         match r {

@@ -445,6 +445,11 @@ pub enum BuiltinTag {
     RedirectPolicy,
     /// `DbFailure` — the closed database-failure-cause ADT carried by `ErrorDetails.Database`.
     DbFailure,
+    /// `AuthError` — the closed, payload-free refusal of `Auth.verifyToken`:
+    /// `Malformed | BadSignature | Expired | NotYetValid | MissingClaim |
+    /// Revoked | RevocationUnavailable | TooManyCredentials | SecretTooShort`,
+    /// each `Auth.`-qualified.
+    AuthError,
     /// `Duration` — the `Ipe.Duration.Duration` opaque non-negative time span
     /// (`Duration Int`, compiled-source), consumed by the `Http.withTimeout`
     /// kernel's typed timeout argument. Homed at `["Ipe", "Duration"]` (see
@@ -10317,7 +10322,12 @@ impl StdlibKernel {
         const AUTH_SIGN_TOKEN: TyShape =
             TyShape::Fun(&SECRET, &DICT_SS_TO_INT_TO_RESULT_ERR_STRING);
         const STRING_TO_RESULT_ERR_DICT_SS: TyShape = TyShape::Fun(&STRING, &RESULT_ERR_DICT_SS);
-        const AUTH_VERIFY_TOKEN: TyShape = TyShape::Fun(&SECRET, &STRING_TO_RESULT_ERR_DICT_SS);
+        // Auth.verifyToken : Secret -> String -> Result AuthError (Dict String String).
+        const AUTH_ERROR: TyShape = TyShape::Con(BuiltinTag::AuthError, &[]);
+        const RESULT_AUTH_ERROR_DICT_SS: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[AUTH_ERROR, DICT_STRING_STRING]);
+        const AUTH_VERIFY_TOKEN: TyShape =
+            TyShape::Fun(&SECRET, &TyShape::Fun(&STRING, &RESULT_AUTH_ERROR_DICT_SS));
         const STRING_TO_RESULT_ERR_BOOL: TyShape = TyShape::Fun(&STRING, &RESULT_ERR_BOOL);
         const STRING_TO_STRING_TO_RESULT_ERR_BOOL: TyShape =
             TyShape::Fun(&STRING, &STRING_TO_RESULT_ERR_BOOL);

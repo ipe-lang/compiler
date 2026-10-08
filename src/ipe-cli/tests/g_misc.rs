@@ -22,6 +22,8 @@ mod golden_any_ctor_payload;
 mod golden_attribute_home_disambiguation_179;
 #[path = "g_misc/golden_aud14_duplicate_qualifier.rs"]
 mod golden_aud14_duplicate_qualifier;
+#[path = "g_misc/golden_auth_error.rs"]
+mod golden_auth_error;
 #[path = "g_misc/golden_bare_ui_arity_fill.rs"]
 mod golden_bare_ui_arity_fill;
 #[path = "g_misc/golden_basics.rs"]

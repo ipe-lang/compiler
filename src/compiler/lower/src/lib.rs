@@ -265,6 +265,9 @@ pub fn lower(
         // ── DbFailure ADT ────────────────────────────────────────────────────
         db_failure: interner.intern("DbFailure").map_err(homeless)?,
         db_failure_ctors: lower::intern_db_failure_ctors(interner).map_err(homeless)?,
+        // ── AuthError ADT ────────────────────────────────────────────────────
+        auth_error: interner.intern("AuthError").map_err(homeless)?,
+        auth_error_ctors: lower::intern_auth_error_ctors(interner).map_err(homeless)?,
         http_method: interner.intern("HttpMethod").map_err(homeless)?,
         hm_get: interner.intern("Get").map_err(homeless)?,
         hm_post: interner.intern("Post").map_err(homeless)?,

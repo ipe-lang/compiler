@@ -45,6 +45,7 @@ pins! {
     "PanicInfo" => Value: ipe_runtime_rust::error::IpePanicInfo;
     "TypeInfo" => Value: ipe_runtime_rust::error::IpeTypeInfo;
     "DbFailure" => Value: ipe_runtime_rust::error::IpeDbFailure;
+    "AuthError" => Value: ipe_runtime_rust::error::IpeAuthError;
     "Path" => Value: ipe_runtime_rust::path::Path;
     #[cfg(feature = "url")]
     "UrlRelative" => Value: ipe_runtime_rust::url::UrlRelative;
@@ -216,4 +217,29 @@ fn every_pin_names_a_listed_leaf() {
             "{pin} is pinned but not listed"
         );
     }
+}
+
+// `Debug.toString Auth.Expired` renders the bare constructor name, for every
+// variant, in declaration order.
+#[test]
+fn auth_error_shows_its_constructor_name() {
+    use ipe_runtime_rust::stringify::IpeStringify;
+    let shown: Vec<String> = ipe_runtime_rust::error::IpeAuthError::ALL
+        .iter()
+        .map(IpeStringify::ipe_show)
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "Malformed",
+            "BadSignature",
+            "Expired",
+            "NotYetValid",
+            "MissingClaim",
+            "Revoked",
+            "RevocationUnavailable",
+            "TooManyCredentials",
+            "SecretTooShort",
+        ]
+    );
 }

@@ -13675,7 +13675,7 @@ mod web_revocation_tests {
     /// Whether `Auth.verifyToken` admits `token` where it is called.
     fn verifies(token: &str) -> bool {
         matches!(
-            crate::auth::auth_verify_token::<String>(SECRET.to_owned(), token.to_owned()),
+            crate::auth::auth_verify_token(SECRET.to_owned(), token.to_owned()),
             crate::IpeResult::Ok(_)
         )
     }
