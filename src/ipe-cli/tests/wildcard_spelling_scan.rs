@@ -11,21 +11,21 @@ use std::path::{Path, PathBuf};
 /// Production source roots scanned, relative to this crate's manifest: every
 /// crate that sees a parsed, canonical, inferred, or lowered type.
 const ROOTS: &[&str] = &[
-    "../syntax/src",
-    "../parse/src",
-    "../types/src",
-    "../canon/src",
-    "../lower/src",
-    "../ir/src",
-    "../backend",
-    "../kernels/src",
-    "../ffi/src",
-    "../db/src",
-    "../lint/src",
-    "../annotate/src",
-    "../diagnostics/src",
-    "../../lsp",
-    "../../ipe-cli/src",
+    "../compiler/syntax/src",
+    "../compiler/parse/src",
+    "../compiler/types/src",
+    "../compiler/canon/src",
+    "../compiler/lower/src",
+    "../compiler/ir/src",
+    "../compiler/backend",
+    "../compiler/kernels/src",
+    "../compiler/ffi/src",
+    "../compiler/db/src",
+    "../compiler/lint/src",
+    "../compiler/annotate/src",
+    "../compiler/diagnostics/src",
+    "../lsp",
+    "src",
 ];
 
 /// The only production lines that may name the spelling, each keyed by the
