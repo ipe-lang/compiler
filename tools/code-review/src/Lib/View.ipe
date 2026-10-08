@@ -13,10 +13,10 @@ import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
-import Lib.Db as LibDb exposing (ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Token(..))
-import Lib.Index as Index exposing (Change(..), LogStatus(..), SourceRow(..), SourceView(..))
+import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
@@ -289,10 +289,16 @@ recordsDecisions model =
     case model.queueState of
         Loaded page ->
             case page.log of
-                Signed _ ->
+                ShownProven ->
                     True
 
-                Unsigned ->
+                ShownBroken _ ->
+                    True
+
+                ShownKeyMismatch ->
+                    True
+
+                ShownUnkeyed ->
                     False
 
         Loading ->
@@ -302,11 +308,11 @@ recordsDecisions model =
             False
 
 
--- The chain-break banner of a loaded queue or history page; no banner while
--- the chain is intact or the server holds no key.
-chainBannerLine : LogStatus -> Ui.Element Msg
-chainBannerLine status =
-    case Queue.chainBanner status of
+-- The log banner of a loaded queue or history page; no banner while the
+-- log is proven or the server holds no key.
+chainBannerLine : LogShown -> Ui.Element Msg
+chainBannerLine shown =
+    case Queue.chainBanner shown of
         Just text ->
             Ui.el [ Font.size 13, Font.bold, Font.color (Ui.rgb 230 120 120) ] (Ui.text text)
 

@@ -1,4 +1,4 @@
-module Lib.Db exposing (Decision(..), HistoryCursor(..), HistoryRows, LogRow, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, checkChainWithin, countedRows, currentHead, holdsEveryEntry, findDecision, findLatestForUid, historyPage, historyPlan, insertDecision, lastSeq, logPageCeiling, logRowsAfter, openAt, parseReason, probe, reasonMaxChars, reasonText, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier)
+module Lib.Db exposing (BreakAt(..), Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, brokenRefusal, copyCurrent, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, openAt, parseReason, probe, reasonMaxChars, reasonText, stateHead, stateVerdict, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -193,35 +193,206 @@ verifiedPair row =
             r.pair
 
 
--- How a reader treats the log's rows: verifying each under the key on an
--- unbroken chain (`Counting`), under the key on a broken chain, where a row
--- that verifies still does not count (`Broken`), or with no key, where none
--- counts (`Keyless`). Opaque: built only by `verifier`.
+-- Where the review log fails its walk: at an entry (`BreaksAt`), or with
+-- `n` entries past its head (`PastHead n`), which a decision, moving the
+-- head in the transaction that inserts its entry, never leaves.
+type BreakAt
+    = BreaksAt Int
+    | PastHead Int
+
+
+-- A head the walk proved under the running key: every entry from 1 to it
+-- present, in order, linked to the mac before it and signed by the key; no
+-- entry past it; and its key check made by the key. Opaque: built only by
+-- `walkVerdict`, so no reader counts a row the walk did not prove.
+type ProvenHead
+    = ProvenHead Index.ChainHead
+
+
+provenChain : ProvenHead -> Index.ChainHead
+provenChain proven =
+    case proven of
+        ProvenHead head ->
+            head
+
+
+provenSeq : ProvenHead -> Int
+provenSeq proven =
+    Index.chainSeq (provenChain proven)
+
+
+-- What the review log is under the running key: proven to its head; broken;
+-- signed by another key (`KeyMismatch`); or not verifiable, with no key
+-- (`Unkeyed`).
+type LogVerdict
+    = Proven ProvenHead
+    | Broken BreakAt
+    | KeyMismatch
+    | Unkeyed
+
+
+-- The review log as one walk found it: the head read, the verdict on it,
+-- and the key it was walked under. Opaque: built only by `stateWithin`, the
+-- one producer of a verdict, which every consumer takes as a value.
+type LogState
+    = LogState { head : Index.ChainHead, verdict : LogVerdict, key : ReviewKey }
+
+
+stateHead : LogState -> Index.ChainHead
+stateHead state =
+    case state of
+        LogState s ->
+            s.head
+
+
+stateVerdict : LogState -> LogVerdict
+stateVerdict state =
+    case state of
+        LogState s ->
+            s.verdict
+
+
+-- A verdict as a page shows it, its proof dropped.
+type LogShown
+    = ShownProven
+    | ShownBroken BreakAt
+    | ShownKeyMismatch
+    | ShownUnkeyed
+
+
+logShown : LogState -> LogShown
+logShown state =
+    case stateVerdict state of
+        Proven _ ->
+            ShownProven
+
+        Broken at ->
+            ShownBroken at
+
+        KeyMismatch ->
+            ShownKeyMismatch
+
+        Unkeyed ->
+            ShownUnkeyed
+
+
+-- The status the `reviewed` copy is rebuilt under for a verdict: only a
+-- proven log is intact. Every other verdict drains nothing, so two of them
+-- sharing a status share the copy's contents too.
+copyStatus : LogState -> LogStatus
+copyStatus state =
+    case state of
+        LogState s ->
+            case s.verdict of
+                Proven _ ->
+                    Signed Intact
+
+                Broken (BreaksAt n) ->
+                    Signed (BrokenAt n)
+
+                Broken (PastHead _) ->
+                    Signed (BrokenAt (Index.chainSeq s.head + 1))
+
+                KeyMismatch ->
+                    Signed (BrokenAt 1)
+
+                Unkeyed ->
+                    Unsigned
+
+
+-- The stamp a `reviewed` copy rebuilt under the verdict carries: signed by
+-- the running key over the head and the copy's status, or unsigned with no
+-- key. A signing key paired with an unsigned status gets the unsigned stamp,
+-- which no signing key's `Index.stampStatus` accepts, so it fails closed.
+copyStamp : LogState -> Index.Stamp
+copyStamp state =
+    case state of
+        LogState s ->
+            case s.key of
+                ReadOnly ->
+                    Index.unsignedStamp s.head
+
+                Signing macKey ->
+                    case copyStatus state of
+                        Signed verdict ->
+                            Index.signedStamp macKey s.head verdict
+
+                        Unsigned ->
+                            Index.unsignedStamp s.head
+
+
+-- True exactly when a `reviewed` copy's stamp is the one `copyStamp` writes
+-- for this verdict: the copy was rebuilt from this head under this status.
+copyCurrent : LogState -> Maybe String -> Bool
+copyCurrent state stamp =
+    case state of
+        LogState s ->
+            Index.stampStatus s.key s.head stamp == Just (copyStatus state)
+
+
+-- How a reader treats the log's rows: counting, under the key, each row up
+-- to a proven head (`Counting`); under the key on a log that is broken or
+-- signed by another key, where a row that verifies still does not count
+-- (`Breaking`); or with no key, where none counts (`Keyless`). Opaque: built
+-- only by `verifier`, from a verdict.
 type Verifier
-    = Counting MacKey
-    | Broken MacKey
+    = Counting ProvenHead MacKey
+    | Breaking Index.ChainHead MacKey
     | Keyless
 
 
--- The verifier for a server's key and the status the `reviewed` copy was
--- rebuilt under. A key with an unsigned status counts nothing: no copy
--- `stampStatus` accepts has that pairing, and the branch fails closed.
-verifier : ReviewKey -> LogStatus -> Verifier
-verifier key status =
-    case key of
-        ReadOnly ->
-            Keyless
+-- The verifier a verdict allows. A signing key with an `Unkeyed` verdict
+-- counts nothing: `stateWithin` never pairs them, and the branch fails
+-- closed.
+verifier : LogState -> Verifier
+verifier state =
+    case state of
+        LogState s ->
+            case s.key of
+                ReadOnly ->
+                    Keyless
 
-        Signing macKey ->
-            case status of
-                Signed Intact ->
-                    Counting macKey
+                Signing macKey ->
+                    case s.verdict of
+                        Proven proven ->
+                            Counting proven macKey
 
-                Signed (BrokenAt _) ->
-                    Broken macKey
+                        Broken _ ->
+                            Breaking s.head macKey
 
-                Unsigned ->
-                    Broken macKey
+                        KeyMismatch ->
+                            Breaking s.head macKey
+
+                        Unkeyed ->
+                            Keyless
+
+
+-- The `seq <= ?` bound a reader's SQL carries: the proven seq under a
+-- counting verifier, none otherwise, where no row counts.
+boundClause : Verifier -> String
+boundClause verify =
+    case verify of
+        Counting _ _ ->
+            " AND seq <= ?"
+
+        Breaking _ _ ->
+            ""
+
+        Keyless ->
+            ""
+
+
+boundParams : Verifier -> List SqlValue
+boundParams verify =
+    case verify of
+        Counting proven _ ->
+            [ SqlInt (provenSeq proven) ]
+
+        Breaking _ _ ->
+            []
+
+        Keyless ->
+            []
 
 
 -- One row of the legacy `review` table, parsed. Built only by `fromRecord`;
@@ -359,13 +530,113 @@ legacyEntry row =
 -- the server before it listens, naming the variable, the file and the fix.
 -- A driver failure is refused once, through `Settings.openFailure`; a lost
 -- guard is its own refusal, since no change of location repairs that log.
-probe : DbLocation -> Task.Task Error ()
-probe loc =
+-- Under a signing key the log must be bound to that key: a head's key check
+-- must verify, and a head with none is bound only when a walk proves the key
+-- signed every entry. Any other key is refused by `keyMismatchRefusal`.
+probe : ReviewKey -> DbLocation -> Task.Task Error ()
+probe key loc =
     do
         db <- openMigrated loc
         requireGuards loc db
         headAt loc db
-        Task.succeed ()
+        case key of
+            ReadOnly ->
+                Task.succeed ()
+
+            Signing macKey ->
+                Db.withTransaction db (\tx -> requireKeyCheck macKey tx)
+
+
+-- The head bound to `key`: its key check verifies, or, absent, is written
+-- once the walk proves the log under `key`. A log the walk does not prove
+-- is refused and keeps no key check, since a different key and an edited
+-- log read alike.
+requireKeyCheck : MacKey -> Db -> Task.Task Error ()
+requireKeyCheck key tx =
+    do
+        head <- currentHead tx
+        case Index.chainKeyCheck head of
+            Just _ ->
+                if keyCheckHolds key head then
+                    Task.succeed ()
+
+                else
+                    Task.fail keyMismatchRefusal
+
+            Nothing ->
+                do
+                    verdict <- walkVerdict key tx PageSize.pairs logPageCeiling chainCeilingRefusal head
+                    case verdict of
+                        Proven _ ->
+                            adoptLog key tx head
+
+                        Broken _ ->
+                            Task.fail keyMismatchRefusal
+
+                        KeyMismatch ->
+                            Task.fail keyMismatchRefusal
+
+                        Unkeyed ->
+                            Task.fail keyMismatchRefusal
+
+
+-- The key check written on a head that still has none and still reads as
+-- `head`; a head another process moved or bound first fails the write.
+adoptLog : MacKey -> Db -> Index.ChainHead -> Task.Task Error ()
+adoptLog key tx head =
+    do
+        bound <- Db.exec tx
+            "UPDATE review_log_head SET key_check = ? WHERE one = 1 AND key_check IS NULL AND log_id = ? AND seq = ? AND head = ?"
+            [ SqlString (keyCheckOf key (Index.chainLogId head)), SqlString (Index.chainLogId head), SqlInt (Index.chainSeq head), SqlString (Index.chainMac head) ]
+        if bound == 1 then
+            Task.succeed ()
+
+        else
+            Task.fail (Error.conflict "the review log's head moved while this server bound it to its key; start the server again")
+
+
+-- What a head's key check covers: a domain tag and the log's id, kept apart
+-- by `Index.lengthPrefixed`, so a check made for one log never verifies for
+-- another.
+keyCheckInput : String -> String
+keyCheckInput logId =
+    Index.lengthPrefixed [ "ipe-code-review/key-check/v1", logId ]
+
+
+keyCheckOf : MacKey -> String -> String
+keyCheckOf key logId =
+    ReviewKey.sign key (keyCheckInput logId)
+
+
+-- True exactly when the head carries a key check that verifies under `key`
+-- for its log. An absent or unparsable check never holds.
+keyCheckHolds : MacKey -> Index.ChainHead -> Bool
+keyCheckHolds key head =
+    case Index.chainKeyCheck head of
+        Nothing ->
+            False
+
+        Just stored ->
+            signedBy key (keyCheckInput (Index.chainLogId head)) stored
+
+
+-- True exactly when `macHex`, parsed once, is the tag of `message` under
+-- `key`. An unparsable mac never verifies.
+signedBy : MacKey -> String -> String -> Bool
+signedBy key message macHex =
+    case Crypto.macFromHex macHex of
+        Nothing ->
+            False
+
+        Just mac ->
+            ReviewKey.verifies key message mac
+
+
+-- The refusal of a key that did not sign the review log. It names the
+-- variable only, never the key nor the head's stored check.
+keyMismatchRefusal : Error
+keyMismatchRefusal =
+    Error.invalidInput ("the review log was signed by a different " ++ ReviewKey.keyVar ++ ", so this key can neither verify nor record its decisions.\n  fix: start with the key that signed it.")
 
 
 openMigrated : DbLocation -> Task.Task Error Db
@@ -458,7 +729,7 @@ currentHead db =
 
 headRows : Db -> Task.Task Error (List Index.ChainHead)
 headRows db =
-    Db.queryDecode db "SELECT log_id, seq, head FROM review_log_head WHERE one = 1" [] Index.chainHeadDecoder
+    Db.queryDecode db "SELECT log_id, seq, head, key_check FROM review_log_head WHERE one = 1" [] Index.chainHeadDecoder
 
 
 oneHead : List Index.ChainHead -> Task.Task Error Index.ChainHead
@@ -471,30 +742,24 @@ oneHead rows =
             Task.fail (Error.unexpected "review_log_head did not return exactly one row")
 
 
--- True when the log holds one entry for every seq from 1 to the head's:
--- the seq is the table's key and at least 1, so a count of entries up to
--- the head's seq equal to that seq leaves no gap. The cheap check a page
--- load makes before it trusts a stamp of an intact chain, so an entry
--- removed below an unmoved head is seen without waiting for a rebuild.
-holdsEveryEntry : Db -> Index.ChainHead -> Task.Task Error Bool
-holdsEveryEntry db head =
-    Db.queryDecode db
-        "SELECT count(*) AS entries FROM review_log WHERE seq <= ?"
-        [ SqlInt (Index.chainSeq head) ]
-        entriesDecoder
-        |> Task.map (\counts -> counts == [ Index.chainSeq head ])
-
-
--- True when the log holds an entry past the head's seq. A decision moves the
--- head in the transaction that inserts its entry, so such an entry was added
--- outside this tool; the next decision's insert would collide with it.
-entriesPast : Db -> Index.ChainHead -> Task.Task Error Bool
+-- How many entries the log holds past the head's seq.
+entriesPast : Db -> Index.ChainHead -> Task.Task Error Int
 entriesPast db head =
     Db.queryDecode db
         "SELECT count(*) AS entries FROM review_log WHERE seq > ?"
         [ SqlInt (Index.chainSeq head) ]
         entriesDecoder
-        |> Task.map (\counts -> counts /= [ 0 ])
+        |> Task.andThen oneCount
+
+
+oneCount : List Int -> Task.Task Error Int
+oneCount counts =
+    case counts of
+        [ n ] ->
+            Task.succeed n
+
+        _ ->
+            Task.fail (Error.unexpected "a count of review-log entries did not return exactly one row")
 
 
 entriesDecoder : Db.Decode.Decoder Int
@@ -502,20 +767,31 @@ entriesDecoder =
     Db.Decode.succeed (\entries -> entries) |> Db.Decode.required "entries" (Db.Decode.int "entries")
 
 
--- The head moved from `prev` to `next` only if it still reads `prev`: a head
--- another writer moved first fails the move, so two decisions can never
--- both link from the same head.
+-- The head moved from `prev` to `next` only if it still reads `prev`, its
+-- key check included: a head another writer moved, or whose key check was
+-- swapped, fails the move, so two decisions can never both link from the
+-- same head and no decision links onto a head bound to another key.
 advanceHead : Db -> Index.ChainHead -> Index.ChainHead -> Task.Task Error ()
 advanceHead db prev next =
     do
         moved <- Db.exec db
-            "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1 AND log_id = ? AND seq = ? AND head = ?"
-            [ SqlInt (Index.chainSeq next), SqlString (Index.chainMac next), SqlString (Index.chainLogId prev), SqlInt (Index.chainSeq prev), SqlString (Index.chainMac prev) ]
+            "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1 AND log_id = ? AND seq = ? AND head = ? AND key_check IS ?"
+            [ SqlInt (Index.chainSeq next), SqlString (Index.chainMac next), SqlString (Index.chainLogId prev), SqlInt (Index.chainSeq prev), SqlString (Index.chainMac prev), keyCheckValue prev ]
         if moved == 1 then
             Task.succeed ()
 
         else
             Task.fail headMoved
+
+
+keyCheckValue : Index.ChainHead -> SqlValue
+keyCheckValue head =
+    case Index.chainKeyCheck head of
+        Nothing ->
+            SqlNull (SqlString "")
+
+        Just check ->
+            SqlString check
 
 
 headMoved : Error
@@ -527,14 +803,14 @@ headMoved =
 -- the chain, and every column it records. A NULL reason (`-`) and an empty
 -- one (`+`) differ, and `Index.lengthPrefixed` keeps any two field lists
 -- apart, so no edit of any column keeps the mac.
-macInput : String -> Int -> String -> Uid -> String -> String -> Maybe String -> Int -> String
+macInput : String -> Int -> String -> String -> String -> String -> Maybe String -> Int -> String
 macInput logId seq prev uid bodyHash decision reason reviewedAt =
     Index.lengthPrefixed
         [ "ipe-code-review/review-row/v1"
         , logId
         , String.fromInt seq
         , prev
-        , Uid.toString uid
+        , uid
         , bodyHash
         , decision
         , reasonField reason
@@ -591,16 +867,11 @@ rowVerifies : MacKey -> String -> LogRow -> Bool
 rowVerifies key logId row =
     case row of
         LogRow r ->
-            case Crypto.macFromHex r.mac of
-                Nothing ->
-                    False
-
-                Just mac ->
-                    let
-                        ( uid, bodyHash ) =
-                            Index.decidedPairKey r.pair
-                    in
-                    ReviewKey.verifies key (macInput logId r.seq r.prev uid bodyHash r.decision r.reason r.reviewedAt) mac
+            let
+                ( uid, bodyHash ) =
+                    Index.decidedPairKey r.pair
+            in
+            signedBy key (macInput logId r.seq r.prev (Uid.toString uid) bodyHash r.decision r.reason r.reviewedAt) r.mac
 
 
 -- A row's decision column parsed: Nothing for any text but `approve` or
@@ -620,23 +891,27 @@ logDecision row =
 
 
 -- The one classifier of a review-log row: `Verified` only under a counting
--- verifier, when its mac verifies and its decision parses; otherwise why it
--- is not counted.
-entryOf : Verifier -> String -> LogRow -> ReviewEntry
-entryOf verify logId row =
+-- verifier, for a row at or below the proven head whose mac verifies and
+-- whose decision parses; otherwise why it is not counted. A row past the
+-- proven head is one the walk did not prove, so it never counts.
+entryOf : Verifier -> LogRow -> ReviewEntry
+entryOf verify row =
     case verify of
         Keyless ->
             unverifiedOf NoKey row
 
-        Broken key ->
-            if rowVerifies key logId row then
+        Breaking head key ->
+            if rowVerifies key (Index.chainLogId head) row then
                 unverifiedOf ChainBroken row
 
             else
                 unverifiedOf Tampered row
 
-        Counting key ->
-            if rowVerifies key logId row then
+        Counting proven key ->
+            if logSeq row > provenSeq proven then
+                unverifiedOf ChainBroken row
+
+            else if rowVerifies key (Index.chainLogId (provenChain proven)) row then
                 case logDecision row of
                     Just decision ->
                         Verified (verifiedOf decision row)
@@ -677,19 +952,71 @@ logSeq row =
             r.seq
 
 
--- One link of the chain as a walk reads it: an entry's seq, the mac it
--- links from, and its own mac.
-type alias ChainLink =
+-- The review log under the running key, read in one review transaction:
+-- the one producer of a verdict. Every page load, the `reviewed` copy's
+-- rebuild and the save path take its result as a value; none re-derives
+-- whether the log is intact.
+logVerdict : ReviewKey -> Db -> Task.Task Error LogState
+logVerdict key db =
+    logVerdictWithin key db PageSize.pairs logPageCeiling chainCeilingRefusal
+
+
+-- `logVerdict` reading at most `ceiling` pages of `size` entries; a longer
+-- log fails with `refusal`.
+logVerdictWithin : ReviewKey -> Db -> PageSize -> Int -> Error -> Task.Task Error LogState
+logVerdictWithin key db size ceiling refusal =
+    Db.withTransaction db (\tx -> stateWithin key tx size ceiling refusal)
+
+
+stateWithin : ReviewKey -> Db -> PageSize -> Int -> Error -> Task.Task Error LogState
+stateWithin key tx size ceiling refusal =
+    do
+        head <- currentHead tx
+        verdict <- verdictOf key tx size ceiling refusal head
+        Task.succeed (LogState { head = head, verdict = verdict, key = key })
+
+
+-- With no key nothing is verifiable. Under a key the head's key check comes
+-- first: an absent one, or one another key made, is `KeyMismatch` without a
+-- walk, since `probe` binds every log it lets a signing key serve.
+verdictOf : ReviewKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> Task.Task Error LogVerdict
+verdictOf key tx size ceiling refusal head =
+    case key of
+        ReadOnly ->
+            Task.succeed Unkeyed
+
+        Signing macKey ->
+            if keyCheckHolds macKey head then
+                walkVerdict macKey tx size ceiling refusal head
+
+            else
+                Task.succeed KeyMismatch
+
+
+-- One review-log row as the walk reads it: every column its mac covers, the
+-- uid as stored, so a row whose uid is not a unit id breaks the chain at its
+-- seq rather than failing the walk.
+type alias WalkRow =
     { seq : Int
+    , uid : String
+    , bodyHash : String
+    , decision : String
+    , reason : Maybe String
+    , reviewedAt : Int
     , prev : String
     , mac : String
     }
 
 
-chainLinkDecoder : Db.Decode.Decoder ChainLink
-chainLinkDecoder =
-    Db.Decode.succeed (\seq prev mac -> { seq = seq, prev = prev, mac = mac })
+walkRowDecoder : Db.Decode.Decoder WalkRow
+walkRowDecoder =
+    Db.Decode.succeed (\seq uid bodyHash decision reason reviewedAt prev mac -> { seq = seq, uid = uid, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac })
         |> Db.Decode.required "seq" (Db.Decode.int "seq")
+        |> Db.Decode.required "uid" (Db.Decode.string "uid")
+        |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
+        |> Db.Decode.required "decision" (Db.Decode.string "decision")
+        |> Db.Decode.required "reason" (Db.Decode.nullable (Db.Decode.string "reason"))
+        |> Db.Decode.required "reviewed_at" (Db.Decode.int "reviewed_at")
         |> Db.Decode.required "prev" (Db.Decode.string "prev")
         |> Db.Decode.required "mac" (Db.Decode.string "mac")
 
@@ -703,73 +1030,84 @@ type alias ChainWalk =
     }
 
 
--- The review log walked in seq order up to `head`: every entry from 1 must
--- follow the one before it and link its mac, and the last must be the head's
--- seq and mac. The verdict names the first entry where that fails. Entries
--- past the head's seq are not read: a decision is recorded with its head
--- move in one transaction, so they are ones a later head covers. At most
--- `ceiling` pages of `size` entries are read; a longer log fails with
--- `refusal`. The walk reads only the chain columns; no mac is verified here.
-checkChainWithin : Db -> PageSize -> Int -> Error -> Index.ChainHead -> Task.Task Error ChainVerdict
-checkChainWithin db size ceiling refusal head =
-    Task.loop (ceiling + 1) { pagesRead = 0, nextSeq = 1, prev = "genesis" } (chainStep db size ceiling refusal head)
-
-
-chainStep : Db -> PageSize -> Int -> Error -> Index.ChainHead -> ChainWalk -> Task.Task Error (Task.Step ChainWalk ChainVerdict)
-chainStep db size ceiling refusal head walk =
+-- The whole review log walked under `key`: every entry from 1 must follow
+-- the one before it, link its mac and verify under the key; the last must be
+-- the head's seq and mac; and no entry may sit past the head. Only then is
+-- the head `Proven`. At most `ceiling` pages of `size` entries are read; a
+-- longer log fails with `refusal`.
+walkVerdict : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> Task.Task Error LogVerdict
+walkVerdict key db size ceiling refusal head =
     do
-        links <- Db.queryDecode db
-            "SELECT seq, prev, mac FROM review_log WHERE seq >= ? AND seq <= ? ORDER BY seq LIMIT ?"
+        walked <- Task.loop (ceiling + 1) { pagesRead = 0, nextSeq = 1, prev = "genesis" } (walkStep key db size ceiling refusal head)
+        case walked of
+            BrokenAt n ->
+                Task.succeed (Broken (BreaksAt n))
+
+            Intact ->
+                do
+                    past <- entriesPast db head
+                    if past > 0 then
+                        Task.succeed (Broken (PastHead past))
+
+                    else
+                        Task.succeed (Proven (ProvenHead head))
+
+
+walkStep : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> ChainWalk -> Task.Task Error (Task.Step ChainWalk ChainVerdict)
+walkStep key db size ceiling refusal head walk =
+    do
+        rows <- Db.queryDecode db
+            (logColumns ++ " WHERE seq >= ? AND seq <= ? ORDER BY seq LIMIT ?")
             [ SqlInt walk.nextSeq, SqlInt (Index.chainSeq head), SqlInt (PageSize.toInt size) ]
-            chainLinkDecoder
-        if List.isEmpty links then
+            walkRowDecoder
+        if List.isEmpty rows then
             Task.succeed (Task.Done (chainEnd head walk))
 
         else if walk.pagesRead >= ceiling then
             Task.fail refusal
 
         else
-            case followLinks walk.nextSeq walk.prev links of
+            case followRows key (Index.chainLogId head) walk.nextSeq walk.prev rows of
                 Err brokenAt ->
                     Task.succeed (Task.Done (BrokenAt brokenAt))
 
                 Ok ( nextSeq, prev ) ->
-                    if List.length links < PageSize.toInt size then
+                    if List.length rows < PageSize.toInt size then
                         Task.succeed (Task.Done (chainEnd head { pagesRead = walk.pagesRead + 1, nextSeq = nextSeq, prev = prev }))
 
                     else
                         Task.succeed (Task.Continue { pagesRead = walk.pagesRead + 1, nextSeq = nextSeq, prev = prev })
 
 
--- One page of links followed from the expected seq and mac: the seq and mac
+-- One page of rows followed from the expected seq and mac: the seq and mac
 -- after the page, or the first entry the chain breaks at. A missing entry
--- breaks at its seq; an entry linking another mac breaks at its own.
-followLinks : Int -> String -> List ChainLink -> Result Int ( Int, String )
-followLinks nextSeq prev links =
+-- breaks at its seq; an entry linking another mac, or whose own mac does not
+-- verify under the key, breaks at its own.
+followRows : MacKey -> String -> Int -> String -> List WalkRow -> Result Int ( Int, String )
+followRows key logId nextSeq prev rows =
     List.foldl
-        (\link walked ->
+        (\row walked ->
             case walked of
                 Err n ->
                     Err n
 
                 Ok ( expected, mac ) ->
-                    if link.seq /= expected then
+                    if row.seq /= expected then
                         Err expected
 
-                    else if Crypto.constantTimeEqual link.prev mac then
-                        Ok ( expected + 1, link.mac )
+                    else if Crypto.constantTimeEqual row.prev mac && signedBy key (macInput logId row.seq row.prev row.uid row.bodyHash row.decision row.reason row.reviewedAt) row.mac then
+                        Ok ( expected + 1, row.mac )
 
                     else
                         Err expected
         )
         (Ok ( nextSeq, prev ))
-        links
+        rows
 
 
--- The verdict once every entry up to the head's seq is read: intact when
--- the walk ended on the head's seq and mac; otherwise broken at the first
--- missing entry, or at the head's own entry when its mac is not the last
--- entry's.
+-- The walk's end once every entry up to the head's seq is read: intact when
+-- it ended on the head's seq and mac; otherwise broken at the first missing
+-- entry, or at the head's own entry when its mac is not the last entry's.
 chainEnd : Index.ChainHead -> ChainWalk -> ChainVerdict
 chainEnd head walk =
     let
@@ -786,14 +1124,42 @@ chainEnd head walk =
         BrokenAt (max 1 lastSeq)
 
 
--- The refusal of a decision on a broken chain, naming the first entry it
--- breaks at.
-chainBrokenRefusal : Int -> Error
-chainBrokenRefusal n =
-    Error.conflict
-        ("the review log's chain breaks at entry "
-            ++ String.fromInt n
-            ++ ": a decision was removed, reordered or replaced outside this tool, so no decision is recorded until the log is restored"
+-- The refusal of a decision on a broken log, naming where it breaks.
+brokenRefusal : BreakAt -> Error
+brokenRefusal at =
+    case at of
+        BreaksAt n ->
+            Error.conflict
+                ("the review log's chain breaks at entry "
+                    ++ String.fromInt n
+                    ++ ": a decision was removed, reordered or replaced outside this tool, so no decision is recorded until the log is restored"
+                )
+
+        PastHead n ->
+            Error.conflict
+                ("the review log holds "
+                    ++ entriesText n
+                    ++ " past its head: a decision was added outside this tool, so no decision is recorded until the log is restored"
+                )
+
+
+entriesText : Int -> String
+entriesText n =
+    if n == 1 then
+        "1 entry"
+
+    else
+        String.fromInt n ++ " entries"
+
+
+chainCeilingRefusal : Error
+chainCeilingRefusal =
+    Error.invalidInput
+        ("the review log holds more than "
+            ++ String.fromInt (logPageCeiling * PageSize.toInt PageSize.pairs)
+            ++ " decisions, past the "
+            ++ String.fromInt logPageCeiling
+            ++ "-page ceiling of a chain check"
         )
 
 
@@ -819,9 +1185,9 @@ candidateCeiling =
 -- the reviewer was shown exactly those bytes, and only under `key`: a
 -- read-only server holds no `MacKey` and cannot call it. A refusal's reason
 -- is already a parsed `Reason`, so every decision that reaches the log is
--- well formed. One review transaction reads the head, walks the chain to it
--- and refuses a broken one or one with an entry past the head, inserting
--- nothing; returns `AlreadyDecided` when
+-- well formed. One review transaction takes the log's verdict from
+-- `stateWithin`, the same producer every page load reads, and refuses any
+-- verdict but `Proven`, inserting nothing; returns `AlreadyDecided` when
 -- a row for the pair already verifies, the first verified decision winning;
 -- otherwise appends the next entry, signed over every column and linked to
 -- the head, and moves the head to it through a compare-and-set that fails,
@@ -836,48 +1202,35 @@ insertDecision key db attested decision =
 recordDecision : MacKey -> Db -> Attested -> Decision -> Int -> Task.Task Error Index.Written
 recordDecision key tx attested decision at =
     do
-        head <- currentHead tx
-        walked <- checkChainWithin tx PageSize.pairs logPageCeiling decideCeilingRefusal head
-        past <- entriesPast tx head
-        case decideVerdict head walked past of
-            BrokenAt n ->
-                Task.fail (chainBrokenRefusal n)
-
-            Intact ->
+        state <- stateWithin (Signing key) tx PageSize.pairs logPageCeiling decideCeilingRefusal
+        case stateVerdict state of
+            Proven proven ->
                 do
-                    decided <- pairVerifies key tx head (Index.attestedUid attested) (Index.attestedHash attested)
+                    decided <- pairVerifies key tx proven (Index.attestedUid attested) (Index.attestedHash attested)
                     if decided then
                         Task.succeed Index.AlreadyDecided
 
                     else
-                        appendDecision key tx head attested decision at
+                        appendDecision key tx (provenChain proven) attested decision at
+
+            Broken at ->
+                Task.fail (brokenRefusal at)
+
+            KeyMismatch ->
+                Task.fail keyMismatchRefusal
+
+            Unkeyed ->
+                Task.fail ReviewKey.readOnlyError
 
 
--- The chain a decision links onto: intact only when the walk to the head
--- found no break and no entry sits past the head, which would take the seq
--- the next entry needs.
-decideVerdict : Index.ChainHead -> ChainVerdict -> Bool -> ChainVerdict
-decideVerdict head walked past =
-    case walked of
-        BrokenAt n ->
-            BrokenAt n
-
-        Intact ->
-            if past then
-                BrokenAt (Index.chainSeq head + 1)
-
-            else
-                Intact
-
-
--- True when a row for the pair, up to the head, verifies under `key`.
-pairVerifies : MacKey -> Db -> Index.ChainHead -> Uid -> String -> Task.Task Error Bool
-pairVerifies key db head uid bodyHash =
+-- True when a row for the pair, up to the proven head, verifies under `key`.
+pairVerifies : MacKey -> Db -> ProvenHead -> Uid -> String -> Task.Task Error Bool
+pairVerifies key db proven uid bodyHash =
     Db.queryDecode db
         (logColumns ++ " WHERE uid = ? AND body_hash = ? AND seq <= ? ORDER BY seq LIMIT ?")
-        [ Uid.toSql uid, SqlString bodyHash, SqlInt (Index.chainSeq head), SqlInt candidateCeiling ]
+        [ Uid.toSql uid, SqlString bodyHash, SqlInt (provenSeq proven), SqlInt candidateCeiling ]
         logRowDecoder
-        |> Task.map (List.any (rowVerifies key (Index.chainLogId head)))
+        |> Task.map (List.any (rowVerifies key (Index.chainLogId (provenChain proven))))
 
 
 appendDecision : MacKey -> Db -> Index.ChainHead -> Attested -> Decision -> Int -> Task.Task Error Index.Written
@@ -904,7 +1257,7 @@ appendDecision key tx head attested decision at =
             Index.chainMac head
 
         mac =
-            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev uid bodyHash decisionText reason at)
+            ReviewKey.sign key (macInput (Index.chainLogId head) seq prev (Uid.toString uid) bodyHash decisionText reason at)
 
         next =
             Index.chainNext head mac
@@ -932,23 +1285,23 @@ reasonValue reason =
 
 
 -- One page of the review log in seq order, strictly after entry `after` and
--- up to the head's seq, at most `size` rows: the refill's read. Every value
--- is a bound parameter.
-logRowsAfter : Db -> PageSize -> Index.ChainHead -> Int -> Task.Task Error (List LogRow)
-logRowsAfter db size head after =
+-- up to the proven head's seq, at most `size` rows: the refill's read. Every
+-- value is a bound parameter.
+logRowsAfter : Db -> PageSize -> ProvenHead -> Int -> Task.Task Error (List LogRow)
+logRowsAfter db size proven after =
     Db.queryDecode db
         (logColumns ++ " WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?")
-        [ SqlInt after, SqlInt (Index.chainSeq head), SqlInt (PageSize.toInt size) ]
+        [ SqlInt after, SqlInt (provenSeq proven), SqlInt (PageSize.toInt size) ]
         logRowDecoder
 
 
--- A refill page's rows that count: each classified under `verify` in the
--- head's log, the verified ones kept.
-countedRows : Verifier -> Index.ChainHead -> List LogRow -> List VerifiedRow
-countedRows verify head rows =
+-- A refill page's rows that count: each classified under `verify`, the
+-- verified ones kept.
+countedRows : Verifier -> List LogRow -> List VerifiedRow
+countedRows verify rows =
     List.filterMap
         (\row ->
-            case entryOf verify (Index.chainLogId head) row of
+            case entryOf verify row of
                 Verified v ->
                     Just v
 
@@ -966,16 +1319,16 @@ lastSeq rows =
 
 -- The review entry for one (uid, body_hash) pair, if any: its first row that
 -- counts, else its latest row that does not, else its legacy row as
--- `Legacy`. A legacy row `fromRecord` refuses fails the read.
+-- `Legacy`. Under a counting verifier only rows up to the proven head are
+-- read. A legacy row `fromRecord` refuses fails the read.
 findDecision : Verifier -> Db -> Uid -> String -> Task.Task Error (Maybe ReviewEntry)
 findDecision verify db uid bodyHash =
     do
-        head <- currentHead db
         rows <- Db.queryDecode db
-            (logColumns ++ " WHERE uid = ? AND body_hash = ? ORDER BY seq LIMIT ?")
-            [ Uid.toSql uid, SqlString bodyHash, SqlInt candidateCeiling ]
+            (logColumns ++ " WHERE uid = ? AND body_hash = ?" ++ boundClause verify ++ " ORDER BY seq LIMIT ?")
+            ([ Uid.toSql uid, SqlString bodyHash ] ++ boundParams verify ++ [ SqlInt candidateCeiling ])
             logRowDecoder
-        case pickEntry (List.map (entryOf verify (Index.chainLogId head)) rows) of
+        case pickEntry (List.map (entryOf verify) rows) of
             Just entry ->
                 Task.succeed (Just entry)
 
@@ -1017,18 +1370,24 @@ findLegacy db uid bodyHash =
 
 
 -- The most recent counted row for a uid across all hashes, if any: of its
--- newest `candidateCeiling` rows up to the head, the first that verifies.
--- A row that does not verify, and a legacy row, never stand for a previous
--- review.
+-- newest `candidateCeiling` rows up to the proven head, the first that
+-- verifies. A row that does not verify, a legacy row, and every row of a log
+-- not proven never stand for a previous review.
 findLatestForUid : Verifier -> Db -> Uid -> Task.Task Error (Maybe VerifiedRow)
 findLatestForUid verify db uid =
-    do
-        head <- currentHead db
-        rows <- Db.queryDecode db
-            (logColumns ++ " WHERE uid = ? AND seq <= ? ORDER BY reviewed_at DESC, seq DESC LIMIT ?")
-            [ Uid.toSql uid, SqlInt (Index.chainSeq head), SqlInt candidateCeiling ]
-            logRowDecoder
-        Task.succeed (List.head (countedRows verify head rows))
+    case verify of
+        Counting proven _ ->
+            Db.queryDecode db
+                (logColumns ++ " WHERE uid = ? AND seq <= ? ORDER BY reviewed_at DESC, seq DESC LIMIT ?")
+                [ Uid.toSql uid, SqlInt (provenSeq proven), SqlInt candidateCeiling ]
+                logRowDecoder
+                |> Task.map (\rows -> List.head (countedRows verify rows))
+
+        Breaking _ _ ->
+            Task.succeed Nothing
+
+        Keyless ->
+            Task.succeed Nothing
 
 
 -- Where a History page starts: at the newest review-log row; strictly after
@@ -1073,9 +1432,8 @@ historyPage verify db size cursor =
 logHistoryPage : Verifier -> Db -> Int -> HistoryCursor -> Task.Task Error HistoryRows
 logHistoryPage verify db limit cursor =
     do
-        head <- currentHead db
-        rows <- Db.queryDecode db (historySql cursor) (historyParams limit cursor) logRowDecoder
-        logPageOf verify db limit (List.map (entryOf verify (Index.chainLogId head)) rows) rows
+        rows <- Db.queryDecode db (historySql (historyBound verify) cursor) (historyParams (historyBound verify) limit cursor) logRowDecoder
+        logPageOf verify db limit (List.map (entryOf verify) rows) rows
 
 
 -- A full page of log rows ends at its last row; a short one is filled with
@@ -1111,7 +1469,8 @@ legacyPage db limit cursor =
 -- detail line per step. The page order is the `review_log_time` index order
 -- for the log's rows and the `review_history_order` index order for legacy
 -- rows, so a page seeks into an index and reads at most its size, never a
--- whole table nor a sort of it.
+-- whole table nor a sort of it. The plan is the one a counting page runs,
+-- bounded by a proven seq.
 historyPlan : Db -> HistoryCursor -> Task.Task Error (List String)
 historyPlan db cursor =
     Db.queryDecode db
@@ -1124,10 +1483,10 @@ planSql : HistoryCursor -> String
 planSql cursor =
     case cursor of
         HistoryStart ->
-            historySql cursor
+            historySql (UpTo 0) cursor
 
         HistoryAfter _ _ ->
-            historySql cursor
+            historySql (UpTo 0) cursor
 
         HistoryLegacyAfter _ _ _ ->
             legacySql cursor
@@ -1137,39 +1496,91 @@ planParams : HistoryCursor -> List SqlValue
 planParams cursor =
     case cursor of
         HistoryStart ->
-            historyParams (PageSize.toInt PageSize.history) cursor
+            historyParams (UpTo 0) (PageSize.toInt PageSize.history) cursor
 
         HistoryAfter _ _ ->
-            historyParams (PageSize.toInt PageSize.history) cursor
+            historyParams (UpTo 0) (PageSize.toInt PageSize.history) cursor
 
         HistoryLegacyAfter _ _ _ ->
             legacyParams (PageSize.toInt PageSize.history) cursor
 
 
-historySql : HistoryCursor -> String
-historySql cursor =
-    case cursor of
-        HistoryAfter _ _ ->
-            logColumns ++ " WHERE reviewed_at <= ? AND (reviewed_at < ? OR seq < ?)" ++ historyOrder
+-- How far a History page reads the log: up to a proven seq, or, where no
+-- row counts, every row, each shown uncounted.
+type HistoryBound
+    = UpTo Int
+    | Unbounded
 
-        HistoryStart ->
+
+historyBound : Verifier -> HistoryBound
+historyBound verify =
+    case verify of
+        Counting proven _ ->
+            UpTo (provenSeq proven)
+
+        Breaking _ _ ->
+            Unbounded
+
+        Keyless ->
+            Unbounded
+
+
+-- A page's filter. The bound is written `+seq`, so SQLite reads it as a
+-- filter on the `review_log_time` order, never as a seq range that would
+-- trade the index order for a sort.
+historySql : HistoryBound -> HistoryCursor -> String
+historySql bound cursor =
+    let
+        upTo =
+            case bound of
+                UpTo _ ->
+                    [ "+seq <= ?" ]
+
+                Unbounded ->
+                    []
+
+        after =
+            case cursor of
+                HistoryAfter _ _ ->
+                    [ "reviewed_at <= ? AND (reviewed_at < ? OR seq < ?)" ]
+
+                HistoryStart ->
+                    []
+
+                HistoryLegacyAfter _ _ _ ->
+                    []
+    in
+    case after ++ upTo of
+        [] ->
             logColumns ++ historyOrder
 
-        HistoryLegacyAfter _ _ _ ->
-            logColumns ++ historyOrder
+        filters ->
+            logColumns ++ " WHERE " ++ String.join " AND " filters ++ historyOrder
 
 
-historyParams : Int -> HistoryCursor -> List SqlValue
-historyParams limit cursor =
-    case cursor of
-        HistoryAfter at seq ->
-            [ SqlTime (Timestamp.toUnixMillis at), SqlTime (Timestamp.toUnixMillis at), SqlInt seq, SqlInt limit ]
+historyParams : HistoryBound -> Int -> HistoryCursor -> List SqlValue
+historyParams bound limit cursor =
+    let
+        upTo =
+            case bound of
+                UpTo seq ->
+                    [ SqlInt seq ]
 
-        HistoryStart ->
-            [ SqlInt limit ]
+                Unbounded ->
+                    []
 
-        HistoryLegacyAfter _ _ _ ->
-            [ SqlInt limit ]
+        after =
+            case cursor of
+                HistoryAfter at seq ->
+                    [ SqlTime (Timestamp.toUnixMillis at), SqlTime (Timestamp.toUnixMillis at), SqlInt seq ]
+
+                HistoryStart ->
+                    []
+
+                HistoryLegacyAfter _ _ _ ->
+                    []
+    in
+    after ++ upTo ++ [ SqlInt limit ]
 
 
 historyOrder : String

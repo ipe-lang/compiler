@@ -20,11 +20,11 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
-import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (ChainVerdict(..), Change(..), LogStatus(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
+import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
@@ -33,7 +33,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -1026,7 +1026,7 @@ queueStateTextsDistinct =
             Error.unexpected "boom"
 
         empty =
-            { units = [], total = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = Signed Intact }
+            { units = [], total = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
 
         drained =
             { empty | total = 41000 }
@@ -1992,8 +1992,9 @@ flippedRefusalBackInQueue =
 
 
 -- A forged entry for a unit, linked into the chain with the head moved to
--- it, never takes the unit off the queue. Red if the rebuild counts a row on
--- its chain position without verifying its mac.
+-- it, never takes the unit off the queue: the walk breaks at it. Red if the
+-- rebuild counts a row, or the walk proves it, on its chain position without
+-- verifying its mac.
 forgedEntryLeavesUnitQueued : Task.Task Error Bool
 forgedEntryLeavesUnitQueued =
     let
@@ -2009,7 +2010,7 @@ forgedEntryLeavesUnitQueued =
         Db.exec db "UPDATE review_log_head SET seq = 1, head = ? WHERE one = 1" [ SqlString forged ]
         page <- loadPageNow Index.Start
         cleanupProgressScratch at
-        Task.succeed (onPage "u-a" page && page.progress.reviewed == 0 && page.log == Signed Intact)
+        Task.succeed (onPage "u-a" page && page.progress.reviewed == 0 && page.log == ShownBroken (BreaksAt 1))
 
 
 -- A middle entry removed outside the tool breaks the chain at entry 2: the
@@ -2031,9 +2032,7 @@ brokenChainCountsNothing =
         mirrored <- mirroredCount at.indexDb
         page <- loadPageNow Index.Start
         history <- loadHistoryPageNow HistoryStart
-        refused <- decideNow db (uid "u-a") Approved
-            |> Task.map (\_ -> False)
-            |> Task.onError (\e -> Task.succeed (String.contains "chain breaks at entry 2" (Error.message e)))
+        refused <- refusedWith (LibDb.brokenRefusal (BreaksAt 2)) (decideNow db (uid "u-a") Approved)
         rows <- logRowCount db
         cleanupProgressScratch at
         Task.succeed
@@ -2042,11 +2041,11 @@ brokenChainCountsNothing =
                 && mirrored
                 == 0
                 && page.log
-                == Signed (BrokenAt 2)
+                == ShownBroken (BreaksAt 2)
                 && Queue.chainBanner page.log
                 == Just "The review log's chain breaks at entry 2: a decision was removed, reordered or replaced outside this tool."
                 && history.log
-                == Signed (BrokenAt 2)
+                == ShownBroken (BreaksAt 2)
                 && List.length history.rows
                 == 2
                 && List.all (\row -> whyOf row.entry == Just ChainBroken) history.rows
@@ -2079,6 +2078,53 @@ removedEntryBelowHeadSeenOnLoad =
         Task.succeed (decidedThenReopened before page)
 
 
+-- A decided entry edited below an unmoved head, its guards dropped and put
+-- back, breaks the chain at that entry on the very next page load,
+-- with no restart and no rebuild asked for: the verdict is
+-- `Broken (BreaksAt 1)` and both drained units are listed again. Red if a
+-- load trusts the copy's stamp on an equal entry count without walking the
+-- entries under the key.
+editedRowBelowHeadBreaksPerLoad : Task.Task Error Bool
+editedRowBelowHeadBreaksPerLoad =
+    do
+        at <- freshScratch "ipe-index-log-edited-below-head"
+        db <- seedProgressScratch at
+        decideAndDrain db "u-a"
+        decideAndDrain db "u-b"
+        before <- loadPageNow Index.Start
+        tamperLog db "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" []
+        Db.exec db "CREATE TRIGGER IF NOT EXISTS review_log_no_update BEFORE UPDATE ON review_log BEGIN SELECT RAISE(ABORT, 'review_log is append-only'); END" []
+        Db.exec db "CREATE TRIGGER IF NOT EXISTS review_log_no_delete BEFORE DELETE ON review_log BEGIN SELECT RAISE(ABORT, 'review_log is append-only'); END" []
+        verdict <- logVerdictOf db
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed (verdict == LibDb.Broken (BreaksAt 1) && decidedThenReopened before page)
+
+
+-- Entries removed below an unmoved head, with as many rows left in the log
+-- as the head's seq (the first removed, one appended past the head), never
+-- read as intact on an equal count: the next page load shows the break at
+-- entry 1, its banner, and both units again. Red if a load or the verdict
+-- counts the log's rows instead of walking them.
+countingOnlyIntactIsGone : Task.Task Error Bool
+countingOnlyIntactIsGone =
+    do
+        at <- freshScratch "ipe-index-log-equal-count"
+        db <- seedProgressScratch at
+        decideAndDrain db "u-a"
+        decideAndDrain db "u-b"
+        before <- loadPageNow Index.Start
+        tamperLog db "DELETE FROM review_log WHERE seq = 1" []
+        Db.exec db
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (3, ?, ?, 'approve', NULL, 0, 'genesis', ?)"
+            [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString (String.repeat 64 "d") ]
+        rows <- logRowCount db
+        verdict <- logVerdictOf db
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed (rows == 2 && verdict == LibDb.Broken (BreaksAt 1) && decidedThenReopened before page)
+
+
 decideAndDrain : Db -> String -> Task.Task Error Int
 decideAndDrain db label =
     decideNow db (uid label) Approved |> Task.andThen (\( attested, written ) -> drainUnitNow attested written)
@@ -2087,11 +2133,11 @@ decideAndDrain db label =
 decidedThenReopened : Queue.QueuePage -> Queue.QueuePage -> Bool
 decidedThenReopened before page =
     before.log
-        == Signed Intact
+        == ShownProven
         && not (onPage "u-a" before)
         && not (onPage "u-b" before)
         && page.log
-        == Signed (BrokenAt 1)
+        == ShownBroken (BreaksAt 1)
         && Queue.chainBanner page.log
         == Just "The review log's chain breaks at entry 1: a decision was removed, reordered or replaced outside this tool."
         && onPage "u-a" page
@@ -2140,7 +2186,7 @@ readOnlyRecordsAndCountsNothing =
                 && rows
                 == 1
                 && page.log
-                == Unsigned
+                == ShownUnkeyed
                 && onPage "u-a" page
                 && page.progress.reviewed
                 == 0
@@ -2193,6 +2239,8 @@ checks =
             , check "a forged log entry leaves its unit queued" forgedEntryLeavesUnitQueued
             , check "a broken chain counts nothing, shows its banner and refuses a decision" brokenChainCountsNothing
             , check "an entry removed below an unmoved head is seen on the next page load" removedEntryBelowHeadSeenOnLoad
+            , check "an entry edited below an unmoved head breaks the chain on the next page load" editedRowBelowHeadBreaksPerLoad
+            , check "an equal entry count never reads as an intact log" countingOnlyIntactIsGone
             , check "a server with no key records and counts nothing" readOnlyRecordsAndCountsNothing
             , check "a failed drain keeps the queue row" drainIsAtomic
             , check "a progress rebuild stops at its page ceiling and rolls back" resyncStopsAtCeiling

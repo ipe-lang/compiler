@@ -90,6 +90,14 @@ module TestSupport exposing
     , logIdOf
     , logRowCount
     , countingVerifier
+    , logVerdictOf
+    , otherKeyHex
+    , otherMacKey
+    , appendSignedPastHead
+    , rawKeyCheck
+    , rawKeyCheckFor
+    , isRefusal
+    , refusedWith
     )
 
 import Ipe.ByteSize as ByteSize
@@ -823,11 +831,32 @@ testReviewKey =
     Task.map Signing testMacKey
 
 
--- The verifier of a server holding the test key over an intact chain: the
--- one under which a signed row counts.
-countingVerifier : Task.Task Error LibDb.Verifier
-countingVerifier =
-    testReviewKey |> Task.map (\key -> LibDb.verifier key (Index.Signed Index.Intact))
+-- A second well-formed key, one that never signed a test log.
+otherKeyHex : String
+otherKeyHex =
+    "0ddba11c0ffee5ca1ab1e5c0ffee15dec1dedba5eba11c0de0f0a11fee1900d2"
+
+
+otherMacKey : Task.Task Error ReviewKey.MacKey
+otherMacKey =
+    Task.fromResult (ReviewKey.parseMacKey otherKeyHex)
+
+
+-- The verdict a server holding the test key reads on `db`'s log.
+logVerdictOf : Db -> Task.Task Error LibDb.LogVerdict
+logVerdictOf db =
+    testReviewKey
+        |> Task.andThen (\key -> LibDb.logVerdict key db)
+        |> Task.map LibDb.stateVerdict
+
+
+-- The verifier of a server holding the test key over `db`'s log as it
+-- stands now: the one under which a signed row up to the proven head counts.
+countingVerifier : Db -> Task.Task Error LibDb.Verifier
+countingVerifier db =
+    testReviewKey
+        |> Task.andThen (\key -> LibDb.logVerdict key db)
+        |> Task.map LibDb.verifier
 
 
 -- One review-log row as a test writes it, column by column.
@@ -891,6 +920,14 @@ appendSignedClaiming db claim row =
     rawHead db |> Task.andThen (\head -> appendClaimedAt db head.logId (claim head) head row)
 
 
+-- `row` signed under the test key as the entry after the head and stored
+-- at that seq, the head left where it is: a correctly signed entry added
+-- past the head outside the tool.
+appendSignedPastHead : Db -> RawRow -> Task.Task Error Int
+appendSignedPastHead db row =
+    rawHead db |> Task.andThen (\head -> insertClaimed db head.logId head head row)
+
+
 appendSignedAt : Db -> String -> RawHead -> RawRow -> Task.Task Error Int
 appendSignedAt db logId head row =
     appendClaimedAt db logId head head row
@@ -898,18 +935,47 @@ appendSignedAt db logId head row =
 
 appendClaimedAt : Db -> String -> RawHead -> RawHead -> RawRow -> Task.Task Error Int
 appendClaimedAt db logId claimed head row =
-    let
-        seq =
-            head.seq + 1
-
-        mac =
-            rawMac (rawMacInput logId (claimed.seq + 1) claimed.head row)
-    in
     do
-        Db.exec db
-            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            [ SqlInt seq, Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac ]
-        Db.exec db "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1" [ SqlInt seq, SqlString mac ]
+        insertClaimed db logId claimed head row
+        Db.exec db "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1" [ SqlInt (head.seq + 1), SqlString (claimedMac logId claimed row) ]
+
+
+-- The row stored at the seq after `head`, linked to it, with the mac signed
+-- as if the head were `claimed`; the head row is not touched.
+insertClaimed : Db -> String -> RawHead -> RawHead -> RawRow -> Task.Task Error Int
+insertClaimed db logId claimed head row =
+    Db.exec db
+        "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        [ SqlInt (head.seq + 1), Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString (claimedMac logId claimed row) ]
+
+
+claimedMac : String -> RawHead -> RawRow -> String
+claimedMac logId claimed row =
+    rawMac (rawMacInput logId (claimed.seq + 1) claimed.head row)
+
+
+-- The key check the head row holds, as raw text.
+rawKeyCheck : Db -> Task.Task Error (Maybe String)
+rawKeyCheck db =
+    Db.queryDecode db
+        "SELECT key_check FROM review_log_head WHERE one = 1"
+        []
+        (Db.Decode.succeed identity |> Db.Decode.required "key_check" (Db.Decode.nullable (Db.Decode.string "key_check")))
+        |> Task.andThen (singleRow "review_log_head")
+
+
+-- True when `e` is exactly the refusal `expected`: its kind and its message.
+isRefusal : Error -> Error -> Bool
+isRefusal expected e =
+    Error.kind e == Error.kind expected && Error.message e == Error.message expected
+
+
+-- True when `task` fails with exactly the refusal `expected`.
+refusedWith : Error -> Task.Task Error a -> Task.Task Error Bool
+refusedWith expected task =
+    task
+        |> Task.map (\_ -> False)
+        |> Task.onError (\e -> Task.succeed (isRefusal expected e))
 
 
 rawReason : Maybe String -> SqlValue
@@ -951,6 +1017,17 @@ rawMac input =
 
         Nothing ->
             ""
+
+
+-- The key check the test key makes for the log `logId`, its input spelled
+-- independently of the tool: a domain tag and the log id, each prefixed by
+-- its length.
+rawKeyCheckFor : String -> String
+rawKeyCheckFor logId =
+    [ "ipe-code-review/key-check/v1", logId ]
+        |> List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part)
+        |> String.concat
+        |> rawMac
 
 
 -- An edit an attacker with write access to the review database makes:
@@ -1081,7 +1158,8 @@ migratedReviewAt : String -> Task.Task Error Db
 migratedReviewAt path =
     do
         loc <- Settings.parseDbLocation "IPE_REVIEW_DB" path
-        LibDb.probe loc
+        key <- testReviewKey
+        LibDb.probe key loc
         LibDb.openAt loc
 
 

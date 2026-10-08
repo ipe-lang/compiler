@@ -19,10 +19,10 @@ import Ipe.Set as Set
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
-import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Change(..), ChainVerdict(..), LogStatus(..), SourceView(..), StaleReason(..), Written(..))
+import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
@@ -32,7 +32,7 @@ import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, rawKeyCheck, refusedWith)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -61,8 +61,9 @@ drainCursorGoneAfterMigrateIn base =
     in
     do
         loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
-        LibDb.probe loc
-        LibDb.probe loc
+        key <- testReviewKey
+        LibDb.probe key loc
+        LibDb.probe key loc
         db <- LibDb.openAt loc
         tables <- tableNames db
         removeReviewFiles dbPath
@@ -86,8 +87,8 @@ openDoesNotMigrateIn base =
     in
     do
         db <- Settings.parseReviewDb dbPath |> Task.andThen LibDb.openAt
-        verify <- countingVerifier
-        readFailed <- LibDb.findDecision verify db (uid "u-a") "h"
+        readFailed <- countingVerifier db
+            |> Task.andThen (\verify -> LibDb.findDecision verify db (uid "u-a") "h")
             |> Task.map (\_ -> False)
             |> Task.onError (\_ -> Task.succeed True)
         created <- tableExists db "review"
@@ -109,7 +110,6 @@ duplicateDecisionAlreadyDecided =
             do
                 attested <- attestedFor "ipe-review-duplicate-index" (uid "u-a")
                 key <- testMacKey
-                verify <- countingVerifier
                 genesis <- reviewHeadOf db
                 first <- LibDb.insertDecision key db attested Approved
                 afterFirst <- reviewHeadOf db
@@ -117,6 +117,7 @@ duplicateDecisionAlreadyDecided =
                 second <- LibDb.insertDecision key db attested changed
                 afterSecond <- reviewHeadOf db
                 n <- countReviewRows db (uid "u-a") (Index.attest viewA)
+                verify <- countingVerifier db
                 found <- LibDb.findDecision verify db (uid "u-a") (Index.attest viewA)
                 Task.succeed
                     (linksFrom genesis afterFirst first
@@ -185,7 +186,6 @@ reviewLogAppendOnly db =
     do
         attested <- attestedFor "ipe-review-append-only-index" (uid "u-a")
         key <- testMacKey
-        verify <- countingVerifier
         LibDb.insertDecision key db attested Approved
         head <- headTextOf db
         refusals <- Task.sequence
@@ -207,6 +207,7 @@ reviewLogAppendOnly db =
                 ]
             )
         n <- countReviewRows db (uid "u-a") (Index.attest viewA)
+        verify <- countingVerifier db
         kept <- LibDb.findDecision verify db (uid "u-a") (Index.attest viewA)
         headAfter <- headTextOf db
         Task.succeed
@@ -235,18 +236,24 @@ concurrentHeadCasRefuses db =
         Task.succeed (refusedAsConflict && n == 0 && headAfter == before)
 
 
--- One transaction that writes the log's first entry, then moves the head
--- from `stale`; True when it fails as a conflict.
+-- `staleCasWrite`, True when it fails as a conflict.
 staleCasRefused : Db -> Index.ChainHead -> Task.Task Error Bool
 staleCasRefused db stale =
+    staleCasWrite db stale
+        |> Task.map (\_ -> False)
+        |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "") && carriesNoFailure e))
+
+
+-- One transaction that writes the log's first entry, then moves the head
+-- from `stale`.
+staleCasWrite : Db -> Index.ChainHead -> Task.Task Error ()
+staleCasWrite db stale =
     Db.withTransaction db
         (\tx ->
             do
                 Db.exec tx "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, ?, 'approve', NULL, 0, 'genesis', ?)" [ Uid.toSql (uid "cas-uid"), SqlString "cas-hash", SqlString (String.repeat 64 "c") ]
                 LibDb.advanceHead tx stale (Index.chainNext stale (String.repeat 64 "c"))
         )
-        |> Task.map (\_ -> False)
-        |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "") && carriesNoFailure e))
 
 
 -- A review file whose log head is gone fails the startup probe, naming the
@@ -331,7 +338,8 @@ probeAfterEdits dbPath edits =
         db <- migratedReviewAt dbPath
         Task.sequence (List.map (\sql -> Db.exec db sql []) edits)
         loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
-        message <- probeMessage (LibDb.probe loc)
+        key <- testReviewKey
+        message <- probeMessage (LibDb.probe key loc)
         removeReviewFiles dbPath
         Task.succeed message
 
@@ -380,7 +388,7 @@ reasonBounded db =
     in
     do
         appendSigned db (rawRow "long-uid" "hL" "refuse" (Just (atBound ++ "x")))
-        verify <- countingVerifier
+        verify <- countingVerifier db
         storedRefused <- LibDb.findDecision verify db (uid "long-uid") "hL" |> Task.map (storedReasonShown "reason not shown: 501 characters, over the 500-character limit")
         Task.succeed
             (rejected ""
@@ -428,7 +436,7 @@ decisionRoundtrip =
         (\db ->
             do
                 insertBoth "ipe-review-roundtrip-index" db
-                verify <- countingVerifier
+                verify <- countingVerifier db
                 Task.map2 checkPair
                     (LibDb.findDecision verify db (uid "u-a") (Index.attest viewA))
                     (LibDb.findDecision verify db (uid "u-b") (Index.attest viewB))
@@ -448,7 +456,7 @@ storedOverlongReasonDecodes db =
     in
     do
         appendSigned db (rawRow "huge-uid" "hH" "refuse" (Just (String.repeat 5000 "y")))
-        verify <- countingVerifier
+        verify <- countingVerifier db
         byPair <- LibDb.findDecision verify db (uid "huge-uid") "hH"
         byUid <- LibDb.findLatestForUid verify db (uid "huge-uid")
         Task.succeed (storedReasonShown expected byPair && storedReasonShown expected (Maybe.map Verified byUid))
@@ -460,7 +468,7 @@ storedBlankReasonDecodes : Db -> Task.Task Error Bool
 storedBlankReasonDecodes db =
     do
         appendSigned db (rawRow "blank-uid" "hB" "refuse" (Just "\n\t"))
-        verify <- countingVerifier
+        verify <- countingVerifier db
         found <- LibDb.findDecision verify db (uid "blank-uid") "hB"
         Task.succeed (storedReasonShown "reason not shown: it is blank" found)
 
@@ -500,7 +508,7 @@ historyWalkMatchesOrder db =
     do
         Task.sequence (List.map seed seeded)
         Task.sequence (List.map seedLegacy legacy)
-        verify <- countingVerifier
+        verify <- countingVerifier db
         walked <- Task.loop 1000 { cursor = HistoryStart, seen = [], pages = 0 } (historyWalkStep verify db)
         logged <- Db.queryDecode db "SELECT uid, body_hash FROM review_log ORDER BY reviewed_at DESC, seq DESC" [] keyDecoder
         legacyRows <- Db.queryDecode db "SELECT uid, body_hash FROM review ORDER BY reviewed_at DESC, uid, body_hash" [] keyDecoder
@@ -589,7 +597,7 @@ historyPageSizeRefused db =
     in
     do
         one <- pageOf 1
-        verify <- countingVerifier
+        verify <- countingVerifier db
         onePage <- LibDb.historyPage verify db one HistoryStart
         Task.succeed
             (refused 0
@@ -624,7 +632,7 @@ historyStateTextsDistinct =
             HistoryAfter (Timestamp.fromUnixMillis 0) 1
 
         log =
-            Signed Intact
+            ShownProven
     in
     List.all identity
         [ Queue.historyStatusText HistoryLoading == Just "Loading history…"
@@ -724,7 +732,7 @@ failedWritesOutcome key rw ro seen fresh head =
                 |> Task.onError (\e -> Task.succeed (carriesFailure Db.ReadOnlyDatabase e))
     in
     do
-        verify <- countingVerifier
+        verify <- countingVerifier rw
         duplicate <- recordedNothing (LibDb.insertDecision key ro seen Approved)
         freshReview <- failedReadOnly (LibDb.insertDecision key ro fresh Approved)
         kept <- LibDb.findDecision verify rw (uid "u-b") (Index.attest viewB)
@@ -768,7 +776,7 @@ historyRoundtripIn base =
             )
         |> Task.andThen
             (\db ->
-                countingVerifier
+                countingVerifier db
                     |> Task.andThen (\verify -> LibDb.historyPage verify db PageSize.history HistoryStart)
                     |> Task.map
                         (\page ->
@@ -854,7 +862,7 @@ isCounted found =
 -- The entry the counting verifier finds for a pair.
 lookUp : Db -> String -> String -> Task.Task Error (Maybe ReviewEntry)
 lookUp db label bodyHash =
-    countingVerifier |> Task.andThen (\verify -> LibDb.findDecision verify db (uid label) bodyHash)
+    countingVerifier db |> Task.andThen (\verify -> LibDb.findDecision verify db (uid label) bodyHash)
 
 
 -- A signed refusal whose decision is flipped to an approval outside the
@@ -868,43 +876,47 @@ flippedDecisionTampered db =
         signed <- lookUp db "flip-uid" "hF"
         tamperLog db "UPDATE review_log SET decision = 'approve', reason = NULL WHERE seq = 1" []
         flipped <- lookUp db "flip-uid" "hF"
-        verify <- countingVerifier
+        verify <- countingVerifier db
         latest <- LibDb.findLatestForUid verify db (uid "flip-uid")
         Task.succeed (isCounted signed && whyOf flipped == Just Tampered && latest == Nothing)
 
 
 -- Every signed column is covered by the mac: an edit outside the tool of
 -- the reason, the review time, the body hash or the uid each makes its row
--- read `Tampered` at the pair it now names, while each row counts as
--- written before its edit and an untouched row still counts after them all.
--- The rows are signed with the mac input spelled out in the test, so the
--- counted rows pin the tool's mac input to it: red if any one of the four
--- is left out of the mac input (no row counts as written), or if an edit
--- is not refused.
-fieldEditsTampered : Db -> Task.Task Error Bool
-fieldEditsTampered db =
-    do
-        appendSigned db (rawRow "edit-control" "h1" "refuse" (Just "first"))
-        reason <- editTampers db (rawRow "edit-reason" "h1" "refuse" (Just "first")) "UPDATE review_log SET reason = 'second' WHERE uid = ?" [] "edit-reason" "h1"
-        time <- editTampers db (rawRow "edit-time" "h1" "refuse" (Just "first")) "UPDATE review_log SET reviewed_at = 99 WHERE uid = ?" [] "edit-time" "h1"
-        hash <- editTampers db (rawRow "edit-hash" "h1" "approve" Nothing) "UPDATE review_log SET body_hash = 'h2' WHERE uid = ?" [] "edit-hash" "h2"
-        unit <- editTampers db (rawRow "edit-uid" "h1" "approve" Nothing) "UPDATE review_log SET uid = ? WHERE uid = ?" [ Uid.toSql (uid "edit-other") ] "edit-other" "h1"
-        control <- lookUp db "edit-control" "h1"
-        Task.succeed (reason && time && hash && unit && isCounted control)
+-- read `Tampered` at the pair it now names, while the row counts as written
+-- before its edit. The edit breaks the chain at that row, so the untouched
+-- row before it stops counting too: it reads `ChainBroken`. The rows are
+-- signed with the mac input spelled out in the test, so the counted rows pin
+-- the tool's mac input to it: red if any one of the four is left out of the
+-- mac input (no row counts as written), if an edit is not refused, or if a
+-- row below an edited one still counts.
+fieldEditsTampered : Task.Task Error Bool
+fieldEditsTampered =
+    Task.sequence
+        [ onFreshReview "ipe-review-editReason" (\db -> editTampers db (rawRow "edit-reason" "h1" "refuse" (Just "first")) "UPDATE review_log SET reason = 'second' WHERE uid = ?" [] "edit-reason" "h1")
+        , onFreshReview "ipe-review-editTime" (\db -> editTampers db (rawRow "edit-time" "h1" "refuse" (Just "first")) "UPDATE review_log SET reviewed_at = 99 WHERE uid = ?" [] "edit-time" "h1")
+        , onFreshReview "ipe-review-editHash" (\db -> editTampers db (rawRow "edit-hash" "h1" "approve" Nothing) "UPDATE review_log SET body_hash = 'h2' WHERE uid = ?" [] "edit-hash" "h2")
+        , onFreshReview "ipe-review-editUid" (\db -> editTampers db (rawRow "edit-uid" "h1" "approve" Nothing) "UPDATE review_log SET uid = ? WHERE uid = ?" [ Uid.toSql (uid "edit-other") ] "edit-other" "h1")
+        ]
+        |> Task.map (List.all identity)
 
 
--- `row` appended signed and counted as written, then `sql` run on it (its
--- uid bound last, after `params`); True when it then reads `Tampered` at
--- the pair `label`, `bodyHash`.
+-- A control row and then `row` appended signed, `row` counted as written,
+-- then `sql` run on it (its uid bound last, after `params`); True when it
+-- then reads `Tampered` at the pair `label`, `bodyHash`, and the control row
+-- `ChainBroken`.
 editTampers : Db -> RawRow -> String -> List SqlValue -> String -> String -> Task.Task Error Bool
 editTampers db row sql params label bodyHash =
     do
+        appendSigned db (rawRow "edit-control" "h1" "refuse" (Just "first"))
         appendSigned db row
-        verify <- countingVerifier
+        verify <- countingVerifier db
         before <- LibDb.findDecision verify db row.uid row.bodyHash
         tamperLog db sql (params ++ [ Uid.toSql row.uid ])
         after <- lookUp db label bodyHash
-        Task.succeed (isCounted before && whyOf after == Just Tampered)
+        control <- lookUp db "edit-control" "h1"
+        verdict <- logVerdictOf db
+        Task.succeed (isCounted before && whyOf after == Just Tampered && whyOf control == Just ChainBroken && verdict == Broken (BreaksAt 2))
 
 
 -- An absent reason and an empty one sign differently: changing an
@@ -921,9 +933,9 @@ emptyReasonTampered db =
 
 
 -- A forged entry with a made-up mac, linked into the chain and with the
--- head moved to it, keeps the chain intact but never counts: it reads
--- `Tampered`, and the uid has no counted row. Red if a row is counted on
--- its chain position without its mac being verified.
+-- head moved to it, breaks the chain at itself and never counts: it reads
+-- `Tampered`, and the uid has no counted row. Red if a row is counted, or
+-- the chain proven, on the row's position without its mac being verified.
 forgedRowTampered : Db -> Task.Task Error Bool
 forgedRowTampered db =
     let
@@ -935,12 +947,11 @@ forgedRowTampered db =
             "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, 'hX', 'approve', NULL, 0, 'genesis', ?)"
             [ Uid.toSql (uid "forged-uid"), SqlString forged ]
         Db.exec db "UPDATE review_log_head SET seq = 1, head = ? WHERE one = 1" [ SqlString forged ]
-        head <- LibDb.currentHead db
-        verdict <- LibDb.checkChainWithin db PageSize.pairs LibDb.logPageCeiling (Error.conflict "ceiling") head
+        verdict <- logVerdictOf db
         found <- lookUp db "forged-uid" "hX"
-        verify <- countingVerifier
+        verify <- countingVerifier db
         latest <- LibDb.findLatestForUid verify db (uid "forged-uid")
-        Task.succeed (verdict == Intact && whyOf found == Just Tampered && latest == Nothing)
+        Task.succeed (verdict == Broken (BreaksAt 1) && whyOf found == Just Tampered && latest == Nothing)
 
 
 -- A row signed by the same key for another log (another log id) does not
@@ -960,12 +971,13 @@ crossLogReplayTampered db =
 
 
 -- A row's sequence number and its link to the entry before it are signed:
--- a row stored at seq 2 but signed for seq 7, and a row stored after the
--- head but signed with another `prev`, each read `Tampered` while the
--- chain itself stays intact (the stored seqs and links are contiguous) and
--- the correctly signed first row counts. Red if the seq or the `prev` is
--- left out of the mac input (the first row stops counting, since the test
--- spells both out), or if a renumbered or relinked row counts.
+-- a row stored at seq 2 but signed for seq 7, and a row stored after it but
+-- signed with another `prev`, each read `Tampered` though the stored seqs
+-- and links are contiguous, and the walk breaks at the first of them, while
+-- the correctly signed first row counts as written. Red if the seq or the
+-- `prev` is left out of the mac input (the first row stops counting, since
+-- the test spells both out), or if a renumbered or relinked row counts or
+-- passes the walk.
 renumberedRowTampered : Db -> Task.Task Error Bool
 renumberedRowTampered db =
     do
@@ -973,40 +985,51 @@ renumberedRowTampered db =
         control <- lookUp db "renumber-control" "hN"
         appendSignedClaiming db (\h -> { h | seq = h.seq + 5 }) (rawRow "renumber-seq" "hN" "approve" Nothing)
         appendSignedClaiming db (\h -> { h | head = String.repeat 64 "f" }) (rawRow "renumber-prev" "hN" "approve" Nothing)
-        head <- LibDb.currentHead db
-        verdict <- LibDb.checkChainWithin db PageSize.pairs LibDb.logPageCeiling (Error.conflict "ceiling") head
+        verdict <- logVerdictOf db
         renumbered <- lookUp db "renumber-seq" "hN"
         relinked <- lookUp db "renumber-prev" "hN"
-        Task.succeed (isCounted control && verdict == Intact && whyOf renumbered == Just Tampered && whyOf relinked == Just Tampered)
+        Task.succeed (isCounted control && verdict == Broken (BreaksAt 2) && whyOf renumbered == Just Tampered && whyOf relinked == Just Tampered)
 
 
--- Three signed entries, a tamper `edit` applied to them, and the verdict of
--- the chain check up to the head.
-chainAfter : Db -> List ( String, List SqlValue ) -> Task.Task Error ChainVerdict
+-- True when the verdict proves the log to its head.
+isProven : LogVerdict -> Bool
+isProven verdict =
+    case verdict of
+        Proven _ ->
+            True
+
+        Broken _ ->
+            False
+
+        KeyMismatch ->
+            False
+
+        Unkeyed ->
+            False
+
+
+-- Three signed entries, a tamper `edit` applied to them, and the log's
+-- verdict under the test key.
+chainAfter : Db -> List ( String, List SqlValue ) -> Task.Task Error LogVerdict
 chainAfter db edits =
     do
         appendSigned db (rawRow "chain-1" "h" "approve" Nothing)
         appendSigned db (rawRow "chain-2" "h" "approve" Nothing)
         appendSigned db (rawRow "chain-3" "h" "approve" Nothing)
         Task.sequence (List.map (\( sql, params ) -> tamperLog db sql params) edits)
-        head <- LibDb.currentHead db
-        LibDb.checkChainWithin db PageSize.pairs LibDb.logPageCeiling (Error.conflict "ceiling") head
+        logVerdictOf db
 
 
--- Reordering two entries or removing a middle one breaks the chain at
--- entry 2, and under the verifier of a broken log the entry before the
--- break — whose own mac still verifies — reads `ChainBroken`, not counted.
--- Red if the walk skips a seq gap, ignores a `prev` mismatch, or if a
--- broken log still counts the rows before its break.
+-- Removing a middle entry breaks the chain at entry 2, and the entry before
+-- the break — whose own mac still verifies — reads `ChainBroken`, not
+-- counted. Red if the walk skips a seq gap, or if a broken log still counts
+-- the rows before its break.
 chainBreakUncounts : Db -> Task.Task Error Bool
 chainBreakUncounts db =
     do
         verdict <- chainAfter db [ ( "DELETE FROM review_log WHERE seq = 2", [] ) ]
-        key <- testReviewKey
-        first <- LibDb.findDecision (LibDb.verifier key (Signed verdict)) db (uid "chain-1") "h"
-        verify <- countingVerifier
-        intactRead <- LibDb.findDecision verify db (uid "chain-1") "h"
-        Task.succeed (verdict == BrokenAt 2 && whyOf first == Just ChainBroken && isCounted intactRead)
+        first <- lookUp db "chain-1" "h"
+        Task.succeed (verdict == Broken (BreaksAt 2) && whyOf first == Just ChainBroken)
 
 
 chainReorderBreaks : Db -> Task.Task Error Bool
@@ -1016,12 +1039,13 @@ chainReorderBreaks db =
         , ( "UPDATE review_log SET seq = 2 WHERE seq = 3", [] )
         , ( "UPDATE review_log SET seq = 3 WHERE seq = 100", [] )
         ]
-        |> Task.map (\verdict -> verdict == BrokenAt 2)
+        |> Task.map (\verdict -> verdict == Broken (BreaksAt 2))
 
 
--- A decision on a broken chain is refused with a conflict naming the entry
--- the chain breaks at, and nothing is inserted. Red if `insertDecision`
--- appends without walking the chain, or walks it and ignores a break.
+-- A decision on a broken chain is refused with the break's own refusal,
+-- naming the entry the chain breaks at, and nothing is inserted. Red if
+-- `insertDecision` appends without walking the chain, or walks it and
+-- ignores a break.
 decideOnBrokenChainRefused : Db -> Task.Task Error Bool
 decideOnBrokenChainRefused db =
     do
@@ -1029,18 +1053,16 @@ decideOnBrokenChainRefused db =
         before <- logRowCount db
         attested <- attestedFor "ipe-review-broken-decide-index" (uid "u-a")
         key <- testMacKey
-        refused <- LibDb.insertDecision key db attested Approved
-            |> Task.map (\_ -> False)
-            |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "") && String.contains "chain breaks at entry 2" (Error.message e)))
+        refused <- refusedWith (LibDb.brokenRefusal (BreaksAt 2)) (LibDb.insertDecision key db attested Approved)
         after <- logRowCount db
-        Task.succeed (refused && before == 2 && after == 2)
+        Task.succeed (refused && String.contains "chain breaks at entry 2" (Error.message (LibDb.brokenRefusal (BreaksAt 2))) && before == 2 && after == 2)
 
 
--- An entry added past the head, the head left where it was, keeps the walk
--- to the head intact but takes the seq the next decision needs: the
--- decision is refused as a break at that entry, never as a moved head the
--- reviewer is told to retry against, and nothing is inserted. Red if a
--- decision ignores the entries past the head.
+-- An entry added past the head, the head left where it was, breaks the log
+-- as one entry past its head: the decision is refused with that refusal,
+-- never as a moved head the reviewer is told to retry against, and nothing
+-- is inserted. Red if the walk or a decision ignores the entries past the
+-- head.
 decideWithEntryPastHeadRefused : Db -> Task.Task Error Bool
 decideWithEntryPastHeadRefused db =
     do
@@ -1048,20 +1070,17 @@ decideWithEntryPastHeadRefused db =
         Db.exec db
             "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (2, ?, 'hX', 'approve', NULL, 0, 'genesis', ?)"
             [ Uid.toSql (uid "past-2"), SqlString (String.repeat 64 "e") ]
-        head <- LibDb.currentHead db
-        walked <- LibDb.checkChainWithin db PageSize.pairs LibDb.logPageCeiling (Error.conflict "ceiling") head
+        walked <- logVerdictOf db
         before <- logRowCount db
         attested <- attestedFor "ipe-review-past-head-decide-index" (uid "u-a")
         key <- testMacKey
-        refused <- LibDb.insertDecision key db attested Approved
-            |> Task.map (\_ -> False)
-            |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "") && String.contains "chain breaks at entry 2" (Error.message e)))
+        refused <- refusedWith (LibDb.brokenRefusal (PastHead 1)) (LibDb.insertDecision key db attested Approved)
         after <- logRowCount db
-        Task.succeed (walked == Intact && refused && before == 2 && after == 2)
+        Task.succeed (walked == Broken (PastHead 1) && refused && before == 2 && after == 2)
 
 
 -- Removing the log's tail and rewinding the head to the new last entry is
--- not detected — the chain is intact again — but fails closed: the earlier
+-- not detected — the chain is proven again — but fails closed: the earlier
 -- entries still count and the removed decision is undecided, never
 -- approved. Red if the rewound log stops counting its remaining entries or
 -- the removed pair still reads as decided.
@@ -1075,7 +1094,13 @@ truncatedTailFailsClosed db =
         first <- lookUp db "chain-1" "h"
         second <- lookUp db "chain-2" "h"
         removed <- lookUp db "chain-3" "h"
-        Task.succeed (verdict == Intact && isCounted first && isCounted second && removed == Nothing)
+        Task.succeed (isProven verdict && isCounted first && isCounted second && removed == Nothing)
+
+
+-- True when none of `entries` counts.
+countsNone : List ReviewEntry -> Bool
+countsNone entries =
+    not (List.any (\entry -> isCounted (Just entry)) entries)
 
 
 -- A row of the legacy review table, written before rows were signed, reads
@@ -1095,6 +1120,317 @@ legacyRowRedecidable db =
         Task.succeed (whyOf legacy == Just Legacy && not (isAlreadyDecided written) && n == 1 && isCounted redecided)
 
 
+-- ── one verdict, bound to the key ───────────────────────────────────────
+--
+-- Six signed entries with the head rewound to entry 3: the walk proves the
+-- log to its head but finds three entries past it, so the verdict is
+-- `Broken (PastHead 3)`; every entry, the three past the head included,
+-- reads `ChainBroken` on a History lookup and on a History page; the page
+-- shows the same break; and a decision is refused with that same break,
+-- inserting nothing. Red if the walk stops at the head, if a row past the
+-- head counts on its own mac, or if the save path and the read path tell the
+-- log apart.
+headRolledBackBelowRowsIsPastHead : Db -> Task.Task Error Bool
+headRolledBackBelowRowsIsPastHead db =
+    let
+        labels =
+            [ "roll-1", "roll-2", "roll-3", "roll-4", "roll-5", "roll-6" ]
+    in
+    do
+        Task.sequence (List.map (\label -> appendSigned db (rawRow label "h" "approve" Nothing)) labels)
+        Db.exec db "UPDATE review_log_head SET seq = 3, head = (SELECT mac FROM review_log WHERE seq = 3) WHERE one = 1" []
+        key <- testReviewKey
+        state <- LibDb.logVerdict key db
+        found <- Task.sequence (List.map (\label -> lookUp db label "h") labels)
+        verify <- countingVerifier db
+        page <- LibDb.historyPage verify db PageSize.history HistoryStart
+        attested <- attestedFor "ipe-review-rolled-back-index" (uid "u-a")
+        macKey <- testMacKey
+        refused <- refusedWith (LibDb.brokenRefusal (PastHead 3)) (LibDb.insertDecision macKey db attested Approved)
+        rows <- logRowCount db
+        Task.succeed
+            (LibDb.stateVerdict state
+                == Broken (PastHead 3)
+                && LibDb.logShown state
+                == ShownBroken (PastHead 3)
+                && List.all (\entry -> whyOf entry == Just ChainBroken) found
+                && List.length page.rows
+                == 6
+                && countsNone page.rows
+                && refused
+                && rows
+                == 6
+            )
+
+
+-- Two signed entries with the head reset to the genesis: both are past the
+-- head, so the verdict is `Broken (PastHead 2)` and no entry counts. Red if
+-- a log whose head is the genesis is proven with rows in it.
+headResetToGenesisWithRowsIsPastHead : Db -> Task.Task Error Bool
+headResetToGenesisWithRowsIsPastHead db =
+    do
+        appendSigned db (rawRow "reset-1" "h" "approve" Nothing)
+        appendSigned db (rawRow "reset-2" "h" "approve" Nothing)
+        Db.exec db "UPDATE review_log_head SET seq = 0, head = 'genesis' WHERE one = 1" []
+        verdict <- logVerdictOf db
+        first <- lookUp db "reset-1" "h"
+        second <- lookUp db "reset-2" "h"
+        verify <- countingVerifier db
+        page <- LibDb.historyPage verify db PageSize.history HistoryStart
+        Task.succeed (verdict == Broken (PastHead 2) && not (isCounted first) && not (isCounted second) && countsNone page.rows)
+
+
+-- An entry signed under the test key for the seq after the head, linked to
+-- it, and stored there with the head left where it is: its own mac
+-- verifies, but it is one entry past the head, so the verdict is
+-- `Broken (PastHead 1)` and the entry never counts. Red if a reader counts
+-- a row on its mac without the walk having proved it.
+rowAppendedPastHeadNeverVerified : Db -> Task.Task Error Bool
+rowAppendedPastHeadNeverVerified db =
+    do
+        appendSigned db (rawRow "below-1" "h" "approve" Nothing)
+        appendSignedPastHead db (rawRow "past-uid" "hP" "approve" Nothing)
+        verdict <- logVerdictOf db
+        found <- lookUp db "past-uid" "hP"
+        verify <- countingVerifier db
+        latest <- LibDb.findLatestForUid verify db (uid "past-uid")
+        Task.succeed (verdict == Broken (PastHead 1) && whyOf found == Just ChainBroken && latest == Nothing)
+
+
+-- One tamper fixture: its name, the edits made after three signed entries,
+-- and the break the log must read as.
+type alias TamperFixture =
+    { name : String
+    , edits : List ( String, List SqlValue )
+    , expected : BreakAt
+    }
+
+
+tamperFixtures : List TamperFixture
+tamperFixtures =
+    [ { name = "rolled-back", edits = [ ( "UPDATE review_log_head SET seq = 1, head = (SELECT mac FROM review_log WHERE seq = 1) WHERE one = 1", [] ) ], expected = PastHead 2 }
+    , { name = "genesis", edits = [ ( "UPDATE review_log_head SET seq = 0, head = 'genesis' WHERE one = 1", [] ) ], expected = PastHead 3 }
+    , { name = "edited", edits = [ ( "UPDATE review_log SET reviewed_at = 99 WHERE seq = 2", [] ) ], expected = BreaksAt 2 }
+    , { name = "removed", edits = [ ( "DELETE FROM review_log WHERE seq = 1", [] ) ], expected = BreaksAt 1 }
+    , { name = "past-head", edits = [ ( "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (4, 'x', 'hX', 'approve', NULL, 0, 'genesis', ?)", [ SqlString (String.repeat 64 "e") ] ) ], expected = PastHead 1 }
+    ]
+
+
+-- For every tamper fixture, the verdict a page load reads and the refusal a
+-- decision gets are the same break: the page shows `fixture.expected` and
+-- the decision is refused with `brokenRefusal fixture.expected`, inserting
+-- nothing. Red if the save path decides the log apart from the read path.
+saveGateAndReadPathAgree : Task.Task Error Bool
+saveGateAndReadPathAgree =
+    Task.sequence (List.map (\fixture -> onFreshReview ("ipe-review-agree-" ++ fixture.name) (gateAgrees fixture)) tamperFixtures)
+        |> Task.map (List.all identity)
+
+
+gateAgrees : TamperFixture -> Db -> Task.Task Error Bool
+gateAgrees fixture db =
+    do
+        chainAfter db fixture.edits
+        key <- testReviewKey
+        state <- LibDb.logVerdict key db
+        before <- logRowCount db
+        attested <- attestedFor ("ipe-review-agree-index-" ++ fixture.name) (uid "u-a")
+        macKey <- testMacKey
+        refused <- refusedWith (LibDb.brokenRefusal fixture.expected) (LibDb.insertDecision macKey db attested Approved)
+        after <- logRowCount db
+        Task.succeed (LibDb.logShown state == ShownBroken fixture.expected && LibDb.stateVerdict state == Broken fixture.expected && refused && after == before)
+
+
+-- A review file bound to the test key, probed under a second valid key, is
+-- refused at startup with the key-mismatch refusal, which names the key's
+-- variable; the file keeps its key check. Red if the probe accepts a key
+-- that did not sign the log.
+wrongKeyRefusesStartup : Task.Task Error Bool
+wrongKeyRefusesStartup =
+    freshDir "ipe-review-wrong-key" |> Task.andThen wrongKeyRefusesStartupIn
+
+
+wrongKeyRefusesStartupIn : String -> Task.Task Error Bool
+wrongKeyRefusesStartupIn base =
+    let
+        dbPath =
+            base ++ "/review.db"
+    in
+    do
+        db <- migratedReviewAt dbPath
+        appendSigned db (rawRow "bound-1" "h" "approve" Nothing)
+        bound <- rawKeyCheck db
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        other <- otherMacKey
+        refused <- refusedWith LibDb.keyMismatchRefusal (LibDb.probe (ReviewKey.Signing other) loc)
+        kept <- rawKeyCheck db
+        removeReviewFiles dbPath
+        Task.succeed (refused && String.contains "IPE_REVIEW_MAC_KEY" (Error.message LibDb.keyMismatchRefusal) && bound /= Nothing && kept == bound)
+
+
+-- A decision recorded straight through `insertDecision` under a second
+-- valid key, the startup probe skipped, is refused inside its transaction
+-- with the key-mismatch refusal, and no row is added: a log bound to one
+-- key never takes an entry signed by another. Red if the save path checks
+-- the key only at startup.
+wrongKeyCannotAppend : Db -> Task.Task Error Bool
+wrongKeyCannotAppend db =
+    do
+        appendSigned db (rawRow "bound-1" "h" "approve" Nothing)
+        before <- logRowCount db
+        attested <- attestedFor "ipe-review-wrong-key-append-index" (uid "u-a")
+        other <- otherMacKey
+        refused <- refusedWith LibDb.keyMismatchRefusal (LibDb.insertDecision other db attested Approved)
+        after <- logRowCount db
+        Task.succeed (refused && before == 1 && after == 1)
+
+
+-- A head with no key check, as a log written before the check had: after
+-- startup it reads `KeyMismatch`, never proven; the probe binds it to the
+-- running key only when the walk proves every entry under that key. An
+-- intact log is bound, and then proven; a log with one edited entry, or an
+-- intact log probed under another key, is refused with the key-mismatch
+-- refusal and keeps no key check. Red if a head with no check is read as
+-- matching, or bound without a walk proving it.
+legacyHeadAdoptsOnlyOnProof : Task.Task Error Bool
+legacyHeadAdoptsOnlyOnProof =
+    freshDir "ipe-review-legacy-head" |> Task.andThen legacyHeadAdoptsOnlyOnProofIn
+
+
+legacyHeadAdoptsOnlyOnProofIn : String -> Task.Task Error Bool
+legacyHeadAdoptsOnlyOnProofIn base =
+    do
+        intact <- legacyProbe (base ++ "/intact.db") [] testReviewKey
+        tampered <- legacyProbe (base ++ "/tampered.db") [ "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" ] testReviewKey
+        otherKey <- legacyProbe (base ++ "/other-key.db") [] (Task.map ReviewKey.Signing otherMacKey)
+        Task.succeed
+            (intact.unbound
+                == KeyMismatch
+                && intact.refusal
+                == Nothing
+                && intact.check
+                /= Nothing
+                && isProven intact.after
+                && tampered.refusal
+                == Just (Error.message LibDb.keyMismatchRefusal)
+                && tampered.check
+                == Nothing
+                && otherKey.refusal
+                == Just (Error.message LibDb.keyMismatchRefusal)
+                && otherKey.check
+                == Nothing
+            )
+
+
+-- What one legacy-head probe saw: the verdict before it, its refusal, the
+-- key check after it, and the verdict after it.
+type alias LegacyProbe =
+    { unbound : LogVerdict
+    , refusal : Maybe String
+    , check : Maybe String
+    , after : LogVerdict
+    }
+
+
+-- Two signed entries, `edits` run with the update guard dropped and put
+-- back, the head's key check cleared, then the probe under `probeKey`.
+legacyProbe : String -> List String -> Task.Task Error ReviewKey.ReviewKey -> Task.Task Error LegacyProbe
+legacyProbe dbPath edits probeKey =
+    do
+        db <- migratedReviewAt dbPath
+        appendSigned db (rawRow "legacy-1" "h" "approve" Nothing)
+        appendSigned db (rawRow "legacy-2" "h" "approve" Nothing)
+        Task.sequence (List.map (\sql -> tamperLog db sql []) edits)
+        Db.exec db "CREATE TRIGGER IF NOT EXISTS review_log_no_update BEFORE UPDATE ON review_log BEGIN SELECT RAISE(ABORT, 'review_log is append-only'); END" []
+        Db.exec db "CREATE TRIGGER IF NOT EXISTS review_log_no_delete BEFORE DELETE ON review_log BEGIN SELECT RAISE(ABORT, 'review_log is append-only'); END" []
+        Db.exec db "UPDATE review_log_head SET key_check = NULL WHERE one = 1" []
+        unbound <- logVerdictOf db
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        key <- probeKey
+        refusal <- probeMessage (LibDb.probe key loc)
+        check <- rawKeyCheck db
+        after <- logVerdictOf db
+        removeReviewFiles dbPath
+        Task.succeed { unbound = unbound, refusal = refusal, check = check, after = after }
+
+
+-- A legacy head at the genesis, with no entry, is bound to the running key
+-- at startup and then proven. Red if the genesis is refused or left
+-- unbound.
+legacyGenesisAdopts : Task.Task Error Bool
+legacyGenesisAdopts =
+    freshDir "ipe-review-legacy-genesis" |> Task.andThen legacyGenesisAdoptsIn
+
+
+legacyGenesisAdoptsIn : String -> Task.Task Error Bool
+legacyGenesisAdoptsIn base =
+    let
+        dbPath =
+            base ++ "/review.db"
+    in
+    do
+        db <- migratedReviewAt dbPath
+        Db.exec db "UPDATE review_log_head SET key_check = NULL WHERE one = 1" []
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        key <- testReviewKey
+        refusal <- probeMessage (LibDb.probe key loc)
+        check <- rawKeyCheck db
+        verdict <- logVerdictOf db
+        removeReviewFiles dbPath
+        Task.succeed (refusal == Nothing && check /= Nothing && isProven verdict)
+
+
+-- The head's compare-and-set covers its key check: a head read, its key
+-- check then swapped for another, and a move from the head as read fails
+-- with the moved-head conflict, rolling back the entry written with it. Red
+-- if `advanceHead` leaves the key check out of its compare.
+headCasPinsKeyCheck : Db -> Task.Task Error Bool
+headCasPinsKeyCheck db =
+    do
+        current <- LibDb.currentHead db
+        Db.exec db "UPDATE review_log_head SET key_check = ? WHERE one = 1" [ SqlString (String.repeat 64 "a") ]
+        refused <- refusedWith LibDb.headMoved (staleCasWrite db current)
+        n <- logRowCount db
+        Task.succeed (refused && n == 0)
+
+
+-- The key-mismatch refusal, at startup and on a decision, and the banner a
+-- page shows for it, carry neither key's hex nor the head's stored key
+-- check. Red if a message renders key material or the stored check.
+keyCheckMismatchMessageIsSecretFree : Task.Task Error Bool
+keyCheckMismatchMessageIsSecretFree =
+    freshDir "ipe-review-secret-free" |> Task.andThen keyCheckMismatchMessageIsSecretFreeIn
+
+
+keyCheckMismatchMessageIsSecretFreeIn : String -> Task.Task Error Bool
+keyCheckMismatchMessageIsSecretFreeIn base =
+    let
+        dbPath =
+            base ++ "/review.db"
+    in
+    do
+        db <- migratedReviewAt dbPath
+        stored <- rawKeyCheck db
+        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        other <- otherMacKey
+        startup <- probeMessage (LibDb.probe (ReviewKey.Signing other) loc)
+        attested <- attestedFor "ipe-review-secret-free-index" (uid "u-a")
+        decision <- LibDb.insertDecision other db attested Approved
+            |> Task.map (\_ -> Nothing)
+            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+        removeReviewFiles dbPath
+        let
+            secrets =
+                [ testKeyHex, String.toUpper testKeyHex, otherKeyHex, String.toUpper otherKeyHex ] ++ Maybe.withDefault [] (Maybe.map List.singleton stored)
+
+            rendered =
+                Maybe.withDefault "" startup :: Maybe.withDefault "" decision :: Maybe.withDefault "" (Queue.chainBanner ShownKeyMismatch) :: []
+
+            clean text =
+                not (String.isEmpty text) && not (List.any (\secret -> String.contains secret text) secrets)
+        in
+        Task.succeed (stored /= Nothing && List.all clean rendered)
+
+
 reviewLogChecks : Task.Task Error (List ( String, Bool ))
 reviewLogChecks =
     Task.sequence
@@ -1104,7 +1440,7 @@ reviewLogChecks =
         , check "the review log is append-only" (onFreshReview "ipe-review-reviewLogAppendOnly" reviewLogAppendOnly)
         , check "a head compare-and-set from a stale head is refused" (onFreshReview "ipe-review-concurrentHeadCasRefuses" concurrentHeadCasRefuses)
         , check "a flipped decision reads tampered" (onFreshReview "ipe-review-flippedDecisionTampered" flippedDecisionTampered)
-        , check "an edit of any signed field reads tampered" (onFreshReview "ipe-review-fieldEditsTampered" fieldEditsTampered)
+        , check "an edit of any signed field reads tampered and breaks the chain" fieldEditsTampered
         , check "an absent reason made empty reads tampered" (onFreshReview "ipe-review-emptyReasonTampered" emptyReasonTampered)
         , check "a forged entry never counts" (onFreshReview "ipe-review-forgedRowTampered" forgedRowTampered)
         , check "a row replayed from another log reads tampered" (onFreshReview "ipe-review-crossLogReplayTampered" crossLogReplayTampered)
@@ -1117,6 +1453,16 @@ reviewLogChecks =
         , check "a legacy row reads legacy and can be decided again" (onFreshReview "ipe-review-legacyRowRedecidable" legacyRowRedecidable)
         , check "a review file without its log head fails the probe" probeRefusesReviewWithoutHead
         , check "a review file without its append-only guards fails the probe" probeRefusesReviewWithoutGuards
+        , check "a head rolled back below its rows is broken past the head" (onFreshReview "ipe-review-headRolledBackBelowRowsIsPastHead" headRolledBackBelowRowsIsPastHead)
+        , check "a head reset to the genesis with rows is broken past the head" (onFreshReview "ipe-review-headResetToGenesisWithRowsIsPastHead" headResetToGenesisWithRowsIsPastHead)
+        , check "a signed row appended past the head never counts" (onFreshReview "ipe-review-rowAppendedPastHeadNeverVerified" rowAppendedPastHeadNeverVerified)
+        , check "the save gate and the read path read every tamper alike" saveGateAndReadPathAgree
+        , check "a different key is refused at startup" wrongKeyRefusesStartup
+        , check "a different key cannot append" (onFreshReview "ipe-review-wrongKeyCannotAppend" wrongKeyCannotAppend)
+        , check "a head with no key check is bound only on proof" legacyHeadAdoptsOnlyOnProof
+        , check "a genesis head with no key check is bound" legacyGenesisAdopts
+        , check "the head compare-and-set covers the key check" (onFreshReview "ipe-review-headCasPinsKeyCheck" headCasPinsKeyCheck)
+        , check "the key-mismatch messages carry no key material" keyCheckMismatchMessageIsSecretFree
         ]
 
 

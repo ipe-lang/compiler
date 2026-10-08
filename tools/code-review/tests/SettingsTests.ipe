@@ -309,7 +309,7 @@ reviewProbed at =
     in
     do
         System.setenv "IPE_REVIEW_DB" badReview
-        message <- probeMessage (envReview |> Task.andThen LibDb.probe)
+        message <- probeMessage (envReview |> Task.andThen (LibDb.probe ReadOnly))
         Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && maybeContains "cannot be created there" message && not (maybeContains "ipe-index index" message))
 
 
@@ -397,7 +397,7 @@ notSqliteRefused =
         writeFileText (base ++ "/index.db") "plain text, not a database\n"
         writeFileText (base ++ "/review.db") "plain text, not a database\n"
         index <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd |> Task.andThen Index.probe)
-        review <- probeMessage (Settings.parseReviewDb (base ++ "/review.db") |> Task.andThen LibDb.probe)
+        review <- probeMessage (Settings.parseReviewDb (base ++ "/review.db") |> Task.andThen (LibDb.probe ReadOnly))
         removeFileIfAny (base ++ "/index.db")
         removeFileIfAny (base ++ "/review.db")
         Task.succeed

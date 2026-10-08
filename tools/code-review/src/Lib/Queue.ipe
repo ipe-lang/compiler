@@ -8,14 +8,14 @@ import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Lib.Db as LibDb exposing (HistoryCursor(..), ReviewEntry(..))
+import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
 import Lib.Epoch exposing (Epoch)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
 -- module.
 import Lib.Highlight as Highlight
-import Lib.Index as Index exposing (ChainVerdict(..), LogStatus(..), Oversize(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
@@ -38,7 +38,7 @@ type alias QueuedUnit =
 -- One loaded page of the queue. `total` counts the whole queue (never this
 -- page's length); `next` is the cursor of the following page, Nothing on the
 -- last page; `dbName` is the index file's name, rendered once; `log` is the
--- status the `reviewed` copy the page was read from was rebuilt under.
+-- review log's verdict the page was read under.
 type alias QueuePage =
     { units : List QueuedUnit
     , total : Int
@@ -46,7 +46,7 @@ type alias QueuePage =
     , dbBytes : Int
     , next : Maybe Index.Cursor
     , progress : Progress
-    , log : LogStatus
+    , log : LogShown
     }
 
 
@@ -121,16 +121,15 @@ boundCeiling bound =
             b.pageCeiling
 
 
--- The `reviewed` copy rebuilt from the review log under `key`: one index
--- transaction empties it, walks the log's chain to the head read before the
--- refill, and, only on an unbroken chain, drains every row whose mac
--- verifies, so a pair's undrained queue row leaves too. The copy is stamped
--- with that head and the chain's verdict, signed under the key, so a broken
--- chain drains nothing and every page shows the break. With no key nothing
--- is drained and the copy is stamped read-only. A decision recorded during
--- the refill moves the head past that stamp, so the next load rebuilds again
--- rather than trust a copy that may lack it. Returns the count of pairs
--- copied.
+-- The `reviewed` copy rebuilt from the review log under `key`: the log's
+-- verdict is taken, then one index transaction empties the copy and, only
+-- on a proven head, drains every row up to it whose mac verifies, so a
+-- pair's undrained queue row leaves too. The copy is stamped with that head
+-- and the verdict, signed under the key, so a log not proven drains nothing
+-- and every page shows why. With no key nothing is drained
+-- and the copy is stamped read-only. A decision recorded after the verdict
+-- moves the head past that stamp, so the next load rebuilds again rather
+-- than trust a copy that may lack it. Returns the count of pairs copied.
 resyncReviewed : ReviewKey -> IndexSettings -> Db.Db -> Task.Task Error Int
 resyncReviewed key settings db =
     resyncReviewedWithin key settings resyncBound db
@@ -143,26 +142,25 @@ resyncReviewed key settings db =
 resyncReviewedWithin : ReviewKey -> IndexSettings -> ResyncBound -> Db.Db -> Task.Task Error Int
 resyncReviewedWithin key settings bound db =
     do
-        head <- LibDb.currentHead db
-        Index.rebuildReviewed settings (\conn -> refillLog key bound head db conn)
+        state <- LibDb.logVerdictWithin key db (boundPageSize bound) (boundCeiling bound) (resyncCeilingRefusal bound)
+        Index.rebuildReviewed settings (\conn -> refillLog bound state db conn)
 
 
-refillLog : ReviewKey -> ResyncBound -> Index.ChainHead -> Db.Db -> Db.Db -> Task.Task Error ( Index.Stamp, Int )
-refillLog key bound head db conn =
-    case key of
-        ReadOnly ->
-            Task.succeed ( Index.unsignedStamp head, 0 )
+refillLog : ResyncBound -> LibDb.LogState -> Db.Db -> Db.Db -> Task.Task Error ( Index.Stamp, Int )
+refillLog bound state db conn =
+    case LibDb.stateVerdict state of
+        Proven proven ->
+            refillPages (LibDb.verifier state) bound proven db conn
+                |> Task.map (\copied -> ( LibDb.copyStamp state, copied ))
 
-        Signing macKey ->
-            do
-                verdict <- LibDb.checkChainWithin db (boundPageSize bound) (boundCeiling bound) (resyncCeilingRefusal bound) head
-                case verdict of
-                    BrokenAt _ ->
-                        Task.succeed ( Index.signedStamp macKey head verdict, 0 )
+        Broken _ ->
+            Task.succeed ( LibDb.copyStamp state, 0 )
 
-                    Intact ->
-                        refillPages (LibDb.verifier key (Signed Intact)) bound head db conn
-                            |> Task.map (\copied -> ( Index.signedStamp macKey head Intact, copied ))
+        KeyMismatch ->
+            Task.succeed ( LibDb.copyStamp state, 0 )
+
+        Unkeyed ->
+            Task.succeed ( LibDb.copyStamp state, 0 )
 
 
 -- The state one `refillPages` step carries: how many pages have been read,
@@ -180,20 +178,20 @@ type alias RefillState =
 -- one, is an unreachable backstop (defence in depth): the step itself
 -- refuses a non-empty page once `pagesRead` reaches the page ceiling, so the
 -- loop's own limit never has a chance to fire.
-refillPages : LibDb.Verifier -> ResyncBound -> Index.ChainHead -> Db.Db -> Db.Db -> Task.Task Error Int
-refillPages verify bound head db conn =
-    Task.loop (boundCeiling bound + 1) { pagesRead = 0, copied = 0, after = 0 } (refillStep verify bound head db conn)
+refillPages : LibDb.Verifier -> ResyncBound -> LibDb.ProvenHead -> Db.Db -> Db.Db -> Task.Task Error Int
+refillPages verify bound proven db conn =
+    Task.loop (boundCeiling bound + 1) { pagesRead = 0, copied = 0, after = 0 } (refillStep verify bound proven db conn)
 
 
--- One page of review-log rows after `state.after`, up to the head: an empty
+-- One page of review-log rows after `state.after`, up to the proven head: an empty
 -- page ends the walk with the pairs copied so far; a non-empty page past the
 -- ceiling fails the whole rebuild; otherwise the page's verified rows drain
 -- on `conn`, then a short page ends the walk and a full page continues from
 -- its last row.
-refillStep : LibDb.Verifier -> ResyncBound -> Index.ChainHead -> Db.Db -> Db.Db -> RefillState -> Task.Task Error (Task.Step RefillState Int)
-refillStep verify bound head db conn state =
+refillStep : LibDb.Verifier -> ResyncBound -> LibDb.ProvenHead -> Db.Db -> Db.Db -> RefillState -> Task.Task Error (Task.Step RefillState Int)
+refillStep verify bound proven db conn state =
     do
-        rows <- LibDb.logRowsAfter db (boundPageSize bound) head state.after
+        rows <- LibDb.logRowsAfter db (boundPageSize bound) proven state.after
         if List.isEmpty rows then
             Task.succeed (Task.Done state.copied)
 
@@ -203,7 +201,7 @@ refillStep verify bound head db conn state =
         else
             let
                 counted =
-                    LibDb.countedRows verify head rows
+                    LibDb.countedRows verify rows
             in
             do
                 counted
@@ -289,13 +287,13 @@ type alias HistoryRow =
 
 
 -- One loaded History page: its rows, the cursor it was read from, the
--- cursor of the page after it (Nothing on the last page), and the status the
--- `reviewed` copy was rebuilt under, which every row was classified with.
+-- cursor of the page after it (Nothing on the last page), and the review
+-- log's verdict every row was classified under.
 type alias HistoryPage =
     { rows : List HistoryRow
     , at : LibDb.HistoryCursor
     , next : Maybe LibDb.HistoryCursor
-    , log : LogStatus
+    , log : LogShown
     }
 
 
@@ -346,19 +344,19 @@ historyStatusText state =
 
 
 -- One History page from `cursor`, newest first, each row classified under
--- the server's key and the status of a current `reviewed` copy (rebuilt
--- once when its stamp is not current), with the unit's qualified name
--- resolved from the index db named by `settings`. At most
--- `PageSize.history` rows are read, and one name lookup runs per row.
+-- the review log's verdict, taken once for the load with the `reviewed`
+-- copy proved current for it (rebuilt once when its stamp is not), with the
+-- unit's qualified name resolved from the index db named by `settings`. At
+-- most `PageSize.history` rows are read, and one name lookup runs per row.
 loadHistoryPage : AppSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
 loadHistoryPage settings cursor =
     do
         db <- LibDb.openAt settings.review
         conn <- Index.readConnection settings.index
-        status <- freshStatus settings conn db
-        page <- LibDb.historyPage (LibDb.verifier settings.key status) db PageSize.history cursor
+        state <- freshStatus settings conn db
+        page <- LibDb.historyPage (LibDb.verifier state) db PageSize.history cursor
         rows <- Task.sequence (List.map (historyRow conn) page.rows)
-        Task.succeed { rows = rows, at = cursor, next = page.next, log = status }
+        Task.succeed { rows = rows, at = cursor, next = page.next, log = LibDb.logShown state }
 
 
 historyRow : Db.Db -> LibDb.ReviewEntry -> Task.Task Error HistoryRow
@@ -376,65 +374,49 @@ entryUid entry =
             row.uid
 
 
--- The status of the `reviewed` copy when its stamp is current for the
--- review log's head under the server's key: read as is, or once more after
--- one rebuild of the copy; a stamp still not current after the rebuild is a
--- failed load.
-freshStatus : AppSettings -> Db.Db -> Db.Db -> Task.Task Error LogStatus
+-- The review log's verdict, with the `reviewed` copy's stamp current for
+-- it: taken as is, or once more after one rebuild of the copy; a stamp
+-- still not current after the rebuild is a failed load.
+freshStatus : AppSettings -> Db.Db -> Db.Db -> Task.Task Error LibDb.LogState
 freshStatus settings conn db =
     do
         first <- currentStatus settings.key conn db
         case first of
-            Just status ->
-                Task.succeed status
+            Just state ->
+                Task.succeed state
 
             Nothing ->
                 do
                     resyncReviewed settings.key settings.index db
                     second <- currentStatus settings.key conn db
                     case second of
-                        Just status ->
-                            Task.succeed status
+                        Just state ->
+                            Task.succeed state
 
                         Nothing ->
                             Task.fail stillBehind
 
 
-currentStatus : ReviewKey -> Db.Db -> Db.Db -> Task.Task Error (Maybe LogStatus)
+-- The verdict `LibDb.logVerdict` takes now, Just when the copy's stamp is
+-- the one a rebuild under it writes. The verdict is taken first: a decision
+-- recorded after it moves the head on, so a match proves the copy holds
+-- every counted decision up to a head the log really had.
+currentStatus : ReviewKey -> Db.Db -> Db.Db -> Task.Task Error (Maybe LibDb.LogState)
 currentStatus key conn db =
     do
-        head <- LibDb.currentHead db
+        state <- LibDb.logVerdict key db
         stamp <- Index.readStamp conn
-        confirmedStatus db head (Index.stampStatus key head stamp)
+        Task.succeed (confirmedStatus state stamp)
 
 
--- A stamp's status kept only while the log still bears it out: a stamp of
--- an intact chain counts only when the log holds every entry up to the
--- head, so an entry removed below an unmoved head sends the copy to a
--- rebuild, whose walk names the break. A broken or unsigned status is
--- kept as read: it counts nothing.
-confirmedStatus : Db.Db -> Index.ChainHead -> Maybe LogStatus -> Task.Task Error (Maybe LogStatus)
-confirmedStatus db head status =
-    case status of
-        Just (Signed Intact) ->
-            LibDb.holdsEveryEntry db head
-                |> Task.map
-                    (\whole ->
-                        if whole then
-                            status
+-- The verdict, kept only when the copy's stamp is current for it.
+confirmedStatus : LibDb.LogState -> Maybe String -> Maybe LibDb.LogState
+confirmedStatus state stamp =
+    if LibDb.copyCurrent state stamp then
+        Just state
 
-                        else
-                            Nothing
-                    )
-
-        Just (Signed (BrokenAt _)) ->
-            Task.succeed status
-
-        Just Unsigned ->
-            Task.succeed status
-
-        Nothing ->
-            Task.succeed Nothing
+    else
+        Nothing
 
 
 stillBehind : Error
@@ -442,19 +424,35 @@ stillBehind =
     Error.conflict "the review progress copy is still behind the review database after a rebuild; reload"
 
 
--- The banner a page shows when the `reviewed` copy was rebuilt over a broken
--- chain, naming the first entry it breaks at; Nothing otherwise.
-chainBanner : LogStatus -> Maybe String
-chainBanner status =
-    case status of
-        Signed (BrokenAt n) ->
+-- The banner a page shows when the review log is not proven under the
+-- server's key: where it breaks, or that another key signed it; Nothing for a
+-- proven log and for a server with no key.
+chainBanner : LogShown -> Maybe String
+chainBanner shown =
+    case shown of
+        ShownBroken (BreaksAt n) ->
             Just ("The review log's chain breaks at entry " ++ String.fromInt n ++ ": a decision was removed, reordered or replaced outside this tool.")
 
-        Signed Intact ->
+        ShownBroken (PastHead n) ->
+            Just ("The review log holds " ++ pastHeadText n ++ " past its head: a decision was added outside this tool.")
+
+        ShownKeyMismatch ->
+            Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts.")
+
+        ShownProven ->
             Nothing
 
-        Unsigned ->
+        ShownUnkeyed ->
             Nothing
+
+
+pastHeadText : Int -> String
+pastHeadText n =
+    if n == 1 then
+        "1 entry"
+
+    else
+        String.fromInt n ++ " entries"
 
 
 -- The one way a decision is recorded: only under a signing key, so a
@@ -982,12 +980,12 @@ loadPage settings cursor =
         pageOf settings db fresh
 
 
-pageOf : AppSettings -> Db.Db -> ( LogStatus, Index.Snapshot ) -> Task.Task Error QueuePage
+pageOf : AppSettings -> Db.Db -> ( LibDb.LogState, Index.Snapshot ) -> Task.Task Error QueuePage
 pageOf settings db fresh =
     case fresh of
-        ( status, snap ) ->
+        ( state, snap ) ->
             do
-                units <- classify (LibDb.verifier settings.key status) db snap.rows
+                units <- classify (LibDb.verifier state) db snap.rows
                 Task.succeed
                     { units = units
                     , total = snap.open
@@ -995,14 +993,14 @@ pageOf settings db fresh =
                     , dbBytes = snap.bytes
                     , next = nextCursor snap.rows
                     , progress = { reviewed = snap.units - snap.open, total = snap.units }
-                    , log = status
+                    , log = LibDb.logShown state
                     }
 
 
--- The index read at `cursor` under a current stamp, with the status the
--- copy was rebuilt under: read as is, or once more after one rebuild of the
--- copy; a stamp still not current after the rebuild is a failed load.
-freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error ( LogStatus, Index.Snapshot )
+-- The index read at `cursor` under a stamp current for the review log's
+-- verdict, with that verdict: read as is, or once more after one rebuild of
+-- the copy; a stamp still not current after the rebuild is a failed load.
+freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error ( LibDb.LogState, Index.Snapshot )
 freshSnapshot settings conn db cursor =
     do
         first <- currentSnapshot settings.key conn db cursor
@@ -1022,19 +1020,18 @@ freshSnapshot settings conn db cursor =
                             Task.fail stillBehind
 
 
--- The index read at `cursor`, Just when the copy's stamp is the one `key`
--- would write for the review log's current head, with the status it
--- records. The head is read first: a decision recorded after it moves the
--- head on, so a match proves the copy holds every counted decision up to a
--- head the log really had; an intact status also needs the log to still
--- hold every entry up to that head.
-currentSnapshot : ReviewKey -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error (Maybe ( LogStatus, Index.Snapshot ))
+-- The index read at `cursor`, Just when the copy's stamp is the one a
+-- rebuild under the review log's verdict, taken now, writes. The verdict is
+-- taken first: a decision recorded after it moves the head on, so a match
+-- proves the copy holds every counted decision up to a head the log really
+-- had, and an entry edited, removed or added outside this tool changes the
+-- verdict, so the copy is rebuilt on this load.
+currentSnapshot : ReviewKey -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error (Maybe ( LibDb.LogState, Index.Snapshot ))
 currentSnapshot key conn db cursor =
     do
-        head <- LibDb.currentHead db
+        state <- LibDb.logVerdict key db
         snap <- Index.readSnapshot conn cursor
-        status <- confirmedStatus db head (Index.stampStatus key head snap.stamp)
-        Task.succeed (Maybe.map (\confirmed -> ( confirmed, snap )) status)
+        Task.succeed (Maybe.map (\confirmed -> ( confirmed, snap )) (confirmedStatus state snap.stamp))
 
 
 -- A decided unit drained from the index, then the queue page at `cursor`
