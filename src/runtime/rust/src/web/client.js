@@ -19,7 +19,14 @@ function __ipeDocProp(doc, name) {
 // hand the client the app's sibling, `<form name="body">` the app's form.
 var __ipeDoc = (function(doc) {
   function prop(name) { return function() { return __ipeDocProp(doc, name); }; }
-  function method(proto, name) { return proto[name].bind(doc); }
+  // A method the browser lacks refuses every call: boot never stops on it.
+  function method(proto, name) {
+    var fn = proto[name];
+    if (typeof fn !== "function") {
+      return function() { throw new TypeError("Ipe client: document member unavailable"); };
+    }
+    return fn.bind(doc);
+  }
   return {
     script: prop("currentScript"),
     body: prop("body"),
@@ -42,13 +49,50 @@ var __ipeDoc = (function(doc) {
 // through the form's own lookup throws before the submit is intercepted and
 // the browser submits the form natively, its fields in the URL.
 var __ipeNode = (function() {
-  var getAttribute = Element.prototype.getAttribute;
-  var setAttribute = Element.prototype.setAttribute;
-  var removeAttribute = Element.prototype.removeAttribute;
-  var remove = Element.prototype.remove;
-  var contains = Node.prototype.contains;
-  var on = EventTarget.prototype.addEventListener;
-  var controls = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements");
+  // A member the browser lacks is a function that refuses every call: boot
+  // never stops on it, and a read that needs it throws rather than answer
+  // through the node's own lookup.
+  function missing() { throw new TypeError("Ipe client: DOM member unavailable"); }
+  function own(fn) { return typeof fn === "function" ? fn : missing; }
+  function getter(proto, name) {
+    var d = Object.getOwnPropertyDescriptor(proto, name);
+    return own(d && d.get);
+  }
+  function setter(proto, name) {
+    var d = Object.getOwnPropertyDescriptor(proto, name);
+    return own(d && d.set);
+  }
+  var getAttribute = own(Element.prototype.getAttribute);
+  var setAttribute = own(Element.prototype.setAttribute);
+  var removeAttribute = own(Element.prototype.removeAttribute);
+  var remove = own(Element.prototype.remove);
+  var contains = own(Node.prototype.contains);
+  var removeChild = own(Node.prototype.removeChild);
+  var appendChild = own(Node.prototype.appendChild);
+  var replaceChild = own(Node.prototype.replaceChild);
+  var queryAll = own(Element.prototype.querySelectorAll);
+  var on = own(EventTarget.prototype.addEventListener);
+  var controls = getter(HTMLFormElement.prototype, "elements");
+  var parentElement = getter(Node.prototype, "parentElement");
+  var parentNode = getter(Node.prototype, "parentNode");
+  var firstChild = getter(Node.prototype, "firstChild");
+  var textContent = setter(Node.prototype, "textContent");
+  var firstElementChild = getter(Element.prototype, "firstElementChild");
+  var nextElementSibling = getter(Element.prototype, "nextElementSibling");
+  var previousElementSibling = getter(Element.prototype, "previousElementSibling");
+  var tagName = getter(Element.prototype, "tagName");
+  var namespaceURI = getter(Element.prototype, "namespaceURI");
+  var queryOne = own(Element.prototype.querySelector);
+  var closest = own(Element.prototype.closest);
+  // `focus()` per element interface: HTML, SVG and MathML elements are every
+  // element that has one. An interface the browser lacks is left out.
+  var focusers = [
+    typeof HTMLElement === "function" ? HTMLElement : null,
+    typeof SVGElement === "function" ? SVGElement : null,
+    typeof MathMLElement === "function" ? MathMLElement : null
+  ].filter(function(c) { return c !== null; }).map(function(c) {
+    return {of: c, run: own(c.prototype.focus)};
+  });
   return {
     attr: function(el, name) { return getAttribute.call(el, name); },
     setAttr: function(el, name, v) { setAttribute.call(el, name, v); },
@@ -58,8 +102,61 @@ var __ipeNode = (function() {
     on: function(el, type, fn) { on.call(el, type, fn); },
     // A form's controls; null for any other node.
     controls: function(el) {
-      return el instanceof HTMLFormElement && controls && controls.get
-          ? controls.get.call(el) : null;
+      return el instanceof HTMLFormElement ? controls.call(el) : null;
+    },
+    parent: function(el) { return parentElement.call(el); },
+    parentNode: function(el) { return parentNode.call(el); },
+    firstChild: function(el) { return firstChild.call(el); },
+    firstElement: function(el) { return firstElementChild.call(el); },
+    next: function(el) { return nextElementSibling.call(el); },
+    removeChild: function(el, child) { removeChild.call(el, child); },
+    append: function(el, child) { appendChild.call(el, child); },
+    replaceChild: function(el, fresh, old) { replaceChild.call(el, fresh, old); },
+    queryAll: function(el, sel) { return queryAll.call(el, sel); },
+    closest: function(el, sel) { return closest.call(el, sel); },
+    setText: function(el, text) { textContent.call(el, text); },
+    tag: function(el) { return tagName.call(el); },
+    ns: function(el) { return namespaceURI.call(el); },
+    // The child-element indices leading from `root` down to `el`; null when
+    // `el` is not below `root`.
+    pathFrom: function(root, el) {
+      var path = [];
+      var node = el;
+      while (node && node !== root) {
+        var index = 0;
+        var sibling = previousElementSibling.call(node);
+        while (sibling) {
+          index++;
+          sibling = previousElementSibling.call(sibling);
+        }
+        path.push(index);
+        node = parentElement.call(node);
+      }
+      return node === root ? path.reverse() : null;
+    },
+    // The element below `root` at `path`, or its deepest ancestor that
+    // exists, with its depth below `root` (0 for `root` itself).
+    resolve: function(root, path) {
+      var node = root;
+      var depth = 0;
+      for (; depth < path.length; depth++) {
+        var child = firstElementChild.call(node);
+        for (var k = 0; child && k < path[depth]; k++) child = nextElementSibling.call(child);
+        if (!child) break;
+        node = child;
+      }
+      return {node: node, depth: depth};
+    },
+    firstAutofocus: function(root) { return queryOne.call(root, "[autofocus]"); },
+    // Whether `el` took focus: a node that cannot be focused stays unfocused.
+    focus: function(el) {
+      var run = null;
+      for (var i = 0; i < focusers.length && run === null; i++) {
+        if (el instanceof focusers[i].of) run = focusers[i].run;
+      }
+      if (run === null) return false;
+      try { run.call(el, {preventScroll: true}); } catch (_) { return false; }
+      return __ipeDoc.active() === el;
     }
   };
 })();
@@ -172,7 +269,7 @@ function __ipeAdoptFullBody(token, applyFn) {
 var __ipeHeldRender = null;
 function __ipeSelectOpen() {
   var a = __ipeDoc.active();
-  return !!a && a.tagName === "SELECT";
+  return !!a && __ipeNode.tag(a) === "SELECT";
 }
 function __ipeHoldRender(apply) {
   __ipeHeldRender = { apply: apply, stale: false };
@@ -194,12 +291,12 @@ function __ipeReleaseHeldRender(picked) {
 // pick. Deferred so the select's own handlers send first, with the epoch of
 // the DOM the user acted on.
 __ipeDoc.on("focusout", function(ev) {
-  if (ev.target && ev.target.tagName === "SELECT") {
+  if (ev.target && __ipeNode.tag(ev.target) === "SELECT") {
     setTimeout(function() { __ipeReleaseHeldRender(false); }, 0);
   }
 }, true);
 __ipeDoc.on("change", function(ev) {
-  if (ev.target && ev.target.tagName === "SELECT") {
+  if (ev.target && __ipeNode.tag(ev.target) === "SELECT") {
     setTimeout(function() { __ipeReleaseHeldRender(true); }, 0);
   }
 }, true);
@@ -303,7 +400,7 @@ function __ipeInputsSnapshot() {
 // data-ipe-hid, or an unacked typed value at the input's ipe-id.
 function __ipeIsDirty(el) {
   if (!el || el.nodeType !== 1) return false;
-  var tag = el.tagName;
+  var tag = __ipeNode.tag(el);
   if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
   if (el === __ipeDoc.active()) return true;
   var hid = el.getAttribute && el.getAttribute("data-ipe-hid");
@@ -419,6 +516,17 @@ function __ipePlaceholderUncontrolled(placeholder) {
   return true;
 }
 
+// `s` as a quoted CSS string, every character escaped as the CSS syntax
+// requires: an attribute value from the page or the server (a newline, a
+// backslash, a quote) never ends the string or makes the selector throw.
+var __ipeCssEscape =
+    typeof CSS === "object" && CSS !== null && typeof CSS.escape === "function"
+        ? CSS.escape
+        : function() { throw new TypeError("Ipe client: CSS.escape unavailable"); };
+function __ipeCssString(s) {
+  return '"' + __ipeCssEscape(s) + '"';
+}
+
 // __ipeFindPlaceholder — locate a live input's slot in the new tree.
 // Prefer ipe-id (structurally stable + uniquely keyed). Fall back to
 // tag+name only when the live element has no ipe-id AND the new tree
@@ -427,13 +535,13 @@ function __ipePlaceholderUncontrolled(placeholder) {
 function __ipeFindPlaceholder(tmp, live) {
   var sid = live.getAttribute && live.getAttribute("ipe-id");
   if (sid) {
-    var bySid = tmp.querySelector('[ipe-id="' + sid.replace(/"/g, '\\"') + '"]');
+    var bySid = tmp.querySelector("[ipe-id=" + __ipeCssString(sid) + "]");
     if (bySid) return bySid;
   }
   var name = live.getAttribute && live.getAttribute("name");
   if (!name) return null;
   var tag = live.tagName.toLowerCase();
-  var matches = tmp.querySelectorAll(tag + '[name="' + name.replace(/"/g, '\\"') + '"]');
+  var matches = tmp.querySelectorAll(tag + "[name=" + __ipeCssString(name) + "]");
   if (matches.length === 1) return matches[0];
   return null;
 }
@@ -484,7 +592,8 @@ function __ipeParseFor(container, html) {
   // namespaced children. Drawing tools, charts, and apps that swap
   // inline-SVG icon <path> children are the common victims.
   var tmp;
-  if (container.namespaceURI && container.namespaceURI !== "http://www.w3.org/1999/xhtml") {
+  var ns = __ipeNode.ns(container);
+  if (ns && ns !== "http://www.w3.org/1999/xhtml") {
     var range = __ipeDoc.range();
     range.selectNodeContents(container);
     tmp = range.createContextualFragment(html);
@@ -497,21 +606,43 @@ function __ipeParseFor(container, html) {
 
 // Replace `container`'s children with the parsed holder `tmp`'s, splicing the
 // live inputs described above into their placeholders.
+//
+// A swap never moves keyboard focus. Focus on any node inside `container` is
+// recorded as the node's child-element path and the `ipe-id` of it and of
+// each ancestor at its depth, and put back once the commit lands on the
+// nearest node on that path whose chain from `container` carries the recorded
+// `ipe-id` and tag at every depth (see `__ipeRestoreFocus`); a live field
+// keeps its own node, value and selection (below). Focus outside `container`
+// is not read or written. Every member read on `container` goes through
+// `__ipeNode`: it may be a `<form>`.
 function __ipeSwapPreservingFocus(container, tmp) {
   var focused = __ipeDoc.active();
-  var focusedInside = focused && focused !== __ipeDoc.body() &&
-      container.contains(focused) &&
-      (focused.tagName === "INPUT" ||
-       focused.tagName === "TEXTAREA" ||
-       focused.tagName === "SELECT");
+  var inside = focused && focused !== __ipeDoc.body() &&
+      __ipeNode.contains(container, focused);
+  var focusPath = inside ? __ipeNode.pathFrom(container, focused) : null;
+  var focusTag = inside ? __ipeNode.tag(focused) : "";
+  var focusedInside = inside &&
+      (focusTag === "INPUT" || focusTag === "TEXTAREA" || focusTag === "SELECT");
+  // The focused node and each of its ancestors below `container`, by depth:
+  // entry `d - 1` holds the server identity (`ipe-id`: path, tag and key, null
+  // when absent) and the tag of the node `d` levels below `container`.
+  var focusIds = [];
+  if (focusPath) {
+    var at = focused;
+    for (var d = focusPath.length; d > 0; d--) {
+      focusIds[d - 1] = {id: __ipeNode.attr(at, "ipe-id"), tag: __ipeNode.tag(at)};
+      at = __ipeNode.parent(at);
+    }
+  }
 
   // Snapshot focused-state BEFORE any DOM mutation. Selection read
   // throws on some input types, so catch.
-  var selStart = null, selEnd = null, scrollTop = 0;
+  var selStart = null, selEnd = null, selDir = "none", scrollTop = 0;
   if (focusedInside) {
     try {
       selStart = focused.selectionStart;
       selEnd   = focused.selectionEnd;
+      selDir   = focused.selectionDirection || "none";
     } catch (_) {}
     scrollTop = focused.scrollTop;
   }
@@ -522,7 +653,7 @@ function __ipeSwapPreservingFocus(container, tmp) {
   // server-side placeholder is uncontrolled (no value/checked/
   // selected) — i.e. user state is canonical.
   var preservedFocus = null;
-  var liveNodes = container.querySelectorAll("input, textarea, select");
+  var liveNodes = __ipeNode.queryAll(container, "input, textarea, select");
   for (var i = 0; i < liveNodes.length; i++) {
     var live = liveNodes[i];
     var placeholder = __ipeFindPlaceholder(tmp, live);
@@ -544,15 +675,17 @@ function __ipeSwapPreservingFocus(container, tmp) {
     // slot; the container still references it too (until the swap
     // below). DOM trees are tolerant of this — the upcoming
     // removeChild + appendChild commit moves it cleanly.
-    placeholder.parentNode.replaceChild(live, placeholder);
+    __ipeNode.replaceChild(__ipeNode.parentNode(placeholder), live, placeholder);
     if (isFocused) preservedFocus = live;
   }
 
   // Commit: throw away container's current children (those we didn't
   // splice are stale; spliced ones already moved into tmp), then
   // attach tmp's children. Done.
-  while (container.firstChild) container.removeChild(container.firstChild);
-  while (tmp.firstChild) container.appendChild(tmp.firstChild);
+  var gone;
+  while ((gone = __ipeNode.firstChild(container))) __ipeNode.removeChild(container, gone);
+  var moved;
+  while ((moved = __ipeNode.firstChild(tmp))) __ipeNode.append(container, moved);
 
   // Focus restoration on the SAME node — so .value, IME state,
   // composition buffer survive untouched. removeChild + appendChild
@@ -563,10 +696,79 @@ function __ipeSwapPreservingFocus(container, tmp) {
     }
     if (typeof preservedFocus.setSelectionRange === "function" &&
         selStart !== null && selEnd !== null) {
-      try { preservedFocus.setSelectionRange(selStart, selEnd); } catch (_) {}
+      try { preservedFocus.setSelectionRange(selStart, selEnd, selDir); } catch (_) {}
     }
     if (scrollTop) preservedFocus.scrollTop = scrollTop;
+  } else if (focusPath) {
+    __ipeRestoreFocus(container, focusPath, focusIds);
   }
+}
+
+// Put focus back after a swap dropped it. Focus goes to the node at `path`
+// below `container`, else to its nearest ancestor, that takes focus, walking
+// from the path's deepest surviving node upward past `container`: a key
+// handler bound on an ancestor keeps receiving keys. A node the swap created
+// is a candidate only when it and every node above it on the path, down from
+// `container`, carry the `ipe-id` and tag recorded for their own depth in
+// `ids`. One `ipe-id` alone does not name a node: a key may contain `_` and
+// spell the next segment, so a node whose chain differs higher up can carry
+// the same id at the same depth. The matched chain fixes every segment's
+// index, tag and key, so the id then names one node. Any other node at the
+// path is another control, and a node without an `ipe-id` (raw markup) is
+// never one. `container` and the nodes above it are the ones the swap kept.
+// Focus that is already somewhere is left where it is. A kept ancestor bound
+// to `onFocus` delivers that message once.
+function __ipeRestoreFocus(container, path, ids) {
+  var now = __ipeDoc.active();
+  if (now && now !== __ipeDoc.body()) return;
+  var found = __ipeNode.resolve(container, path);
+  // The resolved nodes by depth: entry `d - 1` is the node at depth `d`.
+  var chain = [];
+  var at = found.node;
+  for (var d = found.depth; d > 0; d--) {
+    chain[d - 1] = at;
+    at = __ipeNode.parent(at);
+  }
+  // The deepest depth whose whole prefix, from depth 1, matches `ids`.
+  var matched = 0;
+  while (matched < chain.length) {
+    var was = ids[matched];
+    var node = chain[matched];
+    var own = __ipeNode.attr(node, "ipe-id");
+    if (!was || own === null || own !== was.id || __ipeNode.tag(node) !== was.tag) break;
+    matched++;
+  }
+  for (var m = matched; m > 0; m--) {
+    if (__ipeNode.focus(chain[m - 1])) return;
+  }
+  for (var up = container; up; up = __ipeNode.parent(up)) {
+    if (__ipeNode.focus(up)) return;
+  }
+}
+
+// The first mount of the page focuses the element the browser would have
+// focused at load (the first `[autofocus]` below `root`) only while the load's
+// own autofocus is still due: nothing has held focus since the client started,
+// the user has not pressed a key or a pointer, and the URL names no fragment
+// target (the browser skips autofocus for one too). Any later frame only puts
+// lost focus back (`__ipeRestoreFocus`): an element is never autofocused after
+// the user has acted or focus has been somewhere.
+var __ipeMounted = false;
+var __ipeAutofocusSpent = (function() {
+  var now = __ipeDoc.active();
+  return !!now && now !== __ipeDoc.body();
+})();
+["focusin", "pointerdown", "mousedown", "touchstart", "keydown"].forEach(function(type) {
+  __ipeDoc.on(type, function() { __ipeAutofocusSpent = true; }, true);
+});
+function __ipeAutofocusDue() {
+  return !__ipeMounted && !__ipeAutofocusSpent && !__ipeDoc.query(":target");
+}
+function __ipeFocusAutofocus(root) {
+  var now = __ipeDoc.active();
+  if (__ipeAutofocusSpent || (now && now !== __ipeDoc.body())) return;
+  var el = __ipeNode.firstAutofocus(root);
+  if (el) __ipeNode.focus(el);
 }
 
 // __ipeCopyAttrsExceptAuthority — mirror attrs from src onto dst,
@@ -610,7 +812,11 @@ function __ipePatch(t, mode) {
   // live root, where script revival would run a second client.
   var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);
   var scrollX = window.scrollX, scrollY = window.scrollY;
+  // Read before the swap: a fragment target the swap replaces stops matching.
+  var autofocus = __ipeAutofocusDue();
+  __ipeMounted = true;
   __ipeSwapPreservingFocus(root, parsed);
+  if (autofocus) __ipeFocusAutofocus(root);
   // behavior:"instant" keeps this housekeeping scroll a synchronous jump
   // even under a global `scroll-behavior: smooth`, which would otherwise
   // animate every restore and fight the caret on per-keystroke re-renders.
@@ -635,9 +841,9 @@ function __ipePatch(t, mode) {
 var __IPE_SHELL_HEAD_TAGS = ["META", "STYLE", "LINK", "TITLE", "BASE"];
 function __ipeShellRoot(tmp, t) {
   if (!/^\s*<!doctype/i.test(t)) return tmp;
-  var el = tmp.firstElementChild;
-  while (el && __IPE_SHELL_HEAD_TAGS.indexOf(el.tagName) >= 0) el = el.nextElementSibling;
-  return el && el.tagName === "DIV" && el.id === "ipe-root" ? el : tmp;
+  var el = __ipeNode.firstElement(tmp);
+  while (el && __IPE_SHELL_HEAD_TAGS.indexOf(__ipeNode.tag(el)) >= 0) el = __ipeNode.next(el);
+  return el && __ipeNode.tag(el) === "DIV" && __ipeNode.attr(el, "id") === "ipe-root" ? el : tmp;
 }
 
 // __ipeReviveScripts: browsers DO NOT execute <script> tags inserted
@@ -749,7 +955,9 @@ function __ipeReviveScripts(root) {
     // Replacing the old node with the fresh one triggers script
     // execution (for src= it fetches + runs; for inline it runs
     // the body).
-    old.parentNode.replaceChild(fresh, old);
+    // Bound reads: the script's parent may be a `<form>`, whose control named
+    // `replaceChild` (or `parentNode`) would answer for the member.
+    __ipeNode.replaceChild(__ipeNode.parentNode(old), fresh, old);
   }
 }
 
@@ -790,9 +998,10 @@ function __ipeDebouncedSend(msgName, args, hid, delay, epoch) {
 // because the debounce hasn't fired yet.
 __ipeDoc.on("focusout", function(ev) {
   var t = ev.target;
-  if (!t) return;
-  var hid = t.getAttribute("data-ipe-hid");
-  var key = hid || t.getAttribute("ipe-input");
+  // A focusable `<form>` loses focus too; its controls shadow `getAttribute`.
+  if (!(t instanceof Element)) return;
+  var hid = __ipeNode.attr(t, "data-ipe-hid");
+  var key = hid || __ipeNode.attr(t, "ipe-input");
   if (key && __ipeInputPending[key]) {
     clearTimeout(__ipeInputTimers[key]);
     var p = __ipeInputPending[key];
@@ -897,7 +1106,8 @@ function __ipeFlushPendingSync() {
 // outgoing navigation. Beacon path handles cross-page; sync path
 // handles SPA-style internal routing.
 __ipeDoc.on("click", function(ev) {
-  var a = ev.target && ev.target.closest && ev.target.closest("a[href]");
+  // The target may be a `<form>`, whose control named `closest` would answer.
+  var a = ev.target instanceof Element ? __ipeNode.closest(ev.target, "a[href]") : null;
   if (!a) return;
   var root = __ipeDoc.byId("ipe-root");
   if (!root || !root.contains(a)) return;
@@ -1177,6 +1387,7 @@ var __IPE_LIVE_PROPS = Object.freeze({
 });
 function __ipeApplyPatches(patches) {
   if (!patches || patches.length === 0) return;
+  __ipeMounted = true;
   // Open <select> defence: native dropdowns close on ANY DOM mutation
   // inside the open select OR any ancestor that would re-mount it.
   // There's no JS API for "is the dropdown open", so use focus as the
@@ -1186,11 +1397,10 @@ function __ipeApplyPatches(patches) {
   // triggers a fresh response and reconciliation. Sibling subtrees
   // and unrelated parts of the DOM apply normally — the dropdown is
   // unaffected. See Bug 3 in docs/internals/web/architecture.md.
-  var openSel = (__ipeDoc.active() && __ipeDoc.active().tagName === "SELECT")
-      ? __ipeDoc.active() : null;
+  var openSel = __ipeSelectOpen() ? __ipeDoc.active() : null;
   for (var i = 0; i < patches.length; i++) {
     var p = patches[i];
-    var el = __ipeDoc.query('[ipe-id="' + p.id.replace(/"/g, '\\"') + '"]');
+    var el = __ipeDoc.query("[ipe-id=" + __ipeCssString(String(p.id)) + "]");
     if (!el) continue;
     if (openSel && (el === openSel || __ipeNode.contains(el, openSel) ||
         __ipeNode.contains(openSel, el))) {
@@ -1198,13 +1408,13 @@ function __ipeApplyPatches(patches) {
       continue;
     }
     if (p.text !== undefined && p.text !== null) {
-      // textContent on a container that contains the focused input
-      // would also wipe the input (replaces all children with one
+      // textContent on a container that contains the focused node
+      // would also wipe it (replaces all children with one
       // text node). Guard the same way as innerHTML.
-      if (__ipeContainsFocusedInput(el)) {
+      if (__ipeContainsFocus(el)) {
         __ipeReplaceHTMLPreservingFocus(el, __ipeEscapeHTML(p.text));
       } else {
-        el.textContent = p.text;
+        __ipeNode.setText(el, p.text);
       }
     }
     if (p.html !== undefined && p.html !== null) {
@@ -1221,13 +1431,15 @@ function __ipeApplyPatches(patches) {
       // the server pushes a fresh value via SSE. Without this,
       // the cursor jumps to the end mid-edit. Clamping handles
       // shorter new values (selectionStart > newLen -> newLen).
-      var isInputLike = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
+      var elTag = __ipeNode.tag(el);
+      var isInputLike = elTag === "INPUT" || elTag === "TEXTAREA";
       var hadFocus = isInputLike && el === __ipeDoc.active();
-      var savedSelStart = null, savedSelEnd = null, savedScrollTop = 0;
+      var savedSelStart = null, savedSelEnd = null, savedSelDir = "none", savedScrollTop = 0;
       if (hadFocus) {
         try {
           savedSelStart = el.selectionStart;
           savedSelEnd = el.selectionEnd;
+          savedSelDir = el.selectionDirection || "none";
         } catch (_) {}
         savedScrollTop = el.scrollTop;
       }
@@ -1266,7 +1478,7 @@ function __ipeApplyPatches(patches) {
         var newLen = (el.value || "").length;
         var s = Math.min(savedSelStart, newLen);
         var e = Math.min(savedSelEnd === null ? s : savedSelEnd, newLen);
-        try { el.setSelectionRange(s, e); } catch (_) {}
+        try { el.setSelectionRange(s, e, savedSelDir); } catch (_) {}
         if (savedScrollTop) el.scrollTop = savedScrollTop;
       }
     }
@@ -1286,12 +1498,15 @@ function __ipeApplyPatches(patches) {
   if (ipeRootForPatches) __ipeReviveScripts(ipeRootForPatches);
 }
 
-function __ipeContainsFocusedInput(el) {
+// Whether a wholesale rewrite of `el`'s children would drop focus: focus is
+// on a node below `el`, or on `el` itself when `el` is a field.
+function __ipeContainsFocus(el) {
   var a = __ipeDoc.active();
   if (!a || a === __ipeDoc.body()) return false;
-  var tag = a.tagName;
-  if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
-  return el === a || __ipeNode.contains(el, a);
+  if (!__ipeNode.contains(el, a)) return false;
+  if (el !== a) return true;
+  var tag = __ipeNode.tag(a);
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 }
 
 function __ipeEscapeHTML(s) {
@@ -1582,7 +1797,9 @@ __ipeDoc.on("click", function(ev) {
   if (ev.button !== 0) return;
   if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
   var el = ev.target;
-  while (el && el.tagName !== "A") el = el.parentElement;
+  // Bound reads: a `<form>` with a control named `parentElement` answers that
+  // read with the control, whose parent is the form again, so the walk loops.
+  while (el && __ipeNode.tag(el) !== "A") el = __ipeNode.parent(el);
   if (!el) return;
   if (!el.hasAttribute("ipe-nav")) return;
   var href = el.getAttribute("href");
