@@ -137,6 +137,31 @@ where
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 const BLOCK_ON_THREAD: &str = "ipe-block-on";
 
+/// `task`, kept inside the `Server` request scope of its caller when it runs
+/// on another task or thread, so a credential it verifies binds to the request
+/// that owns it.
+#[cfg(all(
+    feature = "tokio",
+    feature = "server",
+    feature = "jwt",
+    not(target_arch = "wasm32")
+))]
+fn on_behalf_of_caller<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::server::inherit_request_scope(task)
+}
+
+/// `task` as it is: without `server` and `jwt` no request scope exists.
+#[cfg(all(
+    feature = "tokio",
+    not(all(feature = "server", feature = "jwt")),
+    not(target_arch = "wasm32")
+))]
+const fn on_behalf_of_caller<F: std::future::Future>(task: F) -> F {
+    task
+}
+
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
@@ -147,6 +172,7 @@ where
         Ok(r) => r,
         Err(e) => return IpeResult::Err(e.into()),
     };
+    let future = on_behalf_of_caller(future);
     // The spawned OS thread keeps the entry poll outside any runtime context
     // (a nested `block_on` inside a worker thread would panic) and lets a
     // panicking future be `.join()`-mapped to `Err` instead of aborting. The
@@ -758,8 +784,12 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
         // Spawn every task up front so they run concurrently. `VecDeque` lets us
         // pop the front (input order) to await while the un-awaited tail stays
         // addressable for `abort()` on failure.
+        // Each spawned task stays inside the request scope this one runs in.
         let mut handles: std::collections::VecDeque<tokio::task::JoinHandle<IpeResult<E, A>>> =
-            tasks.into_iter().map(tokio::spawn).collect();
+            tasks
+                .into_iter()
+                .map(|task| tokio::spawn(on_behalf_of_caller(task)))
+                .collect();
         let mut out = Vec::with_capacity(handles.len());
         while let Some(h) = handles.pop_front() {
             let result = match h.await {

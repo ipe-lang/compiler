@@ -2449,6 +2449,21 @@ pub(crate) fn request_bindings() -> Option<Arc<Mutex<crate::revocation::SessionB
     SERVER_REQUEST.try_with(Arc::clone).ok()
 }
 
+/// `task`, run inside the binding set of the `Server` request the caller
+/// handles, so work spawned on that request's behalf binds into it.
+///
+/// The set is read when this is called, on the caller's task.
+#[cfg(feature = "jwt")]
+pub(crate) fn inherit_request_scope<F: Future>(task: F) -> impl Future<Output = F::Output> {
+    let bindings = request_bindings();
+    async move {
+        match bindings {
+            Some(bindings) => SERVER_REQUEST.scope(bindings, task).await,
+            None => task.await,
+        }
+    }
+}
+
 /// How long a gated channel waits after a revocation before it re-proves.
 ///
 /// One recheck per interval answers any number of revocations, so a party
@@ -2459,27 +2474,58 @@ pub(crate) const RECHECK_COALESCE: std::time::Duration = std::time::Duration::fr
 /// The close reason a gated channel sends once its credentials no longer hold.
 const CHANNEL_DENIED_REASON: &str = "credential revoked";
 
-/// Why a gated channel ends.
+/// Why a gated channel ends, or never opens.
 #[cfg(feature = "jwt")]
-pub(crate) type ChannelDenial = crate::revocation::Denial;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChannelDenial {
+    /// A credential the channel holds no longer passes the gate.
+    Credential(crate::revocation::Denial),
+    /// The armed process opened a channel outside any `Server` request: no
+    /// binding set exists to re-prove.
+    Unscoped,
+}
+
+#[cfg(feature = "jwt")]
+impl From<crate::revocation::Denial> for ChannelDenial {
+    fn from(denial: crate::revocation::Denial) -> Self {
+        Self::Credential(denial)
+    }
+}
+
+#[cfg(feature = "jwt")]
+impl std::fmt::Display for ChannelDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Credential(denial) => denial.fmt(f),
+            Self::Unscoped => f.write_str("channel opened outside any Server request"),
+        }
+    }
+}
 
 /// Why a gated channel ends; without `jwt` no channel is gated.
 #[cfg(not(feature = "jwt"))]
 pub(crate) enum ChannelDenial {}
 
-/// The credentials a channel opened by the current `Server` request inherits.
+/// The credentials a channel inherits from the code that opened it.
 #[cfg(feature = "jwt")]
-pub(crate) struct ChannelCredentials(Option<Arc<Mutex<crate::revocation::SessionBindings>>>);
+#[derive(Clone)]
+pub(crate) enum ChannelCredentials {
+    /// The binding set of the `Server` request that opened the channel.
+    Request(Arc<Mutex<crate::revocation::SessionBindings>>),
+    /// No `Server` request owns the code that opened the channel.
+    Unscoped,
+}
 
 /// The credentials a channel inherits; without `jwt` there are none.
 #[cfg(not(feature = "jwt"))]
+#[derive(Clone, Copy)]
 pub(crate) struct ChannelCredentials;
 
 impl ChannelCredentials {
     /// The binding set of the `Server` request the current task handles.
     #[cfg(feature = "jwt")]
     pub(crate) fn of_request() -> Self {
-        Self(request_bindings())
+        request_bindings().map_or(Self::Unscoped, Self::Request)
     }
 
     /// No binding set exists without `jwt`.
@@ -2519,8 +2565,10 @@ impl ChannelGate {
     /// # Errors
     ///
     /// The [`ChannelDenial`] of the opening recheck; a poisoned binding set is
-    /// [`crate::revocation::Denial::StoreUnavailable`].
-    pub(crate) fn open(credentials: ChannelCredentials) -> Result<Option<Self>, ChannelDenial> {
+    /// [`crate::revocation::Denial::StoreUnavailable`]; an armed process
+    /// refuses a channel no `Server` request opened
+    /// ([`ChannelDenial::Unscoped`]), since its credentials cannot be known.
+    pub(crate) fn open(credentials: &ChannelCredentials) -> Result<Option<Self>, ChannelDenial> {
         use crate::revocation::{ArmedGate, Denial, process_mode, subscribe};
         // Subscribed before the opening recheck: a revocation that lands after
         // the recheck read the store is still seen as a generation change.
@@ -2528,9 +2576,10 @@ impl ChannelGate {
         let Some(gate) = ArmedGate::resolve(process_mode()) else {
             return Ok(None);
         };
-        let Some(bindings) = credentials.0 else {
-            return Ok(None);
+        let ChannelCredentials::Request(bindings) = credentials else {
+            return Err(ChannelDenial::Unscoped);
         };
+        let bindings = Arc::clone(bindings);
         if bindings
             .lock()
             .map_err(|_| Denial::StoreUnavailable)?
@@ -2603,7 +2652,7 @@ impl ChannelGate {
             if let Some(at) = self.recheck_at {
                 tokio::select! {
                     () = tokio::time::sleep_until(at) => return Ok(()),
-                    () = deadline_sleep(self.deadline_at) => return Err(Denial::PastDeadline),
+                    () = deadline_sleep(self.deadline_at) => return Err(Denial::PastDeadline.into()),
                 }
             }
             tokio::select! {
@@ -2616,7 +2665,7 @@ impl ChannelGate {
                             .map_or(now, |at| at.max(now)),
                     );
                 }
-                () = deadline_sleep(self.deadline_at) => return Err(Denial::PastDeadline),
+                () = deadline_sleep(self.deadline_at) => return Err(Denial::PastDeadline.into()),
             }
         }
     }
@@ -2641,7 +2690,7 @@ impl ChannelGate {
     /// No channel is gated without `jwt`.
     #[allow(clippy::unnecessary_wraps)] // the `jwt` build's signature, which can refuse
     pub(crate) const fn open(
-        _credentials: ChannelCredentials,
+        _credentials: &ChannelCredentials,
     ) -> Result<Option<Self>, ChannelDenial> {
         Ok(None)
     }
@@ -3001,7 +3050,7 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
         };
         // The socket inherits every credential this request bound; a gate
         // that cannot prove them now refuses the upgrade (fail closed).
-        let Some(gate) = ChannelGate::open(ChannelCredentials::of_request()).ok() else {
+        let Some(gate) = ChannelGate::open(&ChannelCredentials::of_request()).ok() else {
             return ok_res(ws_resp(401, "unauthorized"));
         };
         {
@@ -7766,7 +7815,7 @@ mod tests {
                 "/ws".to_string(),
                 server_with_revocation(1, bearer_cfg()),
                 move |_req, _p| {
-                    let opened = ChannelGate::open(ChannelCredentials::of_request())
+                    let opened = ChannelGate::open(&ChannelCredentials::of_request())
                         .ok()
                         .flatten();
                     if let Ok(mut held) = sink.lock() {
@@ -7919,7 +7968,7 @@ mod tests {
         async fn unauthed_ws_has_no_gate() {
             crate::revocation::arm_process();
             let opened =
-                in_request_scope(async { ChannelGate::open(ChannelCredentials::of_request()) })
+                in_request_scope(async { ChannelGate::open(&ChannelCredentials::of_request()) })
                     .await;
             assert!(
                 matches!(opened, Ok(None)),
@@ -7953,7 +8002,7 @@ mod tests {
                     matches!(verified, IpeResult::Ok(_)),
                     "the armed kernel admits the token"
                 );
-                ChannelGate::open(ChannelCredentials::of_request())
+                ChannelGate::open(&ChannelCredentials::of_request())
                     .ok()
                     .flatten()
             })
@@ -8015,6 +8064,86 @@ mod tests {
                 serve_public(h).await,
                 "true|1",
                 "a token verified in the handler body binds to the request it answers"
+            );
+        }
+
+        /// A task that answers whether it runs inside the binding set `outer`.
+        fn probe_scope(
+            outer: Option<Arc<Mutex<crate::revocation::SessionBindings>>>,
+        ) -> IpeTask<String, bool> {
+            Box::pin(async move {
+                ok_res::<String, _>(matches!(
+                    (request_bindings(), outer),
+                    (Some(inner), Some(outer)) if Arc::ptr_eq(&inner, &outer)
+                ))
+            })
+        }
+
+        #[tokio::test]
+        async fn parallel_tasks_inside_a_request_keep_its_scope() {
+            let seen = in_request_scope(async {
+                let probe = probe_scope(request_bindings());
+                crate::task::task_parallel(vec![probe]).await
+            })
+            .await;
+            assert!(
+                matches!(seen, IpeResult::Ok(ref all) if all.as_slice() == [true]),
+                "a Task.parallel branch binds into the request that spawned it"
+            );
+        }
+
+        #[tokio::test]
+        async fn task_run_inside_a_request_keeps_its_scope() {
+            let seen = in_request_scope(async {
+                let probe = probe_scope(request_bindings());
+                crate::task::task_run(probe)
+            })
+            .await;
+            assert!(
+                matches!(seen, IpeResult::Ok(true)),
+                "a Task.run inside a handler binds into the request that called it"
+            );
+        }
+
+        #[tokio::test]
+        async fn armed_channel_opened_outside_any_request_is_refused() {
+            crate::revocation::arm_process();
+            assert!(
+                matches!(
+                    ChannelGate::open(&ChannelCredentials::of_request()),
+                    Err(ChannelDenial::Unscoped)
+                ),
+                "an armed process cannot know the credentials of an unscoped channel"
+            );
+        }
+
+        #[tokio::test]
+        async fn armed_stream_registered_outside_any_request_answers_401() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            crate::revocation::arm_process();
+            let ran = Arc::new(AtomicBool::new(false));
+            let ran_in = Arc::clone(&ran);
+            let registered = crate::server_stream::server_stream_stream::<String, _>(
+                "text/plain".to_string(),
+                move |_writer| {
+                    ran_in.store(true, Ordering::SeqCst);
+                    Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
+                },
+            )
+            .await;
+            let IpeResult::Ok(resp) = registered else {
+                panic!("stream registration answers a sentinel response");
+            };
+            let served = to_axum_response(resp);
+            assert_eq!(
+                served.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "an unscoped stream of an armed process is refused"
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "a refused stream never runs its handler"
             );
         }
     }

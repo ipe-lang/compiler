@@ -319,7 +319,7 @@ impl ServerPendingStream {
             handler,
             credentials,
         } = self;
-        let Some(gate) = crate::server::ChannelGate::open(credentials).ok() else {
+        let Some(gate) = crate::server::ChannelGate::open(&credentials).ok() else {
             return axum::http::StatusCode::UNAUTHORIZED.into_response();
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
