@@ -194,6 +194,19 @@ pub fn auth_sign_token<E: From<String>>(
             uuid::Uuid::new_v4().to_string()
         }
     };
+    // A caller-supplied `nbf` is signed as a NumericDate, the only form the
+    // verifier reads; any other value mints no token.
+    let nbf = match claims.get("nbf").map(|raw| raw.parse::<i64>()) {
+        None => None,
+        Some(Ok(nbf)) => Some(nbf),
+        Some(Err(_)) => {
+            return IpeResult::Err(
+                "auth.signToken: `nbf` must be whole Unix seconds"
+                    .to_string()
+                    .into(),
+            );
+        }
+    };
     // Build the claims object with keys in ascending order so the signed bytes are
     // deterministic across runs. A `BTreeMap` fixes the key order explicitly,
     // independent of both the source `HashMap` iteration order and the ambient
@@ -203,9 +216,13 @@ pub fn auth_sign_token<E: From<String>>(
         // Strip any caller-supplied `cap`, `exp`, `iat`, and `jti` — these are
         // runtime-controlled claims; a caller must not be able to override them
         // via the claims map (the computed values below are authoritative).
-        .filter(|(k, _)| k != "cap" && k != "exp" && k != "iat" && k != "jti")
+        // `nbf` is re-inserted as a number below.
+        .filter(|(k, _)| k != "cap" && k != "exp" && k != "iat" && k != "jti" && k != "nbf")
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
+    if let Some(nbf) = nbf {
+        sorted.insert("nbf".to_string(), serde_json::Value::Number(nbf.into()));
+    }
     sorted.insert("cap".to_string(), serde_json::Value::Number(cap.into()));
     sorted.insert("exp".to_string(), serde_json::Value::Number(exp.into()));
     sorted.insert("iat".to_string(), serde_json::Value::Number(iat.into()));
@@ -234,6 +251,12 @@ pub enum TokenRefusal {
     NotYetValid,
     /// The token is at or past its absolute lifetime `cap`.
     PastCap,
+    /// A time claim (`nbf`, `cap`) is present but not a JSON number, so no
+    /// check could read it.
+    NonNumericDate {
+        /// The claim's name.
+        claim: &'static str,
+    },
     /// The signature does not verify under the secret.
     BadSignature(jsonwebtoken::errors::Error),
     /// Any other refusal by the verifier: a malformed token, a missing or
@@ -252,6 +275,9 @@ impl std::fmt::Display for TokenRefusal {
             Self::NotYetValid => f.write_str("auth.verifyToken: token is not yet valid"),
             Self::PastCap => {
                 f.write_str("auth.verifyToken: token has exceeded its absolute lifetime cap")
+            }
+            Self::NonNumericDate { claim } => {
+                write!(f, "auth.verifyToken: token `{claim}` is not a NumericDate")
             }
             Self::BadSignature(e) | Self::Malformed(e) => write!(f, "jwt verify: {e}"),
         }
@@ -316,8 +342,13 @@ impl std::fmt::Debug for VerifiedClaims {
     }
 }
 
+/// The optional time claims `verify_claims` checks itself; `exp` is required
+/// numeric by the verifier.
+const DATE_CLAIMS: [&str; 2] = ["nbf", "cap"];
+
 /// Verify an HS256 `token` under `secret`: signature, `exp`, `nbf`, and (when
-/// present) the absolute lifetime `cap`.
+/// present) the absolute lifetime `cap`. A present `nbf` or `cap` must be a JSON
+/// number.
 ///
 /// # Absolute lifetime cap (`cap` claim)
 ///
@@ -395,6 +426,15 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
                 TokenRefusal::Malformed(e)
             }
         })?;
+    // A time claim the checks cannot read is refused, never skipped: both the
+    // pre-reject above and jsonwebtoken pass over a non-number `nbf` or `cap`,
+    // which would otherwise verify a token before its start or past its cap.
+    if let Some(claim) = DATE_CLAIMS
+        .into_iter()
+        .find(|claim| parsed.claims.get(*claim).is_some_and(|v| !v.is_number()))
+    {
+        return Err(TokenRefusal::NonNumericDate { claim });
+    }
     // Re-check the absolute cap on the signature-verified claims. The pre-reject
     // above already denies past-cap tokens before the signature decode, but this
     // second check on the verified payload closes any edge where the pre-reject
@@ -570,9 +610,13 @@ pub fn auth_reissue_token<E: From<String>>(
         .min(ctx.cap);
     // Build deterministic sorted payload. `iat`, `cap`, `jti`, and `sub` come
     // verbatim from `ctx` (verified-origin); caller-supplied duplicates are stripped.
+    // `nbf` is dropped: the verified token was already past it, and its text
+    // form would not be a NumericDate.
     let mut sorted: std::collections::BTreeMap<String, serde_json::Value> = extra_claims
         .into_iter()
-        .filter(|(k, _)| k != "cap" && k != "exp" && k != "iat" && k != "jti" && k != "sub")
+        .filter(|(k, _)| {
+            k != "cap" && k != "exp" && k != "iat" && k != "jti" && k != "sub" && k != "nbf"
+        })
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
     sorted.insert("cap".to_string(), serde_json::Value::Number(ctx.cap.into()));
@@ -1614,6 +1658,114 @@ mod tests {
             context_of(&serde_json::json!({ "sub": "user", "iat": iat, "cap": cap, "exp": exp }))
                 .is_some(),
             "all fields present must yield Some"
+        );
+    }
+
+    // ── Time claims must be numbers ───────────────────────────────────────────
+
+    #[test]
+    fn verify_claims_refuses_non_numeric_time_claims() {
+        let now = now_unix();
+        let refused = |claims: serde_json::Value| match verify_claims(SECRET, &raw_hs256(&claims)) {
+            Err(TokenRefusal::NonNumericDate { claim }) => Some(claim),
+            _ => None,
+        };
+        assert_eq!(
+            refused(
+                serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": (now - 10).to_string() })
+            ),
+            Some("cap"),
+            "a past `cap` written as text is refused, not skipped"
+        );
+        assert_eq!(
+            refused(
+                serde_json::json!({ "sub": "u", "exp": now + 3600, "nbf": (now + 3600).to_string() })
+            ),
+            Some("nbf"),
+            "a future `nbf` written as text is refused, not skipped"
+        );
+        assert_eq!(
+            refused(serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": null })),
+            Some("cap")
+        );
+        assert!(matches!(
+            verify_claims(
+                SECRET,
+                &raw_hs256(&serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": now - 10 }))
+            ),
+            Err(TokenRefusal::PastCap)
+        ));
+        assert!(
+            verify_claims(
+                SECRET,
+                &raw_hs256(&serde_json::json!({
+                    "sub": "u",
+                    "exp": now + 3600,
+                    "cap": now + 7200,
+                    "nbf": now - 10,
+                }))
+            )
+            .is_ok(),
+            "numeric time claims inside their window verify"
+        );
+    }
+
+    #[test]
+    fn sign_token_writes_nbf_as_a_numeric_date() {
+        let now = now_unix();
+        let sign = |nbf: String| {
+            let mut claims = HashMap::new();
+            claims.insert("sub".to_string(), "u".to_string());
+            claims.insert("nbf".to_string(), nbf);
+            auth_sign_token::<String>(SECRET.to_string(), claims, 3600)
+        };
+        let IpeResult::Ok(future) = sign((now + 3600).to_string()) else {
+            panic!("an integer `nbf` signs");
+        };
+        assert!(
+            matches!(
+                verify_claims(SECRET, &future),
+                Err(TokenRefusal::NotYetValid)
+            ),
+            "a future `nbf` from `signToken` is enforced"
+        );
+        let IpeResult::Ok(past) = sign((now - 10).to_string()) else {
+            panic!("an integer `nbf` signs");
+        };
+        assert!(
+            verify_claims(SECRET, &past).is_ok(),
+            "a past `nbf` verifies"
+        );
+        assert!(
+            matches!(sign("soon".to_string()), IpeResult::Err(_)),
+            "a non-integer `nbf` mints no token"
+        );
+    }
+
+    #[test]
+    fn reissued_token_drops_nbf_and_verifies() {
+        let now = now_unix();
+        let original = raw_hs256(&serde_json::json!({
+            "sub": "u",
+            "jti": "nbf-jti",
+            "iat": now - 60,
+            "nbf": now - 60,
+            "exp": now + 60,
+            "cap": now + 7200,
+        }));
+        let claims = verify_claims(SECRET, &original).expect("verify original");
+        let ctx = reissue_context_from_claims(&claims).expect("context");
+        let extra: HashMap<String, String> = claims
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let Some(IpeResult::Ok(reissued)) = auth_reissue_token::<String>(SECRET, &ctx, extra, 600)
+        else {
+            panic!("a live session re-issues");
+        };
+        assert!(
+            verify_claims(SECRET, &reissued).is_ok(),
+            "a re-issued token never carries a text `nbf`"
         );
     }
 
