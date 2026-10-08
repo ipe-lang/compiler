@@ -220,10 +220,104 @@ pub fn auth_sign_token<E: From<String>>(
     }
 }
 
-/// Ipê `verifyToken : String -> String -> Result Error a`. Verifies signature,
-/// `exp`, and (when present) the absolute lifetime `cap`. Returns the claims as a
-/// `HashMap<String, String>` (Ipê-side resolves polymorphic `a` to this shape at
-/// the FFI boundary).
+/// Why `verify_claims` refused a token.
+#[derive(Debug)]
+pub enum TokenRefusal {
+    /// The HS256 secret is shorter than the floor.
+    ShortSecret {
+        /// The secret's length in bytes.
+        len: usize,
+    },
+    /// The token is at or past its `exp`.
+    Expired,
+    /// The token is before its `nbf`.
+    NotYetValid,
+    /// The token is at or past its absolute lifetime `cap`.
+    PastCap,
+    /// The signature does not verify under the secret.
+    BadSignature(jsonwebtoken::errors::Error),
+    /// Any other refusal by the verifier: a malformed token, a missing or
+    /// non-numeric `exp`, a claim outside the validation window.
+    Malformed(jsonwebtoken::errors::Error),
+}
+
+impl std::fmt::Display for TokenRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShortSecret { len } => f.write_str(&crate::jwt::hs256_short_secret_msg(
+                "auth.verifyToken",
+                *len,
+            )),
+            Self::Expired => f.write_str("auth.verifyToken: token has expired"),
+            Self::NotYetValid => f.write_str("auth.verifyToken: token is not yet valid"),
+            Self::PastCap => {
+                f.write_str("auth.verifyToken: token has exceeded its absolute lifetime cap")
+            }
+            Self::BadSignature(e) | Self::Malformed(e) => write!(f, "jwt verify: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TokenRefusal {}
+
+/// The claims of a token whose signature, `exp`, `nbf` and `cap` verified, each
+/// value coerced to a string.
+///
+/// Only `verify_claims` builds one, so a value of this type is proof the claims
+/// came from a verified token.
+pub struct VerifiedClaims(HashMap<String, String>);
+
+impl VerifiedClaims {
+    /// The value of claim `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
+    }
+
+    /// Every claim as a `(name, value)` pair.
+    pub fn iter(&self) -> ClaimPairs<'_> {
+        self.0
+            .iter()
+            .map(claim_pair as fn((&String, &String)) -> (&str, &str))
+    }
+
+    /// The claims as the map the `Auth.verifyToken` kernel returns.
+    #[must_use]
+    pub fn into_map(self) -> HashMap<String, String> {
+        self.0
+    }
+}
+
+/// The `(name, value)` pairs of [`VerifiedClaims`].
+pub type ClaimPairs<'a> = std::iter::Map<
+    std::collections::hash_map::Iter<'a, String, String>,
+    fn((&'a String, &'a String)) -> (&'a str, &'a str),
+>;
+
+/// A claim entry as borrowed strings.
+fn claim_pair<'a>((name, value): (&'a String, &'a String)) -> (&'a str, &'a str) {
+    (name.as_str(), value.as_str())
+}
+
+impl<'a> IntoIterator for &'a VerifiedClaims {
+    type Item = (&'a str, &'a str);
+    type IntoIter = ClaimPairs<'a>;
+
+    fn into_iter(self) -> ClaimPairs<'a> {
+        self.iter()
+    }
+}
+
+// A claim value can name the caller or the session, so `Debug` shows the claim
+// names only.
+impl std::fmt::Debug for VerifiedClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+/// Verify an HS256 `token` under `secret`: signature, `exp`, `nbf`, and (when
+/// present) the absolute lifetime `cap`.
 ///
 /// # Absolute lifetime cap (`cap` claim)
 ///
@@ -232,34 +326,29 @@ pub fn auth_sign_token<E: From<String>>(
 /// A token without a `cap` claim is a legacy token (minted before this feature);
 /// it is accepted only against its `exp` and is never granted an unlimited
 /// lifetime — the `exp` bound is the sole gate in that case.
-pub fn auth_verify_token<E: From<String>>(
-    secret: String,
-    token: String,
-) -> IpeResult<E, HashMap<String, String>> {
+///
+/// # Errors
+///
+/// A [`TokenRefusal`] naming the check the token failed.
+pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims, TokenRefusal> {
     if secret.len() < crate::jwt::HS256_MIN_SECRET_BYTES {
-        return IpeResult::Err(
-            crate::jwt::hs256_short_secret_msg("auth.verifyToken", secret.len()).into(),
-        );
+        return Err(TokenRefusal::ShortSecret { len: secret.len() });
     }
     // Pre-reject on the full RFC 7519 NumericDate domain (negative, fractional,
     // integer) before jsonwebtoken's `exp - 1` u64 subtraction can underflow.
     // Mirrors jwt.rs's `jwt_decode_hs256` pre-reject; see that function's
     // comment for the detailed rationale.
-    if let Some(payload) = crate::jwt::decode_payload(&token) {
+    if let Some(payload) = crate::jwt::decode_payload(token) {
         let now = crate::jwt::now_unix_seconds();
         if let Some(exp) = crate::jwt::numeric_date(&payload, "exp")
             && now >= exp
         {
-            return IpeResult::Err("auth.verifyToken: token has expired".to_string().into());
+            return Err(TokenRefusal::Expired);
         }
         if let Some(nbf) = crate::jwt::numeric_date(&payload, "nbf")
             && now < nbf
         {
-            return IpeResult::Err(
-                "auth.verifyToken: token is not yet valid"
-                    .to_string()
-                    .into(),
-            );
+            return Err(TokenRefusal::NotYetValid);
         }
         // Absolute cap gate — checked on the unverified payload first for a fast
         // pre-reject path, then confirmed on the verified claims after signature
@@ -270,11 +359,7 @@ pub fn auth_verify_token<E: From<String>>(
         if let Some(cap) = crate::jwt::numeric_date(&payload, "cap")
             && now >= cap
         {
-            return IpeResult::Err(
-                "auth.verifyToken: token has exceeded its absolute lifetime cap"
-                    .to_string()
-                    .into(),
-            );
+            return Err(TokenRefusal::PastCap);
         }
     }
     let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
@@ -302,24 +387,23 @@ pub fn auth_verify_token<E: From<String>>(
     // sign-then-verify roundtrip of aud-bearing claims. Mirrors jwt.rs's
     // identical rationale.
     validation.validate_aud = false;
-    let parsed = match jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation) {
-        Ok(d) => d,
-        Err(e) => return IpeResult::Err(format!("jwt verify: {}", e).into()),
-    };
+    let parsed =
+        jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation).map_err(|e| {
+            if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::InvalidSignature) {
+                TokenRefusal::BadSignature(e)
+            } else {
+                TokenRefusal::Malformed(e)
+            }
+        })?;
     // Re-check the absolute cap on the signature-verified claims. The pre-reject
     // above already denies past-cap tokens before the signature decode, but this
     // second check on the verified payload closes any edge where the pre-reject
     // payload and the verified payload diverge (they cannot in practice — the
     // signature covers both — but defence-in-depth here costs nothing).
-    if let Some(cap) = crate::jwt::numeric_date(&parsed.claims, "cap") {
-        let now = crate::jwt::now_unix_seconds();
-        if now >= cap {
-            return IpeResult::Err(
-                "auth.verifyToken: token has exceeded its absolute lifetime cap"
-                    .to_string()
-                    .into(),
-            );
-        }
+    if let Some(cap) = crate::jwt::numeric_date(&parsed.claims, "cap")
+        && crate::jwt::now_unix_seconds() >= cap
+    {
+        return Err(TokenRefusal::PastCap);
     }
     let mut out = HashMap::new();
     if let serde_json::Value::Object(m) = parsed.claims {
@@ -334,7 +418,68 @@ pub fn auth_verify_token<E: From<String>>(
             out.insert(k, s);
         }
     }
-    IpeResult::Ok(out)
+    Ok(VerifiedClaims(out))
+}
+
+/// Ipê `verifyToken : String -> String -> Result Error a`. Verifies the token
+/// (`verify_claims`) and returns its claims as a `HashMap<String, String>`
+/// (Ipê-side resolves polymorphic `a` to this shape at the FFI boundary).
+///
+/// When the process revocation mode is `Store`
+/// ([`process_mode`](crate::revocation::process_mode)), the token must also
+/// pass the revocation gate: a revoked token, a token the store cannot judge,
+/// and a token with no `sub`, no `jti` or no lifetime bound are refused. Inside
+/// a `Server` request the admitted credential is bound to that request.
+pub fn auth_verify_token<E: From<String>>(
+    secret: String,
+    token: String,
+) -> IpeResult<E, HashMap<String, String>> {
+    let gate = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode());
+    match verify_token_under(gate, &secret, &token) {
+        Ok(claims) => IpeResult::Ok(claims),
+        Err(refusal) => IpeResult::Err(refusal.into()),
+    }
+}
+
+/// Where an armed `Auth.verifyToken` binds the credential it admits.
+enum BindTarget {
+    /// The binding set of the `Server` request being handled.
+    #[cfg(feature = "server")]
+    ServerRequest(std::sync::Arc<std::sync::Mutex<crate::revocation::SessionBindings>>),
+    /// No channel owner: a script, a CLI program or a background task.
+    Outside,
+}
+
+/// The channel owner the current task runs on behalf of.
+fn bind_target() -> BindTarget {
+    #[cfg(feature = "server")]
+    if let Some(bindings) = crate::server::request_bindings() {
+        return BindTarget::ServerRequest(bindings);
+    }
+    BindTarget::Outside
+}
+
+/// The `Auth.verifyToken` kernel under `gate`: verify, then (when armed) admit
+/// and bind.
+fn verify_token_under(
+    gate: Option<crate::revocation::ArmedGate>,
+    secret: &str,
+    token: &str,
+) -> Result<HashMap<String, String>, String> {
+    let claims = verify_claims(secret, token).map_err(|refusal| refusal.to_string())?;
+    if let Some(gate) = gate {
+        let refuse = |denial: crate::revocation::Denial| format!("auth.verifyToken: {denial}");
+        let credential = gate.admit(&claims, "sub").map_err(refuse)?;
+        match bind_target() {
+            #[cfg(feature = "server")]
+            BindTarget::ServerRequest(bindings) => {
+                crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
+            }
+            // Admitted; no channel exists to bind.
+            BindTarget::Outside => drop(credential),
+        }
+    }
+    Ok(claims.into_map())
 }
 
 // ─── Sliding re-issue ────────────────────────────────────────────────
@@ -369,9 +514,9 @@ crate::redact::redacting_debug!(ReissueContext {
     masked: [subject, jti],
 });
 
-/// Parse a `ReissueContext` from a signature-verified claims map (the output of
-/// `auth_verify_token`). Returns `None` when any required field is missing or
-/// malformed — the caller must deny in that case.
+/// Parse a `ReissueContext` from signature-verified claims. Returns `None` when
+/// any required field is missing or malformed — the caller must deny in that
+/// case.
 ///
 /// Tokens minted before `jti` was introduced carry no `jti` claim. For backward
 /// compatibility, a missing `jti` is treated as an empty string — such a token
@@ -380,14 +525,12 @@ crate::redact::redacting_debug!(ReissueContext {
 /// `auth_sign_token` path (the empty string is filtered out in that path).
 #[cfg(feature = "jwt")]
 #[must_use]
-pub fn reissue_context_from_claims(
-    claims: &std::collections::HashMap<String, String>,
-) -> Option<ReissueContext> {
+pub fn reissue_context_from_claims(claims: &VerifiedClaims) -> Option<ReissueContext> {
     let iat = claims.get("iat")?.parse::<i64>().ok()?;
     let cap = claims.get("cap")?.parse::<i64>().ok()?;
-    let subject = claims.get("sub").filter(|s| !s.is_empty())?.clone();
+    let subject = claims.get("sub").filter(|s| !s.is_empty())?.to_owned();
     // `jti` absent on legacy tokens — treat as empty (cannot be session-revoked by id).
-    let jti = claims.get("jti").cloned().unwrap_or_default();
+    let jti = claims.get("jti").unwrap_or_default().to_owned();
     Some(ReissueContext {
         iat,
         cap,
@@ -1304,11 +1447,7 @@ mod tests {
 
     /// Build a ReissueContext directly from a signed+verified token.
     fn reissue_ctx_from_token(token: &str) -> crate::auth::ReissueContext {
-        let claims: HashMap<String, String> =
-            match auth_verify_token::<String>(SECRET.to_string(), token.to_string()) {
-                IpeResult::Ok(c) => c,
-                IpeResult::Err(e) => panic!("verify: {e}"),
-            };
+        let claims = verify_claims(SECRET, token).expect("verify");
         crate::auth::reissue_context_from_claims(&claims)
             .expect("reissue context from verified claims")
     }
@@ -1356,11 +1495,7 @@ mod tests {
             "exp": now + 30,
             "cap": cap,
         }));
-        let claims: HashMap<String, String> =
-            match auth_verify_token::<String>(SECRET.to_string(), token) {
-                IpeResult::Ok(c) => c,
-                IpeResult::Err(e) => panic!("verify near-cap token: {e}"),
-            };
+        let claims = verify_claims(SECRET, &token).expect("verify near-cap token");
         let ctx =
             crate::auth::reissue_context_from_claims(&claims).expect("context from near-cap token");
         let new_token =
@@ -1457,36 +1592,504 @@ mod tests {
 
     #[test]
     fn reissue_context_from_verified_claims_requires_iat_cap_sub() {
-        // Missing `cap` → None.
-        let mut claims = HashMap::new();
-        claims.insert("sub".to_string(), "u".to_string());
-        claims.insert("iat".to_string(), "1000".to_string());
+        let now = now_unix();
+        let context_of = |claims: &serde_json::Value| {
+            let verified = verify_claims(SECRET, &raw_hs256(claims)).expect("verify");
+            crate::auth::reissue_context_from_claims(&verified)
+        };
+        let (iat, exp, cap) = (now - 60, now + 3600, now + 7200);
         assert!(
-            crate::auth::reissue_context_from_claims(&claims).is_none(),
+            context_of(&serde_json::json!({ "sub": "u", "iat": iat, "exp": exp })).is_none(),
             "missing cap must yield None"
         );
-        // Missing `iat` → None.
-        let mut claims2 = HashMap::new();
-        claims2.insert("sub".to_string(), "u".to_string());
-        claims2.insert("cap".to_string(), "9000".to_string());
         assert!(
-            crate::auth::reissue_context_from_claims(&claims2).is_none(),
+            context_of(&serde_json::json!({ "sub": "u", "cap": cap, "exp": exp })).is_none(),
             "missing iat must yield None"
         );
-        // Missing `sub` → None.
-        let mut claims3 = HashMap::new();
-        claims3.insert("iat".to_string(), "1000".to_string());
-        claims3.insert("cap".to_string(), "9000".to_string());
         assert!(
-            crate::auth::reissue_context_from_claims(&claims3).is_none(),
+            context_of(&serde_json::json!({ "iat": iat, "cap": cap, "exp": exp })).is_none(),
             "missing sub must yield None"
         );
-        // All present → Some.
-        let mut claims4 = HashMap::new();
-        claims4.insert("sub".to_string(), "user".to_string());
-        claims4.insert("iat".to_string(), "1000".to_string());
-        claims4.insert("cap".to_string(), "9000".to_string());
-        let ctx = crate::auth::reissue_context_from_claims(&claims4);
-        assert!(ctx.is_some(), "all fields present must yield Some");
+        assert!(
+            context_of(&serde_json::json!({ "sub": "user", "iat": iat, "cap": cap, "exp": exp }))
+                .is_some(),
+            "all fields present must yield Some"
+        );
+    }
+
+    // ── Armed revocation gate ─────────────────────────────────────────────────
+
+    /// The armed gate.
+    fn armed() -> Option<crate::revocation::ArmedGate> {
+        crate::revocation::ArmedGate::resolve(crate::app_config::RevocationMode::Store)
+    }
+
+    /// A token for `sub` with session id `jti`, live for an hour.
+    fn session_token(sub: &str, jti: &str) -> String {
+        let now = now_unix();
+        raw_hs256(&serde_json::json!({
+            "sub": sub,
+            "jti": jti,
+            "iat": now,
+            "exp": now + 3600,
+            "cap": now + 7200,
+        }))
+    }
+
+    #[test]
+    fn verify_token_armed_refuses_revoked_token() {
+        crate::revocation::revoke_subject("k1-revoked-subject".to_owned()).expect("revoke subject");
+        crate::revocation::revoke_session("k1-revoked-jti".to_owned(), now_unix() + 7200)
+            .expect("revoke session");
+        let by_subject = verify_token_under(
+            armed(),
+            SECRET,
+            &session_token("k1-revoked-subject", "k1-live-jti"),
+        )
+        .expect_err("a revoked subject is refused");
+        let by_session = verify_token_under(
+            armed(),
+            SECRET,
+            &session_token("k1-live-subject", "k1-revoked-jti"),
+        )
+        .expect_err("a revoked session is refused");
+        for message in [by_subject, by_session] {
+            assert_eq!(message, "auth.verifyToken: credential revoked");
+            assert!(!message.contains("k1-"), "{message}");
+        }
+    }
+
+    #[test]
+    fn verify_token_off_is_unchanged() {
+        crate::revocation::revoke_subject("k2-revoked-subject".to_owned()).expect("revoke subject");
+        let claims =
+            verify_token_under(None, SECRET, &session_token("k2-revoked-subject", "k2-jti"))
+                .expect("an unarmed gate never consults the store");
+        assert_eq!(
+            claims.get("sub").map(String::as_str),
+            Some("k2-revoked-subject")
+        );
+        let legacy = raw_hs256(&serde_json::json!({ "sub": "k2-legacy", "exp": now_unix() + 60 }));
+        assert!(
+            verify_token_under(None, SECRET, &legacy).is_ok(),
+            "an unarmed gate admits a token with no `jti`"
+        );
+    }
+
+    #[test]
+    fn verify_token_armed_in_script_process_admits_without_binding() {
+        #[cfg(feature = "server")]
+        assert!(
+            crate::server::request_bindings().is_none(),
+            "a script runs outside any request scope"
+        );
+        let claims = verify_token_under(armed(), SECRET, &session_token("k4-subject", "k4-jti"))
+            .expect("an armed gate admits a live token outside a request");
+        assert_eq!(claims.get("jti").map(String::as_str), Some("k4-jti"));
+    }
+
+    #[test]
+    fn verify_token_armed_refuses_jti_less_and_sub_less() {
+        let now = now_unix();
+        let refused = |claims: &serde_json::Value| {
+            verify_token_under(armed(), SECRET, &raw_hs256(claims))
+                .expect_err("an incomplete token is refused when armed")
+        };
+        let session_absent = "auth.verifyToken: token carries no session id (`jti`)";
+        let subject_absent = "auth.verifyToken: token carries no subject";
+        assert_eq!(
+            refused(&serde_json::json!({ "sub": "k8-subject", "exp": now + 60 })),
+            session_absent
+        );
+        assert_eq!(
+            refused(&serde_json::json!({ "sub": "k8-subject", "jti": "", "exp": now + 60 })),
+            session_absent
+        );
+        assert_eq!(
+            refused(&serde_json::json!({ "jti": "k8-jti", "exp": now + 60 })),
+            subject_absent
+        );
+        assert_eq!(
+            refused(&serde_json::json!({ "sub": "", "jti": "k8-jti", "exp": now + 60 })),
+            subject_absent
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn verify_token_in_server_handler_binds_request_set() {
+        let bindings = crate::server::in_request_scope(async {
+            let admitted =
+                verify_token_under(armed(), SECRET, &session_token("k7-subject", "k7-jti"));
+            assert!(admitted.is_ok(), "{admitted:?}");
+            crate::server::request_bindings()
+        })
+        .await
+        .expect("a request scope carries a binding set");
+        let held = bindings.lock().expect("bindings lock");
+        assert_eq!(held.len(), 1);
+        assert!(held.binds_session("k7-jti"));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn verify_token_armed_full_bindings_refuses() {
+        let bound = crate::revocation::MAX_SESSION_CREDENTIALS;
+        let (ninth, bindings) = crate::server::in_request_scope(async move {
+            for n in 0..bound {
+                verify_token_under(
+                    armed(),
+                    SECRET,
+                    &session_token("k5-subject", &format!("k5-jti-{n}")),
+                )
+                .expect("within the bound");
+            }
+            let ninth = verify_token_under(
+                armed(),
+                SECRET,
+                &session_token("k5-subject", "k5-jti-ninth"),
+            );
+            (ninth, crate::server::request_bindings())
+        })
+        .await;
+        assert_eq!(
+            ninth.expect_err("a full set refuses the next session"),
+            "auth.verifyToken: too many credentials bound to this channel"
+        );
+        let bindings = bindings.expect("a request scope carries a binding set");
+        let held = bindings.lock().expect("bindings lock");
+        assert_eq!(held.len(), bound);
+        assert!((0..bound).all(|n| held.binds_session(&format!("k5-jti-{n}"))));
+        assert!(!held.binds_session("k5-jti-ninth"));
+    }
+
+    // ── Construction scan ─────────────────────────────────────────────────────
+    //
+    // `VerifiedClaims` and `SessionCredential` keep private fields, so no other
+    // module can build one; the scan covers the two defining files.
+
+    /// The blank a masked source character becomes; newlines stay, so line
+    /// numbers survive.
+    const fn blank(c: char) -> char {
+        if c == '\n' { '\n' } else { ' ' }
+    }
+
+    /// Whether `chars[at]` continues an identifier.
+    fn is_ident(chars: &[char], at: usize) -> bool {
+        chars
+            .get(at)
+            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+    }
+
+    /// The end of a `//` comment starting at `at`.
+    fn line_comment_end(chars: &[char], at: usize) -> Option<usize> {
+        if !matches!(chars.get(at..at + 2), Some(['/', '/'])) {
+            return None;
+        }
+        let rest = chars.get(at..).unwrap_or_default();
+        Some(at + rest.iter().position(|c| *c == '\n').unwrap_or(rest.len()))
+    }
+
+    /// The end of a (nested) `/* */` comment starting at `at`.
+    fn block_comment_end(chars: &[char], at: usize) -> Option<usize> {
+        if !matches!(chars.get(at..at + 2), Some(['/', '*'])) {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut k = at;
+        while k < chars.len() {
+            match chars.get(k..k + 2) {
+                Some(['/', '*']) => {
+                    depth += 1;
+                    k += 2;
+                }
+                Some(['*', '/']) => {
+                    depth -= 1;
+                    k += 2;
+                    if depth == 0 {
+                        return Some(k);
+                    }
+                }
+                _ => k += 1,
+            }
+        }
+        Some(chars.len())
+    }
+
+    /// The end of a raw string (`r"…"`, `r#"…"#`, `br#"…"#`) starting at `at`.
+    fn raw_string_end(chars: &[char], at: usize) -> Option<usize> {
+        if at > 0 && is_ident(chars, at - 1) {
+            return None;
+        }
+        let open = match (chars.get(at), chars.get(at + 1)) {
+            (Some('r'), _) => at + 1,
+            (Some('b'), Some('r')) => at + 2,
+            _ => return None,
+        };
+        let hashes = chars
+            .get(open..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|c| **c == '#')
+            .count();
+        if chars.get(open + hashes) != Some(&'"') {
+            return None;
+        }
+        let mut k = open + hashes + 1;
+        while k < chars.len() {
+            if chars.get(k) == Some(&'"') && (1..=hashes).all(|h| chars.get(k + h) == Some(&'#')) {
+                return Some(k + 1 + hashes);
+            }
+            k += 1;
+        }
+        Some(chars.len())
+    }
+
+    /// The end of a `"…"` or `b"…"` string starting at `at`.
+    fn string_end(chars: &[char], at: usize) -> Option<usize> {
+        let open = match (chars.get(at), chars.get(at + 1)) {
+            (Some('"'), _) => at,
+            (Some('b'), Some('"')) if at == 0 || !is_ident(chars, at - 1) => at + 1,
+            _ => return None,
+        };
+        let mut k = open + 1;
+        while k < chars.len() {
+            match chars.get(k) {
+                Some('\\') => k += 2,
+                Some('"') => return Some(k + 1),
+                _ => k += 1,
+            }
+        }
+        Some(chars.len())
+    }
+
+    /// The end of a char literal starting at `at`; a lifetime is none.
+    fn char_literal_end(chars: &[char], at: usize) -> Option<usize> {
+        if chars.get(at) != Some(&'\'') {
+            return None;
+        }
+        match chars.get(at + 1) {
+            Some('\\') => {
+                let rest = chars.get(at + 3..)?;
+                Some(at + 4 + rest.iter().position(|c| *c == '\'')?)
+            }
+            Some(_) if chars.get(at + 2) == Some(&'\'') => Some(at + 3),
+            _ => None,
+        }
+    }
+
+    /// `source` with comments, strings and char literals blanked, so a scan sees
+    /// code only.
+    fn code_only(source: &str) -> Vec<char> {
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = Vec::with_capacity(chars.len());
+        let mut at = 0;
+        while let Some(&c) = chars.get(at) {
+            let masked = line_comment_end(&chars, at)
+                .or_else(|| block_comment_end(&chars, at))
+                .or_else(|| raw_string_end(&chars, at))
+                .or_else(|| string_end(&chars, at))
+                .or_else(|| char_literal_end(&chars, at));
+            if let Some(end) = masked {
+                let end = end.min(chars.len());
+                out.extend(
+                    chars
+                        .get(at..end)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|c| blank(*c)),
+                );
+                at = end;
+            } else {
+                out.push(c);
+                at += 1;
+            }
+        }
+        out
+    }
+
+    /// Whether the code before `at`, past whitespace, ends with `pattern`.
+    fn preceded_by(code: &[char], at: usize, pattern: &str) -> bool {
+        let before: Vec<char> = code
+            .get(..at)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .skip_while(|c| c.is_whitespace())
+            .take(pattern.chars().count())
+            .copied()
+            .collect();
+        before.into_iter().rev().eq(pattern.chars())
+    }
+
+    /// The first non-whitespace character at or after `at`.
+    fn next_significant(code: &[char], at: usize) -> Option<char> {
+        code.get(at..)?.iter().copied().find(|c| !c.is_whitespace())
+    }
+
+    /// A brace scope: the `fn` it belongs to and the type an enclosing `impl`
+    /// names.
+    #[derive(Clone, Default)]
+    struct Scope {
+        func: Option<String>,
+        impl_target: Option<String>,
+    }
+
+    /// An `impl` header being read up to its `{`.
+    #[derive(Default)]
+    struct ImplHeader {
+        angle_depth: usize,
+        target: Option<String>,
+        in_where: bool,
+    }
+
+    /// The 1-based lines of `source` that construct `ty` (`ty(`, `ty {`, or
+    /// `Self(`/`Self {` inside an `impl` of `ty`) outside the functions
+    /// `allowed` names.
+    fn constructions(source: &str, ty: &str, allowed: &[&str]) -> Vec<usize> {
+        let code = code_only(source);
+        let mut scopes: Vec<Scope> = Vec::new();
+        let mut pending_fn: Option<String> = None;
+        let mut expect_fn_name = false;
+        let mut header: Option<ImplHeader> = None;
+        let mut found = Vec::new();
+        let mut line = 1;
+        let mut at = 0;
+        while let Some(&c) = code.get(at) {
+            if c.is_alphabetic() || c == '_' {
+                let start = at;
+                while is_ident(&code, at) {
+                    at += 1;
+                }
+                let word: String = code.get(start..at).unwrap_or_default().iter().collect();
+                if expect_fn_name {
+                    expect_fn_name = false;
+                    pending_fn = Some(word);
+                    continue;
+                }
+                if let Some(h) = header.as_mut() {
+                    if word == "where" {
+                        h.in_where = true;
+                    } else if h.angle_depth == 0 && !h.in_where && word != "for" && word != "dyn" {
+                        h.target = Some(word);
+                    }
+                    continue;
+                }
+                match word.as_str() {
+                    "fn" => {
+                        expect_fn_name = next_significant(&code, at)
+                            .is_some_and(|n| n.is_alphabetic() || n == '_');
+                    }
+                    "impl" if pending_fn.is_none() => header = Some(ImplHeader::default()),
+                    _ => {}
+                }
+                let scope = scopes.last().cloned().unwrap_or_default();
+                let names_ty =
+                    word == ty || (word == "Self" && scope.impl_target.as_deref() == Some(ty));
+                let builds = matches!(next_significant(&code, at), Some('(' | '{'));
+                let declares = ["struct", "enum", "type", "->", "redacting_debug!("]
+                    .iter()
+                    .any(|p| preceded_by(&code, start, p));
+                let sanctioned = scope.func.as_deref().is_some_and(|f| allowed.contains(&f));
+                if names_ty && builds && !declares && !sanctioned {
+                    found.push(line);
+                }
+                continue;
+            }
+            match c {
+                '\n' => line += 1,
+                ';' => pending_fn = None,
+                '<' => {
+                    if let Some(h) = header.as_mut() {
+                        h.angle_depth += 1;
+                    }
+                }
+                '>' if !preceded_by(&code, at, "-") => {
+                    if let Some(h) = header.as_mut() {
+                        h.angle_depth = h.angle_depth.saturating_sub(1);
+                    }
+                }
+                '{' => {
+                    let parent = scopes.last().cloned().unwrap_or_default();
+                    let scope = match header.take() {
+                        Some(h) => Scope {
+                            func: parent.func,
+                            impl_target: h.target,
+                        },
+                        None => Scope {
+                            func: pending_fn.take().or(parent.func),
+                            impl_target: parent.impl_target,
+                        },
+                    };
+                    scopes.push(scope);
+                }
+                '}' => {
+                    scopes.pop();
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        found
+    }
+
+    /// Source exercising every masking and scoping rule of the scan.
+    const SYNTHETIC: &str = r##"
+struct VerifiedClaims(Map);
+impl VerifiedClaims {
+    fn get(&self) -> &str { "VerifiedClaims(x)" }
+    fn forge() -> Self { Self(Map::new()) }
+}
+// VerifiedClaims(in a comment)
+/* VerifiedClaims { nested /* VerifiedClaims( */ } */
+fn verify_claims() -> VerifiedClaims {
+    let brace = '{';
+    let raw = r#"VerifiedClaims("#;
+    VerifiedClaims(Map::new())
+}
+fn rogue<'a>(x: &'a str) {
+    let _ = VerifiedClaims { 0: x };
+}
+"##;
+
+    #[test]
+    fn construction_scan_masks_literals_and_tracks_scopes() {
+        assert_eq!(
+            constructions(SYNTHETIC, "VerifiedClaims", &["verify_claims"]),
+            vec![5, 15]
+        );
+        assert_eq!(
+            constructions(SYNTHETIC, "VerifiedClaims", &[]),
+            vec![5, 12, 15]
+        );
+    }
+
+    #[test]
+    fn verified_claims_only_from_verify_claims() {
+        let auth = include_str!("auth.rs");
+        let revocation = include_str!("revocation.rs");
+        let none: Vec<usize> = Vec::new();
+        assert_eq!(
+            constructions(auth, "VerifiedClaims", &["verify_claims"]),
+            none,
+            "`VerifiedClaims` is built only inside `verify_claims`"
+        );
+        assert_eq!(constructions(revocation, "VerifiedClaims", &[]), none);
+        assert_eq!(
+            constructions(revocation, "SessionCredential", &["admit_in", "try_from"]),
+            none,
+            "`SessionCredential` is built only by the gate and its wire decode"
+        );
+        assert_eq!(constructions(auth, "SessionCredential", &[]), none);
+        assert_eq!(
+            constructions(auth, "VerifiedClaims", &[]).len(),
+            1,
+            "the scan sees the sanctioned construction"
+        );
+        assert_eq!(
+            constructions(revocation, "SessionCredential", &[]).len(),
+            2,
+            "the scan sees both sanctioned constructions"
+        );
     }
 }
