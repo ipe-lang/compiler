@@ -7862,10 +7862,8 @@ mod tests {
                         OnMessage::Verify => {
                             // Verified at call time, as an emitted callback's
                             // pure code is.
-                            let _ = crate::auth::auth_verify_token::<String>(
-                                SECRET.to_string(),
-                                text.clone(),
-                            );
+                            let _ =
+                                crate::auth::auth_verify_token(SECRET.to_string(), text.clone());
                         }
                         OnMessage::Hold(release) => {
                             let _ = seen.send(text);
@@ -8152,7 +8150,7 @@ mod tests {
             let cap = crate::jwt::now_unix_seconds() + 7200;
             let token = hs256(&session_claims("ws-public-subject", "ws-public-jti", cap));
             let (credentials, gate) = in_request_scope(async move {
-                let verified = crate::auth::auth_verify_token::<String>(SECRET.to_string(), token);
+                let verified = crate::auth::auth_verify_token(SECRET.to_string(), token);
                 assert!(
                     matches!(verified, IpeResult::Ok(_)),
                     "the armed kernel admits the token"
@@ -8202,7 +8200,7 @@ mod tests {
             let route =
                 server_get::<String, _>("/public".to_string(), move |_req: ServerRequest| {
                     let verified = matches!(
-                        crate::auth::auth_verify_token::<String>(SECRET.to_string(), token.clone()),
+                        crate::auth::auth_verify_token(SECRET.to_string(), token.clone()),
                         IpeResult::Ok(_)
                     );
                     let bound = request_bindings()
@@ -8268,7 +8266,7 @@ mod tests {
             let bound = in_request_scope(async move {
                 let verify: IpeTask<String, bool> = Box::pin(async move {
                     ok_res::<String, _>(matches!(
-                        crate::auth::auth_verify_token::<String>(SECRET.to_string(), token),
+                        crate::auth::auth_verify_token(SECRET.to_string(), token),
                         IpeResult::Ok(_)
                     ))
                 });
@@ -8394,10 +8392,8 @@ mod tests {
                         move |writer| {
                             // Verified at call time, as an emitted handler's pure
                             // code is.
-                            let _ = crate::auth::auth_verify_token::<String>(
-                                SECRET.to_string(),
-                                token.clone(),
-                            );
+                            let _ =
+                                crate::auth::auth_verify_token(SECRET.to_string(), token.clone());
                             let release = Arc::clone(&release);
                             Box::pin(async move {
                                 let _ = crate::server_stream::server_stream_emit::<String>(
@@ -8515,7 +8511,7 @@ mod tests {
             let cap = crate::jwt::now_unix_seconds() + 7200;
             let token = hs256(&session_claims("ws-upgrade-subject", "ws-upgrade-jti", cap));
             let status = in_request_scope(async move {
-                let verified = crate::auth::auth_verify_token::<String>(SECRET.to_string(), token);
+                let verified = crate::auth::auth_verify_token(SECRET.to_string(), token);
                 assert!(matches!(verified, IpeResult::Ok(_)), "the token verifies");
                 crate::revocation::revoke_session("ws-upgrade-jti".to_string(), cap)
                     .expect("revoke");
