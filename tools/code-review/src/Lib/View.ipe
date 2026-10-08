@@ -13,10 +13,10 @@ import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
-import Lib.Db as LibDb exposing (ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Token(..))
-import Lib.Index as Index exposing (Change(..), LogStatus(..), SourceRow(..), SourceView(..))
+import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
@@ -282,18 +282,15 @@ hintLine records =
         )
 
 
--- A server with no key records no decision, so its queue page carries no
--- decision control and no decision shortcut; `update` refuses on its own.
+-- Only a proven log under the server's key records a decision, so a queue
+-- page over a broken log, a log another key signed, or a server with no key
+-- carries no decision control and no decision shortcut; the save path
+-- refuses on its own.
 recordsDecisions : Model -> Bool
 recordsDecisions model =
     case model.queueState of
         Loaded page ->
-            case page.log of
-                Signed _ ->
-                    True
-
-                Unsigned ->
-                    False
+            noDecisionReason page.log == Nothing
 
         Loading ->
             False
@@ -302,11 +299,29 @@ recordsDecisions model =
             False
 
 
--- The chain-break banner of a loaded queue or history page; no banner while
--- the chain is intact or the server holds no key.
-chainBannerLine : LogStatus -> Ui.Element Msg
-chainBannerLine status =
-    case Queue.chainBanner status of
+-- Why a queue page over this log records no decision; Nothing for a proven
+-- log, the only one that records.
+noDecisionReason : LogShown -> Maybe String
+noDecisionReason shown =
+    case shown of
+        ShownProven ->
+            Nothing
+
+        ShownBroken _ ->
+            Just "The review log is not intact, so no decision is recorded until it is restored."
+
+        ShownKeyMismatch ->
+            Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ", so no decision is recorded.")
+
+        ShownUnkeyed ->
+            Just ("Read-only: " ++ ReviewKey.keyVar ++ " is not set, so no decision is recorded.")
+
+
+-- The log banner of a loaded queue or history page; no banner while the
+-- log is proven or the server holds no key.
+chainBannerLine : LogShown -> Ui.Element Msg
+chainBannerLine shown =
+    case Queue.chainBanner shown of
         Just text ->
             Ui.el [ Font.size 13, Font.bold, Font.color (Ui.rgb 230 120 120) ] (Ui.text text)
 
@@ -767,11 +782,20 @@ decisionButtons model loaded =
             Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text why)
 
         Nothing ->
-            if recordsDecisions model then
-                verifiedDecisionButtons model loaded.unit
+            case model.queueState of
+                Loaded page ->
+                    case noDecisionReason page.log of
+                        Nothing ->
+                            verifiedDecisionButtons model loaded.unit
 
-            else
-                Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text ("Read-only: " ++ ReviewKey.keyVar ++ " is not set, so no decision is recorded."))
+                        Just why ->
+                            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text why)
+
+                Loading ->
+                    Ui.none
+
+                Failed _ ->
+                    Ui.none
 
 
 verifiedDecisionButtons : Model -> Index.Unit -> Ui.Element Msg

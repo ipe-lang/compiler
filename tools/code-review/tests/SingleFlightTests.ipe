@@ -9,6 +9,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Lib.App as App exposing (Model, Msg(..), Page(..))
+import Lib.Db as LibDb
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Index as Index exposing (Change(..))
 import Lib.Queue as Queue exposing (DecisionSlot(..), QueueState(..), SelectedView(..), UnitPageState(..))
@@ -108,7 +109,7 @@ queuePageOf units =
     , dbBytes = 2048
     , next = Nothing
     , progress = { reviewed = 0, total = List.length units }
-    , log = Index.Signed Index.Intact
+    , log = LibDb.ShownProven
     }
 
 

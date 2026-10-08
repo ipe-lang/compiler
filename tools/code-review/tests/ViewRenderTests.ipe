@@ -15,9 +15,9 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
 import Lib.App exposing (Model, Page(..), initialModel)
-import Lib.Db as LibDb exposing (HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
-import Lib.Index as Index exposing (ChainVerdict(..), Change(..), LogStatus(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
@@ -73,7 +73,7 @@ queuePage units total progress =
     , dbBytes = 2048
     , next = Nothing
     , progress = progress
-    , log = Signed Intact
+    , log = ShownProven
     }
 
 
@@ -122,7 +122,7 @@ historyModel : List Queue.HistoryRow -> Model
 historyModel rows =
     { baseModel
         | page = HistoryPage
-        , history = HistoryLoaded { rows = rows, at = HistoryStart, next = Nothing, log = Signed Intact }
+        , history = HistoryLoaded { rows = rows, at = HistoryStart, next = Nothing, log = ShownProven }
     }
 
 
@@ -132,7 +132,7 @@ historyRowOf row =
 
 
 -- The queue card of `loaded` on a server whose review log reads `log`.
-cardModelUnder : LogStatus -> Index.UnitView -> Model
+cardModelUnder : LogShown -> Index.UnitView -> Model
 cardModelUnder log loaded =
     let
         shown =
@@ -146,7 +146,7 @@ cardModelUnder log loaded =
 
 -- The History page of one entry that does not count, for `why`, on a log
 -- that reads `log`.
-unverifiedHistory : LogStatus -> Unverified -> Model
+unverifiedHistory : LogShown -> Unverified -> Model
 unverifiedHistory log why =
     { baseModel
         | page = HistoryPage
@@ -649,16 +649,28 @@ seededChecks a b =
             historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Just (SafeText.renderForeign hostileText) } ]
 
         readOnlyCard =
-            page (cardModelUnder Unsigned a)
+            page (cardModelUnder ShownUnkeyed a)
 
         brokenCard =
-            page (cardModelUnder (Signed (BrokenAt 2)) a)
+            page (cardModelUnder (ShownBroken (BreaksAt 2)) a)
 
         banner =
             "The review log&#39;s chain breaks at entry 2"
 
+        pastHeadCard =
+            page (cardModelUnder (ShownBroken (PastHead 2)) a)
+
+        keyMismatchCard =
+            page (cardModelUnder ShownKeyMismatch a)
+
+        beforeFirstCard =
+            page (cardModelUnder (ShownBroken (BeforeFirst 1)) a)
+
+        noControl html =
+            not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
+
         everyPage =
-            [ shownCard, shownPage, opened, page hostileHistory, readOnlyCard, brokenCard, page (unverifiedHistory (Signed (BrokenAt 2)) ChainBroken) ]
+            [ shownCard, shownPage, opened, page hostileHistory, readOnlyCard, brokenCard, pastHeadCard, keyMismatchCard, beforeFirstCard, page (unverifiedHistory (ShownBroken (BreaksAt 2)) ChainBroken) ]
     in
     [ ( "a verified source shows Approve, Refuse and its source text", button "Approve" shownCard && button "Refuse" shownCard && has sourceMarker shownCard )
     , ( "a withheld source shows its reason, no decision button and no source text, for every stale reason and an unreadable file", List.all (withheldRefuses a) withheldCases )
@@ -680,8 +692,27 @@ seededChecks a b =
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
     , ( "a read-only server shows no decision control and says why, beside a signing server that shows them", not (button "Approve" readOnlyCard) && not (button "Refuse" readOnlyCard) && has "Read-only: IPE_REVIEW_MAC_KEY is not set, so no decision is recorded." readOnlyCard && button "Approve" shownCard && not (has "Read-only:" shownCard) )
-    , ( "a broken chain shows its banner, naming the entry, on the queue and the History, and an intact one shows none", has banner brokenCard && has banner (page (unverifiedHistory (Signed (BrokenAt 2)) ChainBroken)) && not (has "chain breaks" shownCard) && not (has "chain breaks" (page hostileHistory)) )
-    , ( "each reason an entry does not count shows its own text", List.all (\( why, text ) -> has text (page (unverifiedHistory (Signed Intact) why))) unverifiedTexts )
+    , ( "a broken chain shows its banner, naming the entry, on the queue and the History, and an intact one shows none", has banner brokenCard && has banner (page (unverifiedHistory (ShownBroken (BreaksAt 2)) ChainBroken)) && not (has "chain breaks" shownCard) && not (has "chain breaks" (page hostileHistory)) )
+    , ( "a log with entries past its head and a log signed by another key each show their own banner"
+    , has "The review log holds 2 entries past its head: a decision was added outside this tool." pastHeadCard
+        && not (has "chain breaks" pastHeadCard)
+        && has "The review log was signed by a different IPE_REVIEW_MAC_KEY: no decision in it counts." keyMismatchCard
+        && not (has "chain breaks" keyMismatchCard)
+        && has "The review log holds 1 entry before its first: a decision was added outside this tool." beforeFirstCard
+        && not (has "past its head" beforeFirstCard)
+    )
+    , ( "a log not proven under the server's key shows no decision control or shortcut and says why, beside a proven one that shows them"
+    , List.all noControl [ brokenCard, pastHeadCard, beforeFirstCard, keyMismatchCard ]
+        && has "The review log is not intact, so no decision is recorded until it is restored." brokenCard
+        && has "The review log is not intact, so no decision is recorded until it is restored." pastHeadCard
+        && has "The review log is not intact, so no decision is recorded until it is restored." beforeFirstCard
+        && has "The review log was signed by a different IPE_REVIEW_MAC_KEY, so no decision is recorded." keyMismatchCard
+        && not (has "Read-only:" brokenCard)
+        && not (has "Read-only:" keyMismatchCard)
+        && button "Approve" shownCard
+        && has "a approve" shownCard
+    )
+    , ( "each reason an entry does not count shows its own text", List.all (\( why, text ) -> has text (page (unverifiedHistory ShownProven why))) unverifiedTexts )
     , ( "the review key never appears on any page", List.all (\html -> not (has testKeyHex html) && not (has (String.toUpper testKeyHex) html)) everyPage )
     ]
 
@@ -778,7 +809,7 @@ storedChecks =
         insertReviewWith db "u-a" "h-long" "refuse" (Just overlongReason)
         insertReviewWith db "u-b" "h-ok" "refuse" (Just "needs a test")
         insertReviewWith db "u-c" "h-yes" "approve" Nothing
-        verify <- countingVerifier
+        verify <- countingVerifier db
         long <- LibDb.findDecision verify db (uid "u-a") "h-long" |> Task.andThen requireRow
         ok <- LibDb.findDecision verify db (uid "u-b") "h-ok" |> Task.andThen requireRow
         yes <- LibDb.findDecision verify db (uid "u-c") "h-yes" |> Task.andThen requireRow
