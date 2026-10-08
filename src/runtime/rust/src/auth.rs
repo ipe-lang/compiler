@@ -278,7 +278,7 @@ impl VerifiedClaims {
     pub fn iter(&self) -> ClaimPairs<'_> {
         self.0
             .iter()
-            .map(claim_pair as fn((&String, &String)) -> (&str, &str))
+            .map(claim_pair as for<'x> fn((&'x String, &'x String)) -> (&'x str, &'x str))
     }
 
     /// The claims as the map the `Auth.verifyToken` kernel returns.
