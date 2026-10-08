@@ -44,14 +44,28 @@ pub enum HostMode {
 ///
 /// `Off` is the zero-overhead default: the gate is never called, preserving
 /// today's token-only validation path for apps that do not need revocation.
-/// `Store` arms the fail-closed `is_revoked` check on every authenticated request.
+/// `Store` arms the fail-closed `is_revoked` check on every authenticated
+/// `Server` route. Only the `Server` request path enforces it: a `Web` app
+/// that asks for `Store` refuses startup.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RevocationMode {
     /// No revocation check — today's token-only validation path. Zero overhead.
     Off,
     /// Arm the runtime revocation store check. Denies on `Revoked`, `Unknown`,
-    /// and any store error (fail-closed). Enabled via `withRevocation Store`.
+    /// and any store error (fail-closed). Enabled via `Server.withRevocation`
+    /// or `IPE_AUTH_REVOCATION=store`.
     Store,
+}
+
+impl RevocationMode {
+    /// The stricter of two modes: `Store` wins over `Off`.
+    #[cfg(all(feature = "jwt", feature = "server"))]
+    pub(crate) const fn stricter(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Off, Self::Off) => Self::Off,
+            (Self::Store, _) | (_, Self::Store) => Self::Store,
+        }
+    }
 }
 
 /// The runtime-config carrier `ipe_runtime::app_config::Setting` — the single
@@ -85,11 +99,11 @@ pub enum Setting {
     /// extending `exp` to `min(now + window, cap)`. Default: 30 m (1 800 s).
     /// It must be below the max lifetime, else startup refuses.
     WebAuthSlideWindow(i64),
-    /// `Web.withRevocation RevocationMode` — controls whether the per-request
-    /// revocation gate is consulted. `Off` (default) skips the gate entirely;
-    /// `Store` arms the fail-closed `is_revoked` check on every authenticated
-    /// request. Setting `Off` after `Store` is a no-op (stricter-only monotonic:
-    /// once armed the gate cannot be disarmed via a setting, only via env).
+    /// `Web.withRevocation RevocationMode` — the requested revocation mode.
+    /// `Off` (default) skips the gate; `Store` asks for the per-request
+    /// `is_revoked` check, which the `Web` request path does not enforce, so a
+    /// `Web` app installing `Store` refuses startup. Setting `Off` after `Store`
+    /// is a no-op (stricter-only: a later setting cannot disarm an earlier one).
     WebAuthRevocationMode(RevocationMode),
     /// `Console.adminToken` / `Console.ingestToken` / `Console.metricsToken` —
     /// a console/telemetry auth token, sealed as a [`Secret`](crate::secret::Secret).
@@ -285,12 +299,12 @@ pub fn ipe_setting_web_auth_slide_window(seconds: i64) -> Setting {
     Setting::WebAuthSlideWindow(seconds)
 }
 
-/// `Web.withRevocation : RevocationMode -> Setting Web`. Arms (or keeps armed)
-/// the per-request revocation gate. The tag is closed: `0` is `Off`, `1` is
-/// `Store`. Out-of-range tags fall closed to `Store` (arms the gate; the safe
-/// branch when the intent is unclear). This is stricter-only: once the gate is
-/// `Store`, a subsequent `Off` setting in the same list is a no-op at resolution
-/// time (`install_web` applies them in order but the resolver takes the max).
+/// `Web.withRevocation : RevocationMode -> Setting Web`. Requests the
+/// per-request revocation gate. The tag is closed: `0` is `Off`, `1` is
+/// `Store`. Out-of-range tags fall closed to `Store`. This is stricter-only:
+/// once the request is `Store`, a subsequent `Off` setting in the same list is
+/// a no-op (`install_web` keeps the maximum). The `Web` request path has no
+/// revocation gate, so an installed `Store` refuses `Web` startup.
 #[must_use]
 pub fn ipe_setting_web_auth_revocation_mode(mode_tag: i64) -> Setting {
     let mode = match mode_tag {
@@ -346,6 +360,7 @@ struct ResolvedConfig {
     auth_max_lifetime_secs: Option<i64>,
     #[cfg(all(feature = "jwt", feature = "server"))]
     auth_slide_window_secs: Option<i64>,
+    #[cfg(all(feature = "web-core", feature = "server"))]
     auth_revocation_mode: Option<RevocationMode>,
     #[cfg(feature = "db")]
     db_url: Option<crate::secret::Secret>,
@@ -396,12 +411,16 @@ pub fn install_web(settings: Vec<Setting>) {
             Setting::WebAuthSlideWindow(_) => {}
             // Stricter-only: `Store` arms the gate; `Off` only applies when no
             // prior `Store` setting was seen (take the maximum/strictest value).
+            #[cfg(all(feature = "web-core", feature = "server"))]
             Setting::WebAuthRevocationMode(mode) => {
                 cfg.auth_revocation_mode = Some(match cfg.auth_revocation_mode {
                     Some(RevocationMode::Store) => RevocationMode::Store, // already armed
                     _ => mode,
                 });
             }
+            // No reader in this build.
+            #[cfg(not(all(feature = "web-core", feature = "server")))]
+            Setting::WebAuthRevocationMode(_) => {}
             #[cfg(feature = "db")]
             Setting::DbUrl(url) => cfg.db_url = Some(url),
             // No reader in this build.
@@ -735,33 +754,122 @@ fn slide_window_from(
     seconds_from(below_lifetime, raw, "Web.authSlideWindow", setting)
 }
 
-/// The resolved revocation mode, applying the one precedence:
-/// `IPE_AUTH_REVOCATION` (env) > `withRevocation` (setting-in-code) > `Off`
-/// fallback. The env var value `"store"` (case-insensitive) arms the gate; any
-/// other non-empty value is ignored and the setting applies. An empty env var
-/// is treated as absent. `Off` is the zero-overhead default.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unread until the revocation setting is wired or removed"
-    )
-)]
-pub(crate) fn resolve_auth_revocation_mode() -> RevocationMode {
-    if let Ok(raw) = crate::system::read_env_var("IPE_AUTH_REVOCATION") {
-        let trimmed = raw.trim();
-        if trimmed.eq_ignore_ascii_case("store") || trimmed == "1" {
-            return RevocationMode::Store;
+/// The variable that arms the per-request revocation gate.
+#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+const REVOCATION_VAR: &str = "IPE_AUTH_REVOCATION";
+
+/// What an `IPE_AUTH_REVOCATION` value must be.
+#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+const REVOCATION_EXPECTED: &str = "`store`, `1`, `off` or `0`";
+
+/// The mode `IPE_AUTH_REVOCATION` names, if the operator set one.
+///
+/// `store` / `1` (case-insensitive, trimmed) is [`RevocationMode::Store`];
+/// `off` / `0` is [`RevocationMode::Off`]; an absent or empty value is `None`.
+///
+/// # Errors
+///
+/// A refusal naming `IPE_AUTH_REVOCATION` for any other value, so a typo never
+/// leaves the process serving under a mode the operator did not choose.
+#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+pub(crate) fn revocation_env() -> Result<Option<RevocationMode>, crate::system::EnvValueRefusal> {
+    revocation_from(crate::system::read_env_var(REVOCATION_VAR))
+}
+
+/// Pure `IPE_AUTH_REVOCATION` parse over the raw lookup.
+#[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+fn revocation_from(
+    raw: Result<String, std::env::VarError>,
+) -> Result<Option<RevocationMode>, crate::system::EnvValueRefusal> {
+    let refuse = |shown: &[u8]| {
+        crate::system::EnvValueRefusal::new(REVOCATION_VAR, REVOCATION_EXPECTED, shown)
+    };
+    match raw {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else if trimmed.eq_ignore_ascii_case("store") || trimmed == "1" {
+                Ok(Some(RevocationMode::Store))
+            } else if trimmed.eq_ignore_ascii_case("off") || trimmed == "0" {
+                Ok(Some(RevocationMode::Off))
+            } else {
+                Err(refuse(value.as_bytes()))
+            }
         }
-        if trimmed.eq_ignore_ascii_case("off") || trimmed == "0" {
-            return RevocationMode::Off;
-        }
-        // Unrecognised non-empty env value: fall through to in-code setting.
+        Err(std::env::VarError::NotUnicode(os)) => Err(refuse(os.as_encoded_bytes())),
+        Err(std::env::VarError::NotPresent) => Ok(None),
     }
-    INSTALLED
-        .get()
-        .and_then(|c| c.auth_revocation_mode)
-        .unwrap_or(RevocationMode::Off)
+}
+
+/// The least strict mode an authed `Server` route runs under, from the env.
+///
+/// The env only ever arms the gate: `store` gives [`RevocationMode::Store`];
+/// `off` and an absent value give [`RevocationMode::Off`], which never lowers a
+/// mode written in code. A value [`revocation_env`] refuses arms the gate too,
+/// so a refused value is never re-read as the permissive one; `Server.listen`
+/// reports the refusal itself.
+#[cfg(all(feature = "jwt", feature = "server"))]
+pub(crate) fn env_revocation_floor() -> RevocationMode {
+    match revocation_env() {
+        Ok(Some(RevocationMode::Store)) | Err(_) => RevocationMode::Store,
+        Ok(Some(RevocationMode::Off) | None) => RevocationMode::Off,
+    }
+}
+
+/// Why a `Web` app cannot start under the auth configuration it was given.
+#[cfg(all(feature = "web-core", feature = "server"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthStartupRefusal {
+    /// `IPE_AUTH_REVOCATION` is present but not a mode.
+    Revocation(crate::system::EnvValueRefusal),
+    /// A revocation gate was asked for, and the `Web` request path has none.
+    RevocationUnenforced,
+}
+
+#[cfg(all(feature = "web-core", feature = "server"))]
+impl std::fmt::Display for AuthStartupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Revocation(refusal) => write!(f, "{refusal}"),
+            Self::RevocationUnenforced => write!(
+                f,
+                "a session revocation gate is requested (`Web.withRevocation` or \
+                 IPE_AUTH_REVOCATION=store) but the Web request path does not enforce one, so \
+                 revoked sessions would still be accepted; guard the routes with \
+                 `Server.withRevocation`, or remove the setting"
+            ),
+        }
+    }
+}
+
+/// Refuses a `Web` app that asks for a revocation gate it cannot enforce.
+///
+/// # Errors
+///
+/// [`AuthStartupRefusal::Revocation`] for a malformed `IPE_AUTH_REVOCATION`;
+/// [`AuthStartupRefusal::RevocationUnenforced`] when the installed
+/// `Web.withRevocation` or the env is `Store`.
+#[cfg(all(feature = "web-core", feature = "server"))]
+pub(crate) fn refuse_unenforced_web_revocation() -> Result<(), AuthStartupRefusal> {
+    web_revocation_gate(
+        INSTALLED.get().and_then(|c| c.auth_revocation_mode),
+        revocation_env().map_err(AuthStartupRefusal::Revocation)?,
+    )
+}
+
+/// Pure `Web` revocation decision over the installed mode and the env mode.
+#[cfg(all(feature = "web-core", feature = "server"))]
+fn web_revocation_gate(
+    installed: Option<RevocationMode>,
+    env: Option<RevocationMode>,
+) -> Result<(), AuthStartupRefusal> {
+    match (installed, env) {
+        (Some(RevocationMode::Store), _) | (_, Some(RevocationMode::Store)) => {
+            Err(AuthStartupRefusal::RevocationUnenforced)
+        }
+        (Some(RevocationMode::Off) | None, Some(RevocationMode::Off) | None) => Ok(()),
+    }
 }
 
 /// The per-map entry ceiling for the runtime revocation store. Applies the one
@@ -1331,16 +1439,130 @@ mod tests {
         assert_eq!(resolve_revocation_capacity(), Ok(REVOCATION_STORE_CAPACITY));
     }
 
+    #[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
     #[test]
-    fn the_revocation_env_value_arms_or_disarms_the_gate() {
+    fn revocation_env_unknown_value_refuses() {
         let name = "IPE_AUTH_REVOCATION";
-        crate::system::locked_set_var(name, "store");
-        let armed = resolve_auth_revocation_mode();
-        crate::system::locked_set_var(name, "off");
-        let disarmed = resolve_auth_revocation_mode();
-        crate::system::locked_remove_var(name);
-        assert_eq!(armed, RevocationMode::Store);
-        assert_eq!(disarmed, RevocationMode::Off);
+        for refused in ["stroe", "on", "true", "2", "store now", "storé"] {
+            crate::system::locked_set_var(name, refused);
+            let outcome = revocation_env();
+            crate::system::locked_remove_var(name);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == name),
+                "{refused:?} must be refused naming {name}, got {outcome:?}"
+            );
+        }
+        assert_eq!(revocation_env(), Ok(None), "an absent value names no mode");
+    }
+
+    #[cfg(all(feature = "server", any(feature = "jwt", feature = "web-core")))]
+    #[test]
+    fn revocation_env_parses_the_closed_value_set() {
+        let value = |raw: &str| revocation_from(Ok(raw.to_owned()));
+        for armed in ["store", "STORE", " Store ", "1"] {
+            assert_eq!(value(armed), Ok(Some(RevocationMode::Store)), "{armed:?}");
+        }
+        for off in ["off", "OFF", " off\t", "0"] {
+            assert_eq!(value(off), Ok(Some(RevocationMode::Off)), "{off:?}");
+        }
+        for unset in ["", "   "] {
+            assert_eq!(value(unset), Ok(None), "{unset:?} is absent");
+        }
+        assert_eq!(
+            revocation_from(Err(std::env::VarError::NotPresent)),
+            Ok(None)
+        );
+        for refused in ["stroe", "on", "store1", "-1"] {
+            assert!(value(refused).is_err(), "{refused:?} must be refused");
+        }
+    }
+
+    #[cfg(all(unix, feature = "server", any(feature = "jwt", feature = "web-core")))]
+    #[test]
+    fn revocation_env_non_unicode_value_refuses() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = std::ffi::OsString::from_vec(vec![0x73, 0xFF, 0x74]);
+        let outcome = revocation_from(Err(std::env::VarError::NotUnicode(raw)));
+        assert!(
+            outcome.is_err_and(|r| r.name() == "IPE_AUTH_REVOCATION"),
+            "a value that is not UTF-8 is refused, never read as absent"
+        );
+    }
+
+    #[cfg(all(feature = "jwt", feature = "server"))]
+    #[test]
+    fn the_env_only_ever_arms_the_server_gate() {
+        let name = "IPE_AUTH_REVOCATION";
+        let floor = |value: &str| {
+            crate::system::locked_set_var(name, value);
+            let mode = env_revocation_floor();
+            crate::system::locked_remove_var(name);
+            mode
+        };
+        assert_eq!(floor("store"), RevocationMode::Store);
+        assert_eq!(floor("off"), RevocationMode::Off);
+        assert_eq!(
+            floor("stroe"),
+            RevocationMode::Store,
+            "a refused value arms the gate, never disarms it"
+        );
+        assert_eq!(env_revocation_floor(), RevocationMode::Off);
+        for (code, env, effective) in [
+            (
+                RevocationMode::Store,
+                RevocationMode::Off,
+                RevocationMode::Store,
+            ),
+            (
+                RevocationMode::Off,
+                RevocationMode::Store,
+                RevocationMode::Store,
+            ),
+            (
+                RevocationMode::Store,
+                RevocationMode::Store,
+                RevocationMode::Store,
+            ),
+            (
+                RevocationMode::Off,
+                RevocationMode::Off,
+                RevocationMode::Off,
+            ),
+        ] {
+            assert_eq!(code.stricter(env), effective, "{code:?} vs {env:?}");
+        }
+    }
+
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[test]
+    fn the_web_revocation_gate_refuses_every_armed_request() {
+        use RevocationMode::{Off, Store};
+        let unenforced = Err(AuthStartupRefusal::RevocationUnenforced);
+        for (installed, env) in [
+            (Some(Store), None),
+            (Some(Store), Some(Off)),
+            (Some(Store), Some(Store)),
+            (None, Some(Store)),
+            (Some(Off), Some(Store)),
+        ] {
+            assert_eq!(
+                web_revocation_gate(installed, env),
+                unenforced,
+                "{installed:?} / {env:?} asks for a gate Web cannot enforce"
+            );
+        }
+        for (installed, env) in [
+            (None, None),
+            (Some(Off), None),
+            (None, Some(Off)),
+            (Some(Off), Some(Off)),
+        ] {
+            assert_eq!(
+                web_revocation_gate(installed, env),
+                Ok(()),
+                "{installed:?} / {env:?} asks for no gate"
+            );
+        }
     }
 
     // ── RevocationMode setting constructor ──────────────────────────────────

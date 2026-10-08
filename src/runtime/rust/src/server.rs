@@ -402,7 +402,7 @@ pub fn server_auth_config(secret: crate::secret::Secret, source: TokenSource) ->
 /// Arms (or keeps armed) the per-request revocation gate on this config.
 /// The mode is supplied as a raw tag: `0` = `Off`, `1` = `Store`; out-of-range
 /// falls closed to `Store`. Stricter-only: once `Store`, a subsequent `Off` is
-/// a no-op.
+/// a no-op, and `IPE_AUTH_REVOCATION=off` cannot lower it either.
 #[must_use]
 pub fn server_with_revocation(mode_tag: i64, mut cfg: AuthConfig) -> AuthConfig {
     use crate::app_config::RevocationMode;
@@ -547,7 +547,9 @@ fn reissue_set_cookie_with(
 /// Revocation gate (when `RevocationMode::Store`): the store is queried AFTER
 /// signature + expiry verification and BEFORE the `Principal` is minted. Deny
 /// on `Verdict::Revoked`, on `Verdict::Unknown`, and on any store error
-/// (fail-closed). Only `Verdict::Active` allows the request through.
+/// (fail-closed). Only `Verdict::Active` allows the request through. The mode
+/// is the stricter of the config's and `IPE_AUTH_REVOCATION`'s, read once when
+/// the route is built: the env arms the gate and never disarms it.
 ///
 /// Sliding re-issue: for cookie-based token sources, when the verified token is
 /// past its re-issue threshold (`exp - slide_window/2`) and the absolute cap has
@@ -563,6 +565,12 @@ where
         + 'static,
 {
     let handler = Arc::new(handler);
+    let cfg = AuthConfig {
+        revocation_mode: cfg
+            .revocation_mode
+            .stricter(crate::app_config::env_revocation_floor()),
+        ..cfg
+    };
     let guarded = move |req: ServerRequest| -> IpeTask<E, ServerResponse> {
         // Snapshot the request-scoped TLS signal BEFORE `req` is moved into
         // the async block — same technique as `middleware_with_csrf`. The bool
@@ -2122,6 +2130,16 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                 ))));
             }
         };
+        // A revocation mode the env names but the runtime cannot parse refuses
+        // the listener; the routes already treat it as armed.
+        #[cfg(feature = "jwt")]
+        {
+            if let Err(refusal) = crate::app_config::revocation_env() {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                    "Server.listen: {refusal}"
+                ))));
+            }
+        }
         // The framing policy every response carries is parsed before bind, so
         // a value with no header representation refuses the listener.
         if let Err(refusal) = crate::telemetry::frame_ancestors_config() {
@@ -3651,6 +3669,108 @@ pub fn rate_limit_allow(name: String, key: String, capacity: i64, refill_per_sec
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "jwt")]
+mod revocation_env_tests {
+    use super::*;
+
+    const SECRET: &str = "a-test-secret-of-32-bytes-padding";
+    const ENV: &str = "IPE_AUTH_REVOCATION";
+
+    fn bearer_cfg() -> AuthConfig {
+        server_auth_config(
+            crate::secret::secret_from_string(SECRET.to_string()),
+            TokenSource::BearerHeader,
+        )
+    }
+
+    fn token_for(jti: &str) -> String {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let key = jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes());
+        let claims = serde_json::json!({
+            "sub": "env-revocation-user",
+            "jti": jti,
+            "exp": 9_999_999_999i64,
+        });
+        jsonwebtoken::encode(&header, &claims, &key).unwrap_or_default()
+    }
+
+    /// The status the authed route answers for a bearer token carrying `jti`,
+    /// with the route built while `IPE_AUTH_REVOCATION` is `env`.
+    async fn status_with_env(cfg: AuthConfig, env: &str, jti: &str) -> i64 {
+        crate::system::locked_set_var(ENV, env);
+        let route = server_get_authed::<String, _>("/me".to_string(), cfg, |_req, principal| {
+            let subject = crate::principal::principal_subject(principal);
+            Box::pin(std::future::ready(ok_res(server_text(subject))))
+        });
+        crate::system::locked_remove_var(ENV);
+        let RouteTarget::Handler(handler) = route.target else {
+            return 500;
+        };
+        let req = ServerRequest {
+            method: "GET".to_string(),
+            path: "/me".to_string(),
+            body: String::new(),
+            headers: [(
+                "authorization".to_string(),
+                format!("Bearer {}", token_for(jti)),
+            )]
+            .into_iter()
+            .collect(),
+            params: HashMap::new(),
+            query: HashMap::new(),
+            cookies: HashMap::new(),
+            remoteAddr: String::new(),
+        };
+        handler(req).await.map_or(500, |resp| resp.status)
+    }
+
+    #[tokio::test]
+    async fn revocation_env_off_cannot_disarm_server_store() {
+        let jti = "env-off-cannot-disarm-jti-001";
+        assert!(crate::revocation::revoke_session(jti.to_string(), i64::MAX / 2).is_ok());
+        let armed = server_with_revocation(1, bearer_cfg());
+        assert_eq!(
+            status_with_env(armed, "off", jti).await,
+            401,
+            "the env must not switch off a gate written in code"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_env_store_arms_server_gate() {
+        let revoked = "env-store-arms-revoked-jti-001";
+        let active = "env-store-arms-active-jti-001";
+        assert!(crate::revocation::revoke_session(revoked.to_string(), i64::MAX / 2).is_ok());
+        assert_eq!(
+            status_with_env(bearer_cfg(), "off", revoked).await,
+            200,
+            "without the env the unarmed route does not consult the store"
+        );
+        assert_eq!(
+            status_with_env(bearer_cfg(), "store", revoked).await,
+            401,
+            "the env arms the gate on a route built without one"
+        );
+        assert_eq!(
+            status_with_env(bearer_cfg(), "store", active).await,
+            200,
+            "an armed gate lets an active session through"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_env_unknown_value_arms_server_gate() {
+        let jti = "env-unknown-arms-jti-001";
+        assert!(crate::revocation::revoke_session(jti.to_string(), i64::MAX / 2).is_ok());
+        assert_eq!(
+            status_with_env(bearer_cfg(), "stroe", jti).await,
+            401,
+            "a value the runtime cannot parse is never read as the permissive one"
+        );
     }
 }
 

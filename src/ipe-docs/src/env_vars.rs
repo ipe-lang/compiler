@@ -931,10 +931,14 @@ pub static ENV_VARS: &[EnvVar] = &[
     EnvVar {
         name: "IPE_AUTH_REVOCATION",
         default: "unset (Off)",
-        purpose: "Session-token revocation mode. Set to `store` or `1` to enable the \
-                  in-process revocation store, which checks each request against a list \
-                  of revoked token IDs. `off` or `0` disables; default is Off \
-                  (zero overhead).",
+        purpose: "Arms the per-request session revocation check on authenticated \
+                  `Server` routes. `store` or `1` checks each request against the \
+                  in-process list of revoked token IDs and denies on any store error; \
+                  `off` or `0` or unset leaves the mode `Server.withRevocation` chose. It \
+                  only ever arms the check, never disarms an in-code `Store`. Any other \
+                  value refuses startup. A `Web` app has no revocation check, so \
+                  `store` (or `Web.withRevocation` `Store`) refuses its startup; guard \
+                  its routes with `Server.withRevocation` instead.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

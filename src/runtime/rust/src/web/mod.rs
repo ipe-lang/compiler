@@ -3146,6 +3146,8 @@ pub(crate) enum StartupRefusal {
     FrameAncestors(crate::telemetry::FrameAncestorsRefusal),
     /// `IPE_HTTP_BIND` is present but not an IP address.
     Bind(crate::system::EnvValueRefusal),
+    /// The auth configuration asks for a session gate the app cannot enforce.
+    Auth(crate::app_config::AuthStartupRefusal),
 }
 
 #[cfg(feature = "server")]
@@ -3163,6 +3165,7 @@ impl std::fmt::Display for StartupRefusal {
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
             Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
             Self::Bind(refusal) => write!(f, "{refusal}"),
+            Self::Auth(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -5693,6 +5696,9 @@ where
     let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
     #[cfg(feature = "jwt")]
     crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
+    // The `Web` request path has no revocation gate: a requested one refuses
+    // the router rather than serving revoked sessions as live.
+    crate::app_config::refuse_unenforced_web_revocation().map_err(StartupRefusal::Auth)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
     if let Err(refusal) = client_tuning() {
@@ -10464,6 +10470,99 @@ mod emitted_router_behavior_tests {
             matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base == "/app/x%41"),
             "a non-mount base must refuse the router, got {refused:?}"
         );
+    }
+
+    /// The router built with the current environment and installed config.
+    fn router_refusal() -> Option<StartupRefusal> {
+        build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+            false,
+        )
+        .err()
+    }
+
+    /// The `Web` request path has no revocation gate, so a request for one
+    /// refuses the router instead of serving revoked sessions as live.
+    #[tokio::test]
+    async fn web_revocation_store_refuses_startup() {
+        for armed in ["store", "STORE", "1"] {
+            crate::system::locked_set_var("IPE_AUTH_REVOCATION", armed);
+            let refused = router_refusal();
+            crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+            assert!(
+                matches!(
+                    &refused,
+                    Some(StartupRefusal::Auth(
+                        crate::app_config::AuthStartupRefusal::RevocationUnenforced
+                    ))
+                ),
+                "IPE_AUTH_REVOCATION={armed:?} must refuse the router, got {refused:?}"
+            );
+        }
+        crate::system::locked_set_var("IPE_AUTH_REVOCATION", "stroe");
+        let malformed = router_refusal();
+        crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+        assert!(
+            matches!(
+                &malformed,
+                Some(StartupRefusal::Auth(
+                    crate::app_config::AuthStartupRefusal::Revocation(r)
+                )) if r.name() == "IPE_AUTH_REVOCATION"
+            ),
+            "an unparseable mode must refuse the router naming its variable, got {malformed:?}"
+        );
+    }
+
+    /// `Web.withRevocation` `Store` installed in code refuses the router too.
+    #[tokio::test]
+    async fn web_revocation_installed_store_refuses_startup() {
+        crate::app_config::install_web(vec![
+            crate::app_config::ipe_setting_web_auth_revocation_mode(1),
+        ]);
+        let refused = router_refusal();
+        assert!(
+            matches!(
+                &refused,
+                Some(StartupRefusal::Auth(
+                    crate::app_config::AuthStartupRefusal::RevocationUnenforced
+                ))
+            ),
+            "an installed Store mode must refuse the router, got {refused:?}"
+        );
+        crate::system::locked_set_var("IPE_AUTH_REVOCATION", "off");
+        let env_off = router_refusal();
+        crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+        assert!(
+            matches!(
+                &env_off,
+                Some(StartupRefusal::Auth(
+                    crate::app_config::AuthStartupRefusal::RevocationUnenforced
+                ))
+            ),
+            "the env cannot disarm an installed Store mode, got {env_off:?}"
+        );
+    }
+
+    /// An `Off` or absent mode asks for no gate, so the router starts.
+    #[tokio::test]
+    async fn web_revocation_off_starts() {
+        assert!(router_refusal().is_none(), "no mode must start the router");
+        for off in ["off", "0", ""] {
+            crate::system::locked_set_var("IPE_AUTH_REVOCATION", off);
+            let refused = router_refusal();
+            crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+            assert!(
+                refused.is_none(),
+                "IPE_AUTH_REVOCATION={off:?} asks for no gate, got {refused:?}"
+            );
+        }
     }
 
     /// A present `IPE_HTTP_BIND` that is not an IP address refuses the app
