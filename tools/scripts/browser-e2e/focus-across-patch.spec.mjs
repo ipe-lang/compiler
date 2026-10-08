@@ -107,7 +107,9 @@ test("focus-across-patch: another control at the focused position never takes fo
 
 test("focus-across-patch: typing survives patch", async ({ page }) => {
   await open(page);
-  const field = page.locator("#panel input");
+  // A compound selector: matching a descendant combinator walks `parentElement`
+  // from every input, including those in the shadowing form below.
+  const field = page.locator("input#note");
   await field.click();
   await page.keyboard.type("hello");
   // Let the debounced input event settle before the patch under test.
