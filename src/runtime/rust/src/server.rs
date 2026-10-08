@@ -1419,6 +1419,7 @@ fn parse_query(q: Option<&str>) -> Result<HashMap<String, String>, crate::encodi
 
 /// A request URI parsed once by the strict core: its path split and decoded
 /// segment by segment, its query decoded under the form grammar.
+#[cfg(feature = "web")]
 pub(crate) struct StrictUrl {
     /// The decoded request path; every route matcher reads this, never the raw
     /// path text.
@@ -1443,19 +1444,30 @@ pub(crate) struct StrictUrl {
 /// This is the one gate every HTTP entry point (Ipe.Server handlers, every
 /// Ipe.Web route, the static file mounts) passes before any handler or file
 /// service sees the URI.
+#[cfg(feature = "web")]
 pub(crate) fn strict_url(uri: &axum::http::Uri) -> Result<StrictUrl, RequestRejection> {
-    let path = crate::encoding::DecodedPath::parse(uri.path())
-        .map_err(|_| RequestRejection::BadRequest)?;
-    let query = parse_query(uri.query()).map_err(|_| RequestRejection::BadRequest)?;
+    let path = strict_path(uri)?;
+    let query = strict_query(uri)?;
     Ok(StrictUrl { path, query })
 }
 
-/// [`strict_url`], keeping only the decoded query, for an entry point that
-/// never matches on the path.
+/// The strict path parse shared by every entry point.
+fn strict_path(uri: &axum::http::Uri) -> Result<crate::encoding::DecodedPath, RequestRejection> {
+    crate::encoding::DecodedPath::parse(uri.path()).map_err(|_| RequestRejection::BadRequest)
+}
+
+/// The strict query parse shared by every entry point.
+fn strict_query(uri: &axum::http::Uri) -> Result<HashMap<String, String>, RequestRejection> {
+    parse_query(uri.query()).map_err(|_| RequestRejection::BadRequest)
+}
+
+/// The decoded query of a URI whose path is also proven strict, for an entry
+/// point that never matches on the path.
 pub(crate) fn strict_url_query(
     uri: &axum::http::Uri,
 ) -> Result<HashMap<String, String>, RequestRejection> {
-    strict_url(uri).map(|url| url.query)
+    strict_path(uri)?;
+    strict_query(uri)
 }
 
 /// Middleware answering the fixed 400 `Bad Request` for a malformed request

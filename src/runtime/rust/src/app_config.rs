@@ -1001,6 +1001,8 @@ mod tests {
     /// subsystem's startup snapshot, so env presence has one source.
     #[test]
     fn the_log_level_setting_tier_reads_no_env() {
+        #[allow(clippy::needless_update)]
+        // `log_level` is the only field when no config feature is on
         let cfg = ResolvedConfig {
             log_level: Some(2),
             ..ResolvedConfig::default()
