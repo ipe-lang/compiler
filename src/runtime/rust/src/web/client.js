@@ -19,7 +19,14 @@ function __ipeDocProp(doc, name) {
 // hand the client the app's sibling, `<form name="body">` the app's form.
 var __ipeDoc = (function(doc) {
   function prop(name) { return function() { return __ipeDocProp(doc, name); }; }
-  function method(proto, name) { return proto[name].bind(doc); }
+  // A method the browser lacks refuses every call: boot never stops on it.
+  function method(proto, name) {
+    var fn = proto[name];
+    if (typeof fn !== "function") {
+      return function() { throw new TypeError("Ipe client: document member unavailable"); };
+    }
+    return fn.bind(doc);
+  }
   return {
     script: prop("currentScript"),
     body: prop("body"),
@@ -42,31 +49,50 @@ var __ipeDoc = (function(doc) {
 // through the form's own lookup throws before the submit is intercepted and
 // the browser submits the form natively, its fields in the URL.
 var __ipeNode = (function() {
-  var getAttribute = Element.prototype.getAttribute;
-  var setAttribute = Element.prototype.setAttribute;
-  var removeAttribute = Element.prototype.removeAttribute;
-  var remove = Element.prototype.remove;
-  var contains = Node.prototype.contains;
-  var removeChild = Node.prototype.removeChild;
-  var appendChild = Node.prototype.appendChild;
-  var replaceChild = Node.prototype.replaceChild;
-  var queryAll = Element.prototype.querySelectorAll;
-  var on = EventTarget.prototype.addEventListener;
-  var controls = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "elements");
-  function getter(proto, name) { return Object.getOwnPropertyDescriptor(proto, name).get; }
+  // A member the browser lacks is a function that refuses every call: boot
+  // never stops on it, and a read that needs it throws rather than answer
+  // through the node's own lookup.
+  function missing() { throw new TypeError("Ipe client: DOM member unavailable"); }
+  function own(fn) { return typeof fn === "function" ? fn : missing; }
+  function getter(proto, name) {
+    var d = Object.getOwnPropertyDescriptor(proto, name);
+    return own(d && d.get);
+  }
+  function setter(proto, name) {
+    var d = Object.getOwnPropertyDescriptor(proto, name);
+    return own(d && d.set);
+  }
+  var getAttribute = own(Element.prototype.getAttribute);
+  var setAttribute = own(Element.prototype.setAttribute);
+  var removeAttribute = own(Element.prototype.removeAttribute);
+  var remove = own(Element.prototype.remove);
+  var contains = own(Node.prototype.contains);
+  var removeChild = own(Node.prototype.removeChild);
+  var appendChild = own(Node.prototype.appendChild);
+  var replaceChild = own(Node.prototype.replaceChild);
+  var queryAll = own(Element.prototype.querySelectorAll);
+  var on = own(EventTarget.prototype.addEventListener);
+  var controls = getter(HTMLFormElement.prototype, "elements");
   var parentElement = getter(Node.prototype, "parentElement");
   var parentNode = getter(Node.prototype, "parentNode");
   var firstChild = getter(Node.prototype, "firstChild");
-  var textContent = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set;
+  var textContent = setter(Node.prototype, "textContent");
   var firstElementChild = getter(Element.prototype, "firstElementChild");
   var nextElementSibling = getter(Element.prototype, "nextElementSibling");
   var previousElementSibling = getter(Element.prototype, "previousElementSibling");
   var tagName = getter(Element.prototype, "tagName");
   var namespaceURI = getter(Element.prototype, "namespaceURI");
-  var queryOne = Element.prototype.querySelector;
-  var closest = Element.prototype.closest;
-  var focusHtml = HTMLElement.prototype.focus;
-  var focusSvg = SVGElement.prototype.focus;
+  var queryOne = own(Element.prototype.querySelector);
+  var closest = own(Element.prototype.closest);
+  // `focus()` per element interface: HTML, SVG and MathML elements are every
+  // element that has one. An interface the browser lacks is left out.
+  var focusers = [
+    typeof HTMLElement === "function" ? HTMLElement : null,
+    typeof SVGElement === "function" ? SVGElement : null,
+    typeof MathMLElement === "function" ? MathMLElement : null
+  ].filter(function(c) { return c !== null; }).map(function(c) {
+    return {of: c, run: own(c.prototype.focus)};
+  });
   return {
     attr: function(el, name) { return getAttribute.call(el, name); },
     setAttr: function(el, name, v) { setAttribute.call(el, name, v); },
@@ -76,8 +102,7 @@ var __ipeNode = (function() {
     on: function(el, type, fn) { on.call(el, type, fn); },
     // A form's controls; null for any other node.
     controls: function(el) {
-      return el instanceof HTMLFormElement && controls && controls.get
-          ? controls.get.call(el) : null;
+      return el instanceof HTMLFormElement ? controls.call(el) : null;
     },
     parent: function(el) { return parentElement.call(el); },
     parentNode: function(el) { return parentNode.call(el); },
@@ -125,8 +150,11 @@ var __ipeNode = (function() {
     firstAutofocus: function(root) { return queryOne.call(root, "[autofocus]"); },
     // Whether `el` took focus: a node that cannot be focused stays unfocused.
     focus: function(el) {
-      var run = el instanceof HTMLElement ? focusHtml : el instanceof SVGElement ? focusSvg : null;
-      if (!run) return false;
+      var run = null;
+      for (var i = 0; i < focusers.length && run === null; i++) {
+        if (el instanceof focusers[i].of) run = focusers[i].run;
+      }
+      if (run === null) return false;
       try { run.call(el, {preventScroll: true}); } catch (_) { return false; }
       return __ipeDoc.active() === el;
     }
@@ -488,6 +516,17 @@ function __ipePlaceholderUncontrolled(placeholder) {
   return true;
 }
 
+// `s` as a quoted CSS string, every character escaped as the CSS syntax
+// requires: an attribute value from the page or the server (a newline, a
+// backslash, a quote) never ends the string or makes the selector throw.
+var __ipeCssEscape =
+    typeof CSS === "object" && CSS !== null && typeof CSS.escape === "function"
+        ? CSS.escape
+        : function() { throw new TypeError("Ipe client: CSS.escape unavailable"); };
+function __ipeCssString(s) {
+  return '"' + __ipeCssEscape(s) + '"';
+}
+
 // __ipeFindPlaceholder — locate a live input's slot in the new tree.
 // Prefer ipe-id (structurally stable + uniquely keyed). Fall back to
 // tag+name only when the live element has no ipe-id AND the new tree
@@ -496,13 +535,13 @@ function __ipePlaceholderUncontrolled(placeholder) {
 function __ipeFindPlaceholder(tmp, live) {
   var sid = live.getAttribute && live.getAttribute("ipe-id");
   if (sid) {
-    var bySid = tmp.querySelector('[ipe-id="' + sid.replace(/"/g, '\\"') + '"]');
+    var bySid = tmp.querySelector("[ipe-id=" + __ipeCssString(sid) + "]");
     if (bySid) return bySid;
   }
   var name = live.getAttribute && live.getAttribute("name");
   if (!name) return null;
   var tag = live.tagName.toLowerCase();
-  var matches = tmp.querySelectorAll(tag + '[name="' + name.replace(/"/g, '\\"') + '"]');
+  var matches = tmp.querySelectorAll(tag + "[name=" + __ipeCssString(name) + "]");
   if (matches.length === 1) return matches[0];
   return null;
 }
@@ -598,11 +637,12 @@ function __ipeSwapPreservingFocus(container, tmp) {
 
   // Snapshot focused-state BEFORE any DOM mutation. Selection read
   // throws on some input types, so catch.
-  var selStart = null, selEnd = null, scrollTop = 0;
+  var selStart = null, selEnd = null, selDir = "none", scrollTop = 0;
   if (focusedInside) {
     try {
       selStart = focused.selectionStart;
       selEnd   = focused.selectionEnd;
+      selDir   = focused.selectionDirection || "none";
     } catch (_) {}
     scrollTop = focused.scrollTop;
   }
@@ -656,7 +696,7 @@ function __ipeSwapPreservingFocus(container, tmp) {
     }
     if (typeof preservedFocus.setSelectionRange === "function" &&
         selStart !== null && selEnd !== null) {
-      try { preservedFocus.setSelectionRange(selStart, selEnd); } catch (_) {}
+      try { preservedFocus.setSelectionRange(selStart, selEnd, selDir); } catch (_) {}
     }
     if (scrollTop) preservedFocus.scrollTop = scrollTop;
   } else if (focusPath) {
@@ -706,13 +746,27 @@ function __ipeRestoreFocus(container, path, ids) {
   }
 }
 
-// The first mount of the page: the element the browser would have focused at
-// parse time (the first `[autofocus]` below `root`), when nothing holds focus.
-// The client mounts by patch, after the browser's own autofocus pass.
+// The first mount of the page focuses the element the browser would have
+// focused at load (the first `[autofocus]` below `root`) only while the load's
+// own autofocus is still due: nothing has held focus since the client started,
+// the user has not pressed a key or a pointer, and the URL names no fragment
+// target (the browser skips autofocus for one too). Any later frame only puts
+// lost focus back (`__ipeRestoreFocus`): an element is never autofocused after
+// the user has acted or focus has been somewhere.
 var __ipeMounted = false;
+var __ipeAutofocusSpent = (function() {
+  var now = __ipeDoc.active();
+  return !!now && now !== __ipeDoc.body();
+})();
+["focusin", "pointerdown", "mousedown", "touchstart", "keydown"].forEach(function(type) {
+  __ipeDoc.on(type, function() { __ipeAutofocusSpent = true; }, true);
+});
+function __ipeAutofocusDue() {
+  return !__ipeMounted && !__ipeAutofocusSpent && !__ipeDoc.query(":target");
+}
 function __ipeFocusAutofocus(root) {
   var now = __ipeDoc.active();
-  if (now && now !== __ipeDoc.body()) return;
+  if (__ipeAutofocusSpent || (now && now !== __ipeDoc.body())) return;
   var el = __ipeNode.firstAutofocus(root);
   if (el) __ipeNode.focus(el);
 }
@@ -758,10 +812,11 @@ function __ipePatch(t, mode) {
   // live root, where script revival would run a second client.
   var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);
   var scrollX = window.scrollX, scrollY = window.scrollY;
-  var firstMount = !__ipeMounted;
+  // Read before the swap: a fragment target the swap replaces stops matching.
+  var autofocus = __ipeAutofocusDue();
   __ipeMounted = true;
   __ipeSwapPreservingFocus(root, parsed);
-  if (firstMount) __ipeFocusAutofocus(root);
+  if (autofocus) __ipeFocusAutofocus(root);
   // behavior:"instant" keeps this housekeeping scroll a synchronous jump
   // even under a global `scroll-behavior: smooth`, which would otherwise
   // animate every restore and fight the caret on per-keystroke re-renders.
@@ -1345,7 +1400,7 @@ function __ipeApplyPatches(patches) {
   var openSel = __ipeSelectOpen() ? __ipeDoc.active() : null;
   for (var i = 0; i < patches.length; i++) {
     var p = patches[i];
-    var el = __ipeDoc.query('[ipe-id="' + p.id.replace(/"/g, '\\"') + '"]');
+    var el = __ipeDoc.query("[ipe-id=" + __ipeCssString(String(p.id)) + "]");
     if (!el) continue;
     if (openSel && (el === openSel || __ipeNode.contains(el, openSel) ||
         __ipeNode.contains(openSel, el))) {
@@ -1379,11 +1434,12 @@ function __ipeApplyPatches(patches) {
       var elTag = __ipeNode.tag(el);
       var isInputLike = elTag === "INPUT" || elTag === "TEXTAREA";
       var hadFocus = isInputLike && el === __ipeDoc.active();
-      var savedSelStart = null, savedSelEnd = null, savedScrollTop = 0;
+      var savedSelStart = null, savedSelEnd = null, savedSelDir = "none", savedScrollTop = 0;
       if (hadFocus) {
         try {
           savedSelStart = el.selectionStart;
           savedSelEnd = el.selectionEnd;
+          savedSelDir = el.selectionDirection || "none";
         } catch (_) {}
         savedScrollTop = el.scrollTop;
       }
@@ -1422,7 +1478,7 @@ function __ipeApplyPatches(patches) {
         var newLen = (el.value || "").length;
         var s = Math.min(savedSelStart, newLen);
         var e = Math.min(savedSelEnd === null ? s : savedSelEnd, newLen);
-        try { el.setSelectionRange(s, e); } catch (_) {}
+        try { el.setSelectionRange(s, e, savedSelDir); } catch (_) {}
         if (savedScrollTop) el.scrollTop = savedScrollTop;
       }
     }
