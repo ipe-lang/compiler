@@ -188,13 +188,20 @@ Each change closes a class, not one site.
     - a container (`Node`, `TaggedNode`, row/column/paragraph and the other
       container variants) → true iff some child `has_content`;
     - a non-text leaf that renders something visible or announced (image,
-      input control, and the other leaf variants) → true.
+      input control, and the other leaf variants) → true;
+    - a tagged element that presents its own box with no children
+      (`textarea`, `select`, `iframe`, `object`, `canvas`, `video`, `audio`,
+      `progress`, `meter`) → true;
+    - a node carrying an `AttrNearby` overlay → true.
 
     The walk is bounded by the existing `MAX_HTML_DEPTH`. Past the ceiling it
     returns true: the heading is kept and the render's own depth refusal
     applies.
-  - Entering `DescSection` checks whether its first child is a
-    `DescSectionHeading` node with some child that `has_content`.
+  - One classifier, `section_head(&Description, &[Element<M>]) -> SectionHead
+    { NoHeading, Empty, Present }` in `ui/element.rs`, is computed once per
+    node and shared by the HTML renderer and the TUI. Entering `DescSection`
+    checks whether its first child is a `DescSectionHeading` node that
+    `has_content`.
     - If so, the section sets `section = Some(prev.map_or(H1, deeper))` and
       renders the heading.
     - If not, the section keeps `section = prev` and skips that heading child
@@ -218,8 +225,50 @@ Each change closes a class, not one site.
     heading renders as `span`.
   - `render_paragraph_child` folds into this one rule, so there is no second
     copy.
-  - `Element::TaggedNode` (Ui.Unsafe only) renders as written. Its content
-    model is the caller's contract and is documented in `Ui/Unsafe.ipe`.
+  - A demoted node keeps its landmark as `role`: the `describe` landmark
+    first, else the one its own `Description` names. A heading keeps
+    `role="heading"`/`aria-level` as before.
+  - `Element::TaggedNode` renders its written tag. Slice 1b classifies that
+    tag (see "Ancestor exclusions") so the content model and the exclusions
+    apply to it too; a tag outside the classification table (a custom
+    element) renders as written, which `Ui/Unsafe.ipe` documents.
+- **Ancestor exclusions.** A flow/phrasing model cannot express the HTML
+  rules that forbid an element below a given ancestor whatever the content
+  model: `form` in `form`, interactive content in `button`, and `a` or other
+  interactive content in `a`. The parser drops the inner `<form>` start tag
+  and closes an open `button` or `a` early, so the browser tree differs from
+  the server tree and its diff ids. Once `form` is `node descForm`
+  (slice 2), `Ui.form [] [ Ui.form [] [] ]` reaches this from the safe
+  surface.
+  - `RenderCtx` gains `ancestors: Exclusions`, a set over the closed enum
+    `Exclusion { Form, Interactive, Anchor }` (with `ALL`). It is passed by
+    value like the other fields and starts empty at the root.
+  - One classification table, `fn classify(&ResolvedTag) -> TagClass`,
+    declared once: `TagClass { category: ContentModel, content:
+    ContentModel, is: Exclusions, forbids: Exclusions }`. For `Typed` it
+    reads `NodeTag`. For `Written` it matches the tag ASCII-case-insensitively
+    against `NodeTag::ALL` and the interactive tags the runtime builders and
+    `Ui.Unsafe` can write (`a`, `button`, `input`, `select`, `textarea`,
+    `label`, `iframe`, `details`, `embed`, `audio`, `video`); a tag in
+    neither is `Unclassified` and renders as written. The match has no
+    wildcard over the table's members.
+    - `form`: `is = {Form}`, `forbids = {Form}`.
+    - `button`, `label`, `input`, `select`, `textarea`, `iframe`,
+      `details`, `embed`, `audio`, `video`: `is = {Interactive}`.
+      `button` also `forbids = {Interactive, Anchor}`.
+    - `a`: `is = {Interactive, Anchor}`, `forbids = {Interactive, Anchor}`.
+  - A node whose class `is` intersects `ctx.ancestors` renders as `span`
+    through the same demotion as the content model (`demote_attrs`). It keeps
+    its children, event attributes and landmark `role`, and drops the tag's
+    form or interactive semantics. It adds nothing to `ancestors`, so its
+    own descendants are judged against the real ancestors. The render
+    reports it once per render through the developer diagnostic that
+    reports a refused style key.
+  - The child context is `ancestors ∪ class.forbids`.
+  - The content model uses the same table, so a `Written` flow tag under
+    phrasing (`Ui.Unsafe.unsafeTaggedNode "p"` inside a paragraph) is
+    demoted like a typed one.
+  - The TUI has no parser and is unaffected.
 - `DescCodeBlock` renders `<pre style=…><code>children</code></pre>`:
   - The style and HTML attributes go on `pre`. The inner `code` carries none.
   - The default white-space is `pre` (UA default). An explicit
@@ -254,9 +303,10 @@ Each change closes a class, not one site.
 - TUI (`tui/layout.rs`):
   - `DescSectionHeading` sets bold, as `DescHeading` does today. The TUI has
     no heading levels, so depth only affects which headings render.
-  - The TUI applies the same `has_content` check. A heading without content
-    lays out as nothing: no bold blank row, and no spacing line reserved for
-    it. Its section's content lays out as if the heading were absent.
+  - The TUI applies the same `section_head` rule. A section's first-child
+    heading without content lays out as nothing: no bold blank row, and no
+    spacing line reserved for it. Its section's content lays out as if the
+    heading were absent. A heading anywhere else lays out as HTML renders it.
   - `DescCodeBlock` lays out as a block.
   - `DescCode` and `DescKbd` lay out as inline text runs. The terminal is
     already monospace, so they add no decoration.
@@ -759,6 +809,12 @@ control that runs the same input with the guarded difference removed and gets
 | Backend `CompileUiDesc` JSON for every variant decodes to runtime `UiDescription` and back. | runtime `template.rs` test | `test` |
 | The seal: the golden programs (`stdui_input`, `region_seal`) build and run. | `golden_stdui_input.rs`, `golden_region_seal.rs` | `e2e` (`IPE_E2E=1`) |
 | Markdown `# a`, `## b`, `### c`, then `## d` renders nested sections `h1 > h2 > h3` with `d` at `h2`. A fence renders `<pre><code>`, and inline code renders `<code>`. | ipe-cli emit test over `Markdown.toUi` | `e2e` |
+| A demoted landmark keeps its role: a `describe descNavigation` node and a `node descMain` inside `Ui.paragraph` render `span` with `role="navigation"` and `role="main"`. Control: under a flow parent they render `<nav>` and `<main>` with no `role`. | runtime `ui/render.rs` tests | `test` |
+| Overlays: a chain of `MAX_HTML_DEPTH + 2` nested `AttrNearby` overlays is truncated by the depth ceiling, and a 400 000-deep chain renders without overflowing (the overlay is moved, not cloned). Control: a 10-deep chain renders its leaf. | runtime `ui/render.rs` tests | `test` |
+| Ancestor exclusions (slice 1b): `form` in `form`, `button` in `button`, `a` in `a`, and `a`/`input` in `button`, each typed and each written through `TaggedNode`, render the inner element as `span` with its children and events, and the developer diagnostic fires once. Control: the same element as a sibling keeps its tag. A walker over the rendered `Html` finds no element whose class `is` meets an ancestor's `forbids`. | runtime `ui/render.rs` tests | `test` |
+| The same nested shapes, served: the server HTML of `#ipe-root` equals `root.innerHTML` after the browser parses it. | `ui-text-roles.spec.mjs` | `browser-e2e` |
+| A written flow tag under phrasing (`unsafeTaggedNode "section"` in a paragraph) is demoted to `span`; an unclassified written tag (`my-widget`) renders as written. | runtime `ui/render.rs` tests | `test` |
+| No `style "__paragraph"` or `style "__textcolumn"` in `src/stdlib/Ipe/` (slice 2), widened to every `style "__` in slice 7. A planted line in a copy of `Ui.ipe` turns it red. | `stdlib/src/lib.rs` tests | `test` |
 | Empty heading: `section [] { heading = [], content = [p] }` renders `<section>` with no `h1`..`h6` element, and its content is unchanged. Control: `heading = [text "a"]` renders `h1`. | runtime `ui/render.rs` tests | `test` |
 | Headings that count as empty: `[text " \t\n"]`, `[text "\u{00A0}"]`, `[Ui.none]`, `[el [] (text " ")]`, and a heading of three nested empty containers. Each gives no `hN`. Control: `[el [] (text " x ")]` is present. | runtime tests | `test` |
 | Nested empty headings keep levels contiguous: `section "a" > section [] > section "b"` gives `h1 a`, `h2 b`, and `section [] > section [] > section "c"` gives `h1 c`. Seven present levels under two empty ones still saturate at `h6`. | runtime tests | `test` |
@@ -808,6 +864,9 @@ control that runs the same input with the guarded difference removed and gets
 | Unbounded resource a remote party chooses | The file count and each `Picked` field. | `MAX_PICKED_FILES`, `MAX_PICKED_NAME_BYTES`, `MAX_PICKED_SIZE` and `MAX_PICKED_MIME_BYTES`, each with a one-past-the-ceiling refusal test. The count is checked before any field is read. |
 | Caller attributes override a builder's fixed attributes | `Input.file`'s `<input>`. | The `<input>` attribute list is built only by the runtime, and user attrs go to the wrapper. Pre-existing: `input_base_` appends caller `control_attrs` after its fixed `type`/`value`. Browsers keep the first duplicate, but the shape is the same; the `Input.file` slice's guardian review checks it. |
 
+| Markup the HTML parser restructures (ancestor exclusions) | `form` in `form`, interactive in `button`, `a` in `a`, and a written flow tag under phrasing. | `RenderCtx.ancestors` plus one `classify` table over typed and written tags; excluded descendants demote; a walker test and the browser parse-equality check pin it. |
+| Retag drops a semantic attribute | Content-model demotion to `span`. | The demoted node carries its landmark `role`; a test with a flow control pins it. |
+
 New class for the orchestrator to add (it is pre-existing, found here):
 **Markup the HTML parser restructures**. A renderer that emits a flow element
 under a phrasing ancestor (`<p><span><div>`) ships a tree the browser rebuilds
@@ -829,7 +888,17 @@ alone.
    - the paragraph and text-column identity moves to `Description`.
 
    `DescHeading(i64)` and its helpers stay until the section slice, so the
-   branch builds alone. It can run in parallel with the Ui.Unsafe slice.
+   branch builds alone.
+
+1b. **Ancestor exclusions. Runtime only.** SCEF: correctness (parser
+   restructuring).
+   - `ui/render.rs` (`Exclusion`, `Exclusions`, `TagClass`, `classify`,
+     `RenderCtx.ancestors`, the demotion), the developer-diagnostic reporter
+     it shares with the refused style key;
+   - `Ui/Unsafe.ipe` doc text is slice 2's, so 1b touches no `.ipe`.
+
+   It runs after slice 1 and must merge before slice 2, which makes nested
+   `node descForm` reachable from the safe surface.
 2. **Ipe.Ui.Unsafe module. Gated alone (kernels, goldens).** SCEF: trust
    boundary.
    - `Ui/Unsafe.ipe`; `Ui.ipe` (exposure, and the `taggedNode` binding
@@ -840,9 +909,14 @@ alone.
      guides, docs regen.
 
    It switches `paragraph`, `textColumn` and `form` to `node` with the
-   `descTextColumn` and `descForm` kernels (kernels rows plus the
-   `emit_ui_plan` and `emit_ui_template` arms). It needs the runtime slice
-   merged first.
+   `descParagraph`, `descTextColumn` and `descForm` kernels (kernels rows plus
+   the `emit_ui_plan` and `emit_ui_template` arms). The same edit deletes the
+   dead `style "__paragraph" "true"` prepend in `Ui.paragraph` and the
+   `__textcolumn` marker on `Ui.textColumn`, and the TUI `__textcolumn`
+   reader in `walk_attrs` goes with it. A source scan over `src/stdlib/Ipe/`
+   pins that no `style "__paragraph"` or `style "__textcolumn"` remains; slice
+   7 widens it to every `style "__`. `ui_paragraph_` builds
+   `Element::Node(DescParagraph, …)`. It needs slices 1 and 1b merged first.
 3. **Section headings and text roles wiring. Gated alone (kernels, goldens).**
    The empty-heading rule's runtime half (`has_content` and the depth skip)
    lands in slice 1. This slice wires the Ipê side and the goldens.
