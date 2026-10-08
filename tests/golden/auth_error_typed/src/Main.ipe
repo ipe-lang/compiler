@@ -1,0 +1,99 @@
+module Main exposing (main)
+
+-- `Auth.verifyToken` refuses with the closed `AuthError`, never text to
+-- parse. Each check verifies one token and prints the constructor it was
+-- refused with:
+--
+--   * a token signed under another key is `BadSignature`;
+--   * a token whose payload is spliced from another token is `BadSignature`;
+--   * a token minted with a zero lifetime is `Expired`;
+--   * a token whose `nbf` is far in the future is `NotYetValid`;
+--   * text that is not a token is `Malformed`;
+--   * a verifying key shorter than the minimum is `SecretTooShort`;
+--   * the control: the untouched token under its own key verifies.
+--
+-- Every key is sealed from a runtime `String` (`System.getenvOr` with a
+-- test-default fallback), never a committed literal (IPE-L0150).
+--
+-- Output: see expected.txt.
+
+import Describe
+import Ipe.Auth as Auth exposing (AuthError(..))
+import Ipe.Dict
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.Maybe
+import Ipe.Secret
+import Ipe.String
+import Ipe.System as System
+
+
+signingKey =
+    Secret.fromString (System.getenvOr "AUTH_GOLDEN_KEY" "this-is-a-32-byte-or-longer-secret-key-value")
+
+
+otherKey =
+    Secret.fromString (System.getenvOr "AUTH_GOLDEN_OTHER_KEY" "another-32-byte-or-longer-secret-key-value!")
+
+
+shortKey =
+    Secret.fromString (System.getenvOr "AUTH_GOLDEN_SHORT_KEY" "short")
+
+
+-- A token for `sub`, valid for `ttl` seconds, carrying `extra` claims too.
+mint : String -> List ( String, String ) -> Int -> String
+mint sub extra ttl =
+    case Auth.signToken signingKey (Dict.fromList (List.append [ ( "sub", sub ) ] extra)) ttl of
+        Ok token ->
+            token
+
+        Err _ ->
+            "sign-failed"
+
+
+-- `token`'s header and signature around `donor`'s payload.
+splice : String -> String -> String
+splice token donor =
+    let
+        parts =
+            String.split "." token
+    in
+    String.join "."
+        (List.concat
+            [ List.take 1 parts
+            , List.take 1 (List.drop 1 (String.split "." donor))
+            , List.drop 2 parts
+            ]
+        )
+
+
+verdict : String -> Result AuthError (Dict String String) -> String
+verdict label result =
+    case result of
+        Ok claims ->
+            label ++ ": valid " ++ Maybe.withDefault "?" (Dict.get "sub" claims)
+
+        Err Auth.Expired ->
+            label ++ ": Expired"
+
+        Err err ->
+            label ++ ": " ++ Describe.describe err
+
+
+main =
+    let
+        token =
+            mint "alice" [] 3600
+    in
+    Io.println
+        (String.join "\n"
+            [ verdict "own key" (Auth.verifyToken signingKey token)
+            , verdict "other key" (Auth.verifyToken otherKey token)
+            , verdict "spliced payload" (Auth.verifyToken signingKey (splice token (mint "mallory" [] 3600)))
+            , verdict "zero lifetime" (Auth.verifyToken signingKey (mint "alice" [] 0))
+            , verdict "future nbf" (Auth.verifyToken signingKey (mint "alice" [ ( "nbf", "4102444800" ) ] 3600))
+            , verdict "not a token" (Auth.verifyToken signingKey "not-a-token")
+            , verdict "short key" (Auth.verifyToken shortKey token)
+            , "constructed: " ++ Describe.describe Auth.Revoked
+            ]
+        )
