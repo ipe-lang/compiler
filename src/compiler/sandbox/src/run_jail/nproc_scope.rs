@@ -46,10 +46,10 @@ pub const SCOPE_SCRIPT: &str = "/bin/true; /bin/true";
 pub const TEETH_SCRIPT: &str = "for i in 1 2 3 4 5 6; do sleep 1 & done; wait";
 
 /// How long a canary jail may run before it is killed and the proof refused.
+///
+/// It is the canary's only wall clock: a jail cut off by it is a refusal, never
+/// a [`CanaryExit::Failed`] that would read as the cap refusing a fork.
 const CANARY_WALL: Duration = Duration::from_secs(15);
-
-/// The wall clock a canary hands `timeout`, inside [`CANARY_WALL`].
-const CANARY_TIMEOUT_SECS: u64 = 10;
 
 /// The interval between polls of a running canary.
 const CANARY_POLL: Duration = Duration::from_millis(10);
@@ -198,7 +198,7 @@ fn measure(tools: &RunJailTools) -> Result<(), RunJailDefect> {
     })?;
     let baseline = run_canary(
         tools,
-        &canary_profile(tools, ProcCap::MAX),
+        &canary_profile(ProcCap::MAX),
         &mounts,
         &[OsString::from("/bin/true")],
         Stdio::from(sink),
@@ -212,7 +212,7 @@ fn measure(tools: &RunJailTools) -> Result<(), RunJailDefect> {
         });
     }
 
-    let tight = canary_profile(tools, ProcCap::CANARY);
+    let tight = canary_profile(ProcCap::CANARY);
     let scope_run = run_canary(tools, &tight, &mounts, &shell(SCOPE_SCRIPT), Stdio::null())?;
     let teeth_run = run_canary(tools, &tight, &mounts, &shell(TEETH_SCRIPT), Stdio::null())?;
     classify(scope_run, teeth_run).map_err(|reason| RunJailDefect::ProcCapUnscoped { reason })
@@ -220,14 +220,19 @@ fn measure(tools: &RunJailTools) -> Result<(), RunJailDefect> {
 
 /// The canary jail's profile: production's isolation with `proc_cap`, and the
 /// network and subprocess axes granted so only the cap can refuse a fork.
-fn canary_profile(tools: &RunJailTools, proc_cap: ProcCap) -> SandboxProfile {
+///
+/// It sets no wall clock, so no `timeout` wraps the jail: a `timeout` that
+/// fired exits nonzero exactly like a refused fork, and a teeth run cut off
+/// that way would prove a cap that never bit. [`CANARY_WALL`] bounds the run
+/// instead and refuses the proof when it fires.
+fn canary_profile(proc_cap: ProcCap) -> SandboxProfile {
     let mut profile = SandboxProfile {
         network: true,
         subprocess: true,
         ..SandboxProfile::maximally_isolated()
     };
     profile.limits.proc_cap = proc_cap;
-    profile.limits.wall_secs = tools.timeout.as_ref().map(|_| CANARY_TIMEOUT_SECS);
+    profile.limits.wall_secs = None;
     profile
 }
 
@@ -265,24 +270,24 @@ fn run_canary(
         .map_err(|e| RunJailDefect::Spawn {
             detail: format!("the process-cap canary jail could not be spawned: {e}"),
         })?;
-    await_canary(&mut child)
+    await_canary(&mut child, CANARY_WALL)
 }
 
-/// Wait for a canary, killing and reaping it once [`CANARY_WALL`] has passed.
-fn await_canary(child: &mut Child) -> Result<CanaryExit, RunJailDefect> {
+/// Wait for a canary, killing and reaping it once `wall` has passed.
+fn await_canary(child: &mut Child, wall: Duration) -> Result<CanaryExit, RunJailDefect> {
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(CanaryExit::Succeeded),
             Ok(Some(_)) => return Ok(CanaryExit::Failed),
-            Ok(None) if started.elapsed() < CANARY_WALL => std::thread::sleep(CANARY_POLL),
+            Ok(None) if started.elapsed() < wall => std::thread::sleep(CANARY_POLL),
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(RunJailDefect::Spawn {
                     detail: format!(
-                        "the process-cap canary jail did not finish within {} seconds",
-                        CANARY_WALL.as_secs()
+                        "the process-cap canary jail did not finish within {} ms",
+                        wall.as_millis()
                     ),
                 });
             }
@@ -318,7 +323,43 @@ fn capped_text(stderr: &mut ScratchFile) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CanaryExit, Scope, classify};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    use super::{
+        CanaryExit, ProcCap, RunJailDefect, Scope, await_canary, canary_profile, classify,
+    };
+
+    /// No canary runs under `timeout`: its firing exits nonzero like a refused
+    /// fork and would prove a cap that never bit.
+    #[test]
+    fn no_canary_jail_runs_under_a_timeout_wall() {
+        for cap in [ProcCap::MAX, ProcCap::CANARY] {
+            assert_eq!(canary_profile(cap).limits.wall_secs, None);
+        }
+    }
+
+    /// A canary that overruns its wall is a refusal, never a `Failed` exit.
+    #[cfg(unix)]
+    #[test]
+    fn an_overrunning_canary_is_refused_not_read_as_a_refused_fork() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a sleeper");
+        let outcome = await_canary(&mut child, Duration::from_millis(50));
+        assert!(
+            matches!(outcome, Err(RunJailDefect::Spawn { .. })),
+            "{outcome:?}"
+        );
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "the overrunning canary is killed and reaped"
+        );
+    }
 
     #[test]
     fn classify_refuses_user_wide_and_inert_scopes() {
