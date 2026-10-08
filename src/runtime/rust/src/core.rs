@@ -906,18 +906,40 @@ thread_local! {
     static STACK_FLOOR: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// The largest `IPE_RECURSION_LIMIT` the wasm32 target accepts.
+///
+/// Native threads add the red-zone probe as a second bound; wasm32 has no stack
+/// introspection, so the depth budget alone keeps real recursion inside the
+/// wasm stack and a larger value is refused rather than left to trap.
+const WASM_RECURSION_BOUND: u64 = DEFAULT_RECURSION_LIMIT as u64;
+
+/// The `IPE_RECURSION_LIMIT` ceiling, bounded above by `bound` when given.
+const fn recursion_ceiling(bound: Option<u64>) -> crate::system::EnvCeiling {
+    let ceiling = crate::system::EnvCeiling::new(
+        "IPE_RECURSION_LIMIT",
+        DEFAULT_RECURSION_LIMIT as u64,
+        crate::system::ZeroCeiling::Refused,
+        "decimal recursion depth",
+    );
+    match bound {
+        Some(max) => ceiling.at_most(max),
+        None => ceiling,
+    }
+}
+
 /// The recursion depth budget read from `IPE_RECURSION_LIMIT`.
 ///
 /// A present value must be a positive decimal integer; anything else (`0`,
-/// padding and signs included) refuses the program at startup. Any positive
-/// value is accepted: the red-zone probe still backstops a value set recklessly
-/// high, so raising the variable can never reintroduce the abort.
-const RECURSION_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
-    "IPE_RECURSION_LIMIT",
-    DEFAULT_RECURSION_LIMIT as u64,
-    crate::system::ZeroCeiling::Refused,
-    "decimal recursion depth",
-);
+/// padding and signs included) refuses the program at startup. Native targets
+/// accept any positive value: the red-zone probe still backstops a value set
+/// recklessly high. On wasm32 a value above [`WASM_RECURSION_BOUND`] is refused
+/// too; lowering stays possible.
+const RECURSION_CEILING: crate::system::EnvCeiling =
+    recursion_ceiling(if cfg!(target_arch = "wasm32") {
+        Some(WASM_RECURSION_BOUND)
+    } else {
+        None
+    });
 
 /// The `IPE_RECURSION_LIMIT` snapshot taken by [`recursion_startup_check`],
 /// once per process.
@@ -1805,6 +1827,33 @@ mod recursion_guard_tests {
             Ok(DEFAULT_RECURSION_LIMIT)
         );
         crate::system::assert_env_ceiling_contract(RECURSION_CEILING);
+    }
+
+    // The wasm32 bound is a parameter of the ceiling, so the refusal of a raised
+    // limit is proven on every target.
+    #[test]
+    fn wasm_recursion_bound_refuses_a_raised_limit() {
+        let bounded = recursion_ceiling(Some(WASM_RECURSION_BOUND));
+        assert_eq!(WASM_RECURSION_BOUND, 10_000);
+        let limit = |raw: &str| bounded.parse_as::<usize>(Ok(raw.to_owned()));
+        assert_eq!(limit("1"), Ok(1));
+        assert_eq!(limit("10000"), Ok(DEFAULT_RECURSION_LIMIT));
+        for raw in ["10001", "20000", "18446744073709551615"] {
+            let outcome = limit(raw);
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|r| r.name() == "IPE_RECURSION_LIMIT"
+                        && r.to_string().starts_with("IPE_RECURSION_LIMIT")),
+                "{raw} must be refused naming the variable, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            bounded.parse_as::<usize>(Err(std::env::VarError::NotPresent)),
+            Ok(DEFAULT_RECURSION_LIMIT)
+        );
+        crate::system::assert_env_ceiling_contract(bounded);
+        assert_eq!(recursion_ceiling(None).max_value(), u64::MAX);
     }
 
     // The runtime's unit tests run no startup check, so the budget is the

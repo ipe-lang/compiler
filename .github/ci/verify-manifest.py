@@ -2577,12 +2577,14 @@ _CLAIM_ENV: dict[str, frozenset[str] | None] = {
     "CHROMEDRIVER": frozenset({"chromedriver"}),
     "CARGO_TERM_COLOR": frozenset({"always", "never", "auto"}),
     "CARGO_INCREMENTAL": frozenset({"0", "1"}),
-    # Read by other steps of the job (the `ipe` CLI, the geo-clipboard and
-    # layout-fill servers); neither cargo nor rustc reads them, and no build
-    # script of the tree does (`test_inert_claim_env_unread_by_build_scripts`).
+    # Read by other steps of the job (the `ipe` CLI and the geo-clipboard,
+    # layout-fill and focus-across-patch servers); neither cargo nor rustc
+    # reads them, and no build script of the tree does
+    # (`test_inert_claim_env_unread_by_build_scripts`).
     "IPE_RUNTIME_DIR": None,
     "IPE_GEO_CLIPBOARD_PORT": None,
     "IPE_LAYOUT_FILL_PORT": None,
+    "IPE_FOCUS_ACROSS_PATCH_PORT": None,
 }
 # The `.cargo/config.toml` a claimed run reads: its admitted tables, the keys
 # of `[build]` and of a `[target]` table that applies to the claim platform,
