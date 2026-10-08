@@ -54,6 +54,7 @@ var __ipeNode = (function() {
   var firstElementChild = getter(Element.prototype, "firstElementChild");
   var nextElementSibling = getter(Element.prototype, "nextElementSibling");
   var previousElementSibling = getter(Element.prototype, "previousElementSibling");
+  var tagName = getter(Element.prototype, "tagName");
   var queryOne = Element.prototype.querySelector;
   var focusHtml = HTMLElement.prototype.focus;
   var focusSvg = SVGElement.prototype.focus;
@@ -70,6 +71,7 @@ var __ipeNode = (function() {
           ? controls.get.call(el) : null;
     },
     parent: function(el) { return parentElement.call(el); },
+    tag: function(el) { return tagName.call(el); },
     // The child-element indices leading from `root` down to `el`; null when
     // `el` is not below `root`.
     pathFrom: function(root, el) {
@@ -544,19 +546,26 @@ function __ipeParseFor(container, html) {
 // live inputs described above into their placeholders.
 //
 // A swap never moves keyboard focus. Focus on any node inside `container` is
-// recorded as the node's child-element path and put back on the node at that
-// path once the commit lands (see `__ipeRestoreFocus`); a live field keeps its
-// own node, value and selection (below). Focus outside `container` is not read
-// or written.
+// recorded as the node's child-element path and the `ipe-id`s of it and its
+// ancestors, and put back once the commit lands on the nearest node on that
+// path carrying one of those `ipe-id`s (see `__ipeRestoreFocus`); a live field
+// keeps its own node, value and selection (below). Focus outside `container`
+// is not read or written.
 function __ipeSwapPreservingFocus(container, tmp) {
   var focused = __ipeDoc.active();
   var inside = focused && focused !== __ipeDoc.body() &&
       __ipeNode.contains(container, focused);
   var focusPath = inside ? __ipeNode.pathFrom(container, focused) : null;
+  var focusTag = inside ? __ipeNode.tag(focused) : "";
   var focusedInside = inside &&
-      (focused.tagName === "INPUT" ||
-       focused.tagName === "TEXTAREA" ||
-       focused.tagName === "SELECT");
+      (focusTag === "INPUT" || focusTag === "TEXTAREA" || focusTag === "SELECT");
+  // The server's identities (`ipe-id`: path, tag and key) of the focused node
+  // and of its ancestors below `container`.
+  var focusIds = [];
+  for (var at = inside ? focused : null; at && at !== container; at = __ipeNode.parent(at)) {
+    var atId = __ipeNode.attr(at, "ipe-id");
+    if (atId !== null) focusIds.push(atId);
+  }
 
   // Snapshot focused-state BEFORE any DOM mutation. Selection read
   // throws on some input types, so catch.
@@ -620,19 +629,30 @@ function __ipeSwapPreservingFocus(container, tmp) {
     }
     if (scrollTop) preservedFocus.scrollTop = scrollTop;
   } else if (focusPath) {
-    __ipeRestoreFocus(container, focusPath);
+    __ipeRestoreFocus(container, focusPath, focusIds);
   }
 }
 
 // Put focus back after a swap dropped it. Focus goes to the node at `path`
-// below `container` when that node takes focus, else to the nearest ancestor
-// that does (the path's deepest surviving node, then upward, `container`
-// included): a key handler bound on an ancestor keeps receiving keys. Focus
-// that is already somewhere is left where it is.
-function __ipeRestoreFocus(container, path) {
+// below `container`, else to its nearest ancestor, that takes focus, walking
+// from the path's deepest surviving node upward past `container`: a key
+// handler bound on an ancestor keeps receiving keys. A node the swap created
+// is a candidate only when its `ipe-id` is one of `ids`, the focused node's
+// and its ancestors' before the swap; any other node at the path is another
+// control, and a node without an `ipe-id` (raw markup) is never one.
+// `container` and the nodes above it are the ones the swap kept. Focus that is
+// already somewhere is left where it is.
+function __ipeRestoreFocus(container, path, ids) {
   var now = __ipeDoc.active();
   if (now && now !== __ipeDoc.body()) return;
   var node = __ipeNode.resolve(container, path);
+  while (node) {
+    var kept = node === container;
+    var own = kept ? null : __ipeNode.attr(node, "ipe-id");
+    if ((kept || (own !== null && ids.indexOf(own) !== -1)) && __ipeNode.focus(node)) return;
+    if (kept) break;
+    node = __ipeNode.parent(node);
+  }
   while (node) {
     if (__ipeNode.focus(node)) return;
     node = __ipeNode.parent(node);

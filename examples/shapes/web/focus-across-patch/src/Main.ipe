@@ -6,10 +6,11 @@ module Main exposing (main)
 -- key works wherever focus sits below it. `add` appends a row and `drop`
 -- removes itself, each changing the panel's children (the client swaps the
 -- panel); `Escape` toggles the row from the keyboard. The note field sits
--- ahead of the row so its position survives either change.
+-- ahead of the row so its position survives either change. `swap` replaces
+-- itself with another focusable control at the same position, which is not the
+-- node that held focus.
 --
 -- Co-located, no capabilities, no JS ports.
-
 
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
@@ -23,6 +24,7 @@ type alias Model =
     , row : Bool
     , drop : Bool
     , note : String
+    , swapped : Bool
     }
 
 
@@ -31,12 +33,13 @@ type Msg
     | AddRow
     | DropButton
     | Note String
+    | Swap
     | NoOp
 
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init _req =
-    ( { keys = "", row = False, drop = True, note = "" }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -57,6 +60,9 @@ update msg model =
 
         Note text ->
             ( { model | note = text }, Cmd.none )
+
+        Swap ->
+            ( { model | swapped = True }, Cmd.none )
 
         NoOp ->
             ( model, Cmd.none )
@@ -85,6 +91,15 @@ panelDrop model =
         []
 
 
+swapSlot : Model -> Ui.Element Msg
+swapSlot model =
+    if model.swapped then
+        Ui.el [ Ui.id "swapped", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "swapped")
+
+    else
+        Ui.button [ Ui.id "swap" ] { onPress = Just Swap, label = Ui.text "swap" }
+
+
 view : Model -> Ui.Element Msg
 view model =
     Ui.column
@@ -97,17 +112,18 @@ view model =
         , Ui.column
             [ Ui.id "panel" ]
             ([ Ui.button [ Ui.id "add" ] { onPress = Just AddRow, label = Ui.text "add" }
-             , Input.text
+            , Input.text
                 [ Ui.id "note" ]
                 { label = Input.labelHidden "Note"
                 , text = model.note
                 , onChange = Note
                 , placeholder = Nothing
                 }
-             ]
+            ]
                 ++ panelRow model
                 ++ panelDrop model
             )
+        , Ui.column [ Ui.id "swapper" ] [ swapSlot model ]
         ]
 
 

@@ -4,9 +4,10 @@
  * The client rewrites the children of the container a patch targets. A focused
  * node inside it is dropped by that rewrite, and focus falls to `body`, where
  * a key handler bound on an ancestor no longer receives keys. The client
- * records the focused node's position, puts focus back on the node at that
- * position once the swap lands, else on its nearest focusable ancestor, and
- * never reads or writes focus that sits outside the swapped container.
+ * records the focused node's position and server identity (`ipe-id`), puts
+ * focus back on the node at that position carrying that identity once the swap
+ * lands, else on its nearest focusable ancestor, and never reads or writes
+ * focus that sits outside the swapped container.
  *
  * Every test drives a real pointer click and a real key press; none sets focus
  * from the page. A key reaches the root's handler only while focus is below
@@ -51,6 +52,16 @@ test("focus-across-patch: removed focused node falls back to ancestor", async ({
   await page.click("#drop");
   // The clicked button is gone from the swapped panel.
   await expect(page.locator("#drop")).toHaveCount(0);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+});
+
+test("focus-across-patch: another control at the focused position never takes focus", async ({ page }) => {
+  await open(page);
+  await page.click("#swap");
+  // The clicked button's position now holds a different focusable control.
+  await expect(page.locator("#swapped")).toHaveCount(1);
   await expect.poll(() => focusedId(page)).toBe("root");
   await page.keyboard.press("j");
   await expect(page.locator("#keys")).toHaveText("keys: j");
