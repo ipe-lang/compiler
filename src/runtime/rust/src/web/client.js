@@ -23,7 +23,7 @@ var __ipeDoc = (function(doc) {
   function method(proto, name) {
     var fn = proto[name];
     if (typeof fn !== "function") {
-      return function() { throw new TypeError("Ipe client: document member unavailable"); };
+      return function() { throw new TypeError("Ipe client: browser member unavailable"); };
     }
     return fn.bind(doc);
   }
