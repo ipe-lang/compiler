@@ -1569,7 +1569,7 @@ mod tests {
     #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
     fn the_web_revocation_gate_starts_every_request_with_a_verifier() {
-        use RevocationMode::{Off, Store};
+        use RevocationMode::Off;
         for (installed, env) in ARMED_REQUESTS {
             assert_eq!(
                 web_revocation_gate(installed, env, true),
