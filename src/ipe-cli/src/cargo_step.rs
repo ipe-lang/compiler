@@ -707,7 +707,7 @@ impl std::error::Error for PipeOverflow {}
 
 impl CargoPipes {
     /// Take both pipes off `child`.
-    const fn take(child: &mut GroupedChild, stdout_cap: usize) -> Self {
+    fn take(child: &mut GroupedChild, stdout_cap: usize) -> Self {
         let (stdout, stderr) = child.take_pipes();
         Self {
             stdout,
