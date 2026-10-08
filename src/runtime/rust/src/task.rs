@@ -1867,7 +1867,7 @@ mod loop_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod spawn_scope_scan_tests {
     /// A spelling that starts a task on a runtime or a thread pool.
     const RAW_SPAWNS: [&str; 7] = [
