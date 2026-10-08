@@ -19,8 +19,9 @@
 //! - [`read_capped`] reads a stream through `take(cap + 1)`, so an oversized
 //!   body is refused without ever being buffered past `cap + 1` bytes.
 //! - [`Git`] and [`Curl`] run a child whose output lands on disk. The child is
-//!   started in its own process group (on Unix platforms with `waitid`), so a
-//!   refusal kills every process it started, not only the direct child; the
+//!   started in its own process group (on Unix platforms with `waitid`) or its
+//!   own kill-on-close job object (on Windows), so a refusal kills every
+//!   process it started, not only the direct child; the
 //!   interrupt, quit, hangup, stop and continue signals reaching the CLI are
 //!   relayed to that group, except a signal the CLI inherited as ignored, and a
 //!   termination request (`SIGTERM`) kills every group before the CLI acts on
@@ -33,6 +34,12 @@
 //!   acceptance, so an accepted transfer is always within budget. While it
 //!   runs, the disk may briefly hold more than the ceiling, by at most one
 //!   [`POLL_INTERVAL`] of transfer throughput.
+//!
+//! On Windows the CLI joins a kill-on-close job of its own before its first
+//! detached transfer, so every child it starts from then on dies with the CLI.
+//! A transfer whose job cannot be made or joined is refused with a
+//! `ContainmentRefusal` and its child killed and reaped: no uncontained
+//! transfer runs.
 //!
 //! [`Git`] and [`Curl`] are the only constructors of a `git` or `curl` child in
 //! the CLI; each fixes the hardened environment and arguments once.
@@ -1760,7 +1767,8 @@ fn transfer_start() -> Instant {
 /// Whether a watched child is detached from the terminal in its own process group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// Its own process group: a refusal kills every process it started.
+    /// Its own process group (its own job on Windows): a refusal kills every
+    /// process it started.
     Detached,
     /// The CLI's process group, keeping the terminal for a prompt (a signing
     /// passphrase); a refusal or a termination request kills the direct child.
@@ -1904,6 +1912,15 @@ pub(crate) fn end_transfers() {
     group::end_all();
 }
 
+/// Whether the CLI has joined its own job, which lets a child break away from it.
+///
+/// Before the CLI joins, a breakaway request would answer only to a job the
+/// CLI was started in, which may refuse it.
+#[cfg(windows)]
+pub(crate) fn cli_job_joined() -> bool {
+    group::cli_joined()
+}
+
 /// The process-group primitives, for the signal owners' tests.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod test_group {
@@ -1951,12 +1968,16 @@ impl Running {
         })
     }
 
-    /// Whether the child has exited, leaving it unreaped where it leads a group.
+    /// Whether the child has exited, leaving it unreaped where it leads a process group.
+    ///
+    /// A Windows child is never reaped before it is dropped: the CLI holds its
+    /// process handle, which keeps its process ID from being reused.
     fn exited(&mut self) -> std::io::Result<bool> {
-        match self.group {
-            Some(id) => group::exited(id),
-            None => self.child.try_wait().map(|status| status.is_some()),
+        #[cfg(all(unix, not(any(target_os = "openbsd", target_os = "redox"))))]
+        if let Some(id) = self.group {
+            return group::exited(id);
         }
+        self.child.try_wait().map(|status| status.is_some())
     }
 
     /// Kill what the exited child left running in its group, then reap it.
@@ -2177,8 +2198,535 @@ mod group {
     }
 }
 
+/// A child's own kill-on-close job object, nested in the CLI's own job.
+///
+/// Closing a transfer's job terminates every process in it, so a refusal
+/// kills the whole tree the child started, and the reader threads of its
+/// pipes reach their end. The CLI joins its own job (kill on close, breakaway
+/// allowed) before its first transfer, so a CLI that dies takes every later
+/// child with it, a descendant started before its transfer's assignment
+/// included.
+#[cfg(windows)]
+mod group {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::process::{Child, Command};
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    use win32job::{ExtendedLimitInfo, Job};
+
+    use super::containment::{ContainmentRefusal, ContainmentStep, Jobs, spawn_contained};
+
+    /// A live transfer's ID: its child's process ID.
+    ///
+    /// The CLI holds the child's process handle until it is dropped, after the
+    /// job is closed, so the ID names no other process meanwhile.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GroupId(u32);
+
+    /// Uninhabited: an attached child is contained by the CLI's job only.
+    #[derive(Debug, Clone, Copy)]
+    pub enum AttachedId {}
+
+    /// Every live transfer's job; closing one terminates its tree.
+    static JOBS: Mutex<Jobs<Job>> = Mutex::new(Jobs::new());
+
+    /// The CLI's own job, joined once, or why it could not be.
+    static CLI_JOB: OnceLock<Result<Job, ContainmentRefusal>> = OnceLock::new();
+
+    /// Join the CLI to its own job, once per process.
+    fn join_cli() -> Result<(), ContainmentRefusal> {
+        let joined = CLI_JOB.get_or_init(|| {
+            let refused = |e: win32job::JobError| {
+                ContainmentRefusal::at(ContainmentStep::JoinCli, &std::io::Error::from(e))
+            };
+            let mut limits = ExtendedLimitInfo::new();
+            limits.limit_kill_on_job_close().limit_breakaway_ok();
+            let job = Job::create_with_limit_info(&limits).map_err(refused)?;
+            job.assign_current_process().map_err(refused)?;
+            Ok(job)
+        });
+        joined.as_ref().map(|_| ()).map_err(|refusal| *refusal)
+    }
+
+    /// Whether the CLI is in its own job, which lets a child break away from it.
+    pub fn cli_joined() -> bool {
+        CLI_JOB.get().is_some_and(Result::is_ok)
+    }
+
+    /// A new kill-on-close job a member cannot break away from.
+    fn transfer_job() -> std::io::Result<Job> {
+        let mut limits = ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close();
+        Job::create_with_limit_info(&limits).map_err(std::io::Error::from)
+    }
+
+    /// Put `child` in `job`.
+    fn assign(job: &Job, child: &Child) -> std::io::Result<()> {
+        let handle = child.as_raw_handle().expose_provenance();
+        job.assign_process(isize::from_ne_bytes(handle.to_ne_bytes()))
+            .map_err(std::io::Error::from)
+    }
+
+    /// Spawn `command` in a job of its own.
+    ///
+    /// # Errors
+    /// The CLI could not join its own job (nothing is spawned), the spawn
+    /// failed, or the child's job could not be made or assigned (the child is
+    /// killed and reaped first); a containment failure carries a
+    /// `ContainmentRefusal`.
+    pub fn spawn_detached(command: Command) -> std::io::Result<(Child, Option<GroupId>)> {
+        let (child, job) = spawn_contained(
+            join_cli,
+            || ipe_runtime_rust::system::spawn_hardened(command).map_err(std::io::Error::from),
+            transfer_job,
+            assign,
+        )?;
+        let id = GroupId(child.id());
+        JOBS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.0, job);
+        Ok((child, Some(id)))
+    }
+
+    /// Spawn `command` as a plain child, in the CLI's job once the CLI has joined it.
+    pub fn spawn_attached(command: Command) -> std::io::Result<(Child, Option<AttachedId>)> {
+        Ok((ipe_runtime_rust::system::spawn_hardened(command)?, None))
+    }
+
+    /// Unreachable: no `AttachedId` exists.
+    pub const fn forget_attached(id: AttachedId) {
+        match id {}
+    }
+
+    /// Close transfer `id`'s job, terminating every process in it.
+    pub fn kill(id: GroupId) {
+        let job = JOBS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id.0);
+        drop(job);
+    }
+
+    /// Deregister transfer `id`, closing its job if it is still open.
+    pub fn forget(id: GroupId) {
+        kill(id);
+    }
+
+    /// Never: no signal ends every transfer here.
+    pub const fn ended() -> bool {
+        false
+    }
+}
+
+/// A transfer's containment in a job, for the Windows process tree.
+///
+/// The job type is a parameter, so the refusal and the bookkeeping are the
+/// same code on every host and tested on each.
+#[cfg(any(windows, test))]
+mod containment {
+    use std::collections::BTreeMap;
+    use std::process::Child;
+
+    /// The containment step that failed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ContainmentStep {
+        /// Making the CLI's own job, or joining the CLI to it.
+        JoinCli,
+        /// Making the transfer's own job.
+        CreateTransferJob,
+        /// Putting the transfer's child in its job.
+        AssignTransfer,
+    }
+
+    impl std::fmt::Display for ContainmentStep {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Self::JoinCli => "the CLI could not join its own job",
+                Self::CreateTransferJob => "the transfer's job could not be made",
+                Self::AssignTransfer => "the transfer could not be put in its job",
+            })
+        }
+    }
+
+    /// A transfer refused because its process tree could not be contained.
+    ///
+    /// Nothing is left running: a child started before the failing step is
+    /// killed and reaped before this is returned.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ContainmentRefusal {
+        step: ContainmentStep,
+        kind: std::io::ErrorKind,
+        os: Option<i32>,
+    }
+
+    impl ContainmentRefusal {
+        /// The refusal of `step`, which failed with `error`.
+        pub fn at(step: ContainmentStep, error: &std::io::Error) -> Self {
+            Self {
+                step,
+                kind: error.kind(),
+                os: error.raw_os_error(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for ContainmentRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} ({}", self.step, self.kind)?;
+            if let Some(code) = self.os {
+                write!(f, ", os error {code}")?;
+            }
+            f.write_str("), so the transfer was refused before it ran")
+        }
+    }
+
+    impl std::error::Error for ContainmentRefusal {}
+
+    impl From<ContainmentRefusal> for std::io::Error {
+        fn from(refusal: ContainmentRefusal) -> Self {
+            Self::other(refusal)
+        }
+    }
+
+    /// Put `child` in a job that `create` makes and `assign` fills, or kill and reap it.
+    ///
+    /// # Errors
+    /// `create` or `assign` failed; the child is then killed and reaped.
+    pub fn contain<J>(
+        mut child: Child,
+        create: impl FnOnce() -> std::io::Result<J>,
+        assign: impl FnOnce(&J, &Child) -> std::io::Result<()>,
+    ) -> Result<(Child, J), ContainmentRefusal> {
+        let contained = create()
+            .map_err(|e| ContainmentRefusal::at(ContainmentStep::CreateTransferJob, &e))
+            .and_then(|job| {
+                assign(&job, &child)
+                    .map(|()| job)
+                    .map_err(|e| ContainmentRefusal::at(ContainmentStep::AssignTransfer, &e))
+            });
+        match contained {
+            Ok(job) => Ok((child, job)),
+            Err(refusal) => {
+                // The child may already have exited; either way it is reaped.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Join the CLI's own job, start the child, then contain it.
+    ///
+    /// The order is the guarantee: nothing starts before the CLI is in its own
+    /// job, and no job is made for a child that never started.
+    ///
+    /// # Errors
+    /// `join` refused (nothing is started), `start` failed, or [`contain`]
+    /// refused (the child is killed and reaped first); a containment failure
+    /// carries a [`ContainmentRefusal`].
+    pub fn spawn_contained<J>(
+        join: impl FnOnce() -> Result<(), ContainmentRefusal>,
+        start: impl FnOnce() -> std::io::Result<Child>,
+        create: impl FnOnce() -> std::io::Result<J>,
+        assign: impl FnOnce(&J, &Child) -> std::io::Result<()>,
+    ) -> std::io::Result<(Child, J)> {
+        join()?;
+        let child = start()?;
+        Ok(contain(child, create, assign)?)
+    }
+
+    /// The live transfers' jobs, keyed by their child's process ID.
+    pub struct Jobs<J> {
+        live: BTreeMap<u32, J>,
+    }
+
+    impl<J> Jobs<J> {
+        /// No live job.
+        pub const fn new() -> Self {
+            Self {
+                live: BTreeMap::new(),
+            }
+        }
+
+        /// Hold `job` for the transfer whose child is `id`.
+        ///
+        /// A job already held for `id` is dropped, which closes it.
+        pub fn insert(&mut self, id: u32, job: J) {
+            drop(self.live.insert(id, job));
+        }
+
+        /// Hand back the job of transfer `id`, if it is still held.
+        pub fn remove(&mut self, id: u32) -> Option<J> {
+            self.live.remove(&id)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::process::{Child, Command, Stdio};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        use super::{ContainmentRefusal, ContainmentStep, Jobs, contain, spawn_contained};
+
+        /// A job stand-in counting how often it was closed.
+        struct Counted(Arc<AtomicUsize>);
+
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// A child that runs for 30 seconds unless it is killed.
+        fn sleeper() -> Command {
+            if cfg!(windows) {
+                let mut command = Command::new("ping");
+                command.args(["-n", "30", "127.0.0.1"]);
+                command
+            } else {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                command
+            }
+        }
+
+        /// What [`contain`] did with a live sleeper.
+        struct Contained {
+            /// The refusal, or whether the handed-back child was still running.
+            result: Result<bool, ContainmentRefusal>,
+            /// How long the call took.
+            took: Duration,
+            /// On a refusal: the sleeper's stdout reached its end within 5 s
+            /// of the call, so the sleeper was dead when the call returned.
+            ended: bool,
+            /// On a refusal: no process with the sleeper's ID is left, not
+            /// even an unreaped one (Linux only; elsewhere `true`).
+            reaped: bool,
+        }
+
+        /// Whether no process `pid` is left, not even an unreaped one.
+        fn no_process_left(pid: u32) -> bool {
+            !cfg!(target_os = "linux") || !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+
+        /// Contain a live sleeper with `create` and `assign`.
+        ///
+        /// A contained sleeper is killed and reaped before this returns.
+        #[allow(clippy::expect_used)] // a host that cannot start the sleeper cannot run the test
+        fn contain_sleeper(
+            create: impl FnOnce() -> std::io::Result<()>,
+            assign: impl FnOnce(&(), &Child) -> std::io::Result<()>,
+        ) -> Contained {
+            let mut command = sleeper();
+            command.stdout(Stdio::piped());
+            let mut child =
+                ipe_runtime_rust::system::spawn_hardened(command).expect("spawn sleeper");
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let pid = child.id();
+            let (tx, rx) = mpsc::channel();
+            // The reader ends when the sleeper does: at its kill, or after 30 s.
+            std::thread::Builder::new()
+                .name("ipe-test-sleeper-stdout".to_owned())
+                .spawn(move || {
+                    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+                    let _ = tx.send(());
+                })
+                .expect("start the stdout reader");
+            let started = Instant::now();
+            let contained = contain(child, create, assign);
+            let took = started.elapsed();
+            let refused = contained.is_err();
+            let ended = refused && rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let reaped = refused && no_process_left(pid);
+            let result = contained.map(|(mut child, ())| {
+                let running = matches!(child.try_wait(), Ok(None));
+                let _ = child.kill();
+                let _ = child.wait();
+                running
+            });
+            Contained {
+                result,
+                took,
+                ended,
+                reaped,
+            }
+        }
+
+        fn os_error(code: i32) -> std::io::Error {
+            std::io::Error::from_raw_os_error(code)
+        }
+
+        /// A refusal left the sleeper neither running nor unreaped, and did not wait it out.
+        fn assert_killed_and_reaped(contained: &Contained) {
+            assert!(
+                contained.took < Duration::from_secs(10),
+                "the child was waited on, not killed"
+            );
+            assert!(contained.ended, "the refused child was left running");
+            assert!(contained.reaped, "the refused child was left unreaped");
+        }
+
+        #[test]
+        fn a_job_that_cannot_be_made_refuses_the_spawn_and_reaps_the_child() {
+            let contained = contain_sleeper(|| Err(os_error(8)), |(), _| Ok(()));
+            assert_eq!(
+                contained.result,
+                Err(ContainmentRefusal::at(
+                    ContainmentStep::CreateTransferJob,
+                    &os_error(8)
+                ))
+            );
+            assert_killed_and_reaped(&contained);
+        }
+
+        #[test]
+        fn a_child_that_cannot_join_its_job_is_refused_and_reaped() {
+            let contained = contain_sleeper(|| Ok(()), |(), _| Err(os_error(5)));
+            assert_eq!(
+                contained.result,
+                Err(ContainmentRefusal::at(
+                    ContainmentStep::AssignTransfer,
+                    &os_error(5)
+                ))
+            );
+            assert_killed_and_reaped(&contained);
+        }
+
+        #[test]
+        fn a_contained_child_is_handed_back_running_with_its_job() {
+            let contained = contain_sleeper(|| Ok(()), |(), _| Ok(()));
+            assert_eq!(contained.result, Ok(true));
+        }
+
+        /// A CLI that cannot join its own job starts nothing and makes no transfer job.
+        #[test]
+        fn a_cli_that_cannot_join_its_job_starts_nothing() {
+            let calls = AtomicUsize::new(0);
+            let refusal = ContainmentRefusal::at(ContainmentStep::JoinCli, &os_error(5));
+            let result = spawn_contained(
+                || Err(refusal),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::ErrorKind::Other.into())
+                },
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |(), _| Ok(()),
+            );
+            let error = result.expect_err("a CLI outside its own job started a transfer");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a step ran after the refusal"
+            );
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ContainmentRefusal>()),
+                Some(carried) if *carried == refusal
+            ));
+        }
+
+        /// A child that never started gets no job, and its spawn error is its own.
+        #[test]
+        fn a_failed_start_makes_no_job() {
+            let made = AtomicUsize::new(0);
+            let result = spawn_contained(
+                || Ok(()),
+                || Err(std::io::ErrorKind::NotFound.into()),
+                || {
+                    made.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |(), _| Ok(()),
+            );
+            assert!(
+                matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+                "{result:?}"
+            );
+            assert_eq!(
+                made.load(Ordering::SeqCst),
+                0,
+                "a job was made for no child"
+            );
+        }
+
+        #[test]
+        fn a_refusal_rides_the_spawn_error_with_its_step_and_os_error() {
+            let refusal = ContainmentRefusal::at(ContainmentStep::AssignTransfer, &os_error(5));
+            let error = std::io::Error::from(refusal);
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ContainmentRefusal>()),
+                Some(carried) if *carried == refusal
+            ));
+            let text = error.to_string();
+            assert!(
+                text.contains("the transfer could not be put in its job"),
+                "{text}"
+            );
+            assert!(text.contains("os error 5"), "{text}");
+            assert!(text.contains("refused before it ran"), "{text}");
+        }
+
+        #[test]
+        fn every_step_names_what_could_not_be_contained() {
+            let named = [
+                (
+                    ContainmentStep::JoinCli,
+                    "the CLI could not join its own job",
+                ),
+                (
+                    ContainmentStep::CreateTransferJob,
+                    "the transfer's job could not be made",
+                ),
+                (
+                    ContainmentStep::AssignTransfer,
+                    "the transfer could not be put in its job",
+                ),
+            ];
+            for (step, phrase) in named {
+                let refusal = ContainmentRefusal::at(step, &std::io::ErrorKind::Other.into());
+                assert!(refusal.to_string().starts_with(phrase), "{refusal}");
+            }
+        }
+
+        #[test]
+        fn removing_a_job_hands_it_back_once() {
+            let closed = Arc::new(AtomicUsize::new(0));
+            let mut jobs = Jobs::new();
+            jobs.insert(7, Counted(Arc::clone(&closed)));
+            assert_eq!(closed.load(Ordering::SeqCst), 0);
+            drop(jobs.remove(7));
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+            assert!(jobs.remove(7).is_none());
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_job_displaced_under_the_same_id_is_closed() {
+            let closed = Arc::new(AtomicUsize::new(0));
+            let mut jobs = Jobs::new();
+            jobs.insert(7, Counted(Arc::clone(&closed)));
+            jobs.insert(7, Counted(Arc::clone(&closed)));
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+            drop(jobs);
+            assert_eq!(closed.load(Ordering::SeqCst), 2);
+        }
+    }
+}
+
 /// No process groups here: a refusal kills the direct child only.
-#[cfg(not(all(unix, not(any(target_os = "openbsd", target_os = "redox")))))]
+#[cfg(not(any(
+    all(unix, not(any(target_os = "openbsd", target_os = "redox"))),
+    windows
+)))]
 mod group {
     use std::process::{Child, Command};
 
@@ -2202,11 +2750,6 @@ mod group {
 
     /// Unreachable: no `AttachedId` exists.
     pub const fn forget_attached(id: AttachedId) {
-        match id {}
-    }
-
-    /// Unreachable: no `GroupId` exists.
-    pub const fn exited(id: GroupId) -> std::io::Result<bool> {
         match id {}
     }
 
@@ -3953,6 +4496,59 @@ mod tests {
         let run = run(sh("sleep 30 & exit 0"), None, None, &unstaged());
         assert!(matches!(run, Ok(ref captured) if captured.status.success()));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// `cmd /d /s /c <line>`: `/s` strips exactly the outer quotes around `line`.
+    #[cfg(windows)]
+    fn cmd(line: &str) -> Command {
+        use std::os::windows::process::CommandExt as _;
+        let mut command = Command::new("cmd");
+        command.raw_arg(format!("/d /s /c \"{line}\""));
+        command
+    }
+
+    /// A refusal closes the transfer's job, killing the grandchild writing the stage.
+    ///
+    /// The grandchild starts a second after the child, once the child is in its job.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_transfer_kills_the_grandchild() {
+        let dir = scratch();
+        let out = dir.path().join("out");
+        let line = format!(
+            "ping -n 2 127.0.0.1 > nul & ping -t 127.0.0.1 >> \"{}\"",
+            out.display()
+        );
+        let run = run(cmd(&line), None, None, &unstaged().with_wall(wall(4)));
+        assert!(
+            matches!(run, Err(RunError::Exceeded(IngestLimit::Time(_)))),
+            "{run:?}"
+        );
+        let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+        std::thread::sleep(Duration::from_millis(500));
+        let settled = size(&out);
+        assert!(
+            settled > 0,
+            "the grandchild never wrote, so nothing was killed"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(size(&out), settled, "the grandchild kept writing");
+    }
+
+    /// A grandchild holding the stderr pipe of a finished child dies with the job, so the pipe ends.
+    ///
+    /// Without the job the pipe stays open past the drain grace.
+    #[cfg(windows)]
+    #[test]
+    fn reader_threads_end_when_the_job_drops() {
+        let started = Instant::now();
+        let line = "ping -n 2 127.0.0.1 > nul & start /b ping -n 60 127.0.0.1 > nul";
+        let run = run(cmd(line), None, None, &unstaged());
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < super::PIPE_DRAIN_GRACE);
     }
 
     /// An attached child's grandchild holding stdout ends in a typed drain timeout, not a byte refusal.

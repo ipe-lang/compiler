@@ -193,6 +193,9 @@ signal-hook = "0.3"
 # our own; opening and identifying a held level lives in `ipe_fs_open`.
 [target.'cfg(windows)'.dependencies]
 cap-primitives = "3.4.6"
+# A transfer's process tree lives in a kill-on-close job object, and the CLI in
+# a job of its own, through the same safe wrapper the run jail uses.
+win32job = "2"
 
 [dev-dependencies]
 ipe-test-temp = { path = "../../tools/test-temp" }

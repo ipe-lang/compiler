@@ -3057,6 +3057,7 @@ dependencies = [
  "ureq",
  "wasmtime",
  "wasmtime-wasi",
+ "win32job",
  "zeroize",
 ]
 
