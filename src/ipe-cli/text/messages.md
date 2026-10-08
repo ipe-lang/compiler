@@ -679,6 +679,10 @@ a signal ended the transfer — stopped; nothing was recorded
 
 {source}: did not finish within {limit} — stopped; nothing was recorded
 
+## cli-cargo-build-timed-out
+
+cargo build did not finish within {wall} — stopped with every process it started; run `cargo build -vv` in the crate to see the step that hangs
+
 ## cli-local-tree-refused
 
 {source}: holds {shape}, which ipe does not accept — stopped; nothing was recorded

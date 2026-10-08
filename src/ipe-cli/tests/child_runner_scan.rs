@@ -280,7 +280,6 @@ const SITES: &[SiteRow] = &[
 /// Every runner body: the fns that start a child directly, by the sink they call.
 const RUNNER_BODIES: &[NameRow] = &[
     ("browser.rs", "run_opener", "spawn_hardened", 1),
-    ("cargo_step.rs", "spawn_cargo", "spawn_hardened", 1),
     ("driver/commands.rs", "exec_program", "exec_naming", 1),
     ("driver/commands.rs", "run_run_with_args", "exec_naming", 1),
     ("remote_ingest.rs", "Running::spawn", "spawn_attached", 1),

@@ -47,7 +47,7 @@
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -316,6 +316,17 @@ impl LocalWall {
     pub const fn limit(self) -> WallSecs {
         WallSecs(self.0)
     }
+
+    /// This ceiling lengthened by `secs` seconds, held to [`MAX_LOCAL_WALL_SECS`].
+    #[must_use]
+    pub const fn extended_by(self, secs: u64) -> Self {
+        let longer = self.0.saturating_add(secs);
+        if longer.get() > MAX_LOCAL_WALL_SECS {
+            Self::of_secs::<MAX_LOCAL_WALL_SECS>()
+        } else {
+            Self(longer)
+        }
+    }
 }
 
 /// What a remote-ingest surface may leave on disk.
@@ -557,13 +568,26 @@ pub const WASM_TOOL_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<600>(),
 });
 
+/// The seconds a self-run of this CLI may take beyond the `cargo build` it contains.
+const SELF_RUN_MARGIN_SECS: u64 = 60;
+
+/// The wall of a self-run of this CLI: the cargo build wall plus
+/// [`SELF_RUN_MARGIN_SECS`], held to [`MAX_LOCAL_WALL_SECS`].
+const SELF_RUN_WALL: LocalWall =
+    crate::cargo_step::CARGO_BUILD_WALL.extended_by(SELF_RUN_MARGIN_SECS);
+
+// A self-run contains a full cargo build, so its wall never cuts the build
+// short of the build's own wall.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the self-run wall drops below the cargo build wall it contains [ledger #boundary]
+const _: () = assert!(SELF_RUN_WALL.secs() >= crate::cargo_step::CARGO_BUILD_WALL.secs());
+
 /// The ceilings of a self-run of this CLI (`ipe dev run <snippet>`), which contains a full cargo build.
 ///
-/// Its stdout (the snippet's output) is held to 1 MiB and its run to
-/// [`MAX_LOCAL_WALL_SECS`].
+/// Its stdout (the snippet's output) is held to 1 MiB and its run to the
+/// cargo build wall plus a margin, never past [`MAX_LOCAL_WALL_SECS`].
 pub const SELF_RUN_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     stdout_bytes: ByteBudget::of::<MIB>(),
-    wall: LocalWall::of_secs::<MAX_LOCAL_WALL_SECS>(),
+    wall: SELF_RUN_WALL,
 });
 
 /// Run a local `command` detached in its own process group, held to `ceiling`.
@@ -2003,6 +2027,99 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+impl Running {
+    /// Kill the child's group, or the child where it leads none, leaving it unreaped.
+    fn kill(&mut self) {
+        match self.group {
+            Some(id) => group::kill(id),
+            None => {
+                // The child may already have exited; `reap` or `stop` reaps it.
+                let _ = self.child.kill();
+            }
+        }
+    }
+
+    /// Reap the exited child, leaving what it started in its group running.
+    ///
+    /// # Errors
+    /// Waiting failed, or a signal ended every transfer
+    /// ([`std::io::ErrorKind::Interrupted`]): its owner may have killed the
+    /// child, so its status is not the run's outcome.
+    fn reap(&mut self) -> std::io::Result<ExitStatus> {
+        if let Some(id) = self.group.take() {
+            group::forget(id);
+        }
+        if let Some(id) = self.attached.take() {
+            group::forget_attached(id);
+        }
+        let status = self.child.wait();
+        self.reaped = true;
+        if group::ended() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        status
+    }
+}
+
+/// A child leading its own process group, killed and reaped however it is left.
+///
+/// The group lets a wall stop every process the child started, not only the
+/// child. Outside the terminal's foreground group, the child hears an
+/// interrupt, a quit, a hangup, a stop and a continue only through the relay
+/// every detached group shares, and its group is killed on a termination
+/// request. On a platform without process groups it is a plain child.
+pub struct GroupedChild(Running);
+
+impl GroupedChild {
+    /// Spawn `command` as the leader of a new process group.
+    ///
+    /// The child starts through the runtime's hardened spawner.
+    ///
+    /// # Errors
+    /// The termination owner or the relay could not be installed, a signal
+    /// ended every detached group ([`std::io::ErrorKind::Interrupted`]), or
+    /// the spawn failed.
+    pub fn spawn(command: Command) -> std::io::Result<Self> {
+        Running::spawn(command, Mode::Detached).map(Self)
+    }
+
+    /// Take the child's stdout and stderr pipes, when piped.
+    pub const fn take_pipes(&mut self) -> (Option<ChildStdout>, Option<ChildStderr>) {
+        (self.0.child.stdout.take(), self.0.child.stderr.take())
+    }
+
+    /// Whether the child has exited, leaving it unreaped.
+    ///
+    /// # Errors
+    /// The platform could not report the child's state.
+    pub fn exited(&mut self) -> std::io::Result<bool> {
+        self.0.exited()
+    }
+
+    /// Kill the child and every process in its group, leaving the child unreaped.
+    pub fn kill(&mut self) {
+        self.0.kill();
+    }
+
+    /// Reap the exited child; what it started in its group is left running.
+    ///
+    /// # Errors
+    /// Waiting failed, or a signal ended every detached group
+    /// ([`std::io::ErrorKind::Interrupted`]), so its status is not the run's
+    /// outcome.
+    pub fn reap(&mut self) -> std::io::Result<ExitStatus> {
+        self.0.reap()
+    }
+
+    /// Kill the child's whole group and reap the child.
+    ///
+    /// # Errors
+    /// As [`Self::reap`].
+    pub fn finish(&mut self) -> std::io::Result<ExitStatus> {
+        self.0.finish()
     }
 }
 
