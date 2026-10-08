@@ -65,21 +65,109 @@ fn payload_json(claims_json: &str) -> Result<String, String> {
     Ok(super::json_enc_canonical(&value))
 }
 
-/// Read a NumericDate claim (RFC 7519 §2: any JSON number, may be fractional)
-/// as a whole-second count, flooring toward −∞ so a token is never accepted
-/// longer than its fractional `exp` states.
-///
-/// Returns `None` when the claim is absent or not a number (treated as absent
-/// = accepted, for optional `exp`/`nbf`).
+/// Why a token's claims set was refused before any claim in it was trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimsRefusal {
+    /// The payload is not a JSON object, so it has no claims to read
+    /// (RFC 7519 §7.2).
+    NotAnObject,
+    /// A NumericDate claim is present but not a JSON number, so no clock check
+    /// could read it.
+    NonNumericDate {
+        /// The claim's name.
+        claim: &'static str,
+    },
+    /// The token is at or past its `exp`.
+    Expired,
+    /// The token is before its `nbf`.
+    NotYetValid,
+}
+
+impl std::fmt::Display for ClaimsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAnObject => f.write_str("token claims set is not a JSON object"),
+            Self::NonNumericDate { claim } => {
+                write!(f, "token `{claim}` is not a NumericDate")
+            }
+            Self::Expired => f.write_str("token has expired"),
+            Self::NotYetValid => f.write_str("token is not yet valid"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimsRefusal {}
+
+/// A JSON number as whole Unix seconds, flooring toward −∞ so a token is never
+/// accepted longer than its fractional `exp` states. `None` when the number has
+/// no `f64` reading.
 ///
 /// Flooring is the conservative direction for both claims:
 ///   - `exp 0.4` → `0`  (already expired at epoch; rejected)
 ///   - `nbf 0.4` → `0`  (accepts slightly earlier than the fractional value,
 ///     matching integer-second oracle behaviour)
 ///   - `exp -0.1` → `-1` (negative, unconditionally in the past; rejected)
+fn number_seconds(n: &serde_json::Number) -> Option<i64> {
+    n.as_i64().or_else(|| n.as_f64().map(|f| f.floor() as i64))
+}
+
+/// Read the NumericDate claim `claim` (RFC 7519 §2: any JSON number, may be
+/// fractional) of the claims set `claims` as whole seconds.
+///
+/// `Ok(None)` means the claim is absent, and only that: a present value that
+/// is not a number the clock can read is refused, never passed over.
+///
+/// # Errors
+///
+/// [`ClaimsRefusal::NotAnObject`] when `claims` is not a JSON object;
+/// [`ClaimsRefusal::NonNumericDate`] when the claim is present but not a
+/// readable number (a string, `null`, a boolean, an array, an object).
+pub(crate) fn read_numeric_date(
+    claims: &JsonValue,
+    claim: &'static str,
+) -> Result<Option<i64>, ClaimsRefusal> {
+    let object = claims.as_object().ok_or(ClaimsRefusal::NotAnObject)?;
+    match object.get(claim) {
+        None => Ok(None),
+        Some(JsonValue::Number(n)) => number_seconds(n)
+            .map(Some)
+            .ok_or(ClaimsRefusal::NonNumericDate { claim }),
+        Some(_) => Err(ClaimsRefusal::NonNumericDate { claim }),
+    }
+}
+
+/// Admit the claims set `claims` at time `now` (Unix seconds): every registered
+/// NumericDate claim (`exp`, `nbf`, `iat`, RFC 7519 §4.1.4–6) that is present
+/// must be a number, `now` must be before `exp` and at or after `nbf`. An
+/// absent `exp` or `nbf` sets no bound.
+///
+/// # Errors
+///
+/// The [`ClaimsRefusal`] naming the first check the claims set failed.
+pub(crate) fn admit_time_claims(claims: &JsonValue, now: i64) -> Result<(), ClaimsRefusal> {
+    let exp = read_numeric_date(claims, "exp")?;
+    let nbf = read_numeric_date(claims, "nbf")?;
+    // `iat` bounds nothing here, but a present non-number `iat` is a claims set
+    // a reader of the decoded claims would misread.
+    read_numeric_date(claims, "iat")?;
+    if exp.is_some_and(|exp| now >= exp) {
+        return Err(ClaimsRefusal::Expired);
+    }
+    if nbf.is_some_and(|nbf| now < nbf) {
+        return Err(ClaimsRefusal::NotYetValid);
+    }
+    Ok(())
+}
+
+/// Lenient NumericDate reader: `None` when the claim is absent OR not a number.
+///
+/// It passes over a mistyped claim, so it must not decide admission: the
+/// `Ipe.Jwt` decoders admit through [`admit_time_claims`], and `auth.rs` is to
+/// adopt [`read_numeric_date`] in place of this reader for its `exp`/`nbf`/`cap`
+/// checks.
 pub(crate) fn numeric_date(value: &JsonValue, claim: &str) -> Option<i64> {
     match value.get(claim) {
-        Some(JsonValue::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f.floor() as i64)),
+        Some(JsonValue::Number(n)) => number_seconds(n),
         _ => None,
     }
 }
@@ -171,21 +259,14 @@ pub fn jwt_decode_hs256<E: From<String>>(secret: String, token: String) -> IpeRe
     }
     // Pre-reject on the full RFC 7519 NumericDate domain (integer, negative,
     // fractional) before jsonwebtoken's `exp - 1` u64 subtraction can underflow.
-    // `numeric_date` floors fractional values conservatively, so `exp 0.4 → 0`
+    // `admit_time_claims` floors fractional values conservatively, so `exp 0.4 → 0`
     // (already past), `exp -1 → -1` (negative epoch, always past), enforcing
-    // `now >= exp` / `now < nbf` on every numeric spelling.
-    if let Some(payload) = decode_payload(&token) {
-        let now = now_unix_seconds();
-        if let Some(exp) = numeric_date(&payload, "exp")
-            && now >= exp
-        {
-            return IpeResult::Err("jwt-decode: token has expired".to_string().into());
-        }
-        if let Some(nbf) = numeric_date(&payload, "nbf")
-            && now < nbf
-        {
-            return IpeResult::Err("jwt-decode: token is not yet valid".to_string().into());
-        }
+    // `now >= exp` / `now < nbf` on every numeric spelling, and refuses a
+    // present date claim that is not a number (jsonwebtoken passes over one).
+    if let Some(payload) = decode_payload(&token)
+        && let Err(refusal) = admit_time_claims(&payload, now_unix_seconds())
+    {
+        return IpeResult::Err(format!("jwt-decode: {refusal}").into());
     }
     let key = DecodingKey::from_secret(secret.as_bytes());
     let mut validation = Validation::new(Algorithm::HS256);
@@ -217,9 +298,14 @@ pub fn jwt_decode_hs256<E: From<String>>(secret: String, token: String) -> IpeRe
     // expected-audience decoder variant.
     validation.validate_aud = false;
     match decode::<JsonValue>(&token, &key, &validation) {
-        Ok(data) => match serde_json::to_string(&data.claims) {
-            Ok(s) => IpeResult::Ok(s),
-            Err(e) => IpeResult::Err(format!("jwt-decode: re-encode claims: {}", e).into()),
+        // The verified claims are admitted again: the pre-reject above reads the
+        // unverified payload and is skipped when that payload does not parse.
+        Ok(data) => match admit_time_claims(&data.claims, now_unix_seconds()) {
+            Err(refusal) => IpeResult::Err(format!("jwt-decode: {refusal}").into()),
+            Ok(()) => match serde_json::to_string(&data.claims) {
+                Ok(s) => IpeResult::Ok(s),
+                Err(e) => IpeResult::Err(format!("jwt-decode: re-encode claims: {}", e).into()),
+            },
         },
         Err(e) => IpeResult::Err(format!("jwt-decode: {}", e).into()),
     }
@@ -261,18 +347,10 @@ pub fn jwt_encode_rs256<E: From<String>>(
 pub fn jwt_decode_rs256<E: From<String>>(key_pem: String, token: String) -> IpeResult<E, String> {
     // Pre-reject on the full RFC 7519 NumericDate domain — mirrors the HS256
     // path; see `jwt_decode_hs256` for the detailed rationale.
-    if let Some(payload) = decode_payload(&token) {
-        let now = now_unix_seconds();
-        if let Some(exp) = numeric_date(&payload, "exp")
-            && now >= exp
-        {
-            return IpeResult::Err("jwt-decode-rs: token has expired".to_string().into());
-        }
-        if let Some(nbf) = numeric_date(&payload, "nbf")
-            && now < nbf
-        {
-            return IpeResult::Err("jwt-decode-rs: token is not yet valid".to_string().into());
-        }
+    if let Some(payload) = decode_payload(&token)
+        && let Err(refusal) = admit_time_claims(&payload, now_unix_seconds())
+    {
+        return IpeResult::Err(format!("jwt-decode-rs: {refusal}").into());
     }
     let key = match DecodingKey::from_rsa_pem(key_pem.as_bytes()) {
         Ok(k) => k,
@@ -309,9 +387,13 @@ pub fn jwt_decode_rs256<E: From<String>>(key_pem: String, token: String) -> IpeR
     // expected-audience decoder variant.
     validation.validate_aud = false;
     match decode::<JsonValue>(&token, &key, &validation) {
-        Ok(data) => match serde_json::to_string(&data.claims) {
-            Ok(s) => IpeResult::Ok(s),
-            Err(e) => IpeResult::Err(format!("jwt-decode-rs: re-encode: {}", e).into()),
+        // The verified claims are admitted again — see `jwt_decode_hs256`.
+        Ok(data) => match admit_time_claims(&data.claims, now_unix_seconds()) {
+            Err(refusal) => IpeResult::Err(format!("jwt-decode-rs: {refusal}").into()),
+            Ok(()) => match serde_json::to_string(&data.claims) {
+                Ok(s) => IpeResult::Ok(s),
+                Err(e) => IpeResult::Err(format!("jwt-decode-rs: re-encode: {}", e).into()),
+            },
         },
         Err(e) => IpeResult::Err(format!("jwt-decode-rs: {}", e).into()),
     }
@@ -514,6 +596,8 @@ pub fn ipe_jwt_encode(
 ///   pastClaim:   now >= exp  → Err "Jwt.decode: token has expired"
 ///   futureClaim: now <  nbf  → Err "Jwt.decode: token is not yet valid"
 ///   absent claim              → accept (optional)
+///   present `exp`/`nbf`/`iat` that is not a JSON number
+///                             → Err "Jwt.decode: token `<claim>` is not a NumericDate"
 /// Returns the raw payload JSON string (base64url-decoded middle segment).
 /// No wall-clock access; deterministic on `now`.
 pub fn ipe_jwt_decode(
@@ -581,23 +665,15 @@ pub fn ipe_jwt_decode(
         Err(_) => return IpeResult::Err("jwt-decode: payload is not valid UTF-8".into()),
     };
 
-    // 4. Manual time validation matching reference semantics exactly.
-    //    Uses `numeric_date` (the total NumericDate reader) so fractional and
-    //    negative exp/nbf values are honoured, not silently skipped the way
-    //    `as_i64()` would skip a float claim.
-    let claims_val: JsonValue = serde_json::from_str(&payload_json).unwrap_or(JsonValue::Null);
-
-    if let Some(exp) = numeric_date(&claims_val, "exp") {
-        // pastClaim: now >= exp  → expired
-        if now >= exp {
-            return IpeResult::Err("Jwt.decode: token has expired".into());
-        }
-    }
-    if let Some(nbf) = numeric_date(&claims_val, "nbf") {
-        // futureClaim: now < nbf  → not yet valid
-        if now < nbf {
-            return IpeResult::Err("Jwt.decode: token is not yet valid".into());
-        }
+    // 4. Manual time validation matching reference semantics exactly, on the
+    //    payload parsed once into a claims set. `admit_time_claims` honours
+    //    fractional and negative `exp`/`nbf` and refuses a present date claim
+    //    that is not a number, never passing over it.
+    let Ok(claims_val) = serde_json::from_str::<JsonValue>(&payload_json) else {
+        return IpeResult::Err("jwt-decode: payload is not JSON".into());
+    };
+    if let Err(refusal) = admit_time_claims(&claims_val, now) {
+        return IpeResult::Err(format!("Jwt.decode: {refusal}").into());
     }
 
     IpeResult::Ok(payload_json)
@@ -1155,5 +1231,134 @@ mod tests {
             }
             IpeResult::Ok(_) => panic!("unknown algorithm descriptor must not succeed"),
         }
+    }
+
+    // ── A present NumericDate claim must be a number ─────────────────────────
+    //
+    // jsonwebtoken's validation passes over a date claim it cannot parse as a
+    // number, so a token whose future `nbf` (or past `exp`) is written as text
+    // would verify unless the decoders refuse it themselves.
+
+    const DATE_SECRET: &str = "date-claim-secret-0123456789abcdef";
+
+    fn hs256_token(claims: &str) -> String {
+        match jwt_encode_hs256::<String>(DATE_SECRET.to_string(), claims.to_string()) {
+            IpeResult::Ok(t) => t,
+            IpeResult::Err(e) => panic!("encode: {e}"),
+        }
+    }
+
+    fn flat_hs256(token: String) -> IpeResult<String, String> {
+        jwt_decode_hs256(DATE_SECRET.to_string(), token)
+    }
+
+    fn builder_hs256(now: i64, token: String) -> IpeResult<crate::error::IpeError, String> {
+        let desc = crate::secret::secret_from_string(format!("HS256:{DATE_SECRET}"));
+        ipe_jwt_decode(desc, now, token)
+    }
+
+    /// The error text of a refused decode; panics when the decode succeeded.
+    fn refusal<E: std::fmt::Display>(decoded: IpeResult<E, String>) -> String {
+        match decoded {
+            IpeResult::Err(e) => e.to_string(),
+            IpeResult::Ok(payload) => panic!("decode must be refused, got Ok({payload})"),
+        }
+    }
+
+    /// The flat HS256 decoder refuses a future `nbf`, a past `exp`, and an
+    /// `iat` written as JSON strings.
+    #[test]
+    fn flat_hs256_text_date_claims_refused() {
+        let future = now_unix() + 3600;
+        for (claims, claim) in [
+            (format!(r#"{{"sub":"x","nbf":"{future}"}}"#), "nbf"),
+            (r#"{"sub":"x","exp":"1"}"#.to_string(), "exp"),
+            (r#"{"sub":"x","iat":"1"}"#.to_string(), "iat"),
+        ] {
+            let msg = refusal(flat_hs256(hs256_token(&claims)));
+            assert!(
+                msg.contains(&format!("`{claim}` is not a NumericDate")),
+                "{claims}: unexpected refusal {msg}"
+            );
+        }
+    }
+
+    /// The flat RS256 decoder refuses a text `nbf` and a text `exp`.
+    #[test]
+    fn flat_rs256_text_date_claims_refused() {
+        let future = now_unix() + 3600;
+        for (claims, claim) in [
+            (format!(r#"{{"sub":"bob","nbf":"{future}"}}"#), "nbf"),
+            (r#"{"sub":"bob","exp":"1"}"#.to_string(), "exp"),
+        ] {
+            let token = match jwt_encode_rs256::<String>(RS256_PRIV_PEM.to_string(), claims.clone())
+            {
+                IpeResult::Ok(t) => t,
+                IpeResult::Err(e) => panic!("encode-rs: {e}"),
+            };
+            let msg = refusal(jwt_decode_rs256::<String>(RS256_PUB_PEM.to_string(), token));
+            assert!(
+                msg.contains(&format!("`{claim}` is not a NumericDate")),
+                "{claims}: unexpected refusal {msg}"
+            );
+        }
+    }
+
+    /// `Jwt.decode` refuses every present date claim that is not a JSON number:
+    /// text, `null`, boolean, array and object values.
+    #[test]
+    fn builder_non_numeric_date_claims_refused() {
+        for (claims, claim) in [
+            (r#"{"sub":"x","nbf":"1000"}"#, "nbf"),
+            (r#"{"sub":"x","exp":"100"}"#, "exp"),
+            (r#"{"sub":"x","iat":"100"}"#, "iat"),
+            (r#"{"sub":"x","nbf":null}"#, "nbf"),
+            (r#"{"sub":"x","exp":true}"#, "exp"),
+            (r#"{"sub":"x","exp":[1]}"#, "exp"),
+            (r#"{"sub":"x","nbf":{"at":1000}}"#, "nbf"),
+        ] {
+            let msg = refusal(builder_hs256(500, hs256_token(claims)));
+            // `IpeError`'s display prefixes the error kind's label.
+            assert!(
+                msg.ends_with(&format!("Jwt.decode: token `{claim}` is not a NumericDate")),
+                "{claims}: unexpected refusal {msg}"
+            );
+        }
+    }
+
+    /// Numeric date claims at their boundaries still decode on both paths, and
+    /// a text value in a claim that is not a date is not refused.
+    #[test]
+    fn numeric_date_claims_at_boundary_accepted() {
+        // Builder: now == nbf, now == exp - 1, numeric iat, fractional nbf.
+        let token = hs256_token(r#"{"sub":"x","nbf":500,"exp":501,"iat":400,"jti":"100"}"#);
+        assert!(matches!(builder_hs256(500, token), IpeResult::Ok(_)));
+        let token = hs256_token(r#"{"sub":"x","nbf":500.9,"iat":0.5}"#);
+        assert!(matches!(builder_hs256(500, token), IpeResult::Ok(_)));
+        // Flat: a far-future exp and a numeric iat.
+        let token = hs256_token(r#"{"sub":"x","exp":9999999999,"iat":1}"#);
+        assert!(matches!(flat_hs256(token), IpeResult::Ok(_)));
+    }
+
+    /// The reader distinguishes an absent claim from a mistyped one and refuses
+    /// a claims set that is not an object.
+    #[test]
+    fn read_numeric_date_absent_vs_mistyped() {
+        let claims = serde_json::json!({"exp": 7, "nbf": "7", "frac": -0.1});
+        assert_eq!(read_numeric_date(&claims, "exp"), Ok(Some(7)));
+        assert_eq!(read_numeric_date(&claims, "frac"), Ok(Some(-1)));
+        assert_eq!(read_numeric_date(&claims, "iat"), Ok(None));
+        assert_eq!(
+            read_numeric_date(&claims, "nbf"),
+            Err(ClaimsRefusal::NonNumericDate { claim: "nbf" })
+        );
+        assert_eq!(
+            read_numeric_date(&serde_json::json!([7]), "exp"),
+            Err(ClaimsRefusal::NotAnObject)
+        );
+        assert_eq!(
+            admit_time_claims(&serde_json::json!("exp"), 0),
+            Err(ClaimsRefusal::NotAnObject)
+        );
     }
 }
