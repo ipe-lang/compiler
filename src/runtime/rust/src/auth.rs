@@ -291,18 +291,34 @@ impl std::error::Error for TokenRefusal {}
 ///
 /// Only `verify_claims` builds one, so a value of this type is proof the claims
 /// came from a verified token.
-pub struct VerifiedClaims(HashMap<String, String>);
+pub struct VerifiedClaims {
+    /// Every claim, its value coerced to a string.
+    claims: HashMap<String, String>,
+    /// The names of the claims whose value was not a JSON string.
+    coerced: std::collections::HashSet<String>,
+}
 
 impl VerifiedClaims {
-    /// The value of claim `name`.
+    /// The value of claim `name`, coerced to a string.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.0.get(name).map(String::as_str)
+        self.claims.get(name).map(String::as_str)
+    }
+
+    /// The value of claim `name` only when the token wrote it as a JSON
+    /// string: a `null`, number, boolean, array or object is absent here, never
+    /// its JSON text.
+    #[must_use]
+    pub fn text(&self, name: &str) -> Option<&str> {
+        if self.coerced.contains(name) {
+            return None;
+        }
+        self.get(name)
     }
 
     /// Every claim as a `(name, value)` pair.
     pub fn iter(&self) -> ClaimPairs<'_> {
-        self.0
+        self.claims
             .iter()
             .map(claim_pair as for<'x> fn((&'x String, &'x String)) -> (&'x str, &'x str))
     }
@@ -310,7 +326,7 @@ impl VerifiedClaims {
     /// The claims as the map the `Auth.verifyToken` kernel returns.
     #[must_use]
     pub fn into_map(self) -> HashMap<String, String> {
-        self.0
+        self.claims
     }
 }
 
@@ -338,7 +354,7 @@ impl<'a> IntoIterator for &'a VerifiedClaims {
 // names only.
 impl std::fmt::Debug for VerifiedClaims {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_set().entries(self.0.keys()).finish()
+        f.debug_set().entries(self.claims.keys()).finish()
     }
 }
 
@@ -445,20 +461,25 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
     {
         return Err(TokenRefusal::PastCap);
     }
-    let mut out = HashMap::new();
+    let mut claims = HashMap::new();
+    let mut coerced = std::collections::HashSet::new();
     if let serde_json::Value::Object(m) = parsed.claims {
         for (k, v) in m {
             // Coerce each claim value to a string. Numbers/booleans get
             // their JSON-text representation; nested objects/arrays get their
-            // JSON serialisation (Sprintf behaviour).
+            // JSON serialisation (Sprintf behaviour). A coerced claim's name is
+            // kept, so `text` never reads `null` as the string "null".
             let s = match v {
                 serde_json::Value::String(s) => s,
-                other => other.to_string(),
+                other => {
+                    coerced.insert(k.clone());
+                    other.to_string()
+                }
             };
-            out.insert(k, s);
+            claims.insert(k, s);
         }
     }
-    Ok(VerifiedClaims(out))
+    Ok(VerifiedClaims { claims, coerced })
 }
 
 /// Ipê `verifyToken : String -> String -> Result Error a`. Verifies the token

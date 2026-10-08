@@ -417,9 +417,11 @@ impl UnixSecs {
 /// session id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Denial {
-    /// The token carries no subject, or an empty one.
+    /// The token carries no subject, an empty one, or one that is not a JSON
+    /// string.
     SubjectAbsent,
-    /// The token carries no session id (`jti`), or an empty one.
+    /// The token carries no session id (`jti`), an empty one, or one that is
+    /// not a JSON string.
     SessionIdAbsent,
     /// The token carries no lifetime bound (`cap`, else `exp`).
     NoDeadline,
@@ -572,12 +574,14 @@ impl ArmedGate {
         claims: &VerifiedClaims,
         subject_claim: &str,
     ) -> Result<SessionCredential, Denial> {
+        // RFC 7519 writes `sub` and `jti` as strings; a `null` or a number is
+        // no subject or session id, never its JSON text.
         let subject = claims
-            .get(subject_claim)
+            .text(subject_claim)
             .and_then(Subject::parse)
             .ok_or(Denial::SubjectAbsent)?;
         let session = claims
-            .get("jti")
+            .text("jti")
             .and_then(SessionJti::parse)
             .ok_or(Denial::SessionIdAbsent)?;
         let deadline = deadline_of(claims).ok_or(Denial::NoDeadline)?;
@@ -744,7 +748,8 @@ pub fn encode_bindings(bindings: &SessionBindings) -> Vec<u8> {
 /// # Errors
 ///
 /// [`BindingsDecodeRefusal`] for malformed bytes, an empty field, more than
-/// [`MAX_SESSION_CREDENTIALS`] credentials, or a repeated session id.
+/// [`MAX_SESSION_CREDENTIALS`] credentials, or a repeated subject and session
+/// id pair.
 pub fn decode_bindings(bytes: &[u8]) -> Result<SessionBindings, BindingsDecodeRefusal> {
     let credentials: Vec<SessionCredential> =
         serde_json::from_slice(bytes).map_err(|_| BindingsDecodeRefusal::Malformed)?;
@@ -1496,6 +1501,9 @@ mod tests {
         for claims in [
             serde_json::json!({ "jti": "g3-jti", "exp": LIVE_UNTIL }),
             serde_json::json!({ "sub": "", "jti": "g3-jti", "exp": LIVE_UNTIL }),
+            serde_json::json!({ "sub": null, "jti": "g3-jti", "exp": LIVE_UNTIL }),
+            serde_json::json!({ "sub": 42, "jti": "g3-jti", "exp": LIVE_UNTIL }),
+            serde_json::json!({ "sub": ["g3-subject"], "jti": "g3-jti", "exp": LIVE_UNTIL }),
         ] {
             assert_eq!(
                 gate().admit_in(&store, &claims_of(&claims), "sub"),
@@ -1515,6 +1523,9 @@ mod tests {
         for claims in [
             serde_json::json!({ "sub": "g3-subject", "exp": LIVE_UNTIL }),
             serde_json::json!({ "sub": "g3-subject", "jti": "", "exp": LIVE_UNTIL }),
+            serde_json::json!({ "sub": "g3-subject", "jti": null, "exp": LIVE_UNTIL }),
+            serde_json::json!({ "sub": "g3-subject", "jti": 7, "exp": LIVE_UNTIL }),
+            serde_json::json!({ "sub": "g3-subject", "jti": false, "exp": LIVE_UNTIL }),
         ] {
             assert_eq!(
                 gate().admit_in(&store, &claims_of(&claims), "sub"),
@@ -1742,5 +1753,13 @@ mod tests {
         bindings.bind(early).expect("a held session id rebinds");
         assert_eq!(bindings.len(), MAX_SESSION_CREDENTIALS);
         assert_eq!(bindings.earliest_deadline(), Some(UnixSecs(LIVE_UNTIL - 5)));
+        bindings
+            .bind(admitted("bind-subject", "bind-jti-0"))
+            .expect("a held session id rebinds");
+        assert_eq!(
+            bindings.earliest_deadline(),
+            Some(UnixSecs(LIVE_UNTIL - 5)),
+            "a later deadline never extends a held credential"
+        );
     }
 }
