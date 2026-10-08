@@ -55,7 +55,7 @@ struct BcryptCost(u32);
 /// Why a stored hash was refused before bcrypt ran on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoredHashRefusal {
-    /// The hash does not start with a `$2[abxy]$NN$` prefix bcrypt accepts.
+    /// The hash is not a `$2[abxy]$NN$<salt><digest>` hash bcrypt verifies.
     NotBcrypt,
     /// The hash's cost field is above [`BCRYPT_COST_MAX`].
     CostOverCeiling,
@@ -110,6 +110,67 @@ impl BcryptCost {
     }
 }
 
+/// The byte length of a bcrypt hash's `$2[abxy]$NN$` prefix.
+const BCRYPT_PREFIX_LEN: usize = 7;
+
+/// The salt's length in bcrypt base64 characters.
+const BCRYPT_SALT_CHARS: usize = 22;
+
+/// The salt and digest's length in bcrypt base64 characters.
+const BCRYPT_BODY_CHARS: usize = 53;
+
+/// The salt's length in bytes.
+const BCRYPT_SALT_BYTES: usize = 16;
+
+/// The stored digest's length in bytes.
+const BCRYPT_DIGEST_BYTES: usize = 23;
+
+/// The base64 engine bcrypt encodes its salt and digest with: its own
+/// alphabet, no padding, canonical trailing bits.
+const BCRYPT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::BCRYPT,
+    base64::engine::general_purpose::NO_PAD,
+);
+
+/// A stored hash bcrypt verifies without refusing it: the exact
+/// `$2[abxy]$NN$<salt><digest>` shape, its cost inside
+/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]`, salt and digest each decoding to its
+/// full length. Verifying one always runs the KDF, at a bounded cost.
+#[derive(Clone, Copy)]
+struct StoredHash<'a> {
+    /// The hash text, proven to have that shape.
+    text: &'a str,
+}
+
+impl<'a> StoredHash<'a> {
+    /// The stored hash `text`, admitted only in the shape bcrypt verifies.
+    fn parse(text: &'a str) -> Result<Self, StoredHashRefusal> {
+        use base64::Engine as _;
+        BcryptCost::of_hash(text)?;
+        let decodes_to = |part: &str, len: usize| {
+            BCRYPT_BASE64
+                .decode(part)
+                .is_ok_and(|bytes| bytes.len() == len)
+        };
+        let body = text.get(BCRYPT_PREFIX_LEN..).unwrap_or_default();
+        match body.split_at_checked(BCRYPT_SALT_CHARS) {
+            Some((salt, digest))
+                if body.len() == BCRYPT_BODY_CHARS
+                    && decodes_to(salt, BCRYPT_SALT_BYTES)
+                    && decodes_to(digest, BCRYPT_DIGEST_BYTES) =>
+            {
+                Ok(Self { text })
+            }
+            _ => Err(StoredHashRefusal::NotBcrypt),
+        }
+    }
+
+    /// Whether `password` hashes to this hash.
+    fn verifies(self, password: &str) -> Result<bool, StoredHashRefusal> {
+        bcrypt::verify(password, self.text).map_err(|_| StoredHashRefusal::NotBcrypt)
+    }
+}
+
 /// Ipê `hashPasswordCost : String -> Int -> Result Error String`. Clamps cost to
 /// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]` = [4, 15] (4 = fast for tests, 12 =
 /// production default, 14–15 = high security). The bcrypt VALID range is
@@ -136,20 +197,16 @@ pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeRes
 /// Ipê `verifyPassword : String -> String -> Result Error Bool`.
 /// `verifyPassword candidate hash` — true if candidate hashes to the same hash.
 ///
-/// A hash that is not a bcrypt hash, or whose cost is above
-/// [`BCRYPT_COST_MAX`], is refused before the KDF runs, with a fixed
+/// A hash that is not a [`StoredHash`] (not a bcrypt hash, or its cost above
+/// [`BCRYPT_COST_MAX`]) is refused before the KDF runs, with a fixed
 /// `InvalidInput` message that never names the hash.
 pub fn auth_verify_password(pw: String, hash: String) -> IpeResult<IpeError, bool> {
-    let refuse = |refusal: StoredHashRefusal| {
-        IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned()))
-    };
-    if let Err(refusal) = BcryptCost::of_hash(&hash) {
-        return refuse(refusal);
-    }
-    match bcrypt::verify(&pw, &hash) {
-        Ok(b) => IpeResult::Ok(b),
-        Err(_) => refuse(StoredHashRefusal::NotBcrypt),
-    }
+    StoredHash::parse(&hash)
+        .and_then(|stored| stored.verifies(&pw))
+        .map_or_else(
+            |refusal| IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned())),
+            IpeResult::Ok,
+        )
 }
 
 /// Ipê `passwordStrength : String -> Result Error String`. Validates length
@@ -898,15 +955,16 @@ pub fn auth_register<
 #[cfg(feature = "db")]
 /// Whether `password` verifies against the `stored` hash a login read.
 ///
-/// A stored hash that is not a bcrypt hash inside
-/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]` never verifies, and bcrypt runs on
-/// `decoy` instead: a cost above the ceiling never reaches the KDF, and the
-/// refusal costs what a wrong password costs.
+/// A stored hash that is not a [`StoredHash`] never verifies, and bcrypt runs
+/// on `decoy` instead: a cost above the ceiling never reaches the KDF, and a
+/// hash bcrypt would refuse before hashing costs what a wrong password costs.
 fn login_hash_verifies(password: &str, stored: &str, decoy: &str) -> bool {
-    let admissible = BcryptCost::of_hash(stored).is_ok();
-    let checked = if admissible { stored } else { decoy };
-    let verified = bcrypt::verify(password, checked).unwrap_or(false);
-    admissible && verified
+    let parsed = StoredHash::parse(stored);
+    let verified = parsed.map_or_else(
+        |_| bcrypt::verify(password, decoy).unwrap_or(false),
+        |hash| hash.verifies(password).unwrap_or(false),
+    );
+    parsed.is_ok() && verified
 }
 
 #[cfg(feature = "db")]
@@ -1465,9 +1523,17 @@ mod tests {
         let at_floor = bcrypt::hash("hunter2!", BCRYPT_COST_MIN).expect("hash");
         let over_ceiling = at_floor.replacen("$04$", "$31$", 1);
         assert_ne!(over_ceiling, at_floor, "the fixture raised the cost field");
+        // A cost-12 prefix whose digest is one character short: bcrypt refuses
+        // it before hashing.
+        let at_default = at_floor.replacen("$04$", "$12$", 1);
+        let (malformed, _) = at_default
+            .split_at_checked(at_default.len() - 1)
+            .expect("a full hash");
+        assert!(bcrypt::verify("hunter2!", malformed).is_err());
         for (email, stored) in [
             ("floor@example.com", at_floor.as_str()),
             ("over@example.com", over_ceiling.as_str()),
+            ("malformed@example.com", malformed),
             ("plain@example.com", "hunter2!"),
         ] {
             sqlx::query(
@@ -1501,6 +1567,28 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(120),
             "no cost-31 KDF ran: {elapsed:?}"
+        );
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            bcrypt::verify("hunter2!", dummy_bcrypt_hash()),
+            Ok(false)
+        ));
+        let decoy_kdf = started.elapsed();
+        let started = std::time::Instant::now();
+        let malformed = login("malformed@example.com").await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                &malformed,
+                IpeResult::Err(IpeError::Error(_, info))
+                    if info.message == "auth.login: invalid credentials"
+            ),
+            "{malformed:?}"
+        );
+        assert!(
+            elapsed >= decoy_kdf / 10,
+            "a stored hash bcrypt refuses before hashing costs a decoy KDF: \
+             {elapsed:?} vs {decoy_kdf:?}"
         );
         assert!(
             matches!(login("plain@example.com").await, IpeResult::Err(_)),
@@ -2243,6 +2331,49 @@ mod tests {
             let Some((_, message)) = refused else { return };
             assert!(stored.contains("LEAKMARKER"));
             assert!(!message.contains("LEAKMARKER"), "{message}");
+        }
+    }
+
+    /// A stored hash bcrypt would turn back before hashing, or read in another
+    /// shape than it writes, is refused by the parse, so every admitted hash
+    /// runs the KDF; a hash bcrypt wrote is admitted and verifies.
+    #[test]
+    fn stored_hash_admits_only_the_shape_bcrypt_writes() {
+        let valid = bcrypt::hash("password123", BCRYPT_COST_MIN).expect("hash");
+        assert_eq!(
+            StoredHash::parse(&valid).map(|stored| stored.verifies("password123")),
+            Ok(Ok(true)),
+            "the control: a hash bcrypt wrote verifies"
+        );
+        let (head, _) = valid
+            .split_at_checked(valid.len() - 1)
+            .expect("a full hash");
+        let (prefix, body) = valid.split_at_checked(BCRYPT_PREFIX_LEN).expect("a prefix");
+        let (salt, digest) = body.split_at_checked(BCRYPT_SALT_CHARS).expect("a salt");
+        let (salt_head, _) = salt
+            .split_at_checked(BCRYPT_SALT_CHARS - 1)
+            .expect("a salt");
+        let refused = [
+            (head.to_owned(), "a digest one character short"),
+            (format!("{valid}."), "a digest one character long"),
+            (format!("{valid}$"), "a trailing `$` bcrypt's split skips"),
+            (format!("{prefix}${body}"), "an empty `$` segment"),
+            (format!("{head}/"), "digest trailing bits set"),
+            (
+                format!("{prefix}{salt_head}/{digest}"),
+                "salt trailing bits set",
+            ),
+            (format!("{head}+"), "a character outside bcrypt's alphabet"),
+            (format!("{head}\u{e9}"), "a multibyte character"),
+            (format!("{prefix}{salt}"), "a salt without a digest"),
+            (prefix.to_owned(), "a prefix alone"),
+        ];
+        for (stored, why) in refused {
+            assert_eq!(
+                StoredHash::parse(&stored).err(),
+                Some(StoredHashRefusal::NotBcrypt),
+                "{why}: {stored}"
+            );
         }
     }
 
