@@ -2233,7 +2233,7 @@ fn super_bounds_satisfied(
     // documented loss every sibling bound accepts; genuine cross-binding
     // obligation propagation is a follow-up design for ALL bounds at once — see
     // `docs/adr/0001-language-semantics-and-types.md` §6.
-    let not_curried_ok = !matches!(ty, Ty::Fun(_, _) | Ty::Var(_));
+    let not_curried_ok = !matches!(ty, Ty::Fun(_, _) | Ty::Var(_) | Ty::Wildcard);
     // SQL-bind-parameter obligation: satisfied by exactly the Ipê types the
     // runtime has a `From<T> for SqlParam` impl for — the bare scalars
     // `ipe_runtime::db` binds directly, plus the `SqlValue` ADT itself.
@@ -7873,6 +7873,25 @@ mod tests {
                 ),
                 "obligation bit {bit:?} must reject a function type at a concrete-pin site"
             );
+        }
+    }
+
+    /// The wildcard is no known type, so it satisfies no obligation at either
+    /// site: a bound left open on it would reach `cargo` unchecked.
+    #[test]
+    fn every_bound_bit_rejects_the_wildcard_at_both_sites() {
+        let i = Interner::new();
+        let no_fn_enums = EnumEmbeds::default();
+        for &bit in TyBounds::ALL_BITS {
+            for site in [
+                super_bounds::BoundSite::EmittedGeneric,
+                super_bounds::BoundSite::ConcretePin,
+            ] {
+                assert!(
+                    !super_bounds_satisfied(&i, bit, &Ty::Wildcard, site, &no_fn_enums),
+                    "obligation bit {bit:?} must reject the wildcard at {site:?}"
+                );
+            }
         }
     }
 
