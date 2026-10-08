@@ -974,6 +974,30 @@ mod tests {
         assert!(patch.html.is_none(), "no html replace: {patch:?}");
     }
 
+    /// Swapping two keyed items changes both ids at their positions, so the
+    /// parent's children are replaced in one patch.
+    #[test]
+    fn keyed_swap_replaces_parent_children() {
+        let list = |first: &str, second: &str| -> Html<()> {
+            Html::HElement(
+                "ul".into(),
+                vec![],
+                vec![keyed_li(first, first), keyed_li(second, second)],
+            )
+        };
+        let mut old = list("a", "b");
+        let mut new = list("b", "a");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r");
+        assert!(patch.html.is_some(), "html replace expected: {patch:?}");
+    }
+
     /// A key change two levels down is replaced at the nearest parent that
     /// holds the changed child, never above it.
     #[test]
