@@ -90,7 +90,7 @@ announceKey key =
 
 -- Parse every configured location, then open and probe each one before
 -- serving: the index read-only with every column a page reads, the review
--- database created and migrated, and the root, which the parse requires to
+-- database created and migrated with its log bound to `key`, and the root, which the parse requires to
 -- be an existing directory and `Index.probeRoot` to hold the index's files.
 -- A relative value resolves against the working directory. Then the index's
 -- `reviewed` copy is rebuilt from the review database once and stamped with
@@ -112,7 +112,7 @@ requireSettings key rawDb rawRoot rawReview =
             Index.probe index
             Index.probeRoot index
             review <- Settings.parseReviewDb rawReview
-            LibDb.probe review
+            LibDb.probe key review
             db <- LibDb.openAt review
             Queue.resyncReviewed key index db
             epoch <- Epoch.mint

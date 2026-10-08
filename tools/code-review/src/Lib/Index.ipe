@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -705,20 +705,23 @@ readStamp conn =
 
 
 -- The review log's head: the log's id, the seq of its last entry (0 while
--- the log is empty) and that entry's mac (`genesis` while it is empty).
+-- the log is empty), that entry's mac (`genesis` while it is empty) and the
+-- key check binding the log to the key that signs it (absent until a
+-- signing key adopts the log).
 -- Opaque: minted only by `chainHeadDecoder` (a read of the review
 -- database's `review_log_head`) and `chainNext` (the head after one more
 -- entry), so a head is never built from a count or a bare string.
 type ChainHead
-    = ChainHead { logId : String, seq : Int, mac : String }
+    = ChainHead { logId : String, seq : Int, mac : String, keyCheck : Maybe String }
 
 
 chainHeadDecoder : Db.Decode.Decoder ChainHead
 chainHeadDecoder =
-    Db.Decode.succeed (\logId seq mac -> ChainHead { logId = logId, seq = seq, mac = mac })
+    Db.Decode.succeed (\logId seq mac keyCheck -> ChainHead { logId = logId, seq = seq, mac = mac, keyCheck = keyCheck })
         |> Db.Decode.required "log_id" (Db.Decode.string "log_id")
         |> Db.Decode.required "seq" (Db.Decode.int "seq")
         |> Db.Decode.required "head" (Db.Decode.string "head")
+        |> Db.Decode.required "key_check" (Db.Decode.nullable (Db.Decode.string "key_check"))
 
 
 -- The head once the entry whose mac is `mac` is appended at the next seq.
@@ -726,7 +729,7 @@ chainNext : ChainHead -> String -> ChainHead
 chainNext head mac =
     case head of
         ChainHead h ->
-            ChainHead { logId = h.logId, seq = h.seq + 1, mac = mac }
+            ChainHead { logId = h.logId, seq = h.seq + 1, mac = mac, keyCheck = h.keyCheck }
 
 
 -- A head as it is stamped and compared: the log id, the seq and the mac.
@@ -760,6 +763,14 @@ chainMac head =
     case head of
         ChainHead h ->
             h.mac
+
+
+-- The key check the head carries, absent on a log no signing key adopted.
+chainKeyCheck : ChainHead -> Maybe String
+chainKeyCheck head =
+    case head of
+        ChainHead h ->
+            h.keyCheck
 
 
 -- The parts, each written as its decimal length in code points, `:`, then
