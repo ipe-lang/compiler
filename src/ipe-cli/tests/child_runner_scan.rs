@@ -22,7 +22,7 @@
 //!   program expression, held to [`SITES`]; each row names the runner the site
 //!   reaches and is proved from the syntax tree, not trusted;
 //! - every direct child start (a call whose path ends in a [`SINK_FNS`] name, or
-//!   a [`SINK_METHODS`] name qualified by `Command`, `CommandExt` or `Child`),
+//!   a [`SINK_METHODS`] name qualified by a [`CHILD_TYPES`] name),
 //!   held to [`RUNNER_BODIES`];
 //! - every zero-argument call of a [`SINK_METHODS`] name, whatever its
 //!   receiver, held to [`METHODS`], so a raw `.output()` is red and a non-child
@@ -280,6 +280,7 @@ const SITES: &[SiteRow] = &[
 /// Every runner body: the fns that start a child directly, by the sink they call.
 const RUNNER_BODIES: &[NameRow] = &[
     ("browser.rs", "run_opener", "spawn_hardened", 1),
+    ("cargo_step.rs", "spawn_cargo", "spawn", 1),
     ("driver/commands.rs", "exec_program", "exec_naming", 1),
     ("driver/commands.rs", "run_run_with_args", "exec_naming", 1),
     ("remote_ingest.rs", "Running::spawn", "spawn_attached", 1),
@@ -342,7 +343,7 @@ const SINK_FNS: &[&str] = &[
 const SINK_METHODS: &[&str] = &["spawn", "output", "status", "exec", "wait_with_output"];
 
 /// The types a qualified [`SINK_METHODS`] path call starts a child through.
-const CHILD_TYPES: &[&str] = &["Command", "CommandExt", "Child"];
+const CHILD_TYPES: &[&str] = &["Command", "CommandExt", "Child", "GroupedChild"];
 
 /// The runner fns a renaming `use` may not rebind, beside [`CHILD_TYPES`] and [`SINK_FNS`].
 const RUNNER_FNS: &[&str] = &["run_local", "run_local_fed", "run_inherited", "run_probe"];
@@ -2071,6 +2072,8 @@ fn a_raw_child_start_is_refused() {
         "fn f(mut c: Command) { let _ = <Command as CommandExt>::exec(&mut c); }",
         "fn f() { let run = Command::status; }",
         "fn f(c: Command) { let _ = spawn_hardened(c); }",
+        "fn f(c: Command) { let _ = GroupedChild::spawn(c); }",
+        "fn f(c: Command) { let _ = crate::remote_ingest::GroupedChild::spawn(c); }",
         "fn f(c: Command) { let _ = ipe_runtime_rust::system::spawn_detached(c); }",
         "fn f() { let start = spawn_hardened; }",
         "impl Tool { fn f(c: Command) { let _ = exec_naming(c, NamedFds::default()); } }",
