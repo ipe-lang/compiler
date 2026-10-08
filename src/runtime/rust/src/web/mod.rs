@@ -1993,13 +1993,30 @@ impl SessionOwner {
 ///
 /// The spawned task runs inside `scope` across every poll, so a credential the
 /// task admits binds to the session that dispatched it.
+///
+/// The session's credentials are re-proved at dispatch, with no await between
+/// the check and the effects: a revocation that returned while the caller
+/// awaited its SSE send or checkpoint write drops the whole Cmd.
 #[cfg(feature = "server")]
 fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, scope: &pubsub::SessionScope) {
+    if recheck_scope(scope, None) == Standing::Revoked {
+        return;
+    }
+    dispatch_cmd(cmd, tx, scope);
+}
+
+/// Fire a `Cmd` whose session [`run_cmd`] just re-proved.
+#[cfg(feature = "server")]
+fn dispatch_cmd<Msg: Send + 'static>(
+    cmd: IpeCmd<Msg>,
+    tx: &Sender<Msg>,
+    scope: &pubsub::SessionScope,
+) {
     match cmd {
         IpeCmd::None => {}
         IpeCmd::Batch(items) => {
             for c in items {
-                run_cmd(c, tx, scope);
+                dispatch_cmd(c, tx, scope);
             }
         }
         IpeCmd::Perform(thunk) => {
@@ -13643,6 +13660,8 @@ mod web_revocation_tests {
         Bump,
         RunTask,
         TaskDone(bool),
+        /// Counts one step and returns [`revoked_cmd`], revoking nothing itself.
+        Effect,
     }
 
     impl crate::stringify::IpeStringify for Msg {
@@ -13676,7 +13695,7 @@ mod web_revocation_tests {
 
     /// Times `update` ran a `Msg::Bump`, read as a before and after delta.
     static BUMPS: AtomicUsize = AtomicUsize::new(0);
-    /// Times a Cmd that user code returned while revoking its own session ran.
+    /// Times a Cmd a revoked session must never dispatch ran.
     static REVOKED_CMDS: AtomicUsize = AtomicUsize::new(0);
 
     /// A Cmd that counts its own dispatch in [`REVOKED_CMDS`].
@@ -13723,6 +13742,10 @@ mod web_revocation_tests {
                 },
                 IpeCmd::None,
             ),
+            Msg::Effect => {
+                let n = model.n + 1;
+                (Model { n, ..model }, revoked_cmd())
+            }
         }
     }
 
@@ -14639,6 +14662,142 @@ mod web_revocation_tests {
         });
     }
 
+    /// A memory store whose next write revokes `subject`, as a revocation that
+    /// returns while a checkpoint write is in flight.
+    struct RevokeOnSet {
+        inner: Store,
+        subject: Mutex<Option<String>>,
+    }
+
+    impl RevokeOnSet {
+        /// Revoke `subject` at the next write.
+        fn arm(&self, subject: &str) {
+            *self
+                .subject
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(subject.to_owned());
+        }
+
+        /// Whether a write has revoked the armed subject.
+        fn fired(&self) -> bool {
+            self.subject
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl store::SessionStore<Model, Msg> for RevokeOnSet {
+        async fn get(&self, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(&self, sid: &str, handle: store::SessionHandle<Model, Msg>) {
+            self.inner.set(sid, handle).await;
+            let armed = self
+                .subject
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(subject) = armed {
+                assert!(crate::revocation::revoke_subject_unannounced(subject).is_ok());
+            }
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// A revocation that returns while a Msg's checkpoint write is in flight
+    /// drops that Msg's Cmd: the commit is already stored, the effect never runs.
+    #[test]
+    fn revocation_during_checkpoint_dispatches_no_cmd() {
+        run(false, || async {
+            let store = Arc::new(RevokeOnSet {
+                inner: Store::new(Duration::from_secs(60)),
+                subject: Mutex::new(None),
+            });
+            let router =
+                router_over(Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>);
+            let opened = open_session(&router, "w19-subject", 7200, "").await;
+            let handle = store.get(&opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            settle().await;
+            let cmds = REVOKED_CMDS.load(Ordering::Relaxed);
+            store.arm("w19-subject");
+            assert!(msg_tx_of(&handle).try_send(Msg::Effect).is_ok());
+            for _ in 0..200 {
+                if store.fired() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            settle().await;
+            assert!(
+                store.fired(),
+                "the Msg's checkpoint write revoked the subject"
+            );
+            let n = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model
+                .n;
+            assert_eq!(n, 1, "the Msg committed before its checkpoint write");
+            assert_eq!(
+                REVOKED_CMDS.load(Ordering::Relaxed),
+                cmds,
+                "a Cmd whose session was revoked during its checkpoint is never dispatched"
+            );
+        });
+    }
+
+    /// A Cmd dispatched for a session whose subject is revoked runs nothing,
+    /// whichever path hands it over (a Msg, a URL entry, a page load's seed).
+    #[test]
+    fn run_cmd_for_revoked_session_dispatches_nothing() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w20-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let msg_tx = msg_tx_of(&handle);
+            let cmds = REVOKED_CMDS.load(Ordering::Relaxed);
+            run_cmd(revoked_cmd(), &msg_tx, &scope);
+            settle().await;
+            let live = REVOKED_CMDS.load(Ordering::Relaxed);
+            assert_eq!(live, cmds + 1, "a standing session dispatches its Cmd");
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w20-subject".to_owned()).is_ok()
+            );
+            run_cmd(
+                IpeCmd::Batch(vec![revoked_cmd(), revoked_cmd()]),
+                &msg_tx,
+                &scope,
+            );
+            settle().await;
+            assert_eq!(
+                REVOKED_CMDS.load(Ordering::Relaxed),
+                live,
+                "a revoked session dispatches no Cmd"
+            );
+        });
+    }
+
     /// An idle SSE stream ends once its session's subject is revoked, with no
     /// request arriving to notice.
     #[test]
@@ -15068,29 +15227,54 @@ mod web_revocation_tests {
             .map(|(name, _)| name.clone())
     }
 
-    /// Every task `run_cmd` spawns runs in the session's scope, and a sid
-    /// becomes a live entry only through the resolver.
-    #[test]
-    fn cmd_dispatch_spawns_are_session_scoped() {
-        let code = production_only(&code_only(include_str!("mod.rs")));
-        let bodies = fn_bodies(&code);
-        let run_cmd: Vec<_> = bodies
-            .iter()
-            .filter(|(name, _)| name == "run_cmd")
-            .collect();
-        assert_eq!(run_cmd.len(), 1, "one `run_cmd` in production code");
-        let body: String = run_cmd
+    /// The whitespace-free body of the one production function named `name`.
+    fn sole_body(code: &str, bodies: &[(String, std::ops::Range<usize>)], name: &str) -> String {
+        let named: Vec<_> = bodies.iter().filter(|(n, _)| n == name).collect();
+        assert_eq!(named.len(), 1, "one `{name}` in production code");
+        named
             .first()
             .and_then(|(_, span)| code.get(span.clone()))
             .unwrap_or_default()
             .split_whitespace()
-            .collect();
+            .collect()
+    }
+
+    /// Every task a Cmd dispatch spawns runs in the session's scope, every
+    /// dispatch re-proves the session first, and a sid becomes a live entry
+    /// only through the resolver.
+    #[test]
+    fn cmd_dispatch_spawns_are_session_scoped() {
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        let bodies = fn_bodies(&code);
+        let body = sole_body(&code, &bodies, "dispatch_cmd");
         let spawns = body.matches("spawn").count();
         let scoped = body.matches("tokio::spawn(scope.clone().scoped(").count();
-        assert!(scoped >= 1, "`run_cmd` spawns its Perform task");
+        assert!(scoped >= 1, "`dispatch_cmd` spawns its Perform task");
         assert_eq!(
             spawns, scoped,
-            "every task `run_cmd` spawns is session-scoped"
+            "every task `dispatch_cmd` spawns is session-scoped"
+        );
+        let gate = sole_body(&code, &bodies, "run_cmd");
+        let recheck = gate.find("ifrecheck_scope(scope,None)==Standing::Revoked{return;}");
+        let dispatch = gate.find("dispatch_cmd(cmd,tx,scope)");
+        assert!(
+            recheck.is_some_and(|r| dispatch.is_some_and(|d| r < d)) && !gate.contains("spawn"),
+            "`run_cmd` re-proves the session before it dispatches: {gate}"
+        );
+        let dispatchers: Vec<_> = code
+            .match_indices("dispatch_cmd(")
+            .filter(|(pos, _)| {
+                code.get(..*pos)
+                    .and_then(|head| head.chars().next_back())
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            })
+            .map(|(pos, _)| enclosing_fn(&bodies, pos))
+            .collect();
+        assert!(
+            dispatchers
+                .iter()
+                .all(|o| matches!(o.as_deref(), Some("run_cmd" | "dispatch_cmd"))),
+            "a Cmd is dispatched only through the re-proving `run_cmd`: {dispatchers:?}"
         );
 
         let owners = call_owners(&code, &bodies, "store", "get");
