@@ -1283,6 +1283,20 @@ mod tests {
         }
     }
 
+    /// An array or object date claim never reaches the date reader:
+    /// `jsonwebtoken` cannot read the claim set, so the decode is refused
+    /// with the signature-path refusal.
+    #[test]
+    fn builder_structured_date_claims_refused() {
+        for claims in [
+            r#"{"sub":"x","exp":[1]}"#,
+            r#"{"sub":"x","nbf":{"at":1000}}"#,
+        ] {
+            let msg = refusal(builder_hs256(500, hs256_token(claims)));
+            assert!(msg.ends_with("invalid signature"), "{claims}: {msg}");
+        }
+    }
+
     /// The flat RS256 decoder refuses a text `nbf` and a text `exp`.
     #[test]
     fn flat_rs256_text_date_claims_refused() {
@@ -1314,8 +1328,6 @@ mod tests {
             (r#"{"sub":"x","iat":"100"}"#, "iat"),
             (r#"{"sub":"x","nbf":null}"#, "nbf"),
             (r#"{"sub":"x","exp":true}"#, "exp"),
-            (r#"{"sub":"x","exp":[1]}"#, "exp"),
-            (r#"{"sub":"x","nbf":{"at":1000}}"#, "nbf"),
         ] {
             let msg = refusal(builder_hs256(500, hs256_token(claims)));
             // `IpeError`'s display prefixes the error kind's label.
