@@ -120,7 +120,7 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let handle = tokio::task::spawn(future);
+    let handle = spawn_in_current_scope(future);
     let guard = AbortOnDrop::new(handle.abort_handle());
     let joined = handle.await;
     guard.defuse();
@@ -137,6 +137,59 @@ where
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 const BLOCK_ON_THREAD: &str = "ipe-block-on";
 
+/// `task`, carried into every task-local scope its caller runs in, so code
+/// that runs on another task or thread on the caller's behalf sees the scopes
+/// the caller sees (a credential it verifies binds to the request that owns
+/// it).
+///
+/// Every caller-owned task-local scope is carried here and only here: a new
+/// one wraps the result, `carry_new_scope(carry_server_request(task))`, and
+/// every spawn of this module inherits it.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+#[allow(clippy::missing_const_for_fn)] // const only in builds that carry no scope
+fn on_behalf_of_caller<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    carry_server_request(task)
+}
+
+/// `task`, kept inside the binding set of the `Server` request its caller
+/// handles.
+#[cfg(all(
+    feature = "tokio",
+    feature = "server",
+    feature = "jwt",
+    not(target_arch = "wasm32")
+))]
+fn carry_server_request<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::server::inherit_request_scope(task)
+}
+
+/// `task` as it is: without `server` and `jwt` no request scope exists.
+#[cfg(all(
+    feature = "tokio",
+    not(all(feature = "server", feature = "jwt")),
+    not(target_arch = "wasm32")
+))]
+const fn carry_server_request<F: std::future::Future>(task: F) -> F {
+    task
+}
+
+/// Spawn `task` on the runtime inside every scope its caller runs in.
+///
+/// The one runtime spawn of this module: a bare spawn starts the task outside
+/// the caller's task-locals, where a credential it verifies binds to nothing.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn spawn_in_current_scope<F>(task: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(on_behalf_of_caller(task))
+}
+
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
@@ -147,6 +200,7 @@ where
         Ok(r) => r,
         Err(e) => return IpeResult::Err(e.into()),
     };
+    let future = on_behalf_of_caller(future);
     // The spawned OS thread keeps the entry poll outside any runtime context
     // (a nested `block_on` inside a worker thread would panic) and lets a
     // panicking future be `.join()`-mapped to `Err` instead of aborting. The
@@ -758,8 +812,9 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
         // Spawn every task up front so they run concurrently. `VecDeque` lets us
         // pop the front (input order) to await while the un-awaited tail stays
         // addressable for `abort()` on failure.
+        // Each spawned task stays inside the request scope this one runs in.
         let mut handles: std::collections::VecDeque<tokio::task::JoinHandle<IpeResult<E, A>>> =
-            tasks.into_iter().map(tokio::spawn).collect();
+            tasks.into_iter().map(spawn_in_current_scope).collect();
         let mut out = Vec::with_capacity(handles.len());
         while let Some(h) = handles.pop_front() {
             let result = match h.await {
@@ -1808,6 +1863,85 @@ mod loop_tests {
             loop_spread <= LOOP_MAX_SPREAD,
             "Task.loop must hold the stack flat across {STEPS} steps \
              (spread {loop_spread} bytes)"
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod spawn_scope_scan_tests {
+    /// A spelling that starts a task on a runtime or a thread pool.
+    const RAW_SPAWNS: [&str; 7] = [
+        "tokio::spawn",
+        "task::spawn",
+        "spawn_local",
+        "spawn_blocking",
+        "JoinSet",
+        "Handle::spawn",
+        ".spawn(",
+    ];
+
+    /// The production source of this module: everything before its first
+    /// test module, refused if any non-test item follows that module.
+    fn production_source() -> &'static str {
+        let source = include_str!("task.rs");
+        let Some((production, tests)) = source.split_once("#[cfg(test)]") else {
+            panic!("task.rs carries its test modules");
+        };
+        for line in tests.lines() {
+            let top_level = !line.is_empty() && !line.starts_with(char::is_whitespace);
+            assert!(
+                !top_level
+                    || ["#[", "mod ", "}", "//"]
+                        .iter()
+                        .any(|item| line.starts_with(item)),
+                "production code follows a test module in task.rs, so the spawn scan \
+                 cannot see it; move it above the first test module: {line}"
+            );
+        }
+        production
+    }
+
+    #[test]
+    fn task_spawns_only_through_the_scope_carrier() {
+        let mut carriers = 0;
+        for line in production_source().lines() {
+            let code = line.trim();
+            if code.starts_with("//") {
+                continue;
+            }
+            if code == "tokio::spawn(on_behalf_of_caller(task))" {
+                carriers += 1;
+                continue;
+            }
+            assert!(
+                !RAW_SPAWNS.iter().any(|raw| code.contains(raw)),
+                "a spawn in task.rs drops the caller's request scope; route it \
+                 through `spawn_in_current_scope`: {code}"
+            );
+            assert!(
+                !(code.starts_with("use ") && code.contains("tokio") && code.contains("spawn")),
+                "a spawn imported into task.rs escapes the scan: {code}"
+            );
+        }
+        assert_eq!(
+            carriers, 1,
+            "`spawn_in_current_scope` is the one runtime spawn"
+        );
+    }
+
+    #[test]
+    fn block_on_thread_carries_the_scope() {
+        let production = production_source();
+        let carried = production.find("let future = on_behalf_of_caller(future);");
+        let spawned = production.find("crate::threads::spawn_sized(");
+        assert!(
+            matches!((carried, spawned), (Some(c), Some(s)) if c < s),
+            "`block_on` carries the caller's scope before its entry thread starts"
+        );
+        assert_eq!(
+            production.matches("spawn_sized(").count(),
+            1,
+            "`block_on` is the one thread spawn of task.rs"
         );
     }
 }

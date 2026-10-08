@@ -61,10 +61,18 @@ type ErasedStreamHandler =
 /// can be reaped instead of living for the life of the process (memory-DoS:
 /// each leaked entry pins its `ErasedStreamHandler` closure, which may itself
 /// capture app state). See `reap_expired_pending_handlers` below.
-fn pending_handlers() -> &'static Mutex<HashMap<i64, (std::time::Instant, ErasedStreamHandler)>> {
-    static R: OnceLock<Mutex<HashMap<i64, (std::time::Instant, ErasedStreamHandler)>>> =
-        OnceLock::new();
+fn pending_handlers() -> &'static Mutex<HashMap<i64, PendingHandler>> {
+    static R: OnceLock<Mutex<HashMap<i64, PendingHandler>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A `stream()`-registered handler waiting for its sentinel to be claimed.
+struct PendingHandler {
+    inserted: std::time::Instant,
+    handler: ErasedStreamHandler,
+    /// The credentials of the request that called `stream()`, which the
+    /// served body inherits.
+    credentials: crate::server::ChannelCredentials,
 }
 
 fn stream_senders() -> &'static Mutex<HashMap<i64, tokio::sync::mpsc::Sender<String>>> {
@@ -99,7 +107,7 @@ fn reap_expired_pending_handlers() {
     pending_handlers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, (inserted, _)| now.duration_since(*inserted) < PENDING_HANDLER_TTL);
+        .retain(|_, pending| now.duration_since(pending.inserted) < PENDING_HANDLER_TTL);
 }
 
 const SENTINEL_PREFIX: &str = "__ipe_stream:";
@@ -156,18 +164,27 @@ where
     } else {
         content_type
     };
-    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    if PENDING_HANDLER_TICK
-        .fetch_add(1, Ordering::Relaxed)
-        .is_multiple_of(PENDING_HANDLER_SWEEP_EVERY)
-    {
-        reap_expired_pending_handlers();
-    }
-    pending_handlers()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(token, (std::time::Instant::now(), erased));
     Box::pin(async move {
+        // Registered when the task runs, inside the request it answers, so the
+        // handler is captured with that request's credentials.
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        if PENDING_HANDLER_TICK
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(PENDING_HANDLER_SWEEP_EVERY)
+        {
+            reap_expired_pending_handlers();
+        }
+        pending_handlers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                token,
+                PendingHandler {
+                    inserted: std::time::Instant::now(),
+                    handler: erased,
+                    credentials: crate::server::ChannelCredentials::of_request(),
+                },
+            );
         IpeResult::Ok(ServerResponse {
             status: 200,
             body: format!("{}{}:{}", SENTINEL_PREFIX, sentinel_nonce(), token),
@@ -247,6 +264,7 @@ pub enum ServerStreamClaim {
 /// A claimed stream handler, run only by [`ServerPendingStream::serve`].
 pub struct ServerPendingStream {
     handler: ErasedStreamHandler,
+    credentials: crate::server::ChannelCredentials,
 }
 
 /// Claim the stream handler `body` names, when it is a streaming sentinel.
@@ -273,8 +291,11 @@ pub fn claim_streaming_sentinel(body: &str) -> ServerStreamClaim {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&token)
-        .map_or(ServerStreamClaim::Abandoned, |(_, handler)| {
-            ServerStreamClaim::Stream(ServerPendingStream { handler })
+        .map_or(ServerStreamClaim::Abandoned, |pending| {
+            ServerStreamClaim::Stream(ServerPendingStream {
+                handler: pending.handler,
+                credentials: pending.credentials,
+            })
         })
 }
 
@@ -285,9 +306,22 @@ impl ServerPendingStream {
     /// spawns the handler driving a `StreamWriter(id)`, and returns the response
     /// whose body streams the channel. The head is committed when the response
     /// is returned, before the first chunk, as SSE requires.
+    ///
+    /// A body opened under the credentials the request bound ends on a
+    /// coalesced revocation and at the earliest deadline; the receiver drops,
+    /// so the handler's next `emit` reports the client gone. A gate that
+    /// cannot prove those credentials now answers 401 and never runs the
+    /// handler (fail closed).
     #[must_use]
     pub fn serve(self, head: ServerResponseHead) -> axum::response::Response {
-        let handler = self.handler;
+        use axum::response::IntoResponse;
+        let Self {
+            handler,
+            credentials,
+        } = self;
+        let Some(gate) = crate::server::ChannelGate::open(&credentials).ok() else {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
         let id = loop {
             let n = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
@@ -300,10 +334,14 @@ impl ServerPendingStream {
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, tx);
 
-        // Drive the handler in its own task; on completion drop the sender so
-        // the body stream terminates even if the handler forgot to call `finish`.
+        // Drive the handler in its own task, inside the request's binding set
+        // so a token it verifies binds to this stream; on completion drop the
+        // sender so the body stream terminates even if the handler forgot to
+        // call `finish`.
         tokio::spawn(async move {
-            handler(StreamWriter::StreamWriter(id)).await;
+            credentials
+                .scoped(|| handler(StreamWriter::StreamWriter(id)))
+                .await;
             stream_senders()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -311,12 +349,23 @@ impl ServerPendingStream {
         });
 
         // Receiver to byte stream: unfold yields each chunk; `None` ends the
-        // body once every sender has dropped (finish / handler exit).
-        let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
-            rx.recv()
-                .await
-                .map(|chunk| (Ok::<String, std::io::Error>(chunk), rx))
-        });
+        // body once every sender has dropped (finish / handler exit), or once
+        // the gate denies, which drops the receiver. A chunk is written only
+        // after the gate settles, so a credential the handler bound, or a
+        // revocation already due, is proved before the chunk leaves.
+        let body_stream =
+            futures_util::stream::unfold((rx, gate), |(mut rx, mut gate)| async move {
+                tokio::select! {
+                    biased;
+                    () = crate::server::channel_denial(&mut gate) => None,
+                    chunk = rx.recv() => match chunk {
+                        Some(chunk) if !crate::server::channel_unsettled(&mut gate) => {
+                            Some((Ok::<String, std::io::Error>(chunk), (rx, gate)))
+                        }
+                        Some(_) | None => None,
+                    },
+                }
+            });
         head.into_response(axum::body::Body::from_stream(body_stream))
     }
 }
@@ -342,8 +391,22 @@ mod tests {
             .unwrap_or_else(std::time::Instant::now);
         {
             let mut g = pending_handlers().lock().unwrap_or_else(|e| e.into_inner());
-            g.insert(stale_token, (stale_at, noop.clone()));
-            g.insert(fresh_token, (std::time::Instant::now(), noop));
+            g.insert(
+                stale_token,
+                PendingHandler {
+                    inserted: stale_at,
+                    handler: noop.clone(),
+                    credentials: crate::server::ChannelCredentials::of_request(),
+                },
+            );
+            g.insert(
+                fresh_token,
+                PendingHandler {
+                    inserted: std::time::Instant::now(),
+                    handler: noop,
+                    credentials: crate::server::ChannelCredentials::of_request(),
+                },
+            );
         }
 
         reap_expired_pending_handlers();
