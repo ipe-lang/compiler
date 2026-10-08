@@ -186,6 +186,7 @@ shown_leaves! {
     "PanicInfo" => Value;
     "TypeInfo" => Value;
     "DbFailure" => Value;
+    "AuthError" => Value;
     "Path" => Value;
     "UrlRelative" => Value;
     "Locale" => Value;

@@ -104,6 +104,7 @@ show_leaves! {
     PANIC_INFO = "PanicInfo" => Value;
     TYPE_INFO = "TypeInfo" => Value;
     DB_FAILURE = "DbFailure" => Value;
+    AUTH_ERROR = "AuthError" => Value;
     PATH = "Path" => Value;
     URL_RELATIVE = "UrlRelative" => Value;
     LOCALE = "Locale" => Value;
