@@ -1322,10 +1322,12 @@ legacyHeadAdoptsOnlyOnProof =
 legacyHeadAdoptsOnlyOnProofIn : String -> Task.Task Error Bool
 legacyHeadAdoptsOnlyOnProofIn base =
     do
-        intact <- legacyProbe (base ++ "/intact.db") [] testReviewKey
-        tampered <- legacyProbe (base ++ "/tampered.db") [ "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" ] testReviewKey
-        otherKey <- legacyProbe (base ++ "/other-key.db") [] (Task.map ReviewKey.Signing otherMacKey)
-        pastHead <- legacyProbe (base ++ "/past-head.db") [ "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (3, 'x', 'hX', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')" ] testReviewKey
+        key <- testReviewKey
+        other <- Task.map ReviewKey.Signing otherMacKey
+        intact <- legacyProbe (base ++ "/intact.db") [] key
+        tampered <- legacyProbe (base ++ "/tampered.db") [ "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" ] key
+        otherKey <- legacyProbe (base ++ "/other-key.db") [] other
+        pastHead <- legacyProbe (base ++ "/past-head.db") [ "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (3, 'x', 'hX', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')" ] key
         Task.succeed
             (intact.unbound
                 == KeyMismatch
@@ -1360,9 +1362,9 @@ type alias LegacyProbe =
 
 
 -- Two signed entries, `edits` run with the update guard dropped and put
--- back, the head's key check cleared, then the probe under `probeKey`.
-legacyProbe : String -> List String -> Task.Task Error ReviewKey.ReviewKey -> Task.Task Error LegacyProbe
-legacyProbe dbPath edits probeKey =
+-- back, the head's key check cleared, then the probe under `key`.
+legacyProbe : String -> List String -> ReviewKey.ReviewKey -> Task.Task Error LegacyProbe
+legacyProbe dbPath edits key =
     do
         db <- migratedReviewAt dbPath
         appendSigned db (rawRow "legacy-1" "h" "approve" Nothing)
@@ -1373,7 +1375,6 @@ legacyProbe dbPath edits probeKey =
         Db.exec db "UPDATE review_log_head SET key_check = NULL WHERE one = 1" []
         unbound <- logVerdictOf db
         loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
-        key <- probeKey
         refusal <- probeMessage (LibDb.probe key loc)
         check <- rawKeyCheck db
         after <- logVerdictOf db
