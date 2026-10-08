@@ -1503,13 +1503,20 @@ mod tests {
             serde_json::json!({ "sub": "", "jti": "g3-jti", "exp": LIVE_UNTIL }),
             serde_json::json!({ "sub": null, "jti": "g3-jti", "exp": LIVE_UNTIL }),
             serde_json::json!({ "sub": 42, "jti": "g3-jti", "exp": LIVE_UNTIL }),
-            serde_json::json!({ "sub": ["g3-subject"], "jti": "g3-jti", "exp": LIVE_UNTIL }),
         ] {
             assert_eq!(
                 gate().admit_in(&store, &claims_of(&claims), "sub"),
                 Err(Denial::SubjectAbsent)
             );
         }
+        // An array subject never reaches the gate: the verifier cannot read the
+        // claim set.
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let key = jsonwebtoken::EncodingKey::from_secret(GATE_SECRET.as_bytes());
+        let claims =
+            serde_json::json!({ "sub": ["g3-subject"], "jti": "g3-jti", "exp": LIVE_UNTIL });
+        let token = jsonwebtoken::encode(&header, &claims, &key).expect("encode");
+        assert!(crate::auth::verify_claims(GATE_SECRET, &token).is_err());
         assert_eq!(
             gate().admit_in(&store, &live_claims("g3-subject", "g3-jti"), "uid"),
             Err(Denial::SubjectAbsent),
