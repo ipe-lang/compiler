@@ -1016,6 +1016,7 @@ mod tests {
         assert!(!message.contains("index"), "{message}");
     }
 
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_register_login_flow() {
         let pool = DbPool::connect("sqlite::memory:").await.expect("connect");
@@ -1064,6 +1065,7 @@ mod tests {
         assert!(matches!(token2, IpeResult::Err(_)));
     }
 
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_login_id_decode_failure_yields_err_not_user_zero() {
         let pool = match DbPool::connect("sqlite::memory:").await {
