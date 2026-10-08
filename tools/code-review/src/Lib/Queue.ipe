@@ -143,7 +143,15 @@ resyncReviewedWithin : ReviewKey -> IndexSettings -> ResyncBound -> Db.Db -> Tas
 resyncReviewedWithin key settings bound db =
     do
         state <- LibDb.logVerdictWithin key db (boundPageSize bound) (boundCeiling bound) (resyncCeilingRefusal bound)
-        Index.rebuildReviewed settings (\conn -> refillLog bound state db conn)
+        rebuildUnder settings bound state db
+
+
+-- The `reviewed` copy rebuilt in one index transaction under a verdict
+-- already taken: emptied, then refilled from the log only on a proven head,
+-- and stamped for that verdict. No walk of its own.
+rebuildUnder : IndexSettings -> ResyncBound -> LibDb.LogState -> Db.Db -> Task.Task Error Int
+rebuildUnder settings bound state db =
+    Index.rebuildReviewed settings (\conn -> refillLog bound state db conn)
 
 
 refillLog : ResyncBound -> LibDb.LogState -> Db.Db -> Db.Db -> Task.Task Error ( Index.Stamp, Int )
@@ -374,49 +382,30 @@ entryUid entry =
             row.uid
 
 
--- The review log's verdict, with the `reviewed` copy's stamp current for
--- it: taken as is, or once more after one rebuild of the copy; a stamp
--- still not current after the rebuild is a failed load.
+-- The review log's verdict, taken once for the load, with the `reviewed`
+-- copy's stamp current for it: as read, or after one rebuild of the copy
+-- under that same verdict; a stamp still not current after the rebuild is a
+-- failed load. The verdict is taken before the stamp is read: a decision
+-- recorded after it moves the head on, so a match proves the copy holds
+-- every counted decision up to a head the log really had. One walk of the
+-- log per load.
 freshStatus : AppSettings -> Db.Db -> Db.Db -> Task.Task Error LibDb.LogState
 freshStatus settings conn db =
     do
-        first <- currentStatus settings.key conn db
-        case first of
-            Just state ->
-                Task.succeed state
+        state <- LibDb.logVerdict settings.key db
+        first <- Index.readStamp conn
+        if LibDb.copyCurrent state first then
+            Task.succeed state
 
-            Nothing ->
-                do
-                    resyncReviewed settings.key settings.index db
-                    second <- currentStatus settings.key conn db
-                    case second of
-                        Just state ->
-                            Task.succeed state
+        else
+            do
+                rebuildUnder settings.index resyncBound state db
+                second <- Index.readStamp conn
+                if LibDb.copyCurrent state second then
+                    Task.succeed state
 
-                        Nothing ->
-                            Task.fail stillBehind
-
-
--- The verdict `LibDb.logVerdict` takes now, Just when the copy's stamp is
--- the one a rebuild under it writes. The verdict is taken first: a decision
--- recorded after it moves the head on, so a match proves the copy holds
--- every counted decision up to a head the log really had.
-currentStatus : ReviewKey -> Db.Db -> Db.Db -> Task.Task Error (Maybe LibDb.LogState)
-currentStatus key conn db =
-    do
-        state <- LibDb.logVerdict key db
-        stamp <- Index.readStamp conn
-        Task.succeed (confirmedStatus state stamp)
-
-
--- The verdict, kept only when the copy's stamp is current for it.
-confirmedStatus : LibDb.LogState -> Maybe String -> Maybe LibDb.LogState
-confirmedStatus state stamp =
-    if LibDb.copyCurrent state stamp then
-        Just state
-
-    else
-        Nothing
+                else
+                    Task.fail stillBehind
 
 
 stillBehind : Error
@@ -1001,40 +990,31 @@ pageOf settings db fresh =
 
 
 -- The index read at `cursor` under a stamp current for the review log's
--- verdict, with that verdict: read as is, or once more after one rebuild of
--- the copy; a stamp still not current after the rebuild is a failed load.
+-- verdict, with that verdict, taken once for the load: read as is, or once
+-- more after one rebuild of the copy under that same verdict; a stamp still
+-- not current after the rebuild is a failed load. The verdict is taken
+-- before the index is read: a decision recorded after it moves the head on,
+-- so a match proves the copy holds every counted decision up to a head the
+-- log really had, and an entry edited, removed or added outside this tool
+-- changes the verdict, so the copy is rebuilt on this load. One walk of the
+-- log per load.
 freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error ( LibDb.LogState, Index.Snapshot )
 freshSnapshot settings conn db cursor =
     do
-        first <- currentSnapshot settings.key conn db cursor
-        case first of
-            Just fresh ->
-                Task.succeed fresh
+        state <- LibDb.logVerdict settings.key db
+        first <- Index.readSnapshot conn cursor
+        if LibDb.copyCurrent state first.stamp then
+            Task.succeed ( state, first )
 
-            Nothing ->
-                do
-                    resyncReviewed settings.key settings.index db
-                    second <- currentSnapshot settings.key conn db cursor
-                    case second of
-                        Just fresh ->
-                            Task.succeed fresh
+        else
+            do
+                rebuildUnder settings.index resyncBound state db
+                second <- Index.readSnapshot conn cursor
+                if LibDb.copyCurrent state second.stamp then
+                    Task.succeed ( state, second )
 
-                        Nothing ->
-                            Task.fail stillBehind
-
-
--- The index read at `cursor`, Just when the copy's stamp is the one a
--- rebuild under the review log's verdict, taken now, writes. The verdict is
--- taken first: a decision recorded after it moves the head on, so a match
--- proves the copy holds every counted decision up to a head the log really
--- had, and an entry edited, removed or added outside this tool changes the
--- verdict, so the copy is rebuilt on this load.
-currentSnapshot : ReviewKey -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error (Maybe ( LibDb.LogState, Index.Snapshot ))
-currentSnapshot key conn db cursor =
-    do
-        state <- LibDb.logVerdict key db
-        snap <- Index.readSnapshot conn cursor
-        Task.succeed (Maybe.map (\confirmed -> ( confirmed, snap )) (confirmedStatus state snap.stamp))
+                else
+                    Task.fail stillBehind
 
 
 -- A decided unit drained from the index, then the queue page at `cursor`
