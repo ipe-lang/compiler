@@ -3166,7 +3166,7 @@ import Ipe.Ui as Ui
 
 signingKey : Secret.Secret
 signingKey =
-    Secret.fromString "live-e2e-revocation-signing-key-of-32-bytes-or-more"
+    Secret.fromString (System.getenvOr "LIVE_E2E_SIGNING_KEY" "live-e2e-revocation-signing-key-of-32-bytes-or-more")
 
 
 type Msg
@@ -3330,9 +3330,9 @@ struct RevokedRun {
     page: Page,
     /// The auth cookie carrying alice's token.
     auth_cookie: String,
-    /// The raw headers of the event POSTed after the revocation.
+    /// The raw headers of the event sent after the revocation.
     after_headers: String,
-    /// The body of the event POSTed after the revocation.
+    /// The body of the event sent after the revocation.
     after_body: String,
 }
 
@@ -3464,6 +3464,7 @@ import Ipe.Maybe as Maybe exposing (Maybe(..))
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.Secret as Secret
 import Ipe.String as String
+import Ipe.System as System
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd
 import Ipe.Tea.Web.Sub
@@ -3472,7 +3473,7 @@ import Ipe.Ui as Ui
 
 signingKey : Secret.Secret
 signingKey =
-    Secret.fromString "live-e2e-capped-session-signing-key-of-32-bytes-or-more"
+    Secret.fromString (System.getenvOr "LIVE_E2E_SIGNING_KEY" "live-e2e-capped-session-signing-key-of-32-bytes-or-more")
 
 
 type Msg
