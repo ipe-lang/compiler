@@ -542,11 +542,11 @@ fn nproc_scope_is_proven_on_this_host() {
     );
 }
 
-/// A `/bin/sh -c script` jail with `prlimit` OUTSIDE `bwrap`, so the cap is set
+/// A `/bin/sh -c script` jail with `prlimit` OUTSIDE `bwrap`, so `cap` is set
 /// in the invoker's namespace and counts every task the user owns.
-fn user_wide_canary(tools: &RunJailTools, script: &str) -> CanaryExit {
+fn user_wide_canary(tools: &RunJailTools, cap: ProcCap, script: &str) -> CanaryExit {
     let status = Command::new(&tools.prlimit)
-        .arg(format!("--nproc={}", ProcCap::CANARY.get()))
+        .arg(format!("--nproc={}", cap.get()))
         .arg("--")
         .arg(&tools.bwrap)
         .args([
@@ -581,12 +581,14 @@ fn a_canary_with_prlimit_outside_the_namespace_is_refused() {
     let Some(tools) = e2e_tools() else { return };
     // The discriminator must tell the two scopes apart on a real kernel: the
     // same scripts under a user-wide count classify as a refusal.
-    let scope_run = user_wide_canary(&tools, SCOPE_SCRIPT);
-    let teeth_run = user_wide_canary(&tools, TEETH_SCRIPT);
+    let teeth_control = user_wide_canary(&tools, ProcCap::MAX, TEETH_SCRIPT);
+    let scope_run = user_wide_canary(&tools, ProcCap::CANARY, SCOPE_SCRIPT);
+    let teeth_run = user_wide_canary(&tools, ProcCap::CANARY, TEETH_SCRIPT);
     assert_eq!(
-        classify(scope_run, teeth_run),
+        classify(teeth_control, scope_run, teeth_run),
         Err(Scope::UserWide),
-        "a cap counting the whole user must be refused (scope {scope_run:?}, teeth {teeth_run:?})"
+        "a cap counting the whole user must be refused (control {teeth_control:?}, \
+         scope {scope_run:?}, teeth {teeth_run:?})"
     );
 }
 
@@ -635,8 +637,6 @@ fn a_busy_user_does_not_starve_a_granted_jail() {
 #[test]
 fn a_fork_bomb_is_bounded_in_a_granted_jail() {
     let Some(tools) = e2e_tools() else { return };
-    let mut profile = subprocess_granted();
-    profile.limits.proc_cap = ProcCap::of::<8>();
     let payload: Vec<OsString> = [
         "/bin/sh",
         "-c",
@@ -645,10 +645,29 @@ fn a_fork_bomb_is_bounded_in_a_granted_jail() {
     .iter()
     .map(OsString::from)
     .collect();
-    let code = run_jailed(&tools, &profile, &payload);
+    // Control: under a cap above the payload's peak the same jail succeeds, so
+    // a refusal below is the cap's and not the jail's or the payload's.
+    let mut roomy = subprocess_granted();
+    roomy.limits.proc_cap = ProcCap::of::<64>();
+    let control = run_jailed_capturing(&tools, &roomy, &payload);
+    assert_eq!(
+        control.code,
+        Some(0),
+        "the payload must run under a cap above its peak: {}",
+        control.stderr
+    );
+    let mut profile = subprocess_granted();
+    profile.limits.proc_cap = ProcCap::of::<8>();
+    let bounded = run_jailed_capturing(&tools, &profile, &payload);
     assert_ne!(
-        code,
+        bounded.code,
         Some(0),
         "a jail forking past its cap must be refused the excess forks"
+    );
+    // dash says "Cannot fork", bash "fork: ...", busybox "can't fork".
+    assert!(
+        bounded.stderr.to_lowercase().contains("fork"),
+        "the jail must fail on a refused fork, not on another error: {}",
+        bounded.stderr
     );
 }

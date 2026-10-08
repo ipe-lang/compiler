@@ -7,9 +7,10 @@
 //! owns; for root it is not enforced at all. Neither the kernel version nor the
 //! uid settles which holds (a setuid `bwrap`, a namespace sysctl, a container
 //! all change it), so the scope is measured: canary jails built by the same
-//! argv builder production spawns through run under [`ProcCap::CANARY`], and
-//! [`classify`] reads their outcomes. [`NprocScope`] is the token only a
-//! passing measurement mints, and every Linux jail argv builder requires one.
+//! argv builder production spawns through run under [`ProcCap::CANARY`] and
+//! under [`ProcCap::MAX`] as a control, and [`classify`] reads their outcomes.
+//! [`NprocScope`] is the token only a passing measurement mints, and every
+//! Linux jail argv builder requires one.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -43,6 +44,10 @@ impl ProcCap {
 pub const SCOPE_SCRIPT: &str = "/bin/true; /bin/true";
 
 /// The script whose failure under [`ProcCap::CANARY`] proves the cap is enforced.
+///
+/// It must succeed under [`ProcCap::MAX`] in the same measurement, so a
+/// refused fork is the cap's doing rather than another bound's (a nearly full
+/// cgroup `pids.max`, say).
 pub const TEETH_SCRIPT: &str = "for i in 1 2 3 4 5 6; do sleep 1 & done; wait";
 
 /// How long a canary jail may run before it is killed and the proof refused.
@@ -67,6 +72,9 @@ pub enum Scope {
     UserWide,
     /// The cap is not enforced for the invoking user.
     Inert,
+    /// A fork is refused even under the widest cap, so no refusal can be
+    /// attributed to the cap.
+    Unattributable,
 }
 
 impl Scope {
@@ -82,6 +90,11 @@ impl Scope {
                 "the process cap does not apply to this user (root is exempt); run ipe as an \
                  unprivileged user"
             }
+            Self::Unattributable => {
+                "a fork was refused even under the widest process cap, so something other than \
+                 the cap (such as a nearly full cgroup pids.max) limits processes here; free \
+                 processes or raise that limit"
+            }
         }
     }
 }
@@ -95,21 +108,29 @@ pub enum CanaryExit {
     Failed,
 }
 
-/// Decide the cap's scope from the scope run and the teeth run.
+/// Decide the cap's scope from the teeth control, the scope run and the teeth run.
 ///
-/// A teeth run that succeeds means the cap never bit, whatever the scope run
-/// did. A scope run that fails under an enforced cap means the count reached
-/// past the jail. Only a passing scope run with a refused teeth run proves the
-/// cap counts exactly the jail.
+/// A teeth control that fails under [`ProcCap::MAX`] means forks are refused
+/// by something other than the cap, so neither tight run says anything about
+/// it. A teeth run that succeeds means the cap never bit, whatever the scope
+/// run did. A scope run that fails under an enforced cap means the count
+/// reached past the jail. Only a passing control and scope run with a refused
+/// teeth run proves the cap counts exactly the jail.
 ///
 /// # Errors
-/// [`Scope::Inert`] when the teeth run succeeded; [`Scope::UserWide`] when the
-/// scope run failed and the teeth run was refused.
-pub const fn classify(scope_run: CanaryExit, teeth_run: CanaryExit) -> Result<(), Scope> {
-    match (scope_run, teeth_run) {
-        (_, CanaryExit::Succeeded) => Err(Scope::Inert),
-        (CanaryExit::Failed, CanaryExit::Failed) => Err(Scope::UserWide),
-        (CanaryExit::Succeeded, CanaryExit::Failed) => Ok(()),
+/// [`Scope::Unattributable`] when the teeth control failed; [`Scope::Inert`]
+/// when the teeth run succeeded; [`Scope::UserWide`] when the scope run failed
+/// and the teeth run was refused.
+pub const fn classify(
+    teeth_control: CanaryExit,
+    scope_run: CanaryExit,
+    teeth_run: CanaryExit,
+) -> Result<(), Scope> {
+    match (teeth_control, scope_run, teeth_run) {
+        (CanaryExit::Failed, _, _) => Err(Scope::Unattributable),
+        (CanaryExit::Succeeded, _, CanaryExit::Succeeded) => Err(Scope::Inert),
+        (CanaryExit::Succeeded, CanaryExit::Failed, CanaryExit::Failed) => Err(Scope::UserWide),
+        (CanaryExit::Succeeded, CanaryExit::Succeeded, CanaryExit::Failed) => Ok(()),
     }
 }
 
@@ -212,10 +233,30 @@ fn measure(tools: &RunJailTools) -> Result<(), RunJailDefect> {
         });
     }
 
-    let tight = canary_profile(ProcCap::CANARY);
-    let scope_run = run_canary(tools, &tight, &mounts, &shell(SCOPE_SCRIPT), Stdio::null())?;
-    let teeth_run = run_canary(tools, &tight, &mounts, &shell(TEETH_SCRIPT), Stdio::null())?;
-    classify(scope_run, teeth_run).map_err(|reason| RunJailDefect::ProcCapUnscoped { reason })
+    decide(|cap, script| {
+        run_canary(
+            tools,
+            &canary_profile(cap),
+            &mounts,
+            &shell(script),
+            Stdio::null(),
+        )
+    })
+}
+
+/// Run the teeth control, the scope run and the teeth run through `run`, which
+/// jails a `/bin/sh -c` script under a cap, and classify their outcomes.
+///
+/// The control runs first and alone, so the headroom it shows is not shared
+/// with a concurrent canary.
+fn decide(
+    mut run: impl FnMut(ProcCap, &str) -> Result<CanaryExit, RunJailDefect>,
+) -> Result<(), RunJailDefect> {
+    let teeth_control = run(ProcCap::MAX, TEETH_SCRIPT)?;
+    let scope_run = run(ProcCap::CANARY, SCOPE_SCRIPT)?;
+    let teeth_run = run(ProcCap::CANARY, TEETH_SCRIPT)?;
+    classify(teeth_control, scope_run, teeth_run)
+        .map_err(|reason| RunJailDefect::ProcCapUnscoped { reason })
 }
 
 /// The canary jail's profile: production's isolation with `proc_cap`, and the
@@ -327,7 +368,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CanaryExit, ProcCap, RunJailDefect, Scope, await_canary, canary_profile, classify,
+        CanaryExit, ProcCap, RunJailDefect, SCOPE_SCRIPT, Scope, TEETH_SCRIPT, await_canary,
+        canary_profile, classify, decide,
     };
 
     /// No canary runs under `timeout`: its firing exits nonzero like a refused
@@ -364,10 +406,109 @@ mod tests {
     #[test]
     fn classify_refuses_user_wide_and_inert_scopes() {
         use CanaryExit::{Failed, Succeeded};
-        assert_eq!(classify(Succeeded, Failed), Ok(()));
-        assert_eq!(classify(Failed, Failed), Err(Scope::UserWide));
-        assert_eq!(classify(Succeeded, Succeeded), Err(Scope::Inert));
-        assert_eq!(classify(Failed, Succeeded), Err(Scope::Inert));
+        assert_eq!(classify(Succeeded, Succeeded, Failed), Ok(()));
+        assert_eq!(classify(Succeeded, Failed, Failed), Err(Scope::UserWide));
+        assert_eq!(classify(Succeeded, Succeeded, Succeeded), Err(Scope::Inert));
+        assert_eq!(classify(Succeeded, Failed, Succeeded), Err(Scope::Inert));
+    }
+
+    /// A failed teeth control refuses whatever the tight runs did: their
+    /// refusals could be another bound's, not the cap's.
+    #[test]
+    fn classify_refuses_when_the_teeth_control_fails() {
+        use CanaryExit::{Failed, Succeeded};
+        for scope_run in [Succeeded, Failed] {
+            for teeth_run in [Succeeded, Failed] {
+                assert_eq!(
+                    classify(Failed, scope_run, teeth_run),
+                    Err(Scope::Unattributable),
+                    "scope {scope_run:?}, teeth {teeth_run:?}"
+                );
+            }
+        }
+    }
+
+    /// The peak task count each canary script reaches in the jail's own
+    /// namespace (the reaper, the shell and its children).
+    fn jail_peak(script: &str) -> u32 {
+        if script == SCOPE_SCRIPT {
+            3
+        } else {
+            assert_eq!(script, TEETH_SCRIPT, "an unmodelled canary script");
+            8
+        }
+    }
+
+    /// A model host: `charged` tasks outside the jail count against its cap,
+    /// `enforced` says whether the cap applies at all, and `fork_ceiling`
+    /// bounds the jail's tasks whatever the cap.
+    fn model_host(
+        charged: u32,
+        enforced: bool,
+        fork_ceiling: u32,
+    ) -> impl FnMut(ProcCap, &str) -> Result<CanaryExit, RunJailDefect> {
+        move |cap, script| {
+            let peak = jail_peak(script);
+            let over_cap = enforced && peak.saturating_add(charged) > cap.get();
+            Ok(if over_cap || peak > fork_ceiling {
+                CanaryExit::Failed
+            } else {
+                CanaryExit::Succeeded
+            })
+        }
+    }
+
+    #[test]
+    fn decide_proves_a_per_namespace_cap() {
+        assert_eq!(decide(model_host(0, true, u32::MAX)), Ok(()));
+    }
+
+    #[test]
+    fn decide_refuses_a_user_wide_cap() {
+        assert_eq!(
+            decide(model_host(2, true, u32::MAX)),
+            Err(RunJailDefect::ProcCapUnscoped {
+                reason: Scope::UserWide
+            })
+        );
+    }
+
+    /// A cap the kernel never enforces (root is exempt) is refused through the
+    /// whole measurement, with no root needed to drive it.
+    #[test]
+    fn decide_refuses_an_inert_cap() {
+        assert_eq!(
+            decide(model_host(0, false, u32::MAX)),
+            Err(RunJailDefect::ProcCapUnscoped {
+                reason: Scope::Inert
+            })
+        );
+    }
+
+    /// An exempt invoker under a nearly full process bound no cap moves: the
+    /// tight teeth run is refused, but not by the cap.
+    #[test]
+    fn decide_refuses_a_refusal_the_cap_did_not_make() {
+        assert_eq!(
+            decide(model_host(0, false, 5)),
+            Err(RunJailDefect::ProcCapUnscoped {
+                reason: Scope::Unattributable
+            })
+        );
+    }
+
+    /// A canary that cannot run refuses the proof rather than read as an exit.
+    #[test]
+    fn decide_propagates_a_canary_that_cannot_run() {
+        let refused = decide(|_, _| {
+            Err(RunJailDefect::Spawn {
+                detail: "no canary".to_owned(),
+            })
+        });
+        assert!(
+            matches!(refused, Err(RunJailDefect::Spawn { .. })),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -376,5 +517,6 @@ mod tests {
         assert!(Scope::UserWide.remedy().contains("user namespaces"));
         assert!(Scope::Inert.remedy().contains("root is exempt"));
         assert!(Scope::Inert.remedy().contains("unprivileged user"));
+        assert!(Scope::Unattributable.remedy().contains("pids.max"));
     }
 }
