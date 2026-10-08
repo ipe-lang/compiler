@@ -204,7 +204,7 @@ fn audit(files: &[(PathBuf, String)]) -> Vec<String> {
 
 #[test]
 fn wildcard_spelling_is_read_once() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = e2e_support::manifest_dir!();
     let mut paths = Vec::new();
     for root in ROOTS {
         let dir = manifest.join(root);
