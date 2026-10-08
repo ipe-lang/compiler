@@ -1869,7 +1869,7 @@ fn method_router(method: &str, h: ErasedHandler) -> axum::routing::MethodRouter 
                 .scope(std::cell::Cell::new(upgrader), async move {
                     WS_RESPONSE
                         .scope(std::cell::Cell::new(None), async move {
-                            let result = in_request_scope(h(ipe_req)).await;
+                            let result = dispatch(&h, ipe_req).await;
                             if let Some(ws_resp) = WS_RESPONSE.with(|c| c.take()) {
                                 return ws_resp;
                             }
@@ -2417,6 +2417,10 @@ tokio::task_local! {
 }
 
 /// Run `request` as one `Server` dispatch, inside a fresh, empty binding set.
+///
+/// Only code that runs while `request` is polled is inside the scope: a
+/// handler CALLED to build `request` ran before it, so a dispatch goes
+/// through [`dispatch`], which calls the handler inside.
 #[cfg(feature = "jwt")]
 pub(crate) async fn in_request_scope<F: Future>(request: F) -> F::Output {
     SERVER_REQUEST.scope(Arc::default(), request).await
@@ -2427,6 +2431,15 @@ pub(crate) async fn in_request_scope<F: Future>(request: F) -> F::Output {
 #[cfg(not(feature = "jwt"))]
 async fn in_request_scope<F: Future>(request: F) -> F::Output {
     request.await
+}
+
+/// Run `h` on `req` as one `Server` dispatch.
+///
+/// The handler is called inside the request scope, not only awaited there: an
+/// emitted handler runs its pure code (an `Auth.verifyToken` match) when it is
+/// called, and that code binds into the request's set.
+async fn dispatch(h: &ErasedHandler, req: ServerRequest) -> Result<ServerResponse, String> {
+    in_request_scope(async move { h(req).await }).await
 }
 
 /// The binding set of the `Server` request the current task handles, or
@@ -4055,7 +4068,7 @@ mod revocation_env_tests {
             cookies: HashMap::new(),
             remoteAddr: String::new(),
         };
-        in_request_scope(handler(req))
+        dispatch(&handler, req)
             .await
             .map_or(500, |resp| resp.status)
     }
@@ -7205,7 +7218,7 @@ mod tests {
             let RouteTarget::Handler(h) = route.target else {
                 panic!("authed route must carry a handler");
             };
-            in_request_scope(h(req))
+            dispatch(&h, req)
                 .await
                 .expect("guarded handler never returns Err")
         }
@@ -7230,7 +7243,7 @@ mod tests {
             let RouteTarget::Handler(h) = route.target else {
                 return plain_resp(500, "no handler", &[]);
             };
-            in_request_scope(h(req))
+            dispatch(&h, req)
                 .await
                 .expect("guarded handler never returns Err")
         }
@@ -7765,7 +7778,7 @@ mod tests {
             let RouteTarget::Handler(h) = route.target else {
                 return None;
             };
-            let admitted = in_request_scope(h(bearer_req(claims)))
+            let admitted = dispatch(&h, bearer_req(claims))
                 .await
                 .map_or(500, |resp| resp.status);
             assert_eq!(admitted, 200, "the armed route admits the token");
@@ -7872,7 +7885,7 @@ mod tests {
             let RouteTarget::Handler(h) = route.target else {
                 return;
             };
-            let resp = in_request_scope(h(bearer_req(&claims)))
+            let resp = dispatch(&h, bearer_req(&claims))
                 .await
                 .expect("the stream handler answers");
             let streamed = to_axum_response(resp);
@@ -7955,6 +7968,53 @@ mod tests {
             assert!(
                 is_denied_close(frame.as_ref()),
                 "revoking the verified token closes the socket 1008: {frame:?}"
+            );
+        }
+
+        /// Serve one GET of `/public` through a real `method_router` whose
+        /// route handler is `h`, and answer the response body.
+        async fn serve_public(h: ErasedHandler) -> String {
+            use tower::ServiceExt;
+            let app = axum::Router::new().route("/public", method_router("GET", h));
+            let wire = axum::http::Request::builder()
+                .method("GET")
+                .uri("/public")
+                .body(axum::body::Body::empty())
+                .expect("a buildable request");
+            let resp = match app.oneshot(wire).await {
+                Ok(r) => r,
+                Err(e) => match e {},
+            };
+            axum_body_string(resp).await
+        }
+
+        #[tokio::test]
+        async fn verify_token_called_in_handler_body_binds_to_the_request() {
+            crate::revocation::arm_process();
+            let cap = crate::jwt::now_unix_seconds() + 7200;
+            let token = hs256(&session_claims("dispatch-subject", "dispatch-jti", cap));
+            // The verify runs when the handler is CALLED, as an emitted
+            // handler's pure code does, not when its task is awaited.
+            let route =
+                server_get::<String, _>("/public".to_string(), move |_req: ServerRequest| {
+                    let verified = matches!(
+                        crate::auth::auth_verify_token::<String>(SECRET.to_string(), token.clone()),
+                        IpeResult::Ok(_)
+                    );
+                    let bound = request_bindings()
+                        .and_then(|bindings| bindings.lock().ok().map(|held| held.len()))
+                        .unwrap_or_default();
+                    Box::pin(std::future::ready(ok_res::<String, _>(server_text(
+                        format!("{verified}|{bound}"),
+                    )))) as IpeTask<String, ServerResponse>
+                });
+            let RouteTarget::Handler(h) = route.target else {
+                panic!("a GET route carries a handler");
+            };
+            assert_eq!(
+                serve_public(h).await,
+                "true|1",
+                "a token verified in the handler body binds to the request it answers"
             );
         }
     }
