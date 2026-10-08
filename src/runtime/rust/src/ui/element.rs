@@ -196,6 +196,20 @@ pub enum Description {
     DescLiveAssertive,
     DescButton,
     DescParagraph,
+    /// A document section; its first child may be its heading.
+    DescSection,
+    /// The heading of the enclosing section, ranked by section depth.
+    DescSectionHeading,
+    /// A preformatted block of code.
+    DescCodeBlock,
+    /// An inline run of code.
+    DescCode,
+    /// An inline run of keyboard input.
+    DescKbd,
+    /// A column of text blocks.
+    DescTextColumn,
+    /// A form that groups input controls.
+    DescForm,
 }
 
 impl Description {
@@ -213,10 +227,113 @@ impl Description {
             | Self::DescLivePolite
             | Self::DescLiveAssertive
             | Self::DescButton
-            | Self::DescParagraph => None,
+            | Self::DescParagraph
+            | Self::DescSection
+            | Self::DescSectionHeading
+            | Self::DescCodeBlock
+            | Self::DescCode
+            | Self::DescKbd
+            | Self::DescTextColumn
+            | Self::DescForm => None,
         }
     }
 }
+
+/// How a text box treats white-space and line breaks.
+///
+/// The CSS `white-space` keyword of each mode is its `css()` text; the terminal
+/// renderer reads the same mode through `wraps()` and `preserves_newlines()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum WhiteSpace {
+    #[default]
+    Normal,
+    NoWrap,
+    Pre,
+    PreWrap,
+    PreLine,
+    BreakSpaces,
+}
+
+impl WhiteSpace {
+    /// Every mode, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::Normal,
+        Self::NoWrap,
+        Self::Pre,
+        Self::PreWrap,
+        Self::PreLine,
+        Self::BreakSpaces,
+    ];
+
+    /// The CSS `white-space` keyword of this mode.
+    #[must_use]
+    pub const fn css(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::NoWrap => "nowrap",
+            Self::Pre => "pre",
+            Self::PreWrap => "pre-wrap",
+            Self::PreLine => "pre-line",
+            Self::BreakSpaces => "break-spaces",
+        }
+    }
+
+    /// True when a line longer than its box wraps.
+    #[must_use]
+    pub const fn wraps(self) -> bool {
+        match self {
+            Self::Normal | Self::PreWrap | Self::PreLine | Self::BreakSpaces => true,
+            Self::NoWrap | Self::Pre => false,
+        }
+    }
+
+    /// True when a newline in the text starts a new line.
+    #[must_use]
+    pub const fn preserves_newlines(self) -> bool {
+        match self {
+            Self::Pre | Self::PreWrap | Self::PreLine | Self::BreakSpaces => true,
+            Self::Normal | Self::NoWrap => false,
+        }
+    }
+}
+
+/// True when two ASCII keywords are byte-equal.
+const fn same_keyword(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.split_first(), b.split_first()) {
+            (None, None) => return true,
+            (Some((x, a_rest)), Some((y, b_rest))) => {
+                if *x != *y {
+                    return false;
+                }
+                a = a_rest;
+                b = b_rest;
+            }
+            (Some(_), None) | (None, Some(_)) => return false,
+        }
+    }
+}
+
+/// True when the `css()` texts of `WhiteSpace::ALL` are pairwise distinct.
+const fn white_space_texts_distinct() -> bool {
+    let mut rest: &[WhiteSpace] = &WhiteSpace::ALL;
+    while let Some((head, tail)) = rest.split_first() {
+        let mut others = tail;
+        while let Some((other, more)) = others.split_first() {
+            if same_keyword(head.css(), other.css()) {
+                return false;
+            }
+            others = more;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if two `WhiteSpace` modes share a CSS keyword [ledger #boundary]
+const _: () = assert!(white_space_texts_distinct());
 
 /// `Ipe.Ui.LayoutContext` — the flex direction a parent imposes on its children.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -289,6 +406,8 @@ pub enum Attribute<M> {
     AttrTransition(String, bool),
     AttrGridTracks(String, String),
     AttrAnimation(String, String, String, bool),
+    /// `Font.whiteSpace` — the closed white-space mode of a text box.
+    AttrFontWhiteSpace(WhiteSpace),
 }
 
 /// `Ipe.Ui.Element msg` — the layout tree. Variant order matches
@@ -305,6 +424,41 @@ pub enum Element<M> {
     /// verbatim by the terminal backend and embeddable as an island inside an
     /// otherwise-structured `Ipe.Ui` view under `Tui.tea`.
     Cells(Vec<Vec<char>>),
+}
+
+/// True when an element renders something visible or announced.
+///
+/// An empty element, a text leaf of Unicode `White_Space` only, and a
+/// container whose every child is itself empty have no content. A void tagged
+/// leaf (an image, an input control), raw markup and a cell grid have content.
+/// The walk is iterative and stops at `MAX_HTML_DEPTH`, where it answers true
+/// so the render's own depth ceiling decides.
+#[must_use]
+pub fn has_content<M>(elem: &Element<M>) -> bool {
+    let mut pending: Vec<(&Element<M>, usize)> = vec![(elem, 0)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth >= crate::html::MAX_HTML_DEPTH {
+            return true;
+        }
+        let below = depth.saturating_add(1);
+        match node {
+            Element::Empty => {}
+            Element::Text(s) => {
+                if s.chars().any(|c| !c.is_whitespace()) {
+                    return true;
+                }
+            }
+            Element::Node(_, _, kids) => pending.extend(kids.iter().map(|k| (k, below))),
+            Element::TaggedNode(tag, _, _, kids) => {
+                if crate::html::is_void(tag) {
+                    return true;
+                }
+                pending.extend(kids.iter().map(|k| (k, below)));
+            }
+            Element::Raw(_) | Element::Cells(_) => return true,
+        }
+    }
+    false
 }
 
 /// Move every `Element` nested inside a node's attributes (an `AttrNearby`
