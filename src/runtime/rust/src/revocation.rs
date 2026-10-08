@@ -384,25 +384,45 @@ pub fn subject_is_revoked(subject: &str) -> Result<bool, RevocationError> {
 
 // ─── The gate ─────────────────────────────────────────────────────────────────
 
-/// A subject claim value; never empty.
+/// The longest subject or session id a credential carries, in bytes.
+///
+/// It bounds the persisted form of a [`SessionBindings`], so every set the
+/// gate admits fits the checkpoint's credential section.
+pub const MAX_CREDENTIAL_FIELD_BYTES: usize = 512;
+
+// The checkpoint sizes its credential section from the same two bounds.
+#[cfg(all(feature = "web-core", feature = "server"))]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the gate's credential bounds drift from the checkpoint section's [ledger #boundary]
+const _: () = assert!(
+    MAX_CREDENTIAL_FIELD_BYTES == crate::web::store::MAX_CRED_FIELD_BYTES
+        && MAX_SESSION_CREDENTIALS == crate::web::store::MAX_CRED_SECTION_CREDENTIALS
+);
+
+/// Whether `raw` is a credential field: non-empty and within [`MAX_CREDENTIAL_FIELD_BYTES`].
+const fn is_credential_field(raw: &str) -> bool {
+    !raw.is_empty() && raw.len() <= MAX_CREDENTIAL_FIELD_BYTES
+}
+
+/// A subject claim value; never empty, never past [`MAX_CREDENTIAL_FIELD_BYTES`].
 #[derive(Clone, PartialEq, Eq)]
 struct Subject(String);
 
 impl Subject {
-    /// The subject `raw` names, or `None` for an empty value.
+    /// The subject `raw` names, or `None` for an empty or over-long value.
     fn parse(raw: &str) -> Option<Self> {
-        (!raw.is_empty()).then(|| Self(raw.to_owned()))
+        is_credential_field(raw).then(|| Self(raw.to_owned()))
     }
 }
 
-/// A session id (`jti`) claim value; never empty, and never a [`Subject`].
+/// A session id (`jti`) claim value; never empty, never past
+/// [`MAX_CREDENTIAL_FIELD_BYTES`], and never a [`Subject`].
 #[derive(Clone, PartialEq, Eq)]
 struct SessionJti(String);
 
 impl SessionJti {
-    /// The session id `raw` names, or `None` for an empty value.
+    /// The session id `raw` names, or `None` for an empty or over-long value.
     fn parse(raw: &str) -> Option<Self> {
-        (!raw.is_empty()).then(|| Self(raw.to_owned()))
+        is_credential_field(raw).then(|| Self(raw.to_owned()))
     }
 }
 
@@ -424,11 +444,11 @@ impl UnixSecs {
 /// session id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Denial {
-    /// The token carries no subject, an empty one, or one that is not a JSON
-    /// string.
+    /// The token carries no subject, an empty or over-long one, or one that
+    /// is not a JSON string.
     SubjectAbsent,
-    /// The token carries no session id (`jti`), an empty one, or one that is
-    /// not a JSON string.
+    /// The token carries no session id (`jti`), an empty or over-long one, or
+    /// one that is not a JSON string.
     SessionIdAbsent,
     /// The token carries no lifetime bound (`cap`, else `exp`).
     NoDeadline,
@@ -696,6 +716,18 @@ impl SessionBindings {
         self.credentials.iter().map(|held| held.deadline).min()
     }
 
+    /// Bind every credential of `other`, as [`SessionBindings::bind`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`Denial::BindingsFull`] when the union passes [`MAX_SESSION_CREDENTIALS`].
+    pub fn absorb(&mut self, other: Self) -> Result<(), Denial> {
+        other
+            .credentials
+            .into_iter()
+            .try_for_each(|credential| self.bind(credential))
+    }
+
     /// Re-prove every bound credential at `now_unix`.
     ///
     /// # Errors
@@ -756,17 +788,31 @@ pub fn encode_bindings(bindings: &SessionBindings) -> Vec<u8> {
 
 /// Parse persisted bindings, re-proving every credential invariant.
 ///
+/// The count is checked as the list is read: a credential past
+/// [`MAX_SESSION_CREDENTIALS`] is refused before it is parsed or stored.
+///
 /// # Errors
 ///
-/// [`BindingsDecodeRefusal`] for malformed bytes, an empty field, more than
-/// [`MAX_SESSION_CREDENTIALS`] credentials, or a repeated subject and session
-/// id pair.
+/// [`BindingsDecodeRefusal`] for malformed bytes, an empty or over-long field,
+/// more than [`MAX_SESSION_CREDENTIALS`] credentials, or a repeated subject and
+/// session id pair.
 pub fn decode_bindings(bytes: &[u8]) -> Result<SessionBindings, BindingsDecodeRefusal> {
-    let credentials: Vec<SessionCredential> =
-        serde_json::from_slice(bytes).map_err(|_| BindingsDecodeRefusal::Malformed)?;
-    if credentials.len() > MAX_SESSION_CREDENTIALS {
-        return Err(BindingsDecodeRefusal::TooMany);
-    }
+    let too_many = std::cell::Cell::new(false);
+    let mut input = serde_json::Deserializer::from_slice(bytes);
+    let credentials = serde::de::DeserializeSeed::deserialize(
+        BoundedCredentials {
+            too_many: &too_many,
+        },
+        &mut input,
+    )
+    .and_then(|credentials| input.end().map(|()| credentials))
+    .map_err(|_| {
+        if too_many.get() {
+            BindingsDecodeRefusal::TooMany
+        } else {
+            BindingsDecodeRefusal::Malformed
+        }
+    })?;
     let mut bindings = SessionBindings::default();
     for credential in credentials {
         if bindings
@@ -779,6 +825,44 @@ pub fn decode_bindings(bytes: &[u8]) -> Result<SessionBindings, BindingsDecodeRe
         bindings.credentials.push(credential);
     }
     Ok(bindings)
+}
+
+/// A persisted credential list read at most [`MAX_SESSION_CREDENTIALS`] deep.
+///
+/// Sets `too_many` when another element follows the last legal one.
+struct BoundedCredentials<'a> {
+    too_many: &'a std::cell::Cell<bool>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for BoundedCredentials<'_> {
+    type Value = Vec<SessionCredential>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, input: D) -> Result<Self::Value, D::Error> {
+        input.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for BoundedCredentials<'_> {
+    type Value = Vec<SessionCredential>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a list of persisted credentials")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut credentials = Vec::with_capacity(MAX_SESSION_CREDENTIALS);
+        while credentials.len() < MAX_SESSION_CREDENTIALS {
+            match seq.next_element::<SessionCredential>()? {
+                Some(credential) => credentials.push(credential),
+                None => return Ok(credentials),
+            }
+        }
+        if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            self.too_many.set(true);
+            return Err(serde::de::Error::custom(BindingsDecodeRefusal::TooMany));
+        }
+        Ok(credentials)
+    }
 }
 
 // ─── Generation ───────────────────────────────────────────────────────────────
@@ -1552,6 +1636,32 @@ mod tests {
         }
     }
 
+    /// A field past the ceiling is refused at admission, and the last legal length binds.
+    #[test]
+    fn admit_refuses_an_over_long_subject_or_jti() {
+        let store = healthy_store();
+        let longest = "f".repeat(MAX_CREDENTIAL_FIELD_BYTES);
+        let over = format!("{longest}f");
+        assert_eq!(
+            gate()
+                .admit_in(&store, &live_claims(&over, "field-jti"), "sub")
+                .map(|_| ()),
+            Err(Denial::SubjectAbsent)
+        );
+        assert_eq!(
+            gate()
+                .admit_in(&store, &live_claims("field-subject", &over), "sub")
+                .map(|_| ()),
+            Err(Denial::SessionIdAbsent)
+        );
+        assert!(
+            gate()
+                .admit_in(&store, &live_claims(&longest, &longest), "sub")
+                .is_ok(),
+            "the longest legal fields admit"
+        );
+    }
+
     #[test]
     fn admit_refuses_no_deadline() {
         // A verified token always carries `exp` and a numeric `cap`, so the
@@ -1680,7 +1790,7 @@ mod tests {
     fn wire_of(jtis: &[String]) -> Vec<u8> {
         let wire: Vec<serde_json::Value> = jtis
             .iter()
-            .map(|jti| serde_json::json!({ "sub": "g9-subject", "jti": jti, "deadline": LIVE_UNTIL }))
+            .map(|jti| serde_json::json!({ "sub": "decode-subject", "jti": jti, "deadline": LIVE_UNTIL }))
             .collect();
         serde_json::to_vec(&wire).expect("encode")
     }
@@ -1688,7 +1798,7 @@ mod tests {
     #[test]
     fn decode_bindings_refuses_nine_and_empty_fields() {
         let jtis: Vec<String> = (0..=MAX_SESSION_CREDENTIALS)
-            .map(|n| format!("g9-jti-{n}"))
+            .map(|n| format!("decode-jti-{n}"))
             .collect();
         assert_eq!(
             decode_bindings(&wire_of(&jtis)),
@@ -1705,10 +1815,81 @@ mod tests {
             Err(BindingsDecodeRefusal::Malformed)
         );
         assert_eq!(
-            decode_bindings(&wire_of(&["g9-twice".to_owned(), "g9-twice".to_owned()])),
+            decode_bindings(&wire_of(&[
+                "decode-twice".to_owned(),
+                "decode-twice".to_owned()
+            ])),
             Err(BindingsDecodeRefusal::DuplicateCredential)
         );
         assert_eq!(decode_bindings(b""), Err(BindingsDecodeRefusal::Malformed));
+        let longest = "j".repeat(MAX_CREDENTIAL_FIELD_BYTES);
+        assert_eq!(
+            decode_bindings(&wire_of(std::slice::from_ref(&longest))).map(|b| b.len()),
+            Ok(1),
+            "the longest legal field decodes"
+        );
+        assert_eq!(
+            decode_bindings(&wire_of(&[format!("{longest}j")])),
+            Err(BindingsDecodeRefusal::Malformed),
+            "a field one byte past the ceiling is refused"
+        );
+        let mut ninth_malformed: Vec<serde_json::Value> =
+            serde_json::from_slice(&wire_of(bound)).unwrap_or_default();
+        ninth_malformed.push(serde_json::json!({ "sub": "", "jti": "", "deadline": 0 }));
+        assert_eq!(
+            decode_bindings(&serde_json::to_vec(&ninth_malformed).unwrap_or_default()),
+            Err(BindingsDecodeRefusal::TooMany),
+            "the count is refused before the ninth credential is parsed"
+        );
+    }
+
+    /// The largest set the gate can admit fits the checkpoint's credential section.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[test]
+    fn the_largest_admitted_set_fits_the_checkpoint_section() {
+        let field = |n: usize| {
+            let mut field = format!("{n}");
+            field.push_str(&"\u{1}".repeat(MAX_CREDENTIAL_FIELD_BYTES - field.len()));
+            field
+        };
+        let mut bindings = SessionBindings::default();
+        for n in 0..MAX_SESSION_CREDENTIALS {
+            bindings.credentials.push(SessionCredential {
+                subject: Subject(field(n)),
+                session: SessionJti(field(n)),
+                deadline: UnixSecs(i64::MIN),
+            });
+        }
+        let encoded = encode_bindings(&bindings);
+        assert!(
+            encoded.len() <= crate::web::store::MAX_CRED_SECTION_BYTES,
+            "{} bytes past the section ceiling",
+            encoded.len()
+        );
+        assert_eq!(decode_bindings(&encoded), Ok(bindings));
+    }
+
+    /// A union binds every credential of both sets and refuses past the bound.
+    #[test]
+    fn absorb_unions_and_refuses_past_the_bound() {
+        let mut held = SessionBindings::default();
+        held.bind(admitted("absorb-subject", "absorb-held"))
+            .expect("bind");
+        let mut other = SessionBindings::default();
+        other
+            .bind(admitted("absorb-subject", "absorb-held"))
+            .expect("bind");
+        other
+            .bind(admitted("absorb-subject", "absorb-other"))
+            .expect("bind");
+        assert_eq!(held.absorb(other), Ok(()));
+        assert_eq!(held.len(), 2, "a shared credential is held once");
+        let mut full = SessionBindings::default();
+        for n in 0..MAX_SESSION_CREDENTIALS {
+            full.bind(admitted("absorb-subject", &format!("absorb-full-{n}")))
+                .expect("within the bound");
+        }
+        assert_eq!(held.absorb(full), Err(Denial::BindingsFull));
     }
 
     #[test]

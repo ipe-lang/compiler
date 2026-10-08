@@ -693,6 +693,35 @@ pub struct SessionEntry<Model, Msg> {
     pub liveness: SessionLiveness,
 }
 
+#[cfg(feature = "server")]
+impl<Model, Msg> SessionEntry<Model, Msg> {
+    /// The credential section a checkpoint of this session carries.
+    ///
+    /// Armed, the session's bound set encoded by
+    /// [`crate::revocation::encode_bindings`], the empty set included, so an
+    /// armed anonymous session stays apart from a row written unarmed.
+    /// Unarmed, `None`. A poisoned credential lock is `None` too: the row is
+    /// then sectionless, which an armed reader refuses.
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn checkpoint_section(&self) -> Option<Vec<u8>> {
+        crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())?;
+        self.liveness
+            .scope
+            .bindings()
+            .lock()
+            .ok()
+            .map(|held| crate::revocation::encode_bindings(&held))
+    }
+
+    /// Without `jwt` no credential is ever bound, so no section is written.
+    #[cfg(not(feature = "jwt"))]
+    #[must_use]
+    pub const fn checkpoint_section(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 /// A live session's credential scope and the switch that ends its channels.
 #[cfg(feature = "server")]
 pub struct SessionLiveness {
@@ -769,6 +798,73 @@ fn recheck_scope(scope: &pubsub::SessionScope, at_least: Option<i64>) -> Standin
 #[cfg(all(feature = "server", not(feature = "jwt")))]
 const fn recheck_scope(_scope: &pubsub::SessionScope, _at_least: Option<i64>) -> Standing {
     Standing::Live
+}
+
+/// Prove a cold row's persisted credential `section` into `scope`, then re-prove the union.
+///
+/// Unarmed, the section is skipped unread and the row stands. Armed, a row
+/// without a section, one whose section does not decode, a union past
+/// [`crate::revocation::MAX_SESSION_CREDENTIALS`], a poisoned credential lock,
+/// or any credential that no longer re-proves is `Revoked`: the row is never
+/// restored unbound. `scope` holds what the lazy `init` bound, so a rebuilt
+/// row is proved over the persisted set and the new one together.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn prove_persisted(section: &store::CredSection, scope: &pubsub::SessionScope) -> Standing {
+    let Some(gate) = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
+    else {
+        return Standing::Live;
+    };
+    let store::CredSection::Present(bytes) = section else {
+        return Standing::Revoked;
+    };
+    let Ok(persisted) = crate::revocation::decode_bindings(bytes) else {
+        return Standing::Revoked;
+    };
+    let now = crate::jwt::now_unix_seconds();
+    let proved = scope.bindings().lock().is_ok_and(|mut held| {
+        held.absorb(persisted).is_ok() && held.recheck_all(gate, now).is_ok()
+    });
+    if proved {
+        Standing::Live
+    } else {
+        Standing::Revoked
+    }
+}
+
+/// Without `jwt` no gate exists, so every cold row stands.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+const fn prove_persisted(_section: &store::CredSection, _scope: &pubsub::SessionScope) -> Standing {
+    Standing::Live
+}
+
+/// A cold `rejoin` of `sid` whose credentials re-prove into `scope`, else a miss.
+///
+/// A refused row is deleted before its claim is released, so no later request
+/// restores it; the caller's miss path then mints a new sid and runs `init`.
+/// A live hit and a miss pass through unchanged.
+#[cfg(feature = "server")]
+async fn prove_rejoin<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    rejoin: store::Rejoin<Model, Msg>,
+    scope: &pubsub::SessionScope,
+) -> store::Rejoin<Model, Msg>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let standing = match &rejoin {
+        store::Rejoin::Restored { section, .. } | store::Rejoin::Rebuilt { section, .. } => {
+            prove_persisted(section, scope)
+        }
+        store::Rejoin::Live(_) | store::Rejoin::Miss => Standing::Live,
+    };
+    if standing == Standing::Live {
+        return rejoin;
+    }
+    store.delete(sid).await;
+    drop(rejoin);
+    store::Rejoin::Miss
 }
 
 /// End session `sid`: flip its closer, detach its SSE sender, drop it from the store.
@@ -4160,6 +4256,22 @@ mod handlers {
             }
             other => other,
         };
+        // A cold row restores only once its persisted credentials re-prove
+        // under the armed gate, together with any `init` bound while
+        // rebuilding it; a refused row is deleted and this GET takes the miss
+        // path, minting a fresh sid.
+        let hit = match hit {
+            Some((
+                sid,
+                rejoin @ (store::Rejoin::Restored { .. } | store::Rejoin::Rebuilt { .. }),
+            )) => {
+                let scope =
+                    claim_scope.get_or_insert_with(|| pubsub::SessionScope::new(sid.clone()));
+                let rejoin = prove_rejoin(&st.store, &sid, rejoin, scope).await;
+                Some((sid, rejoin))
+            }
+            other => other,
+        };
 
         //
         // session (live or persisted) 404s WITHOUT touching it. Re-routing
@@ -4217,7 +4329,7 @@ mod handlers {
                 #[cfg(not(feature = "debugger"))]
                 return page_response(&sid, &body, &epoch, &csrf_tok, &headers);
             }
-            Some((_, store::Rejoin::Restored { claim, model })) => {
+            Some((_, store::Rejoin::Restored { claim, model, .. })) => {
                 // A returning user with a valid sid cookie → not new attack
                 // volume, so NOT rejected; but count its driver. The slot is
                 // taken at once, so the count is given back on every exit,
@@ -4238,6 +4350,7 @@ mod handlers {
                     claim,
                     model,
                     init_cmd,
+                    ..
                 },
             )) => {
                 // Returning user, same slot pairing as `Restored`; the rebuilt
@@ -6205,10 +6318,10 @@ where
     let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
     #[cfg(feature = "jwt")]
     crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
-    // A requested revocation gate still refuses the router: a session restored
-    // from a persistent store comes back without the credentials it bound, so
-    // its live requests would run unchecked against them.
-    crate::app_config::refuse_unenforced_web_revocation().map_err(StartupRefusal::Auth)?;
+    // A requested revocation gate arms every session; a build without the
+    // token verifier could bind nothing to it, so it refuses the router.
+    crate::app_config::refuse_unbound_web_revocation(cfg!(feature = "jwt"))
+        .map_err(StartupRefusal::Auth)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
     if let Err(refusal) = client_tuning() {
@@ -11017,23 +11130,56 @@ mod emitted_router_behavior_tests {
         .err()
     }
 
-    /// A session restored from a persisted row comes back without its bound
-    /// credentials, so a requested gate refuses the router instead of
-    /// serving a restored session unchecked.
-    #[tokio::test]
-    async fn web_revocation_store_refuses_startup() {
-        for armed in ["store", "STORE", "1"] {
-            crate::system::locked_set_var("IPE_AUTH_REVOCATION", armed);
-            let refused = router_refusal();
-            crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+    /// Whether the process-wide revocation gate resolves armed right now.
+    #[cfg(feature = "jwt")]
+    fn gate_armed() -> bool {
+        crate::revocation::ArmedGate::resolve(crate::revocation::process_mode()).is_some()
+    }
+
+    /// Without `jwt` no gate type is compiled, so nothing is ever armed.
+    #[cfg(not(feature = "jwt"))]
+    const fn gate_armed() -> bool {
+        false
+    }
+
+    /// Assert an armed request's router outcome in this build.
+    ///
+    /// With the token verifier the router starts and the gate is `armed`;
+    /// without it nothing could bind, so the router refuses.
+    fn assert_starts_armed(refused: Option<&StartupRefusal>, armed: bool, what: &str) {
+        #[cfg(feature = "jwt")]
+        {
             assert!(
-                matches!(
-                    &refused,
+                refused.is_none(),
+                "{what} must start the router, got {refused:?}"
+            );
+            assert!(armed, "{what} must arm the process gate");
+        }
+        #[cfg(not(feature = "jwt"))]
+        assert!(
+            !armed
+                && matches!(
+                    refused,
                     Some(StartupRefusal::Auth(
-                        crate::app_config::AuthStartupRefusal::RevocationUnenforced
+                        crate::app_config::AuthStartupRefusal::RevocationUnbound
                     ))
                 ),
-                "IPE_AUTH_REVOCATION={armed:?} must refuse the router, got {refused:?}"
+            "{what} has nothing to bind without a verifier, got {refused:?}"
+        );
+    }
+
+    /// A requested gate starts the router armed; a malformed mode refuses it.
+    #[tokio::test]
+    async fn web_revocation_store_starts_armed() {
+        for requested in ["store", "STORE", "1"] {
+            crate::system::locked_set_var("IPE_AUTH_REVOCATION", requested);
+            let refused = router_refusal();
+            let armed = gate_armed();
+            crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+            assert_starts_armed(
+                refused.as_ref(),
+                armed,
+                &format!("IPE_AUTH_REVOCATION={requested:?}"),
             );
         }
         crate::system::locked_set_var("IPE_AUTH_REVOCATION", "stroe");
@@ -11050,20 +11196,20 @@ mod emitted_router_behavior_tests {
         );
     }
 
-    /// Set on the child process [`web_revocation_installed_store_refuses_startup`]
+    /// Set on the child process [`web_revocation_installed_store_starts_armed`]
     /// spawns; its child half is a no-op without it.
     const INSTALL_CHILD_MARKER: &str = "IPE_REVOCATION_INSTALL_CHILD";
 
-    /// Printed by the child half once it has observed both refusals.
-    const INSTALL_CHILD_REFUSED: &str = "installed revocation store refusal observed";
+    /// Printed by the child half once it has observed both armed starts.
+    const INSTALL_CHILD_ARMED: &str = "installed revocation store armed start observed";
 
-    /// `Web.withRevocation` `Store` installed in code refuses the router too.
+    /// `Web.withRevocation` `Store` installed in code starts the router armed too.
     ///
     /// `install_web` fills a process-wide `OnceLock` that the first install
     /// wins, so the install runs in a child process: here it would arm every
     /// other router test of the binary, and an earlier install would mask it.
     #[test]
-    fn web_revocation_installed_store_refuses_startup() {
+    fn web_revocation_installed_store_starts_armed() {
         let module = module_path!();
         let module = module.split_once("::").map_or(module, |(_, rest)| rest);
         let filter = format!("{module}::web_revocation_installed_store_child");
@@ -11084,14 +11230,14 @@ mod emitted_router_behavior_tests {
         let observed = out.as_ref().is_ok_and(|out| {
             out.status.success()
                 && std::str::from_utf8(&out.stdout)
-                    .is_ok_and(|text| text.contains(INSTALL_CHILD_REFUSED))
+                    .is_ok_and(|text| text.contains(INSTALL_CHILD_ARMED))
         });
-        assert!(observed, "the child must observe the refusal: {out:?}");
+        assert!(observed, "the child must observe the armed start: {out:?}");
     }
 
-    /// The child half of [`web_revocation_installed_store_refuses_startup`].
+    /// The child half of [`web_revocation_installed_store_starts_armed`].
     #[tokio::test]
-    #[ignore = "run as a child process by web_revocation_installed_store_refuses_startup"]
+    #[ignore = "run as a child process by web_revocation_installed_store_starts_armed"]
     async fn web_revocation_installed_store_child() {
         if crate::system::read_env_var(INSTALL_CHILD_MARKER).as_deref() != Ok("1") {
             return;
@@ -11100,28 +11246,17 @@ mod emitted_router_behavior_tests {
             crate::app_config::ipe_setting_web_auth_revocation_mode(1),
         ]);
         let refused = router_refusal();
-        assert!(
-            matches!(
-                &refused,
-                Some(StartupRefusal::Auth(
-                    crate::app_config::AuthStartupRefusal::RevocationUnenforced
-                ))
-            ),
-            "an installed Store mode must refuse the router, got {refused:?}"
-        );
+        assert_starts_armed(refused.as_ref(), gate_armed(), "an installed Store mode");
         crate::system::locked_set_var("IPE_AUTH_REVOCATION", "off");
         let env_off = router_refusal();
+        let armed = gate_armed();
         crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
-        assert!(
-            matches!(
-                &env_off,
-                Some(StartupRefusal::Auth(
-                    crate::app_config::AuthStartupRefusal::RevocationUnenforced
-                ))
-            ),
-            "the env cannot disarm an installed Store mode, got {env_off:?}"
+        assert_starts_armed(
+            env_off.as_ref(),
+            armed,
+            "an installed Store mode under IPE_AUTH_REVOCATION=off (the env cannot disarm it)",
         );
-        println!("\n{INSTALL_CHILD_REFUSED}");
+        println!("\n{INSTALL_CHILD_ARMED}");
     }
 
     /// An `Off` or absent mode asks for no gate, so the router starts.
@@ -12662,6 +12797,7 @@ mod route_entry_cmd_tests {
             if claim.key().as_str() == self.cold_sid {
                 store::Rejoin::Restored {
                     claim,
+                    section: store::CredSection::Absent,
                     model: Model {
                         page: Page::Home,
                         log: vec!["persisted".to_owned()],
@@ -13461,12 +13597,12 @@ mod tab_seq_window_tests {
 mod web_revocation_tests {
     //! A revoked or expired credential ends the `Web` session it is bound to.
     //!
-    //! Every test arms the process through the `Server` floor
-    //! ([`crate::revocation::arm_process`]): the startup refusal still refuses
-    //! the installed and environment arming, and the floor is the arming a
-    //! `Web` app mounted under an armed `Server` route runs with. Neither the
-    //! arming nor the serving flag the router sets is ever cleared, as in
-    //! production, so the suite runs one process per test (nextest).
+    //! A test arms the process through the `Server` floor
+    //! ([`crate::revocation::arm_process`]), which resolves the same gate the
+    //! installed and environment arming do and leaves no setting installed
+    //! for the next router. Neither the arming nor the serving flag the router
+    //! sets is ever cleared, as in production, so the suite runs one process
+    //! per test (nextest).
     //!
     //! A test that covers a request-side or driver-side check revokes through
     //! [`crate::revocation::revoke_subject_unannounced`]: no generation bump
@@ -13631,10 +13767,15 @@ mod web_revocation_tests {
     }
 
     /// The production router over `store`.
-    #[allow(clippy::expect_used)] // test helper: the Server floor arming never trips the startup refusal
     fn make_router(store: &Arc<Store>) -> axum::Router {
+        router_over(Arc::clone(store) as Arc<dyn store::SessionStore<Model, Msg>>)
+    }
+
+    /// The production router over any session `store`.
+    #[allow(clippy::expect_used)] // test helper: an armed router with `jwt` compiled always builds
+    fn router_over(store: Arc<dyn store::SessionStore<Model, Msg>>) -> axum::Router {
         let state: RouterState = WebState {
-            store: Arc::clone(store) as Arc<dyn store::SessionStore<Model, Msg>>,
+            store,
             init: Arc::new(init),
             update: Arc::new(update),
             view: Arc::new(view),
@@ -13653,11 +13794,22 @@ mod web_revocation_tests {
 
     /// Arm the process through the `Server` floor, then run `body` on a
     /// current-thread runtime, its clock paused when `paused`, with CSRF off.
-    #[allow(clippy::expect_used)] // test helper: runtime build failure is a test environment issue
     fn run<F: std::future::Future<Output = ()>>(paused: bool, body: impl FnOnce() -> F) {
+        run_with(true, paused, body);
+    }
+
+    /// [`run`], arming the process first only when `armed`.
+    #[allow(clippy::expect_used)] // test helper: runtime build failure is a test environment issue
+    fn run_with<F: std::future::Future<Output = ()>>(
+        armed: bool,
+        paused: bool,
+        body: impl FnOnce() -> F,
+    ) {
         let _g = crate::web::literal_table::overlay_test_lock();
         crate::system::locked_set_var("IPE_CSRF", "off");
-        crate::revocation::arm_process();
+        if armed {
+            crate::revocation::arm_process();
+        }
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(paused)
@@ -13830,6 +13982,432 @@ mod web_revocation_tests {
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
+    }
+
+    /// The schema tag the persistent test stores write under.
+    const TAG: [u8; 32] = [3; 32];
+
+    /// A schema tag of an earlier build of the Model.
+    const OLD_TAG: [u8; 32] = [4; 32];
+
+    /// A file session store at `path`, as a fresh process opens it.
+    fn file_store(path: &std::path::Path) -> Arc<store::FileStore<Model, Msg>> {
+        Arc::new(store::FileStore::new(
+            path.to_str().unwrap_or_default(),
+            Duration::from_secs(60),
+            TAG,
+        ))
+    }
+
+    /// A per-test scratch path for a store file named `name`.
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_webrev_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// A persisted row's Model, counting `n`.
+    fn row_model(n: i64) -> Model {
+        Model {
+            sub: String::new(),
+            authed: false,
+            n,
+            revoked: false,
+            view_token: String::new(),
+            task_token: String::new(),
+            task_ok: None,
+        }
+    }
+
+    /// A checkpoint blob under `tag`, with the credential `section` when given.
+    ///
+    /// Framed by hand, so a reader drift from the writer shows here.
+    fn blob(tag: [u8; 32], section: Option<&[u8]>, body: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let mut framed = tag.to_vec();
+        if let Some(section) = section {
+            framed.push(0x00);
+            framed.extend_from_slice(
+                &u16::try_from(section.len())
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes(),
+            );
+            framed.extend_from_slice(section);
+        }
+        framed.extend_from_slice(body);
+        B64.encode(framed)
+    }
+
+    /// The JSON body of `model`.
+    fn body_of(model: &Model) -> Vec<u8> {
+        serde_json::to_vec(model).unwrap_or_default()
+    }
+
+    /// The JSON body of `model` as an earlier build wrote it, without `task_ok`.
+    fn old_body_of(model: &Model) -> Vec<u8> {
+        let mut value = serde_json::to_value(model).unwrap_or_default();
+        if let Some(map) = value.as_object_mut() {
+            map.remove("task_ok");
+        }
+        serde_json::to_vec(&value).unwrap_or_default()
+    }
+
+    /// A persisted credential section binding one live credential per subject.
+    fn section_of(subjects: &[String]) -> Vec<u8> {
+        let deadline = crate::jwt::now_unix_seconds() + 3600;
+        let credentials: Vec<serde_json::Value> = subjects
+            .iter()
+            .map(|sub| serde_json::json!({ "sub": sub, "jti": format!("{sub}-jti"), "deadline": deadline }))
+            .collect();
+        serde_json::to_vec(&credentials).unwrap_or_default()
+    }
+
+    /// Write the file-store map at `path` holding `rows`.
+    fn seed_rows(path: &std::path::Path, rows: &[(&str, String)]) -> bool {
+        let seen = crate::jwt::now_unix_seconds();
+        let map: std::collections::HashMap<&str, (&str, i64)> = rows
+            .iter()
+            .map(|(sid, blob)| (*sid, (blob.as_str(), seen)))
+            .collect();
+        serde_json::to_string(&map).is_ok_and(|json| std::fs::write(path, json).is_ok())
+    }
+
+    /// The bytes after the schema tag of `sid`'s row in the file map at `path`.
+    fn row_after_tag(path: &std::path::Path, sid: &str) -> Option<Vec<u8>> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let json = std::fs::read_to_string(path).ok()?;
+        let map: std::collections::HashMap<String, (String, i64)> =
+            serde_json::from_str(&json).ok()?;
+        let (blob, _) = map.get(sid)?;
+        B64.decode(blob.as_bytes())
+            .ok()?
+            .get(32..)
+            .map(<[u8]>::to_vec)
+    }
+
+    /// Whether a fresh `store` still holds a cold row for `sid` that restores.
+    async fn cold_row_restores(store: &dyn store::SessionStore<Model, Msg>, sid: &str) -> bool {
+        let Some(key) = store::SessionKey::parse(sid) else {
+            return false;
+        };
+        let Ok(claim) = store.claim(key).await else {
+            return false;
+        };
+        let init = || (row_model(0), IpeCmd::None);
+        matches!(
+            store.get_reconstructing(claim, &init).await,
+            store::Rejoin::Restored { .. } | store::Rejoin::Rebuilt { .. }
+        )
+    }
+
+    /// A page load of `sid` with the extra `cookies`: the sid it answers with and its body.
+    async fn reload(router: &axum::Router, sid: &str, cookies: &str) -> (String, String) {
+        let resp = send(
+            router,
+            "GET",
+            "/",
+            &format!("{}; {cookies}", sid_cookie(sid)),
+            "",
+        )
+        .await;
+        let answered = minted_sid(&resp);
+        (answered, text(resp).await)
+    }
+
+    /// The number of credentials the live session `sid` in `store` holds.
+    async fn bound_count(store: &dyn store::SessionStore<Model, Msg>, sid: &str) -> Option<usize> {
+        let handle = store.get(sid).await?;
+        let bindings = Arc::clone(
+            handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .bindings(),
+        );
+        bindings.lock().ok().map(|held| held.len())
+    }
+
+    /// A restored row is rechecked against its persisted credentials: it
+    /// restores while they stand, and once revoked the row is deleted and the
+    /// page load mints a new sid and re-runs `init`.
+    #[cfg(feature = "db")]
+    #[test]
+    fn restored_row_rechecks_persisted_bindings() {
+        run(false, || async {
+            let path = scratch_path("restore.db");
+            let Some(p) = path.to_str() else { return };
+            let open = || async {
+                store::SqliteStore::<Model, Msg>::new(p, Duration::from_secs(60), TAG)
+                    .await
+                    .ok()
+                    .map(Arc::new)
+            };
+            let Some(first) = open().await else { return };
+            let opened = open_session(
+                &router_over(first as Arc<dyn store::SessionStore<Model, Msg>>),
+                "persist-subject",
+                7200,
+                "",
+            )
+            .await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            let Some(second) = open().await else { return };
+            let (answered, _) = reload(
+                &router_over(second as Arc<dyn store::SessionStore<Model, Msg>>),
+                &opened.sid,
+                &opened.cookies,
+            )
+            .await;
+            assert_eq!(
+                answered, opened.sid,
+                "a standing credential restores the row"
+            );
+            assert!(
+                crate::revocation::revoke_subject_unannounced("persist-subject".to_owned()).is_ok()
+            );
+            let Some(third) = open().await else { return };
+            let (answered, body) = reload(
+                &router_over(third as Arc<dyn store::SessionStore<Model, Msg>>),
+                &opened.sid,
+                &opened.cookies,
+            )
+            .await;
+            assert!(
+                !answered.is_empty() && answered != opened.sid,
+                "a revoked row is a miss with a new sid"
+            );
+            assert!(body.contains("authed=false"), "`init` re-ran: {body}");
+            let Some(fourth) = open().await else { return };
+            assert!(
+                !cold_row_restores(fourth.as_ref(), &opened.sid).await,
+                "the revoked row is deleted"
+            );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// Armed, a row without a credential section is a miss with a new sid: a
+    /// row an earlier build wrote, and a row this build wrote unarmed.
+    #[test]
+    fn sectionless_row_when_armed_is_miss_with_new_sid() {
+        run_with(false, false, || async {
+            let unarmed_path = scratch_path("unarmed.json");
+            let opened = open_session(
+                &router_over(file_store(&unarmed_path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                "sectionless-subject",
+                7200,
+                "",
+            )
+            .await;
+            assert!(
+                row_after_tag(&unarmed_path, &opened.sid)
+                    .is_some_and(|rest| rest.first() != Some(&0x00)),
+                "an unarmed process writes no section"
+            );
+            let legacy_path = scratch_path("legacy.json");
+            let legacy_sid = new_sid();
+            assert!(seed_rows(
+                &legacy_path,
+                &[(
+                    legacy_sid.as_str(),
+                    blob(TAG, None, &body_of(&row_model(5)))
+                )]
+            ));
+            crate::revocation::arm_process();
+            for (path, sid, cookies) in [
+                (&unarmed_path, opened.sid.as_str(), opened.cookies.as_str()),
+                (&legacy_path, legacy_sid.as_str(), ""),
+            ] {
+                let (answered, body) = reload(
+                    &router_over(file_store(path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                    sid,
+                    cookies,
+                )
+                .await;
+                assert!(
+                    !answered.is_empty() && answered != sid,
+                    "a sectionless row is a miss with a new sid"
+                );
+                assert!(body.contains("n=0"), "`init` re-ran: {body}");
+                assert!(
+                    !cold_row_restores(file_store(path).as_ref(), sid).await,
+                    "the sectionless row is deleted"
+                );
+                let _ = std::fs::remove_file(path);
+            }
+        });
+    }
+
+    /// Unarmed, a row without a credential section restores as it always did.
+    #[test]
+    fn sectionless_row_when_off_restores() {
+        run_with(false, false, || async {
+            let path = scratch_path("off.json");
+            let sid = new_sid();
+            assert!(seed_rows(
+                &path,
+                &[(sid.as_str(), blob(TAG, None, &body_of(&row_model(5))))]
+            ));
+            let (answered, body) = reload(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                &sid,
+                "",
+            )
+            .await;
+            assert_eq!(answered, sid, "the row restores under its sid");
+            assert!(body.contains("n=5"), "the persisted model restores: {body}");
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// Unarmed, a sectioned row restores with its section skipped unread, and
+    /// the next checkpoint writes the row without one.
+    #[test]
+    fn sectioned_row_when_off_restores_and_skips_section() {
+        run_with(false, false, || async {
+            let path = scratch_path("offsection.json");
+            let sid = new_sid();
+            let unreadable = b"not a credential list";
+            assert!(seed_rows(
+                &path,
+                &[(
+                    sid.as_str(),
+                    blob(TAG, Some(unreadable), &body_of(&row_model(5)))
+                )]
+            ));
+            let (answered, body) = reload(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                &sid,
+                "",
+            )
+            .await;
+            assert_eq!(answered, sid, "the row restores under its sid");
+            assert!(body.contains("n=5"), "the persisted model restores: {body}");
+            assert!(
+                row_after_tag(&path, &sid).is_some_and(|rest| rest.first() != Some(&0x00)),
+                "the unarmed checkpoint rewrites the row without a section"
+            );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// An armed session that bound nothing persists the empty set and restores.
+    #[test]
+    fn anonymous_armed_session_persists_empty_section() {
+        run(false, || async {
+            let path = scratch_path("anonymous.json");
+            let resp = send(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                "GET",
+                "/",
+                "",
+                "",
+            )
+            .await;
+            let sid = minted_sid(&resp);
+            assert!(!sid.is_empty(), "the page load minted a session");
+            let empty =
+                crate::revocation::encode_bindings(&crate::revocation::SessionBindings::default());
+            let mut framed = vec![0x00];
+            framed.extend_from_slice(&u16::try_from(empty.len()).unwrap_or(u16::MAX).to_be_bytes());
+            framed.extend_from_slice(&empty);
+            assert!(
+                row_after_tag(&path, &sid).is_some_and(|rest| rest.starts_with(&framed)),
+                "the row carries the empty set as a present section"
+            );
+            let (answered, _) = reload(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                &sid,
+                "",
+            )
+            .await;
+            assert_eq!(answered, sid, "the anonymous row restores, never a miss");
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// A row rebuilt across an additive Model change keeps its persisted
+    /// credentials beside the ones `init` binds, and is a miss with a new sid
+    /// once one is revoked or the union passes the bound; a union exactly at
+    /// the bound restores.
+    #[test]
+    fn rebuilt_row_unions_persisted_and_init_bindings() {
+        run(false, || async {
+            let path = scratch_path("rebuilt.json");
+            let kept = new_sid();
+            let revoked = new_sid();
+            let full = new_sid();
+            let at_bound = new_sid();
+            let old = old_body_of(&row_model(5));
+            let persisted = ["union-persisted".to_owned()];
+            let eight: Vec<String> = (0..crate::revocation::MAX_SESSION_CREDENTIALS)
+                .map(|n| format!("union-full-{n}"))
+                .collect();
+            assert!(seed_rows(
+                &path,
+                &[
+                    (
+                        kept.as_str(),
+                        blob(OLD_TAG, Some(&section_of(&persisted)), &old)
+                    ),
+                    (
+                        revoked.as_str(),
+                        blob(
+                            OLD_TAG,
+                            Some(&section_of(&["union-revoked".to_owned()])),
+                            &old
+                        )
+                    ),
+                    (
+                        full.as_str(),
+                        blob(OLD_TAG, Some(&section_of(&eight)), &old)
+                    ),
+                    (
+                        at_bound.as_str(),
+                        blob(OLD_TAG, Some(&section_of(&eight)), &old)
+                    ),
+                ]
+            ));
+            assert!(
+                crate::revocation::revoke_subject_unannounced("union-revoked".to_owned()).is_ok()
+            );
+            let store = file_store(&path);
+            let router =
+                router_over(Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>);
+            let login = format!(
+                "sub=union-login; tok={}",
+                token("union-login", Some("union-login-jti"), 7200)
+            );
+            let (answered, body) = reload(&router, &kept, &login).await;
+            assert_eq!(answered, kept, "the rebuilt row restores under its sid");
+            assert!(
+                body.contains("n=5"),
+                "the persisted fields are kept: {body}"
+            );
+            assert_eq!(
+                bound_count(store.as_ref(), &kept).await,
+                Some(2),
+                "the persisted credential and the one `init` bound are both held"
+            );
+            let (answered, _) = reload(&router, &revoked, "").await;
+            assert!(
+                !answered.is_empty() && answered != revoked,
+                "a revoked persisted credential is a miss with a new sid"
+            );
+            let (answered, _) = reload(&router, &full, &login).await;
+            assert!(
+                !answered.is_empty() && answered != full,
+                "a union past the bound is a miss with a new sid"
+            );
+            let (answered, _) = reload(&router, &at_bound, "").await;
+            assert_eq!(answered, at_bound, "a union at the bound restores");
+            let fresh = file_store(&path);
+            assert!(!cold_row_restores(fresh.as_ref(), &revoked).await);
+            assert!(!cold_row_restores(fresh.as_ref(), &full).await);
+            let _ = std::fs::remove_file(&path);
+        });
     }
 
     /// A Msg whose `update` revokes its own session commits nothing and
