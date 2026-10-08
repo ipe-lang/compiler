@@ -303,8 +303,9 @@ pub fn ipe_setting_web_auth_slide_window(seconds: i64) -> Setting {
 /// per-request revocation gate. The tag is closed: `0` is `Off`, `1` is
 /// `Store`. Out-of-range tags fall closed to `Store`. This is stricter-only:
 /// once the request is `Store`, a subsequent `Off` setting in the same list is
-/// a no-op (`install_web` keeps the maximum). The `Web` request path has no
-/// revocation gate, so an installed `Store` refuses `Web` startup.
+/// a no-op (`install_web` keeps the maximum). An installed `Store` arms every
+/// `Web` session and `Auth.verifyToken`; a build that compiles no token
+/// verifier refuses `Web` startup under it, since nothing could bind.
 #[must_use]
 pub fn ipe_setting_web_auth_revocation_mode(mode_tag: i64) -> Setting {
     let mode = match mode_tag {
@@ -841,8 +842,9 @@ pub(crate) const fn installed_revocation_mode() -> RevocationMode {
 pub(crate) enum AuthStartupRefusal {
     /// `IPE_AUTH_REVOCATION` is present but not a mode.
     Revocation(crate::system::EnvValueRefusal),
-    /// A revocation gate was asked for, and the `Web` request path has none.
-    RevocationUnenforced,
+    /// A revocation gate was asked for, and the app compiles no token
+    /// verifier that could bind a credential to it.
+    RevocationUnbound,
 }
 
 #[cfg(all(feature = "web-core", feature = "server"))]
@@ -850,41 +852,52 @@ impl std::fmt::Display for AuthStartupRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Revocation(refusal) => write!(f, "{refusal}"),
-            Self::RevocationUnenforced => write!(
+            Self::RevocationUnbound => write!(
                 f,
-                "a session revocation gate is requested (`Web.withRevocation` or \
-                 IPE_AUTH_REVOCATION=store) but the Web request path does not enforce one, so \
-                 revoked sessions would still be accepted; guard the routes with \
-                 `Server.withRevocation`, or remove the setting"
+                "Web.withRevocation / IPE_AUTH_REVOCATION=store needs Ipe.Auth (no token \
+                 verifier is compiled into this app)"
             ),
         }
     }
 }
 
-/// Refuses a `Web` app that asks for a revocation gate it cannot enforce.
+/// Refuses a `Web` app that asks for a revocation gate nothing in it can bind to.
+///
+/// `jwt_compiled` says whether the app compiles the token verifier; the
+/// production caller passes `cfg!(feature = "jwt")`.
 ///
 /// # Errors
 ///
 /// [`AuthStartupRefusal::Revocation`] for a malformed `IPE_AUTH_REVOCATION`;
-/// [`AuthStartupRefusal::RevocationUnenforced`] when the installed
-/// `Web.withRevocation` or the env is `Store`.
+/// [`AuthStartupRefusal::RevocationUnbound`] when the installed
+/// `Web.withRevocation` or the env is `Store` and `jwt_compiled` is false.
 #[cfg(all(feature = "web-core", feature = "server"))]
-pub(crate) fn refuse_unenforced_web_revocation() -> Result<(), AuthStartupRefusal> {
+pub(crate) fn refuse_unbound_web_revocation(jwt_compiled: bool) -> Result<(), AuthStartupRefusal> {
     web_revocation_gate(
         INSTALLED.get().and_then(|c| c.auth_revocation_mode),
         revocation_env().map_err(AuthStartupRefusal::Revocation)?,
+        jwt_compiled,
     )
 }
 
-/// Pure `Web` revocation decision over the installed mode and the env mode.
+/// Pure `Web` revocation decision over the installed mode, the env mode, and
+/// whether a token verifier is compiled.
+///
+/// An armed request starts enforcing when the verifier is compiled; without
+/// it nothing could bind, so the setting would be inert and it refuses.
 #[cfg(all(feature = "web-core", feature = "server"))]
-fn web_revocation_gate(
+const fn web_revocation_gate(
     installed: Option<RevocationMode>,
     env: Option<RevocationMode>,
+    jwt_compiled: bool,
 ) -> Result<(), AuthStartupRefusal> {
     match (installed, env) {
         (Some(RevocationMode::Store), _) | (_, Some(RevocationMode::Store)) => {
-            Err(AuthStartupRefusal::RevocationUnenforced)
+            if jwt_compiled {
+                Ok(())
+            } else {
+                Err(AuthStartupRefusal::RevocationUnbound)
+            }
         }
         (Some(RevocationMode::Off) | None, Some(RevocationMode::Off) | None) => Ok(()),
     }
@@ -1555,20 +1568,13 @@ mod tests {
 
     #[cfg(all(feature = "web-core", feature = "server"))]
     #[test]
-    fn the_web_revocation_gate_refuses_every_armed_request() {
-        use RevocationMode::{Off, Store};
-        let unenforced = Err(AuthStartupRefusal::RevocationUnenforced);
-        for (installed, env) in [
-            (Some(Store), None),
-            (Some(Store), Some(Off)),
-            (Some(Store), Some(Store)),
-            (None, Some(Store)),
-            (Some(Off), Some(Store)),
-        ] {
+    fn the_web_revocation_gate_starts_every_request_with_a_verifier() {
+        use RevocationMode::Off;
+        for (installed, env) in ARMED_REQUESTS {
             assert_eq!(
-                web_revocation_gate(installed, env),
-                unenforced,
-                "{installed:?} / {env:?} asks for a gate Web cannot enforce"
+                web_revocation_gate(installed, env, true),
+                Ok(()),
+                "{installed:?} / {env:?} starts enforcing"
             );
         }
         for (installed, env) in [
@@ -1577,12 +1583,42 @@ mod tests {
             (None, Some(Off)),
             (Some(Off), Some(Off)),
         ] {
+            for jwt_compiled in [true, false] {
+                assert_eq!(
+                    web_revocation_gate(installed, env, jwt_compiled),
+                    Ok(()),
+                    "{installed:?} / {env:?} asks for no gate"
+                );
+            }
+        }
+    }
+
+    /// Every installed and env pair that asks for the gate.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    const ARMED_REQUESTS: [(Option<RevocationMode>, Option<RevocationMode>); 5] = [
+        (Some(RevocationMode::Store), None),
+        (Some(RevocationMode::Store), Some(RevocationMode::Off)),
+        (Some(RevocationMode::Store), Some(RevocationMode::Store)),
+        (None, Some(RevocationMode::Store)),
+        (Some(RevocationMode::Off), Some(RevocationMode::Store)),
+    ];
+
+    /// Without a token verifier an armed request refuses startup, naming the fix.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[test]
+    fn web_revocation_gate_without_jwt_refuses() {
+        for (installed, env) in ARMED_REQUESTS {
             assert_eq!(
-                web_revocation_gate(installed, env),
-                Ok(()),
-                "{installed:?} / {env:?} asks for no gate"
+                web_revocation_gate(installed, env, false),
+                Err(AuthStartupRefusal::RevocationUnbound),
+                "{installed:?} / {env:?} has nothing to bind"
             );
         }
+        assert_eq!(
+            AuthStartupRefusal::RevocationUnbound.to_string(),
+            "Web.withRevocation / IPE_AUTH_REVOCATION=store needs Ipe.Auth (no token verifier \
+             is compiled into this app)"
+        );
     }
 
     // ── RevocationMode setting constructor ──────────────────────────────────

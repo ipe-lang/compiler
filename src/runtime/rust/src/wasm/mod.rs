@@ -327,7 +327,7 @@ struct App<Model, Msg> {
 /// Recompute `subscriptions(model)` and hand it to the `SubManager`, wrapped
 /// in [`pubsub::with_origin`] so a `Sub.subscribeTopic` materialised during
 /// this call registers against the owning mount instance (mirrors native's
-/// `with_session_sid` around `SubManager::update`).
+/// `with_session` around `SubManager::update`).
 fn resync_subscriptions<Model, Msg>(app: &Rc<App<Model, Msg>>)
 where
     Model: Clone + 'static,

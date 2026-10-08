@@ -44,46 +44,155 @@ const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 /// tag can never equal a `v2` binary's — an old-format checkpoint fails the
 /// reject-before-deserialize gate and takes the clean re-init path, never a
 /// mis-decode of positional bytes as JSON.
+///
+/// The credential section a checkpoint may carry is versioned by its in-band
+/// marker ([`split_checkpoint`]), not by this epoch.
 pub const WEB_MODEL_SCHEMA_WIRE_VERSION: &str = "ipe-live-model-schema-v2";
 
-/// Encode one Model checkpoint as `base64(schema_tag(32) ++ serde_json(model))`
-/// — self-contained (tag travels inside the blob), TEXT-column-safe on every
-/// backend (base64 never emits NUL / invalid UTF-8, so no `ALTER TABLE` or
-/// BYTEA migration is ever needed). The body is field-keyed JSON so a purely
-/// additive Model change can splice the old fields onto the new `init` (see
-/// [`decode_or_reconstruct_checkpoint`]). `None` when serialization fails (the
-/// caller skips the checkpoint write, same as the old JSON path's `if let Ok`).
+/// A checkpoint's persisted credential section, framed but never parsed here.
+///
+/// The Web session layer decodes and re-proves a `Present` section before a
+/// row restores; this module only splits it off by its length.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CredSection {
+    /// The row carries no section: it was written by an unarmed process, or
+    /// before rows carried one.
+    Absent,
+    /// The section's bytes, as the writer stored them.
+    Present(Vec<u8>),
+}
+
+// The section names subjects and session ids, so `Debug` shows only its length.
+impl std::fmt::Debug for CredSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Present(bytes) => f.debug_tuple("Present").field(&bytes.len()).finish(),
+        }
+    }
+}
+
+/// The longest subject or session id a persisted credential carries, in bytes.
+pub const MAX_CRED_FIELD_BYTES: usize = 512;
+
+/// The most credentials one persisted section holds.
+pub const MAX_CRED_SECTION_CREDENTIALS: usize = 8;
+
+/// The most bytes one input byte of a JSON string encodes to (`\u00XX`).
+const MAX_JSON_ESCAPE_BYTES: usize = 6;
+
+/// The bytes one encoded credential spends beyond its two text fields.
+///
+/// The keys and punctuation, and the longest `i64` deadline.
+const CRED_ENTRY_FRAME_BYTES: usize =
+    r#"{"sub":"","jti":"","deadline":}"#.len() + "-9223372036854775808".len();
+
+/// The longest credential section a checkpoint carries.
+///
+/// A JSON list of [`MAX_CRED_SECTION_CREDENTIALS`] credentials whose subject
+/// and session id are each [`MAX_CRED_FIELD_BYTES`] fully escaped bytes.
+pub const MAX_CRED_SECTION_BYTES: usize = "[]".len()
+    + MAX_CRED_SECTION_CREDENTIALS
+        * (2 * MAX_JSON_ESCAPE_BYTES * MAX_CRED_FIELD_BYTES + CRED_ENTRY_FRAME_BYTES)
+    + (MAX_CRED_SECTION_CREDENTIALS - 1);
+
+// The section length travels as a `u16`, so every legal section fits it.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the largest credential section outgrows its `u16` length prefix [ledger #boundary]
+const _: () = assert!(MAX_CRED_SECTION_BYTES <= u16::MAX as usize);
+
+/// The byte that opens a credential section after the tag.
+///
+/// No JSON text starts with it, so a sectionless body can never be read as
+/// sectioned.
+#[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+const CRED_SECTION_MARKER: u8 = 0x00;
+
+/// The width of the big-endian section length after [`CRED_SECTION_MARKER`].
+#[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+const CRED_SECTION_LEN_BYTES: usize = 2;
+
+/// Encode one Model checkpoint, with the credential `section` when one is given.
+///
+/// Without a section the blob is `base64(schema_tag(32) ++ serde_json(model))`;
+/// with one it is `base64(schema_tag(32) ++ 0x00 ++ u16_be(len) ++ section ++
+/// serde_json(model))`. The blob is self-contained (the tag travels inside it)
+/// and TEXT-column-safe on every backend (base64 never emits NUL or invalid
+/// UTF-8, so no `ALTER TABLE` or BYTEA migration is ever needed). The body is
+/// field-keyed JSON so a purely additive Model change can splice the old
+/// fields onto the new `init` (see [`decode_or_reconstruct_checkpoint`]).
+/// [`split_checkpoint`] is the one reader of this framing. `None` when
+/// serialization fails or the section is longer than
+/// [`MAX_CRED_SECTION_BYTES`]; the caller then skips the checkpoint write.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
 fn encode_checkpoint<Model: serde::Serialize>(
     schema_tag: &[u8; 32],
+    section: Option<&[u8]>,
     model: &Model,
 ) -> Option<String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let body = serde_json::to_vec(model).ok()?;
-    let mut framed = Vec::with_capacity(32 + body.len());
+    let framing = section.map_or(0, |bytes| 1 + CRED_SECTION_LEN_BYTES + bytes.len());
+    let mut framed = Vec::with_capacity(32 + framing + body.len());
     framed.extend_from_slice(schema_tag);
+    if let Some(bytes) = section {
+        if bytes.len() > MAX_CRED_SECTION_BYTES {
+            return None;
+        }
+        let len = u16::try_from(bytes.len()).ok()?;
+        framed.push(CRED_SECTION_MARKER);
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(bytes);
+    }
     framed.extend_from_slice(&body);
     Some(B64.encode(framed))
 }
 
-/// Split a persisted checkpoint blob into `(stored_tag, body)`, bounding the
-/// body length at [`MAX_CHECKPOINT_BYTES`]. `None` on bad base64 (including a
-/// pre-`v2` row), a blob shorter than the 32-byte tag, or a body past the
-/// ceiling — every one the same fail-soft miss the whole store family takes.
-/// The tag is NOT compared here; the caller decides accept / reconstruct /
-/// reject from the returned tag.
+/// Split a persisted checkpoint blob into `(stored_tag, section, body)`.
+///
+/// The reader of [`encode_checkpoint`]'s framing. A body that opens with
+/// [`CRED_SECTION_MARKER`] carries a section: its length must be present, at
+/// most [`MAX_CRED_SECTION_BYTES`], and within the blob. The section is split
+/// off by its length and never parsed here. The body length is bounded at
+/// [`MAX_CHECKPOINT_BYTES`]. `None` on bad base64 (including a pre-`v2` row),
+/// a blob shorter than the 32-byte tag, a section whose framing fails, or a
+/// body past the ceiling — every one the same fail-soft miss the whole store
+/// family takes. The tag is NOT compared here; the caller decides accept /
+/// reconstruct / reject from the returned tag.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
-fn split_checkpoint(blob: &str) -> Option<([u8; 32], Vec<u8>)> {
+fn split_checkpoint(blob: &str) -> Option<([u8; 32], CredSection, Vec<u8>)> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let framed = B64.decode(blob.as_bytes()).ok()?;
     let tag: [u8; 32] = framed.get(..32)?.try_into().ok()?;
-    let body = framed.get(32..)?;
+    let rest = framed.get(32..)?;
+    let (section, body) = match rest.split_first() {
+        Some((&CRED_SECTION_MARKER, framed_section)) => {
+            let (len, after) = framed_section.split_first_chunk::<CRED_SECTION_LEN_BYTES>()?;
+            let len = usize::from(u16::from_be_bytes(*len));
+            if len > MAX_CRED_SECTION_BYTES {
+                return None;
+            }
+            let (section, body) = after.split_at_checked(len)?;
+            (CredSection::Present(section.to_vec()), body)
+        }
+        _ => (CredSection::Absent, rest),
+    };
     // A body past the ceiling is turned back BEFORE any deserialize walks it —
     // a crafted at-rest length can never drive an allocation spike.
     if body.len() as u64 > MAX_CHECKPOINT_BYTES {
         return None;
     }
-    Some((tag, body.to_vec()))
+    Some((tag, section, body.to_vec()))
+}
+
+/// The model and credential section a checkpoint of `handle` writes.
+///
+/// Read under one lock, so the section belongs to the model beside it.
+#[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+fn checkpoint_parts<Model: Clone, Msg>(
+    handle: &SessionHandle<Model, Msg>,
+) -> (Model, Option<Vec<u8>>) {
+    let entry = handle.lock().unwrap_or_else(PoisonError::into_inner);
+    (entry.model.clone(), entry.checkpoint_section())
 }
 
 /// Decode a persisted checkpoint, with an additive-superset fallback when the
@@ -111,28 +220,44 @@ fn decode_or_reconstruct_checkpoint<Model, Seed>(
 where
     Model: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let (tag, body) = split_checkpoint(blob)?;
+    // The section is split off before either path, so a rebuilt row keeps
+    // its credentials: they do not depend on the Model's shape.
+    let (tag, section, body) = split_checkpoint(blob)?;
     if &tag == schema_tag {
         // Fast path: exact schema match, decode verbatim. `init` is never
         // invoked here — an unchanged-schema restore pays no `init` cost.
-        return serde_json::from_slice(&body).ok().map(Decoded::Verbatim);
+        return serde_json::from_slice(&body)
+            .ok()
+            .map(|model| Decoded::Verbatim { model, section });
     }
     // A different tag is an additive candidate. Produce the live `init` pair
     // (ONLY now — a matched restore never runs it) and splice the persisted
     // fields onto its model, keeping state ONLY on a proven additive superset.
     // The seed travels with the rebuilt model; a failed splice drops both.
     let (init_model, seed) = make_init();
-    super::additive::reconstruct(&body, &init_model).map(|model| Decoded::Rebuilt { model, seed })
+    super::additive::reconstruct(&body, &init_model).map(|model| Decoded::Rebuilt {
+        model,
+        seed,
+        section,
+    })
 }
 
 /// A decoded checkpoint: restored verbatim, or rebuilt onto a fresh `init`.
 ///
 /// `Rebuilt` carries the seed `make_init` returned beside the model it
 /// produced, so a rebuilt model cannot be separated from its `init` effect.
+/// Both carry the row's credential section.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
 enum Decoded<Model, Seed> {
-    Verbatim(Model),
-    Rebuilt { model: Model, seed: Seed },
+    Verbatim {
+        model: Model,
+        section: CredSection,
+    },
+    Rebuilt {
+        model: Model,
+        seed: Seed,
+        section: CredSection,
+    },
 }
 
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
@@ -140,9 +265,18 @@ impl<Model, Msg> Decoded<Model, IpeCmd<Msg>> {
     /// The rejoin this checkpoint seeds, held under `claim` until its driver is published.
     fn into_rejoin(self, claim: SidClaim) -> Rejoin<Model, Msg> {
         match self {
-            Self::Verbatim(model) => Rejoin::Restored { claim, model },
-            Self::Rebuilt { model, seed } => Rejoin::Rebuilt {
+            Self::Verbatim { model, section } => Rejoin::Restored {
                 claim,
+                section,
+                model,
+            },
+            Self::Rebuilt {
+                model,
+                seed,
+                section,
+            } => Rejoin::Rebuilt {
+                claim,
+                section,
                 model,
                 init_cmd: seed,
             },
@@ -161,15 +295,19 @@ pub type SessionHandle<Model, Msg> = Arc<Mutex<SessionEntry<Model, Msg>>>;
 /// sid. `Miss` = no usable session for the sid. A cold model (`Restored` or
 /// `Rebuilt`) exists only beside the [`SidClaim`] that admitted it, so no
 /// second request for the sid can seed a driver from it while the claim is
-/// held; a rebuilt model without its Cmd has no representation.
+/// held; a rebuilt model without its Cmd has no representation. Each cold
+/// model carries its row's credential section, which the caller proves under
+/// the armed gate before the model restores.
 pub enum Rejoin<Model, Msg> {
     Live(SessionHandle<Model, Msg>),
     Restored {
         claim: SidClaim,
+        section: CredSection,
         model: Model,
     },
     Rebuilt {
         claim: SidClaim,
+        section: CredSection,
         model: Model,
         init_cmd: IpeCmd<Msg>,
     },
@@ -706,16 +844,12 @@ where
         decoded.map_or(Rejoin::Miss, |d| d.into_rejoin(claim))
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let model = handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .model
-            .clone();
+        let (model, section) = checkpoint_parts(&handle);
         self.mem_cache
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(sid.to_string(), (handle, Instant::now()));
-        if let Some(blob) = encode_checkpoint(&self.schema_tag, &model) {
+        if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let mut disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
             disk.insert(sid.to_string(), (blob, file_now_secs()));
             self.persist(&disk);
@@ -1021,16 +1155,12 @@ where
         decoded.into_rejoin(claim)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let model = handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .model
-            .clone();
+        let (model, section) = checkpoint_parts(&handle);
         self.mem_cache
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(sid.to_string(), (handle, Instant::now()));
-        if let Some(blob) = encode_checkpoint(&self.schema_tag, &model) {
+        if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let _ = sqlx::query(
                 "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) VALUES (?, ?, ?, ?) \
                  ON CONFLICT(sid) DO UPDATE SET blob=excluded.blob, \
@@ -1208,16 +1338,12 @@ where
         decoded.into_rejoin(claim)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let model = handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .model
-            .clone();
+        let (model, section) = checkpoint_parts(&handle);
         self.mem_cache
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(sid.to_string(), (handle, Instant::now()));
-        if let Some(blob) = encode_checkpoint(&self.schema_tag, &model) {
+        if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let _ = sqlx::query(
                 "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) \
                  VALUES ($1, $2, $3, $4) \
@@ -1397,16 +1523,12 @@ where
         decoded.into_rejoin(claim)
     }
     async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let model = handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .model
-            .clone();
+        let (model, section) = checkpoint_parts(&handle);
         self.mem_cache
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(sid.to_string(), (handle, Instant::now()));
-        if let Some(blob) = encode_checkpoint(&self.schema_tag, &model) {
+        if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let mut conn = self.conn.clone();
             // HASH per session, one key + one TTL; the tag lives INSIDE the
             // framed blob, so nothing can drift apart.
@@ -1722,6 +1844,7 @@ mod tests {
             history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -1778,6 +1901,7 @@ mod tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -2213,7 +2337,7 @@ mod tests {
             "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) VALUES (?, ?, ?, ?)",
         )
         .bind(COLD_SID)
-        .bind(encode_checkpoint(&TEST_TAG, &41_i32).unwrap())
+        .bind(encode_checkpoint(&TEST_TAG, None, &41_i32).unwrap())
         .bind(now_secs())
         .bind(hex::encode(TEST_TAG))
         .execute(&s.pool)
@@ -2772,13 +2896,188 @@ mod tests {
     #[test]
     fn decode_checkpoint_accepts_a_within_limit_body() {
         let payload: Vec<u8> = vec![1, 2, 3, 4, 5];
-        let blob = encode_checkpoint(&TEST_TAG, &payload);
+        let blob = encode_checkpoint(&TEST_TAG, None, &payload);
         assert!(blob.is_some(), "encoding a small Vec<u8> cannot fail");
         if let Some(blob) = blob {
             let init = || (Vec::<u8>::new(), ());
             let decoded = decode_or_reconstruct_checkpoint(&TEST_TAG, &blob, &init);
-            assert!(matches!(decoded, Some(Decoded::Verbatim(p)) if p == payload));
+            assert!(
+                matches!(decoded, Some(Decoded::Verbatim { model: p, section: CredSection::Absent }) if p == payload)
+            );
         }
+    }
+
+    /// `base64(tag ++ rest)` for a hand-framed checkpoint.
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    fn framed_blob(rest: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let mut framed = TEST_TAG.to_vec();
+        framed.extend_from_slice(rest);
+        B64.encode(framed)
+    }
+
+    /// A marker, a big-endian `len`, then `section` and `body`.
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    fn sectioned(len: usize, section: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut rest = vec![CRED_SECTION_MARKER];
+        rest.extend_from_slice(&u16::try_from(len).unwrap_or(u16::MAX).to_be_bytes());
+        rest.extend_from_slice(section);
+        rest.extend_from_slice(body);
+        rest
+    }
+
+    /// Every credential-section framing failure is a miss, and the last legal
+    /// section length still splits.
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    #[test]
+    fn checkpoint_credential_section_refusals() {
+        let body = b"41";
+        let init = || (0_i32, ());
+        let refused: [(&str, Vec<u8>); 5] = [
+            ("a marker with no length", vec![CRED_SECTION_MARKER]),
+            ("a truncated length", vec![CRED_SECTION_MARKER, 0x00]),
+            (
+                "a length past the section ceiling",
+                sectioned(
+                    MAX_CRED_SECTION_BYTES + 1,
+                    &vec![b' '; MAX_CRED_SECTION_BYTES + 1],
+                    body,
+                ),
+            ),
+            ("a length past the blob", sectioned(3, b"[]", b"")),
+            (
+                "an unknown leading byte",
+                [&[0x01_u8][..], &body[..]].concat(),
+            ),
+        ];
+        for (case, rest) in refused {
+            let blob = framed_blob(&rest);
+            assert!(
+                decode_or_reconstruct_checkpoint(&TEST_TAG, &blob, &init).is_none(),
+                "{case} must be a miss"
+            );
+        }
+        let longest = vec![b' '; MAX_CRED_SECTION_BYTES];
+        let split = split_checkpoint(&framed_blob(&sectioned(
+            MAX_CRED_SECTION_BYTES,
+            &longest,
+            body,
+        )));
+        assert!(
+            matches!(&split, Some((_, CredSection::Present(section), rest))
+                if *section == longest && rest == body),
+            "the longest legal section splits off by its length"
+        );
+        assert!(
+            encode_checkpoint(
+                &TEST_TAG,
+                Some(&[b' '; MAX_CRED_SECTION_BYTES + 1]),
+                &41_i32
+            )
+            .is_none(),
+            "the writer refuses a section past the ceiling"
+        );
+    }
+
+    /// No JSON value's encoding starts with the section marker, so a
+    /// sectionless body always splits as `Absent`, and a sectioned one round-trips.
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    #[test]
+    fn json_body_never_starts_with_marker() {
+        let kinds = [
+            serde_json::json!({ "k": 1 }),
+            serde_json::json!([1]),
+            serde_json::json!("text"),
+            serde_json::json!(7),
+            serde_json::json!(-7),
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::Value::Null,
+        ];
+        for value in kinds {
+            let encoded = serde_json::to_vec(&value).unwrap_or_default();
+            assert!(
+                encoded
+                    .first()
+                    .is_some_and(|first| *first != CRED_SECTION_MARKER),
+                "{value} must not open with the marker"
+            );
+            let bare =
+                encode_checkpoint(&TEST_TAG, None, &value).and_then(|b| split_checkpoint(&b));
+            assert!(
+                matches!(&bare, Some((tag, CredSection::Absent, rest)) if *tag == TEST_TAG && *rest == encoded),
+                "{value} without a section splits as `Absent`"
+            );
+            let with = encode_checkpoint(&TEST_TAG, Some(b"[]"), &value)
+                .and_then(|b| split_checkpoint(&b));
+            assert!(
+                matches!(&with, Some((_, CredSection::Present(section), rest))
+                    if section.as_slice() == b"[]" && *rest == encoded),
+                "{value} with a section round-trips it"
+            );
+        }
+    }
+
+    /// A tag mismatch rebuilds the model and keeps the row's credential section.
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    #[test]
+    fn additive_rebuild_keeps_the_credential_section() {
+        let old = OldModel {
+            count: 3,
+            name: "kept".to_owned(),
+        };
+        let blob = encode_checkpoint(&OLD_TAG, Some(b"[]"), &old);
+        let init = || {
+            (
+                NewModel {
+                    count: 0,
+                    name: String::new(),
+                    scroll: 5,
+                },
+                (),
+            )
+        };
+        let decoded =
+            blob.and_then(|blob| decode_or_reconstruct_checkpoint(&NEW_TAG, &blob, &init));
+        assert!(
+            matches!(&decoded, Some(Decoded::Rebuilt { model, section: CredSection::Present(section), .. })
+                if model.count == 3 && section.as_slice() == b"[]"),
+            "the rebuilt row carries its section"
+        );
+    }
+
+    /// The file store hands a sectioned row's section to the caller and turns
+    /// a mis-framed row into a miss.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn file_store_carries_the_credential_section() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_credsection_{}.json", std::process::id()));
+        let Some(p) = path.to_str() else {
+            return;
+        };
+        let _ = std::fs::remove_file(p);
+        let seed = |blob: String| {
+            let mut map: HashMap<String, (String, i64)> = HashMap::new();
+            map.insert(SID.to_owned(), (blob, file_now_secs()));
+            std::fs::write(p, serde_json::to_string(&map).unwrap_or_default()).is_ok()
+        };
+        let init = || (0_i32, IpeCmd::<()>::None);
+        let blob = encode_checkpoint(&TEST_TAG, Some(b"[]"), &41_i32).unwrap_or_default();
+        assert!(seed(blob), "seed the sectioned row");
+        let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
+        assert!(matches!(
+            reconstruct(&s, SID, &init).await,
+            Rejoin::Restored { model: 41, section: CredSection::Present(section), .. }
+                if section.as_slice() == b"[]"
+        ));
+        assert!(
+            seed(framed_blob(&sectioned(3, b"[]", b""))),
+            "seed the mis-framed row"
+        );
+        let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
+        assert!(matches!(reconstruct(&s, SID, &init).await, Rejoin::Miss));
+        let _ = std::fs::remove_file(p);
     }
 
     /// Prod fail-closed: `IPE_WEB_STORE=sqlite` in a build WITHOUT the `db`
@@ -2949,6 +3248,7 @@ mod tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
             model,
             rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
             tabs: crate::web::TabSeqs::default(),

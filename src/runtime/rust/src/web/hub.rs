@@ -98,7 +98,7 @@ tokio::task_local! {
 ///
 /// This is the `.scope(value, future).await` async form (mirrors
 /// `db.rs`'s `TXN_CONN.scope(..)` pattern), deliberately NOT
-/// `LocalKey::sync_scope` (mirrors `pubsub.rs`'s `SESSION_SID` pattern):
+/// `LocalKey::sync_scope` (mirrors `pubsub.rs`'s `SESSION` pattern):
 /// `sync_scope` only holds the task-local for a SYNCHRONOUS closure, and
 /// [`current_tenant_prefix`] is read deep inside a lazily-polled
 /// `Box::pin(async move { .. })` future body (`hub_read_filtered_logs` and
