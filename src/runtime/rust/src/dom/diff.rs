@@ -41,13 +41,17 @@ impl Patch {
 /// Structural diff between two `Html` trees that have already had `assign_ipe_ids`
 /// applied. Returns the minimal list of `Patch` operations needed to update the
 /// DOM from `old` to `new`:
-/// - Matched-tag element pair: diff attributes + events, then children.
-/// - Tag/kind mismatch, child-count change, or any mixed-child text change:
-///   whole-subtree `html` replace at the parent.
+/// - Same-node element pair (equal tag AND equal `ipe-id`): diff attributes +
+///   events, then children.
+/// - Tag/kind mismatch, server-identity (`ipe-id`) mismatch, child-count
+///   change, or any mixed-child text change: whole-subtree `html` replace at
+///   the parent, so every element in the DOM carries the `ipe-id` of the node
+///   it now renders.
 /// - Sole text-child change: `SetText` via `p.text` (fast path).
 /// - Event handlers toggled on/off: `ipe-<event>` attr set/remove + `data-ipe-hid`.
-/// - Keyed identity is carried by `assign_ipe_ids` (the `:{key}` segment) so a
-///   reordered keyed item keeps its ipe-id and only its moved attrs patch.
+/// - Keyed identity is carried by `assign_ipe_ids` (the `:{key}` segment): a
+///   position whose key differs between the trees holds a different node, so
+///   its parent's children are replaced rather than patched under the old id.
 #[must_use]
 pub fn diff<M>(old: &Html<M>, new: &Html<M>) -> Vec<Patch> {
     let mut out = vec![];
@@ -68,6 +72,19 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
         }
     }
     None
+}
+
+/// True when `old` and `new` are the same node for in-place patching: both
+/// elements with equal tags and equal server identity (`ipe-id`). An element
+/// unstamped on both sides lies past the stamping depth ceiling, where
+/// `diff_node_depth` emits nothing.
+fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
+    match (old, new) {
+        (Html::HElement(ot, _, _), Html::HElement(nt, _, _)) => {
+            ot == nt && ipe_id(old) == ipe_id(new)
+        }
+        _ => false,
+    }
 }
 
 /// Emit a replace of every child of the element at `id`.
@@ -115,11 +132,14 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
         return;
     }
     let (ot, oa, ok, nt, na, nk) = match (old, new) {
-        (Html::HElement(ot, oa, ok), Html::HElement(nt, na, nk)) if ot == nt => {
+        (Html::HElement(ot, oa, ok), Html::HElement(nt, na, nk)) if same_node(old, new) => {
             (ot, oa, ok, nt, na, nk)
         }
-        // Tag/kind mismatch is handled by the parent (mixed-child / count branch).
-        // A top-level mismatch has no parent to address, so nothing to emit.
+        // A tag, kind, or identity mismatch is handled by the parent's
+        // per-position loop. A top-level mismatch has no parent to address,
+        // so nothing is emitted; every caller stamps both trees from the same
+        // root path, which a root's `ipe-id` equals, so a top-level identity
+        // mismatch does not arise.
         _ => return,
     };
     // SECURITY: the render sink's own admission rule. A refused element is
@@ -186,7 +206,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                     return;
                 }
             }
-            (Html::HElement(t1, _, _), Html::HElement(t2, _, _)) if t1 == t2 => {
+            (Html::HElement(..), Html::HElement(..)) if same_node(oc, nc) => {
                 // A child that gains or loses admission appears in or vanishes
                 // from the page, so the parent's subtree is replaced.
                 if is_refused_element(oc) != is_refused_element(nc) {
@@ -195,7 +215,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                 }
                 diff_node_depth(oc, nc, out, child_depth);
             }
-            // Tag / kind mismatch → replace the subtree at the parent.
+            // Tag / kind / identity mismatch → replace the subtree at the parent.
             _ => {
                 push_children_replace(id, body, nk, out);
                 return;
@@ -898,5 +918,94 @@ mod tests {
         ids(&mut old);
         ids(&mut new);
         assert!(diff(&old, &new).is_empty());
+    }
+
+    fn keyed_li(key: &str, text: &str) -> Html<()> {
+        Html::HElement(
+            "li".into(),
+            vec![Attribute::Attr("ipe-key".into(), key.into())],
+            vec![Html::HText(text.into())],
+        )
+    }
+
+    /// A same-tag sibling whose key changes is a different node: the parent's
+    /// children are replaced, so the DOM element carries the new `ipe-id`,
+    /// and nothing is addressed to the old one.
+    #[test]
+    fn key_change_at_same_position_replaces_parent_children() {
+        let mut old: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "x")]);
+        let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("b", "x")]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r");
+        let Some(html) = patch.html.as_deref() else {
+            assert!(patch.html.is_some(), "expected an html replace: {patch:?}");
+            return;
+        };
+        assert!(
+            html.contains("ipe-id=\"r_0_li:b\""),
+            "the replace carries the new identity; got {html:?}"
+        );
+        assert!(
+            patches.iter().all(|p| p.id != "r_0_li:a"),
+            "no patch may address the old identity: {patches:?}"
+        );
+    }
+
+    /// Control: the same key with changed text keeps the in-place fast path.
+    #[test]
+    fn same_key_text_change_patches_in_place() {
+        let mut old: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "x")]);
+        let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "y")]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_li:a");
+        assert_eq!(patch.text.as_deref(), Some("y"));
+        assert!(patch.html.is_none(), "no html replace: {patch:?}");
+    }
+
+    /// A key change two levels down is replaced at the nearest parent that
+    /// holds the changed child, never above it.
+    #[test]
+    fn nested_key_change_replaces_at_the_nearest_parent() {
+        let tree = |key: &str| -> Html<()> {
+            Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HElement(
+                    "ul".into(),
+                    vec![],
+                    vec![keyed_li(key, "x")],
+                )],
+            )
+        };
+        let mut old = tree("a");
+        let mut new = tree("b");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_ul");
+        let Some(html) = patch.html.as_deref() else {
+            assert!(patch.html.is_some(), "expected an html replace: {patch:?}");
+            return;
+        };
+        assert!(
+            html.contains("ipe-id=\"r_0_ul_0_li:b\""),
+            "the replace carries the new identity; got {html:?}"
+        );
     }
 }
