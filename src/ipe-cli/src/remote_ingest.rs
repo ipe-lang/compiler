@@ -47,7 +47,7 @@
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr as PipeStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -2078,7 +2078,7 @@ impl GroupedChild {
     }
 
     /// Take the child's stdout and stderr pipes, when piped.
-    pub const fn take_pipes(&mut self) -> (Option<ChildStdout>, Option<ChildStderr>) {
+    pub const fn take_pipes(&mut self) -> (Option<ChildStdout>, Option<PipeStderr>) {
         (self.0.child.stdout.take(), self.0.child.stderr.take())
     }
 
