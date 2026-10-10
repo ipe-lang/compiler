@@ -2211,63 +2211,72 @@ impl<'a> Printer<'a> {
         indent: usize,
         span: ipe_diagnostics::Span,
     ) -> String {
-        // Each operator with the operand to its right. A comment above an
-        // operator line attaches to that right operand, so it is claimed here
-        // and printed above the operator.
-        let first_operand = chain.first().map_or(last, |(operand, _)| operand);
-        let rights: Vec<(String, &Expr, bool)> = chain
-            .iter()
-            .enumerate()
-            .map(|(i, (_, op))| {
-                let right = chain.get(i + 1).map_or((last, true), |(o, _)| (o, false));
-                (self.sym(op.value), right.0, right.1)
-            })
-            .collect();
-        let right_operand = |operand: &Expr, is_last: bool, at: usize| {
-            self.claim_expr(operand, || {
-                if is_last {
-                    self.binop_last_operand(operand, at)
-                } else {
-                    self.binop_operand(operand, at)
-                }
-            })
-        };
-        // Build the flat operand/operator sequence.
-        let flat_mark = self.pads.mark();
-        let mut one = self.binop_operand(first_operand, indent);
-        let mut commented = false;
-        for (op, operand, is_last) in &rights {
-            let (comments, s) = right_operand(operand, *is_last, indent);
-            commented |= !comments.is_empty();
-            let _ = write!(one, " {op} {s}");
-        }
-        // Modal, like every other construct: a chain written on one line stays
-        // single-line however wide (elm-format keeps 900-column `::` chains
-        // intact), and only a source-multiline chain — or one whose operand
-        // itself broke, or that carries a comment — lays out one operator per
-        // continuation line.
-        if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
-            return one;
-        }
-        // The broken layout below re-renders every operand, so the flat
-        // candidate's indentation is not part of the output.
-        self.pads.rewind(flat_mark, one);
         // The backward pipe `<|` breaks differently from every other operator:
         // it is right-associative and elm-format leaves it at the END of the
         // left operand's line, dropping the right-hand side onto the next line
         // indented one level (`f x <|\n    g y`). A whole chain of `<|` nests
         // this way. Every other operator (`|>`, `::`, `++`, `==`, …) begins the
         // continuation line instead.
-        let all_backward = chain.iter().all(|(_, op)| self.sym(op.value) == "<|");
+        let ops: Vec<String> = chain.iter().map(|(_, op)| self.sym(op.value)).collect();
+        let all_backward = ops.iter().all(|op| op == "<|");
+        let first_operand = chain.first().map_or(last, |(operand, _)| operand);
+
+        // Every operand is rendered exactly ONCE, at the indent it takes in
+        // the broken layout, and the flat-versus-broken choice reads those
+        // renderings. A rendering with no layout newline reads identically at
+        // any indent (padding is only ever inserted after a newline), so the
+        // same string serves the flat layout too. Rendering a flat candidate
+        // first and every operand again for the broken layout costs two
+        // renders per node per ENCLOSING chain, which is exponential in
+        // nesting depth.
+        //
+        // Each operator carries the operand to its right. A comment above an
+        // operator line attaches to that right operand, so it is claimed here
+        // and printed above the operator.
+        let first_s = self.binop_operand(first_operand, indent);
+        let rights: Vec<(&str, Comments<'a>, String)> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                let (operand, is_last) = chain.get(i + 1).map_or((last, true), |(o, _)| (o, false));
+                let at = if all_backward && !is_last {
+                    indent
+                } else {
+                    indent + 1
+                };
+                let (comments, s) = self.claim_expr(operand, || {
+                    if is_last {
+                        self.binop_last_operand(operand, at)
+                    } else {
+                        self.binop_operand(operand, at)
+                    }
+                });
+                (op.as_str(), comments, s)
+            })
+            .collect();
+
+        // Modal, like every other construct: a chain written on one line stays
+        // single-line however wide (elm-format keeps 900-column `::` chains
+        // intact), and only a source-multiline chain — or one whose operand
+        // itself broke, or that carries a comment — lays out one operator per
+        // continuation line.
+        let commented = rights.iter().any(|(_, comments, _)| !comments.is_empty());
+        if !commented && !self.was_multiline(span) {
+            let mut one = first_s.clone();
+            for (op, _, s) in &rights {
+                let _ = write!(one, " {op} {s}");
+            }
+            if !has_layout_newline(&one) {
+                return one;
+            }
+        }
         let inner = self.pad(indent + 1);
         if all_backward {
             // Each right operand opens the next line one level in; its
             // comments head that line.
-            let mut out = self.binop_operand(first_operand, indent);
-            for (op, operand, is_last) in &rights {
-                let at = if *is_last { indent + 1 } else { indent };
-                let (comments, s) = right_operand(operand, *is_last, at);
-                let line = self.with_comments(comments, &s, indent + 1);
+            let mut out = first_s;
+            for (op, comments, s) in &rights {
+                let line = self.with_comments(comments.iter().copied(), s, indent + 1);
                 let _ = write!(out, " {op}\n{inner}{line}");
             }
             return out;
@@ -2278,9 +2287,8 @@ impl<'a> Printer<'a> {
         //   { … }
         //       |> Vector
         // keeps the record at the base indent and only the `|>` step indents.
-        let mut out = self.binop_operand(first_operand, indent);
-        for (op, operand, is_last) in &rights {
-            let (comments, s) = right_operand(operand, *is_last, indent + 1);
+        let mut out = first_s;
+        for (op, comments, s) in &rights {
             for c in comments {
                 let _ = write!(out, "\n{inner}{}", c.text);
             }
@@ -3943,9 +3951,7 @@ mod tests {
     }
 
     /// A module whose value is `depth` source-multiline pipes, each into a
-    /// lambda whose body is the next pipe. The printer renders every chain
-    /// flat before breaking it, so each level renders the levels inside it
-    /// twice.
+    /// lambda whose body is the next pipe.
     fn nested_pipe_lambdas(depth: usize) -> String {
         let pad = |n: usize| INDENT_UNIT.repeat(n);
         let mut body = format!("{}b", pad(1 + 3 * depth));
@@ -3962,9 +3968,9 @@ mod tests {
         format!("module M exposing (x)\n\n\nx =\n{body}\n")
     }
 
-    /// Only the layout a print keeps is charged: the flat candidate of a
-    /// broken operator chain gives its indentation back, so nested pipes
-    /// format under a cap of exactly their output.
+    /// Only the layout a print keeps is charged: an operator chain renders
+    /// no flat candidate beside its broken layout, so nested pipes format
+    /// under a cap of exactly their output.
     #[test]
     fn discarded_operator_layout_is_not_charged() {
         let depth = 12;
@@ -3986,6 +3992,53 @@ mod tests {
             Some(out.as_str())
         );
         assert_eq!(format_source(&src).ok().as_deref(), Some(out.as_str()));
+    }
+
+    /// A module whose value is one source line of `depth` pipes, each carrying
+    /// a block comment before its right operand and nesting the next pipe in a
+    /// lambda. The comment breaks every chain, whatever the source layout.
+    fn nested_commented_pipes(depth: usize) -> String {
+        let mut body = "b".to_owned();
+        for k in (0..depth).rev() {
+            body = format!("a |> {{- c -}} f (\\v{k} -> {body})");
+        }
+        format!("module M exposing (x)\n\n\nx =\n    {body}\n")
+    }
+
+    /// The render calls one format of `src` makes. A refused format has
+    /// rendered all the same, so the outcome is not read.
+    fn render_calls_of(src: &str) -> u64 {
+        reset_render_call_count();
+        let _ = format_source(src);
+        render_call_count()
+    }
+
+    /// Each operand of an operator chain renders once, so the render count of
+    /// nested chains grows with their depth, not with its power of two.
+    ///
+    /// A chain that renders a flat candidate and then every operand again for
+    /// its broken layout renders the chain below it twice per level; depth 16
+    /// would then cost about 4096 times depth 4 where this bound allows 8. The
+    /// count is a work counter, never wall time, so the test cannot flake.
+    #[test]
+    fn nested_operator_chains_render_each_operand_once() {
+        let shapes: [(&str, fn(usize) -> String); 2] = [
+            ("source-multiline", nested_pipe_lambdas),
+            ("commented", nested_commented_pipes),
+        ];
+        for (name, shape) in shapes {
+            let small = render_calls_of(&shape(4));
+            let big = render_calls_of(&shape(16));
+            assert!(
+                small >= 4,
+                "{name}: precondition: every level renders at least once: {small}"
+            );
+            assert!(
+                big <= small * 8,
+                "{name}: render calls grew super-linearly with depth: \
+                 {small} at depth 4, {big} at depth 16"
+            );
+        }
     }
 
     /// A module whose value is `depth` lists nested in their first element,
