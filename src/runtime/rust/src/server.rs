@@ -639,12 +639,11 @@ where
                         let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
                         let now = crate::jwt::now_unix_seconds();
                         // Throttle: re-issue only once past exp - slide_window/2.
-                        // Parse exp from the verified claims string representation.
+                        // `exp` is the typed value `verify_claims` read.
                         let past_threshold = claims
-                            .get("exp")
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .map(|exp| now > exp.saturating_sub(slide_i64 / 2))
-                            .unwrap_or(false);
+                            .times()
+                            .exp()
+                            .is_some_and(|exp| now > exp.saturating_sub(slide_i64 / 2));
                         if past_threshold && now < ctx.cap {
                             // Extra claims to carry into the re-issued token (all
                             // verified claims except the time anchors and subject —
@@ -7641,6 +7640,29 @@ mod tests {
             assert!(
                 cookie.contains("; Max-Age="),
                 "re-issued cookie must include Max-Age: {cookie}"
+            );
+        }
+
+        /// A cookie token whose time claims are written as fractional numbers
+        /// slides like an integer one: the throttle reads the `exp` the verifier
+        /// judged, never the claim's text.
+        #[tokio::test]
+        async fn fractional_exp_still_slides() {
+            let now = now_secs();
+            let claims: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"sub":"user-frac","exp":{}.5,"iat":{}.5,"cap":{}.5}}"#,
+                now + 800,
+                now - 600,
+                now + 7200
+            ))
+            .expect("fractional claims parse");
+            let token = hs256(&claims);
+            let resp = run(cookie_cfg(), req_with(&[], &[("ipe_sid", &token)])).await;
+            assert_eq!(resp.status, 200, "a fractional-date token dispatches");
+            assert!(
+                resp.cookies.iter().any(|c| c.starts_with("ipe_sid=")),
+                "a past-threshold fractional `exp` re-issues: {:?}",
+                resp.cookies
             );
         }
 

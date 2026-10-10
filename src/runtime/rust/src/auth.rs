@@ -385,8 +385,8 @@ pub enum TokenRefusal {
     NotYetValid,
     /// The token is at or past its absolute lifetime `cap`.
     PastCap,
-    /// A time claim (`exp`, `nbf`, `cap`) is present but not a JSON number, so
-    /// no check could read it.
+    /// A time claim (`exp`, `nbf`, `iat`, `cap`) is present but not a JSON
+    /// number, so no check could read it.
     NonNumericDate,
     /// The signature does not verify under the secret, or the header names
     /// another algorithm or key family.
@@ -463,9 +463,60 @@ pub struct VerifiedClaims {
     claims: HashMap<String, String>,
     /// The names of the claims whose value was not a JSON string.
     coerced: std::collections::HashSet<String>,
+    /// The time claims, as the one reading `verify_claims` judged them by.
+    times: TimeClaims,
+}
+
+/// The NumericDate claims of a verified token, as whole Unix seconds.
+///
+/// Only `verify_claims` builds one, from the same `jwt::read_numeric_date`
+/// reading its clock checks used, so no later reader re-parses a date from the
+/// claim's string form. `None` means the claim is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeClaims {
+    /// `exp`: the token is refused at or after it.
+    exp: Option<i64>,
+    /// `nbf`: the token is refused before it.
+    nbf: Option<i64>,
+    /// `iat`: when the session was first minted.
+    iat: Option<i64>,
+    /// `cap`: the absolute lifetime bound.
+    cap: Option<i64>,
+}
+
+impl TimeClaims {
+    /// The `exp` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn exp(self) -> Option<i64> {
+        self.exp
+    }
+
+    /// The `nbf` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn nbf(self) -> Option<i64> {
+        self.nbf
+    }
+
+    /// The `iat` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn iat(self) -> Option<i64> {
+        self.iat
+    }
+
+    /// The `cap` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn cap(self) -> Option<i64> {
+        self.cap
+    }
 }
 
 impl VerifiedClaims {
+    /// The time claims the verification judged the token by.
+    #[must_use]
+    pub const fn times(&self) -> TimeClaims {
+        self.times
+    }
+
     /// The value of claim `name`, coerced to a string.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -525,13 +576,28 @@ impl std::fmt::Debug for VerifiedClaims {
     }
 }
 
-/// The optional time claims `verify_claims` checks itself; `exp` is required
-/// numeric by the verifier.
-const DATE_CLAIMS: [&str; 2] = ["nbf", "cap"];
+/// The time claim `claim` of the claims set `payload`, read as `verify_claims`
+/// judges it.
+///
+/// # Errors
+///
+/// [`TokenRefusal::Malformed`] when `payload` is not a JSON object;
+/// [`TokenRefusal::NonNumericDate`] when the claim is present but not a number.
+fn time_claim(
+    payload: &serde_json::Value,
+    claim: &'static str,
+) -> Result<Option<i64>, TokenRefusal> {
+    crate::jwt::read_numeric_date(payload, claim).map_err(|refusal| match refusal {
+        crate::jwt::ClaimsRefusal::NonNumericDate { .. } => TokenRefusal::NonNumericDate,
+        crate::jwt::ClaimsRefusal::NotAnObject => TokenRefusal::Malformed,
+        crate::jwt::ClaimsRefusal::Expired => TokenRefusal::Expired,
+        crate::jwt::ClaimsRefusal::NotYetValid => TokenRefusal::NotYetValid,
+    })
+}
 
 /// Verify an HS256 `token` under `secret`: signature, `exp`, `nbf`, and (when
-/// present) the absolute lifetime `cap`. A present `nbf` or `cap` must be a JSON
-/// number.
+/// present) the absolute lifetime `cap`. A present `exp`, `nbf`, `iat` or `cap`
+/// must be a JSON number.
 ///
 /// # Absolute lifetime cap (`cap` claim)
 ///
@@ -548,34 +614,28 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
     if secret.len() < crate::jwt::HS256_MIN_SECRET_BYTES {
         return Err(TokenRefusal::ShortSecret);
     }
-    let unverified = crate::jwt::decode_payload(token);
-    // Pre-reject on the full RFC 7519 NumericDate domain (negative, fractional,
-    // integer) before jsonwebtoken's `exp - 1` u64 subtraction can underflow.
-    // Mirrors jwt.rs's `jwt_decode_hs256` pre-reject; see that function's
-    // comment for the detailed rationale.
-    if let Some(payload) = &unverified {
-        let now = crate::jwt::now_unix_seconds();
-        if let Some(exp) = crate::jwt::numeric_date(payload, "exp")
-            && now >= exp
-        {
-            return Err(TokenRefusal::Expired);
-        }
-        if let Some(nbf) = crate::jwt::numeric_date(payload, "nbf")
-            && now < nbf
-        {
-            return Err(TokenRefusal::NotYetValid);
-        }
-        // Absolute cap gate — checked on the unverified payload first for a fast
-        // pre-reject path, then confirmed on the verified claims after signature
-        // check below. A cap in the past denies immediately (the signature check
-        // below is still required, but there is no point decoding claims we will
-        // discard). Legacy tokens without a `cap` are not pre-rejected here — the
-        // `exp` gate above is their sole bound.
-        if let Some(cap) = crate::jwt::numeric_date(payload, "cap")
-            && now >= cap
-        {
-            return Err(TokenRefusal::PastCap);
-        }
+    // The time claims are read once, here, on the full RFC 7519 NumericDate
+    // domain (negative, fractional, integer), before jsonwebtoken's `exp - 1`
+    // u64 subtraction can underflow; see `jwt_decode_hs256` for that mechanism.
+    // A present claim that is not a number is refused, never skipped, and the
+    // typed values read here are the ones every later reader uses.
+    let payload = crate::jwt::decode_payload(token).ok_or(TokenRefusal::Malformed)?;
+    let times = TimeClaims {
+        exp: time_claim(&payload, "exp")?,
+        nbf: time_claim(&payload, "nbf")?,
+        iat: time_claim(&payload, "iat")?,
+        cap: time_claim(&payload, "cap")?,
+    };
+    let now = crate::jwt::now_unix_seconds();
+    if times.exp.is_some_and(|exp| now >= exp) {
+        return Err(TokenRefusal::Expired);
+    }
+    if times.nbf.is_some_and(|nbf| now < nbf) {
+        return Err(TokenRefusal::NotYetValid);
+    }
+    // A token without a `cap` is bounded by its `exp` alone.
+    if times.cap.is_some_and(|cap| now >= cap) {
+        return Err(TokenRefusal::PastCap);
     }
     let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -602,39 +662,12 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
     // sign-then-verify roundtrip of aud-bearing claims. Mirrors jwt.rs's
     // identical rationale.
     validation.validate_aud = false;
-    let parsed =
-        jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation).map_err(|e| {
-            match classify_jwt(e.kind()) {
-                // jsonwebtoken reports an `exp` it cannot read as absent; the
-                // signature already verified, so the payload says which.
-                TokenRefusal::MissingClaim
-                    if unverified
-                        .as_ref()
-                        .is_some_and(|payload| payload.get("exp").is_some()) =>
-                {
-                    TokenRefusal::NonNumericDate
-                }
-                refusal => refusal,
-            }
-        })?;
-    // A time claim the checks cannot read is refused, never skipped: both the
-    // pre-reject above and jsonwebtoken pass over a non-number `nbf` or `cap`,
-    // which would otherwise verify a token before its start or past its cap.
-    if DATE_CLAIMS
-        .into_iter()
-        .any(|claim| parsed.claims.get(claim).is_some_and(|v| !v.is_number()))
-    {
-        return Err(TokenRefusal::NonNumericDate);
-    }
-    // Re-check the absolute cap on the signature-verified claims. The pre-reject
-    // above already denies past-cap tokens before the signature decode, but this
-    // second check on the verified payload closes any edge where the pre-reject
-    // payload and the verified payload diverge (they cannot in practice — the
-    // signature covers both — but defence-in-depth here costs nothing).
-    if let Some(cap) = crate::jwt::numeric_date(&parsed.claims, "cap")
-        && crate::jwt::now_unix_seconds() >= cap
-    {
-        return Err(TokenRefusal::PastCap);
+    let parsed = jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
+        .map_err(|e| classify_jwt(e.kind()))?;
+    // The time claims were judged on the payload read above; the verified
+    // claims set must be that same payload, or the judgement is of another one.
+    if parsed.claims != payload {
+        return Err(TokenRefusal::Malformed);
     }
     let mut claims = HashMap::new();
     let mut coerced = std::collections::HashSet::new();
@@ -654,7 +687,11 @@ pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims,
             claims.insert(k, s);
         }
     }
-    Ok(VerifiedClaims { claims, coerced })
+    Ok(VerifiedClaims {
+        claims,
+        coerced,
+        times,
+    })
 }
 
 /// Ipê `verifyToken : Secret -> String -> Result AuthError (Dict String String)`.
@@ -822,8 +859,9 @@ crate::redact::redacting_debug!(ReissueContext {
 #[cfg(feature = "jwt")]
 #[must_use]
 pub fn reissue_context_from_claims(claims: &VerifiedClaims) -> Option<ReissueContext> {
-    let iat = claims.get("iat")?.parse::<i64>().ok()?;
-    let cap = claims.get("cap")?.parse::<i64>().ok()?;
+    let times = claims.times();
+    let iat = times.iat()?;
+    let cap = times.cap()?;
     let subject = claims.get("sub").filter(|s| !s.is_empty())?.to_owned();
     // `jti` absent on legacy tokens — treat as empty (cannot be session-revoked by id).
     let jti = claims.get("jti").unwrap_or_default().to_owned();
@@ -1699,7 +1737,9 @@ mod tests {
             };
         // Extract the cap from the first token.
         let payload = crate::jwt::decode_payload(&first_token).expect("first payload");
-        let original_cap = crate::jwt::numeric_date(&payload, "cap").expect("cap in first token");
+        let original_cap = crate::jwt::read_numeric_date(&payload, "cap")
+            .expect("a numeric date")
+            .expect("cap in first token");
         // Simulate a re-issue: extract all claims and pass them (including cap) back.
         let verified: HashMap<String, String> =
             match auth_verify_token(SECRET.to_string(), first_token) {
@@ -1714,8 +1754,9 @@ mod tests {
             };
         let reissued_payload =
             crate::jwt::decode_payload(&reissued_token).expect("reissued payload");
-        let reissued_cap =
-            crate::jwt::numeric_date(&reissued_payload, "cap").expect("cap in reissued token");
+        let reissued_cap = crate::jwt::read_numeric_date(&reissued_payload, "cap")
+            .expect("a numeric date")
+            .expect("cap in reissued token");
         assert_eq!(
             original_cap, reissued_cap,
             "cap must be identical on the re-issued token — it is immutable"
@@ -1734,7 +1775,9 @@ mod tests {
         };
         let after = now_unix();
         let payload = crate::jwt::decode_payload(&token).expect("payload");
-        let cap = crate::jwt::numeric_date(&payload, "cap").expect("cap");
+        let cap = crate::jwt::read_numeric_date(&payload, "cap")
+            .expect("a numeric date")
+            .expect("cap");
         let lifetime = i64::try_from(
             crate::app_config::resolve_auth_max_lifetime().expect("the default lifetime resolves"),
         )
@@ -1831,7 +1874,9 @@ mod tests {
         };
         let payload = crate::jwt::decode_payload(&token).expect("payload");
         assert!(
-            crate::jwt::numeric_date(&payload, "cap").is_some(),
+            crate::jwt::read_numeric_date(&payload, "cap")
+                .expect("a numeric date")
+                .is_some(),
             "a freshly minted token must carry a signed `cap` claim"
         );
     }
@@ -1877,14 +1922,20 @@ mod tests {
                 None => panic!("reissue returned None unexpectedly"),
             };
         let new_payload = crate::jwt::decode_payload(&new_token).expect("payload");
-        let new_exp = crate::jwt::numeric_date(&new_payload, "exp").expect("exp");
+        let new_exp = crate::jwt::read_numeric_date(&new_payload, "exp")
+            .expect("a numeric date")
+            .expect("exp");
         let now = now_unix();
         // new_exp must be in (now, now + slide + 2s fuzz] and <= cap.
         assert!(new_exp > now, "reissued exp must be in the future");
         assert!(new_exp <= ctx.cap, "reissued exp must not exceed cap");
         // iat and cap must be carried verbatim.
-        let new_iat = crate::jwt::numeric_date(&new_payload, "iat").expect("iat");
-        let new_cap = crate::jwt::numeric_date(&new_payload, "cap").expect("cap");
+        let new_iat = crate::jwt::read_numeric_date(&new_payload, "iat")
+            .expect("a numeric date")
+            .expect("iat");
+        let new_cap = crate::jwt::read_numeric_date(&new_payload, "cap")
+            .expect("a numeric date")
+            .expect("cap");
         assert_eq!(new_iat, ctx.iat, "iat must be unchanged on re-issue");
         assert_eq!(new_cap, ctx.cap, "cap must be unchanged on re-issue");
     }
@@ -1912,7 +1963,9 @@ mod tests {
                 None => panic!("reissue returned None unexpectedly"),
             };
         let new_payload = crate::jwt::decode_payload(&new_token).expect("payload");
-        let new_exp = crate::jwt::numeric_date(&new_payload, "exp").expect("exp");
+        let new_exp = crate::jwt::read_numeric_date(&new_payload, "exp")
+            .expect("a numeric date")
+            .expect("exp");
         assert_eq!(
             new_exp, cap,
             "exp must be clamped to cap when slide > remaining"
@@ -1981,7 +2034,9 @@ mod tests {
             None => panic!("reissue returned None (forged cap is future, expected Some)"),
         };
         let payload = crate::jwt::decode_payload(&token).expect("payload");
-        let emitted_cap = crate::jwt::numeric_date(&payload, "cap").expect("cap");
+        let emitted_cap = crate::jwt::read_numeric_date(&payload, "cap")
+            .expect("a numeric date")
+            .expect("cap");
         // The emitted cap equals whatever is in ctx — structural proof that the
         // reissue function does NOT override ctx.cap with something larger. The
         // defence against a forged ctx is that verified-origin is the ONLY path
@@ -1990,7 +2045,9 @@ mod tests {
             emitted_cap, forged_ctx.cap,
             "auth_reissue_token must copy ctx.cap verbatim — it never inflates it further"
         );
-        let emitted_exp = crate::jwt::numeric_date(&payload, "exp").expect("exp");
+        let emitted_exp = crate::jwt::read_numeric_date(&payload, "exp")
+            .expect("a numeric date")
+            .expect("exp");
         assert!(
             emitted_exp <= forged_ctx.cap,
             "exp must always be <= ctx.cap regardless of slide_window"
@@ -2054,6 +2111,14 @@ mod tests {
             refused(serde_json::json!({ "sub": "u", "exp": (now + 3600).to_string() })),
             "an `exp` written as text is refused as unreadable, not as absent"
         );
+        assert!(
+            refused(serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": "1" })),
+            "a `cap` written as text is refused even when it reads as past"
+        );
+        assert!(
+            refused(serde_json::json!({ "sub": "u", "exp": true })),
+            "a boolean `exp` is refused as unreadable, not as absent"
+        );
         assert!(matches!(
             verify_claims(
                 SECRET,
@@ -2073,6 +2138,76 @@ mod tests {
             )
             .is_ok(),
             "numeric time claims inside their window verify"
+        );
+    }
+
+    #[test]
+    fn string_iat_is_refused() {
+        let now = now_unix();
+        assert!(matches!(
+            verify_claims(
+                SECRET,
+                &raw_hs256(&serde_json::json!({ "sub": "u", "exp": now + 3600, "iat": "x" }))
+            ),
+            Err(TokenRefusal::NonNumericDate)
+        ));
+        let numeric = verify_claims(
+            SECRET,
+            &raw_hs256(&serde_json::json!({ "sub": "u", "exp": now + 3600, "iat": now - 60 })),
+        );
+        assert!(
+            matches!(&numeric, Ok(claims) if claims.times().iat() == Some(now - 60)),
+            "a numeric `iat` verifies and is carried typed"
+        );
+    }
+
+    #[test]
+    fn non_object_payload_is_malformed() {
+        for payload in [
+            serde_json::json!([{ "sub": "u", "exp": now_unix() + 3600 }]),
+            serde_json::json!("claims"),
+            serde_json::json!(7),
+        ] {
+            let token = signed_under(SECRET, jsonwebtoken::Algorithm::HS256, &payload);
+            assert!(
+                matches!(verify_claims(SECRET, &token), Err(TokenRefusal::Malformed)),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_time_claims_are_the_numbers_the_checks_read() {
+        let now = now_unix();
+        let token = signed_under(
+            SECRET,
+            jsonwebtoken::Algorithm::HS256,
+            &serde_json::from_str::<serde_json::Value>(&format!(
+                r#"{{"sub":"u","exp":{}.5,"nbf":{}.5,"iat":{}.5,"cap":{}.5}}"#,
+                now + 3600,
+                now - 60,
+                now - 60,
+                now + 7200
+            ))
+            .expect("fractional claims parse"),
+        );
+        let verified = verify_claims(SECRET, &token);
+        assert!(verified.is_ok(), "fractional dates verify");
+        let Ok(claims) = verified else { return };
+        let times = claims.times();
+        assert_eq!(times.exp(), Some(now + 3600));
+        assert_eq!(times.nbf(), Some(now - 60));
+        assert_eq!(times.iat(), Some(now - 60));
+        assert_eq!(times.cap(), Some(now + 7200));
+        assert_eq!(
+            claims.get("cap").map(str::to_owned),
+            Some(format!("{}.5", now + 7200)),
+            "the display form keeps the token's own text"
+        );
+        let context = reissue_context_from_claims(&claims);
+        assert!(
+            matches!(&context, Some(ctx) if ctx.iat == now - 60 && ctx.cap == now + 7200),
+            "a fractional `iat` and `cap` still yield a re-issue context"
         );
     }
 
@@ -2973,5 +3108,139 @@ fn rogue<'a>(x: &'a str) {
             2,
             "the scan sees both sanctioned constructions"
         );
+        assert_eq!(
+            constructions(auth, "TimeClaims", &["verify_claims"]),
+            none,
+            "`TimeClaims` is built only inside `verify_claims`"
+        );
+        assert_eq!(constructions(auth, "TimeClaims", &[]).len(), 1);
+        assert_eq!(constructions(revocation, "TimeClaims", &[]), none);
+    }
+
+    /// A code token and the `fn` whose body holds it.
+    struct Token {
+        text: String,
+        func: Option<String>,
+    }
+
+    /// The code tokens of `source` (comments and literals masked), each with
+    /// its enclosing `fn`.
+    fn tokens(source: &str) -> Vec<Token> {
+        let code = code_only(source);
+        let mut out: Vec<Token> = Vec::new();
+        let mut scopes: Vec<Option<String>> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut at = 0;
+        while let Some(&c) = code.get(at) {
+            let func = scopes.last().cloned().flatten();
+            if c.is_alphabetic() || c == '_' {
+                let start = at;
+                while is_ident(&code, at) {
+                    at += 1;
+                }
+                let text: String = code.get(start..at).unwrap_or_default().iter().collect();
+                if out.last().is_some_and(|t| t.text == "fn") {
+                    pending = Some(text.clone());
+                }
+                out.push(Token { text, func });
+                continue;
+            }
+            match c {
+                ';' => pending = None,
+                '{' => {
+                    let parent = scopes.last().cloned().flatten();
+                    scopes.push(pending.take().or(parent));
+                }
+                '}' => {
+                    scopes.pop();
+                }
+                _ => {}
+            }
+            if !c.is_whitespace() {
+                out.push(Token {
+                    text: c.to_string(),
+                    func,
+                });
+            }
+            at += 1;
+        }
+        out
+    }
+
+    /// The integer types a NumericDate could be re-read into.
+    const DATE_INTEGERS: [&str; 6] = ["i64", "u64", "i32", "u32", "i128", "u128"];
+
+    /// The enclosing `fn` of every integer parse in `source`: `parse::<int>` or
+    /// `int::from_str`.
+    fn integer_parses(source: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        let text = |at: usize| tokens.get(at).map_or("", |t| t.text.as_str());
+        let mut sites = Vec::new();
+        for (at, token) in tokens.iter().enumerate() {
+            let turbofish = token.text == "parse"
+                && [":", ":", "<"] == [text(at + 1), text(at + 2), text(at + 3)]
+                && DATE_INTEGERS.contains(&text(at + 4))
+                && text(at + 5) == ">";
+            let from_str = DATE_INTEGERS.contains(&token.text.as_str())
+                && [":", ":"] == [text(at + 1), text(at + 2)]
+                && matches!(text(at + 3), "from_str" | "from_str_radix");
+            if turbofish || from_str {
+                sites.push(token.func.clone().unwrap_or_default());
+            }
+        }
+        sites
+    }
+
+    /// Source exercising the integer-parse scan.
+    const SYNTHETIC_PARSES: &str = r#"
+fn deadline(claims: &Claims) -> Option<i64> {
+    // claims.get("exp").and_then(|s| s.parse::<i64>().ok())
+    let _ = "s.parse::<i64>()";
+    claims.get("exp").and_then(|s| s.parse :: < i64 > ().ok())
+}
+fn width(raw: &str) -> Option<usize> { raw.parse::<usize>().ok() }
+fn radix(raw: &str) -> Option<u64> { u64::from_str_radix(raw, 10).ok() }
+"#;
+
+    #[test]
+    fn integer_parse_scan_masks_literals_and_tracks_fns() {
+        assert_eq!(integer_parses(SYNTHETIC_PARSES), ["deadline", "radix"]);
+    }
+
+    /// No reader after `verify_claims` re-parses a date from a claim's string
+    /// form, and the lenient reader that passed over a mistyped date is gone.
+    #[test]
+    fn date_claims_read_once() {
+        // The two parses read the caller's `signToken` dict, never a verified
+        // token.
+        assert_eq!(
+            integer_parses(include_str!("auth.rs")),
+            ["auth_sign_token", "auth_sign_token"],
+            "only `signToken`'s caller dict parses an integer in `auth.rs`"
+        );
+        let none: Vec<String> = Vec::new();
+        assert_eq!(integer_parses(include_str!("revocation.rs")), none);
+        assert_eq!(integer_parses(include_str!("server.rs")), none);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root];
+        let mut scanned = 0;
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).expect("read a source dir");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let source = std::fs::read_to_string(&path).expect("read a source file");
+                    scanned += 1;
+                    assert!(
+                        tokens(&source).iter().all(|t| t.text != "numeric_date"),
+                        "`numeric_date` is gone; read a date through `read_numeric_date`: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(scanned > 3, "the scan walked the runtime sources");
     }
 }

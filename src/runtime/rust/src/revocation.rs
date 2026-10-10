@@ -586,13 +586,13 @@ impl TryFrom<CredentialWire> for SessionCredential {
 }
 
 /// The deadline of verified claims: `cap`, else `exp` for a token minted with
-/// no `cap`. A present but unreadable `cap` is no deadline.
+/// no `cap`.
+///
+/// Both come from the typed time claims `verify_claims` read, never from the
+/// claims' string form.
 fn deadline_of(claims: &VerifiedClaims) -> Option<UnixSecs> {
-    claims
-        .get("cap")
-        .or_else(|| claims.get("exp"))
-        .and_then(|raw| raw.parse::<i64>().ok())
-        .map(UnixSecs)
+    let times = claims.times();
+    times.cap().or(times.exp()).map(UnixSecs)
 }
 
 /// The armed revocation gate; it exists only when the resolved mode is `Store`.
@@ -1720,20 +1720,30 @@ mod tests {
         );
     }
 
+    /// A fractional `cap` the verifier admitted arms the deadline it was judged
+    /// by, floored to whole seconds.
     #[test]
-    fn admit_refuses_no_deadline() {
-        // A verified token always carries `exp` and a numeric `cap`, so the
-        // reachable no-deadline case is a fractional `cap`, which `exp` never
-        // stands in for.
+    fn fractional_cap_arms_the_floored_deadline() {
         let claims = claims_of(&serde_json::json!({
             "sub": "g3-subject",
             "jti": "g3-jti",
             "exp": LIVE_UNTIL,
-            "cap": 9_999_999_999.5_f64,
+            "cap": 9_999_999_000.5_f64,
+        }));
+        assert_eq!(deadline_of(&claims), Some(UnixSecs(9_999_999_000)));
+        let credential = gate()
+            .admit_in(&healthy_store(), &claims, "sub")
+            .expect("a verified fractional `cap` is admitted");
+        assert_eq!(credential.deadline(), UnixSecs(9_999_999_000));
+        let fractional_exp = claims_of(&serde_json::json!({
+            "sub": "g3-subject",
+            "jti": "g3-exp-jti",
+            "exp": 9_999_999_000.5_f64,
         }));
         assert_eq!(
-            gate().admit_in(&healthy_store(), &claims, "sub"),
-            Err(Denial::NoDeadline)
+            deadline_of(&fractional_exp),
+            Some(UnixSecs(9_999_999_000)),
+            "a fractional `exp` stands in for an absent `cap`, floored"
         );
     }
 
