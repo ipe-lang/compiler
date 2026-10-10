@@ -206,6 +206,20 @@ impl RequestStreams {
     }
 }
 
+impl Drop for RequestStreams {
+    /// A request that ends without claiming its response (an upgraded
+    /// socket, a failed handler, a dropped connection) serves its table too:
+    /// a sub-task still carrying it registers nothing, and every handler it
+    /// held drops here.
+    fn drop(&mut self) {
+        let unclaimed = std::mem::replace(
+            &mut *self.0.lock().unwrap_or_else(PoisonError::into_inner),
+            TableState::Served,
+        );
+        drop(unclaimed);
+    }
+}
+
 /// Run `request` with a fresh stream table in scope.
 ///
 /// Returns the request's output beside the table it registered into.
@@ -546,6 +560,34 @@ mod tests {
             claim_streaming_sentinel("ok", streams),
             ServerStreamClaim::Buffered
         ));
+        assert_eq!(
+            refusal(late.await),
+            Some((IpeErrorKind::InvalidInput, AFTER_RESPONSE.to_owned()))
+        );
+    }
+
+    /// A request dropped without claiming its response releases every
+    /// handler it held and refuses a sub-task still carrying its table.
+    #[tokio::test]
+    async fn a_request_dropped_unclaimed_serves_its_table() {
+        let held = Arc::new(());
+        let captured = Arc::clone(&held);
+        let ((registered, late), streams) = in_stream_scope(async move {
+            let registered = server_stream_stream::<IpeError, _>(
+                "text/plain".to_owned(),
+                move |_w: StreamWriter| {
+                    let _keep = Arc::clone(&captured);
+                    Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+                },
+            )
+            .await;
+            (registered, inherit_stream_scope(stream_idle()))
+        })
+        .await;
+        assert_eq!(refusal(registered), None);
+        assert_eq!(Arc::strong_count(&held), 2, "the pending handler holds it");
+        drop(streams);
+        assert_eq!(Arc::strong_count(&held), 1, "the unclaimed handler dropped");
         assert_eq!(
             refusal(late.await),
             Some((IpeErrorKind::InvalidInput, AFTER_RESPONSE.to_owned()))
