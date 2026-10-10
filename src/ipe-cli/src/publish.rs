@@ -81,6 +81,11 @@ pub enum Refusal {
     /// "Verified" and would be rejected at merge — publish fails closed rather
     /// than author the commit under a placeholder identity.
     UnresolvableIdentity,
+    /// A level of the entry's path in the index-fork checkout, or the entry
+    /// itself, is a link, a reparse point, or of the wrong kind. Git checks a
+    /// committed link out as a link, so publish refuses rather than write
+    /// through one to wherever the fork points it.
+    ForkEntryNotPlain { path: PathBuf },
 }
 
 impl std::fmt::Display for Refusal {
@@ -96,6 +101,9 @@ impl std::fmt::Display for Refusal {
             Self::NoSource => f.write_str(crate::text::publish_no_source()),
             Self::UnsignedCommit => f.write_str(crate::text::publish_unsigned_commit()),
             Self::UnresolvableIdentity => f.write_str(crate::text::publish_unresolvable_identity()),
+            Self::ForkEntryNotPlain { path } => {
+                f.write_str(&crate::text::publish_fork_entry_not_plain(&path.display()))
+            }
         }
     }
 }
@@ -1174,11 +1182,7 @@ fn open_pr(
     // identity so the commit succeeds even where git has none configured, and
     // the signing-key overrides make the commit SSH-signed so a
     // `required_signatures` index will merge it.
-    let entry_path = clone.join(&plan.entry_file);
-    if let Some(parent) = entry_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| scratch_io(&e))?;
-    }
-    std::fs::write(&entry_path, entry_toml).map_err(|e| scratch_io(&e))?;
+    write_fork_entry(&clone, &plan.entry_file, entry_toml)?;
 
     // Every step shares one deadline, so the sequence as a whole is held to it.
     let transfer = Transfer::begin(remote_ingest::INDEX_PUSH);
@@ -1211,6 +1215,66 @@ fn open_pr(
         |token| submit_pr_via_api(plan, fork_owner, &token),
     );
     Ok(())
+}
+
+/// Write `contents` as the entry at `rel` inside `clone`, a checkout of the index fork.
+///
+/// The fork is another party's tree and git checks a committed link out as a
+/// link, so every level is entered through the held level above it, never
+/// following a link, and the entry is staged and renamed within its held
+/// parent: no byte is written through a link the fork planted.
+///
+/// # Errors
+/// [`Refusal::ForkEntryNotPlain`] when a level of `rel`, or the entry itself, is
+/// a link, a reparse point, or of the wrong kind, or `rel` holds a component
+/// other than a plain name; [`CliError::Io`] on a filesystem failure.
+fn write_fork_entry(clone: &Path, rel: &str, contents: &str) -> Result<(), CliError> {
+    use crate::output_dir::OutputRefusal;
+    use crate::output_dir::held::{EntryKind, HeldDir};
+    use std::io::Write as _;
+    use std::path::Component;
+
+    /// A held-walk refusal of a level as the publish refusal naming it.
+    fn plain(error: CliError) -> CliError {
+        match error {
+            CliError::OutputRefused(
+                OutputRefusal::Symlink(path)
+                | OutputRefusal::NotADirectory(path)
+                | OutputRefusal::ReparsePoint(path),
+            ) => refuse(Refusal::ForkEntryNotPlain { path }),
+            other => other,
+        }
+    }
+    let not_plain = |path: PathBuf| refuse(Refusal::ForkEntryNotPlain { path });
+
+    let names = Path::new(rel)
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => Err(not_plain(clone.join(rel))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some((leaf, levels)) = names.split_last() else {
+        return Err(not_plain(clone.join(rel)));
+    };
+    let mut dir = HeldDir::open(clone)
+        .map_err(plain)?
+        .ok_or_else(|| CliError::Io {
+            path: clone.to_path_buf(),
+            source: std::io::ErrorKind::NotFound.into(),
+        })?;
+    for level in levels {
+        dir = dir.create_child(level).map_err(plain)?.0;
+    }
+    match dir.kind_of(leaf).map_err(plain)? {
+        EntryKind::Symlink | EntryKind::Directory => Err(not_plain(dir.path().join(leaf))),
+        EntryKind::Absent | EntryKind::Other => dir
+            .write_file(leaf, None, |file| file.write_all(contents.as_bytes()))
+            .map_err(plain),
+    }
 }
 
 /// The ordered `git` invocations that put the entry on a fresh branch, commit
@@ -2903,5 +2967,138 @@ mod tests {
             !rendered.contains("localhost"),
             "the refusal must not name a placeholder identity: {rendered}"
         );
+    }
+
+    /// The entry path every fork-write test writes.
+    const FORK_ENTRY: &str = "packages/foo.toml";
+
+    /// A scratch fork checkout and a sibling directory outside it.
+    fn fork_and_outside(tag: &str) -> (ScratchDir, PathBuf, PathBuf) {
+        let sd = ScratchDir::new(&format!("ipe-publish-fork-{tag}")).expect("scratch dir");
+        let clone = sd.path().join("index");
+        let outside = sd.path().join("outside");
+        std::fs::create_dir(&clone).expect("clone dir");
+        std::fs::create_dir(&outside).expect("outside dir");
+        (sd, clone, outside)
+    }
+
+    /// `result` is the fork-entry refusal naming `at`.
+    fn assert_fork_entry_refused(result: &Result<(), CliError>, at: &Path) {
+        assert!(
+            matches!(result, Err(CliError::Publish(Refusal::ForkEntryNotPlain { path })) if path == at),
+            "expected the fork-entry refusal at {}: {result:?}",
+            at.display()
+        );
+    }
+
+    /// The entry is written, creating `packages`, when the fork has none yet.
+    #[test]
+    fn fork_entry_is_written_creating_its_directory() {
+        let (_sd, clone, _outside) = fork_and_outside("fresh");
+        write_fork_entry(&clone, FORK_ENTRY, "name = \"foo\"\n").expect("written");
+        let written = std::fs::read_to_string(clone.join(FORK_ENTRY)).expect("read back");
+        assert_eq!(written, "name = \"foo\"\n");
+    }
+
+    /// An existing regular entry is replaced with the new bytes.
+    #[test]
+    fn fork_entry_replaces_an_existing_entry() {
+        let (_sd, clone, _outside) = fork_and_outside("replace");
+        std::fs::create_dir(clone.join("packages")).expect("packages");
+        std::fs::write(clone.join(FORK_ENTRY), "old").expect("old entry");
+        write_fork_entry(&clone, FORK_ENTRY, "new").expect("written");
+        let written = std::fs::read_to_string(clone.join(FORK_ENTRY)).expect("read back");
+        assert_eq!(written, "new");
+    }
+
+    /// A `packages` that is a regular file is refused, and the file is untouched.
+    #[test]
+    fn fork_entry_refuses_a_packages_file() {
+        let (_sd, clone, _outside) = fork_and_outside("packages-file");
+        let packages = clone.join("packages");
+        std::fs::write(&packages, "keep").expect("packages file");
+        let result = write_fork_entry(&clone, FORK_ENTRY, "new");
+        assert_fork_entry_refused(&result, &packages);
+        assert_eq!(std::fs::read_to_string(&packages).expect("read"), "keep");
+    }
+
+    /// An entry that is a directory is refused, never renamed over.
+    #[test]
+    fn fork_entry_refuses_an_entry_directory() {
+        let (_sd, clone, _outside) = fork_and_outside("entry-dir");
+        let entry = clone.join(FORK_ENTRY);
+        std::fs::create_dir_all(&entry).expect("entry dir");
+        let result = write_fork_entry(&clone, FORK_ENTRY, "new");
+        assert_fork_entry_refused(&result, &entry);
+        assert!(entry.is_dir());
+    }
+
+    /// A relative entry path that climbs out of the fork is refused before any write.
+    #[test]
+    fn fork_entry_refuses_a_non_plain_component() {
+        let (_sd, clone, outside) = fork_and_outside("climb");
+        let rel = "../outside/foo.toml";
+        let result = write_fork_entry(&clone, rel, "new");
+        assert_fork_entry_refused(&result, &clone.join(rel));
+        assert!(!outside.join("foo.toml").exists());
+    }
+
+    /// A committed `packages` link to a directory outside the fork is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn fork_entry_refuses_a_packages_symlink() {
+        let (_sd, clone, outside) = fork_and_outside("packages-link");
+        let packages = clone.join("packages");
+        std::os::unix::fs::symlink(&outside, &packages).expect("packages link");
+        let result = write_fork_entry(&clone, FORK_ENTRY, "new");
+        assert_fork_entry_refused(&result, &packages);
+        assert!(
+            !outside.join("foo.toml").exists(),
+            "the write followed the link"
+        );
+    }
+
+    /// A committed entry link to a file outside the fork is refused; the file keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn fork_entry_refuses_an_entry_symlink_to_an_outside_file() {
+        let (_sd, clone, outside) = fork_and_outside("entry-link");
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "keep").expect("victim");
+        std::fs::create_dir(clone.join("packages")).expect("packages");
+        let entry = clone.join(FORK_ENTRY);
+        std::os::unix::fs::symlink(&victim, &entry).expect("entry link");
+        let result = write_fork_entry(&clone, FORK_ENTRY, "new");
+        assert_fork_entry_refused(&result, &entry);
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep");
+        assert!(
+            entry.is_symlink(),
+            "the planted link was replaced, not refused"
+        );
+    }
+
+    /// A committed dangling entry link is refused; its target is never created.
+    #[cfg(unix)]
+    #[test]
+    fn fork_entry_refuses_a_dangling_entry_symlink() {
+        let (_sd, clone, outside) = fork_and_outside("entry-dangling");
+        let target = outside.join("created");
+        std::fs::create_dir(clone.join("packages")).expect("packages");
+        let entry = clone.join(FORK_ENTRY);
+        std::os::unix::fs::symlink(&target, &entry).expect("entry link");
+        let result = write_fork_entry(&clone, FORK_ENTRY, "new");
+        assert_fork_entry_refused(&result, &entry);
+        assert!(!target.exists(), "the write created the link's target");
+    }
+
+    /// The refusal names the fork path inertly, so a hostile name cannot drive the terminal.
+    #[test]
+    fn fork_entry_refusal_renders_inert() {
+        let shown = Refusal::ForkEntryNotPlain {
+            path: PathBuf::from("pkg\u{1b}]0;t\u{7}\nerror: forged"),
+        }
+        .to_string();
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+        assert!(!shown.lines().any(|l| l.starts_with("error:")), "{shown:?}");
     }
 }
