@@ -1022,6 +1022,8 @@ messages! {
     publish_unsigned_commit = "publish-unsigned-commit";
     /// Publish without a resolvable GitHub identity.
     publish_unresolvable_identity = "publish-unresolvable-identity";
+    /// Publish refusing a link or wrong-kind entry in the index-fork checkout.
+    publish_fork_entry_not_plain(path) = "publish-fork-entry-not-plain";
     /// An `ipe.lock` `[[package]]` table lacks a required field.
     lock_missing_field(field) = "lock-missing-field";
     /// An `ipe.lock` package carries an unrecognised `kind`.
