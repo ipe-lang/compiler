@@ -4005,6 +4005,9 @@ mod tests {
         format!("module M exposing (x)\n\n\nx =\n    {body}\n")
     }
 
+    /// A named generator of a nested module by depth.
+    type NamedShape = (&'static str, fn(usize) -> String);
+
     /// The render calls one format of `src` makes. A refused format has
     /// rendered all the same, so the outcome is not read.
     fn render_calls_of(src: &str) -> u64 {
@@ -4022,7 +4025,7 @@ mod tests {
     /// count is a work counter, never wall time, so the test cannot flake.
     #[test]
     fn nested_operator_chains_render_each_operand_once() {
-        let shapes: [(&str, fn(usize) -> String); 2] = [
+        let shapes: [NamedShape; 2] = [
             ("source-multiline", nested_pipe_lambdas),
             ("commented", nested_commented_pipes),
         ];
