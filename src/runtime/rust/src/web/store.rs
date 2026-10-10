@@ -384,6 +384,13 @@ type ClaimTable = Mutex<HashMap<SessionKey, Slot>>;
 /// A store's per-session claim table: at most one cold rejoin per sid at a time.
 ///
 /// The table lock is a `std` mutex, never held across an await.
+///
+/// The claim is per process. Replicas sharing one persistent backend
+/// (Postgres, Redis) each hold their own table, so two replicas can still
+/// rebuild the same sid concurrently, each seeding its own driver and running
+/// a rebuilt session's init Cmd once. Within one process the cold-to-live
+/// transition is single-flight; across replicas it is not, until a backend
+/// overrides [`SessionStore::claim`] with a shared lease.
 #[derive(Default)]
 pub struct SidAdmission(Arc<ClaimTable>);
 
@@ -512,6 +519,9 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     fn admission(&self) -> &SidAdmission;
 
     /// Claim session `key` for a page entry; see [`SidAdmission::claim`].
+    ///
+    /// The provided claim is per process (see [`SidAdmission`]); a backend
+    /// shared by several replicas overrides it to make the claim cross-replica.
     ///
     /// # Errors
     ///
