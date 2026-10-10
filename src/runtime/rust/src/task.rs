@@ -143,14 +143,33 @@ const BLOCK_ON_THREAD: &str = "ipe-block-on";
 /// it).
 ///
 /// Every caller-owned task-local scope is carried here and only here: a new
-/// one wraps the result, `carry_new_scope(carry_server_request(task))`, and
+/// one wraps the result, `carry_new_scope(carry_request_streams(..))`, and
 /// every spawn of this module inherits it.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 #[allow(clippy::missing_const_for_fn)] // const only in builds that carry no scope
 fn on_behalf_of_caller<F: std::future::Future>(
     task: F,
 ) -> impl std::future::Future<Output = F::Output> {
-    carry_server_request(task)
+    carry_request_streams(carry_server_request(task))
+}
+
+/// `task`, kept inside the stream table of the `Server` request its caller
+/// handles, so a `stream` it registers belongs to that request.
+#[cfg(all(feature = "tokio", feature = "server", not(target_arch = "wasm32")))]
+fn carry_request_streams<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::server_stream::inherit_stream_scope(task)
+}
+
+/// `task` as it is: without `server` no request stream table exists.
+#[cfg(all(
+    feature = "tokio",
+    not(feature = "server"),
+    not(target_arch = "wasm32")
+))]
+const fn carry_request_streams<F: std::future::Future>(task: F) -> F {
+    task
 }
 
 /// `task`, kept inside the binding set of the `Server` request its caller
