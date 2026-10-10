@@ -204,12 +204,15 @@ pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
         )?
     };
 
-    // 5/6. Open the PR, or under --dry-run print the entry + intended PR.
+    // 5/6. Open the PR, or under --dry-run print the entry + intended PR. The
+    //      entry path, branch and title are built from the parsed name, a single
+    //      plain path component, never from the raw manifest string.
+    let package_name = crate::package_name::PackageName::parse(&manifest.name)?;
     let plan = PrPlan {
         index_repo: args.index_repo.clone(),
-        entry_file: format!("packages/{}.toml", manifest.name),
-        branch: format!("publish/{}-{}", manifest.name, entry_version.version),
-        title: format!("Publish {} {}", manifest.name, entry_version.version),
+        entry_file: format!("packages/{package_name}.toml"),
+        branch: format!("publish/{package_name}-{}", entry_version.version),
+        title: format!("Publish {package_name} {}", entry_version.version),
     };
 
     if args.dry_run {
@@ -3089,6 +3092,67 @@ mod tests {
         let result = write_fork_entry(&clone, FORK_ENTRY, "new");
         assert_fork_entry_refused(&result, &entry);
         assert!(!target.exists(), "the write created the link's target");
+    }
+
+    /// An entry hard-linked to a file outside the fork is replaced by name; the other link keeps its bytes.
+    #[test]
+    fn fork_entry_replaces_a_hardlinked_entry_without_writing_through_it() {
+        let (_sd, clone, outside) = fork_and_outside("entry-hardlink");
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "keep").expect("victim");
+        std::fs::create_dir(clone.join("packages")).expect("packages");
+        let entry = clone.join(FORK_ENTRY);
+        std::fs::hard_link(&victim, &entry).expect("entry hard link");
+        write_fork_entry(&clone, FORK_ENTRY, "new").expect("written");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep");
+        assert_eq!(std::fs::read_to_string(&entry).expect("read"), "new");
+    }
+
+    /// A FIFO entry is replaced by name without being opened, so the write never blocks.
+    #[cfg(unix)]
+    #[test]
+    fn fork_entry_replaces_a_fifo_entry_without_opening_it() {
+        let (_sd, clone, _outside) = fork_and_outside("entry-fifo");
+        std::fs::create_dir(clone.join("packages")).expect("packages");
+        let entry = clone.join(FORK_ENTRY);
+        let made = std::process::Command::new("mkfifo").arg(&entry).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo creates the fixture"
+        );
+        let (done, wait) = std::sync::mpsc::channel();
+        let writer_clone = clone.clone();
+        std::thread::spawn(move || {
+            let written = write_fork_entry(&writer_clone, FORK_ENTRY, "new");
+            let _ = done.send(written.map_err(|error| format!("{error:?}")));
+        });
+        let result = wait
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the write returned instead of blocking on the FIFO");
+        assert!(result.is_ok(), "{result:?}");
+        let kind = std::fs::symlink_metadata(&entry)
+            .expect("entry")
+            .file_type();
+        assert!(kind.is_file(), "the FIFO was replaced by a regular file");
+        assert_eq!(std::fs::read_to_string(&entry).expect("read"), "new");
+    }
+
+    /// A committed `packages` junction to a directory outside the fork is refused, never entered.
+    #[cfg(windows)]
+    #[test]
+    fn fork_entry_refuses_a_packages_junction() {
+        use crate::output_dir::test_links::junction_in_place;
+
+        let (_sd, clone, outside) = fork_and_outside("packages-junction");
+        let packages = clone.join("packages");
+        std::fs::create_dir(&packages).expect("packages dir");
+        junction_in_place(&packages, &outside);
+        let result = write_fork_entry(&clone, FORK_ENTRY, "new");
+        assert_fork_entry_refused(&result, &packages);
+        assert!(
+            !outside.join("foo.toml").exists(),
+            "the write entered the junction"
+        );
     }
 
     /// The refusal names the fork path inertly, so a hostile name cannot drive the terminal.
