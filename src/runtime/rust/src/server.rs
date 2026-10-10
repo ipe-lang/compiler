@@ -626,57 +626,55 @@ where
 
             // Sliding re-issue — cookie-source only (bearer tokens are API
             // credentials; the client manages re-issue itself via re-auth).
-            let reissue_cookie: Option<SetCookie> =
-                if let TokenSource::Cookie(ref name) = cfg.source {
-                    if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
-                        // A malformed window refuses the request rather than
-                        // re-issuing under an unknown bound; the detail stays out of
-                        // the response.
-                        let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
-                        else {
-                            return ok_res(plain_resp(503, "service unavailable", &[]));
-                        };
-                        let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
-                        let now = crate::jwt::now_unix_seconds();
-                        // Throttle: re-issue only once past exp - slide_window/2.
-                        // `exp` is the typed value `verify_claims` read.
-                        let past_threshold = claims
-                            .times()
-                            .exp()
-                            .is_some_and(|exp| now > exp.saturating_sub(slide_i64 / 2));
-                        if past_threshold && now < ctx.cap {
-                            // Extra claims to carry into the re-issued token (all
-                            // verified claims except the time anchors and subject —
-                            // those come from the ReissueContext).
-                            let extra: HashMap<String, String> = claims
-                                .iter()
-                                .filter(|(k, _)| {
-                                    // Time anchors and session-identity fields come from
-                                    // ReissueContext verbatim; skip them in extra_claims.
-                                    !["exp", "iat", "cap", "jti", "sub"].contains(k)
-                                })
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect();
-                            match crate::auth::auth_reissue_token::<String>(
-                                &secret, &ctx, extra, slide_i64,
-                            ) {
-                                Some(IpeResult::Ok(new_token)) => Some(reissue_set_cookie(
-                                    name,
-                                    &new_token,
-                                    slide_window_secs,
-                                    is_https,
-                                )),
-                                _ => None,
-                            }
-                        } else {
-                            None
+            let reissue_cookie: Option<SetCookie> = if let TokenSource::Cookie(ref name) =
+                cfg.source
+            {
+                if let Some(ctx) = crate::auth::reissue_context_from_claims(&claims) {
+                    // A malformed window refuses the request rather than
+                    // re-issuing under an unknown bound; the detail stays out of
+                    // the response.
+                    let Ok(slide_window_secs) = crate::app_config::resolve_auth_slide_window()
+                    else {
+                        return ok_res(plain_resp(503, "service unavailable", &[]));
+                    };
+                    let slide_i64 = i64::try_from(slide_window_secs).unwrap_or(i64::MAX);
+                    let now = crate::jwt::now_unix_seconds();
+                    // Throttle: re-issue only once past exp - slide_window/2.
+                    // `exp` is the typed value `verify_claims` read.
+                    let past_threshold = now > claims.times().exp().saturating_sub(slide_i64 / 2);
+                    if past_threshold && now < ctx.cap {
+                        // Extra claims to carry into the re-issued token (all
+                        // verified claims except the time anchors and subject —
+                        // those come from the ReissueContext).
+                        let extra: HashMap<String, String> = claims
+                            .iter()
+                            .filter(|(k, _)| {
+                                // Time anchors and session-identity fields come from
+                                // ReissueContext verbatim; skip them in extra_claims.
+                                !["exp", "iat", "cap", "jti", "sub"].contains(k)
+                            })
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                            .collect();
+                        match crate::auth::auth_reissue_token::<String>(
+                            &secret, &ctx, extra, slide_i64,
+                        ) {
+                            Some(IpeResult::Ok(new_token)) => Some(reissue_set_cookie(
+                                name,
+                                &new_token,
+                                slide_window_secs,
+                                is_https,
+                            )),
+                            _ => None,
                         }
                     } else {
                         None
                     }
                 } else {
                     None
-                };
+                }
+            } else {
+                None
+            };
 
             let mut resp = handler(req, principal).await;
             // Attach the re-issue cookie when warranted. The handler returns an

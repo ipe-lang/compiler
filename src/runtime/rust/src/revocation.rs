@@ -13,7 +13,7 @@
 //! `auth::verify_claims` builds: a credential from unverified claims has no
 //! representation either.
 //!
-//! - `admit` refuses a token with no subject, no `jti`, or no lifetime bound
+//! - `admit` refuses a token with no subject or no `jti`
 //!   (`cap`, else `exp`), and a token the store names or cannot judge.
 //! - [`ArmedGate::recheck`] re-proves a held credential: its deadline, then the
 //!   store.
@@ -39,8 +39,8 @@
 //! - A channel that verifies another party's token is bound to it too, so
 //!   revoking that token ends the channel (over-deny, fail closed).
 //! - A script armed by the env starts with an empty store, so it refuses only
-//!   tokens with no subject, `jti` or lifetime bound until something in the same
-//!   process revokes.
+//!   tokens with no subject or `jti` until something in the same process
+//!   revokes.
 //!
 //! # Fail-closed
 //!
@@ -450,8 +450,6 @@ pub enum Denial {
     /// The token carries no session id (`jti`), an empty or over-long one, or
     /// one that is not a JSON string.
     SessionIdAbsent,
-    /// The token carries no lifetime bound (`cap`, else `exp`).
-    NoDeadline,
     /// The store names the subject or the session id.
     Revoked,
     /// The store cannot answer (refused capacity or poisoned lock).
@@ -470,7 +468,6 @@ impl std::fmt::Display for Denial {
         f.write_str(match self {
             Self::SubjectAbsent => "token carries no subject",
             Self::SessionIdAbsent => "token carries no session id (`jti`)",
-            Self::NoDeadline => "token carries no lifetime bound (`cap` or `exp`)",
             Self::Revoked => "credential revoked",
             Self::StoreUnavailable => "revocation store unavailable",
             Self::PastDeadline => "credential past its lifetime bound",
@@ -485,10 +482,9 @@ impl std::error::Error for Denial {}
 impl Denial {
     /// Every variant, in declaration order.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::SubjectAbsent,
         Self::SessionIdAbsent,
-        Self::NoDeadline,
         Self::Revoked,
         Self::StoreUnavailable,
         Self::PastDeadline,
@@ -500,9 +496,7 @@ impl Denial {
     #[must_use]
     pub const fn auth_error(self) -> IpeAuthError {
         match self {
-            Self::SubjectAbsent | Self::SessionIdAbsent | Self::NoDeadline => {
-                IpeAuthError::MissingClaim
-            }
+            Self::SubjectAbsent | Self::SessionIdAbsent => IpeAuthError::MissingClaim,
             Self::Revoked => IpeAuthError::Revoked,
             Self::PastDeadline => IpeAuthError::Expired,
             Self::BindingsFull => IpeAuthError::TooManyCredentials,
@@ -589,10 +583,12 @@ impl TryFrom<CredentialWire> for SessionCredential {
 /// no `cap`.
 ///
 /// Both come from the typed time claims `verify_claims` read, never from the
-/// claims' string form.
-fn deadline_of(claims: &VerifiedClaims) -> Option<UnixSecs> {
+/// claims' string form; `verify_claims` requires `exp`, so every verified token
+/// has a deadline.
+fn deadline_of(claims: &VerifiedClaims) -> UnixSecs {
     let times = claims.times();
-    times.cap().or(times.exp()).map(UnixSecs)
+    let exp = times.exp();
+    UnixSecs(times.cap().unwrap_or(exp))
 }
 
 /// The armed revocation gate; it exists only when the resolved mode is `Store`.
@@ -615,8 +611,8 @@ impl ArmedGate {
     ///
     /// # Errors
     ///
-    /// [`Denial::SubjectAbsent`], [`Denial::SessionIdAbsent`] or
-    /// [`Denial::NoDeadline`] for a claim the token lacks; [`Denial::Revoked`]
+    /// [`Denial::SubjectAbsent`] or [`Denial::SessionIdAbsent`] for a claim the
+    /// token lacks; [`Denial::Revoked`]
     /// when the store names it; [`Denial::StoreUnavailable`] when the store
     /// cannot answer.
     pub fn admit(
@@ -644,7 +640,7 @@ impl ArmedGate {
             .text("jti")
             .and_then(SessionJti::parse)
             .ok_or(Denial::SessionIdAbsent)?;
-        let deadline = deadline_of(claims).ok_or(Denial::NoDeadline)?;
+        let deadline = deadline_of(claims);
         verdict_denial(verdict_in(store, &subject.0, &session.0))?;
         Ok(SessionCredential {
             subject,
@@ -1052,7 +1048,6 @@ mod tests {
         let expected = [
             (Denial::SubjectAbsent, IpeAuthError::MissingClaim),
             (Denial::SessionIdAbsent, IpeAuthError::MissingClaim),
-            (Denial::NoDeadline, IpeAuthError::MissingClaim),
             (Denial::Revoked, IpeAuthError::Revoked),
             (
                 Denial::StoreUnavailable,
@@ -1730,7 +1725,7 @@ mod tests {
             "exp": LIVE_UNTIL,
             "cap": 9_999_999_000.5_f64,
         }));
-        assert_eq!(deadline_of(&claims), Some(UnixSecs(9_999_999_000)));
+        assert_eq!(deadline_of(&claims), UnixSecs(9_999_999_000));
         let credential = gate()
             .admit_in(&healthy_store(), &claims, "sub")
             .expect("a verified fractional `cap` is admitted");
@@ -1742,7 +1737,7 @@ mod tests {
         }));
         assert_eq!(
             deadline_of(&fractional_exp),
-            Some(UnixSecs(9_999_999_000)),
+            UnixSecs(9_999_999_000),
             "a fractional `exp` stands in for an absent `cap`, floored"
         );
     }
