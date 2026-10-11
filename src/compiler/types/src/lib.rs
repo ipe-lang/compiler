@@ -8497,18 +8497,22 @@ h x =
     }
 
     /// A dependency exporting a message-free view whose `msg` slot no use pins.
-    const DEP_UNPINNED_VIEW: &str = "module Lib exposing (Html, p)\n\n\
-                                     type Html msg\n    = Text String\n    | Tagged msg\n\n\
-                                     p : Html msg\n\
-                                     p =\n    Text \"p\"\n";
+    const DEP_UNPINNED_VIEW: &str = "module Lib exposing (p)\n\n\
+                                     p : Int -> Html msg\n\
+                                     p n =\n    spin n\n\n\
+                                     spin : Int -> Html msg\n\
+                                     spin n =\n    spin n\n";
 
     /// An importer of [`DEP_UNPINNED_VIEW`] with a private defaulted view of
     /// its own.
     const MAIN_OVER_UNPINNED_VIEW: &str = "module Main exposing (count)\n\n\
                                            import Lib exposing (p)\n\n\
-                                           type Html msg\n    = Text String\n    | Tagged msg\n\n\
-                                           page : Html msg\n\
-                                           page =\n    Text \"page\"\n\n\
+                                           page : Int -> Html msg\n\
+                                           page n =\n    spin n\n\n\
+                                           spin : Int -> Html msg\n\
+                                           spin n =\n    spin n\n\n\
+                                           probe : Int -> Int\n\
+                                           probe n =\n    case p n of\n        _ ->\n            n\n\n\
                                            count : Int\n\
                                            count =\n    1\n";
 

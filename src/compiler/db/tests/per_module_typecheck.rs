@@ -949,9 +949,10 @@ fn signature_wildcards_agree_across_a_module_edge() {
 fn msg_defaulted_vars_agree_across_a_module_edge() {
     const MSG_SLOT_MODULE: &str = "module V exposing (count)\n\n\
         import A exposing (visible)\n\n\
-        type Html msg\n    = Text String\n    | Tagged msg\n\n\
-        page : Html msg\n\
-        page =\n    Text \"page\"\n\n\
+        page : Int -> Html msg\n\
+        page n =\n    spin n\n\n\
+        spin : Int -> Html msg\n\
+        spin n =\n    spin n\n\n\
         count : Int\n\
         count =\n    visible\n";
     let (db, _log) = logged_db();
@@ -980,7 +981,7 @@ fn msg_defaulted_vars_agree_across_a_module_edge() {
 // ---------------------------------------------------------------------------
 
 /// A solve holding no entries.
-fn empty_solve() -> ipe_types::SolvedTypes {
+const fn empty_solve() -> ipe_types::SolvedTypes {
     ipe_types::SolvedTypes {
         env: BTreeMap::new(),
         regions: BTreeMap::new(),
