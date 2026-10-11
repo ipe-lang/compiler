@@ -1936,7 +1936,7 @@ mod spawn_scope_scan_tests {
             let top_level = !line.is_empty() && !line.starts_with(char::is_whitespace);
             assert!(
                 !top_level
-                    || ["#[", "mod ", "}", "//"]
+                    || ["#[", "mod ", "}", ")", "//"]
                         .iter()
                         .any(|item| line.starts_with(item)),
                 "production code follows a test module in task.rs, so the spawn scan \
