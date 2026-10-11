@@ -1,21 +1,25 @@
 //! Ipe.Http.Server.Stream — server-side streaming HTTP responses (chunked / SSE).
 //!
-//! Mirror of ``. Where http_stream.rs reads an
-//! upstream body chunk-by-chunk, this writes a response body chunk-by-chunk to
-//! the client over a long-lived connection.
+//! Mirror of `http_stream.rs`. Where `http_stream.rs` reads an upstream body
+//! chunk-by-chunk, this writes a response body chunk-by-chunk to the client
+//! over a long-lived connection.
 //!
 //! Integration with the axum server (server.rs):
 //!
-//!   1. `stream ct handler` stashes the (E-erased) handler closure in a global
-//!      registry under a fresh token and returns a normal `ServerResponse`
-//!      whose body is the sentinel `__ipe_stream:<nonce>:<token>`. This survives the
-//!      ServerResponse bridge (which has no handler field).
+//!   1. `stream ct handler` registers the (E-erased) handler in the
+//!      [`RequestStreams`] table of the `Server` request it runs in, under a
+//!      fresh ticket, and returns a normal `ServerResponse` whose body is the
+//!      sentinel `__ipe_stream:<ticket>`. This survives the `ServerResponse`
+//!      bridge (which has no handler field).
 //!
-//!   2. `to_axum_response` (server.rs) calls `claim_streaming_sentinel`. On a
-//!      sentinel hit it pops the handler, builds the response head through the
-//!      one assembler every response goes through (`ServerResponseHead`), and
-//!      only then `ServerPendingStream::serve`s: open a bounded mpsc channel,
-//!      register the sender under a stream id, spawn the handler driving a
+//!   2. `to_axum_response` (server.rs) hands the response body and that same
+//!      request's table to `claim_streaming_sentinel`. A ticket resolves only
+//!      in the table of the request that minted it, so a sentinel copied into
+//!      another request's body names nothing there. On a hit it takes the
+//!      handler, builds the response head through the one assembler every
+//!      response goes through (`ServerResponseHead`), and only then
+//!      `ServerPendingStream::serve`s: open a bounded mpsc channel, register
+//!      the sender under a stream id, spawn the handler driving a
 //!      `StreamWriter(id)`, and return the response whose body streams the
 //!      channel (`Body::from_stream`). The head is committed when this
 //!      response is returned, before the first chunk, as SSE requires. A
@@ -29,17 +33,16 @@
 //! `StreamWriter` is bridged (runtimeOpaqueTypes) so the runtime can construct
 //! it and the stdlib's `case writer of StreamWriter raw` lowers onto it.
 //!
-//! `pending_handlers` entries are reaped on a TTL (`PENDING_HANDLER_TTL`) so a
-//! `stream()` call whose sentinel response never reaches
-//! `claim_streaming_sentinel` (a middleware replaced/discarded it) does not
-//! pin its handler closure in the registry for the life of the process.
+//! The table lives and dies with its request: a handler the response never
+//! claims (a middleware replaced the stream response) drops with it.
 
 use super::*;
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroU128;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Ipe.Http.Server.Stream.StreamWriter — opaque writer handle. The variant name
 /// matches the Ipê constructor so `case w of StreamWriter raw` lowers onto it.
@@ -55,20 +58,8 @@ crate::stringify::show_row!("StreamWriter", Internals, [] StreamWriter, |_| "<Ip
 type ErasedStreamHandler =
     Arc<dyn Fn(StreamWriter) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// Every entry is stamped with its insertion time so an abandoned one (the
-/// response carrying its sentinel never reached `claim_streaming_sentinel` —
-/// e.g. a middleware replaced/discarded it before it reached the axum bridge)
-/// can be reaped instead of living for the life of the process (memory-DoS:
-/// each leaked entry pins its `ErasedStreamHandler` closure, which may itself
-/// capture app state). See `reap_expired_pending_handlers` below.
-fn pending_handlers() -> &'static Mutex<HashMap<i64, PendingHandler>> {
-    static R: OnceLock<Mutex<HashMap<i64, PendingHandler>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// A `stream()`-registered handler waiting for its sentinel to be claimed.
+/// A `stream()`-registered handler waiting for its request to claim it.
 struct PendingHandler {
-    inserted: std::time::Instant,
     handler: ErasedStreamHandler,
     /// The credentials of the request that called `stream()`, which the
     /// served body inherits.
@@ -80,64 +71,205 @@ fn stream_senders() -> &'static Mutex<HashMap<i64, tokio::sync::mpsc::Sender<Str
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
 static NEXT_STREAM_ID: AtomicI64 = AtomicI64::new(1);
-
-/// How long a `stream()`-registered handler waits in `pending_handlers` for
-/// its sentinel response to reach `claim_streaming_sentinel` before it is
-/// considered abandoned. On the normal path the sentinel is consumed within
-/// the same request's response handling (effectively immediate); this is a
-/// generous upper bound so a slow-but-legitimate middleware chain is never
-/// reaped out from under a request actually in flight.
-const PENDING_HANDLER_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How often (in `stream()` calls) the pending-handler map runs its full-map
-/// expiry sweep. Mirrors `server.rs`'s `RL_SWEEP_EVERY`: an O(n) `retain` on
-/// every call would let a caller registering many streams turn each call into
-/// a full-map scan (CPU amplification), so the sweep is amortized.
-const PENDING_HANDLER_SWEEP_EVERY: u64 = 256;
-static PENDING_HANDLER_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Evict any `pending_handlers` entry older than [`PENDING_HANDLER_TTL`].
-/// Called from `server_stream_stream` on insert, amortized to every
-/// `PENDING_HANDLER_SWEEP_EVERY` calls. Assumes the caller already holds no
-/// lock on `pending_handlers` (it acquires its own).
-fn reap_expired_pending_handlers() {
-    let now = std::time::Instant::now();
-    pending_handlers()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, pending| now.duration_since(pending.inserted) < PENDING_HANDLER_TTL);
-}
 
 const SENTINEL_PREFIX: &str = "__ipe_stream:";
 
-/// Per-process random nonce woven into the streaming sentinel. The sentinel is
-/// matched on the BODY of any response, so without an unguessable component an
-/// app (or a relayed upstream) whose body begins `__ipe_stream:<digits>` could be
-/// misread as a streaming sentinel and divert control flow. The nonce is drawn
-/// once from the OS-seeded `RandomState` (std-only — no extra crate dep, so this
-/// module compiles in every server/live project regardless of `Uuid` usage) so
-/// body-controlled content can neither forge nor collide with a real sentinel.
-/// Sentinel shape: `__ipe_stream:<nonce>:<token>`.
-fn sentinel_nonce() -> &'static str {
-    static N: OnceLock<String> = OnceLock::new();
-    N.get_or_init(|| {
-        use std::hash::{BuildHasher, Hasher};
-        // RandomState seeds from the OS each process; hashing two fixed values
-        // mixes the two independent 64-bit seeds into 128 bits of entropy.
-        let rs = std::collections::hash_map::RandomState::new();
-        let mut h = rs.build_hasher();
-        h.write_u64(0x5359_5F73_7472_6D31);
-        let a = h.finish();
-        h.write_u64(0xA5A5_5A5A_F0F0_0F0F);
-        let b = h.finish();
-        format!("{:016x}{:016x}", a, b)
-    })
+/// Hex digits in the wire form of a ticket (128 bits, 4 per digit).
+const TICKET_HEX_LEN: usize = 32;
+
+/// Draws a mint makes before giving up on a zero or colliding ticket.
+const MINT_ATTEMPTS: usize = 4;
+
+/// Streams one request may hold pending at once.
+const MAX_PENDING_STREAMS: usize = 4;
+
+const OUTSIDE_REQUEST: &str = "Server.Stream.stream: called outside a Server request";
+const AFTER_RESPONSE: &str = "Server.Stream.stream: called after its response was sent";
+const MINT_EXHAUSTED: &str = "Server.Stream.stream: ticket mint exhausted";
+const ENTROPY_UNAVAILABLE: &str = "Server.Stream.stream: entropy unavailable";
+const CLIENT_DISCONNECTED: &str = "server.stream emit: client disconnected";
+
+/// The refusal of a request registering one stream past the ceiling.
+fn too_many_streams() -> String {
+    format!("Server.Stream.stream: a request holds at most {MAX_PENDING_STREAMS} pending streams")
 }
+
 // Bounded channel — matches the streamChanBuffer (16). emit's
 // `send().await` blocks when full → backpressure to the producer/relay.
 const STREAM_CHAN_BUFFER: usize = 16;
+
+/// The name a stream response body gives its pending handler.
+///
+/// Drawn from the OS CSPRNG and meaningful only in the table of the request
+/// that minted it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct StreamTicket(NonZeroU128);
+
+impl StreamTicket {
+    /// Parses the exact wire form: 32 lowercase hex digits, value nonzero.
+    fn parse(text: &str) -> Option<Self> {
+        let bytes = text.as_bytes();
+        if bytes.len() != TICKET_HEX_LEN {
+            return None;
+        }
+        let mut acc: u128 = 0;
+        for &b in bytes {
+            let digit = match b {
+                b'0'..=b'9' | b'a'..=b'f' => char::from(b).to_digit(16)?,
+                _ => return None,
+            };
+            acc = (acc << 4) | u128::from(digit);
+        }
+        NonZeroU128::new(acc).map(Self)
+    }
+
+    /// The response body that names this ticket.
+    fn sentinel(self) -> String {
+        format!("{SENTINEL_PREFIX}{:032x}", self.0.get())
+    }
+}
+
+impl std::fmt::Debug for StreamTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StreamTicket(<opaque>)")
+    }
+}
+
+/// Mints a fresh ticket from `source`, redrawing a zero or a `live` collision.
+///
+/// At most `MINT_ATTEMPTS` draws; then `Unavailable`. A failing source is
+/// `Unavailable` at once.
+fn mint_with<S, L>(mut source: S, live: L) -> Result<StreamTicket, IpeError>
+where
+    S: FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+    L: Fn(StreamTicket) -> bool,
+{
+    for _ in 0..MINT_ATTEMPTS {
+        let mut buf = [0u8; 16];
+        source(&mut buf).map_err(|_| IpeError::unavailable(ENTROPY_UNAVAILABLE.to_owned()))?;
+        if let Some(raw) = NonZeroU128::new(u128::from_le_bytes(buf)) {
+            let ticket = StreamTicket(raw);
+            if !live(ticket) {
+                return Ok(ticket);
+            }
+        }
+    }
+    Err(IpeError::unavailable(MINT_EXHAUSTED.to_owned()))
+}
+
+/// The OS CSPRNG, the production ticket source.
+fn os_entropy(buf: &mut [u8; 16]) -> Result<(), getrandom::Error> {
+    getrandom::getrandom(buf)
+}
+
+/// A request's stream table: open while its handler runs, served once its
+/// response is claimed.
+enum TableState {
+    Open(HashMap<StreamTicket, PendingHandler>),
+    Served,
+}
+
+/// The table one request and the tasks spawned on its behalf share.
+type SharedTable = Arc<Mutex<TableState>>;
+
+tokio::task_local! {
+    /// The stream table of the `Server` request the current task handles.
+    static REQUEST_STREAMS: SharedTable;
+}
+
+/// The stream handlers one `Server` request registered.
+///
+/// Created by the one request dispatch and consumed by the one claim of its
+/// response, so a request claims at most once.
+#[must_use]
+pub struct RequestStreams(SharedTable);
+
+impl RequestStreams {
+    /// An open, empty table.
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(TableState::Open(HashMap::new()))))
+    }
+
+    /// Mark the table served and take the handlers it held.
+    ///
+    /// A `stream` call after this is refused.
+    fn into_pending(self) -> HashMap<StreamTicket, PendingHandler> {
+        let state = std::mem::replace(
+            &mut *self.0.lock().unwrap_or_else(PoisonError::into_inner),
+            TableState::Served,
+        );
+        match state {
+            TableState::Open(pending) => pending,
+            TableState::Served => HashMap::new(),
+        }
+    }
+}
+
+impl Drop for RequestStreams {
+    /// A request that ends without claiming its response (an upgraded
+    /// socket, a failed handler, a dropped connection) serves its table too:
+    /// a sub-task still carrying it registers nothing, and every handler it
+    /// held drops here.
+    fn drop(&mut self) {
+        let unclaimed = std::mem::replace(
+            &mut *self.0.lock().unwrap_or_else(PoisonError::into_inner),
+            TableState::Served,
+        );
+        drop(unclaimed);
+    }
+}
+
+/// Run `request` with a fresh stream table in scope.
+///
+/// Returns the request's output beside the table it registered into.
+pub(crate) async fn in_stream_scope<F: Future>(request: F) -> (F::Output, RequestStreams) {
+    let streams = RequestStreams::new();
+    let output = REQUEST_STREAMS.scope(Arc::clone(&streams.0), request).await;
+    (output, streams)
+}
+
+/// `task`, run inside the stream table of the `Server` request its caller
+/// handles, so a stream it registers belongs to that request.
+///
+/// The table is read when this is called, on the caller's task.
+pub(crate) fn inherit_stream_scope<F: Future>(task: F) -> impl Future<Output = F::Output> {
+    let table = REQUEST_STREAMS.try_with(Arc::clone).ok();
+    async move {
+        match table {
+            Some(table) => REQUEST_STREAMS.scope(table, task).await,
+            None => task.await,
+        }
+    }
+}
+
+/// Register `handler` in the current request's table under a fresh ticket.
+///
+/// Refused outside a request, after the request's response was claimed, and
+/// past `MAX_PENDING_STREAMS`.
+fn register(handler: ErasedStreamHandler) -> Result<StreamTicket, IpeError> {
+    let table = REQUEST_STREAMS
+        .try_with(Arc::clone)
+        .map_err(|_| IpeError::invalid_input(OUTSIDE_REQUEST.to_owned()))?;
+    let credentials = crate::server::ChannelCredentials::of_request();
+    let mut state = table.lock().unwrap_or_else(PoisonError::into_inner);
+    let TableState::Open(pending) = &mut *state else {
+        return Err(IpeError::invalid_input(AFTER_RESPONSE.to_owned()));
+    };
+    if pending.len() >= MAX_PENDING_STREAMS {
+        return Err(IpeError::invalid_input(too_many_streams()));
+    }
+    let ticket = mint_with(os_entropy, |t| pending.contains_key(&t))?;
+    pending.insert(
+        ticket,
+        PendingHandler {
+            handler,
+            credentials,
+        },
+    );
+    drop(state);
+    Ok(ticket)
+}
 
 /// Ipe.Http.Server.Stream.stream
 ///   : String -> (StreamWriter -> Task Error ()) -> Task Error Response
@@ -146,12 +278,17 @@ const STREAM_CHAN_BUFFER: usize = 16;
 /// because the HM type scheme uses the `StreamWriter` opaque type for
 /// `Stream.emit` / `Stream.finish` / `Stream.withContentType`.  The user
 /// closure receives a `StreamWriter` and passes it directly to those kernels.
+///
+/// The handler belongs to the `Server` request the task runs in. Outside one,
+/// after that request's response was sent, or past `MAX_PENDING_STREAMS`
+/// pending streams, the task fails `InvalidInput`; a ticket the OS CSPRNG
+/// cannot mint fails `Unavailable`.
 pub fn server_stream_stream<E, H>(content_type: String, handler: H) -> IpeTask<E, ServerResponse>
 where
-    E: Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     H: Fn(StreamWriter) -> IpeTask<E, ()> + Send + Sync + 'static,
 {
-    // Erase E: the registry can't name the project's error type. The handler's
+    // Erase E: the table can't name the project's error type. The handler's
     // returned task is driven to completion; its result is dropped.
     let erased: ErasedStreamHandler = Arc::new(move |w: StreamWriter| {
         let task = handler(w);
@@ -166,39 +303,24 @@ where
     };
     Box::pin(async move {
         // Registered when the task runs, inside the request it answers, so the
-        // handler is captured with that request's credentials.
-        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-        if PENDING_HANDLER_TICK
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(PENDING_HANDLER_SWEEP_EVERY)
-        {
-            reap_expired_pending_handlers();
+        // handler is captured with that request's table and credentials.
+        match register(erased) {
+            Ok(ticket) => IpeResult::Ok(ServerResponse {
+                status: 200,
+                body: ticket.sentinel(),
+                headers: HashMap::new(),
+                contentType: ct,
+                cookies: Vec::new(),
+            }),
+            Err(refusal) => IpeResult::Err(E::from_ipe_error(refusal)),
         }
-        pending_handlers()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                token,
-                PendingHandler {
-                    inserted: std::time::Instant::now(),
-                    handler: erased,
-                    credentials: crate::server::ChannelCredentials::of_request(),
-                },
-            );
-        IpeResult::Ok(ServerResponse {
-            status: 200,
-            body: format!("{}{}:{}", SENTINEL_PREFIX, sentinel_nonce(), token),
-            headers: HashMap::new(),
-            contentType: ct,
-            cookies: Vec::new(),
-        })
     })
 }
 
 /// Ipe.Http.Server.Stream.emit : String -> StreamWriter -> Task Error ()
 /// Sends the chunk + flushes (the channel feeds an unbuffered axum body).
 /// emit-after-finish is a no-op.
-pub fn server_stream_emit<E: From<String> + Send + 'static>(
+pub fn server_stream_emit<E: From<String> + crate::FromUnavailable + Send + 'static>(
     chunk: String,
     writer: StreamWriter,
 ) -> IpeTask<E, ()> {
@@ -206,7 +328,7 @@ pub fn server_stream_emit<E: From<String> + Send + 'static>(
     Box::pin(async move {
         let sender = stream_senders()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&id)
             .cloned();
         match sender {
@@ -214,9 +336,7 @@ pub fn server_stream_emit<E: From<String> + Send + 'static>(
                 Ok(()) => IpeResult::Ok(()),
                 // Receiver dropped — client disconnected. Surface as an error so
                 // a relay's forEachChunk fail-fast stops pulling the upstream.
-                Err(_) => {
-                    IpeResult::Err("server.stream emit: client disconnected".to_string().into())
-                }
+                Err(_) => IpeResult::Err(E::from_unavailable(CLIENT_DISCONNECTED.to_owned())),
             },
             None => IpeResult::Ok(()),
         }
@@ -233,7 +353,7 @@ pub fn server_stream_finish<E: From<String> + Send + 'static>(
     Box::pin(async move {
         stream_senders()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
         IpeResult::Ok(())
     })
@@ -250,15 +370,16 @@ pub fn server_stream_with_content_type<E: From<String> + Send + 'static>(
     Box::pin(async move { IpeResult::Ok(()) })
 }
 
-/// What a response body is to the streaming registry.
+/// What a response body is to its request's stream table.
 pub enum ServerStreamClaim {
-    /// Not a streaming sentinel: the body is served as it is.
+    /// Names no stream: the body is served as it is.
     Buffered,
-    /// A live sentinel, whose handler this claim now holds.
+    /// The exact sentinel of a ticket the request held, whose handler this
+    /// claim now holds.
     Stream(ServerPendingStream),
-    /// This process's sentinel with no live handler (reaped, or already
-    /// served): it has no body to send.
-    Abandoned,
+    /// Sentinel text the request cannot serve: a ticket it does not hold, or
+    /// a held ticket's sentinel wrapped in other text. It has no body to send.
+    Refused,
 }
 
 /// A claimed stream handler, run only by [`ServerPendingStream::serve`].
@@ -267,36 +388,37 @@ pub struct ServerPendingStream {
     credentials: crate::server::ChannelCredentials,
 }
 
-/// Claim the stream handler `body` names, when it is a streaming sentinel.
+/// Claim the stream handler `body` names from the table of the request that
+/// answers with it.
 ///
-/// Sentinel shape: `__ipe_stream:<nonce>:<token>`. The per-process nonce must
-/// match exactly, so application or relayed body content can neither forge nor
-/// collide with a real pending stream; a non-match is [`ServerStreamClaim::Buffered`].
-/// A matching nonce whose token names no pending handler is
-/// [`ServerStreamClaim::Abandoned`], never a buffered body that would send the
-/// nonce to the client.
+/// The claim marks the table served first, so every handler it does not claim
+/// drops here. A body that starts with the sentinel prefix is
+/// [`ServerStreamClaim::Stream`] only when the rest is exactly a ticket this
+/// table held; any other prefixed body (malformed, foreign, already served) is
+/// [`ServerStreamClaim::Refused`]. A body without the prefix that still
+/// contains a held ticket's sentinel is [`ServerStreamClaim::Refused`] too, so
+/// a live ticket never reaches the client.
 #[must_use]
-pub fn claim_streaming_sentinel(body: &str) -> ServerStreamClaim {
-    let Some(token_str) = body
-        .strip_prefix(SENTINEL_PREFIX)
-        .and_then(|rest| rest.strip_prefix(sentinel_nonce()))
-        .and_then(|rest| rest.strip_prefix(':'))
-    else {
-        return ServerStreamClaim::Buffered;
-    };
-    let Ok(token) = token_str.parse::<i64>() else {
-        return ServerStreamClaim::Abandoned;
-    };
-    pending_handlers()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&token)
-        .map_or(ServerStreamClaim::Abandoned, |pending| {
-            ServerStreamClaim::Stream(ServerPendingStream {
-                handler: pending.handler,
-                credentials: pending.credentials,
-            })
-        })
+pub fn claim_streaming_sentinel(body: &str, streams: RequestStreams) -> ServerStreamClaim {
+    let mut pending = streams.into_pending();
+    if let Some(ticket_text) = body.strip_prefix(SENTINEL_PREFIX) {
+        return StreamTicket::parse(ticket_text)
+            .and_then(|ticket| pending.remove(&ticket))
+            .map_or(ServerStreamClaim::Refused, |claimed| {
+                ServerStreamClaim::Stream(ServerPendingStream {
+                    handler: claimed.handler,
+                    credentials: claimed.credentials,
+                })
+            });
+    }
+    if pending
+        .keys()
+        .any(|ticket| body.contains(&ticket.sentinel()))
+    {
+        ServerStreamClaim::Refused
+    } else {
+        ServerStreamClaim::Buffered
+    }
 }
 
 impl ServerPendingStream {
@@ -331,20 +453,21 @@ impl ServerPendingStream {
         };
         stream_senders()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(id, tx);
 
         // Drive the handler in its own task, inside the request's binding set
         // so a token it verifies binds to this stream; on completion drop the
         // sender so the body stream terminates even if the handler forgot to
-        // call `finish`.
+        // call `finish`. The task runs outside the request's stream table, so
+        // a `stream` call inside the handler is refused.
         tokio::spawn(async move {
             credentials
                 .scoped(|| handler(StreamWriter::StreamWriter(id)))
                 .await;
             stream_senders()
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
         });
 
@@ -374,51 +497,240 @@ impl ServerPendingStream {
 mod tests {
     use super::*;
 
-    /// An expired `pending_handlers` entry is reaped; a fresh one survives.
-    /// Uses distinctive high tokens (never issued by `NEXT_TOKEN`, which starts
-    /// at 1) so this test cannot collide with concurrently-running tests that
-    /// exercise the real `server_stream_stream` → `claim_streaming_sentinel`
-    /// path against the same process-global registry.
-    #[test]
-    fn reap_evicts_only_expired_entries() {
-        let noop: ErasedStreamHandler = Arc::new(|_w: StreamWriter| {
-            Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>
-        });
-        let stale_token = i64::MAX - 1;
-        let fresh_token = i64::MAX - 2;
-        let stale_at = std::time::Instant::now()
-            .checked_sub(PENDING_HANDLER_TTL + std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
-        {
-            let mut g = pending_handlers().lock().unwrap_or_else(|e| e.into_inner());
-            g.insert(
-                stale_token,
-                PendingHandler {
-                    inserted: stale_at,
-                    handler: noop.clone(),
-                    credentials: crate::server::ChannelCredentials::of_request(),
-                },
-            );
-            g.insert(
-                fresh_token,
-                PendingHandler {
-                    inserted: std::time::Instant::now(),
-                    handler: noop,
-                    credentials: crate::server::ChannelCredentials::of_request(),
-                },
-            );
+    /// The kind and message of a refused task, or `None` when it succeeded.
+    fn refusal<A>(result: IpeResult<IpeError, A>) -> Option<(IpeErrorKind, String)> {
+        match result {
+            IpeResult::Ok(_) => None,
+            IpeResult::Err(e) => Some((
+                crate::ipe_error_kind(e.clone()),
+                crate::ipe_error_message(e),
+            )),
         }
+    }
 
-        reap_expired_pending_handlers();
+    /// A stream handler that emits nothing.
+    fn idle(_w: StreamWriter) -> IpeTask<IpeError, ()> {
+        Box::pin(async { IpeResult::Ok(()) })
+    }
 
-        let g = pending_handlers().lock().unwrap_or_else(|e| e.into_inner());
+    /// A `stream` task with an idle handler.
+    fn stream_idle() -> IpeTask<IpeError, ServerResponse> {
+        server_stream_stream::<IpeError, _>("text/event-stream".to_owned(), idle)
+    }
+
+    /// The ticket whose value is `n`, or `None` for zero.
+    fn ticket(n: u128) -> Option<StreamTicket> {
+        NonZeroU128::new(n).map(StreamTicket)
+    }
+
+    /// `stream` refuses to register outside any `Server` request; inside one
+    /// it registers.
+    #[tokio::test]
+    async fn stream_outside_a_server_request_is_refused() {
+        assert_eq!(
+            refusal(stream_idle().await),
+            Some((IpeErrorKind::InvalidInput, OUTSIDE_REQUEST.to_owned()))
+        );
+        let (inside, streams) = in_stream_scope(stream_idle()).await;
+        assert_eq!(refusal(inside), None);
+        drop(streams);
+    }
+
+    /// A sub-task carried from a request registers before its response is
+    /// claimed and is refused after.
+    #[tokio::test]
+    async fn a_stream_after_its_response_was_sent_is_refused() {
+        let ((early, late), streams) = in_stream_scope(async {
+            (
+                inherit_stream_scope(stream_idle()),
+                inherit_stream_scope(stream_idle()),
+            )
+        })
+        .await;
+        let early = early.await;
         assert!(
-            !g.contains_key(&stale_token),
-            "an entry older than PENDING_HANDLER_TTL must be reaped"
+            matches!(early, IpeResult::Ok(_)),
+            "a carried sub-task registers before the claim"
+        );
+        let IpeResult::Ok(registered) = early else {
+            return;
+        };
+        assert!(registered.body.starts_with(SENTINEL_PREFIX));
+        assert!(matches!(
+            claim_streaming_sentinel("ok", streams),
+            ServerStreamClaim::Buffered
+        ));
+        assert_eq!(
+            refusal(late.await),
+            Some((IpeErrorKind::InvalidInput, AFTER_RESPONSE.to_owned()))
+        );
+    }
+
+    /// A request dropped without claiming its response releases every
+    /// handler it held and refuses a sub-task still carrying its table.
+    #[tokio::test]
+    async fn a_request_dropped_unclaimed_serves_its_table() {
+        let held = Arc::new(());
+        let captured = Arc::clone(&held);
+        let ((registered, late), streams) = in_stream_scope(async move {
+            let registered = server_stream_stream::<IpeError, _>(
+                "text/plain".to_owned(),
+                move |_w: StreamWriter| {
+                    let _keep = Arc::clone(&captured);
+                    Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+                },
+            )
+            .await;
+            (registered, inherit_stream_scope(stream_idle()))
+        })
+        .await;
+        assert_eq!(refusal(registered), None);
+        assert_eq!(Arc::strong_count(&held), 2, "the pending handler holds it");
+        drop(streams);
+        assert_eq!(Arc::strong_count(&held), 1, "the unclaimed handler dropped");
+        assert_eq!(
+            refusal(late.await),
+            Some((IpeErrorKind::InvalidInput, AFTER_RESPONSE.to_owned()))
+        );
+    }
+
+    /// A request registers `MAX_PENDING_STREAMS` streams; the next is refused.
+    #[tokio::test]
+    async fn the_pending_stream_ceiling_refuses_one_past_the_limit() {
+        let (outcomes, streams) = in_stream_scope(async {
+            let mut outcomes = Vec::new();
+            for _ in 0..=MAX_PENDING_STREAMS {
+                outcomes.push(refusal(stream_idle().await));
+            }
+            outcomes
+        })
+        .await;
+        drop(streams);
+        let (allowed, past) = outcomes.split_at(MAX_PENDING_STREAMS);
+        assert!(allowed.iter().all(Option::is_none), "{allowed:?}");
+        assert_eq!(
+            past,
+            [Some((IpeErrorKind::InvalidInput, too_many_streams()))]
+        );
+    }
+
+    /// The mint redraws a zero and a collision, refuses once its draws run
+    /// out, and refuses a failing source at once.
+    #[test]
+    fn ticket_mint_redraws_zero_and_collisions_and_refuses_a_dead_source() {
+        let draws = [0u128, 3, 9];
+        let mut i = 0;
+        let source = |buf: &mut [u8; 16]| {
+            *buf = draws.get(i).copied().unwrap_or(0).to_le_bytes();
+            i += 1;
+            Ok(())
+        };
+        let minted = mint_with(source, |t| Some(t) == ticket(3));
+        assert!(matches!(minted, Ok(t) if Some(t) == ticket(9)));
+
+        let mut zero_draws = 0;
+        let zeros = |buf: &mut [u8; 16]| {
+            zero_draws += 1;
+            *buf = [0; 16];
+            Ok(())
+        };
+        let exhausted = mint_with(zeros, |_| false).map(|_| ());
+        assert_eq!(zero_draws, MINT_ATTEMPTS);
+        assert!(
+            matches!(&exhausted, Err(e) if crate::ipe_error_kind(e.clone()) == IpeErrorKind::Unavailable)
         );
         assert!(
-            g.contains_key(&fresh_token),
-            "a fresh entry must survive the sweep"
+            matches!(&exhausted, Err(e) if crate::ipe_error_message(e.clone()) == MINT_EXHAUSTED)
+        );
+
+        let ones = |buf: &mut [u8; 16]| {
+            *buf = [1; 16];
+            Ok(())
+        };
+        let colliding = mint_with(ones, |_| true).map(|_| ());
+        assert!(
+            matches!(&colliding, Err(e) if crate::ipe_error_message(e.clone()) == MINT_EXHAUSTED)
+        );
+
+        let broken = |_: &mut [u8; 16]| Err(getrandom::Error::UNSUPPORTED);
+        let dead = mint_with(broken, |_| false).map(|_| ());
+        assert!(
+            matches!(&dead, Err(e) if crate::ipe_error_kind(e.clone()) == IpeErrorKind::Unavailable)
+        );
+        assert!(
+            matches!(&dead, Err(e) if crate::ipe_error_message(e.clone()) == ENTROPY_UNAVAILABLE)
+        );
+    }
+
+    /// A ticket parses only from exactly 32 lowercase hex digits naming a
+    /// nonzero value; a minted ticket round-trips through its sentinel.
+    #[test]
+    fn ticket_parse_accepts_only_the_canonical_form() {
+        let digits = "0123456789abcdef0123456789abcdef";
+        assert!(StreamTicket::parse(digits).is_some());
+        for refused in [
+            "0123456789ABCDEF0123456789abcdef",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "00000000000000000000000000000000",
+            "+123456789abcdef0123456789abcdef",
+            " 123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdeg",
+            "",
+        ] {
+            assert!(StreamTicket::parse(refused).is_none(), "{refused:?}");
+        }
+        assert_eq!(
+            StreamTicket::parse("00000000000000000000000000000001"),
+            ticket(1)
+        );
+        let minted = mint_with(os_entropy, |_| false).ok();
+        let back = minted.and_then(|t| {
+            t.sentinel()
+                .strip_prefix(SENTINEL_PREFIX)
+                .and_then(StreamTicket::parse)
+        });
+        assert!(minted.is_some());
+        assert_eq!(back, minted);
+    }
+
+    /// A ticket's `Debug` names no digit of its value.
+    #[test]
+    fn a_ticket_debug_renders_opaque() {
+        let cd = |buf: &mut [u8; 16]| {
+            *buf = [0xcd; 16];
+            Ok(())
+        };
+        let minted = mint_with(cd, |_| false).ok();
+        assert!(minted.is_some());
+        let shown = format!("{minted:?}");
+        assert_eq!(shown, "Some(StreamTicket(<opaque>))");
+        assert!(!shown.contains("cdcd"));
+    }
+
+    /// `emit` to a writer whose client is gone fails `Unavailable`; to a live
+    /// client it sends the chunk.
+    #[tokio::test]
+    async fn emit_after_client_disconnect_is_unavailable() {
+        let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
+        stream_senders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, tx);
+        let writer = StreamWriter::StreamWriter(id);
+        let sent = server_stream_emit::<IpeError>("a".to_owned(), writer).await;
+        assert_eq!(refusal(sent), None);
+        assert_eq!(rx.recv().await.as_deref(), Some("a"));
+        drop(rx);
+        let gone = server_stream_emit::<IpeError>("b".to_owned(), writer).await;
+        stream_senders()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+        assert_eq!(
+            refusal(gone),
+            Some((IpeErrorKind::Unavailable, CLIENT_DISCONNECTED.to_owned()))
         );
     }
 }
