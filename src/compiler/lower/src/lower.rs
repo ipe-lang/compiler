@@ -7638,6 +7638,245 @@ fn is_direct_closure(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` is a leaf read the shared-carrier demotion moves into its wrapper.
+///
+/// A local, a field read, or a closure built on the `Arc` carrier; any other
+/// value is bound once outside the wrapper instead.
+const fn is_shared_fn_leaf(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Var(_) | Expr::CloneVar(_) | Expr::Access { .. } | Expr::SharedLambda { .. }
+    )
+}
+
+/// What a `case` scrutinee says about the stored functions its arms' binders read.
+struct StoredScrutinee {
+    /// The scrutinee's own arrow when it is a stored function read.
+    value: Option<(Vec<IrType>, IrType)>,
+    /// Whether a built-in constructor's payload under the scrutinee is a storage position.
+    builtin_payload: bool,
+}
+
+/// The carrier a function value is emitted on.
+enum FnCarrier {
+    /// A `Box`/`impl Fn` closure, which a direct function slot accepts as is.
+    Direct,
+    /// An `Arc<dyn Fn>` value with its parameter and return types, which a
+    /// direct function slot refuses.
+    Shared(Vec<IrType>, IrType),
+}
+
+impl FnCarrier {
+    /// The carrier of a value of lowered type `ty`; `None` when `ty` is no function.
+    fn of_type(ty: IrType) -> Option<Self> {
+        match ty {
+            IrType::SharedFun(params, ret) => Some(Self::Shared(params, *ret)),
+            IrType::Fun(..) | IrType::FnOnceChain(..) => Some(Self::Direct),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the solved type `ty` holds a function anywhere a carrier can sit.
+fn ty_holds_fun(ty: &Ty) -> bool {
+    match ty {
+        Ty::Fun(..) => true,
+        Ty::Con { args, .. } | Ty::Tuple(args) => args.iter().any(ty_holds_fun),
+        Ty::Record(fields, _) => fields.values().any(ty_holds_fun),
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
+    }
+}
+
+/// Whether the lowered type `ty` holds an `Arc` function anywhere.
+///
+/// Walks every type-carrying position through the exhaustive
+/// [`ir_type_mentions`], so a container variant added to [`IrType`] is
+/// descended here the day it exists rather than read as holding no function.
+fn ir_holds_shared(ty: &IrType) -> bool {
+    ir_type_mentions(ty, &|t| matches!(t, IrType::SharedFun(..)))
+}
+
+/// Whether the lowered type `ty` is an `Arc` function, or one directly under a `Maybe`/`Result` payload.
+///
+/// These are the positions a branch's own carrier decides; a storage
+/// position is on `Arc` in every branch alike.
+fn holds_shared_direct(ty: &IrType) -> bool {
+    match ty {
+        IrType::SharedFun(..) => true,
+        IrType::Maybe(item) => holds_shared_direct(item),
+        IrType::Result(err, ok) => holds_shared_direct(err) || holds_shared_direct(ok),
+        _ => false,
+    }
+}
+
+/// The carrier type of a branching expression over its branches' carrier types.
+///
+/// A branch on `Arc` at a direct position decides it: every branch of one
+/// expression is emitted on one carrier, and a branch already on the direct
+/// carrier is still a callable a conversion can wrap. Otherwise the first
+/// known branch type.
+fn join_carrier_types(branches: impl Iterator<Item = Option<IrType>>) -> Option<IrType> {
+    let mut first = None;
+    for ty in branches.flatten() {
+        if holds_shared_direct(&ty) {
+            return Some(ty);
+        }
+        if first.is_none() {
+            first = Some(ty);
+        }
+    }
+    first
+}
+
+/// Whether the curried spine of `kernel` whose outer `outer_len` arguments start at slot `offset` lowers as one saturated call.
+///
+/// True when the kernel is an accessor-intercept placeholder or a
+/// capture-cloned handler kernel, whose saturated-call gate must observe every
+/// argument, or when an outer argument `j` that is a stored function read
+/// (`stored(j)`) lands in a [`FnSlotCarrier::Direct`] slot, which only the
+/// saturated call converts.
+fn spine_saturates(
+    kernel: KernelFn,
+    offset: usize,
+    outer_len: usize,
+    stored: impl Fn(usize) -> bool,
+) -> bool {
+    kernel.is_accessor_intercept_placeholder()
+        || kernel.capture_cloned_handler_arg().is_some()
+        || (0..outer_len).any(|j| {
+            matches!(
+                kernel.fn_slot_carrier(offset.saturating_add(j)),
+                Some(FnSlotCarrier::Direct)
+            ) && stored(j)
+        })
+}
+
+/// The curried arrow `shape` past its first `count` arguments, or `None` past its spine.
+const fn spine_after(shape: &ipe_kernels::TyShape, count: usize) -> Option<&ipe_kernels::TyShape> {
+    let mut cur = shape;
+    let mut left = count;
+    while left > 0 {
+        let ipe_kernels::TyShape::Fun(_, rest) = cur else {
+            return None;
+        };
+        cur = rest;
+        left -= 1;
+    }
+    Some(cur)
+}
+
+/// The scheme variables a saturated call of `kernel` binds to its result's carriers.
+///
+/// Each scheme variable bound, through an argument's carrier type
+/// (`arg_types`), to a type holding an `Arc` function takes that type at every
+/// direct position of the result (a bare result variable, a `Maybe`/`Result`
+/// payload); every other position keeps `base`, the solved result type
+/// lowered, whose storage positions are already on `Arc`. A kernel with no
+/// scheme is `base`.
+fn kernel_result_carrier_type(
+    kernel: KernelFn,
+    arg_types: &[Option<IrType>],
+    base: Option<IrType>,
+) -> Option<IrType> {
+    let Some(shape) = kernel.scheme_shape() else {
+        return base;
+    };
+    let mut bound: Vec<(u8, IrType)> = Vec::new();
+    for (index, ty) in arg_types.iter().enumerate() {
+        if let (Some(arg_shape), Some(ty)) = (ipe_kernels::spine_arg(shape, index), ty) {
+            bind_shape_carriers(arg_shape, ty, &mut bound);
+        }
+    }
+    let Some(result_shape) = spine_after(shape, arg_types.len()) else {
+        return base;
+    };
+    base.map_or_else(
+        || match result_shape {
+            ipe_kernels::TyShape::Var(var) => bound_carrier(&bound, *var),
+            _ => None,
+        },
+        |base| Some(overlay_shape_carriers(result_shape, base, &bound)),
+    )
+}
+
+/// The carrier type scheme variable `var` is bound to, if any.
+fn bound_carrier(bound: &[(u8, IrType)], var: u8) -> Option<IrType> {
+    bound
+        .iter()
+        .find(|(bound_var, _)| *bound_var == var)
+        .map(|(_, ty)| ty.clone())
+}
+
+/// The lowered type argument `slot` of the built-in constructor `tag`, read off `ty`.
+fn builtin_child(tag: ipe_kernels::BuiltinTag, ty: &IrType, slot: usize) -> Option<&IrType> {
+    use ipe_kernels::BuiltinTag;
+    match (tag, ty, slot) {
+        (BuiltinTag::Maybe, IrType::Maybe(item), 0)
+        | (BuiltinTag::List, IrType::List(item), 0)
+        | (BuiltinTag::Set, IrType::Set(item), 0)
+        | (BuiltinTag::Result, IrType::Result(item, _), 0)
+        | (BuiltinTag::Dict, IrType::Dict(item, _), 0)
+        | (BuiltinTag::Result, IrType::Result(_, item), 1)
+        | (BuiltinTag::Dict, IrType::Dict(_, item), 1) => Some(item),
+        _ => None,
+    }
+}
+
+/// Bind every scheme variable of `shape` that `ty` instantiates with a type holding an `Arc` function.
+///
+/// Walks a constructor argument and a tuple component in step with `ty`; an
+/// arrow and a record are not walked, so a variable seen only there stays
+/// unbound. The first binding of a variable is kept.
+fn bind_shape_carriers(shape: &ipe_kernels::TyShape, ty: &IrType, bound: &mut Vec<(u8, IrType)>) {
+    use ipe_kernels::TyShape;
+    match shape {
+        TyShape::Var(var) => {
+            if ir_holds_shared(ty) && bound_carrier(bound, *var).is_none() {
+                bound.push((*var, ty.clone()));
+            }
+        }
+        TyShape::Con(tag, items) => {
+            for (slot, item) in items.iter().enumerate() {
+                if let Some(child) = builtin_child(*tag, ty, slot) {
+                    bind_shape_carriers(item, child, bound);
+                }
+            }
+        }
+        TyShape::Tuple(items) => {
+            if let IrType::Tuple(children) = ty
+                && items.len() == children.len()
+            {
+                for (item, child) in items.iter().zip(children) {
+                    bind_shape_carriers(item, child, bound);
+                }
+            }
+        }
+        TyShape::Fun(..) | TyShape::Record { .. } | TyShape::Unit => {}
+    }
+}
+
+/// `base` with every direct position `shape` names a bound scheme variable at replaced by its binding.
+fn overlay_shape_carriers(
+    shape: &ipe_kernels::TyShape,
+    base: IrType,
+    bound: &[(u8, IrType)],
+) -> IrType {
+    use ipe_kernels::{BuiltinTag, TyShape};
+    match (shape, base) {
+        (TyShape::Var(var), base) => bound_carrier(bound, *var).unwrap_or(base),
+        (TyShape::Con(BuiltinTag::Maybe, [item]), IrType::Maybe(base_item)) => {
+            IrType::Maybe(Box::new(overlay_shape_carriers(item, *base_item, bound)))
+        }
+        (TyShape::Con(BuiltinTag::Result, [err, ok]), IrType::Result(base_err, base_ok)) => {
+            IrType::Result(
+                Box::new(overlay_shape_carriers(err, *base_err, bound)),
+                Box::new(overlay_shape_carriers(ok, *base_ok, bound)),
+            )
+        }
+        (_, base) => base,
+    }
+}
+
 /// The fixed inputs of one [`shim_fn_value_reads`] walk, plus whether it rewrote a read.
 struct ShimSite<'a> {
     /// The re-carriered function binder whose value reads are shimmed.
@@ -10958,6 +11197,9 @@ pub struct Lowerer<'a> {
     /// its record's type, so it needs no entry. Saved and restored per scope;
     /// interior mutability so the lowering walk stays over a shared `&self`.
     shared_fn_reads: std::cell::RefCell<BTreeMap<Symbol, (Vec<IrType>, IrType)>>,
+    /// The number of expressions [`Self::value_carrier_type`] has classified.
+    #[cfg(test)]
+    carrier_walks: std::cell::Cell<usize>,
     /// Per-def record of the erased row params a function accumulates during its
     /// own lowering, keyed by `(home_path, name)`. Each entry is a list of
     /// `(param_position, RowParam)` pairs — the zero-based index of the
@@ -12965,6 +13207,8 @@ impl<'a> Lowerer<'a> {
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
             shared_fn_reads: std::cell::RefCell::new(BTreeMap::new()),
+            #[cfg(test)]
+            carrier_walks: std::cell::Cell::new(0),
             fn_row_params: std::cell::RefCell::new(BTreeMap::new()),
             source_path: source_path.to_owned(),
             source_text: source_text.to_owned(),
@@ -22360,14 +22604,11 @@ impl<'a> Lowerer<'a> {
         let Ok(Callee::Kernel(k)) = self.lower_callee(head) else {
             return false;
         };
-        k.is_accessor_intercept_placeholder()
-            || k.capture_cloned_handler_arg().is_some()
-            || outer.iter().enumerate().any(|(j, arg)| {
-                matches!(
-                    k.fn_slot_carrier(offset.saturating_add(j)),
-                    Some(FnSlotCarrier::Direct)
-                ) && self.canon_stored_fn_carrier(arg).is_some()
-            })
+        spine_saturates(k, offset, outer.len(), |j| {
+            outer
+                .get(j)
+                .is_some_and(|arg| self.canon_stored_fn_carrier(arg).is_some())
+        })
     }
 
     /// Kernel-call intercepts that must run BEFORE the uniform arg lowering
@@ -24069,9 +24310,9 @@ impl<'a> Lowerer<'a> {
     /// carrier. A parameter is a direct fn position when the def's DECLARED
     /// signature has an arrow (`Ty::Fun`) there — an ordinary `Box<dyn Fn>` param —
     /// or a bare type variable (`Ty::Var`) there — a monomorphized `FN: Fn(..)`
-    /// generic slot; both reject an `Arc<dyn Fn>` (`E0277`). An argument whose
-    /// lowered carrier is `SharedFun` ([`Self::shared_fn_read_carrier`]) is
-    /// eta-demoted; every other argument is untouched, so a call with no
+    /// generic slot; both reject an `Arc<dyn Fn>` (`E0277`). An argument on the
+    /// shared carrier ([`Self::fn_carrier_of`]) is eta-demoted; every other
+    /// argument is untouched, so a call with no
     /// stored-function read is byte-identical. A missing declared template fails
     /// open exactly as the sibling generic-slot gate does.
     ///
@@ -24107,18 +24348,23 @@ impl<'a> Lowerer<'a> {
                 Ty::Fun(_, _) | Ty::Var(_) | Ty::Wildcard
             );
             if direct_fn_slot
-                && !is_direct_closure(slot)
-                && let Some((params, ret)) = self.shared_fn_read_carrier(slot).or_else(|| {
-                    canon_args
-                        .get(offset)
-                        .and_then(|a| self.canon_record_read_carrier(a))
-                })
+                && let Some(canon_arg) = canon_args.get(offset)
+                && let Some(FnCarrier::Shared(params, ret)) = self.fn_carrier_of(canon_arg, slot)
             {
-                site = site
-                    .charge(params.len())
-                    .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
                 let read = std::mem::replace(slot, Expr::Unit);
-                *slot = self.demote_shared_fn_read(read, &params, &ret)?;
+                // A leaf read is moved into the wrapper; any other value (a
+                // call result, a branching expression) is bound once outside it.
+                *slot = if is_shared_fn_leaf(&read) {
+                    site = site
+                        .charge(params.len())
+                        .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
+                    self.demote_shared_fn_read(read, &params, &ret)?
+                } else {
+                    site = site
+                        .charge(params.len().saturating_add(1))
+                        .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
+                    self.hoist_stored_fn_read(read, &params, &ret)?
+                };
             }
             cur = rest.as_ref();
         }
@@ -24132,8 +24378,8 @@ impl<'a> Lowerer<'a> {
     /// which implements no `Fn` trait, so a kernel parameter typed `impl Fn`,
     /// `F: Fn`, or `Box<dyn Fn>` refuses it (E0277). Which argument is such a
     /// slot is [`KernelFn::fn_slot_carrier`], derived from the kernel scheme:
-    /// every [`FnSlotCarrier::Direct`] slot holding a detected stored read
-    /// ([`Self::stored_fn_read_carrier`]) is rebuilt as a direct closure
+    /// every [`FnSlotCarrier::Direct`] slot holding a value on the shared
+    /// carrier ([`Self::fn_carrier_of`]) is rebuilt as a direct closure
     /// ([`Self::hoist_stored_fn_read`]). An [`FnSlotCarrier::AcceptsShared`]
     /// slot is re-wrapped by the backend and left as is.
     ///
@@ -24159,14 +24405,10 @@ impl<'a> Lowerer<'a> {
             if !matches!(kernel.fn_slot_carrier(arg), Some(FnSlotCarrier::Direct)) {
                 continue;
             }
-            // A fresh direct closure (an inline lambda, or a mapper the
-            // element-carrier pass already wrapped) is on the direct carrier.
-            if is_direct_closure(slot) {
-                continue;
-            }
-            let Some((params, ret)) = self.stored_fn_read_carrier(canon_arg, slot) else {
+            let Some(FnCarrier::Shared(params, ret)) = self.fn_carrier_of(canon_arg, slot) else {
                 continue;
             };
+            let (params, ret) = self.use_site_arrow(canon_arg).unwrap_or((params, ret));
             site = site
                 .charge(params.len().saturating_add(1))
                 .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
@@ -24210,81 +24452,188 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// The arrow of a stored function read passed as `canon_arg`, lowered to `lowered`.
+    /// The carrier the function value `canon_arg`, lowered to `lowered`, reaches a slot on.
     ///
-    /// `None` when the argument is not read out of storage. The parameter and
-    /// return types are the use site's solved arrow when it lowers to one, so
-    /// the closure matches the slot it fills; otherwise the stored carrier's.
-    fn stored_fn_read_carrier(
-        &self,
-        canon_arg: &canon::Expr,
-        lowered: &Expr,
-    ) -> Option<(Vec<IrType>, IrType)> {
-        let carrier = self
-            .shared_fn_read_carrier(lowered)
-            .or_else(|| self.canon_stored_fn_carrier(canon_arg))?;
-        let use_site = self
+    /// A fresh direct closure is on the direct carrier; a lowered storage read
+    /// ([`Self::shared_fn_read_carrier`]) is on the shared one; every other
+    /// shape takes the carrier of its value type
+    /// ([`Self::value_carrier_type`]), so a call result is classified by the
+    /// type it lowers to, never by its syntax. `None` when the value is no
+    /// function.
+    fn fn_carrier_of(&self, canon_arg: &canon::Expr, lowered: &Expr) -> Option<FnCarrier> {
+        if is_direct_closure(lowered) {
+            return Some(FnCarrier::Direct);
+        }
+        if let Some((params, ret)) = self.shared_fn_read_carrier(lowered) {
+            return Some(FnCarrier::Shared(params, ret));
+        }
+        FnCarrier::of_type(self.value_carrier_type(canon_arg)?)
+    }
+
+    /// The use site's solved arrow of `canon_arg`, lowered, when it is one.
+    ///
+    /// A converted stored read takes these parameter and return types so the
+    /// closure matches the slot it fills.
+    fn use_site_arrow(&self, canon_arg: &canon::Expr) -> Option<(Vec<IrType>, IrType)> {
+        let ty = self
             .region_ty(canon_arg.span)
-            .filter(|ty| matches!(ty, Ty::Fun(..)))
-            .and_then(|ty| self.ir_type_from_ty(ty, canon_arg.span).ok());
-        Some(match use_site {
-            Some(IrType::Fun(params, ret) | IrType::SharedFun(params, ret)) => (params, *ret),
-            _ => carrier,
-        })
+            .filter(|ty| matches!(ty, Ty::Fun(..)))?;
+        match self.ir_type_from_ty(ty, canon_arg.span).ok()? {
+            IrType::Fun(params, ret) | IrType::SharedFun(params, ret) => Some((params, *ret)),
+            _ => None,
+        }
     }
 
     /// The stored carrier of a source expression whose value is a function read out of storage.
     ///
-    /// Covers a record field read ([`Self::canon_record_read_carrier`]), a
-    /// local bound to a stored function ([`Self::shared_fn_reads`]), and an
-    /// `if`, `let`, or `case` with such a result in any branch: every branch
-    /// of one expression shares one carrier, and a branch already on the
-    /// direct carrier is still a callable the conversion can wrap. Every other
-    /// shape is `None`.
+    /// The projection of [`Self::value_carrier_type`] onto a `SharedFun`
+    /// value: a record field read, a local bound to a stored function, a
+    /// kernel call whose result carries a stored argument, and an `if`,
+    /// `let`, or `case` with such a result in any branch. Every other value is
+    /// `None`.
     fn canon_stored_fn_carrier(&self, expr: &canon::Expr) -> Option<(Vec<IrType>, IrType)> {
-        match &expr.value {
-            canon::Expr_::Access(..) => self.canon_record_read_carrier(expr),
-            canon::Expr_::VarLocal(sym) => self.shared_fn_reads.borrow().get(sym).cloned(),
-            canon::Expr_::If(branches, otherwise) => branches
-                .iter()
-                .find_map(|(_, then)| self.canon_stored_fn_carrier(then))
-                .or_else(|| self.canon_stored_fn_carrier(otherwise)),
-            canon::Expr_::Let(bindings, body) => {
-                self.with_stored_fn_let_binders(bindings, || self.canon_stored_fn_carrier(body))
-            }
-            canon::Expr_::Case(scrutinee, branches) => branches.iter().find_map(|br| {
-                let saved = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrutinee, None, &br.pat);
-                let found = self.canon_stored_fn_carrier(&br.body);
-                *self.shared_fn_reads.borrow_mut() = saved;
-                found
-            }),
+        match self.value_carrier_type(expr)? {
+            IrType::SharedFun(params, ret) => Some((params, *ret)),
             _ => None,
         }
     }
 
-    /// The `SharedFun` carrier of a RECORD-FIELD read argument, recovered from the
-    /// record's OWN type rather than the lowered access's `field_ty`. A field read
-    /// (`runner.run`) lowers to an [`Expr::Access`] whose `field_ty` is the
-    /// access's direct region type (`Fun`) — the record-field storage flip
-    /// ([`normalize_record_fun_carriers`]) lives on the STRUCT field, not on the
-    /// access — so the read emits `Arc<dyn Fn>` even though its `field_ty` is the
-    /// direct carrier. Consult the record's solved type, lower it (which applies
-    /// the flip), and read the field's carrier: a `SharedFun` field is an
-    /// `Arc`-carried read. A non-record-access argument, a non-`SharedFun` field,
-    /// or an unresolvable record type is `None` — never demoted.
-    fn canon_record_read_carrier(&self, arg: &canon::Expr) -> Option<(Vec<IrType>, IrType)> {
-        let canon::Expr_::Access(record, field) = &arg.value else {
+    /// The lowered type of `expr` with every function on the carrier it is emitted on.
+    ///
+    /// The solved type lowered ([`Self::ir_type_from_ty`]) already places a
+    /// function in storage (a record field, a tuple component, a collection
+    /// element) on the `Arc` carrier; this adds what the solved type alone
+    /// cannot say: a field read keeps its field's carrier, a local bound to a
+    /// stored read is on `Arc`, a branching expression takes the carrier of a
+    /// branch that is on `Arc`, and a saturated kernel call passes its
+    /// arguments' carriers through to the scheme variables of its result
+    /// ([`Self::call_carrier_type`]). `None` when the type holds no function
+    /// or cannot be lowered.
+    fn value_carrier_type(&self, expr: &canon::Expr) -> Option<IrType> {
+        #[cfg(test)]
+        self.carrier_walks
+            .set(self.carrier_walks.get().saturating_add(1));
+        let region = self.region_ty(expr.span);
+        if region.is_some_and(|ty| !ty_holds_fun(ty)) {
             return None;
+        }
+        let lowered = || region.and_then(|ty| self.ir_type_from_ty(ty, expr.span).ok());
+        match &expr.value {
+            canon::Expr_::Access(record, field) => {
+                self.access_field_type(record, *field).or_else(lowered)
+            }
+            canon::Expr_::VarLocal(sym) => {
+                let stored = self.shared_fn_reads.borrow().get(sym).cloned();
+                stored
+                    .map(|(params, ret)| IrType::SharedFun(params, Box::new(ret)))
+                    .or_else(lowered)
+            }
+            canon::Expr_::If(branches, otherwise) => join_carrier_types(
+                branches
+                    .iter()
+                    .map(|(_, then)| then)
+                    .chain(std::iter::once(otherwise.as_ref()))
+                    .map(|branch| self.value_carrier_type(branch)),
+            )
+            .or_else(lowered),
+            canon::Expr_::Let(bindings, body) => self
+                .with_stored_fn_let_binders(bindings, || self.value_carrier_type(body))
+                .or_else(lowered),
+            canon::Expr_::Case(scrutinee, branches) => {
+                let stored = self.stored_fn_scrutinee(scrutinee, None);
+                join_carrier_types(branches.iter().map(|br| {
+                    let saved = self.shared_fn_reads.borrow().clone();
+                    self.register_stored_fn_arm_binders(&stored, &br.pat);
+                    let found = self.value_carrier_type(&br.body);
+                    *self.shared_fn_reads.borrow_mut() = saved;
+                    found
+                }))
+                .or_else(lowered)
+            }
+            canon::Expr_::Call(callee, args) => self.call_carrier_type(callee, args, lowered()),
+            canon::Expr_::VarTopLevel { .. }
+            | canon::Expr_::VarKernel { .. }
+            | canon::Expr_::VarCtor { .. }
+            | canon::Expr_::Int(_)
+            | canon::Expr_::Float(_)
+            | canon::Expr_::Str(_)
+            | canon::Expr_::Char(_)
+            | canon::Expr_::CustomElementCtor(_)
+            | canon::Expr_::Unit
+            | canon::Expr_::ForeignCall { .. }
+            | canon::Expr_::Lambda(..)
+            | canon::Expr_::Binop { .. }
+            | canon::Expr_::Tuple(_)
+            | canon::Expr_::List(_)
+            | canon::Expr_::Cons(..)
+            | canon::Expr_::Record(_)
+            | canon::Expr_::Update(..) => lowered(),
+        }
+    }
+
+    /// The lowered type of the call `callee args`, with its result carrying its arguments' carriers.
+    ///
+    /// Only a kernel call that lowers saturated passes a carrier through: its
+    /// spine holds exactly the kernel's arity, and every curried level
+    /// collapses into the one direct call ([`spine_saturates`], the rule
+    /// [`Self::lower_call`] applies). A partial, over-applied, or
+    /// non-collapsing spine, and a call to anything but a kernel, emits a
+    /// closure or a call whose result is on the solved type's own carriers,
+    /// so it is `base`. A top-level user def's result is its declared return
+    /// type lowered: a declared variable an argument binds to a function is
+    /// refused before lowering ([`Self::reject_fn_through_generic_slot`]),
+    /// so no argument's function carrier reaches the result outside an opaque
+    /// wrapper (`Task`, `Decoder`, `Cmd`, `Sub`) no function slot reads.
+    fn call_carrier_type(
+        &self,
+        callee: &canon::Expr,
+        args: &[canon::Expr],
+        base: Option<IrType>,
+    ) -> Option<IrType> {
+        let mut levels: Vec<&[canon::Expr]> = vec![args];
+        let mut head = callee;
+        while let canon::Expr_::Call(inner, inner_args) = &head.value {
+            levels.push(inner_args);
+            head = inner;
+        }
+        let Ok(Callee::Kernel(kernel)) = self.lower_callee_resolve(head) else {
+            return base;
         };
+        let spine: Vec<&canon::Expr> = levels.iter().rev().flat_map(|level| level.iter()).collect();
+        if spine.len() != usize::from(kernel.decl().arity) {
+            return base;
+        }
+        let arg_types: Vec<Option<IrType>> = spine
+            .iter()
+            .map(|arg| self.value_carrier_type(arg))
+            .collect();
+        let stored = |slot: usize| matches!(arg_types.get(slot), Some(Some(IrType::SharedFun(..))));
+        let mut offset = spine.len();
+        for level in levels.iter().take(levels.len().saturating_sub(1)) {
+            offset = offset.saturating_sub(level.len());
+            let outer_len = spine.len().saturating_sub(offset);
+            if !spine_saturates(kernel, offset, outer_len, |j| {
+                stored(offset.saturating_add(j))
+            }) {
+                return base;
+            }
+        }
+        kernel_result_carrier_type(kernel, &arg_types, base)
+    }
+
+    /// The lowered type of field `field` of the record `record`, on its storage carrier.
+    ///
+    /// A field read lowers to an [`Expr::Access`] whose `field_ty` is the
+    /// access's direct region type; the record-field storage flip
+    /// ([`normalize_record_fun_carriers`]) lives on the struct field, so the
+    /// record's own solved type, lowered, is what says the field is read on
+    /// `Arc`. `None` when the record type does not resolve to a record.
+    fn access_field_type(&self, record: &canon::Expr, field: Symbol) -> Option<IrType> {
         let record_ty = self.region_ty(record.span)?;
         let IrType::Record(fields) = self.ir_type_from_ty(record_ty, record.span).ok()? else {
             return None;
         };
-        match fields.get(field)? {
-            IrType::SharedFun(params, ret) => Some((params.clone(), (**ret).clone())),
-            _ => None,
-        }
+        fields.get(&field).cloned()
     }
 
     /// Does the scrutinee PROJECT a function element out of a stored collection —
@@ -24337,7 +24686,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Register every binder of a match arm's pattern that reads a stored function.
+    /// The stored-function facts of a `case` scrutinee its arms' binders register against.
     ///
     /// A constructor payload is stored when the constructor is a USER enum
     /// (its payload arrow is flipped to `SharedFun`,
@@ -24348,19 +24697,32 @@ impl<'a> Lowerer<'a> {
     /// a directly-built `Maybe (Int -> Int)` payload stays on `Box`. A
     /// root-level binder aliases the scrutinee and reads a stored function
     /// exactly when the scrutinee does. `scrutinee` is the lowered scrutinee
-    /// when one exists. The caller saves and restores [`Self::shared_fn_reads`]
-    /// around the arm so a binder never outlives its pattern scope.
-    fn register_stored_fn_arm_binders(
+    /// when one exists. Computed once per `case`, before its arms: the facts
+    /// depend on the scrutinee alone, and walking the scrutinee per arm makes
+    /// a scrutinee nested `d` cases deep cost `arms^d`.
+    fn stored_fn_scrutinee(
         &self,
         canon_scrutinee: &canon::Expr,
         scrutinee: Option<&Expr>,
-        pat: &canon::Pattern,
-    ) {
+    ) -> StoredScrutinee {
         let lowered = scrutinee.and_then(|s| self.shared_fn_read_carrier(s));
         let builtin_payload =
             lowered.is_some() || self.scrutinee_projects_collection_fn(canon_scrutinee);
         let value = lowered.or_else(|| self.canon_stored_fn_carrier(canon_scrutinee));
-        self.register_stored_fn_root(pat, value, builtin_payload);
+        StoredScrutinee {
+            value,
+            builtin_payload,
+        }
+    }
+
+    /// Register every binder of a match arm's pattern that reads a stored function.
+    ///
+    /// `scrutinee` is the arm's `case` scrutinee, classified once
+    /// ([`Self::stored_fn_scrutinee`]). The caller saves and restores
+    /// [`Self::shared_fn_reads`] around the arm so a binder never outlives
+    /// its pattern scope.
+    fn register_stored_fn_arm_binders(&self, scrutinee: &StoredScrutinee, pat: &canon::Pattern) {
+        self.register_stored_fn_root(pat, scrutinee.value.clone(), scrutinee.builtin_payload);
     }
 
     /// Register the binders of a root pattern bound to a value whose stored carrier is `value`.
@@ -30704,6 +31066,7 @@ impl<'a> Lowerer<'a> {
     #[allow(clippy::too_many_lines)]
     fn lower_case(&self, scrut: &canon::Expr, branches: &[canon::CaseBranch]) -> DResult<Expr> {
         let scrutinee = self.lower_expr(scrut)?;
+        let stored_scrutinee = self.stored_fn_scrutinee(scrut, Some(&scrutinee));
 
         // The parser rejects a zero-branch `case` (CaseDefect::NoBranches), so
         // an empty branch list here is a violated invariant.
@@ -30725,7 +31088,7 @@ impl<'a> Lowerer<'a> {
                 // any outer promotable name over the arm body. A component read
                 // out of storage is registered for the arm body like any arm's.
                 let shared_before = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &first.pat);
+                self.register_stored_fn_arm_binders(&stored_scrutinee, &first.pat);
                 let body = self.with_binders(&shadowing_binder_scope(&first.pat), || {
                     self.lower_expr(&first.body)
                 });
@@ -30793,7 +31156,7 @@ impl<'a> Lowerer<'a> {
                             let arm_pat = self.lower_arm_pat(&br.pat, scrut.span)?;
                             let arm_syms = collect_arm_pat_pvars(&br.pat.value);
                             let shared_before = self.shared_fn_reads.borrow().clone();
-                            self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
+                            self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                             let mut arm_body = self
                                 .with_binders(&arm_binder_scope(&arm_syms), || {
                                     self.lower_expr(&br.body)
@@ -30898,7 +31261,7 @@ impl<'a> Lowerer<'a> {
                 // read into a direct higher-order parameter demotes to `Box`
                 // ([`Self::demote_shared_fn_read`]). Scoped to this arm.
                 let shared_before = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
+                self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                 let mut arm_body =
                     self.with_binders(&arm_binder_scope(&arm_syms), || self.lower_expr(&br.body))?;
                 *self.shared_fn_reads.borrow_mut() = shared_before;
@@ -37651,5 +38014,145 @@ mod tests {
             reject_nonclone_value_reuse(env, xs, &list_int, &reused, span),
             Ok(())
         );
+    }
+
+    /// A `case` whose scrutinee is the same two-arm `case`, `depth` levels deep.
+    fn nested_scrutinee_case(depth: usize) -> canon::Expr {
+        let unit = || Located::new(Span::DUMMY, canon::Expr_::Unit);
+        let arm = || canon::CaseBranch {
+            pat: Located::new(Span::DUMMY, canon::Pattern_::PAnything),
+            body: unit(),
+        };
+        (0..depth).fold(unit(), |scrutinee, _| {
+            Located::new(
+                Span::DUMMY,
+                canon::Expr_::Case(Box::new(scrutinee), vec![arm(), arm()]),
+            )
+        })
+    }
+
+    /// A `case` scrutinee is classified once for all of its arms.
+    ///
+    /// Each of the 24 levels walks its scrutinee once and its two arm bodies
+    /// once: `3 * depth + 1` walks. Classifying the scrutinee per arm doubles
+    /// the walk at every level, `2^depth` walks.
+    #[test]
+    fn nested_case_scrutinee_carrier_walk_is_linear() {
+        const DEPTH: usize = 24;
+        let expr = nested_scrutinee_case(DEPTH);
+        with_binder_type_lowerer(|lowerer, _| {
+            lowerer.carrier_walks.set(0);
+            assert_eq!(lowerer.value_carrier_type(&expr), None);
+            let walks = lowerer.carrier_walks.get();
+            assert!(
+                walks <= 3 * DEPTH + 1,
+                "{walks} carrier walks over a {DEPTH}-deep case scrutinee"
+            );
+        });
+    }
+
+    /// An `Arc` function, the payload every container case below wraps.
+    fn shared_fn() -> IrType {
+        IrType::SharedFun(vec![IrType::Int], Box::new(IrType::Bool))
+    }
+
+    /// A `Box` function, the payload no container case below may report.
+    fn direct_fn() -> IrType {
+        IrType::Fun(vec![IrType::Int], Box::new(IrType::Bool))
+    }
+
+    /// Every container shape over `item`, one per type-carrying [`IrType`] position.
+    fn every_container(item: &IrType) -> Vec<(&'static str, IrType)> {
+        let boxed = || Box::new(item.clone());
+        vec![
+            ("Task", IrType::Task(boxed())),
+            ("Cmd", IrType::Cmd(boxed())),
+            ("Sub", IrType::Sub(boxed())),
+            ("Decoder", IrType::Decoder(boxed())),
+            ("Maybe", IrType::Maybe(boxed())),
+            ("List", IrType::List(boxed())),
+            ("Set", IrType::Set(boxed())),
+            ("WebRoute", IrType::WebRoute(boxed())),
+            (
+                "Ui",
+                IrType::Ui {
+                    ctor: ipe_ir::UiCtor::Html,
+                    msg: boxed(),
+                },
+            ),
+            ("Result err", IrType::Result(boxed(), Box::new(IrType::Int))),
+            ("Result ok", IrType::Result(Box::new(IrType::Int), boxed())),
+            ("Dict key", IrType::Dict(boxed(), Box::new(IrType::Int))),
+            ("Dict value", IrType::Dict(Box::new(IrType::Int), boxed())),
+            (
+                "CustomElement down",
+                IrType::CustomElement {
+                    down: boxed(),
+                    up: Box::new(IrType::Unit),
+                },
+            ),
+            (
+                "CustomElement up",
+                IrType::CustomElement {
+                    down: Box::new(IrType::Unit),
+                    up: boxed(),
+                },
+            ),
+            (
+                "Fun param",
+                IrType::Fun(vec![item.clone()], Box::new(IrType::Unit)),
+            ),
+            ("Fun return", IrType::Fun(vec![IrType::Unit], boxed())),
+            (
+                "FnOnceChain param",
+                IrType::FnOnceChain(vec![item.clone()], Box::new(IrType::Unit)),
+            ),
+            (
+                "FnOnceChain return",
+                IrType::FnOnceChain(vec![IrType::Unit], boxed()),
+            ),
+            ("Tuple", IrType::Tuple(vec![IrType::Int, item.clone()])),
+            (
+                "Record",
+                IrType::Record(BTreeMap::from([(
+                    ipe_intern::Symbol::from_raw(1),
+                    item.clone(),
+                )])),
+            ),
+            (
+                "Enum",
+                IrType::Enum {
+                    home: ipe_ir::ModPath(Vec::new()),
+                    name: ipe_intern::Symbol::from_raw(2),
+                    args: vec![item.clone()],
+                },
+            ),
+        ]
+    }
+
+    /// An `Arc` function under every container shape is seen.
+    #[test]
+    fn ir_holds_shared_sees_an_arc_fn_under_every_container() {
+        assert!(super::ir_holds_shared(&shared_fn()));
+        for (shape, ty) in every_container(&shared_fn()) {
+            assert!(
+                super::ir_holds_shared(&ty),
+                "an Arc function under `{shape}` is missed"
+            );
+        }
+    }
+
+    /// A `Box` function or a plain value under every container shape is not reported as `Arc`.
+    #[test]
+    fn ir_holds_shared_refuses_a_direct_fn_under_every_container() {
+        for item in [direct_fn(), IrType::Int] {
+            assert!(!super::ir_holds_shared(&item));
+            for (shape, ty) in every_container(&item) {
+                assert!(
+                    !super::ir_holds_shared(&ty),
+                    "`{shape}` over {item:?} is reported as holding an Arc function"
+                );
+            }
+        }
     }
 }

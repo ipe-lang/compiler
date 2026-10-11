@@ -1,0 +1,36 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+
+-- A stored function read passed through a user generic def: `first`'s
+-- declared `a` binds to a function, which no generic Rust parameter can
+-- carry, so `ipe` refuses the call before the result reaches the direct
+-- function slot of `List.filter`.
+
+
+type alias Cfg =
+    { keep : Int -> Bool
+    }
+
+
+cfg : Cfg
+cfg =
+    { keep = \n -> n > 1
+    }
+
+
+first : ( a, b ) -> a
+first ( x, _ ) =
+    x
+
+
+viaUserGeneric : Cfg -> Int
+viaUserGeneric c =
+    List.length (List.filter (first ( c.keep, 0 )) [ 1, 2, 3, 4 ])
+
+
+main =
+    Io.println (String.fromInt (viaUserGeneric cfg))
