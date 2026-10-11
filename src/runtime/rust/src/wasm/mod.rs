@@ -54,11 +54,10 @@ const ROOT_IPE_ID: &str = "r";
 /// Classified fatal-diagnostic prefix (mirrors the native panic classifier's
 /// taxonomy labels; the instance may be unusable after one of these).
 ///
-/// `detail` is scrubbed of bidi and control characters before it reaches the
-/// console.
+/// The line is built by [`crate::web::route::console_line`], which scrubs it.
 fn console_fatal(class: &str, detail: &str) {
-    let detail = crate::system::scrub_log_controls(detail);
-    web_sys::console::error_1(&JsValue::from_str(&format!("[ipe-wasm:{class}] {detail}")));
+    let line = crate::web::route::console_line(Some(class), detail);
+    web_sys::console::error_1(&JsValue::from_str(&line));
 }
 
 /// Shared non-fatal diagnostic sink — reused by `ws_client.rs`'s
@@ -66,11 +65,10 @@ fn console_fatal(class: &str, detail: &str) {
 /// rather than fail, e.g. unsettable custom headers), and by the emitted
 /// `hydrate` wasm export for fault-tolerant SSR takeover.
 ///
-/// `detail` is scrubbed of bidi and control characters before it reaches the
-/// console.
+/// The line is built by [`crate::web::route::console_line`], which scrubs it.
 pub fn console_warn(detail: &str) {
-    let detail = crate::system::scrub_log_controls(detail);
-    web_sys::console::warn_1(&JsValue::from_str(&format!("[ipe-wasm] {detail}")));
+    let line = crate::web::route::console_line(None, detail);
+    web_sys::console::warn_1(&JsValue::from_str(&line));
 }
 
 /// Install `console_error_panic_hook` so a residual trap (e.g. stack
@@ -178,6 +176,9 @@ where
 ///
 /// `init` receives a `WebReq` synthesised from `location` + cookies, the same
 /// shape `wasm_app` uses.
+///
+/// Divergence: a routed wasm app is served at the root only; a path below a
+/// base path enters `notFound` until the base path reaches the wasm client.
 pub fn wasm_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
     init: FInit,
     update: FUpdate,
@@ -368,7 +369,8 @@ where
     let document = document()?;
     let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
-    let (model, cmd0) = init(synthesize_req(&document)?);
+    let (req, _pathname) = synthesize_req(&document)?;
+    let (model, cmd0) = init(req);
 
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
@@ -547,7 +549,7 @@ where
     FRender: Fn(&Page) -> Result<crate::web::route::RoutePath, crate::web::route::RenderRefusal>
         + 'static,
 {
-    use crate::web::route::{DecodedPath, Matched, app_path, check_route_table, enter, resolve};
+    use crate::web::route::{DecodedPath, check_route_table, enter_located, navigate};
 
     // A malformed literal in the route table fails the mount loudly, with the
     // same refusal the server's `web_app_routed` starts with.
@@ -558,8 +560,8 @@ where
     let document = document()?;
     let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
-    let req = synthesize_req(&document)?;
-    let initial_path = req.path.clone();
+    let (req, pathname) = synthesize_req(&document)?;
+    let initial = crate::web::route::located(pathname.as_deref(), &base);
 
     // Seed the model from `init`, then enter the current URL so the `page`
     // field reflects the browser's address bar before the first render. This
@@ -567,10 +569,9 @@ where
     // address-bar path that does not locate below the base names no route: it
     // enters `not_found`.
     let (init_model, init_cmd) = init(req);
-    let matched = app_path(&initial_path, &base)
-        .as_ref()
-        .map_or(Matched::Miss, |path| resolve(&routes, path, &render));
-    let entered = enter(matched, &not_found, init_model, &set_page);
+    let entered = enter_located(
+        &routes, &initial, &not_found, init_model, &set_page, &render,
+    );
     let (model, entry_cmd) = (entered.model, entered.cmd);
     let cmd0 = IpeCmd::Batch(vec![init_cmd, entry_cmd]);
 
@@ -599,13 +600,7 @@ where
         let set_page = Rc::clone(&set_page_rc);
         let render = Rc::clone(&render_rc);
         Box::new(move |located: &crate::web::route::LocatedPath, m: Model| {
-            // A path that does not locate below the base is unrouted.
-            let path = located.as_ref().ok()?;
-            let matched = resolve(&routes, path, &*render);
-            // An empty table serves only `/`, as on the server.
-            let routed =
-                matches!(matched, Matched::Hit { .. }) || (routes.is_empty() && path.is_root());
-            routed.then(|| enter(matched, &not_found, m, &*set_page))
+            navigate(&routes, located, &not_found, m, &*set_page, &*render)
         })
     };
 
@@ -667,15 +662,12 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    use crate::web::route::{PathMiss, app_path};
     let window = web_sys::window().ok_or(MountRefusal::NoWindow)?;
     let app = Rc::clone(app);
     let closure =
         Closure::<dyn Fn(web_sys::PopStateEvent)>::new(move |_ev: web_sys::PopStateEvent| {
-            let located = web_sys::window()
-                .and_then(|w| w.location().pathname().ok())
-                .map_or(Err(PathMiss::Unreadable), |raw| app_path(&raw, &base));
-            navigate_to(&app, &located);
+            let raw = web_sys::window().and_then(|w| w.location().pathname().ok());
+            navigate_to(&app, &crate::web::route::located(raw.as_deref(), &base));
         });
     window
         .add_event_listener_with_callback("popstate", closure.as_ref().unchecked_ref())
@@ -743,11 +735,17 @@ fn listener_refusal(event: &'static str, error: &JsValue) -> MountRefusal {
     }
 }
 
-/// Rebuild the row-poly `req` record from the browser environment.
-fn synthesize_req(document: &web_sys::Document) -> Result<WebReq, MountRefusal> {
+/// Rebuild the row-poly `req` record from the browser environment, beside the
+/// address bar's pathname, `None` when the platform cannot report it.
+///
+/// A router locates that report through [`crate::web::route::located`], so an
+/// unreported pathname is `Unreadable` and never enters the root page; the
+/// `req` then carries the empty path.
+fn synthesize_req(document: &web_sys::Document) -> Result<(WebReq, Option<String>), MountRefusal> {
     let window = web_sys::window().ok_or(MountRefusal::NoWindow)?;
     let loc = window.location();
-    let path = loc.pathname().unwrap_or_default();
+    let pathname = loc.pathname().ok();
+    let path = pathname.clone().unwrap_or_default();
     let query = loc.search().unwrap_or_default();
     let raw_query = query.strip_prefix('?').unwrap_or(&query).to_owned();
 
@@ -762,14 +760,15 @@ fn synthesize_req(document: &web_sys::Document) -> Result<WebReq, MountRefusal> 
         }
     }
 
-    Ok(WebReq {
+    let req = WebReq {
         path,
         query: raw_query,
         method: "GET".to_owned(),
         params: crate::dict::IpeDict::new(),
         headers: crate::dict::IpeDict::new(),
         cookies,
-    })
+    };
+    Ok((req, pathname))
 }
 
 /// The delegated event names — one listener per name on `<body>`, so nodes

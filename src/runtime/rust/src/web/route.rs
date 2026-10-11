@@ -230,6 +230,67 @@ pub fn app_path(raw: &str, base: &DecodedPath) -> LocatedPath {
     path.strip_base(base).ok_or(PathMiss::OutsideBase)
 }
 
+/// Locate the platform's report of the current path below `base`.
+///
+/// `raw` is `None` when the platform could not report a path: that is
+/// [`PathMiss::Unreadable`], never the empty path and never the root page.
+///
+/// # Errors
+///
+/// `Unreadable` for an absent report; otherwise as [`app_path`].
+pub fn located(raw: Option<&str>, base: &DecodedPath) -> LocatedPath {
+    raw.map_or(Err(PathMiss::Unreadable), |raw| app_path(raw, base))
+}
+
+/// Enter the page a mount's located path names: a miss enters `not_found`.
+pub fn enter_located<Page: Clone, M, C>(
+    routes: &[Route<Page>],
+    located: &LocatedPath,
+    not_found: &Page,
+    model: M,
+    entry: impl Fn(Page, M) -> (M, C),
+    render: impl Fn(&Page) -> Result<RoutePath, RenderRefusal>,
+) -> Entered<M, C> {
+    let matched = located
+        .as_ref()
+        .map_or(Matched::Miss, |path| resolve(routes, path, render));
+    enter(matched, not_found, model, entry)
+}
+
+/// Enter the page a history navigation names, or `None` when it names no
+/// route.
+///
+/// An unrouted navigation (a path outside the base, an unreadable path, a
+/// path no route builds) leaves the live page alone: entering `not_found`
+/// would rebuild the handler index and orphan the shown page's handlers. An
+/// empty table serves only `/`, as on the server.
+pub fn navigate<Page: Clone, M, C>(
+    routes: &[Route<Page>],
+    located: &LocatedPath,
+    not_found: &Page,
+    model: M,
+    entry: impl Fn(Page, M) -> (M, C),
+    render: impl Fn(&Page) -> Result<RoutePath, RenderRefusal>,
+) -> Option<Entered<M, C>> {
+    let path = located.as_ref().ok()?;
+    let matched = resolve(routes, path, render);
+    let routed = matches!(matched, Matched::Hit { .. }) || (routes.is_empty() && path.is_root());
+    routed.then(|| enter(matched, not_found, model, entry))
+}
+
+/// One browser-console diagnostic line: `[ipe-wasm:<class>] <detail>`, or
+/// `[ipe-wasm] <detail>` without a class.
+///
+/// Both parts are scrubbed of bidi and control characters, so a platform or
+/// app message can neither forge a second line nor restyle the console.
+pub fn console_line(class: Option<&str>, detail: &str) -> String {
+    use crate::system::scrub_log_controls as scrub;
+    match class {
+        Some(class) => format!("[ipe-wasm:{}] {}", scrub(class), scrub(detail)),
+        None => format!("[ipe-wasm] {}", scrub(detail)),
+    }
+}
+
 /// Why the browser client refused to mount an app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountRefusal {
@@ -1283,6 +1344,108 @@ mod tests {
         assert_eq!(app_path("/apple", &app), Err(PathMiss::OutsideBase));
         assert_eq!(app_path("/", &app), Err(PathMiss::OutsideBase));
         assert_eq!(app_path("/other/app", &app), Err(PathMiss::OutsideBase));
+    }
+
+    /// A path the platform could not report is `Unreadable`: a mount enters
+    /// `notFound` and a history navigation enters no page at all.
+    #[test]
+    fn unreadable_path_enters_no_page() {
+        let rs = routes();
+        let root = dp("/");
+        let none = located(None, &root);
+        assert_eq!(none, Err(PathMiss::Unreadable));
+        let entry = |page: Page, (): ()| ((), page);
+        assert!(
+            navigate(&rs, &none, &Page::NF, (), entry, render).is_none(),
+            "an unreadable path must not navigate"
+        );
+        assert_eq!(
+            enter_located(&rs, &none, &Page::NF, (), entry, render).cmd,
+            Page::NF,
+            "an unreadable path must mount notFound, never the root page"
+        );
+        assert_eq!(located(Some("/"), &root), Ok(dp("/")));
+    }
+
+    /// The empty text is not a bare path: it never locates as the root.
+    #[test]
+    fn empty_path_text_is_not_a_bare_path() {
+        let root = dp("/");
+        assert_eq!(app_path("", &root), Err(PathMiss::NotBarePath));
+        assert_eq!(located(Some(""), &root), Err(PathMiss::NotBarePath));
+        let entry = |page: Page, (): ()| ((), page);
+        let nav = navigate(
+            &routes(),
+            &located(Some(""), &root),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert!(nav.is_none(), "the empty text must not navigate");
+    }
+
+    /// History navigation enters a routed page and leaves an unrouted one
+    /// alone; an empty table serves only the root.
+    #[test]
+    fn navigate_enters_only_routed_paths() {
+        let rs = routes();
+        let app = dp("/app");
+        let entry = |page: Page, (): ()| ((), page);
+        let hit = navigate(
+            &rs,
+            &app_path("/app/apps/x", &app),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert_eq!(hit.map(|e| e.cmd), Some(Page::App("x".into())));
+        for raw in ["/app/nope", "/elsewhere", "/app/%zz"] {
+            let nav = navigate(&rs, &app_path(raw, &app), &Page::NF, (), entry, render);
+            assert!(nav.is_none(), "{raw} must not navigate");
+        }
+        let empty: Vec<Route<Page>> = Vec::new();
+        let at_root = navigate(
+            &empty,
+            &app_path("/app", &app),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert_eq!(at_root.map(|e| e.cmd), Some(Page::NF));
+        let below = navigate(
+            &empty,
+            &app_path("/app/x", &app),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert!(below.is_none(), "an empty table serves only the root");
+    }
+
+    /// A hostile class or detail cannot forge a console line or carry a raw
+    /// control or bidi character.
+    #[test]
+    fn console_line_scrubs_hostile_text() {
+        let hostile = "a\n\r\u{1b}[31mred\u{0}\u{7f}\u{85}\u{9b}\u{202e}rlo\u{2066}\u{200b}\u{2028}[ipe-wasm:Forged] x";
+        for line in [
+            console_line(Some(hostile), hostile),
+            console_line(None, hostile),
+        ] {
+            assert!(
+                !line.chars().any(crate::system::is_log_hazard),
+                "a raw control survived: {line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        }
+        assert_eq!(
+            console_line(Some("EntryFailed"), "boom"),
+            "[ipe-wasm:EntryFailed] boom"
+        );
+        assert_eq!(console_line(None, "boom"), "[ipe-wasm] boom");
     }
 
     /// A miss resolves as the `notFound` page, never as the root page.
