@@ -1311,6 +1311,8 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_GETENV_KIND_NOT_UNICODE", // runtime getenv failure-kind tests: a fixed name, never read in production
     "IPE_GETENV_KIND_READABLE", // runtime getenv failure-kind tests: a fixed name, never read in production
     "IPE_GETENV_NOT_UNICODE_PROBE", // runtime getenv failure-kind tests: selects the non-Unicode re-exec probe
+    "IPE_GRAMMAR_NEW", // env grammar test: a replacement name only quoted in a retired-key message
+    "IPE_GRAMMAR_PROBE", // env grammar test: a fixed probe key, never read in production
     "IPE_HOST_ENV_TEST_UNSET_7F3A9C21D84E", // sandbox host_env test: a name no host sets
     "IPE_HTTP_TEST_URL",
     "IPE_INDEX_EXTRACTOR", // ipe-index build script: extractor digest handed to the crate at compile time
@@ -1318,6 +1320,14 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
     "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
+    "IPE_REGISTRY_TEST_CHOICE_B", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_NEW", // env registry test: a replacement name only quoted in a retired-key message
+    "IPE_REGISTRY_TEST_PORT_A", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_C", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_GOOD", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_SERVED", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_UNSET", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_RETIRED", // env registry test: a fixed fixture key, never read in production
     "IPE_REVOCATION_INSTALL_CHILD", // runtime Web revocation test: marks the install re-exec
     "IPE_RUN_WITH_TEST_VAR",
     "IPE_SECRET_E2E",                   // Windows jail e2e test sentinel

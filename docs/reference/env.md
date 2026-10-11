@@ -167,7 +167,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_HTTP_MAX_BODY_BYTES` | 33554432 (32 MiB) | Maximum request-body size (bytes) for outbound `Http.*` calls. Prevents OOM from unexpectedly large responses. | `Tunable` |
 | `IPE_HTTP_MAX_INFLIGHT` | 1024 | Global cap on simultaneously in-flight HTTP requests at the `Server.listen` front door. Bounds task/worker fan-out; requests beyond the cap are backpressured and, with the request timeout outermost, shed as a timeout rather than queued unboundedly. | `SecurityTunable` |
 | `IPE_HTTP_REQUEST_TIMEOUT` | 30 (seconds) | Per-request deadline (seconds) at the `Server.listen` front door. A request — headers or body — that does not complete within the window is dropped with 408, closing the slowloris hold-open vector. | `SecurityTunable` |
-| `IPE_SERVER_PORT` | the port passed to `Server.listen` | TCP port an `Ipe.Http.Server` app listens on. A value outside `1..=65535` (empty, non-numeric, signed, `0`, or too large) is ignored and the port passed to `Server.listen` is used. Under `ipe dev watch` the supervisor chooses the port, so this value has no effect there. | `Tunable` |
+| `IPE_SERVER_PORT` | the port passed to `Server.listen` | TCP port an `Ipe.Http.Server` app listens on, in `1..=65535`. Any other value (empty, non-numeric, signed, `0`, or too large) refuses startup, naming the variable. Under `ipe dev watch` the supervisor chooses the port and a valid value has no effect, but a malformed one still refuses. | `Tunable` |
 
 ## Observability
 
@@ -210,7 +210,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_WEB_HELLO_TIMEOUT_MS` | 8000 | Timeout (ms) for the initial SSE hello handshake. The browser closes and retries if this deadline passes. | `Tunable` |
 | `IPE_WEB_MAX_BODY_BYTES` | 33554432 (32 MiB) | Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise for large file uploads; lower to tighten the DoS floor. | `Tunable` |
 | `IPE_WEB_MAX_SESSIONS` | 50000 | Maximum concurrent web sessions before new connections are rejected. Prevents unbounded memory growth under a session-creation flood. | `Tunable` |
-| `IPE_WEB_PORT` | 8000 | TCP port an `Ipe.Web` app listens on. A value outside `1..=65535` (empty, non-numeric, signed, `0`, or too large) is ignored and 8000 is used. Under `ipe dev watch` the supervisor chooses the port, so this value has no effect there. | `Tunable` |
+| `IPE_WEB_PORT` | 8000 | TCP port an `Ipe.Web` app listens on, in `1..=65535`. Any other value (empty, non-numeric, signed, `0`, or too large) refuses startup, naming the variable. Under `ipe dev watch` the supervisor chooses the port and a valid value has no effect, but a malformed one still refuses. | `Tunable` |
 | `IPE_WEB_QUEUE_MAX` | 50 | Maximum queued events per session before back-pressure is applied. | `Tunable` |
 | `IPE_WEB_RESET_STATE` | unset (off) | Set to `1`, `true`, `yes`, or `on` to force every returning session to a fresh `init`, bypassing the additive-superset checkpoint splice. Injected by `ipe dev watch --reset-state`; never set in production. Fail-closed: an absent or unrecognised value leaves the normal additive-preserve algorithm in place. | `Tunable` |
 | `IPE_WEB_RETRY_BASE_MS` | 500 | Initial retry interval (ms) for client reconnection after a disconnect. | `Tunable` |
