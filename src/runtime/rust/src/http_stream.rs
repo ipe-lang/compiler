@@ -34,6 +34,7 @@
 use super::*;
 use crate::http_client::VettingResolver;
 use crate::ssrf::DialPolicy;
+use crate::tea::SourceTask;
 use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -763,14 +764,14 @@ where
         let mut relay = ChunkRelay { to_msg, emit };
         match with_registry(reg, |r| r.subscribe(key)) {
             Subscription::Drain(claimed) => {
-                // The lease moves into the task, so a task dropped before its
+                // The lease moves into the body, so a body dropped before its
                 // first poll still ends the slot.
                 let lease = DrainLease {
                     reg,
                     key,
                     seq: claimed.seq,
                 };
-                tokio::spawn(async move {
+                SourceTask::Detached(Box::pin(async move {
                     let (stream, permit) = claimed.value.into_parts();
                     let pump = Pump {
                         stream,
@@ -798,16 +799,16 @@ where
                         DrainEnd::Cancelled => {}
                         DrainEnd::BodyFailed(never) => match never {},
                     }
-                });
+                }))
             }
             Subscription::Refused => {
                 relay.send::<E>(ChunkEvent::Errored(E::from(IpeError::invalid_input(
                     UNKNOWN_STREAM.to_owned(),
                 ))));
+                SourceTask::Idle
             }
-            Subscription::Active => {}
+            Subscription::Active => SourceTask::Idle,
         }
-        tokio::spawn(async {}) // dummy handle for `SubRuntime` to abort harmlessly
     }))
 }
 
@@ -961,7 +962,7 @@ pub fn http_stream_close<E: From<String> + From<IpeError> + Send + 'static>(
 /// Ipe.Http.Stream.chunks → `Sub_subscribeStream`.
 ///
 /// Returns a `IpeSub::Source` that, on first subscribe for a parked stream,
-/// spawns a detached task draining the response and dispatching a `ChunkEvent`
+/// hands the loop a detached body draining the response and dispatching a `ChunkEvent`
 /// Msg per chunk: `Chunk s` per UTF-8 byte chunk, `Done` on clean EOF,
 /// `Errored e` on a read fault or when no bytes arrive within the idle ceiling
 /// (300 s, per read, a `Timeout`); a `close` during the drain stops it at once,
@@ -969,10 +970,10 @@ pub fn http_stream_close<E: From<String> + From<IpeError> + Send + 'static>(
 /// re-evaluated on every TEA `update`, so a re-subscribe to a draining or
 /// ended stream starts nothing — the registry decides that under its one lock.
 /// A handle no open stream holds gets exactly one `Errored InvalidInput` (its
-/// tombstone dedups every re-subscribe). The drain is DETACHED —
-/// `SubRuntime`'s abort-on-respawn only ever hits the dummy handle, never the
-/// drain. `E` is pinned to `IpeError` at the call site.
-/// `to_msg` is moved exclusively into the ONE detached `tokio::spawn` task
+/// tombstone dedups every re-subscribe). The drain is a
+/// `SourceTask::Detached` body, so re-evaluation never stops it; every other
+/// subscribe is `SourceTask::Idle`. `E` is pinned to `IpeError` at the call site.
+/// `to_msg` is moved exclusively into the one detached source body
 /// below (never behind a shared `Arc`, never read from two threads at once) --
 /// the same shape as the sibling `sub_subscribe_topic` (`pubsub.rs`), whose
 /// doc comment states the identical rationale. `Send` is therefore the full
@@ -1216,7 +1217,7 @@ mod tests {
         if let IpeSub::Source(spawn) = sub {
             let emit: Arc<dyn Fn(ChunkEvent<IpeError>) + Send + Sync> =
                 Arc::new(move |event: ChunkEvent<IpeError>| sink.lock().unwrap().push(event));
-            drop(spawn(emit));
+            drop(crate::tea::start_source(spawn(emit)));
         }
         events
     }

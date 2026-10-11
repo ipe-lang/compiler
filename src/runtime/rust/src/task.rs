@@ -139,18 +139,42 @@ const BLOCK_ON_THREAD: &str = "ipe-block-on";
 
 /// `task`, carried into every task-local scope its caller runs in, so code
 /// that runs on another task or thread on the caller's behalf sees the scopes
-/// the caller sees (a credential it verifies binds to the request that owns
-/// it).
+/// the caller sees (a credential it verifies binds to the Web session or the
+/// `Server` request that owns it).
 ///
 /// Every caller-owned task-local scope is carried here and only here: a new
-/// one wraps the result, `carry_new_scope(carry_request_streams(..))`, and
-/// every spawn of this module inherits it.
+/// one wraps the result, `carry_new_scope(carry_web_session(..))`, and every
+/// spawn through [`spawn_in_current_scope`] inherits it.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 #[allow(clippy::missing_const_for_fn)] // const only in builds that carry no scope
 fn on_behalf_of_caller<F: std::future::Future>(
     task: F,
 ) -> impl std::future::Future<Output = F::Output> {
-    carry_request_streams(carry_server_request(task))
+    carry_web_session(carry_request_streams(carry_server_request(task)))
+}
+
+/// `task`, kept inside the Web session its caller runs on behalf of, so a
+/// credential it verifies binds to that session.
+#[cfg(all(
+    feature = "tokio",
+    feature = "web-core",
+    feature = "server",
+    not(target_arch = "wasm32")
+))]
+fn carry_web_session<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::web::pubsub::inherit_session_scope(task)
+}
+
+/// `task` as it is: without the served Web runtime no session scope exists.
+#[cfg(all(
+    feature = "tokio",
+    not(all(feature = "web-core", feature = "server")),
+    not(target_arch = "wasm32")
+))]
+const fn carry_web_session<F: std::future::Future>(task: F) -> F {
+    task
 }
 
 /// `task`, kept inside the stream table of the `Server` request its caller
@@ -198,10 +222,12 @@ const fn carry_server_request<F: std::future::Future>(task: F) -> F {
 
 /// Spawn `task` on the runtime inside every scope its caller runs in.
 ///
-/// The one runtime spawn of this module: a bare spawn starts the task outside
-/// the caller's task-locals, where a credential it verifies binds to nothing.
+/// The spawn every task of this module goes through, and the one a spawn for
+/// work on user code's behalf elsewhere in the runtime must use: a bare spawn
+/// starts the task outside the caller's task-locals, where a credential it
+/// verifies binds to nothing.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-fn spawn_in_current_scope<F>(task: F) -> tokio::task::JoinHandle<F::Output>
+pub(crate) fn spawn_in_current_scope<F>(task: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
@@ -1910,7 +1936,7 @@ mod spawn_scope_scan_tests {
             let top_level = !line.is_empty() && !line.starts_with(char::is_whitespace);
             assert!(
                 !top_level
-                    || ["#[", "mod ", "}", "//"]
+                    || ["#[", "mod ", "}", ")", "//"]
                         .iter()
                         .any(|item| line.starts_with(item)),
                 "production code follows a test module in task.rs, so the spawn scan \
@@ -1949,6 +1975,28 @@ mod spawn_scope_scan_tests {
     }
 
     #[test]
+    fn the_scope_carrier_carries_every_caller_scope() {
+        let production = production_source();
+        let carrier = production
+            .split_once("fn on_behalf_of_caller<")
+            .and_then(|(_, body)| body.split_once("\n}"))
+            .map(|(body, _)| body);
+        assert!(
+            carrier.is_some_and(|body| {
+                [
+                    "carry_web_session(",
+                    "carry_request_streams(",
+                    "carry_server_request(",
+                ]
+                .iter()
+                .all(|scope| body.contains(scope))
+            }),
+            "`on_behalf_of_caller` carries the Web session, the request stream table \
+             and the request binding set"
+        );
+    }
+
+    #[test]
     fn block_on_thread_carries_the_scope() {
         let production = production_source();
         let carried = production.find("let future = on_behalf_of_caller(future);");
@@ -1961,6 +2009,98 @@ mod spawn_scope_scan_tests {
             production.matches("spawn_sized(").count(),
             1,
             "`block_on` is the one thread spawn of task.rs"
+        );
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "tokio",
+    feature = "web-core",
+    feature = "server",
+    feature = "jwt",
+    not(target_arch = "wasm32")
+))]
+mod web_session_carrier_tests {
+    use super::*;
+    use crate::revocation::SessionBindings;
+    use crate::web::pubsub::{SessionScope, current_session_sid, session_bindings};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// The session sid and credential set a spawned child observes.
+    type Seen = (String, Option<Arc<Mutex<SessionBindings>>>);
+
+    /// How long a test waits before it counts a child as hung.
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn observe() -> Seen {
+        (current_session_sid(), session_bindings())
+    }
+
+    /// Whether `seen` is the session `sid` with exactly the credential set `bindings`.
+    fn binds_to(seen: &Seen, sid: &str, bindings: &Arc<Mutex<SessionBindings>>) -> bool {
+        seen.0 == sid
+            && seen
+                .1
+                .as_ref()
+                .is_some_and(|set| Arc::ptr_eq(set, bindings))
+    }
+
+    #[tokio::test]
+    async fn task_parallel_child_binds_to_web_session() {
+        let scope = SessionScope::new("sid-parallel".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let tasks: Vec<IpeTask<String, Seen>> = vec![
+            Box::pin(async { IpeResult::Ok(observe()) }),
+            Box::pin(async { IpeResult::Ok(observe()) }),
+        ];
+        let result = tokio::time::timeout(DEADLINE, scope.scoped(task_parallel(tasks))).await;
+        assert!(
+            matches!(&result, Ok(IpeResult::Ok(seen)) if seen.len() == 2
+                && seen.iter().all(|child| binds_to(child, "sid-parallel", &bindings))),
+            "every parallel child runs inside the dispatching session's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn ffi_spawn_child_binds_to_web_session() {
+        let scope = SessionScope::new("sid-ffi".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let child = ffi_spawn_guarded(async { observe() });
+        let result = tokio::time::timeout(DEADLINE, scope.scoped(child)).await;
+        assert!(
+            matches!(&result, Ok(Ok(seen)) if binds_to(seen, "sid-ffi", &bindings)),
+            "a guarded foreign task runs inside the dispatching session's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_keep_their_own_scope() {
+        let first = SessionScope::new("sid-first".to_owned());
+        let second = SessionScope::new("sid-second".to_owned());
+        let first_set = Arc::clone(first.bindings());
+        let second_set = Arc::clone(second.bindings());
+        let both = async {
+            tokio::join!(
+                first.scoped(ffi_spawn_guarded(async { observe() })),
+                second.scoped(ffi_spawn_guarded(async { observe() })),
+            )
+        };
+        let result = tokio::time::timeout(DEADLINE, both).await;
+        assert!(
+            matches!(&result, Ok((Ok(a), Ok(b)))
+                if binds_to(a, "sid-first", &first_set) && binds_to(b, "sid-second", &second_set)),
+            "a child binds to its own session, never a sibling session's credential set"
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_a_session_a_child_carries_no_session() {
+        let result = tokio::time::timeout(DEADLINE, ffi_spawn_guarded(async { observe() })).await;
+        assert!(
+            matches!(&result, Ok(Ok((sid, None))) if sid.is_empty()),
+            "a child spawned outside any session sees no session scope"
         );
     }
 }

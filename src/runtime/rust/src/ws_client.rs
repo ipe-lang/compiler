@@ -15,7 +15,7 @@
 //! fns, so the surface is reachable on the native target: importing
 //! `Ipe.WebSocket` and calling any of the stdlib `on*` wrappers compiles and
 //! runs end-to-end. `F`'s bound is `Send` (not `Send + Sync`) because `to_msg`
-//! is moved into exactly one detached `tokio::spawn` task per subscription,
+//! is moved into exactly one detached source body per subscription,
 //! never shared behind an `Arc` — the same contract `sub_subscribe_stream`
 //! uses.
 //!
@@ -25,6 +25,8 @@
 //! `KernelClass::Tea` arm for the allowlist tag that makes it resolvable.
 
 use super::*;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::tea::SourceTask;
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -693,12 +695,12 @@ fn subscribe_events(socket_id: i64) -> Option<tokio::sync::broadcast::Receiver<W
 }
 
 // WS subscriptions are set up ONCE per (socket, kind): the `SubRuntime`
-// reconciler aborts + respawns every source on each update, but a broadcast has
-// no replay, so a re-spawned receiver would miss frames sent during the gap. So
-// the real listener is spawned DETACHED (not the handle `SubRuntime` tracks) the first
-// time, and re-subscribes are no-ops — matching  "subsequent re-subscriptions
-// are no-ops". The emit callback funnels into the loop channel, stable for the
-// program's lifetime.
+// reconciler stops and restarts every tracked source on each update, but a
+// broadcast has no replay, so a restarted receiver would miss frames sent during
+// the gap. So the first subscribe returns the real listener as a
+// `SourceTask::Detached` body, which re-evaluation never stops, and every
+// re-subscribe returns `SourceTask::Idle`. The emit callback funnels into the
+// loop channel, stable for the program's lifetime.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 #[cfg(not(target_arch = "wasm32"))]
 enum WsSubKind {
@@ -736,7 +738,7 @@ fn ws_registered(socket_id: i64) -> bool {
 
 /// onMessage : (WebSocketMessage -> msg) -> Sub msg
 ///
-/// `to_msg` is moved exclusively into the ONE detached `tokio::spawn` task
+/// `to_msg` is moved exclusively into the one detached source body
 /// below (never behind a shared `Arc`, never read from two threads at once) —
 /// the same shape as the sibling `sub_subscribe_stream` (`http_stream.rs`) and
 /// `sub_subscribe_topic` (`pubsub.rs`), whose doc comments state the identical
@@ -754,7 +756,7 @@ where
 {
     IpeSub::Source(Box::new(move |emit| {
         if ws_registered(socket_id) && ws_mark_subscribed(socket_id, WsSubKind::Message) {
-            tokio::spawn(async move {
+            SourceTask::Detached(Box::pin(async move {
                 let mut rx = match subscribe_events(socket_id) {
                     Some(rx) => rx,
                     None => return,
@@ -770,9 +772,10 @@ where
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            });
+            }))
+        } else {
+            SourceTask::Idle
         }
-        tokio::spawn(async {}) // dummy handle for `SubRuntime` to abort harmlessly
     }))
 }
 
@@ -786,14 +789,14 @@ where
         if ws_registered(socket_id) && ws_mark_subscribed(socket_id, WsSubKind::Open) {
             emit(msg);
         }
-        tokio::spawn(async {})
+        SourceTask::Idle
     }))
 }
 
 /// onClose : (CloseCode -> msg) -> Sub msg
 ///
 /// Same `Send`-only bound rationale as [`sub_subscribe_ws_message`]:
-/// `to_msg` is moved into the single detached `tokio::spawn` below and never
+/// `to_msg` is moved into the one detached source body below and never
 /// shared behind an `Arc`, so `Send + 'static` is the exact contract.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn sub_subscribe_ws_close<M, F>(socket_id: i64, to_msg: F) -> IpeSub<M>
@@ -803,7 +806,7 @@ where
 {
     IpeSub::Source(Box::new(move |emit| {
         if ws_registered(socket_id) && ws_mark_subscribed(socket_id, WsSubKind::Close) {
-            tokio::spawn(async move {
+            SourceTask::Detached(Box::pin(async move {
                 let mut rx = match subscribe_events(socket_id) {
                     Some(rx) => rx,
                     None => return,
@@ -820,16 +823,17 @@ where
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            });
+            }))
+        } else {
+            SourceTask::Idle
         }
-        tokio::spawn(async {})
     }))
 }
 
 /// onError : (Error -> msg) -> Sub msg. E is the project error (From<String>).
 ///
 /// Same `Send`-only bound rationale as [`sub_subscribe_ws_message`]:
-/// `to_msg` is moved into the single detached `tokio::spawn` below and never
+/// `to_msg` is moved into the one detached source body below and never
 /// shared behind an `Arc`, so `Send + 'static` is the exact contract.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn sub_subscribe_ws_error<E, M, F>(socket_id: i64, to_msg: F) -> IpeSub<M>
@@ -840,7 +844,7 @@ where
 {
     IpeSub::Source(Box::new(move |emit| {
         if ws_registered(socket_id) && ws_mark_subscribed(socket_id, WsSubKind::Error) {
-            tokio::spawn(async move {
+            SourceTask::Detached(Box::pin(async move {
                 let mut rx = match subscribe_events(socket_id) {
                     Some(rx) => rx,
                     None => return,
@@ -857,9 +861,10 @@ where
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            });
+            }))
+        } else {
+            SourceTask::Idle
         }
-        tokio::spawn(async {})
     }))
 }
 
@@ -991,6 +996,80 @@ mod tests {
             WsFailure::Io(std::io::ErrorKind::ConnectionRefused)
         );
         assert!(!WsFailure::of(&io).to_string().contains("73.150.2.210"));
+    }
+
+    /// A subscription sink collecting every emitted message.
+    #[derive(Clone)]
+    struct Inbox(tokio::sync::mpsc::UnboundedSender<WsClientMessage>);
+
+    impl crate::tea::SubSink<WsClientMessage> for Inbox {
+        fn deliver(&self, msg: WsClientMessage) -> impl std::future::Future<Output = bool> + Send {
+            std::future::ready(self.0.send(msg).is_ok())
+        }
+
+        fn emit(&self, msg: WsClientMessage) {
+            let _ = self.0.send(msg);
+        }
+    }
+
+    /// The `onMessage` listener started by the first subscribe keeps running
+    /// when the loop re-evaluates its subscriptions, and a re-subscribe starts
+    /// no second listener.
+    #[tokio::test]
+    async fn ws_message_listener_survives_reconcile() {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        let id = WS_CLIENT_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel::<WsCmd>(1);
+        let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(8);
+        let writer = tokio::spawn(std::future::pending::<()>());
+        let reader = tokio::spawn(std::future::pending::<()>());
+        registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            ClientEntry {
+                cmd_tx,
+                frames_tx: frames_tx.clone(),
+                writer_abort: writer.abort_handle(),
+                reader_abort: reader.abort_handle(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subs = crate::tea::SubRuntime::new(Inbox(tx));
+        let on_message = || sub_subscribe_ws_message(id, |m: WsClientMessage| m);
+        subs.reconcile(on_message());
+        subs.reconcile(on_message());
+        let subscribed = tokio::time::timeout(DEADLINE, async {
+            while frames_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(subscribed.is_ok(), "the listener survives re-evaluation");
+        assert_eq!(
+            frames_tx.receiver_count(),
+            1,
+            "a re-subscribe starts no second listener"
+        );
+
+        let sent = frames_tx.send(WsEvent::Message(WsClientMessage::Text("hi".to_owned())));
+        assert!(sent.is_ok());
+        let first = tokio::time::timeout(DEADLINE, rx.recv()).await;
+        assert!(
+            matches!(&first, Ok(Some(WsClientMessage::Text(t))) if t == "hi"),
+            "the frame reaches the loop"
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the frame reaches the loop exactly once"
+        );
+
+        drop(subs);
+        deregister(id);
+        writer.abort();
+        reader.abort();
     }
 
     #[test]
