@@ -462,8 +462,18 @@ pub fn extract_tree(root: &Path) -> Result<PublicApi, DiffError> {
 /// # Errors
 /// [`DiffError`] on a typecheck failure or an open interface.
 pub fn extract_walked(tree: &WalkedTree) -> Result<PublicApi, DiffError> {
-    let sources = &tree.modules;
+    extract_sources(&tree.modules)
+}
 
+/// Extract the public API surface of exactly the module `sources` given.
+///
+/// The one extraction every caller reaches, so the API a verdict judges comes
+/// from the very text the caller holds (a [`project::PackageSnapshot`]'s
+/// sources) and never from a second read of the files.
+///
+/// # Errors
+/// [`DiffError`] on a typecheck failure or an open interface.
+pub fn extract_sources(sources: &project::ModuleSources) -> Result<PublicApi, DiffError> {
     let db = ipe_db::IpeDatabase::new();
     let mut prepared: BTreeMap<Vec<String>, (PathBuf, String)> = sources.clone();
     let mut discovered: Vec<project::DiscoveredModule> = sources
@@ -677,5 +687,24 @@ mod tests {
             result.as_ref().is_ok_and(|tree| tree.modules.len() == 1),
             "a named single-file link must be followed: {result:?}"
         );
+    }
+
+    /// Extracting from the sources a tree holds is the same extraction as the tree's own.
+    #[test]
+    fn extract_sources_equals_extract_walked() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-api-surface-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mk src");
+        std::fs::write(
+            root.join("src").join("Main.ipe"),
+            "module Main exposing (answer)\n\nanswer : Int\nanswer =\n    42\n",
+        )
+        .expect("write Main");
+        let tree = read_tree(&root).expect("read tree");
+        let _ = std::fs::remove_dir_all(&root);
+        let walked = extract_walked(&tree).expect("walked api");
+        let sources = extract_sources(&tree.modules).expect("sources api");
+        assert_eq!(walked, sources);
     }
 }

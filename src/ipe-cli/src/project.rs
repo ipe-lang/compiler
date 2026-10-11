@@ -1040,6 +1040,289 @@ fn file_to_module(src_root: &Path, path: &Path) -> Result<Option<DiscoveredModul
     }
 }
 
+/// The `module path -> (source file, source text)` map a package's modules read into.
+pub type ModuleSources = BTreeMap<Vec<String>, (PathBuf, String)>;
+
+/// One bounded read of a package directory: what a verdict judges and the digest that pins it.
+///
+/// The manifest, the lockfile, every module's source and the tree digest all come
+/// from a single walk, so a verdict over a snapshot and the digest the package
+/// ships under describe the same bytes, never two reads of one path. The walk is
+/// held to the package-source ceilings; a symlink, a special file or a name that
+/// is not UTF-8 refuses it. Fields are private: a snapshot is minted only by
+/// [`PackageSnapshot::capture`].
+pub struct PackageSnapshot {
+    manifest: ProjectManifest,
+    lock: crate::lockfile::Lockfile,
+    modules: Vec<DiscoveredModule>,
+    sources: ModuleSources,
+    tree: crate::cache::TreeDigest,
+}
+
+impl PackageSnapshot {
+    /// Capture the package directory `root` in one walk under the package-source ceilings.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] when the tree cannot be walked, `package.ipe` is absent, a
+    /// kept file is not UTF-8, or the source root lies in a hidden directory the
+    /// tree digest does not cover; [`CliError::LocalLimitExceeded`] past a tree
+    /// ceiling or on a refused entry; [`CliError::FileTooLarge`] for a manifest,
+    /// lockfile or module past its read cap; [`CliError::SourceRefused`] when
+    /// `package.ipe` or `ipe.lock` is a directory; [`CliError::DeviceNamedModule`]
+    /// for a module path with a device-named segment; and every refusal of the
+    /// manifest and lockfile readers for malformed text.
+    pub fn capture(root: &Path) -> Result<Self, CliError> {
+        Self::capture_within(root, crate::remote_ingest::PACKAGE_SOURCE.tree())
+    }
+
+    /// [`PackageSnapshot::capture`] under an explicit tree ceiling.
+    ///
+    /// # Errors
+    /// As [`PackageSnapshot::capture`].
+    pub fn capture_within(
+        root: &Path,
+        ceiling: &crate::remote_ingest::TreeCeiling,
+    ) -> Result<Self, CliError> {
+        use crate::io_bounded::{MANIFEST_READ_CAP, SMALL_FILE_READ_CAP};
+        use crate::lockfile::LOCKFILE_NAME;
+        use crate::package_manifest::PACKAGE_IPE;
+
+        let manifest_path = root.join(PACKAGE_IPE);
+        let lock_path = root.join(LOCKFILE_NAME);
+        let mut capture = crate::cache::capture_tree_within(root, ceiling, snapshot_keep_cap)?;
+        // The walk lists files, so a directory in a file's place would read as absent.
+        for name in [PACKAGE_IPE, LOCKFILE_NAME] {
+            if capture.has_dir(name) {
+                return Err(crate::io_bounded::source_refused(
+                    &root.join(name),
+                    crate::io_bounded::SourceRefusal::NotRegularFile,
+                ));
+            }
+        }
+
+        let manifest_text = capture
+            .take(PACKAGE_IPE)
+            .map(|file| kept_text(file, &manifest_path, MANIFEST_READ_CAP))
+            .transpose()?
+            .ok_or_else(|| CliError::Io {
+                path: manifest_path.clone(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })?;
+        let (manifest, spelled_src_root) =
+            crate::package_manifest::parse_package_manifest_source(&manifest_text, &manifest_path)?;
+        let lock = capture
+            .take(LOCKFILE_NAME)
+            .map(|file| kept_text(file, &lock_path, SMALL_FILE_READ_CAP))
+            .transpose()?
+            .map_or_else(
+                || Ok(crate::lockfile::Lockfile::default()),
+                |text| crate::lockfile::Lockfile::from_text(&text),
+            )?;
+
+        let prefix = src_root_prefix(root, &spelled_src_root, &manifest.src_root, &capture)?;
+        let (tree, kept) = capture.into_parts();
+        let (modules, sources) = snapshot_modules(&manifest.src_root, &prefix, kept)?;
+        Ok(Self {
+            manifest,
+            lock,
+            modules,
+            sources,
+            tree,
+        })
+    }
+
+    /// The parsed `package.ipe`.
+    #[must_use]
+    pub const fn manifest(&self) -> &ProjectManifest {
+        &self.manifest
+    }
+
+    /// The parsed `ipe.lock`; empty when the package has none.
+    #[must_use]
+    pub const fn lock(&self) -> &crate::lockfile::Lockfile {
+        &self.lock
+    }
+
+    /// The modules the walk found under the source root, sorted.
+    #[must_use]
+    pub const fn modules(&self) -> &[DiscoveredModule] {
+        self.modules.as_slice()
+    }
+
+    /// Every module's source text, keyed by module path.
+    #[must_use]
+    pub const fn sources(&self) -> &ModuleSources {
+        &self.sources
+    }
+
+    /// The digest of the walked tree: the one the kept bytes were hashed under.
+    #[must_use]
+    pub const fn tree(&self) -> &crate::cache::TreeDigest {
+        &self.tree
+    }
+}
+
+/// The byte cap the walk keeps the file at tree-relative `rel` under, or `None` for a file it only hashes.
+///
+/// The manifest, the lockfile and every `.ipe` file whose name is a module
+/// segment are kept; the source root is known only once the manifest is parsed,
+/// so which of those files are modules is decided afterwards.
+fn snapshot_keep_cap(rel: &str) -> Option<u64> {
+    use crate::io_bounded::{MANIFEST_READ_CAP, SMALL_FILE_READ_CAP, SOURCE_READ_CAP};
+    if rel == crate::package_manifest::PACKAGE_IPE {
+        Some(MANIFEST_READ_CAP)
+    } else if rel == crate::lockfile::LOCKFILE_NAME {
+        Some(SMALL_FILE_READ_CAP)
+    } else {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        name.strip_suffix(".ipe")
+            .is_some_and(is_well_formed_segment)
+            .then_some(SOURCE_READ_CAP)
+    }
+}
+
+/// The UTF-8 text of a kept file, refused past its read cap.
+fn kept_text(file: crate::cache::KeptFile, path: &Path, cap: u64) -> Result<String, CliError> {
+    let too_large = |max| CliError::FileTooLarge {
+        path: path.to_path_buf(),
+        max,
+    };
+    match file {
+        crate::cache::KeptFile::Oversize { cap: kept_cap } => Err(too_large(kept_cap)),
+        crate::cache::KeptFile::Bytes(bytes) => {
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
+                return Err(too_large(cap));
+            }
+            String::from_utf8(bytes).map_err(|e| CliError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            })
+        }
+    }
+}
+
+/// An `InvalidInput` I/O refusal at `path`.
+fn snapshot_invalid(path: &Path, reason: &'static str) -> CliError {
+    CliError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, reason),
+    }
+}
+
+/// The directory segments of the source root the manifest `spelled`, located in the captured tree.
+///
+/// The segments come from the manifest's spelling, never from a live lookup,
+/// and the walk must have met them as one visible directory: the walk refuses a
+/// link, so every level it met is a real directory and the modules read from the
+/// capture are those of the spelled one. A source root in a hidden directory is
+/// refused: the walk skips hidden directories, so modules there would be read by
+/// no walk and pinned by no hash. The live `src_root` the manifest parse resolved
+/// must name the same directory, or the tree changed while it was read.
+fn src_root_prefix(
+    root: &Path,
+    spelled: &str,
+    src_root: &Path,
+    capture: &crate::cache::TreeCapture,
+) -> Result<Vec<String>, CliError> {
+    use crate::contained_path::PathEscape;
+    let escape = |reason| CliError::PathEscape {
+        raw: spelled.to_owned(),
+        reason,
+    };
+    let mut prefix = Vec::new();
+    for component in Path::new(spelled).components() {
+        let name = match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(escape(PathEscape::Absolute));
+            }
+            std::path::Component::ParentDir => return Err(escape(PathEscape::ParentTraversal)),
+        };
+        let Some(name) = name.to_str() else {
+            return Err(snapshot_invalid(
+                src_root,
+                "the source root's path is not valid UTF-8",
+            ));
+        };
+        if name.starts_with('.') {
+            return Err(snapshot_invalid(
+                src_root,
+                "the source root lies in a hidden directory the tree digest does not cover",
+            ));
+        }
+        prefix.push(name.to_owned());
+    }
+    if !prefix.is_empty() && !capture.has_dir(&prefix.join("/")) {
+        return Err(snapshot_invalid(
+            src_root,
+            "the source root is not a directory the package walk met",
+        ));
+    }
+    let canon_root = fs::canonicalize(root).map_err(|source| CliError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let walked = prefix
+        .iter()
+        .fold(canon_root, |path, segment| path.join(segment));
+    if walked != src_root {
+        return Err(snapshot_invalid(
+            src_root,
+            "the source root changed while the package was read",
+        ));
+    }
+    Ok(prefix)
+}
+
+/// `rel` with the leading `prefix` segments removed, or `None` when it is not under them.
+fn strip_src_prefix<'r>(rel: &'r str, prefix: &[String]) -> Option<&'r str> {
+    let mut rest = rel;
+    for segment in prefix {
+        rest = rest.strip_prefix(segment.as_str())?.strip_prefix('/')?;
+    }
+    Some(rest)
+}
+
+/// The modules among the walk's kept `.ipe` files, under the same path rule [`discover_modules`] applies.
+fn snapshot_modules(
+    src_root: &Path,
+    prefix: &[String],
+    kept: BTreeMap<String, crate::cache::KeptFile>,
+) -> Result<(Vec<DiscoveredModule>, ModuleSources), CliError> {
+    let mut modules = Vec::new();
+    let mut sources = ModuleSources::new();
+    for (rel, file) in kept {
+        let Some(in_src) = strip_src_prefix(&rel, prefix) else {
+            continue;
+        };
+        let Some(stem) = in_src.strip_suffix(".ipe") else {
+            continue;
+        };
+        let segments: Vec<&str> = stem.split('/').collect();
+        // One join per segment, so the path carries the platform's separator as discovery's does.
+        let path = in_src
+            .split('/')
+            .fold(src_root.to_path_buf(), |path, segment| path.join(segment));
+        match module_path_shape(&segments) {
+            ModulePathShape::NotModule => continue,
+            ModulePathShape::DeviceNamed(segment) => {
+                return Err(CliError::DeviceNamedModule {
+                    path,
+                    segment: segment.to_owned(),
+                });
+            }
+            ModulePathShape::Module => {}
+        }
+        let text = kept_text(file, &path, crate::io_bounded::SOURCE_READ_CAP)?;
+        let module_path: Vec<String> = segments.iter().copied().map(str::to_owned).collect();
+        sources.insert(module_path.clone(), (path.clone(), text));
+        modules.push(DiscoveredModule::user(path, module_path));
+    }
+    modules.sort();
+    Ok((modules, sources))
+}
+
 /// What a candidate module path is, the one rule package discovery and loose-file imports share.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ModulePathShape<'s> {
@@ -2362,5 +2645,404 @@ import String
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ── Package snapshot ──────────────────────────────────────────────────────
+
+    const SNAPSHOT_MANIFEST: &str =
+        "module Package exposing (package)\n\npackage =\n    { name = \"snap\" }\n";
+
+    /// A package directory unique to this test: a manifest and `src/Main.ipe`.
+    #[allow(clippy::expect_used)] // test fixture: an unwritable temp dir IS the failure
+    fn snapshot_dir(name: &str) -> PathBuf {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe_snapshot_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create src/");
+        fs::write(root.join("package.ipe"), SNAPSHOT_MANIFEST).expect("write package.ipe");
+        fs::write(
+            root.join("src").join("Main.ipe"),
+            "module Main exposing (main)\nmain = 0\n",
+        )
+        .expect("write Main.ipe");
+        root
+    }
+
+    /// Whether `result` is the typed refusal of a file past `max` bytes.
+    fn is_too_large<T>(result: &Result<T, CliError>, max: u64) -> bool {
+        matches!(result, Err(CliError::FileTooLarge { max: got, .. }) if *got == max)
+    }
+
+    /// A snapshot lists the modules discovery lists and carries the digest `hash_tree` computes.
+    #[test]
+    fn snapshot_digest_equals_hash_tree() {
+        let root = snapshot_dir("agrees");
+        fs::create_dir_all(root.join("src").join("Lib")).expect("create Lib");
+        fs::write(
+            root.join("src").join("Lib").join("Utils.ipe"),
+            "module Lib.Utils exposing (x)\n\nx = 0\n",
+        )
+        .expect("write Utils");
+        fs::write(root.join("src").join("lower.ipe"), "not a module\n").expect("write lower");
+        fs::write(root.join("src").join("notes.txt"), "notes\n").expect("write notes");
+
+        let snapshot = PackageSnapshot::capture(&root);
+        let manifest = parse_manifest(&root.join("package.ipe")).expect("manifest");
+        let discovered = discover_modules(&manifest.src_root).expect("discover");
+        let hash = crate::cache::hash_tree(&root).expect("hash");
+        let main_text = crate::io_bounded::read_walked_source(&root.join("src").join("Main.ipe"))
+            .expect("read");
+        let _ = fs::remove_dir_all(&root);
+
+        let snapshot = snapshot.expect("capture");
+        assert_eq!(snapshot.modules(), discovered.as_slice());
+        assert_eq!(snapshot.tree().to_hex(), hash);
+        assert_eq!(snapshot.manifest().name, "snap");
+        assert_eq!(snapshot.sources().len(), 2, "only modules are sources");
+        assert_eq!(
+            snapshot
+                .sources()
+                .get(&module(&["Main"]))
+                .map(|(_, text)| text.as_str()),
+            Some(main_text.as_str())
+        );
+        assert!(snapshot.lock().packages().is_empty());
+    }
+
+    /// The digest covers exactly the bytes the snapshot holds: rebuilding the
+    /// tree from the held manifest and sources hashes to the same value.
+    #[test]
+    fn the_digest_covers_exactly_the_bytes_the_snapshot_holds() {
+        let root = snapshot_dir("digest_bytes");
+        fs::create_dir_all(root.join("src").join("Lib")).expect("create Lib");
+        fs::write(
+            root.join("src").join("Lib").join("Utils.ipe"),
+            "module Lib.Utils exposing (x)\n\nx = 0\n",
+        )
+        .expect("write Utils");
+        let snapshot = PackageSnapshot::capture(&root).expect("capture");
+        let _ = fs::remove_dir_all(&root);
+
+        let rebuilt =
+            ipe_test_temp::temp_root().join(format!("ipe_snapshot_rebuilt_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&rebuilt);
+        fs::create_dir_all(&rebuilt).expect("create rebuilt");
+        fs::write(rebuilt.join("package.ipe"), SNAPSHOT_MANIFEST).expect("write manifest");
+        for (path, text) in snapshot.sources().values() {
+            let rel = path
+                .strip_prefix(&snapshot.manifest().src_root)
+                .expect("a source lies under the source root");
+            let dest = rebuilt.join("src").join(rel);
+            fs::create_dir_all(dest.parent().expect("a source has a parent")).expect("mkdir");
+            fs::write(&dest, text).expect("write source");
+        }
+        let rebuilt_hash = crate::cache::hash_tree(&rebuilt).expect("hash rebuilt");
+        let _ = fs::remove_dir_all(&rebuilt);
+        assert_eq!(snapshot.tree().to_hex(), rebuilt_hash);
+    }
+
+    /// The source root the manifest names decides which `.ipe` files are modules.
+    #[test]
+    fn a_snapshot_reads_modules_under_the_manifest_source_root() {
+        let root = snapshot_dir("src_prefix");
+        fs::write(
+            root.join("package.ipe"),
+            "module Package exposing (package)\n\npackage =\n    \
+             { name = \"snap\", sourceRoot = \"app\" }\n",
+        )
+        .expect("write manifest");
+        fs::create_dir_all(root.join("app")).expect("create app");
+        fs::write(
+            root.join("app").join("Entry.ipe"),
+            "module Entry exposing (e)\n\ne = 0\n",
+        )
+        .expect("write Entry");
+        let snapshot = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        let snapshot = snapshot.expect("capture");
+        let paths: Vec<&[String]> = snapshot
+            .modules()
+            .iter()
+            .map(DiscoveredModule::module_path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec![module(&["Entry"]).as_slice()],
+            "`src/Main.ipe` lies outside the source root"
+        );
+    }
+
+    /// A source root in a hidden directory is refused: the digest would not cover it.
+    #[test]
+    fn a_source_root_in_a_hidden_directory_is_refused() {
+        let root = snapshot_dir("hidden_src");
+        fs::write(
+            root.join("package.ipe"),
+            "module Package exposing (package)\n\npackage =\n    \
+             { name = \"snap\", sourceRoot = \".src\" }\n",
+        )
+        .expect("write manifest");
+        fs::create_dir_all(root.join(".src")).expect("create .src");
+        fs::write(
+            root.join(".src").join("Main.ipe"),
+            "module Main exposing (main)\nmain = 0\n",
+        )
+        .expect("write Main");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(invalid_because(&result, "hidden directory"));
+    }
+
+    /// Whether `result` is the `InvalidInput` refusal whose reason names `needle`.
+    fn invalid_because<T>(result: &Result<T, CliError>, needle: &str) -> bool {
+        matches!(
+            result,
+            Err(CliError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidInput
+                    && source.to_string().contains(needle)
+        )
+    }
+
+    /// A source root spelled through a hidden directory is refused even where a
+    /// link there resolves to a visible directory: the walk never lists the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_root_spelled_through_a_hidden_link_is_refused() {
+        let root = snapshot_dir("hidden_link_src");
+        fs::write(
+            root.join("package.ipe"),
+            "module Package exposing (package)\n\npackage =\n    \
+             { name = \"snap\", sourceRoot = \".h/link\" }\n",
+        )
+        .expect("write manifest");
+        fs::create_dir_all(root.join("app")).expect("create app");
+        fs::write(
+            root.join("app").join("Entry.ipe"),
+            "module Entry exposing (e)\n\ne = 0\n",
+        )
+        .expect("write Entry");
+        fs::create_dir_all(root.join(".h")).expect("create .h");
+        std::os::unix::fs::symlink("../app", root.join(".h").join("link"))
+            .expect("plant .h/link -> app");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(invalid_because(&result, "hidden directory"));
+    }
+
+    /// The source root is located in the captured walk by the manifest's
+    /// spelling: one the walk never met, or a live resolution naming another
+    /// directory than the spelled one, is refused.
+    #[test]
+    fn the_source_root_is_located_in_the_walk_never_by_a_live_lookup() {
+        let root = snapshot_dir("src_in_walk");
+        let capture = crate::cache::capture_tree_within(
+            &root,
+            crate::remote_ingest::PACKAGE_SOURCE.tree(),
+            snapshot_keep_cap,
+        )
+        .expect("capture");
+        // A directory made after the walk exists live but was never walked.
+        fs::create_dir_all(root.join("app")).expect("create app");
+        let live_app = fs::canonicalize(root.join("app")).expect("canonical app");
+        let live_src = fs::canonicalize(root.join("src")).expect("canonical src");
+        let unwalked = src_root_prefix(&root, "app", &live_app, &capture);
+        let moved = src_root_prefix(&root, "src", &live_app, &capture);
+        let spelled = src_root_prefix(&root, "./src", &live_src, &capture);
+        let _ = fs::remove_dir_all(&root);
+        assert!(invalid_because(&unwalked, "the package walk met"));
+        assert!(invalid_because(
+            &moved,
+            "changed while the package was read"
+        ));
+        assert_eq!(
+            spelled.expect("the walked source root"),
+            vec!["src".to_owned()]
+        );
+    }
+
+    /// A manifest past its read cap is refused, never parsed from a truncated read.
+    #[test]
+    fn a_manifest_past_its_read_cap_is_refused() {
+        let root = snapshot_dir("big_manifest");
+        let cap = crate::io_bounded::MANIFEST_READ_CAP;
+        let past = usize::try_from(cap).expect("cap fits usize") + 1;
+        fs::write(root.join("package.ipe"), vec![b' '; past]).expect("write manifest");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(is_too_large(&result, cap));
+    }
+
+    /// A module past its read cap is refused; a non-module `.ipe` file past it is only hashed.
+    #[test]
+    fn a_module_past_its_read_cap_is_refused_but_a_non_module_is_not() {
+        let cap = crate::io_bounded::SOURCE_READ_CAP;
+        let past = usize::try_from(cap).expect("cap fits usize") + 1;
+
+        let root = snapshot_dir("big_module");
+        fs::write(root.join("src").join("Big.ipe"), vec![b' '; past]).expect("write Big");
+        let module_result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(is_too_large(&module_result, cap));
+
+        let root = snapshot_dir("big_non_module");
+        fs::write(root.join("src").join("big.ipe"), vec![b' '; past]).expect("write big");
+        let non_module_result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(non_module_result.is_ok());
+    }
+
+    /// An absent manifest is a not-found error.
+    #[test]
+    fn a_missing_manifest_is_not_found() {
+        let root = snapshot_dir("no_manifest");
+        fs::remove_file(root.join("package.ipe")).expect("remove manifest");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(
+            result,
+            Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    /// A directory standing where the manifest or the lockfile belongs is refused, never read as absent.
+    #[test]
+    fn a_directory_in_place_of_the_manifest_or_lockfile_is_refused() {
+        let root = snapshot_dir("dir_lock");
+        fs::create_dir_all(root.join("ipe.lock")).expect("create ipe.lock dir");
+        let lock_dir = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(is_refused(
+            &lock_dir,
+            crate::io_bounded::SourceRefusal::NotRegularFile
+        ));
+
+        let root = snapshot_dir("dir_manifest");
+        fs::remove_file(root.join("package.ipe")).expect("remove manifest");
+        fs::create_dir_all(root.join("package.ipe")).expect("create package.ipe dir");
+        let manifest_dir = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(is_refused(
+            &manifest_dir,
+            crate::io_bounded::SourceRefusal::NotRegularFile
+        ));
+    }
+
+    /// A malformed lockfile refuses the snapshot.
+    #[test]
+    fn a_malformed_lockfile_is_refused() {
+        let root = snapshot_dir("bad_lock");
+        fs::write(root.join("ipe.lock"), "[[package]]\nname = \"mylib\"\n").expect("write lock");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(result, Err(CliError::LockRefused(_))));
+    }
+
+    /// A module whose path has a device-named segment is refused, as discovery refuses it.
+    #[test]
+    fn a_device_named_module_is_refused() {
+        let root = snapshot_dir("device");
+        fs::write(
+            root.join("src").join("Aux.ipe"),
+            "module Aux exposing (a)\n\na = 0\n",
+        )
+        .expect("write Aux");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(
+            result,
+            Err(CliError::DeviceNamedModule { segment, .. }) if segment == "Aux"
+        ));
+    }
+
+    /// A module that is not UTF-8 is refused, never lossily decoded.
+    #[test]
+    fn a_non_utf8_module_is_refused() {
+        let root = snapshot_dir("non_utf8");
+        fs::write(root.join("src").join("Bad.ipe"), [0xff_u8, 0xfe, 0xfd]).expect("write Bad");
+        let result = PackageSnapshot::capture(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(
+            result,
+            Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    /// The package-source ceilings bind the snapshot's one walk.
+    #[test]
+    fn a_tree_past_the_entry_ceiling_is_refused() {
+        let root = snapshot_dir("entries");
+        let ceiling = crate::remote_ingest::TreeCeiling::for_test(1 << 20, 1, 1 << 20, 8)
+            .expect("paired tree ceiling");
+        let result = PackageSnapshot::capture_within(&root, &ceiling);
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(
+            result,
+            Err(CliError::LocalLimitExceeded(refusal))
+                if refusal.limit == crate::remote_ingest::IngestLimit::Entries(1)
+        ));
+    }
+
+    /// The tree refusal `result` carries, from a snapshot or from `hash_tree`.
+    fn snapshot_limit<T>(
+        result: &Result<T, CliError>,
+    ) -> Option<crate::remote_ingest::IngestLimit> {
+        match result {
+            Err(CliError::LocalLimitExceeded(refusal)) => Some(refusal.limit),
+            _ => None,
+        }
+    }
+
+    /// The tree refusal a `hash_tree` result carries.
+    fn hash_limit<T>(
+        result: &Result<T, crate::cache::TreeHashError>,
+    ) -> Option<crate::remote_ingest::IngestLimit> {
+        match result {
+            Err(crate::cache::TreeHashError::Exceeded(refusal)) => Some(refusal.limit),
+            _ => None,
+        }
+    }
+
+    /// A snapshot is refused exactly where `hash_tree` is: a symlinked module,
+    /// a FIFO, and a file past the per-file ceiling each refuse both with the
+    /// same limit, so a kept file is never a followed link nor an unbounded read.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_symlink_and_oversize_like_hash_tree() {
+        use crate::remote_ingest::IngestLimit;
+
+        let root = snapshot_dir("symlink");
+        std::os::unix::fs::symlink(
+            root.join("src").join("Main.ipe"),
+            root.join("src").join("Alias.ipe"),
+        )
+        .expect("plant Alias -> Main");
+        let link_snapshot = PackageSnapshot::capture(&root);
+        let link_hash = crate::cache::hash_tree(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(snapshot_limit(&link_snapshot), Some(IngestLimit::Symlink));
+        assert_eq!(hash_limit(&link_hash), Some(IngestLimit::Symlink));
+
+        let root = snapshot_dir("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(root.join("src").join("Pipe.ipe"))
+            .status();
+        assert!(matches!(made, Ok(status) if status.success()), "mkfifo");
+        let fifo_snapshot = PackageSnapshot::capture(&root);
+        let fifo_hash = crate::cache::hash_tree(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            snapshot_limit(&fifo_snapshot),
+            Some(IngestLimit::SpecialFile)
+        );
+        assert_eq!(hash_limit(&fifo_hash), Some(IngestLimit::SpecialFile));
+
+        let root = snapshot_dir("oversize");
+        let ceiling = crate::remote_ingest::TreeCeiling::for_test(1 << 20, 64, 8, 8)
+            .expect("paired tree ceiling");
+        let big_snapshot = PackageSnapshot::capture_within(&root, &ceiling);
+        let big_hash = crate::cache::hash_tree_within(&root, &ceiling);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(snapshot_limit(&big_snapshot), Some(IngestLimit::Bytes(8)));
+        assert_eq!(hash_limit(&big_hash), Some(IngestLimit::Bytes(8)));
     }
 }

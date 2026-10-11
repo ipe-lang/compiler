@@ -318,16 +318,110 @@ impl TreeDigest {
 /// Feed the deterministic byte stream [`hash_tree`] hashes into a fresh
 /// [`Sha256`] under `ceiling` and return the UN-finalized hasher.
 ///
+/// # Errors
+/// As [`hash_tree`].
+fn tree_hasher_within(root: &Path, ceiling: &TreeCeiling) -> Result<Sha256, TreeHashError> {
+    walk_within(root, ceiling, |_| None).map(|walked| walked.hasher)
+}
+
+/// What one budgeted walk produced: the un-finalized hasher and what it kept.
+struct Walked {
+    hasher: Sha256,
+    kept: BTreeMap<String, KeptFile>,
+    dirs: BTreeSet<String>,
+}
+
+/// The one budgeted walk: hash every file into the [`hash_tree`] stream and keep
+/// the bytes of each file `keep` names.
+///
 /// The root is held once; every entry below it is reached from that handle,
 /// one entry name per level, each level opened without following a link, so
 /// no lookup leaves the tree or passes through a link.
 ///
+/// `keep` maps a tree-relative path to the byte cap its file is kept under, or
+/// `None` when the file is only hashed. A kept file's bytes are the very bytes
+/// fed to the hasher, so the digest is a function of the kept value.
+///
 /// # Errors
 /// As [`hash_tree`].
-fn tree_hasher_within(root: &Path, ceiling: &TreeCeiling) -> Result<Sha256, TreeHashError> {
+fn walk_within(
+    root: &Path,
+    ceiling: &TreeCeiling,
+    keep: impl Fn(&str) -> Option<u64>,
+) -> Result<Walked, TreeHashError> {
     let held = HeldDir::open_root(root).map_err(|refusal| tree_io(root, refusal.into_io()))?;
-    let files = walk_tree(&held, root, ceiling)?;
-    hash_walked(&held, root, &files, ceiling)
+    let (files, dirs) = walk_tree(&held, root, ceiling)?;
+    let (hasher, kept) = hash_walked(&held, root, &files, ceiling, keep)?;
+    Ok(Walked {
+        hasher,
+        kept,
+        dirs: dirs.into_iter().map(|dir| dir.0).collect(),
+    })
+}
+
+/// What a walk keeps of one file whose bytes the caller asked for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeptFile {
+    /// The file's bytes, exactly those hashed into the tree digest.
+    Bytes(Vec<u8>),
+    /// The file is larger than the cap it was to be kept under; it is hashed, not kept.
+    Oversize {
+        /// The byte cap the file exceeded.
+        cap: u64,
+    },
+}
+
+/// One budgeted walk of a source tree: its digest and the bytes it kept.
+///
+/// The digest is computed over the same bytes the kept files hold, so a verdict
+/// over the kept bytes and the digest that pins them can never describe two
+/// reads.
+pub struct TreeCapture {
+    digest: TreeDigest,
+    kept: BTreeMap<String, KeptFile>,
+    dirs: BTreeSet<String>,
+}
+
+impl TreeCapture {
+    /// Whether the walk met a visible directory at this tree-relative path.
+    #[must_use]
+    pub fn has_dir(&self, rel: &str) -> bool {
+        self.dirs.contains(rel)
+    }
+
+    /// Take what the walk kept of the file at this tree-relative path.
+    pub fn take(&mut self, rel: &str) -> Option<KeptFile> {
+        self.kept.remove(rel)
+    }
+
+    /// The [`hash_tree`] digest of the walked tree and the kept files.
+    ///
+    /// The files are keyed by forward-slash path relative to the tree root.
+    #[must_use]
+    pub fn into_parts(self) -> (TreeDigest, BTreeMap<String, KeptFile>) {
+        (self.digest, self.kept)
+    }
+}
+
+/// Walk the tree at `root` once, hashing it and keeping the files `keep` names.
+///
+/// `keep` maps a tree-relative path to the byte cap its file is kept under
+/// (`None`: hashed only). A file past its cap is recorded as
+/// [`KeptFile::Oversize`] and still hashed.
+///
+/// # Errors
+/// As [`hash_tree`].
+pub fn capture_tree_within(
+    root: &Path,
+    ceiling: &TreeCeiling,
+    keep: impl Fn(&str) -> Option<u64>,
+) -> Result<TreeCapture, TreeHashError> {
+    let Walked { hasher, kept, dirs } = walk_within(root, ceiling, keep)?;
+    Ok(TreeCapture {
+        digest: TreeDigest(hasher),
+        kept,
+        dirs,
+    })
 }
 
 /// A regular file the walk listed: its tree path and the entry names that reach it from the root.
@@ -337,7 +431,7 @@ struct WalkedFile {
     names: Vec<EntryName>,
 }
 
-/// List every regular file below the held `dir`, sorted by tree path.
+/// List every regular file below the held `dir`, sorted by tree path, and every visible directory.
 ///
 /// `root` is the path `dir` was opened from, used only to name a failing
 /// entry in an error; nothing is opened through it.
@@ -348,20 +442,22 @@ fn walk_tree(
     dir: &HeldDir,
     root: &Path,
     ceiling: &TreeCeiling,
-) -> Result<Vec<WalkedFile>, TreeHashError> {
+) -> Result<(Vec<WalkedFile>, BTreeSet<TreePath>), TreeHashError> {
     let mut files = Vec::new();
+    let mut dirs = BTreeSet::new();
     let mut seen: u64 = 0;
     let mut walk = Walk {
         root,
         ceiling,
         out: &mut files,
+        dirs: &mut dirs,
         seen: &mut seen,
     };
     walk.collect(dir, &TreePath::root(), &[], 0)?;
     // Sort by the relative path so the hash is independent of directory-read
     // order (which the OS does not guarantee).
     files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(files)
+    Ok((files, dirs))
 }
 
 /// Hash the listed `files`, each opened afresh from the held `dir` and read from that one handle.
@@ -369,8 +465,9 @@ fn walk_tree(
 /// Each file is reached by [`HeldDir::open_rel`], which opens every level
 /// without following a link and proves the final entry a regular file from
 /// its own handle, so an entry swapped for a link, a FIFO or a device after
-/// the walk is refused, never followed or blocked on: the bytes hashed are
-/// the bytes of the handle that was checked.
+/// the walk is refused, never followed or blocked on: the bytes hashed (and
+/// kept, for each file `keep` names) are the bytes of the handle that was
+/// checked.
 ///
 /// # Errors
 /// As [`hash_tree`].
@@ -379,7 +476,8 @@ fn hash_walked(
     root: &Path,
     files: &[WalkedFile],
     ceiling: &TreeCeiling,
-) -> Result<Sha256, TreeHashError> {
+    keep: impl Fn(&str) -> Option<u64>,
+) -> Result<(Sha256, BTreeMap<String, KeptFile>), TreeHashError> {
     let mut hasher = Sha256::new();
     update_len_prefixed(&mut hasher, TREE_TAG);
     let count = u64::try_from(files.len()).unwrap_or(u64::MAX);
@@ -389,24 +487,35 @@ fn hash_walked(
     // same fixed-size window.
     let mut buf = vec![0u8; TREE_HASH_CHUNK_BYTES];
     let mut total_bytes: u64 = 0;
+    let mut kept = BTreeMap::new();
     for walked in files {
-        let shown = root.join(walked.rel.as_str());
-        update_str(&mut hasher, walked.rel.as_str());
+        let rel = walked.rel.as_str();
+        let shown = root.join(rel);
+        update_str(&mut hasher, rel);
         let file = dir
             .open_rel(&walked.names)
             .map_err(|refusal| tree_refusal(&shown, refusal, ceiling))?;
-        let len = hash_one_file(
+        let (len, file_kept) = hash_one_file(
             &mut hasher,
             file,
-            walked.rel.as_str(),
-            &shown,
+            &FileAt { rel, shown: &shown },
             &mut buf,
             total_bytes,
             ceiling,
+            keep(rel),
         )?;
+        if let Some(file_kept) = file_kept {
+            kept.insert(rel.to_owned(), file_kept);
+        }
         total_bytes = total_bytes.saturating_add(len);
     }
-    Ok(hasher)
+    Ok((hasher, kept))
+}
+
+/// The file one hash step reads: its tree path and the path that names it in an error.
+struct FileAt<'a> {
+    rel: &'a str,
+    shown: &'a Path,
 }
 
 /// The tree-hash refusal an [`OpenRefusal`] of the entry at `shown` stands for.
@@ -444,16 +553,19 @@ fn tree_refusal(shown: &Path, refusal: OpenRefusal, ceiling: &TreeCeiling) -> Tr
 /// length is the streaming window and its contents on entry are irrelevant.
 /// `hashed_so_far` is the byte total of the tree's earlier files: a file that
 /// would carry the tree past `ceiling.bytes()` is refused before it is read.
-/// `shown` names the file in an error only. Returns the file's length.
+/// `at.shown` names the file in an error only. `keep_cap` asks for the file's
+/// bytes to be kept as they are hashed: `None` keeps nothing, and a file larger
+/// than the cap is reported as oversize. Returns the file's length and what
+/// was kept.
 fn hash_one_file(
     hasher: &mut Sha256,
     file: RegularFile,
-    rel: &str,
-    shown: &Path,
+    at: &FileAt<'_>,
     buf: &mut [u8],
     hashed_so_far: u64,
     ceiling: &TreeCeiling,
-) -> Result<u64, TreeHashError> {
+    keep_cap: Option<u64>,
+) -> Result<(u64, Option<KeptFile>), TreeHashError> {
     use std::io::Read as _;
 
     let declared_len = file.len();
@@ -466,6 +578,13 @@ fn hash_one_file(
 
     hasher.update(declared_len.to_le_bytes());
 
+    // Reserved only for a file within its cap, so the reservation is bounded by
+    // that cap and by the per-file ceiling checked above; the read below stops
+    // one byte past `declared_len`, so the buffer never grows past it.
+    let mut kept: Option<Vec<u8>> = keep_cap
+        .filter(|cap| declared_len <= *cap)
+        .map(|_| Vec::with_capacity(usize::try_from(declared_len).unwrap_or(0)));
+
     let one_past = ByteCap::from_nonzero(std::num::NonZeroU64::MIN.saturating_add(declared_len));
     let mut reader = file.into_reader(one_past);
     let mut total: u64 = 0;
@@ -473,9 +592,9 @@ fn hash_one_file(
         let n = match reader.read(buf) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
-                return Err(size_changed(shown, rel, declared_len));
+                return Err(size_changed(at.shown, at.rel, declared_len));
             }
-            Err(e) => return Err(tree_io(shown, e)),
+            Err(e) => return Err(tree_io(at.shown, e)),
         };
         if n == 0 {
             break;
@@ -486,17 +605,25 @@ fn hash_one_file(
         }
         let chunk = buf.get(..n).ok_or_else(|| {
             tree_io(
-                shown,
+                at.shown,
                 std::io::Error::other("short read reported more bytes than the buffer holds"),
             )
         })?;
         hasher.update(chunk);
+        if let Some(kept) = kept.as_mut() {
+            kept.extend_from_slice(chunk);
+        }
     }
 
     if total != declared_len {
-        return Err(size_changed(shown, rel, declared_len));
+        return Err(size_changed(at.shown, at.rel, declared_len));
     }
-    Ok(declared_len)
+    let outcome = match (keep_cap, kept) {
+        (Some(_), Some(bytes)) => Some(KeptFile::Bytes(bytes)),
+        (Some(cap), None) => Some(KeptFile::Oversize { cap }),
+        (None, _) => None,
+    };
+    Ok((declared_len, outcome))
 }
 
 /// The refusal of the file `rel` at `shown`, whose content stopped matching the `declared` length its proof saw.
@@ -526,6 +653,7 @@ fn size_changed(shown: &Path, rel: &str, declared: u64) -> TreeHashError {
 /// block the read, and a name that is not UTF-8 cannot be hashed without two
 /// distinct trees colliding.
 ///
+/// `out` collects every regular file and `dirs` every visible directory met.
 /// `seen` counts every entry listed across the whole walk; one past
 /// `ceiling.entries()` refuses the tree. A directory below `ceiling.depth()`
 /// levels is refused before it is listed, bounding the recursion; only the
@@ -534,6 +662,7 @@ struct Walk<'a> {
     root: &'a Path,
     ceiling: &'a TreeCeiling,
     out: &'a mut Vec<WalkedFile>,
+    dirs: &'a mut BTreeSet<TreePath>,
     seen: &'a mut u64,
 }
 
@@ -580,6 +709,7 @@ impl Walk<'_> {
                     })?;
                     let child_names = extended(names, name);
                     self.collect(&held, &child, &child_names, depth.saturating_add(1))?;
+                    self.dirs.insert(child);
                 }
                 FileKind::Regular => {
                     let child = rel.child(&name)?;
@@ -620,7 +750,6 @@ pub fn compute_project_key(
     db_driver: DbDriver,
     target: ipe_ir::Target,
     wasm_public_env: &[String],
-    mount_base: &MountBase,
     intent: ipe_backend_rust::BuildIntent,
     debugger: bool,
     hot_appearance: bool,
@@ -3096,7 +3225,7 @@ mod tests {
     #[cfg(unix)]
     fn walked(base: &Path) -> (HeldDir, Vec<WalkedFile>) {
         let held = HeldDir::open_root(base).expect("hold the tree root");
-        let files = walk_tree(&held, base, PACKAGE_SOURCE.tree()).expect("walk the tree");
+        let (files, _) = walk_tree(&held, base, PACKAGE_SOURCE.tree()).expect("walk the tree");
         (held, files)
     }
 
@@ -3125,7 +3254,7 @@ mod tests {
         std::fs::remove_file(base.join("Main.ipe")).expect("remove listed file");
         std::os::unix::fs::symlink(&outside, base.join("Main.ipe")).expect("plant link");
 
-        let result = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree());
+        let result = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree(), |_| None);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_file(&outside);
         assert!(
@@ -3149,7 +3278,8 @@ mod tests {
         let hashed_base = base.clone();
         std::thread::Builder::new()
             .spawn(move || {
-                let result = hash_walked(&held, &hashed_base, &files, PACKAGE_SOURCE.tree());
+                let result =
+                    hash_walked(&held, &hashed_base, &files, PACKAGE_SOURCE.tree(), |_| None);
                 let _ = send.send(result.map(|_| ()));
             })
             .expect("spawn hashing thread");
@@ -3173,13 +3303,193 @@ mod tests {
         std::fs::rename(base.join("sub"), &aside).expect("move listed dir aside");
         std::os::unix::fs::symlink(&aside, base.join("sub")).expect("plant link");
 
-        let result = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree());
+        let result = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree(), |_| None);
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&aside);
         assert!(
             matches!(&result, Err(TreeHashError::Exceeded(refusal)) if *refusal == refused(IngestLimit::Symlink)),
             "a directory swapped for a link after the walk must be refused as a link, got: {:?}",
             result.map(|_| ())
+        );
+    }
+
+    /// The capture's digest is the `hash_tree` value, and the bytes it keeps are the file bytes.
+    #[test]
+    fn capture_digest_equals_hash_tree_and_keeps_the_hashed_bytes() {
+        let base = capped_tree("capture-eq");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |rel| {
+            (rel == "sub/b").then_some(1024)
+        });
+        let expected = hash_tree(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        let (digest, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(
+            digest.to_hex(),
+            expected.expect("hash_tree ok"),
+            "the capture digest must equal hash_tree over the same tree"
+        );
+        assert_eq!(kept.get("sub/b"), Some(&KeptFile::Bytes(vec![b'b'; 6])));
+        assert_eq!(
+            kept.len(),
+            1,
+            "only the named file is kept, never the whole tree"
+        );
+    }
+
+    /// A capture keeps the pinned digest of a fixed tree: keeping bytes never moves the stream.
+    #[test]
+    fn a_capture_keeping_every_file_has_the_pinned_digest() {
+        let base = two_file_tree("capture-pinned");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&base);
+        let (digest, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(
+            digest.to_hex(),
+            "167b37abffdcb99712c3a6b27bc51955e3aed6248c244f2059772190bb62d466"
+        );
+        assert_eq!(
+            kept.get("Main.ipe"),
+            Some(&KeptFile::Bytes(b"module Main exposing (main)\n".to_vec()))
+        );
+        assert_eq!(
+            kept.get("sub/Helper.ipe"),
+            Some(&KeptFile::Bytes(b"module Helper\n".to_vec()))
+        );
+    }
+
+    /// A file past its keep cap is hashed but never held: it is reported oversize, with the same digest.
+    #[test]
+    fn capture_marks_a_file_past_its_keep_cap_oversize_and_still_hashes_it() {
+        let base = capped_tree("capture-oversize");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |rel| {
+            (rel == "a").then_some(9)
+        });
+        let expected = hash_tree(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        let (digest, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(kept.get("a"), Some(&KeptFile::Oversize { cap: 9 }));
+        assert_eq!(
+            digest.to_hex(),
+            expected.expect("hash_tree ok"),
+            "an oversize file still contributes its bytes to the digest"
+        );
+    }
+
+    /// A file exactly at its keep cap is kept; one byte past is oversize.
+    #[test]
+    fn capture_keeps_a_file_at_its_keep_cap() {
+        let base = capped_tree("capture-at-cap");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |rel| {
+            (rel == "a").then_some(10)
+        });
+        let _ = std::fs::remove_dir_all(&base);
+        let (_, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(kept.get("a"), Some(&KeptFile::Bytes(vec![b'a'; 10])));
+    }
+
+    /// The capture lists visible directories and never a hidden one.
+    #[test]
+    fn capture_lists_visible_directories_and_skips_hidden_ones() {
+        let base = capped_tree("capture-dirs");
+        std::fs::create_dir_all(base.join(".hidden")).expect("create hidden dir");
+        std::fs::write(base.join(".hidden").join("x"), b"x").expect("write hidden file");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |_| None);
+        let _ = std::fs::remove_dir_all(&base);
+        let capture = capture.expect("capture ok");
+        assert!(capture.has_dir("sub"));
+        assert!(!capture.has_dir(".hidden"));
+        assert!(!capture.has_dir("a"), "a file is not a directory");
+    }
+
+    /// A capture is refused wherever `hash_tree` is: the ceilings bind the one shared walk.
+    #[test]
+    fn capture_refuses_a_tree_past_each_ceiling() {
+        let base = capped_tree("capture-ceilings");
+        let entries = capture_tree_within(&base, &ceiling(16, 2, 10, 8), |_| Some(1024));
+        let bytes = capture_tree_within(&base, &ceiling(15, 3, 10, 8), |_| Some(1024));
+        let per_file = capture_tree_within(&base, &ceiling(16, 3, 9, 8), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(entries, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Entries(2)))
+        );
+        assert!(
+            matches!(bytes, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Bytes(15)))
+        );
+        assert!(
+            matches!(per_file, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Bytes(9)))
+        );
+    }
+
+    /// A symlink or a FIFO in the tree is refused by the capture, so a kept file is never a followed link.
+    #[cfg(unix)]
+    #[test]
+    fn capture_refuses_a_symlink_and_a_fifo() {
+        let linked = capped_tree("capture-symlink");
+        std::os::unix::fs::symlink(linked.join("a"), linked.join("link")).expect("create symlink");
+        let link = capture_tree_within(&linked, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&linked);
+        let piped = capped_tree("capture-fifo");
+        make_fifo(&piped.join("pipe.ipe"));
+        let fifo = capture_tree_within(&piped, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&piped);
+        assert!(
+            matches!(link, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Symlink))
+        );
+        assert!(
+            matches!(fifo, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::SpecialFile))
+        );
+    }
+
+    /// A kept file the walk listed, swapped for a link or for different bytes
+    /// before it is read, is refused: nothing is kept from a handle the walk
+    /// did not check, and kept bytes never disagree with the length proven.
+    #[test]
+    #[cfg(unix)]
+    fn a_kept_file_swapped_after_listing_is_refused_never_kept() {
+        let base = two_file_tree("capture-swap-link");
+        let outside = base.with_extension("outside");
+        std::fs::write(&outside, b"a secret outside the tree").expect("write outside file");
+        let (held, files) = walked(&base);
+        std::fs::remove_file(base.join("Main.ipe")).expect("remove listed file");
+        std::os::unix::fs::symlink(&outside, base.join("Main.ipe")).expect("plant link");
+        let link = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&outside);
+        assert!(
+            matches!(&link, Err(TreeHashError::Exceeded(refusal)) if *refusal == refused(IngestLimit::Symlink)),
+            "a kept file swapped for a link must be refused, got: {:?}",
+            link.map(|_| ())
+        );
+
+        let base = two_file_tree("capture-swap-grow");
+        let file = proven_file(&base, "Main.ipe");
+        std::fs::write(
+            base.join("Main.ipe"),
+            b"module Main exposing (main, more)\n",
+        )
+        .expect("rewrite listed file");
+        let mut buf = vec![0u8; TREE_HASH_CHUNK_BYTES];
+        let grown = hash_one_file(
+            &mut Sha256::new(),
+            file,
+            &FileAt {
+                rel: "Main.ipe",
+                shown: &base.join("Main.ipe"),
+            },
+            &mut buf,
+            0,
+            PACKAGE_SOURCE.tree(),
+            Some(1024),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(
+                &grown,
+                Err(TreeHashError::Io { source, .. })
+                    if source.to_string().contains("changed size during hashing")
+            ),
+            "a kept file that changed size after its proof must be refused, got: {:?}",
+            grown.map(|_| ())
         );
     }
 
@@ -3243,11 +3553,14 @@ mod tests {
             let result = hash_one_file(
                 &mut Sha256::new(),
                 file,
-                "File.ipe",
-                &path,
+                &FileAt {
+                    rel: "File.ipe",
+                    shown: &path,
+                },
                 &mut buf,
                 0,
                 PACKAGE_SOURCE.tree(),
+                None,
             );
             outcomes.push((change, result));
         }
