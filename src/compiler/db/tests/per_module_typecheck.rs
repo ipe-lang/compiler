@@ -577,6 +577,26 @@ fn assembly_refuses_an_incomplete_or_conflicting_cover() {
         Some(FallbackReason::AssemblyConflict),
         "two key-free slices for one home must refuse the assembly"
     );
+    let b_slice = slice_with_vars(&b, 1);
+    assert_eq!(
+        ipe_db::assemble_scoped(
+            &[a_slice.clone(), b_slice],
+            &BTreeSet::from([a.clone()]),
+            solver
+        )
+        .err(),
+        Some(FallbackReason::AssemblyConflict),
+        "a slice with entries for a home the linked program lacks must refuse the assembly"
+    );
+    assert!(
+        ipe_db::assemble_scoped(
+            &[a_slice.clone(), slice_with_vars(&b, 0)],
+            &BTreeSet::from([a.clone()]),
+            solver
+        )
+        .is_ok(),
+        "an empty slice for an unlinked module adds nothing and is admitted"
+    );
     let misfiled = (b.clone(), Arc::clone(&a_slice.1));
     assert_eq!(
         ipe_db::assemble_scoped(&[misfiled], &BTreeSet::from([b.clone()]), solver).err(),

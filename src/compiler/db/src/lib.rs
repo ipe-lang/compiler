@@ -1294,13 +1294,15 @@ pub type ModuleSlice = (Vec<Symbol>, Arc<ipe_types::CanonicalTypes>);
 /// Merge per-module canonical slices into one typed program.
 ///
 /// Every slice must hold only keys and warnings of its own home, no two slices
-/// may share a home, and every home in `linked_homes` must have a slice; the
+/// may share a home, a slice holding entries must be of a home in
+/// `linked_homes`, and every home in `linked_homes` must have a slice; the
 /// merge is then renumbered under [`ipe_types::VarScope::PerHome`] within
 /// `ceiling`.
 ///
 /// # Errors
-/// - [`FallbackReason::AssemblyConflict`] when two slices share a home or a
-///   slice holds a key or warning of another home.
+/// - [`FallbackReason::AssemblyConflict`] when two slices share a home, a
+///   slice holds a key or warning of another home, or a slice with entries
+///   belongs to a home the linked program lacks.
 /// - [`FallbackReason::IncompleteCover`] when a linked home has no slice.
 /// - [`FallbackReason::VarSpaceExhausted`] when the merge holds more distinct
 ///   solver variables than `ceiling` admits.
@@ -1336,6 +1338,18 @@ pub fn assemble_scoped(
             msg_defaulted_vars,
             signature_wildcards,
         } = slice.as_solved();
+        let holds_entries = !(env.is_empty()
+            && regions.is_empty()
+            && expected.is_empty()
+            && bounds.is_empty()
+            && warnings.is_empty()
+            && poly_var_map.is_empty()
+            && untyped_type_params.is_empty()
+            && msg_defaulted_vars.is_empty()
+            && signature_wildcards.is_empty());
+        if holds_entries && !linked_homes.contains(home.as_slice()) {
+            return Err(FallbackReason::AssemblyConflict);
+        }
         merge_home(&mut assembled.env, env, home)?;
         merge_home(&mut assembled.regions, regions, home)?;
         merge_home(&mut assembled.expected, expected, home)?;
