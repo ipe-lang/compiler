@@ -481,18 +481,35 @@ fn scan_source(rel: &str, src: &str) -> Result<Vec<Site>, String> {
 }
 
 /// Every production `.rs` file under the scanned roots of `repo`, as its path
-/// relative to `repo` with `/` separators.
-fn production_files(repo: &Path) -> Vec<(String, PathBuf)> {
+/// relative to `repo` with `/` separators, and every path the walk could not
+/// judge: an unreadable directory or entry is red, never silently skipped.
+fn production_files(repo: &Path) -> (Vec<(String, PathBuf)>, Vec<String>) {
     let mut found = Vec::new();
+    let mut unjudged = Vec::new();
     let mut pending: Vec<PathBuf> = ROOTS.iter().map(|root| repo.join(root)).collect();
     while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                unjudged.push(format!("{}: cannot be listed: {e}", dir.display()));
                 continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    unjudged.push(format!("{}: an entry cannot be read: {e}", dir.display()));
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(e) => {
+                    unjudged.push(format!("{}: cannot be typed: {e}", path.display()));
+                    continue;
+                }
             };
             let name = entry.file_name().to_string_lossy().into_owned();
             if kind.is_dir() {
@@ -502,6 +519,7 @@ fn production_files(repo: &Path) -> Vec<(String, PathBuf)> {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(repo) else {
+                unjudged.push(format!("{}: is outside the repository", path.display()));
                 continue;
             };
             if path.extension().is_none_or(|e| e != "rs") || panic_scan::is_test_path(rel) {
@@ -516,7 +534,7 @@ fn production_files(repo: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     found.sort();
-    found
+    (found, unjudged)
 }
 
 /// The ratchet: each file's allowed site count.
@@ -590,7 +608,7 @@ fn ratchet_problems(
 #[test]
 fn every_operator_variable_is_read_through_the_registry() {
     let repo = e2e_support::manifest_dir!().join("../..");
-    let files = production_files(&repo);
+    let (files, mut unjudged) = production_files(&repo);
     assert!(
         files.len() > 100,
         "only {} production files found under {}",
@@ -600,7 +618,6 @@ fn every_operator_variable_is_read_through_the_registry() {
     let allowed = pending_counts(PENDING).expect("pending.txt parses");
 
     let mut found = BTreeMap::new();
-    let mut unjudged = Vec::new();
     for (rel, path) in &files {
         let src = match panic_scan::read_source(path) {
             Ok(src) => src,
@@ -719,6 +736,15 @@ fn a_cfg_test_read_is_accepted_and_only_while_gated() {
 #[test]
 fn an_unparseable_file_is_red() {
     assert!(scan_source(FIXTURE_PATH, fixture!("unparseable")).is_err());
+}
+
+/// A scanned root that cannot be listed is red, never an empty, green walk.
+#[test]
+fn an_unlistable_root_is_unjudged() {
+    let missing = e2e_support::manifest_dir!().join("env_read_scan/no-such-repository");
+    let (files, unjudged) = production_files(&missing);
+    assert!(files.is_empty(), "{files:?}");
+    assert_eq!(unjudged.len(), ROOTS.len(), "{unjudged:?}");
 }
 
 #[test]

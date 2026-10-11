@@ -4825,7 +4825,7 @@ mod listen_port_tests {
     use crate::telemetry::BuildPosture;
 
     /// Every value that is not a bindable `1..=65535` port.
-    const GARBAGE: [&str; 15] = [
+    const GARBAGE: [&str; 20] = [
         "",
         "abc",
         "80a0",
@@ -4841,6 +4841,11 @@ mod listen_port_tests {
         "65536",
         "70000",
         "99999999999",
+        "0x1F90",
+        "8080\0",
+        "\t8080",
+        "\u{FF18}\u{FF10}\u{FF18}\u{FF10}",
+        "8080\n[ERROR] forged",
     ];
     const OPERATOR_KEYS: [PortKey; 2] = [WEB_PORT, SERVER_PORT];
     const OPERATOR_VARS: [&str; 2] = [WEB_PORT.name(), SERVER_PORT.name()];
@@ -4890,6 +4895,22 @@ mod listen_port_tests {
                         |r| r.name() == key.name() && r.to_string().contains("1..=65535")
                     ),
                     "{}={garbage:?} must refuse naming the variable, got {outcome:?}",
+                    key.name()
+                );
+            }
+        }
+    }
+
+    /// A malformed operator value refuses even under a valid relocation: every
+    /// set layer is judged, not only the one that wins.
+    #[test]
+    fn garbage_operator_value_refuses_under_a_valid_relocation() {
+        for key in OPERATOR_KEYS {
+            for garbage in GARBAGE {
+                let outcome = try_resolve(Some("9100"), key, Some(garbage));
+                assert!(
+                    outcome.as_ref().is_err_and(|r| r.name() == key.name()),
+                    "{}={garbage:?} under a relocation must refuse, got {outcome:?}",
                     key.name()
                 );
             }
