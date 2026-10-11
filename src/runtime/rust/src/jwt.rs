@@ -159,19 +159,6 @@ pub(crate) fn admit_time_claims(claims: &JsonValue, now: i64) -> Result<(), Clai
     Ok(())
 }
 
-/// Lenient NumericDate reader: `None` when the claim is absent OR not a number.
-///
-/// It passes over a mistyped claim, so it must not decide admission: the
-/// `Ipe.Jwt` decoders admit through [`admit_time_claims`], and `auth.rs` is to
-/// adopt [`read_numeric_date`] in place of this reader for its `exp`/`nbf`/`cap`
-/// checks.
-pub(crate) fn numeric_date(value: &JsonValue, claim: &str) -> Option<i64> {
-    match value.get(claim) {
-        Some(JsonValue::Number(n)) => number_seconds(n),
-        _ => None,
-    }
-}
-
 /// Extract and base64url-decode the payload segment of a compact JWS token,
 /// returning the parsed JSON value. Returns `None` on any parse failure.
 /// Reading the unverified payload is safe: every caller only takes the
@@ -1118,9 +1105,9 @@ mod tests {
     // builder (ipe_jwt_decode) path.
 
     /// Flat HS256: `exp = -1` (negative epoch) must be rejected.
-    /// Was silently accepted before the `numeric_date` pre-reject because
-    /// `as_u64()` returns None for negatives, bypassing the old `exp_is_zero`
-    /// guard and letting jsonwebtoken's `exp - 1` underflow to `u64::MAX`.
+    /// `as_u64()` is `None` for a negative, so only the floored
+    /// `read_numeric_date` pre-reject keeps jsonwebtoken's `exp - 1` from
+    /// underflowing to `u64::MAX`.
     #[test]
     fn test_flat_decode_negative_exp_rejected() {
         let secret = "neg-exp-test-secret-0123456789abcde".to_string();
@@ -1200,7 +1187,7 @@ mod tests {
     }
 
     /// Flat HS256: a token with a fractional but far-FUTURE exp must still be
-    /// ACCEPTED — the `numeric_date` floor must not over-reject valid tokens.
+    /// ACCEPTED — the `read_numeric_date` floor must not over-reject valid tokens.
     #[test]
     fn test_flat_decode_fractional_future_exp_accepted() {
         let secret = "future-frac-secret-0123456789abcde".to_string();
