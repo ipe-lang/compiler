@@ -498,33 +498,47 @@ fn scan_source(rel: &str, src: &str) -> Result<Vec<Site>, String> {
 }
 
 /// Every production `.rs` file under the scanned roots of `repo`, as its path
-/// relative to `repo` with `/` separators.
+/// relative to `repo` with `/` separators, and every path the walk could not
+/// judge: an unreadable directory or entry, or a symlinked directory the walk
+/// does not follow, is red, never silently skipped.
 ///
 /// A `tests` directory or `tests.rs` file is skipped only once its test-only
 /// premise is confirmed on disk ([`panic_scan::is_verified_test_path`]); an
 /// ungated `mod tests;` is production and scanned.
-///
-/// # Errors
-///
-/// A message naming the path when a directory cannot be listed, an entry's
-/// type cannot be read, or an entry is a symlinked directory the walk does not
-/// follow: a tree the walk cannot see into cannot be judged clean.
-fn production_files(repo: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+fn production_files(repo: &Path) -> (Vec<(String, PathBuf)>, Vec<String>) {
     let mut found = Vec::new();
+    let mut unjudged = Vec::new();
     let mut pending: Vec<PathBuf> = ROOTS.iter().map(|root| repo.join(root)).collect();
     while let Some(dir) = pending.pop() {
-        let unlisted = |e: std::io::Error| format!("{}: cannot be listed: {e}", dir.display());
-        for entry in std::fs::read_dir(&dir).map_err(unlisted)? {
-            let entry = entry.map_err(unlisted)?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                unjudged.push(format!("{}: cannot be listed: {e}", dir.display()));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    unjudged.push(format!("{}: an entry cannot be read: {e}", dir.display()));
+                    continue;
+                }
+            };
             let path = entry.path();
-            let kind = entry
-                .file_type()
-                .map_err(|e| format!("{}: type cannot be read: {e}", path.display()))?;
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(e) => {
+                    unjudged.push(format!("{}: cannot be typed: {e}", path.display()));
+                    continue;
+                }
+            };
             if kind.is_symlink() && path.is_dir() {
-                return Err(format!(
-                    "{}: a symlinked directory is not followed, so it cannot be judged",
+                unjudged.push(format!(
+                    "{}: a symlinked directory is not followed",
                     path.display()
                 ));
+                continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             if kind.is_dir() {
@@ -534,11 +548,8 @@ fn production_files(repo: &Path) -> Result<Vec<(String, PathBuf)>, String> {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(repo) else {
-                return Err(format!(
-                    "{}: lies outside {}",
-                    path.display(),
-                    repo.display()
-                ));
+                unjudged.push(format!("{}: is outside the repository", path.display()));
+                continue;
             };
             if path.extension().is_none_or(|e| e != "rs")
                 || panic_scan::is_verified_test_path(repo, rel)
@@ -554,7 +565,7 @@ fn production_files(repo: &Path) -> Result<Vec<(String, PathBuf)>, String> {
         }
     }
     found.sort();
-    Ok(found)
+    (found, unjudged)
 }
 
 /// The ratchet: each file's allowed site count.
@@ -628,7 +639,7 @@ fn ratchet_problems(
 #[test]
 fn every_operator_variable_is_read_through_the_registry() {
     let repo = e2e_support::manifest_dir!().join("../..");
-    let files = production_files(&repo).expect("the production tree is walkable");
+    let (files, mut unjudged) = production_files(&repo);
     assert!(
         files.len() > 100,
         "only {} production files found under {}",
@@ -638,7 +649,6 @@ fn every_operator_variable_is_read_through_the_registry() {
     let allowed = pending_counts(PENDING).expect("pending.txt parses");
 
     let mut found = BTreeMap::new();
-    let mut unjudged = Vec::new();
     for (rel, path) in &files {
         let src = match panic_scan::read_source(path) {
             Ok(src) => src,
@@ -759,6 +769,15 @@ fn an_unparseable_file_is_red() {
     assert!(scan_source(FIXTURE_PATH, fixture!("unparseable")).is_err());
 }
 
+/// A scanned root that cannot be listed is red, never an empty, green walk.
+#[test]
+fn an_unlistable_root_is_unjudged() {
+    let missing = e2e_support::manifest_dir!().join("env_read_scan/no-such-repository");
+    let (files, unjudged) = production_files(&missing);
+    assert!(files.is_empty(), "{files:?}");
+    assert_eq!(unjudged.len(), ROOTS.len(), "{unjudged:?}");
+}
+
 #[test]
 fn a_variable_token_needs_a_name_outside_the_harness_set() {
     assert!(names_a_variable("set IPE_WEB_PORT=1", &[]));
@@ -844,13 +863,10 @@ fn the_walk_skips_only_confirmed_test_code_and_ignored_output() {
             ("tools/gated/tests/mod.rs", "fn f() {}\n"),
         ],
     );
-    let found = production_files(&root);
+    let (found, unjudged) = production_files(&root);
     let _ = std::fs::remove_dir_all(&root);
-    let rels = found
-        .expect("the tree is walkable")
-        .into_iter()
-        .map(|(rel, _)| rel)
-        .collect::<Vec<_>>();
+    assert!(unjudged.is_empty(), "{unjudged:?}");
+    let rels = found.into_iter().map(|(rel, _)| rel).collect::<Vec<_>>();
     assert_eq!(
         rels,
         [
@@ -862,27 +878,20 @@ fn the_walk_skips_only_confirmed_test_code_and_ignored_output() {
     );
 }
 
-/// A root the walk cannot list, and a symlinked directory it does not follow,
-/// are red: an unseen tree is never judged clean.
+/// A symlinked directory the walk does not follow is unjudged: an unseen tree
+/// is never judged clean.
+#[cfg(unix)]
 #[test]
-fn an_unwalkable_tree_is_red() {
-    let root = tree("unwalkable", &[("src/lib.rs", "pub fn f() {}\n")]);
-    let missing_root = production_files(&root);
-    #[cfg(unix)]
-    let linked = {
-        std::fs::create_dir_all(root.join("tools")).expect("tools dir is created");
-        std::os::unix::fs::symlink(root.join("src"), root.join("tools/linked"))
-            .expect("symlink is created");
-        production_files(&root)
-    };
+fn a_symlinked_directory_is_unjudged() {
+    let root = tree("symlinked", &[("src/lib.rs", "pub fn f() {}\n")]);
+    std::fs::create_dir_all(root.join("tools")).expect("tools dir is created");
+    std::os::unix::fs::symlink(root.join("src"), root.join("tools/linked"))
+        .expect("symlink is created");
+    let (_, unjudged) = production_files(&root);
     let _ = std::fs::remove_dir_all(&root);
-    assert!(missing_root.is_err(), "{missing_root:?}");
-    #[cfg(unix)]
     assert!(
-        linked
-            .as_ref()
-            .is_err_and(|e| e.contains("symlinked directory")),
-        "{linked:?}"
+        unjudged.iter().any(|e| e.contains("symlinked directory")),
+        "{unjudged:?}"
     );
 }
 

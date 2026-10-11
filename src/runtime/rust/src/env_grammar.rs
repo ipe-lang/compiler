@@ -561,7 +561,9 @@ mod tests {
     /// A tunable's refused value is escaped onto one line.
     #[test]
     fn tunable_refusal_escapes_the_value() {
-        let Err(refusal) = port("80\n[ERROR] forged") else {
+        let refusal = port("80\n[ERROR] forged");
+        let Err(refusal) = refusal else {
+            assert!(refusal.is_err(), "a forged line is not a port");
             return;
         };
         let text = refusal.to_string();
@@ -593,7 +595,10 @@ mod tests {
             Ok("x".to_owned()),
             ListenPort::parse,
         );
-        let Err(refusal) = refusal else { return };
+        let Err(refusal) = refusal else {
+            assert!(refusal.is_err(), "`x` is not a port");
+            return;
+        };
         assert!(refusal.to_string().contains("dev supervisor"), "{refusal}");
     }
 
