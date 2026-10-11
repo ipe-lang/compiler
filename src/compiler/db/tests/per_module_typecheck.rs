@@ -89,6 +89,7 @@ fn root_of(db: &IpeDatabase, files: &[(&[&str], SourceFile)]) -> SourceRoot {
 }
 
 /// The interned module path of `module`.
+#[allow(clippy::expect_used)] // an interner refusal is the test failure
 fn home_of(db: &IpeDatabase, module: SourceFile) -> Vec<Symbol> {
     let mut interner = db.interner().lock();
     module
@@ -112,6 +113,7 @@ fn joint_projection(
 }
 
 /// The joint solve in program-canonical form, or its refusal.
+#[allow(clippy::expect_used)] // a joint solve past the solver space is the test failure
 fn canonical_joint(
     db: &IpeDatabase,
     root: SourceRoot,
@@ -462,6 +464,7 @@ fn unrelated_module_keeps_types_while_sibling_is_red() {
 
 /// A one-home canonical slice holding `vars` distinct solver variables, one
 /// per region.
+#[allow(clippy::expect_used)] // a fixture past the solver space is the test failure
 fn slice_with_vars(home: &[Symbol], vars: u32) -> ipe_db::ModuleSlice {
     let regions = (0..vars)
         .map(|n| {
@@ -493,6 +496,7 @@ fn slice_with_vars(home: &[Symbol], vars: u32) -> ipe_db::ModuleSlice {
 
 /// A canonical slice holding no keys and one redundant-branch warning owned by
 /// `owner`.
+#[allow(clippy::expect_used)] // a refused fixture warning is the test failure
 fn slice_with_warning_of(owner: &[Symbol]) -> ipe_types::CanonicalTypes {
     let warning = ipe_types::HomedWarning::new(
         ipe_diagnostics::Diagnostic::Type {
@@ -524,7 +528,8 @@ fn slice_with_warning_of(owner: &[Symbol]) -> ipe_types::CanonicalTypes {
 }
 
 /// A ceiling of `n` variable ids.
-fn ceiling(n: u32) -> ipe_types::VarCeiling {
+#[allow(clippy::expect_used)] // a zero ceiling is a test bug
+const fn ceiling(n: u32) -> ipe_types::VarCeiling {
     ipe_types::VarCeiling::at_most(NonZeroU32::new(n).expect("a non-zero ceiling"))
 }
 

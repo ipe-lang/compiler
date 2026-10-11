@@ -470,15 +470,6 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
             ),
             "[{label}] Lib's own types must come from the whole-program solve"
         );
-        assert_eq!(
-            ipe_db::program_types(&db, root, main_file)
-                .clone()
-                .map(|program| program.typed_by),
-            Ok(ipe_db::TypedBy::Joint(
-                ipe_db::FallbackReason::ImporterDependent
-            )),
-            "[{label}] the program is served by the joint solve, attributed to Lib"
-        );
         assert!(
             ipe_db::typed_interface(&db, root, lib_file).is_some(),
             "[{label}] Lib's exported schemes are closed, so its interface must be served"
@@ -539,6 +530,36 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
             engaged,
             engaged_set.len(),
             "[{label}] parity sweep and engaged set disagree"
+        );
+    }
+    Ok(())
+}
+
+/// A program reaching a module whose own facts read its importers' use sites
+/// is served by the joint solve, and the fallback names that reason.
+#[test]
+fn importer_dependent_module_attributes_the_joint_fallback() -> Result<(), String> {
+    let lib: &[&str] = &["Lib"];
+    let main: &[&str] = &["Main"];
+    for (label, lib_src) in [("untyped", MSG_LIB_UNTYPED), ("typed", MSG_LIB_TYPED)] {
+        let (sources, injected) = prepared(&sources_of(&[(main, MSG_MAIN), (lib, lib_src)]));
+        let db = ipe_db::IpeDatabase::new();
+        let root =
+            ipe::create_source_root(&db, &sources, &injected, &std::collections::BTreeSet::new());
+        let main_file = root
+            .files(&db)
+            .iter()
+            .find(|(p, _)| p.iter().map(String::as_str).eq(main.iter().copied()))
+            .map(|(_, f)| *f)
+            .ok_or_else(|| format!("[{label}] fixture must carry Main"))?;
+        assert_eq!(
+            ipe_db::program_types(&db, root, main_file)
+                .clone()
+                .map(|program| program.typed_by),
+            Ok(ipe_db::TypedBy::Joint(
+                ipe_db::FallbackReason::ImporterDependent
+            )),
+            "[{label}] the program is served by the joint solve, attributed to Lib"
         );
     }
     Ok(())
