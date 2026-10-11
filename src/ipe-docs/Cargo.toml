@@ -32,8 +32,7 @@ ipe_kernels   = { path = "../compiler/kernels" }
 ipe_syntax    = { path = "../compiler/syntax" }
 ipe_parse     = { path = "../compiler/parse" }
 ipe_stdlib    = { path = "../stdlib" }
-
-[dev-dependencies]
+# The runtime's operator env registry, projected into the env reference.
 ipe-runtime-rust = { path = "../runtime/rust", default-features = false }
 
 [lints]

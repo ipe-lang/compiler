@@ -165,7 +165,7 @@ fn unhomed_names_in_text(vars: &[EnvVar], excluded: &[&str]) -> BTreeSet<String>
         .chain(excluded.iter().copied())
         .collect();
     vars.iter()
-        .flat_map(|v| [v.default, v.purpose])
+        .flat_map(|v| [v.default.as_ref(), v.purpose])
         .flat_map(ipe_names_in)
         .filter(|name| !homed.contains(name))
         .map(str::to_owned)
@@ -183,7 +183,7 @@ fn unread_exclusions<'a>(excluded: &[&'a str], reads: &BTreeSet<String>) -> Vec<
 
 #[test]
 fn registry_text_names_only_registered_or_excluded_variables() {
-    let unhomed = unhomed_names_in_text(ENV_VARS, EXCLUDED_NAMES);
+    let unhomed = unhomed_names_in_text(&ENV_VARS, EXCLUDED_NAMES);
     assert!(
         unhomed.is_empty(),
         "registry text mentions `IPE_*` names that are neither registered nor excluded (a \
@@ -208,7 +208,7 @@ fn a_documented_alias_with_no_registry_home_is_refused() {
     // The alias sits in backticked prose, the way the registry once wrote it.
     let phantom = EnvVar {
         name: REAL_PORT,
-        default: "unset",
+        default: "unset".into(),
         purpose: "Listen port. Deprecated alias: `IPE_PHANTOM_PORT`.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
@@ -225,14 +225,14 @@ fn a_documented_alias_with_no_registry_home_is_refused() {
 fn a_prose_mention_of_a_registered_or_excluded_name_is_accepted() {
     let first = EnvVar {
         name: REAL_PORT,
-        default: "unset",
+        default: "unset".into(),
         purpose: "Outranked by `IPE_SUPERVISOR_PORT`; see also `IPE_OTHER_PORT`.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     };
     let second = EnvVar {
         name: OTHER_PORT,
-        default: "unset",
+        default: "unset".into(),
         purpose: "The glob `IPE_*` and a lowercase `IPE_word` are not names.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
