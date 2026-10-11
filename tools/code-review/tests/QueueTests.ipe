@@ -599,7 +599,7 @@ dbSizeAndMissingDbIn base =
         setIndexEnv indexDb repo
         System.setenv "IPE_REVIEW_DB" reviewDb
         migratedReviewAt reviewDb
-        bytes <- indexConn |> Task.andThen (\conn -> Index.readSnapshot conn Index.Start) |> Task.map (\snap -> snap.bytes)
+        bytes <- indexConn |> Task.andThen (\conn -> Index.readSnapshot ReadOnly conn Index.Start) |> Task.map (\snap -> snap.bytes)
         setIndexEnv (base ++ "/missing.db") repo
         result <- loadPageNow Index.Start
             |> Task.map Ok
@@ -1422,6 +1422,226 @@ sameCountDifferentPairsResyncs =
             )
 
 
+-- Both fixture units decided at once, each on its own connection to the
+-- review database, both land. The two decisions race, so this pins only
+-- that concurrent decisions complete; `decisionHoldsWriteLockBeforeRead`
+-- proves the lock they rely on.
+concurrentDecisionsBothLand : Task.Task Error Bool
+concurrentDecisionsBothLand =
+    do
+        at <- freshScratch "ipe-index-concurrent-decisions"
+        seedProgressScratch at
+        loadPageNow Index.Start
+        loc <- envReview
+        decided <- Task.parallel (List.map (\unit -> LibDb.openAt loc |> Task.andThen (\conn -> decideNow conn unit Approved)) [ uid "u-a", uid "u-b" ])
+        db <- LibDb.openAt loc
+        n <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (List.length decided == 2 && n == 2)
+
+
+-- A review write transaction holds the database's write lock from its
+-- first statement: a second connection's write inside it fails busy at
+-- once rather than interleave, so no decision reads a log another
+-- decision is about to move; the same write after it commits lands, so the
+-- refusal is the lock's. Red while `writeTransaction` reads before it
+-- claims the lock.
+decisionHoldsWriteLockBeforeRead : Task.Task Error Bool
+decisionHoldsWriteLockBeforeRead =
+    do
+        at <- freshScratch "ipe-index-write-lock"
+        seedProgressScratch at
+        loc <- envReview
+        holder <- LibDb.openAt loc
+        other <- Db.open "sqlite" ("sqlite://" ++ at.reviewDb ++ "?mode=rw")
+        busy <- LibDb.writeTransaction holder (\_ -> writeFailsBusy other)
+        free <- writeFailsBusy other
+        cleanupProgressScratch at
+        Task.succeed (busy && not free)
+
+
+-- True when a write on `conn`, waiting on no busy timeout, fails.
+writeFailsBusy : Db -> Task.Task Error Bool
+writeFailsBusy conn =
+    Db.withTransaction conn
+        (\tx ->
+            do
+                Db.exec tx "PRAGMA busy_timeout = 0" []
+                Db.exec tx "UPDATE review_log_head SET seq = seq WHERE 0" []
+                Task.succeed False
+        )
+        |> Task.onError (\_ -> Task.succeed True)
+
+
+-- Two entries deciding the same pair are refused by the walk: an XOR set
+-- digest cancels the repeat, so a log {u-a, u-a} digests as a copy
+-- {u-b, u-b} would, and a trusted copy would take u-b off the queue. The
+-- unit stays open and the banner names the repeated entry. Red while the
+-- walk proves a log with a repeated pair.
+repeatedLogPairHidesNoUnit : Task.Task Error Bool
+repeatedLogPairHidesNoUnit =
+    do
+        at <- freshScratch "ipe-index-repeated-log-pair"
+        db <- seedProgressScratch at
+        insertReviewRow db "u-a" (Index.attest viewA)
+        insertReviewRow db "u-a" (Index.attest viewA)
+        loadPageNow Index.Start
+        execIndex at.indexDb "DROP TABLE reviewed" []
+        execIndex at.indexDb "CREATE TABLE reviewed (uid TEXT NOT NULL, body_hash TEXT NOT NULL)" []
+        mirrorPair at.indexDb "u-b" (Index.attest viewB)
+        mirrorPair at.indexDb "u-b" (Index.attest viewB)
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed (onPage "u-b" page && page.log == ShownBroken (RepeatsAt 2))
+
+
+-- Every review transaction that may write opens through
+-- `writeTransaction`; the one other review transaction is the read-only
+-- walk. `src/Lib/Index.ipe` owns the index database and is not scanned.
+-- Red when a review transaction opens anywhere else, or `writeTransaction`
+-- stops claiming the write lock first.
+reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
+reviewWritesGoThroughWriteTransaction =
+    let
+        others =
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
+    in
+    do
+        cwd <- System.cwd ()
+        srcNames <- Task.fromResult (Path.fromString (cwd ++ "/src")) |> Task.andThen File.readDir
+        libNames <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib")) |> Task.andThen File.readDir
+        db <- sourceAt cwd "src/Lib/Db.ipe"
+        rest <- Task.sequence (List.map (sourceAt cwd) others)
+        let
+            listed =
+                List.map (\name -> "src/" ++ name) (List.filter (String.endsWith ".ipe") srcNames)
+                    ++ List.map (\name -> "src/Lib/" ++ name) (List.filter (String.endsWith ".ipe") libNames)
+        in
+        Task.succeed
+            (transactionsAdmitted db
+                && List.all (\text -> not (String.contains "withTransaction" text)) rest
+                && List.all (\name -> List.member name ("src/Lib/Db.ipe" :: "src/Lib/Index.ipe" :: others)) listed
+            )
+
+
+-- The scan refuses a third review transaction, a write lock dropped from
+-- `writeTransaction`, and a write statement added outside the known four.
+-- Red while the scan counts no transactions or matches no lock line.
+transactionScanRefusesEvasions : Task.Task Error Bool
+transactionScanRefusesEvasions =
+    do
+        cwd <- System.cwd ()
+        db <- sourceAt cwd "src/Lib/Db.ipe"
+        Task.succeed
+            (transactionsAdmitted db
+                && not (transactionsAdmitted (db ++ "\n\nrogue db =\n    Db.withTransaction db (\\tx -> Task.succeed ())\n"))
+                && not (transactionsAdmitted (String.replace "                Db.exec tx \"UPDATE review_log_head SET seq = seq WHERE 0\" []\n" "" db))
+                && not (transactionsAdmitted (db ++ "\n\nrogue tx =\n    Db.exec tx \"DELETE FROM review_log\" []\n"))
+                && not (transactionsAdmitted (db ++ "\n\nrogue db =\n    Db.queryDecode db \"DELETE FROM review_log RETURNING seq\" [] seqDecoder\n"))
+                && not (transactionsAdmitted (db ++ "\n\nrogue db =\n    Db.queryDecode db \"INSERT INTO review_log_head DEFAULT VALUES\" [] seqDecoder\n"))
+            )
+
+
+-- `source` opens exactly two review transactions, the read-only walk and
+-- `writeTransaction`, whose first statement claims the write lock, and
+-- runs exactly the four write statements the decision path owns. A write
+-- keyword anywhere beyond those four statements is refused, so a write
+-- smuggled through a query call is counted too.
+transactionsAdmitted : String -> Bool
+transactionsAdmitted source =
+    occurrences "withTransaction" source
+        == 2
+        && occurrences "Db.exec" source
+        == 4
+        && occurrences "INSERT" source
+        == 1
+        && occurrences "UPDATE" source
+        == 3
+        && List.all (\word -> occurrences word source == 0) [ "DELETE", "REPLACE", "RETURNING", "ALTER", "DROP", "CREATE", "PRAGMA", "ATTACH" ]
+        && String.contains "Db.withTransaction db (\\tx -> stateWithin key tx size ceiling refusal)" source
+        && String.contains "writeTransaction db body =\n    Db.withTransaction db\n        (\\tx ->\n            do\n                Db.exec tx \"UPDATE review_log_head SET seq = seq WHERE 0\" []\n                body tx\n" source
+
+
+occurrences : String -> String -> Int
+occurrences needle text =
+    List.length (String.split needle text) - 1
+
+
+sourceAt : String -> String -> Task.Task Error String
+sourceAt cwd rel =
+    Task.fromResult (Path.fromString (cwd ++ "/" ++ rel)) |> Task.andThen (\path -> File.readFileLimit path (ByteSize.kib 256))
+
+
+-- A pair written straight into the `reviewed` copy while its stamp is
+-- current is not counted: the copy holds a pair no verified log entry has,
+-- so the load rebuilds it from the log and the unit stays open. Red while
+-- the copy is trusted on its stamp alone.
+forgedPairNotCounted : Task.Task Error Bool
+forgedPairNotCounted =
+    do
+        at <- freshScratch "ipe-index-forged-pair"
+        seedProgressScratch at
+        before <- loadPageNow Index.Start
+        stamped <- stampOf at.indexDb
+        mirrorPair at.indexDb "u-b" (Index.attest viewB)
+        after <- loadPageNow Index.Start
+        copied <- mirroredCount at.indexDb
+        cleanupProgressScratch at
+        Task.succeed
+            (stamped
+                /= Nothing
+                && after.progress
+                == before.progress
+                && copied
+                == 0
+                && List.any (\q -> q.unit.uid == uid "u-b") after.units
+            )
+
+
+-- A drained pair swapped for another in the `reviewed` copy, its size and
+-- stamp unchanged, is not counted: the copy's pairs are not the verified
+-- entries', so the load rebuilds it, the decided unit leaves the page and
+-- the planted one returns. Red if the copy is compared with the log by its
+-- size alone.
+swappedPairNotCounted : Task.Task Error Bool
+swappedPairNotCounted =
+    do
+        at <- freshScratch "ipe-index-swapped-pair"
+        drained <- decideAndDrainA at
+        execIndex at.indexDb "DELETE FROM reviewed WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        mirrorPair at.indexDb "u-b" (Index.attest viewB)
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (page.progress
+                == drained.after
+                && List.any (\q -> q.unit.uid == uid "u-b") page.units
+                && not (List.any (\q -> q.unit.uid == uid "u-a") page.units)
+            )
+
+
+-- A copy one pair longer than a page of `PageSize.pairs` is digested
+-- whole: a load over a log of that many decisions rebuilds the copy and
+-- trusts it. Red if the digest read stops after its first page, if a later
+-- page skips or repeats a pair, or if its query after the first page fails.
+multiPageCopyHolds : Task.Task Error Bool
+multiPageCopyHolds =
+    let
+        decisions =
+            PageSize.toInt PageSize.pairs + 1
+    in
+    do
+        at <- freshScratch "ipe-index-multi-page-copy"
+        db <- seedProgressScratch at
+        List.range 1 decisions
+            |> List.map (\i -> insertReviewRow db ("p-" ++ String.fromInt i) "hp")
+            |> Task.sequence
+        page <- loadPageNow Index.Start
+        copied <- mirroredCount at.indexDb
+        cleanupProgressScratch at
+        Task.succeed (page.log == ShownProven && copied == decisions)
+
+
 -- A drain whose decision moved the head from `prev` while the copy's stamp
 -- names another head deletes the stamp rather than move it, so the next
 -- load rebuilds the copy and stamps the log's head. Red if the drain moves
@@ -2230,6 +2450,14 @@ checks =
             , check "a removed unit leaves progress and returns when re-added" removedUnitReturnsReviewed
             , check "an undrained decision moves the head and is counted on load" undrainedDecisionCountedOnLoad
             , check "a copy with the log's pair count but other pairs is rebuilt" sameCountDifferentPairsResyncs
+            , check "decisions recorded at once both land" concurrentDecisionsBothLand
+            , check "a review write transaction holds the write lock before it reads" decisionHoldsWriteLockBeforeRead
+            , check "a log deciding one pair twice hides no unit" repeatedLogPairHidesNoUnit
+            , check "every review write transaction goes through writeTransaction" reviewWritesGoThroughWriteTransaction
+            , check "the transaction scan refuses each evasion" transactionScanRefusesEvasions
+            , check "a pair written into the copy outside a drain is not counted" forgedPairNotCounted
+            , check "a copy pair swapped for another of the same count is not counted" swappedPairNotCounted
+            , check "a copy longer than one page is digested whole" multiPageCopyHolds
             , check "a drain whose stamp moved elsewhere drops the stamp" drainCasMismatchDropsStamp
             , check "a replaced review database re-opens every drained unit" replacedReviewDbReopensDrained
             , check "two fresh review databases start at different genesis heads" freshReviewDbsHaveDistinctGenesis

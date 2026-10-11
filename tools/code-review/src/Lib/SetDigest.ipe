@@ -1,0 +1,89 @@
+module Lib.SetDigest exposing (SetDigest, add, empty, same)
+
+import Ipe.Bitwise as Bitwise
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.List as List
+import Ipe.String as String
+import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
+
+
+-- A set of members, the decided (uid, body_hash) pairs one page load
+-- compares: how many went in and, under a signing key, the XOR of a keyed
+-- mac of each, kept as eight 32-bit words. The mac is the key's, so no one
+-- without the key can choose pairs whose digest matches another set's.
+-- Opaque: built only by `empty` and `add`, and read only by `same`; it is
+-- computed for one load and never written, so no pair's mac leaves the
+-- process. With no key only the count is kept: no copy rebuilt without a
+-- key holds any pair, so a count of zero is the whole proof.
+type SetDigest
+    = SetDigest { pairs : Int, mix : List Int }
+
+
+empty : SetDigest
+empty =
+    SetDigest { pairs = 0, mix = List.repeat macWords 0 }
+
+
+-- The digest with one more member, `member` being the member's framed
+-- text (`Index.digestPair` frames a decided pair).
+add : ReviewKey -> String -> SetDigest -> SetDigest
+add key member digest =
+    case digest of
+        SetDigest d ->
+            case key of
+                ReadOnly ->
+                    SetDigest { pairs = d.pairs + 1, mix = d.mix }
+
+                Signing macKey ->
+                    SetDigest
+                        { pairs = d.pairs + 1
+                        , mix = List.map2 Bitwise.xor d.mix (macWordsOf (ReviewKey.sign macKey member))
+                        }
+
+
+-- True when two digests describe the same set: the same count and the same
+-- mix, compared in constant time.
+same : SetDigest -> SetDigest -> Bool
+same left right =
+    case left of
+        SetDigest l ->
+            case right of
+                SetDigest r ->
+                    l.pairs == r.pairs && Crypto.constantTimeEqual (mixText l.mix) (mixText r.mix)
+
+
+-- An HMAC-SHA-256 is 64 hex digits: eight words of eight digits each.
+macWords : Int
+macWords =
+    8
+
+
+macWordsOf : String -> List Int
+macWordsOf hex =
+    List.map (\i -> hexWord (String.slice (i * 8) (i * 8 + 8) hex)) (List.range 0 (macWords - 1))
+
+
+-- The value of at most eight lowercase hex digits, as `ReviewKey.sign`
+-- writes them; at most 2^32 - 1, so it never overflows.
+hexWord : String -> Int
+hexWord digits =
+    String.foldl (\c acc -> acc * 16 + hexDigit c) 0 digits
+
+
+hexDigit : Char -> Int
+hexDigit c =
+    let
+        code =
+            Char.toCode c
+    in
+    if code >= Char.toCode 'a' then
+        code - Char.toCode 'a' + 10
+
+    else
+        code - Char.toCode '0'
+
+
+mixText : List Int -> String
+mixText mix =
+    String.join " " (List.map String.fromInt mix)

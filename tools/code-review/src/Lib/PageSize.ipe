@@ -1,4 +1,4 @@
-module Lib.PageSize exposing (PageSize, history, maxRows, pairs, parse, queue, toInt)
+module Lib.PageSize exposing (PageSize, history, logPageCeiling, maxRows, pairs, parse, queue, toInt)
 
 -- How many rows one page read may return: at least one, at most `maxRows`.
 -- Opaque: built only by `parse` and the constants below, so a page size of
@@ -49,6 +49,13 @@ history =
 pairs : PageSize
 pairs =
     PageSize 200
+
+
+-- The most pages of `pairs` rows one walk of the review log reads, and so
+-- the most one read of the `reviewed` copy rebuilt from it needs.
+logPageCeiling : Int
+logPageCeiling =
+    10000
 
 
 toInt : PageSize -> Int

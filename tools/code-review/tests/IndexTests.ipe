@@ -28,6 +28,7 @@ import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
 import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid)
@@ -880,15 +881,15 @@ probeRefusesIndexWithoutFiles =
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
 
 
--- An index without the `open_units` view, or without the `reviewed_stamp`
--- table, stops startup naming `IPE_INDEX_DB`. Red if the probe stops
--- selecting either.
-probeRefusesIndexWithoutView : Task.Task Error Bool
-probeRefusesIndexWithoutView =
+-- An index without the `change_queue` table a queue page joins, or without
+-- the `reviewed_stamp` table, stops startup naming `IPE_INDEX_DB`. Red if
+-- the probe stops selecting either.
+probeRefusesIndexWithoutQueueOrStamp : Task.Task Error Bool
+probeRefusesIndexWithoutQueueOrStamp =
     do
-        noView <- probeAfter "ipe-index-probe-view" "DROP VIEW open_units"
+        noQueue <- probeAfter "ipe-index-probe-queue" "DROP TABLE change_queue"
         noStamp <- probeAfter "ipe-index-probe-stamp" "DROP TABLE reviewed_stamp"
-        Task.succeed (noView && noStamp)
+        Task.succeed (noQueue && noStamp)
 
 
 -- The probe of a seeded index after `sql` ran on it: True when it refuses,
@@ -936,30 +937,91 @@ changeDecodeRefusesModifiedWithoutOld =
     pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'")
 
 
--- An index whose view reports a change kind this reviewer does not know, or
--- an old hash with no change, fails the page read rather than show the unit
--- as some other change. The view is replaced, as a foreign or tampered index
--- could, since the shipped view lists only `new` and `modified`. Red if the
--- decoder has a catch-all arm.
+-- An index whose queue row reports a change kind this reviewer does not
+-- know, or an old hash with no change, fails the page read rather than show
+-- the unit as some other change. The `change_queue` table is replaced
+-- without its CHECK and NOT NULL, as a foreign or tampered index could. Red
+-- if the decoder has a catch-all arm, or if the page drops a queue row of a
+-- kind it does not know, listing the unit as unrecorded.
 changeDecodeRefusesUnknown : Task.Task Error Bool
 changeDecodeRefusesUnknown =
     do
-        unknown <- pageReadFailsAfter "ipe-index-change-unknown" (foreignView "'renamed'" "NULL")
-        orphanOld <- pageReadFailsAfter "ipe-index-change-orphan-old" (foreignView "NULL" "'h-old'")
+        unknown <- pageReadFailsAfter "ipe-index-change-unknown" (foreignQueue "'renamed'" "NULL")
+        orphanOld <- pageReadFailsAfter "ipe-index-change-orphan-old" (foreignQueue "NULL" "'h-old'")
         Task.succeed (unknown && orphanOld)
 
 
--- A replacement `open_units` view listing every unit with a fixed change and
--- old hash.
-foreignView : String -> String -> String
-foreignView change oldHash =
+-- A replacement `change_queue` with one row per unit for its current body,
+-- holding a fixed change and old hash.
+foreignQueue : String -> String -> String
+foreignQueue change oldHash =
     String.concat
-        [ "DROP VIEW open_units; CREATE VIEW open_units AS SELECT u.uid, u.path, u.kind, u.name, u.qualified, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang, "
+        [ "DROP TABLE change_queue; CREATE TABLE change_queue (uid TEXT, change TEXT, old_hash TEXT, new_hash TEXT, enqueued_sha TEXT, enqueued_at INTEGER); INSERT INTO change_queue SELECT uid, "
         , change
-        , " AS change, "
+        , ", "
         , oldHash
-        , " AS old_hash, 0 AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path"
+        , ", body_hash, 'sha', 0 FROM units"
         ]
+
+
+-- An `open_units` view redefined in the index to leave a unit out does not
+-- hide it: the queue's membership is the app's own query over the index's
+-- tables, so both units are listed and counted. Red while any page or count
+-- reads the view.
+redefinedViewHidesNoUnit : Task.Task Error Bool
+redefinedViewHidesNoUnit =
+    do
+        at <- freshScratch "ipe-index-redefined-view"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ Uid.toString (uid "u-b") ++ "'")
+        r <- loadFirstPage
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (r.total == 2 && List.map (\e -> e.uid) r.units == [ uid "u-a", uid "u-b" ])
+
+
+-- The `reviewed` copy is digested only while each pair is in it once: a
+-- copy recreated without its primary key and holding one pair twice reads
+-- no digest, while the same keyless table holding the pair once still does,
+-- so the refusal is the repeat's. Red if the copy is digested without
+-- proving its pairs distinct, where a repeated pair cancels out of the
+-- digest.
+repeatedCopyPairReadsNoDigest : Task.Task Error Bool
+repeatedCopyPairReadsNoDigest =
+    let
+        keyless =
+            "DROP TABLE reviewed; CREATE TABLE reviewed (uid TEXT NOT NULL, body_hash TEXT NOT NULL); INSERT INTO reviewed VALUES ('x', 'hx')"
+    in
+    do
+        once <- copyReadAfter "ipe-index-copy-once" keyless
+        twice <- copyReadAfter "ipe-index-copy-twice" (keyless ++ "; INSERT INTO reviewed VALUES ('x', 'hx')")
+        Task.succeed (once && not twice)
+
+
+-- A `reviewed` copy replaced by a view over another table reads no digest:
+-- a view can show the digest read and the membership read different rows.
+-- Red if the copy is digested without proving it a plain table.
+viewCopyReadsNoDigest : Task.Task Error Bool
+viewCopyReadsNoDigest =
+    do
+        plain <- copyReadAfter "ipe-index-copy-plain" "DELETE FROM reviewed"
+        viewed <- copyReadAfter "ipe-index-copy-view" "DROP TABLE reviewed; CREATE TABLE reviewed_rows (uid TEXT NOT NULL, body_hash TEXT NOT NULL); CREATE VIEW reviewed AS SELECT uid, body_hash FROM reviewed_rows"
+        Task.succeed (plain && not viewed)
+
+
+-- True when a snapshot of a seeded index, after `sql` ran on it, carries a
+-- digest of its `reviewed` copy.
+copyReadAfter : String -> String -> Task.Task Error Bool
+copyReadAfter name sql =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb sql
+        conn <- indexConn
+        snap <- Index.readSnapshot ReviewKey.ReadOnly conn Index.Start
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (Maybe.withDefault False (Maybe.map (\_ -> True) snap.copy))
 
 
 -- True when the first page read fails on a seeded index after `sql` ran.
@@ -991,7 +1053,7 @@ execIndexScript indexDb sql =
 -- one reader of a page `Lib.Index` exposes.
 pendingRows : Db -> Task.Task Error (List Index.PendingRow)
 pendingRows conn =
-    Index.readSnapshot conn Index.Start |> Task.map (\snap -> snap.rows)
+    Index.readSnapshot ReviewKey.ReadOnly conn Index.Start |> Task.map (\snap -> snap.rows)
 
 
 -- ── one reader of a page ───────────────────────────────────────────────
@@ -1006,7 +1068,7 @@ indexExposesOnlySnapshotReader =
     do
         cwd <- System.cwd ()
         path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
-        source <- File.readFileLimit path (ByteSize.kib 64)
+        source <- File.readFileLimit path (ByteSize.kib 256)
         Task.succeed
             (exposesAdmitted source
                 && List.all (\reader -> not (List.member reader indexExposes)) snapshotReaders
@@ -1014,7 +1076,7 @@ indexExposesOnlySnapshotReader =
             )
 
 
--- The scan refuses each way around it: one of the four readers re-exposed,
+-- The scan refuses each way around it: one of the readers re-exposed,
 -- a wrapper exposed under a new name, an `exposing (..)` header, and a
 -- reader on a continuation line of a multi-line header. The same header
 -- written over several lines without a reader is admitted, so the
@@ -1029,7 +1091,7 @@ indexExposingScanRefusesEvasions =
     do
         cwd <- System.cwd ()
         path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
-        source <- File.readFileLimit path (ByteSize.kib 64)
+        source <- File.readFileLimit path (ByteSize.kib 256)
         Task.succeed
             (exposesAdmitted source
                 && List.all (\reader -> not (exposesAdmitted (String.replace "readSnapshot," ("readSnapshot, " ++ reader ++ ",") source))) snapshotReaders
@@ -1043,13 +1105,13 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
 snapshotReaders : List String
 snapshotReaders =
-    [ "loadPendingPage", "countPending", "countUnits", "dbBytes" ]
+    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "dbBytes" ]
 
 
 -- True when the module header of `source` exposes exactly `indexExposes`.
@@ -1105,10 +1167,13 @@ checks =
         , check "a queue page reads no source file; only a unit's view load does" pageReadsNoSource
         , check "a unit's language comes from its file's indexed language" langFromFilesTable
         , check "an index without a files table fails the probe" probeRefusesIndexWithoutFiles
-        , check "an index without the open_units view or the stamp fails the probe" probeRefusesIndexWithoutView
+        , check "an index without the change queue or the stamp fails the probe" probeRefusesIndexWithoutQueueOrStamp
         , check "a unit with no change row is still listed" unrecordedUnitListed
         , check "a modified row without its old hash fails the page" changeDecodeRefusesModifiedWithoutOld
         , check "an unknown change kind fails the page" changeDecodeRefusesUnknown
+        , check "a redefined open_units view hides no unit" redefinedViewHidesNoUnit
+        , check "a copy holding a pair twice reads no digest" repeatedCopyPairReadsNoDigest
+        , check "a copy that is a view reads no digest" viewCopyReadsNoDigest
         , check "the page snapshot is the only reader of a page, its counts and size Lib.Index exposes" indexExposesOnlySnapshotReader
         , check "the exposing scan refuses a re-exposed reader, a wrapper, an open list and a multi-line header" indexExposingScanRefusesEvasions
         , check "a span of exactly the line ceiling is shown" spanAtLineCeilingShown

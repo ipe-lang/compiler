@@ -624,12 +624,12 @@ loadFirstPage =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        snap <- Index.readSnapshot conn Index.Start
+        snap <- Index.readSnapshot ReadOnly conn Index.Start
         entries <- Task.sequence (List.map (pageEntry conn settings.roots) snap.rows)
         Task.succeed { units = entries, total = snap.open }
 
 
--- The change comes from the page's `open_units` row, the one place it
+-- The change comes from the page's pending row, the one place it
 -- exists; the unit and its view from `loadView`, as the selected card reads them.
 pageEntry : Db -> RootMap -> Index.PendingRow -> Task.Task Error PageEntry
 pageEntry conn roots row =

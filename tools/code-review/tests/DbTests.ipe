@@ -1220,6 +1220,30 @@ rowBeforeFirstNeverVerified db =
         Task.succeed (verdict == Broken (BeforeFirst 1) && whyOf found == Just ChainBroken && whyOf first == Just ChainBroken && latest == Nothing && refused && after == before)
 
 
+-- Entries sharing a uid or a body hash, but no whole pair, prove; a fourth
+-- entry, signed and linked, deciding the pair the first decided breaks the
+-- walk at it as `Broken (RepeatsAt 4)`, and a decision is refused with
+-- that break, inserting nothing. The digest of the verified pairs is a set
+-- digest a repeated pair cancels out of, so a log holding one would let a
+-- copy holding another pair twice match it. Red if the walk proves a log
+-- deciding one pair twice.
+repeatedPairBreaksTheWalk : Db -> Task.Task Error Bool
+repeatedPairBreaksTheWalk db =
+    do
+        appendSigned db (rawRow "dup" "h1" "approve" Nothing)
+        appendSigned db (rawRow "dup" "h2" "approve" Nothing)
+        appendSigned db (rawRow "other" "h1" "approve" Nothing)
+        distinct <- logVerdictOf db
+        appendSigned db (rawRow "dup" "h1" "approve" Nothing)
+        repeated <- logVerdictOf db
+        before <- logRowCount db
+        attested <- attestedFor "ipe-review-repeated-pair-index" (uid "u-a")
+        macKey <- testMacKey
+        refused <- refusedWith (LibDb.brokenRefusal (RepeatsAt 4)) (LibDb.insertDecision macKey db attested Approved)
+        after <- logRowCount db
+        Task.succeed (isProven distinct && repeated == Broken (RepeatsAt 4) && refused && after == before)
+
+
 -- An entry whose uid column holds text that is no unit id, signed so its
 -- own mac and link verify, breaks the chain at its seq: the walk reads it
 -- and returns `Broken (BreaksAt 2)` rather than failing, and a decision is
@@ -1507,6 +1531,7 @@ reviewLogChecks =
         , check "a signed row appended past the head never counts" (onFreshReview "ipe-review-rowAppendedPastHeadNeverVerified" rowAppendedPastHeadNeverVerified)
         , check "a signed row stored below the first entry never counts" (onFreshReview "ipe-review-rowBeforeFirstNeverVerified" rowBeforeFirstNeverVerified)
         , check "a stored uid that is no unit id breaks the chain at its seq" (onFreshReview "ipe-review-storedUidNotAUnitIdBreaksAtItsSeq" storedUidNotAUnitIdBreaksAtItsSeq)
+        , check "an entry deciding a pair an earlier entry decided breaks the walk at it" (onFreshReview "ipe-review-repeatedPairBreaksTheWalk" repeatedPairBreaksTheWalk)
         , check "the save gate and the read path read every tamper alike" saveGateAndReadPathAgree
         , check "a different key is refused at startup" wrongKeyRefusesStartup
         , check "a different key cannot append" (onFreshReview "ipe-review-wrongKeyCannotAppend" wrongKeyCannotAppend)

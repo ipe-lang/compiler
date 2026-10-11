@@ -10679,6 +10679,10 @@ mod bind_error_tests {
                         && !text.contains("IPE_SERVER_PORT"),
                     "{posture:?}: {text}"
                 );
+                assert!(
+                    text.contains("IPE_WEB_PORT=8123 ./<program>"),
+                    "a {posture:?} build may run as a built binary: {text}"
+                );
             }
             let (_, release) = refusal(r, BuildPosture::Release, ErrorKind::AddrInUse);
             assert!(

@@ -428,6 +428,9 @@ chainBanner shown =
         ShownBroken (BeforeFirst n) ->
             Just ("The review log holds " ++ pastHeadText n ++ " before its first: a decision was added outside this tool.")
 
+        ShownBroken (RepeatsAt n) ->
+            Just ("The review log's entry " ++ String.fromInt n ++ " decides a pair an earlier entry decided: a decision was added outside this tool.")
+
         ShownKeyMismatch ->
             Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts.")
 
@@ -956,9 +959,10 @@ pageHeaderText page =
 --
 -- The page rows, the open count, the progress and the database size come
 -- from one index read, trusted only when the `reviewed` copy's stamp is the
--- one the server's key would write for the review log's head: any other
--- stamp (a failed drain, a replaced index
--- or review file, a decision another process recorded) rebuilds the copy
+-- one the server's key would write for the review log's head and the copy
+-- holds exactly the pairs the log's walk verified: any other copy (a failed
+-- drain, a replaced index or review file, a decision another process
+-- recorded, a pair written into the copy directly) rebuilds the copy
 -- and reads once more, and a stamp that still differs fails the load rather
 -- than show a stale queue. It never loops. The settings are the value
 -- resolved at startup and every index read runs on the one read connection
@@ -989,10 +993,13 @@ pageOf settings db fresh =
                     }
 
 
--- The index read at `cursor` under a stamp current for the review log's
--- verdict, with that verdict, taken once for the load: read as is, or once
--- more after one rebuild of the copy under that same verdict; a stamp still
--- not current after the rebuild is a failed load. The verdict is taken
+-- The index read at `cursor` with the review log's verdict, taken once for
+-- the load, trusted only when the `reviewed` copy holds for it: a stamp
+-- current for the verdict and exactly the pairs of the entries its walk
+-- verified. It is read as is, or once more after one rebuild of the copy
+-- under that same verdict; a copy that still does not hold is a failed
+-- load. A pair written into the copy outside a drain is never counted: the
+-- load rebuilds the copy from the log first. The verdict is taken
 -- before the index is read: a decision recorded after it moves the head on,
 -- so a match proves the copy holds every counted decision up to a head the
 -- log really had, and an entry edited, removed or added outside this tool
@@ -1002,15 +1009,15 @@ freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error
 freshSnapshot settings conn db cursor =
     do
         state <- LibDb.logVerdict settings.key db
-        first <- Index.readSnapshot conn cursor
-        if LibDb.copyCurrent state first.stamp then
+        first <- Index.readSnapshot settings.key conn cursor
+        if LibDb.copyHolds state first then
             Task.succeed ( state, first )
 
         else
             do
                 rebuildUnder settings.index resyncBound state db
-                second <- Index.readSnapshot conn cursor
-                if LibDb.copyCurrent state second.stamp then
+                second <- Index.readSnapshot settings.key conn cursor
+                if LibDb.copyHolds state second then
                     Task.succeed ( state, second )
 
                 else

@@ -1010,12 +1010,17 @@ impl BindRefusal {
 /// The relaunch line a fix suggests: `assignment` before the command that
 /// starts this program again.
 ///
-/// A dev-loop build is started by `ipe dev run`; a release binary is started
-/// directly, so its line names no `ipe` verb.
+/// A dev-posture build may be started by `ipe dev run` or run directly as a
+/// built binary, and the posture cannot tell which, so its line names both; a
+/// release binary is started directly, so its line names no `ipe` verb.
 #[cfg(feature = "server")]
 fn relaunch_line(posture: crate::telemetry::BuildPosture, assignment: &str) -> String {
     match posture {
-        crate::telemetry::BuildPosture::Development => format!("{assignment} ipe dev run"),
+        crate::telemetry::BuildPosture::Development => format!(
+            "{assignment} ipe dev run\n\
+             or, for a built binary:\n\
+             {assignment} ./<program>"
+        ),
         crate::telemetry::BuildPosture::Release => format!("{assignment} ./<program>"),
     }
 }
@@ -4940,6 +4945,10 @@ mod listen_port_tests {
                     assert!(
                         msg.contains(&format!("{var}=8123 {launch}")),
                         "the advice must name {var} and how {posture:?} starts: {msg}"
+                    );
+                    assert!(
+                        msg.contains(&format!("{var}=8123 ./<program>")),
+                        "a {posture:?} build may run as a built binary: {msg}"
                     );
                     assert!(
                         OPERATOR_VARS.iter().filter(|v| msg.contains(*v)).count() == 1,
