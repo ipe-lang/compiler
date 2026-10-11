@@ -1789,8 +1789,10 @@ async fn build_request(
     ))
 }
 
-fn to_axum_response(r: ServerResponse) -> axum::response::Response {
-    to_axum_response_with(r, response_security_headers())
+/// The response `r` sends, claiming its stream from `streams`, the table of
+/// the request `r` answers.
+fn to_axum_response(r: ServerResponse, streams: RequestStreams) -> axum::response::Response {
+    to_axum_response_with(r, streams, response_security_headers())
 }
 
 /// The security headers of a handler response or a static file: the
@@ -1805,17 +1807,19 @@ fn response_security_headers()
 /// [`to_axum_response`] over the outcome of reading the security headers.
 fn to_axum_response_with(
     r: ServerResponse,
+    streams: RequestStreams,
     security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // A streaming response carries the sentinel body `stream` registered.
-    // Claiming it takes its handler, which runs only once the head is built.
-    let pending = match claim_streaming_sentinel(&r.body) {
+    // A streaming response carries the sentinel body `stream` registered in
+    // this request's table. Claiming it takes its handler, which runs only
+    // once the head is built.
+    let pending = match claim_streaming_sentinel(&r.body, streams) {
         ServerStreamClaim::Buffered => None,
         ServerStreamClaim::Stream(pending) => Some(pending),
-        // This process's sentinel with no live handler: serving it as a
-        // buffered body would send the sentinel nonce to the client.
-        ServerStreamClaim::Abandoned => {
+        // Sentinel text this request cannot serve: sending it as a buffered
+        // body would put stream tickets on the wire.
+        ServerStreamClaim::Refused => {
             return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1866,12 +1870,14 @@ fn method_router(method: &str, h: ErasedHandler) -> axum::routing::MethodRouter 
                 .scope(std::cell::Cell::new(upgrader), async move {
                     WS_RESPONSE
                         .scope(std::cell::Cell::new(None), async move {
-                            let result = dispatch(&h, ipe_req).await;
+                            let (result, streams) = dispatch(&h, ipe_req).await;
+                            // An upgraded socket answers the request; the
+                            // streams it registered drop unclaimed.
                             if let Some(ws_resp) = WS_RESPONSE.with(|c| c.take()) {
                                 return ws_resp;
                             }
                             match result {
-                                Ok(resp) => to_axum_response(resp),
+                                Ok(resp) => to_axum_response(resp, streams),
                                 Err(_) => (
                                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                     "Internal Server Error",
@@ -2434,9 +2440,13 @@ async fn in_request_scope<F: Future>(request: F) -> F::Output {
 ///
 /// The handler is called inside the request scope, not only awaited there: an
 /// emitted handler runs its pure code (an `Auth.verifyToken` match) when it is
-/// called, and that code binds into the request's set.
-async fn dispatch(h: &ErasedHandler, req: ServerRequest) -> Result<ServerResponse, String> {
-    in_request_scope(async move { h(req).await }).await
+/// called, and that code binds into the request's set. Returns the outcome
+/// beside the request's stream table, which only its response may claim.
+async fn dispatch(
+    h: &ErasedHandler,
+    req: ServerRequest,
+) -> (Result<ServerResponse, String>, RequestStreams) {
+    crate::server_stream::in_stream_scope(in_request_scope(async move { h(req).await })).await
 }
 
 /// The binding set of the `Server` request the current task handles, or
@@ -4202,6 +4212,7 @@ mod revocation_env_tests {
         };
         dispatch(&handler, req)
             .await
+            .0
             .map_or(500, |resp| resp.status)
     }
 
@@ -5321,7 +5332,7 @@ mod tests {
         crate::system::locked_remove_var("IPE_ENV");
         crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let ipe = server_html("<html><body><h1>hi</h1></body></html>".to_string());
-        let out = axum_body_string(to_axum_response(ipe)).await;
+        let out = axum_body_string(to_axum_response(ipe, RequestStreams::new())).await;
         assert!(
             out.contains(r#"<a id="__ipe-dev-console""#),
             "banner must be injected: {out}"
@@ -5344,7 +5355,11 @@ mod tests {
         crate::system::locked_set_var("ENV", "dev");
         crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         let html = "<html><body><h1>hi</h1></body></html>";
-        let out = axum_body_string(to_axum_response(server_html(html.to_string()))).await;
+        let out = axum_body_string(to_axum_response(
+            server_html(html.to_string()),
+            RequestStreams::new(),
+        ))
+        .await;
         crate::system::locked_remove_var("ENV");
         assert_eq!(out, html, "release HTML must be verbatim");
     }
@@ -5353,11 +5368,11 @@ mod tests {
     async fn to_axum_response_leaves_non_html_untouched() {
         // JSON / plain-text responses never get the banner (only text/html).
         let ipe = server_json(r#"{"ok":true}"#.to_string());
-        let out = axum_body_string(to_axum_response(ipe)).await;
+        let out = axum_body_string(to_axum_response(ipe, RequestStreams::new())).await;
         assert_eq!(out, r#"{"ok":true}"#, "non-html body must be verbatim");
 
         let ipe_text = server_text("plain body</body>".to_string());
-        let out_text = axum_body_string(to_axum_response(ipe_text)).await;
+        let out_text = axum_body_string(to_axum_response(ipe_text, RequestStreams::new())).await;
         assert_eq!(
             out_text, "plain body</body>",
             "text/plain body must be verbatim even with a </body> substring"
@@ -5733,7 +5748,7 @@ mod tests {
         let mut r = server_text("ok".to_string());
         r = server_with_cookie(cookie("a", "1"), r);
         r = server_with_cookie(cookie("b", "2"), r);
-        let resp = to_axum_response(r);
+        let resp = to_axum_response(r, RequestStreams::new());
         let cookies: Vec<_> = resp
             .headers()
             .get_all(axum::http::header::SET_COOKIE)
@@ -5760,7 +5775,7 @@ mod tests {
 
     /// The `Set-Cookie` lines of `r` once it is an HTTP response.
     fn set_cookie_lines(r: ServerResponse) -> Vec<String> {
-        to_axum_response(r)
+        to_axum_response(r, RequestStreams::new())
             .headers()
             .get_all(axum::http::header::SET_COOKIE)
             .iter()
@@ -5888,7 +5903,7 @@ mod tests {
             cookie("sid", "é; a, b \"c\""),
             server_text("ok".to_string()),
         );
-        let resp = to_axum_response(r);
+        let resp = to_axum_response(r, RequestStreams::new());
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let cookies: Vec<_> = resp
             .headers()
@@ -6115,6 +6130,7 @@ mod tests {
     fn response_refuses_a_refused_framing_policy() {
         let refused = to_axum_response_with(
             server_text("ok".to_owned()),
+            RequestStreams::new(),
             Err(crate::telemetry::FrameAncestorsRefusal::Blank),
         );
         assert_eq!(
@@ -6124,6 +6140,7 @@ mod tests {
         assert!(refused.headers().get("x-frame-options").is_none());
         let framed = to_axum_response_with(
             server_text("ok".to_owned()),
+            RequestStreams::new(),
             Ok(vec![("x-frame-options", "SAMEORIGIN".to_owned())]),
         );
         assert_eq!(framed.status(), axum::http::StatusCode::OK);
@@ -6150,7 +6167,7 @@ mod tests {
     /// profile through the production header path.
     #[test]
     fn server_default_csp_present() {
-        let resp = to_axum_response(server_html("<p>hi</p>".to_owned()));
+        let resp = to_axum_response(server_html("<p>hi</p>".to_owned()), RequestStreams::new());
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let want = response_policy();
         assert_eq!(
@@ -6175,7 +6192,7 @@ mod tests {
         let mut r = server_html("<p>hi</p>".to_owned());
         r.headers
             .insert("Content-Security-Policy".to_owned(), own.to_owned());
-        let resp = to_axum_response(r);
+        let resp = to_axum_response(r, RequestStreams::new());
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -6231,7 +6248,11 @@ mod tests {
             let parsed = crate::telemetry::FrameAncestors::parse(raw);
             assert!(parsed.is_err(), "{raw:?}");
             if let Err(refusal) = parsed {
-                let resp = to_axum_response_with(server_html("<p>hi</p>".to_owned()), Err(refusal));
+                let resp = to_axum_response_with(
+                    server_html("<p>hi</p>".to_owned()),
+                    RequestStreams::new(),
+                    Err(refusal),
+                );
                 assert_eq!(
                     resp.status(),
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -6358,7 +6379,7 @@ mod tests {
         ) else {
             panic!("`X-Frame-Options: DENY` must be accepted by `withHeader`");
         };
-        let resp = to_axum_response(r);
+        let resp = to_axum_response(r, RequestStreams::new());
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -6382,7 +6403,7 @@ mod tests {
         ] {
             let mut r = server_text("ok".to_owned());
             r.headers.insert(name.to_owned(), value.to_owned());
-            let resp = to_axum_response(r);
+            let resp = to_axum_response(r, RequestStreams::new());
             assert_eq!(
                 resp.status(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -6402,22 +6423,58 @@ mod tests {
         let mut r = server_text("ok".to_owned());
         r.cookies
             .push(SetCookie::unchecked_for_test("sid=a\r\nX-Injected: 1"));
-        let resp = to_axum_response(r);
+        let resp = to_axum_response(r, RequestStreams::new());
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
         assert!(resp.headers().get("x-injected").is_none());
     }
 
-    /// A `stream` response whose handler emits nothing.
-    async fn streamed(content_type: &str) -> ServerResponse {
+    /// A `stream` response whose handler emits nothing, beside the table of
+    /// the request that registered it.
+    async fn streamed(content_type: &str) -> (ServerResponse, RequestStreams) {
         let task = server_stream_stream::<IpeError, _>(content_type.to_owned(), |_w| {
             Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
         });
-        let built = match task.await {
+        let (result, streams) = crate::server_stream::in_stream_scope(task).await;
+        let built = match result {
             IpeResult::Ok(r) => Some(r),
             IpeResult::Err(_) => None,
         };
-        built.expect("`stream` must build a response")
+        (built.expect("`stream` must build a response"), streams)
+    }
+
+    /// A `stream` task whose handler sets `ran` when it runs.
+    fn flagged_stream(
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    ) -> IpeTask<IpeError, ServerResponse> {
+        server_stream_stream::<IpeError, _>("text/event-stream".to_owned(), move |_w| {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+        })
+    }
+
+    /// The response of a fresh request whose handler registered
+    /// `flagged_stream`, beside that request's table.
+    async fn flagged(ran: &Arc<std::sync::atomic::AtomicBool>) -> (ServerResponse, RequestStreams) {
+        let (result, streams) =
+            crate::server_stream::in_stream_scope(flagged_stream(Arc::clone(ran))).await;
+        let built = match result {
+            IpeResult::Ok(r) => Some(r),
+            IpeResult::Err(_) => None,
+        };
+        (built.expect("`stream` must build a response"), streams)
+    }
+
+    /// Whether `ran` is set once the runtime has had the chance to run a
+    /// spawned stream handler.
+    async fn ran_eventually(ran: &std::sync::atomic::AtomicBool) -> bool {
+        for _ in 0..1024 {
+            if ran.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        ran.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The security headers `to_axum_response_with` is handed in these tests.
@@ -6443,10 +6500,10 @@ mod tests {
     /// content type and the streaming hints; a handler header overrides a hint.
     #[tokio::test]
     async fn streamed_response_carries_the_security_headers() {
-        let mut r = streamed("text/event-stream").await;
+        let (mut r, streams) = streamed("text/event-stream").await;
         r.headers
             .insert("Cache-Control".to_owned(), "no-store".to_owned());
-        let resp = to_axum_response_with(r, framed_security());
+        let resp = to_axum_response_with(r, streams, framed_security());
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         assert_eq!(single_header(&resp, "x-frame-options"), Some("SAMEORIGIN"));
         assert_eq!(
@@ -6464,10 +6521,10 @@ mod tests {
     /// A streamed response sends every `Set-Cookie` line of its `cookies`.
     #[tokio::test]
     async fn streamed_response_emits_its_set_cookie_lines() {
-        let mut r = streamed("text/event-stream").await;
+        let (mut r, streams) = streamed("text/event-stream").await;
         r = server_with_cookie(cookie("a", "1"), r);
         r = server_with_cookie(cookie("b", "2"), r);
-        let resp = to_axum_response_with(r, framed_security());
+        let resp = to_axum_response_with(r, streams, framed_security());
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let lines: Vec<_> = resp
             .headers()
@@ -6483,8 +6540,12 @@ mod tests {
     /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500 on a streamed response.
     #[tokio::test]
     async fn streamed_response_refuses_a_refused_framing_policy() {
-        let r = streamed("text/event-stream").await;
-        let resp = to_axum_response_with(r, Err(crate::telemetry::FrameAncestorsRefusal::Blank));
+        let (r, streams) = streamed("text/event-stream").await;
+        let resp = to_axum_response_with(
+            r,
+            streams,
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         assert!(resp.headers().get("x-frame-options").is_none());
         assert!(resp.headers().get("x-accel-buffering").is_none());
@@ -6514,9 +6575,9 @@ mod tests {
                     "{name:?}: {value:?} under {delivery:?}"
                 );
             }
-            let mut r = streamed("text/event-stream").await;
+            let (mut r, streams) = streamed("text/event-stream").await;
             r.headers.insert(name.to_owned(), value.to_owned());
-            let resp = to_axum_response_with(r, framed_security());
+            let resp = to_axum_response_with(r, streams, framed_security());
             assert_eq!(
                 resp.status(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -6557,16 +6618,16 @@ mod tests {
                     "{first:?}/{second:?} under {delivery:?}"
                 );
             }
-            let resp = to_axum_response_with(buffered, framed_security());
+            let resp = to_axum_response_with(buffered, RequestStreams::new(), framed_security());
             assert_eq!(
                 resp.status(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "{first:?}/{second:?}"
             );
-            let mut r = streamed("text/event-stream").await;
+            let (mut r, streams) = streamed("text/event-stream").await;
             r.headers.insert(first.to_owned(), first_value.to_owned());
             r.headers.insert(second.to_owned(), second_value.to_owned());
-            let resp = to_axum_response_with(r, framed_security());
+            let resp = to_axum_response_with(r, streams, framed_security());
             assert_eq!(
                 resp.status(),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -6591,7 +6652,7 @@ mod tests {
         let r = set("X-Custom", "1", r);
         let r = set("x-custom", "2", r);
         assert_eq!(r.headers.len(), 2, "{:?}", r.headers);
-        let resp = to_axum_response_with(r, framed_security());
+        let resp = to_axum_response_with(r, RequestStreams::new(), framed_security());
         assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
         assert_eq!(single_header(&resp, "location"), Some("/b"));
         assert_eq!(single_header(&resp, "x-custom"), Some("2"));
@@ -6640,7 +6701,7 @@ mod tests {
         let IpeResult::Ok(r) = h(mk_req(method, HashMap::new(), req_headers)).await else {
             panic!("the CORS middleware must pass the handler's response through");
         };
-        to_axum_response_with(r, framed_security())
+        to_axum_response_with(r, RequestStreams::new(), framed_security())
     }
 
     /// A handler's `Access-Control-Allow-Origin` in any case is replaced by
@@ -6926,9 +6987,10 @@ mod tests {
                 "{delivery:?}"
             );
         }
-        let resp = to_axum_response_with(buffered, framed_security());
+        let resp = to_axum_response_with(buffered, RequestStreams::new(), framed_security());
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        let resp = to_axum_response_with(streamed("text/\u{e9}").await, framed_security());
+        let (r, streams) = streamed("text/\u{e9}").await;
+        let resp = to_axum_response_with(r, streams, framed_security());
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
             resp.headers()
@@ -6954,16 +7016,24 @@ mod tests {
             built.expect("`stream` must build a response")
         };
         let refused_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let r = built(stream_with_flag(refused_ran.clone()).await);
-        let resp = to_axum_response_with(r, Err(crate::telemetry::FrameAncestorsRefusal::Blank));
+        let (result, streams) =
+            crate::server_stream::in_stream_scope(stream_with_flag(refused_ran.clone())).await;
+        let r = built(result);
+        let resp = to_axum_response_with(
+            r,
+            streams,
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
         assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
         assert!(!refused_ran.load(std::sync::atomic::Ordering::SeqCst));
         let served_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let r = built(stream_with_flag(served_ran.clone()).await);
-        let resp = to_axum_response_with(r, framed_security());
+        let (result, streams) =
+            crate::server_stream::in_stream_scope(stream_with_flag(served_ran.clone())).await;
+        let r = built(result);
+        let resp = to_axum_response_with(r, streams, framed_security());
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         for _ in 0..1024 {
             if served_ran.load(std::sync::atomic::Ordering::SeqCst) {
@@ -6974,21 +7044,125 @@ mod tests {
         assert!(served_ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// A stream sentinel served a second time has no live handler: it answers
-    /// 500, never a buffered body that sends the sentinel nonce.
+    /// A stream sentinel served a second time, by a request that never minted
+    /// it, names no handler: it answers 500, never a buffered body that sends
+    /// the ticket.
     #[tokio::test]
     async fn abandoned_stream_sentinel_answers_500_without_the_sentinel() {
-        let r = streamed("text/event-stream").await;
+        let (r, streams) = streamed("text/event-stream").await;
         let again = r.clone();
-        let first = to_axum_response_with(r, framed_security());
+        let first = to_axum_response_with(r, streams, framed_security());
         assert_eq!(first.status(), axum::http::StatusCode::OK);
-        let second = to_axum_response_with(again, framed_security());
+        let second = to_axum_response_with(again, RequestStreams::new(), framed_security());
         assert_eq!(
             second.status(),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
         let body = axum_body_string(second).await;
         assert!(!body.contains("__ipe_stream:"), "{body:?}");
+    }
+
+    /// A request serving another request's exact sentinel answers 500, sends
+    /// no sentinel and never runs that handler; the minting request serves it.
+    #[tokio::test]
+    async fn a_sentinel_from_another_request_never_runs_its_handler() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (minted, streams) = flagged(&ran).await;
+        let foreign =
+            to_axum_response_with(minted.clone(), RequestStreams::new(), framed_security());
+        assert_eq!(
+            foreign.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum_body_string(foreign).await;
+        assert!(!body.contains("__ipe_stream:"), "{body:?}");
+        assert!(
+            !ran_eventually(&ran).await,
+            "a foreign claim runs no handler"
+        );
+        let own = to_axum_response_with(minted, streams, framed_security());
+        assert_eq!(own.status(), axum::http::StatusCode::OK);
+        assert!(ran_eventually(&ran).await, "the minting request runs it");
+    }
+
+    /// A live sentinel wrapped in other text answers 500 without the ticket
+    /// and never runs its handler; the exact sentinel streams.
+    #[tokio::test]
+    async fn a_wrapped_live_sentinel_answers_500_and_sends_no_ticket() {
+        let wraps: [fn(&str) -> String; 3] = [
+            |s| format!("x{s}"),
+            |s| format!("{s}x"),
+            |s| format!("<p>{s}</p>"),
+        ];
+        for wrap in wraps {
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (mut r, streams) = flagged(&ran).await;
+            let ticket = r
+                .body
+                .strip_prefix("__ipe_stream:")
+                .map(str::to_owned)
+                .unwrap_or_default();
+            assert_eq!(ticket.len(), 32, "{:?}", r.body);
+            r.body = wrap(&r.body);
+            let wrapped = r.body.clone();
+            let resp = to_axum_response_with(r, streams, framed_security());
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{wrapped:?}"
+            );
+            let body = axum_body_string(resp).await;
+            assert!(!body.contains(&ticket), "{wrapped:?}: {body:?}");
+            assert!(!ran_eventually(&ran).await, "{wrapped:?}");
+        }
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (r, streams) = flagged(&ran).await;
+        let resp = to_axum_response_with(r, streams, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(ran_eventually(&ran).await);
+    }
+
+    /// A handler the response never claims drops with its request's table,
+    /// releasing what it captured.
+    #[tokio::test]
+    async fn an_unclaimed_handler_drops_with_its_request() {
+        let held = Arc::new(());
+        let captured = Arc::clone(&held);
+        let task = server_stream_stream::<IpeError, _>("text/plain".to_owned(), move |_w| {
+            let _keep = Arc::clone(&captured);
+            Box::pin(async { IpeResult::Ok(()) }) as IpeTask<IpeError, ()>
+        });
+        let (registered, streams) = crate::server_stream::in_stream_scope(task).await;
+        assert!(matches!(registered, IpeResult::Ok(_)));
+        drop(registered);
+        assert_eq!(Arc::strong_count(&held), 2, "the pending handler holds it");
+        let resp = to_axum_response_with(
+            server_text("replaced".to_owned()),
+            streams,
+            framed_security(),
+        );
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(Arc::strong_count(&held), 1, "the unclaimed handler dropped");
+    }
+
+    /// A `stream` registered by a `Task.parallel` branch belongs to the
+    /// request the branch runs for, whose response claims it.
+    #[tokio::test]
+    async fn stream_in_a_spawned_subtask_registers_in_its_request() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parallel = crate::task::task_parallel(vec![flagged_stream(Arc::clone(&ran))]);
+        let (result, streams) = crate::server_stream::in_stream_scope(parallel).await;
+        let built = match result {
+            IpeResult::Ok(mut responses) => responses.pop(),
+            IpeResult::Err(_) => None,
+        };
+        assert!(built.is_some(), "the branch registers inside its request");
+        let Some(r) = built else {
+            return;
+        };
+        let resp = to_axum_response_with(r, streams, framed_security());
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert!(ran_eventually(&ran).await);
     }
 
     /// `redirect` percent-encodes CTLs, space, non-ASCII and the characters
@@ -7006,7 +7180,7 @@ mod tests {
             ),
             ("/\u{65e5}", "/%E6%97%A5"),
         ] {
-            let resp = to_axum_response(server_redirect(raw.to_owned()));
+            let resp = to_axum_response(server_redirect(raw.to_owned()), RequestStreams::new());
             assert_eq!(resp.status(), axum::http::StatusCode::FOUND, "{raw:?}");
             assert_eq!(
                 resp.headers()
@@ -7352,6 +7526,7 @@ mod tests {
             };
             dispatch(&h, req)
                 .await
+                .0
                 .expect("guarded handler never returns Err")
         }
 
@@ -7377,6 +7552,7 @@ mod tests {
             };
             dispatch(&h, req)
                 .await
+                .0
                 .expect("guarded handler never returns Err")
         }
 
@@ -7992,6 +8168,7 @@ mod tests {
             };
             let admitted = dispatch(&h, bearer_req(claims))
                 .await
+                .0
                 .map_or(500, |resp| resp.status);
             assert_eq!(admitted, 200, "the armed route admits the token");
             let opened = slot.lock().ok().and_then(|mut held| held.take());
@@ -8098,10 +8275,9 @@ mod tests {
             let RouteTarget::Handler(h) = route.target else {
                 return;
             };
-            let resp = dispatch(&h, bearer_req(&claims))
-                .await
-                .expect("the stream handler answers");
-            let streamed = to_axum_response(resp);
+            let (resp, streams) = dispatch(&h, bearer_req(&claims)).await;
+            let resp = resp.expect("the stream handler answers");
+            let streamed = to_axum_response(resp, streams);
             assert_eq!(streamed.status(), axum::http::StatusCode::OK);
             let mut body = streamed.into_body().into_data_stream();
             let first = tokio::time::timeout(RECHECK_COALESCE, body.next()).await;
@@ -8337,24 +8513,29 @@ mod tests {
             );
         }
 
+        /// A stream table with no binding set beside it: the serve-time gate
+        /// of an armed process still refuses the unscoped credentials.
         #[tokio::test]
-        async fn armed_stream_registered_outside_any_request_answers_401() {
+        async fn armed_stream_without_request_credentials_answers_401() {
             use std::sync::atomic::{AtomicBool, Ordering};
             crate::revocation::arm_process();
             let ran = Arc::new(AtomicBool::new(false));
             let ran_in = Arc::clone(&ran);
-            let registered = crate::server_stream::server_stream_stream::<String, _>(
-                "text/plain".to_string(),
-                move |_writer| {
-                    ran_in.store(true, Ordering::SeqCst);
-                    Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
-                },
+            let (registered, streams) = crate::server_stream::in_stream_scope(
+                crate::server_stream::server_stream_stream::<String, _>(
+                    "text/plain".to_string(),
+                    move |_writer| {
+                        ran_in.store(true, Ordering::SeqCst);
+                        Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
+                    },
+                ),
             )
             .await;
+            assert!(matches!(registered, IpeResult::Ok(_)));
             let IpeResult::Ok(resp) = registered else {
-                panic!("stream registration answers a sentinel response");
+                return;
             };
-            let served = to_axum_response(resp);
+            let served = to_axum_response(resp, streams);
             assert_eq!(
                 served.status(),
                 axum::http::StatusCode::UNAUTHORIZED,
@@ -8435,10 +8616,11 @@ mod tests {
             let RouteTarget::Handler(h) = route.target else {
                 panic!("a GET route carries a handler");
             };
-            let resp = dispatch(&h, req_with(&[], &[]))
-                .await
-                .expect("the stream handler answers");
-            let mut body = to_axum_response(resp).into_body().into_data_stream();
+            let (resp, streams) = dispatch(&h, req_with(&[], &[])).await;
+            let resp = resp.expect("the stream handler answers");
+            let mut body = to_axum_response(resp, streams)
+                .into_body()
+                .into_data_stream();
             let first = tokio::time::timeout(RECHECK_COALESCE, body.next()).await;
             assert!(
                 matches!(first, Ok(Some(Ok(ref chunk))) if chunk.to_vec() == b"first"),
