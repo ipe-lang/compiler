@@ -498,27 +498,7 @@ fn slice_with_vars(home: &[Symbol], vars: u32) -> ipe_db::ModuleSlice {
 /// `owner`.
 #[allow(clippy::expect_used)] // a refused fixture warning is the test failure
 fn slice_with_warning_of(owner: &[Symbol]) -> ipe_types::CanonicalTypes {
-    let warning = ipe_types::HomedWarning::new(
-        ipe_diagnostics::Diagnostic::Type {
-            span: ipe_diagnostics::Span::DUMMY,
-            msg: ipe_diagnostics::TypeError::RedundantCaseBranch {
-                constructor: "Red".into(),
-            },
-        },
-        owner,
-    )
-    .expect("a redundant branch is a homed warning");
-    let solved = ipe_types::SolvedTypes {
-        env: BTreeMap::new(),
-        regions: BTreeMap::new(),
-        expected: BTreeMap::new(),
-        bounds: BTreeMap::new(),
-        warnings: vec![warning],
-        poly_var_map: BTreeMap::new(),
-        untyped_type_params: BTreeMap::new(),
-        msg_defaulted_vars: BTreeMap::new(),
-        signature_wildcards: BTreeMap::new(),
-    };
+    let solved = solve_with_warning_of(owner);
     ipe_types::canonicalize(
         solved,
         ipe_types::VarScope::PerHome,
@@ -992,5 +972,225 @@ fn msg_defaulted_vars_agree_across_a_module_edge() {
             .values()
             .all(|vars| !vars.is_empty()),
         "every keyed binding defaults at least one variable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The scoped slice: dependency seeds are dropped, every other foreign entry refused
+// ---------------------------------------------------------------------------
+
+/// A solve holding no entries.
+fn empty_solve() -> ipe_types::SolvedTypes {
+    ipe_types::SolvedTypes {
+        env: BTreeMap::new(),
+        regions: BTreeMap::new(),
+        expected: BTreeMap::new(),
+        bounds: BTreeMap::new(),
+        warnings: Vec::new(),
+        poly_var_map: BTreeMap::new(),
+        untyped_type_params: BTreeMap::new(),
+        msg_defaulted_vars: BTreeMap::new(),
+        signature_wildcards: BTreeMap::new(),
+    }
+}
+
+/// The dependency interfaces of a scoped solve: `dep` exporting `values`.
+fn deps_exporting(
+    dep: &[Symbol],
+    values: &[Symbol],
+) -> BTreeMap<Vec<Symbol>, Arc<ipe_types::TypedInterface>> {
+    let interface = ipe_types::TypedInterface {
+        values: values
+            .iter()
+            .map(|name| {
+                (
+                    *name,
+                    ipe_types::TypedScheme {
+                        ty: ipe_types::Ty::Unit,
+                        bounds: BTreeMap::new(),
+                        wildcard_pins: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect(),
+        unions: Vec::new(),
+        reachable_unions: Vec::new(),
+    };
+    BTreeMap::from([(dep.to_vec(), Arc::new(interface))])
+}
+
+/// One solve per keyed field other than `env`, each holding a single entry of
+/// `key_home`, labelled by its field.
+fn one_entry_per_field(
+    key_home: &[Symbol],
+    name: Symbol,
+) -> [(&'static str, ipe_types::SolvedTypes); 7] {
+    let key = (key_home.to_vec(), name);
+    let span_key = (key_home.to_vec(), ipe_diagnostics::Span::new(0, 1));
+    [
+        (
+            "regions",
+            ipe_types::SolvedTypes {
+                regions: BTreeMap::from([(span_key.clone(), ipe_types::Ty::Unit)]),
+                ..empty_solve()
+            },
+        ),
+        (
+            "expected",
+            ipe_types::SolvedTypes {
+                expected: BTreeMap::from([(span_key, ipe_types::Ty::Unit)]),
+                ..empty_solve()
+            },
+        ),
+        (
+            "bounds",
+            ipe_types::SolvedTypes {
+                bounds: BTreeMap::from([(key.clone(), BTreeMap::new())]),
+                ..empty_solve()
+            },
+        ),
+        (
+            "poly_var_map",
+            ipe_types::SolvedTypes {
+                poly_var_map: BTreeMap::from([(key.clone(), BTreeMap::new())]),
+                ..empty_solve()
+            },
+        ),
+        (
+            "untyped_type_params",
+            ipe_types::SolvedTypes {
+                untyped_type_params: BTreeMap::from([(key.clone(), Vec::new())]),
+                ..empty_solve()
+            },
+        ),
+        (
+            "msg_defaulted_vars",
+            ipe_types::SolvedTypes {
+                msg_defaulted_vars: BTreeMap::from([(key.clone(), BTreeSet::new())]),
+                ..empty_solve()
+            },
+        ),
+        (
+            "signature_wildcards",
+            ipe_types::SolvedTypes {
+                signature_wildcards: BTreeMap::from([(
+                    key,
+                    ipe_types::SignatureWildcards::default(),
+                )]),
+                ..empty_solve()
+            },
+        ),
+    ]
+}
+
+/// A solve holding one redundant-branch warning owned by `owner`.
+#[allow(clippy::expect_used)] // a refused fixture warning is the test failure
+fn solve_with_warning_of(owner: &[Symbol]) -> ipe_types::SolvedTypes {
+    let warning = ipe_types::HomedWarning::new(
+        ipe_diagnostics::Diagnostic::Type {
+            span: ipe_diagnostics::Span::DUMMY,
+            msg: ipe_diagnostics::TypeError::RedundantCaseBranch {
+                constructor: "Red".into(),
+            },
+        },
+        owner,
+    )
+    .expect("a redundant branch is a homed warning");
+    ipe_types::SolvedTypes {
+        warnings: vec![warning],
+        ..empty_solve()
+    }
+}
+
+/// `env` admits a foreign key only as a value of the matching dependency's
+/// interface, and drops it from the slice; a key of a home that is no
+/// dependency, or of a name the dependency does not export, is refused.
+#[test]
+fn scoped_slice_admits_only_dependency_interface_values_in_env() {
+    let home = vec![Symbol::from_raw(1)];
+    let dep = vec![Symbol::from_raw(2)];
+    let stranger = vec![Symbol::from_raw(3)];
+    let (own, seeded, unexported) = (
+        Symbol::from_raw(10),
+        Symbol::from_raw(11),
+        Symbol::from_raw(12),
+    );
+    let deps = deps_exporting(&dep, &[seeded]);
+    let own_entry = ((home.clone(), own), ipe_types::Ty::Unit);
+
+    let seeded_solve = ipe_types::SolvedTypes {
+        env: BTreeMap::from([
+            own_entry.clone(),
+            ((dep.clone(), seeded), ipe_types::Ty::Unit),
+        ]),
+        ..empty_solve()
+    };
+    assert_eq!(
+        ipe_db::scoped_module_slice(&seeded_solve, &home, &deps),
+        Ok(ipe_types::SolvedTypes {
+            env: BTreeMap::from([own_entry.clone()]),
+            ..empty_solve()
+        }),
+        "a dependency interface value is admitted and left to the dependency's slice"
+    );
+
+    for (what, foreign) in [
+        ("a home that is no dependency", (stranger, seeded)),
+        ("a name the dependency does not export", (dep, unexported)),
+    ] {
+        let solve = ipe_types::SolvedTypes {
+            env: BTreeMap::from([own_entry.clone(), (foreign, ipe_types::Ty::Unit)]),
+            ..empty_solve()
+        };
+        assert_eq!(
+            ipe_db::scoped_module_slice(&solve, &home, &deps),
+            Err(FallbackReason::AssemblyConflict),
+            "an env key of {what} must be refused"
+        );
+    }
+}
+
+/// Every keyed field but `env` is refused on any foreign key, a dependency's
+/// included, and kept whole when its keys are all the module's own.
+#[test]
+fn scoped_slice_refuses_a_foreign_key_in_every_other_field() {
+    let home = vec![Symbol::from_raw(1)];
+    let dep = vec![Symbol::from_raw(2)];
+    let seeded = Symbol::from_raw(11);
+    let deps = deps_exporting(&dep, &[seeded]);
+
+    for (field, solve) in one_entry_per_field(&home, seeded) {
+        assert_eq!(
+            ipe_db::scoped_module_slice(&solve, &home, &deps),
+            Ok(solve.clone()),
+            "an own-home `{field}` entry is kept"
+        );
+    }
+    for (field, solve) in one_entry_per_field(&dep, seeded) {
+        assert_eq!(
+            ipe_db::scoped_module_slice(&solve, &home, &deps),
+            Err(FallbackReason::AssemblyConflict),
+            "a dependency-home `{field}` entry must be refused"
+        );
+    }
+}
+
+/// A warning owned by another module is refused; the module's own is kept.
+#[test]
+fn scoped_slice_refuses_a_foreign_warning() {
+    let home = vec![Symbol::from_raw(1)];
+    let dep = vec![Symbol::from_raw(2)];
+    let deps = deps_exporting(&dep, &[]);
+
+    let own = solve_with_warning_of(&home);
+    assert_eq!(
+        ipe_db::scoped_module_slice(&own, &home, &deps),
+        Ok(own.clone()),
+        "the module's own warning is kept"
+    );
+    assert_eq!(
+        ipe_db::scoped_module_slice(&solve_with_warning_of(&dep), &home, &deps),
+        Err(FallbackReason::AssemblyConflict),
+        "a dependency's warning must be refused"
     );
 }

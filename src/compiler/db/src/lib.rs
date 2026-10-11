@@ -887,9 +887,10 @@ pub fn project_module_types(solved: &ipe_types::SolvedTypes, home: &[Symbol]) ->
 ///
 /// Keeps each `(home, _)` entry of all nine fields and each warning owned by
 /// `home`, so the slice is the module's whole share of the program: nothing
-/// dropped, nothing filled in. Entries of other homes are not this module's
-/// share: a scoped solve's `env` also holds the dep schemes it was seeded
-/// with, which each dep's own slice serves.
+/// dropped, nothing filled in. Entries of other homes are other modules'
+/// shares of the joint solve and are left out. A scoped solve's output is
+/// sliced by [`scoped_module_slice`] instead, which refuses a foreign entry
+/// rather than dropping it.
 #[must_use]
 pub fn module_slice(solved: &ipe_types::SolvedTypes, home: &[Symbol]) -> ipe_types::SolvedTypes {
     let ipe_types::SolvedTypes {
@@ -986,6 +987,74 @@ impl From<ipe_types::CanonicalizeError> for FallbackReason {
     }
 }
 
+/// One scoped solve's output restricted to its own home, refusing every entry
+/// the solve should never have produced.
+///
+/// A scoped solve over `home` holds its own home's entries plus, in `env`
+/// only, each dep interface value it was seeded with; those seeds are dropped,
+/// since each dep's own slice serves them. Any other foreign entry means the
+/// scoped solve and its dep interfaces disagree, so it is refused rather than
+/// dropped.
+///
+/// # Errors
+/// [`FallbackReason::AssemblyConflict`] when `env` holds a foreign key that is
+/// not a value of the matching dep's interface, when any other keyed field
+/// holds a foreign key, or when a warning is owned by another home.
+pub fn scoped_module_slice(
+    solved: &ipe_types::SolvedTypes,
+    home: &[Symbol],
+    deps: &BTreeMap<Vec<Symbol>, Arc<ipe_types::TypedInterface>>,
+) -> Result<ipe_types::SolvedTypes, FallbackReason> {
+    let ipe_types::SolvedTypes {
+        env,
+        regions,
+        expected,
+        bounds,
+        warnings,
+        poly_var_map,
+        untyped_type_params,
+        msg_defaulted_vars,
+        signature_wildcards,
+    } = solved;
+    let mut own_env = BTreeMap::new();
+    for ((key_home, name), ty) in env {
+        if key_home == home {
+            own_env.insert((key_home.clone(), *name), ty.clone());
+        } else if !deps
+            .get(key_home)
+            .is_some_and(|interface| interface.values.contains_key(name))
+        {
+            return Err(FallbackReason::AssemblyConflict);
+        }
+    }
+    if warnings.iter().any(|warning| warning.home() != home) {
+        return Err(FallbackReason::AssemblyConflict);
+    }
+    Ok(ipe_types::SolvedTypes {
+        env: own_env,
+        regions: own_home_only(regions, home)?,
+        expected: own_home_only(expected, home)?,
+        bounds: own_home_only(bounds, home)?,
+        warnings: warnings.clone(),
+        poly_var_map: own_home_only(poly_var_map, home)?,
+        untyped_type_params: own_home_only(untyped_type_params, home)?,
+        msg_defaulted_vars: own_home_only(msg_defaulted_vars, home)?,
+        signature_wildcards: own_home_only(signature_wildcards, home)?,
+    })
+}
+
+/// A copy of a `(home, _)`-keyed map, refused when any key is of another home.
+fn own_home_only<K: Clone, V: Clone>(
+    map: &BTreeMap<(Vec<Symbol>, K), V>,
+    home: &[Symbol],
+) -> Result<BTreeMap<(Vec<Symbol>, K), V>, FallbackReason> {
+    if map.keys().all(|(key_home, _)| key_home == home) {
+        Ok(map.clone())
+    } else {
+        Err(FallbackReason::AssemblyConflict)
+    }
+}
+
 /// The memoized outcome of one module's scoped solve: a per-module result, or
 /// the reason only the joint solve is faithful for this module.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1068,8 +1137,15 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
     match inference {
         Ok(inference) => match inference.interface {
             ipe_types::InterfaceStatus::Closed(interface) => {
-                canonical_module_slice(&inference.solved, &home)
-                    .map_err(FallbackReason::from)
+                scoped_module_slice(&inference.solved, &home, &deps)
+                    .and_then(|slice| {
+                        ipe_types::canonicalize(
+                            slice,
+                            ipe_types::VarScope::PerHome,
+                            ipe_types::VarCeiling::SOLVER,
+                        )
+                        .map_err(FallbackReason::from)
+                    })
                     .map_or_else(ScopedModuleTypes::WholeProgram, |solved| {
                         ScopedModuleTypes::PerModule {
                             solved: Arc::new(solved),

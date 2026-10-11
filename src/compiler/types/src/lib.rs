@@ -1066,6 +1066,13 @@ fn infer_core(
                 .push(&app.vars);
         }
         for (key, ty) in &generated.top_level {
+            // A scoped solve's `top_level` also holds the dependency interface
+            // seeds. Defaulting a dependency's message slot is that
+            // dependency's own fact, decided by its own solve over every use;
+            // this module sees only its own uses of it.
+            if scoped.is_some_and(|ctx| ctx.deps.contains_key(&key.0)) {
+                continue;
+            }
             let mut ui_msg_vars = BTreeSet::new();
             let mut other_vars = BTreeSet::new();
             collect_ui_msg_and_other_vars(
@@ -8487,6 +8494,80 @@ h x =
             results.push(result);
         }
         Some(results)
+    }
+
+    /// A dependency exporting a message-free view whose `msg` slot no use pins.
+    const DEP_UNPINNED_VIEW: &str = "module Lib exposing (Html, p)\n\n\
+                                     type Html msg\n    = Text String\n    | Tagged msg\n\n\
+                                     p : Html msg\n\
+                                     p =\n    Text \"p\"\n";
+
+    /// An importer of [`DEP_UNPINNED_VIEW`] with a private defaulted view of
+    /// its own.
+    const MAIN_OVER_UNPINNED_VIEW: &str = "module Main exposing (count)\n\n\
+                                           import Lib exposing (p)\n\n\
+                                           type Html msg\n    = Text String\n    | Tagged msg\n\n\
+                                           page : Html msg\n\
+                                           page =\n    Text \"page\"\n\n\
+                                           count : Int\n\
+                                           count =\n    1\n";
+
+    /// A scoped solve records message defaulting for its own bindings only:
+    /// the dependency's `p`, seeded into the importer's solve, gets no entry in
+    /// the importer's `msg_defaulted_vars`, while the importer's own `page`
+    /// does and its interface stays closed.
+    #[test]
+    fn scoped_msg_defaulting_records_no_dependency_binding() {
+        let results = infer_scoped(&[
+            ("Lib", DEP_UNPINNED_VIEW),
+            ("Main", MAIN_OVER_UNPINNED_VIEW),
+        ])
+        .expect("the two-module fixture must canonicalise");
+        assert!(
+            matches!(results.first(), Some(Ok(_))),
+            "Lib's scoped solve must succeed: {results:?}"
+        );
+        let Some(Ok(lib)) = results.first() else {
+            return;
+        };
+        let lib_homes: BTreeSet<&Vec<Symbol>> = lib
+            .solved
+            .msg_defaulted_vars
+            .keys()
+            .map(|(home, _)| home)
+            .collect();
+        assert_eq!(
+            lib.solved.msg_defaulted_vars.len(),
+            1,
+            "Lib's own solve defaults `p`'s message slot: {:?}",
+            lib.solved.msg_defaulted_vars
+        );
+        assert!(
+            matches!(results.get(1), Some(Ok(_))),
+            "Main's scoped solve must succeed: {results:?}"
+        );
+        let Some(Ok(main)) = results.get(1) else {
+            return;
+        };
+        assert!(
+            main.solved
+                .msg_defaulted_vars
+                .keys()
+                .all(|(home, _)| !lib_homes.contains(home)),
+            "Main's solve must not record defaulting for Lib's seeded `p`: {:?}",
+            main.solved.msg_defaulted_vars
+        );
+        assert_eq!(
+            main.solved.msg_defaulted_vars.len(),
+            1,
+            "Main's own `page` is defaulted: {:?}",
+            main.solved.msg_defaulted_vars
+        );
+        assert!(
+            matches!(main.interface, InterfaceStatus::Closed(_)),
+            "Main exports only `count : Int`, so its interface is closed: {:?}",
+            main.interface
+        );
     }
 
     /// `true` iff inference refused the program with a type mismatch.
