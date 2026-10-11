@@ -1233,8 +1233,9 @@ fn connect_refused(port: u16) -> bool {
 }
 
 /// E2 (prove the refusal): the operator `IPE_SERVER_PORT` loses to the
-/// supervisor's relocation var, and a malformed operator value falls back to
-/// the source port, never to `0` or a refusal to bind.
+/// supervisor's relocation var, so the operator port stays closed. A malformed
+/// operator value refuses the program at startup instead of falling back
+/// (`env_startup_refusal.rs`).
 ///
 /// # Errors
 ///
@@ -1247,26 +1248,6 @@ fn server_port_precedence_is_relocation_then_operator_then_source() -> Result<()
     let test_name = "server_port_precedence_is_relocation_then_operator_then_source";
     let relocation = ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV;
     let exe = compile_and_build(test_name, IPE_SERVER_SOURCE_PORT_PROGRAM)?;
-
-    // Garbage operator value over a free source port: the source port binds.
-    let source = pick_ephemeral_port()?;
-    let source_text = source.to_string();
-    {
-        let _guard = spawn_and_wait_ready_with_env(
-            test_name,
-            &exe,
-            source,
-            &[
-                ("IPE_SERVER_PORT", "80a0"),
-                ("E2E_SOURCE_PORT", source_text.as_str()),
-            ],
-        )?;
-        let body = http_get(test_name, &format!("127.0.0.1:{source}"), "/")?;
-        assert_eq!(
-            body, "source ok",
-            "{test_name}: garbage IPE_SERVER_PORT must fall back to the source port"
-        );
-    }
 
     // A valid operator value and a relocation: the relocation binds and the
     // operator port stays closed.
