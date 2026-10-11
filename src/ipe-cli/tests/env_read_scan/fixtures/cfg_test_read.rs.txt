@@ -1,0 +1,8 @@
+pub fn production() {}
+
+#[cfg(test)]
+mod reads {
+    pub fn read() -> Option<String> {
+        crate::read_env_var("IPE_FIXTURE_TEST")
+    }
+}

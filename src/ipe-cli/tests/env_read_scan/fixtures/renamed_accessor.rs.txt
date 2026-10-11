@@ -1,0 +1,11 @@
+use crate::system::read_env_var as rv;
+use ipe_env as host_env;
+use ipe_env::{var_os as raw_os};
+
+pub fn read(name: &str) -> Option<String> {
+    rv(name)
+}
+
+pub fn read_os(name: &str) -> Option<std::ffi::OsString> {
+    host_env::var_os(name).or_else(|| raw_os(name))
+}
