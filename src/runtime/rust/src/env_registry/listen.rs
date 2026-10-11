@@ -15,7 +15,8 @@ pub const SERVER_PORT: PortKey = PortKey::new(
         purpose: "TCP port an `Ipe.Http.Server` app listens on, in `1..=65535`. Any \
                   other value (empty, non-numeric, signed, `0`, or too large) refuses \
                   startup, naming the variable. Under `ipe dev watch` the supervisor \
-                  chooses the port, so this value has no effect there.",
+                  chooses the port and a valid value has no effect, but a malformed one \
+                  still refuses.",
     },
 );
 

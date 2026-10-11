@@ -44,9 +44,11 @@ use syn::{Expr, ExprCall, ExprPath, Lit, Macro, Meta, UseTree};
 /// The source roots scanned, relative to the repository root.
 const ROOTS: &[&str] = &["src", "tools"];
 
-/// Directory names never descended into: build output, tool test inputs and
-/// vendored JavaScript packages.
-const SKIPPED_DIRS: &[&str] = &["target", "fixtures", "node_modules"];
+/// Directory names never descended into, each a `**/<name>` line of the
+/// repository `.gitignore` (build output and vendored JavaScript packages), so
+/// no tracked source can sit under one. A dot-directory is likewise ignored
+/// output (`.ipe`, `.ipe-cache`) or tool config, never a Rust module.
+const SKIPPED_DIRS: &[&str] = &["target", "out", "node_modules"];
 
 /// The registry: every path starting with one of these may name and read a
 /// variable.
@@ -450,6 +452,20 @@ impl<'ast> Visit<'ast> for Reads<'_> {
     }
 }
 
+/// The `EXCLUDED_NAMES` a literal may name outside the registry: every one
+/// that is not also a registry entry's name. An internal registry entry is
+/// excluded from the operator docs, but its name is still spelled only by its
+/// key, so the docs exclusion never exempts it here.
+fn harness_names() -> Vec<&'static str> {
+    ipe_docs::env_vars::EXCLUDED_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            !ipe_runtime_rust::env_registry::registry().any(|entry| entry.name() == *name)
+        })
+        .collect()
+}
+
 /// The refused production sites of the file at `rel` holding `src`.
 ///
 /// # Errors
@@ -461,7 +477,8 @@ fn scan_source(rel: &str, src: &str) -> Result<Vec<Site>, String> {
     }
     let test_lines = panic_scan::test_only_item_lines(src)
         .map_err(|e| format!("{rel}: does not parse, so it cannot be judged: {e}"))?;
-    let excluded = ipe_docs::env_vars::EXCLUDED_NAMES;
+    let excluded = harness_names();
+    let excluded = excluded.as_slice();
     let sites = panic_scan::with_parsed(src, |file| {
         let mut reads = Reads {
             names: Names::of(file),
@@ -482,18 +499,33 @@ fn scan_source(rel: &str, src: &str) -> Result<Vec<Site>, String> {
 
 /// Every production `.rs` file under the scanned roots of `repo`, as its path
 /// relative to `repo` with `/` separators.
-fn production_files(repo: &Path) -> Vec<(String, PathBuf)> {
+///
+/// A `tests` directory or `tests.rs` file is skipped only once its test-only
+/// premise is confirmed on disk ([`panic_scan::is_verified_test_path`]); an
+/// ungated `mod tests;` is production and scanned.
+///
+/// # Errors
+///
+/// A message naming the path when a directory cannot be listed, an entry's
+/// type cannot be read, or an entry is a symlinked directory the walk does not
+/// follow: a tree the walk cannot see into cannot be judged clean.
+fn production_files(repo: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let mut found = Vec::new();
     let mut pending: Vec<PathBuf> = ROOTS.iter().map(|root| repo.join(root)).collect();
     while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        let unlisted = |e: std::io::Error| format!("{}: cannot be listed: {e}", dir.display());
+        for entry in std::fs::read_dir(&dir).map_err(unlisted)? {
+            let entry = entry.map_err(unlisted)?;
             let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{}: type cannot be read: {e}", path.display()))?;
+            if kind.is_symlink() && path.is_dir() {
+                return Err(format!(
+                    "{}: a symlinked directory is not followed, so it cannot be judged",
+                    path.display()
+                ));
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if kind.is_dir() {
                 if !name.starts_with('.') && !SKIPPED_DIRS.contains(&name.as_str()) {
@@ -502,9 +534,15 @@ fn production_files(repo: &Path) -> Vec<(String, PathBuf)> {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(repo) else {
-                continue;
+                return Err(format!(
+                    "{}: lies outside {}",
+                    path.display(),
+                    repo.display()
+                ));
             };
-            if path.extension().is_none_or(|e| e != "rs") || panic_scan::is_test_path(rel) {
+            if path.extension().is_none_or(|e| e != "rs")
+                || panic_scan::is_verified_test_path(repo, rel)
+            {
                 continue;
             }
             let rel = rel
@@ -516,7 +554,7 @@ fn production_files(repo: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     found.sort();
-    found
+    Ok(found)
 }
 
 /// The ratchet: each file's allowed site count.
@@ -590,7 +628,7 @@ fn ratchet_problems(
 #[test]
 fn every_operator_variable_is_read_through_the_registry() {
     let repo = e2e_support::manifest_dir!().join("../..");
-    let files = production_files(&repo);
+    let files = production_files(&repo).expect("the production tree is walkable");
     assert!(
         files.len() > 100,
         "only {} production files found under {}",
@@ -755,4 +793,111 @@ fn the_ratchet_refuses_new_and_stale_sites() {
         pending_counts("# header\n\na.rs 2"),
         Ok(BTreeMap::from([(String::from("a.rs"), 2)]))
     );
+}
+
+/// A docs exclusion exempts a harness name, never a registry entry's name:
+/// the internal relocation port is excluded from the operator docs but is
+/// still spelled only by its key.
+#[test]
+fn an_excluded_name_that_is_registered_is_still_refused() {
+    let named = |name: &str| format!("pub fn f() -> &'static str {{ \"{name}\" }}\n");
+    assert_eq!(
+        kinds(FIXTURE_PATH, &named("IPE_INTERNAL_LISTEN_PORT")),
+        [Kind::Literal]
+    );
+    assert_eq!(kinds(FIXTURE_PATH, &named("IPE_E2E")), Vec::<Kind>::new());
+    let harness = harness_names();
+    assert!(
+        !harness.contains(&"IPE_INTERNAL_LISTEN_PORT"),
+        "{harness:?}"
+    );
+    assert!(harness.contains(&"IPE_E2E"), "{harness:?}");
+}
+
+/// A fresh tree holding `files` (path relative to the tree, contents).
+fn tree(label: &str, files: &[(&str, &str)]) -> PathBuf {
+    let root = ipe_test_temp::temp_root()
+        .join(format!("ipe_env_read_scan_{label}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for (rel, text) in files {
+        let path = root.join(rel);
+        let parent = path.parent().expect("a tree file has a parent");
+        std::fs::create_dir_all(parent).expect("tree dir is created");
+        std::fs::write(&path, text).expect("tree file is written");
+    }
+    root
+}
+
+/// The walk scans what only looks like test code or tool input: an ungated
+/// `mod tests;` body and a module under a directory named `fixtures`. A test
+/// module gated behind `#[cfg(test)]` and ignored build output are skipped.
+#[test]
+fn the_walk_skips_only_confirmed_test_code_and_ignored_output() {
+    let root = tree(
+        "walk",
+        &[
+            ("src/lib.rs", "pub mod tests;\npub mod fixtures;\n"),
+            ("src/tests/mod.rs", "pub fn f() {}\n"),
+            ("src/fixtures/mod.rs", "pub fn f() {}\n"),
+            ("src/out/emitted.rs", "pub fn f() {}\n"),
+            ("tools/gated/lib.rs", "#[cfg(test)]\nmod tests;\n"),
+            ("tools/gated/tests/mod.rs", "fn f() {}\n"),
+        ],
+    );
+    let found = production_files(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    let rels = found
+        .expect("the tree is walkable")
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rels,
+        [
+            "src/fixtures/mod.rs",
+            "src/lib.rs",
+            "src/tests/mod.rs",
+            "tools/gated/lib.rs"
+        ]
+    );
+}
+
+/// A root the walk cannot list, and a symlinked directory it does not follow,
+/// are red: an unseen tree is never judged clean.
+#[test]
+fn an_unwalkable_tree_is_red() {
+    let root = tree("unwalkable", &[("src/lib.rs", "pub fn f() {}\n")]);
+    let missing_root = production_files(&root);
+    #[cfg(unix)]
+    let linked = {
+        std::fs::create_dir_all(root.join("tools")).expect("tools dir is created");
+        std::os::unix::fs::symlink(root.join("src"), root.join("tools/linked"))
+            .expect("symlink is created");
+        production_files(&root)
+    };
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(missing_root.is_err(), "{missing_root:?}");
+    #[cfg(unix)]
+    assert!(
+        linked
+            .as_ref()
+            .is_err_and(|e| e.contains("symlinked directory")),
+        "{linked:?}"
+    );
+}
+
+/// Every skipped directory name is ignored by the repository `.gitignore`, so
+/// the skip can hide no tracked source.
+#[test]
+fn every_skipped_dir_is_gitignored() {
+    let gitignore = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../.gitignore"))
+        .expect(".gitignore reads");
+    let patterns = gitignore.lines().map(str::trim).collect::<BTreeSet<_>>();
+    for name in SKIPPED_DIRS {
+        assert!(
+            patterns.contains(format!("**/{name}").as_str())
+                || patterns.contains(format!("**/{name}/").as_str()),
+            "{name} is skipped but no `**/{name}` line of .gitignore ignores it"
+        );
+    }
 }

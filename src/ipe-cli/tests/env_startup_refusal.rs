@@ -147,8 +147,14 @@ fn run_to_exit(
     Ok((status, stderr))
 }
 
+/// The prefixes the listener's own at-use refusal carries. The startup check
+/// refuses before the program's first line, so its refusal carries neither; a
+/// start that reached the listener first was not refused at startup.
+const LISTEN_TIME_PREFIXES: &[&str] = &["Server.listen:", "Web.tea:"];
+
 /// Assert a refused start: exit `1`, stderr naming `var` and the port range,
-/// and no listening line.
+/// written by the startup check rather than the listener, and no listening
+/// line.
 fn assert_refused(test_name: &str, var: &str, status: ExitStatus, stderr: &str) {
     assert_eq!(
         status.code(),
@@ -158,6 +164,13 @@ fn assert_refused(test_name: &str, var: &str, status: ExitStatus, stderr: &str) 
     assert!(
         stderr.contains(var) && stderr.contains("1..=65535"),
         "{test_name}: stderr must name {var} and the accepted range\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        !LISTEN_TIME_PREFIXES
+            .iter()
+            .any(|prefix| stderr.contains(prefix)),
+        "{test_name}: {var} must be refused by the startup check, not at the listener\n\
+         --- stderr ---\n{stderr}"
     );
     assert!(
         !stderr.contains("listening on"),
