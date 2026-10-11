@@ -61,8 +61,9 @@ type alias UnitView =
 
 
 -- The unit columns as they come off the DB, before the source is attached.
--- The unit page queries units directly, not via `open_units`: a decided
--- unit is not open, but its page must still render, so it reads no change.
+-- The unit page queries units directly, not through `openColumns`: a
+-- decided unit is not open, but its page must still render, so it reads no
+-- change.
 unitByUidSql : String
 unitByUidSql =
     "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid = ?"
@@ -306,11 +307,10 @@ partBDecoder =
 
 
 -- The startup check of `IPE_INDEX_DB`: the index is opened read-only and
--- every column a queue page reads from the `open_units` view is selected,
--- with the `reviewed` copy and its `reviewed_stamp`, so a missing file, a
--- file that is not an ipe-index database, or one missing the view, a table
--- or a column stops the server before it listens, naming the variable and
--- the file.
+-- every column a queue page reads through `openColumns` is selected, with
+-- the `reviewed` copy and its `reviewed_stamp`, so a missing file, a file
+-- that is not an ipe-index database, or one missing a table or a column
+-- stops the server before it listens, naming the variable and the file.
 probe : IndexSettings -> Task.Task Error ()
 probe settings =
     (do
@@ -474,7 +474,7 @@ readConnection settings =
     Db.open "sqlite" (Settings.indexReadUrl settings.db)
 
 
--- Where a page starts in the `(enqueued_at, uid)` order of `open_units`: the
+-- Where a page starts in the `(enqueued_at, uid)` order of `openColumns`: the
 -- head, or strictly after the last row of the previous page. `uid` breaks
 -- ties on `enqueued_at` (a unit with no queue row orders at 0), so the order
 -- is total and no row is skipped or repeated across pages.
@@ -503,7 +503,7 @@ type Change
     | Unrecorded
 
 
--- The `change`/`old_hash` columns of `open_units`, parsed once. A `modified`
+-- The `change`/`old_hash` columns of `openColumns`, parsed once. A `modified`
 -- row without the hash it replaced, an `old_hash` with no change, and a
 -- change kind this reviewer does not know each fail the read rather than
 -- being shown as something they are not.
@@ -542,13 +542,26 @@ changeOf change old =
                 Db.Decode.fail "an open unit has a change kind this reviewer does not know"
 
 
--- The one membership read: `open_units` is the index's current units whose
--- (uid, body_hash) pair is not in the `reviewed` copy. The page and the
--- count both read it, so the total always counts exactly the rows a page
--- can return.
+-- The one membership read: the index's current units whose (uid,
+-- body_hash) pair is not in the `reviewed` copy, written here over the
+-- index's tables rather than read through any view, trigger or other
+-- derived object the index file defines, since anyone who can write the
+-- file can redefine those. The page and the count share `openMembership`,
+-- so the total always counts exactly the rows a page can return. The pairs
+-- compare under `BINARY`, whatever collation the file declares. A unit
+-- joins its queue row for its current body whatever the row's kind, so a
+-- kind this reviewer does not know reaches `changeDecoder` and fails the
+-- read.
 openColumns : String
 openColumns =
-    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM open_units"
+    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash WHERE" ++ openMembership ++ ")"
+
+
+-- The membership condition on a unit row `u`: no pair of the `reviewed`
+-- copy is its (uid, body_hash).
+openMembership : String
+openMembership =
+    " NOT EXISTS (SELECT 1 FROM reviewed r WHERE r.uid = u.uid COLLATE BINARY AND r.body_hash = u.body_hash COLLATE BINARY)"
 
 
 openOrder : String
@@ -607,13 +620,13 @@ countDecoder =
         |> Db.Decode.required "total" (Db.Decode.int "total")
 
 
--- How many units are open, counted over `open_units` without loading a
--- row. A count query that yields no row is a failed read, never a zero.
+-- How many units are open, counted over `openMembership` without loading
+-- a row. A count query that yields no row is a failed read, never a zero.
 countPending : Db.Db -> Task.Task Error Int
 countPending conn =
     do
-        rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM open_units" [] countDecoder
-        singleInt "COUNT(*) over open_units" rows
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE" ++ openMembership) [] countDecoder
+        singleInt "COUNT(*) of open units" rows
 
 
 -- How many units the index holds, open or decided.
@@ -692,58 +705,142 @@ digestPair key uid bodyHash digest =
     SetDigest.add key (lengthPrefixed [ "ipe-code-review/reviewed-pair/v1", uid, bodyHash ]) digest
 
 
--- How far a read of the `reviewed` copy has come: the pages read, the last
--- pair read, and the digest so far.
+-- How far a read of the `reviewed` copy has come: the pages read, the rows
+-- read, the last pair read, and the digest so far.
 type alias CopyRead =
     { pagesRead : Int
+    , rows : Int
     , after : Maybe ( String, String )
     , digest : SetDigest
     }
 
 
 -- Every pair of the `reviewed` copy on `conn`, in key order, in pages of
--- `PageSize.pairs`, digested under `key`: Nothing past
--- `PageSize.logPageCeiling` pages, more than any proven log drains.
+-- `PageSize.pairs`, digested under `key`. The digest is a set digest a
+-- repeated pair cancels out of, so it is returned only with the proof that
+-- every pair it covers is distinct and that it covers every row: `reviewed`
+-- is a plain table, so the membership read in the same transaction sees the
+-- rows this read saw; no pair repeats in it; every page reads strictly
+-- ascending pairs, compared here rather than by any collation the file
+-- declares; and the rows read are as many as the table holds. A copy failing
+-- any of these, or longer than `PageSize.logPageCeiling` pages, more than
+-- any proven log drains, reads Nothing.
 reviewedDigest : ReviewKey -> Db.Db -> Task.Task Error (Maybe SetDigest)
 reviewedDigest key conn =
-    Task.loop (PageSize.logPageCeiling + 1) { pagesRead = 0, after = Nothing, digest = SetDigest.empty } (copyStep key conn)
+    do
+        tables <- countOf conn "the reviewed table check" reviewedTableSql
+        repeats <- countOf conn "the reviewed repeat check" reviewedRepeatSql
+        stored <- countOf conn "COUNT(*) over reviewed" "SELECT COUNT(*) AS total FROM reviewed"
+        read <- Task.loop (PageSize.logPageCeiling + 1) { pagesRead = 0, rows = 0, after = Nothing, digest = SetDigest.empty } (copyStep key conn)
+        Task.succeed (provenCopy (tables == 1 && repeats == 0) stored read)
 
 
-copyStep : ReviewKey -> Db.Db -> CopyRead -> Task.Task Error (Task.Step CopyRead (Maybe SetDigest))
+-- The digest of a whole copy read, kept only when the copy's checks held
+-- and the read covered every stored row.
+provenCopy : Bool -> Int -> Maybe CopyRead -> Maybe SetDigest
+provenCopy checked stored read =
+    case read of
+        Just whole ->
+            if checked && whole.rows == stored then
+                Just whole.digest
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- One row exactly when `reviewed` is a plain table: a view or a virtual
+-- table could show this read and the membership read different rows.
+reviewedTableSql : String
+reviewedTableSql =
+    "SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND lower(name) = 'reviewed' AND sql LIKE 'CREATE TABLE %'"
+
+
+-- How many (uid, body_hash) pairs the copy holds more than once.
+reviewedRepeatSql : String
+reviewedRepeatSql =
+    "SELECT COUNT(*) AS total FROM (SELECT 1 FROM reviewed GROUP BY uid, body_hash HAVING COUNT(*) > 1)"
+
+
+countOf : Db.Db -> String -> String -> Task.Task Error Int
+countOf conn what sql =
+    do
+        rows <- Db.queryDecode conn sql [] countDecoder
+        singleInt what rows
+
+
+copyStep : ReviewKey -> Db.Db -> CopyRead -> Task.Task Error (Task.Step CopyRead (Maybe CopyRead))
 copyStep key conn read =
     do
         rows <- reviewedPage conn read.after
         Task.succeed (copyAfter key read rows)
 
 
-copyAfter : ReviewKey -> CopyRead -> List ( String, String ) -> Task.Step CopyRead (Maybe SetDigest)
+copyAfter : ReviewKey -> CopyRead -> List ( String, String ) -> Task.Step CopyRead (Maybe CopyRead)
 copyAfter key read rows =
     if List.isEmpty rows then
-        Task.Done (Just read.digest)
+        Task.Done (Just read)
 
     else if read.pagesRead >= PageSize.logPageCeiling then
         Task.Done Nothing
 
+    else if not (ascending read.after rows) then
+        Task.Done Nothing
+
     else
         let
-            digest =
-                List.foldl (\( uid, hash ) d -> digestPair key uid hash d) read.digest rows
+            next =
+                { pagesRead = read.pagesRead + 1
+                , rows = read.rows + List.length rows
+                , after = List.head (List.reverse rows)
+                , digest = List.foldl (\( uid, hash ) d -> digestPair key uid hash d) read.digest rows
+                }
         in
         if List.length rows < PageSize.toInt PageSize.pairs then
-            Task.Done (Just digest)
+            Task.Done (Just next)
 
         else
-            Task.Continue { pagesRead = read.pagesRead + 1, after = List.head (List.reverse rows), digest = digest }
+            Task.Continue next
+
+
+-- True when every pair of `rows` follows the one before it, the first
+-- following `after`, so no pair of one read repeats.
+ascending : Maybe ( String, String ) -> List ( String, String ) -> Bool
+ascending after rows =
+    case List.foldl (\pair last -> Maybe.andThen (\prior -> pairFollows prior pair) last) (Just after) rows of
+        Just _ ->
+            True
+
+        Nothing ->
+            False
+
+
+pairFollows : Maybe ( String, String ) -> ( String, String ) -> Maybe (Maybe ( String, String ))
+pairFollows prior pair =
+    case prior of
+        Nothing ->
+            Just (Just pair)
+
+        Just ( lastUid, lastHash ) ->
+            case pair of
+                ( uid, hash ) ->
+                    if uid > lastUid || (uid == lastUid && hash > lastHash) then
+                        Just (Just pair)
+
+                    else
+                        Nothing
 
 
 reviewedPage : Db.Db -> Maybe ( String, String ) -> Task.Task Error (List ( String, String ))
 reviewedPage conn after =
     case after of
         Nothing ->
-            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed ORDER BY uid, body_hash LIMIT ?" [ SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
+            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed ORDER BY uid COLLATE BINARY, body_hash COLLATE BINARY LIMIT ?" [ SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
 
         Just ( uid, hash ) ->
-            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed WHERE (uid, body_hash) > (?, ?) ORDER BY uid, body_hash LIMIT ?" [ SqlString uid, SqlString hash, SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
+            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed WHERE (uid COLLATE BINARY, body_hash COLLATE BINARY) > (?, ?) ORDER BY uid COLLATE BINARY, body_hash COLLATE BINARY LIMIT ?" [ SqlString uid, SqlString hash, SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
 
 
 stampDecoder : Db.Decode.Decoder String
@@ -1063,8 +1160,8 @@ drainDecided conn pair =
 -- change_queue row queued for that hash is deleted. Only the row queued for
 -- the decided hash is deleted: a re-index that re-queued the unit under new
 -- content keeps its row, so the index's own pending list still names that
--- change. Whether a unit is open never reads this row: `open_units` compares
--- the current pair with `reviewed`. Returns the count of queue rows
+-- change. Whether a unit is open never reads this row: `openMembership`
+-- compares the current pair with `reviewed`. Returns the count of queue rows
 -- deleted. Atomic only inside a transaction the caller opens.
 drainPair : Db.Db -> Uid -> String -> Task.Task Error Int
 drainPair conn uid hash =

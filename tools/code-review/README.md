@@ -56,8 +56,8 @@ by variable name only, never by value, since a mistyped URL can carry a
 password. Each refusal states one fix.
 
 The startup probes: the index DB is opened read-only and every column a queue
-page reads from its `open_units` view is selected, with the `reviewed` copy and
-its `reviewed_stamp`, so a missing file or a database that is not an
+page reads from its `units`, `files` and `change_queue` tables is selected,
+with the `reviewed` copy and its `reviewed_stamp`, so a missing file or a database that is not an
 `ipe-index` index stops startup; the review DB is opened (created when absent),
 migrated, and its log head read; the root must be an existing directory. A probe failure names
 the variable and the resolved file, which is a plain absolute path once
@@ -100,12 +100,25 @@ length, never its text.
 History shows 100 reviews per page, newest first; each page reads only its own
 rows, through an index in that order.
 
-The queue lists the index's `open_units` view: its current units minus the
-`(uid, body_hash)` pairs in its `reviewed` table, the app's copy of the review
-DB's decisions. A unit is listed because its current body has no decision, not
-because a change event names it, so an edited unit re-opens, a unit reverted
-to a decided body stays decided, and a unit with no `change_queue` row is
-still listed, badged UNRECORDED.
+The queue lists the index's current units minus the `(uid, body_hash)` pairs
+in its `reviewed` table, the app's copy of the review DB's decisions. A unit
+is listed because its current body has no decision, not because a change
+event names it, so an edited unit re-opens, a unit reverted to a decided body
+stays decided, and a unit with no `change_queue` row is still listed, badged
+UNRECORDED. The app writes this query itself over the index's tables: it reads
+no view, trigger or other object the index file defines (`ipe-index`'s own
+`open_units` view included), since anyone who can write the file can redefine
+them, and it compares pairs byte for byte, whatever collation the file
+declares.
+
+The index records what the code is; the app does not check that record
+against the working tree. Anyone who can write the index file can therefore
+change, remove or add rows of `units`, and the queue lists exactly what those
+rows say: a unit whose row is removed, or whose `body_hash` is set to a pair
+already decided, is not listed. Closing that needs each unit's row bound to
+the tree it was indexed from, which the app does not do. The review decisions
+themselves are not at risk: they live in the signed review log, and the
+`reviewed` copy is checked against it on every load (below).
 
 The progress counter in the header is the index's units minus its open units,
 out of all its units. The page rows, the open count and the progress are read
@@ -185,7 +198,12 @@ The index's `reviewed` copy is trusted only when its `reviewed_stamp` matches
 the log's current head and state, and its pairs are exactly the pairs that
 page load's walk of the log verified (compared by a digest keyed by
 `IPE_REVIEW_MAC_KEY`, so a pair written into the copy, removed or swapped
-outside a drain is rebuilt away before anything is counted): draining a decision moves the stamp along
+outside a drain is rebuilt away before anything is counted). That digest is
+taken only over a copy proven to hold each pair once: `reviewed` must be a
+plain table, no pair may repeat in it, its rows must read in strictly
+ascending order and number exactly as many as the table holds, and the log
+walk breaks at any entry deciding a pair an earlier entry decided ("The
+review log's entry N decides a pair an earlier entry decided"): draining a decision moves the stamp along
 with the head, and any other stamp (a decision whose drain failed, an index
 file replaced by another, a decision made from another process) rebuilds the
 copy from the verified rows of the review DB before the page is read. The

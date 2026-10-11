@@ -370,7 +370,7 @@ everyWithheldConstructorRendered =
     do
         cwd <- System.cwd ()
         path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
-        source <- File.readFileLimit path (ByteSize.kib 64)
+        source <- File.readFileLimit path (ByteSize.kib 256)
         let
             views =
                 constructorsOf "SourceView" source
