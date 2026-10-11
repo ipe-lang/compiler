@@ -297,6 +297,25 @@ pub fn current_session_sid() -> String {
     SESSION.try_with(|s| s.sid.clone()).unwrap_or_default()
 }
 
+/// `task`, run inside the session scope its caller runs in, or as it is
+/// outside any session.
+///
+/// The scope is read when this is called, on the caller's task, so a task
+/// spawned on a session's behalf keeps the session's sid and credential set
+/// across every poll: a token it verifies binds to that session, where
+/// revocation and expiry can close it.
+pub(crate) fn inherit_session_scope<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let scope = SESSION.try_with(SessionScope::clone).ok();
+    async move {
+        match scope {
+            Some(scope) => SESSION.scope(scope, task).await,
+            None => task.await,
+        }
+    }
+}
+
 /// The credential set of the session in scope, or `None` outside any session.
 #[cfg(feature = "jwt")]
 #[must_use]
