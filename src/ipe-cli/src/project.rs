@@ -1132,6 +1132,11 @@ impl PackageSnapshot {
     }
 
     /// The parsed `package.ipe`.
+    ///
+    /// Its fields are parsed from the captured bytes, but its paths (`root`,
+    /// `src_root`, `icon`) are locations: a file read through one is a fresh
+    /// read, not the captured value. Module text comes from
+    /// [`PackageSnapshot::sources`]; `icon` names a file no digest pins.
     #[must_use]
     pub const fn manifest(&self) -> &ProjectManifest {
         &self.manifest
