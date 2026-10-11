@@ -7649,6 +7649,14 @@ const fn is_shared_fn_leaf(expr: &Expr) -> bool {
     )
 }
 
+/// What a `case` scrutinee says about the stored functions its arms' binders read.
+struct StoredScrutinee {
+    /// The scrutinee's own arrow when it is a stored function read.
+    value: Option<(Vec<IrType>, IrType)>,
+    /// Whether a built-in constructor's payload under the scrutinee is a storage position.
+    builtin_payload: bool,
+}
+
 /// The carrier a function value is emitted on.
 enum FnCarrier {
     /// A `Box`/`impl Fn` closure, which a direct function slot accepts as is.
@@ -7680,22 +7688,12 @@ fn ty_holds_fun(ty: &Ty) -> bool {
 }
 
 /// Whether the lowered type `ty` holds an `Arc` function anywhere.
+///
+/// Walks every type-carrying position through the exhaustive
+/// [`ir_type_mentions`], so a container variant added to [`IrType`] is
+/// descended here the day it exists rather than read as holding no function.
 fn ir_holds_shared(ty: &IrType) -> bool {
-    match ty {
-        IrType::SharedFun(..) => true,
-        IrType::Fun(params, ret) | IrType::FnOnceChain(params, ret) => {
-            params.iter().any(ir_holds_shared) || ir_holds_shared(ret)
-        }
-        IrType::Maybe(item) | IrType::List(item) | IrType::Set(item) | IrType::Task(item) => {
-            ir_holds_shared(item)
-        }
-        IrType::Result(left, right) | IrType::Dict(left, right) => {
-            ir_holds_shared(left) || ir_holds_shared(right)
-        }
-        IrType::Tuple(items) => items.iter().any(ir_holds_shared),
-        IrType::Record(fields) => fields.values().any(ir_holds_shared),
-        _ => false,
-    }
+    ir_type_mentions(ty, &|t| matches!(t, IrType::SharedFun(..)))
 }
 
 /// Whether the lowered type `ty` is an `Arc` function, or one directly under a `Maybe`/`Result` payload.
@@ -11199,6 +11197,9 @@ pub struct Lowerer<'a> {
     /// its record's type, so it needs no entry. Saved and restored per scope;
     /// interior mutability so the lowering walk stays over a shared `&self`.
     shared_fn_reads: std::cell::RefCell<BTreeMap<Symbol, (Vec<IrType>, IrType)>>,
+    /// The number of expressions [`Self::value_carrier_type`] has classified.
+    #[cfg(test)]
+    carrier_walks: std::cell::Cell<usize>,
     /// Per-def record of the erased row params a function accumulates during its
     /// own lowering, keyed by `(home_path, name)`. Each entry is a list of
     /// `(param_position, RowParam)` pairs — the zero-based index of the
@@ -13206,6 +13207,8 @@ impl<'a> Lowerer<'a> {
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
             shared_fn_reads: std::cell::RefCell::new(BTreeMap::new()),
+            #[cfg(test)]
+            carrier_walks: std::cell::Cell::new(0),
             fn_row_params: std::cell::RefCell::new(BTreeMap::new()),
             source_path: source_path.to_owned(),
             source_text: source_text.to_owned(),
@@ -24507,6 +24510,9 @@ impl<'a> Lowerer<'a> {
     /// ([`Self::call_carrier_type`]). `None` when the type holds no function
     /// or cannot be lowered.
     fn value_carrier_type(&self, expr: &canon::Expr) -> Option<IrType> {
+        #[cfg(test)]
+        self.carrier_walks
+            .set(self.carrier_walks.get().saturating_add(1));
         let region = self.region_ty(expr.span);
         if region.is_some_and(|ty| !ty_holds_fun(ty)) {
             return None;
@@ -24534,9 +24540,10 @@ impl<'a> Lowerer<'a> {
                 .with_stored_fn_let_binders(bindings, || self.value_carrier_type(body))
                 .or_else(lowered),
             canon::Expr_::Case(scrutinee, branches) => {
+                let stored = self.stored_fn_scrutinee(scrutinee, None);
                 join_carrier_types(branches.iter().map(|br| {
                     let saved = self.shared_fn_reads.borrow().clone();
-                    self.register_stored_fn_arm_binders(scrutinee, None, &br.pat);
+                    self.register_stored_fn_arm_binders(&stored, &br.pat);
                     let found = self.value_carrier_type(&br.body);
                     *self.shared_fn_reads.borrow_mut() = saved;
                     found
@@ -24572,7 +24579,11 @@ impl<'a> Lowerer<'a> {
     /// [`Self::lower_call`] applies). A partial, over-applied, or
     /// non-collapsing spine, and a call to anything but a kernel, emits a
     /// closure or a call whose result is on the solved type's own carriers,
-    /// so it is `base`.
+    /// so it is `base`. A top-level user def's result is its declared return
+    /// type lowered: a declared variable an argument binds to a function is
+    /// refused before lowering ([`Self::reject_fn_through_generic_slot`]),
+    /// so no argument's function carrier reaches the result outside an opaque
+    /// wrapper (`Task`, `Decoder`, `Cmd`, `Sub`) no function slot reads.
     fn call_carrier_type(
         &self,
         callee: &canon::Expr,
@@ -24675,7 +24686,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Register every binder of a match arm's pattern that reads a stored function.
+    /// The stored-function facts of a `case` scrutinee its arms' binders register against.
     ///
     /// A constructor payload is stored when the constructor is a USER enum
     /// (its payload arrow is flipped to `SharedFun`,
@@ -24686,19 +24697,32 @@ impl<'a> Lowerer<'a> {
     /// a directly-built `Maybe (Int -> Int)` payload stays on `Box`. A
     /// root-level binder aliases the scrutinee and reads a stored function
     /// exactly when the scrutinee does. `scrutinee` is the lowered scrutinee
-    /// when one exists. The caller saves and restores [`Self::shared_fn_reads`]
-    /// around the arm so a binder never outlives its pattern scope.
-    fn register_stored_fn_arm_binders(
+    /// when one exists. Computed once per `case`, before its arms: the facts
+    /// depend on the scrutinee alone, and walking the scrutinee per arm makes
+    /// a scrutinee nested `d` cases deep cost `arms^d`.
+    fn stored_fn_scrutinee(
         &self,
         canon_scrutinee: &canon::Expr,
         scrutinee: Option<&Expr>,
-        pat: &canon::Pattern,
-    ) {
+    ) -> StoredScrutinee {
         let lowered = scrutinee.and_then(|s| self.shared_fn_read_carrier(s));
         let builtin_payload =
             lowered.is_some() || self.scrutinee_projects_collection_fn(canon_scrutinee);
         let value = lowered.or_else(|| self.canon_stored_fn_carrier(canon_scrutinee));
-        self.register_stored_fn_root(pat, value, builtin_payload);
+        StoredScrutinee {
+            value,
+            builtin_payload,
+        }
+    }
+
+    /// Register every binder of a match arm's pattern that reads a stored function.
+    ///
+    /// `scrutinee` is the arm's `case` scrutinee, classified once
+    /// ([`Self::stored_fn_scrutinee`]). The caller saves and restores
+    /// [`Self::shared_fn_reads`] around the arm so a binder never outlives
+    /// its pattern scope.
+    fn register_stored_fn_arm_binders(&self, scrutinee: &StoredScrutinee, pat: &canon::Pattern) {
+        self.register_stored_fn_root(pat, scrutinee.value.clone(), scrutinee.builtin_payload);
     }
 
     /// Register the binders of a root pattern bound to a value whose stored carrier is `value`.
@@ -31042,6 +31066,7 @@ impl<'a> Lowerer<'a> {
     #[allow(clippy::too_many_lines)]
     fn lower_case(&self, scrut: &canon::Expr, branches: &[canon::CaseBranch]) -> DResult<Expr> {
         let scrutinee = self.lower_expr(scrut)?;
+        let stored_scrutinee = self.stored_fn_scrutinee(scrut, Some(&scrutinee));
 
         // The parser rejects a zero-branch `case` (CaseDefect::NoBranches), so
         // an empty branch list here is a violated invariant.
@@ -31063,7 +31088,7 @@ impl<'a> Lowerer<'a> {
                 // any outer promotable name over the arm body. A component read
                 // out of storage is registered for the arm body like any arm's.
                 let shared_before = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &first.pat);
+                self.register_stored_fn_arm_binders(&stored_scrutinee, &first.pat);
                 let body = self.with_binders(&shadowing_binder_scope(&first.pat), || {
                     self.lower_expr(&first.body)
                 });
@@ -31131,7 +31156,7 @@ impl<'a> Lowerer<'a> {
                             let arm_pat = self.lower_arm_pat(&br.pat, scrut.span)?;
                             let arm_syms = collect_arm_pat_pvars(&br.pat.value);
                             let shared_before = self.shared_fn_reads.borrow().clone();
-                            self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
+                            self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                             let mut arm_body = self
                                 .with_binders(&arm_binder_scope(&arm_syms), || {
                                     self.lower_expr(&br.body)
@@ -31236,7 +31261,7 @@ impl<'a> Lowerer<'a> {
                 // read into a direct higher-order parameter demotes to `Box`
                 // ([`Self::demote_shared_fn_read`]). Scoped to this arm.
                 let shared_before = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
+                self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                 let mut arm_body =
                     self.with_binders(&arm_binder_scope(&arm_syms), || self.lower_expr(&br.body))?;
                 *self.shared_fn_reads.borrow_mut() = shared_before;
@@ -37989,5 +38014,145 @@ mod tests {
             reject_nonclone_value_reuse(env, xs, &list_int, &reused, span),
             Ok(())
         );
+    }
+
+    /// A `case` whose scrutinee is the same two-arm `case`, `depth` levels deep.
+    fn nested_scrutinee_case(depth: usize) -> canon::Expr {
+        let unit = || Located::new(Span::DUMMY, canon::Expr_::Unit);
+        let arm = || canon::CaseBranch {
+            pat: Located::new(Span::DUMMY, canon::Pattern_::PAnything),
+            body: unit(),
+        };
+        (0..depth).fold(unit(), |scrutinee, _| {
+            Located::new(
+                Span::DUMMY,
+                canon::Expr_::Case(Box::new(scrutinee), vec![arm(), arm()]),
+            )
+        })
+    }
+
+    /// A `case` scrutinee is classified once for all of its arms.
+    ///
+    /// Each of the 24 levels walks its scrutinee once and its two arm bodies
+    /// once: `3 * depth + 1` walks. Classifying the scrutinee per arm doubles
+    /// the walk at every level, `2^depth` walks.
+    #[test]
+    fn nested_case_scrutinee_carrier_walk_is_linear() {
+        const DEPTH: usize = 24;
+        let expr = nested_scrutinee_case(DEPTH);
+        with_binder_type_lowerer(|lowerer, _| {
+            lowerer.carrier_walks.set(0);
+            assert_eq!(lowerer.value_carrier_type(&expr), None);
+            let walks = lowerer.carrier_walks.get();
+            assert!(
+                walks <= 3 * DEPTH + 1,
+                "{walks} carrier walks over a {DEPTH}-deep case scrutinee"
+            );
+        });
+    }
+
+    /// An `Arc` function, the payload every container case below wraps.
+    fn shared_fn() -> IrType {
+        IrType::SharedFun(vec![IrType::Int], Box::new(IrType::Bool))
+    }
+
+    /// A `Box` function, the payload no container case below may report.
+    fn direct_fn() -> IrType {
+        IrType::Fun(vec![IrType::Int], Box::new(IrType::Bool))
+    }
+
+    /// Every container shape over `item`, one per type-carrying [`IrType`] position.
+    fn every_container(item: &IrType) -> Vec<(&'static str, IrType)> {
+        let boxed = || Box::new(item.clone());
+        vec![
+            ("Task", IrType::Task(boxed())),
+            ("Cmd", IrType::Cmd(boxed())),
+            ("Sub", IrType::Sub(boxed())),
+            ("Decoder", IrType::Decoder(boxed())),
+            ("Maybe", IrType::Maybe(boxed())),
+            ("List", IrType::List(boxed())),
+            ("Set", IrType::Set(boxed())),
+            ("WebRoute", IrType::WebRoute(boxed())),
+            (
+                "Ui",
+                IrType::Ui {
+                    ctor: ipe_ir::UiCtor::Html,
+                    msg: boxed(),
+                },
+            ),
+            ("Result err", IrType::Result(boxed(), Box::new(IrType::Int))),
+            ("Result ok", IrType::Result(Box::new(IrType::Int), boxed())),
+            ("Dict key", IrType::Dict(boxed(), Box::new(IrType::Int))),
+            ("Dict value", IrType::Dict(Box::new(IrType::Int), boxed())),
+            (
+                "CustomElement down",
+                IrType::CustomElement {
+                    down: boxed(),
+                    up: Box::new(IrType::Unit),
+                },
+            ),
+            (
+                "CustomElement up",
+                IrType::CustomElement {
+                    down: Box::new(IrType::Unit),
+                    up: boxed(),
+                },
+            ),
+            (
+                "Fun param",
+                IrType::Fun(vec![item.clone()], Box::new(IrType::Unit)),
+            ),
+            ("Fun return", IrType::Fun(vec![IrType::Unit], boxed())),
+            (
+                "FnOnceChain param",
+                IrType::FnOnceChain(vec![item.clone()], Box::new(IrType::Unit)),
+            ),
+            (
+                "FnOnceChain return",
+                IrType::FnOnceChain(vec![IrType::Unit], boxed()),
+            ),
+            ("Tuple", IrType::Tuple(vec![IrType::Int, item.clone()])),
+            (
+                "Record",
+                IrType::Record(BTreeMap::from([(
+                    ipe_intern::Symbol::from_raw(1),
+                    item.clone(),
+                )])),
+            ),
+            (
+                "Enum",
+                IrType::Enum {
+                    home: ipe_ir::ModPath(Vec::new()),
+                    name: ipe_intern::Symbol::from_raw(2),
+                    args: vec![item.clone()],
+                },
+            ),
+        ]
+    }
+
+    /// An `Arc` function under every container shape is seen.
+    #[test]
+    fn ir_holds_shared_sees_an_arc_fn_under_every_container() {
+        assert!(super::ir_holds_shared(&shared_fn()));
+        for (shape, ty) in every_container(&shared_fn()) {
+            assert!(
+                super::ir_holds_shared(&ty),
+                "an Arc function under `{shape}` is missed"
+            );
+        }
+    }
+
+    /// A `Box` function or a plain value under every container shape is not reported as `Arc`.
+    #[test]
+    fn ir_holds_shared_refuses_a_direct_fn_under_every_container() {
+        for item in [direct_fn(), IrType::Int] {
+            assert!(!super::ir_holds_shared(&item));
+            for (shape, ty) in every_container(&item) {
+                assert!(
+                    !super::ir_holds_shared(&ty),
+                    "`{shape}` over {item:?} is reported as holding an Arc function"
+                );
+            }
+        }
     }
 }

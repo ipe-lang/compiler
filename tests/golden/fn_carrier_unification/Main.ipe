@@ -9,8 +9,8 @@ import Ipe.String as String
 -- A function value that a kernel call returns from a stored read keeps the
 -- read's `Arc` carrier. Each case passes such a call result to a direct
 -- function slot (a kernel's, a user def's), directly, through a `let` alias,
--- a `case` binder, an `if`, and a pipe; the last cases are hand-written
--- lambdas the same slots accept.
+-- a `case` binder, an `if`, a pipe, and a partial application; the last
+-- cases are hand-written lambdas the same slots accept.
 
 
 type alias Cfg =
@@ -105,6 +105,35 @@ viaAny c =
         0
 
 
+viaPipedDef : Cfg -> Int
+viaPipedDef c =
+    c.keep |> identity |> count
+
+
+viaPipedHead : Cfg -> Int
+viaPipedHead c =
+    nums |> List.filter (Maybe.withDefault c.keep (List.head c.fns)) |> List.length
+
+
+viaPipedDefault : Cfg -> Int
+viaPipedDefault c =
+    List.length (List.filter (Maybe.withDefault (c.keep |> identity) (List.head c.fns)) nums)
+
+
+viaPipedWithDefaultDef : Cfg -> Int
+viaPipedWithDefaultDef c =
+    Maybe.withDefault c.keep (List.head c.fns) |> count
+
+
+viaPartial : Cfg -> Int
+viaPartial c =
+    let
+        keepOnly =
+            List.filter (Maybe.withDefault c.keep (List.head c.fns))
+    in
+    List.length (keepOnly nums)
+
+
 handWritten : List Int
 handWritten =
     [ List.length (List.filter (\n -> n > 1) nums)
@@ -128,6 +157,11 @@ main =
                  , viaPipe cfg
                  , viaPipedList cfg
                  , viaAny cfg
+                 , viaPipedDef cfg
+                 , viaPipedHead cfg
+                 , viaPipedDefault cfg
+                 , viaPipedWithDefaultDef cfg
+                 , viaPartial cfg
                  ]
                     ++ handWritten
                 )
