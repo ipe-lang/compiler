@@ -7,7 +7,8 @@
 //! `write_fork_entry`, which walks every level through a held directory. This
 //! scan parses the non-test items of `src/publish.rs` and refuses any mention
 //! of a path-based filesystem API (`fs`, `File`, `OpenOptions`, `DirBuilder`,
-//! link creators), macro bodies included, and requires `open_pr` to call
+//! link creators), macro bodies included, refuses source it cannot read (an
+//! `include!` or an out-of-line `mod`), and requires `open_pr` to call
 //! `write_fork_entry`.
 
 use std::collections::BTreeSet;
@@ -27,6 +28,7 @@ const BANNED: &[&str] = &[
     "symlink",
     "symlink_file",
     "symlink_dir",
+    "include",
 ];
 
 /// The one function that writes into the fork checkout.
@@ -143,9 +145,16 @@ impl Scan {
 
 impl<'ast> Visit<'ast> for Scan {
     fn visit_item(&mut self, item: &'ast syn::Item) {
-        if !is_test_only(item_attrs(item)) {
-            visit::visit_item(self, item);
+        if is_test_only(item_attrs(item)) {
+            return;
         }
+        if let syn::Item::Mod(module) = item
+            && module.content.is_none()
+        {
+            let site = self.site();
+            self.reaches.insert((site, format!("mod {}", module.ident)));
+        }
+        visit::visit_item(self, item);
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
@@ -241,6 +250,8 @@ fn a_path_based_fork_write_is_refused() -> Result<(), String> {
         "fn write_fork_entry() {}\nfn open_pr() { write_fork_entry(); File::create(p); }\n",
         "fn write_fork_entry() {}\nfn open_pr() { std::fs::create_dir_all(p); }\n",
         "fn open_pr() {}\n",
+        "fn write_fork_entry() {}\nfn open_pr() { write_fork_entry(); include!(\"w.rs\"); }\n",
+        "mod disk;\nfn write_fork_entry() {}\nfn open_pr() { write_fork_entry(); disk::w(); }\n",
     ];
     for source in breaches {
         assert!(!refusals(&scan(source)?).is_empty(), "refused:\n{source}");
