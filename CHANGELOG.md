@@ -10,6 +10,56 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.5.1](https://github.com/ipe-lang/compiler/compare/ipe-v0.5.0...ipe-v0.5.1) (2026-10-08)
+
+
+### Features
+
+* **auth:** Auth.verifyToken refuses with a closed AuthError, never text ([#3574](https://github.com/ipe-lang/compiler/issues/3574)) ([d3c7d8a](https://github.com/ipe-lang/compiler/commit/d3c7d8a3b708ff2b2af59b5d466807861e3d7943))
+* **cli:** rank ipe doc misses into a numbered, re-runnable list ([#3532](https://github.com/ipe-lang/compiler/issues/3532)) ([81aeb73](https://github.com/ipe-lang/compiler/commit/81aeb73253e2a73ee9592d03f379c1da58785068))
+* **code-review:** sign the review log and refuse decisions on a broken chain ([#3543](https://github.com/ipe-lang/compiler/issues/3543)) ([6ee0368](https://github.com/ipe-lang/compiler/commit/6ee036860d134751aa5d41ce54bb32852ce9801a))
+* **crypto:** parse a stored tag into a Mac and verify an HMAC-SHA-256 in constant time ([#3535](https://github.com/ipe-lang/compiler/issues/3535)) ([7e6fffa](https://github.com/ipe-lang/compiler/commit/7e6fffaefb939659d1a78f1085efa2d6f137b55a))
+* **runtime:** admit every authenticated action through one revocation gate ([#3566](https://github.com/ipe-lang/compiler/issues/3566)) ([27e6273](https://github.com/ipe-lang/compiler/commit/27e627304bb6a5c94a091c551b0fe6b56fccc3f0))
+* **runtime:** close live channels when their credential is revoked or expires ([#3572](https://github.com/ipe-lang/compiler/issues/3572)) ([842a65b](https://github.com/ipe-lang/compiler/commit/842a65bd067d60be1353b8062f9da4775a011bfb))
+* **runtime:** persisted web sessions keep their revocation guarantees ([#3573](https://github.com/ipe-lang/compiler/issues/3573)) ([32550b5](https://github.com/ipe-lang/compiler/commit/32550b51b7ce209487c1ad6235983d4b802aa1a6))
+
+
+### Bug Fixes
+
+* **canon:** |= and |. require an import of Ipe.Parser ([#3522](https://github.com/ipe-lang/compiler/issues/3522)) ([035eed6](https://github.com/ipe-lang/compiler/commit/035eed6f921fcd2a3e4799d02440e015de5cec0c))
+* **canon:** classify placement by canonical module, close the operator set ([#3505](https://github.com/ipe-lang/compiler/issues/3505)) ([9a541db](https://github.com/ipe-lang/compiler/commit/9a541dbc2bbb3132a64b87c833fce9ed82f06b49))
+* **canon:** qualified names resolve only through imports ([#3518](https://github.com/ipe-lang/compiler/issues/3518)) ([243cc9d](https://github.com/ipe-lang/compiler/commit/243cc9de18cdfd3bdb6ed16ae88708b6b34a425f))
+* **cli:** bound the FFI inspector child and type its failures ([#3509](https://github.com/ipe-lang/compiler/issues/3509)) ([d0db1e6](https://github.com/ipe-lang/compiler/commit/d0db1e64f6c892826134b0aa66d3a6c2a34c91cd))
+* **cli:** claim an output directory atomically under a locked claim file ([#3513](https://github.com/ipe-lang/compiler/issues/3513)) ([901bdfa](https://github.com/ipe-lang/compiler/commit/901bdfa331e3372d70db713cfa849cb6917f6583))
+* **cli:** contain a Windows transfer's process tree in a kill-on-close job ([#3561](https://github.com/ipe-lang/compiler/issues/3561)) ([f5d8fba](https://github.com/ipe-lang/compiler/commit/f5d8fba5635f6734b4c422eee56a6b36adf0e926))
+* **cli:** hold every cargo build to one wall and kill its process group ([#3558](https://github.com/ipe-lang/compiler/issues/3558)) ([1818c7c](https://github.com/ipe-lang/compiler/commit/1818c7ca5713795bd8dd5acaec136086b68a4893))
+* **cli:** read untrusted project files through held, no-follow, capped handles ([#3488](https://github.com/ipe-lang/compiler/issues/3488)) ([43c555f](https://github.com/ipe-lang/compiler/commit/43c555f403e1e772b7d97a4ab55614ea00e5a81a))
+* **cli:** run wasm tools and package spawns through the bounded child runner ([#3515](https://github.com/ipe-lang/compiler/issues/3515)) ([e2e4037](https://github.com/ipe-lang/compiler/commit/e2e403733babf3cabf06acd7c39de9a6da70029a))
+* **code-review:** attest file residuals under their own hash and refuse a mismatched index root ([#3525](https://github.com/ipe-lang/compiler/issues/3525)) ([8030c84](https://github.com/ipe-lang/compiler/commit/8030c847489c4f4d53bcac7c5027fd7111535387))
+* **code-review:** one chain verdict for the review log, a stored uid typed apart in the mac input ([#3556](https://github.com/ipe-lang/compiler/issues/3556)) ([bace04a](https://github.com/ipe-lang/compiler/commit/bace04a03045422d38541c03815dc91d7bf7b02d))
+* **db:** a database failure is a typed cause in ErrorInfo.details ([#3551](https://github.com/ipe-lang/compiler/issues/3551)) ([01bd86a](https://github.com/ipe-lang/compiler/commit/01bd86a2ae1fa17f7eb8a955b100d6fd7344f813))
+* **db:** ban ambient reads in ipe_db queries and pin the bans ([#3534](https://github.com/ipe-lang/compiler/issues/3534)) ([7934c94](https://github.com/ipe-lang/compiler/commit/7934c94e46d410192f599b8942d7733cd15327fd))
+* **doc:** rank did-you-mean through one shared typed ranker ([#3552](https://github.com/ipe-lang/compiler/issues/3552)) ([7aa2da8](https://github.com/ipe-lang/compiler/commit/7aa2da8daf36f12edb65f3ee0d5576d2c87e632b))
+* **panic-scan:** bound every parse behind a typed depth ceiling and scan templates ([#3524](https://github.com/ipe-lang/compiler/issues/3524)) ([19c8911](https://github.com/ipe-lang/compiler/commit/19c8911fd1131264a584fbc827c6fcee563be1d1))
+* **runtime:** bind loopback unless an operator or the app opts in ([#3536](https://github.com/ipe-lang/compiler/issues/3536)) ([bb53b0f](https://github.com/ipe-lang/compiler/commit/bb53b0f66bcfdc8e17a0fe8a06d4b70a01966bc9))
+* **runtime:** boot live pages from an inert data block and type the home directory ([#3545](https://github.com/ipe-lang/compiler/issues/3545)) ([76e359f](https://github.com/ipe-lang/compiler/commit/76e359f5e8ed17c43655d2e250c7de4a4dbc3d75))
+* **runtime:** getenv failure kinds and Ui input structure ([#3550](https://github.com/ipe-lang/compiler/issues/3550)) ([2db8b36](https://github.com/ipe-lang/compiler/commit/2db8b3644fbc329e8f3eaf3762654adf8468d549))
+* **runtime:** Jwt decoders refuse a date claim that is not a number ([#3567](https://github.com/ipe-lang/compiler/issues/3567)) ([1588327](https://github.com/ipe-lang/compiler/commit/15883276b46ac2b91cdcf3324ea1b6cc93522886))
+* **runtime:** keep focus across patches, type Ui text roles, bound wasm recursion ([#3557](https://github.com/ipe-lang/compiler/issues/3557)) ([6b1651c](https://github.com/ipe-lang/compiler/commit/6b1651c3df5d2019e45c4f396b39b2113aff95a0))
+* **runtime:** one admission rule for script and raw-text elements on the safe surface ([#3533](https://github.com/ipe-lang/compiler/issues/3533)) ([ef8230c](https://github.com/ipe-lang/compiler/commit/ef8230cffd77c694361bf9152691f671c70032d0))
+* **runtime:** one cold rejoin per web session, init Cmd runs for rebuilt sessions ([#3514](https://github.com/ipe-lang/compiler/issues/3514)) ([acc3912](https://github.com/ipe-lang/compiler/commit/acc39129e3618b210370f0fc9be3b57f2a1fd1f5))
+* **runtime:** parse the regex and recursion ceilings through EnvCeiling ([#3519](https://github.com/ipe-lang/compiler/issues/3519)) ([2a7aacc](https://github.com/ipe-lang/compiler/commit/2a7aacc6c2eaf9c9ff1c16414960d8bf8aa1e889))
+* **runtime:** read document and form members only through bound prototypes ([#3549](https://github.com/ipe-lang/compiler/issues/3549)) ([707556a](https://github.com/ipe-lang/compiler/commit/707556af622adae4ae874b374c514d304f10c8cd))
+* **runtime:** refuse an unenforced revocation setting at startup, pin the heartbeat ceiling ([#3559](https://github.com/ipe-lang/compiler/issues/3559)) ([4e97ad6](https://github.com/ipe-lang/compiler/commit/4e97ad67fa88c0e686592ef840f9ca9b9f88c8e9))
+* **runtime:** resolve live events only against the render that produced them ([#3527](https://github.com/ipe-lang/compiler/issues/3527)) ([ece0963](https://github.com/ipe-lang/compiler/commit/ece0963ca6929e0a73f57621469f18198295fe8c))
+* **runtime:** send a strict default content-security-policy on every runtime response ([#3531](https://github.com/ipe-lang/compiler/issues/3531)) ([fcf4855](https://github.com/ipe-lang/compiler/commit/fcf48557a2dc1fcdf40c1c9640590557b160acae))
+* **runtime:** typed bind refusal with a posture fix line; comparable sort docs ([#3528](https://github.com/ipe-lang/compiler/issues/3528)) ([c013010](https://github.com/ipe-lang/compiler/commit/c013010e3a94bd86ae1462797eedc5c282841aee))
+* **sandbox:** prove the jail process cap counts only the jail ([#3562](https://github.com/ipe-lang/compiler/issues/3562)) ([8a8300c](https://github.com/ipe-lang/compiler/commit/8a8300c0b4a26e47e1c4fa39ec567138b4be1333))
+* **types:** bind every Db bind list to the SqlParam obligation ([#3529](https://github.com/ipe-lang/compiler/issues/3529)) ([c34ba7c](https://github.com/ipe-lang/compiler/commit/c34ba7c9786a7a7e47d31f8109e0212472d0ac75))
+* **types:** refuse a sortBy key or member/unique element Rust cannot order or compare ([#3544](https://github.com/ipe-lang/compiler/issues/3544)) ([3b25e5a](https://github.com/ipe-lang/compiler/commit/3b25e5a685f319aa1c03659ce21ff87cd56ef89b))
+* **types:** the wildcard any is a variant, never a spelled name ([#3564](https://github.com/ipe-lang/compiler/issues/3564)) ([56cd1e9](https://github.com/ipe-lang/compiler/commit/56cd1e94aa35bd52b805bf5b244011eed6bf52d4))
+* **web:** one typed mount base for every browser shell URL ([#3490](https://github.com/ipe-lang/compiler/issues/3490)) ([6377f5e](https://github.com/ipe-lang/compiler/commit/6377f5ef5ca088ee615a076f9600e286fa359ab2))
+
 ## [0.5.0](https://github.com/ipe-lang/compiler/compare/ipe-v0.4.0...ipe-v0.5.0) (2026-10-06)
 
 
