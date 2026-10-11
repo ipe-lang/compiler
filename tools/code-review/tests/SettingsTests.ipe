@@ -206,9 +206,10 @@ probesNameTheirVariable =
         missing <- missingIndexProbed at
         notIndex <- foreignDbProbed at
         review <- reviewProbed at
+        reviewDir <- reviewDirProbed at
         System.setenv "IPE_INDEX_DB" at.indexDb
         cleanupIndex at.indexDb at.repo
-        Task.succeed (good == Nothing && missing && notIndex && review)
+        Task.succeed (good == Nothing && missing && notIndex && review && reviewDir)
 
 
 -- An `IPE_INDEX_ROOT` that is a directory but not the tree the index was
@@ -239,6 +240,7 @@ rootProbeJoinsIndexedPath =
                 == Just True
                 && maybeContains "ipe:src/" wrong
                 && maybeContains empty wrong
+                && maybeContains " is not found under " wrong
                 && maybeContains "repository root the index was built from" wrong
                 && not (maybeContains "os error" wrong)
             )
@@ -311,6 +313,21 @@ reviewProbed at =
         System.setenv "IPE_REVIEW_DB" badReview
         message <- probeMessage (envReview |> Task.andThen (LibDb.probe ReadOnly))
         Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && maybeContains "cannot be created there" message && not (maybeContains "ipe-index index" message))
+
+
+-- A review location that is a directory is refused as a directory, with the
+-- fix to name a file, never as a permission the process lacks. Red if the
+-- directory reads as the not-permitted refusal its open fails with.
+reviewDirProbed : Scratch -> Task.Task Error Bool
+reviewDirProbed at =
+    let
+        dirReview =
+            at.repo ++ "/src"
+    in
+    do
+        System.setenv "IPE_REVIEW_DB" dirReview
+        message <- probeMessage (envReview |> Task.andThen (LibDb.probe ReadOnly))
+        Task.succeed (probeNames "IPE_REVIEW_DB" dirReview message && maybeContains "it is a directory, not a database file" message && not (maybeContains "may not write it" message))
 
 
 -- A database failure is classified once, by the typed `DbFailure` it carries,

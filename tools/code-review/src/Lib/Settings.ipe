@@ -180,6 +180,7 @@ type DbRefusal
     | NotSqliteFile
     | Locked
     | NotPermitted
+    | NotAFile
     | MissingSchema
     | Unusable
 
@@ -279,12 +280,28 @@ absentOr present fallback =
 -- and one fix, never the driver's own text or code. A parsed location is a
 -- plain file path (`parseDbLocation` refuses a URL with a host, credentials
 -- or a query), so naming it leaks no secret; it is still quoted, since it
--- came from the environment.
+-- came from the environment. A directory at the location is `NotAFile`
+-- whatever the driver reported, since no access grant makes it a database.
 openFailure : DbRole -> DbLocation -> Error -> Task.Task Error a
 openFailure role loc e =
-    File.exists (locationFile loc)
-        |> Task.onError (\_ -> Task.succeed True)
-        |> Task.andThen (\present -> Task.fail (useRefusal role loc (refusalProblem role (dbRefusalOf present e))))
+    locationRefusal (locationFile loc) e
+        |> Task.andThen (\refusal -> Task.fail (useRefusal role loc (refusalProblem role refusal)))
+
+
+locationRefusal : Path -> Error -> Task.Task Error DbRefusal
+locationRefusal file e =
+    File.isDir file
+        |> Task.onError (\_ -> Task.succeed False)
+        |> Task.andThen
+            (\isDir ->
+                if isDir then
+                    Task.succeed NotAFile
+
+                else
+                    File.exists file
+                        |> Task.onError (\_ -> Task.succeed True)
+                        |> Task.map (\present -> dbRefusalOf present e)
+            )
 
 
 -- A migrated review file that opens and reads but whose log is broken: an
@@ -340,6 +357,9 @@ refusalProblem role refusal =
                 NotPermitted ->
                     ( "this process may not open it", "grant read access to the file and its directory, or point IPE_INDEX_DB at a readable copy" )
 
+                NotAFile ->
+                    ( "it is a directory, not a database file", "point IPE_INDEX_DB at the index file itself, not the directory holding it" )
+
                 MissingSchema ->
                     ( "it lacks a table, view or column this tool reads", indexBuildFix )
 
@@ -359,6 +379,9 @@ refusalProblem role refusal =
 
                 NotPermitted ->
                     ( "this process may not write it", reviewWritableFix )
+
+                NotAFile ->
+                    ( "it is a directory, not a database file", "point IPE_REVIEW_DB at a file path, such as a `review.db` inside that directory" )
 
                 MissingSchema ->
                     ( "its tables are not this tool's review log", reviewLogFix )

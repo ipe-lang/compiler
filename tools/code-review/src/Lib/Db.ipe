@@ -1,4 +1,4 @@
-module Lib.Db exposing (BreakAt(..), Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, brokenRefusal, copyCurrent, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, openAt, parseReason, probe, reasonMaxChars, reasonText, stateHead, stateVerdict, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier)
+module Lib.Db exposing (BreakAt(..), Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, brokenRefusal, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, openAt, parseReason, probe, reasonMaxChars, reasonText, stateHead, stateVerdict, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -19,6 +19,7 @@ import Lib.Index as Index exposing (Attested, ChainVerdict(..), DecidedPair, Log
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.SetDigest as SetDigest exposing (SetDigest)
 import Lib.Settings as Settings exposing (DbLocation, DbRole(..))
 import Lib.Uid as Uid exposing (Uid)
 import Migrations exposing (all)
@@ -205,16 +206,18 @@ type BreakAt
 
 -- A head the walk proved under the running key: every entry from 1 to it
 -- present, in order, linked to the mac before it and signed by the key; no
--- entry past it; and its key check made by the key. Opaque: built only by
--- `walkVerdict`, so no reader counts a row the walk did not prove.
+-- entry past it; and its key check made by the key. It carries the digest
+-- of the (uid, body_hash) pair of every entry the walk verified. Opaque:
+-- built only by `walkVerdict`, so no reader counts a row the walk did not
+-- prove.
 type ProvenHead
-    = ProvenHead Index.ChainHead
+    = ProvenHead Index.ChainHead SetDigest
 
 
 provenChain : ProvenHead -> Index.ChainHead
 provenChain proven =
     case proven of
-        ProvenHead head ->
+        ProvenHead head _ ->
             head
 
 
@@ -333,6 +336,39 @@ copyCurrent state stamp =
     case state of
         LogState s ->
             Index.stampStatus s.key s.head stamp == Just (copyStatus state)
+
+
+-- True exactly when a snapshot's `reviewed` copy may be counted under this
+-- verdict: its stamp is current, and the pairs it holds are exactly the
+-- pairs of the entries this walk verified, none under any verdict but
+-- `Proven`, under which nothing drains. A pair written into the copy by
+-- anything but a drain of a verified entry fails it, whatever the stamp.
+copyHolds : LogState -> Index.Snapshot -> Bool
+copyHolds state snap =
+    copyCurrent state snap.stamp
+        && (case snap.copy of
+                Just digest ->
+                    SetDigest.same (verifiedPairs state) digest
+
+                Nothing ->
+                    False
+           )
+
+
+verifiedPairs : LogState -> SetDigest
+verifiedPairs state =
+    case stateVerdict state of
+        Proven (ProvenHead _ digest) ->
+            digest
+
+        Broken _ ->
+            SetDigest.empty
+
+        KeyMismatch ->
+            SetDigest.empty
+
+        Unkeyed ->
+            SetDigest.empty
 
 
 -- How a reader treats the log's rows: counting, under the key, each row up
@@ -549,7 +585,7 @@ probe key loc =
                 Task.succeed ()
 
             Signing macKey ->
-                Db.withTransaction db (\tx -> requireKeyCheck macKey tx)
+                writeTransaction db (requireKeyCheck macKey)
 
 
 -- The head bound to `key`: its key check verifies, or, absent, is written
@@ -722,7 +758,7 @@ migrate db =
 -- constant stack depth through `Task.loop`.
 logPageCeiling : Int
 logPageCeiling =
-    10000
+    PageSize.logPageCeiling
 
 
 -- The review log's head: the one `review_log_head` row. A missing or extra
@@ -1067,11 +1103,13 @@ walkRowDecoder =
 
 
 -- The state one walk step carries: pages read, the seq the next entry must
--- have, and the mac it must link from.
+-- have, the mac it must link from, and the digest of the pairs verified so
+-- far.
 type alias ChainWalk =
     { pagesRead : Int
     , nextSeq : Int
     , prev : String
+    , pairs : SetDigest
     }
 
 
@@ -1084,12 +1122,12 @@ type alias ChainWalk =
 walkVerdict : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> Task.Task Error LogVerdict
 walkVerdict key db size ceiling refusal head =
     do
-        walked <- Task.loop (ceiling + 1) { pagesRead = 0, nextSeq = 1, prev = "genesis" } (walkStep key db size ceiling refusal head)
+        walked <- Task.loop (ceiling + 1) { pagesRead = 0, nextSeq = 1, prev = "genesis", pairs = SetDigest.empty } (walkStep key db size ceiling refusal head)
         case walked of
-            BrokenAt n ->
+            Err n ->
                 Task.succeed (Broken (BreaksAt n))
 
-            Intact ->
+            Ok pairs ->
                 do
                     before <- entriesBefore db
                     past <- entriesPast db head
@@ -1100,10 +1138,10 @@ walkVerdict key db size ceiling refusal head =
                         Task.succeed (Broken (PastHead past))
 
                     else
-                        Task.succeed (Proven (ProvenHead head))
+                        Task.succeed (Proven (ProvenHead head pairs))
 
 
-walkStep : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> ChainWalk -> Task.Task Error (Task.Step ChainWalk ChainVerdict)
+walkStep : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> ChainWalk -> Task.Task Error (Task.Step ChainWalk (Result Int SetDigest))
 walkStep key db size ceiling refusal head walk =
     do
         rows <- Db.queryDecode db
@@ -1117,62 +1155,63 @@ walkStep key db size ceiling refusal head walk =
             Task.fail refusal
 
         else
-            case followRows key (Index.chainLogId head) walk.nextSeq walk.prev rows of
+            case followRows key (Index.chainLogId head) walk rows of
                 Err brokenAt ->
-                    Task.succeed (Task.Done (BrokenAt brokenAt))
+                    Task.succeed (Task.Done (Err brokenAt))
 
-                Ok ( nextSeq, prev ) ->
+                Ok followed ->
                     if List.length rows < PageSize.toInt size then
-                        Task.succeed (Task.Done (chainEnd head { pagesRead = walk.pagesRead + 1, nextSeq = nextSeq, prev = prev }))
+                        Task.succeed (Task.Done (chainEnd head followed))
 
                     else
-                        Task.succeed (Task.Continue { pagesRead = walk.pagesRead + 1, nextSeq = nextSeq, prev = prev })
+                        Task.succeed (Task.Continue followed)
 
 
--- One page of rows followed from the expected seq and mac: the seq and mac
--- after the page, or the first entry the chain breaks at. A missing entry
--- breaks at its seq; an entry linking another mac, holding a uid that is not
--- a unit id, or whose own mac does not verify under the key, breaks at its
--- own.
-followRows : MacKey -> String -> Int -> String -> List WalkRow -> Result Int ( Int, String )
-followRows key logId nextSeq prev rows =
+-- One page of rows followed from the walk's expected seq and mac: the walk
+-- after the page, each row's pair added to its digest, or the first entry
+-- the chain breaks at. A missing entry breaks at its seq; an entry linking
+-- another mac, holding a uid that is not a unit id, or whose own mac does
+-- not verify under the key, breaks at its own.
+followRows : MacKey -> String -> ChainWalk -> List WalkRow -> Result Int ChainWalk
+followRows key logId walk rows =
     List.foldl
         (\row walked ->
             case walked of
                 Err n ->
                     Err n
 
-                Ok ( expected, mac ) ->
-                    if row.seq /= expected then
-                        Err expected
+                Ok at ->
+                    if row.seq /= at.nextSeq then
+                        Err at.nextSeq
 
-                    else if Crypto.constantTimeEqual row.prev mac && storedIsUnitId row.uid && signedBy key (macInput logId row.seq row.prev row.uid row.bodyHash row.decision row.reason row.reviewedAt) row.mac then
-                        Ok ( expected + 1, row.mac )
+                    else if Crypto.constantTimeEqual row.prev at.prev && storedIsUnitId row.uid && signedBy key (macInput logId row.seq row.prev row.uid row.bodyHash row.decision row.reason row.reviewedAt) row.mac then
+                        Ok { pagesRead = at.pagesRead, nextSeq = at.nextSeq + 1, prev = row.mac, pairs = Index.digestPair (Signing key) (storedUidText row.uid) row.bodyHash at.pairs }
 
                     else
-                        Err expected
+                        Err at.nextSeq
         )
-        (Ok ( nextSeq, prev ))
+        (Ok { pagesRead = walk.pagesRead + 1, nextSeq = walk.nextSeq, prev = walk.prev, pairs = walk.pairs })
         rows
 
 
--- The walk's end once every entry up to the head's seq is read: intact when
--- it ended on the head's seq and mac; otherwise broken at the first missing
--- entry, or at the head's own entry when its mac is not the last entry's.
-chainEnd : Index.ChainHead -> ChainWalk -> ChainVerdict
+-- The walk's end once every entry up to the head's seq is read: the digest
+-- of the pairs it verified when it ended on the head's seq and mac;
+-- otherwise broken at the first missing entry, or at the head's own entry
+-- when its mac is not the last entry's.
+chainEnd : Index.ChainHead -> ChainWalk -> Result Int SetDigest
 chainEnd head walk =
     let
         lastSeq =
             walk.nextSeq - 1
     in
     if lastSeq < Index.chainSeq head then
-        BrokenAt walk.nextSeq
+        Err walk.nextSeq
 
     else if Crypto.constantTimeEqual walk.prev (Index.chainMac head) then
-        Intact
+        Ok walk.pairs
 
     else
-        BrokenAt (max 1 lastSeq)
+        Err (max 1 lastSeq)
 
 
 -- The refusal of a decision on a broken log, naming where it breaks.
@@ -1254,7 +1293,22 @@ insertDecision : MacKey -> Db -> Attested -> Decision -> Task.Task Error Index.W
 insertDecision key db attested decision =
     do
         now <- Time.unixMillis ()
-        Db.withTransaction db (\tx -> recordDecision key tx attested decision (Timestamp.toUnixMillis now))
+        writeTransaction db (\tx -> recordDecision key tx attested decision (Timestamp.toUnixMillis now))
+
+
+-- One review transaction that may write, its first statement a write that
+-- changes no row, so it holds the database's write lock before it reads:
+-- a second writer waits on the busy timeout for the first to commit rather
+-- than fail busy when its read snapshot goes stale. Every review
+-- transaction that may write runs through it.
+writeTransaction : Db -> (Db -> Task.Task Error a) -> Task.Task Error a
+writeTransaction db body =
+    Db.withTransaction db
+        (\tx ->
+            do
+                Db.exec tx "UPDATE review_log_head SET seq = seq WHERE 0" []
+                body tx
+        )
 
 
 recordDecision : MacKey -> Db -> Attested -> Decision -> Int -> Task.Task Error Index.Written

@@ -182,7 +182,10 @@ decision: their units are back in the queue, and deciding one again appends a
 signed row.
 
 The index's `reviewed` copy is trusted only when its `reviewed_stamp` matches
-the log's current head and state: draining a decision moves the stamp along
+the log's current head and state, and its pairs are exactly the pairs that
+page load's walk of the log verified (compared by a digest keyed by
+`IPE_REVIEW_MAC_KEY`, so a pair written into the copy, removed or swapped
+outside a drain is rebuilt away before anything is counted): draining a decision moves the stamp along
 with the head, and any other stamp (a decision whose drain failed, an index
 file replaced by another, a decision made from another process) rebuilds the
 copy from the verified rows of the review DB before the page is read. The
@@ -219,7 +222,8 @@ IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe dev run
 ```
 
 `ipe dev run` builds and serves on <http://localhost:8000>. Set `IPE_SERVER_PORT`
-to listen on another port, e.g. `IPE_SERVER_PORT=8123 ipe dev run`; a value that is
+to listen on another port, e.g. `IPE_SERVER_PORT=8123 ipe dev run`, or the same
+assignment before a built binary; a value that is
 not a decimal port in `1..=65535` (empty, non-numeric, signed, `0`, or too
 large) is ignored and `8000` is used. `ipe type-check` runs a fast check with
 no runtime, and `ipe dev build` compiles to a native binary.

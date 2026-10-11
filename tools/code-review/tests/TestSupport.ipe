@@ -624,7 +624,7 @@ loadFirstPage =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        snap <- Index.readSnapshot conn Index.Start
+        snap <- Index.readSnapshot ReadOnly conn Index.Start
         entries <- Task.sequence (List.map (pageEntry conn settings.roots) snap.rows)
         Task.succeed { units = entries, total = snap.open }
 

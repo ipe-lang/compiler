@@ -599,7 +599,7 @@ dbSizeAndMissingDbIn base =
         setIndexEnv indexDb repo
         System.setenv "IPE_REVIEW_DB" reviewDb
         migratedReviewAt reviewDb
-        bytes <- indexConn |> Task.andThen (\conn -> Index.readSnapshot conn Index.Start) |> Task.map (\snap -> snap.bytes)
+        bytes <- indexConn |> Task.andThen (\conn -> Index.readSnapshot ReadOnly conn Index.Start) |> Task.map (\snap -> snap.bytes)
         setIndexEnv (base ++ "/missing.db") repo
         result <- loadPageNow Index.Start
             |> Task.map Ok
@@ -1422,6 +1422,74 @@ sameCountDifferentPairsResyncs =
             )
 
 
+-- Both fixture units decided at once, each on its own connection to the
+-- review database, both land: a decision holds the write lock before
+-- it reads the log, so the next one waits for it to commit rather than
+-- fail busy on a stale read. Red while a decision reads before it claims
+-- the lock; the two decisions race, so a run without the lock goes red
+-- whenever their transactions overlap.
+concurrentDecisionsBothLand : Task.Task Error Bool
+concurrentDecisionsBothLand =
+    do
+        at <- freshScratch "ipe-index-concurrent-decisions"
+        seedProgressScratch at
+        loadPageNow Index.Start
+        loc <- envReview
+        decided <- Task.parallel (List.map (\unit -> LibDb.openAt loc |> Task.andThen (\conn -> decideNow conn unit Approved)) [ uid "u-a", uid "u-b" ])
+        db <- LibDb.openAt loc
+        n <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (List.length decided == 2 && n == 2)
+
+
+-- A pair written straight into the `reviewed` copy while its stamp is
+-- current is not counted: the copy holds a pair no verified log entry has,
+-- so the load rebuilds it from the log and the unit stays open. Red while
+-- the copy is trusted on its stamp alone.
+forgedPairNotCounted : Task.Task Error Bool
+forgedPairNotCounted =
+    do
+        at <- freshScratch "ipe-index-forged-pair"
+        seedProgressScratch at
+        before <- loadPageNow Index.Start
+        stamped <- stampOf at.indexDb
+        mirrorPair at.indexDb "u-b" (Index.attest viewB)
+        after <- loadPageNow Index.Start
+        copied <- mirroredCount at.indexDb
+        cleanupProgressScratch at
+        Task.succeed
+            (stamped
+                /= Nothing
+                && after.progress
+                == before.progress
+                && copied
+                == 0
+                && List.any (\q -> q.unit.uid == uid "u-b") after.units
+            )
+
+
+-- A drained pair swapped for another in the `reviewed` copy, its size and
+-- stamp unchanged, is not counted: the copy's pairs are not the verified
+-- entries', so the load rebuilds it, the decided unit leaves the page and
+-- the planted one returns. Red if the copy is compared with the log by its
+-- size alone.
+swappedPairNotCounted : Task.Task Error Bool
+swappedPairNotCounted =
+    do
+        at <- freshScratch "ipe-index-swapped-pair"
+        drained <- decideAndDrainA at
+        execIndex at.indexDb "DELETE FROM reviewed WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        mirrorPair at.indexDb "u-b" (Index.attest viewB)
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (page.progress
+                == drained.after
+                && List.any (\q -> q.unit.uid == uid "u-b") page.units
+                && not (List.any (\q -> q.unit.uid == uid "u-a") page.units)
+            )
+
+
 -- A drain whose decision moved the head from `prev` while the copy's stamp
 -- names another head deletes the stamp rather than move it, so the next
 -- load rebuilds the copy and stamps the log's head. Red if the drain moves
@@ -2230,6 +2298,9 @@ checks =
             , check "a removed unit leaves progress and returns when re-added" removedUnitReturnsReviewed
             , check "an undrained decision moves the head and is counted on load" undrainedDecisionCountedOnLoad
             , check "a copy with the log's pair count but other pairs is rebuilt" sameCountDifferentPairsResyncs
+            , check "decisions recorded at once both land" concurrentDecisionsBothLand
+            , check "a pair written into the copy outside a drain is not counted" forgedPairNotCounted
+            , check "a copy pair swapped for another of the same count is not counted" swappedPairNotCounted
             , check "a drain whose stamp moved elsewhere drops the stamp" drainCasMismatchDropsStamp
             , check "a replaced review database re-opens every drained unit" replacedReviewDbReopensDrained
             , check "two fresh review databases start at different genesis heads" freshReviewDbsHaveDistinctGenesis

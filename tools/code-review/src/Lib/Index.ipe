@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -22,6 +22,7 @@ import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (PathError, Root, RootMap, Tag)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.SetDigest as SetDigest exposing (SetDigest)
 import Lib.Settings as Settings exposing (DbRole(..), IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
 
@@ -435,7 +436,7 @@ rootMismatch sampled first rootDir =
                 , SafeText.render (String.fromInt sampled)
                 , SafeText.literal " indexed files checked: index path "
                 , SafeText.quoted first
-                , SafeText.literal " is not under "
+                , SafeText.literal " is not found under "
                 , SafeText.quoted (Path.toString rootDir)
                 , SafeText.literal "; "
                 , RepoPath.rootFix
@@ -655,10 +656,13 @@ singleInt what rows =
 -- caller can read one of them outside this transaction. `stamp` is the
 -- text stamped on the `reviewed` copy when it was last brought up to the
 -- review log, or Nothing when the copy has never been stamped or was marked
--- stale; the caller reads it through `stampStatus` against the review
--- database's head before trusting the rest.
+-- stale; `copy` is the digest under the server's key of every pair the
+-- copy holds, or Nothing for a copy longer than any proven log. The caller
+-- reads both against the review log's verdict, through `stampStatus` and
+-- the digest of the pairs the log walk verified, before trusting the rest.
 type alias Snapshot =
     { stamp : Maybe String
+    , copy : Maybe SetDigest
     , rows : List PendingRow
     , open : Int
     , units : Int
@@ -666,18 +670,80 @@ type alias Snapshot =
     }
 
 
-readSnapshot : Db.Db -> Cursor -> Task.Task Error Snapshot
-readSnapshot conn cursor =
+readSnapshot : ReviewKey -> Db.Db -> Cursor -> Task.Task Error Snapshot
+readSnapshot key conn cursor =
     Db.withTransaction conn
         (\tx ->
             do
                 stamp <- readStamp tx
+                copy <- reviewedDigest key tx
                 rows <- loadPendingPage tx PageSize.queue cursor
                 open <- countPending tx
                 units <- countUnits tx
                 bytes <- dbBytes tx
-                Task.succeed { stamp = stamp, rows = rows, open = open, units = units, bytes = bytes }
+                Task.succeed { stamp = stamp, copy = copy, rows = rows, open = open, units = units, bytes = bytes }
         )
+
+
+-- A decided pair, as the review log stores its uid and body hash, added to
+-- a digest: the one framing both the log walk and the copy read use.
+digestPair : ReviewKey -> String -> String -> SetDigest -> SetDigest
+digestPair key uid bodyHash digest =
+    SetDigest.add key (lengthPrefixed [ "ipe-code-review/reviewed-pair/v1", uid, bodyHash ]) digest
+
+
+-- How far a read of the `reviewed` copy has come: the pages read, the last
+-- pair read, and the digest so far.
+type alias CopyRead =
+    { pagesRead : Int
+    , after : Maybe ( String, String )
+    , digest : SetDigest
+    }
+
+
+-- Every pair of the `reviewed` copy on `conn`, in key order, in pages of
+-- `PageSize.pairs`, digested under `key`: Nothing past
+-- `PageSize.logPageCeiling` pages, more than any proven log drains.
+reviewedDigest : ReviewKey -> Db.Db -> Task.Task Error (Maybe SetDigest)
+reviewedDigest key conn =
+    Task.loop (PageSize.logPageCeiling + 1) { pagesRead = 0, after = Nothing, digest = SetDigest.empty } (copyStep key conn)
+
+
+copyStep : ReviewKey -> Db.Db -> CopyRead -> Task.Task Error (Task.Step CopyRead (Maybe SetDigest))
+copyStep key conn read =
+    do
+        rows <- reviewedPage conn read.after
+        Task.succeed (copyAfter key read rows)
+
+
+copyAfter : ReviewKey -> CopyRead -> List ( String, String ) -> Task.Step CopyRead (Maybe SetDigest)
+copyAfter key read rows =
+    if List.isEmpty rows then
+        Task.Done (Just read.digest)
+
+    else if read.pagesRead >= PageSize.logPageCeiling then
+        Task.Done Nothing
+
+    else
+        let
+            digest =
+                List.foldl (\( uid, hash ) d -> digestPair key uid hash d) read.digest rows
+        in
+        if List.length rows < PageSize.toInt PageSize.pairs then
+            Task.Done (Just digest)
+
+        else
+            Task.Continue { pagesRead = read.pagesRead + 1, after = List.head (List.reverse rows), digest = digest }
+
+
+reviewedPage : Db.Db -> Maybe ( String, String ) -> Task.Task Error (List ( String, String ))
+reviewedPage conn after =
+    case after of
+        Nothing ->
+            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed ORDER BY uid, body_hash LIMIT ?" [ SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
+
+        Just ( uid, hash ) ->
+            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed WHERE (uid, body_hash) > (?, ?) ORDER BY uid, body_hash LIMIT ?" [ SqlString uid, SqlString hash, SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
 
 
 stampDecoder : Db.Decode.Decoder String
