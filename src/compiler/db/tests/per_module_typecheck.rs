@@ -859,3 +859,138 @@ fn program_types_invalidates_per_module() {
     );
     assert_eq!(assert_program_oracle(&db, root, b), scoped);
 }
+
+// ---------------------------------------------------------------------------
+// Polymorphic side tables: each fixture fills the table it is about, so the
+// full-program comparison is not vacuous on it
+// ---------------------------------------------------------------------------
+
+/// Serve `entry`'s program, require the scoped assembly over `modules`
+/// modules to equal the canonical joint solve on every field, and return the
+/// served program.
+///
+/// Every generic binding in these fixtures is annotated, so no synthesized
+/// type-parameter name is minted and no compared table depends on which solve
+/// named it.
+#[allow(clippy::expect_used)] // a refused program is the test failure
+fn assert_scoped_oracle(
+    db: &IpeDatabase,
+    root: SourceRoot,
+    entry: SourceFile,
+    modules: usize,
+) -> Arc<ipe_db::ProgramTypes> {
+    assert_eq!(
+        assert_program_oracle(db, root, entry),
+        NonZeroUsize::new(modules).map(|modules| TypedBy::Scoped { modules }),
+        "every module must be scoped for the comparison to cover the assembly"
+    );
+    let served = ipe_db::program_types(db, root, entry)
+        .clone()
+        .expect("the program type-checks");
+    assert!(
+        served.types.untyped_type_params.is_empty(),
+        "an annotated fixture mints no synthesized type parameter"
+    );
+    served
+}
+
+/// The homes holding at least one entry of a `(home, _)`-keyed table.
+fn homes_of<K, V>(table: &BTreeMap<(Vec<Symbol>, K), V>) -> BTreeSet<Vec<Symbol>> {
+    table.keys().map(|(home, _)| home.clone()).collect()
+}
+
+/// An annotated generic in a dep, used by an annotated generic in its
+/// importer: both homes key their rigid variables in `poly_var_map`, and the
+/// scoped assembly renumbers those keys exactly as the joint solve does.
+#[test]
+fn poly_var_map_agrees_across_a_module_edge() {
+    const GENERIC_DEP: &str = "module A exposing (ident)\n\nident : a -> a\nident x =\n    x\n";
+    const GENERIC_IMPORTER: &str = "module B exposing (b)\n\n\
+        import A exposing (ident)\n\n\
+        keep : k -> k\n\
+        keep y =\n    ident y\n\n\
+        b : Int\n\
+        b =\n    keep 1\n";
+    let (db, _log) = logged_db();
+    let a = file(&db, &["A"], GENERIC_DEP);
+    let b = file(&db, &["B"], GENERIC_IMPORTER);
+    let root = root_of(&db, &[(&["A"], a), (&["B"], b)]);
+
+    let served = assert_scoped_oracle(&db, root, b, 2);
+    assert_eq!(
+        homes_of(&served.types.poly_var_map),
+        BTreeSet::from([home_of(&db, a), home_of(&db, b)]),
+        "each module's annotated generic keys its rigid variable"
+    );
+    assert!(
+        served
+            .types
+            .poly_var_map
+            .values()
+            .all(|vars| !vars.is_empty()),
+        "every keyed binding maps at least one variable"
+    );
+}
+
+/// A dep's wildcard parameter pinned by its body, used by an importer at the
+/// pinned type: `signature_wildcards` carries the pin, and the scoped
+/// assembly serves it exactly as the joint solve does.
+#[test]
+fn signature_wildcards_agree_across_a_module_edge() {
+    const WILDCARD_DEP: &str = "module A exposing (h)\n\nh : any -> Bool\nh x =\n    x + x == x\n";
+    const WILDCARD_IMPORTER: &str =
+        "module B exposing (b)\n\nimport A exposing (h)\n\nb : Bool\nb =\n    h 2\n";
+    let (db, _log) = logged_db();
+    let a = file(&db, &["A"], WILDCARD_DEP);
+    let b = file(&db, &["B"], WILDCARD_IMPORTER);
+    let root = root_of(&db, &[(&["A"], a), (&["B"], b)]);
+
+    let served = assert_scoped_oracle(&db, root, b, 2);
+    assert_eq!(
+        homes_of(&served.types.signature_wildcards),
+        BTreeSet::from([home_of(&db, a)]),
+        "the dep's wildcard signature is recorded under its own home"
+    );
+    assert!(
+        served
+            .types
+            .signature_wildcards
+            .values()
+            .any(|wildcards| !wildcards.pins.is_empty()),
+        "the body pins the wildcard, so the pinned type is compared too"
+    );
+}
+
+/// A private binding whose message slot no use pins: `msg_defaulted_vars`
+/// records the defaulted slot, and the scoped assembly serves it exactly as
+/// the joint solve does. The binding is not exported, so no importer's use
+/// can change the default and the module stays scoped.
+#[test]
+fn msg_defaulted_vars_agree_across_a_module_edge() {
+    const MSG_SLOT_MODULE: &str = "module V exposing (count)\n\n\
+        import A exposing (visible)\n\n\
+        type Html msg\n    = Text String\n    | Tagged msg\n\n\
+        page : Html msg\n\
+        page =\n    Text \"page\"\n\n\
+        count : Int\n\
+        count =\n    visible\n";
+    let (db, _log) = logged_db();
+    let a = file(&db, &["A"], DEP_A);
+    let v = file(&db, &["V"], MSG_SLOT_MODULE);
+    let root = root_of(&db, &[(&["A"], a), (&["V"], v)]);
+
+    let served = assert_scoped_oracle(&db, root, v, 2);
+    assert_eq!(
+        homes_of(&served.types.msg_defaulted_vars),
+        BTreeSet::from([home_of(&db, v)]),
+        "the private binding's unpinned message slot is defaulted"
+    );
+    assert!(
+        served
+            .types
+            .msg_defaulted_vars
+            .values()
+            .all(|vars| !vars.is_empty()),
+        "every keyed binding defaults at least one variable"
+    );
+}
