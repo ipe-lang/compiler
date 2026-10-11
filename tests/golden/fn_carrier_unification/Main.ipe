@@ -1,0 +1,135 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+-- A function value that a kernel call returns from a stored read keeps the
+-- read's `Arc` carrier. Each case passes such a call result to a direct
+-- function slot (a kernel's, a user def's), directly, through a `let` alias,
+-- a `case` binder, an `if`, and a pipe; the last cases are hand-written
+-- lambdas the same slots accept.
+
+
+type alias Cfg =
+    { keep : Int -> Bool
+    , fns : List (Int -> Bool)
+    }
+
+
+cfg : Cfg
+cfg =
+    { keep = \n -> n > 1
+    , fns = [ \n -> n > 2 ]
+    }
+
+
+nums : List Int
+nums =
+    [ 1, 2, 3, 4 ]
+
+
+count : (Int -> Bool) -> Int
+count p =
+    List.length (List.filter p nums)
+
+
+viaIdentity : Cfg -> Int
+viaIdentity c =
+    List.length (List.filter (identity c.keep) nums)
+
+
+viaNothing : Cfg -> Int
+viaNothing c =
+    List.length (List.filter (Maybe.withDefault c.keep Nothing) nums)
+
+
+viaHead : Cfg -> Int
+viaHead c =
+    List.length (List.filter (Maybe.withDefault c.keep (List.head c.fns)) nums)
+
+
+viaLet : Cfg -> Int
+viaLet c =
+    let
+        p =
+            identity c.keep
+    in
+    List.length (List.filter p nums)
+
+
+viaCase : Cfg -> Int
+viaCase c =
+    case Maybe.withDefault c.keep (List.head c.fns) of
+        p ->
+            List.length (List.filter p nums)
+
+
+viaDef : Cfg -> Int
+viaDef c =
+    count (identity c.keep) + count (Maybe.withDefault c.keep (List.head c.fns))
+
+
+viaIf : Bool -> Cfg -> Int
+viaIf flag c =
+    List.length
+        (List.filter
+            (if flag then
+                identity c.keep
+
+             else
+                Maybe.withDefault c.keep (List.head c.fns)
+            )
+            nums
+        )
+
+
+viaPipe : Cfg -> Int
+viaPipe c =
+    List.length (List.filter (c.keep |> identity) nums)
+
+
+viaPipedList : Cfg -> Int
+viaPipedList c =
+    nums |> List.filter (identity c.keep) |> List.length
+
+
+viaAny : Cfg -> Int
+viaAny c =
+    if List.any (identity c.keep) nums then
+        1
+
+    else
+        0
+
+
+handWritten : List Int
+handWritten =
+    [ List.length (List.filter (\n -> n > 1) nums)
+    , List.length (List.filter (\n -> n > 2) nums)
+    , count (\n -> n > 1)
+    ]
+
+
+main =
+    Io.println
+        (String.join " "
+            (List.map String.fromInt
+                ([ viaIdentity cfg
+                 , viaNothing cfg
+                 , viaHead cfg
+                 , viaLet cfg
+                 , viaCase cfg
+                 , viaDef cfg
+                 , viaIf True cfg
+                 , viaIf False cfg
+                 , viaPipe cfg
+                 , viaPipedList cfg
+                 , viaAny cfg
+                 ]
+                    ++ handWritten
+                )
+            )
+        )

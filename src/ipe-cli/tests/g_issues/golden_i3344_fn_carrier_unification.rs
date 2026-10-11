@@ -1,0 +1,90 @@
+//! SEAL tests for a function value whose carrier is decided by its type, not its syntax.
+//!
+//! A kernel call over a stored function read (`identity c.keep`,
+//! `Maybe.withDefault c.keep (List.head c.fns)`) returns the read on its
+//! `Arc<dyn Fn>` carrier, which no direct function slot accepts. The fixture
+//! `fn_carrier_unification` passes such call results to kernel and user-def
+//! function slots directly, through a `let` alias, a `case` binder, an `if`,
+//! and a pipe.
+//!
+//! ```text
+//! cargo test -p ipe --test g_issues golden_i3344
+//! IPE_E2E=1 cargo test -p ipe --test g_issues golden_i3344
+//! ```
+
+use std::path::{Path, PathBuf};
+
+use crate::support::repo_root;
+
+const FIXTURE: &str = "fn_carrier_unification";
+
+/// The fixture's stdout: one count per case, then the hand-written twins.
+const EXPECTED_STDOUT: &str = "3 3 2 3 2 5 3 2 3 3 1 3 2 3";
+
+/// Emitted calls that hand an `Arc` call result straight to a direct function slot.
+const ARC_INTO_DIRECT_SLOT: [&str; 4] = [
+    "list_filter(basics_identity(",
+    "list_filter(maybe_with_default(",
+    "list_any(basics_identity(",
+    "count(basics_identity(",
+];
+
+fn fixture_entry() -> PathBuf {
+    repo_root()
+        .join("tests")
+        .join("golden")
+        .join(FIXTURE)
+        .join("Main.ipe")
+}
+
+/// Lower the fixture into `out`, asserting `ipe` accepts it.
+fn build_fixture(out: &Path) {
+    let _ = std::fs::remove_dir_all(out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&fixture_entry(), out, &runtime);
+    assert!(
+        built.is_ok(),
+        "{FIXTURE}: ipe must accept the fixture; got {built:?}"
+    );
+}
+
+/// No call result on the `Arc` carrier is emitted into a direct function slot.
+#[test]
+fn call_result_is_converted_before_a_direct_fn_slot() {
+    let out = crate::support::scratch_root().join("ipec_i3344_emit_shape");
+    build_fixture(&out);
+    let emitted = std::fs::read_to_string(out.join("src").join("main.rs")).unwrap_or_default();
+    let compact: String = emitted.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("list_filter("),
+        "{FIXTURE}: emitted main.rs holds no kernel call to check"
+    );
+    for shape in ARC_INTO_DIRECT_SLOT {
+        assert!(
+            !compact.contains(shape),
+            "{FIXTURE}: an Arc call result reaches a direct fn slot as `{shape}`"
+        );
+    }
+}
+
+/// The emitted crate builds and runs to the expected output (THE SEAL).
+#[test]
+fn call_result_reaches_a_direct_fn_slot_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let out = crate::support::scratch_root().join("ipec_i3344_run");
+    build_fixture(&out);
+    let outcome = crate::support::build_and_run_emitted(FIXTURE, &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "{FIXTURE}: emitted crate must build and exit 0; stdout:\n{}",
+        outcome.stdout
+    );
+    assert_eq!(
+        outcome.stdout.trim_end(),
+        EXPECTED_STDOUT,
+        "{FIXTURE}: emitted crate built (SEAL held) but ran to the wrong output"
+    );
+}
