@@ -3778,12 +3778,16 @@ impl std::fmt::Display for StartupRefusal {
         match self {
             Self::RouteTable(refusal) => write!(f, "{refusal}"),
             Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
-            Self::BasePath { base, refusal } => {
-                write!(f, "web base path `{base}` is malformed: {refusal}")
-            }
-            Self::MountBase { base, refusal } => {
-                write!(f, "web base path `{base}` is not a mount base: {refusal}")
-            }
+            Self::BasePath { base, refusal } => write!(
+                f,
+                "web base path `{}` is malformed: {refusal}",
+                crate::system::scrub_log_controls(base)
+            ),
+            Self::MountBase { base, refusal } => write!(
+                f,
+                "web base path `{}` is not a mount base: {refusal}",
+                crate::system::scrub_log_controls(base)
+            ),
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
             Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
             Self::Bind(refusal) => write!(f, "{refusal}"),
@@ -3920,8 +3924,10 @@ where
 {
     Box::pin(async move {
         // A malformed route pattern refuses to start, never a dead route.
-        if let Err(message) = route::refuse_route_table(&routes) {
-            return IpeResult::Err(message.into());
+        if let Err(refusal) = route::check_route_table(&routes) {
+            return IpeResult::Err(E::from_ipe_error(
+                StartupRefusal::RouteTable(refusal).into(),
+            ));
         }
         let (route_entry, param_resolver, route_matched) =
             routed_resolvers(routes, not_found, set_page, render);
@@ -4094,12 +4100,15 @@ fn client_route_path(
     raw: &str,
     base: &route::DecodedPath,
 ) -> Result<Option<route::DecodedPath>, crate::server::RequestRejection> {
-    let path =
-        route::DecodedPath::parse(raw).map_err(|_| crate::server::RequestRejection::BadRequest)?;
-    if !raw.starts_with('/') || raw.contains('?') || raw.contains('#') {
-        return Ok(None);
+    match route::app_path(raw, base) {
+        Ok(path) => Ok(Some(path)),
+        Err(route::PathMiss::Malformed(_)) => Err(crate::server::RequestRejection::BadRequest),
+        Err(
+            route::PathMiss::Unreadable
+            | route::PathMiss::NotBarePath
+            | route::PathMiss::OutsideBase,
+        ) => Ok(None),
     }
-    Ok(path.strip_base(base))
 }
 
 #[cfg(feature = "server")]
@@ -8546,6 +8555,34 @@ mod sse_reconnect_reconcile_tests {
         }
         assert_eq!(parse_mount_base(""), Ok(crate::encoding::MountBase::root()));
         assert!(parse_mount_base("/_ipe/console").is_ok_and(|b| b.prefix() == "/_ipe/console"));
+    }
+
+    /// A refused base path renders bidi overrides and control characters as
+    /// visible escapes, never raw into the startup log.
+    #[test]
+    fn startup_refusal_scrubs_bidi_and_controls() {
+        let hostile = "/%zz\u{202e}\n\u{1b}[31m";
+        let refusals = [
+            parse_route_base(hostile).err(),
+            parse_mount_base(hostile).err(),
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(
+                    &refusal,
+                    Some(StartupRefusal::BasePath { base, .. } | StartupRefusal::MountBase { base, .. })
+                        if base == hostile
+                ),
+                "{refusal:?}"
+            );
+            let rendered = refusal.map(|r| r.to_string()).unwrap_or_default();
+            assert!(
+                !rendered.contains('\u{202e}')
+                    && !rendered.contains('\n')
+                    && !rendered.contains('\u{1b}'),
+                "a startup refusal must scrub the base it names: {rendered:?}"
+            );
+        }
     }
 
     /// A base path that does not decode is refused when the router is built,

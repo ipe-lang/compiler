@@ -39,6 +39,7 @@ use crate::core::{IpeResult, IpeTask};
 use crate::dom::{HandlerIndex, WebReq, build_index, diff::Patch, diff::diff};
 use crate::html::{FormData, Html, assign_ipe_ids, render_html};
 use crate::tea::{IpeCmd, IpeSub};
+use crate::web::route::MountRefusal;
 
 #[cfg(feature = "debugger")]
 mod debugger_overlay;
@@ -52,7 +53,11 @@ const ROOT_IPE_ID: &str = "r";
 
 /// Classified fatal-diagnostic prefix (mirrors the native panic classifier's
 /// taxonomy labels; the instance may be unusable after one of these).
+///
+/// `detail` is scrubbed of bidi and control characters before it reaches the
+/// console.
 fn console_fatal(class: &str, detail: &str) {
+    let detail = crate::system::scrub_log_controls(detail);
     web_sys::console::error_1(&JsValue::from_str(&format!("[ipe-wasm:{class}] {detail}")));
 }
 
@@ -60,7 +65,11 @@ fn console_fatal(class: &str, detail: &str) {
 /// `web_socket_connect_with` (browser platform limitations that degrade
 /// rather than fail, e.g. unsettable custom headers), and by the emitted
 /// `hydrate` wasm export for fault-tolerant SSR takeover.
+///
+/// `detail` is scrubbed of bidi and control characters before it reaches the
+/// console.
 pub fn console_warn(detail: &str) {
+    let detail = crate::system::scrub_log_controls(detail);
     web_sys::console::warn_1(&JsValue::from_str(&format!("[ipe-wasm] {detail}")));
 }
 
@@ -73,10 +82,10 @@ pub fn install_panic_hook() {
 
 /// Drive the program's entry task on the browser microtask queue.
 /// The `Err` arm logs a classified diagnostic (there is no process to exit).
-pub fn run_start<E: std::fmt::Debug + 'static>(task: IpeTask<E, ()>) {
+pub fn run_start<E: std::fmt::Display + 'static>(task: IpeTask<E, ()>) {
     wasm_bindgen_futures::spawn_local(async move {
         if let IpeResult::Err(e) = task.await {
-            console_fatal("EntryFailed", &format!("{e:?}"));
+            console_fatal("EntryFailed", &e.to_string());
         }
     });
 }
@@ -94,7 +103,7 @@ pub fn wasm_app<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     subscriptions: FSubs,
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + 'static,
+    E: crate::FromIpeError + 'static,
     Model: Clone + 'static,
     Msg: Clone + crate::stringify::IpeStringify + 'static,
     FInit: Fn(WebReq) -> (Model, IpeCmd<Msg>) + 'static,
@@ -106,8 +115,8 @@ where
         match mount_app(init, update, view, subscriptions) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("MountFailed", &e);
-                IpeResult::Err(E::from(e))
+                console_fatal("MountFailed", &e.to_string());
+                IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
     })
@@ -138,7 +147,7 @@ pub fn wasm_adopt_app<E, Model, Msg, FUpdate, FView, FSubs>(
     subscriptions: FSubs,
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + 'static,
+    E: crate::FromIpeError + 'static,
     Model: Clone + 'static,
     Msg: Clone + crate::stringify::IpeStringify + 'static,
     FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + 'static,
@@ -149,8 +158,8 @@ where
         match adopt_app(model, update, view, subscriptions) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("AdoptFailed", &e);
-                IpeResult::Err(E::from(e))
+                console_fatal("AdoptFailed", &e.to_string());
+                IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
     })
@@ -180,7 +189,7 @@ pub fn wasm_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPa
     render: FRender,
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + 'static,
+    E: crate::FromIpeError + 'static,
     Model: Clone + 'static,
     Msg: Clone + crate::stringify::IpeStringify + 'static,
     Page: Clone + 'static,
@@ -205,8 +214,8 @@ where
         ) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("MountFailed", &e);
-                IpeResult::Err(E::from(e))
+                console_fatal("MountFailed", &e.to_string());
+                IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
     })
@@ -278,9 +287,11 @@ fn install_port_inbound_seam() {
 }
 
 /// The retained application state driving one mounted TEA app.
-/// A routed app's URL entry: path + current model → the entered model and entry Cmd, or `None` when unrouted.
-type WasmRouter<Model, Msg> =
-    dyn Fn(&str, Model) -> Option<crate::web::route::Entered<Model, IpeCmd<Msg>>>;
+/// A routed app's URL entry: located path + current model → the entered model and entry Cmd, or `None` when unrouted.
+type WasmRouter<Model, Msg> = dyn Fn(
+    &crate::web::route::LocatedPath,
+    Model,
+) -> Option<crate::web::route::Entered<Model, IpeCmd<Msg>>>;
 
 struct App<Model, Msg> {
     model: RefCell<Model>,
@@ -345,7 +356,7 @@ fn mount_app<Model, Msg, FInit, FUpdate, FView, FSubs>(
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
-) -> Result<(), String>
+) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
     Msg: Clone + crate::stringify::IpeStringify + 'static,
@@ -355,7 +366,7 @@ where
     FSubs: Fn(Model) -> IpeSub<Msg> + 'static,
 {
     let document = document()?;
-    let body: web_sys::HtmlElement = document.body().ok_or("document has no <body>")?;
+    let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
     let (model, cmd0) = init(synthesize_req(&document)?);
 
@@ -432,7 +443,7 @@ fn adopt_app<Model, Msg, FUpdate, FView, FSubs>(
     update: FUpdate,
     view: FView,
     subscriptions: FSubs,
-) -> Result<(), String>
+) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
     Msg: Clone + crate::stringify::IpeStringify + 'static,
@@ -441,7 +452,7 @@ where
     FSubs: Fn(Model) -> IpeSub<Msg> + 'static,
 {
     let document = document()?;
-    let body: web_sys::HtmlElement = document.body().ok_or("document has no <body>")?;
+    let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
@@ -523,7 +534,7 @@ fn mount_app_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FR
     not_found: Page,
     set_page: FSetPage,
     render: FRender,
-) -> Result<(), String>
+) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
     Msg: Clone + crate::stringify::IpeStringify + 'static,
@@ -536,35 +547,31 @@ where
     FRender: Fn(&Page) -> Result<crate::web::route::RoutePath, crate::web::route::RenderRefusal>
         + 'static,
 {
-    use crate::web::route::{DecodedPath, Matched, enter, refuse_route_table, resolve};
+    use crate::web::route::{DecodedPath, Matched, app_path, check_route_table, enter, resolve};
 
     // A malformed literal in the route table fails the mount loudly, with the
     // same refusal the server's `web_app_routed` starts with.
-    refuse_route_table(&routes)?;
+    check_route_table(&routes).map_err(MountRefusal::RouteTable)?;
+    // The client is served at the root: the empty base strips nothing.
+    let base = DecodedPath::parse("").map_err(MountRefusal::BasePath)?;
 
     let document = document()?;
-    let body: web_sys::HtmlElement = document.body().ok_or("document has no <body>")?;
+    let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
     let req = synthesize_req(&document)?;
     let initial_path = req.path.clone();
 
     // Seed the model from `init`, then enter the current URL so the `page`
     // field reflects the browser's address bar before the first render. This
-    // mirrors the server's miss: `init`'s Cmd, then the entry Cmd. A malformed
-    // address-bar path names no route: it enters `not_found`.
+    // mirrors the server's miss: `init`'s Cmd, then the entry Cmd. An
+    // address-bar path that does not locate below the base names no route: it
+    // enters `not_found`.
     let (init_model, init_cmd) = init(req);
-    let (model, entry_cmd) = match DecodedPath::parse(&initial_path) {
-        Ok(path) => {
-            let entered = enter(
-                resolve(&routes, &path, &render),
-                &not_found,
-                init_model,
-                &set_page,
-            );
-            (entered.model, entered.cmd)
-        }
-        Err(_) => set_page(not_found.clone(), init_model),
-    };
+    let matched = app_path(&initial_path, &base)
+        .as_ref()
+        .map_or(Matched::Miss, |path| resolve(&routes, path, &render));
+    let entered = enter(matched, &not_found, init_model, &set_page);
+    let (model, entry_cmd) = (entered.model, entered.cmd);
     let cmd0 = IpeCmd::Batch(vec![init_cmd, entry_cmd]);
 
     let mut tree = view(model.clone());
@@ -591,10 +598,10 @@ where
         let not_found = Rc::clone(&not_found_rc);
         let set_page = Rc::clone(&set_page_rc);
         let render = Rc::clone(&render_rc);
-        Box::new(move |raw: &str, m: Model| {
-            // Parsed once; a malformed path is refused like an unrouted one.
-            let path = DecodedPath::parse(raw).ok()?;
-            let matched = resolve(&routes, &path, &*render);
+        Box::new(move |located: &crate::web::route::LocatedPath, m: Model| {
+            // A path that does not locate below the base is unrouted.
+            let path = located.as_ref().ok()?;
+            let matched = resolve(&routes, path, &*render);
             // An empty table serves only `/`, as on the server.
             let routed =
                 matches!(matched, Matched::Hit { .. }) || (routes.is_empty() && path.is_root());
@@ -635,7 +642,7 @@ where
     attach_overlay_listeners(&app);
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
-    attach_popstate_listener(&app)?;
+    attach_popstate_listener(&app, base)?;
     // First paint went through `set_inner_html`; deliver each widget's decoded
     // down-state PROPERTY once here (later changes ride the diff/patch route).
     widget::sync_widget_properties(&document, &app.tree.borrow());
@@ -647,23 +654,32 @@ where
 
 /// Install a `popstate` listener on `window` so back/forward navigation
 /// enters the new URL (running its entry Cmd).
-fn attach_popstate_listener<Model, Msg>(app: &Rc<App<Model, Msg>>) -> Result<(), String>
+///
+/// A pathname the platform cannot report is [`PathMiss::Unreadable`]: an
+/// unrouted no-op, never an entry at the root page.
+///
+/// [`PathMiss::Unreadable`]: crate::web::route::PathMiss::Unreadable
+fn attach_popstate_listener<Model, Msg>(
+    app: &Rc<App<Model, Msg>>,
+    base: crate::web::route::DecodedPath,
+) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    let window = web_sys::window().ok_or("no window")?;
+    use crate::web::route::{PathMiss, app_path};
+    let window = web_sys::window().ok_or(MountRefusal::NoWindow)?;
     let app = Rc::clone(app);
     let closure =
         Closure::<dyn Fn(web_sys::PopStateEvent)>::new(move |_ev: web_sys::PopStateEvent| {
-            let path = web_sys::window()
+            let located = web_sys::window()
                 .and_then(|w| w.location().pathname().ok())
-                .unwrap_or_else(|| "/".to_owned());
-            navigate_to(&app, &path);
+                .map_or(Err(PathMiss::Unreadable), |raw| app_path(&raw, &base));
+            navigate_to(&app, &located);
         });
     window
         .add_event_listener_with_callback("popstate", closure.as_ref().unchecked_ref())
-        .map_err(|e| format!("addEventListener(popstate) failed: {e:?}"))?;
+        .map_err(|e| listener_refusal("popstate", &e))?;
     // The listener lives for the whole app lifetime.
     closure.forget();
     Ok(())
@@ -677,7 +693,7 @@ where
 /// the path does not match any declared route — unrouted popstate events (e.g.
 /// a browser extension pushing `/favicon.ico`) must not rebuild the handler
 /// index from the `notFound` view and orphan the live page's handlers.
-fn navigate_to<Model, Msg>(app: &Rc<App<Model, Msg>>, path: &str)
+fn navigate_to<Model, Msg>(app: &Rc<App<Model, Msg>>, path: &crate::web::route::LocatedPath)
 where
     Model: Clone + 'static,
     Msg: Clone + 'static,
@@ -712,15 +728,24 @@ where
     resync_subscriptions(app);
 }
 
-fn document() -> Result<web_sys::Document, String> {
+fn document() -> Result<web_sys::Document, MountRefusal> {
     web_sys::window()
-        .and_then(|w| w.document())
-        .ok_or_else(|| "no window/document (not a browser context?)".to_owned())
+        .ok_or(MountRefusal::NoWindow)?
+        .document()
+        .ok_or(MountRefusal::NoDocument)
+}
+
+/// The refusal for a listener the platform would not register.
+fn listener_refusal(event: &'static str, error: &JsValue) -> MountRefusal {
+    MountRefusal::Listener {
+        event,
+        detail: format!("{error:?}"),
+    }
 }
 
 /// Rebuild the row-poly `req` record from the browser environment.
-fn synthesize_req(document: &web_sys::Document) -> Result<WebReq, String> {
-    let window = web_sys::window().ok_or("no window")?;
+fn synthesize_req(document: &web_sys::Document) -> Result<WebReq, MountRefusal> {
+    let window = web_sys::window().ok_or(MountRefusal::NoWindow)?;
     let loc = window.location();
     let path = loc.pathname().unwrap_or_default();
     let query = loc.search().unwrap_or_default();
@@ -764,7 +789,7 @@ const DELEGATED_EVENTS: &[&str] = &[
 fn attach_delegated_listeners<Model, Msg>(
     body: &web_sys::HtmlElement,
     app: &Rc<App<Model, Msg>>,
-) -> Result<(), String>
+) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
     Msg: Clone + 'static,
@@ -776,7 +801,7 @@ where
             on_dom_event(&app, event_name, &ev);
         });
         body.add_event_listener_with_callback(name, closure.as_ref().unchecked_ref())
-            .map_err(|e| format!("addEventListener({name}) failed: {e:?}"))?;
+            .map_err(|e| listener_refusal(event_name, &e))?;
         // Delegated root listeners live for the whole app lifetime.
         closure.forget();
     }
@@ -796,7 +821,7 @@ where
 fn attach_widget_up_listener<Model, Msg>(
     body: &web_sys::HtmlElement,
     app: &Rc<App<Model, Msg>>,
-) -> Result<(), String>
+) -> Result<(), MountRefusal>
 where
     Model: Clone + 'static,
     Msg: Clone + 'static,
@@ -807,7 +832,7 @@ where
     });
     let name = widget::up_event_name();
     body.add_event_listener_with_callback(name, closure.as_ref().unchecked_ref())
-        .map_err(|e| format!("addEventListener({name}) failed: {e:?}"))?;
+        .map_err(|e| listener_refusal(name, &e))?;
     // The delegated widget-up listener lives for the whole app lifetime.
     closure.forget();
     Ok(())
