@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
 
 use crate::core::{IpeResult, IpeTask, ok_res};
-use crate::tea::{IpeCmd, IpeSub};
+use crate::tea::{IpeCmd, IpeSub, SourceTask};
 
 /// Per-topic broadcast buffer. A subscriber that lags more than this many
 /// messages gets `RecvError::Lagged` (handled by skipping, never panicking).
@@ -268,8 +268,8 @@ impl SessionScope {
 
 tokio::task_local! {
     /// The session in scope while user code runs on its behalf. Read
-    /// synchronously inside the `IpeSub::Source` closure so the spawned recv
-    /// loop captures the owning session's sid for SkipOrigin filtering, and by
+    /// synchronously when a topic subscription is built so its recv loop
+    /// keeps the owning session's sid for SkipOrigin filtering, and by
     /// `Auth.verifyToken` to bind an admitted token. Unset outside a session.
     static SESSION: SessionScope;
 }
@@ -328,14 +328,15 @@ pub fn session_bindings() -> Option<Arc<Mutex<crate::revocation::SessionBindings
 /// from the materialisation scope. SkipOrigin is filtered here, receiver-side.
 ///
 /// IMPORTANT: `current_session_sid()` is called SYNCHRONOUSLY here (at call
-/// time, while `with_session` is in scope), not inside the spawn closure.
-/// The captured `owner_sid` is then moved into the spawn closure so the async
-/// recv loop has the correct sid even after the task-local scope has ended.
+/// time, while `with_session` is in scope), not inside the source body.
+/// The captured `owner_sid` is then moved into the body so the async recv
+/// loop has the correct sid even after the task-local scope has ended. The
+/// loop starts the body inside the scope it reconciles in.
 pub fn sub_subscribe_topic<T, M, F>(topic: String, to_msg: F) -> IpeSub<M>
 where
     T: Clone + Send + 'static,
     M: Send + 'static,
-    // `to_msg` is moved exclusively into the spawned task (never shared across
+    // `to_msg` is moved exclusively into the source body (never shared across
     // threads), so `Send` is the minimum contract — `Sync` is not required.
     F: Fn(T) -> M + Send + 'static,
 {
@@ -343,7 +344,7 @@ where
     let owner_sid = current_session_sid();
     IpeSub::Source(Box::new(move |emit| {
         let mut rx = broker::<T>().subscribe(&topic);
-        tokio::spawn(async move {
+        SourceTask::Tracked(Box::pin(async move {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
@@ -361,7 +362,7 @@ where
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        })
+        }))
     }))
 }
 
@@ -416,7 +417,7 @@ mod tests {
     async fn collect_one(
         owner_sid: &str,
         topic: &str,
-    ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+    ) -> (crate::tea::RunningSource, Arc<Mutex<Vec<String>>>) {
         let got = Arc::new(Mutex::new(Vec::<String>::new()));
         let got2 = got.clone();
         let emit: Arc<dyn Fn(String) + Send + Sync> =
@@ -425,7 +426,7 @@ mod tests {
             sub_subscribe_topic::<String, String, _>(topic.to_string(), |p| p)
         });
         let handle = match sub {
-            IpeSub::Source(spawn) => spawn(emit),
+            IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
             _ => unreachable!("subscribeTopic builds a Source"),
         };
         tokio::time::sleep(std::time::Duration::from_millis(20)).await; // let it subscribe
@@ -438,7 +439,7 @@ mod tests {
         broker::<String>().publish("echo-topic", "m".to_string(), "sid-A", false);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(*got.lock().unwrap(), vec!["m".to_string()]); // origin RECEIVES (echo)
-        h.abort();
+        drop(h);
     }
 
     #[tokio::test]
@@ -468,7 +469,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(got_a.lock().unwrap().is_empty()); // A suppressed
         assert_eq!(*got_b.lock().unwrap(), vec!["m".to_string()]); // B receives
-        ha.abort();
-        hb.abort();
+        drop(ha);
+        drop(hb);
     }
 }

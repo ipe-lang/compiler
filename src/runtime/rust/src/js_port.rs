@@ -185,6 +185,7 @@ mod native {
     use crate::error::IpeError;
     use crate::json::{Decoder, JsonVal};
     use crate::seal_codec::seal_decode;
+    use crate::tea::SourceTask;
     use std::collections::HashMap;
     use std::sync::{
         Arc, Mutex, OnceLock,
@@ -530,13 +531,13 @@ mod native {
     /// `to_msg(a)` on a clean decode. A rejected payload is dropped whole.
     ///
     /// The owning session's sid is read SYNCHRONOUSLY here (while the driver's
-    /// `with_session` scope is active), then moved into the spawned task, so
+    /// `with_session` scope is active), then moved into the source body, so
     /// the recv loop drains exactly that session's channel and can never observe
     /// another session's inbound frames. A subscription materialised with no
     /// session sid in scope (no valid [`SessionId`]) binds an inert per-call
     /// channel that no route feeds, so it receives nothing.
     ///
-    /// `to_msg` is moved into exactly one detached task and never shared behind an
+    /// `to_msg` is moved into exactly one source body and never shared behind an
     /// `Arc`, so `Send` (not `Send + Sync`) is the exact contract — the same
     /// bound `sub_subscribe_ws_message` carries.
     pub fn js_subscribe<T, M, F>(decoder: Decoder<IpeError, T>, to_msg: F) -> IpeSub<M>
@@ -560,7 +561,7 @@ mod native {
         };
         IpeSub::Source(Box::new(move |emit| {
             let mut rx = rx;
-            tokio::spawn(async move {
+            SourceTask::Tracked(Box::pin(async move {
                 loop {
                     match rx.recv().await {
                         Ok(raw) => {
@@ -578,7 +579,7 @@ mod native {
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            })
+            }))
         }))
     }
 
@@ -800,7 +801,7 @@ mod native {
         };
         IpeSub::Source(Box::new(move |emit| {
             let mut rx = rx;
-            tokio::spawn(async move {
+            SourceTask::Tracked(Box::pin(async move {
                 loop {
                     match rx.recv().await {
                         Ok(raw) => {
@@ -812,7 +813,7 @@ mod native {
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            })
+            }))
         }))
     }
 
@@ -1572,7 +1573,7 @@ mod tests {
         fn collect_for(
             sid: &SessionId,
             decoder: Decoder<IpeError, i64>,
-        ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<i64>>>) {
+        ) -> (crate::tea::RunningSource, Arc<Mutex<Vec<i64>>>) {
             let got = Arc::new(Mutex::new(Vec::<i64>::new()));
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
@@ -1581,7 +1582,7 @@ mod tests {
                 js_subscribe::<i64, i64, _>(decoder, |a| a)
             });
             let handle = match sub {
-                IpeSub::Source(spawn) => spawn(emit),
+                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
                 _ => unreachable!("js_subscribe builds a Source"),
             };
             (handle, got)
@@ -1596,7 +1597,7 @@ mod tests {
             deliver_inbound_for(&sid, "7".to_string());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(*got.lock().unwrap_or_else(|e| e.into_inner()), vec![7]);
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1610,7 +1611,7 @@ mod tests {
             deliver_inbound_for(&sid, "{not json".to_string()); // malformed
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // both dropped, no panic, no partial
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1624,7 +1625,7 @@ mod tests {
             deliver_inbound_for(&sid, "2".to_string());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1883,8 +1884,8 @@ mod tests {
             ); // A's sink
             assert!(out_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // B's sink saw NOTHING (no leak)
 
-            ha.abort();
-            hb.abort();
+            drop(ha);
+            drop(hb);
             session_close(&sid_a);
             session_close(&sid_b);
         }
@@ -1903,14 +1904,14 @@ mod tests {
                 Arc::new(move |m| got2.lock().unwrap_or_else(|e| e.into_inner()).push(m));
             let sub = js_subscribe::<i64, i64, _>(int_decoder(), |a| a);
             let h = match sub {
-                IpeSub::Source(spawn) => spawn(emit),
+                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
                 _ => unreachable!(),
             };
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(&sid, "5".to_string());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // inert drain — nothing delivered
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1958,7 +1959,7 @@ mod tests {
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "unknown-id reply must not reach subscribers"
             );
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -2155,7 +2156,7 @@ mod tests {
             deliver_inbound_for(&sid, "1".to_string()); // no channel → dropped
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-            h.abort();
+            drop(h);
         }
 
         // ── Session-stream primitive: routing + refusals ─────────────────────
@@ -2190,7 +2191,7 @@ mod tests {
         fn collect_frames(
             sid: &SessionId,
             handle: i64,
-        ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<i64>>>) {
+        ) -> (crate::tea::RunningSource, Arc<Mutex<Vec<i64>>>) {
             let got = Arc::new(Mutex::new(Vec::<i64>::new()));
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
@@ -2199,7 +2200,7 @@ mod tests {
                 js_session_frames::<i64, i64, _>(handle, int_decoder(), |a| a)
             });
             let h = match sub {
-                IpeSub::Source(spawn) => spawn(emit),
+                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
                 _ => unreachable!("js_session_frames builds a Source"),
             };
             (h, got)
@@ -2217,7 +2218,7 @@ mod tests {
             deliver_inbound_for(&sid, format!(r#"{{"__ipe_session":{handle},"payload":7}}"#));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(*got.lock().unwrap_or_else(|e| e.into_inner()), vec![7]);
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -2237,7 +2238,7 @@ mod tests {
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "foreign session-id frame must not reach the subscriber"
             );
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -2260,7 +2261,7 @@ mod tests {
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "a frame after close must be dropped"
             );
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -2408,8 +2409,8 @@ mod tests {
                 got_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "session B must not see session A's frame"
             );
-            ha.abort();
-            hb.abort();
+            drop(ha);
+            drop(hb);
             session_close(&sid);
         }
     }
