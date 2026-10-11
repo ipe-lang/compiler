@@ -353,12 +353,12 @@ copyHolds : LogState -> Index.Snapshot -> Bool
 copyHolds state snap =
     copyCurrent state snap.stamp
         && (case snap.copy of
-                Just digest ->
-                    SetDigest.same (verifiedPairs state) digest
+            Just digest ->
+                SetDigest.same (verifiedPairs state) digest
 
-                Nothing ->
-                    False
-           )
+            Nothing ->
+                False
+        )
 
 
 verifiedPairs : LogState -> SetDigest

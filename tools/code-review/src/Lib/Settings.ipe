@@ -293,8 +293,8 @@ locationRefusal file e =
     File.isDir file
         |> Task.onError (\_ -> Task.succeed False)
         |> Task.andThen
-            (\isDir ->
-                if isDir then
+            (\directory ->
+                if directory then
                     Task.succeed NotAFile
 
                 else

@@ -556,7 +556,7 @@ admittedSites =
     , ( "System.", [ ( "Main.ipe", 5 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
-    , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ) ] )
+    , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/Settings.ipe", 3 ) ] )
     , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )

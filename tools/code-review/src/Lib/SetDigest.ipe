@@ -46,9 +46,11 @@ add key member digest =
 -- mix, compared in constant time.
 same : SetDigest -> SetDigest -> Bool
 same left right =
-    case ( left, right ) of
-        ( SetDigest l, SetDigest r ) ->
-            l.pairs == r.pairs && Crypto.constantTimeEqual (mixText l.mix) (mixText r.mix)
+    case left of
+        SetDigest l ->
+            case right of
+                SetDigest r ->
+                    l.pairs == r.pairs && Crypto.constantTimeEqual (mixText l.mix) (mixText r.mix)
 
 
 -- An HMAC-SHA-256 is 64 hex digits: eight words of eight digits each.

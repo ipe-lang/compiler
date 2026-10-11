@@ -549,12 +549,13 @@ changeOf change old =
 -- file can redefine those. The page and the count share `openMembership`,
 -- so the total always counts exactly the rows a page can return. The pairs
 -- compare under `BINARY`, whatever collation the file declares. A unit
--- joins its queue row for its current body whatever the row's kind, so a
--- kind this reviewer does not know reaches `changeDecoder` and fails the
--- read.
+-- joins its queue row for its current body unless that row is `deleted`,
+-- which says nothing about a unit that still stands; any other kind, a
+-- missing one included, reaches `changeDecoder`, which fails the read on
+-- one this reviewer does not know.
 openColumns : String
 openColumns =
-    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash WHERE" ++ openMembership ++ ")"
+    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ ")"
 
 
 -- The membership condition on a unit row `u`: no pair of the `reviewed`
