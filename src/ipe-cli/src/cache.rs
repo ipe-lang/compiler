@@ -750,6 +750,7 @@ pub fn compute_project_key(
     db_driver: DbDriver,
     target: ipe_ir::Target,
     wasm_public_env: &[String],
+    mount_base: &MountBase,
     intent: ipe_backend_rust::BuildIntent,
     debugger: bool,
     hot_appearance: bool,
