@@ -3187,6 +3187,61 @@ fn rogue<'a>(x: &'a str) {
         );
         assert_eq!(constructions(auth, "TimeClaims", &[]).len(), 1);
         assert_eq!(constructions(revocation, "TimeClaims", &[]), none);
+        for ty in ["VerifiedClaims", "TimeClaims", "SessionCredential"] {
+            for source in [auth, revocation] {
+                assert_eq!(
+                    aliases(source, ty),
+                    Vec::<String>::new(),
+                    "`{ty}` has no alias the construction scan cannot see"
+                );
+            }
+        }
+    }
+
+    /// The enclosing `fn` of every alias of `ty` in `source` (`use … ty as N`,
+    /// or `type N = … ty` naming `ty` itself), a name under which the
+    /// construction scan would not see `ty` built. A `type` that only holds
+    /// `ty` inside another type (`Vec<ty>`) builds no `ty`.
+    fn aliases(source: &str, ty: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        let mut sites = Vec::new();
+        for (at, token) in tokens.iter().enumerate() {
+            if token.text != "use" && token.text != "type" {
+                continue;
+            }
+            let item: Vec<&str> = tokens
+                .iter()
+                .skip(at + 1)
+                .map(|t| t.text.as_str())
+                .take_while(|t| *t != ";")
+                .collect();
+            let renames = item.windows(2).any(|pair| pair == [ty, "as"]);
+            let names = item.contains(&"=") && item.last() == Some(&ty);
+            if (token.text == "use" && renames) || (token.text == "type" && names) {
+                sites.push(token.func.clone().unwrap_or_default());
+            }
+        }
+        sites
+    }
+
+    /// Source exercising the alias scan.
+    const SYNTHETIC_ALIASES: &str = r#"
+use crate::auth::TimeClaims;
+use crate::auth::{TimeClaims as Times, VerifiedClaims};
+type T = TimeClaims;
+fn forge() -> Option<i64> {
+    type Inner = crate::auth::TimeClaims;
+    type Many = Vec<TimeClaims>;
+    let t: Option<TimeClaims> = None;
+    None
+}
+// type C = TimeClaims;
+type Other = VerifiedClaims;
+"#;
+
+    #[test]
+    fn alias_scan_refuses_every_rename() {
+        assert_eq!(aliases(SYNTHETIC_ALIASES, "TimeClaims"), ["", "", "forge"]);
     }
 
     /// A code token and the `fn` whose body holds it.
@@ -3239,44 +3294,86 @@ fn rogue<'a>(x: &'a str) {
         out
     }
 
-    /// The integer types a NumericDate could be re-read into.
-    const DATE_INTEGERS: [&str; 6] = ["i64", "u64", "i32", "u32", "i128", "u128"];
+    /// The text-to-value readers a date could be re-read through.
+    const TEXT_READERS: [&str; 5] = [
+        "parse",
+        "from_str",
+        "from_str_radix",
+        "from_slice",
+        "from_reader",
+    ];
 
-    /// The enclosing `fn` of every integer parse in `source`: `parse::<int>` or
-    /// `int::from_str`.
-    fn integer_parses(source: &str) -> Vec<String> {
+    /// `from_str` qualifiers that read header bytes, never a number.
+    const HEADER_READERS: [&str; 1] = ["HeaderValue"];
+
+    /// The enclosing `fn` of every text read in `source`, whatever type it
+    /// reads into: `.parse()`, `str::parse`, any `from_str*`, `from_slice` or
+    /// `from_reader`. A `fn` of that name being declared, a `Type::parse`
+    /// smart constructor (an upper-case qualifier), and a `HeaderValue` read
+    /// are not reads of a number.
+    fn text_reads(source: &str) -> Vec<String> {
         let tokens = tokens(source);
-        let text = |at: usize| tokens.get(at).map_or("", |t| t.text.as_str());
+        let text = |at: Option<usize>| {
+            at.and_then(|at| tokens.get(at))
+                .map_or("", |t| t.text.as_str())
+        };
         let mut sites = Vec::new();
         for (at, token) in tokens.iter().enumerate() {
-            let turbofish = token.text == "parse"
-                && [":", ":", "<"] == [text(at + 1), text(at + 2), text(at + 3)]
-                && DATE_INTEGERS.contains(&text(at + 4))
-                && text(at + 5) == ">";
-            let from_str = DATE_INTEGERS.contains(&token.text.as_str())
-                && [":", ":"] == [text(at + 1), text(at + 2)]
-                && matches!(text(at + 3), "from_str" | "from_str_radix");
-            if turbofish || from_str {
+            let word = token.text.as_str();
+            if !TEXT_READERS.contains(&word) || text(at.checked_sub(1)) == "fn" {
+                continue;
+            }
+            let qualifier = ([":", ":"] == [text(at.checked_sub(2)), text(at.checked_sub(1))])
+                .then(|| text(at.checked_sub(3)));
+            let constructor = word == "parse"
+                && qualifier.is_some_and(|q| q.starts_with(|c: char| c.is_uppercase()));
+            let header =
+                word == "from_str" && qualifier.is_some_and(|q| HEADER_READERS.contains(&q));
+            if !constructor && !header {
                 sites.push(token.func.clone().unwrap_or_default());
             }
         }
         sites
     }
 
-    /// Source exercising the integer-parse scan.
+    /// Source exercising the text-read scan: one evasion per `fn`, plus the
+    /// masked and exempt forms.
     const SYNTHETIC_PARSES: &str = r#"
-fn deadline(claims: &Claims) -> Option<i64> {
+fn turbofish(claims: &Claims) -> Option<i64> {
     // claims.get("exp").and_then(|s| s.parse::<i64>().ok())
     let _ = "s.parse::<i64>()";
     claims.get("exp").and_then(|s| s.parse :: < i64 > ().ok())
 }
-fn width(raw: &str) -> Option<usize> { raw.parse::<usize>().ok() }
+fn inferred(s: &str) -> Option<i64> { let e: i64 = s.parse().ok()?; Some(e) }
+fn pathed(s: &str) -> Option<i64> { s.parse::<core::primitive::i64>().ok() }
+fn aliased(s: &str) -> Option<i64> { type S = i64; s.parse::<S>().ok() }
+fn serde(s: &str) -> Option<i64> { serde_json::from_str::<i64>(s).ok() }
+fn bytes(s: &str) -> Option<i64> { serde_json::from_slice(s.as_bytes()).ok() }
 fn radix(raw: &str) -> Option<u64> { u64::from_str_radix(raw, 10).ok() }
+fn trait_path(raw: &str) -> Option<i64> { <i64 as FromStr>::from_str(raw).ok() }
+fn point_free(raw: Option<&str>) -> Option<i64> { raw.map(str::parse::<i64>)?.ok() }
+fn width(raw: &str) -> Option<usize> { raw.parse::<usize>().ok() }
+fn parse(raw: &str) -> Option<Name> { Name::parse(raw) }
+fn header(raw: &str) -> bool { HeaderValue::from_str(raw).is_ok() }
 "#;
 
     #[test]
-    fn integer_parse_scan_masks_literals_and_tracks_fns() {
-        assert_eq!(integer_parses(SYNTHETIC_PARSES), ["deadline", "radix"]);
+    fn text_read_scan_refuses_every_evasion() {
+        assert_eq!(
+            text_reads(SYNTHETIC_PARSES),
+            [
+                "turbofish",
+                "inferred",
+                "pathed",
+                "aliased",
+                "serde",
+                "bytes",
+                "radix",
+                "trait_path",
+                "point_free",
+                "width",
+            ]
+        );
     }
 
     /// No reader after `verify_claims` re-parses a date from a claim's string
@@ -3285,14 +3382,48 @@ fn radix(raw: &str) -> Option<u64> { u64::from_str_radix(raw, 10).ok() }
     fn date_claims_read_once() {
         // The two parses read the caller's `signToken` dict, never a verified
         // token.
+        // Production: the two reads are `signToken`'s caller dict, never a
+        // verified token. Tests: JSON fixtures decoded whole.
         assert_eq!(
-            integer_parses(include_str!("auth.rs")),
-            ["auth_sign_token", "auth_sign_token"],
-            "only `signToken`'s caller dict parses an integer in `auth.rs`"
+            text_reads(include_str!("auth.rs")),
+            [
+                "auth_sign_token",
+                "auth_sign_token",
+                "test_auth_sign_token_payload_keys_sorted",
+                "tampered_cap_fails_signature_verification",
+                "verified_time_claims_are_the_numbers_the_checks_read",
+                "exp_past_the_decoders_range_is_non_numeric_not_missing",
+            ],
+            "a new text read in `auth.rs` must not re-read a verified date"
         );
-        let none: Vec<String> = Vec::new();
-        assert_eq!(integer_parses(include_str!("revocation.rs")), none);
-        assert_eq!(integer_parses(include_str!("server.rs")), none);
+        // Production: the bindings wire decode. Tests: wire fixtures.
+        let fixture = "session_credential_deserialize_refuses_empty_fields";
+        assert_eq!(
+            text_reads(include_str!("revocation.rs")),
+            [
+                "decode_bindings",
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                "decode_bindings_refuses_nine_and_empty_fields",
+            ],
+            "a new text read in `revocation.rs` must not re-read a verified date"
+        );
+        // Production: the `Content-Length` header. Tests: an address and a
+        // JSON payload fixture.
+        assert_eq!(
+            text_reads(include_str!("server.rs")),
+            [
+                "build_request",
+                "an_env_exposure_warns_with_the_parsed_address",
+                "fractional_exp_still_slides",
+            ],
+            "a new text read in `server.rs` must not re-read a verified date"
+        );
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut pending = vec![root];
         let mut scanned = 0;

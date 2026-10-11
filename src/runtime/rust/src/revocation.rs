@@ -13,8 +13,8 @@
 //! `auth::verify_claims` builds: a credential from unverified claims has no
 //! representation either.
 //!
-//! - `admit` refuses a token with no subject or no `jti`
-//!   (`cap`, else `exp`), and a token the store names or cannot judge.
+//! - `admit` refuses a token with no subject or no `jti`, and a token the
+//!   store names or cannot judge; its deadline is `cap`, else `exp`.
 //! - [`ArmedGate::recheck`] re-proves a held credential: its deadline, then the
 //!   store.
 //! - Both take the store mutex a revocation write holds, so a write that has
