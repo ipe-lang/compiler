@@ -2284,14 +2284,33 @@ mod source_spawn_scan_tests {
         ("tea.rs", include_str!("tea.rs")),
     ];
 
-    /// The production bare spawns these files may hold, by file and enclosing fn:
-    /// the socket pumps, which run no user code.
-    const ADMITTED_SPAWNS: [(&str, &str); 2] = [
-        ("ws_client.rs", "do_connect"),
-        ("ws_client.rs", "do_connect"),
+    /// Every task-starting name the production text of these files may hold,
+    /// by file, enclosing fn and name: the loop's own starts through the scope
+    /// carrier, its stdin reader thread, the source closure the loop and
+    /// `sub_map` invoke (a binding named `spawn`), and the socket pumps, which
+    /// run no user code. Sorted.
+    const ADMITTED_SPAWNS: [(&str, &str, &str); 16] = [
+        ("tea.rs", "add", "spawn"),
+        ("tea.rs", "add", "spawn"),
+        ("tea.rs", "apply", "spawn"),
+        ("tea.rs", "apply", "spawn"),
+        ("tea.rs", "apply", "spawn_in_current_scope"),
+        ("tea.rs", "cli_run_cmd_tracked", "spawn_in_current_scope"),
+        ("tea.rs", "console_app", "spawn_named"),
+        ("tea.rs", "start_source", "spawn_in_current_scope"),
+        ("tea.rs", "start_source", "spawn_in_current_scope"),
+        ("tea.rs", "sub_map_arc", "spawn"),
+        ("tea.rs", "sub_map_arc", "spawn"),
+        ("tea.rs", "sub_map_rc", "spawn"),
+        ("tea.rs", "sub_map_rc", "spawn"),
+        ("tea.rs", "worker_run_cmd", "spawn_in_current_scope"),
+        ("ws_client.rs", "do_connect", "spawn"),
+        ("ws_client.rs", "do_connect", "spawn"),
     ];
 
-    const BARE_SPAWN: &str = "tokio::spawn(";
+    /// Source files under `src/` that build a subscription source and are not
+    /// scanned: the browser broker, which has no tokio task to start.
+    const UNSCANNED_SOURCE_FILES: [&str; 1] = ["wasm/pubsub.rs"];
 
     fn is_ident(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
@@ -2445,10 +2464,44 @@ mod source_spawn_scan_tests {
         s.len()
     }
 
+    /// The comma-separated items of `list` at bracket depth zero.
+    fn top_level_items(list: &str) -> Vec<&str> {
+        let mut items = Vec::new();
+        let mut depth = 0_usize;
+        let mut start = 0_usize;
+        for (at, c) in list.char_indices() {
+            match c {
+                '(' => depth = depth.saturating_add(1),
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    items.push(list.get(start..at).unwrap_or_default());
+                    start = at.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        items.push(list.get(start..).unwrap_or_default());
+        items
+    }
+
     /// Whether the `cfg` attribute `attr` compiles its item only under test.
+    ///
+    /// Only a `test` predicate, or an `all(..)` with `test` among its own
+    /// conjuncts, does; any other predicate (`any(test, ..)`, `not(test)`)
+    /// keeps the item in production.
     fn gates_test(attr: &str) -> bool {
         let compact: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
-        !compact.contains("not(test") && attr.split(|c: char| !is_ident(c)).any(|w| w == "test")
+        let Some(predicate) = compact
+            .strip_prefix("#[cfg(")
+            .and_then(|rest| rest.strip_suffix(")]"))
+        else {
+            return false;
+        };
+        predicate == "test"
+            || predicate
+                .strip_prefix("all(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .is_some_and(|conjuncts| top_level_items(conjuncts).contains(&"test"))
     }
 
     /// `code` without the items a test-only `cfg` attribute gates.
@@ -2493,22 +2546,48 @@ mod source_spawn_scan_tests {
         ""
     }
 
-    /// The enclosing fn of every `needle` in `code`.
-    fn sites<'a>(code: &'a str, needle: &str) -> Vec<&'a str> {
-        code.match_indices(needle)
-            .map(|(at, _)| enclosing_fn(code, at))
-            .collect()
+    /// Whether `ident` names a way to start a task or thread: `spawn` (a free
+    /// fn, a method, a re-export, an alias source) or any `spawn_*`.
+    fn starts_a_task(ident: &str) -> bool {
+        ident == "spawn" || ident.starts_with("spawn_")
     }
 
-    /// Every production bare spawn in `files`, by file and enclosing fn, sorted.
-    fn bare_spawn_sites(files: &[(&str, &str)]) -> Vec<(String, String)> {
-        let mut found: Vec<(String, String)> = files
+    /// Every task-starting identifier of `code` with its enclosing fn.
+    fn spawn_idents(code: &str) -> Vec<(&str, &str)> {
+        let mut found = Vec::new();
+        let mut start: Option<usize> = None;
+        let mut prev_ident = false;
+        for (at, c) in code
+            .char_indices()
+            .chain(std::iter::once((code.len(), ' ')))
+        {
+            let ident = is_ident(c);
+            match (ident, prev_ident, start) {
+                (true, false, _) => start = Some(at),
+                (false, true, Some(from)) => {
+                    let word = code.get(from..at).unwrap_or_default();
+                    if starts_a_task(word) {
+                        found.push((enclosing_fn(code, from), word));
+                    }
+                    start = None;
+                }
+                _ => {}
+            }
+            prev_ident = ident;
+        }
+        found
+    }
+
+    /// Every production task-starting identifier in `files`, by file, enclosing
+    /// fn and name, sorted.
+    fn spawn_sites(files: &[(&str, &str)]) -> Vec<(String, String, String)> {
+        let mut found: Vec<(String, String, String)> = files
             .iter()
             .flat_map(|&(file, src)| {
                 let code = production(&code_only(src));
-                sites(&code, BARE_SPAWN)
+                spawn_idents(&code)
                     .into_iter()
-                    .map(|name| (file.to_owned(), name.to_owned()))
+                    .map(|(name, word)| (file.to_owned(), name.to_owned(), word.to_owned()))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -2516,20 +2595,51 @@ mod source_spawn_scan_tests {
         found
     }
 
+    /// Every runtime source file, by path under `src/` with `/` separators.
+    fn runtime_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root.clone()];
+        let mut files = Vec::new();
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for path in entries.flatten().map(|entry| entry.path()) {
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && let (Ok(rel), Ok(src)) =
+                        (path.strip_prefix(&root), std::fs::read_to_string(&path))
+                {
+                    let rel: Vec<String> = rel
+                        .components()
+                        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    files.push((rel.join("/"), src));
+                }
+            }
+        }
+        files
+    }
+
     #[test]
     fn sub_sources_never_spawn() {
-        let admitted: Vec<(String, String)> = ADMITTED_SPAWNS
+        let admitted: Vec<(String, String, String)> = ADMITTED_SPAWNS
             .iter()
-            .map(|&(file, name)| (file.to_owned(), name.to_owned()))
+            .map(|&(file, name, word)| (file.to_owned(), name.to_owned(), word.to_owned()))
             .collect();
         assert_eq!(
-            bare_spawn_sites(&SOURCE_FILES),
+            spawn_sites(&SOURCE_FILES),
             admitted,
             "a subscription source returns its body; only the loop starts it"
         );
 
         let tea = production(&code_only(include_str!("tea.rs")));
-        let scoped = sites(&tea, "spawn_in_current_scope(");
+        let scoped: Vec<&str> = spawn_idents(&tea)
+            .into_iter()
+            .filter(|&(_, word)| word == "spawn_in_current_scope")
+            .map(|(name, _)| name)
+            .collect();
         assert!(
             scoped.contains(&"start_source") && scoped.contains(&"apply"),
             "the loop starts sources and timers through the scope carrier: {scoped:?}"
@@ -2551,12 +2661,37 @@ mod source_spawn_scan_tests {
     }
 
     #[test]
+    fn every_source_building_file_is_scanned() {
+        let sources = runtime_sources();
+        assert!(sources.len() > 3, "the scan walked the runtime sources");
+        let unscanned: Vec<String> = sources
+            .iter()
+            .filter(|(_, src)| production(&code_only(src)).contains("IpeSub::Source("))
+            .map(|(file, _)| file.clone())
+            .filter(|file| {
+                !SOURCE_FILES
+                    .iter()
+                    .any(|&(scanned, _)| scanned == file.as_str())
+                    && !UNSCANNED_SOURCE_FILES.contains(&file.as_str())
+            })
+            .collect();
+        assert!(
+            unscanned.is_empty(),
+            "a file that builds a subscription source joins `SOURCE_FILES`: {unscanned:?}"
+        );
+    }
+
+    #[test]
     fn spawn_scan_sees_through_literals_and_test_modules() {
         let bare = "pub fn sub_fake() { IpeSub::Source(Box::new(move |emit| { \
                     tokio::spawn(async move {}); SourceTask::Idle })) }";
         assert_eq!(
-            bare_spawn_sites(&[("fake.rs", bare)]),
-            vec![("fake.rs".to_owned(), "sub_fake".to_owned())],
+            spawn_sites(&[("fake.rs", bare)]),
+            vec![(
+                "fake.rs".to_owned(),
+                "sub_fake".to_owned(),
+                "spawn".to_owned()
+            )],
             "a bare spawn in a source constructor is found"
         );
         let quoted = r##"pub fn sub_quoted() {
@@ -2570,10 +2705,47 @@ mod source_spawn_scan_tests {
 mod tests {
     fn t() { tokio::spawn(async {}); }
 }
+#[cfg(all(feature = "x", test))]
+fn u() { tokio::spawn(async {}); }
 "##;
         assert!(
-            bare_spawn_sites(&[("fake.rs", quoted)]).is_empty(),
-            "a spawn in a literal, a comment, or a test module is not production code"
+            spawn_sites(&[("fake.rs", quoted)]).is_empty(),
+            "a spawn in a literal, a comment, or a test-only item is not production code"
+        );
+    }
+
+    #[test]
+    fn spawn_scan_finds_every_way_to_start_a_task() {
+        let starts = r#"
+fn by_path() { tokio::task::spawn(async {}); }
+fn by_alias() { use tokio::spawn as go; go(async {}); }
+fn by_handle() { tokio::runtime::Handle::current().spawn(async {}); }
+fn by_blocking() { tokio::task::spawn_blocking(|| ()); }
+fn by_thread() { std::thread::spawn(|| ()); }
+#[cfg(any(test, feature = "x"))]
+fn by_any_test() { tokio::spawn(async {}); }
+#[cfg(not(test))]
+fn by_not_test() { tokio::spawn(async {}); }
+"#;
+        let found: Vec<(String, String)> = spawn_sites(&[("fake.rs", starts)])
+            .into_iter()
+            .map(|(_, name, word)| (name, word))
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("by_alias", "spawn"),
+            ("by_any_test", "spawn"),
+            ("by_blocking", "spawn_blocking"),
+            ("by_handle", "spawn"),
+            ("by_not_test", "spawn"),
+            ("by_path", "spawn"),
+            ("by_thread", "spawn"),
+        ]
+        .iter()
+        .map(|&(name, word)| (name.to_owned(), word.to_owned()))
+        .collect();
+        assert_eq!(
+            found, expected,
+            "a task started by any path, alias, method or production cfg is found"
         );
     }
 }
