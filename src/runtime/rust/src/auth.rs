@@ -3413,12 +3413,14 @@ fn header(raw: &str) -> bool { HeaderValue::from_str(raw).is_ok() }
             ],
             "a new text read in `revocation.rs` must not re-read a verified date"
         );
-        // Production: the `Content-Length` header. Tests: an address and a
-        // JSON payload fixture.
+        // Production: the `Content-Length` header. Tests: a port variable
+        // parsed through the registry, an address and a JSON payload fixture.
         assert_eq!(
             text_reads(include_str!("server.rs")),
             [
                 "build_request",
+                "ipe_server_port_resolves_operator_over_source_under_relocation",
+                "ipe_server_port_resolves_operator_over_source_under_relocation",
                 "an_env_exposure_warns_with_the_parsed_address",
                 "fractional_exp_still_slides",
             ],

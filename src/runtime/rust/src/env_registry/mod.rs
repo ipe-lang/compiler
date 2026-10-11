@@ -435,7 +435,7 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
