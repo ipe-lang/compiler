@@ -139,8 +139,8 @@ const BLOCK_ON_THREAD: &str = "ipe-block-on";
 
 /// `task`, carried into every task-local scope its caller runs in, so code
 /// that runs on another task or thread on the caller's behalf sees the scopes
-/// the caller sees (a credential it verifies binds to the request that owns
-/// it).
+/// the caller sees (a credential it verifies binds to the Web session or the
+/// `Server` request that owns it).
 ///
 /// Every caller-owned task-local scope is carried here and only here: a new
 /// one wraps the result, `carry_new_scope(carry_web_session(..))`, and every
@@ -222,9 +222,10 @@ const fn carry_server_request<F: std::future::Future>(task: F) -> F {
 
 /// Spawn `task` on the runtime inside every scope its caller runs in.
 ///
-/// The one runtime spawn for work on user code's behalf: a bare spawn starts
-/// the task outside the caller's task-locals, where a credential it verifies
-/// binds to nothing.
+/// The spawn every task of this module goes through, and the one a spawn for
+/// work on user code's behalf elsewhere in the runtime must use: a bare spawn
+/// starts the task outside the caller's task-locals, where a credential it
+/// verifies binds to nothing.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) fn spawn_in_current_scope<F>(task: F) -> tokio::task::JoinHandle<F::Output>
 where
