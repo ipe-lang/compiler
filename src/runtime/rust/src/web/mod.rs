@@ -3310,7 +3310,7 @@ pub fn web_app<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + crate::FromIpeError + Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -3358,7 +3358,9 @@ where
         .await
         {
             Ok(s) => s,
-            Err(e) => return IpeResult::Err(e.to_string().into()),
+            Err(e) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::SessionStore(e).into()));
+            }
         };
         let state = WebState {
             store,
@@ -3777,13 +3779,21 @@ impl std::fmt::Display for StartupRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RouteTable(refusal) => write!(f, "{refusal}"),
-            Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
-            Self::BasePath { base, refusal } => {
-                write!(f, "web base path `{base}` is malformed: {refusal}")
-            }
-            Self::MountBase { base, refusal } => {
-                write!(f, "web base path `{base}` is not a mount base: {refusal}")
-            }
+            Self::SessionStore(e) => write!(
+                f,
+                "session store misconfigured: {}",
+                crate::system::scrub_log_controls(&e.to_string())
+            ),
+            Self::BasePath { base, refusal } => write!(
+                f,
+                "web base path `{}` is malformed: {refusal}",
+                crate::system::scrub_log_controls(base)
+            ),
+            Self::MountBase { base, refusal } => write!(
+                f,
+                "web base path `{}` is not a mount base: {refusal}",
+                crate::system::scrub_log_controls(base)
+            ),
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
             Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
             Self::Bind(refusal) => write!(f, "{refusal}"),
@@ -3886,7 +3896,7 @@ pub fn web_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPag
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + crate::FromIpeError + Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -3920,8 +3930,10 @@ where
 {
     Box::pin(async move {
         // A malformed route pattern refuses to start, never a dead route.
-        if let Err(message) = route::refuse_route_table(&routes) {
-            return IpeResult::Err(message.into());
+        if let Err(refusal) = route::check_route_table(&routes) {
+            return IpeResult::Err(E::from_ipe_error(
+                StartupRefusal::RouteTable(refusal).into(),
+            ));
         }
         let (route_entry, param_resolver, route_matched) =
             routed_resolvers(routes, not_found, set_page, render);
@@ -3941,7 +3953,9 @@ where
         .await
         {
             Ok(s) => s,
-            Err(e) => return IpeResult::Err(e.to_string().into()),
+            Err(e) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::SessionStore(e).into()));
+            }
         };
         let state = WebState {
             store,
@@ -4094,12 +4108,15 @@ fn client_route_path(
     raw: &str,
     base: &route::DecodedPath,
 ) -> Result<Option<route::DecodedPath>, crate::server::RequestRejection> {
-    let path =
-        route::DecodedPath::parse(raw).map_err(|_| crate::server::RequestRejection::BadRequest)?;
-    if !raw.starts_with('/') || raw.contains('?') || raw.contains('#') {
-        return Ok(None);
+    match route::app_path(raw, base) {
+        Ok(path) => Ok(Some(path)),
+        Err(route::PathMiss::Malformed(_)) => Err(crate::server::RequestRejection::BadRequest),
+        Err(
+            route::PathMiss::Unreadable
+            | route::PathMiss::NotBarePath
+            | route::PathMiss::OutsideBase,
+        ) => Ok(None),
     }
-    Ok(path.strip_base(base))
 }
 
 #[cfg(feature = "server")]
@@ -6146,7 +6163,7 @@ async fn serve_web<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
 ) -> IpeResult<E, ()>
 where
-    E: From<String> + crate::FromIpeError + Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     // IpeStringify: required by inspect_handler for the live-datum GET
     // (`/_ipe/debug/inspect`). Generated Model types always satisfy this bound.
     Model: Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
@@ -6278,7 +6295,10 @@ where
         .await
     {
         Ok(()) => ok_res(()),
-        Err(e) => IpeResult::Err(format!("Web.tea: serve: {e}").into()),
+        Err(e) => IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
+            "Web.tea: serve: {}",
+            crate::system::scrub_log_controls(&e.to_string())
+        )))),
     }
 }
 
@@ -8546,6 +8566,34 @@ mod sse_reconnect_reconcile_tests {
         }
         assert_eq!(parse_mount_base(""), Ok(crate::encoding::MountBase::root()));
         assert!(parse_mount_base("/_ipe/console").is_ok_and(|b| b.prefix() == "/_ipe/console"));
+    }
+
+    /// A refused base path renders bidi overrides and control characters as
+    /// visible escapes, never raw into the startup log.
+    #[test]
+    fn startup_refusal_scrubs_bidi_and_controls() {
+        let hostile = "/%zz\u{202e}\n\u{1b}[31m";
+        let refusals = [
+            parse_route_base(hostile).err(),
+            parse_mount_base(hostile).err(),
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(
+                    &refusal,
+                    Some(StartupRefusal::BasePath { base, .. } | StartupRefusal::MountBase { base, .. })
+                        if base == hostile
+                ),
+                "{refusal:?}"
+            );
+            let rendered = refusal.map(|r| r.to_string()).unwrap_or_default();
+            assert!(
+                !rendered.contains('\u{202e}')
+                    && !rendered.contains('\n')
+                    && !rendered.contains('\u{1b}'),
+                "a startup refusal must scrub the base it names: {rendered:?}"
+            );
+        }
     }
 
     /// A base path that does not decode is refused when the router is built,
@@ -12347,6 +12395,77 @@ mod emitted_router_behavior_tests {
             ),
             "a malformed route table must refuse to start, naming the pattern: {result:?}"
         );
+    }
+
+    /// A standalone app whose store config a policy gate refuses resolves to a
+    /// typed `InvalidInput` startup error naming the store, never the
+    /// `Unexpected` catch-all a stringified error lands in.
+    #[cfg(feature = "db")]
+    #[test]
+    fn standalone_app_store_refusal_is_typed() {
+        let plain = block_on(web_app::<crate::error::IpeError, Model, Msg, _, _, _, _>(
+            init,
+            update,
+            view,
+            subs,
+            "postgres".to_string(),
+            "mysql://db.example/app".to_string(),
+            [0u8; 32],
+        ));
+        let routed = block_on(web_app_routed::<
+            crate::error::IpeError,
+            Model,
+            Msg,
+            (),
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(
+            init,
+            update,
+            view,
+            subs,
+            vec![crate::web::route::Route::new("/", |_| Some(()))],
+            (),
+            |_page: (), model: Model| (model, IpeCmd::None),
+            |_page: &()| Err(crate::web::route::RenderRefusal::NoRoute),
+            "postgres".to_string(),
+            "mysql://db.example/app".to_string(),
+            [0u8; 32],
+        ));
+        for (what, result) in [("web_app", plain), ("web_app_routed", routed)] {
+            let IpeResult::Err(error) = result else {
+                panic!("{what}: a refused store must not start");
+            };
+            assert_eq!(
+                crate::error::ipe_error_kind(error.clone()),
+                crate::error::IpeErrorKind::InvalidInput,
+                "{what}: {error:?}"
+            );
+            let message = crate::error::ipe_error_message(error);
+            assert!(
+                message.starts_with("session store misconfigured: "),
+                "{what}: {message}"
+            );
+        }
+    }
+
+    /// A store refusal's operator text is scrubbed of controls before it
+    /// reaches the startup error or the log.
+    #[test]
+    fn store_refusal_display_is_scrubbed() {
+        let cause = StartupRefusal::SessionStore(store::StoreConfigError(
+            "bad\n[ipe.live] forged\u{1b}[31m\u{202e}".to_string(),
+        ));
+        let shown = cause.to_string();
+        assert!(
+            !shown.chars().any(crate::system::is_log_hazard),
+            "a raw control survived: {shown:?}"
+        );
+        assert_eq!(shown.lines().count(), 1, "{shown:?}");
     }
 
     /// A mounted routed app whose table holds a malformed pattern answers every
