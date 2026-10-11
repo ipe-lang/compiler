@@ -550,15 +550,10 @@ pub(crate) trait SubSink<M>: Clone + Send + Sync + 'static {
     fn emit(&self, msg: M);
 }
 
-/// A spawned task aborted when its owner drops it.
+/// The guard that aborts `task` when its owner drops it.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+fn abort_on_drop(task: &tokio::task::JoinHandle<()>) -> crate::task::AbortOnDrop {
+    crate::task::AbortOnDrop::new(task.abort_handle())
 }
 
 /// A subscription source the loop has started.
@@ -568,7 +563,7 @@ impl Drop for AbortOnDrop {
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) enum RunningSource {
     /// A tracked body, stopped when this is dropped.
-    Tracked { _task: AbortOnDrop },
+    Tracked { _task: crate::task::AbortOnDrop },
     /// A detached body or an idle source: nothing for the loop to stop.
     Untracked,
 }
@@ -579,7 +574,7 @@ pub(crate) enum RunningSource {
 pub(crate) fn start_source(task: SourceTask) -> RunningSource {
     match task {
         SourceTask::Tracked(body) => RunningSource::Tracked {
-            _task: AbortOnDrop(crate::task::spawn_in_current_scope(body)),
+            _task: abort_on_drop(&crate::task::spawn_in_current_scope(body)),
         },
         SourceTask::Detached(body) => {
             drop(crate::task::spawn_in_current_scope(body));
@@ -597,7 +592,7 @@ type TickMsgs<M> = std::sync::Arc<std::sync::Mutex<Vec<M>>>;
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 struct NativeEvery<M> {
     msgs: TickMsgs<M>,
-    _task: AbortOnDrop,
+    _task: crate::task::AbortOnDrop,
 }
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -666,7 +661,7 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
             });
             NativeEvery {
                 msgs,
-                _task: AbortOnDrop(task),
+                _task: abort_on_drop(&task),
             }
         });
         self.sources.clear();
@@ -2368,27 +2363,30 @@ mod source_spawn_scan_tests {
     fn code_only(src: &str) -> String {
         let mut out = String::with_capacity(src.len());
         let mut chars = src.chars().peekable();
-        let mut after_ident = false;
+        // The length and first char of the identifier the cursor is inside.
+        let mut word = (0_usize, ' ');
         while let Some(c) = chars.next() {
-            after_ident = match (c, chars.peek().copied()) {
+            // `r"`, `br"` and `cr"` open a raw literal; `xr"` is an identifier.
+            let raw_prefix = word.0 == 0 || (word.0 == 1 && matches!(word.1, 'b' | 'c'));
+            word = match (c, chars.peek().copied()) {
                 ('/', Some('/')) => {
                     if chars.by_ref().any(|skipped| skipped == '\n') {
                         out.push('\n');
                     }
-                    false
+                    (0, ' ')
                 }
                 ('/', Some('*')) => {
                     chars.next();
                     skip_block_comment(&mut chars);
                     out.push(' ');
-                    false
+                    (0, ' ')
                 }
                 ('"', _) => {
                     skip_string(&mut chars);
                     out.push_str("\"\"");
-                    false
+                    (0, ' ')
                 }
-                ('r', Some('#' | '"')) if !after_ident => {
+                ('r', Some('#' | '"')) if raw_prefix => {
                     let mut hashes = 0_usize;
                     while chars.next_if_eq(&'#').is_some() {
                         hashes = hashes.saturating_add(1);
@@ -2400,24 +2398,28 @@ mod source_spawn_scan_tests {
                         out.push('r');
                         out.extend(std::iter::repeat_n('#', hashes));
                     }
-                    false
+                    (0, ' ')
                 }
                 ('\'', Some('\\')) => {
                     chars.next();
                     chars.next();
                     let _closed = chars.by_ref().any(|skipped| skipped == '\'');
                     out.push_str("' '");
-                    false
+                    (0, ' ')
                 }
                 ('\'', Some(_)) if chars.clone().nth(1) == Some('\'') => {
                     chars.next();
                     chars.next();
                     out.push_str("' '");
-                    false
+                    (0, ' ')
                 }
                 _ => {
                     out.push(c);
-                    is_ident(c)
+                    match (is_ident(c), word.0) {
+                        (false, _) => (0, ' '),
+                        (true, 0) => (1, c),
+                        (true, len) => (len.saturating_add(1), word.1),
+                    }
                 }
             };
         }
@@ -2716,7 +2718,9 @@ fn u() { tokio::spawn(async {}); }
 
     #[test]
     fn spawn_scan_finds_every_way_to_start_a_task() {
-        let starts = r#"
+        let starts = r##"
+fn by_byte_raw() { let b = br#"x"y"#; tokio::spawn(async {}); }
+fn by_c_raw() { let c = cr#"x"y"#; tokio::spawn(async {}); }
 fn by_path() { tokio::task::spawn(async {}); }
 fn by_alias() { use tokio::spawn as go; go(async {}); }
 fn by_handle() { tokio::runtime::Handle::current().spawn(async {}); }
@@ -2726,7 +2730,7 @@ fn by_thread() { std::thread::spawn(|| ()); }
 fn by_any_test() { tokio::spawn(async {}); }
 #[cfg(not(test))]
 fn by_not_test() { tokio::spawn(async {}); }
-"#;
+"##;
         let found: Vec<(String, String)> = spawn_sites(&[("fake.rs", starts)])
             .into_iter()
             .map(|(_, name, word)| (name, word))
@@ -2735,6 +2739,8 @@ fn by_not_test() { tokio::spawn(async {}); }
             ("by_alias", "spawn"),
             ("by_any_test", "spawn"),
             ("by_blocking", "spawn_blocking"),
+            ("by_byte_raw", "spawn"),
+            ("by_c_raw", "spawn"),
             ("by_handle", "spawn"),
             ("by_not_test", "spawn"),
             ("by_path", "spawn"),
@@ -2748,4 +2754,10 @@ fn by_not_test() { tokio::spawn(async {}); }
             "a task started by any path, alias, method or production cfg is found"
         );
     }
+
+    /// The crate root re-exports one task guard: a second `AbortOnDrop` reached
+    /// through `pub use tea::*` makes the root name ambiguous and stops this
+    /// from compiling.
+    const _ROOT_TASK_GUARD: fn(tokio::task::AbortHandle) -> crate::AbortOnDrop =
+        crate::AbortOnDrop::new;
 }
