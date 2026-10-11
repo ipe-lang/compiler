@@ -686,6 +686,7 @@ macro_rules! fixture {
 const FIXTURE_PATH: &str = "src/fixture.rs";
 
 /// The kinds of the sites the scan finds in `src` at `rel`.
+#[allow(clippy::expect_used)] // test helper: a fixture that does not parse IS the failure
 fn kinds(rel: &str, src: &str) -> Vec<Kind> {
     scan_source(rel, src)
         .expect("fixture parses")
@@ -834,6 +835,7 @@ fn an_excluded_name_that_is_registered_is_still_refused() {
 }
 
 /// A fresh tree holding `files` (path relative to the tree, contents).
+#[allow(clippy::expect_used)] // test helper: a failed scratch-tree setup IS the failure
 fn tree(label: &str, files: &[(&str, &str)]) -> PathBuf {
     let root = ipe_test_temp::temp_root()
         .join(format!("ipe_env_read_scan_{label}_{}", std::process::id()));
