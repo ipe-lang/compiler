@@ -3121,11 +3121,12 @@ mod tests {
             "mkfifo creates the fixture"
         );
         let (done, wait) = std::sync::mpsc::channel();
-        let writer_clone = clone.clone();
-        std::thread::spawn(move || {
-            let written = write_fork_entry(&writer_clone, FORK_ENTRY, "new");
-            let _ = done.send(written.map_err(|error| format!("{error:?}")));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let written = write_fork_entry(&clone, FORK_ENTRY, "new");
+                let _ = done.send(written.map_err(|error| format!("{error:?}")));
+            })
+            .expect("writer thread");
         let result = wait
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("the write returned instead of blocking on the FIFO");
