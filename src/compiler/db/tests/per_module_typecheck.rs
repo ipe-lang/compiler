@@ -182,6 +182,7 @@ const ENTRY_WITH_TWO_DEPS: &str = "module Entry exposing (e)\n\n\
 /// is the joint solve's slice of that module in canonical form, field for
 /// field.
 #[test]
+#[allow(clippy::panic)] // the scoped path not engaging is the test failure
 fn scoped_solve_engages_and_matches_projection() {
     let (db, _log) = logged_db();
     let a = file(&db, &["A"], DEP_A);
@@ -193,12 +194,8 @@ fn scoped_solve_engages_and_matches_projection() {
 
     for module in [a, b] {
         let scoped = ipe_db::infer_module_scoped(&db, root, module);
-        assert!(
-            matches!(scoped, ScopedModuleTypes::PerModule { .. }),
-            "closed modular program must take the scoped path, got {scoped:?}"
-        );
         let ScopedModuleTypes::PerModule { solved, .. } = scoped else {
-            return;
+            panic!("closed modular program must take the scoped path, got {scoped:?}");
         };
         let home = home_of(&db, module);
         assert_eq!(
