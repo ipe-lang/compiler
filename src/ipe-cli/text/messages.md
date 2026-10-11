@@ -859,6 +859,10 @@ no commit-signing key is configured, so the publish commit could only be pushed 
 
 could not resolve your GitHub identity for the index-PR commit — the curated index requires signed commits marked "Verified", which is only possible when the commit's committer is your authenticated GitHub account's verified noreply identity. Run `ipe login` so publish can sign the index PR under your verified GitHub identity, then publish again. Nothing was published.
 
+## publish-fork-entry-not-plain
+
+{path} in the checkout of your index fork is a symbolic link or not a plain file or directory — publish never writes through one, so nothing was published. Remove it from your fork (the index holds only plain `packages/<name>.toml` entries), then publish again.
+
 # Lockfile refusals
 
 ## lock-missing-field
