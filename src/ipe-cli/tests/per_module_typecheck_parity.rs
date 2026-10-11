@@ -3,7 +3,7 @@
 //!
 //! Wherever the per-module scoped solve engages
 //! ([`ipe_db::ScopedModuleTypes::PerModule`]), its result MUST equal the
-//! normalized whole-program projection of that module — for EVERY module of
+//! canonical whole-program slice of that module — for EVERY module of
 //! EVERY golden fixture, and at every state of the adversarial multi-module
 //! edit sequence. A scoped result that diverges from the joint solve is a
 //! correctness violation (the LSP would show a type the build disagrees
@@ -60,7 +60,7 @@ fn entry_path() -> Vec<String> {
 
 /// Per-state parity sweep: demand the JOINT solve first, then every
 /// module's scoped outcome; assert each engaged module's scoped result
-/// equals the normalized joint projection. Returns `(engaged, total)`.
+/// equals the canonical joint slice. Returns `(engaged, total)`.
 fn assert_state_parity(
     label: &str,
     db: &ipe_db::IpeDatabase,
@@ -88,7 +88,7 @@ fn assert_state_parity(
     let mut engaged = 0usize;
     for (path, file) in &files {
         match ipe_db::infer_module_scoped(db, root, *file) {
-            ipe_db::ScopedModuleTypes::PerModule { types, .. } => {
+            ipe_db::ScopedModuleTypes::PerModule { solved: scoped, .. } => {
                 engaged += 1;
                 // On a red program there is no joint slice to compare
                 // against — the scoped result standing on closed
@@ -105,10 +105,9 @@ fn assert_state_parity(
                     let Some(home) = home else {
                         return (engaged, files.len());
                     };
-                    let projected =
-                        ipe_db::normalize_module_types(ipe_db::project_module_types(solved, &home));
+                    let projected = ipe_db::canonical_module_types(solved, &home).ok();
                     assert_eq!(
-                        **types,
+                        Some(ipe_db::project_module_types(scoped, &home)),
                         projected,
                         "[{label}] scoped result for {} diverges from the joint slice",
                         path.join(".")
@@ -116,7 +115,7 @@ fn assert_state_parity(
                 }
             }
             ipe_db::ScopedModuleTypes::InterfaceOnly { .. }
-            | ipe_db::ScopedModuleTypes::WholeProgram => {}
+            | ipe_db::ScopedModuleTypes::WholeProgram(_) => {}
         }
     }
     (engaged, files.len())
@@ -422,9 +421,8 @@ fn scoped_own_types(
         ipe_types::infer_module(&canonical.module, &canonical.exports, &deps, &mut interner)
             .map_err(|e| format!("scoped solve failed: {e:?}"))?;
     drop(interner);
-    Ok(ipe_db::normalize_module_types(
-        ipe_db::project_module_types(&inference.solved, home),
-    ))
+    ipe_db::canonical_module_types(&inference.solved, home)
+        .map_err(|e| format!("canonicalize types failed: {e:?}"))
 }
 
 /// An exported message-only UI slot keeps its module's own types on the
@@ -472,6 +470,15 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
             ),
             "[{label}] Lib's own types must come from the whole-program solve"
         );
+        assert_eq!(
+            ipe_db::program_types(&db, root, main_file)
+                .clone()
+                .map(|program| program.typed_by),
+            Ok(ipe_db::TypedBy::Joint(
+                ipe_db::FallbackReason::ImporterDependent
+            )),
+            "[{label}] the program is served by the joint solve, attributed to Lib"
+        );
         assert!(
             ipe_db::typed_interface(&db, root, lib_file).is_some(),
             "[{label}] Lib's exported schemes are closed, so its interface must be served"
@@ -486,8 +493,8 @@ fn importer_pinnable_msg_slot_refuses_scoped_path() -> Result<(), String> {
         let lib_served = ipe_db::typecheck_module(&db, root, main_file, lib_file)
             .clone()
             .map_err(|e| format!("[{label}] Lib's types must be served: {e:?}"))?;
-        let lib_joint =
-            ipe_db::normalize_module_types(ipe_db::project_module_types(&joint, &lib_home));
+        let lib_joint = ipe_db::canonical_module_types(&joint, &lib_home)
+            .map_err(|e| format!("[{label}] canonicalize types failed: {e:?}"))?;
         assert_eq!(
             *lib_served, lib_joint,
             "[{label}] Lib's served types must be the joint slice"
@@ -560,7 +567,7 @@ const fn verdict_name(verdict: &ipe_db::ScopedModuleTypes) -> &'static str {
     match verdict {
         ipe_db::ScopedModuleTypes::PerModule { .. } => "PerModule",
         ipe_db::ScopedModuleTypes::InterfaceOnly { .. } => "InterfaceOnly",
-        ipe_db::ScopedModuleTypes::WholeProgram => "WholeProgram",
+        ipe_db::ScopedModuleTypes::WholeProgram(_) => "WholeProgram",
     }
 }
 
@@ -742,8 +749,8 @@ fn shared_msg_class_verdict_is_order_independent() -> Result<(), String> {
                 drop(interner);
                 (vec![lib], wrap)
             };
-            let lib_joint =
-                ipe_db::normalize_module_types(ipe_db::project_module_types(&joint, &lib_home));
+            let lib_joint = ipe_db::canonical_module_types(&joint, &lib_home)
+                .map_err(|e| format!("[{label}] canonicalize types failed: {e:?}"))?;
             let lib_served = ipe_db::typecheck_module(&db, root, main_file, lib_file)
                 .clone()
                 .map_err(|e| format!("[{label}] Lib's types must be served: {e:?}"))?;
