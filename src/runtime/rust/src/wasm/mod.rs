@@ -177,8 +177,11 @@ where
 /// `init` receives a `WebReq` synthesised from `location` + cookies, the same
 /// shape `wasm_app` uses.
 ///
-/// Divergence: a routed wasm app is served at the root only; a path below a
-/// base path enters `notFound` until the base path reaches the wasm client.
+/// Divergence: a routed wasm app is served at the root only. Until the base
+/// path reaches the wasm client, a path below a base is matched with the base
+/// still on it: it enters `notFound`, or the page a pattern with a leading
+/// `:param` segment builds from the base segment (`/:slug` at `/app` enters
+/// `slug = "app"`).
 pub fn wasm_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
     init: FInit,
     update: FUpdate,
