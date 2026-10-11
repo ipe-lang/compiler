@@ -1537,18 +1537,27 @@ transactionScanRefusesEvasions =
                 && not (transactionsAdmitted (db ++ "\n\nrogue db =\n    Db.withTransaction db (\\tx -> Task.succeed ())\n"))
                 && not (transactionsAdmitted (String.replace "                Db.exec tx \"UPDATE review_log_head SET seq = seq WHERE 0\" []\n" "" db))
                 && not (transactionsAdmitted (db ++ "\n\nrogue tx =\n    Db.exec tx \"DELETE FROM review_log\" []\n"))
+                && not (transactionsAdmitted (db ++ "\n\nrogue db =\n    Db.queryDecode db \"DELETE FROM review_log RETURNING seq\" [] seqDecoder\n"))
+                && not (transactionsAdmitted (db ++ "\n\nrogue db =\n    Db.queryDecode db \"INSERT INTO review_log_head DEFAULT VALUES\" [] seqDecoder\n"))
             )
 
 
 -- `source` opens exactly two review transactions, the read-only walk and
 -- `writeTransaction`, whose first statement claims the write lock, and
--- runs exactly the four write statements the decision path owns.
+-- runs exactly the four write statements the decision path owns. A write
+-- keyword anywhere beyond those four statements is refused, so a write
+-- smuggled through a query call is counted too.
 transactionsAdmitted : String -> Bool
 transactionsAdmitted source =
     occurrences "withTransaction" source
         == 2
         && occurrences "Db.exec" source
         == 4
+        && occurrences "INSERT" source
+        == 1
+        && occurrences "UPDATE" source
+        == 3
+        && List.all (\word -> occurrences word source == 0) [ "DELETE", "REPLACE", "RETURNING", "ALTER", "DROP", "CREATE", "PRAGMA", "ATTACH" ]
         && String.contains "Db.withTransaction db (\\tx -> stateWithin key tx size ceiling refusal)" source
         && String.contains "writeTransaction db body =\n    Db.withTransaction db\n        (\\tx ->\n            do\n                Db.exec tx \"UPDATE review_log_head SET seq = seq WHERE 0\" []\n                body tx\n" source
 
