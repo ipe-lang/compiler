@@ -876,7 +876,7 @@ pub fn maybe_combine<A>(maybes: Vec<IpeMaybe<A>>) -> IpeMaybe<Vec<A>> {
 /// ~100–800 bytes per emitted frame, 10 000 frames occupy ~1–8 MiB, so the depth
 /// budget trips deterministically for typical frames and the red-zone probe
 /// covers the fat-frame tail.
-const DEFAULT_RECURSION_LIMIT: usize = 10_000;
+pub(crate) const DEFAULT_RECURSION_LIMIT: usize = 10_000;
 
 /// The remaining-stack margin that must stay free when the guard admits a call.
 /// Its contract: one emitted frame plus the deepest non-guarded call chain
@@ -911,21 +911,7 @@ thread_local! {
 /// Native threads add the red-zone probe as a second bound; wasm32 has no stack
 /// introspection, so the depth budget alone keeps real recursion inside the
 /// wasm stack and a larger value is refused rather than left to trap.
-const WASM_RECURSION_BOUND: u64 = DEFAULT_RECURSION_LIMIT as u64;
-
-/// The `IPE_RECURSION_LIMIT` ceiling, bounded above by `bound` when given.
-const fn recursion_ceiling(bound: Option<u64>) -> crate::system::EnvCeiling {
-    let ceiling = crate::system::EnvCeiling::new(
-        "IPE_RECURSION_LIMIT",
-        DEFAULT_RECURSION_LIMIT as u64,
-        crate::system::ZeroCeiling::Refused,
-        "decimal recursion depth",
-    );
-    match bound {
-        Some(max) => ceiling.at_most(max),
-        None => ceiling,
-    }
-}
+pub(crate) const WASM_RECURSION_BOUND: u64 = DEFAULT_RECURSION_LIMIT as u64;
 
 /// The recursion depth budget read from `IPE_RECURSION_LIMIT`.
 ///
@@ -935,11 +921,7 @@ const fn recursion_ceiling(bound: Option<u64>) -> crate::system::EnvCeiling {
 /// recklessly high. On wasm32 a value above [`WASM_RECURSION_BOUND`] is refused
 /// too; lowering stays possible.
 const RECURSION_CEILING: crate::system::EnvCeiling =
-    recursion_ceiling(if cfg!(target_arch = "wasm32") {
-        Some(WASM_RECURSION_BOUND)
-    } else {
-        None
-    });
+    crate::env_registry::telemetry::RECURSION_LIMIT.ceiling();
 
 /// The `IPE_RECURSION_LIMIT` snapshot taken by [`recursion_startup_check`],
 /// once per process.
@@ -961,7 +943,7 @@ fn settle_recursion_limit(
 /// # Errors
 ///
 /// The refusal naming the variable when its value is present but malformed.
-fn recursion_startup_check() -> Result<(), crate::system::EnvCeilingRefusal> {
+pub(crate) fn recursion_startup_check() -> Result<(), crate::system::EnvCeilingRefusal> {
     RECURSION_LIMIT
         .get_or_init(|| settle_recursion_limit(RECURSION_CEILING.lookup()))
         .as_ref()
@@ -1277,9 +1259,9 @@ pub fn panic_500_body(payload: &(dyn std::any::Any + Send)) -> String {
 /// `fn main()`; server/live handlers additionally catch a panic per request
 /// (`CatchPanicLayer`, so a handler panic returns a 500, not exit).
 ///
-/// Before installing the hook it runs the runtime's startup checks: a malformed
-/// `IPE_LOG_LEVEL` or `IPE_RECURSION_LIMIT` writes its refusal to stderr and
-/// exits 1 before the program's first line.
+/// Before installing the hook it judges every registered operator variable
+/// (`env_registry::startup_check`): each malformed one writes its refusal to
+/// stderr, all of them in one run, and the program exits 1 before its first line.
 ///
 /// **Design note — hook logs then RESUMES the unwind (never calls exit).** Calling
 /// `process::exit(1)` from the hook would prevent `catch_unwind` anywhere in the
@@ -1305,15 +1287,12 @@ pub fn install_panic_classifier() {
     // shape that never installs the hook simply runs depth-only there.
     #[cfg(not(target_arch = "wasm32"))]
     record_stack_floor(RUNTIME_THREAD_STACK_SIZE);
-    // A malformed `IPE_LOG_LEVEL` refuses the program before its first line.
-    #[cfg(feature = "log")]
-    if let Err(refusal) = super::log::startup_check() {
-        eprint_task_error(&refusal.to_string());
-        crate::system::system_exit(1);
-    }
-    // So does a malformed `IPE_RECURSION_LIMIT`; a well-formed one is fixed here.
-    if let Err(refusal) = recursion_startup_check() {
-        eprint_task_error(&refusal.to_string());
+    // A malformed operator variable refuses the program before its first line;
+    // the values read once per process are fixed here.
+    if let Err(refusals) = crate::env_registry::startup_check() {
+        for refusal in &refusals {
+            eprint_task_error(&refusal.to_string());
+        }
         crate::system::system_exit(1);
     }
     std::panic::set_hook(Box::new(|info| {
@@ -1783,6 +1762,7 @@ mod tests {
 #[cfg(not(target_arch = "wasm32"))]
 mod recursion_guard_tests {
     use super::*;
+    use crate::env_registry::telemetry::recursion_ceiling;
 
     // Every malformed `IPE_RECURSION_LIMIT` (zero and padding included) is a
     // refusal naming the variable, never the default; absent is the default and

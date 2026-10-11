@@ -6122,10 +6122,6 @@ mod handlers {
     }
 }
 
-/// The documented operator var naming `Ipe.Web`'s listen port.
-#[cfg(feature = "server")]
-const WEB_PORT_ENV: &str = "IPE_WEB_PORT";
-
 /// The address a standalone web app binds, under `IPE_HTTP_BIND` > `Host.bind`
 /// > `127.0.0.1`.
 ///
@@ -6242,21 +6238,28 @@ where
     };
 
     // Port precedence (shared with `Ipe.Http.Server`): the supervisor's
-    // relocation var > `IPE_WEB_PORT` (operator) > 8000. A malformed env layer
-    // falls through, never to `0`.
-    let resolved = crate::system::listen_port_from_env(
-        (WEB_PORT_ENV, crate::system::read_env_var(WEB_PORT_ENV).ok()),
-        8000,
-    );
-    let port = resolved.port;
+    // relocation var > `IPE_WEB_PORT` (operator) > 8000. A set env layer that
+    // is not a port refuses the listen, naming its variable; no layer can
+    // yield `0`.
+    let default_port = crate::env_registry::web::WEB_DEFAULT_PORT;
+    let Some(source) = crate::system::SourcePort::parse(i64::from(default_port)) else {
+        return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+            format!("Web.tea: port {default_port} is not a TCP port in 1..=65535"),
+        )));
+    };
+    let resolved =
+        match crate::system::listen_port_from_env(crate::env_registry::web::WEB_PORT, source) {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                    format!("Web.tea: {refusal}"),
+                )));
+            }
+        };
     // The same host-bind precedence and bind site as the Ipe.Http.Server path
     // (`IPE_HTTP_BIND` > `Host.bind` setting > `127.0.0.1`). `host` is the
     // value resolved and recorded above, before the console gates.
-    let Ok(port) = u16::try_from(port) else {
-        return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
-            format!("Web.tea: port {port} is not a TCP port"),
-        )));
-    };
+    let port = resolved.port.get();
     let addr = host.addr(port);
     // Logs the bind-address line (stderr), and the exposure warning if any.
     let listener = match crate::server::bind_app_listener("web", host, port).await {
@@ -10631,13 +10634,46 @@ mod bind_error_tests {
     use crate::telemetry::BuildPosture;
 
     /// `Web.tea`'s port resolution: `relocation` over the operator's
-    /// `IPE_WEB_PORT` over the default `8000`.
-    fn resolve(relocation: Option<&str>, operator: Option<&str>) -> crate::system::ResolvedPort {
+    /// `IPE_WEB_PORT` over the default port, each layer parsed by its key.
+    fn try_resolve(
+        relocation: Option<&str>,
+        operator: Option<&str>,
+    ) -> Result<crate::system::ResolvedPort, crate::env_grammar::EnvRefusal> {
+        let lookup = |value: Option<&str>| {
+            value.map_or(Err(std::env::VarError::NotPresent), |v| Ok(v.to_owned()))
+        };
+        let key = crate::env_registry::web::WEB_PORT;
+        #[allow(clippy::expect_used)] // the default port is a TCP port
+        let source =
+            crate::system::SourcePort::parse(i64::from(crate::env_registry::web::WEB_DEFAULT_PORT))
+                .expect("the default port is a TCP port");
         crate::system::resolve_listen_port(
-            relocation.map(str::to_owned),
-            (super::WEB_PORT_ENV, operator.map(str::to_owned)),
-            8000,
+            crate::env_registry::listen::LISTEN_PORT_RELOCATION.parse(lookup(relocation)),
+            (key.name(), key.parse(lookup(operator))),
+            source,
         )
+    }
+
+    /// [`try_resolve`] over layers that all parse.
+    #[allow(clippy::expect_used)] // every caller passes well-formed layers
+    fn resolve(relocation: Option<&str>, operator: Option<&str>) -> crate::system::ResolvedPort {
+        try_resolve(relocation, operator).expect("well-formed layers resolve")
+    }
+
+    /// A set `IPE_WEB_PORT` that is not a port refuses, naming the variable,
+    /// rather than serving on the default.
+    #[test]
+    fn malformed_web_port_refuses_rather_than_defaulting() {
+        for raw in ["abc", "0", "65536", "", "+8080"] {
+            let outcome = try_resolve(None, Some(raw));
+            assert!(
+                outcome.as_ref().is_err_and(
+                    |r| r.name() == "IPE_WEB_PORT" && r.to_string().contains("1..=65535")
+                ),
+                "IPE_WEB_PORT={raw:?} must refuse, got {outcome:?}"
+            );
+        }
+        assert_eq!(resolve(None, None).port.get(), 8000);
     }
 
     /// The `Web.tea` refusal of a bind that failed with `kind` under `posture`,
@@ -10687,7 +10723,7 @@ mod bind_error_tests {
             );
         }
         let relocated = resolve(Some("9100"), Some("9200"));
-        assert_eq!(relocated.port, 9100);
+        assert_eq!(relocated.port.get(), 9100);
         for posture in [BuildPosture::Development, BuildPosture::Release] {
             let (kind, text) = refusal(relocated, posture, ErrorKind::AddrInUse);
             assert_eq!(kind, crate::IpeErrorKind::Conflict, "{text}");

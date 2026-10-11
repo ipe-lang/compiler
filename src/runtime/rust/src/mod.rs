@@ -555,6 +555,12 @@ pub mod ws_client;
 ))]
 pub use ws_client::*;
 
+// The operator environment registry: every variable the runtime reads, its one
+// accepted form, and the startup check that judges them all. Std-only and
+// declared in every module set; reached by qualified path, not glob-re-exported.
+pub mod env_grammar;
+pub mod env_registry;
+
 // The one HTML escaper (text and attribute forms). Std-only and declared in
 // every module set (the emitted floor and the wasm set too): `html`, the
 // always-vendored `telemetry` dev banner, and the debugger overlay all call it,

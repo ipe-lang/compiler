@@ -1908,9 +1908,6 @@ fn strip_trailing_slash(p: &str) -> String {
     }
 }
 
-/// The documented operator var naming `Ipe.Http.Server`'s listen port.
-const SERVER_PORT_ENV: &str = "IPE_SERVER_PORT";
-
 /// Server.listen : Int -> List Route -> Task Error ()  — serves via axum/tokio.
 /// Detect an unambiguous endpoint collision in the route set BEFORE the axum
 /// router is built. axum (matchit) *panics* on a conflicting insert, and that
@@ -2261,21 +2258,25 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
             ));
         // Port precedence: the supervisor's relocation var (`ipe dev watch` placing
         // the app behind its proxy) > `IPE_SERVER_PORT` (operator) > the port the
-        // program passed to `Server.listen`. A malformed env layer falls through,
-        // never to `0`.
-        let resolved = crate::system::listen_port_from_env(
-            (
-                SERVER_PORT_ENV,
-                crate::system::read_env_var(SERVER_PORT_ENV).ok(),
-            ),
-            port,
-        );
-        let port = resolved.port;
-        let Ok(port) = u16::try_from(port) else {
+        // program passed to `Server.listen`. A set env layer that is not a port
+        // refuses the listen, naming its variable; no layer can yield `0`.
+        let Some(source) = crate::system::SourcePort::parse(port) else {
             return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
-                "Server.listen: port {port} is not a TCP port"
+                "Server.listen: port {port} is not a TCP port in 1..=65535"
             ))));
         };
+        let resolved = match crate::system::listen_port_from_env(
+            crate::env_registry::listen::SERVER_PORT,
+            source,
+        ) {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                    "Server.listen: {refusal}"
+                ))));
+            }
+        };
+        let port = resolved.port.get();
         // Recorded before the bind, so no dev surface outlives an exposed listener.
         let host = RecordedHost::record(host);
         let addr = host.addr(port);
@@ -4302,16 +4303,26 @@ mod tests {
     /// supervisor relocation wins over both.
     #[test]
     fn ipe_server_port_resolves_operator_over_source_under_relocation() {
-        let resolve = |relocation: Option<&str>, operator: Option<&str>| {
+        let key = crate::env_registry::listen::SERVER_PORT;
+        let lookup = |value: Option<&str>| {
+            value.map_or(Err(std::env::VarError::NotPresent), |v| Ok(v.to_owned()))
+        };
+        let try_resolve = |relocation: Option<&str>, operator: Option<&str>| {
             crate::system::resolve_listen_port(
-                relocation.map(str::to_owned),
-                (SERVER_PORT_ENV, operator.map(str::to_owned)),
-                8000,
+                crate::env_registry::listen::LISTEN_PORT_RELOCATION.parse(lookup(relocation)),
+                (key.name(), key.parse(lookup(operator))),
+                crate::system::SourcePort::parse(8000).expect("8000 is a port"),
             )
         };
-        assert_eq!(resolve(None, Some("9123")).port, 9123);
-        assert_eq!(resolve(Some("9100"), Some("9123")).port, 9100);
-        assert_eq!(resolve(None, Some("0")).port, 8000);
+        let resolve = |relocation: Option<&str>, operator: Option<&str>| {
+            try_resolve(relocation, operator).expect("well-formed layers resolve")
+        };
+        assert_eq!(resolve(None, Some("9123")).port.get(), 9123);
+        assert_eq!(resolve(Some("9100"), Some("9123")).port.get(), 9100);
+        assert!(
+            try_resolve(None, Some("0")).is_err_and(|r| r.name() == "IPE_SERVER_PORT"),
+            "a malformed operator port refuses, never falls back"
+        );
         let in_use = std::io::Error::from(std::io::ErrorKind::AddrInUse);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8000));
         let dev = crate::telemetry::BuildPosture::Development;
@@ -4369,7 +4380,12 @@ mod tests {
     fn bind_refusals_are_typed_and_release_advice_names_no_dev_verb() {
         use crate::telemetry::BuildPosture;
         use std::io::ErrorKind;
-        let resolved = crate::system::resolve_listen_port(None, (SERVER_PORT_ENV, None), 80);
+        let resolved = crate::system::resolve_listen_port(
+            Ok(None),
+            (crate::env_registry::listen::SERVER_PORT.name(), Ok(None)),
+            crate::system::SourcePort::parse(80).expect("80 is a port"),
+        )
+        .expect("no env layer is set");
         let addr = std::net::SocketAddr::from(([10, 255, 255, 1], 80));
         let refusal = |posture: BuildPosture, kind: ErrorKind| {
             let error = resolved.bind_refusal_for(
@@ -4711,9 +4727,9 @@ mod tests {
     /// typed `InvalidInput` before it binds, never the `Unexpected` catch-all.
     #[tokio::test]
     async fn listen_on_an_out_of_range_port_is_invalid_input() {
-        crate::system::locked_remove_var(SERVER_PORT_ENV);
+        crate::system::locked_remove_var(crate::env_registry::listen::SERVER_PORT.name());
         crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
-        for port in [-1, 65_536, i64::MAX] {
+        for port in [0, -1, 65_536, i64::MAX] {
             let listened: Result<IpeResult<crate::IpeError, ()>, _> = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 server_listen(port, Vec::new()),
@@ -4729,7 +4745,43 @@ mod tests {
             );
             assert_eq!(
                 crate::ipe_error_message(error),
-                format!("Server.listen: port {port} is not a TCP port")
+                format!("Server.listen: port {port} is not a TCP port in 1..=65535")
+            );
+        }
+    }
+
+    /// A set `IPE_SERVER_PORT` that is not a port refuses `Server.listen` as
+    /// typed invalid input naming the variable, before any bind, never falling
+    /// back to the program's port.
+    #[tokio::test]
+    async fn listen_under_a_malformed_operator_port_is_invalid_input() {
+        let var = crate::env_registry::listen::SERVER_PORT.name();
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        for raw in ["99999", "0", "abc", "", " 8080"] {
+            crate::system::locked_set_var(var, raw);
+            let listened: Result<IpeResult<crate::IpeError, ()>, _> = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                server_listen(8000, Vec::new()),
+            )
+            .await;
+            crate::system::locked_remove_var(var);
+            assert!(
+                matches!(&listened, Ok(IpeResult::Err(_))),
+                "{var}={raw:?} must refuse the listener: {listened:?}"
+            );
+            let Ok(IpeResult::Err(error)) = listened else {
+                return;
+            };
+            assert_eq!(
+                crate::ipe_error_kind(error.clone()),
+                crate::IpeErrorKind::InvalidInput,
+                "{error:?}"
+            );
+            let message = crate::ipe_error_message(error);
+            assert!(
+                message
+                    .starts_with("Server.listen: IPE_SERVER_PORT must be a TCP port in 1..=65535"),
+                "{var}={raw:?}: {message}"
             );
         }
     }

@@ -270,6 +270,8 @@ pub mod task;
 pub mod threads;
 pub mod dict;
 pub mod encoding;
+pub mod env_grammar;
+pub mod env_registry;
 pub mod error;
 pub mod escape;
 pub mod ffi_polyfills;

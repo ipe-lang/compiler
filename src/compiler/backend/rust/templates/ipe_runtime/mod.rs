@@ -22,6 +22,8 @@ pub mod debug;
 pub mod decimal;
 pub mod dict;
 pub mod error;
+pub mod env_grammar;
+pub mod env_registry;
 pub mod escape;
 pub mod ffi_polyfills;
 pub mod file;

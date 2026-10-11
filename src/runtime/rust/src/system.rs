@@ -136,6 +136,12 @@ impl EnvCeiling {
         self.name
     }
 
+    /// The phrase completing "`NAME` must be a …", e.g. `"decimal byte count"`.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        self.unit
+    }
+
     /// The value applied while the variable is absent.
     #[must_use]
     pub const fn default_value(self) -> u64 {
@@ -636,7 +642,7 @@ impl From<EnvValueRefusal> for IpeError {
 /// every other one (`char::escape_debug` — controls, ESC, CR/LF, bidi
 /// overrides, `"` and `\`), and each byte that is not UTF-8 shows as `\xNN`.
 /// At most [`ENV_VALUE_SHOWN_CHARS`] source characters or bytes are shown.
-fn shown_env_value(raw: &[u8]) -> String {
+pub(crate) fn shown_env_value(raw: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let mut budget = ENV_VALUE_SHOWN_CHARS;
@@ -923,34 +929,20 @@ pub(crate) fn emit_runtime_log_stamped(stamp: &str, tag: &str, msg: &str) {
     write_stderr_line(&runtime_log_line(Some(stamp), tag, msg));
 }
 
-/// A TCP port an HTTP listener may bind: `1..=65535`.
+/// The port a program passed to its listener, admitted once as a
+/// [`ListenPort`](crate::env_grammar::ListenPort).
 ///
-/// `0` (an OS-chosen ephemeral port the caller cannot reach) has no
-/// representation, so no env layer can request it.
+/// `0` and any value outside `1..=65535` have no representation, so the
+/// program layer can no more request an ephemeral port than an env layer can.
 #[cfg(feature = "server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ListenPort(std::num::NonZeroU16);
+pub(crate) struct SourcePort(crate::env_grammar::ListenPort);
 
 #[cfg(feature = "server")]
-impl ListenPort {
-    /// Parse an env value: `None` for empty, non-numeric, signed, `0`, or
-    /// out-of-range text.
-    ///
-    /// Only ASCII digits are admitted: `u16`'s `FromStr` alone also accepts a
-    /// leading `+`.
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        raw.parse::<u16>()
-            .ok()
-            .and_then(std::num::NonZeroU16::new)
-            .map(Self)
-    }
-
-    /// The port as the listener's address integer.
-    pub(crate) fn get(self) -> i64 {
-        i64::from(self.0.get())
+impl SourcePort {
+    /// The program's `port`, or `None` when it is not a TCP port in `1..=65535`.
+    pub(crate) fn parse(port: i64) -> Option<Self> {
+        crate::env_grammar::ListenPort::from_program(port).map(Self)
     }
 }
 
@@ -962,7 +954,7 @@ pub(crate) enum PortOrigin {
     Relocated,
     /// The operator set the runtime's documented port var.
     Operator,
-    /// Neither env layer held a valid port: the program's own port.
+    /// Neither env layer was set: the program's own port.
     Source,
 }
 
@@ -971,7 +963,7 @@ pub(crate) enum PortOrigin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedPort {
     /// The port to bind.
-    pub(crate) port: i64,
+    pub(crate) port: crate::env_grammar::ListenPort,
     /// The layer the port came from.
     pub(crate) origin: PortOrigin,
     /// The runtime's documented operator port var (`IPE_WEB_PORT` /
@@ -1070,7 +1062,7 @@ impl ResolvedPort {
         refusal: BindRefusal,
         host: std::net::IpAddr,
     ) -> String {
-        let port = self.port;
+        let port = self.port.get();
         let cause = match refusal {
             BindRefusal::PortInUse => {
                 format!("port {port} is already in use — another application is bound to it.")
@@ -1108,49 +1100,60 @@ impl ResolvedPort {
     }
 }
 
+/// A parsed env port layer: `Ok(None)` when unset, the refusal when set but not
+/// a port.
+#[cfg(feature = "server")]
+pub(crate) type PortLayer =
+    Result<Option<crate::env_grammar::ListenPort>, crate::env_grammar::EnvRefusal>;
+
 /// Resolve the port an HTTP listener binds, by fixed precedence: the
-/// supervisor's `relocation` value, then the operator's value (`operator.1`, of
+/// supervisor's `relocation` layer, then the operator's layer (`operator.1`, of
 /// the var named `operator.0`), then the program's `source` port.
 ///
-/// The first layer that parses as a [`ListenPort`] wins; an absent or malformed
-/// layer falls through to the next, so no env text can yield `0` or an
-/// out-of-range port. Pure over its inputs, so the precedence is unit-testable
+/// The first set layer wins. A set layer that is not a port refuses the listen
+/// (the relocation layer first), so a typo never falls through to another
+/// layer's port. Pure over its inputs, so the precedence is unit-testable
 /// without touching the process environment. Gated to `server`: both callers
 /// (`server::server_listen`, `web::serve_web`) are.
+///
+/// # Errors
+///
+/// The refusal of the first set layer that is not a TCP port in `1..=65535`.
 #[cfg(feature = "server")]
 pub(crate) fn resolve_listen_port(
-    relocation: Option<String>,
-    operator: (&'static str, Option<String>),
-    source: i64,
-) -> ResolvedPort {
-    let (operator_var, operator_value) = operator;
-    let layer = |raw: Option<String>| raw.as_deref().and_then(ListenPort::parse);
-    let (port, origin) = layer(relocation).map_or_else(
-        || {
-            layer(operator_value).map_or((source, PortOrigin::Source), |p| {
-                (p.get(), PortOrigin::Operator)
-            })
-        },
-        |p| (p.get(), PortOrigin::Relocated),
-    );
-    ResolvedPort {
+    relocation: PortLayer,
+    operator: (&'static str, PortLayer),
+    source: SourcePort,
+) -> Result<ResolvedPort, crate::env_grammar::EnvRefusal> {
+    let (operator_var, operator_layer) = operator;
+    let relocated = relocation?;
+    let operated = operator_layer?;
+    let (port, origin) = match (relocated, operated) {
+        (Some(port), _) => (port, PortOrigin::Relocated),
+        (None, Some(port)) => (port, PortOrigin::Operator),
+        (None, None) => (source.0, PortOrigin::Source),
+    };
+    Ok(ResolvedPort {
         port,
         origin,
         operator_var,
-    }
+    })
 }
 
 /// [`resolve_listen_port`] over the live environment (overlay first): the
-/// relocation var [`crate::LISTEN_PORT_RELOCATION_ENV`], then `operator`: the
-/// operator var's name and the value its caller read under that constant key.
+/// supervisor's relocation key, then the `operator` key.
+///
+/// # Errors
+///
+/// The refusal of the first set layer that is not a TCP port in `1..=65535`.
 #[cfg(feature = "server")]
 pub(crate) fn listen_port_from_env(
-    operator: (&'static str, Option<String>),
-    source: i64,
-) -> ResolvedPort {
+    operator: crate::env_registry::PortKey,
+    source: SourcePort,
+) -> Result<ResolvedPort, crate::env_grammar::EnvRefusal> {
     resolve_listen_port(
-        read_env_var(crate::LISTEN_PORT_RELOCATION_ENV).ok(),
-        operator,
+        crate::env_registry::listen::LISTEN_PORT_RELOCATION.read(),
+        (operator.name(), operator.read()),
         source,
     )
 }
@@ -1464,7 +1467,8 @@ fn apply_env_directives(
 /// and re-exported at the runtime root), so the `ipe` CLI, which links the
 /// runtime without the `server` feature, and the runtime listeners share ONE
 /// wire name.
-pub const LISTEN_PORT_RELOCATION_ENV: &str = "IPE_INTERNAL_LISTEN_PORT";
+pub const LISTEN_PORT_RELOCATION_ENV: &str =
+    crate::env_registry::listen::LISTEN_PORT_RELOCATION.name();
 
 /// Why a hardened spawn was refused.
 ///
@@ -4813,7 +4817,11 @@ mod descriptor_floor_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod listen_port_tests {
-    use super::{PortOrigin, ResolvedPort, resolve_listen_port};
+    use super::{PortOrigin, ResolvedPort, SourcePort, resolve_listen_port};
+    use crate::env_grammar::EnvRefusal;
+    use crate::env_registry::PortKey;
+    use crate::env_registry::listen::{LISTEN_PORT_RELOCATION, SERVER_PORT};
+    use crate::env_registry::web::WEB_PORT;
     use crate::telemetry::BuildPosture;
 
     /// Every value that is not a bindable `1..=65535` port.
@@ -4834,29 +4842,55 @@ mod listen_port_tests {
         "70000",
         "99999999999",
     ];
-    const OPERATOR_VARS: [&str; 2] = ["IPE_WEB_PORT", "IPE_SERVER_PORT"];
+    const OPERATOR_KEYS: [PortKey; 2] = [WEB_PORT, SERVER_PORT];
+    const OPERATOR_VARS: [&str; 2] = [WEB_PORT.name(), SERVER_PORT.name()];
 
-    fn resolve(
+    /// A raw lookup of a variable holding `value`, or unset.
+    fn lookup(value: Option<&str>) -> Result<String, std::env::VarError> {
+        value.map_or(Err(std::env::VarError::NotPresent), |v| Ok(v.to_owned()))
+    }
+
+    /// The source port every test passes.
+    #[allow(clippy::expect_used)] // 8000 is a TCP port
+    fn source() -> SourcePort {
+        SourcePort::parse(8000).expect("8000 is a port")
+    }
+
+    /// Resolves the layers holding these texts, each parsed by its registry key.
+    fn try_resolve(
         relocation: Option<&str>,
-        var: &'static str,
+        key: PortKey,
         operator: Option<&str>,
-    ) -> ResolvedPort {
+    ) -> Result<ResolvedPort, EnvRefusal> {
         resolve_listen_port(
-            relocation.map(str::to_owned),
-            (var, operator.map(str::to_owned)),
-            8000,
+            LISTEN_PORT_RELOCATION.parse(lookup(relocation)),
+            (key.name(), key.parse(lookup(operator))),
+            source(),
         )
     }
 
+    /// [`try_resolve`] over layers that all parse.
+    #[allow(clippy::expect_used)] // every caller passes well-formed layers
+    fn resolve(relocation: Option<&str>, key: PortKey, operator: Option<&str>) -> ResolvedPort {
+        try_resolve(relocation, key, operator).expect("well-formed layers resolve")
+    }
+
+    /// A resolved port as `(port, origin)`.
+    fn chosen(r: ResolvedPort) -> (u16, PortOrigin) {
+        (r.port.get(), r.origin)
+    }
+
     #[test]
-    fn garbage_operator_value_falls_back_to_the_source_port() {
-        for var in OPERATOR_VARS {
+    fn garbage_operator_value_refuses_the_listen() {
+        for key in OPERATOR_KEYS {
             for garbage in GARBAGE {
-                let r = resolve(None, var, Some(garbage));
-                assert_eq!(
-                    (r.port, r.origin),
-                    (8000, PortOrigin::Source),
-                    "{var}={garbage:?} must fall back to the source port, never bind 0"
+                let outcome = try_resolve(None, key, Some(garbage));
+                assert!(
+                    outcome.as_ref().is_err_and(
+                        |r| r.name() == key.name() && r.to_string().contains("1..=65535")
+                    ),
+                    "{}={garbage:?} must refuse naming the variable, got {outcome:?}",
+                    key.name()
                 );
             }
         }
@@ -4864,43 +4898,55 @@ mod listen_port_tests {
 
     #[test]
     fn relocation_outranks_a_valid_operator_value() {
-        for var in OPERATOR_VARS {
-            let r = resolve(Some("9100"), var, Some("9200"));
-            assert_eq!((r.port, r.origin), (9100, PortOrigin::Relocated), "{var}");
+        for key in OPERATOR_KEYS {
+            let r = resolve(Some("9100"), key, Some("9200"));
+            assert_eq!(chosen(r), (9100, PortOrigin::Relocated), "{}", key.name());
         }
     }
 
+    /// A malformed relocation refuses before the operator layer is consulted,
+    /// naming the supervisor rather than an operator fix.
     #[test]
-    fn garbage_relocation_falls_through_to_operator_then_source() {
-        for var in OPERATOR_VARS {
+    fn garbage_relocation_refuses_over_any_operator_layer() {
+        for key in OPERATOR_KEYS {
             for garbage in GARBAGE {
-                let r = resolve(Some(garbage), var, Some("9200"));
-                assert_eq!(
-                    (r.port, r.origin, r.operator_var),
-                    (9200, PortOrigin::Operator, var),
-                    "relocation {garbage:?} must fall through to {var}"
-                );
-                let r = resolve(Some(garbage), var, None);
-                assert_eq!(
-                    (r.port, r.origin),
-                    (8000, PortOrigin::Source),
-                    "relocation {garbage:?} over no operator value must give the source port"
-                );
+                for operator in [Some("9200"), None, Some("abc")] {
+                    let outcome = try_resolve(Some(garbage), key, operator);
+                    assert!(
+                        outcome
+                            .as_ref()
+                            .is_err_and(|r| r.name() == LISTEN_PORT_RELOCATION.name()
+                                && r.to_string().contains("dev supervisor")),
+                        "relocation {garbage:?} must refuse, got {outcome:?}"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn absent_layers_give_the_source_and_port_bounds_are_accepted() {
-        for var in OPERATOR_VARS {
-            let r = resolve(None, var, None);
-            assert_eq!((r.port, r.origin), (8000, PortOrigin::Source), "{var}");
-            for edge in [("1", 1), ("65535", 65535)] {
-                let r = resolve(Some(edge.0), var, None);
-                assert_eq!((r.port, r.origin), (edge.1, PortOrigin::Relocated), "{var}");
-                let r = resolve(None, var, Some(edge.0));
-                assert_eq!((r.port, r.origin), (edge.1, PortOrigin::Operator), "{var}");
+        for key in OPERATOR_KEYS {
+            let name = key.name();
+            assert_eq!(chosen(resolve(None, key, None)), (8000, PortOrigin::Source));
+            for (text, port) in [("1", 1), ("65535", 65535)] {
+                let r = resolve(Some(text), key, None);
+                assert_eq!(chosen(r), (port, PortOrigin::Relocated), "{name}");
+                let r = resolve(None, key, Some(text));
+                assert_eq!(chosen(r), (port, PortOrigin::Operator), "{name}");
+                assert_eq!(r.operator_var, name);
             }
+        }
+    }
+
+    /// A program port outside `1..=65535`, `0` included, has no source layer.
+    #[test]
+    fn program_port_outside_the_tcp_range_is_refused() {
+        for port in [0, -1, 65_536, i64::MIN, i64::MAX] {
+            assert_eq!(SourcePort::parse(port), None, "{port}");
+        }
+        for port in [1, 80, 65_535] {
+            assert!(SourcePort::parse(port).is_some(), "{port}");
         }
     }
 
@@ -4916,9 +4962,9 @@ mod listen_port_tests {
 
     #[test]
     fn relocated_bind_failure_advises_no_operator_var() {
-        for var in OPERATOR_VARS {
+        for key in OPERATOR_KEYS {
             for posture in [BuildPosture::Development, BuildPosture::Release] {
-                let msg = in_use_message(resolve(Some("9100"), var, Some("9200")), posture);
+                let msg = in_use_message(resolve(Some("9100"), key, Some("9200")), posture);
                 assert!(
                     OPERATOR_VARS.iter().all(|v| !msg.contains(v)),
                     "a supervisor-chosen port must not advise an operator var: {msg}"
@@ -4930,8 +4976,9 @@ mod listen_port_tests {
 
     #[test]
     fn operator_and_source_bind_failure_names_the_runtime_var() {
-        for var in OPERATOR_VARS {
-            for r in [resolve(None, var, Some("9200")), resolve(None, var, None)] {
+        for key in OPERATOR_KEYS {
+            let var = key.name();
+            for r in [resolve(None, key, Some("9200")), resolve(None, key, None)] {
                 for (posture, launch) in [
                     (BuildPosture::Development, "ipe dev run"),
                     (BuildPosture::Release, "./<program>"),
@@ -4958,8 +5005,8 @@ mod listen_port_tests {
     /// `bind_refusal` gives the refusal of the compiled posture.
     #[test]
     fn bind_refusal_follows_the_compiled_posture() {
-        for var in OPERATOR_VARS {
-            let r = resolve(None, var, None);
+        for key in OPERATOR_KEYS {
+            let r = resolve(None, key, None);
             let compiled = crate::ipe_error_message(r.bind_refusal(
                 "listen",
                 std::net::SocketAddr::from(([127, 0, 0, 1], 8000)),
