@@ -112,6 +112,7 @@ use std::path::{Path, PathBuf};
 use ipe_diagnostics::{TyDoc, render_ty};
 use ipe_docs::{CommandInfo, Index, html};
 use ipe_intern::Interner;
+use ipe_runtime_rust::inbound_authority::{Authority, AuthorityRefusal, DeclaredNames};
 use ipe_types::{VarNamer, kernel_type_table, ty_to_doc};
 
 use crate::CliError;
@@ -5232,33 +5233,220 @@ fn serve(path: &Path, port: Option<u16>) -> Result<(), CliError> {
         let _ = crate::browser::open_url(&url);
     }
 
-    // A single dropped connection must not take the server down; `flatten` skips
-    // the `Err`s and serves each accepted stream.
-    for mut conn in listener.incoming().flatten() {
-        serve_one(&mut conn, &site);
-    }
+    serve_site(&listener, &site);
     Ok(())
 }
 
-/// Serve one HTTP/1.1 request from the in-memory `site`, read-only.
+/// Serve `site` on `listener`, one connection at a time, until the process ends.
 ///
-/// Reads the request line, maps its path to a built file (`/` → `index.html`),
-/// and writes the file with its content type — or a `404` when the path names no
-/// built file. Only `GET`/`HEAD`-shaped requests are honoured; the body, if any,
-/// is ignored (nothing here writes or executes).
-/// The largest request line the doc server will read before giving up. A request
-/// line is a method, a path, and a version; a few kilobytes covers any real one,
-/// and the cap turns a client that streams bytes without a newline into a bounded
-/// read rather than an unbounded buffer growth.
-const DOC_SERVE_REQUEST_LINE_CAP: usize = 16 * 1024;
+/// A single dropped connection must not take the server down; `flatten` skips
+/// the `Err`s and serves each accepted stream.
+fn serve_site(listener: &std::net::TcpListener, site: &BTreeMap<String, String>) {
+    for mut conn in listener.incoming().flatten() {
+        serve_one(&mut conn, site);
+    }
+}
+
+/// The most bytes the doc server reads of one request head, request line and
+/// headers together.
+///
+/// A few kilobytes covers any real head, and the cap turns a client that streams
+/// bytes without ending its head into a bounded read rather than unbounded buffer
+/// growth.
+const DOC_SERVE_REQUEST_HEAD_CAP: usize = 16 * 1024;
 
 /// The wall-clock a single read may block before the doc server abandons the
 /// connection, so a client that opens a socket and never sends stalls one
 /// connection briefly instead of pinning the accept loop forever.
 const DOC_SERVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The fixed body of a `421` answered to a request whose host is not admitted.
+const DOC_SERVE_REFUSED_HOST_BODY: &str = r#"{"status":"host_not_admitted"}"#;
+
+/// The `Host` headers one request head carries.
+#[derive(Debug, PartialEq, Eq)]
+enum HostHeader {
+    /// No `Host` header.
+    Absent,
+    /// Exactly one `Host` header, its value trimmed of optional whitespace.
+    One(String),
+    /// Two or more `Host` headers.
+    Duplicate,
+}
+
+/// The parts of a request head the doc server acts on.
+#[derive(Debug)]
+struct RequestHead {
+    /// The request target, as the request line spells it.
+    target: String,
+    /// The head's `Host` headers.
+    host: HostHeader,
+}
+
+/// Why a request head is not read to its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadRefusal {
+    /// The head fills [`DOC_SERVE_REQUEST_HEAD_CAP`] without ending: `431`.
+    TooLarge,
+    /// A line is not UTF-8 or not a `name: value` header field: `400`.
+    Malformed,
+    /// The peer closed or stalled before ending the head: nothing is answered.
+    Abandoned,
+}
+
+impl RequestHead {
+    /// The path to serve, when the request's target authority is admitted.
+    ///
+    /// The doc server declares no DNS name, so only an IP literal or a loopback
+    /// name admits: a rebound DNS name pointed at the loopback server is refused.
+    ///
+    /// # Errors
+    ///
+    /// The [`AuthorityRefusal`] of an absent, duplicated, disagreeing or
+    /// malformed authority, or [`AuthorityRefusal::Malformed`] for a target in
+    /// neither origin nor absolute form; `Ok(None)` for an undeclared DNS name.
+    fn admitted_path(&self) -> Result<Option<&str>, AuthorityRefusal> {
+        let (path, target_authority) = split_request_target(&self.target)?;
+        let authority = request_authority(target_authority, &self.host)?;
+        Ok(DeclaredNames::none()
+            .admits(authority.host())
+            .then_some(path))
+    }
+}
+
+/// Split a request target into the path to serve and the authority it names.
+///
+/// Origin form (`/path`) names no authority; absolute form
+/// (`scheme://authority/path`) names its authority.
+///
+/// # Errors
+///
+/// [`AuthorityRefusal::Malformed`] for any other form.
+fn split_request_target(target: &str) -> Result<(&str, Option<&str>), AuthorityRefusal> {
+    if target.starts_with('/') {
+        return Ok((target, None));
+    }
+    let (_, rest) = target
+        .split_once("://")
+        .ok_or(AuthorityRefusal::Malformed)?;
+    let (authority, path) = rest
+        .find(['/', '?', '#'])
+        .and_then(|end| rest.split_at_checked(end))
+        .unwrap_or((rest, ""));
+    Ok((if path.is_empty() { "/" } else { path }, Some(authority)))
+}
+
+/// The request's target authority: the absolute-form target's, else the one
+/// `Host` header's.
+///
+/// # Errors
+///
+/// [`AuthorityRefusal::Duplicate`] for two `Host` headers,
+/// [`AuthorityRefusal::Absent`] for neither source,
+/// [`AuthorityRefusal::Disagrees`] when both are present and differ, and
+/// [`AuthorityRefusal::Malformed`] when either does not parse.
+fn request_authority(
+    target_authority: Option<&str>,
+    host: &HostHeader,
+) -> Result<Authority, AuthorityRefusal> {
+    let header = match host {
+        HostHeader::Duplicate => return Err(AuthorityRefusal::Duplicate),
+        HostHeader::Absent => None,
+        HostHeader::One(value) => Some(value.as_str()),
+    };
+    match (target_authority, header) {
+        (None, None) => Err(AuthorityRefusal::Absent),
+        (Some(raw), None) | (None, Some(raw)) => Authority::parse(raw),
+        (Some(target), Some(value)) => {
+            let target = Authority::parse(target)?;
+            if Authority::parse(value)? == target {
+                Ok(target)
+            } else {
+                Err(AuthorityRefusal::Disagrees)
+            }
+        }
+    }
+}
+
+/// Read one request head: its request line, then header lines up to the blank
+/// line that ends it.
+///
+/// Every line read consumes at least its newline from the capped reader, so the
+/// loop ends within [`DOC_SERVE_REQUEST_HEAD_CAP`] bytes.
+///
+/// # Errors
+///
+/// [`HeadRefusal::TooLarge`] when the cap runs out first,
+/// [`HeadRefusal::Malformed`] for a line that is not a header field, and
+/// [`HeadRefusal::Abandoned`] when the peer stops sending.
+fn read_head<R: std::io::Read>(
+    reader: &mut std::io::BufReader<std::io::Take<R>>,
+) -> Result<RequestHead, HeadRefusal> {
+    let mut line = String::new();
+    read_head_line(reader, &mut line)?;
+    let target = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+    let mut host = HostHeader::Absent;
+    loop {
+        read_head_line(reader, &mut line)?;
+        if line.is_empty() {
+            return Ok(RequestHead { target, host });
+        }
+        let (name, value) = header_field(&line).ok_or(HeadRefusal::Malformed)?;
+        if name.eq_ignore_ascii_case("host") {
+            host = match host {
+                HostHeader::Absent => HostHeader::One(value.to_owned()),
+                HostHeader::One(_) | HostHeader::Duplicate => HostHeader::Duplicate,
+            };
+        }
+    }
+}
+
+/// Read one head line into `line`, its `\n` or `\r\n` terminator removed.
+///
+/// # Errors
+///
+/// [`HeadRefusal::TooLarge`] for a line the cap cuts short,
+/// [`HeadRefusal::Malformed`] for a line that is not UTF-8, and
+/// [`HeadRefusal::Abandoned`] for a peer that closes or stalls mid-line.
+fn read_head_line<R: std::io::Read>(
+    reader: &mut std::io::BufReader<std::io::Take<R>>,
+    line: &mut String,
+) -> Result<(), HeadRefusal> {
+    use std::io::BufRead;
+
+    line.clear();
+    match reader.read_line(line) {
+        Ok(_) if line.ends_with('\n') => {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            Ok(())
+        }
+        Ok(_) if reader.get_ref().limit() == 0 => Err(HeadRefusal::TooLarge),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(HeadRefusal::Malformed),
+        Ok(_) | Err(_) => Err(HeadRefusal::Abandoned),
+    }
+}
+
+/// A header line's name and its value trimmed of optional whitespace.
+///
+/// `None` for a folded continuation line or a line that is not `name: value`.
+fn header_field(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once(':')?;
+    let token = !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic());
+    token.then(|| (name, value.trim_matches([' ', '\t'])))
+}
+
+/// Serve one HTTP/1.1 request from the in-memory `site`, read-only.
+///
+/// Reads the request head under a byte cap and a read timeout, judges the
+/// request's target authority, maps its path to a built file (`/` →
+/// `index.html`), and writes the file with its content type, a `404` when the
+/// path names no built file, or a `421` when the host is not admitted. The body,
+/// if any, is ignored (nothing here writes or executes).
 fn serve_one(conn: &mut std::net::TcpStream, site: &BTreeMap<String, String>) {
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufReader, Read, Write};
 
     // Bound the wait: a peer that connects and never writes stalls this one
     // connection for at most the timeout, never the whole loop (a remote
@@ -5269,34 +5457,34 @@ fn serve_one(conn: &mut std::net::TcpStream, site: &BTreeMap<String, String>) {
     let Ok(clone) = conn.try_clone() else {
         return;
     };
-    // Bound the size: read at most one capped request line. `take` caps the byte
-    // count, so a client that never sends a newline yields a bounded buffer, not
-    // unbounded growth. A line that fills the cap without a terminating newline is
-    // an over-long request: fail closed with `431` rather than act on a truncated
-    // request line.
-    let mut reader = BufReader::new(clone.take(DOC_SERVE_REQUEST_LINE_CAP as u64));
-    let mut request_line = String::new();
-    let Ok(read) = reader.read_line(&mut request_line) else {
-        return;
-    };
-    if read >= DOC_SERVE_REQUEST_LINE_CAP && !request_line.ends_with('\n') {
-        let overflow = http_response(
+    let mut reader = BufReader::new(clone.take(DOC_SERVE_REQUEST_HEAD_CAP as u64));
+    let response = match read_head(&mut reader) {
+        Err(HeadRefusal::Abandoned) => return,
+        Err(HeadRefusal::TooLarge) => http_response(
             "431 Request Header Fields Too Large",
             "text/plain; charset=utf-8",
-            "request line too long\n",
-        );
-        let _ = conn.write_all(overflow.as_bytes());
-        let _ = conn.flush();
-        return;
-    }
-
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
-    let name = serve_file_name(path);
-
-    let response = site.get(&name).map_or_else(
-        || http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
-        |body| http_response("200 OK", content_type(&name), body),
-    );
+            "request head too large\n",
+        ),
+        Err(HeadRefusal::Malformed) => http_response(
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            "malformed request head\n",
+        ),
+        Ok(head) => match head.admitted_path() {
+            Ok(Some(path)) => {
+                let name = serve_file_name(path);
+                site.get(&name).map_or_else(
+                    || http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
+                    |body| http_response("200 OK", content_type(&name), body),
+                )
+            }
+            Ok(None) | Err(_) => http_response(
+                "421 Misdirected Request",
+                "application/json",
+                DOC_SERVE_REFUSED_HOST_BODY,
+            ),
+        },
+    };
     let _ = conn.write_all(response.as_bytes());
     let _ = conn.flush();
 }
@@ -5326,12 +5514,13 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
-/// A complete HTTP/1.1 response with an explicit `Content-Length` and a
-/// `Connection: close` (the loop serves one request per connection).
+/// A complete HTTP/1.1 response with an explicit `Content-Length`, a
+/// `Connection: close` (the loop serves one request per connection), and
+/// `Cache-Control: no-store` (the site is a live preview built in memory).
 fn http_response(status: &str, content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -7707,33 +7896,228 @@ withBaseMs = something
         );
     }
 
-    #[test]
-    fn doc_serve_answers_a_normal_request() {
-        use std::io::{Read, Write};
-        use std::net::{TcpListener, TcpStream};
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    /// Run the real doc serve loop over a one-page site on an ephemeral loopback
+    /// port; the server thread lives until the test process ends.
+    fn doc_serve_fixture() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
-
-        let handle = std::thread::Builder::new()
+        std::thread::Builder::new()
             .spawn(move || {
                 let mut site: BTreeMap<String, String> = BTreeMap::new();
                 site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
-                let (mut conn, _) = listener.accept().expect("accept");
-                serve_one(&mut conn, &site);
+                serve_site(&listener, &site);
             })
-            .expect("spawn test thread");
+            .expect("spawn doc server");
+        addr
+    }
 
-        let mut client = TcpStream::connect(addr).expect("connect");
+    /// Send `head` on a fresh connection to `addr` and read the whole response.
+    fn doc_serve_exchange(addr: std::net::SocketAddr, head: &str) -> String {
+        use std::io::{Read, Write};
+
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        client.write_all(head.as_bytes()).expect("write request");
         client
-            .write_all(b"GET / HTTP/1.1\r\n\r\n")
-            .expect("write request");
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
         let mut resp = String::new();
         client.read_to_string(&mut resp).expect("read response");
-        handle.join().expect("server thread");
+        resp
+    }
 
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
-        assert!(resp.contains("<h1>hi</h1>"), "body served: {resp}");
+    /// Whether `resp` is the fixed host refusal: `421`, its JSON body, no page.
+    fn is_host_refusal(resp: &str) -> bool {
+        resp.starts_with("HTTP/1.1 421 Misdirected Request\r\n")
+            && resp.ends_with(DOC_SERVE_REFUSED_HOST_BODY)
+            && resp.contains("Cache-Control: no-store\r\n")
+            && !resp.contains("<h1>hi</h1>")
+    }
+
+    #[test]
+    fn doc_serve_admits_ip_literals_and_loopback_names() {
+        let addr = doc_serve_fixture();
+        let port = addr.port();
+        for host in [
+            format!("127.0.0.1:{port}"),
+            "127.0.0.1".to_owned(),
+            format!("localhost:{port}"),
+            format!("LOCALHOST:{port}"),
+            format!("docs.localhost:{port}"),
+            format!("[::1]:{port}"),
+        ] {
+            let resp = doc_serve_exchange(addr, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+            assert!(
+                resp.starts_with("HTTP/1.1 200 OK\r\n") && resp.contains("<h1>hi</h1>"),
+                "Host `{host}` must be served: {resp}"
+            );
+        }
+        let missing = doc_serve_exchange(
+            addr,
+            &format!("GET /no-such.html HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        assert!(
+            missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "an admitted host reaches the site map: {missing}"
+        );
+    }
+
+    #[test]
+    fn doc_serve_refuses_a_rebound_name_with_421() {
+        let addr = doc_serve_fixture();
+        let port = addr.port();
+        for (path, host) in [
+            ("/", format!("evil.example:{port}")),
+            ("/", "evil.example".to_owned()),
+            ("/", format!("localhost.evil.example:{port}")),
+            ("/", format!("evillocalhost:{port}")),
+            ("/no-such.html", format!("evil.example:{port}")),
+        ] {
+            let resp = doc_serve_exchange(
+                addr,
+                &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+            );
+            assert!(
+                is_host_refusal(&resp),
+                "GET {path} with Host `{host}` must be refused with 421 before the site map: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn doc_serve_refuses_a_malformed_authority_with_421() {
+        let addr = doc_serve_fixture();
+        let port = addr.port();
+        for host in [
+            format!("user@127.0.0.1:{port}"),
+            "127.0.0.1:0".to_owned(),
+            "127.0.0.1:65536".to_owned(),
+            "127.0.0.1:".to_owned(),
+            "::1".to_owned(),
+            "localhost.".to_owned(),
+            "127.1".to_owned(),
+            String::new(),
+        ] {
+            let resp = doc_serve_exchange(addr, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"));
+            assert!(
+                is_host_refusal(&resp),
+                "Host `{host}` must be refused with 421: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn doc_serve_refuses_absent_duplicate_and_disagreeing_hosts_with_421() {
+        let addr = doc_serve_fixture();
+        let port = addr.port();
+        let admitted = format!("127.0.0.1:{port}");
+        for head in [
+            "GET / HTTP/1.1\r\n\r\n".to_owned(),
+            "GET / HTTP/1.0\r\n\r\n".to_owned(),
+            format!("GET / HTTP/1.1\r\nHost: {admitted}\r\nHost: {admitted}\r\n\r\n"),
+            format!("GET / HTTP/1.1\r\nHost: {admitted}\r\nhost: evil.example\r\n\r\n"),
+            format!("GET http://evil.example/ HTTP/1.1\r\nHost: {admitted}\r\n\r\n"),
+            format!("GET http://{admitted}/ HTTP/1.1\r\nHost: evil.example\r\n\r\n"),
+            "GET http://evil.example/ HTTP/1.1\r\n\r\n".to_owned(),
+            format!("GET index.html HTTP/1.1\r\nHost: {admitted}\r\n\r\n"),
+        ] {
+            let resp = doc_serve_exchange(addr, &head);
+            assert!(
+                is_host_refusal(&resp),
+                "{head:?} must be refused with 421: {resp}"
+            );
+        }
+        // Control: the same absolute form with an agreeing Host is served, so the
+        // refusals above are the authority judgement, not the target form.
+        let agreeing = doc_serve_exchange(
+            addr,
+            &format!("GET http://{admitted}/ HTTP/1.1\r\nHost: {admitted}\r\n\r\n"),
+        );
+        assert!(
+            agreeing.starts_with("HTTP/1.1 200 OK\r\n") && agreeing.contains("<h1>hi</h1>"),
+            "an agreeing absolute-form request must be served: {agreeing}"
+        );
+    }
+
+    #[test]
+    fn doc_serve_refuses_a_folded_or_malformed_header_with_400() {
+        let addr = doc_serve_fixture();
+        let port = addr.port();
+        for head in [
+            format!("GET / HTTP/1.1\r\nHost: evil.example\r\n 127.0.0.1:{port}\r\n\r\n"),
+            format!("GET / HTTP/1.1\r\nHost : 127.0.0.1:{port}\r\n\r\n"),
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nno colon here\r\n\r\n"),
+        ] {
+            let resp = doc_serve_exchange(addr, &head);
+            assert!(
+                resp.starts_with("HTTP/1.1 400 Bad Request\r\n") && !resp.contains("<h1>hi</h1>"),
+                "{head:?} must be refused with 400: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn doc_serve_refuses_a_head_past_the_cap_with_431() {
+        let addr = doc_serve_fixture();
+        let port = addr.port();
+        let line = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Fill: ");
+        let filler = "a".repeat(DOC_SERVE_REQUEST_HEAD_CAP - line.len());
+        // Exactly the cap, every line short, no blank line: the head never ends
+        // inside the cap, so it is refused rather than served from a cut head.
+        let resp = doc_serve_exchange(addr, &format!("{line}{filler}"));
+        assert!(
+            resp.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+            "a head that fills the cap must be refused with 431: {resp}"
+        );
+        // Control: the same head ended one line short of the cap is served.
+        let ended = format!("{line}{}\r\n\r\n", "a".repeat(filler.len() - 4));
+        assert!(
+            ended.len() <= DOC_SERVE_REQUEST_HEAD_CAP,
+            "control fits the cap"
+        );
+        let served = doc_serve_exchange(addr, &ended);
+        assert!(
+            served.starts_with("HTTP/1.1 200 OK\r\n"),
+            "a head ended inside the cap must be served: {served}"
+        );
+    }
+
+    #[test]
+    fn request_authority_refusals_are_typed() {
+        let one = |v: &str| HostHeader::One(v.to_owned());
+        assert_eq!(
+            request_authority(None, &HostHeader::Absent),
+            Err(AuthorityRefusal::Absent)
+        );
+        assert_eq!(
+            request_authority(None, &HostHeader::Duplicate),
+            Err(AuthorityRefusal::Duplicate)
+        );
+        assert_eq!(
+            request_authority(Some("127.0.0.1"), &HostHeader::Duplicate),
+            Err(AuthorityRefusal::Duplicate)
+        );
+        assert_eq!(
+            request_authority(Some("127.0.0.1:80"), &one("127.0.0.1")),
+            Err(AuthorityRefusal::Disagrees)
+        );
+        assert_eq!(
+            request_authority(None, &one("user@127.0.0.1")),
+            Err(AuthorityRefusal::Malformed)
+        );
+        assert_eq!(
+            split_request_target("index.html"),
+            Err(AuthorityRefusal::Malformed)
+        );
+        assert_eq!(
+            request_authority(Some("127.0.0.1:80"), &one("127.0.0.1:80")),
+            Authority::parse("127.0.0.1:80"),
+            "an agreeing pair is the one authority"
+        );
+        assert_eq!(
+            split_request_target("http://127.0.0.1:80?x"),
+            Ok(("?x", Some("127.0.0.1:80")))
+        );
+        assert_eq!(split_request_target("http://a"), Ok(("/", Some("a"))));
     }
 
     #[test]
@@ -7807,7 +8191,7 @@ withBaseMs = something
         // discard the response) yet still sees no line terminator, which is the
         // over-long condition. Send-then-shutdown so the read below sees the full
         // `431` before the server closes.
-        let over_long = vec![b'a'; DOC_SERVE_REQUEST_LINE_CAP];
+        let over_long = vec![b'a'; DOC_SERVE_REQUEST_HEAD_CAP];
         client.write_all(&over_long).expect("write over-long line");
         client
             .shutdown(std::net::Shutdown::Write)
