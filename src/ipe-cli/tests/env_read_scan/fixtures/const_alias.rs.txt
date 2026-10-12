@@ -1,0 +1,5 @@
+const KEY: &str = "IPE_FIXTURE_ALIAS";
+
+pub fn read() -> Option<String> {
+    lookup(KEY)
+}

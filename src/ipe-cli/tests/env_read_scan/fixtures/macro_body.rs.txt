@@ -1,0 +1,3 @@
+pub fn warn() {
+    log::warn!("{:?}", read_env_var("IPE_FIXTURE_MACRO"));
+}

@@ -42,45 +42,50 @@ impl LogThreshold {
     }
 }
 
-/// The accepted `IPE_LOG_LEVEL` values, as a refusal states them.
-const LOG_LEVEL_EXPECTED: &str = "one of debug, info, warn, warning, error";
+/// The threshold each accepted `IPE_LOG_LEVEL` name selects; its names are the
+/// registry key's, which a test pins.
+const THRESHOLDS: [(&str, LogThreshold); 5] = [
+    ("debug", LogThreshold::Debug),
+    ("info", LogThreshold::Info),
+    ("warn", LogThreshold::Warn),
+    ("warning", LogThreshold::Warn),
+    ("error", LogThreshold::Error),
+];
 
 /// The parsed `IPE_LOG_LEVEL`: `None` when unset, a refusal when present but not
 /// a level name.
-type EnvThreshold = Result<Option<LogThreshold>, crate::system::EnvValueRefusal>;
+type EnvThreshold = Result<Option<LogThreshold>, crate::env_grammar::EnvRefusal>;
 
-/// Parses the raw `IPE_LOG_LEVEL` lookup into a threshold.
+/// Parses the raw `IPE_LOG_LEVEL` lookup into a threshold through the registry key.
 fn threshold_from(raw: Result<String, std::env::VarError>) -> EnvThreshold {
-    let refuse =
-        |raw: &[u8]| crate::system::EnvValueRefusal::new("IPE_LOG_LEVEL", LOG_LEVEL_EXPECTED, raw);
-    let value = match raw {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(std::env::VarError::NotUnicode(os)) => return Err(refuse(os.as_encoded_bytes())),
+    let key = crate::env_registry::log::LOG_LEVEL;
+    let Some(name) = key.parse(raw)? else {
+        return Ok(None);
     };
-    let is = |name: &str| value.eq_ignore_ascii_case(name);
-    let threshold = if is("debug") {
-        LogThreshold::Debug
-    } else if is("info") {
-        LogThreshold::Info
-    } else if is("warn") || is("warning") {
-        LogThreshold::Warn
-    } else if is("error") {
-        LogThreshold::Error
-    } else {
-        return Err(refuse(value.as_bytes()));
-    };
-    Ok(Some(threshold))
+    // A name the key accepts but the table lacks is refused, never defaulted.
+    THRESHOLDS
+        .iter()
+        .find(|(level, _)| *level == name)
+        .map(|(_, threshold)| Some(*threshold))
+        .ok_or_else(|| crate::env_grammar::EnvRefusal::Malformed {
+            name: key.name(),
+            grammar: key.entry().grammar(),
+            class: key.entry().class(),
+            shown: crate::env_grammar::Shown::of(key.entry().class(), name.as_bytes()),
+        })
 }
 
 /// `IPE_LOG_LEVEL`, read and parsed once per process.
 fn env_threshold() -> &'static EnvThreshold {
     static ENV_THRESHOLD: std::sync::OnceLock<EnvThreshold> = std::sync::OnceLock::new();
-    ENV_THRESHOLD.get_or_init(|| threshold_from(crate::system::read_env_var("IPE_LOG_LEVEL")))
+    ENV_THRESHOLD.get_or_init(|| {
+        threshold_from(crate::system::read_env_var(
+            crate::env_registry::log::LOG_LEVEL.name(),
+        ))
+    })
 }
 
-/// Refuses a present `IPE_LOG_LEVEL` that is not a level name, before any line
-/// is logged.
+/// Fixes the `IPE_LOG_LEVEL` snapshot before any line is logged.
 ///
 /// # Errors
 ///
@@ -88,7 +93,7 @@ fn env_threshold() -> &'static EnvThreshold {
 // The vendored emit compiles `log.rs` without the `log` feature, so no entry
 // calls this check there.
 #[cfg_attr(not(feature = "log"), allow(dead_code))]
-pub(crate) fn startup_check() -> Result<(), crate::system::EnvValueRefusal> {
+pub(crate) fn startup_check() -> Result<(), crate::env_grammar::EnvRefusal> {
     env_threshold().as_ref().map(|_| ()).map_err(Clone::clone)
 }
 
@@ -367,6 +372,13 @@ mod threshold_tests {
             threshold_from(Err(std::env::VarError::NotPresent)),
             Ok(None)
         );
+    }
+
+    /// Every name the registry key accepts selects a threshold, and no other.
+    #[test]
+    fn thresholds_cover_exactly_the_registry_names() {
+        let table: Vec<&str> = super::THRESHOLDS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(table, crate::env_registry::log::LOG_LEVEL.names());
     }
 
     #[test]

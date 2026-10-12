@@ -1,10 +1,13 @@
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
 /// A documented `IPE_*` environment variable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvVar {
     /// The environment variable name, e.g. `IPE_LOG_LEVEL`.
     pub name: &'static str,
     /// Default value as a human-readable string, e.g. `"info"` or `"unset"`.
-    pub default: &'static str,
+    pub default: Cow<'static, str>,
     /// One-line description of what the variable controls.
     pub purpose: &'static str,
     /// The runtime subsystem that reads this variable.
@@ -109,9 +112,12 @@ impl Subsystem {
 
 /// The complete annotated table of `IPE_*` environment variables.
 ///
-/// Variables are listed in alphabetical order within each subsystem. The drift
-/// gate test asserts that every `IPE_*` literal read in the codebase appears
-/// here; the generator renders this table into `docs/reference/env.md`.
+/// The runtime's operator registry (`ipe_runtime_rust::env_registry`) is
+/// projected first, so a variable it declares is documented from that one
+/// declaration; [`HAND_TABLE`] holds every variable not yet declared there. The
+/// merged table is ordered by subsystem, then alphabetically. The drift gate
+/// test asserts that every `IPE_*` literal read in the codebase appears here;
+/// the generator renders this table into `docs/reference/env.md`.
 ///
 /// Excluded from this table:
 /// - Test-only variables (`IPE_TEST_*`, `IPE_BLESS`, `IPE_RUN_WITH_TEST_VAR`,
@@ -120,11 +126,71 @@ impl Subsystem {
 /// - Build-time baked vars set by `option_env!` only
 ///   (`IPE_BUILD_COMMIT`, `IPE_BUILD_AT`, `IPE_VERSION`) — documented here for
 ///   operator awareness but never read via `std::env::var` at runtime.
-pub static ENV_VARS: &[EnvVar] = &[
+pub static ENV_VARS: LazyLock<Vec<EnvVar>> = LazyLock::new(|| {
+    let mut vars: Vec<EnvVar> = ipe_runtime_rust::env_registry::registry()
+        .filter_map(project)
+        .chain(HAND_TABLE.iter().cloned())
+        .collect();
+    vars.sort_by_key(|v| (subsystem_rank(v.subsystem), v.name));
+    vars
+});
+
+/// A runtime registry entry as a documented row; an internal variable, set
+/// only by the dev supervisor, is not documented.
+fn project(entry: &ipe_runtime_rust::env_registry::EnvEntry) -> Option<EnvVar> {
+    use ipe_runtime_rust::env_grammar::Class as RuntimeClass;
+    let class = match entry.class() {
+        RuntimeClass::Tunable => Class::Tunable,
+        RuntimeClass::Secret => Class::Secret,
+        RuntimeClass::SecurityTunable => Class::SecurityTunable,
+        RuntimeClass::Internal => return None,
+    };
+    Some(EnvVar {
+        name: entry.name(),
+        default: Cow::Owned(entry.default().to_string()),
+        purpose: entry.purpose(),
+        subsystem: subsystem_of(entry.subsystem()),
+        class,
+    })
+}
+
+/// The reference section a runtime subsystem is grouped under.
+const fn subsystem_of(subsystem: ipe_runtime_rust::env_registry::Subsystem) -> Subsystem {
+    use ipe_runtime_rust::env_registry::Subsystem as Runtime;
+    match subsystem {
+        Runtime::Console => Subsystem::Console,
+        Runtime::Csv => Subsystem::Csv,
+        Runtime::Db => Subsystem::Db,
+        Runtime::Email => Subsystem::Email,
+        Runtime::File => Subsystem::File,
+        Runtime::Http => Subsystem::Http,
+        Runtime::Observability => Subsystem::Observability,
+        Runtime::Regex => Subsystem::Regex,
+        Runtime::Compression => Subsystem::Compression,
+        Runtime::Config => Subsystem::Config,
+        Runtime::Runtime => Subsystem::Runtime,
+        Runtime::Web => Subsystem::Web,
+        Runtime::Ws => Subsystem::Ws,
+        Runtime::Ui => Subsystem::Ui,
+    }
+}
+
+/// The position of `subsystem`'s section: where [`HAND_TABLE`] first lists it,
+/// or after every listed section.
+fn subsystem_rank(subsystem: Subsystem) -> usize {
+    HAND_TABLE
+        .iter()
+        .position(|v| v.subsystem == subsystem)
+        .unwrap_or(HAND_TABLE.len())
+}
+
+/// The variables not declared in the runtime registry, grouped by subsystem in
+/// reference order, alphabetical within each.
+static HAND_TABLE: &[EnvVar] = &[
     // ── Build ─────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_ALLOC",
-        default: "unset (system allocator)",
+        default: Cow::Borrowed("unset (system allocator)"),
         purpose: "Select the memory allocator: `mimalloc`, `jemalloc`, or `system`. \
                   Mirrors `--allocator`; env wins over `package.ipe [rust] allocator`.",
         subsystem: Subsystem::Build,
@@ -132,7 +198,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_BIN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Path to the `ipe` binary used by the build driver when invoking itself \
                   recursively. Set automatically by the wrapper; operator override is rarely needed.",
         subsystem: Subsystem::Build,
@@ -140,7 +206,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_BUILD_AT",
-        default: "unknown",
+        default: Cow::Borrowed("unknown"),
         purpose: "Build timestamp baked in by CI (`option_env!`). Surfaced at \
                   `GET /_ipe/buildinfo`. Not read at runtime via `env::var`.",
         subsystem: Subsystem::Build,
@@ -148,7 +214,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_BUILD_CACHE",
-        default: "on",
+        default: Cow::Borrowed("on"),
         purpose: "Set to `0`, `off`, or `false` to disable the incremental build cache. \
                   Default is on; the cache directory is `<out>/.ipe-cache/<per-user salt>` unless \
                   `IPE_BUILD_CACHE_DIR` is set.",
@@ -157,7 +223,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_BUILD_CACHE_DIR",
-        default: "unset (<out>/.ipe-cache/<per-user salt>)",
+        default: Cow::Borrowed("unset (<out>/.ipe-cache/<per-user salt>)"),
         purpose: "Explicit path for the incremental build cache directory. Takes effect \
                   only when the cache is enabled (`IPE_BUILD_CACHE` not `off`).",
         subsystem: Subsystem::Build,
@@ -165,7 +231,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_BUILD_COMMIT",
-        default: "dev",
+        default: Cow::Borrowed("dev"),
         purpose: "Git commit SHA baked in by CI (`option_env!`). Surfaced at \
                   `GET /_ipe/buildinfo`. Not read at runtime via `env::var`.",
         subsystem: Subsystem::Build,
@@ -173,7 +239,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CFREE",
-        default: "unset (false)",
+        default: Cow::Borrowed("unset (false)"),
         purpose: "Set to `1` or `true` to build without linking any C code. Mirrors \
                   `--cfree`; incompatible with allocators that require C (e.g. mimalloc).",
         subsystem: Subsystem::Build,
@@ -181,7 +247,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_EMBED_APP",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Path to the compiled app binary embedded into a wrapper binary. Set \
                   by the build driver; not intended for operator use.",
         subsystem: Subsystem::Build,
@@ -189,7 +255,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_EMBED_PROFILE",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Build profile string embedded into a wrapper binary alongside \
                   `IPE_EMBED_APP`. Set by the build driver.",
         subsystem: Subsystem::Build,
@@ -197,7 +263,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_EMIT_PACKAGE_NAME",
-        default: "unset (`ipe-app`)",
+        default: Cow::Borrowed("unset (`ipe-app`)"),
         purpose: "Overrides the emitted crate's package name for a single-file build \
                   (validated through the package-name sanitizer). Set by the coverage \
                   probe to give each emitted build a unique crate identity; not intended \
@@ -207,7 +273,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_INDEX_DIR",
-        default: "unset ($XDG_CACHE_HOME/ipe/index, then $HOME/.cache/ipe/index)",
+        default: Cow::Borrowed("unset ($XDG_CACHE_HOME/ipe/index, then $HOME/.cache/ipe/index)"),
         purpose: "Override the root directory of the package-index checkout used by \
                   `ipe add` / `ipe install`. Points to a local mirror of the \
                   ipe-registry index. Useful for air-gapped environments. Must be an \
@@ -217,14 +283,14 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_INSTALL_DIR",
-        default: "$HOME/.local/bin",
+        default: Cow::Borrowed("$HOME/.local/bin"),
         purpose: "Directory `install.sh` installs the `ipe` binary into.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_PUBLISH_SIGNING_KEY",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Path to the SSH private-key file `ipe package publish` signs the index \
                   commit with (its public half must be registered as a signing key on your \
                   GitHub account). Overrides the key `ipe login --signing-key` stored; when \
@@ -235,7 +301,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_REGISTRY_URL",
-        default: "https://arthurmaciel.github.io/ipe-registry",
+        default: Cow::Borrowed("https://arthurmaciel.github.io/ipe-registry"),
         purpose: "Base URL of the registry's static Pages read API (per-package JSON \
                   mirror + advisory index). `ipe add` and `ipe package audit` read it as \
                   a fast-path, falling back to the `IPE_INDEX_DIR` git checkout on any \
@@ -247,7 +313,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_STATIC",
-        default: "unset (dynamic build)",
+        default: Cow::Borrowed("unset (dynamic build)"),
         purpose: "Set to `1` or `true` to request a fully-static (musl) binary. Mirrors \
                   `--static`; env wins over `package.ipe [rust] static`.",
         subsystem: Subsystem::Build,
@@ -255,7 +321,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_TARGET",
-        default: "unset (native)",
+        default: Cow::Borrowed("unset (native)"),
         purpose: "Cross-compilation target triple, e.g. `wasm32-unknown-unknown` or \
                   `aarch64-unknown-linux-musl`. Set to `wasm` as a shorthand for \
                   `wasm32-unknown-unknown`.",
@@ -264,7 +330,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_VERSION",
-        default: "dev",
+        default: Cow::Borrowed("dev"),
         purpose: "Compiler version baked in by CI (`option_env!`). Surfaced at \
                   `GET /_ipe/buildinfo` and used to locate the cached console binary. \
                   Not read at runtime via `env::var`.",
@@ -273,7 +339,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_BLUEGREEN",
-        default: "unset (on)",
+        default: Cow::Borrowed("unset (on)"),
         purpose: "Dev-loop blue-green swaps are ON by default: `ipe dev watch` holds the \
                   port behind a proxy and cuts over to the rebuilt binary without \
                   dropping the browser connection. Set to `0`/empty to force it off, \
@@ -284,7 +350,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_HOT_APPEARANCE",
-        default: "unset (on for `ipe dev watch`)",
+        default: Cow::Borrowed("unset (on for `ipe dev watch`)"),
         purpose: "Explicit control over dev-loop appearance hot-swap, which is ON \
                   by default for `ipe dev watch`: an edit to a style literal is pushed \
                   to the browser without a rebuild. Set to `0` or empty to force it \
@@ -295,7 +361,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_HOT_TOKEN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Per-process control token for the dev-only appearance-hot-swap \
                   endpoint. `ipe dev watch` sets it and sends it as `X-Ipe-Hot-Token`; a \
                   request whose token does not constant-time-match is refused. \
@@ -305,7 +371,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_NO_BLUEGREEN",
-        default: "unset (blue-green on)",
+        default: Cow::Borrowed("unset (blue-green on)"),
         purpose: "Set to any non-empty value other than `0` to opt OUT of dev-loop \
                   blue-green swaps and restore the direct-bind, \
                   kill-old-then-spawn-new `ipe dev watch` path (a rebuild briefly drops \
@@ -316,7 +382,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_NO_HOT_APPEARANCE",
-        default: "unset (hot-swap on)",
+        default: Cow::Borrowed("unset (hot-swap on)"),
         purpose: "Set to any non-empty value other than `0` to opt OUT of dev-loop \
                   appearance hot-swap: `ipe dev watch` normally hot-swaps a style-literal \
                   edit into the running app without a rebuild. This restores the plain \
@@ -327,7 +393,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_NO_INCREMENTAL",
-        default: "unset (incremental on)",
+        default: Cow::Borrowed("unset (incremental on)"),
         purpose: "Set to any non-empty value other than `0` to opt OUT of the \
                   dev-loop incremental rebuild path: `ipe dev watch` normally builds the \
                   emitted app with `CARGO_INCREMENTAL=1` and no rustc wrapper (so a \
@@ -341,7 +407,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WATCH_TIMING",
-        default: "unset (off)",
+        default: Cow::Borrowed("unset (off)"),
         purpose: "Set to `1` or `true` to print a per-phase `ipe dev watch` rebuild \
                   breakdown (emit, cargo, restart, reconnect) to stderr. Dev-loop \
                   instrumentation; has no effect outside `ipe dev watch`.",
@@ -351,7 +417,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Console ───────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_ADMIN_TOKEN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Admin token (`Bearer`, or the `Basic` password) granting access to the \
                   embedded developer console and `/_ipe/metrics` in production or under \
                   `IPE_CONSOLE_AUTH=token`. Provide via your secret manager; never commit. \
@@ -363,7 +429,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_AUTH",
-        default: "unset (token; open only in a dev build on loopback)",
+        default: Cow::Borrowed("unset (token; open only in a dev build on loopback)"),
         purpose: "Console authentication mode: `token` (admin-token gate, enforced in \
                   every posture, dev included), `off` (console disabled), `app` (app \
                   callback; mounted but answers 501 on the Rust runtime). The posture \
@@ -381,7 +447,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_BATCH_INTERVAL_MS",
-        default: "2000",
+        default: Cow::Borrowed("2000"),
         purpose: "Flush cadence (ms) for telemetry batches shipped to the Hub. Reduce \
                   for lower latency at the cost of more HTTP round-trips.",
         subsystem: Subsystem::Console,
@@ -389,7 +455,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_BIN",
-        default: "unset (~/.cache/ipe/rust-console/<version>/ipe-console)",
+        default: Cow::Borrowed("unset (~/.cache/ipe/rust-console/<version>/ipe-console)"),
         purpose: "Explicit path to the `ipe-console` binary. Overrides the default \
                   cache location resolved from `IPE_VERSION`.",
         subsystem: Subsystem::Console,
@@ -397,7 +463,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_DB_PATH",
-        default: "unset (per-process temp file)",
+        default: Cow::Borrowed("unset (per-process temp file)"),
         purpose: "Path to the SQLite database the console uses to store telemetry \
                   (logs, spans). Set automatically when embedding the console; \
                   operator override selects a persistent path.",
@@ -406,7 +472,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_EMBED",
-        default: "unset (on in development)",
+        default: Cow::Borrowed("unset (on in development)"),
         purpose: "Set to `off`, `0`, or `false` to disable the automatic embedded \
                   developer console. The console is never embedded in a sub-app \
                   (sub-app detection is automatic).",
@@ -415,7 +481,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_HUB",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Base URL of a remote Ipê Hub OTLP collector. When set, the console \
                   ships telemetry there. Leave unset unless you operate a Hub.",
         subsystem: Subsystem::Console,
@@ -423,7 +489,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_HUB_DB",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "SQLite path the console child reads as its Hub data source. Set \
                   automatically by the console proxy when wiring the child; not for \
                   operator use.",
@@ -432,7 +498,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_HUB_TOKEN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Bearer token sent to the Hub OTLP collector. Must be at least 32 \
                   bytes; shorter tokens are refused. Provide via your secret manager.",
         subsystem: Subsystem::Console,
@@ -440,7 +506,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_TOKEN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Deprecated alias for `IPE_ADMIN_TOKEN`. Prefer `IPE_ADMIN_TOKEN`. \
                   Provide via your secret manager; never commit.",
         subsystem: Subsystem::Console,
@@ -448,7 +514,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CONSOLE_URL",
-        default: "unset (auto-detected sub-path)",
+        default: Cow::Borrowed("unset (auto-detected sub-path)"),
         purpose: "Explicit URL at which the developer console is reachable. Overrides \
                   the auto-detected `/_ipe/console` path for proxied deployments.",
         subsystem: Subsystem::Console,
@@ -456,7 +522,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_DEV_BANNER",
-        default: "unset (on in development)",
+        default: Cow::Borrowed("unset (on in development)"),
         purpose: "Set to `off` or `0` to suppress the development-mode banner injected \
                   into HTML responses. The banner is never shown in production.",
         subsystem: Subsystem::Console,
@@ -464,7 +530,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_INGEST_TOKEN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Bearer token the parent ingest gate checks on `X-Ipê-Ingest-Token`. \
                   Required when a sub-app pushes telemetry to a parent app's \
                   `/_ipe/ingest` endpoint. Provide via your secret manager.",
@@ -473,7 +539,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_METRICS_TOKEN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Metrics-scrape token (`Bearer`, or the `Basic` password) authorizing \
                   `/_ipe/metrics` only, never the console; the admin token is accepted \
                   there too. Falls back to the in-code `Console.metricsToken`. A non-UTF-8 \
@@ -485,7 +551,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Compiler ──────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_EXHAUST_BUDGET",
-        default: "2000000",
+        default: Cow::Borrowed("2000000"),
         purpose: "Maximum work units the pattern-match exhaustiveness pass spends on a single \
                   `case` before giving up and emitting a budget-exceeded error. Set to `0` for \
                   no limit (escape hatch for a `case` with very many independent or-patterns). \
@@ -495,7 +561,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_SOLVER_BUDGET",
-        default: "5000000",
+        default: Cow::Borrowed("5000000"),
         purpose: "Maximum unification steps the type solver takes before giving up and \
                   emitting a budget-exceeded error. Set to `0` for no limit (escape hatch \
                   for programs with very large type graphs). Raise when the compiler \
@@ -506,7 +572,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Compression ───────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_DECOMPRESS_MAX_BYTES",
-        default: "268435456 (256 MiB)",
+        default: Cow::Borrowed("268435456 (256 MiB)"),
         purpose: "Maximum number of bytes that may be produced by a single decompression \
                   operation. Prevents zip-bomb / decompression-bomb exhaustion of memory.",
         subsystem: Subsystem::Compression,
@@ -515,7 +581,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Config ────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_CONFIG_MAX_BYTES",
-        default: "16777216 (16 MiB)",
+        default: Cow::Borrowed("16777216 (16 MiB)"),
         purpose: "Maximum size (bytes) of a config file loaded via `Config.load*`. \
                   Prevents memory exhaustion from unexpectedly large config files.",
         subsystem: Subsystem::Config,
@@ -523,7 +589,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_YAML_MAX_BYTES",
-        default: "16777216 (16 MiB)",
+        default: Cow::Borrowed("16777216 (16 MiB)"),
         purpose: "Maximum YAML source size (bytes) that `Config.loadYaml` will parse. \
                   A separate ceiling from `IPE_CONFIG_MAX_BYTES`.",
         subsystem: Subsystem::Config,
@@ -532,7 +598,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── CSV ───────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_CSV_MAX_BYTES",
-        default: "536870912 (512 MiB)",
+        default: Cow::Borrowed("536870912 (512 MiB)"),
         purpose: "Maximum total decoded field bytes parsed from a single CSV input. \
                   Bounds heap use when rows fit the row cap but carry oversized fields.",
         subsystem: Subsystem::Csv,
@@ -540,7 +606,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CSV_MAX_ROWS",
-        default: "10000000 (10 M)",
+        default: Cow::Borrowed("10000000 (10 M)"),
         purpose: "Maximum rows parsed from a single CSV input. Prevents OOM from \
                   unbounded CSV streams.",
         subsystem: Subsystem::Csv,
@@ -548,7 +614,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CSV_SANITIZE_FORMULAS",
-        default: "unset (false)",
+        default: Cow::Borrowed("unset (false)"),
         purpose: "Set to `1`, `on`, `true`, or `yes` to prefix formula-injection \
                   characters (`=`, `+`, `-`, `@`) with a single quote in CSV output, \
                   preventing spreadsheet formula injection.",
@@ -558,7 +624,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Regex ─────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_REGEX_MAX_INPUT_BYTES",
-        default: "16777216 (16 MiB)",
+        default: Cow::Borrowed("16777216 (16 MiB)"),
         purpose: "Maximum subject (input) size in bytes that any `Ipe.Regex` \
                   match/find/findAll/replace/split will scan. Past the ceiling the \
                   operation returns its safe empty result, bounding untrusted-input \
@@ -571,7 +637,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Database ──────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_DB_MAX_CONNECTIONS",
-        default: "10",
+        default: Cow::Borrowed("10"),
         purpose: "Maximum connections per database pool. Raise for high-concurrency \
                   workloads; lower to reduce database load.",
         subsystem: Subsystem::Db,
@@ -579,7 +645,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_DB_MAX_POOLS",
-        default: "4",
+        default: Cow::Borrowed("4"),
         purpose: "Maximum number of distinct database pools (one per unique connection \
                   string). Raise if your app connects to many distinct databases.",
         subsystem: Subsystem::Db,
@@ -587,7 +653,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_DB_OP",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Database CLI op mode. Set to `migrate` to run pending migrations and \
                   exit. Intended for container entrypoints and deployment pipelines.",
         subsystem: Subsystem::Db,
@@ -596,7 +662,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Doc ───────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_DOC_NO_OPEN",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Set to any non-empty value to prevent `ipe doc` from opening a \
                   browser tab. The URL is always printed to stdout. Useful in CI or \
                   headless environments.",
@@ -606,7 +672,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Email ─────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_EMAIL_DRY_RUN",
-        default: "unset (false)",
+        default: Cow::Borrowed("unset (false)"),
         purpose: "Set to `1` to skip actual SMTP delivery and return a synthetic \
                   message ID. Useful in integration tests and staging environments.",
         subsystem: Subsystem::Email,
@@ -615,7 +681,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── FFI ───────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_FFI_ALLOW_UNSANDBOXED",
-        default: "unset (false)",
+        default: Cow::Borrowed("unset (false)"),
         purpose: "Set to `1` to allow `ipe add` / `ipe install` to run the FFI \
                   inspector without a bubblewrap (`bwrap`) sandbox. Widens the trust \
                   boundary — untrusted build scripts execute without confinement. \
@@ -625,7 +691,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_CPU_SECS",
-        default: "unset (sandbox default)",
+        default: Cow::Borrowed("unset (sandbox default)"),
         purpose: "CPU-time limit (seconds) for each sandboxed FFI inspector phase. \
                   Raise only when inspecting crates with very long compile phases.",
         subsystem: Subsystem::Ffi,
@@ -633,7 +699,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_DBG",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Set to any non-empty value to enable verbose debug output from the \
                   FFI inspector. For developer diagnostics only.",
         subsystem: Subsystem::Ffi,
@@ -641,14 +707,14 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_FD_CAP",
-        default: "unset (sandbox default)",
+        default: Cow::Borrowed("unset (sandbox default)"),
         purpose: "File-descriptor limit for each sandboxed FFI inspector phase.",
         subsystem: Subsystem::Ffi,
         class: Class::SecurityTunable,
     },
     EnvVar {
         name: "IPE_FFI_INSPECTOR",
-        default: "unset (auto-located beside test binary)",
+        default: Cow::Borrowed("unset (auto-located beside test binary)"),
         purpose: "Explicit path to the `ipe-ffi-inspector` binary used in integration \
                   tests. Not needed in normal use.",
         subsystem: Subsystem::Ffi,
@@ -656,7 +722,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_OUT_CAP_MB",
-        default: "unset (sandbox default)",
+        default: Cow::Borrowed("unset (sandbox default)"),
         purpose: "Output-size cap (MB) for each sandboxed FFI inspector phase. \
                   Prevents inspector stdout from exhausting memory.",
         subsystem: Subsystem::Ffi,
@@ -664,7 +730,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_PROBE_DIR",
-        default: "unset (per-run temp dir)",
+        default: Cow::Borrowed("unset (per-run temp dir)"),
         purpose: "Root directory for the FFI inspector's probe workspace. Setting a \
                   stable path allows Cargo to reuse dependency build artefacts across \
                   repeated `ipe add` invocations.",
@@ -673,7 +739,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_PROC_CAP",
-        default: "unset (sandbox default)",
+        default: Cow::Borrowed("unset (sandbox default)"),
         purpose: "Process-count limit for each sandboxed FFI inspector phase: a whole \
                   number from 1 to 4096. Zero, a larger value, or anything but digits \
                   refuses the inspection.",
@@ -682,21 +748,21 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_RSS_MB",
-        default: "unset (sandbox default)",
+        default: Cow::Borrowed("unset (sandbox default)"),
         purpose: "RSS memory limit (MB) for each sandboxed FFI inspector phase.",
         subsystem: Subsystem::Ffi,
         class: Class::SecurityTunable,
     },
     EnvVar {
         name: "IPE_FFI_WALL_SECS",
-        default: "unset (sandbox default)",
+        default: Cow::Borrowed("unset (sandbox default)"),
         purpose: "Wall-clock time limit (seconds) for each sandboxed FFI inspector phase.",
         subsystem: Subsystem::Ffi,
         class: Class::SecurityTunable,
     },
     EnvVar {
         name: "IPE_FFI_XC_LOAD",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Path to a pre-generated cross-compilation manifest to load instead \
                   of running the inspector. Developer / CI optimisation.",
         subsystem: Subsystem::Ffi,
@@ -704,7 +770,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_FFI_XC_SAVE",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Path at which to save the generated cross-compilation manifest after \
                   an inspector run. Developer / CI optimisation.",
         subsystem: Subsystem::Ffi,
@@ -713,7 +779,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── File ──────────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_FILE_READ_MAX",
-        default: "536870912 (512 MiB)",
+        default: Cow::Borrowed("536870912 (512 MiB)"),
         purpose: "Maximum bytes `File.readFile` reads in a single call; 0 refuses every \
                   non-empty file; a non-numeric value makes the read fail. Prevents OOM \
                   from unexpectedly large files.",
@@ -723,7 +789,9 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── HTTP client ───────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_HTTP_BIND",
-        default: "unset: 127.0.0.1 (set 0.0.0.0 to accept other hosts; a warning is printed)",
+        default: Cow::Borrowed(
+            "unset: 127.0.0.1 (set 0.0.0.0 to accept other hosts; a warning is printed)",
+        ),
         purpose: "Override the IP address the HTTP server binds: IPv4 such as \
                   `127.0.0.1`, or bare IPv6 such as `::1`. A hostname, a socket \
                   form (`host:port`), brackets, a scope id, padding, or an empty \
@@ -737,7 +805,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_HTTP_DENY_PRIVATE",
-        default: "unset (on, except a development binary with no exposed listener)",
+        default: Cow::Borrowed("unset (on, except a development binary with no exposed listener)"),
         purpose: "Set to `1`, `on`, or `true` to block all outbound HTTP / SMTP / \
                   database connections to RFC-1918 private, loopback, and link-local \
                   addresses, closing the SSRF attack surface; `0`, `off`, or `false` \
@@ -750,7 +818,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_HTTP_DNS_TIMEOUT_MS",
-        default: "5000 (5 s)",
+        default: Cow::Borrowed("5000 (5 s)"),
         purpose: "Deadline (ms) for each SSRF-gate DNS resolve (HTTP, WebSocket, database, \
                   SMTP), through the non-blocking resolver. A host still unresolved at the \
                   deadline is refused, so a slow or stalling resolver cannot hold an \
@@ -760,7 +828,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_HTTP_MAX_BODY_BYTES",
-        default: "33554432 (32 MiB)",
+        default: Cow::Borrowed("33554432 (32 MiB)"),
         purpose: "Maximum request-body size (bytes) for outbound `Http.*` calls. \
                   Prevents OOM from unexpectedly large responses.",
         subsystem: Subsystem::Http,
@@ -768,7 +836,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_HTTP_MAX_INFLIGHT",
-        default: "1024",
+        default: Cow::Borrowed("1024"),
         purpose: "Global cap on simultaneously in-flight HTTP requests at the \
                   `Server.listen` front door. Bounds task/worker fan-out; requests \
                   beyond the cap are backpressured and, with the request timeout \
@@ -778,28 +846,17 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_HTTP_REQUEST_TIMEOUT",
-        default: "30 (seconds)",
+        default: Cow::Borrowed("30 (seconds)"),
         purpose: "Per-request deadline (seconds) at the `Server.listen` front door. \
                   A request — headers or body — that does not complete within the \
                   window is dropped with 408, closing the slowloris hold-open vector.",
         subsystem: Subsystem::Http,
         class: Class::SecurityTunable,
     },
-    EnvVar {
-        name: "IPE_SERVER_PORT",
-        default: "the port passed to `Server.listen`",
-        purpose: "TCP port an `Ipe.Http.Server` app listens on. A value outside \
-                  `1..=65535` (empty, non-numeric, signed, `0`, or too large) is \
-                  ignored and the port passed to `Server.listen` is used. Under \
-                  `ipe dev watch` the supervisor chooses the port, so this value has \
-                  no effect there.",
-        subsystem: Subsystem::Http,
-        class: Class::Tunable,
-    },
     // ── Observability ─────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_ENV",
-        default: "unset (development in a dev build, production in a release build)",
+        default: Cow::Borrowed("unset (development in a dev build, production in a release build)"),
         purpose: "Deployment environment marker. Any non-empty value other than `dev`, \
                   `development`, or `local` activates production mode: SSRF guard on, \
                   console requires a token, Secure cookies, no dev banner. Unset, the \
@@ -813,7 +870,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_LOG_FORMAT",
-        default: "unset (human-readable)",
+        default: Cow::Borrowed("unset (human-readable)"),
         purpose: "Set to `json` to emit structured JSON log lines instead of the \
                   default human-readable format. Recommended for log aggregation \
                   pipelines (Datadog, Loki, etc.).",
@@ -821,19 +878,8 @@ pub static ENV_VARS: &[EnvVar] = &[
         class: Class::Tunable,
     },
     EnvVar {
-        name: "IPE_LOG_LEVEL",
-        default: "unset (info)",
-        purpose: "Minimum log level: `debug`, `info`, `warn` (or `warning`), or \
-                  `error`, ASCII case-insensitive. Any other value, an empty or \
-                  padded one included, refuses startup. Read once at process start, \
-                  so a later `System.setenv` or `System.loadEnv` does not change it. \
-                  Takes precedence over an installed `Log.level` setting.",
-        subsystem: Subsystem::Observability,
-        class: Class::Tunable,
-    },
-    EnvVar {
         name: "IPE_OBSERVABILITY_BUFFER",
-        default: "1024",
+        default: Cow::Borrowed("1024"),
         purpose: "Bounded queue depth for the parent-push telemetry exporter. Overflow \
                   drops and warns rather than blocking the application.",
         subsystem: Subsystem::Observability,
@@ -841,7 +887,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_OBSERVABILITY_PUSH_INTERVAL_MS",
-        default: "2000",
+        default: Cow::Borrowed("2000"),
         purpose: "Flush cadence (ms) for telemetry shipped from a sub-app to its \
                   parent's `/_ipe/ingest` endpoint.",
         subsystem: Subsystem::Observability,
@@ -849,27 +895,15 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_PARENT_URL",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Base URL of the parent app to which this sub-app pushes telemetry. \
                   Presence of this variable activates the push exporter.",
         subsystem: Subsystem::Observability,
         class: Class::Tunable,
     },
     EnvVar {
-        name: "IPE_RECURSION_LIMIT",
-        default: "10000",
-        purpose: "Maximum Ipê call-stack depth before a recursion-limit error is \
-                  raised. Prevents stack-overflow crashes from unbounded recursion. \
-                  Read once, at process start; a value that is not a positive \
-                  decimal integer (`0` included) refuses the program before its \
-                  first line. On wasm32 the maximum is `10000`: a larger value is \
-                  refused too, lowering stays possible.",
-        subsystem: Subsystem::Observability,
-        class: Class::Tunable,
-    },
-    EnvVar {
         name: "IPE_SERVICE_NAME",
-        default: "unset (binary name)",
+        default: Cow::Borrowed("unset (binary name)"),
         purpose: "Service name attached as the `service.name` resource attribute on \
                   telemetry records shipped to the Hub or the telemetry SQLite spill.",
         subsystem: Subsystem::Observability,
@@ -877,7 +911,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_TRACE",
-        default: "unset (false)",
+        default: Cow::Borrowed("unset (false)"),
         purpose: "Set to any non-empty truthy value (`1`, `true`, etc.) to emit \
                   `Trace.span` timings to stderr. Off by default — no noise in \
                   production.",
@@ -887,7 +921,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Process ───────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_PROCESS_OUTPUT_MAX",
-        default: "16777216 (16 MiB)",
+        default: Cow::Borrowed("16777216 (16 MiB)"),
         purpose: "Maximum bytes buffered from a subprocess's stdout or stderr by \
                   `Process.run`. Prevents OOM when a child writes without bound.",
         subsystem: Subsystem::File,
@@ -896,7 +930,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Runtime ───────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_HOME",
-        default: "unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe)",
+        default: Cow::Borrowed("unset ($XDG_DATA_HOME/ipe, then $HOME/.ipe)"),
         purpose: "Root directory for materialised runtime source, config, and cached \
                   binaries. Overrides the XDG / home-directory fallback. Must be an \
                   absolute path.",
@@ -905,7 +939,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_RUNTIME_DIR",
-        default: "unset (embedded / in-repo)",
+        default: Cow::Borrowed("unset (embedded / in-repo)"),
         purpose: "Explicit path to the runtime crate source directory. Overrides the \
                   embedded fallback. Used in tests and in-repo development.",
         subsystem: Subsystem::Runtime,
@@ -913,7 +947,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_RUNTIME_VENDORED",
-        default: "unset (false)",
+        default: Cow::Borrowed("unset (false)"),
         purpose: "Set to `1` to declare that the runtime is vendored (already present \
                   on disk) and skip materialization. Used during packaging.",
         subsystem: Subsystem::Runtime,
@@ -922,7 +956,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── Web server ────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_AUTH_MAX_LIFETIME",
-        default: "28800 (8 h)",
+        default: Cow::Borrowed("28800 (8 h)"),
         purpose: "Absolute lifetime cap (seconds) for a signed session token. A stolen \
                   but unrevoked token is worthless after this deadline. Takes \
                   precedence over `Web.authMaxLifetime`.",
@@ -931,7 +965,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_AUTH_REVOCATION",
-        default: "unset (Off)",
+        default: Cow::Borrowed("unset (Off)"),
         purpose: "Arms the session revocation check in every program: the authed \
                   `Server` routes, every `Web` session, and `Auth.verifyToken`. `store` or \
                   `1` checks each request, event and session restore against the \
@@ -952,7 +986,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_AUTH_SLIDE_WINDOW",
-        default: "1800 (30 min)",
+        default: Cow::Borrowed("1800 (30 min)"),
         purpose: "Rolling re-issue window (seconds) for a signed session token. A \
                   request within this window of expiry re-issues a fresh token, \
                   keeping an active session alive without a full login. It must be \
@@ -963,7 +997,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_AUTH_TOKEN_SECRET",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "HMAC signing secret for session tokens. Must be at least 32 bytes. \
                   Rotate with care — outstanding tokens signed with the old secret \
                   become invalid. Provide via your secret manager; never commit.",
@@ -972,7 +1006,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_CSRF",
-        default: "unset (on)",
+        default: Cow::Borrowed("unset (on)"),
         purpose: "Set to `off`, `0`, or `false` to disable CSRF protection. \
                   Disabling widens the trust boundary — only safe on loopback in \
                   automated tests.",
@@ -981,7 +1015,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_REVOCATION_CAPACITY",
-        default: "1048576 (2^20)",
+        default: Cow::Borrowed("1048576 (2^20)"),
         purpose: "Maximum number of entries in the per-process token revocation store. \
                   Each entry is roughly 64 bytes; the default cap holds ~64 MB. Raise \
                   for very high user volumes with token revocation enabled.",
@@ -990,7 +1024,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_TRUSTED_PROXY",
-        default: "unset (false)",
+        default: Cow::Borrowed("unset (false)"),
         purpose: "Set to any truthy value to trust `X-Forwarded-For` / \
                   `X-Forwarded-Proto` headers for remote-address and TLS detection. \
                   Enable only when a trusted reverse proxy sits in front of this \
@@ -1000,7 +1034,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_BANNER",
-        default: "unset (on in dev)",
+        default: Cow::Borrowed("unset (on in dev)"),
         purpose: "Set to `off`, `0`, or `false` to disable the reconnection-status \
                   banner in the browser client.",
         subsystem: Subsystem::Web,
@@ -1008,7 +1042,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_BASE_PATH",
-        default: "unset (root-mounted)",
+        default: Cow::Borrowed("unset (root-mounted)"),
         purpose: "Sub-app mount prefix, e.g. `/billing`. All session-cookie, \
                   CSRF-cookie, and asset paths are scoped to this prefix. Set \
                   automatically when mounting a sub-app. After trimming, \
@@ -1023,7 +1057,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_CSRF_ORIGIN_CHECK",
-        default: "unset (off)",
+        default: Cow::Borrowed("unset (off)"),
         purpose: "Set to `on` to enforce strict `Origin`-header cross-origin checking \
                   on top of the double-submit CSRF token.",
         subsystem: Subsystem::Web,
@@ -1031,7 +1065,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_FRAME_ANCESTORS",
-        default: "unset (no embedding allowed)",
+        default: Cow::Borrowed("unset (no embedding allowed)"),
         purpose: "Space-separated `frame-ancestors` sources of the default \
                   `Content-Security-Policy` sent on HTML responses, e.g. \
                   `https://app.example.com`. Enables embedding this app in a \
@@ -1043,7 +1077,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_HEARTBEAT_TTL_MS",
-        default: "35000",
+        default: Cow::Borrowed("35000"),
         purpose: "SSE heartbeat interval (ms) the browser uses to detect a stale \
                   connection.",
         subsystem: Subsystem::Web,
@@ -1051,7 +1085,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_HELLO_TIMEOUT_MS",
-        default: "8000",
+        default: Cow::Borrowed("8000"),
         purpose: "Timeout (ms) for the initial SSE hello handshake. The browser \
                   closes and retries if this deadline passes.",
         subsystem: Subsystem::Web,
@@ -1059,7 +1093,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_MAX_BODY_BYTES",
-        default: "33554432 (32 MiB)",
+        default: Cow::Borrowed("33554432 (32 MiB)"),
         purpose: "Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise \
                   for large file uploads; lower to tighten the DoS floor.",
         subsystem: Subsystem::Web,
@@ -1067,32 +1101,22 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_MAX_SESSIONS",
-        default: "50000",
+        default: Cow::Borrowed("50000"),
         purpose: "Maximum concurrent web sessions before new connections are rejected. \
                   Prevents unbounded memory growth under a session-creation flood.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
-        name: "IPE_WEB_PORT",
-        default: "8000",
-        purpose: "TCP port an `Ipe.Web` app listens on. A value outside `1..=65535` \
-                  (empty, non-numeric, signed, `0`, or too large) is ignored and \
-                  8000 is used. Under `ipe dev watch` the supervisor chooses the port, \
-                  so this value has no effect there.",
-        subsystem: Subsystem::Web,
-        class: Class::Tunable,
-    },
-    EnvVar {
         name: "IPE_WEB_QUEUE_MAX",
-        default: "50",
+        default: Cow::Borrowed("50"),
         purpose: "Maximum queued events per session before back-pressure is applied.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WEB_RESET_STATE",
-        default: "unset (off)",
+        default: Cow::Borrowed("unset (off)"),
         purpose: "Set to `1`, `true`, `yes`, or `on` to force every returning session \
                   to a fresh `init`, bypassing the additive-superset checkpoint splice. \
                   Injected by `ipe dev watch --reset-state`; never set in production. \
@@ -1103,7 +1127,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_RETRY_BASE_MS",
-        default: "500",
+        default: Cow::Borrowed("500"),
         purpose: "Initial retry interval (ms) for client reconnection after a \
                   disconnect.",
         subsystem: Subsystem::Web,
@@ -1111,7 +1135,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_RETRY_FAST_MS",
-        default: "200",
+        default: Cow::Borrowed("200"),
         purpose: "Fast-retry interval (ms) used during the fast-retry window after a \
                   hot-reload disconnect.",
         subsystem: Subsystem::Web,
@@ -1119,7 +1143,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_RETRY_FAST_WINDOW_MS",
-        default: "3000",
+        default: Cow::Borrowed("3000"),
         purpose: "Duration (ms) of the fast-retry window after a disconnect. Set to \
                   `8000` automatically by `ipe dev watch` to accommodate server restart \
                   time.",
@@ -1128,21 +1152,21 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_RETRY_MAX_ATTEMPTS",
-        default: "10",
+        default: Cow::Borrowed("10"),
         purpose: "Maximum reconnection attempts before the client stops retrying.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WEB_RETRY_MAX_MS",
-        default: "16000",
+        default: Cow::Borrowed("16000"),
         purpose: "Maximum retry interval (ms) — the exponential back-off ceiling.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
     EnvVar {
         name: "IPE_WEB_SHUTDOWN_GRACE_MS",
-        default: "1500",
+        default: Cow::Borrowed("1500"),
         purpose: "Grace period (ms) between receiving SIGTERM and closing active \
                   connections. Allows in-flight requests to complete. Set to `0` for \
                   immediate shutdown.",
@@ -1151,7 +1175,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_SSE_BUFFER",
-        default: "16",
+        default: Cow::Borrowed("16"),
         purpose: "SSE channel buffer capacity per session (clamped 1–1024). A full \
                   buffer applies TCP backpressure rather than dropping events.",
         subsystem: Subsystem::Web,
@@ -1159,7 +1183,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_STATIC_DIR",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Directory served at `/static/*`. Populated from `package.ipe [web] \
                   static`. Path traversal is blocked by construction.",
         subsystem: Subsystem::Web,
@@ -1167,7 +1191,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_STORE",
-        default: "memory",
+        default: Cow::Borrowed("memory"),
         purpose: "Session-store backend for the web server: `memory` (per-process, \
                   lost on restart), `file` (persisted to `IPE_WEB_STORE_PATH`, no \
                   database dependency), or `sqlite`/`postgres`/`redis` (persisted, \
@@ -1186,7 +1210,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_STORE_PATH",
-        default: "unset (temp file)",
+        default: Cow::Borrowed("unset (temp file)"),
         purpose: "Filesystem path for the `file` or `sqlite` session store. Ignored \
                   when `IPE_WEB_STORE` is `memory`. Unset uses a per-process temporary file.",
         subsystem: Subsystem::Web,
@@ -1194,7 +1218,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_SWAP_TOAST",
-        default: "unset (off)",
+        default: Cow::Borrowed("unset (off)"),
         purpose: "Set by the `ipe dev watch` blue-green proxy on the app it supervises. \
                   Tells the web client a reconnect is an expected rebuild cutover, so it \
                   greets it with a brief positive \"updated ✓\" toast instead of the \
@@ -1204,7 +1228,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_TTL",
-        default: "1800 (30 min)",
+        default: Cow::Borrowed("1800 (30 min)"),
         purpose: "Session idle TTL. Accepts seconds (`1800`) or duration strings \
                   (`30m`, `1h`). Takes precedence over `Web.sessionTtl`.",
         subsystem: Subsystem::Web,
@@ -1213,7 +1237,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── WebSocket ─────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_WS_HEARTBEAT",
-        default: "30",
+        default: Cow::Borrowed("30"),
         purpose: "WebSocket ping interval (seconds). A peer that does not respond \
                   within two intervals is considered dead and disconnected.",
         subsystem: Subsystem::Ws,
@@ -1221,7 +1245,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WS_MAX_CONNECTIONS",
-        default: "1024",
+        default: Cow::Borrowed("1024"),
         purpose: "Ceiling on simultaneously live server WebSocket peers. Each peer \
                   pins a registry slot, an mpsc channel, and a heartbeat task; an \
                   upgrade beyond the ceiling is refused with 503 before any slot is \
@@ -1231,7 +1255,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WS_MAX_MESSAGE_BYTES",
-        default: "1048576 (1 MiB)",
+        default: Cow::Borrowed("1048576 (1 MiB)"),
         purpose: "Maximum WebSocket message size (bytes) for both client and server \
                   connections. Messages larger than this limit are rejected.",
         subsystem: Subsystem::Ws,
@@ -1239,7 +1263,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WS_SEND_BUFFER",
-        default: "256",
+        default: Cow::Borrowed("256"),
         purpose: "Per-connection outbound frame buffer depth. A full buffer applies \
                   backpressure (the send kernel returns `Err`) rather than dropping \
                   frames.",
@@ -1249,7 +1273,7 @@ pub static ENV_VARS: &[EnvVar] = &[
     // ── UI render ─────────────────────────────────────────────────────────────
     EnvVar {
         name: "IPE_EXPLAIN_VERBOSE",
-        default: "unset",
+        default: Cow::Borrowed("unset"),
         purpose: "Enable the verbose `Debug.explain` dev overlay: each explained \
                   layout box gets a `title` tooltip annotating its type, width, and \
                   padding. Accepts `1`, `true`, or `on` (case-insensitive). \
@@ -1287,6 +1311,8 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_GETENV_KIND_NOT_UNICODE", // runtime getenv failure-kind tests: a fixed name, never read in production
     "IPE_GETENV_KIND_READABLE", // runtime getenv failure-kind tests: a fixed name, never read in production
     "IPE_GETENV_NOT_UNICODE_PROBE", // runtime getenv failure-kind tests: selects the non-Unicode re-exec probe
+    "IPE_GRAMMAR_NEW", // env grammar test: a replacement name only quoted in a retired-key message
+    "IPE_GRAMMAR_PROBE", // env grammar test: a fixed probe key, never read in production
     "IPE_HOST_ENV_TEST_UNSET_7F3A9C21D84E", // sandbox host_env test: a name no host sets
     "IPE_HTTP_TEST_URL",
     "IPE_INDEX_EXTRACTOR", // ipe-index build script: extractor digest handed to the crate at compile time
@@ -1294,6 +1320,14 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_LOAD_ENV_PROBE_VAR",
     "IPE_ORACLE_SHARED_TARGET",
     "IPE_PDEATH_PROBE", // parent-death spawner test: selects the re-executed probe mode
+    "IPE_REGISTRY_TEST_CHOICE_B", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_NEW", // env registry test: a replacement name only quoted in a retired-key message
+    "IPE_REGISTRY_TEST_PORT_A", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_C", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_GOOD", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_SERVED", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_PORT_UNSET", // env registry test: a fixed fixture key, never read in production
+    "IPE_REGISTRY_TEST_RETIRED", // env registry test: a fixed fixture key, never read in production
     "IPE_REVOCATION_INSTALL_CHILD", // runtime Web revocation test: marks the install re-exec
     "IPE_RUN_WITH_TEST_VAR",
     "IPE_SECRET_E2E",                   // Windows jail e2e test sentinel
@@ -1353,7 +1387,7 @@ mod tests {
     fn env_vars_sorted_within_subsystem() {
         // Collect subsystem-buckets in the order they appear.
         let mut last: Option<(&str, Subsystem)> = None;
-        for v in ENV_VARS {
+        for v in HAND_TABLE {
             if let Some((prev_name, prev_sub)) = last
                 && v.subsystem == prev_sub
             {
@@ -1383,7 +1417,7 @@ mod tests {
     #[test]
     fn env_var_names_unique() {
         let mut seen = std::collections::HashSet::new();
-        for v in ENV_VARS {
+        for v in ENV_VARS.iter() {
             assert!(seen.insert(v.name), "ENV_VARS: duplicate name '{}'", v.name);
         }
     }
@@ -1408,6 +1442,46 @@ mod tests {
                 .iter()
                 .all(|v| v.name != "IPE_INTERNAL_LISTEN_PORT"),
             "the relocation var is internal and must never be documented"
+        );
+    }
+
+    /// The merged table keeps each section together and alphabetical.
+    #[test]
+    fn merged_table_is_grouped_and_sorted() {
+        let keys: Vec<(usize, &str)> = ENV_VARS
+            .iter()
+            .map(|v| (subsystem_rank(v.subsystem), v.name))
+            .collect();
+        assert!(keys.is_sorted(), "{keys:?}");
+    }
+
+    /// A variable the runtime registry declares is documented from that
+    /// declaration alone, never also by hand; an internal one is never
+    /// documented.
+    #[test]
+    fn registry_and_hand_table_are_disjoint() {
+        for entry in ipe_runtime_rust::env_registry::registry() {
+            assert!(
+                HAND_TABLE.iter().all(|v| v.name != entry.name()),
+                "{} is declared in the runtime registry and must not be hand-documented",
+                entry.name()
+            );
+            let documented = ENV_VARS.iter().filter(|v| v.name == entry.name()).count();
+            let internal = entry.class() == ipe_runtime_rust::env_grammar::Class::Internal;
+            assert_eq!(documented, usize::from(!internal), "{}", entry.name());
+        }
+    }
+
+    /// A registry row carries the registry's own default and purpose.
+    #[test]
+    fn registry_rows_carry_the_registry_text() {
+        let entry = ipe_runtime_rust::env_registry::web::WEB_PORT.entry();
+        let row = ENV_VARS.iter().find(|v| v.name == entry.name());
+        assert!(
+            row.is_some_and(|v| v.default == "8000"
+                && v.purpose == entry.purpose()
+                && v.subsystem == Subsystem::Web),
+            "{row:?}"
         );
     }
 

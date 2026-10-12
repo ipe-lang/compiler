@@ -1383,6 +1383,21 @@ mod lexical {
             reason: "callers pass `IPE_*_TOKEN` literals, which the literal rule scans",
         },
         Allowed {
+            file: "src/runtime/rust/src/env_registry/mod.rs",
+            func: "check",
+            reason: "reads one registry entry, and every registered name carries the `IPE_` prefix",
+        },
+        Allowed {
+            file: "src/runtime/rust/src/env_registry/mod.rs",
+            func: "read",
+            reason: "reads one registry entry, and every registered name carries the `IPE_` prefix",
+        },
+        Allowed {
+            file: "src/runtime/rust/src/log.rs",
+            func: "env_threshold",
+            reason: "reads the registered `IPE_LOG_LEVEL` entry named in its own body",
+        },
+        Allowed {
             file: "src/runtime/rust/src/web/push_exporter.rs",
             func: "raw",
             reason: "reads `ExporterEnv::name`, a closed match over fixed `IPE_*` literals",

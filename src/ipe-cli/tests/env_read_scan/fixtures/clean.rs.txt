@@ -1,0 +1,22 @@
+//! Names `IPE_FIXTURE_PROSE` in prose only.
+
+/// Reads `IPE_FIXTURE_DOC` through its registry key.
+pub fn shell_path() -> Option<String> {
+    // IPE_FIXTURE_COMMENT is a comment, not a read.
+    crate::read_env_var("PATH")
+}
+
+pub fn method(store: &Store) -> Option<String> {
+    store.read_env_var("name")
+}
+
+macro_rules! host {
+    () => {
+        $crate::read_env_var("HOME")
+    };
+}
+
+pub fn read_env_var(name: &str) -> Option<String> {
+    let _ = name;
+    None
+}
