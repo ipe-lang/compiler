@@ -13,32 +13,43 @@ use std::collections::HashMap;
 #[cfg(feature = "db")]
 use std::sync::OnceLock;
 
-/// A fixed, valid cost-12 bcrypt hash used ONLY to make the unknown-email login
-/// path do the same KDF work as the known-email path (anti-enumeration timing
-/// defence). Computed once; the verify result is always discarded. Cost 12
-/// matches the register default so both paths cost the same. Only the db
-/// `auth_login` flow consumes it, so it is `db`-gated alongside its sole caller
-/// — a `jwt`-without-`db` auth build (hash/verify/sign kernels only) needs
-/// neither.
+/// The bcrypt cost registration hashes at, and the login decoy hashes at.
+///
+/// One cost for both makes the unknown-email login path do the same KDF work
+/// as the known-email path, so login timing names no account.
+const REGISTER_COST: BcryptCost = BcryptCost(12);
+
+/// A valid bcrypt hash at [`REGISTER_COST`], the decoy when hashing fails.
+///
+/// Its cost field is tied to [`REGISTER_COST`] by a test that parses it.
+#[cfg(feature = "db")]
+const DECOY_FALLBACK_HASH: &str = "$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW";
+
+/// The bcrypt hash at [`REGISTER_COST`] an unknown-email login verifies against.
+///
+/// It makes the unknown-email path do the known-email path's KDF work
+/// (anti-enumeration timing defence). Computed once; the verify result is
+/// always discarded. Only the db `auth_login` flow consumes it, so it is
+/// `db`-gated alongside its sole caller: a `jwt`-without-`db` auth build
+/// (hash/verify/sign kernels only) needs neither.
 #[cfg(feature = "db")]
 fn dummy_bcrypt_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
     HASH.get_or_init(|| {
         // bcrypt::hash is infallible for a fixed valid input + cost; on the
-        // structurally-unreachable Err, fall back to a static valid cost-12
-        // hash literal so the verify still runs the KDF.
-        bcrypt::hash("ipe-login-timing-defence", 12).unwrap_or_else(|_| {
-            "$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW".to_string()
-        })
+        // structurally-unreachable Err, the fallback literal at the same cost
+        // keeps the verify running the KDF.
+        bcrypt::hash("ipe-login-timing-defence", REGISTER_COST.get())
+            .unwrap_or_else(|_| DECOY_FALLBACK_HASH.to_owned())
     })
 }
 
 // ─── Pure crypto kernels ──────────────────────────────────────────────
 
-/// Ipê `hashPassword : String -> Result Error String`. Bcrypt with default
-/// cost 12.
+/// Ipê `hashPassword : String -> Result Error String`. Bcrypt at
+/// [`REGISTER_COST`], the login decoy's cost.
 pub fn auth_hash_password<E: From<String>>(pw: String) -> IpeResult<E, String> {
-    auth_hash_password_cost(pw, 12)
+    auth_hash_password_cost(pw, i64::from(REGISTER_COST.get()))
 }
 
 /// The lowest bcrypt cost the library accepts.
@@ -1129,7 +1140,7 @@ pub fn auth_login<
             }
             Ok(None) => {
                 // TIMING: perform an equal-cost bcrypt verify against a fixed
-                // cost-12 hash so the unknown-email path does the same hashing
+                // `REGISTER_COST` hash so the unknown-email path does the same hashing
                 // work as the known-email path — removing the email-enumeration
                 // timing oracle. The verify result is discarded; a refused
                 // thread is `Unavailable`, as on the known-email path.
@@ -2661,6 +2672,28 @@ mod tests {
         assert_eq!(BcryptCost::clamped(-5), BcryptCost(BCRYPT_COST_MIN));
         assert_eq!(BcryptCost::clamped(12), BcryptCost(12));
         assert_eq!(BcryptCost::clamped(i64::MAX), BcryptCost(BCRYPT_COST_MAX));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_login_decoy_hashes_at_the_registration_cost() {
+        assert_eq!(BcryptCost::of_hash(dummy_bcrypt_hash()), Ok(REGISTER_COST));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_decoy_fallback_hash_is_at_the_registration_cost() {
+        assert_eq!(BcryptCost::of_hash(DECOY_FALLBACK_HASH), Ok(REGISTER_COST));
+        assert!(StoredHash::parse(DECOY_FALLBACK_HASH).is_ok());
+    }
+
+    #[test]
+    fn a_registered_hash_is_at_the_registration_cost() {
+        let hash: IpeResult<String, String> = auth_hash_password("password123".into());
+        assert!(matches!(
+            &hash,
+            IpeResult::Ok(h) if BcryptCost::of_hash(h) == Ok(REGISTER_COST)
+        ));
     }
 
     // ── Armed revocation gate ─────────────────────────────────────────────────
