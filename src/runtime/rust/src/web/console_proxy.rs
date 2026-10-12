@@ -724,7 +724,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(echo));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
 
         // The parent receives POST /_ipe/console/_ipe/event?x=1 with body "hi".
@@ -774,7 +774,7 @@ mod tests {
             .fallback(any(leak))
             .with_state(leak_hits.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(leak_listener, leak_app).await;
+            let _ = crate::server::serve_fixture(leak_listener, leak_app).await;
         });
 
         let leak_base = format!("http://127.0.0.1:{leak_port}");
@@ -794,7 +794,7 @@ mod tests {
             .fallback(any(redirect))
             .with_state(leak_base.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(up_listener, up_app).await;
+            let _ = crate::server::serve_fixture(up_listener, up_app).await;
         });
 
         // The same redirect-disabled client `ensure_console_proxy` constructs.
@@ -835,7 +835,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(echo_path));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
 
         let req = axum::http::Request::builder()

@@ -983,7 +983,7 @@ mod tests {
             .fallback(any(leak))
             .with_state(leak_hits.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(leak_listener, leak_app).await;
+            let _ = crate::server::serve_fixture(leak_listener, leak_app).await;
         });
 
         // The parent: answers every push with a 307 redirect to the leak target.
@@ -1004,7 +1004,7 @@ mod tests {
             .fallback(any(redirect))
             .with_state(leak_base.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(parent_listener, parent_app).await;
+            let _ = crate::server::serve_fixture(parent_listener, parent_app).await;
         });
 
         let ingest_url = format!("http://127.0.0.1:{parent_port}/_ipe/observability/ingest");
@@ -1324,7 +1324,7 @@ mod tests {
             .fallback(any(gate))
             .with_state((want, accepted.clone()));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
         (
             port,

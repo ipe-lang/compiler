@@ -81,4 +81,7 @@ const _AXUM: () = {
     // A use of an alias is not linted, so it carries no expectation.
     let _: Option<QueryAlias<()>> = None;
     let _: Option<FormAlias<()>> = None;
+    #[expect(clippy::disallowed_methods)]
+    let _ =
+        ::axum::serve::serve::<::axum::routing::IntoMakeService<::axum::Router>, ::axum::Router>;
 };
