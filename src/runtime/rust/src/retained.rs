@@ -133,7 +133,7 @@ macro_rules! inline_measure {
 }
 pub(crate) use inline_measure;
 
-inline_measure!(
+crate::retained::inline_measure!(
     bool,
     char,
     (),
@@ -153,7 +153,7 @@ inline_measure!(
     f64,
 );
 
-inline_measure!(IpeOrder, IpeErrorKind, IpeDbFailure, IpeAuthError);
+crate::retained::inline_measure!(IpeOrder, IpeErrorKind, IpeDbFailure, IpeAuthError);
 
 // ─── Strings ─────────────────────────────────────────────────────────────────
 
@@ -448,9 +448,7 @@ mod tests {
         let shared: Arc<String> = Arc::new("a".repeat(k));
         let mut one = Vec::with_capacity(2);
         one.push(Arc::clone(&shared));
-        let mut two = Vec::with_capacity(2);
-        two.push(Arc::clone(&shared));
-        two.push(Arc::clone(&shared));
+        let two = vec![Arc::clone(&shared), Arc::clone(&shared)];
         let k = u64::try_from(k).unwrap();
         assert!(measure(&two) >= measure(&one) + k);
 

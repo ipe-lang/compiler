@@ -1028,15 +1028,15 @@ fn emit_enum_variant_lines_and_arms(
                 &fmt_literal,
                 &show_args,
             ));
-            retained_arms.push(match measured {
-                Some(binders) => {
-                    let head = format!("            {name}::{vn}({}) => ", binders.join(", "));
-                    let terms: Vec<String> =
-                        binders.iter().map(|b| format!(".plus({b})")).collect();
-                    format!("{},", render_retained_chain(&head, &terms, 12))
-                }
-                None => format!("            {name}::{vn}(..) => None,"),
-            });
+            let measured_arm = |binders: Vec<String>| {
+                let head = format!("            {name}::{vn}({}) => ", binders.join(", "));
+                let terms: Vec<String> = binders.iter().map(|b| format!(".plus({b})")).collect();
+                format!("{},", render_retained_chain(&head, &terms, 12))
+            };
+            retained_arms.push(measured.map_or_else(
+                || format!("            {name}::{vn}(..) => None,"),
+                measured_arm,
+            ));
         }
     }
     Ok(EnumArms {
