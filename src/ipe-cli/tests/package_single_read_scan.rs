@@ -9,9 +9,11 @@
 //! non-test items of `src/audit.rs` and `src/publish.rs`, and the admission
 //! functions of `src/driver/commands_pkg.rs`, and refuses any mention of a
 //! working-tree reader, macro bodies included. Each exempt function is named
-//! with the reason it certifies nothing.
+//! with the reason it certifies nothing. The capture itself is pinned too: each
+//! capture or tree walk may appear only at its one sanctioned site, once, so a
+//! second capture judged beside the first is refused like any other re-read.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::punctuated::Punctuated;
@@ -28,6 +30,34 @@ const BANNED: &[&str] = &[
     "extract_tree",
     "hash_source_tree",
     "include",
+    "read_package_modules",
+    "build_project",
+    "build_project_into",
+    "build_project_with_options",
+    "verify_lockfile_hashes",
+    "scan_foreign_defines",
+    "read_source_tree",
+    "read_beneath",
+];
+
+/// The captures and tree walks of the package, each with the one function it
+/// may appear in and how often there (a definition counts once).
+const CAPTURES: &[(&str, &str, usize)] = &[
+    ("run_audit_as", "capture_package", 1),
+    ("capture_package", "capture_package", 1),
+    ("capture_package", "capture_manifest_root", 1),
+    ("capture_manifest_root", "capture_manifest_root", 1),
+    ("capture_manifest_root", "PackageSnapshot::capture", 1),
+    ("run_publish", "capture_manifest_root", 1),
+    ("reprove_tree", "of_tree_within", 1),
+];
+
+/// Identifiers of the capture family [`CAPTURES`] budgets.
+const CAPTURE_NAMES: &[&str] = &[
+    "capture_package",
+    "capture_manifest_root",
+    "of_tree",
+    "of_tree_within",
 ];
 
 /// `Type::read` paths that re-read the package from disk.
@@ -119,6 +149,8 @@ struct Scan<'a> {
     reaches: BTreeSet<(String, String)>,
     /// The functions defined.
     defined: BTreeSet<String>,
+    /// Each capture-family mention, with the function it sits in, counted.
+    captures: BTreeMap<(String, String), usize>,
 }
 
 impl Scan<'_> {
@@ -141,19 +173,34 @@ impl Scan<'_> {
         }
     }
 
-    /// Record `name` when it is banned and judged.
+    /// Record `name` when it is banned or a capture, and judged.
     fn name(&mut self, name: &str) {
         if BANNED.contains(&name) && self.judged() {
             let site = self.site();
             self.reaches.insert((site, name.to_owned()));
         }
+        if CAPTURE_NAMES.contains(&name) {
+            self.capture(name.to_owned());
+        }
     }
 
-    /// Record a `Type::read` pair when it re-reads the package and is judged.
+    /// Count one capture-family mention when judged.
+    fn capture(&mut self, name: String) {
+        if self.judged() {
+            let site = self.site();
+            *self.captures.entry((site, name)).or_insert(0) += 1;
+        }
+    }
+
+    /// Record a `Type::read` pair when it re-reads the package, and a
+    /// `PackageSnapshot::capture`, when judged.
     fn pair(&mut self, owner: &str, member: &str) {
         if member == "read" && BANNED_READS.contains(&owner) && self.judged() {
             let site = self.site();
             self.reaches.insert((site, format!("{owner}::read")));
+        }
+        if owner == "PackageSnapshot" && member == "capture" {
+            self.capture(format!("{owner}::{member}"));
         }
     }
 
@@ -254,6 +301,7 @@ fn scan<'a>(source: &str, scope: Scope<'a>) -> Result<Scan<'a>, String> {
         fns: Vec::new(),
         reaches: BTreeSet::new(),
         defined: BTreeSet::new(),
+        captures: BTreeMap::new(),
     };
     found.visit_file(&file);
     Ok(found)
@@ -268,6 +316,17 @@ fn refusals(found: &Scan<'_>, required: &[&str]) -> Vec<String> {
             format!("`{name}` in `{site}`: a working-tree read beside the snapshot")
         })
         .collect();
+    for ((site, name), count) in &found.captures {
+        let budget = CAPTURES
+            .iter()
+            .find(|(at, what, _)| at == site && what == name)
+            .map_or(0, |(_, _, budget)| *budget);
+        if *count > budget {
+            out.push(format!(
+                "`{name}` {count}x in `{site}` (sanctioned {budget}x): a second capture beside the snapshot"
+            ));
+        }
+    }
     for name in required {
         if !found.defined.contains(*name) {
             out.push(format!("`{name}` is not defined"));
@@ -345,6 +404,13 @@ fn a_planted_working_tree_read_is_refused() -> Result<(), String> {
         "fn run_audit_over() { include!(\"r.rs\"); }\n",
         "mod reader;\nfn run_audit_over() { reader::r(); }\n",
         "fn other() {}\n",
+        "fn run_audit_over() { crate::resolve::verify_lockfile_hashes(root); }\n",
+        "fn run_audit_over() { crate::driver::read_package_modules(m); }\n",
+        "fn run_audit_over() { crate::driver::build_project_into(m); }\n",
+        "fn run_audit_over() { capture_package(p); }\n",
+        "fn run_audit_over() { let _ = format!(\"{:?}\", PackageSnapshot::capture(root)); }\n",
+        "fn run_audit_over() { Sha256Hex::of_tree_within(root, c); }\n",
+        "fn run_audit_over() {}\nfn run_publish() { capture_manifest_root(p); capture_manifest_root(p); }\n",
     ];
     for source in breaches {
         assert!(
@@ -352,6 +418,12 @@ fn a_planted_working_tree_read_is_refused() -> Result<(), String> {
             "refused:\n{source}"
         );
     }
+    let sanctioned = "fn run_audit_over() {}\nfn run_publish() { capture_manifest_root(p); }\n\
+        fn reprove_tree() { Sha256Hex::of_tree_within(root, c); }\n";
+    assert!(
+        refusals(&scan(sanctioned, Scope::Whole)?, &["run_audit_over"]).is_empty(),
+        "one capture at its sanctioned site passes"
+    );
     let exempt = "fn disclose_package() { parse_manifest(p); }\nfn run_audit_over() {}\n";
     assert!(
         refusals(&scan(exempt, Scope::Whole)?, &["run_audit_over"]).is_empty(),

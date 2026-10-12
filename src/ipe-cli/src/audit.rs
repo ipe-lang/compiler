@@ -861,6 +861,10 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
         ));
     }
 
+    // A committed FFI cache is publisher-supplied bindings: remove it whether
+    // or not the package declares crates, so the build only ever loads the
+    // gate-regenerated catalog (or none).
+    purge_committed_ffi_cache(&manifest.root)?;
     // Regenerate FFI bindings for native-bearing packages before the build so
     // the compiler finds `Rust.<Crate>` interface modules.
     if !manifest.rust_dependencies.is_empty() {
@@ -923,23 +927,7 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
 /// cannot be removed.
 fn regenerate_ffi_bindings(manifest_path: &Path) -> Result<(), CliError> {
     let project_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-
-    // Resolve the cache path once and assert it stays inside the project root.
-    // An attacker-authored package tree can ship `.ipe/cache/ffi` as a symlink
-    // to an out-of-tree target (committed via `git add -f`). `remove_dir_all`
-    // traverses intermediate symlinks and would delete the target; the
-    // subsequent write would go through the surviving symlink. We walk every
-    // path component between `project_root` and the intended cache dir with
-    // `symlink_metadata` (no-follow) and reject on the first symlink found,
-    // before any delete or write occurs.
-    let safe_cache = ffi_cache_path_or_reject(project_root)?;
-
-    if safe_cache.exists() {
-        std::fs::remove_dir_all(&safe_cache).map_err(|e| CliError::Io {
-            path: safe_cache.clone(),
-            source: e,
-        })?;
-    }
+    purge_committed_ffi_cache(project_root)?;
     crate::ffi::install_registry_deps_for_project(manifest_path, true).map_err(|e| {
         reject(
             Check::NativeBindingRegen,
@@ -951,6 +939,30 @@ fn regenerate_ffi_bindings(manifest_path: &Path) -> Result<(), CliError> {
             ),
         )
     })
+}
+
+/// Remove any `.ipe/cache/ffi/rust` the package tree ships, so the gate never
+/// loads publisher-supplied bindings.
+///
+/// The cache path is resolved once and asserted to stay inside `project_root`:
+/// an attacker-authored tree can ship `.ipe/cache/ffi` as a symlink to an
+/// out-of-tree target (committed via `git add -f`), and `remove_dir_all`
+/// traverses intermediate symlinks, so every component is checked no-follow
+/// before any delete.
+///
+/// # Errors
+/// [`CliError::PackageAudit`] with [`Check::NativeBindingRegen`] when a cache
+/// path component is a symlink; [`CliError::Io`] when the cache cannot be
+/// removed.
+fn purge_committed_ffi_cache(project_root: &Path) -> Result<(), CliError> {
+    let safe_cache = ffi_cache_path_or_reject(project_root)?;
+    if safe_cache.exists() {
+        std::fs::remove_dir_all(&safe_cache).map_err(|e| CliError::Io {
+            path: safe_cache.clone(),
+            source: e,
+        })?;
+    }
+    Ok(())
 }
 
 /// Resolve the `.ipe/cache/ffi/rust` path under `project_root` and verify that
@@ -1725,7 +1737,8 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
 /// [`CliError::PackageAudit`] when a locked dependency's cached tree no longer
 /// matches its pinned hash.
 fn verify_locked_dependency_hashes(prepared: &Prepared) -> Result<(), CliError> {
-    match crate::resolve::verify_lockfile_hashes(&prepared.manifest().root) {
+    match crate::resolve::verify_locked_hashes(&prepared.manifest().root, prepared.snapshot.lock())
+    {
         Ok(()) => Ok(()),
         Err(CliError::HashMismatch {
             package,
@@ -2533,6 +2546,40 @@ mod tests {
         assert!(
             !manifest.has_rust_wrapper,
             "has_rust_wrapper must be false for a rust-dependencies-only manifest"
+        );
+    }
+
+    /// A package that declares no crates still has a committed
+    /// `.ipe/cache/ffi/rust` removed before the build, so publisher-supplied
+    /// bindings never reach the catalog the certified build loads.
+    #[test]
+    fn prepare_purges_a_committed_ffi_cache_without_rust_dependencies() {
+        let dir = make_test_dir("purge-committed-cache");
+        let src = dir.join("src");
+        std::fs::create_dir(&src).expect("create src/");
+        std::fs::write(src.join("Main.ipe"), "module Main exposing (..)\n")
+            .expect("write Main.ipe");
+        std::fs::write(
+            dir.join("package.ipe"),
+            "module Package exposing (package)\n\n\npackage =\n\
+             \x20   { name = \"cache-pkg\", version = \"0.1.0\" }\n",
+        )
+        .expect("write package.ipe");
+        let cache = dir.join(".ipe/cache/ffi/rust");
+        std::fs::create_dir_all(&cache).expect("create committed cache");
+        std::fs::write(cache.join("evil_bindings.rs"), "pub fn evil() {}\n")
+            .expect("plant committed bindings");
+
+        let result = capture_package(&dir).and_then(prepare);
+        let survived = cache.exists();
+        if let Ok(prepared) = &result {
+            let _ = std::fs::remove_dir_all(&prepared.emitted_dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !survived,
+            "a committed FFI cache must be removed before the build: {:?}",
+            result.as_ref().err()
         );
     }
 
