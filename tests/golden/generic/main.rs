@@ -45,6 +45,15 @@ impl<T1: IpeStringify> IpeStringify for MainOpt<T1> {
     }
 }
 
+impl<T1: RetainedBytes> RetainedBytes for MainOpt<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainOpt::Som(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainOpt::Non => Bytes::inline::<Self>(),
+        }
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

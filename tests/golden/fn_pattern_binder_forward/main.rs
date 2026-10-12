@@ -50,6 +50,14 @@ impl IpeStringify for MainCodec {
     }
 }
 
+impl RetainedBytes for MainCodec {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainCodec::Codec(..) => None,
+        }
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

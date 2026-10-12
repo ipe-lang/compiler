@@ -51,12 +51,26 @@ impl<T1: IpeStringify + 'static> IpeStringify for MainCodec<T1> {
     }
 }
 
+impl<T1: RetainedBytes + 'static> RetainedBytes for MainCodec<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainCodec::Codec(..) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rec_ {}
 
 impl IpeStringify for Rec_ {
     fn ipe_show(&self) -> String {
         "{}".to_string()
+    }
+}
+
+impl RetainedBytes for Rec_ {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()
     }
 }
 
@@ -77,6 +91,12 @@ impl<T1: Clone + 'static> Clone for RecEncMkDec<T1> {
 impl<T1: IpeStringify + 'static> IpeStringify for RecEncMkDec<T1> {
     fn ipe_show(&self) -> String {
         format!("{{{} {}}}", "<function>", "<function>")
+    }
+}
+
+impl<T1: RetainedBytes + 'static> RetainedBytes for RecEncMkDec<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
     }
 }
 

@@ -47,6 +47,12 @@ impl IpeStringify for MainMedal {
     }
 }
 
+impl RetainedBytes for MainMedal {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

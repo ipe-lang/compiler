@@ -51,6 +51,14 @@ impl<T1: IpeStringify + 'static> IpeStringify for MainDecBox<T1> {
     }
 }
 
+impl<T1: RetainedBytes + 'static> RetainedBytes for MainDecBox<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainDecBox::DecBox(..) => None,
+        }
+    }
+}
+
 pub struct RecDec<T1: 'static> {
     dec: Decoder<T1>,
 }
@@ -66,6 +74,12 @@ impl<T1: Clone + 'static> Clone for RecDec<T1> {
 impl<T1: IpeStringify + 'static> IpeStringify for RecDec<T1> {
     fn ipe_show(&self) -> String {
         format!("{{{}}}", IpeStringify::ipe_show(&self.dec))
+    }
+}
+
+impl<T1: RetainedBytes + 'static> RetainedBytes for RecDec<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
     }
 }
 

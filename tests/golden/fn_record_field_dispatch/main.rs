@@ -50,6 +50,12 @@ impl IpeStringify for RecAddMul {
     }
 }
 
+impl RetainedBytes for RecAddMul {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

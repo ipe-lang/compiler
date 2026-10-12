@@ -60,6 +60,12 @@ impl IpeStringify for RecCountFormatLabelOnChange {
     }
 }
 
+impl RetainedBytes for RecCountFormatLabelOnChange {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

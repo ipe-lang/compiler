@@ -54,6 +54,12 @@ impl IpeStringify for RecInnerName {
     }
 }
 
+impl RetainedBytes for RecInnerName {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
+    }
+}
+
 pub struct RecOpTag {
     op: ::std::sync::Arc<dyn Fn(i64) -> i64 + Send + Sync + 'static>,
     tag: i64,
@@ -71,6 +77,12 @@ impl Clone for RecOpTag {
 impl IpeStringify for RecOpTag {
     fn ipe_show(&self) -> String {
         format!("{{{} {}}}", "<function>", IpeStringify::ipe_show(&self.tag))
+    }
+}
+
+impl RetainedBytes for RecOpTag {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
     }
 }
 

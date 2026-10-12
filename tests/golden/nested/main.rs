@@ -45,6 +45,15 @@ impl<T1: IpeStringify> IpeStringify for MainBox<T1> {
     }
 }
 
+impl<T1: RetainedBytes> RetainedBytes for MainBox<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainBox::Wrap(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainBox::Empty => Bytes::inline::<Self>(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MainTree {
     Node(Box<MainTree>, i64, Box<MainTree>),
@@ -65,6 +74,15 @@ impl IpeStringify for MainTree {
     }
 }
 
+impl RetainedBytes for MainTree {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainTree::Node(p0, p1, p2) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1)?.plus(p2),
+            MainTree::Leaf => Bytes::inline::<Self>(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecXY {
     x: i64,
@@ -78,6 +96,12 @@ impl IpeStringify for RecXY {
             IpeStringify::ipe_show(&self.x),
             IpeStringify::ipe_show(&self.y)
         )
+    }
+}
+
+impl RetainedBytes for RecXY {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.x)?.plus(&self.y)
     }
 }
 

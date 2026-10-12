@@ -48,6 +48,12 @@ impl IpeStringify for RecRun {
     }
 }
 
+impl RetainedBytes for RecRun {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
+    }
+}
+
 pub struct RecShouldRetry {
     shouldRetry: ::std::sync::Arc<dyn Fn(i64) -> i64 + Send + Sync + 'static>,
 }
@@ -63,6 +69,12 @@ impl Clone for RecShouldRetry {
 impl IpeStringify for RecShouldRetry {
     fn ipe_show(&self) -> String {
         format!("{{{}}}", "<function>")
+    }
+}
+
+impl RetainedBytes for RecShouldRetry {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
     }
 }
 

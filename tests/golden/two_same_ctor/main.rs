@@ -45,6 +45,15 @@ impl<T1: IpeStringify> IpeStringify for MainBox<T1> {
     }
 }
 
+impl<T1: RetainedBytes> RetainedBytes for MainBox<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainBox::Wrap(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainBox::Empty => Bytes::inline::<Self>(),
+        }
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

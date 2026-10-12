@@ -41,6 +41,12 @@ impl IpeStringify for RecValue {
     }
 }
 
+impl RetainedBytes for RecValue {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.value)
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

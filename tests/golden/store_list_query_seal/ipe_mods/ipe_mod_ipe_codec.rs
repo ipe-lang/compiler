@@ -29,6 +29,22 @@ impl IpeStringify for IpeCodecColType {
     }
 }
 
+impl RetainedBytes for IpeCodecColType {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeCodecColType::CText => Bytes::inline::<Self>(),
+            IpeCodecColType::CInt => Bytes::inline::<Self>(),
+            IpeCodecColType::CReal => Bytes::inline::<Self>(),
+            IpeCodecColType::CBool => Bytes::inline::<Self>(),
+            IpeCodecColType::CBlob => Bytes::inline::<Self>(),
+            IpeCodecColType::CTime => Bytes::inline::<Self>(),
+            IpeCodecColType::CDecimal => Bytes::inline::<Self>(),
+            IpeCodecColType::CMoney => Bytes::inline::<Self>(),
+            IpeCodecColType::CNull(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeCodecShape {
     SRecord(Vec<(String, IpeCodecColType)>),
@@ -42,6 +58,16 @@ impl IpeStringify for IpeCodecShape {
             IpeCodecShape::SRecord(p0) => format!("SRecord {}", IpeStringify::ipe_show(p0)),
             IpeCodecShape::SScalar(p0) => format!("SScalar {}", IpeStringify::ipe_show(p0)),
             IpeCodecShape::SBlob => "SBlob".to_string(),
+        }
+    }
+}
+
+impl RetainedBytes for IpeCodecShape {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeCodecShape::SRecord(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCodecShape::SScalar(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCodecShape::SBlob => Bytes::inline::<Self>(),
         }
     }
 }
@@ -62,6 +88,14 @@ impl<T1: IpeStringify + 'static> IpeStringify for IpeCodecCodec<T1> {
     fn ipe_show(&self) -> String {
         match self {
             IpeCodecCodec::Codec(_) => format!("Codec {}", "<function>"),
+        }
+    }
+}
+
+impl<T1: RetainedBytes + 'static> RetainedBytes for IpeCodecCodec<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeCodecCodec::Codec(..) => None,
         }
     }
 }
