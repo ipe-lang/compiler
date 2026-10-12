@@ -591,7 +591,7 @@ mod tests {
             hot_appearance: true,
             webview_host: true,
         };
-        assert!(changed.mount_base != ipe_backend_rust::MountBase::root());
+        assert_ne!(changed.mount_base, ipe_backend_rust::MountBase::root());
         let second = owner.sync_config(changed.clone());
         assert!(first == second, "a warm sync keeps the one config handle");
         let db = owner.db();
