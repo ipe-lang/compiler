@@ -1056,14 +1056,6 @@ static HAND_TABLE: &[EnvVar] = &[
         class: Class::Tunable,
     },
     EnvVar {
-        name: "IPE_WEB_CSRF_ORIGIN_CHECK",
-        default: Cow::Borrowed("unset (off)"),
-        purpose: "Set to `on` to enforce strict `Origin`-header cross-origin checking \
-                  on top of the double-submit CSRF token.",
-        subsystem: Subsystem::Web,
-        class: Class::SecurityTunable,
-    },
-    EnvVar {
         name: "IPE_WEB_FRAME_ANCESTORS",
         default: Cow::Borrowed("unset (no embedding allowed)"),
         purpose: "Space-separated `frame-ancestors` sources of the default \
