@@ -2369,9 +2369,8 @@ fn exhaust_builtin_adt_nested_nonexhaustive() {
 }
 
 /// A TOP-level `case` over a Prelude built-in ADT (`ErrorKind`) that omits
-/// variants must ALSO be IPE-T0010 — not a `Diagnostic::CompilerBug` ("top
-/// constructors cover 2 of 11"), the shape the pre-fix lower backstop produced.
-/// Guards the second CO-TYPES-001 variant.
+/// variants is IPE-T0010 too, never a `Diagnostic::CompilerBug` from lower's
+/// constructor-coverage backstop.
 #[test]
 fn exhaust_builtin_adt_toplevel_nonexhaustive() {
     let src = format!(

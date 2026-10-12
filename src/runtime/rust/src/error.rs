@@ -34,7 +34,7 @@ use crate::core::IpeMaybe;
 /// `IpeOrder`'s convention). The order is append-only: each discriminant is
 /// stable across serde and the JS port. Canon's `BuiltinUnion` ctor table
 /// (`src/compiler/canon/src/builtins.rs`) mirrors it, and
-/// `src/compiler/kernels/tests/error_kind_agreement.rs` pins the two equal.
+/// `src/ipe-cli/tests/error_kind_agreement.rs` pins the two equal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
@@ -800,7 +800,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn kinds_round_trip_through_serde_by_variant_name() {
-        for kind in [IpeErrorKind::LimitExceeded, IpeErrorKind::InvalidInput] {
+        for kind in IpeErrorKind::ALL {
             let wire = serde_json::to_string(&kind).expect("serialize");
             assert_eq!(wire, format!("\"{}\"", kind.label()));
             let back: IpeErrorKind = serde_json::from_str(&wire).expect("deserialize");

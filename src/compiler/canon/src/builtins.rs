@@ -185,8 +185,8 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
         qualified_home: None,
     },
     // `ErrorKind` — 12 nullary constructors, append-only. The runtime's
-    // `IpeErrorKind` mirrors this list; `tests/error_kind_agreement.rs` pins the
-    // two equal in names and discriminants.
+    // `IpeErrorKind` mirrors this list; `src/ipe-cli/tests/error_kind_agreement.rs`
+    // pins the two equal in names and discriminants.
     BuiltinUnion {
         type_name: "ErrorKind",
         ctors: &[
