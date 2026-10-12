@@ -947,7 +947,7 @@ async fn do_fetch<E: From<String> + FromLimitExceeded + 'static>(
     };
     let body = match read_wasm_body_capped(&resp, cap).await {
         Ok(b) => b,
-        Err(e) => return IpeResult::Err(e.into_error()),
+        Err(e) => return IpeResult::Err(e),
     };
 
     ok_res(HttpResponse {
@@ -964,10 +964,10 @@ async fn do_fetch<E: From<String> + FromLimitExceeded + 'static>(
 /// bounded to `cap` resident bytes by construction, never fully buffered first.
 /// Decodes UTF-8 lossily (parity with the native arm and `Http.Stream`).
 #[cfg(all(target_arch = "wasm32", feature = "wasm-client"))]
-async fn read_wasm_body_capped(
+async fn read_wasm_body_capped<E: From<String> + FromLimitExceeded>(
     resp: &web_sys::Response,
     cap: usize,
-) -> Result<String, KernelFailure> {
+) -> Result<String, E> {
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
 
@@ -979,13 +979,13 @@ async fn read_wasm_body_capped(
     let reader: web_sys::ReadableStreamDefaultReader = stream
         .get_reader()
         .dyn_into()
-        .map_err(|_| KernelFailure::from("http: failed reading response body".to_string()))?;
+        .map_err(|_| E::from("http: failed reading response body".to_string()))?;
 
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let result = JsFuture::from(reader.read())
             .await
-            .map_err(|_| KernelFailure::from("http: failed reading response body".to_string()))?;
+            .map_err(|_| E::from("http: failed reading response body".to_string()))?;
         // Each read resolves to `{ done: bool, value: Uint8Array }`.
         let done = js_sys::Reflect::get(&result, &JsValue::from_str("done"))
             .ok()
@@ -1002,7 +1002,7 @@ async fn read_wasm_body_capped(
                 return Err(LimitRefusal::new(format!(
                     "http: response body too large (> {cap} bytes; raise IPE_HTTP_MAX_BODY_BYTES)"
                 ))
-                .into());
+                .into_error());
             }
             let start = buf.len();
             buf.resize(start + len, 0);
