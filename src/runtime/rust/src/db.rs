@@ -3426,6 +3426,56 @@ fn bind_sql_param<'q>(q: DbQuery<'q>, p: SqlParam) -> DbQuery<'q> {
 // combinator propagates the first poison it sees; the two consumers surface
 // it as a `Task::Err` rather than emitting malformed SQL.
 
+/// Why a [`SqlFragment`] is poisoned: the refusal text, and whether a declared
+/// ceiling refused the input rather than its shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FragmentPoison {
+    reason: String,
+    kind: PoisonKind,
+}
+
+/// The error kind a [`FragmentPoison`] surfaces as at the kernel edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoisonKind {
+    /// A malformed identifier or pattern: an `Unexpected` error.
+    Refused,
+    /// An input past a declared size ceiling: a `LimitExceeded` error.
+    LimitExceeded,
+}
+
+impl FragmentPoison {
+    /// A shape refusal carrying `reason`.
+    const fn refused(reason: String) -> Self {
+        Self {
+            reason,
+            kind: PoisonKind::Refused,
+        }
+    }
+
+    /// A ceiling refusal carrying `reason`.
+    const fn limit_exceeded(reason: String) -> Self {
+        Self {
+            reason,
+            kind: PoisonKind::LimitExceeded,
+        }
+    }
+
+    /// The refusal text, without the kernel prefix.
+    fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// The task error `kernel` fails with: `<kernel>: <reason>`, classified by
+    /// the poison's kind.
+    fn to_error<E: From<String> + crate::FromIpeError>(&self, kernel: &str) -> E {
+        let message = format!("{kernel}: {}", self.reason);
+        match self.kind {
+            PoisonKind::Refused => E::from(message),
+            PoisonKind::LimitExceeded => E::from_ipe_error(IpeError::limit_exceeded(message)),
+        }
+    }
+}
+
 /// `Ipe.Db.Sql`'s opaque, parameterized WHERE-fragment value.
 ///
 /// The derived `PartialEq` precondition is verified above: every `SqlParam`
@@ -3437,7 +3487,7 @@ fn bind_sql_param<'q>(q: DbQuery<'q>, p: SqlParam) -> DbQuery<'q> {
 pub struct SqlFragment {
     sql: String,
     binds: Vec<SqlParam>,
-    invalid: Option<String>,
+    invalid: Option<FragmentPoison>,
 }
 
 crate::stringify::show_row!("SqlFragment", Redacted, [] SqlFragment, |_| crate::stringify::REDACTED_SHOW.to_owned());
@@ -3479,7 +3529,9 @@ pub fn sql_column(name: String) -> SqlFragment {
         SqlFragment {
             sql: String::new(),
             binds: Vec::new(),
-            invalid: Some(format!("Sql.column: invalid identifier {name:?}")),
+            invalid: Some(FragmentPoison::refused(format!(
+                "Sql.column: invalid identifier {name:?}"
+            ))),
         }
     }
 }
@@ -3604,9 +3656,9 @@ pub fn sql_like(a: SqlFragment, pattern: String) -> SqlFragment {
             sql: String::new(),
             binds: Vec::new(),
             invalid: a.invalid.or_else(|| {
-                Some(format!(
+                Some(FragmentPoison::refused(format!(
                     "Sql.like: the pattern ends with the escape character {LIKE_ESCAPE}"
-                ))
+                )))
             }),
         };
     }
@@ -3683,6 +3735,15 @@ impl LikePrefixError {
             }
         }
     }
+
+    /// The poison a refused `Sql.startsWith` carries: the length ceiling is a
+    /// `LimitExceeded` refusal, an empty or NUL-bearing prefix a shape refusal.
+    fn poison(self) -> FragmentPoison {
+        match self {
+            Self::Empty | Self::Nul => FragmentPoison::refused(self.message()),
+            Self::TooLong => FragmentPoison::limit_exceeded(self.message()),
+        }
+    }
 }
 
 impl LikePrefix {
@@ -3749,7 +3810,7 @@ pub fn sql_starts_with(a: SqlFragment, prefix: String) -> SqlFragment {
             return SqlFragment {
                 sql: String::new(),
                 binds: Vec::new(),
-                invalid: a.invalid.or_else(|| Some(refused.message())),
+                invalid: a.invalid.or_else(|| Some(refused.poison())),
             };
         }
     };
@@ -3818,9 +3879,11 @@ pub fn sql_exists(table: String, inner: SqlFragment) -> SqlFragment {
         None => SqlFragment {
             sql: String::new(),
             binds: Vec::new(),
-            invalid: inner
-                .invalid
-                .or_else(|| Some(format!("Sql.exists: invalid table {table:?}"))),
+            invalid: inner.invalid.or_else(|| {
+                Some(FragmentPoison::refused(format!(
+                    "Sql.exists: invalid table {table:?}"
+                )))
+            }),
         },
         Some(qtable) => SqlFragment {
             sql: format!(
@@ -3860,9 +3923,11 @@ pub fn sql_masked_column(pred: SqlFragment, col: String) -> SqlFragment {
         None => SqlFragment {
             sql: String::new(),
             binds: Vec::new(),
-            invalid: pred
-                .invalid
-                .or_else(|| Some(format!("Sql.maskedColumn: invalid column {col:?}"))),
+            invalid: pred.invalid.or_else(|| {
+                Some(FragmentPoison::refused(format!(
+                    "Sql.maskedColumn: invalid column {col:?}"
+                )))
+            }),
         },
         Some(qcol) => SqlFragment {
             sql: format!(
@@ -3889,8 +3954,8 @@ pub fn db_find_where<E: Send + From<String> + crate::FromIpeError + 'static>(
     frag: SqlFragment,
 ) -> IpeTask<E, Vec<HashMap<String, String>>> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.findWhere: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.findWhere"));
         }
         let qtable = match SqlIdent::parse_plain(&table) {
             Some(t) => t,
@@ -3950,13 +4015,13 @@ pub fn db_find_where_masked<
     decoder: Decoder<E, A>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.findWhereMasked: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.findWhereMasked"));
         }
         // First-poison-wins across every projection fragment.
         for p in &projections {
-            if let Some(reason) = &p.invalid {
-                return IpeResult::Err(format!("db.findWhereMasked: {reason}").into());
+            if let Some(poison) = &p.invalid {
+                return IpeResult::Err(poison.to_error("db.findWhereMasked"));
             }
         }
         if projections.is_empty() {
@@ -4135,8 +4200,8 @@ pub fn db_find_join<E: Send + From<String> + crate::FromIpeError + 'static>(
     frag: SqlFragment,
 ) -> IpeTask<E, Vec<JoinRow>> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.findJoin: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.findJoin"));
         }
         let left = match JoinSide::parse(left_table, left_alias, left_columns) {
             Ok(s) => s,
@@ -4295,8 +4360,8 @@ pub fn db_find_projection<E: Send + From<String> + crate::FromIpeError + 'static
     extra_binds: Vec<SqlParam>,
 ) -> IpeTask<E, Vec<HashMap<String, String>>> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.findProjection: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.findProjection"));
         }
         let (sql, literal_count) = match build_projection_statement(
             &left_table,
@@ -4356,8 +4421,8 @@ pub fn db_find_join_ordered<E: Send + From<String> + crate::FromIpeError + 'stat
     order_asc: bool,
 ) -> IpeTask<E, Vec<JoinRow>> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.findJoinOrdered: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.findJoinOrdered"));
         }
         let left = match JoinSide::parse(left_table, left_alias, left_columns) {
             Ok(s) => s,
@@ -4418,8 +4483,8 @@ pub fn db_find_projection_ordered<E: Send + From<String> + crate::FromIpeError +
     order_asc: bool,
 ) -> IpeTask<E, Vec<HashMap<String, String>>> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.findProjectionOrdered: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.findProjectionOrdered"));
         }
         let order_clause = match parse_order_clause(&order_alias, &order_col, order_asc) {
             Ok(s) => s,
@@ -4689,8 +4754,8 @@ pub fn db_delete_where<E: Send + From<String> + crate::FromIpeError + 'static>(
     frag: SqlFragment,
 ) -> IpeTask<E, i64> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.deleteWhere: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.deleteWhere"));
         }
         if frag.sql.trim().is_empty() {
             return IpeResult::Err(
@@ -4744,8 +4809,8 @@ fn build_update_where_sql(
     set_fields: Vec<(String, Option<SqlParam>)>,
     where_: SqlFragment,
 ) -> Result<UpdateStatement, DbBuildError> {
-    if let Some(reason) = where_.invalid {
-        return Err(DbBuildError::PoisonedFragment { reason });
+    if let Some(poison) = where_.invalid {
+        return Err(DbBuildError::PoisonedFragment { poison });
     }
     let qtable = SqlIdent::parse_dotted(table).ok_or_else(|| DbBuildError::InvalidIdent {
         slot: IdentSlot::Table,
@@ -4828,8 +4893,8 @@ impl PolicyCheck {
     /// A poisoned fragment is [`DbBuildError::PoisonedFragment`]; an empty one
     /// is [`DbBuildError::EmptyCheck`].
     fn parse(frag: SqlFragment) -> Result<Self, DbBuildError> {
-        if let Some(reason) = frag.invalid {
-            return Err(DbBuildError::PoisonedFragment { reason });
+        if let Some(poison) = frag.invalid {
+            return Err(DbBuildError::PoisonedFragment { poison });
         }
         if frag.sql.trim().is_empty() {
             return Err(DbBuildError::EmptyCheck);
@@ -5136,8 +5201,8 @@ pub fn db_conn_find_where<E: Send + From<String> + crate::FromIpeError + 'static
     frag: SqlFragment,
 ) -> IpeTask<E, Vec<HashMap<String, String>>> {
     Box::pin(async move {
-        if let Some(reason) = frag.invalid {
-            return IpeResult::Err(format!("db.findWhereOn: {reason}").into());
+        if let Some(poison) = frag.invalid {
+            return IpeResult::Err(poison.to_error("db.findWhereOn"));
         }
         let qtable = match SqlIdent::parse_plain(&table) {
             Some(t) => t,
@@ -5326,9 +5391,9 @@ enum DbBuildError {
     TargetNotSupplied { name: String },
     /// A conflict-target column was bound to `SqlNull`.
     NullTarget { name: String },
-    /// A `SqlFragment` carries a poison marker; `reason` is its own text,
-    /// which names only a Debug-escaped identifier.
-    PoisonedFragment { reason: String },
+    /// A `SqlFragment` carries a poison marker; its reason names only a
+    /// Debug-escaped identifier or a ceiling.
+    PoisonedFragment { poison: FragmentPoison },
     /// An update's `WHERE` fragment is empty, which would rewrite every row.
     UnscopedUpdate,
     /// A policy check fragment is empty, so it states no predicate to hold.
@@ -5364,7 +5429,7 @@ impl std::fmt::Display for DbBuildError {
                 f,
                 "conflict-target column {name:?} is NULL; a NULL key never conflicts"
             ),
-            Self::PoisonedFragment { reason } => f.write_str(reason),
+            Self::PoisonedFragment { poison } => f.write_str(poison.reason()),
             Self::UnscopedUpdate => {
                 f.write_str("refusing unscoped UPDATE (no WHERE); pass an explicit condition")
             }
@@ -5379,9 +5444,20 @@ impl std::fmt::Display for DbBuildError {
 impl std::error::Error for DbBuildError {}
 
 /// Converts a statement-build refusal into the task error at the kernel edge.
+/// A poisoned fragment keeps its poison's kind; every other refusal is a plain
+/// message.
 #[cfg(feature = "db")]
-fn build_refusal<E: From<String>>(kernel: &str, e: &DbBuildError) -> E {
-    E::from(format!("{kernel}: {e}"))
+fn build_refusal<E: From<String> + crate::FromIpeError>(kernel: &str, e: &DbBuildError) -> E {
+    match e {
+        DbBuildError::PoisonedFragment { poison } => poison.to_error(kernel),
+        DbBuildError::InvalidIdent { .. }
+        | DbBuildError::EmptyTarget
+        | DbBuildError::DuplicateColumn { .. }
+        | DbBuildError::TargetNotSupplied { .. }
+        | DbBuildError::NullTarget { .. }
+        | DbBuildError::UnscopedUpdate
+        | DbBuildError::EmptyCheck => E::from(format!("{kernel}: {e}")),
+    }
 }
 
 /// Shared logic for `db_insert_fields` and `db_insert_fields_returning`:
@@ -7684,7 +7760,7 @@ mod tests {
         assert!(
             matches!(
                 PolicyCheck::parse(poisoned.clone()),
-                Err(DbBuildError::PoisonedFragment { reason: r }) if r == reason
+                Err(DbBuildError::PoisonedFragment { poison }) if poison.reason() == reason
             ),
             "a poisoned check must be refused with its own reason"
         );
@@ -7727,7 +7803,7 @@ mod tests {
         assert!(
             matches!(
                 &poisoned_where,
-                Err(DbBuildError::PoisonedFragment { reason: r }) if *r == reason
+                Err(DbBuildError::PoisonedFragment { poison }) if poison.reason() == reason
             ),
             "a poisoned WHERE must be refused: {poisoned_where:?}"
         );
@@ -7764,7 +7840,9 @@ mod tests {
             ),
             (
                 DbBuildError::PoisonedFragment {
-                    reason: "Sql.column: invalid identifier \"x;\"".to_string(),
+                    poison: FragmentPoison::refused(
+                        "Sql.column: invalid identifier \"x;\"".to_string(),
+                    ),
                 },
                 "db.updateWhere: Sql.column: invalid identifier \"x;\"",
             ),
@@ -12675,8 +12753,8 @@ mod like_prefix_tests {
     fn starts_with_upstream_poison_wins() {
         let frag = sql_starts_with(sql_column("bad name".to_string()), String::new());
         assert_eq!(
-            frag.invalid,
-            Some("Sql.column: invalid identifier \"bad name\"".to_string())
+            frag.invalid.as_ref().map(FragmentPoison::reason),
+            Some("Sql.column: invalid identifier \"bad name\"")
         );
         assert_eq!(frag.sql, "");
         assert!(frag.binds.is_empty());
@@ -12686,11 +12764,63 @@ mod like_prefix_tests {
     fn starts_with_refused_prefix_poisons_without_binds() {
         let frag = sql_starts_with(sql_column("n".to_string()), "a\0".to_string());
         assert_eq!(
-            frag.invalid,
-            Some("Sql.startsWith: the prefix contains a NUL character".to_string())
+            frag.invalid.as_ref().map(FragmentPoison::reason),
+            Some("Sql.startsWith: the prefix contains a NUL character")
         );
         assert_eq!(frag.sql, "");
         assert!(frag.binds.is_empty());
+    }
+
+    /// A prefix one byte past its ceiling fails the read with a
+    /// `LimitExceeded` error, on the read path and on the checked-write build
+    /// path alike; a prefix at the ceiling is accepted, and a NUL-bearing one
+    /// stays a plain refusal.
+    #[tokio::test]
+    async fn a_prefix_one_byte_past_its_ceiling_is_limit_exceeded() {
+        let db = names_db(&[Some("a")]).await;
+        let read = |prefix: String| {
+            let db = db.clone();
+            async move {
+                let frag = sql_starts_with(sql_column("name".to_string()), prefix);
+                match db_find_where::<IpeError>(db, "names".into(), frag).await {
+                    IpeResult::Ok(rows) => Ok(rows.len()),
+                    IpeResult::Err(e) => Err(e),
+                }
+            }
+        };
+        let too_long = "Sql.startsWith: the prefix is longer than 16384 bytes";
+        assert_eq!(
+            read("a".repeat(MAX_LIKE_PREFIX_BYTES + 1)).await,
+            Err(IpeError::limit_exceeded(format!(
+                "db.findWhere: {too_long}"
+            )))
+        );
+        assert_eq!(read("a".repeat(MAX_LIKE_PREFIX_BYTES)).await, Ok(0));
+        assert_eq!(
+            read("a\0".to_string()).await,
+            Err(IpeError::unexpected(
+                "db.findWhere: Sql.startsWith: the prefix contains a NUL character".to_owned()
+            ))
+        );
+        let poisoned = sql_starts_with(
+            sql_column("name".to_string()),
+            "a".repeat(MAX_LIKE_PREFIX_BYTES + 1),
+        );
+        let built = build_update_where_sql(
+            "names",
+            vec![("name".to_string(), Some(SqlParam::Int(1)))],
+            poisoned,
+        );
+        let refused = match built {
+            Err(e) => Some(build_refusal::<IpeError>("db.updateWhere", &e)),
+            Ok(_) => None,
+        };
+        assert_eq!(
+            refused,
+            Some(IpeError::limit_exceeded(format!(
+                "db.updateWhere: {too_long}"
+            )))
+        );
     }
 
     #[test]
@@ -12763,8 +12893,8 @@ mod like_prefix_tests {
     fn like_pattern_ending_in_unpaired_escape_poisons() {
         let frag = sql_like(sql_column("n".to_string()), "a\\".to_string());
         assert_eq!(
-            frag.invalid,
-            Some("Sql.like: the pattern ends with the escape character \\".to_string())
+            frag.invalid.as_ref().map(FragmentPoison::reason),
+            Some("Sql.like: the pattern ends with the escape character \\")
         );
         assert_eq!(frag.sql, "");
         assert!(frag.binds.is_empty());
