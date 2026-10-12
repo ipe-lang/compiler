@@ -344,6 +344,22 @@ impl AuditOptions {
         }
     }
 
+    /// The admission run: the submitted entry's claimed publisher and the
+    /// curated `index_root` the semver check reads.
+    #[must_use]
+    pub const fn for_admission(
+        claimed: SelfDeclaredPublisher,
+        index_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            index_root,
+            advisory_db_override: None,
+            no_advisory_db: false,
+            claimed: Some(claimed),
+            format: OutputFormat::Human,
+        }
+    }
+
     /// The claimed publisher the audit runs under.
     #[must_use]
     pub const fn claimed(&self) -> Option<&SelfDeclaredPublisher> {

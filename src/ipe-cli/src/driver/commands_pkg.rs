@@ -1052,26 +1052,20 @@ fn audit_version(
     index_root: Option<&Path>,
     blessing: Result<&BlessedPublisher, &crate::publisher::BlessingRefusal>,
 ) -> Result<(), CliError> {
-    let checkout_str = checkout.to_string_lossy().into_owned();
-    // Pass the submitted entry's claimed publisher (named in a reject) and the
-    // attestation-backed blessing: the reserved-namespace ownership check
-    // exempts only a proven blessed publisher and rejects any other whose
-    // source tree provides a reserved-namespace (`Ipe.*`) module — the
-    // admission-time squat-proofing of the trusted namespace.
-    let mut audit_args: Vec<String> = vec![
-        checkout_str,
-        "--publisher".to_owned(),
-        submitted.publisher.as_str().to_owned(),
-    ];
-    if let Some(ir) = index_root {
-        audit_args.push("--index".to_owned());
-        audit_args.push(ir.to_string_lossy().into_owned());
-    }
-    // Propagate typed errors directly — run_audit already produces a
-    // descriptive typed CliError (PackageAudit / HashMismatch / etc.) whose
-    // Display names the failing check; the version context is clear from
-    // the chatter below and the structured error kind.
-    audit::run_audit_as(&audit_args, blessing)
+    // Audit the checkout path itself, never an argv round-trip of it: a lossy
+    // string of a non-UTF-8 path names another directory. The submitted entry's
+    // claimed publisher is named in a reject, and the attestation-backed
+    // blessing exempts only a proven blessed publisher from the
+    // reserved-namespace ownership check — the admission-time squat-proofing of
+    // the trusted namespace.
+    let options = audit::AuditOptions::for_admission(
+        submitted.publisher.clone(),
+        index_root.map(Path::to_path_buf),
+    );
+    // Typed errors propagate directly: the audit's `CliError` names the failing
+    // check, and the chatter below names the version.
+    audit::capture_package(checkout)
+        .and_then(|snapshot| audit::run_audit_over(snapshot, &options, blessing))
         .and_then(|audited| admit_against_audit(version, submitted.name.as_str(), &audited))
         .inspect_err(|_| {
             crate::screen::chatter(

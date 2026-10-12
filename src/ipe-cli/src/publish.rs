@@ -2757,6 +2757,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A publishable manifest rooted at `root`.
+    fn publishable_manifest(root: &Path) -> crate::project::ProjectManifest {
+        crate::project::ProjectManifest {
+            name: "lib".to_owned(),
+            version: Some("1.0.0".parse().expect("valid release")),
+            root: root.to_path_buf(),
+            src_root: root.to_path_buf(),
+            icon: None,
+            driver: ipe_backend_rust::DbDriver::default(),
+            static_request: crate::build_plan::StaticRequestLayer::default(),
+            wasm: crate::project::WasmConfig::default(),
+            dependencies: std::collections::BTreeMap::new(),
+            rust_dependencies: std::collections::BTreeMap::new(),
+            capabilities: BTreeSet::new(),
+            capabilities_accept: BTreeSet::new(),
+            control_models_accept: BTreeSet::new(),
+            has_rust_wrapper: false,
+            programs: Vec::new(),
+            exposed_modules: Vec::new(),
+            delivery: crate::project::DeliveryConfig::default(),
+        }
+    }
+
+    /// `--rev` pins only the clean, checked-out HEAD: an older commit and a
+    /// dirty tree are both refused, because the audited snapshot is the working
+    /// tree and the pin must be the commit that tree is.
+    #[test]
+    fn publish_rev_refuses_anything_but_the_clean_checked_out_head() {
+        let repo = make_git_repo("pub-rev-head", "module Lib\n");
+        let older = head_sha(&repo);
+        std::fs::write(repo.join("lib.ipe"), "module Lib exposing (..)\n").expect("write");
+        let git = |args: &[&str]| {
+            crate::remote_ingest::fixture_git(&repo)
+                .args(args)
+                .output()
+                .expect("git")
+                .status
+                .success()
+        };
+        assert!(git(&["commit", "--quiet", "-am", "next"]));
+        let head = head_sha(&repo);
+        assert_ne!(older, head);
+        let manifest = publishable_manifest(&repo);
+        let source = Some("https://github.com/arthurmaciel/lib");
+
+        let err = compute_entry_draft(&manifest, source, Some(older.as_str()))
+            .err()
+            .expect("an older commit than HEAD is refused");
+        assert!(matches!(err, CliError::Usage(_)), "{err:?}");
+
+        let draft = compute_entry_draft(&manifest, source, Some("HEAD"))
+            .expect("the clean checked-out HEAD is publishable");
+        assert_eq!(draft.rev.as_str(), head);
+
+        std::fs::write(repo.join("lib.ipe"), "module Lib exposing (x)\n").expect("write");
+        let err = compute_entry_draft(&manifest, source, Some("HEAD"))
+            .err()
+            .expect("a dirty tree is refused");
+        assert!(
+            matches!(err, CliError::Publish(Refusal::DirtyTree { .. })),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // --- Test H: render_entry_version round-trips a PinnedRev entry ---
 
     #[test]

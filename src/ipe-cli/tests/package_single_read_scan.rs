@@ -49,6 +49,7 @@ const CAPTURES: &[(&str, &str, usize)] = &[
     ("capture_manifest_root", "capture_manifest_root", 1),
     ("capture_manifest_root", "PackageSnapshot::capture", 1),
     ("run_publish", "capture_manifest_root", 1),
+    ("audit_version", "capture_package", 1),
     ("reprove_tree", "of_tree_within", 1),
 ];
 
@@ -59,6 +60,20 @@ const CAPTURE_NAMES: &[&str] = &[
     "of_tree",
     "of_tree_within",
 ];
+
+/// Identifiers refused only in the admission functions: admission audits its
+/// checkout path itself, never an argv string of it, since a lossy string of a
+/// non-UTF-8 path names another directory.
+const ADMISSION_BANNED: &[&str] = &["run_audit_as", "to_string_lossy"];
+
+/// The captured snapshot's type: a second name for it would hide a capture
+/// from [`CAPTURES`], so an alias of it is refused.
+const SNAPSHOT: &str = "PackageSnapshot";
+
+/// Whether `ty` is a path naming [`SNAPSHOT`].
+fn names_snapshot(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|last| last.ident == SNAPSHOT))
+}
 
 /// `Type::read` paths that re-read the package from disk.
 const BANNED_READS: &[&str] = &["PackageSourceSet", "Lockfile"];
@@ -143,6 +158,8 @@ enum Scope<'a> {
 /// What the scan found in one source.
 struct Scan<'a> {
     scope: Scope<'a>,
+    /// Identifiers banned in this source beside [`BANNED`].
+    also_banned: &'a [&'a str],
     /// The enclosing function names, innermost last.
     fns: Vec<String>,
     /// Each banned reader met, with the function it sits in.
@@ -175,7 +192,7 @@ impl Scan<'_> {
 
     /// Record `name` when it is banned or a capture, and judged.
     fn name(&mut self, name: &str) {
-        if BANNED.contains(&name) && self.judged() {
+        if (BANNED.contains(&name) || self.also_banned.contains(&name)) && self.judged() {
             let site = self.site();
             self.reaches.insert((site, name.to_owned()));
         }
@@ -199,7 +216,7 @@ impl Scan<'_> {
             let site = self.site();
             self.reaches.insert((site, format!("{owner}::read")));
         }
-        if owner == "PackageSnapshot" && member == "capture" {
+        if owner == SNAPSHOT && member == "capture" {
             self.capture(format!("{owner}::{member}"));
         }
     }
@@ -287,6 +304,34 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         visit::visit_path(self, path);
     }
 
+    fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+        if rename.ident == SNAPSHOT && self.judged() {
+            let site = self.site();
+            self.reaches
+                .insert((site, format!("use {SNAPSHOT} as {}", rename.rename)));
+        }
+        visit::visit_use_rename(self, rename);
+    }
+
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        if names_snapshot(&item.ty) && self.judged() {
+            let site = self.site();
+            self.reaches
+                .insert((site, format!("type {} = {SNAPSHOT}", item.ident)));
+        }
+        visit::visit_item_type(self, item);
+    }
+
+    fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+        if let Some(qself) = &expr.qself
+            && names_snapshot(&qself.ty)
+            && let Some(member) = expr.path.segments.iter().nth(qself.position)
+        {
+            self.pair(SNAPSHOT, &member.ident.to_string());
+        }
+        visit::visit_expr_path(self, expr);
+    }
+
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.tokens(mac.tokens.clone());
         visit::visit_macro(self, mac);
@@ -295,9 +340,19 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
 /// Scan `source` within `scope`.
 fn scan<'a>(source: &str, scope: Scope<'a>) -> Result<Scan<'a>, String> {
+    scan_banning(source, scope, &[])
+}
+
+/// Scan `source` within `scope`, refusing `also_banned` beside [`BANNED`].
+fn scan_banning<'a>(
+    source: &str,
+    scope: Scope<'a>,
+    also_banned: &'a [&'a str],
+) -> Result<Scan<'a>, String> {
     let file = syn::parse_file(source).map_err(|e| format!("parse: {e}"))?;
     let mut found = Scan {
         scope,
+        also_banned,
         fns: Vec::new(),
         reaches: BTreeSet::new(),
         defined: BTreeSet::new(),
@@ -353,16 +408,22 @@ fn source_of(rel: &str) -> Result<String, String> {
 #[test]
 fn the_package_gate_reads_the_package_once() -> Result<(), String> {
     let mut refused = Vec::new();
-    for (rel, scope, required) in [
+    for (rel, scope, required, also_banned) in [
         (
             "audit.rs",
             Scope::Whole,
             &["run_audit_over", "capture_package", "disclose_package"][..],
+            &[][..],
         ),
-        ("publish.rs", Scope::Whole, &["run_publish"][..]),
-        ("driver/commands_pkg.rs", Scope::Only(ADMISSION), ADMISSION),
+        ("publish.rs", Scope::Whole, &["run_publish"][..], &[][..]),
+        (
+            "driver/commands_pkg.rs",
+            Scope::Only(ADMISSION),
+            ADMISSION,
+            ADMISSION_BANNED,
+        ),
     ] {
-        let found = scan(&source_of(rel)?, scope)?;
+        let found = scan_banning(&source_of(rel)?, scope, also_banned)?;
         refused.extend(
             refusals(&found, required)
                 .into_iter()
@@ -410,6 +471,9 @@ fn a_planted_working_tree_read_is_refused() -> Result<(), String> {
         "fn run_audit_over() { capture_package(p); }\n",
         "fn run_audit_over() { let _ = format!(\"{:?}\", PackageSnapshot::capture(root)); }\n",
         "fn run_audit_over() { Sha256Hex::of_tree_within(root, c); }\n",
+        "use crate::project::PackageSnapshot as S;\nfn run_audit_over() { S::capture(root); }\n",
+        "type S = crate::project::PackageSnapshot;\nfn run_audit_over() { S::capture(root); }\n",
+        "fn run_audit_over() { <PackageSnapshot>::capture(root); }\n",
         "fn run_audit_over() {}\nfn run_publish() { capture_manifest_root(p); capture_manifest_root(p); }\n",
     ];
     for source in breaches {
@@ -442,6 +506,23 @@ fn a_planted_working_tree_read_is_refused() -> Result<(), String> {
         refusals(&found, &["audit_version"]).len(),
         1,
         "only the named admission functions are judged"
+    );
+    for source in [
+        "fn audit_version() { run_audit_as(&args, blessing); }\n",
+        "fn audit_version() { let p = checkout.to_string_lossy().into_owned(); }\n",
+        "fn audit_version() { capture_package(c); capture_package(c); }\n",
+    ] {
+        let found = scan_banning(source, Scope::Only(ADMISSION), ADMISSION_BANNED)?;
+        assert!(
+            !refusals(&found, &["audit_version"]).is_empty(),
+            "refused:\n{source}"
+        );
+    }
+    let own_capture = "fn audit_version() { run_audit_over(capture_package(c)?, &o, b); }\n";
+    let found = scan_banning(own_capture, Scope::Only(ADMISSION), ADMISSION_BANNED)?;
+    assert!(
+        refusals(&found, &["audit_version"]).is_empty(),
+        "admission over its own capture passes"
     );
     Ok(())
 }
