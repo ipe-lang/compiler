@@ -17,7 +17,7 @@
 use crate::env_grammar::EnvFlag;
 use crate::env_registry::security::WEB_CSRF_ORIGIN_CHECK;
 use crate::telemetry;
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, request::Parts};
 use axum::response::{IntoResponse, Response};
 
 /// Per-app CSRF cookie name derived from the sub-app base path.
@@ -212,27 +212,34 @@ pub fn is_exempt_path(path: &str) -> bool {
         || path.starts_with("/_ipe/console/")
 }
 
-/// The authority a request was addressed to: its `Host`, else its target URI's.
+/// The authority a request was addressed to, as the app listener's Host
+/// admission parses it: the target URI's (absolute-form, HTTP/2 `:authority`),
+/// else the one `Host` header.
 ///
-/// Never empty, so a comparison against it can never pass vacuously.
+/// Never empty and never ambiguous, so a comparison against it can never pass
+/// vacuously or against one of two disagreeing authorities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestAuthority<'a>(&'a str);
 
 impl<'a> RequestAuthority<'a> {
-    /// The authority `headers` and `uri` name, or `None` when neither names one.
-    ///
-    /// A `Host` that is empty or not visible ASCII names none, so the URI's
-    /// authority (HTTP/2 `:authority`, an absolute-form target) is used instead.
+    /// The authority `parts` names, or `None` when
+    /// [`crate::inbound_authority::Authority::from_request`] refuses it: no
+    /// authority, two `Host` headers, a `Host` disagreeing with the target URI,
+    /// or a malformed one.
     #[must_use]
-    pub fn of(headers: &'a HeaderMap, uri: &'a Uri) -> Option<Self> {
-        headers
-            .get(axum::http::header::HOST)
-            .and_then(|host| host.to_str().ok())
-            .filter(|host| !host.is_empty())
+    pub fn of(parts: &'a Parts) -> Option<Self> {
+        if crate::inbound_authority::Authority::from_request(parts).is_err() {
+            return None;
+        }
+        parts
+            .uri
+            .authority()
+            .map(axum::http::uri::Authority::as_str)
             .or_else(|| {
-                uri.authority()
-                    .map(axum::http::uri::Authority::as_str)
-                    .filter(|authority| !authority.is_empty())
+                parts
+                    .headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|host| host.to_str().ok())
             })
             .map(Self)
     }
@@ -262,22 +269,26 @@ pub fn fix_origin_check() {
 /// Whether the `Origin` check refuses a request under the switch `check`.
 ///
 /// Not applied while `framed` (cross-origin embedding is intentional there) or
-/// when the request carries no `Origin`, where the CSRF token stays the gate. An
-/// `Origin` that is not visible ASCII, or one on a request naming no authority,
-/// is refused.
-fn origin_mismatch(check: EnvFlag, framed: bool, headers: &HeaderMap, uri: &Uri) -> bool {
+/// when the request carries no `Origin`, where the CSRF token stays the gate. A
+/// second `Origin`, one that is not visible ASCII, or one on a request naming no
+/// single well-formed authority is refused.
+fn origin_mismatch(check: EnvFlag, framed: bool, parts: &Parts) -> bool {
     if matches!(check, EnvFlag::Off) || framed {
         return false;
     }
-    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+    let mut origins = parts.headers.get_all(axum::http::header::ORIGIN).iter();
+    let Some(origin) = origins.next() else {
         return false;
     };
+    if origins.next().is_some() {
+        return true;
+    }
     let Ok(origin) = origin.to_str() else {
         return true;
     };
     // The comparison normalises each side's scheme-implied default port, shared
     // with `console.rs::is_cross_origin_ingest` and `server.rs::ws_cross_origin`.
-    RequestAuthority::of(headers, uri).is_none_or(|authority| {
+    RequestAuthority::of(parts).is_none_or(|authority| {
         crate::http_header::origin_host_mismatch(origin, authority.as_str())
     })
 }
@@ -305,16 +316,12 @@ pub async fn csrf_middleware(
         return next.run(req).await;
     }
 
-    let headers = req.headers();
-    if origin_mismatch(
-        origin_check(),
-        frame_ancestors().is_some(),
-        headers,
-        req.uri(),
-    ) {
+    let (parts, body) = req.into_parts();
+    if origin_mismatch(origin_check(), frame_ancestors().is_some(), &parts) {
         telemetry::record_log("warn", "csrf.rejected reason=origin-mismatch");
         return (StatusCode::FORBIDDEN, "{\"status\":\"csrf_origin\"}").into_response();
     }
+    let headers = &parts.headers;
 
     let cookie_tok =
         cookie_value(headers, &csrf_cookie_name_for(&super::web_base_path())).unwrap_or_default();
@@ -330,27 +337,31 @@ pub async fn csrf_middleware(
         telemetry::record_log("warn", "csrf.rejected reason=invalid");
         return (StatusCode::FORBIDDEN, "{\"status\":\"csrf_invalid\"}").into_response();
     }
-    next.run(req).await
+    next.run(axum::extract::Request::from_parts(parts, body))
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Headers carrying `Origin: origin`, plus `Host: host` when given.
-    fn origin_headers(origin: &str, host: Option<&str>) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::ORIGIN,
-            axum::http::HeaderValue::from_str(origin).unwrap(),
-        );
-        if let Some(host) = host {
-            headers.insert(
-                axum::http::header::HOST,
-                axum::http::HeaderValue::from_str(host).unwrap(),
+    /// The head of a request to `uri` carrying each of `origins` as an `Origin`
+    /// header and each of `hosts` as a `Host` header.
+    fn head(uri: &str, origins: &[&[u8]], hosts: &[&[u8]]) -> Parts {
+        let mut builder = axum::http::Request::builder().method("POST").uri(uri);
+        for origin in origins {
+            builder = builder.header(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_bytes(origin).unwrap(),
             );
         }
-        headers
+        for host in hosts {
+            builder = builder.header(
+                axum::http::header::HOST,
+                axum::http::HeaderValue::from_bytes(host).unwrap(),
+            );
+        }
+        builder.body(()).unwrap().into_parts().0
     }
 
     /// The switch an `IPE_WEB_CSRF_ORIGIN_CHECK` lookup of `raw` reads as.
@@ -363,88 +374,146 @@ mod tests {
     fn mismatched_origin_is_refused_with_the_switch_unset() {
         let check = switch_when(None).unwrap();
         assert_eq!(check, EnvFlag::On);
-        let headers = origin_headers("https://evil.example", Some("victim.example"));
-        assert!(origin_mismatch(
-            check,
-            false,
-            &headers,
-            &Uri::from_static("/_ipe/event")
-        ));
-        let same = origin_headers("https://victim.example", Some("victim.example"));
-        assert!(!origin_mismatch(
-            check,
-            false,
-            &same,
-            &Uri::from_static("/_ipe/event")
-        ));
+        let cross = head(
+            "/_ipe/event",
+            &[b"https://evil.example"],
+            &[b"victim.example"],
+        );
+        assert!(origin_mismatch(check, false, &cross));
+        let same = head(
+            "/_ipe/event",
+            &[b"https://victim.example"],
+            &[b"victim.example"],
+        );
+        assert!(!origin_mismatch(check, false, &same));
     }
 
     /// An `Origin` on a request naming no authority at all is refused, never
     /// passed for want of anything to compare against.
     #[test]
     fn origin_without_any_authority_is_refused() {
-        let uri = Uri::from_static("/_ipe/event");
-        let headers = origin_headers("https://victim.example", None);
-        assert_eq!(RequestAuthority::of(&headers, &uri), None);
-        assert!(origin_mismatch(EnvFlag::On, false, &headers, &uri));
-        let empty_host = origin_headers("https://victim.example", Some(""));
-        assert!(origin_mismatch(EnvFlag::On, false, &empty_host, &uri));
+        let absent = head("/_ipe/event", &[b"https://victim.example"], &[]);
+        assert_eq!(RequestAuthority::of(&absent), None);
+        assert!(origin_mismatch(EnvFlag::On, false, &absent));
+        let empty_host = head("/_ipe/event", &[b"https://victim.example"], &[b""]);
+        assert!(origin_mismatch(EnvFlag::On, false, &empty_host));
     }
 
     /// Without a `Host`, the target URI's authority (HTTP/2 `:authority`) is compared.
     #[test]
     fn uri_authority_stands_in_for_an_absent_host() {
-        let uri = Uri::from_static("https://victim.example/_ipe/event");
-        let same = origin_headers("https://victim.example", None);
+        let same = head(
+            "https://victim.example/_ipe/event",
+            &[b"https://victim.example"],
+            &[],
+        );
         assert_eq!(
-            RequestAuthority::of(&same, &uri).map(RequestAuthority::as_str),
+            RequestAuthority::of(&same).map(RequestAuthority::as_str),
             Some("victim.example")
         );
-        assert!(!origin_mismatch(EnvFlag::On, false, &same, &uri));
-        let cross = origin_headers("https://evil.example", None);
-        assert!(origin_mismatch(EnvFlag::On, false, &cross, &uri));
+        assert!(!origin_mismatch(EnvFlag::On, false, &same));
+        let cross = head(
+            "https://victim.example/_ipe/event",
+            &[b"https://evil.example"],
+            &[],
+        );
+        assert!(origin_mismatch(EnvFlag::On, false, &cross));
+    }
+
+    /// A `Host` that disagrees with the target URI's authority names no single
+    /// authority, so the `Origin` matching either one is refused; an agreeing
+    /// pair is admitted.
+    #[test]
+    fn host_disagreeing_with_the_target_is_refused() {
+        let uri = "https://victim.example/_ipe/event";
+        for origin in [&b"https://victim.example"[..], &b"https://evil.example"[..]] {
+            let split = head(uri, &[origin], &[b"evil.example"]);
+            assert_eq!(RequestAuthority::of(&split), None);
+            assert!(origin_mismatch(EnvFlag::On, false, &split));
+        }
+        let agreeing = head(uri, &[b"https://victim.example"], &[b"victim.example"]);
+        assert!(!origin_mismatch(EnvFlag::On, false, &agreeing));
+    }
+
+    /// Two `Host` headers name no single authority; the request is refused even
+    /// when the first matches the `Origin`.
+    #[test]
+    fn two_hosts_are_refused() {
+        let two = head(
+            "/_ipe/event",
+            &[b"https://victim.example"],
+            &[b"victim.example", b"evil.example"],
+        );
+        assert_eq!(RequestAuthority::of(&two), None);
+        assert!(origin_mismatch(EnvFlag::On, false, &two));
+    }
+
+    /// A `Host` that is not visible ASCII is refused, never replaced by another
+    /// authority source.
+    #[test]
+    fn unreadable_host_is_refused() {
+        let bad = head(
+            "https://victim.example/_ipe/event",
+            &[b"https://victim.example"],
+            &[b"victim.\xffexample"],
+        );
+        assert!(origin_mismatch(EnvFlag::On, false, &bad));
+    }
+
+    /// Two `Origin` headers are refused even when the first is same-origin.
+    #[test]
+    fn two_origins_are_refused() {
+        let two = head(
+            "/_ipe/event",
+            &[b"https://victim.example", b"https://evil.example"],
+            &[b"victim.example"],
+        );
+        assert!(origin_mismatch(EnvFlag::On, false, &two));
+    }
+
+    /// An opaque `null` origin (sandboxed frame, `data:` document) is refused.
+    #[test]
+    fn null_origin_is_refused() {
+        let null = head("/_ipe/event", &[b"null"], &[b"victim.example"]);
+        assert!(origin_mismatch(EnvFlag::On, false, &null));
     }
 
     /// An `Origin` that is not visible ASCII is refused, not read as absent.
     #[test]
     fn unreadable_origin_is_refused() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::ORIGIN,
-            axum::http::HeaderValue::from_bytes(b"https://\xffvictim.example").unwrap(),
+        let bad = head(
+            "/_ipe/event",
+            &[b"https://\xffvictim.example"],
+            &[b"victim.example"],
         );
-        headers.insert(
-            axum::http::header::HOST,
-            axum::http::HeaderValue::from_static("victim.example"),
-        );
-        assert!(origin_mismatch(
-            EnvFlag::On,
-            false,
-            &headers,
-            &Uri::from_static("/_ipe/event")
-        ));
+        assert!(origin_mismatch(EnvFlag::On, false, &bad));
     }
 
     /// The switch spellings fold ASCII case: `On` turns the check on, `off` turns it off.
     #[test]
     fn switch_spellings_fold_case() {
-        let headers = origin_headers("https://evil.example", Some("victim.example"));
-        let uri = Uri::from_static("/_ipe/event");
+        let cross = head(
+            "/_ipe/event",
+            &[b"https://evil.example"],
+            &[b"victim.example"],
+        );
         let on = switch_when(Some("On")).unwrap();
         assert_eq!(on, EnvFlag::On);
-        assert!(origin_mismatch(on, false, &headers, &uri));
+        assert!(origin_mismatch(on, false, &cross));
         let off = switch_when(Some("off")).unwrap();
         assert_eq!(off, EnvFlag::Off);
-        assert!(!origin_mismatch(off, false, &headers, &uri));
+        assert!(!origin_mismatch(off, false, &cross));
     }
 
     /// A value spelling no switch is refused, naming the variable, never read as off.
     #[test]
     fn unparseable_switch_is_refused() {
-        let refusal = switch_when(Some("maybe")).unwrap_err();
-        assert_eq!(refusal.name(), "IPE_WEB_CSRF_ORIGIN_CHECK");
+        for raw in ["maybe", "", " on", "yes"] {
+            let refusal = switch_when(Some(raw)).unwrap_err();
+            assert_eq!(refusal.name(), "IPE_WEB_CSRF_ORIGIN_CHECK", "{raw:?}");
+        }
         assert!(matches!(
-            refusal,
+            switch_when(Some("maybe")).unwrap_err(),
             crate::env_grammar::EnvRefusal::Malformed { .. }
         ));
     }
@@ -452,15 +521,14 @@ mod tests {
     /// Frame-ancestors mode and an `Origin`-less request are not judged by the check.
     #[test]
     fn framed_or_origin_less_requests_pass_the_check() {
-        let uri = Uri::from_static("/_ipe/event");
-        let cross = origin_headers("https://evil.example", Some("victim.example"));
-        assert!(!origin_mismatch(EnvFlag::On, true, &cross, &uri));
-        assert!(!origin_mismatch(
-            EnvFlag::On,
-            false,
-            &HeaderMap::new(),
-            &uri
-        ));
+        let cross = head(
+            "/_ipe/event",
+            &[b"https://evil.example"],
+            &[b"victim.example"],
+        );
+        assert!(!origin_mismatch(EnvFlag::On, true, &cross));
+        let origin_less = head("/_ipe/event", &[], &[]);
+        assert!(!origin_mismatch(EnvFlag::On, false, &origin_less));
     }
 
     fn well_formed_tok() -> String {
