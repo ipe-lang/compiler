@@ -74,7 +74,7 @@ fn empty_home_heads(
     out: &mut BTreeSet<String>,
 ) -> Result<(), String> {
     match ty {
-        Ty::Var(_) | Ty::Unit => Ok(()),
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => Ok(()),
         Ty::Fun(arg, result) => {
             empty_home_heads(arg, interner, out)?;
             empty_home_heads(result, interner, out)
