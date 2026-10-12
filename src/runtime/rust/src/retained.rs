@@ -5,8 +5,9 @@
 //! each element's own measure. Every payload byte counts at least once, so the
 //! measure never falls below the payload a value holds alive. An inline field
 //! may count twice (inside its parent's inline size and in its own measure), so
-//! the count errs high, never low. Allocator and hash-table overhead the value
-//! cannot observe is not counted.
+//! the count errs high, never low. A container's internal layout (hash-table
+//! buckets and control bytes, B-tree nodes) counts at an upper bound derived
+//! from what the container reports; allocator bookkeeping is not counted.
 //!
 //! A shared `Arc` counts at every reference: each holder pays for what it keeps
 //! alive, so sharing can never hide a payload from the holder's measure.
@@ -216,28 +217,81 @@ impl<T: RetainedBytes> RetainedBytes for VecDeque<T> {
 
 // ─── Maps and sets ───────────────────────────────────────────────────────────
 
-impl<K: RetainedBytes, V: RetainedBytes, S> RetainedBytes for HashMap<K, V, S> {
-    // Spare slots count their entry size; every slot counts its control byte.
-    fn retained_bytes(&self) -> Option<Bytes> {
-        let spare = self.capacity().checked_sub(self.len())?;
-        let reserved = Bytes::inline::<Self>()?
-            .checked_add(Bytes::slots::<(K, V)>(spare)?)?
-            .plus_count(self.capacity())?;
-        self.iter()
-            .try_fold(reserved, |acc, (k, v)| acc.plus(k)?.plus(v))
+/// Control bytes a hash table keeps past its last bucket (the widest probe group).
+const HASH_GROUP_WIDTH: usize = 16;
+
+/// An upper bound on the buckets a hash table reporting `capacity` allocates.
+///
+/// A table keeps at most seven of every eight buckets full, and a table under
+/// eight buckets keeps one empty, so `capacity + ⌈capacity / 7⌉ + 1` covers
+/// both. A zero capacity allocates nothing.
+fn hash_buckets(capacity: usize) -> Option<usize> {
+    if capacity == 0 {
+        return Some(0);
     }
+    capacity.checked_add(capacity.div_ceil(7))?.checked_add(1)
+}
+
+/// An upper bound on the bytes a hash table of `T` slots reporting `capacity` allocates.
+///
+/// Every bucket counts a padded `T` slot and a control byte, plus the trailing
+/// probe group.
+pub(crate) fn hash_table<T>(capacity: usize) -> Option<Bytes> {
+    let buckets = hash_buckets(capacity)?;
+    if buckets == 0 {
+        return Some(Bytes::ZERO);
+    }
+    Bytes::slots::<T>(buckets)?.plus_count(buckets.checked_add(HASH_GROUP_WIDTH)?)
+}
+
+impl<K: RetainedBytes, V: RetainedBytes, S> RetainedBytes for HashMap<K, V, S> {
+    // The table at its reported capacity; every entry then counts its own measure.
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let table = Bytes::inline::<Self>()?.checked_add(hash_table::<(K, V)>(self.capacity())?)?;
+        self.iter()
+            .try_fold(table, |acc, (k, v)| acc.plus(k)?.plus(v))
+    }
+}
+
+/// Keys one B-tree node holds at most.
+const BTREE_NODE_KEYS: usize = 11;
+
+/// Keys every B-tree node but the root holds at least.
+const BTREE_MIN_NODE_KEYS: usize = 5;
+
+/// An upper bound on the bytes the nodes of a B-tree of `len` entries allocate.
+///
+/// Every key lives in one node and every node but the root holds at least
+/// [`BTREE_MIN_NODE_KEYS`], so `1 + len / 5` bounds the node count. Each node
+/// counts as an internal one: its parent link and lengths, its full key and
+/// value arrays, and a child pointer per key plus one. An empty tree
+/// allocates no node.
+fn btree_nodes<K, V>(len: usize) -> Option<Bytes> {
+    if len == 0 {
+        return Some(Bytes::ZERO);
+    }
+    let nodes = (len / BTREE_MIN_NODE_KEYS).checked_add(1)?;
+    let node = Bytes::inline::<[usize; 2]>()?
+        .checked_add(Bytes::slots::<K>(BTREE_NODE_KEYS)?)?
+        .checked_add(Bytes::slots::<V>(BTREE_NODE_KEYS)?)?
+        .checked_add(Bytes::slots::<usize>(BTREE_NODE_KEYS.checked_add(1)?)?)?;
+    node.checked_mul(u64::try_from(nodes).ok()?)
 }
 
 impl<K: RetainedBytes, V: RetainedBytes> RetainedBytes for BTreeMap<K, V> {
     fn retained_bytes(&self) -> Option<Bytes> {
+        let nodes = Bytes::inline::<Self>()?.checked_add(btree_nodes::<K, V>(self.len())?)?;
         self.iter()
-            .try_fold(Bytes::inline::<Self>()?, |acc, (k, v)| acc.plus(k)?.plus(v))
+            .try_fold(nodes, |acc, (k, v)| acc.plus(k)?.plus(v))
     }
 }
 
 impl<T: RetainedBytes> RetainedBytes for BTreeSet<T> {
+    // A set is a map to `()`, so its nodes hold no value array.
     fn retained_bytes(&self) -> Option<Bytes> {
-        Bytes::inline::<Self>()?.plus_all(self)
+        Bytes::inline::<Self>()?
+            .checked_add(btree_nodes::<T, ()>(self.len())?)?
+            .plus_all(self)
     }
 }
 
@@ -478,6 +532,44 @@ mod tests {
             stack: vec!["s".repeat(3000)],
         });
         assert!(measure(&details) >= 6000);
+    }
+
+    // A hash table allocates a padded slot and a control byte per bucket, and
+    // more buckets than its reported capacity.
+    #[test]
+    fn a_hash_map_counts_its_buckets_at_their_padded_size() {
+        let map: HashMap<u8, u64> = (0..=u8::MAX).map(|k| (k, u64::from(k))).collect();
+        let capacity = map.capacity();
+        let buckets = if capacity < 8 {
+            capacity + 1
+        } else {
+            (capacity * 8 / 7).next_power_of_two()
+        };
+        let table = buckets * size_of::<(u8, u64)>() + buckets + HASH_GROUP_WIDTH;
+        assert!(measure(&map) >= u64::try_from(table).unwrap());
+        assert_eq!(
+            measure(&HashMap::<u8, u64>::new()),
+            u64::try_from(size_of::<HashMap<u8, u64>>()).unwrap()
+        );
+    }
+
+    // A one-entry B-tree allocates a whole node, not one entry's inline size.
+    #[test]
+    fn a_btree_counts_its_nodes() {
+        let one: BTreeSet<i64> = std::iter::once(7).collect();
+        let node = BTREE_NODE_KEYS * size_of::<i64>();
+        assert!(measure(&one) >= u64::try_from(node).unwrap());
+
+        let n = 1000_usize;
+        let map: BTreeMap<i64, i64> = (0..1000).map(|k| (k, k)).collect();
+        // At least `n / 11` nodes, each holding its parent link and full arrays.
+        let nodes = n.div_ceil(BTREE_NODE_KEYS);
+        let floor = nodes * (size_of::<usize>() + BTREE_NODE_KEYS * 2 * size_of::<i64>());
+        assert!(measure(&map) >= u64::try_from(floor).unwrap());
+        assert_eq!(
+            measure(&BTreeSet::<i64>::new()),
+            u64::try_from(size_of::<BTreeSet<i64>>()).unwrap()
+        );
     }
 
     #[test]

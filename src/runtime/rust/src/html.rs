@@ -1223,7 +1223,10 @@ impl<M: RetainedBytes> RetainedBytes for Event<M> {
 
 /// The bytes a shared event handler keeps alive, counted at every reference.
 ///
-/// The pointer, the two reference counters and the closure's captured state.
+/// The pointer, the two reference counters and the closure's inline captures.
+/// Heap a capture owns (a captured `String`'s buffer) is not reachable through
+/// `dyn Fn` and is not counted, so this undercounts a closure capturing an
+/// allocation.
 fn handler_bytes<F: ?Sized>(handler: &std::sync::Arc<F>) -> Option<Bytes> {
     Bytes::inline::<std::sync::Arc<F>>()?
         .checked_add(Bytes::inline::<[usize; 2]>()?)?

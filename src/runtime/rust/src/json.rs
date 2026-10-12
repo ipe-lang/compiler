@@ -11,7 +11,8 @@ crate::stringify::show_row!("Json", Value, [] JsonVal, |j| j.to_string());
 impl crate::retained::RetainedBytes for JsonVal {
     // Walked with an explicit worklist, so a deeply nested document is measured
     // without recursion. Each node counts its inline size once; an array adds
-    // its spare slots, a string its capacity, an object entry its key.
+    // its spare slots, a string its capacity, an object its entry and index
+    // tables (`json_object_tables`) and each entry its key.
     fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
         use crate::retained::Bytes;
         let node = Bytes::inline::<Self>()?;
@@ -28,6 +29,7 @@ impl crate::retained::RetainedBytes for JsonVal {
                     pending.extend(items);
                 }
                 Self::Object(entries) => {
+                    total = total.checked_add(json_object_tables(entries.len())?)?;
                     for (key, item) in entries {
                         total = total.plus(key)?;
                         pending.push(item);
@@ -37,6 +39,21 @@ impl crate::retained::RetainedBytes for JsonVal {
         }
         Some(total)
     }
+}
+
+/// An upper bound on the tables an insertion-order JSON object of `len` entries allocates.
+///
+/// The object keeps a vector of `(hash, key, value)` entries and a hash table
+/// of entry indices; neither capacity is observable. A table grown one insert
+/// at a time, or built at its exact length, reports at most `2 * len + 3`
+/// slots, so both tables count at that capacity.
+fn json_object_tables(len: usize) -> Option<crate::retained::Bytes> {
+    use crate::retained::{Bytes, hash_table};
+    if len == 0 {
+        return Some(Bytes::ZERO);
+    }
+    let capacity = len.checked_mul(2)?.checked_add(3)?;
+    Bytes::slots::<(usize, String, JsonVal)>(capacity)?.checked_add(hash_table::<usize>(capacity)?)
 }
 
 /// `Decoder<E, T>` — the unified decoder type shared by JsonDec, DbDec, and Config.
@@ -2185,6 +2202,29 @@ mod elm_behaviour_verdicts {
         assert_eq!(
             json_enc_encode(0, json_enc_float(0.1 + 0.2)),
             "0.30000000000000004"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use crate::retained::RetainedBytes;
+
+    // An object keeps an entry vector and an index table beside its keys and
+    // values, so its measure covers one entry slot and one index per entry.
+    #[test]
+    fn a_json_object_counts_its_entry_and_index_tables() {
+        let n = 100_usize;
+        let object: serde_json::Map<String, JsonVal> =
+            (0..n).map(|i| (format!("k{i}"), JsonVal::Null)).collect();
+        let value = JsonVal::Object(object);
+        let entry = size_of::<(usize, String, JsonVal)>() + size_of::<usize>();
+        let floor = (n + 1) * size_of::<JsonVal>() + n * entry;
+        let measured = value.retained_bytes().map(crate::retained::Bytes::get);
+        assert!(
+            measured.is_some_and(|m| m >= u64::try_from(floor).unwrap_or(u64::MAX)),
+            "{measured:?} < {floor}"
         );
     }
 }

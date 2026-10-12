@@ -819,3 +819,52 @@ fn every_stringify_impl_has_its_retained_twin() -> DResult<()> {
     );
     Ok(())
 }
+
+/// A tuple wider than the runtime's widest `RetainedBytes` tuple impl is serde
+/// but unmeasured: a field holding one, bare or inside a carrier, measures
+/// `None` rather than naming an impl that does not exist. CI job: `test`.
+#[test]
+fn a_wide_tuple_field_measures_none() -> DResult<()> {
+    let mut interner = Interner::new();
+    let mut prog = maybe_program(&mut interner)?;
+    let wide_name = interner.intern("wide")?;
+    let boxed_name = interner.intern("boxed")?;
+    let keep_name = interner.intern("keep")?;
+    let wide = IrType::Tuple(vec![IrType::Int; ipe_ir::MAX_SHOWN_TUPLE_ARITY + 1]);
+    let widest = IrType::Tuple(vec![IrType::Int; ipe_ir::MAX_SHOWN_TUPLE_ARITY]);
+    let module = prog
+        .modules
+        .first_mut()
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "adts test",
+            detail: "no module".to_owned(),
+        })?;
+    module.records.push(IrType::Record(
+        [(wide_name, wide.clone())].into_iter().collect(),
+    ));
+    module.records.push(IrType::Record(
+        [(boxed_name, IrType::List(Box::new(wide)))]
+            .into_iter()
+            .collect(),
+    ));
+    module
+        .records
+        .push(IrType::Record([(keep_name, widest)].into_iter().collect()));
+    let out = emit(&interner, &prog)?;
+    assert_eq!(
+        impl_targets(&out, "IpeStringify"),
+        impl_targets(&out, "RetainedBytes"),
+        "a shown type lacks its measure:\n{out}"
+    );
+    for field in ["wide", "boxed"] {
+        assert!(
+            !out.contains(&format!(".plus(&self.{field})")),
+            "a wide-tuple field must not be measured:\n{out}"
+        );
+    }
+    assert!(
+        out.contains(".plus(&self.keep)"),
+        "a tuple at the widest impl arity is measured:\n{out}"
+    );
+    Ok(())
+}

@@ -1052,14 +1052,21 @@ const RETAINED_INLINE: &str = "Bytes::inline::<Self>()";
 
 /// Whether a field of type `ty` is measured by its `RetainedBytes` impl.
 ///
-/// A serde field is measured: every serde leaf has a runtime `RetainedBytes`
-/// impl, and every emitted serde type gets one here. A non-serde field (a
-/// function, an opaque handle, `Html`, `Secret`) makes its variant or record
-/// measure `None`: such a type can never reach a Web `Model` or `Msg`, whose
-/// bounds require serde (`IPE-L0120`), so that arm is never one a session
-/// budget reads.
+/// A serde field is measured when every component it holds has a runtime
+/// `RetainedBytes` impl: every serde leaf has one, and every emitted serde type
+/// gets one here. A tuple wider than [`ipe_ir::MAX_SHOWN_TUPLE_ARITY`] is serde
+/// but has no runtime impl, so a field holding one anywhere (directly, inside a
+/// carrier, or as an enum's type argument or payload) is not measured; the
+/// walk's depth ceiling answers the same way. An unmeasured field (a function,
+/// an opaque handle, `Html`, `Secret`, a wide tuple) makes its variant or
+/// record measure `None`. A Web `Model` is serde (`IPE-L0120`), but a `Msg`
+/// needs only the derivable set (`IPE-L0125`), so an `Html`-carrying `Msg`
+/// arm measures `None`.
 fn measured_field(ctx: &EmitCtx, ty: &IrType) -> bool {
     ir_type_is_serde(ty, &|home, name| ctx.enum_is_serde(home, name))
+        && !ipe_ir::ir_type_holds(ty, &ctx.enum_variants, &|t: &IrType| {
+            matches!(t.show_shape(), ipe_ir::ShowShape::TooWide)
+        })
 }
 
 /// The `RetainedBytes` bounds `<T1: RetainedBytes, …>` over a type's parameters.
