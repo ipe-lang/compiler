@@ -178,6 +178,15 @@ pub struct Policy {
 /// ambiguous, whether or not the site's threshold shows that target.
 const RIVAL_EDITS: Distance = Distance(2);
 
+/// The longest folded query every rival comparison sees uncut.
+///
+/// A rival within [`RIVAL_EDITS`] of such a query is at most
+/// [`DISTANCE_CHARS`] characters per compared side, so no cut moves it out of
+/// reach and no cut hides an edit in the guess itself.
+fn exact_query_chars() -> usize {
+    DISTANCE_CHARS.saturating_sub(usize::from(RIVAL_EDITS.get()))
+}
+
 /// An edit distance, at most [`Distance::CEILING`] per compared pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Distance(u8);
@@ -202,8 +211,10 @@ pub enum Confidence {
     /// no unseen spelling could compete.
     CaseOnly,
     /// The one hit at one edit, with no other target within [`RIVAL_EDITS`]
-    /// of the query (shown or kept out by the threshold) and a complete scan,
-    /// so no unseen spelling could compete.
+    /// of the query (shown, kept out by the threshold, or shown farther by
+    /// segment yet that near whole), a complete scan, no spelling cut at
+    /// [`SPELLING_CHARS`], and a query of at most [`exact_query_chars`], so no
+    /// unseen or miscounted spelling could compete.
     UniqueSingleEdit,
     /// Any other hit, including an exact spelling: the site's exact lookup
     /// answers that one before ranking.
@@ -287,33 +298,44 @@ pub fn rank<'a, T: Ord + Clone>(
     let query_segments: Vec<Vec<char>> = query.segments.iter().map(|s| cut_chars(s)).collect();
     let mut work = Work::default();
     let mut best: BTreeMap<T, Best> = BTreeMap::new();
-    // Targets within `RIVAL_EDITS` of the query that the threshold kept out:
-    // never shown, yet each makes a one-edit guess ambiguous.
+    // Targets within `RIVAL_EDITS` of the query by the rival measure that the
+    // site's threshold kept out or scored farther: each makes a one-edit
+    // guess ambiguous.
     let mut rivals: BTreeSet<T> = BTreeSet::new();
+    // Whether every comparison saw its sides whole: a long query or a cut
+    // spelling can hide a rival's real distance.
+    let mut exact = query.folded.chars().nth(exact_query_chars()).is_none();
 
     let mut scan = universe.into_iter();
     for spelling in scan.by_ref().take(MAX_UNIVERSE) {
-        let Some(found) = score(
+        let (head, cut) = head_of(spelling.text);
+        exact &= !cut;
+        let found = score(
             query,
             &query_whole,
             &query_segments,
-            spelling.text,
+            head,
+            cut,
             policy.threshold,
             &mut work,
-        ) else {
+        );
+        if found.is_none_or(|f| f.distance > RIVAL_EDITS) {
             let rival = Threshold::Nearest { max: RIVAL_EDITS };
             if score(
                 query,
                 &query_whole,
                 &query_segments,
-                spelling.text,
+                head,
+                cut,
                 rival,
                 &mut work,
             )
             .is_some()
             {
-                rivals.insert(spelling.target);
+                rivals.insert(spelling.target.clone());
             }
+        }
+        let Some(found) = found else {
             continue;
         };
         best.entry(spelling.target)
@@ -342,6 +364,7 @@ pub fn rank<'a, T: Ord + Clone>(
         .map(|(at, (target, found))| {
             let unique = at == 0
                 && !truncated
+                && exact
                 && found.distance == Distance(1)
                 && runner_up.is_none_or(|next| next > RIVAL_EDITS)
                 && rivals.iter().all(|rival| *rival == target);
@@ -415,24 +438,30 @@ struct Rows {
     cur: Vec<usize>,
 }
 
-/// The score of `text` against the query, or `None` past the threshold.
+/// The first [`SPELLING_CHARS`] characters of `text`, and whether it was cut.
+fn head_of(text: &str) -> (&str, bool) {
+    match text.char_indices().nth(SPELLING_CHARS) {
+        Some((at, _)) => (text.get(..at).unwrap_or(text), true),
+        None => (text, false),
+    }
+}
+
+/// The score of a spelling's `head` against the query, or `None` past the
+/// threshold; `cut` says [`head_of`] cut the spelling.
 ///
 /// A dotted query is aligned against the spelling's trailing segments of the
 /// same count; when the counts differ, the whole folded strings are compared
-/// too and the smaller distance wins. A flat query, or a spelling cut at
-/// [`SPELLING_CHARS`], is compared whole only.
+/// too and the smaller distance wins. A flat query, or a cut spelling, is
+/// compared whole only.
 fn score(
     query: &Query,
     query_whole: &[char],
     query_segments: &[Vec<char>],
-    text: &str,
+    head: &str,
+    cut: bool,
     threshold: Threshold,
     work: &mut Work,
 ) -> Option<Best> {
-    let (head, cut) = match text.char_indices().nth(SPELLING_CHARS) {
-        Some((at, _)) => (text.get(..at).unwrap_or(text), true),
-        None => (text, false),
-    };
     work.folded.clear();
     work.folded
         .extend(head.chars().flat_map(char::to_lowercase));
@@ -961,6 +990,77 @@ mod tests {
             confidence(&["list", "zzzz"]),
             Some(Confidence::UniqueSingleEdit),
             "a far name is no rival"
+        );
+    }
+
+    /// A dotted spelling cut at [`SPELLING_CHARS`] is compared whole on its
+    /// head, so its real trailing segments, one edit away, go unseen.
+    #[test]
+    fn a_cut_spelling_blocks_a_unique_single_edit() {
+        let confidence = |rival: &str| {
+            rank(
+                &query("Lsit.map", Shape::Dotted),
+                spellings(&["List.map", rival]),
+                RELATIVE,
+            )
+            .hits
+            .first()
+            .map(Hit::confidence)
+        };
+        let shown = format!("{}Lsit.mop", "a.".repeat(8));
+        assert_eq!(confidence(&shown), Some(Confidence::Plausible));
+        let cut = format!("{}Lsit.mop", "a.".repeat(SPELLING_CHARS));
+        assert_eq!(
+            confidence(&cut),
+            Some(Confidence::Plausible),
+            "the cut rival is as near as the shown one"
+        );
+    }
+
+    /// Past [`DISTANCE_CHARS`], a cut can push a two-edit rival out of reach
+    /// and hide the guess's own tail: such a query is never confident.
+    #[test]
+    fn a_query_too_long_to_compare_exactly_is_never_a_unique_single_edit() {
+        let body = "a".repeat(DISTANCE_CHARS.saturating_sub(4));
+        let typed = format!("xy{body}bcde");
+        let rival = format!("{body}bcde");
+        let guess = format!("xyz{}bcde", body.get(1..).unwrap_or_default());
+        let ranked = rank(
+            &query(&typed, Shape::Flat),
+            spellings(&[&guess, &rival]),
+            RELATIVE,
+        );
+        assert_eq!(
+            ranked.hits.first().map(|h| (h.target, h.confidence)),
+            Some((guess.as_str(), Confidence::Plausible)),
+            "`{rival}` is two deletions from the query"
+        );
+        let short = rank(
+            &query("xyaaaabcde", Shape::Flat),
+            spellings(&["xyzaaabcde"]),
+            RELATIVE,
+        );
+        assert_eq!(
+            short.hits.first().map(Hit::confidence),
+            Some(Confidence::UniqueSingleEdit)
+        );
+    }
+
+    /// A shown hit whose aligned score is far but whose whole spelling is two
+    /// edits away is a rival like any hidden one.
+    #[test]
+    fn a_far_shown_hit_two_whole_edits_away_blocks_a_unique_single_edit() {
+        let typed = "abcdefghi.jklmnopqr";
+        let rival = "abcdefghijk.lmnopqr";
+        assert_eq!(distance(typed, rival), Some(2));
+        let ranked = rank(
+            &query(typed, Shape::Dotted),
+            spellings(&["abcdefghi.jklmnopqs", rival]),
+            RELATIVE,
+        );
+        assert_eq!(
+            ranked.hits.first().map(|h| (h.target, h.confidence)),
+            Some(("abcdefghi.jklmnopqs", Confidence::Plausible))
         );
     }
 
