@@ -5359,7 +5359,7 @@ mod process_run_tests {
         ];
         let refused = process_run_sync("sh", &args, 64);
         assert!(
-            matches!(&refused, Err(e) if e.contains("capture thread refused")),
+            matches!(&refused, Err(e) if e.message().contains("capture thread refused")),
             "{:?}",
             refused.as_ref().err()
         );

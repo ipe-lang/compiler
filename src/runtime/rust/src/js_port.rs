@@ -2430,9 +2430,10 @@ mod tests {
             session_open(&sid);
             let (handle, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session_sid(sid.to_string(), move || {
-                js_close_session::<i64, i64>(handle, 0_i64, int_decoder())
-            }));
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let past_budget = "a".repeat(crate::seal_codec::DEFAULT_SEAL_MAX_INPUT_BYTES);
             deliver_inbound_for(
