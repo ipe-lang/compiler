@@ -2116,7 +2116,7 @@ pub(crate) async fn serve_app(
 ///
 /// The test modules' one serve site: exporter and proxy upstreams stand in for
 /// a remote peer on `127.0.0.1:0`, never for an app listener.
-#[cfg(test)]
+#[cfg(all(test, feature = "web", feature = "http_client"))]
 #[allow(clippy::disallowed_methods)] // test upstreams stand in for remote peers, never an app listener
 pub(crate) async fn serve_fixture(
     listener: tokio::net::TcpListener,
@@ -2127,7 +2127,7 @@ pub(crate) async fn serve_fixture(
 
 /// One raw HTTP/1.1 exchange with the app listener on `127.0.0.1:port`: send
 /// `request` verbatim and return the whole response text, or `None` when no
-/// connection opens within five seconds.
+/// connection opens within five seconds or the response is not UTF-8.
 ///
 /// Raw bytes, so a test can send the `Host` a rebinding browser sends.
 #[cfg(test)]
@@ -2151,7 +2151,7 @@ pub(crate) async fn raw_exchange(port: u16, request: &str) -> Option<String> {
     .await
     .ok()?
     .ok()?;
-    Some(String::from_utf8_lossy(&out).into_owned())
+    String::from_utf8(out).ok()
 }
 
 /// The status code of a raw HTTP/1.1 `response`, `0` when it has none.
