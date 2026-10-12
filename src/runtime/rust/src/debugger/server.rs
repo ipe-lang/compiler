@@ -5,6 +5,7 @@
 #![cfg(feature = "debugger")]
 
 use crate::debugger::History;
+use crate::retained::{Bytes, RetainedBytes};
 use crate::stringify::IpeStringify;
 use crate::tea::IpeCmd;
 
@@ -16,6 +17,12 @@ use crate::tea::IpeCmd;
 /// knows. Memory is bounded: at most `cap` messages plus one base `Model`.
 pub struct SessionHistory<Msg, Model> {
     inner: History<Msg, Model>,
+}
+
+impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for SessionHistory<Msg, Model> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.inner)
+    }
 }
 
 impl<Msg: Clone, Model: Clone> SessionHistory<Msg, Model> {

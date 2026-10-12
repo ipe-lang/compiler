@@ -8,6 +8,37 @@ pub type JsonVal = serde_json::Value;
 // Compact JSON text; `to_string` on a `serde_json::Value` is infallible.
 crate::stringify::show_row!("Json", Value, [] JsonVal, |j| j.to_string());
 
+impl crate::retained::RetainedBytes for JsonVal {
+    // Walked with an explicit worklist, so a deeply nested document is measured
+    // without recursion. Each node counts its inline size once; an array adds
+    // its spare slots, a string its capacity, an object entry its key.
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        use crate::retained::Bytes;
+        let node = Bytes::inline::<Self>()?;
+        let mut total = Bytes::ZERO;
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(value) = pending.pop() {
+            total = total.checked_add(node)?;
+            match value {
+                Self::Null | Self::Bool(_) | Self::Number(_) => {}
+                Self::String(s) => total = total.plus_count(s.capacity())?,
+                Self::Array(items) => {
+                    let spare = items.capacity().checked_sub(items.len())?;
+                    total = total.checked_add(Bytes::slots::<Self>(spare)?)?;
+                    pending.extend(items);
+                }
+                Self::Object(entries) => {
+                    for (key, item) in entries {
+                        total = total.plus(key)?;
+                        pending.push(item);
+                    }
+                }
+            }
+        }
+        Some(total)
+    }
+}
+
 /// `Decoder<E, T>` — the unified decoder type shared by JsonDec, DbDec, and Config.
 ///
 /// Changed from a bare `Box<dyn Fn>` type alias to a struct carrying:

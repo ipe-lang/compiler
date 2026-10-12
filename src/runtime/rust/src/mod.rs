@@ -719,6 +719,9 @@ pub use error::*;
 pub mod stringify;
 pub use stringify::*;
 
+pub mod retained;
+pub use retained::{Bytes, RetainedBytes};
+
 pub mod char_kernel;
 pub use char_kernel::*;
 
