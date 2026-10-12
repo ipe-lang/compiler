@@ -22,6 +22,7 @@ pub use emit_expr::rust_str_lit;
 /// The typed mount base the emitted browser shell is served under.
 pub use ipe_runtime_rust::encoding::MountBase;
 mod crate_specs;
+#[macro_use]
 mod doc;
 mod emit_console;
 mod emit_doc;

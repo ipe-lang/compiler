@@ -1298,22 +1298,22 @@ pub fn emit_caf_get_or_init(
     // `|| BraceBody(body)` — the single closure argument. `BraceBody` renders
     // the body WITHOUT braces when it fits flat, and WITH braces on a new line
     // when it does not, matching `rustfmt`'s closure body layout.
-    let closure_arg = Doc::concat(vec![Doc::text("|| "), Doc::brace_body(body_doc)]);
+    let closure_arg = Doc::concat(vec![Doc::text(leaf!("|| ")), Doc::brace_body(body_doc)]);
     // `CELL.get_or_init(closure)` — a single-argument function call whose sole
     // closure argument `rustfmt` combines onto the call head: `get_or_init(|| {`
     // on one line, the body broken inside, `})` at the call's indent, no trailing
     // comma.
     let receiver = Doc::call_args(
-        Doc::text("CELL.get_or_init("),
+        Doc::text(leaf!("CELL.get_or_init(")),
         vec![closure_arg],
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
         // A function-call argument list keeps a trailing comma when it breaks.
         true,
     );
     // `.clone()` glued when the receiver stays single-line, dropped onto its own
     // line at the call's indent when the receiver's closure body broke — `rustfmt`'s
     // method-chain layout after a multiline receiver.
-    let call = Doc::method_chain(receiver, Doc::text(".clone()"));
+    let call = Doc::method_chain(receiver, Doc::text(leaf!(".clone()")));
     Ok(render_fn_body(&call))
 }
 
