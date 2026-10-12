@@ -210,7 +210,7 @@ struct State {
     /// a new `recompute` call joins (cancels) the previous one before spawning
     /// its replacement.
     worker: Option<thread::JoinHandle<()>>,
-    /// The in-flight worker's cancel flag, set by the input sync and again
+    /// The in-flight worker's cancel flag, set by `sync_and_recompute` and again
     /// before joining a superseded worker, so a lint stage still pending (it
     /// never demands the db, and so cannot unwind via salsa `Cancelled`) is
     /// skipped rather than run for a stale generation.
@@ -889,8 +889,7 @@ fn handle_notification(
                 },
             );
             ensure_project(state, loader, &path);
-            sync_inputs(state);
-            recompute(state, diag_tx);
+            sync_and_recompute(state, diag_tx);
         }
         DidChangeTextDocument::METHOD => {
             let Ok(params) = serde_json::from_value::<lsp_types::DidChangeTextDocumentParams>(
@@ -916,8 +915,7 @@ fn handle_notification(
                 // blocked the load.
                 ensure_project_fresh(state, loader, &path);
             }
-            sync_inputs(state);
-            recompute(state, diag_tx);
+            sync_and_recompute(state, diag_tx);
         }
         DidSaveTextDocument::METHOD => {
             let Ok(params) = serde_json::from_value::<lsp_types::DidSaveTextDocumentParams>(
@@ -931,8 +929,7 @@ fn handle_notification(
             // Re-resolve the layout from disk (files may have been added,
             // renamed, or removed since the last load).
             ensure_project_fresh(state, loader, &normalize(&path));
-            sync_inputs(state);
-            recompute(state, diag_tx);
+            sync_and_recompute(state, diag_tx);
         }
         DidCloseTextDocument::METHOD => {
             let Ok(params) = serde_json::from_value::<lsp_types::DidCloseTextDocumentParams>(
@@ -947,14 +944,12 @@ fn handle_notification(
             state.overlays.remove(&path);
             // The closed buffer reverts to disk truth.
             ensure_project_fresh(state, loader, &path);
-            sync_inputs(state);
-            recompute(state, diag_tx);
+            sync_and_recompute(state, diag_tx);
         }
         DidChangeWatchedFiles::METHOD => {
             if let Some(anchor) = state.served.watched_file_anchor() {
                 ensure_project_fresh(state, loader, &anchor);
-                sync_inputs(state);
-                recompute(state, diag_tx);
+                sync_and_recompute(state, diag_tx);
             }
         }
         _ => {}
@@ -1036,45 +1031,73 @@ fn module_name_fallback(path: &Path) -> String {
         .to_owned()
 }
 
-/// Reconcile the salsa inputs with the current layout, open-buffer overlays
-/// shadowing disk text.
-///
-/// The outgoing worker is signalled before the first setter: every caller
-/// follows with `recompute`, whose newer worker owns the next publish, so the
-/// outgoing one stops at its next cancellation point instead of holding the
-/// setter for a full pass.
-fn sync_inputs(state: &mut State) {
-    if let Some(cancel) = &state.worker_cancel {
-        cancel.store(true, Ordering::Relaxed);
+/// The input sync, reachable outside tests only paired with a recompute.
+mod input_sync {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+
+    use crossbeam_channel::Sender;
+
+    use super::{DiagnosticsBatch, ModuleOrigin, State, recompute};
+
+    /// Apply an input change: retire the outgoing worker, reconcile the salsa
+    /// inputs, and spawn the worker that owns the next publish.
+    ///
+    /// The outgoing worker is signalled before the first setter, so a lint
+    /// stage it has still to start is skipped rather than run for a
+    /// generation the recompute is about to supersede. The signal lives here,
+    /// not in the sync, because only a paired recompute bumps the generation
+    /// that makes the outgoing batch stale: a sync alone that signalled would
+    /// strip the lint findings from the batch still current.
+    pub(super) fn sync_and_recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
+        if let Some(cancel) = &state.worker_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        sync_inputs(state);
+        recompute(state, diag_tx);
     }
-    let desired: BTreeMap<Vec<String>, (String, ModuleOrigin)> =
-        state.served.layout().map_or_else(BTreeMap::new, |layout| {
-            layout
-                .disk
-                .iter()
-                .map(|(module, file)| {
-                    // Only a user module can carry an open-buffer overlay, and
-                    // its normalized path was canonicalized once in
-                    // `Layout::of`; reuse it rather than re-canonicalizing
-                    // every module (a syscall) on each keystroke.
-                    let overlay = layout
-                        .path_of_module
-                        .get(module)
-                        .and_then(|path| state.overlays.get(path))
-                        .map(|o| &o.text);
-                    let text = overlay.unwrap_or(&file.text).clone();
-                    (module.clone(), (text, file.origin))
-                })
-                .collect()
-        });
-    if state.db.root().is_some() || !desired.is_empty() {
-        // Each setter blocks until every other database clone drops. The
-        // worker holds its clone only through its demand stage, which unwinds
-        // with salsa `Cancelled` on its next query, so the wait is bounded by
-        // one in-flight query.
-        state.db.sync(&desired);
+
+    /// The input sync alone, for tests that inspect the synced inputs without
+    /// spawning a worker.
+    #[cfg(test)]
+    pub(super) fn sync_inputs_alone(state: &mut State) {
+        sync_inputs(state);
+    }
+
+    /// Reconcile the salsa inputs with the current layout, open-buffer overlays
+    /// shadowing disk text.
+    fn sync_inputs(state: &mut State) {
+        let desired: BTreeMap<Vec<String>, (String, ModuleOrigin)> =
+            state.served.layout().map_or_else(BTreeMap::new, |layout| {
+                layout
+                    .disk
+                    .iter()
+                    .map(|(module, file)| {
+                        // Only a user module can carry an open-buffer overlay, and
+                        // its normalized path was canonicalized once in
+                        // `Layout::of`; reuse it rather than re-canonicalizing
+                        // every module (a syscall) on each keystroke.
+                        let overlay = layout
+                            .path_of_module
+                            .get(module)
+                            .and_then(|path| state.overlays.get(path))
+                            .map(|o| &o.text);
+                        let text = overlay.unwrap_or(&file.text).clone();
+                        (module.clone(), (text, file.origin))
+                    })
+                    .collect()
+            });
+        if state.db.root().is_some() || !desired.is_empty() {
+            // Each setter blocks until every other database clone drops. The
+            // worker holds its clone only through its demand stage, which unwinds
+            // with salsa `Cancelled` on its next query, so the wait is bounded by
+            // one in-flight query.
+            state.db.sync(&desired);
+        }
     }
 }
+
+use input_sync::sync_and_recompute;
 
 fn apply_content_change(
     text: &mut String,
@@ -1781,13 +1804,14 @@ mod tests {
 
     use crossbeam_channel::RecvTimeoutError;
 
+    use super::input_sync::sync_inputs_alone as sync_inputs;
     use super::{
         Connection, DiagnosticsBatch, DidChangeTextDocument, DidChangeWatchedFiles,
         DidCloseTextDocument, DidOpenTextDocument, FeatureOutcome, Layout, LoadedFile,
         LoadedProject, Message, ModuleOrigin, Notification, Overlay, Path, PathBuf,
         PositionEncoding, ProjectLoader, PublishDiagnostics, PublishDiagnosticsParams, Served,
         State, TextDocumentContentChangeEvent, Url, code_action_result, ensure_project_fresh,
-        handle_notification, normalize, publish, recompute, sync_inputs,
+        handle_notification, normalize, publish, recompute, sync_and_recompute,
     };
     use crate::loader::{LimitSource, LoadDisposition, LoadError};
     use ipe_lint::{LintConfigLoadError, WorkspaceReadError, load_lint_config};
@@ -2421,8 +2445,7 @@ mod tests {
     /// Sync, recompute, and publish `state`'s diagnostics through `server`.
     fn recompute_and_publish(state: &mut State, server: &Connection) {
         let (diag_tx, diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        sync_inputs(state);
-        recompute(state, &diag_tx);
+        sync_and_recompute(state, &diag_tx);
         let batch = diag_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("diagnostics batch");
@@ -3186,8 +3209,7 @@ mod tests {
     #[allow(clippy::expect_used)] // test fixture: the worker always sends one batch
     fn diagnostics_for(state: &mut State, uri: &Url) -> Vec<lsp_types::Diagnostic> {
         let (diag_tx, diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
-        sync_inputs(state);
-        recompute(state, &diag_tx);
+        sync_and_recompute(state, &diag_tx);
         let batch = diag_rx
             .recv_timeout(Duration::from_secs(60))
             .expect("diagnostics batch");
@@ -3349,17 +3371,49 @@ mod tests {
         assert_eq!(batch.len(), uri_of.len(), "one entry per user document");
     }
 
-    /// An input sync signals the outgoing worker before its first setter, so a
-    /// lint stage still pending on the old database is skipped.
+    /// A sync with no paired recompute leaves the current worker's lint stage
+    /// live: no newer generation supersedes its batch, so a signal here would
+    /// publish that batch stripped of its lint findings.
     #[test]
-    fn sync_inputs_cancels_the_outgoing_worker() {
-        let mut state = synced_two_module_state("/lsp-sync-cancels-test");
+    fn a_bare_input_sync_leaves_the_current_worker_live() {
+        let mut state = synced_two_module_state("/lsp-bare-sync-test");
         let cancel = Arc::new(AtomicBool::new(false));
         state.worker_cancel = Some(cancel.clone());
         sync_inputs(&mut state);
         assert!(
-            cancel.load(Ordering::Relaxed),
-            "an input sync must cancel the outgoing worker"
+            !cancel.load(Ordering::Relaxed),
+            "a sync alone must not cancel the worker whose batch is still current"
         );
+    }
+
+    /// An input change signals the outgoing worker and hands the next publish
+    /// to a fresh worker whose own flag is clear, so no cancel outlives its
+    /// generation.
+    #[test]
+    fn an_input_change_cancels_the_outgoing_worker() {
+        let mut state = synced_two_module_state("/lsp-input-change-cancels-test");
+        let outgoing = Arc::new(AtomicBool::new(false));
+        state.worker_cancel = Some(outgoing.clone());
+        let (diag_tx, diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
+        sync_and_recompute(&mut state, &diag_tx);
+        assert!(
+            outgoing.load(Ordering::Relaxed),
+            "an input change must cancel the outgoing worker"
+        );
+        let incoming = state
+            .worker_cancel
+            .clone()
+            .expect("the incoming worker's flag");
+        assert!(
+            !Arc::ptr_eq(&incoming, &outgoing) && !incoming.load(Ordering::Relaxed),
+            "the incoming worker must start uncancelled"
+        );
+        let batch = diag_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the incoming worker publishes");
+        assert_eq!(batch.generation, state.generation);
+        if let Some(worker) = state.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
