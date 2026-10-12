@@ -67,7 +67,9 @@ use ipe_intern::{Interner, Symbol};
 use ipe_syntax::Module;
 use salsa::Setter as _;
 
-pub use long_lived::{Generation, GrowthCeiling, LONG_LIVED_CEILING, LongLivedDb, Synced};
+pub use long_lived::{
+    BuildConfigFields, Generation, GrowthCeiling, LONG_LIVED_CEILING, LongLivedDb, Synced,
+};
 pub use metadata::{ProgramMetadata, ProgramMetadataResult, program_metadata};
 
 // ---------------------------------------------------------------------------

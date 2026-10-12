@@ -1313,56 +1313,36 @@ fn run_inner(
                 // clone — see the module doc's cancellation walkthrough.
                 let root = db_main.sync(&desired).root;
 
-                let cfg = if let Some(cfg) = db_main.config() {
-                    let db = db_main.db_mut();
-                    if *cfg.db_driver(db) != resolved.db_driver {
-                        use salsa::Setter as _;
-                        cfg.set_db_driver(db).to(resolved.db_driver);
-                    }
-                    if cfg.wasm_public_env(db) != &resolved.wasm_public_env {
-                        use salsa::Setter as _;
-                        cfg.set_wasm_public_env(db)
-                            .to(resolved.wasm_public_env.clone());
-                    }
-                    if cfg.mount_base(db) != &resolved.mount_base {
-                        use salsa::Setter as _;
-                        cfg.set_mount_base(db).to(resolved.mount_base.clone());
-                    }
-                    cfg
-                } else {
-                    // Pass ffi_prep.emit so the backend can write FFI
-                    // bindings (src/ffi.rs) into the emitted project — the
-                    // same slot `run_build` fills via BuildConfig (CO-INCR-005).
-                    db_main.config_or_insert_with(|db| {
-                        ipe_db::BuildConfig::new(
-                            db,
-                            resolved.db_driver,
-                            ffi_prep.emit,
-                            REBUILD_TARGET,
-                            resolved.wasm_public_env.clone(),
-                            resolved.mount_base.clone(),
-                            false,
-                            REBUILD_INTENT,
-                            // Dependency-model emit: the project links the runtime as a
-                            // path dependency (what `ipe dev build` uses by default), so
-                            // no runtime source is vendored into `src/ipe_runtime/`.
-                            // `runtime_dep_root` is the verified crate root (holds
-                            // `Cargo.toml`), resolved once before the loop via
-                            // `runtime_embed::resolve()`, matching `ipe dev build`'s path.
-                            Some(ipe_backend_rust::RuntimeDep {
-                                root: runtime_dep_root.clone(),
-                            }),
-                            // `ipe dev watch --debugger` compiles the in-app debugger
-                            // overlay into the rebuilt runtime loop.
-                            opts.debugger,
-                            resolved.cargo_name.clone(),
-                            opts.hot_appearance,
-                            // `ipe dev watch` reloads the served-live web app; the
-                            // webview-native desktop delivery is not a watch target.
-                            false,
-                        )
-                    })
-                };
+                // Every field is reconciled on every pass, so a warm config
+                // holds exactly what a cold rebuild would build.
+                let cfg = db_main.sync_config(ipe_db::BuildConfigFields {
+                    db_driver: resolved.db_driver,
+                    // The backend writes FFI bindings (src/ffi.rs) into the
+                    // emitted project — the same slot `run_build` fills.
+                    ffi: ffi_prep.emit,
+                    target: REBUILD_TARGET,
+                    wasm_public_env: resolved.wasm_public_env.clone(),
+                    mount_base: resolved.mount_base.clone(),
+                    wasm_hydrate_mode: false,
+                    intent: REBUILD_INTENT,
+                    // Dependency-model emit: the project links the runtime as a
+                    // path dependency (what `ipe dev build` uses by default), so
+                    // no runtime source is vendored into `src/ipe_runtime/`.
+                    // `runtime_dep_root` is the verified crate root (holds
+                    // `Cargo.toml`), resolved once before the loop via
+                    // `runtime_embed::resolve()`, matching `ipe dev build`'s path.
+                    runtime_dep: Some(ipe_backend_rust::RuntimeDep {
+                        root: runtime_dep_root.clone(),
+                    }),
+                    // `ipe dev watch --debugger` compiles the in-app debugger
+                    // overlay into the rebuilt runtime loop.
+                    debugger: opts.debugger,
+                    cargo_name: resolved.cargo_name.clone(),
+                    hot_appearance: opts.hot_appearance,
+                    // `ipe dev watch` reloads the served-live web app; the
+                    // webview-native desktop delivery is not a watch target.
+                    webview_host: false,
+                });
 
                 // The prior worker (if any) has already unwound by the time
                 // `LongLivedDb::sync` returned above; join to reclaim the

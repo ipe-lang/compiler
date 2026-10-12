@@ -37,6 +37,22 @@ pub const LONG_LIVED_CEILING: GrowthCeiling = GrowthCeiling {
 /// Multiplier of the live input count in the created-input ceiling.
 const LIVE_INPUT_FACTOR: u64 = 4;
 
+/// Multiplier of a cold generation's own size that bounds its growth when
+/// that size alone already stands past the absolute arms.
+const COLD_EXCESS_FACTOR: u64 = 2;
+
+/// The size a cold generation measured at its first sync, recorded only when
+/// it already stood past the absolute arms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColdExcess {
+    /// Inputs created when the size was measured.
+    inputs: u64,
+    /// Distinct interned strings when the size was measured.
+    symbols: u64,
+    /// Interned bytes when the size was measured.
+    symbol_bytes: u64,
+}
+
 /// Whether a sync kept the database generation or replaced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Generation {
@@ -55,6 +71,36 @@ pub struct Synced {
     pub generation: Generation,
 }
 
+/// Every field of a [`BuildConfig`], as the driver resolved it for one sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // mirrors the `BuildConfig` input field for field
+pub struct BuildConfigFields {
+    /// See [`BuildConfig::db_driver`].
+    pub db_driver: ipe_backend_rust::DbDriver,
+    /// See [`BuildConfig::ffi`].
+    pub ffi: Option<ipe_backend_rust::FfiEmit>,
+    /// See [`BuildConfig::target`].
+    pub target: ipe_ir::Target,
+    /// See [`BuildConfig::wasm_public_env`].
+    pub wasm_public_env: Vec<String>,
+    /// See [`BuildConfig::mount_base`].
+    pub mount_base: ipe_backend_rust::MountBase,
+    /// See [`BuildConfig::wasm_hydrate_mode`].
+    pub wasm_hydrate_mode: bool,
+    /// See [`BuildConfig::intent`].
+    pub intent: ipe_backend_rust::BuildIntent,
+    /// See [`BuildConfig::runtime_dep`].
+    pub runtime_dep: Option<ipe_backend_rust::RuntimeDep>,
+    /// See [`BuildConfig::debugger`].
+    pub debugger: bool,
+    /// See [`BuildConfig::cargo_name`].
+    pub cargo_name: String,
+    /// See [`BuildConfig::hot_appearance`].
+    pub hot_appearance: bool,
+    /// See [`BuildConfig::webview_host`].
+    pub webview_host: bool,
+}
+
 /// A database generation plus the handles derived from it.
 pub struct LongLivedDb {
     db: IpeDatabase,
@@ -65,9 +111,10 @@ pub struct LongLivedDb {
     ceiling: GrowthCeiling,
     /// Set until the first measurement of a generation built cold.
     cold: bool,
-    /// The created-input count at which a cold generation already stood past
-    /// the absolute arms; those arms stay quiet until inputs grow beyond it.
-    absolute_quiet_until: Option<u64>,
+    /// A cold generation already past the absolute arms: those arms then
+    /// fire only once inputs grow beyond its measurement or the interner
+    /// grows past [`COLD_EXCESS_FACTOR`] times it.
+    cold_excess: Option<ColdExcess>,
 }
 
 impl Default for LongLivedDb {
@@ -94,7 +141,7 @@ impl LongLivedDb {
             resets: 0,
             ceiling,
             cold: true,
-            absolute_quiet_until: None,
+            cold_excess: None,
         }
     }
 
@@ -121,16 +168,83 @@ impl LongLivedDb {
         self.config
     }
 
-    /// The current generation's build config, built by `make` when absent.
-    pub fn config_or_insert_with(
-        &mut self,
-        make: impl FnOnce(&IpeDatabase) -> BuildConfig,
-    ) -> BuildConfig {
-        if let Some(config) = self.config {
+    /// The current generation's build config, holding exactly `fields`.
+    ///
+    /// The first call of a generation creates the config; every later call
+    /// sets each field that differs, so a warm config never keeps a value a
+    /// cold one would not hold.
+    pub fn sync_config(&mut self, fields: BuildConfigFields) -> BuildConfig {
+        use salsa::Setter as _;
+        let BuildConfigFields {
+            db_driver,
+            ffi,
+            target,
+            wasm_public_env,
+            mount_base,
+            wasm_hydrate_mode,
+            intent,
+            runtime_dep,
+            debugger,
+            cargo_name,
+            hot_appearance,
+            webview_host,
+        } = fields;
+        let Some(config) = self.config else {
+            let config = BuildConfig::new(
+                &self.db,
+                db_driver,
+                ffi,
+                target,
+                wasm_public_env,
+                mount_base,
+                wasm_hydrate_mode,
+                intent,
+                runtime_dep,
+                debugger,
+                cargo_name,
+                hot_appearance,
+                webview_host,
+            );
+            self.config = Some(config);
             return config;
+        };
+        let db = &mut self.db;
+        if *config.db_driver(db) != db_driver {
+            config.set_db_driver(db).to(db_driver);
         }
-        let config = make(&self.db);
-        self.config = Some(config);
+        if *config.ffi(db) != ffi {
+            config.set_ffi(db).to(ffi);
+        }
+        if *config.target(db) != target {
+            config.set_target(db).to(target);
+        }
+        if *config.wasm_public_env(db) != wasm_public_env {
+            config.set_wasm_public_env(db).to(wasm_public_env);
+        }
+        if *config.mount_base(db) != mount_base {
+            config.set_mount_base(db).to(mount_base);
+        }
+        if *config.wasm_hydrate_mode(db) != wasm_hydrate_mode {
+            config.set_wasm_hydrate_mode(db).to(wasm_hydrate_mode);
+        }
+        if *config.intent(db) != intent {
+            config.set_intent(db).to(intent);
+        }
+        if *config.runtime_dep(db) != runtime_dep {
+            config.set_runtime_dep(db).to(runtime_dep);
+        }
+        if *config.debugger(db) != debugger {
+            config.set_debugger(db).to(debugger);
+        }
+        if *config.cargo_name(db) != cargo_name {
+            config.set_cargo_name(db).to(cargo_name);
+        }
+        if *config.hot_appearance(db) != hot_appearance {
+            config.set_hot_appearance(db).to(hot_appearance);
+        }
+        if *config.webview_host(db) != webview_host {
+            config.set_webview_host(db).to(webview_host);
+        }
         config
     }
 
@@ -173,6 +287,12 @@ impl LongLivedDb {
     }
 
     /// Whether the generation has grown past the ceiling.
+    ///
+    /// A cold generation's own size is the layout walker's to bound: when
+    /// its first measurement already stands past the absolute arms, a reset
+    /// would only rebuild the same size, so those arms then fire on growth
+    /// alone — a created input past the measurement, or an interner grown
+    /// past [`COLD_EXCESS_FACTOR`] times it. Every arm stays a hard bound.
     fn past_ceiling(&mut self) -> bool {
         let live = self.root.map_or(0, |root| {
             u64::try_from(root.files(&self.db).len()).unwrap_or(u64::MAX)
@@ -181,24 +301,39 @@ impl LongLivedDb {
             .ceiling
             .inputs
             .max(live.saturating_mul(LIVE_INPUT_FACTOR));
+        let (symbols, symbol_bytes) = {
+            let interner = self.db.interner().lock();
+            (
+                u64::try_from(interner.len()).unwrap_or(u64::MAX),
+                interner.held_bytes(),
+            )
+        };
+        let past = |symbol_limit: u64, byte_limit: u64| {
+            symbols > symbol_limit || symbol_bytes > byte_limit
+        };
+        let symbol_limit = u64::from(self.ceiling.symbols);
+        let byte_limit = self.ceiling.symbol_bytes;
+        if std::mem::take(&mut self.cold) {
+            self.cold_excess = past(symbol_limit, byte_limit).then_some(ColdExcess {
+                inputs: self.inputs_created,
+                symbols,
+                symbol_bytes,
+            });
+        }
         if self.inputs_created > input_limit {
             return true;
         }
-        let absolute = {
-            let interner = self.db.interner().lock();
-            let symbols = u64::try_from(interner.len()).unwrap_or(u64::MAX);
-            symbols > u64::from(self.ceiling.symbols)
-                || interner.held_bytes() > self.ceiling.symbol_bytes
-        };
-        if std::mem::take(&mut self.cold) {
-            // A cold generation's own size is the walker's to bound: past the
-            // absolute arms already, a fresh reset would only rebuild it.
-            self.absolute_quiet_until = absolute.then_some(self.inputs_created);
+        match self.cold_excess {
+            None => past(symbol_limit, byte_limit),
+            Some(excess) => {
+                let grown_inputs = self.inputs_created > excess.inputs;
+                let grown_symbols = past(
+                    symbol_limit.max(excess.symbols.saturating_mul(COLD_EXCESS_FACTOR)),
+                    byte_limit.max(excess.symbol_bytes.saturating_mul(COLD_EXCESS_FACTOR)),
+                );
+                grown_symbols || (grown_inputs && past(symbol_limit, byte_limit))
+            }
         }
-        absolute
-            && self
-                .absolute_quiet_until
-                .is_none_or(|quiet| self.inputs_created > quiet)
     }
 
     /// Drop the generation, waiting for every worker clone to release it.
@@ -332,16 +467,18 @@ mod tests {
         let expected = render(&fresh, fresh_root);
         assert!(matches!(expected, Some(Ok((true, _)))), "{expected:?}");
 
-        // A warm generation that answered queries and then churned symbols.
+        // A warm generation that answered queries and then churned symbols
+        // past the ceiling.
         let mut warm = LongLivedDb::with_ceiling(SMALL);
-        for round in 0..4 {
-            let synced = warm.sync(&desired);
-            assert_eq!(render(&warm, synced.root), expected, "round {round}");
-            intern_fresh(&warm, round, usize::try_from(SMALL.symbols).unwrap_or(0));
-        }
+        let synced = warm.sync(&desired);
+        assert_eq!(render(&warm, synced.root), expected);
+        intern_fresh(&warm, 0, usize::try_from(SMALL.symbols).unwrap_or(0) + 1);
         let synced = warm.sync(&desired);
         assert_eq!(synced.generation, Generation::Reset);
-        assert!(warm.resets() >= 2);
+        assert_eq!(warm.resets(), 1);
+        assert_eq!(render(&warm, synced.root), expected);
+        let synced = warm.sync(&desired);
+        assert_eq!(synced.generation, Generation::Kept);
         assert_eq!(render(&warm, synced.root), expected);
     }
 
@@ -384,27 +521,103 @@ mod tests {
     }
 
     #[test]
+    fn long_lived_oversized_cold_generation_growth_stays_bounded() {
+        const PER_SYNC: usize = 64;
+        let mut owner = LongLivedDb::with_ceiling(SMALL);
+        let baseline = usize::try_from(SMALL.symbols).unwrap_or(0) * 2;
+        owner.sync(&one("Main", "main = 1"));
+        intern_fresh(&owner, 0, baseline);
+        assert_eq!(
+            owner.sync(&one("Main", "main = 1")).generation,
+            Generation::Reset
+        );
+        // The cold generation alone stands past the symbol arm.
+        intern_fresh(&owner, 0, baseline);
+        assert_eq!(
+            owner.sync(&one("Main", "main = 1")).generation,
+            Generation::Kept
+        );
+        let bound = symbols(&owner) * 2 + PER_SYNC;
+        // Fresh identifiers over the same inputs: growth alone must reset.
+        for round in 1..=100 {
+            owner.sync(&one("Main", "main = 1"));
+            intern_fresh(&owner, round, PER_SYNC);
+            assert!(
+                symbols(&owner) <= bound,
+                "round {round}: {}",
+                symbols(&owner)
+            );
+        }
+        assert!(owner.resets() >= 2, "resets: {}", owner.resets());
+    }
+
+    fn fields(cargo_name: &str) -> BuildConfigFields {
+        BuildConfigFields {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            intent: ipe_backend_rust::BuildIntent::Development,
+            runtime_dep: None,
+            debugger: false,
+            cargo_name: cargo_name.to_owned(),
+            hot_appearance: false,
+            webview_host: false,
+        }
+    }
+
+    #[test]
+    fn warm_config_holds_every_resolved_field() {
+        let mut owner = LongLivedDb::with_ceiling(SMALL);
+        owner.sync(&one("Main", "main = 1"));
+        let first = owner.sync_config(fields("first"));
+        // Every field differs from the first sync's, so each set is pinned.
+        let changed = BuildConfigFields {
+            db_driver: ipe_backend_rust::DbDriver::Postgres,
+            ffi: Some(ipe_backend_rust::FfiEmit::default()),
+            target: ipe_ir::Target::WasmClient,
+            wasm_public_env: vec!["PUBLIC_KEY".to_owned()],
+            mount_base: ipe_backend_rust::MountBase::parse("/app")
+                .unwrap_or_else(|_| ipe_backend_rust::MountBase::root()),
+            wasm_hydrate_mode: true,
+            intent: ipe_backend_rust::BuildIntent::Release,
+            runtime_dep: Some(ipe_backend_rust::RuntimeDep {
+                root: std::path::PathBuf::from("/runtime"),
+            }),
+            debugger: true,
+            cargo_name: "second".to_owned(),
+            hot_appearance: true,
+            webview_host: true,
+        };
+        assert!(changed.mount_base != ipe_backend_rust::MountBase::root());
+        let second = owner.sync_config(changed.clone());
+        assert!(first == second, "a warm sync keeps the one config handle");
+        let db = owner.db();
+        let held = BuildConfigFields {
+            db_driver: *second.db_driver(db),
+            ffi: second.ffi(db).clone(),
+            target: *second.target(db),
+            wasm_public_env: second.wasm_public_env(db).clone(),
+            mount_base: second.mount_base(db).clone(),
+            wasm_hydrate_mode: *second.wasm_hydrate_mode(db),
+            intent: *second.intent(db),
+            runtime_dep: second.runtime_dep(db).clone(),
+            debugger: *second.debugger(db),
+            cargo_name: second.cargo_name(db).clone(),
+            hot_appearance: *second.hot_appearance(db),
+            webview_host: *second.webview_host(db),
+        };
+        assert_eq!(held, changed, "a warm config holds what a cold one would");
+    }
+
+    #[test]
     fn long_lived_reset_drops_the_config() {
         let mut owner = LongLivedDb::with_ceiling(SMALL);
         owner.sync(&one("Main", "main = 1"));
         assert!(owner.config().is_none());
-        let installed = owner.config_or_insert_with(|db| {
-            BuildConfig::new(
-                db,
-                ipe_backend_rust::DbDriver::Sqlite,
-                None,
-                ipe_ir::Target::Native,
-                Vec::new(),
-                ipe_backend_rust::MountBase::root(),
-                false,
-                ipe_backend_rust::BuildIntent::Development,
-                None,
-                false,
-                String::new(),
-                false,
-                false,
-            )
-        });
+        let installed = owner.sync_config(fields(""));
         assert!(owner.config() == Some(installed));
         let mut generations = (0..=SMALL.inputs.saturating_mul(2))
             .map(|round| owner.sync(&one(&format!("M{round}"), "x = 1")).generation);
