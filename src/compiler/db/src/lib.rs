@@ -45,8 +45,14 @@
 //! full golden corpus plus a dedicated identifier-adding edit sequence. The
 //! LSP session never reaches emission (diagnostics-only), so the byte-level
 //! hazard this gate guards does not apply to it.
+//!
+//! Append-only interning and input creation need a bound in a process that
+//! outlives one build: such a process reaches its database only through
+//! [`LongLivedDb`], which drops the whole generation (database, interner and
+//! every handle into them) past [`LONG_LIVED_CEILING`] and rebuilds cold.
 
 mod clippy_paths_resolve;
+mod long_lived;
 mod metadata;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +67,7 @@ use ipe_intern::{Interner, Symbol};
 use ipe_syntax::Module;
 use salsa::Setter as _;
 
+pub use long_lived::{Generation, GrowthCeiling, LONG_LIVED_CEILING, LongLivedDb, Synced};
 pub use metadata::{ProgramMetadata, ProgramMetadataResult, program_metadata};
 
 // ---------------------------------------------------------------------------
@@ -2122,12 +2129,23 @@ fn raw_word_scan(src: &str) -> BTreeSet<String> {
 /// membership (or any handle) changed — a byte-identical re-sync dirties
 /// nothing. Removed module paths simply drop out of the map; their orphaned
 /// `SourceFile` inputs stay in the database (unreachable from any query once
-/// no resolution points at them).
+/// no resolution points at them); [`LongLivedDb`] bounds how many accumulate.
 pub fn sync_source_root<T: AsRef<str>>(
     db: &mut IpeDatabase,
     root: SourceRoot,
     desired: &BTreeMap<Vec<String>, (T, ModuleOrigin)>,
 ) {
+    reconcile_source_root(db, root, desired);
+}
+
+/// [`sync_source_root`], returning how many fresh [`SourceFile`] inputs it
+/// created.
+pub fn reconcile_source_root<T: AsRef<str>>(
+    db: &mut IpeDatabase,
+    root: SourceRoot,
+    desired: &BTreeMap<Vec<String>, (T, ModuleOrigin)>,
+) -> u64 {
+    let mut created: u64 = 0;
     let current = root.files(db).clone();
     let mut next: BTreeMap<Vec<String>, SourceFile> = BTreeMap::new();
     for (path, (text, origin)) in desired {
@@ -2144,11 +2162,13 @@ pub fn sync_source_root<T: AsRef<str>>(
                 path.clone(),
                 SourceFile::new(db, path.clone(), text.to_owned(), *origin),
             );
+            created = created.saturating_add(1);
         }
     }
     if next != current {
         root.set_files(db).to(next);
     }
+    created
 }
 
 /// Extract `import A.B.C` module paths from raw source.
