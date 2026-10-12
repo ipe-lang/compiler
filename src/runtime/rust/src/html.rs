@@ -352,7 +352,7 @@ fn render_into_ctx<M>(
                 match a {
                     Attribute::Attr(k, v) => {
                         let k = k.as_str();
-                        if k == "ipe-id" {
+                        if k == STAMPED_ID_ATTR {
                             ipe_id = Some(v);
                         }
                         match pairs.iter_mut().find(|(pk, _)| *pk == k) {
@@ -427,11 +427,18 @@ fn render_into_ctx<M>(
                 // injects a new attribute, and a script-bearing key (`onerror`,
                 // `srcdoc`) executes regardless of value-escaping. `SafeAttrName`
                 // enforces both policies in one place; a key that fails is dropped.
-                let Some(safe_key) = SafeAttrName::parse(k) else {
-                    continue;
+                // The stamped identity is the one reserved name the sink writes
+                // itself; every other `ipe-*` name fails `SafeAttrName`.
+                let name = if *k == STAMPED_ID_ATTR {
+                    STAMPED_ID_ATTR
+                } else {
+                    let Some(safe_key) = SafeAttrName::parse(k) else {
+                        continue;
+                    };
+                    safe_key.as_str()
                 };
                 s.push(' ');
-                s.push_str(safe_key.as_str());
+                s.push_str(name);
                 s.push_str("=\"");
                 crate::escape::html_attr_into(sanitise_url_attr(k, v), s);
                 s.push('"');
@@ -755,26 +762,49 @@ fn is_dangerous_attr_name(name: &str) -> bool {
     lower.starts_with("on") || lower == "srcdoc"
 }
 
+/// The attribute-name prefix the runtime reserves for its own wire markers.
+///
+/// The browser client binds a listener on every `[ipe-<event>]` element and
+/// addresses patches by `ipe-id`, so a program-built `ipe-*` attribute would
+/// forge a handler binding or an element identity. Matched ASCII-case-insensitively.
+const RESERVED_ATTR_PREFIX: &[u8] = b"ipe-";
+
+/// The attribute carrying the identity the ipe-id stamper assigns.
+const STAMPED_ID_ATTR: &str = "ipe-id";
+
+/// The attribute `Html.keyed` sets; the stamper reads it as the key segment.
+const KEY_ATTR: &str = "ipe-key";
+
+/// True when `name` starts with [`RESERVED_ATTR_PREFIX`] in any ASCII case.
+fn is_reserved_attr_name(name: &str) -> bool {
+    name.as_bytes()
+        .get(..RESERVED_ATTR_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTR_PREFIX))
+}
+
 /// A validated HTML **attribute** name (parse-don't-validate). The ONLY way to
 /// build one runs the full attribute-name policy — `is_safe_html_name` (charset:
-/// no structural-breakout bytes) AND `!is_dangerous_attr_name` (no script-bearing
-/// names) — exactly once. Every emit sink consumes a `SafeAttrName` instead of a
-/// raw `&str`, so a sink CANNOT forget a check: an unchecked sink leaving
-/// `htmlAttrToString` exposed is unrepresentable.
+/// no structural-breakout bytes), `!is_dangerous_attr_name` (no script-bearing
+/// names) and `!is_reserved_attr_name` (no runtime wire marker) — exactly once.
+/// Every emit sink consumes a `SafeAttrName` instead of a raw `&str`, so a sink
+/// CANNOT forget a check: an unchecked sink leaving `htmlAttrToString` exposed
+/// is unrepresentable. The stamped `ipe-id` is written by the render sink
+/// itself, never through this type.
 /// NB: element tag names and event-marker names are NOT attribute names — they
 /// keep the plain `is_safe_html_name` gate.
 struct SafeAttrName<'a>(&'a str);
 
 impl<'a> SafeAttrName<'a> {
     fn parse(name: &'a str) -> Option<Self> {
-        if is_safe_html_name(name) && !is_dangerous_attr_name(name) {
+        if is_safe_html_name(name) && !is_dangerous_attr_name(name) && !is_reserved_attr_name(name)
+        {
             Some(SafeAttrName(name))
         } else {
             None
         }
     }
 
-    fn as_str(&self) -> &str {
+    const fn as_str(&self) -> &'a str {
         self.0
     }
 }
@@ -909,25 +939,49 @@ fn sanitise_url_attr<'a>(name: &str, value: &'a str) -> &'a str {
 /// fails policy is dropped, which also covers the removal sentinel (an empty
 /// value on a dangerous name must never reach `setAttribute`).
 ///
+/// The patch builder also routes its own `ipe-<event>` listener markers here,
+/// so a reserved name passes only as [`is_event_marker_name`]: never the
+/// stamped `ipe-id` nor `ipe-key`, in any case.
+///
 /// Consumed by `dom/diff.rs` (the shared patch builder) — always compiled.
 pub(crate) fn safe_patch_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'a str, &'a str)> {
-    let SafeAttrName(safe_name) = SafeAttrName::parse(name)?;
-    Some((safe_name, sanitise_url_attr(name, value)))
+    if SafeAttrName::parse(name).is_none() && !is_event_marker_name(name) {
+        return None;
+    }
+    Some((name, sanitise_url_attr(name, value)))
+}
+
+/// True for an `ipe-<event>` listener-marker name the patch builder emits.
+///
+/// A reserved name in the HTML-name charset that is neither the stamped
+/// `ipe-id` nor `ipe-key`, compared ASCII-case-insensitively.
+fn is_event_marker_name(name: &str) -> bool {
+    is_reserved_attr_name(name)
+        && is_safe_html_name(name)
+        && !name.eq_ignore_ascii_case(STAMPED_ID_ATTR)
+        && !name.eq_ignore_ascii_case(KEY_ATTR)
 }
 
 /// Stamp every `HElement` (not HText/HRaw) with a stable `ipe-id` attribute derived
-/// from its path. Idempotent: an existing ipe-id is overwritten with the same
-/// value. HText/HRaw nodes are unaddressable .
+/// from its path. Idempotent: restamping yields the same ids. HText/HRaw nodes
+/// are unaddressable.
 ///
-/// Each non-root segment is `{path}_{idx}_{tag}[:{key}]` — the embedded tag means
-/// two structurally different subtrees never share an id at the same positional
+/// The id grammar is `{root}(_{idx}_{tag}[:{key}])*`: the embedded tag means two
+/// structurally different subtrees never share an id at the same positional
 /// depth, and the optional `:{key}` disambiguator (from an explicit `ipe-key`
 /// attribute, or implicit from `name` on form-bearing tags) lets keyed list items
 /// and named form fields keep identity across reorder.
 ///
-/// The id holds only `[A-Za-z0-9_.:-]`: a tag that fails `is_safe_html_name`
-/// contributes [`UNSAFE_TAG_ID_SEGMENT`] instead of its own text, and a key is
-/// sanitised, so `style_inject` can quote the id inside a CSS selector.
+/// The id is injective over (path, tag, key): the root, every tag and every key
+/// pass through [`push_id_segment`], whose output never holds `_` or `:`, so the
+/// separators split an id back into exactly the segments that built it. The id
+/// holds only `[A-Za-z0-9_.:-]`, so `style_inject` can quote it inside a CSS
+/// selector.
+///
+/// Every program-built `ipe-*` attribute (any ASCII case) on a stamped element is
+/// removed, except the `ipe-key` the key segment is read from, so the stamped
+/// `ipe-id` is the element's only reserved attribute. The render sink drops the
+/// remaining `ipe-key`.
 ///
 /// The same descent names radio groups: a `<fieldset>` carrying
 /// [`RADIO_GROUP_MARKER`] loses it, and every unnamed `<input type="radio">`
@@ -937,13 +991,51 @@ pub(crate) fn safe_patch_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'a 
 /// has a non-empty `name` keeps it. A serialiser that does not stamp
 /// (`Html.toString`) leaves the marker and the radios unnamed.
 pub fn assign_ipe_ids<M>(node: &mut Html<M>, path: &str) {
-    assign_ipe_ids_depth(node, path, 0, None);
+    let mut root = String::with_capacity(path.len());
+    push_id_segment(path, &mut root);
+    assign_ipe_ids_depth(node, &root, 0, None);
 }
 
-/// The `ipe-id` tag segment of an element whose tag fails `is_safe_html_name`.
+/// Separator between an id's root, index and tag segments.
+const ID_STEP_SEP: char = '_';
+
+/// Separator between an id's tag segment and its key segment.
+const ID_KEY_SEP: char = ':';
+
+/// Lead byte of a hex escape inside an id segment.
+const ID_ESCAPE: char = '.';
+
+/// Append `segment` to `out` in the injective id-segment encoding.
 ///
-/// Such an element never renders, but its id still reaches `style_inject`.
-const UNSAFE_TAG_ID_SEGMENT: &str = "x";
+/// ASCII letters, digits and `-` pass through; every other byte, the escape
+/// lead `.` included, becomes `.` followed by its two lowercase hex digits. The
+/// output therefore never holds [`ID_STEP_SEP`] or [`ID_KEY_SEP`], and a decoder
+/// that reads `.hh` as one byte recovers `segment` exactly.
+fn push_id_segment(segment: &str, out: &mut String) {
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' {
+            out.push(char::from(byte));
+        } else {
+            out.push(ID_ESCAPE);
+            for nibble in [byte >> 4, byte & 0x0f] {
+                if let Some(digit) = char::from_digit(u32::from(nibble), 16) {
+                    out.push(digit);
+                }
+            }
+        }
+    }
+}
+
+/// True for a program-built attribute the stamper removes.
+///
+/// That is every reserved name except the `ipe-key` the key segment is read from.
+fn is_unstamped_reserved_attr<M>(attr: &Attribute<M>) -> bool {
+    match attr {
+        Attribute::Attr(k, _) => k != KEY_ATTR && is_reserved_attr_name(k),
+        Attribute::BoolAttr(k, _) => is_reserved_attr_name(k),
+        Attribute::EventAttr(_) | Attribute::NoAttr => false,
+    }
+}
 
 // Same bounded-descent rationale as render_into_ctx (see MAX_HTML_DEPTH): the
 // stamper recurses once per nesting level, so an attacker-influenced deep tree
@@ -954,7 +1046,8 @@ fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: 
         return;
     }
     if let Html::HElement(tag, attrs, kids) = node {
-        set_attr(attrs, "ipe-id", path);
+        attrs.retain(|a| !is_unstamped_reserved_attr(a));
+        attrs.push(Attribute::Attr(STAMPED_ID_ATTR.to_owned(), path.to_owned()));
         let own_group = (tag.as_str() == "fieldset" && take_radio_group_marker(attrs))
             .then(|| format!("ipe-rg-{path}"));
         let group = own_group.as_deref().or(group);
@@ -968,17 +1061,16 @@ fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: 
                 {
                     set_attr(cattrs, "name", name);
                 }
-                let tag_seg = if is_safe_html_name(ctag) {
-                    ctag.as_str()
-                } else {
-                    UNSAFE_TAG_ID_SEGMENT
-                };
-                let mut seg = format!("{path}_{idx}_{tag_seg}");
+                let mut seg = String::from(path);
+                seg.push(ID_STEP_SEP);
+                seg.push_str(&idx.to_string());
+                seg.push(ID_STEP_SEP);
+                push_id_segment(ctag, &mut seg);
                 if let Some(key) = ipe_id_key(ctag, cattrs) {
-                    seg.push(':');
-                    seg.push_str(&key);
+                    seg.push(ID_KEY_SEP);
+                    push_id_segment(key, &mut seg);
                 }
-                idx += 1;
+                idx = idx.saturating_add(1);
                 assign_ipe_ids_depth(child, &seg, depth.saturating_add(1), group);
             }
         }
@@ -992,14 +1084,15 @@ fn take_radio_group_marker<M>(attrs: &mut Vec<Attribute<M>>) -> bool {
     attrs.len() != before
 }
 
-/// Stable disambiguator for an element, or `None`. Priority: an explicit
-/// `ipe-key` attribute (set by `Html.keyed`), then `name` on form-bearing tags.
-/// Any matched value is sanitised so it can't corrupt the ipe-id grammar.
-fn ipe_id_key<M>(tag: &str, attrs: &[Attribute<M>]) -> Option<String> {
-    if let Some(k) = attr_value(attrs, "ipe-key")
+/// Stable disambiguator for an element, or `None`.
+///
+/// Priority: an explicit `ipe-key` attribute (set by `Html.keyed`), then `name`
+/// on form-bearing tags. The caller encodes the value with [`push_id_segment`].
+fn ipe_id_key<'a, M>(tag: &str, attrs: &'a [Attribute<M>]) -> Option<&'a str> {
+    if let Some(k) = attr_value(attrs, KEY_ATTR)
         && !k.is_empty()
     {
-        return Some(sanitise_ipe_id_key(k));
+        return Some(k);
     }
     if matches!(
         tag,
@@ -1007,7 +1100,7 @@ fn ipe_id_key<M>(tag: &str, attrs: &[Attribute<M>]) -> Option<String> {
     ) && let Some(k) = attr_value(attrs, "name")
         && !k.is_empty()
     {
-        return Some(sanitise_ipe_id_key(k));
+        return Some(k);
     }
     None
 }
@@ -1017,20 +1110,6 @@ fn attr_value<'a, M>(attrs: &'a [Attribute<M>], key: &str) -> Option<&'a str> {
         Attribute::Attr(k, v) if k == key => Some(v.as_str()),
         _ => None,
     })
-}
-
-/// Replace anything outside `[A-Za-z0-9_-]` with `_`. Prevents the key from
-/// breaking ipe-id parsing, CSS selector escaping, or HTML attribute quoting.
-fn sanitise_ipe_id_key(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn set_attr<M>(attrs: &mut Vec<Attribute<M>>, key: &str, val: &str) {
@@ -1800,7 +1879,16 @@ mod tests {
         );
         assign_ipe_ids(&mut t, "r");
         let ids = collect_ids(&t);
-        assert_eq!(ids, vec!["r", "r_0_x", "r_0_x_0_b", "r_1_span"]);
+        let unsafe_tag = "r_0_x.22.5d.7b.7d.3c.2fstyle.3e";
+        assert_eq!(
+            ids,
+            vec![
+                "r".to_owned(),
+                unsafe_tag.to_owned(),
+                format!("{unsafe_tag}_0_b"),
+                "r_1_span".to_owned()
+            ]
+        );
         for id in &ids {
             assert!(
                 !id.contains(['"', ']', '{', '<']),
@@ -1853,10 +1941,214 @@ mod tests {
         assert!(collect_ids(&t).contains(&"r_0_input:email".to_string()));
     }
 
+    /// Inverse of `push_id_segment`: `None` for a byte outside the encoding.
+    fn decode_id_segment(encoded: &str) -> Option<String> {
+        let mut out = Vec::new();
+        let mut bytes = encoded.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'.' {
+                let hi = char::from(bytes.next()?).to_digit(16)?;
+                let lo = char::from(bytes.next()?).to_digit(16)?;
+                out.push(u8::try_from(hi * 16 + lo).ok()?);
+            } else if byte.is_ascii_alphanumeric() || byte == b'-' {
+                out.push(byte);
+            } else {
+                return None;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// One decoded id step: index, tag, optional key.
+    type IdStep = (usize, String, Option<String>);
+
+    /// Split a stamped id back into its root and steps.
+    fn decode_id(id: &str) -> Option<(String, Vec<IdStep>)> {
+        let mut parts = id.split('_');
+        let root = decode_id_segment(parts.next()?)?;
+        let mut steps = Vec::new();
+        while let Some(idx) = parts.next() {
+            let idx = idx.parse().ok()?;
+            let mut halves = parts.next()?.split(':');
+            let tag = decode_id_segment(halves.next()?)?;
+            let key = halves.next().map(decode_id_segment);
+            if matches!(key, Some(None)) || halves.next().is_some() {
+                return None;
+            }
+            steps.push((idx, tag, key.flatten()));
+        }
+        Some((root, steps))
+    }
+
+    /// The id stamped on the only child of a `div` root.
+    fn only_child_id(tag: &str, key: Option<&str>) -> String {
+        let attrs = key.map_or_else(Vec::new, |k| {
+            vec![Attribute::Attr(KEY_ATTR.into(), k.into())]
+        });
+        let mut t: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![Html::HElement(tag.into(), attrs, vec![])],
+        );
+        assign_ipe_ids(&mut t, "r");
+        collect_ids(&t).into_iter().nth(1).unwrap_or_default()
+    }
+
     #[test]
-    fn ipe_key_value_is_sanitised() {
-        assert_eq!(sanitise_ipe_id_key("a/b c.d"), "a_b_c_d");
-        assert_eq!(sanitise_ipe_id_key("keep-_OK9"), "keep-_OK9");
+    fn keys_differing_only_in_punctuation_get_distinct_ids() {
+        assert_ne!(
+            only_child_id("li", Some("a.b")),
+            only_child_id("li", Some("a_b"))
+        );
+        assert_ne!(
+            only_child_id("li", Some("a b")),
+            only_child_id("li", Some("a/b"))
+        );
+    }
+
+    #[test]
+    fn colon_in_tag_never_spells_a_key() {
+        assert_ne!(only_child_id("li:a", None), only_child_id("li", Some("a")));
+        assert_ne!(only_child_id("x\"]", None), only_child_id("x", None));
+    }
+
+    #[test]
+    fn id_segment_round_trips_over_a_small_alphabet() {
+        let alphabet = ["a", "Z", "0", "-", "_", ".", ":", " ", "\u{e9}"];
+        let mut inputs = vec![String::new()];
+        for _ in 0..3 {
+            let longer: Vec<String> = inputs
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            inputs.extend(longer);
+        }
+        inputs.sort();
+        inputs.dedup();
+        for input in &inputs {
+            let mut encoded = String::new();
+            push_id_segment(input, &mut encoded);
+            assert!(!encoded.contains(['_', ':']), "{input:?} -> {encoded:?}");
+            assert_eq!(decode_id_segment(&encoded).as_deref(), Some(input.as_str()));
+        }
+    }
+
+    #[test]
+    fn stamped_ids_decode_to_the_shape_that_built_them() {
+        let tags = [
+            "li", "li:a", "li_a", "li.a", "li_0_li", "x", "x\"]", "\u{e9}",
+        ];
+        let keys = [
+            None,
+            Some("a"),
+            Some("a.b"),
+            Some("a_b"),
+            Some("b_0_li"),
+            Some("a:b"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in tags {
+            for key in keys {
+                let id = only_child_id(tag, key);
+                let expected = (
+                    "r".to_owned(),
+                    vec![(0, tag.to_owned(), key.map(str::to_owned))],
+                );
+                assert_eq!(decode_id(&id), Some(expected), "{id}");
+                assert!(seen.insert(id.clone()), "two shapes share the id {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn safe_attr_name_refuses_the_reserved_prefix() {
+        for name in ["ipe-x", "IPE-x", "Ipe-id", "ipe-key", "ipe-click"] {
+            assert!(SafeAttrName::parse(name).is_none(), "{name}");
+            assert_eq!(
+                html_attr_to_string_::<()>(Attribute::Attr(name.into(), "v".into())),
+                ""
+            );
+        }
+        for name in ["ipe-id", "IPE-ID", "ipe-key", "Ipe-Key", "ipe-x y"] {
+            assert!(safe_patch_attr(name, "v").is_none(), "{name}");
+        }
+        assert!(safe_patch_attr("ipe-click", "click").is_some());
+        assert!(SafeAttrName::parse("ipe").is_some());
+        assert!(SafeAttrName::parse("data-ipe-x").is_some());
+    }
+
+    /// An unstamped tree still drops every program-built reserved name other
+    /// than the exact stamped-id spelling.
+    #[test]
+    fn render_sink_drops_program_built_reserved_attrs() {
+        let t: Html<()> = Html::HElement(
+            "button".into(),
+            vec![
+                Attribute::Attr("IPE-ID".into(), "x".into()),
+                Attribute::Attr("ipe-click".into(), "y".into()),
+                Attribute::Attr(KEY_ATTR.into(), "k".into()),
+                Attribute::BoolAttr("Ipe-Flag".into(), true),
+            ],
+            vec![],
+        );
+        let low = render_html(&t).to_ascii_lowercase();
+        assert!(!low.contains("ipe-"), "{low}");
+    }
+
+    #[test]
+    fn stamper_leaves_the_stamped_id_as_the_only_reserved_attr() {
+        let mut t: Html<()> = Html::HElement(
+            "div".into(),
+            vec![
+                Attribute::Attr("ipe-id".into(), "forged".into()),
+                Attribute::Attr("IPE-ID".into(), "forged".into()),
+                Attribute::BoolAttr("ipe-click".into(), true),
+            ],
+            vec![],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let Html::HElement(_, attrs, _) = &t else {
+            return;
+        };
+        let reserved: Vec<(&str, &str)> = attrs
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::Attr(k, v) if is_reserved_attr_name(k) => Some((k.as_str(), v.as_str())),
+                Attribute::BoolAttr(k, _) if is_reserved_attr_name(k) => Some((k.as_str(), "")),
+                Attribute::Attr(..)
+                | Attribute::BoolAttr(..)
+                | Attribute::EventAttr(_)
+                | Attribute::NoAttr => None,
+            })
+            .collect();
+        assert_eq!(reserved, vec![(STAMPED_ID_ATTR, "r")]);
+    }
+
+    #[test]
+    fn ui_html_attribute_cannot_forge_the_stamped_id() {
+        use crate::ui::helpers::{ui_el_, ui_html_attribute_, ui_text_};
+        let elem = ui_el_::<()>(
+            vec![
+                ui_html_attribute_("IPE-ID".into(), "x".into()),
+                ui_html_attribute_("ipe-id".into(), "y".into()),
+            ],
+            ui_text_("t".into()),
+        );
+        let mut html = crate::ui::render::ui_layout(vec![], elem);
+        assign_ipe_ids(&mut html, "r");
+        let stamped = collect_ids(&html);
+        let out = render_html(&html);
+        let rendered: Vec<&str> = out
+            .split(" ipe-id=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert_eq!(rendered, stamped, "{out}");
+        assert_eq!(
+            out.to_ascii_lowercase().matches("ipe-id=").count(),
+            stamped.len(),
+            "{out}"
+        );
     }
 
     #[test]
