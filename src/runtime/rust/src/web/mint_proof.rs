@@ -64,12 +64,13 @@ pub enum MintRefusal {
 #[derive(Debug)]
 pub struct MintProof(());
 
+/// The `Sec-Fetch-Site` value; `User` is `none`, an arrival the user started.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Site {
+enum Initiator {
     SameOrigin,
     SameSite,
     CrossSite,
-    None,
+    User,
     Unknown,
 }
 
@@ -96,7 +97,11 @@ enum Dest {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FetchMetadata {
     Absent,
-    Present { site: Site, mode: Mode, dest: Dest },
+    Present {
+        site: Initiator,
+        mode: Mode,
+        dest: Dest,
+    },
 }
 
 /// One header's value: absent, unreadable (duplicated or non-ASCII), or its single line.
@@ -118,13 +123,13 @@ fn field<'a>(headers: &'a HeaderMap, name: &str) -> Field<'a> {
     first.to_str().map_or(Field::Unreadable, Field::Value)
 }
 
-impl Site {
+impl Initiator {
     fn parse(token: &str) -> Self {
         match token {
             "same-origin" => Self::SameOrigin,
             "same-site" => Self::SameSite,
             "cross-site" => Self::CrossSite,
-            "none" => Self::None,
+            "none" => Self::User,
             _ => Self::Unknown,
         }
     }
@@ -165,7 +170,7 @@ impl FetchMetadata {
             (Field::Absent, Field::Absent, Field::Absent) => Some(Self::Absent),
             (Field::Absent, _, _) | (_, Field::Absent, _) | (_, _, Field::Absent) => None,
             (site, mode, dest) => Some(Self::Present {
-                site: read(site, Site::parse, Site::Unknown),
+                site: read(site, Initiator::parse, Initiator::Unknown),
                 mode: read(mode, Mode::parse, Mode::Unknown),
                 dest: read(dest, Dest::parse, Dest::Unknown),
             }),
@@ -199,7 +204,7 @@ impl MintProof {
         let FetchMetadata::Present { site, mode, dest } = metadata else {
             return Ok(Self(()));
         };
-        if site == Site::Unknown || mode == Mode::Unknown || dest == Dest::Unknown {
+        if site == Initiator::Unknown || mode == Mode::Unknown || dest == Dest::Unknown {
             return Err(MintRefusal::Malformed);
         }
         match (site, mode, dest) {
@@ -208,10 +213,10 @@ impl MintProof {
                 Embedding::Embeddable => Ok(Self(())),
                 Embedding::NotEmbeddable => Err(MintRefusal::FrameNotEmbeddable),
             },
-            (Site::SameOrigin, _, _) if client_router(headers) => Ok(Self(())),
-            (Site::SameOrigin, _, _) => Err(MintRefusal::UnprovenSameOrigin),
+            (Initiator::SameOrigin, _, _) if client_router(headers) => Ok(Self(())),
+            (Initiator::SameOrigin, _, _) => Err(MintRefusal::UnprovenSameOrigin),
             (
-                Site::SameSite | Site::CrossSite | Site::None | Site::Unknown,
+                Initiator::SameSite | Initiator::CrossSite | Initiator::User | Initiator::Unknown,
                 Mode::Navigate
                 | Mode::SameOrigin
                 | Mode::NoCors
