@@ -24,7 +24,7 @@ Constructors fall into two groups:
 
 * **Message-carrying** — take a `String` description and produce an `Error`:
   `unexpected`, `invalidInput`, `io`, `network`, `ffi`, `decode`,
-  `conflict`, `unavailable`.
+  `conflict`, `unavailable`, `limitExceeded`.
 
 * **Canonical** — produce an `Error` with a fixed message matching the
   kind label: `timeout`, `notFound`, `permissionDenied`.
@@ -37,7 +37,14 @@ Modifiers and inspectors:
 * `isRetryable` — `True` for `timeout`, `network`, and `unavailable`.
 * `kind` — extract the `ErrorKind` tag.
 * `message` — extract the bare message string.
-* `kindName` — stable lowercase label of an `ErrorKind`.
+* `kindName` — the variant name of an `ErrorKind`, the same prefix
+  `toString` uses.
+
+`ErrorKind` has twelve variants: `Io`, `Network`, `Ffi`, `Decode`,
+`Timeout`, `NotFound`, `PermissionDenied`, `InvalidInput`, `Conflict`,
+`Unavailable`, `Unexpected` and `LimitExceeded`. `LimitExceeded` marks an
+input refused by a declared ceiling (too large, too long, too deep or with
+too many parts for its bound); a larger bound would accept the same input.
 
 ## `unexpected`
 
@@ -102,6 +109,22 @@ unavailable : String -> Error
 ```
 
 Construct an `Error` with kind `Unavailable` and the given message.
+
+## `limitExceeded`
+
+```ipe
+limitExceeded : String -> Error
+```
+
+Construct an `Error` with kind `LimitExceeded` and the given message: a
+declared ceiling (a size, count or depth bound on one input) turned the input
+back. It is not retryable: the same input fails again against the same bound.
+
+```ipe
+kind (limitExceeded "x") --> LimitExceeded
+toString (limitExceeded "x") --> "LimitExceeded: x"
+isRetryable (limitExceeded "x") --> False
+```
 
 ## `timeout`
 
@@ -182,5 +205,6 @@ Extract the bare message string from an `Error`.
 kindName : ErrorKind -> String
 ```
 
-Stable lowercase label of an `ErrorKind` (the same prefix `toString` uses).
+The variant name of an `ErrorKind` (`"Io"`, `"LimitExceeded"`, …), the
+same prefix `toString` uses.
 
