@@ -2206,7 +2206,7 @@ mod elm_behaviour_verdicts {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod retained_tests {
     use super::*;
     use crate::retained::RetainedBytes;

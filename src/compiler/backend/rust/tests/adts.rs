@@ -840,16 +840,14 @@ fn a_wide_tuple_field_measures_none() -> DResult<()> {
             detail: "no module".to_owned(),
         })?;
     module.records.push(IrType::Record(
-        [(wide_name, wide.clone())].into_iter().collect(),
+        std::iter::once((wide_name, wide.clone())).collect(),
     ));
     module.records.push(IrType::Record(
-        [(boxed_name, IrType::List(Box::new(wide)))]
-            .into_iter()
-            .collect(),
+        std::iter::once((boxed_name, IrType::List(Box::new(wide)))).collect(),
     ));
-    module
-        .records
-        .push(IrType::Record([(keep_name, widest)].into_iter().collect()));
+    module.records.push(IrType::Record(
+        std::iter::once((keep_name, widest)).collect(),
+    ));
     let out = emit(&interner, &prog)?;
     assert_eq!(
         impl_targets(&out, "IpeStringify"),
