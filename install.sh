@@ -427,12 +427,16 @@ require_release_tag() {
 # shell reads as code, or as a line break, inside the double-quoted
 # `. "DIR/.ipe/env"` line the installer adds to a startup file, or to '' when
 # DIR holds none: a double quote, a dollar sign, a backtick, a backslash, a
-# newline, or any other C0 control byte or DEL. Spaces and non-ASCII characters
-# stay legal (`/c/Users/John Doe`, an accented user name). DIR is judged as
-# `od` byte numbers, so the verdict never depends on a tool's character model.
+# newline, or any other C0 control byte or DEL. Spaces and non-ASCII characters stay legal
+# (`/c/Users/John Doe`, an accented user name). DIR is judged as `od` byte
+# numbers, so the verdict never depends on a tool's character model; a trailing
+# `/` sentinel byte proves `od` read DIR to its end, so an `od` that is missing,
+# fails, or prints anything but byte numbers refuses DIR rather than admitting
+# it unread.
 home_flaw() {
   HOME_FLAW=''
-  for _hf_byte in $(printf '%s' "$1" | od -An -v -tu1); do
+  _hf_last=''
+  for _hf_byte in $(printf '%s/' "$1" | od -An -v -tu1); do
     case "$_hf_byte" in
       34) HOME_FLAW='a double quote' ;;
       36) HOME_FLAW='a dollar sign' ;;
@@ -440,20 +444,47 @@ home_flaw() {
       92) HOME_FLAW='a backslash' ;;
       10) HOME_FLAW='a newline' ;;
       [0-9]|1[0-9]|2[0-9]|3[01]|127) HOME_FLAW='a control character' ;;
+      *[!0123456789]*) HOME_FLAW='a byte the installer could not read' ;;
     esac
     [ -z "$HOME_FLAW" ] || return 0
+    _hf_last="$_hf_byte"
   done
+  [ "$_hf_last" = 47 ] || HOME_FLAW='a byte the installer could not read'
 }
 
 # parse_home DIR — set USER_HOME to DIR, the home directory every later path
 # and every line the installer writes for a shell derives from; die when DIR is
-# empty or home_flaw finds a flaw in it.
+# empty, relative, or home_flaw finds a flaw in it. A relative DIR would make
+# the line added to a startup file source a file relative to whatever directory
+# a shell starts in.
 parse_home() {
   [ -n "$1" ] || die 'HOME is not set. Set it to your home directory and try again.'
+  case "$1" in
+    /*) ;;
+    *) die 'Refusing HOME %s: it is not an absolute path, so the line the installer adds to your startup file would source a file relative to whatever directory a shell starts in. Set HOME to the absolute path of your home directory and try again.' "$1" ;;
+  esac
   home_flaw "$1"
   [ -z "$HOME_FLAW" ] \
     || die 'Refusing HOME %s: it contains %s, which a shell would run as code from the line the installer adds to your startup file. Set HOME to a plain directory path and try again.' "$1" "$HOME_FLAW"
   USER_HOME="$1"
+}
+
+# fish_literal TEXT — set FISH_LITERAL to TEXT as one fish single-quoted
+# literal. Inside fish single quotes a backslash escapes a backslash or a
+# single quote, so each of those is written backslash-escaped; every other
+# character is literal.
+fish_literal() {
+  _fl_in="$1"; _fl_out=''
+  while [ -n "$_fl_in" ]; do
+    _fl_tail="${_fl_in#?}"
+    _fl_char="${_fl_in%"$_fl_tail"}"
+    case "$_fl_char" in
+      \\|\') _fl_out="$_fl_out\\$_fl_char" ;;
+      *) _fl_out="$_fl_out$_fl_char" ;;
+    esac
+    _fl_in="$_fl_tail"
+  done
+  FISH_LITERAL="'$_fl_out'"
 }
 # <<< input parsers
 
@@ -660,12 +691,20 @@ INSTALL_DIR="${IPE_INSTALL_DIR:-$USER_HOME/.local/bin}"
 # backtick, `$`, or whitespace could inject shell code into a sourced file, so we
 # refuse rather than try to quote it perfectly at each use. Backslash and the
 # drive-letter colon ARE allowed — Windows paths (`D:\...`) need them, and both
-# are inert inside the single-quoted `export PATH='…'` the env file emits.
+# are inert inside the single-quoted `export PATH='…'` the env file emits (the
+# fish file escapes each backslash, see fish_literal). The class is spelled out
+# byte by byte, so no locale's collation can widen a range. The directory must
+# also be absolute (`/…` or a drive letter): a relative PATH entry would make
+# every later shell look commands up relative to its working directory.
 case "$INSTALL_DIR" in
-  *[!A-Za-z0-9._/+@:\\-]*)
-    die 'The install directory contains unsupported characters: %s' "$INSTALL_DIR" ;;
   '') die 'The install directory is empty.' ;;
+  *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/+@:\\-]*)
+    die 'The install directory %s holds a character the installer will not write into a shell startup file: only letters, digits, backslash and . _ / + @ : - are allowed. Set IPE_INSTALL_DIR to a directory path made of those and try again.' "$INSTALL_DIR" ;;
+  /*|[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]:[\\/]*) ;;
+  *) die 'The install directory %s is not an absolute path. Set IPE_INSTALL_DIR to an absolute directory path and try again.' "$INSTALL_DIR" ;;
 esac
+fish_literal "$INSTALL_DIR"
+INSTALL_DIR_FISH="$FISH_LITERAL"
 # A requested release tag becomes a download URL path segment and the tag file
 # `ipe upgrade` reads back, so it must be a plain version tag.
 if [ -n "${IPE_VERSION:-}" ]; then
@@ -1095,12 +1134,12 @@ resolve_shell_rc() {
   esac
   if [ "$SH_NAME" = fish ]; then
     RC_SOURCE_LINE="source \"$ENV_FISH\""
-    PATH_NOW="fish_add_path $INSTALL_DIR"
+    PATH_NOW="fish_add_path $INSTALL_DIR_FISH"
     SOURCE_NOW="source \"$ENV_FISH\""
   else
     RC_SOURCE_LINE=". \"$ENV_POSIX\""
     # shellcheck disable=SC2016  # $PATH must stay literal so it expands per-shell
-    PATH_NOW="export PATH=\"$INSTALL_DIR:\$PATH\""
+    PATH_NOW="export PATH='$INSTALL_DIR':\"\$PATH\""
     SOURCE_NOW=". \"$ENV_POSIX\""
   fi
 }
@@ -1127,14 +1166,15 @@ write_env_files() {
   refuse_symlink_escape "$ENV_POSIX"
   refuse_symlink_escape "$ENV_FISH"
   # INSTALL_DIR is gated to path characters at the boundary, so single-quoting
-  # it here yields an inert literal even though the file is later sourced.
+  # it here yields an inert literal even though the file is later sourced; the
+  # fish file takes INSTALL_DIR_FISH, whose backslashes fish_literal escaped.
   # shellcheck disable=SC2016  # $PATH must stay literal for per-shell expansion
   write_env_files_posix="# Managed by the Ipê installer — puts ipe on your PATH.
-case \":\${PATH}:\" in *\":$INSTALL_DIR:\"*) ;; *) export PATH='$INSTALL_DIR':\"\$PATH\" ;; esac
+case \":\${PATH}:\" in *':$INSTALL_DIR:'*) ;; *) export PATH='$INSTALL_DIR':\"\$PATH\" ;; esac
 "
   write_env_files_fish="# Managed by the Ipê installer — puts ipe on your PATH.
-if not contains '$INSTALL_DIR' \$PATH
-    fish_add_path '$INSTALL_DIR'
+if not contains $INSTALL_DIR_FISH \$PATH
+    fish_add_path $INSTALL_DIR_FISH
 end
 "
   write_managed "$ENV_POSIX" "$write_env_files_posix"
