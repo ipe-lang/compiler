@@ -143,11 +143,44 @@ function Die([string]$msg) {
 function Ask([string]$q) {
     Detach
     if (-not $Interactive) { return $false }
+    # Keys typed while a stage was running must never answer a later question.
+    try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { $null = $_ }
     Put "  $q [Y/n] " 'Yellow'
     $a = [Console]::In.ReadLine()
     if ($null -eq $a) { Nl; return $false }
     $a = $a.Trim()
     return ($a -eq '' -or $a -match '^(y|yes)$')
+}
+
+# Runs a native tool to completion while the stage line animates a spinner and
+# the elapsed time; its output goes to temp files and is discarded. Returns the
+# exit code, or -1 when the tool is missing or cannot start.
+function RunSpin([string]$exe, [string[]]$argv) {
+    $cmd = Get-Command $exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $cmd) { return -1 }
+    $so = [IO.Path]::GetTempFileName()
+    $se = [IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $cmd.Source -ArgumentList $argv -NoNewWindow -PassThru -RedirectStandardOutput $so -RedirectStandardError $se
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $frame = 0
+        while (-not $p.HasExited) {
+            if ($Tty -and $script:Pending) {
+                $sp = $Spin[$frame % $Spin.Count]
+                Write-Host "`r" -NoNewline
+                Put "  $sp " 'Yellow'
+                Put ("{0}  {1}s   " -f $script:Label, [int]$sw.Elapsed.TotalSeconds)
+                $frame++
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        $p.WaitForExit()
+        return [int]$p.ExitCode
+    } catch {
+        return -1
+    } finally {
+        Remove-Item -LiteralPath $so, $se -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Banner([string]$ver) {
@@ -401,11 +434,11 @@ function Main {
                 $toolchain = if (HasMsvcTools) { 'stable-x86_64-pc-windows-msvc' } else { 'stable-x86_64-pc-windows-gnu' }
                 $ErrorActionPreference = 'Continue'
                 try {
-                    & winget install -e --id Rustlang.Rustup --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+                    $null = RunSpin 'winget' @('install', '-e', '--id', 'Rustlang.Rustup', '--accept-source-agreements', '--accept-package-agreements')
                     $env:Path = "$cargoBin;$env:Path"
                     RefreshPath
-                    & rustup toolchain install $toolchain 2>&1 | Out-Null
-                    & rustup default $toolchain 2>&1 | Out-Null
+                    $null = RunSpin 'rustup' @('toolchain', 'install', $toolchain)
+                    $null = RunSpin 'rustup' @('default', $toolchain)
                 } catch {
                     $null = $_
                 }
@@ -439,7 +472,7 @@ function Main {
                 StageStart "Installing a C linker via winget$Ell"
                 $ErrorActionPreference = 'Continue'
                 try {
-                    & winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+                    $null = RunSpin 'winget' @('install', '-e', '--id', 'BrechtSanders.WinLibs.POSIX.UCRT', '--accept-source-agreements', '--accept-package-agreements')
                 } catch {
                     $null = $_
                 }
