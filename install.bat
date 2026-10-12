@@ -7,10 +7,14 @@ rem
 rem   install.bat
 rem
 rem Override the install directory:  set IPE_INSTALL_DIR=C:\tools\ipe
-rem The PowerShell body below the marker line is read from this file.
+rem The PowerShell body below the marker line is copied to a temp .ps1 and run.
 set "IPE_BAT=%~f0"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = [IO.File]::ReadAllText($env:IPE_BAT); iex $s.Substring($s.LastIndexOf('#PS' + '-BODY') + 8)"
-exit /b %errorlevel%
+set "IPE_PS1=%TEMP%\ipe-install-%RANDOM%.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$l = Get-Content -LiteralPath $env:IPE_BAT; $n = [array]::IndexOf($l, '#PS' + '-BODY'); Set-Content -LiteralPath $env:IPE_PS1 -Value $l[($n + 1)..($l.Count - 1)]"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%IPE_PS1%"
+set "IPE_RC=%errorlevel%"
+del "%IPE_PS1%" 2>nul
+exit /b %IPE_RC%
 #PS-BODY
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
