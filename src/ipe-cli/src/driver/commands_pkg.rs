@@ -1070,17 +1070,43 @@ fn audit_version(
     // Propagate typed errors directly — run_audit already produces a
     // descriptive typed CliError (PackageAudit / HashMismatch / etc.) whose
     // Display names the failing check; the version context is clear from
-    // the eprintln below and the structured error kind.
-    audit::run_audit_as(&audit_args, blessing).inspect_err(|_| {
-        crate::screen::chatter(
-            crate::screen::Stream::Stderr,
-            crate::screen::Tone::UserError,
-            &format!(
-                "audit-entry: `{}` version {} rejected",
-                submitted.name, version.version
-            ),
-        );
-    })
+    // the chatter below and the structured error kind.
+    audit::run_audit_as(&audit_args, blessing)
+        .and_then(|audited| admit_against_audit(version, &submitted.name, &audited))
+        .inspect_err(|_| {
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &format!(
+                    "audit-entry: `{}` version {} rejected",
+                    submitted.name, version.version
+                ),
+            );
+        })
+}
+
+/// Admit a submitted entry `version` only when it records what the audit of its source certified.
+///
+/// The entry's `sha256` must be the digest of the tree the audit judged, and
+/// its `capabilities` the set the audit inferred: the index records the
+/// audit's own output, never a submitted claim beside it.
+///
+/// # Errors
+/// [`CliError::HashMismatch`] when the recorded digest is not the audited one;
+/// [`CliError::PackageAudit`] when the recorded capabilities are not the audited set.
+pub fn admit_against_audit(
+    version: &index::EntryVersion,
+    package: &str,
+    audited: &audit::AuditedPackage,
+) -> Result<(), CliError> {
+    if version.sha256 != *audited.digest() {
+        return Err(CliError::HashMismatch {
+            package: package.to_owned(),
+            expected: version.sha256.as_str().to_owned(),
+            actual: audited.digest().as_str().to_owned(),
+        });
+    }
+    audited.refuse_other_capabilities(&version.capabilities)
 }
 
 /// The parsed `ipe package audit-entry` invocation.
@@ -4128,5 +4154,79 @@ mod test_binary_tests {
             return;
         };
         assert_eq!(path, absent);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use ipe_ir::Capability;
+    use std::collections::BTreeSet;
+
+    /// A digest literal of `fill` hex digits.
+    #[allow(clippy::expect_used)] // test fixture: the literal is a valid digest
+    fn digest(fill: &str) -> index::Sha256Hex {
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        index::Sha256Hex::parse(&package, &fill.repeat(64)).expect("valid digest")
+    }
+
+    /// An entry version recording `sha256` and `capabilities`.
+    #[allow(clippy::expect_used)] // test fixture: every literal is valid
+    fn entry(sha256: index::Sha256Hex, capabilities: BTreeSet<Capability>) -> index::EntryVersion {
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        index::EntryVersion {
+            version: crate::published_version::PublishedVersion::parse("0.1.0")
+                .expect("valid version"),
+            source: index::SourceUrl::parse(&package, "https://github.com/example/p")
+                .expect("valid source url"),
+            rev: index::PinnedRev::from_full_sha(
+                &package,
+                "9f2c7b1e0a4d5c6f8b2a1e3d4c5b6a7f8e9d0c1b",
+            )
+            .expect("valid pinned rev"),
+            sha256,
+            capabilities,
+            signature: None,
+        }
+    }
+
+    /// An entry whose recorded digest is not the audited tree's is refused.
+    #[test]
+    fn admission_refuses_a_digest_other_than_the_audited_one() {
+        let audited = audit::AuditedPackage::for_test(digest("a"), BTreeSet::new());
+        assert!(
+            admit_against_audit(&entry(digest("a"), BTreeSet::new()), "p", &audited).is_ok(),
+            "control: the audited digest and set are admitted"
+        );
+        assert!(
+            matches!(
+                admit_against_audit(&entry(digest("b"), BTreeSet::new()), "p", &audited),
+                Err(CliError::HashMismatch { .. })
+            ),
+            "a recorded digest other than the audited one is refused"
+        );
+    }
+
+    /// An entry whose recorded capabilities are not the audited set is refused.
+    #[test]
+    fn admission_refuses_capabilities_other_than_the_audited_set() {
+        let audited =
+            audit::AuditedPackage::for_test(digest("a"), BTreeSet::from([Capability::Network]));
+        assert!(
+            admit_against_audit(
+                &entry(digest("a"), BTreeSet::from([Capability::Network])),
+                "p",
+                &audited
+            )
+            .is_ok(),
+            "control: the audited set is admitted"
+        );
+        assert!(
+            matches!(
+                admit_against_audit(&entry(digest("a"), BTreeSet::new()), "p", &audited),
+                Err(CliError::PackageAudit(_))
+            ),
+            "an entry hiding an audited capability is refused"
+        );
     }
 }

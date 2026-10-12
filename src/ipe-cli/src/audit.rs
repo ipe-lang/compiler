@@ -59,7 +59,8 @@ use ipe_ir::Capability;
 
 use crate::CliError;
 use crate::cli_args::OutputFormat;
-use crate::project::{self, ProjectManifest};
+use crate::index::Sha256Hex;
+use crate::project::{ModuleSources, PackageSnapshot, ProjectManifest};
 use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
 use crate::remote_ingest::{
@@ -214,20 +215,139 @@ impl ControlModelDisclosure {
     }
 }
 
-/// The already-built package the four checks read from: its parsed manifest, its
-/// `package.ipe` path, and the directory it was emitted into. Preparing these once
-/// keeps each check a pure function of a ready package rather than re-deriving
-/// paths and re-building.
-#[derive(Debug)]
+/// The captured, already-built package the checks judge.
+///
+/// Every check reads the one [`PackageSnapshot`] (manifest, lockfile, module
+/// list, module text) or the [`crate::driver::PackageSourceSet`] assembled from it,
+/// which is also exactly what was emitted into `emitted_dir`. No check takes a
+/// package path to read from.
 struct Prepared {
-    /// The parsed manifest (name, version, declared capabilities, deps).
-    manifest: ProjectManifest,
-    /// The `package.ipe` path (the semver check's public-API extraction root is
-    /// its parent; the build's blame path).
-    manifest_path: PathBuf,
+    /// The one capture of the package tree every verdict is over.
+    snapshot: PackageSnapshot,
+    /// The snapshot's sources with the stdlib closure and FFI interface modules
+    /// injected: the set the build emitted and capability inference judges.
+    sources: crate::driver::PackageSourceSet,
     /// The directory the package was emitted into (the `cargo-deny` target for
     /// the supply-chain check).
     emitted_dir: PathBuf,
+}
+
+impl Prepared {
+    /// The captured, parsed manifest.
+    const fn manifest(&self) -> &ProjectManifest {
+        self.snapshot.manifest()
+    }
+}
+
+/// What a passing audit certified: the digest and capability set of the bytes it judged.
+///
+/// A consumer of the verdict (admission, publish) pins these values, never a
+/// fresh hash or inference of the path, so the recorded entry is the audit's
+/// own output.
+#[derive(Debug)]
+pub struct AuditedPackage {
+    /// The tree digest of the snapshot, re-proved over the tree after the last check.
+    digest: Sha256Hex,
+    /// The control model and the inferred capability set, disclosed to consumers.
+    disclosure: Disclosure,
+    /// The native Tier-2 disposition.
+    tier2: crate::audit_native::Tier2Outcome,
+}
+
+impl AuditedPackage {
+    /// The content digest of the audited tree.
+    #[must_use]
+    pub const fn digest(&self) -> &Sha256Hex {
+        &self.digest
+    }
+
+    /// The inferred capability set the audit reconciled with the manifest.
+    #[must_use]
+    pub const fn capabilities(&self) -> &BTreeSet<Capability> {
+        self.disclosure.capabilities()
+    }
+
+    /// Refuse an index entry whose recorded `capabilities` are not the audited set.
+    ///
+    /// The entry's set is the record `ipe add` reports to consumers, so it must
+    /// be the audit's output, not a value the submitter wrote.
+    ///
+    /// # Errors
+    /// [`CliError::PackageAudit`] with [`Check::Capability`] when the sets differ.
+    pub fn refuse_other_capabilities(
+        &self,
+        recorded: &BTreeSet<Capability>,
+    ) -> Result<(), CliError> {
+        if recorded == self.capabilities() {
+            return Ok(());
+        }
+        let words = |set: &BTreeSet<Capability>| {
+            let words: Vec<&'static str> = set.iter().map(|c| c.as_str()).collect();
+            if words.is_empty() {
+                "none".to_owned()
+            } else {
+                words.join(", ")
+            }
+        };
+        Err(reject(
+            Check::Capability,
+            format!(
+                "the entry's recorded `capabilities` are not the set the audit inferred — the \
+                 index records the audit's own output, never a submitted claim.\n  \
+                 recorded: {}\n  inferred: {}",
+                words(recorded),
+                words(self.capabilities())
+            ),
+        ))
+    }
+
+    /// An audited package with the given digest and capabilities, for a consumer's unit test.
+    #[cfg(test)]
+    pub const fn for_test(digest: Sha256Hex, capabilities: BTreeSet<Capability>) -> Self {
+        Self {
+            digest,
+            disclosure: Disclosure {
+                control_model: ControlModelDisclosure::NotApplicable,
+                capabilities,
+            },
+            tier2: crate::audit_native::Tier2Outcome::SkippedPureIpe,
+        }
+    }
+}
+
+/// How one audit runs: the index and advisory database it reads, the claimed publisher and the output format.
+#[derive(Debug)]
+pub struct AuditOptions {
+    /// The curated index checkout the semver check reads (`--index`).
+    index_root: Option<PathBuf>,
+    /// A custom advisory-database root (`--advisory-db`).
+    advisory_db_override: Option<PathBuf>,
+    /// `--no-advisory-db`: the explicit advisory opt-out.
+    no_advisory_db: bool,
+    /// The claimed publisher (`--publisher`).
+    claimed: Option<SelfDeclaredPublisher>,
+    /// The output format.
+    format: OutputFormat,
+}
+
+impl AuditOptions {
+    /// The defaults under a claimed publisher: the resolver's index, the default advisory database, human output.
+    #[must_use]
+    pub fn for_publisher(claimed: SelfDeclaredPublisher) -> Self {
+        Self {
+            index_root: None,
+            advisory_db_override: None,
+            no_advisory_db: false,
+            claimed: Some(claimed),
+            format: OutputFormat::Human,
+        }
+    }
+
+    /// The claimed publisher the audit runs under.
+    #[must_use]
+    pub const fn claimed(&self) -> Option<&SelfDeclaredPublisher> {
+        self.claimed.as_ref()
+    }
 }
 
 /// `ipe package audit [<path>]` — run the full Tier-1 gate on the working
@@ -245,10 +365,10 @@ struct Prepared {
 /// check rejects the package (the gate's hard reject).
 pub fn run_audit(rest: &[String]) -> Result<(), CliError> {
     let unproven = BlessingRefusal::NoProvenIdentity;
-    run_audit_as(rest, Err(&unproven))
+    run_audit_as(rest, Err(&unproven)).map(drop)
 }
 
-/// [`run_audit`] under a proven publisher standing.
+/// [`run_audit`] under a proven publisher standing, returning what the audit certified.
 ///
 /// `blessing` is the [`BlessedPublisher`] an authenticated (`ipe package publish`) or attested
 /// (`ipe package audit-entry`) identity established for the claimed
@@ -261,13 +381,53 @@ pub fn run_audit(rest: &[String]) -> Result<(), CliError> {
 pub fn run_audit_as(
     rest: &[String],
     blessing: Result<&BlessedPublisher, &BlessingRefusal>,
-) -> Result<(), CliError> {
+) -> Result<AuditedPackage, CliError> {
     let (path, index_root, advisory_db_override, no_advisory_db, claimed, format) =
         parse_audit_args(rest)?;
-    let prepared = prepare(&path)?;
-    let name = prepared.manifest.name.clone();
+    let options = AuditOptions {
+        index_root,
+        advisory_db_override,
+        no_advisory_db,
+        claimed,
+        format,
+    };
+    run_audit_over(capture_package(&path)?, &options, blessing)
+}
+
+/// Capture the package `path` names (a directory or its `package.ipe`) in one walk.
+///
+/// # Errors
+/// [`CliError::Usage`] when `path` names no `package.ipe`; the
+/// [`PackageSnapshot::capture`] refusals otherwise.
+pub fn capture_package(path: &Path) -> Result<PackageSnapshot, CliError> {
+    capture_manifest_root(&locate_manifest(path)?)
+}
+
+/// Capture the package whose `package.ipe` is `manifest_path` in one walk.
+///
+/// # Errors
+/// The [`PackageSnapshot::capture`] refusals.
+pub fn capture_manifest_root(manifest_path: &Path) -> Result<PackageSnapshot, CliError> {
+    let root = manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    PackageSnapshot::capture(root)
+}
+
+/// [`run_audit_as`] over an already-captured `snapshot`.
+///
+/// # Errors
+/// As [`run_audit`].
+pub fn run_audit_over(
+    snapshot: PackageSnapshot,
+    options: &AuditOptions,
+    blessing: Result<&BlessedPublisher, &BlessingRefusal>,
+) -> Result<AuditedPackage, CliError> {
+    let prepared = prepare(snapshot)?;
+    let name = prepared.manifest().name.clone();
     let version = prepared
-        .manifest
+        .manifest()
         .version
         .as_ref()
         .map_or_else(|| "(unversioned)".to_owned(), ToString::to_string);
@@ -276,39 +436,42 @@ pub fn run_audit_as(
     // Priority: explicit --advisory-db > default registry checkout > --no-advisory-db (None).
     // Absence of --advisory-db uses the registry index checkout the resolver already has.
     // --no-advisory-db is the ONLY way to skip; omitting --advisory-db does NOT skip.
-    let effective_advisory_db: Option<PathBuf> = if no_advisory_db {
+    let effective_advisory_db: Option<PathBuf> = if options.no_advisory_db {
         None
     } else {
-        Some(advisory_db_override.map_or_else(crate::resolve::index_root, Ok)?)
+        Some(
+            options
+                .advisory_db_override
+                .clone()
+                .map_or_else(crate::resolve::index_root, Ok)?,
+        )
     };
 
     let outcome = audit_gate(
         &prepared,
-        index_root.as_deref(),
+        options.index_root.as_deref(),
         effective_advisory_db.as_deref(),
         PublisherStanding {
-            claimed: claimed.as_ref(),
+            claimed: options.claimed.as_ref(),
             blessing,
         },
     );
 
-    match format {
-        OutputFormat::Json => emit_audit_json(&name, &version, &outcome),
+    match options.format {
+        OutputFormat::Json => emit_audit_json(&name, &version, outcome),
         // `--plain` and the default share the human renderer; the audit verdict
         // has no separate flush-left line form, so `--plain` is the human report
         // (the format parse already rejected `--plain --json` together).
-        OutputFormat::Human | OutputFormat::Plain => match outcome {
-            Ok((tier2, disclosure)) => {
-                crate::screen::Screen::new(crate::screen::Stream::Stdout)
-                    .line(
-                        crate::screen::Tone::Text,
-                        &passing_summary(&name, &version, &tier2, &disclosure),
-                    )
-                    .emit();
-                Ok(())
-            }
-            Err(err) => Err(err),
-        },
+        OutputFormat::Human | OutputFormat::Plain => {
+            let audited = outcome?;
+            crate::screen::Screen::new(crate::screen::Stream::Stdout)
+                .line(
+                    crate::screen::Tone::Text,
+                    &passing_summary(&name, &version, &audited.tier2, &audited.disclosure),
+                )
+                .emit();
+            Ok(audited)
+        }
     }
 }
 
@@ -334,26 +497,26 @@ fn audit_gate(
     index_root: Option<&Path>,
     advisory_db: Option<&Path>,
     standing: PublisherStanding<'_>,
-) -> Result<(crate::audit_native::Tier2Outcome, Disclosure), CliError> {
-    reserved_namespace_ownership(prepared, standing)?;
-    provenance_panic_scan(prepared)?;
+) -> Result<AuditedPackage, CliError> {
+    let manifest = prepared.manifest();
+    reserved_namespace_ownership(&manifest.name, prepared.snapshot.modules(), standing)?;
+    provenance_panic_scan(&prepared.sources)?;
 
     // The whole-tree inferred capability union — computed once and shared by the
     // consistency check (reconcile against the manifest) and the disclosure
     // (surface to the consumer), so the two can never disagree about the effects.
-    let inferred = crate::infer_package_capabilities(&prepared.manifest_path)?;
-    capability_consistency(prepared, &inferred)?;
+    let inferred = capability_verdict(manifest, &prepared.sources)?;
 
-    enforced_semver(prepared, index_root)?;
+    enforced_semver(manifest, prepared.snapshot.sources(), index_root)?;
     supply_chain(prepared)?;
-    advisory_check(prepared, advisory_db)?;
+    advisory_check(prepared.snapshot.lock(), advisory_db)?;
 
-    let disclosure = derive_disclosure(prepared, inferred)?;
+    let disclosure = derive_disclosure(manifest, prepared.snapshot.sources(), inferred)?;
 
     let tier2 = crate::audit_native::native_tier2(&crate::audit_native::NativeAudit {
-        declared: &prepared.manifest.capabilities,
-        has_rust_deps: !prepared.manifest.rust_dependencies.is_empty(),
-        root: &prepared.manifest.root,
+        declared: &manifest.capabilities,
+        has_rust_deps: !manifest.rust_dependencies.is_empty(),
+        root: &manifest.root,
         emitted_dir: &prepared.emitted_dir,
     })?;
 
@@ -366,14 +529,43 @@ fn audit_gate(
     // final gate on an otherwise-certifiable package and never preempts a
     // native-surface refusal.
     if let ControlModelDisclosure::Entry(model) = disclosure.control_model {
-        crate::control_model_consent::gate(
-            model,
-            &prepared.manifest.control_models_accept,
-            &prepared.manifest.name,
-        )?;
+        crate::control_model_consent::gate(model, &manifest.control_models_accept, &manifest.name)?;
     }
 
-    Ok((tier2, disclosure))
+    Ok(AuditedPackage {
+        digest: reprove_tree(&prepared.snapshot)?,
+        disclosure,
+        tier2,
+    })
+}
+
+/// Re-walk the captured package's tree and require the snapshot's digest: the digest an audit certifies.
+///
+/// The second, detective boundary behind the single capture: a tree changed
+/// while the checks ran (a file swapped after capture, a write by a stage the
+/// gate ran) no longer hashes to what was judged, and is refused rather than
+/// certified under either digest. Hidden directories (`.ipe/`, `.git/`) are
+/// outside the digest stream, so the gate-owned FFI regeneration does not
+/// perturb it.
+///
+/// # Errors
+/// [`CliError::HashMismatch`] when the tree's digest is not the snapshot's; the
+/// tree-walk refusals otherwise.
+fn reprove_tree(snapshot: &PackageSnapshot) -> Result<Sha256Hex, CliError> {
+    let judged = Sha256Hex::of_digest(snapshot.tree());
+    let now = Sha256Hex::of_tree_within(
+        &snapshot.manifest().root,
+        crate::remote_ingest::PACKAGE_SOURCE.tree(),
+    )?;
+    if now == judged {
+        Ok(judged)
+    } else {
+        Err(CliError::HashMismatch {
+            package: snapshot.manifest().name.clone(),
+            expected: judged.as_str().to_owned(),
+            actual: now.as_str().to_owned(),
+        })
+    }
 }
 
 /// Emit the compact JSON audit verdict to stdout, then map a rejection to the
@@ -384,19 +576,16 @@ fn audit_gate(
 fn emit_audit_json(
     name: &str,
     version: &str,
-    outcome: &Result<(crate::audit_native::Tier2Outcome, Disclosure), CliError>,
-) -> Result<(), CliError> {
+    outcome: Result<AuditedPackage, CliError>,
+) -> Result<AuditedPackage, CliError> {
     crate::screen::emit_machine(
         crate::screen::Stream::Stdout,
-        &format!("{}\n", audit_verdict_json(name, version, outcome)),
+        &format!("{}\n", audit_verdict_json(name, version, &outcome)),
     );
 
-    match outcome {
-        Ok(_) => Ok(()),
-        // The verdict object was already written to stdout; return the sentinel
-        // so the exit is non-zero with nothing more printed.
-        Err(_) => Err(CliError::DiagnosticJsonEmitted),
-    }
+    // On a reject the verdict object was already written to stdout; the
+    // sentinel makes the exit non-zero with nothing more printed.
+    outcome.map_err(|_| CliError::DiagnosticJsonEmitted)
 }
 
 /// Build the compact JSON audit verdict object (the pure core of
@@ -405,12 +594,15 @@ fn emit_audit_json(
 fn audit_verdict_json(
     name: &str,
     version: &str,
-    outcome: &Result<(crate::audit_native::Tier2Outcome, Disclosure), CliError>,
+    outcome: &Result<AuditedPackage, CliError>,
 ) -> String {
     use crate::audit_native::Tier2Outcome;
     use crate::cli_args::json;
 
-    match outcome {
+    match outcome
+        .as_ref()
+        .map(|audited| (&audited.tier2, &audited.disclosure))
+    {
         Ok((Tier2Outcome::SkippedPureIpe, disclosure)) => json::object(&[
             ("package", json::string(name)),
             ("version", json::string(version)),
@@ -639,15 +831,17 @@ fn set_format(slot: &mut Option<OutputFormat>, requested: OutputFormat) -> Resul
 /// `_bindings.rs` that the gate cannot re-derive must never reach a certified
 /// build.
 ///
+/// The build emits exactly the source set assembled from `snapshot`, the set
+/// every later check judges; no package file is read again.
+///
 /// # Errors
-/// [`CliError::Usage`] when `path` names no `package.ipe`;
 /// [`CliError::PackageAudit`] with [`Check::NativeBindingRegen`] when the
 /// manifest declares a `wrapper` field; the build errors
 /// ([`CliError::Pipeline`] / [`CliError::Io`] / [`CliError::StaticRefusal`])
 /// otherwise.
-fn prepare(path: &Path) -> Result<Prepared, CliError> {
-    let manifest_path = locate_manifest(path)?;
-    let manifest = project::parse_manifest(&manifest_path)?;
+fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
+    let manifest = snapshot.manifest();
+    let manifest_path = crate::driver::snapshot_manifest_path(&snapshot);
 
     // Reject wrapper-only packages: the gate cannot regenerate wrapper bindings
     // from an independent pinned source, so a committed `_bindings.rs` must
@@ -684,11 +878,21 @@ fn prepare(path: &Path) -> Result<Prepared, CliError> {
     // separate walk-up (that never materialized) is what made `audit` fail on a
     // clean machine while `build` succeeded.
     let runtime_dir = crate::resolve_vendored_runtime_dir(None, !crate::runtime_dep_from_env())?;
-    crate::build_project(&manifest_path, &emitted_dir, &runtime_dir)?;
+    // The FFI interface modules and `src/ffi.rs` text are assembled AFTER the
+    // regeneration above, so the set holds the gate-owned bindings.
+    let sources = crate::driver::PackageSourceSet::from_snapshot(&snapshot)?;
+    crate::driver::build_from_sources(
+        manifest,
+        &manifest_path,
+        sources.clone(),
+        crate::driver::OutTarget::Path(&emitted_dir),
+        &runtime_dir,
+        &crate::driver::BuildOptions::from_env(),
+    )?;
 
     Ok(Prepared {
-        manifest,
-        manifest_path,
+        snapshot,
+        sources,
         emitted_dir,
     })
 }
@@ -855,14 +1059,20 @@ fn audit_scratch_dir(package: &str) -> Result<PathBuf, CliError> {
 ///   accidental codegen. The provenance boundary is therefore exact by
 ///   construction: the gate rejects ONLY the author-supplied FFI wrapper Rust.
 ///
+/// The scanned text is the `src/ffi.rs` the build emitted from `sources`, so
+/// the Rust judged is the Rust shipped, never a second read of the cache.
+///
 /// # Errors
-/// [`CliError::PackageAudit`] when an author FFI Rust file contains an abrupt-
-/// failure construct; [`CliError::Io`] on a read failure.
-fn provenance_panic_scan(prepared: &Prepared) -> Result<(), CliError> {
+/// [`CliError::PackageAudit`] when the author FFI Rust contains an abrupt-
+/// failure construct or cannot be scanned.
+fn provenance_panic_scan(sources: &crate::driver::PackageSourceSet) -> Result<(), CliError> {
     // Author FFI wrapper Rust is the one surface this check gates: it compiles
     // unsandboxed into the shipped artifact, so an authored abrupt-failure
     // construct there is a soundness hole the package must not ship with.
-    if let Some(hit) = scan_author_ffi_rust(prepared)? {
+    let Some(bindings) = sources.bindings_source() else {
+        return Ok(());
+    };
+    if let Some(hit) = first_hit_in(Path::new(EMITTED_FFI_RS), bindings)? {
         return Err(reject(
             Check::Provenance,
             format!(
@@ -888,51 +1098,17 @@ struct LocatedHit {
     tok: String,
 }
 
-/// Scan the project's author-supplied FFI wrapper Rust (`*_bindings.rs` under the
-/// FFI cache) for the first abrupt-failure construct, if any. Returns `None` when
-/// the package carries no FFI cache or no author Rust hit.
+/// The emitted file the author FFI wrapper Rust ships in, named in a provenance reject.
 ///
-/// This is the exact author-Rust surface the `_bindings.rs` naming marks: the FFI
-/// cache stores one `<slug>_bindings.rs` per installed crate, the hand-written
-/// wrapper the inspection produced from the author's `[rust.define.*]` decls.
-/// The interface `.ipe` modules (origin [`ipe_canon::ModuleOrigin::FfiInterface`])
-/// are Ipê, not Rust; the `_bindings.rs` files are the author Rust the scan
-/// attributes to the user.
-///
-/// # Errors
-/// [`CliError::Io`] on a read failure.
-fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliError> {
-    let cache_root = prepared.manifest.root.join(".ipe/cache/ffi/rust");
-    if !cache_root.is_dir() {
-        return Ok(None);
-    }
-    let mut files: Vec<PathBuf> = Vec::new();
-    collect_rust_files(&cache_root, &mut files)?;
-    files.sort();
-    for file in files {
-        // Only the `_bindings.rs` wrapper is author-authored Rust that compiles
-        // into the crate; the other cache artifacts (`.ipei`, `consumer.json`,
-        // `<slug>.ipe`) are interface metadata, not Rust.
-        let is_bindings = file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with("_bindings.rs"));
-        if !is_bindings {
-            continue;
-        }
-        if let Some(hit) = first_hit(&cache_root, &file)? {
-            return Ok(Some(hit));
-        }
-    }
-    Ok(None)
-}
+/// It holds every installed crate's `<slug>_bindings.rs` wrapper, the
+/// hand-written Rust the inspection produced from the author's
+/// `[rust.define.*]` decls; the interface `.ipe` modules are Ipê, not Rust.
+const EMITTED_FFI_RS: &str = "src/ffi.rs";
 
-/// Run the shared [`panic_scan`] token scanner over one file below `root`, returning its first
-/// hit (lowest line) if any.
+/// Run the shared [`panic_scan`] token scanner over the Rust text `src` of `file`, returning its
+/// first hit (lowest line) if any.
 ///
-/// The file is read beneath `root`, every level held and never followed.
-///
-/// Fail closed on a non-lexing file: a `_bindings.rs` the scanner cannot
+/// Fail closed on a non-lexing file: Rust the scanner cannot
 /// tokenise is opaque — the no-panic audit cannot attest its content. The
 /// scanner refuses rather than admits (the same posture `capability_scan`
 /// takes for a non-lexing source). A `cargo build` of a non-lexing file would
@@ -940,12 +1116,10 @@ fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliEr
 /// before the file reaches `cargo`.
 ///
 /// # Errors
-/// [`CliError::Io`] on a file-read failure; [`CliError::PackageAudit`]
-/// ([`Check::Provenance`]) when the file is over a scan ceiling (too large, too
-/// deep, too many tokens) or does not parse as Rust.
-fn first_hit(root: &Path, file: &Path) -> Result<Option<LocatedHit>, CliError> {
-    let src = crate::io_bounded::read_beneath(root, file, crate::io_bounded::FFI_CACHE_CAP)?;
-    let hits = panic_scan::scan_str(&src).map_err(|error| {
+/// [`CliError::PackageAudit`] ([`Check::Provenance`]) when the text is over a
+/// scan ceiling (too large, too deep, too many tokens) or does not parse as Rust.
+fn first_hit_in(file: &Path, src: &str) -> Result<Option<LocatedHit>, CliError> {
+    let hits = panic_scan::scan_str(src).map_err(|error| {
         let why = match error {
             panic_scan::ScanError::TooLarge { bytes, ceiling } => format!(
                 "is too large to audit (at least {bytes} bytes, over the {ceiling}-byte ceiling)"
@@ -987,34 +1161,6 @@ fn first_hit(root: &Path, file: &Path) -> Result<Option<LocatedHit>, CliError> {
     }))
 }
 
-/// Recursively collect every `.rs` file under `dir` into `out`.
-///
-/// # Errors
-/// [`CliError::Io`] on a directory-read failure.
-fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| CliError::Io {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| CliError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| CliError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
-        if file_type.is_dir() {
-            collect_rust_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 // ===========================================================================
 // 1b. Capability consistency
 // ===========================================================================
@@ -1022,7 +1168,7 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError
 /// Verify the manifest's declared `[capabilities]` set EQUALS the set inferred
 /// over the WHOLE package — no hidden effect, no over-broad claim.
 ///
-/// Uses [`crate::infer_package_capabilities`] (the union over every shipped
+/// Uses the whole-package inference over the captured source set (the union over every shipped
 /// module, not just `Main`'s reachability closure) so a sibling module a consumer
 /// could `import` cannot smuggle in an undeclared effect. This is the same
 /// whole-tree posture the enforced-semver check takes over the public API — the
@@ -1038,12 +1184,12 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError
 /// # Errors
 /// [`CliError::PackageAudit`] when the declared and inferred sets differ.
 fn capability_consistency(
-    prepared: &Prepared,
+    manifest: &ProjectManifest,
     inferred: &BTreeSet<Capability>,
 ) -> Result<(), CliError> {
     use std::fmt::Write as _;
 
-    let declared: BTreeSet<Capability> = prepared.manifest.capabilities.clone();
+    let declared: BTreeSet<Capability> = manifest.capabilities.clone();
 
     if declared == *inferred {
         if declared.contains(&Capability::NativeFfi) {
@@ -1056,7 +1202,7 @@ fn capability_consistency(
                     &format!(
                         "package audit: note — `{}` exercises the `native-ffi` capability; its \
                      native effects cannot be inferred from Ipê alone.",
-                        prepared.manifest.name
+                        manifest.name
                     ),
                 )
                 .emit();
@@ -1085,6 +1231,24 @@ fn capability_consistency(
         );
     }
     Err(reject(Check::Capability, message))
+}
+
+/// Infer the capability set of exactly the assembled `sources` and reconcile it with `manifest`.
+///
+/// `sources` is the set the build emitted, so the verdict is over the
+/// shipped bytes and never over a re-read of the package path.
+///
+/// # Errors
+/// The inference errors; [`CliError::PackageAudit`] when the declared and
+/// inferred sets differ.
+fn capability_verdict(
+    manifest: &ProjectManifest,
+    sources: &crate::driver::PackageSourceSet,
+) -> Result<BTreeSet<Capability>, CliError> {
+    let inferred =
+        crate::driver::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), sources)?;
+    capability_consistency(manifest, &inferred)?;
+    Ok(inferred)
 }
 
 // ===========================================================================
@@ -1116,42 +1280,23 @@ fn capability_consistency(
 /// [`CliError::PackageAudit`] with [`Check::Capability`] when a runnable entry
 /// exists but its control model cannot be derived.
 fn derive_disclosure(
-    prepared: &Prepared,
+    manifest: &ProjectManifest,
+    sources: &ModuleSources,
     inferred: BTreeSet<Capability>,
 ) -> Result<Disclosure, CliError> {
-    let entry = crate::driver::analysis_root_of(&prepared.manifest)?;
-
-    // A library ships no runnable `Main.ipe`; `analysis_root_of` then points at
-    // the first exposed module (or a non-existent default). Only an ABSENT entry
-    // is an honest absence; any other read failure (a link, a FIFO, a denied or
-    // oversized file) fails the audit closed rather than disclosing a permissive
-    // default for a source we cannot classify.
-    let read = crate::io_bounded::read_beneath(
-        &prepared.manifest.src_root,
-        &entry,
-        crate::io_bounded::SOURCE_CAP,
-    );
-    if let Err(CliError::Io { source, .. }) = &read
-        && source.kind() == std::io::ErrorKind::NotFound
-    {
+    // A library ships no runnable `Main`; the entry is then the first exposed
+    // module (or the absent default). Only an ABSENT entry is an honest
+    // absence. A source the capture could not hold (a link, a FIFO, an
+    // oversized file) already refused the package, so every present entry is
+    // classified from the captured text.
+    let Some((entry, source)) = sources.get(&entry_module_of(manifest, sources)?) else {
         return Ok(Disclosure {
             control_model: ControlModelDisclosure::NotApplicable,
             capabilities: inferred,
         });
-    }
-    let source = read.map_err(|_| {
-        reject(
-            Check::Capability,
-            format!(
-                "the package's entry source (`{}`) could not be read, so its control model \
-                     cannot be derived. A program whose self-driving model the audit cannot state \
-                     is refused rather than certified with an assumed model.",
-                entry.display()
-            ),
-        )
-    })?;
+    };
     let mut interner = ipe_intern::Interner::new();
-    let module = ipe_parse::parse_module(&source, &mut interner).map_err(|_| {
+    let module = ipe_parse::parse_module(source, &mut interner).map_err(|_| {
         reject(
             Check::Capability,
             format!(
@@ -1185,6 +1330,29 @@ fn derive_disclosure(
     })
 }
 
+/// The module path of a package's entry: the declared program's entry, else `Main`, else the first exposed module.
+///
+/// The same choice [`crate::driver::analysis_root_of`] makes over files,
+/// made over the module `sources` a caller holds.
+///
+/// # Errors
+/// [`CliError::Manifest`]-family errors when a declared program's entry is refused.
+fn entry_module_of(
+    manifest: &ProjectManifest,
+    sources: &ModuleSources,
+) -> Result<Vec<String>, CliError> {
+    if manifest.default_program().is_some() {
+        return manifest.resolved_entry();
+    }
+    let main = vec!["Main".to_owned()];
+    if sources.contains_key(&main) {
+        return Ok(main);
+    }
+    Ok(manifest.exposed_modules.first().map_or(main, |module| {
+        module.split('.').map(str::to_owned).collect()
+    }))
+}
+
 /// The package disclosure a non-audit surface (`ipe doc`) reads — the SAME
 /// compiler-derived control model and whole-tree capability union `ipe audit`
 /// discloses, reusing [`derive_disclosure`] and
@@ -1204,17 +1372,17 @@ fn derive_disclosure(
 /// [`CliError`] when the manifest cannot be located or parsed, the capability
 /// inference fails, or the entry source cannot be read or parsed (fail-closed).
 pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
+    // A working-tree reader, not a capture: `ipe doc` certifies nothing, and a
+    // capture would walk the build output under the project root. The modules
+    // are read once and both derivations judge that one read.
     let manifest_path = locate_manifest(path)?;
-    let manifest = project::parse_manifest(&manifest_path)?;
-    let inferred = crate::infer_package_capabilities(&manifest_path)?;
-    let prepared = Prepared {
-        manifest,
-        manifest_path,
-        // The disclosure never reads the emitted directory (only the native
-        // Tier-2 check does), so no build is performed for a doc-side disclosure.
-        emitted_dir: PathBuf::new(),
-    };
-    derive_disclosure(&prepared, inferred)
+    let manifest = crate::project::parse_manifest(&manifest_path)?;
+    let (sources, entries) = crate::driver::read_package_modules(&manifest)?;
+    let source_set =
+        crate::driver::PackageSourceSet::assemble(sources.clone(), entries, &manifest_path)?;
+    let inferred =
+        crate::driver::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &source_set)?;
+    derive_disclosure(&manifest, &sources, inferred)
 }
 
 /// Render the disclosure as a human-readable frame — the control model and the
@@ -1248,7 +1416,8 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
 /// prerelease and reach stable ranges as a patch. When the package is not in the
 /// index, or has no release below this one, this is a FIRST stable version — the
 /// check has no baseline to diff against and skips (per §1c). Otherwise it runs
-/// [`crate::diff::check_semver_bump`] and rejects an under-bump.
+/// [`crate::diff::check_semver_bump_over`] against the captured `sources` and
+/// rejects an under-bump.
 ///
 /// The predecessor's public API is rebuilt from its pinned source (fetched +
 /// hash-verified through the resolver), so the baseline is exactly the bytes the
@@ -1259,8 +1428,12 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
 /// [`CliError::PackageAudit`] on an under-bump or a missing manifest version;
 /// [`CliError::VersionRefused`] when the manifest version carries build metadata;
 /// [`CliError::Diff`] when a tree cannot be diffed; resolution errors otherwise.
-fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(), CliError> {
-    let Some(manifest_version) = prepared.manifest.version.clone() else {
+fn enforced_semver(
+    manifest: &ProjectManifest,
+    sources: &ModuleSources,
+    index_root: Option<&Path>,
+) -> Result<(), CliError> {
+    let Some(manifest_version) = manifest.version.clone() else {
         return Err(reject(
             Check::Semver,
             "the manifest declares no `version = \"…\"` — the enforced-semver check needs a \
@@ -1269,7 +1442,7 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
         ));
     };
     let new_version = PublishedVersion::from_semver(manifest_version)
-        .map_err(|refusal| refusal.for_package(&prepared.manifest.name))?;
+        .map_err(|refusal| refusal.for_package(&manifest.name))?;
 
     // A prerelease (`X.Y.Z-<pre>`) is, by semver §9, explicitly unstable and
     // exempt from the compatibility guarantee a release version carries. Range
@@ -1289,7 +1462,7 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
                     "package audit: `{}` {new_version} is a prerelease — exempt from the \
                  enforced-semver API-compatibility bump (semver §9: a prerelease is unstable \
                  and is not resolved by a stable version requirement).",
-                    prepared.manifest.name
+                    manifest.name
                 ),
             )
             .emit();
@@ -1302,7 +1475,7 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
     // Unreadable ⇒ fail closed: a corrupt predecessor must not silently pass
     // as "first version" — propagate the error so the gate refuses.
     let Some(entry) =
-        crate::index::read_entry_lookup(&index_root, &prepared.manifest.name).absent_or_err()?
+        crate::index::read_entry_lookup(&index_root, &manifest.name).absent_or_err()?
     else {
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
@@ -1310,7 +1483,7 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
                 &format!(
                     "package audit: `{}` has no previously published version in the index — \
                  skipping the enforced-semver check (first version).",
-                    prepared.manifest.name
+                    manifest.name
                 ),
             )
             .emit();
@@ -1325,7 +1498,7 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
                     "package audit: `{}` has no published stable version below {new_version} — \
                  skipping the enforced-semver check (first stable version; a prerelease \
                  carries no compatibility promise to diff against).",
-                    prepared.manifest.name
+                    manifest.name
                 ),
             )
             .emit();
@@ -1335,19 +1508,13 @@ fn enforced_semver(prepared: &Prepared, index_root: Option<&Path>) -> Result<(),
     // Fetch + hash-verify the predecessor's pinned source, then diff the two
     // public APIs. `fetch_and_verify_baseline` returns the checkout root the
     // predecessor's `src/` lives under.
-    let baseline = crate::resolve::fetch_and_verify_index_version(
-        &prepared.manifest.root,
-        &prepared.manifest.name,
-        previous,
-    )?;
+    let baseline =
+        crate::resolve::fetch_and_verify_index_version(&manifest.root, &manifest.name, previous)?;
 
-    let new_tree = prepared
-        .manifest_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let report = crate::diff::check_semver_bump(
+    let report = crate::diff::check_semver_bump_over(
         &baseline,
-        &new_tree,
+        &manifest.root,
+        sources,
         previous.version.as_semver(),
         new_version.as_semver(),
     )?;
@@ -1557,7 +1724,7 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
 /// [`CliError::PackageAudit`] when a locked dependency's cached tree no longer
 /// matches its pinned hash.
 fn verify_locked_dependency_hashes(prepared: &Prepared) -> Result<(), CliError> {
-    match crate::resolve::verify_lockfile_hashes(&prepared.manifest.root) {
+    match crate::resolve::verify_lockfile_hashes(&prepared.manifest().root) {
         Ok(()) => Ok(()),
         Err(CliError::HashMismatch {
             package,
@@ -1595,7 +1762,10 @@ fn verify_locked_dependency_hashes(prepared: &Prepared) -> Result<(), CliError> 
 /// [`CliError::AdvisoryVulnerable`] on a `high`/`critical` match.
 /// [`CliError::AdvisoryDbMalformed`] on a malformed advisory file.
 /// [`CliError::AdvisoryDbUnreachable`] on an unreadable advisory directory.
-fn advisory_check(prepared: &Prepared, advisory_db: Option<&Path>) -> Result<(), CliError> {
+fn advisory_check(
+    lockfile: &crate::lockfile::Lockfile,
+    advisory_db: Option<&Path>,
+) -> Result<(), CliError> {
     let Some(db_root) = advisory_db else {
         // Explicit opt-out via --no-advisory-db.  Warn loudly; the check is
         // on by default and omitting --no-advisory-db is the safe path.
@@ -1609,11 +1779,11 @@ fn advisory_check(prepared: &Prepared, advisory_db: Option<&Path>) -> Result<(),
         return Ok(());
     };
 
-    advisory_check_with_base(prepared, db_root, &crate::registry::registry_base_url())
+    advisory_check_with_base(lockfile, db_root, &crate::registry::registry_base_url())
 }
 
-/// The base-URL-injected core of [`advisory_check`]: reads the lockfile and
-/// cross-checks every locked dep, using `base_url` as the registry Pages read
+/// The base-URL-injected core of [`advisory_check`]: cross-checks every dep of
+/// the captured `lockfile`, using `base_url` as the registry Pages read
 /// API. Tests pass an empty `base_url` to disable the HTTP attempt (immediate
 /// unreachable → the git-checkout DB is authoritative), keeping them hermetic and
 /// off the network.
@@ -1622,13 +1792,12 @@ fn advisory_check(prepared: &Prepared, advisory_db: Option<&Path>) -> Result<(),
 /// [`CliError::AdvisoryVulnerable`] on a `high`/`critical` match; the advisory-DB
 /// errors when the fallback checkout is present but corrupt or unreadable.
 fn advisory_check_with_base(
-    prepared: &Prepared,
+    lockfile: &crate::lockfile::Lockfile,
     db_root: &Path,
     base_url: &str,
 ) -> Result<(), CliError> {
-    let lockfile = crate::lockfile::Lockfile::read(&prepared.manifest.root)?;
     for dep in lockfile.packages() {
-        // `Lockfile::read` parses each `name` into a `PackageName` — a single
+        // The lockfile parse turns each `name` into a `PackageName` — a single
         // non-traversing path component by construction — so a hand-edited
         // `ipe.lock` name never reaches the registry URL segment or the
         // advisory-DB path join raw.
@@ -1774,18 +1943,17 @@ fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
 ///
 /// # Errors
 /// [`CliError::PackageAudit`] with [`Check::ReservedNamespace`] when a
-/// non-blessed package provides a reserved-namespace module; [`CliError::Io`] /
-/// [`CliError::DiscoveryLimitReached`] if the source tree cannot be walked.
+/// non-blessed package provides a reserved-namespace module.
 fn reserved_namespace_ownership(
-    prepared: &Prepared,
+    name: &str,
+    modules: &[crate::project::DiscoveredModule],
     standing: PublisherStanding<'_>,
 ) -> Result<(), CliError> {
-    let modules = crate::project::discover_modules(&prepared.manifest.src_root)?;
     let module_paths: Vec<&[String]> = modules
         .iter()
         .map(crate::project::DiscoveredModule::module_path)
         .collect();
-    reserved_namespace_verdict(&prepared.manifest.name, &module_paths, standing)
+    reserved_namespace_verdict(name, &module_paths, standing)
 }
 
 /// The publisher an audit runs under: what the entry claims, and the proof (or
@@ -2190,7 +2358,11 @@ mod tests {
         let pass = audit_verdict_json(
             "http",
             "1.2.0",
-            &Ok((Tier2Outcome::SkippedPureIpe, disclosure)),
+            &Ok(AuditedPackage {
+                digest: test_digest(),
+                disclosure,
+                tier2: Tier2Outcome::SkippedPureIpe,
+            }),
         );
         // The verdict discloses the compiler-derived control model and the
         // capability set, byte-uniform compact.
@@ -2309,25 +2481,18 @@ mod tests {
         )
         .expect("write package.ipe");
 
-        let err = prepare(&dir).expect_err("prepare must reject a wrapper-only package");
+        let result = capture_package(&dir).and_then(prepare);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            matches!(err, CliError::PackageAudit(_)),
-            "expected PackageAudit, got: {err:?}"
+            matches!(
+                &result,
+                Err(CliError::PackageAudit(r))
+                    if r.check == Check::NativeBindingRegen && r.message.contains("`wrapper` field")
+            ),
+            "prepare must reject a wrapper-only package with a NativeBindingRegen reject naming \
+             the wrapper field: {:?}",
+            result.as_ref().err()
         );
-        if let CliError::PackageAudit(ref r) = err {
-            assert_eq!(
-                r.check,
-                Check::NativeBindingRegen,
-                "wrong check: must be NativeBindingRegen, got {:?}",
-                r.check
-            );
-            assert!(
-                r.message.contains("`wrapper` field"),
-                "rejection message must name the wrapper field: {}",
-                r.message
-            );
-        }
     }
 
     /// A manifest with only `[rust.dependencies]` (no `[rust.wrapper]`) must NOT
@@ -2447,48 +2612,43 @@ mod tests {
         // A `_bindings.rs` that does not lex as Rust tokens must produce Err,
         // not Ok(None). Returning Ok(None) would silently pass the no-panic
         // gate for a file whose content cannot be attested.
-        let dir = make_test_dir("first-hit-nonlex");
-        let file = dir.join("x_bindings.rs");
         // Unterminated raw string — proc-macro2 cannot tokenise this.
-        std::fs::write(&file, r#"fn f() { let x = r##"unterminated"#)
-            .expect("write non-lexing fixture");
-        let result = super::first_hit(&dir, &file);
+        let result = first_hit_in(
+            Path::new("x_bindings.rs"),
+            r#"fn f() { let x = r##"unterminated"#,
+        );
         assert!(
             result.is_err(),
             "a non-lexing _bindings.rs must return Err (refuse), not Ok(None)"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn first_hit_clean_lexing_source_is_ok_none() {
         // A well-formed, panic-free file must still return Ok(None).
-        let dir = make_test_dir("first-hit-clean");
-        let file = dir.join("x_bindings.rs");
-        std::fs::write(&file, "pub fn add(a: i64, b: i64) -> i64 { a + b }")
-            .expect("write clean fixture");
-        let result = super::first_hit(&dir, &file);
+        let result = first_hit_in(
+            Path::new("x_bindings.rs"),
+            "pub fn add(a: i64, b: i64) -> i64 { a + b }",
+        );
         assert!(result.is_ok(), "a clean file must return Ok(_)");
         assert!(
             result.unwrap().is_none(),
             "a panic-free file must return Ok(None)"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn first_hit_file_with_panic_is_ok_some() {
         // A file with a panic! must produce Ok(Some(hit)), unchanged.
-        let dir = make_test_dir("first-hit-panic");
-        let file = dir.join("x_bindings.rs");
-        std::fs::write(&file, "pub fn f() { panic!(\"oops\"); }").expect("write panic fixture");
-        let result = super::first_hit(&dir, &file);
+        let result = first_hit_in(
+            Path::new("x_bindings.rs"),
+            "pub fn f() { panic!(\"oops\"); }",
+        );
         assert!(result.is_ok(), "a lexing file must return Ok(_)");
         assert!(
             result.unwrap().is_some(),
             "a panic-bearing file must return Ok(Some(_))"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `_bindings.rs` whose body is `n` nested `!` operators.
@@ -2500,11 +2660,8 @@ mod tests {
     fn first_hit_too_deep_source_is_a_provenance_refusal() {
         // Past the scanner's depth ceiling the parse would overflow its stack;
         // the audit must refuse with a typed reject, never crash or admit.
-        let dir = make_test_dir("first-hit-too-deep");
-        let file = dir.join("x_bindings.rs");
         let over = panic_scan::NestDepth::CEILING.get().saturating_add(1);
-        std::fs::write(&file, nested_not_bindings(over)).expect("write deep fixture");
-        let result = super::first_hit(&dir, &file);
+        let result = first_hit_in(Path::new("x_bindings.rs"), &nested_not_bindings(over));
         assert!(
             matches!(
                 &result,
@@ -2516,7 +2673,6 @@ mod tests {
             "{:?}",
             result.as_ref().err()
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2530,105 +2686,96 @@ mod tests {
         let at = nested_not_bindings(ceiling.saturating_sub(base));
         let measured = panic_scan::measure(&at).expect("the control lexes").depth;
         assert_eq!(measured, ceiling, "the control must sit at the ceiling");
-        let dir = make_test_dir("first-hit-at-ceiling");
-        let file = dir.join("x_bindings.rs");
-        std::fs::write(&file, at).expect("write control fixture");
-        let result = super::first_hit(&dir, &file);
+        let result = first_hit_in(Path::new("x_bindings.rs"), &at);
         assert!(matches!(result, Ok(None)), "{:?}", result.as_ref().err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Disclosure derivation (control model + capabilities) ────────────────
 
-    /// Write a project with a single `src/Main.ipe` of `main_src` and return a
-    /// `Prepared` pointing at it. Only the manifest's `src_root` and `programs`
-    /// matter to [`derive_disclosure`].
-    fn prepared_with_main(tag: &str, main_src: &str) -> (PathBuf, Prepared) {
-        let dir = make_test_dir(tag);
-        let src = dir.join("src");
-        std::fs::create_dir_all(&src).expect("create src/");
-        std::fs::write(src.join("Main.ipe"), main_src).expect("write Main.ipe");
-        let prepared = make_prepared(&dir);
-        (dir, prepared)
+    /// A manifest and captured sources holding a single `Main` module of `main_src`.
+    ///
+    /// Only the manifest's `programs` and `exposed_modules` matter to [`derive_disclosure`].
+    fn manifest_with_main(main_src: &str) -> (ProjectManifest, ModuleSources) {
+        let manifest = test_manifest(Path::new("/nonexistent/disclosure"));
+        let sources = ModuleSources::from([(
+            vec!["Main".to_owned()],
+            (manifest.src_root.join("Main.ipe"), main_src.to_owned()),
+        )]);
+        (manifest, sources)
     }
 
     #[test]
     fn disclosure_derives_tea_for_a_web_tea_entry() {
-        let (dir, prepared) = prepared_with_main(
-            "disclosure-tea",
+        let (manifest, sources) = manifest_with_main(
             "module Main exposing (main)\n\
              import Ipe.Tea.Web as Web\n\n\
              main = Web.tea config\n",
         );
-        let d = derive_disclosure(&prepared, BTreeSet::new()).expect("derives");
+        let d = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
         assert_eq!(
             d.control_model,
             ControlModelDisclosure::Entry(crate::delivery::ControlModel::Tea),
             "a `Web.tea` entry discloses the TEA control model"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn disclosure_derives_direct_for_a_plain_task_main() {
-        let (dir, prepared) = prepared_with_main(
-            "disclosure-direct",
+        let (manifest, sources) = manifest_with_main(
             "module Main exposing (main)\n\n\
              main = doNothing\n",
         );
-        let d = derive_disclosure(&prepared, BTreeSet::new()).expect("derives");
+        let d = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
         assert_eq!(
             d.control_model,
             ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
             "a plain-`Task` `main` discloses the Direct control model"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn disclosure_capabilities_are_the_inferred_set_passed_in() {
         // The disclosure surfaces exactly the SSOT inferred set it is handed —
         // never a re-derivation that could disagree with the consistency check.
-        let (dir, prepared) = prepared_with_main(
-            "disclosure-caps",
-            "module Main exposing (main)\n\nmain = doNothing\n",
-        );
+        let (manifest, sources) =
+            manifest_with_main("module Main exposing (main)\n\nmain = doNothing\n");
         let inferred = BTreeSet::from([Capability::Clock, Capability::Network]);
-        let d = derive_disclosure(&prepared, inferred.clone()).expect("derives");
+        let d = derive_disclosure(&manifest, &sources, inferred.clone()).expect("derives");
         assert_eq!(d.capabilities, inferred, "discloses the passed-in SSOT set");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn disclosure_is_not_applicable_for_a_library_with_no_runnable_entry() {
         // A library exposes modules but ships no runnable `Main.ipe`; it drives
         // nothing, so the disclosure is an honest absence, not a default model.
-        let dir = make_test_dir("disclosure-library");
-        let src = dir.join("src");
-        std::fs::create_dir_all(&src).expect("create src/");
-        std::fs::write(
-            src.join("MyLib.ipe"),
-            "module MyLib exposing (helper)\n\nhelper = 1\n",
-        )
-        .expect("write MyLib.ipe");
-        let mut prepared = make_prepared(&dir);
-        prepared.manifest.exposed_modules = vec!["MyLib".to_owned()];
-        let d = derive_disclosure(&prepared, BTreeSet::new()).expect("derives");
+        let mut manifest = test_manifest(Path::new("/nonexistent/disclosure-library"));
+        manifest.exposed_modules = vec!["MyLib".to_owned()];
+        let sources = ModuleSources::from([(
+            vec!["MyLib".to_owned()],
+            (
+                manifest.src_root.join("MyLib.ipe"),
+                "module MyLib exposing (helper)\n\nhelper = 1\n".to_owned(),
+            ),
+        )]);
+        let d = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
         assert_eq!(
             d.control_model,
             ControlModelDisclosure::NotApplicable,
             "a library with no runnable entry discloses no control model"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A library whose entry module is a FIFO is refused, never disclosed as having no entry.
+    /// A package whose entry module is a FIFO is refused at capture, never disclosed as having no entry.
     #[cfg(unix)]
     #[test]
-    fn disclosure_refuses_a_fifo_entry_rather_than_disclosing_absence() {
+    fn audit_refuses_a_fifo_entry_rather_than_disclosing_absence() {
         let dir = make_test_dir("disclosure-fifo");
         let src = dir.join("src");
         assert!(std::fs::create_dir_all(&src).is_ok(), "create src/");
+        assert!(
+            std::fs::write(dir.join("package.ipe"), SNAPSHOT_MANIFEST).is_ok(),
+            "write package.ipe"
+        );
         let made = std::process::Command::new("mkfifo")
             .arg(src.join("MyLib.ipe"))
             .status();
@@ -2636,14 +2783,11 @@ mod tests {
             made.is_ok_and(|status| status.success()),
             "mkfifo creates the fixture"
         );
-        let mut prepared = make_prepared(&dir);
-        prepared.manifest.exposed_modules = vec!["MyLib".to_owned()];
-        let result = derive_disclosure(&prepared, BTreeSet::new());
-        let _ = std::fs::remove_dir_all(&dir);
+        let result = capture_package(&dir);
         assert!(
-            matches!(&result, Err(CliError::PackageAudit(r)) if r.check == Check::Capability),
-            "a FIFO entry must fail the audit closed: {:?}",
-            result.as_ref().map(|d| &d.control_model)
+            matches!(&result, Err(CliError::LocalLimitExceeded(_))),
+            "a FIFO entry must fail the audit closed at capture: {:?}",
+            result.as_ref().err()
         );
     }
 
@@ -2653,11 +2797,9 @@ mod tests {
         // must REJECT rather than disclose a permissive-looking default. This is
         // the fail-closed branch — a program whose control model we cannot state
         // is refused, never certified as `direct`/library.
-        let (dir, prepared) = prepared_with_main(
-            "disclosure-unparseable",
-            "module Main exposing (main)\n\nmain = = = broken (((\n",
-        );
-        let err = derive_disclosure(&prepared, BTreeSet::new())
+        let (manifest, sources) =
+            manifest_with_main("module Main exposing (main)\n\nmain = = = broken (((\n");
+        let err = derive_disclosure(&manifest, &sources, BTreeSet::new())
             .expect_err("an unparseable runnable entry must fail closed");
         assert!(
             matches!(err, CliError::PackageAudit(ref r) if r.check == Check::Capability),
@@ -2667,7 +2809,6 @@ mod tests {
             !err.to_string().contains("direct") && !err.to_string().contains("library"),
             "the fail-closed reject discloses no permissive default model: {err}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2676,13 +2817,12 @@ mod tests {
         // that opted into control-model consent (a non-empty `acceptsControl`)
         // whose declared set does not cover its actual Direct model is refused —
         // fail-closed, never certified against a stale acceptance.
-        let (dir, mut prepared) = prepared_with_main(
-            "audit-consent-direct",
-            "module Main exposing (main)\n\nmain = doNothing\n",
-        );
-        prepared.manifest.control_models_accept =
+        let (mut manifest, sources) =
+            manifest_with_main("module Main exposing (main)\n\nmain = doNothing\n");
+        manifest.control_models_accept =
             std::iter::once(crate::delivery::ControlModel::Tea).collect();
-        let disclosure = derive_disclosure(&prepared, BTreeSet::new()).expect("derives Direct");
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
             ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
@@ -2690,34 +2830,31 @@ mod tests {
         );
         let err = crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
-            &prepared.manifest.control_models_accept,
-            &prepared.manifest.name,
+            &manifest.control_models_accept,
+            &manifest.name,
         )
         .expect_err("a declared accept-set that omits the derived model is refused");
         assert!(err.to_string().contains("IPE-S0004"), "carries the code");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn audit_accepts_a_direct_entry_a_declared_accept_set_covers() {
-        let (dir, mut prepared) = prepared_with_main(
-            "audit-consent-direct-ok",
-            "module Main exposing (main)\n\nmain = doNothing\n",
-        );
-        prepared.manifest.control_models_accept =
+        let (mut manifest, sources) =
+            manifest_with_main("module Main exposing (main)\n\nmain = doNothing\n");
+        manifest.control_models_accept =
             std::iter::once(crate::delivery::ControlModel::Direct).collect();
-        let disclosure = derive_disclosure(&prepared, BTreeSet::new()).expect("derives Direct");
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
             ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
         );
         crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
-            &prepared.manifest.control_models_accept,
-            &prepared.manifest.name,
+            &manifest.control_models_accept,
+            &manifest.name,
         )
         .expect("a Direct entry a declared accept-set covers passes");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2725,26 +2862,24 @@ mod tests {
         // A clean package with no `acceptsControl` — including a legitimate
         // self-driving Direct script — certifies: the model is disclosed, not
         // gated, until the author opts into control-model consent.
-        let (dir, prepared) = prepared_with_main(
-            "audit-consent-clean",
-            "module Main exposing (main)\n\nmain = doNothing\n",
-        );
-        let disclosure = derive_disclosure(&prepared, BTreeSet::new()).expect("derives Direct");
+        let (manifest, sources) =
+            manifest_with_main("module Main exposing (main)\n\nmain = doNothing\n");
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
             ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
         );
         assert!(
-            prepared.manifest.control_models_accept.is_empty(),
+            manifest.control_models_accept.is_empty(),
             "the clean package declares no acceptsControl"
         );
         crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
-            &prepared.manifest.control_models_accept,
-            &prepared.manifest.name,
+            &manifest.control_models_accept,
+            &manifest.name,
         )
         .expect("a clean Direct entry with no acceptsControl certifies unconstrained");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A prerelease submission is EXEMPT from the enforced-semver API-bump, even
@@ -2774,11 +2909,11 @@ mod tests {
         )
         .expect("write baseline entry");
 
-        let mut prepared = make_prepared(&index_root.join("proj"));
-        prepared.manifest.name = "test-pkg".to_owned();
-        prepared.manifest.version = Some("0.0.0-smoke.2".parse().expect("valid prerelease"));
+        let mut manifest = test_manifest(&index_root.join("proj"));
+        manifest.name = "test-pkg".to_owned();
+        manifest.version = Some("0.0.0-smoke.2".parse().expect("valid prerelease"));
 
-        let result = enforced_semver(&prepared, Some(&index_root));
+        let result = enforced_semver(&manifest, &ModuleSources::new(), Some(&index_root));
         let _ = std::fs::remove_dir_all(&index_root);
         assert!(
             result.is_ok(),
@@ -2799,9 +2934,9 @@ mod tests {
     fn enforced_semver_refuses_build_metadata() {
         let index_root = make_test_dir("semver-build-metadata");
         for raw in ["1.0.0+b", "0.0.0-smoke.2+sha.abc"] {
-            let mut prepared = make_prepared(&index_root.join("proj"));
-            prepared.manifest.version = Some(raw.parse().expect("valid semver with build"));
-            let result = enforced_semver(&prepared, Some(&index_root));
+            let mut manifest = test_manifest(&index_root.join("proj"));
+            manifest.version = Some(raw.parse().expect("valid semver with build"));
+            let result = enforced_semver(&manifest, &ModuleSources::new(), Some(&index_root));
             assert!(
                 matches!(
                     &result,
@@ -2842,11 +2977,11 @@ mod tests {
         let index_root = make_test_dir("semver-first-stable");
         write_index_versions(&index_root, &["0.0.1-rc.1"]);
 
-        let mut prepared = make_prepared(&index_root.join("proj"));
-        prepared.manifest.name = "test-pkg".to_owned();
-        prepared.manifest.version = Some("0.0.1".parse().expect("valid release"));
+        let mut manifest = test_manifest(&index_root.join("proj"));
+        manifest.name = "test-pkg".to_owned();
+        manifest.version = Some("0.0.1".parse().expect("valid release"));
 
-        let result = enforced_semver(&prepared, Some(&index_root));
+        let result = enforced_semver(&manifest, &ModuleSources::new(), Some(&index_root));
         let _ = std::fs::remove_dir_all(&index_root);
         assert!(
             result.is_ok(),
@@ -2903,32 +3038,159 @@ mod tests {
 
     // ── Advisory-check gate-level tests ─────────────────────────────────────
 
-    /// Build a minimal `Prepared` whose `manifest.root` points at `root`.
-    /// Only `manifest.root` is used by `advisory_check` (to read `ipe.lock`).
-    fn make_prepared(root: &std::path::Path) -> Prepared {
+    /// A minimal manifest rooted at `root`.
+    fn test_manifest(root: &std::path::Path) -> ProjectManifest {
         use std::collections::{BTreeMap, BTreeSet};
-        Prepared {
-            manifest: crate::project::ProjectManifest {
-                name: "test-pkg".to_owned(),
-                version: None,
-                root: root.to_path_buf(),
-                src_root: root.join("src"),
-                icon: None,
-                driver: ipe_backend_rust::DbDriver::default(),
-                static_request: crate::build_plan::StaticRequestLayer::default(),
-                wasm: crate::project::WasmConfig::default(),
-                dependencies: BTreeMap::new(),
-                rust_dependencies: BTreeMap::new(),
-                capabilities: BTreeSet::new(),
-                capabilities_accept: BTreeSet::new(),
-                control_models_accept: BTreeSet::new(),
-                has_rust_wrapper: false,
-                programs: Vec::new(),
-                exposed_modules: Vec::new(),
-                delivery: crate::project::DeliveryConfig::default(),
-            },
-            manifest_path: root.join("package.ipe"),
-            emitted_dir: root.join("emitted"),
+        ProjectManifest {
+            name: "test-pkg".to_owned(),
+            version: None,
+            root: root.to_path_buf(),
+            src_root: root.join("src"),
+            icon: None,
+            driver: ipe_backend_rust::DbDriver::default(),
+            static_request: crate::build_plan::StaticRequestLayer::default(),
+            wasm: crate::project::WasmConfig::default(),
+            dependencies: BTreeMap::new(),
+            rust_dependencies: BTreeMap::new(),
+            capabilities: BTreeSet::new(),
+            capabilities_accept: BTreeSet::new(),
+            control_models_accept: BTreeSet::new(),
+            has_rust_wrapper: false,
+            programs: Vec::new(),
+            exposed_modules: Vec::new(),
+            delivery: crate::project::DeliveryConfig::default(),
+        }
+    }
+
+    /// The advisory check over the `ipe.lock` written under `dir`, against the DB at `db`.
+    fn advisory_over(dir: &Path, db: &Path) -> Result<(), CliError> {
+        crate::lockfile::Lockfile::read(dir)
+            .and_then(|lock| advisory_check_with_base(&lock, db, ""))
+    }
+
+    /// A digest literal for a verdict that judged no tree.
+    #[allow(clippy::expect_used)] // test fixture: the literal is a valid digest
+    fn test_digest() -> Sha256Hex {
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        Sha256Hex::parse(&package, &"0".repeat(64)).expect("valid digest")
+    }
+
+    // ── One capture: every verdict is over the snapshot ─────────────────────
+
+    /// A pure package manifest declaring no capabilities.
+    const SNAPSHOT_MANIFEST: &str = "module Package exposing (package)\n\n\npackage =\n    \
+                                     { name = \"snap-pkg\", version = \"0.1.0\" }\n";
+
+    /// A module whose effects the manifest above does not declare.
+    const LEAK_MODULE: &str = "module Leak exposing (leak)\n\
+                               import Ipe.Html exposing (render, section)\n\
+                               import Ipe.Html.Unsafe exposing (unsafeScript)\n\n\
+                               leak = render (section [] [ unsafeScript \"x\" ])\n";
+
+    /// A capability-clean package directory.
+    fn clean_package(tag: &str) -> PathBuf {
+        let dir = make_test_dir(tag);
+        assert!(
+            std::fs::create_dir_all(dir.join("src")).is_ok(),
+            "create src/"
+        );
+        assert!(
+            std::fs::write(dir.join("package.ipe"), SNAPSHOT_MANIFEST).is_ok(),
+            "write package.ipe"
+        );
+        assert!(
+            std::fs::write(
+                dir.join("src/Lib.ipe"),
+                "module Lib exposing (one)\n\none = 1\n"
+            )
+            .is_ok(),
+            "write Lib.ipe"
+        );
+        dir
+    }
+
+    /// The capability verdict over a snapshot's assembled sources.
+    fn snapshot_capability_verdict(
+        snapshot: &PackageSnapshot,
+    ) -> Result<BTreeSet<Capability>, CliError> {
+        let sources = crate::driver::PackageSourceSet::from_snapshot(snapshot)?;
+        capability_verdict(snapshot.manifest(), &sources)
+    }
+
+    /// A module added after capture does not change the verdict: the check
+    /// judges the captured bytes, and a fresh capture of the swapped tree is
+    /// refused.
+    #[test]
+    fn audit_verdict_is_over_the_snapshot() {
+        let dir = clean_package("snapshot-verdict");
+        let captured = capture_package(&dir);
+        assert!(
+            std::fs::write(dir.join("src/Leak.ipe"), LEAK_MODULE).is_ok(),
+            "swap in a module after capture"
+        );
+        let judged = captured.and_then(|snapshot| snapshot_capability_verdict(&snapshot));
+        let fresh =
+            capture_package(&dir).and_then(|snapshot| snapshot_capability_verdict(&snapshot));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&judged, Ok(set) if set.is_empty()),
+            "the verdict is over the captured tree: {:?}",
+            judged.as_ref().err()
+        );
+        assert!(
+            matches!(&fresh, Err(CliError::PackageAudit(r)) if r.check == Check::Capability),
+            "control: the swapped tree carries an undeclared effect: {:?}",
+            fresh.as_ref().ok()
+        );
+    }
+
+    /// A tree changed while the audit ran is refused, never certified under either digest.
+    #[test]
+    fn audit_refuses_a_tree_changed_during_the_audit() {
+        let dir = clean_package("snapshot-reprove");
+        let unchanged = capture_package(&dir).and_then(|snapshot| {
+            reprove_tree(&snapshot).map(|digest| digest == Sha256Hex::of_digest(snapshot.tree()))
+        });
+        let captured = capture_package(&dir);
+        assert!(
+            std::fs::write(dir.join("src/Leak.ipe"), LEAK_MODULE).is_ok(),
+            "swap in a module after capture"
+        );
+        let changed = captured.and_then(|snapshot| reprove_tree(&snapshot));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(unchanged, Ok(true)),
+            "control: an unchanged tree certifies the snapshot's digest: {:?}",
+            unchanged.err()
+        );
+        assert!(
+            matches!(&changed, Err(CliError::HashMismatch { package, .. }) if package == "snap-pkg"),
+            "a tree changed after capture is refused: {:?}",
+            changed.as_ref().ok()
+        );
+    }
+
+    /// An entry recording other capabilities than the audited set is refused.
+    #[test]
+    fn audited_capabilities_refuse_a_different_record() {
+        let audited = AuditedPackage::for_test(test_digest(), BTreeSet::from([Capability::Clock]));
+        assert!(
+            audited
+                .refuse_other_capabilities(&BTreeSet::from([Capability::Clock]))
+                .is_ok(),
+            "control: the audited set is admitted"
+        );
+        for lie in [
+            BTreeSet::new(),
+            BTreeSet::from([Capability::Clock, Capability::Network]),
+        ] {
+            assert!(
+                matches!(
+                    audited.refuse_other_capabilities(&lie),
+                    Err(CliError::PackageAudit(r)) if r.check == Check::Capability
+                ),
+                "a recorded set {lie:?} other than the audited one is refused"
+            );
         }
     }
 
@@ -2973,10 +3235,9 @@ mod tests {
         write_lockfile(&dir, "vuln-pkg", "1.1.0");
         write_high_advisory(&db, "vuln-pkg", ">=1.0.0, <1.2.0");
 
-        let prepared = make_prepared(&dir);
         // Empty base URL disables the HTTP fast-path (hermetic, off-network); the
         // planted git-checkout DB is authoritative on the fallback path.
-        let result = advisory_check_with_base(&prepared, &db, "");
+        let result = advisory_over(&dir, &db);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&db);
         assert!(
@@ -2985,7 +3246,7 @@ mod tests {
         );
     }
 
-    /// Explicit opt-out gate-level test: `advisory_check(prepared, None)` must
+    /// Explicit opt-out gate-level test: `advisory_check(lock, None)` must
     /// return `Ok(())` — `None` is the explicit `--no-advisory-db` opt-out path.
     #[test]
     fn advisory_check_none_skips_check() {
@@ -2994,8 +3255,8 @@ mod tests {
         write_lockfile(&dir, "vuln-pkg", "1.1.0");
         write_high_advisory(&db, "vuln-pkg", ">=1.0.0, <1.2.0");
 
-        let prepared = make_prepared(&dir);
-        let result = advisory_check(&prepared, None);
+        let result =
+            crate::lockfile::Lockfile::read(&dir).and_then(|lock| advisory_check(&lock, None));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&db);
         assert!(result.is_ok(), "explicit opt-out must pass: {result:?}");
@@ -3017,8 +3278,7 @@ mod tests {
             // turns the read back.
             write_high_advisory(db.parent().unwrap_or(&db), "x", ">=0.0.0");
 
-            let prepared = make_prepared(&dir);
-            let result = advisory_check_with_base(&prepared, &db, "");
+            let result = advisory_over(&dir, &db);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&db);
             assert!(
@@ -3037,8 +3297,7 @@ mod tests {
         let db = make_test_dir("adv-gate-legit-db");
         write_lockfile(&dir, "http-extras", "1.0.0");
 
-        let prepared = make_prepared(&dir);
-        let result = advisory_check_with_base(&prepared, &db, "");
+        let result = advisory_over(&dir, &db);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&db);
         assert!(

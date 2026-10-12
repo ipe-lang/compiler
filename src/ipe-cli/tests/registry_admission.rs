@@ -867,3 +867,79 @@ fn publish_dry_run_computes_a_correct_entry_offline() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// ── audit-entry: the admitted capabilities are the audited set ──────────────
+
+/// A fixture package source git repo that passes its own audit with no
+/// capability: a `Main` that only prints. Returns `(repo_path, tree_sha256)`.
+fn fixture_pure_package(tag: &str, name: &str) -> (PathBuf, Sha256Hex) {
+    let repo = temp_dir(&format!("pure-src-{tag}"));
+    std::fs::create_dir_all(repo.join("src")).expect("src dir");
+    std::fs::write(
+        repo.join("package.ipe"),
+        format!(
+            "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n\
+             package : Package\npackage =\n    {{ name = \"{name}\"\n    , version = \"1.0.0\"\n    }}\n"
+        ),
+    )
+    .expect("write package.ipe");
+    std::fs::write(
+        repo.join("src").join("Main.ipe"),
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    Io.println \"pkg\"\n",
+    )
+    .expect("write Main.ipe");
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "seed"]);
+    let sha = hash_source_tree(&repo).expect("hash package tree");
+    (repo, sha)
+}
+
+#[test]
+fn audit_entry_refuses_capabilities_other_than_the_audited_set() {
+    // Gated: the package passes its audit, which builds it.
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!(
+            "skipping audit_entry_refuses_capabilities_other_than_the_audited_set (set IPE_E2E=1)"
+        );
+        return;
+    }
+    // Schema, fetch, integrity and every audit check pass; the entry alone lies:
+    // it records `network` for a package whose audit infers no capability. The
+    // admitted set is the audit's own output, so the entry is refused.
+    let (source, sha) = fixture_pure_package("lying-caps", "lying-caps-pkg");
+    let index = fixture_index(
+        "lying-caps",
+        "lying-caps-pkg",
+        "1.0.0",
+        &source,
+        sha.as_str(),
+    );
+    let entry_path = index.join("packages").join("lying-caps-pkg.toml");
+
+    let out = Command::new(ipe_bin())
+        .args(["package", "audit-entry"])
+        .arg(&entry_path)
+        .env("IPE_REGISTRY_URL", "")
+        .output()
+        .expect("ipe runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "audit-entry must REJECT an entry recording capabilities the audit did not infer; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("recorded: network") && stderr.contains("inferred: none"),
+        "the reject names the recorded and the audited capability sets; got:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("new version(s) certified"),
+        "a rejected entry must NOT print the certified summary; got:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&source);
+    let _ = std::fs::remove_dir_all(&index);
+}
