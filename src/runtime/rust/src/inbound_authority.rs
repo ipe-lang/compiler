@@ -327,8 +327,16 @@ mod served {
     /// The most distinct refused hosts logged by name; later ones are counted.
     const MAX_LOGGED_HOSTS: usize = 64;
 
-    /// The most bytes of a refused host a log line or the logged set keeps.
-    const MAX_LOGGED_HOST_BYTES: usize = 256;
+    /// The most characters of a refused host a log line or the logged set
+    /// keeps.
+    const MAX_LOGGED_HOST_CHARS: usize = 256;
+
+    /// The mark ending a logged host cut at [`MAX_LOGGED_HOST_CHARS`].
+    ///
+    /// Every character of a logged host is at most U+00FF (a URI authority is
+    /// ASCII, a header byte maps to the code point of the same value), so the
+    /// mark never occurs in an uncut one.
+    const LOGGED_HOST_CUT: char = '\u{2026}';
 
     /// The fixed body a refused request answers with.
     const REFUSED_BODY: &str = r#"{"status":"host_not_admitted"}"#;
@@ -438,7 +446,7 @@ mod served {
     }
 
     impl RefusalLog {
-        /// Record one refusal of `host` (already scrubbed and capped).
+        /// Record one refusal of `host` (already capped).
         fn decide(&self, host: &str) -> LogDecision {
             {
                 let mut seen = self
@@ -475,10 +483,9 @@ mod served {
         fn log_refusal(&self, parts: &Parts, reason: &dyn std::fmt::Display) {
             let host = target_text(parts);
             match self.log.decide(&host) {
-                LogDecision::Fresh => crate::system::emit_runtime_log(
-                    self.tag,
-                    &format!("host.refused: {reason}: host `{host}`"),
-                ),
+                LogDecision::Fresh => {
+                    crate::system::emit_runtime_log(self.tag, &fresh_record(reason, &host));
+                }
                 LogDecision::Repeat => {}
                 LogDecision::Counted(n) if n.is_power_of_two() => crate::system::emit_runtime_log(
                     self.tag,
@@ -491,32 +498,41 @@ mod served {
         }
     }
 
-    /// The target authority text `parts` carries, scrubbed and capped for a log
-    /// line: the URI's authority, else the first `Host` header, else empty.
+    /// The record logging the first refusal of `host` for `reason`. Raw: the
+    /// one runtime log emitter scrubs it.
+    fn fresh_record(reason: &dyn std::fmt::Display, host: &str) -> String {
+        format!("host.refused: {reason}: host `{host}`")
+    }
+
+    /// The target authority text `parts` carries, capped for a log line: the
+    /// URI's authority, else the first `Host` header, else empty.
     ///
-    /// A header's bytes map to the code points of the same value, so the text
-    /// is injective in its input and never lossy.
+    /// A header's bytes map to the code points of the same value, and a cut
+    /// text ends in [`LOGGED_HOST_CUT`], so two distinct texts within the cap
+    /// never record alike.
     fn target_text(parts: &Parts) -> String {
-        let raw: String = match parts.uri.authority() {
-            Some(target) => target
-                .as_str()
-                .chars()
-                .take(MAX_LOGGED_HOST_BYTES)
-                .collect(),
+        match parts.uri.authority() {
+            Some(target) => capped_host(target.as_str().chars()),
             None => parts
                 .headers
                 .get(header::HOST)
-                .map(|value| {
-                    value
-                        .as_bytes()
-                        .iter()
-                        .take(MAX_LOGGED_HOST_BYTES)
-                        .map(|b| char::from(*b))
-                        .collect()
-                })
+                .map(|value| capped_host(value.as_bytes().iter().map(|b| char::from(*b))))
                 .unwrap_or_default(),
-        };
-        crate::system::scrub_log_controls_capped(&raw, MAX_LOGGED_HOST_BYTES)
+        }
+    }
+
+    /// The first [`MAX_LOGGED_HOST_CHARS`] of `chars`, ending in
+    /// [`LOGGED_HOST_CUT`] when more follow.
+    fn capped_host(chars: impl Iterator<Item = char>) -> String {
+        let mut out = String::new();
+        for (kept, c) in chars.enumerate() {
+            if kept == MAX_LOGGED_HOST_CHARS {
+                out.push(LOGGED_HOST_CUT);
+                break;
+            }
+            out.push(c);
+        }
+        out
     }
 
     /// The response a refused request answers with: `421`, a fixed body, no
@@ -625,7 +641,42 @@ mod served {
     #[cfg(test)]
     mod tests {
         use super::super::{Authority, AuthorityRefusal};
-        use axum::http::Request;
+        use super::{LOGGED_HOST_CUT, MAX_LOGGED_HOST_CHARS, fresh_record, target_text};
+        use axum::http::{HeaderValue, Request};
+
+        /// The refusal line one `Host` header of `bytes` logs, as emitted.
+        fn logged_line(bytes: &[u8]) -> String {
+            let refused =
+                parts(Request::get("/").header("host", HeaderValue::from_bytes(bytes).unwrap()));
+            crate::system::runtime_log_line(
+                None,
+                "web",
+                &fresh_record(&AuthorityRefusal::Malformed, &target_text(&refused)),
+            )
+        }
+
+        #[test]
+        fn a_refused_host_is_escaped_once_and_capped() {
+            // One scrub: `\` shows as `\\`, a tab as `\t`, a C1 control as
+            // `\u{9b}`, never their escapes escaped again.
+            let line = logged_line(b"a\\b\t\x9b.example");
+            assert!(line.contains("host `a\\\\b\\t\\u{9b}.example`"), "{line}");
+            // A host past the cap keeps its first characters and the cut mark;
+            // one at the cap is whole.
+            let long = vec![b'a'; MAX_LOGGED_HOST_CHARS + 1];
+            let line = logged_line(&long);
+            let kept = "a".repeat(MAX_LOGGED_HOST_CHARS);
+            assert!(
+                line.contains(&format!("host `{kept}{LOGGED_HOST_CUT}`")),
+                "{line}"
+            );
+            let line = logged_line(&long[..MAX_LOGGED_HOST_CHARS]);
+            assert!(line.contains(&format!("host `{kept}`")), "{line}");
+            assert!(!line.contains(LOGGED_HOST_CUT), "{line}");
+            // An absolute-form target is logged from the URI.
+            let target = parts(Request::get("http://evil.example/"));
+            assert_eq!(target_text(&target), "evil.example");
+        }
 
         /// The request parts of `builder` with an empty body.
         fn parts(builder: axum::http::request::Builder) -> axum::http::request::Parts {
