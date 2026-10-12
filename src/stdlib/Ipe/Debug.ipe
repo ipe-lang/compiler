@@ -58,8 +58,12 @@ import Ipe.Ffi.Kernel as Kernel
 
 
 -- | `log label value` — print `"label: value"` to stderr, return `value`.
--- The value is rendered by the total debug stringifier (the one behind
--- `Error.toString`), so any non-function value renders.
+-- In a development build the value prints in its dev view: a redacted
+-- runtime value (a `Url`'s path and query, a request, `Bytes`, a config)
+-- shows its contents, while a `Secret`, a crypto key and every credential
+-- field (a password, a signing secret, an `Authorization` or `Cookie`
+-- header, a cookie value) stay `<redacted>`. `Error.toString`, logs and the
+-- debugger keep the redacted rendering.
 log : String -> a -> a
 log = Kernel.kernel "Debug_log"
 

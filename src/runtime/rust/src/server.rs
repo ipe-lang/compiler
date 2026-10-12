@@ -48,7 +48,40 @@ pub struct ServerRequest {
     pub remoteAddr: String,
 }
 
-crate::stringify::show_row!("ServerRequest", Redacted, [] ServerRequest, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "ServerRequest",
+    Redacted(Reveal),
+    [] ServerRequest,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |r, view| r.dev(view),
+);
+
+impl ServerRequest {
+    /// The request as `Debug.log` prints it in a dev-posture build.
+    ///
+    /// Every field, except the values of the credential headers and of every
+    /// cookie, which render as the marker.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        use crate::stringify::{IpeStringify, dev_cookie_names, dev_header_map, dev_record};
+        dev_record(
+            "ServerRequest",
+            &[
+                ("method", self.method.clone()),
+                ("path", self.path.clone()),
+                ("body", self.body.clone()),
+                ("headers", dev_header_map(&self.headers)),
+                ("params", self.params.ipe_render(view)),
+                ("query", self.query.ipe_render(view)),
+                (
+                    "cookies",
+                    dev_cookie_names(self.cookies.keys().map(String::as_str)),
+                ),
+                ("remoteAddr", self.remoteAddr.clone()),
+            ],
+        )
+    }
+}
 
 redacting_debug!(ServerRequest {
     shown: [method],
@@ -105,7 +138,44 @@ pub struct ServerResponse {
     pub cookies: Vec<SetCookie>,
 }
 
-crate::stringify::show_row!("ServerResponse", Redacted, [] ServerResponse, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "ServerResponse",
+    Redacted(Reveal),
+    [] ServerResponse,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |r, _| r.dev(),
+);
+
+impl ServerResponse {
+    /// The response as `Debug.log` prints it in a dev-posture build.
+    ///
+    /// Every field, except the values of the credential headers and of every
+    /// `Set-Cookie` line, which render as the marker.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self) -> String {
+        use crate::stringify::{REDACTED_SHOW, dev_header_map, dev_record};
+        let cookies: Vec<String> = self
+            .cookies
+            .iter()
+            .map(|cookie| {
+                cookie.as_str().split_once('=').map_or_else(
+                    || REDACTED_SHOW.to_owned(),
+                    |(name, _)| format!("{name}={REDACTED_SHOW}"),
+                )
+            })
+            .collect();
+        dev_record(
+            "ServerResponse",
+            &[
+                ("status", self.status.to_string()),
+                ("body", self.body.clone()),
+                ("headers", dev_header_map(&self.headers)),
+                ("contentType", self.contentType.clone()),
+                ("cookies", format!("[{}]", cookies.join(" "))),
+            ],
+        )
+    }
+}
 
 // The body, headers and `Set-Cookie` values can carry a session id or a token;
 // the emitter builds this struct by field name, so the masking lives in `Debug`.
@@ -122,7 +192,19 @@ pub struct ServerCookie {
     pub value: Redacted<CookieValue>,
 }
 
-crate::stringify::show_row!("ServerCookie", Redacted, [] ServerCookie, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "ServerCookie",
+    Redacted(Reveal),
+    [] ServerCookie,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| crate::stringify::dev_record(
+        "ServerCookie",
+        &[
+            ("name", c.name.text().to_owned()),
+            ("value", crate::stringify::REDACTED_SHOW.to_owned()),
+        ],
+    ),
+);
 
 /// A handler erased of its Ipê error type `E`: it awaits the Ipê task and maps
 /// the result to either the response (Ok) or a 500 marker (Err). Erasing E here
@@ -366,7 +448,26 @@ pub enum TokenSource {
 }
 
 #[cfg(feature = "jwt")]
-crate::stringify::show_row!("TokenSource", Redacted, [] TokenSource, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "TokenSource",
+    Redacted(Reveal),
+    [] TokenSource,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |s, _| s.dev(),
+);
+
+#[cfg(feature = "jwt")]
+impl TokenSource {
+    /// The token source as `Debug.log` prints it in a dev-posture build: its
+    /// constructor and the cookie name it reads.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self) -> String {
+        match self {
+            Self::BearerHeader => "BearerHeader".to_owned(),
+            Self::Cookie(name) => format!("Cookie {}", name.text()),
+        }
+    }
+}
 
 /// Ipe.Server.AuthConfig (opaque) — the secret, token source, claim key, and
 /// revocation mode the middleware uses. Built by [`server_auth_config`]; the
@@ -382,7 +483,37 @@ pub struct AuthConfig {
 }
 
 #[cfg(feature = "jwt")]
-crate::stringify::show_row!("AuthConfig", Redacted, [] AuthConfig, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "AuthConfig",
+    Redacted(Reveal),
+    [] AuthConfig,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| c.dev(),
+);
+
+#[cfg(feature = "jwt")]
+impl AuthConfig {
+    /// The configuration as `Debug.log` prints it in a dev-posture build.
+    ///
+    /// Every field but the signing secret, which renders as the marker.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self) -> String {
+        use crate::app_config::RevocationMode;
+        let revocation = match self.revocation_mode {
+            RevocationMode::Off => "Off",
+            RevocationMode::Store => "Store",
+        };
+        crate::stringify::dev_record(
+            "AuthConfig",
+            &[
+                ("secret", crate::stringify::REDACTED_SHOW.to_owned()),
+                ("source", self.source.dev()),
+                ("subjectClaim", self.subject_claim.clone()),
+                ("revocationMode", revocation.to_owned()),
+            ],
+        )
+    }
+}
 
 #[cfg(feature = "jwt")]
 /// Ipe.Server.authConfig : Secret -> TokenSource -> AuthConfig. The subject
