@@ -30,6 +30,8 @@ to learn more about it.
 curl -fsSL https://raw.githubusercontent.com/ipe-lang/compiler/main/install.sh | sh
 ```
 
+For Windows (experimental), follow [these instructions](docs/guide/windows.md).
+
 ## Quickstart
 
 ```sh

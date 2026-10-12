@@ -16,6 +16,8 @@ at the top and follow the links; each page assumes only the ones before it.
 
 ## Tooling
 
+- [Installing on Windows](windows.md) — Rust, a C linker and `ipe` without
+  administrator rights, then a first run.
 - [Linting](lint.md) — `ipe lint` (+ `--fix`): the idiom, consistency, and
   safety-by-convention checks over code that already type-checks, the
   Ipê-native `lint.ipe` config, and inline suppression.
