@@ -546,9 +546,8 @@ const fn is_ident_byte(b: u8) -> bool {
 const fn skip_quoted(mut s: &[u8]) -> Lexed<'_> {
     loop {
         match s {
-            [b'\\', _, tail @ ..] => s = tail,
             [b'"', tail @ ..] => return Lexed::Literal(tail),
-            [_, tail @ ..] => s = tail,
+            [b'\\', _, tail @ ..] | [_, tail @ ..] => s = tail,
             [] => return Lexed::Open,
         }
     }
@@ -1198,7 +1197,7 @@ mod tests {
     use ipe_diagnostics::{DResult, Diagnostic};
 
     use super::{Doc, Leaf, LeafRefusal};
-    use crate::render::{RenderConfig, render};
+    use crate::render::{RenderConfig, render, render_seeded};
 
     /// The texts a leaf refuses, each with its refusal.
     const REFUSED: [(&str, LeafRefusal); 12] = [
@@ -1334,28 +1333,29 @@ mod tests {
                     let spliced = format!("{a}{join}{b}");
                     assert_eq!(Leaf::lex(&spliced), Ok(()), "{spliced:?}");
                 }
-                let doc = Doc::group(Doc::concat(vec![
+                let soft = Doc::group(Doc::concat(vec![
                     Doc::text(leaf_of(a)),
                     Doc::Line,
                     Doc::text(leaf_of(b)),
+                ]));
+                let glued = Doc::concat(vec![
+                    Doc::text(leaf_of(a)),
                     Doc::HardLine,
                     Doc::text(leaf_of(a)),
                     Doc::text(leaf_of(b)),
-                ]));
-                let mut leaves = String::new();
-                doc.collect_leaves(&mut leaves);
-                let narrow = RenderConfig {
-                    max_width: 1,
-                    ..RenderConfig::default()
-                };
-                for out in [
-                    leaves,
-                    doc.plain_layout(0),
-                    doc.plain_layout(8),
-                    render(&doc, RenderConfig::default()),
-                    render(&doc, narrow),
-                ] {
-                    assert_eq!(Leaf::lex(&out), Ok(()), "{out:?}");
+                ]);
+                for doc in [soft, glued] {
+                    let mut leaves = String::new();
+                    doc.collect_leaves(&mut leaves);
+                    for out in [
+                        leaves,
+                        doc.plain_layout(0),
+                        doc.plain_layout(8),
+                        render(&doc, RenderConfig::default()),
+                        render_seeded(&doc, RenderConfig::default(), 4, 99),
+                    ] {
+                        assert_eq!(Leaf::lex(&out), Ok(()), "{out:?}");
+                    }
                 }
             }
         }
