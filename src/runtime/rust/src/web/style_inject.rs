@@ -23,8 +23,8 @@
 //! breakout. The close-tag strip applied to EVERY CSS fragment stays as
 //! belt-and-braces and must never be dropped. The selector uses the element's
 //! own ipe-id (`assign_ipe_ids`), never a user attr. That id holds only
-//! `[A-Za-z0-9_.:-]` (an unsafe tag contributes a fixed segment, a key is
-//! sanitised), so the quoted selector cannot be broken out of either.
+//! `[A-Za-z0-9_.:-]` (every tag and key byte outside `[A-Za-z0-9-]` is
+//! hex-escaped behind `.`), so the quoted selector cannot be broken out of either.
 //!
 //! Idempotent: a second run finds the markers already stripped and is a no-op
 //! (matches  idempotency contract), a belt-and-braces against a missed
@@ -199,10 +199,10 @@ fn build_style_node<M>(
 }
 
 /// The ipe-id is spliced raw into `[ipe-id="…"]` inside an `HRaw` `<style>`
-/// body. `assign_ipe_ids` builds it from the tag names the renderer admits
-/// (`[A-Za-z0-9_:.-]`), the sanitised key, `:`, and the `!doctype-wrapper`
-/// pseudo-tag; an id with any other byte (a `"`, `]`, `{`, `<`, `\`) did not
-/// come from that stamper and gets no style block.
+/// body. `assign_ipe_ids` builds it from `[A-Za-z0-9_:.-]` alone (every tag
+/// and key byte outside `[A-Za-z0-9-]` is hex-escaped behind `.`); an id with
+/// any other byte (a `"`, `]`, `{`, `<`, `\`) did not come from that stamper
+/// and gets no style block.
 fn is_selector_safe_ipe_id(id: &str) -> bool {
     !id.is_empty()
         && id

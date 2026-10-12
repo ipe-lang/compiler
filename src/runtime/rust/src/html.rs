@@ -459,7 +459,9 @@ fn render_into_ctx<M>(
                 s.push_str(&events.join(" "));
                 s.push('"');
                 if let Some(id) = ipe_id {
-                    s.push_str(" data-ipe-hid=\"");
+                    s.push(' ');
+                    s.push_str(HANDLER_ID_ATTR);
+                    s.push_str("=\"");
                     crate::escape::html_attr_into(id, s);
                     s.push('"');
                 }
@@ -775,11 +777,21 @@ const STAMPED_ID_ATTR: &str = "ipe-id";
 /// The attribute `Html.keyed` sets; the stamper reads it as the key segment.
 const KEY_ATTR: &str = "ipe-key";
 
-/// True when `name` starts with [`RESERVED_ATTR_PREFIX`] in any ASCII case.
+/// The attribute carrying an event element's handler identity.
+///
+/// The client posts it as the handler id of every gesture on the element, and
+/// the HTML parser keeps the first of two same-named attributes, so a
+/// program-built one would route the gesture to another element's handler.
+pub(crate) const HANDLER_ID_ATTR: &str = "data-ipe-hid";
+
+/// True for a runtime wire-marker name, compared ASCII-case-insensitively.
+///
+/// That is a name starting with [`RESERVED_ATTR_PREFIX`], or [`HANDLER_ID_ATTR`].
 fn is_reserved_attr_name(name: &str) -> bool {
     name.as_bytes()
         .get(..RESERVED_ATTR_PREFIX.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTR_PREFIX))
+        || name.eq_ignore_ascii_case(HANDLER_ID_ATTR)
 }
 
 /// A validated HTML **attribute** name (parse-don't-validate). The ONLY way to
@@ -939,27 +951,28 @@ fn sanitise_url_attr<'a>(name: &str, value: &'a str) -> &'a str {
 /// fails policy is dropped, which also covers the removal sentinel (an empty
 /// value on a dangerous name must never reach `setAttribute`).
 ///
-/// The patch builder also routes its own `ipe-<event>` listener markers here,
-/// so a reserved name passes only as [`is_event_marker_name`]: never the
-/// stamped `ipe-id` nor `ipe-key`, in any case.
+/// Every reserved name fails [`SafeAttrName`], so a program-built wire marker
+/// never reaches `setAttribute`; the builder's own markers go through
+/// [`patch_marker_attr`].
 ///
 /// Consumed by `dom/diff.rs` (the shared patch builder) — always compiled.
 pub(crate) fn safe_patch_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'a str, &'a str)> {
-    if SafeAttrName::parse(name).is_none() && !is_event_marker_name(name) {
-        return None;
-    }
-    Some((name, sanitise_url_attr(name, value)))
+    let SafeAttrName(safe_name) = SafeAttrName::parse(name)?;
+    Some((safe_name, sanitise_url_attr(name, value)))
 }
 
-/// True for an `ipe-<event>` listener-marker name the patch builder emits.
+/// Gate a listener marker the patch builder writes for an event delta.
 ///
-/// A reserved name in the HTML-name charset that is neither the stamped
-/// `ipe-id` nor `ipe-key`, compared ASCII-case-insensitively.
-fn is_event_marker_name(name: &str) -> bool {
-    is_reserved_attr_name(name)
-        && is_safe_html_name(name)
+/// Admits a name in the HTML-name charset that carries no script and is
+/// neither the stamped `ipe-id` nor `ipe-key` in any case: the `ipe-<event>`
+/// and `data-ipe-ev-<event>` markers and [`HANDLER_ID_ATTR`]. Only the
+/// builder's event delta calls it, never with a program-built attribute.
+pub(crate) fn patch_marker_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'a str, &'a str)> {
+    (is_safe_html_name(name)
+        && !is_dangerous_attr_name(name)
         && !name.eq_ignore_ascii_case(STAMPED_ID_ATTR)
-        && !name.eq_ignore_ascii_case(KEY_ATTR)
+        && !name.eq_ignore_ascii_case(KEY_ATTR))
+    .then_some((name, value))
 }
 
 /// Stamp every `HElement` (not HText/HRaw) with a stable `ipe-id` attribute derived
@@ -2069,10 +2082,24 @@ mod tests {
                 ""
             );
         }
-        for name in ["ipe-id", "IPE-ID", "ipe-key", "Ipe-Key", "ipe-x y"] {
+        for name in [
+            "ipe-id",
+            "IPE-ID",
+            "ipe-key",
+            "ipe-click",
+            "data-ipe-hid",
+            "DATA-IPE-HID",
+        ] {
             assert!(safe_patch_attr(name, "v").is_none(), "{name}");
         }
-        assert!(safe_patch_attr("ipe-click", "click").is_some());
+        for name in [
+            "ipe-id", "IPE-ID", "ipe-key", "Ipe-Key", "ipe-x y", "onclick",
+        ] {
+            assert!(patch_marker_attr(name, "v").is_none(), "{name}");
+        }
+        for name in ["ipe-click", "data-ipe-ev-ipe-file", HANDLER_ID_ATTR] {
+            assert!(patch_marker_attr(name, "v").is_some(), "{name}");
+        }
         assert!(SafeAttrName::parse("ipe").is_some());
         assert!(SafeAttrName::parse("data-ipe-x").is_some());
     }
@@ -2122,6 +2149,34 @@ mod tests {
             })
             .collect();
         assert_eq!(reserved, vec![(STAMPED_ID_ATTR, "r")]);
+    }
+
+    /// The HTML parser keeps the first of two same-named attributes, so a
+    /// program-built handler id rendered ahead of the stamped one would route
+    /// this button's click to another element's handler.
+    #[test]
+    fn program_built_handler_id_never_reaches_the_page() {
+        let mut t: Html<()> = Html::HElement(
+            "button".into(),
+            vec![
+                Attribute::Attr("data-ipe-hid".into(), "r_9_button".into()),
+                Attribute::Attr("Data-Ipe-Hid".into(), "r_9_button".into()),
+                Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+            ],
+            vec![],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let out = render_html(&t);
+        let low = out.to_ascii_lowercase();
+        assert_eq!(low.matches("data-ipe-hid=").count(), 1, "{out}");
+        assert!(out.contains(r#"data-ipe-hid="r""#), "{out}");
+        assert!(!out.contains("r_9_button"), "{out}");
+        let unstamped: Html<()> = Html::HElement(
+            "b".into(),
+            vec![Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
+            vec![],
+        );
+        assert!(!render_html(&unstamped).contains("r_9_button"));
     }
 
     #[test]

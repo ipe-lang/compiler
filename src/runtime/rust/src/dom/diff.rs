@@ -322,19 +322,29 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
     };
     let (on, nn) = (names(old), names(new));
     let id = p.id.clone();
+    let hid = crate::html::HANDLER_ID_ATTR;
     for ev in &nn {
         if !on.contains(ev) {
-            insert_safe_attr(p, &ev_key(ev), ev);
-            insert_safe_attr(p, "data-ipe-hid", &id);
+            insert_marker_attr(p, &ev_key(ev), ev);
+            insert_marker_attr(p, hid, &id);
         }
     }
     for ev in &on {
         if !nn.contains(ev) {
-            insert_safe_attr(p, &ev_key(ev), "");
+            insert_marker_attr(p, &ev_key(ev), "");
             if nn.is_empty() {
-                insert_safe_attr(p, "data-ipe-hid", "");
+                insert_marker_attr(p, hid, "");
             }
         }
+    }
+}
+
+/// Insert a listener marker of the event delta through
+/// [`crate::html::patch_marker_attr`]; a program-built attribute takes
+/// [`insert_safe_attr`] instead, which refuses every runtime wire-marker name.
+fn insert_marker_attr(p: &mut Patch, key: &str, val: &str) {
+    if let Some((k, v)) = crate::html::patch_marker_attr(key, val) {
+        p.attrs.insert(k.to_string(), v.to_string());
     }
 }
 
@@ -522,6 +532,40 @@ mod tests {
         // Removal sentinel: empty string for both the marker and the (now-stale) hid.
         assert_eq!(p[0].attrs.get("ipe-click").map(String::as_str), Some(""));
         assert_eq!(p[0].attrs.get("data-ipe-hid").map(String::as_str), Some(""));
+    }
+
+    /// A program-built handler id is never patched onto an element: the
+    /// client would post the element's gestures under that forged id.
+    #[test]
+    fn program_built_handler_id_is_never_patched() {
+        let button = |hid: &str| -> Html<()> {
+            Html::HElement(
+                "button".into(),
+                vec![
+                    Attribute::Attr("data-ipe-hid".into(), hid.into()),
+                    Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+                ],
+                vec![],
+            )
+        };
+        let mut a = button("r_1_button");
+        let mut b = button("r_9_button");
+        ids(&mut a);
+        ids(&mut b);
+        assert!(diff(&a, &b).is_empty());
+        let mut patch = Patch {
+            id: "r".into(),
+            text: None,
+            html: None,
+            attrs: HashMap::new(),
+            remove: false,
+        };
+        diff_attrs::<()>(
+            &[],
+            &[Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
+            &mut patch,
+        );
+        assert!(patch.attrs.is_empty(), "{patch:?}");
     }
 
     #[test]
