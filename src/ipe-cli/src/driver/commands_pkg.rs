@@ -1986,7 +1986,15 @@ pub fn run_version(rest: &[String]) -> Result<(), CliError> {
     if let Some(extra) = positional.first() {
         return Err(cli_args::usage_unexpected_argument("version", extra));
     }
-    crate::screen::emit_report(format, &render_version(format, &std::io::stdout()));
+    let text = render_version(format, &std::io::stdout());
+    match format {
+        cli_args::OutputFormat::Human => {
+            crate::screen::emit_banner(crate::screen::Stream::Stdout, &text);
+        }
+        cli_args::OutputFormat::Plain | cli_args::OutputFormat::Json => {
+            crate::screen::emit_machine(crate::screen::Stream::Stdout, &text);
+        }
+    }
     Ok(())
 }
 
@@ -2485,14 +2493,12 @@ pub fn render_upgrade(
 
 /// Render the ipe version in the requested [`OutputFormat`].
 ///
-/// - Human (default): a guttered `ipe <version>` line.
+/// - Human (default): the product header alone, a blank line before and after;
+///   the version rides in the header.
 /// - `--plain`: the bare version string, flush-left, nothing else.
 /// - `--json`: the shared `{schema, status, command, payload}` machine envelope,
 ///   with the version under `payload.version` (`ipe.cli.version/1`).
-pub fn render_version(
-    format: cli_args::OutputFormat,
-    _stream: &impl std::io::IsTerminal,
-) -> String {
+pub fn render_version(format: cli_args::OutputFormat, stream: &impl std::io::IsTerminal) -> String {
     use cli_args::OutputFormat::{Human, Json, Plain};
     let version = env!("CARGO_PKG_VERSION");
     match format {
@@ -2505,7 +2511,7 @@ pub fn render_version(
             crate::machine_output::MachineOutput::ok("ipe.cli.version/1", "version", payload)
                 .render_json()
         }
-        Human => style::frame(&style::gutter(&format!("ipe {version}\n"))),
+        Human => style::command_header(style::use_color(stream)),
     }
 }
 

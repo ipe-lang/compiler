@@ -149,6 +149,13 @@ pub fn emit_header(stream: Stream) {
     }
 }
 
+/// Write `banner`, a complete screen that is the product header alone, to
+/// `stream` byte for byte, and mark the header shown so no later screen repeats it.
+pub fn emit_banner(stream: Stream, banner: &str) {
+    let _ = claim_header();
+    stream.write(banner);
+}
+
 /// Write machine output (`--json`, `--plain`) to `stream` byte for byte —
 /// never framed, never coloured.
 pub fn emit_machine(stream: Stream, text: &str) {
