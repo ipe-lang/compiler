@@ -41,6 +41,12 @@ impl<T1: IpeStringify> IpeStringify for RecQ<T1> {
     }
 }
 
+impl<T1: RetainedBytes> RetainedBytes for RecQ<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.q)
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

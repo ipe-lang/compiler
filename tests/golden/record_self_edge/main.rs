@@ -45,6 +45,15 @@ impl IpeStringify for MainRChain {
     }
 }
 
+impl RetainedBytes for MainRChain {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainRChain::REnd => Bytes::inline::<Self>(),
+            MainRChain::RNode(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecRestVal {
     rest: MainRChain,
@@ -58,6 +67,12 @@ impl IpeStringify for RecRestVal {
             IpeStringify::ipe_show(&self.rest),
             IpeStringify::ipe_show(&self.val)
         )
+    }
+}
+
+impl RetainedBytes for RecRestVal {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.rest)?.plus(&self.val)
     }
 }
 

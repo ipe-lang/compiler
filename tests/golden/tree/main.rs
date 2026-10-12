@@ -50,6 +50,15 @@ impl IpeStringify for MainTree {
     }
 }
 
+impl RetainedBytes for MainTree {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainTree::Leaf => Bytes::inline::<Self>(),
+            MainTree::Node(p0, p1, p2) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1)?.plus(p2),
+        }
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

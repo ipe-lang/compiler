@@ -1,4 +1,4 @@
-//! Type emission: user enums and their `IpeStringify` impls, plus
+//! Type emission: user enums, their `IpeStringify` and `RetainedBytes` impls, plus
 //! IR-type → Rust-type rendering.
 //!
 //! Ports the relevant arms of `Ipê/Generate/Rust/Builder/TypeEmitter.hs`
@@ -7,7 +7,9 @@
 
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::{Symbol, rust_fmt_str_lit, rust_str_lit};
-use ipe_ir::{EnumDef, IrType, UiCtor, UiPlain, refused_marker, runtime_aliased_enum};
+use ipe_ir::{
+    EnumDef, IrType, UiCtor, UiPlain, ir_type_is_serde, refused_marker, runtime_aliased_enum,
+};
 
 use std::collections::BTreeSet;
 
@@ -760,6 +762,20 @@ fn render_fn_once_chain(
 /// }
 /// ```
 ///
+/// Every enum also gets its `RetainedBytes` impl from the same per-variant
+/// loop: the inline size plus each field's measure, or `None` for a variant
+/// holding a non-serde field:
+/// ```text
+/// impl<T1: RetainedBytes> RetainedBytes for MainMaybe<T1> {
+///     fn retained_bytes(&self) -> Option<Bytes> {
+///         match self {
+///             MainMaybe::Just(p0) => Bytes::inline::<Self>()?.plus(p0),
+///             MainMaybe::Nothing => Bytes::inline::<Self>(),
+///         }
+///     }
+/// }
+/// ```
+///
 /// A payload field that sits on a type-size cycle back to its own enum —
 /// directly (`Node Tree Int Tree`) or indirectly (mutual recursion, or a
 /// self-edge routed through a tuple / record / another generic's type argument)
@@ -794,7 +810,12 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     // position. Empty for a non-generic enum.
     let scope = GenericScope::new(&def.type_params);
 
-    let (variants, arms) = emit_enum_variant_lines_and_arms(ctx, def, &name, scope)?;
+    let EnumArms {
+        variants,
+        show_arms: arms,
+        retained_arms,
+        all_nullary,
+    } = emit_enum_variant_lines_and_arms(ctx, def, &name, scope)?;
 
     let self_clone = ctx.enum_is_clone(&def.home, def.name);
     // seal: an enum storing a function payload carries it on the `Arc<dyn Fn(..)
@@ -892,10 +913,32 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
     }}
 }}"
     ));
+    let retained_body = if all_nullary {
+        RETAINED_INLINE.to_owned()
+    } else {
+        format!("match self {{\n{retained_arms}\n        }}")
+    };
+    items.push(&retained_impl(
+        &retained_bounds(&params, bound_static),
+        &format!("{name}{use_clause}"),
+        &retained_body,
+    ));
     Ok(items.render())
 }
 
-/// Emit an enum's variant declaration lines and its `ipe_show` match arms.
+/// An enum's variant declaration lines and its `ipe_show` and `retained_bytes` match arms.
+struct EnumArms {
+    /// The variant lines of the enum declaration.
+    variants: String,
+    /// The `ipe_show` match arms.
+    show_arms: String,
+    /// The `retained_bytes` match arms.
+    retained_arms: String,
+    /// Whether every variant is nullary, so the measure is the inline size alone.
+    all_nullary: bool,
+}
+
+/// Emit an enum's variant declaration lines and its `ipe_show` and `retained_bytes` match arms.
 ///
 /// A nullary variant renders a bare ident and a `Name::V => "V".to_string()`
 /// arm; a payload variant renders `V(field types…)` (boxing a direct self-edge)
@@ -903,14 +946,19 @@ pub fn emit_enum(ctx: &EmitCtx, def: &EnumDef) -> DResult<String> {
 /// has a show row renders through its `IpeStringify` impl; a field holding a
 /// component with no rendering (a function, an opaque `Rust.*` handle) is bound
 /// `_` and renders as that component's fixed marker ([`refused_marker`]).
+///
+/// The same loop writes each variant's `retained_bytes` arm, so a variant can
+/// never gain a show arm without its measure: the inline size plus every
+/// field's measure, or `None` when a field is not serde ([`measured_field`]).
 fn emit_enum_variant_lines_and_arms(
     ctx: &EmitCtx,
     def: &EnumDef,
     name: &str,
     scope: GenericScope,
-) -> DResult<(String, String)> {
+) -> DResult<EnumArms> {
     let mut variant_lines = Vec::with_capacity(def.variants.len());
     let mut show_arms = Vec::with_capacity(def.variants.len());
+    let mut retained_arms = Vec::with_capacity(def.variants.len());
     for variant in &def.variants {
         // The Rust variant ident is keyword-mangled; the `ipe_show` string keeps
         // the original Ipê name so a variant like `Type` still displays as
@@ -924,12 +972,14 @@ fn emit_enum_variant_lines_and_arms(
                 "            {name}::{vn} => {}.to_string(),",
                 rust_str_lit(&display)
             ));
+            retained_arms.push(format!("            {name}::{vn} => {RETAINED_INLINE},"));
         } else {
             // Payload variant: render each field type (boxing a direct self-edge),
             // and bind a `pN` per field in the stringify arm.
             let mut field_types = Vec::with_capacity(variant.fields.len());
             let mut binders = Vec::with_capacity(variant.fields.len());
             let mut show_args = Vec::with_capacity(variant.fields.len());
+            let mut measured = Some(Vec::with_capacity(variant.fields.len()));
             for (i, field_ty) in variant.fields.iter().enumerate() {
                 let rendered = render_type(ctx, field_ty, scope)?;
                 let rendered = if ctx.is_cyclic_self_field(field_ty, &def.home, def.name) {
@@ -938,6 +988,10 @@ fn emit_enum_variant_lines_and_arms(
                     rendered
                 };
                 field_types.push(rendered);
+                measured = measured.filter(|_| measured_field(ctx, field_ty));
+                if let Some(binders) = measured.as_mut() {
+                    binders.push(format!("p{i}"));
+                }
                 // seal: a field holding a component with no show row has no
                 // `IpeStringify` impl, so it binds `_` and renders as its fixed
                 // marker; every other field has one (the `ipe-cli` show-table
@@ -974,9 +1028,108 @@ fn emit_enum_variant_lines_and_arms(
                 &fmt_literal,
                 &show_args,
             ));
+            let measured_arm = |binders: Vec<String>| {
+                let head = format!("            {name}::{vn}({}) => ", binders.join(", "));
+                let terms: Vec<String> = binders.iter().map(|b| format!(".plus({b})")).collect();
+                format!("{},", render_retained_chain(&head, &terms, 12))
+            };
+            retained_arms.push(measured.map_or_else(
+                || format!("            {name}::{vn}(..) => None,"),
+                measured_arm,
+            ));
         }
     }
-    Ok((variant_lines.join("\n"), show_arms.join("\n")))
+    Ok(EnumArms {
+        variants: variant_lines.join("\n"),
+        show_arms: show_arms.join("\n"),
+        retained_arms: retained_arms.join("\n"),
+        all_nullary: def.variants.iter().all(|v| v.fields.is_empty()),
+    })
+}
+
+/// The measure of a value owning no measured field: its inline size.
+const RETAINED_INLINE: &str = "Bytes::inline::<Self>()";
+
+/// Whether a field of type `ty` is measured by its `RetainedBytes` impl.
+///
+/// A serde field is measured when every component it holds has a runtime
+/// `RetainedBytes` impl: every serde leaf has one, and every emitted serde type
+/// gets one here. A tuple wider than [`ipe_ir::MAX_SHOWN_TUPLE_ARITY`] is serde
+/// but has no runtime impl, so a field holding one anywhere (directly, inside a
+/// carrier, or as an enum's type argument or payload) is not measured; the
+/// walk's depth ceiling answers the same way. An unmeasured field (a function,
+/// an opaque handle, `Html`, `Secret`, a wide tuple) makes its variant or
+/// record measure `None`. A Web `Model` is serde (`IPE-L0120`), but a `Msg`
+/// needs only the derivable set (`IPE-L0125`), so an `Html`-carrying `Msg`
+/// arm measures `None`.
+fn measured_field(ctx: &EmitCtx, ty: &IrType) -> bool {
+    ir_type_is_serde(ty, &|home, name| ctx.enum_is_serde(home, name))
+        && !ipe_ir::ir_type_holds(ty, &ctx.enum_variants, &|t: &IrType| {
+            matches!(t.show_shape(), ipe_ir::ShowShape::TooWide)
+        })
+}
+
+/// The `RetainedBytes` bounds `<T1: RetainedBytes, …>` over a type's parameters.
+fn retained_bounds(params: &[String], bound_static: &str) -> String {
+    if params.is_empty() {
+        String::new()
+    } else {
+        let bounds: Vec<String> = params
+            .iter()
+            .map(|p| format!("{p}: RetainedBytes{bound_static}"))
+            .collect();
+        format!("<{}>", bounds.join(", "))
+    }
+}
+
+/// The `impl RetainedBytes` item for `ty`, whose `retained_bytes` body is `body`.
+///
+/// `body` starts at column 8, the method body's block indent.
+fn retained_impl(bounds: &str, ty: &str, body: &str) -> String {
+    let head = impl_header(bounds, "RetainedBytes", ty);
+    format!(
+        "{head}
+    fn retained_bytes(&self) -> Option<Bytes> {{
+        {body}
+    }}
+}}"
+    )
+}
+
+/// The checked measure chain after `head`, laid out as `rustfmt` would.
+///
+/// The chain is `Bytes::inline::<Self>()?.plus(a)?.plus(b)`, one `.plus` per term.
+///
+/// `head` is the text before the chain on its first line and `indent` that
+/// line's block indent. The chain stays on one line while it fits both the
+/// 60-column chain width and the 100-column line (one column kept for a
+/// trailing `,`); otherwise every `.plus(..)` drops to its own line four
+/// columns deeper.
+fn render_retained_chain(head: &str, terms: &[String], indent: usize) -> String {
+    let Some((last, init)) = terms.split_last() else {
+        return format!("{head}{RETAINED_INLINE}");
+    };
+    let mut chain = format!("{RETAINED_INLINE}?");
+    for term in init {
+        chain.push_str(term);
+        chain.push('?');
+    }
+    chain.push_str(last);
+    if chain.len() <= 60 && head.len() + chain.len() < 100 {
+        return format!("{head}{chain}");
+    }
+    let pad = " ".repeat(indent + 4);
+    let mut out = format!("{head}{RETAINED_INLINE}?");
+    for term in init {
+        out.push('\n');
+        out.push_str(&pad);
+        out.push_str(term);
+        out.push('?');
+    }
+    out.push('\n');
+    out.push_str(&pad);
+    out.push_str(last);
+    out
 }
 
 /// Emit the HAND-WRITTEN `impl Clone` for an enum that is `Clone` but NOT fully
@@ -1066,7 +1219,7 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
     }
 }
 
-/// Emit a synthesised record struct and its derived `IpeStringify` impl,
+/// Emit a synthesised record struct with its `IpeStringify` and `RetainedBytes` impls,
 /// including the trailing newline.
 ///
 /// Shape (for `{ x : Int, y : Int }`):
@@ -1104,6 +1257,10 @@ fn impl_header(bounds: &str, trait_name: &str, ty: &str) -> String {
 /// ```
 /// The impl bounds each parameter `IpeStringify`, so a field typed by it
 /// renders at the generic frame. A monomorphic record emits an empty clause.
+///
+/// The `RetainedBytes` impl comes from the same field loop: the inline size
+/// plus each field's measure (`Bytes::inline::<Self>()?.plus(&self.x)`), or
+/// `None` when a field is not serde.
 pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> {
     let name = &rec.name;
     // The struct's own generic scope: each parameter symbol → `T1`, `T2`, … by
@@ -1111,10 +1268,18 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     let scope = GenericScope::new(&rec.type_params);
     let mut field_lines = Vec::with_capacity(rec.fields.len());
     let mut show_args = Vec::with_capacity(rec.fields.len());
+    // The `.plus(&self.f)` term of every field, or `None` once a field is not
+    // serde ([`measured_field`]): computed in the same loop as the show
+    // arguments, so a field can never render without its measure.
+    let mut measured = Some(Vec::with_capacity(rec.fields.len()));
     for (field_name, field_ty) in &rec.fields {
         let ident = mangle_reserved(field_name.clone());
         let rust_ty = render_type(ctx, field_ty, scope)?;
         field_lines.push(format!("    {ident}: {rust_ty},"));
+        measured = measured.filter(|_| measured_field(ctx, field_ty));
+        if let Some(terms) = measured.as_mut() {
+            terms.push(format!(".plus(&self.{ident})"));
+        }
         // seal: a field holding a component with no show row has no
         // `IpeStringify` impl, so it renders as its fixed marker.
         match refused_marker(field_ty, &ctx.enum_variants, ctx.interner) {
@@ -1233,6 +1398,15 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
         {body}
     }}
 }}"
+    ));
+    let retained_body = measured.map_or_else(
+        || "None".to_owned(),
+        |terms| render_retained_chain("", &terms, 8),
+    );
+    items.push(&retained_impl(
+        &retained_bounds(&params, bound_static),
+        &format!("{name}{use_clause}"),
+        &retained_body,
     ));
     Ok(items.render())
 }

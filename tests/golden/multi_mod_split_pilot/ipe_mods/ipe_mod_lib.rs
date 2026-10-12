@@ -15,6 +15,12 @@ impl IpeStringify for LibStatus {
     }
 }
 
+impl RetainedBytes for LibStatus {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()
+    }
+}
+
 pub(crate) fn lib_label(status: LibStatus) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match status {

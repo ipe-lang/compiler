@@ -49,6 +49,15 @@ impl IpeStringify for MainShape {
     }
 }
 
+impl RetainedBytes for MainShape {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainShape::Circle(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainShape::Rect(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+        }
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

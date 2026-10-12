@@ -13,6 +13,14 @@ impl IpeStringify for IpeDbStoreColumn {
     }
 }
 
+impl RetainedBytes for IpeDbStoreColumn {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreColumn::Column(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreColumnSpec {
     PrimaryKey(String),
@@ -52,6 +60,22 @@ impl IpeStringify for IpeDbStoreColumnSpec {
     }
 }
 
+impl RetainedBytes for IpeDbStoreColumnSpec {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreColumnSpec::PrimaryKey(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreColumnSpec::Serial(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreColumnSpec::Unique(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreColumnSpec::DefaultNow(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreColumnSpec::DefaultText(p0, p1) => Bytes::inline::<Self>()?
+                .plus(p0)?
+                .plus(p1),
+            IpeDbStoreColumnSpec::DefaultInt(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+            IpeDbStoreColumnSpec::TouchOnUpdate(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStorePrimaryKeyDecl {
     NoPk,
@@ -76,6 +100,19 @@ impl IpeStringify for IpeDbStorePrimaryKeyDecl {
     }
 }
 
+impl RetainedBytes for IpeDbStorePrimaryKeyDecl {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStorePrimaryKeyDecl::NoPk => Bytes::inline::<Self>(),
+            IpeDbStorePrimaryKeyDecl::SinglePk(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePrimaryKeyDecl::CompositePk(p0, p1, p2) => Bytes::inline::<Self>()?
+                .plus(p0)?
+                .plus(p1)?
+                .plus(p2),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreIndexSpec {
     Index(Vec<String>),
@@ -91,6 +128,15 @@ impl IpeStringify for IpeDbStoreIndexSpec {
                 IpeStringify::ipe_show(p0),
                 IpeStringify::ipe_show(p1)
             ),
+        }
+    }
+}
+
+impl RetainedBytes for IpeDbStoreIndexSpec {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreIndexSpec::Index(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreIndexSpec::IndexNamed(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
         }
     }
 }
@@ -118,6 +164,15 @@ impl IpeStringify for IpeDbStoreSchemaOp {
     }
 }
 
+impl RetainedBytes for IpeDbStoreSchemaOp {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreSchemaOp::RenameColumn(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+            IpeDbStoreSchemaOp::RenameTable(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+        }
+    }
+}
+
 pub(crate) enum IpeDbStoreDraft<T1: 'static> {
     Draft(RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable<T1>),
 }
@@ -134,6 +189,14 @@ impl<T1: IpeStringify + 'static> IpeStringify for IpeDbStoreDraft<T1> {
     fn ipe_show(&self) -> String {
         match self {
             IpeDbStoreDraft::Draft(_) => format!("Draft {}", "<function>"),
+        }
+    }
+}
+
+impl<T1: RetainedBytes + 'static> RetainedBytes for IpeDbStoreDraft<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreDraft::Draft(..) => None,
         }
     }
 }
@@ -158,6 +221,14 @@ impl<T1: IpeStringify + 'static> IpeStringify for IpeDbStoreStore<T1> {
     }
 }
 
+impl<T1: RetainedBytes + 'static> RetainedBytes for IpeDbStoreStore<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreStore::Store(..) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreColumnView {
     ColumnView(Vec<IpeDbStoreColumn>, Vec<IpeDbStoreColumn>),
@@ -171,6 +242,14 @@ impl IpeStringify for IpeDbStoreColumnView {
                 IpeStringify::ipe_show(p0),
                 IpeStringify::ipe_show(p1)
             ),
+        }
+    }
+}
+
+impl RetainedBytes for IpeDbStoreColumnView {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreColumnView::ColumnView(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
         }
     }
 }
@@ -195,6 +274,12 @@ impl IpeStringify for IpeDbStoreCompareOp {
             IpeDbStoreCompareOp::OpLt => "OpLt".to_string(),
             IpeDbStoreCompareOp::OpLte => "OpLte".to_string(),
         }
+    }
+}
+
+impl RetainedBytes for IpeDbStoreCompareOp {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()
     }
 }
 
@@ -244,6 +329,25 @@ impl IpeStringify for IpeDbStoreCond {
     }
 }
 
+impl RetainedBytes for IpeDbStoreCond {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreCond::Compare(p0, p1, p2) => Bytes::inline::<Self>()?
+                .plus(p0)?
+                .plus(p1)?
+                .plus(p2),
+            IpeDbStoreCond::Like(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+            IpeDbStoreCond::StartsWith(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+            IpeDbStoreCond::IsNull(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreCond::NotNull(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreCond::InList(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+            IpeDbStoreCond::AndList(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreCond::OrList(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStoreCond::NotCond(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStorePred {
     PAll(Box<Vec<IpeDbStorePred>>),
@@ -281,6 +385,24 @@ impl IpeStringify for IpeDbStorePred {
     }
 }
 
+impl RetainedBytes for IpeDbStorePred {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStorePred::PAll(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePred::PAny(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePred::PNotP(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePred::PAlways => Bytes::inline::<Self>(),
+            IpeDbStorePred::PNever => Bytes::inline::<Self>(),
+            IpeDbStorePred::PMatch(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePred::POwner(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePred::PRole(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePred::PMemberOf(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeDbStorePred::PClaimEquals(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),
+            IpeDbStorePred::PExists(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreExistsRef {
     ExistsRef(Box<RecOuterColShareColShareReadShareTableShareView>),
@@ -296,6 +418,14 @@ impl IpeStringify for IpeDbStoreExistsRef {
     }
 }
 
+impl RetainedBytes for IpeDbStoreExistsRef {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreExistsRef::ExistsRef(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStorePolicy {
     Policy(RecDeleteImmutablesInsertMasksOwnersReadUpdate),
@@ -305,6 +435,14 @@ impl IpeStringify for IpeDbStorePolicy {
     fn ipe_show(&self) -> String {
         match self {
             IpeDbStorePolicy::Policy(p0) => format!("Policy {}", IpeStringify::ipe_show(p0)),
+        }
+    }
+}
+
+impl RetainedBytes for IpeDbStorePolicy {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStorePolicy::Policy(p0) => Bytes::inline::<Self>()?.plus(p0),
         }
     }
 }
@@ -327,6 +465,14 @@ impl<T1: IpeStringify + 'static> IpeStringify for IpeDbStoreSecured<T1> {
             IpeDbStoreSecured::Secured(_, p1) => {
                 format!("Secured {} {}", "<function>", IpeStringify::ipe_show(p1))
             }
+        }
+    }
+}
+
+impl<T1: RetainedBytes + 'static> RetainedBytes for IpeDbStoreSecured<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbStoreSecured::Secured(..) => None,
         }
     }
 }

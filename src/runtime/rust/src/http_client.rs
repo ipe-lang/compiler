@@ -94,6 +94,8 @@ pub enum HttpMethod {
     Options,
 }
 
+crate::retained::inline_measure!(HttpMethod);
+
 crate::stringify::show_row!("HttpMethod", Value, [] HttpMethod, |m| match m {
     HttpMethod::Get => "Get".to_owned(),
     HttpMethod::Post => "Post".to_owned(),
