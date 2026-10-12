@@ -1,4 +1,4 @@
-use crate::html::{Attribute, ElementBody, Html, admit_rendered};
+use crate::html::{Attribute, ElementBody, Html, ParseContext, admit_rendered_in};
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -55,7 +55,7 @@ impl Patch {
 #[must_use]
 pub fn diff<M>(old: &Html<M>, new: &Html<M>) -> Vec<Patch> {
     let mut out = vec![];
-    diff_node_depth(old, new, &mut out, 0);
+    diff_node_depth(old, new, ParseContext::Data, &mut out, 0);
     out
 }
 
@@ -89,7 +89,8 @@ fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
 
 /// Emit a replace of every child of the element at `id`.
 ///
-/// `parent_body` is how `admit_rendered` admitted that element. A markup body
+/// `parent_body` is how `admit_rendered_in` admitted that element and
+/// `child_ctx` is the parse context it puts its children in. A markup body
 /// is sent as `Patch.html`, which the client parses as markup. A `<script>` or
 /// `<style>` body is a raw-text body: it is sent as `Patch.text`, which the
 /// client assigns to `textContent` without parsing, so the element holds the
@@ -100,6 +101,7 @@ fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
 fn push_children_replace<M>(
     id: &str,
     parent_body: ElementBody,
+    child_ctx: ParseContext,
     new_kids: &[Html<M>],
     out: &mut Vec<Patch>,
 ) {
@@ -107,7 +109,7 @@ fn push_children_replace<M>(
         return;
     }
     let mut p = Patch::for_id(id);
-    let body = render_children(parent_body, new_kids);
+    let body = render_children(parent_body, child_ctx, new_kids);
     match parent_body {
         ElementBody::Markup => p.html = Some(body),
         ElementBody::Script | ElementBody::Style => p.text = Some(body),
@@ -115,19 +117,27 @@ fn push_children_replace<M>(
     out.push(p);
 }
 
-/// True when `node` is an element the render sink's admission rule refuses, so
-/// the renderer leaves it out of the page.
-fn is_refused_element<M>(node: &Html<M>) -> bool {
+/// True when `node`, written in `ctx`, is an element the render sink's
+/// admission rule refuses, so the renderer leaves it out of the page.
+fn is_refused_element<M>(ctx: ParseContext, node: &Html<M>) -> bool {
     match node {
-        Html::HElement(tag, _, kids) => admit_rendered(tag, kids).is_err(),
+        Html::HElement(tag, _, kids) => admit_rendered_in(ctx, tag, kids).is_err(),
         Html::HText(_) | Html::HRaw(_) => false,
     }
 }
 
 /// Bounded-descent diff. Stops at `MAX_HTML_DEPTH` (same ceiling as
 /// `html.rs::render_into_ctx`) rather than recursing into an arbitrarily deep
-/// Model-derived tree that would overflow the thread stack.
-fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth: usize) {
+/// Model-derived tree that would overflow the thread stack. `ctx` is the parse
+/// context both nodes are written in, threaded from the root exactly as the
+/// render sink threads it.
+fn diff_node_depth<M>(
+    old: &Html<M>,
+    new: &Html<M>,
+    ctx: ParseContext,
+    out: &mut Vec<Patch>,
+    depth: usize,
+) {
     if depth >= crate::html::MAX_HTML_DEPTH {
         return;
     }
@@ -148,10 +158,14 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
     // whole subtree (see the per-position loop), which re-renders through the
     // same rule. The `Html.doctype` wrapper is admitted as markup, so a view
     // rooted at it is diffed through to its children.
-    let (Ok(new_rendered), Ok(_)) = (admit_rendered(nt, nk), admit_rendered(ot, ok)) else {
+    let (Ok(new_rendered), Ok(_)) = (
+        admit_rendered_in(ctx, nt, nk),
+        admit_rendered_in(ctx, ot, ok),
+    ) else {
         return;
     };
     let body = new_rendered.body();
+    let child_ctx = ctx.enter(nt);
     // Patch id targets the element currently in the DOM — the OLD tree's id
     // . Borrowed: `Patch::for_id` copies it only when
     // a Patch is actually built, so an unchanged element pair allocates
@@ -180,7 +194,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
 
     // Child-count change → replace the whole subtree.
     if ok.len() != nk.len() {
-        push_children_replace(id, body, nk, out);
+        push_children_replace(id, body, child_ctx, nk, out);
         return;
     }
 
@@ -193,7 +207,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                 // (single-text is the fast path above; anything else is a
                 // parent html-replace).
                 if o != n {
-                    push_children_replace(id, body, nk, out);
+                    push_children_replace(id, body, child_ctx, nk, out);
                     return;
                 }
             }
@@ -202,22 +216,22 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
             // the same body class the first paint used.
             (Html::HRaw(o), Html::HRaw(n)) => {
                 if o != n {
-                    push_children_replace(id, body, nk, out);
+                    push_children_replace(id, body, child_ctx, nk, out);
                     return;
                 }
             }
             (Html::HElement(..), Html::HElement(..)) if same_node(oc, nc) => {
                 // A child that gains or loses admission appears in or vanishes
                 // from the page, so the parent's subtree is replaced.
-                if is_refused_element(oc) != is_refused_element(nc) {
-                    push_children_replace(id, body, nk, out);
+                if is_refused_element(child_ctx, oc) != is_refused_element(child_ctx, nc) {
+                    push_children_replace(id, body, child_ctx, nk, out);
                     return;
                 }
-                diff_node_depth(oc, nc, out, child_depth);
+                diff_node_depth(oc, nc, child_ctx, out, child_depth);
             }
             // Tag / kind / identity mismatch → replace the subtree at the parent.
             _ => {
-                push_children_replace(id, body, nk, out);
+                push_children_replace(id, body, child_ctx, nk, out);
                 return;
             }
         }
@@ -329,9 +343,13 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
 /// The children render through `render_children_into` with the parent's
 /// admitted body class, the same path the first-paint renderer takes, so a
 /// `<script>`/`<style>` body is neutralised and a refused child is left out.
-fn render_children<M>(parent_body: ElementBody, kids: &[Html<M>]) -> String {
+fn render_children<M>(
+    parent_body: ElementBody,
+    child_ctx: ParseContext,
+    kids: &[Html<M>],
+) -> String {
     let mut s = String::new();
-    crate::html::render_children_into(parent_body, kids, &mut s);
+    crate::html::render_children_into(parent_body, child_ctx, kids, &mut s);
     s
 }
 
@@ -726,6 +744,51 @@ mod tests {
             !html.contains("alert"),
             "refused body must not render; got: {html:?}"
         );
+    }
+
+    /// A patch that inserts a trusted script under an `svg` parent emits no
+    /// script and none of its body, the verdict the first paint gives; under a
+    /// `div` (the control) the same script is patched in.
+    #[test]
+    fn diff_patch_under_svg_refuses_script() {
+        let script = || -> Html<()> {
+            Html::HElement(
+                "script".into(),
+                vec![],
+                vec![Html::HRaw("<img src=x onerror=alert(1)>".into())],
+            )
+        };
+        for (parent, admitted) in [("svg", false), ("math", false), ("div", true)] {
+            let mut old: Html<()> = Html::HElement(parent.into(), vec![], vec![]);
+            let mut new: Html<()> = Html::HElement(parent.into(), vec![], vec![script()]);
+            ids(&mut old);
+            ids(&mut new);
+            let patches = diff(&old, &new);
+            assert_eq!(patches.len(), 1, "{parent}: {patches:?}");
+            let [patch] = patches.as_slice() else {
+                return;
+            };
+            let html = patch.html.as_deref().unwrap_or_default();
+            assert_eq!(html.contains("<script"), admitted, "{parent}: {html}");
+            assert_eq!(html.contains("<img"), admitted, "{parent}: {html}");
+            let first_paint = crate::html::render_html(&new);
+            assert_eq!(first_paint.contains("<script"), admitted, "{first_paint}");
+        }
+    }
+
+    /// A trusted script body that changes under an `svg` parent is not on the
+    /// page, so the diff emits no patch for it.
+    #[test]
+    fn diff_changed_script_under_svg_emits_no_patch() {
+        let page = |body: &str| -> Html<()> {
+            let script = Html::HElement("script".into(), vec![], vec![Html::HRaw(body.into())]);
+            Html::HElement("svg".into(), vec![], vec![script])
+        };
+        let mut old = page("a();");
+        let mut new = page("<img src=x onerror=alert(1)>");
+        ids(&mut old);
+        ids(&mut new);
+        assert!(diff(&old, &new).is_empty());
     }
 
     /// A child-count change that adds a text-bodied `<script>` (or an empty,

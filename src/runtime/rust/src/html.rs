@@ -223,16 +223,23 @@ pub(crate) const MAX_HTML_DEPTH: usize = 1024;
 /// write every child into one shared String instead of allocating a
 /// throwaway String per child (efficiency-audit §6 medium).
 pub(crate) fn render_into<M>(node: &Html<M>, s: &mut String) {
-    render_into_ctx(node, s, None, 0);
+    render_into_ctx(node, s, ParseContext::Data, None, 0);
 }
 
 /// Render the children of an element admitted as `body` into `s`.
 ///
 /// The SSE diff's whole-subtree replace writes an element's new children
 /// through this, so a patched `<script>`/`<style>` body gets the same
-/// neutralisation the first paint applies.
-pub(crate) fn render_children_into<M>(body: ElementBody, kids: &[Html<M>], s: &mut String) {
-    render_body_into(body, kids, s, None, 0);
+/// neutralisation the first paint applies. `child_ctx` is the context the
+/// element puts its children in (`ParseContext::enter` of its own context),
+/// so a patched subtree is admitted exactly as the first paint admitted it.
+pub(crate) fn render_children_into<M>(
+    body: ElementBody,
+    child_ctx: ParseContext,
+    kids: &[Html<M>],
+    s: &mut String,
+) {
+    render_body_into(body, child_ctx, kids, s, None, 0);
 }
 
 /// Render `kids`, the children of an element admitted as `body`, into `s`.
@@ -241,9 +248,11 @@ pub(crate) fn render_children_into<M>(body: ElementBody, kids: &[Html<M>], s: &m
 /// trusted `HRaw` node, so it is gathered verbatim into a scratch buffer and
 /// neutralised as a whole: `neutralise_script_close` splits a `</script`
 /// breakout, `neutralise_style_body` removes `</style` and every other markup
-/// opener. `select_value` reaches only a `Markup` body's direct children.
+/// opener. `select_value` reaches only a `Markup` body's direct children, and
+/// `child_ctx` is the parse context every child is written in.
 fn render_body_into<M>(
     body: ElementBody,
+    child_ctx: ParseContext,
     kids: &[Html<M>],
     s: &mut String,
     select_value: Option<&str>,
@@ -253,20 +262,20 @@ fn render_body_into<M>(
     match body {
         ElementBody::Markup => {
             for c in kids {
-                render_into_ctx(c, s, select_value, child_depth);
+                render_into_ctx(c, s, child_ctx, select_value, child_depth);
             }
         }
         ElementBody::Script => {
             let mut raw = String::new();
             for c in kids {
-                render_into_ctx(c, &mut raw, None, child_depth);
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
             }
             s.push_str(&css_safety::neutralise_script_close(&raw));
         }
         ElementBody::Style => {
             let mut raw = String::new();
             for c in kids {
-                render_into_ctx(c, &mut raw, None, child_depth);
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
             }
             s.push_str(&css_safety::neutralise_style_body(&raw));
         }
@@ -275,9 +284,15 @@ fn render_body_into<M>(
 
 // `select_value`: when this node renders as a direct child of a `<select>` that
 // carries a value, the chosen value is threaded here so the matching `<option>`
-// flips `selected`.
+// flips `selected`. `ctx` is the parse context `node` is written in.
 #[allow(clippy::too_many_lines)]
-fn render_into_ctx<M>(node: &Html<M>, s: &mut String, select_value: Option<&str>, depth: usize) {
+fn render_into_ctx<M>(
+    node: &Html<M>,
+    s: &mut String,
+    ctx: ParseContext,
+    select_value: Option<&str>,
+    depth: usize,
+) {
     // Bounded descent: a tree deeper than the cap is dropped here rather than
     // recursed into (see MAX_HTML_DEPTH). The parent has already emitted its
     // open tag and will emit its close tag, so the output stays well-formed.
@@ -293,10 +308,11 @@ fn render_into_ctx<M>(node: &Html<M>, s: &mut String, select_value: Option<&str>
         Html::HElement(tag, attrs, kids) => {
             // SECURITY: the shared tag gate, re-checked at the sink. A refused
             // element (an unsafe tag name, an unclosable `<plaintext>`, or a
-            // `<script>`/`<style>` whose body is not trusted raw markup) is
-            // dropped with its whole subtree, so no value built on the safe
-            // surface reaches a raw-text or executable element body.
-            let Ok(rendered) = admit_rendered(tag, kids) else {
+            // `<script>`/`<style>` whose body is not trusted raw markup, or a
+            // `<script>` outside an HTML data-state context) is dropped with
+            // its whole subtree, so no value built on the safe surface reaches
+            // a raw-text or executable element body.
+            let Ok(rendered) = admit_rendered_in(ctx, tag, kids) else {
                 return;
             };
             let body = match rendered {
@@ -305,7 +321,7 @@ fn render_into_ctx<M>(node: &Html<M>, s: &mut String, select_value: Option<&str>
                 // with full name/attr/text gating.
                 RenderedElement::Doctype => {
                     s.push_str("<!DOCTYPE html>");
-                    render_body_into(ElementBody::Markup, kids, s, None, depth);
+                    render_body_into(ElementBody::Markup, ctx, kids, s, None, depth);
                     return;
                 }
                 RenderedElement::Element(body) => body,
@@ -483,7 +499,7 @@ fn render_into_ctx<M>(node: &Html<M>, s: &mut String, select_value: Option<&str>
             } else {
                 None
             };
-            render_body_into(body, kids, s, child_select_value, depth);
+            render_body_into(body, ctx.enter(tag), kids, s, child_select_value, depth);
             s.push_str("</");
             s.push_str(tag);
             s.push('>');
@@ -553,6 +569,72 @@ pub(crate) enum ElementRefusal {
     /// A `<style>` holding a child that is not trusted raw markup: its text
     /// would be read as CSS, a raw-text body the safe surface never builds.
     UntrustedStyle,
+    /// A trusted `<script>` under an RCDATA, RAWTEXT or foreign-content
+    /// ancestor: its body would be read as text that can end that ancestor,
+    /// or as live markup, instead of as script data.
+    ScriptOutsideData,
+}
+
+/// Elements whose children the HTML tokenizer reads as RCDATA or RAWTEXT.
+///
+/// `noscript` is RAWTEXT when scripting is enabled, which is how a browser
+/// renders the page.
+const RAW_OR_RCDATA_TAGS: [&str; 7] = [
+    "textarea", "title", "xmp", "noscript", "iframe", "noembed", "noframes",
+];
+
+/// The tokenizer state an element's children are written in.
+///
+/// The render sink and the SSE diff thread it from the root down, so both
+/// walkers judge a raw body against the same ancestors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParseContext {
+    /// HTML namespace, no raw-text ancestor: a `<script>` start tag puts the
+    /// tokenizer in script-data state.
+    Data,
+    /// Below an RCDATA or RAWTEXT element: every byte is that element's text
+    /// until its own close tag.
+    RawOrRcdata,
+    /// Below an `<svg>` or `<math>` element: a `<script>` body is tokenized as
+    /// markup.
+    Foreign,
+}
+
+impl ParseContext {
+    /// The context of the children of an element `tag` written in `self`.
+    ///
+    /// `svg` and `math` open foreign content, and foreign content stays sticky
+    /// for the whole subtree, `foreignObject` and the HTML elements that would
+    /// break out of it included. That is stricter than the HTML parser, which
+    /// returns to the HTML namespace there: the divergence only refuses more
+    /// scripts, so it fails closed. An RCDATA or RAWTEXT element makes its
+    /// whole subtree text. Tags are matched without regard to ASCII case.
+    pub(crate) fn enter(self, tag: &str) -> Self {
+        match self {
+            Self::Foreign => Self::Foreign,
+            Self::RawOrRcdata => Self::RawOrRcdata,
+            Self::Data => {
+                if tag.eq_ignore_ascii_case("svg") || tag.eq_ignore_ascii_case("math") {
+                    Self::Foreign
+                } else if RAW_OR_RCDATA_TAGS
+                    .iter()
+                    .any(|t| tag.eq_ignore_ascii_case(t))
+                {
+                    Self::RawOrRcdata
+                } else {
+                    Self::Data
+                }
+            }
+        }
+    }
+
+    /// True when a `<script>` start tag written here enters script-data state.
+    const fn admits_script(self) -> bool {
+        match self {
+            Self::Data => true,
+            Self::RawOrRcdata | Self::Foreign => false,
+        }
+    }
 }
 
 /// Decide whether an element `tag` with children `kids` may be rendered.
@@ -596,6 +678,25 @@ pub(crate) fn admit_element<K: TrustedRawChild>(
     Ok(ElementBody::Markup)
 }
 
+/// Decide whether an element `tag` with children `kids`, written in `ctx`, may
+/// be rendered.
+///
+/// It runs `admit_element`, then refuses a `<script>` whose start tag would not
+/// put the tokenizer in script-data state. `<style>` is admitted in every
+/// context, as `neutralise_style_body` removes every markup opener from its
+/// body.
+pub(crate) fn admit_in_context<K: TrustedRawChild>(
+    ctx: ParseContext,
+    tag: &str,
+    kids: &[K],
+) -> Result<ElementBody, ElementRefusal> {
+    let body = admit_element(tag, kids)?;
+    match body {
+        ElementBody::Script if !ctx.admits_script() => Err(ElementRefusal::ScriptOutsideData),
+        ElementBody::Script | ElementBody::Markup | ElementBody::Style => Ok(body),
+    }
+}
+
 /// The `Html.doctype` pseudo-tag.
 ///
 /// It renders as `<!DOCTYPE html>` and then its children, with no element of
@@ -622,21 +723,24 @@ impl RenderedElement {
     }
 }
 
-/// Decide how an `Html` element node `tag` with children `kids` is rendered.
+/// Decide how an `Html` element node `tag` with children `kids`, written in
+/// `ctx`, is rendered.
 ///
 /// This is the one admission rule of every rendered-tree walker (the render
 /// sink and the SSE diff), so the two cannot disagree on which nodes are on
 /// the page: the `Html.doctype` wrapper is recognised by its exact pseudo-tag,
 /// before the name gate its `!` fails, and every other tag runs
-/// `admit_element`.
-pub(crate) fn admit_rendered<M>(
+/// `admit_in_context`. The context is a required argument, so no walker can
+/// judge a raw body without its ancestors.
+pub(crate) fn admit_rendered_in<M>(
+    ctx: ParseContext,
     tag: &str,
     kids: &[Html<M>],
 ) -> Result<RenderedElement, ElementRefusal> {
     if tag == DOCTYPE_WRAPPER_TAG {
         return Ok(RenderedElement::Doctype);
     }
-    admit_element(tag, kids).map(RenderedElement::Element)
+    admit_in_context(ctx, tag, kids).map(RenderedElement::Element)
 }
 
 /// Attribute NAMES that execute script (or embed a scripting context) regardless
@@ -2310,5 +2414,124 @@ mod tests {
             vec![Html::HText("hi".into())],
         );
         assert_eq!(html_render_(t.clone()), render_html(&t));
+    }
+
+    fn element(tag: &str, kids: Vec<Html<()>>) -> Html<()> {
+        Html::HElement(tag.into(), vec![], kids)
+    }
+
+    fn trusted_script(body: &str) -> Html<()> {
+        element("script", vec![Html::HRaw(body.into())])
+    }
+
+    /// Each element's tag puts its children in the context the HTML tokenizer
+    /// reads them in, and foreign content and raw text stay sticky below it.
+    #[test]
+    fn parse_context_follows_the_tokenizer_state() {
+        assert_eq!(ParseContext::Data.enter("div"), ParseContext::Data);
+        assert_eq!(ParseContext::Data.enter("svg"), ParseContext::Foreign);
+        assert_eq!(ParseContext::Data.enter("MATH"), ParseContext::Foreign);
+        for tag in RAW_OR_RCDATA_TAGS {
+            assert_eq!(ParseContext::Data.enter(tag), ParseContext::RawOrRcdata);
+            let upper = tag.to_ascii_uppercase();
+            assert_eq!(ParseContext::Data.enter(&upper), ParseContext::RawOrRcdata);
+        }
+        for tag in ["foreignObject", "div", "textarea"] {
+            assert_eq!(ParseContext::Foreign.enter(tag), ParseContext::Foreign);
+        }
+        for tag in ["div", "svg"] {
+            assert_eq!(
+                ParseContext::RawOrRcdata.enter(tag),
+                ParseContext::RawOrRcdata
+            );
+        }
+    }
+
+    /// A trusted `<script>` is admitted only in the HTML data state; `<style>`
+    /// and markup are admitted in every context.
+    #[test]
+    fn admit_in_context_refuses_a_script_outside_data_state() {
+        let raw = vec![Html::<()>::HRaw("r".into())];
+        assert_eq!(
+            admit_in_context(ParseContext::Data, "script", &raw),
+            Ok(ElementBody::Script)
+        );
+        for ctx in [ParseContext::RawOrRcdata, ParseContext::Foreign] {
+            assert_eq!(
+                admit_in_context(ctx, "script", &raw),
+                Err(ElementRefusal::ScriptOutsideData)
+            );
+            assert_eq!(
+                admit_in_context(ctx, "SCRIPT", &raw),
+                Err(ElementRefusal::ScriptOutsideData)
+            );
+            assert_eq!(admit_in_context(ctx, "style", &raw), Ok(ElementBody::Style));
+            assert_eq!(admit_in_context(ctx, "div", &raw), Ok(ElementBody::Markup));
+        }
+    }
+
+    /// A trusted script under `svg`, `math` or `svg > foreignObject` would be
+    /// tokenized as markup, so it renders no script and none of its body.
+    #[test]
+    fn script_under_foreign_ancestor_refused() {
+        let body = "<img src=x onerror=alert(1)>";
+        for node in [
+            element("svg", vec![trusted_script(body)]),
+            element("math", vec![trusted_script(body)]),
+            element(
+                "svg",
+                vec![element("foreignObject", vec![trusted_script(body)])],
+            ),
+            element("SVG", vec![element("g", vec![trusted_script(body)])]),
+        ] {
+            let out = render_html(&node);
+            assert!(!out.contains("<img"), "{out}");
+            assert!(!out.to_ascii_lowercase().contains("<script"), "{out}");
+        }
+    }
+
+    /// A trusted script under an RCDATA or RAWTEXT ancestor would be that
+    /// ancestor's text, so a body naming the ancestor's close tag cannot end it.
+    #[test]
+    fn script_under_rcdata_ancestor_refused() {
+        for tag in RAW_OR_RCDATA_TAGS {
+            let body = format!("</{tag}><img src=x onerror=alert(1)>");
+            let out = render_html(&element(tag, vec![trusted_script(&body)]));
+            let close = format!("</{tag}");
+            assert_eq!(out.matches(close.as_str()).count(), 1, "{out}");
+            assert!(!out.contains("<img"), "{out}");
+            assert!(!out.contains("<script"), "{out}");
+        }
+    }
+
+    /// A `<!--` in a script body is split, so a later `<script` cannot enter
+    /// the double-escaped state and the renderer's `</script>` is the only
+    /// close.
+    #[test]
+    fn script_body_comment_open_neutralised() {
+        let out = render_html(&trusted_script("x = '<!--<script>'; y();"));
+        assert!(!out.contains("<!--"), "{out}");
+        assert_eq!(
+            out.to_ascii_lowercase().matches("</script").count(),
+            1,
+            "{out}"
+        );
+        assert!(out.ends_with("</script>"), "{out}");
+        let body = crate::css_safety::neutralise_script_close("<!--<script>");
+        assert_eq!(crate::css_safety::neutralise_script_close(&body), body);
+    }
+
+    /// The control: a trusted script at the top level and under ordinary
+    /// markup still renders its body verbatim.
+    #[test]
+    fn script_in_data_state_renders_verbatim() {
+        assert_eq!(
+            render_html(&trusted_script("init();")),
+            "<script>init();</script>"
+        );
+        assert_eq!(
+            render_html(&element("div", vec![trusted_script("init();")])),
+            "<div><script>init();</script></div>"
+        );
     }
 }

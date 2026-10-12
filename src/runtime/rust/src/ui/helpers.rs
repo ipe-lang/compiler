@@ -677,7 +677,7 @@ pub fn html_node_<M>(
 }
 
 /// `Html.doctype : List (Html msg) -> Html msg` — wraps children in the
-/// `!doctype-wrapper` pseudo-tag, which `ipe_runtime::html::admit_rendered`
+/// `!doctype-wrapper` pseudo-tag, which `ipe_runtime::html::admit_rendered_in`
 /// recognises for the render sink and the SSE diff alike: it renders as
 /// `<!DOCTYPE html>` and then the children directly.
 #[must_use]

@@ -3700,7 +3700,7 @@ mod tests {
 #[cfg(not(target_arch = "wasm32"))]
 mod text_role_tests {
     use super::*;
-    use crate::html::{ElementBody, RenderedElement, admit_rendered, render_html};
+    use crate::html::{ElementBody, ParseContext, RenderedElement, admit_rendered_in, render_html};
     use crate::ui::element::{Presence, WhiteSpace, presence};
     use crate::ui::helpers::{ui_column_, ui_el_, ui_paragraph_, ui_row_};
 
@@ -3771,7 +3771,7 @@ mod text_role_tests {
             return true;
         };
         matches!(
-            admit_rendered(tag, kids),
+            admit_rendered_in(ParseContext::Data, tag, kids),
             Ok(RenderedElement::Element(ElementBody::Markup))
         ) && kids.iter().all(all_admitted)
     }
@@ -3783,7 +3783,7 @@ mod text_role_tests {
         for tag in NodeTag::ALL {
             assert!(
                 matches!(
-                    admit_rendered::<()>(tag.as_str(), &[]),
+                    admit_rendered_in::<()>(ParseContext::Data, tag.as_str(), &[]),
                     Ok(RenderedElement::Element(ElementBody::Markup))
                 ),
                 "{tag:?}"
@@ -3819,7 +3819,11 @@ mod text_role_tests {
         assert!(all_admitted(&page));
         assert!(!render_html(&page).contains("<script"));
         assert!(!matches!(
-            admit_rendered::<()>("script", &[Html::HText("alert(1)".to_owned())]),
+            admit_rendered_in::<()>(
+                ParseContext::Data,
+                "script",
+                &[Html::HText("alert(1)".to_owned())]
+            ),
             Ok(RenderedElement::Element(ElementBody::Markup))
         ));
     }

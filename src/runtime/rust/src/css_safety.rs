@@ -996,13 +996,20 @@ pub(crate) fn neutralise_style_body(css: &str) -> String {
     out
 }
 
-/// Split any ASCII-case-insensitive `</script` breakout in a `<script>` body so
-/// it cannot terminate the enclosing element early. The browser's HTML parser
-/// ends a script element only at a literal `</script` byte run; inserting a `\`
-/// after the `<` (`<\/script`) keeps the JavaScript semantically identical (a
-/// redundant escape inside a string/regex, inert outside one) while removing the
-/// exact byte run the parser scans for. Non-`</script` text is untouched, so
+/// Split every way a `<script>` body could leave script-data state early.
+///
+/// The browser's HTML parser ends a script element at a literal
+/// ASCII-case-insensitive `</script` byte run, and a `<!--` followed later by
+/// `<script` puts it in the double-escaped state, where the renderer's own
+/// `</script>` no longer closes the element. Inserting a `\` after the `<`
+/// (`<\/script`, `<\!--`) removes both byte runs the parser scans for. Inside a
+/// JavaScript string, template literal or ordinary regex the escape is
+/// redundant and the program is unchanged; inside a `/u` regex `\!` is a
+/// `SyntaxError`, which fails closed with no markup. Other text is untouched, so
 /// ordinary script bodies pass through unchanged.
+///
+/// Total and a fixpoint: every `<` it writes specially is followed by `\`, so
+/// its output holds neither byte run and a second pass changes nothing.
 ///
 /// Sibling of `strip_style_close`: both neutralise a raw-text element's own
 /// close tag at the sink so no attacker-influenced body can break out. `<script>`
@@ -1013,17 +1020,20 @@ pub(crate) fn neutralise_style_body(css: &str) -> String {
 /// Total (never panics; only ASCII single-byte characters are ever compared or
 /// emitted specially, and every multi-byte `char` is copied whole).
 pub(crate) fn neutralise_script_close(body: &str) -> String {
-    const NEEDLE: &[u8] = b"</script";
+    /// Each byte run that leaves script-data state, and its split form.
+    const SPLITS: [(&[u8], &str); 2] = [(b"</script", "<\\/script"), (b"<!--", "<\\!--")];
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i < bytes.len() {
-        let matches_here = bytes
-            .get(i..i.saturating_add(NEEDLE.len()))
-            .is_some_and(|w| w.eq_ignore_ascii_case(NEEDLE));
-        if matches_here {
-            out.push_str("<\\/script");
-            i = i.saturating_add(NEEDLE.len());
+        let split_here = SPLITS.iter().find(|(needle, _)| {
+            bytes
+                .get(i..i.saturating_add(needle.len()))
+                .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+        });
+        if let Some((needle, split)) = split_here {
+            out.push_str(split);
+            i = i.saturating_add(needle.len());
         } else {
             // A multi-byte UTF-8 char never starts with `<`, so the needle branch
             // only fires on single-byte ASCII; here we copy the next whole char
@@ -1451,6 +1461,26 @@ mod tests {
         // no-op — the capability-gated path keeps its exact bytes.
         let once = neutralise_script_close("x</script>y");
         assert_eq!(neutralise_script_close(&once), once);
+    }
+
+    /// A `<!--` in a script body is split like a `</script`, and the split
+    /// output holds neither byte run on any later pass.
+    #[test]
+    fn neutralise_script_close_splits_comment_open() {
+        assert_eq!(neutralise_script_close("a<!--<script>"), "a<\\!--<script>");
+        for body in [
+            "<!--<script>",
+            "<<!--",
+            "<!<!--",
+            "</scr</script>ipt>",
+            "<!---->",
+            "</SCRIPT<!--",
+        ] {
+            let once = neutralise_script_close(body);
+            assert!(!once.contains("<!--"), "{once}");
+            assert!(!once.to_ascii_lowercase().contains("</script"), "{once}");
+            assert_eq!(neutralise_script_close(&once), once);
+        }
     }
 
     /// Legacy script-execution CSS properties are blocked in both the value
