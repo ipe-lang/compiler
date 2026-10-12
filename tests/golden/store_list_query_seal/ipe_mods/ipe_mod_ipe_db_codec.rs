@@ -17,6 +17,16 @@ impl IpeStringify for IpeDbCodecCell {
     }
 }
 
+impl RetainedBytes for IpeDbCodecCell {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeDbCodecCell::CellAbsent => Bytes::inline::<Self>(),
+            IpeDbCodecCell::CellNull => Bytes::inline::<Self>(),
+            IpeDbCodecCell::CellText(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 pub(crate) fn user_ipe_db_codec_codec_from_row<T1: 'static + Send + Clone>(
     codec: IpeCodecCodec<T1>,
     row: HashMap<String, IpeMaybe<String>>,

@@ -35,6 +35,25 @@ impl IpeStringify for IpeCssLength {
     }
 }
 
+impl RetainedBytes for IpeCssLength {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeCssLength::Px(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Rem(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Em(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Pct(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Vh(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Vw(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Ch(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Fr(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::Num(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssLength::LenAuto => Bytes::inline::<Self>(),
+            IpeCssLength::LenZero => Bytes::inline::<Self>(),
+            IpeCssLength::LenRaw(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeCssColor {
     Hex(String),
@@ -84,6 +103,29 @@ impl IpeStringify for IpeCssColor {
     }
 }
 
+impl RetainedBytes for IpeCssColor {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeCssColor::Hex(p0) => Bytes::inline::<Self>()?.plus(p0),
+            IpeCssColor::Rgb(p0, p1, p2) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1)?.plus(p2),
+            IpeCssColor::Rgba(p0, p1, p2, p3) => Bytes::inline::<Self>()?
+                .plus(p0)?
+                .plus(p1)?
+                .plus(p2)?
+                .plus(p3),
+            IpeCssColor::Hsl(p0, p1, p2) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1)?.plus(p2),
+            IpeCssColor::Hsla(p0, p1, p2, p3) => Bytes::inline::<Self>()?
+                .plus(p0)?
+                .plus(p1)?
+                .plus(p2)?
+                .plus(p3),
+            IpeCssColor::ColorTransparent => Bytes::inline::<Self>(),
+            IpeCssColor::ColorCurrent => Bytes::inline::<Self>(),
+            IpeCssColor::ColorRaw(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeCssOpacity {
     Opacity(f64),
@@ -93,6 +135,14 @@ impl IpeStringify for IpeCssOpacity {
     fn ipe_show(&self) -> String {
         match self {
             IpeCssOpacity::Opacity(p0) => format!("Opacity {}", IpeStringify::ipe_show(p0)),
+        }
+    }
+}
+
+impl RetainedBytes for IpeCssOpacity {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeCssOpacity::Opacity(p0) => Bytes::inline::<Self>()?.plus(p0),
         }
     }
 }

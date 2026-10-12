@@ -45,6 +45,15 @@ impl IpeStringify for MainEven {
     }
 }
 
+impl RetainedBytes for MainEven {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainEven::EZero => Bytes::inline::<Self>(),
+            MainEven::ESucc(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MainOdd {
     OSucc(Box<MainEven>),
@@ -54,6 +63,14 @@ impl IpeStringify for MainOdd {
     fn ipe_show(&self) -> String {
         match self {
             MainOdd::OSucc(p0) => format!("OSucc {}", IpeStringify::ipe_show(p0)),
+        }
+    }
+}
+
+impl RetainedBytes for MainOdd {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainOdd::OSucc(p0) => Bytes::inline::<Self>()?.plus(p0),
         }
     }
 }

@@ -60,6 +60,22 @@ impl IpeStringify for MainSqlValue {
     }
 }
 
+impl RetainedBytes for MainSqlValue {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainSqlValue::SqlString(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlInt(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlFloat(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlBool(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlBytes(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlTime(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlDecimal(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlMoney(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlNull(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MainSqlField {
     SetField(MainSqlValue),
@@ -71,6 +87,15 @@ impl IpeStringify for MainSqlField {
         match self {
             MainSqlField::SetField(p0) => format!("SetField {}", IpeStringify::ipe_show(p0)),
             MainSqlField::OmitField => "OmitField".to_string(),
+        }
+    }
+}
+
+impl RetainedBytes for MainSqlField {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainSqlField::SetField(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlField::OmitField => Bytes::inline::<Self>(),
         }
     }
 }

@@ -60,6 +60,22 @@ impl IpeStringify for MainSqlValue {
     }
 }
 
+impl RetainedBytes for MainSqlValue {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainSqlValue::SqlString(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlInt(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlFloat(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlBool(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlBytes(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlTime(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlDecimal(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlMoney(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlValue::SqlNull(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MainSqlField {
     SetField(MainSqlValue),
@@ -71,6 +87,15 @@ impl IpeStringify for MainSqlField {
         match self {
             MainSqlField::SetField(p0) => format!("SetField {}", IpeStringify::ipe_show(p0)),
             MainSqlField::OmitField => "OmitField".to_string(),
+        }
+    }
+}
+
+impl RetainedBytes for MainSqlField {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainSqlField::SetField(p0) => Bytes::inline::<Self>()?.plus(p0),
+            MainSqlField::OmitField => Bytes::inline::<Self>(),
         }
     }
 }
@@ -87,6 +112,12 @@ pub struct Rec_ {}
 impl IpeStringify for Rec_ {
     fn ipe_show(&self) -> String {
         "{}".to_string()
+    }
+}
+
+impl RetainedBytes for Rec_ {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()
     }
 }
 
@@ -139,6 +170,14 @@ impl<T1: IpeStringify + 'static> IpeStringify
     }
 }
 
+impl<T1: RetainedBytes + 'static> RetainedBytes
+    for RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable<T1>
+{
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecColTypeName {
     colType: IpeCodecColType,
@@ -152,6 +191,14 @@ impl IpeStringify for RecColTypeName {
             IpeStringify::ipe_show(&self.colType),
             IpeStringify::ipe_show(&self.name)
         )
+    }
+}
+
+impl RetainedBytes for RecColTypeName {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?
+            .plus(&self.colType)?
+            .plus(&self.name)
     }
 }
 
@@ -179,6 +226,12 @@ impl<T1: IpeStringify + 'static> IpeStringify for RecEncMkDecShp<T1> {
             "<function>",
             IpeStringify::ipe_show(&self.shp)
         )
+    }
+}
+
+impl<T1: RetainedBytes + 'static> RetainedBytes for RecEncMkDecShp<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        None
     }
 }
 

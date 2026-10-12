@@ -35,6 +35,7 @@
 
 use std::collections::VecDeque;
 
+use crate::retained::{Bytes, RetainedBytes};
 use crate::tea::IpeCmd;
 
 // Server-driven TEA debugger: session-scoped history and overlay HTML.
@@ -90,6 +91,21 @@ pub struct RecordBuffer<Msg, Model> {
     cap: usize,
     /// `true` once a step has been evicted, so `base` is no longer the initial model.
     overflowed: bool,
+}
+
+impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for Step<Msg, Model> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?
+            .plus(&self.msg)?
+            .plus(&self.model_after)
+    }
+}
+
+impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for RecordBuffer<Msg, Model> {
+    // The base model plus every retained step, spare log slots included.
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.base)?.plus(&self.log)
+    }
 }
 
 impl<Msg: Clone, Model: Clone> RecordBuffer<Msg, Model> {
@@ -297,6 +313,12 @@ impl<Msg: Clone, Model: Clone> RecordBuffer<Msg, Model> {
 pub struct History<Msg, Model> {
     inner: RecordBuffer<Msg, Model>,
     update: fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+}
+
+impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for History<Msg, Model> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.inner)
+    }
 }
 
 impl<Msg: Clone, Model: Clone> History<Msg, Model> {

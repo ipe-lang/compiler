@@ -41,6 +41,12 @@ impl<T1: IpeStringify> IpeStringify for RecQ<T1> {
     }
 }
 
+impl<T1: RetainedBytes> RetainedBytes for RecQ<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.q)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecQ2<T1> {
     q: (T1, T1),
@@ -49,6 +55,12 @@ pub struct RecQ2<T1> {
 impl<T1: IpeStringify> IpeStringify for RecQ2<T1> {
     fn ipe_show(&self) -> String {
         format!("{{{}}}", IpeStringify::ipe_show(&self.q))
+    }
+}
+
+impl<T1: RetainedBytes> RetainedBytes for RecQ2<T1> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.q)
     }
 }
 

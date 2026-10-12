@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::css_safety;
+use crate::retained::{Bytes, RetainedBytes};
 
 /// Form data delivered to an `OnForm` handler (lower-cased keys; see dispatch).
 pub type FormData = HashMap<String, String>;
@@ -1359,6 +1360,58 @@ crate::stringify::show_row!("Html", Internals, [M] Html<M>, |_| "<Ipe.Html.Html>
 crate::stringify::show_row!("HtmlAttribute", Internals, [M] Attribute<M>, |_| "<Ipe.Html.Attribute>".to_owned());
 crate::stringify::show_row!("HtmlEvent", Internals, [M] Event<M>, |_| "<Ipe.Html.Events.Event>".to_owned());
 
+// ─── Retained measures for the Html runtime types ───────────────────────────
+
+impl<M: RetainedBytes> RetainedBytes for Html<M> {
+    // Walked with an explicit worklist, as `Drop` is, so a deep tree is measured
+    // without recursion. Each node counts its inline size once; an element adds
+    // its tag, its attributes and its children list's spare slots.
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let node = Bytes::inline::<Self>()?;
+        let mut total = Bytes::ZERO;
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(html) = pending.pop() {
+            total = total.checked_add(node)?;
+            match html {
+                Self::HElement(tag, attrs, children) => {
+                    let spare = children.capacity().checked_sub(children.len())?;
+                    total = total
+                        .plus(tag)?
+                        .plus(attrs)?
+                        .checked_add(Bytes::slots::<Self>(spare)?)?;
+                    pending.extend(children);
+                }
+                Self::HText(text) | Self::HRaw(text) => total = total.plus(text)?,
+            }
+        }
+        Some(total)
+    }
+}
+
+impl<M: RetainedBytes> RetainedBytes for Attribute<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            Self::Attr(key, value) => inline.plus(key)?.plus(value),
+            Self::BoolAttr(key, on) => inline.plus(key)?.plus(on),
+            Self::EventAttr(event) => inline.plus(event),
+            Self::NoAttr => Some(inline),
+        }
+    }
+}
+
+impl<M: RetainedBytes> RetainedBytes for Event<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
+            // A handler's captured heap is not reachable through `dyn Fn`, so
+            // its measure is unknown rather than an undercount.
+            Self::OnString(..) | Self::OnBool(..) | Self::OnForm(..) | Self::OnWidget(..) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
@@ -1366,6 +1419,35 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
+    }
+
+    // A tree far deeper than any recursion could walk is measured on the heap,
+    // and the measure covers every text byte it holds.
+    #[test]
+    fn a_deep_tree_is_measured_without_recursion() {
+        let depth = 200_000_usize;
+        let mut tree: Html<()> = Html::HText("x".repeat(64));
+        for _ in 0..depth {
+            tree = Html::HElement("div".into(), Vec::new(), vec![tree]);
+        }
+        let measured = tree.retained_bytes().map(Bytes::get);
+        let floor = u64::try_from(64 + 3 * depth).unwrap();
+        assert!(measured.is_some_and(|n| n >= floor), "{measured:?}");
+    }
+
+    // A handler's captured heap is unreachable, so a handler event is unmeasurable.
+    #[test]
+    fn a_handler_event_is_unmeasurable() {
+        let attr: Attribute<String> = html_on_string_("input".into(), std::sync::Arc::new(|s| s));
+        assert_eq!(attr.retained_bytes(), None);
+    }
+
+    // A message an event carries counts toward the attribute holding it.
+    #[test]
+    fn an_event_counts_its_message() {
+        let msg = "m".repeat(4096);
+        let attr: Attribute<String> = Attribute::EventAttr(Event::OnMsg("click".into(), msg));
+        assert!(attr.retained_bytes().is_some_and(|n| n.get() >= 4096));
     }
 
     // An attribute's `{:?}` names the attribute and hides its value.

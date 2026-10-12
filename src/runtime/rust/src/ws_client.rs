@@ -66,6 +66,19 @@ pub enum WsCloseCode {
     Custom(i64),
 }
 
+impl crate::retained::RetainedBytes for WsClientMessage {
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        let inline = crate::retained::Bytes::inline::<Self>()?;
+        match self {
+            Self::Text(text) => inline.plus(text),
+            Self::Binary(bytes) => inline.plus(bytes),
+        }
+    }
+}
+
+// Every close code is held inline: the inline size is the whole measure.
+crate::retained::inline_measure!(WsCloseCode);
+
 fn ws_close_code(code: i64) -> WsCloseCode {
     match code {
         1000 => WsCloseCode::Normal,

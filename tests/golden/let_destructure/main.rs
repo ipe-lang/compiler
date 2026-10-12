@@ -41,6 +41,12 @@ impl IpeStringify for RecX {
     }
 }
 
+impl RetainedBytes for RecX {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.x)
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {

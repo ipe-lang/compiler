@@ -45,6 +45,15 @@ impl IpeStringify for MainChain {
     }
 }
 
+impl RetainedBytes for MainChain {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            MainChain::ChainEnd => Bytes::inline::<Self>(),
+            MainChain::ChainNode(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 pub use ipe_runtime::error::IpeError;
 
 pub fn str_err(s: &str) -> IpeError {
