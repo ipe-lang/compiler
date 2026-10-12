@@ -13564,7 +13564,7 @@ mod route_entry_cmd_tests {
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run the child test");
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
         assert!(out.status.success(), "the child failed: {stdout}");
         assert!(
             stdout.contains(EMBEDDABLE_CHILD_RAN),
