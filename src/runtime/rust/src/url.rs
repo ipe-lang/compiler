@@ -35,21 +35,35 @@ use url::{Url as UrlCrate, form_urlencoded};
 /// construction contract. The wrapped `url::Url` is always an absolute,
 /// scheme-carrying URL produced by [`url_from_string`].
 ///
-/// `Clone` / `Debug` / `PartialEq` / `Eq` are derived on `url::Url` and safe: a
-/// URL is not a secret, so printing or comparing it leaks nothing the caller did
-/// not already hand in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A URL can carry a credential in its userinfo and a token in its path, query
+/// or fragment, so every implicit rendering, `Debug` included, is the shown
+/// form; `Url.toString` is the one way to the full text. `Clone`, `PartialEq`
+/// and `Eq` are derived on `url::Url`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Url(UrlCrate);
 
 // `Url.toString` keeps the full URL; an implicit rendering shows `shown`.
-crate::stringify::show_row!("Url", Redacted, [] Url, |u| u.shown());
+crate::stringify::show_row!(
+    "Url",
+    Redacted(Reveal),
+    [] Url,
+    shown: |u| u.shown(),
+    dev: |u, _| u.dev(),
+);
+
+impl std::fmt::Debug for Url {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Url({})", self.shown())
+    }
+}
 
 impl Url {
-    /// The URL reduced to scheme, host, port and path.
+    /// The URL reduced to scheme, host and port.
     ///
-    /// Userinfo, query and fragment, where credentials and tokens travel, never
-    /// appear. The parser ends the authority at the first `/`, `?` or `#` (and,
-    /// under a special scheme, `\`), so a credential holding one of them
+    /// Userinfo, path, query and fragment, where credentials and tokens travel,
+    /// never appear: the path renders as the marker. The parser ends the
+    /// authority at the first `/`, `?` or `#` (and, under a special scheme,
+    /// `\`), so a credential holding one of them
     /// spills out of the userinfo: `user:pw@host` parses with scheme `user`,
     /// no host and path `pw@host`, and `https://u:1/pw@host` with host `u`.
     /// The `@` that ended the userinfo stays literal in the path, query or
@@ -62,23 +76,55 @@ impl Url {
             SchemeShown::Known(scheme) => Some(scheme),
             SchemeShown::Withheld => None,
         };
-        let spilled = [Some(self.0.path()), self.0.query(), self.0.fragment()]
+        let host = match self.0.host_str() {
+            Some(host) if !self.spilled() => host,
+            _ => {
+                return scheme.map_or_else(
+                    || REDACTED_SHOW.to_owned(),
+                    |scheme| format!("{scheme}:{REDACTED_SHOW}"),
+                );
+            }
+        };
+        let port = self
+            .0
+            .port()
+            .map_or_else(String::new, |port| format!(":{port}"));
+        format!(
+            "{}://{host}{port}/{REDACTED_SHOW}",
+            scheme.unwrap_or(REDACTED_SHOW)
+        )
+    }
+
+    /// Whether an `@` or `\\` sits past the authority, the trace of a credential
+    /// that spilled out of the userinfo.
+    fn spilled(&self) -> bool {
+        [Some(self.0.path()), self.0.query(), self.0.fragment()]
             .into_iter()
             .flatten()
-            .any(|part| part.contains(['@', '\\']));
-        if self.0.host_str().is_none() || spilled {
-            return scheme.map_or_else(
-                || REDACTED_SHOW.to_owned(),
-                |scheme| format!("{scheme}:{REDACTED_SHOW}"),
-            );
+            .any(|part| part.contains(['@', '\\']))
+    }
+
+    /// The URL as `Debug.log` prints it in a dev-posture build.
+    ///
+    /// The full text with the userinfo password as the marker. A URL with no
+    /// host, or one a credential spilled out of, renders its shown form: the
+    /// parser could not tell that credential from the rest of the text.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self) -> String {
+        use crate::stringify::REDACTED_SHOW;
+        if self.0.host_str().is_none() || self.spilled() {
+            return self.shown();
         }
-        let mut shown = self.0.clone();
-        let _ = shown.set_password(None);
-        let _ = shown.set_username("");
-        shown.set_query(None);
-        shown.set_fragment(None);
-        let after_scheme = shown.as_str().strip_prefix(shown.scheme()).unwrap_or(":");
-        format!("{}{after_scheme}", scheme.unwrap_or(REDACTED_SHOW))
+        if self.0.password().is_none() {
+            return self.0.as_str().to_owned();
+        }
+        let mut bare = self.0.clone();
+        let _ = bare.set_password(None);
+        let prefix = format!("{}://{}", bare.scheme(), bare.username());
+        bare.as_str().strip_prefix(prefix.as_str()).map_or_else(
+            || self.shown(),
+            |rest| format!("{prefix}:{REDACTED_SHOW}{rest}"),
+        )
     }
 }
 
