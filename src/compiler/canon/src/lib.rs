@@ -670,7 +670,7 @@ mod tests {
         };
         assert_eq!(&*member, "getcw");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "getcwd"),
+            suggestions.names().any(|s| s == "getcwd"),
             "suggestions should include `getcwd`, got {suggestions:?}"
         );
     }
@@ -688,7 +688,7 @@ mod tests {
             return;
         };
         assert!(
-            suggestions.names.is_empty(),
+            suggestions.names().next().is_none(),
             "no suggestion within edit-distance 2, got {suggestions:?}"
         );
     }
@@ -710,10 +710,13 @@ mod tests {
             return;
         };
         assert!(
-            suggestions.names.first().is_some_and(|s| &**s == "sha256"),
+            suggestions.names().next() == Some("sha256"),
             "the one-edit member ranks first, got {suggestions:?}"
         );
-        assert!(suggestions.names.len() <= 3, "capped, got {suggestions:?}");
+        assert!(
+            suggestions.names().len() <= 3,
+            "capped, got {suggestions:?}"
+        );
     }
 
     #[test]
@@ -735,7 +738,7 @@ mod tests {
         };
         assert_eq!(&*qualifier, "Crpyto");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Crypto"),
+            suggestions.names().any(|s| s == "Crypto"),
             "should suggest `Crypto`, got {suggestions:?}"
         );
     }
@@ -841,7 +844,7 @@ mod tests {
         assert_eq!(&*module, "Crypto");
         assert_eq!(&*member, "sha25");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "sha256"),
+            suggestions.names().any(|s| s == "sha256"),
             "should suggest `sha256`, got {suggestions:?}"
         );
     }
@@ -869,7 +872,7 @@ mod tests {
         };
         assert_eq!(&*name, "Ipe.Crpyto");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Ipe.Crypto"),
+            suggestions.names().any(|s| s == "Ipe.Crypto"),
             "should suggest `Ipe.Crypto`, got {suggestions:?}"
         );
     }
@@ -896,7 +899,7 @@ mod tests {
         };
         assert_eq!(&*name, "Ipe.Crpyto");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Ipe.Crypto"),
+            suggestions.names().any(|s| s == "Ipe.Crypto"),
             "should suggest `Ipe.Crypto`, got {suggestions:?}"
         );
     }
@@ -1017,7 +1020,7 @@ mod tests {
         };
         assert_eq!(&*name, "Incremen");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Increment"),
+            suggestions.names().any(|s| s == "Increment"),
             "should suggest `Increment`, got {suggestions:?}"
         );
     }

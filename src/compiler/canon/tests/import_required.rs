@@ -64,7 +64,7 @@ fn unknown_module_suggestions(diag: &Diagnostic) -> Option<Vec<&str>> {
         Diagnostic::Name {
             msg: NameError::UnknownModule { suggestions, .. },
             ..
-        } => Some(suggestions.names.iter().map(|c| &**c).collect()),
+        } => Some(suggestions.names().collect()),
         _ => None,
     }
 }

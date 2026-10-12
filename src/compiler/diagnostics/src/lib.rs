@@ -477,33 +477,6 @@ mod tests {
         );
     }
 
-    /// Candidates built with no ranked hit carry no confidence, so no edit
-    /// they could ever hold is applicable unprompted.
-    #[test]
-    fn candidates_without_a_ranked_best_are_never_machine_applicable() {
-        let mut candidates =
-            Candidates::at(EditTarget::whole(Span::new(0, 6), "lenght"), Box::new([]));
-        candidates.names = Box::new(["length".into()]);
-        let help = Diagnostic::Name {
-            span: Span::new(0, 6),
-            msg: NameError::ValueNotFound {
-                name: "lenght".into(),
-                suggestions: candidates,
-            },
-        }
-        .help();
-        assert!(
-            matches!(
-                help.as_slice(),
-                [HelpLine::Suggest(Suggestion {
-                    applicability: Applicability::MaybeIncorrect,
-                    ..
-                })]
-            ),
-            "{help:?}"
-        );
-    }
-
     /// `Lsit.map` at `10..18`: the applicable edit overwrites only `Lsit`.
     #[test]
     fn unknown_module_suggestion_region_is_the_qualifier() {

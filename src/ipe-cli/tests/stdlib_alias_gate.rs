@@ -452,7 +452,7 @@ fn interpolated_unknown_qualifier_is_refused() {
             Err(Diagnostic::Name {
                 msg: NameError::UnknownModule { suggestions, .. },
                 ..
-            }) if suggestions.names.iter().any(|n| &**n == "Crypto")
+            }) if suggestions.names().any(|n| n == "Crypto")
         ),
         "{unknown:?}"
     );

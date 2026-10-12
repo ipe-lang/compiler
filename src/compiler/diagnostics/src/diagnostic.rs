@@ -2250,7 +2250,7 @@ impl EditTarget {
 /// Ranked did-you-mean names for an unresolved name, plus where a fix may land.
 ///
 /// Built only from the hits of [`crate::suggest::rank`], so the names keep the
-/// ranker's order and the sole name's edit carries the ranker's confidence.
+/// ranker's order and each name carries the ranker's confidence in it.
 /// `region` is `None` when the producer cannot prove the exact sub-span the
 /// replacement would overwrite (a type annotation carries one span for the
 /// whole annotation); such candidates only ever render as "did you mean"
@@ -2259,43 +2259,39 @@ impl EditTarget {
 pub struct Candidates {
     /// The region a sole candidate replaces, when provable.
     pub region: Option<EditTarget>,
-    /// The candidate names, best first.
-    pub names: Box<[Box<str>]>,
-    /// The ranker's confidence in the best name; `None` when there is none.
-    best: Option<Confidence>,
+    /// The ranked hits, best first.
+    hits: Box<[Hit<Box<str>>]>,
 }
 
 impl Candidates {
     /// Ranked hits with a proven (or absent) replace region.
     #[must_use]
-    pub fn at(region: Option<EditTarget>, hits: Box<[Hit<Box<str>>]>) -> Self {
-        let best = hits.first().map(|hit| hit.confidence);
-        let names = hits.into_iter().map(|hit| hit.target).collect();
-        Self {
-            region,
-            names,
-            best,
-        }
+    pub const fn at(region: Option<EditTarget>, hits: Box<[Hit<Box<str>>]>) -> Self {
+        Self { region, hits }
     }
 
     /// Ranked hits that are hints only: no region, so never an edit.
     #[must_use]
-    pub fn hints(hits: Box<[Hit<Box<str>>]>) -> Self {
+    pub const fn hints(hits: Box<[Hit<Box<str>>]>) -> Self {
         Self::at(None, hits)
     }
 
-    /// How sure an edit to the sole name may be.
-    ///
-    /// Only a case-only match or a unique single edit is unambiguous enough to
-    /// apply unprompted; any other guess could rewrite the code to a different
-    /// binding that still type-checks, so it needs the author's confirmation.
-    const fn sole_applicability(&self) -> Applicability {
-        match self.best {
-            Some(Confidence::CaseOnly | Confidence::UniqueSingleEdit) => {
-                Applicability::MachineApplicable
-            }
-            Some(Confidence::Plausible) | None => Applicability::MaybeIncorrect,
-        }
+    /// The candidate names, best first.
+    #[must_use]
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.hits.iter().map(|hit| &*hit.target)
+    }
+}
+
+/// How sure an edit to a sole candidate the ranker rated `confidence` may be.
+///
+/// Only a case-only match or a unique single edit is unambiguous enough to
+/// apply unprompted; any other guess could rewrite the code to a different
+/// binding that still type-checks, so it needs the author's confirmation.
+const fn sole_applicability(confidence: Confidence) -> Applicability {
+    match confidence {
+        Confidence::CaseOnly | Confidence::UniqueSingleEdit => Applicability::MachineApplicable,
+        Confidence::Plausible => Applicability::MaybeIncorrect,
     }
 }
 
@@ -3538,20 +3534,20 @@ const fn consent_code(msg: &ConsentError) -> Code {
 ///
 /// A single candidate with a proven [`EditTarget`] becomes a [`Suggestion`]
 /// over exactly that region, applicable unprompted only when the ranker found
-/// it unambiguous ([`Candidates::sole_applicability`]); any other shape
+/// it unambiguous ([`sole_applicability`]); any other shape
 /// (several candidates, or no provable region) stays a non-committal "did you
 /// mean" line per name, in the ranker's order.
 fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
-    match (&*candidates.names, &candidates.region) {
+    match (&*candidates.hits, &candidates.region) {
         ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
             span: target.span,
             replaces: target.replaces.clone(),
-            replacement: only.clone(),
-            applicability: candidates.sole_applicability(),
+            replacement: only.target.clone(),
+            applicability: sole_applicability(only.confidence),
         })],
         (many, _) => many
             .iter()
-            .map(|s| HelpLine::DidYouMean(s.clone()))
+            .map(|hit| HelpLine::DidYouMean(hit.target.clone()))
             .collect(),
     }
 }
