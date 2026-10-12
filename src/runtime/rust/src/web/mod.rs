@@ -6293,9 +6293,7 @@ where
     // print the shutdown line, drain in-flight requests, and return cleanly so
     // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
     // SECOND signal force-exits 130 via the watchdog inside web_shutdown_signal.
-    match axum::serve(listener, app)
-        .with_graceful_shutdown(web_shutdown_signal(shutdown_store, grace))
-        .await
+    match crate::server::serve_app(listener, app, web_shutdown_signal(shutdown_store, grace)).await
     {
         Ok(()) => ok_res(()),
         Err(e) => IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
@@ -12789,9 +12787,15 @@ mod route_entry_cmd_tests {
     /// The fixture router over `store`, counting its session drivers in `session_count`.
     #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
     fn router_counted(store: Store, session_count: Arc<AtomicUsize>) -> axum::Router {
+        build_web_router(fixture_state(store, session_count), false)
+            .expect("the fixture route table and base are well-formed")
+    }
+
+    /// The fixture app's state over `store`, counting its session drivers in `session_count`.
+    fn fixture_state(store: Store, session_count: Arc<AtomicUsize>) -> FixtureState {
         let (route_entry, _, route_matched) =
             routed_resolvers(routes(), Page::Home, set_page, render);
-        let state: FixtureState = WebState {
+        WebState {
             store,
             init: Arc::new(init),
             update: Arc::new(update),
@@ -12802,12 +12806,63 @@ mod route_entry_cmd_tests {
             route_matched,
             session_count,
             watch_build_status: Arc::new(Mutex::new(None)),
-        };
-        build_web_router(state, false).expect("the fixture route table and base are well-formed")
+        }
     }
 
     fn memory() -> Store {
         Arc::new(MemoryStore::<Model, Msg>::new(Duration::from_secs(60)))
+    }
+
+    /// A rebound name reaches no route of a real `serve_web`: the page GET
+    /// and the event POST both answer 421, no session driver starts and
+    /// `init` never runs; the same listener addressed by its IP literal
+    /// serves the page.
+    #[test]
+    fn dev_posture_pin_web_refuses_a_rebound_host() {
+        run(false, || async {
+            let port = crate::server::free_loopback_port().unwrap();
+            crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+            crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
+            crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+            crate::system::locked_set_var(
+                crate::env_registry::web::WEB_PORT.name(),
+                &port.to_string(),
+            );
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let served = serve_web::<crate::IpeError, _, _, _, _, _, _>(fixture_state(
+                memory(),
+                sessions.clone(),
+            ));
+            let checks = async {
+                let evil = format!("evil.example:{port}");
+                let page = format!("GET / HTTP/1.1\r\nHost: {evil}\r\nConnection: close\r\n\r\n");
+                let event = format!(
+                    "POST /_ipe/event HTTP/1.1\r\nHost: {evil}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+                for request in [page, event] {
+                    let resp = crate::server::raw_exchange(port, &request).await.unwrap();
+                    assert_eq!(crate::server::raw_status(&resp), 421, "{request}: {resp}");
+                    assert!(resp.contains("host_not_admitted"), "{resp}");
+                    assert!(!resp.to_ascii_lowercase().contains("set-cookie"), "{resp}");
+                }
+                assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(take_init_sids().is_empty());
+                let control = format!(
+                    "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                );
+                let resp = crate::server::raw_exchange(port, &control).await.unwrap();
+                assert_eq!(crate::server::raw_status(&resp), 200, "{resp}");
+            };
+            // The listener serves until shutdown; the checks finishing first is the pass.
+            let checked = tokio::select! {
+                _ = served => false,
+                () = checks => true,
+            };
+            assert!(checked, "serve_web returned before the checks ran");
+            crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
     }
 
     /// Run `body` on a current-thread runtime (deterministic task order); `paused` starts tokio's clock paused.
