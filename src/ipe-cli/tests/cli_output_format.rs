@@ -53,30 +53,84 @@ fn sample_entry() -> String {
 
 // ---- version ---------------------------------------------------------------
 
+/// The whole human version output: a blank line, the guttered product header,
+/// a blank line — nothing else.
+fn framed_header() -> String {
+    format!(
+        "\n  {}\n\n",
+        ipe::style::header_line(env!("CARGO_PKG_VERSION"))
+    )
+}
+
 #[test]
-fn version_default_is_human_and_guttered() {
+fn version_default_is_the_framed_header_alone() {
     let r = run(&["version"]);
     assert!(r.ok);
-    // Human form is a screen like every other: a blank line, the guttered
-    // product header, then the guttered (two-space indent) `ipe …` line.
-    let mut lines = r.stdout.lines().filter(|l| !l.trim().is_empty());
     assert_eq!(
-        lines.next(),
-        Some(format!("  {}", ipe::style::header_line(env!("CARGO_PKG_VERSION"))).as_str()),
-        "human version must open with the product header: {:?}",
-        r.stdout
+        r.stdout,
+        framed_header(),
+        "human version is the header between two blank lines and nothing more"
     );
+}
+
+#[test]
+fn version_flags_print_the_same_framed_header_as_the_command() {
+    let command = run(&["version"]);
+    for flag in ["--version", "-V"] {
+        let r = run(&[flag]);
+        assert!(r.ok, "`ipe {flag}` must succeed: {}", r.stderr);
+        assert_eq!(
+            r.stdout, command.stdout,
+            "`ipe {flag}` must print exactly what `ipe version` prints"
+        );
+        assert_eq!(r.stdout, framed_header());
+    }
+}
+
+#[test]
+fn version_flags_keep_the_machine_forms_unframed() {
+    let plain = run(&["version", "--plain"]);
+    let json = run(&["version", "--json"]);
+    for flag in ["--version", "-V"] {
+        assert_eq!(
+            run(&[flag, "--plain"]).stdout,
+            plain.stdout,
+            "`ipe {flag} --plain` must equal `ipe version --plain`"
+        );
+        assert_eq!(
+            run(&[flag, "--json"]).stdout,
+            json.stdout,
+            "`ipe {flag} --json` must equal `ipe version --json`"
+        );
+    }
+    assert_eq!(plain.stdout, format!("{}\n", env!("CARGO_PKG_VERSION")));
     assert!(
-        lines.next().is_some_and(|l| l.starts_with("  ipe ")),
-        "human version must be guttered: {:?}",
-        r.stdout
+        json.stdout.starts_with('{'),
+        "--json is the bare envelope, no frame: {:?}",
+        json.stdout
     );
-    // The frame: output starts and ends with a newline.
-    assert!(
-        r.stdout.starts_with('\n'),
-        "human version must open with a newline: {:?}",
-        r.stdout
-    );
+}
+
+#[test]
+fn version_refuses_an_extra_positional_with_usage() {
+    for args in [
+        &["version", "extra"][..],
+        &["--version", "extra"][..],
+        &["-V", "extra"][..],
+    ] {
+        let r = run(args);
+        assert!(!r.ok, "`ipe {args:?}` must be refused");
+        assert!(
+            r.stdout.is_empty(),
+            "a refused version writes nothing to stdout: {:?}",
+            r.stdout
+        );
+        assert!(
+            r.stderr.contains("ipe version"),
+            "the refusal shows the version usage: {:?}",
+            r.stderr
+        );
+    }
 }
 
 #[test]

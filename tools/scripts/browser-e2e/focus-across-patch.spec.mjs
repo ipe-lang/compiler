@@ -350,6 +350,15 @@ test("focus-across-patch: a fragment target keeps the first mount from autofocus
   expect(await focusedId(page)).toBe("");
 });
 
+test("focus-across-patch: a percent-encoded fragment target keeps the first mount from autofocusing", async ({ page }) => {
+  await page.addInitScript(clientOwnsFirstFocus);
+  await page.goto(`${BASE}/#ke%79s`);
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  await expect.poll(() => page.evaluate(() => window.__ipeMounted === true)).toBe(true);
+  expect(await page.evaluate(() => window.__testFocusCalls)).not.toContain("root");
+  expect(await focusedId(page)).toBe("");
+});
+
 test("focus-across-patch: a full re-render after the user acted never autofocuses", async ({ page }) => {
   await open(page);
   await page.evaluate(() => {
