@@ -16,7 +16,28 @@ pub struct WebReq {
     pub cookies: IpeDict<String>,
 }
 
-crate::stringify::show_row!("WebReq", Redacted, [] WebReq, |_| crate::stringify::REDACTED_SHOW.to_owned());
+// The dev view names every field; a credential header's value and every
+// cookie value render as the marker.
+crate::stringify::show_row!(
+    "WebReq",
+    Redacted(Reveal),
+    [] WebReq,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |r, view| {
+        use crate::stringify::{dev_cookie_names, dev_header_map, dev_record};
+        dev_record(
+            "WebReq",
+            &[
+                ("path", r.path.clone()),
+                ("query", r.query.clone()),
+                ("method", r.method.clone()),
+                ("params", r.params.ipe_render(view)),
+                ("headers", dev_header_map(&r.headers)),
+                ("cookies", dev_cookie_names(r.cookies.keys().map(String::as_str))),
+            ],
+        )
+    },
+);
 
 // Every field but the method is client-supplied data that can carry a credential
 // (a session cookie, an `Authorization` header, a token in the path or query);

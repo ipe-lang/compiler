@@ -3490,7 +3490,51 @@ pub struct SqlFragment {
     invalid: Option<FragmentPoison>,
 }
 
-crate::stringify::show_row!("SqlFragment", Redacted, [] SqlFragment, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "SqlFragment",
+    Redacted(Reveal),
+    [] SqlFragment,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |f, view| f.dev(view),
+);
+
+impl SqlFragment {
+    /// The fragment as `Debug.log` prints it in a dev-posture build: its SQL
+    /// text, each bind value and the poison marker.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        let binds: Vec<String> = self.binds.iter().map(|bind| bind.dev(view)).collect();
+        let invalid = self
+            .invalid
+            .as_ref()
+            .map_or_else(|| "Nothing".to_owned(), |reason| format!("Just {reason}"));
+        crate::stringify::dev_record(
+            "SqlFragment",
+            &[
+                ("sql", self.sql.clone()),
+                ("binds", format!("[{}]", binds.join(" "))),
+                ("invalid", invalid),
+            ],
+        )
+    }
+}
+
+impl SqlParam {
+    /// The bind as `Debug.log` prints it in a dev-posture build: its
+    /// constructor and its value, each value through its own show row.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        use crate::stringify::IpeStringify;
+        match self {
+            Self::Text(s) => format!("SqlString {}", s.ipe_render(view)),
+            Self::Int(n) => format!("SqlInt {}", n.ipe_render(view)),
+            Self::Float(x) => format!("SqlFloat {}", x.ipe_render(view)),
+            Self::Bool(b) => format!("SqlBool {}", b.ipe_render(view)),
+            Self::Bytes(b) => format!("SqlBytes {}", b.ipe_render(view)),
+            Self::Null(_) => "SqlNull".to_owned(),
+        }
+    }
+}
 
 impl std::fmt::Debug for SqlFragment {
     /// SQL text + bind COUNT only — never bind VALUES. A bind may carry a

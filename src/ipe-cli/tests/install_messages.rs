@@ -429,6 +429,288 @@ fn release_tag_ok_table() -> io::Result<()> {
     Ok(())
 }
 
+/// Each `HOME` the installer refuses, the class `home_flaw` names, and how
+/// `safe_text` prints it.
+const REFUSED_HOMES: [(&[u8], &str, &str); 8] = [
+    (b"/tmp/a\"$(id)", "a double quote", "/tmp/a\"$(id)"),
+    (b"/tmp/a$(id)", "a dollar sign", "/tmp/a$(id)"),
+    (b"/tmp/a`id`", "a backtick", "/tmp/a`id`"),
+    (b"/tmp/a\\b", "a backslash", "/tmp/a\\\\b"),
+    (b"/tmp/a\nb", "a newline", "/tmp/a\\012b"),
+    (b"/tmp/a\x01b", "a control character", "/tmp/a\\001b"),
+    (b"/tmp/a\tb", "a control character", "/tmp/a\\011b"),
+    (b"/tmp/a\x7fb", "a control character", "/tmp/a\\177b"),
+];
+
+/// Each `HOME` the installer admits: spaces and non-ASCII are plain path text.
+const ADMITTED_HOMES: [&str; 3] = ["/home/ana", "/c/Users/John Doe", "/home/jos\u{e9}"];
+
+#[test]
+fn home_flaw_table() -> io::Result<()> {
+    let mut inputs: Vec<(&[u8], &str)> = REFUSED_HOMES
+        .iter()
+        .map(|&(home, class, _)| (home, class))
+        .collect();
+    inputs.push((b"/tmp/a\n", "a newline"));
+    inputs.extend(ADMITTED_HOMES.iter().map(|home| (home.as_bytes(), "")));
+    let args: Vec<&OsStr> = inputs
+        .iter()
+        .map(|(home, _)| OsStr::from_bytes(home))
+        .collect();
+    let output = run_block(
+        "for a in \"$@\"; do home_flaw \"$a\"; printf '%s\\n' \"$HOME_FLAW\"; done",
+        &args,
+        "C",
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let verdicts: Vec<&str> = stdout.split('\n').take(inputs.len()).collect();
+    assert_eq!(
+        verdicts.len(),
+        inputs.len(),
+        "one verdict per HOME: {verdicts:?}"
+    );
+    for ((home, class), verdict) in inputs.iter().zip(&verdicts) {
+        assert_eq!(
+            verdict,
+            class,
+            "home_flaw `{}` must name `{class}`",
+            String::from_utf8_lossy(home)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn home_with_shell_active_byte_is_refused_before_network() -> io::Result<()> {
+    for (home, class, shown) in REFUSED_HOMES {
+        let r = root("install-msg-home")?;
+        let run = run_installer(&r, &[("HOME", OsStr::from_bytes(home))])?;
+        assert_refused_escaped(&run, shown, class);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains(&format!("Refusing HOME {shown}: it contains {class}")),
+            "HOME `{shown}` must be refused as holding {class}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_home_is_refused_before_network() -> io::Result<()> {
+    let r = root("install-msg-home-empty")?;
+    let run = run_installer(&r, &[("HOME", OsStr::new(""))])?;
+    assert_refused_escaped(&run, "HOME is not set", "an empty HOME");
+    Ok(())
+}
+
+#[test]
+fn home_with_space_or_non_ascii_is_admitted() -> io::Result<()> {
+    for name in ["John Doe", "jos\u{e9}"] {
+        let r = root("install-msg-home-ok")?;
+        let home = r.path().join(name);
+        mkdir_mode(&home, 0o700)?;
+        let bin = leaf(&r, "install-bin")?;
+        let run = run_installer(
+            &r,
+            &[
+                ("HOME", home.as_os_str()),
+                ("IPE_INSTALL_DIR", bin.as_os_str()),
+            ],
+        )?;
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !stderr.contains("Refusing HOME"),
+            "HOME `{name}` must be admitted: {stderr}"
+        );
+        assert!(
+            !run.curl_log.is_empty(),
+            "HOME `{name}` must let the run reach the network: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn home_flaw_refuses_a_home_od_did_not_read() -> io::Result<()> {
+    for stub in [
+        "od() { :; }",
+        "od() { return 1; }",
+        "od() { printf '0000000  47 104\\n0000002\\n'; }",
+        "od() { printf ' 47 104 111\\n'; }",
+    ] {
+        let body = format!("{stub}\nhome_flaw /home/ana\nprintf '%s' \"$HOME_FLAW\"");
+        let output = run_block(&body, &[], "C")?;
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "a byte the installer could not read",
+            "with `{stub}`, home_flaw must refuse rather than admit an unread HOME"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn relative_home_is_refused_before_network() -> io::Result<()> {
+    for home in ["home/ana", "-x", "--", "~", "~/ana", "./ana", "../ana"] {
+        let r = root("install-msg-home-relative")?;
+        let run = run_installer(&r, &[("HOME", OsStr::new(home))])?;
+        assert_refused_escaped(&run, home, "a relative HOME");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains(&format!("Refusing HOME {home}: it is not an absolute path")),
+            "HOME `{home}` must be refused as relative: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn relative_install_dir_is_refused_before_network() -> io::Result<()> {
+    for dir in ["bin", "./bin", "-x", "../bin", "D:"] {
+        let r = root("install-msg-dir-relative")?;
+        let run = run_installer(&r, &[("IPE_INSTALL_DIR", OsStr::new(dir))])?;
+        assert_refused_escaped(&run, dir, "a relative IPE_INSTALL_DIR");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "The install directory {dir} is not an absolute path"
+            )),
+            "IPE_INSTALL_DIR `{dir}` must be refused as relative: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn drive_letter_install_dir_is_admitted() -> io::Result<()> {
+    for dir in ["D:\\a\\_temp/ipe-smoke", "c:/ipe"] {
+        let r = root("install-msg-dir-drive")?;
+        let run = run_installer(&r, &[("IPE_INSTALL_DIR", OsStr::new(dir))])?;
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            !run.curl_log.is_empty(),
+            "IPE_INSTALL_DIR `{dir}` must let the run reach the network: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn default_install_dir_refusal_names_the_override() -> io::Result<()> {
+    let r = root("install-msg-dir-space")?;
+    let home = r.path().join("John Doe");
+    mkdir_mode(&home, 0o700)?;
+    let run = run_installer(&r, &[("HOME", home.as_os_str())])?;
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_refused_escaped(&run, "John Doe/.local/bin", "a HOME with a space");
+    assert!(
+        stderr.contains("Set IPE_INSTALL_DIR to a directory path made of those"),
+        "refusing the default install dir must name the override: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn fish_literal_table() -> io::Result<()> {
+    let cases: [(&str, &str); 7] = [
+        ("/home/ana/.local/bin", "'/home/ana/.local/bin'"),
+        ("D:\\x\\", "'D:\\\\x\\\\'"),
+        ("\\", "'\\\\'"),
+        ("a'b", "'a\\'b'"),
+        ("a\\\\b", "'a\\\\\\\\b'"),
+        ("a b*?", "'a b*?'"),
+        ("", "''"),
+    ];
+    let args: Vec<&OsStr> = cases.iter().map(|(text, _)| OsStr::new(text)).collect();
+    let output = run_block(
+        "for a in \"$@\"; do fish_literal \"$a\"; printf '%s\\n' \"$FISH_LITERAL\"; done",
+        &args,
+        "C",
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let literals: Vec<&str> = stdout.lines().collect();
+    let expected: Vec<&str> = cases.iter().map(|(_, literal)| *literal).collect();
+    assert_eq!(
+        literals, expected,
+        "fish_literal must escape `\\` and `'` only"
+    );
+    Ok(())
+}
+
+#[test]
+fn env_files_quote_install_dir_for_their_shell() -> io::Result<()> {
+    let script = installer_script()?;
+    for needed in [
+        "fish_literal \"$INSTALL_DIR\"\nINSTALL_DIR_FISH=\"$FISH_LITERAL\"",
+        "if not contains $INSTALL_DIR_FISH \\$PATH",
+        "    fish_add_path $INSTALL_DIR_FISH\n",
+        "PATH_NOW=\"fish_add_path $INSTALL_DIR_FISH\"",
+        "in *':$INSTALL_DIR:'*) ;; *) export PATH='$INSTALL_DIR':",
+        "PATH_NOW=\"export PATH='$INSTALL_DIR':",
+    ] {
+        assert!(
+            script.contains(needed),
+            "install.sh must quote INSTALL_DIR for the shell that reads it: `{needed}`"
+        );
+    }
+    for line in script.lines().filter(|line| line.contains("fish_add_path")) {
+        assert!(
+            !line.contains("$INSTALL_DIR'") && !line.contains("$INSTALL_DIR\""),
+            "a fish line must take INSTALL_DIR_FISH, never a raw INSTALL_DIR: `{line}`"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `line` expands `HOME` itself, not a longer name starting with it.
+fn expands_home(line: &str) -> bool {
+    ["$HOME", "${HOME"].iter().any(|needle| {
+        line.match_indices(needle).any(|(at, _)| {
+            !line
+                .get(at + needle.len()..)
+                .unwrap_or_default()
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    })
+}
+
+#[test]
+fn installer_reads_home_once_at_the_boundary() -> io::Result<()> {
+    let script = installer_script()?;
+    let code: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    let readers: Vec<&str> = code
+        .iter()
+        .copied()
+        .filter(|line| expands_home(line))
+        .collect();
+    assert_eq!(
+        readers,
+        [concat!("parse_home \"${", "HOME:-}\"")],
+        "HOME must be read once, by `parse_home`; every later use derives from `USER_HOME`"
+    );
+    let writers: Vec<&str> = code
+        .iter()
+        .copied()
+        .filter(|line| line.contains("USER_HOME="))
+        .collect();
+    assert_eq!(
+        writers,
+        ["USER_HOME=\"$1\""],
+        "`USER_HOME` must be set only by `parse_home`"
+    );
+    for line in ["IPE_HOME=\"$HOME/.ipe\"", "x=\"${HOME:-/}\"", "x=$HOME"] {
+        assert!(expands_home(line), "`{line}` expands HOME");
+    }
+    for line in ["IPE_HOME=\"$USER_HOME/.ipe\"", "x=\"$HOME_FLAW\""] {
+        assert!(!expands_home(line), "`{line}` does not expand HOME");
+    }
+    Ok(())
+}
+
 #[test]
 fn c1_and_invalid_bytes_are_escaped_in_utf8_locale() -> io::Result<()> {
     let script = installer_script()?;
@@ -1026,7 +1308,7 @@ const RUNNERS: [&str; 27] = [
 /// defines; `cargo` is allowed only as `cargo version`. Options that make one
 /// of these run a program (GNU `sed`'s `e`, `tar --to-command`) are not
 /// parsed.
-const COMMANDS: [&str; 43] = [
+const COMMANDS: [&str; 44] = [
     "fi",
     "done",
     "for",
@@ -1063,6 +1345,7 @@ const COMMANDS: [&str; 43] = [
     "sha256sum",
     "shasum",
     "cut",
+    "od",
     "head",
     "tail",
     "tr",
@@ -1113,7 +1396,7 @@ const FILE_TARGETS: [&str; 5] = [
 
 /// The one file the installer sources, on the user's say-so: rustup's own
 /// `env` script, which puts cargo on `PATH`.
-const SOURCED: &str = "\"$HOME/.cargo/env\"";
+const SOURCED: &str = "\"$USER_HOME/.cargo/env\"";
 
 /// What the message scan found.
 #[derive(Debug, Default)]
@@ -1852,6 +2135,7 @@ const REFUSED_SHAPES: &[&str] = &[
     "$f \"$x\"",
     "builtin printf x",
     ". \"$f\"",
+    ". \"$HOME/.cargo/env\"",
     "function g { :; }",
     "alias d=die",
     "printf() { :; }",
@@ -1949,7 +2233,7 @@ const ACCEPTED_SHAPES: &[&str] = &[
     "command -v cargo >/dev/null 2>&1",
     "x=$((1 << 2))",
     "trap 'rm -rf \"$tmp\"' EXIT",
-    ". \"$HOME/.cargo/env\"",
+    ". \"$USER_HOME/.cargo/env\"",
 ];
 
 /// Commands the scan refuses because it cannot know what they run or write.

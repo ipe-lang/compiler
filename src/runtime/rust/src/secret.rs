@@ -98,7 +98,7 @@ impl std::fmt::Debug for Secret {
 
 // ALWAYS the fixed placeholder: a `Secret` shown directly (without
 // `Secret.redacted`) renders the safe redacted output, never its content.
-crate::stringify::show_row!("Secret", Redacted, [] Secret, |_| REDACTED.to_owned());
+crate::stringify::show_row!("Secret", Redacted(Withhold), [] Secret, |_| REDACTED.to_owned());
 
 impl Drop for Secret {
     /// Zeroize the backing buffer so the plaintext does not linger in freed

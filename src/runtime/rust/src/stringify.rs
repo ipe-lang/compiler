@@ -20,6 +20,14 @@
 //! (`Vec`, `HashMap`, `BTreeSet`, tuples, `IpeMaybe`, `IpeResult`, references,
 //! boxes) are structural impls in this module.
 //!
+//! Every rendering is the shown [`View`] except `Debug.log` in a dev-posture
+//! build, which renders the dev view: each `Redacted` row states, in its
+//! `show_row!`, whether the dev view reveals its contents (`Reveal`, through a
+//! dev rendering written beside the shown one) or keeps the marker
+//! (`Withhold`, for a secret, a key or a credential). The dev view is a
+//! [`View::Dev`] carrying a [`DevToken`] only this module builds, and it
+//! exists in no release build.
+//!
 //! Why a trait, not `Debug`: `Debug` QUOTES a `String` (`"hi"`), diverging
 //! from unquoted `hi`, and prints every field of a runtime struct, secrets
 //! included.
@@ -41,7 +49,12 @@
 use crate::core::{IpeMaybe, IpeResult};
 use std::collections::{BTreeSet, HashMap};
 
-/// Total Ipê stringifier. One method, infallible, never panics.
+/// Total Ipê stringifier, infallible and panic-free.
+///
+/// `ipe_show` is the shown view, the one every implicit rendering uses.
+/// `ipe_render` renders a chosen [`View`]; its provided body ignores the view
+/// and renders the shown form, so a type that states no dev view is never
+/// revealed.
 ///
 /// A type with only a `Debug` impl has no rendering:
 ///
@@ -52,8 +65,43 @@ use std::collections::{BTreeSet, HashMap};
 /// let _ = IpeStringify::ipe_show(&OnlyDebug);
 /// ```
 pub trait IpeStringify {
-    /// Render `self` byte-identically to  `Basics_errorToString` / `%v`.
+    /// Render `self` byte-identically to `Basics_errorToString` / `%v`.
     fn ipe_show(&self) -> String;
+
+    /// Render `self` in `view`.
+    ///
+    /// The provided body renders the shown form whatever the view.
+    fn ipe_render(&self, _view: View) -> String {
+        self.ipe_show()
+    }
+}
+
+/// Which rendering of a value is produced.
+///
+/// `Shown` is every implicit rendering: error text, logs, web, the debugger.
+/// `Dev` exists only in a dev-posture build and carries a [`DevToken`], which
+/// only `dev_view` builds, so no state outside the argument selects it.
+#[derive(Clone, Copy)]
+pub enum View {
+    /// The redacted rendering every implicit path uses.
+    Shown,
+    /// The developer rendering `Debug.log` prints.
+    #[cfg(feature = "dev-posture")]
+    Dev(DevToken),
+}
+
+/// Proof that a [`View::Dev`] was built by `dev_view`.
+///
+/// The field is private, so no other module can construct one.
+#[cfg(feature = "dev-posture")]
+#[derive(Clone, Copy)]
+pub struct DevToken(());
+
+/// The dev view, the rendering `Debug.log` prints.
+#[cfg(feature = "dev-posture")]
+#[must_use]
+pub(crate) const fn dev_view() -> View {
+    View::Dev(DevToken(()))
 }
 
 /// How a lowered type leaf becomes text.
@@ -82,6 +130,29 @@ impl ShowPolicy {
     }
 }
 
+/// What a leaf renders in the dev view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DevView {
+    /// The shown rendering: the leaf redacts nothing.
+    Same,
+    /// The leaf's contents, through the dev rendering its row states.
+    Reveal,
+    /// The shown rendering: the leaf is a credential.
+    Withhold,
+}
+
+impl DevView {
+    /// The dev view as a number, comparable in a `const` context.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Same => 0,
+            Self::Reveal => 1,
+            Self::Withhold => 2,
+        }
+    }
+}
+
 /// A runtime type that a lowered leaf renders to, with that leaf's show policy.
 ///
 /// Implemented only by `show_row!`, beside the type's `IpeStringify` impl.
@@ -90,34 +161,112 @@ pub trait ShownRow: IpeStringify {
     const LEAF: &'static str;
     /// The leaf's show policy.
     const POLICY: ShowPolicy;
+    /// The leaf's dev view.
+    const DEV: DevView;
 }
 
 /// Write a type's `IpeStringify` impl and its [`ShownRow`] facts in one place.
 ///
-/// `show_row!("Leaf", Policy, [generics] Type, |binder| body)`: `body` renders
-/// `binder` (a `&Type`). Invoked in the module that owns `Type`, so the impl
-/// exists in every build that has the type.
+/// `show_row!("Leaf", Policy, [generics] Type, |binder| body)` for a `Value`,
+/// `Internals` or `Refused` leaf: `body` renders `binder` (a `&Type`) in every
+/// view. A `Redacted` leaf states its dev view:
+///
+/// - `Redacted(Withhold)` takes one closure, rendered in every view;
+/// - `Redacted(Reveal)` takes `shown: |binder| ..` and `dev: |binder, view| ..`,
+///   and the dev closure exists only in a dev-posture build.
+///
+/// Invoked in the module that owns `Type`, so the impl exists in every build
+/// that has the type.
+///
+/// A `Redacted` leaf that states no dev view does not compile:
+///
+/// ```compile_fail
+/// struct Token;
+/// ipe_runtime_rust::show_row!("Secret", Redacted, [] Token, |_| String::new());
+/// ```
+///
+/// The same leaf with its dev view stated compiles:
+///
+/// ```
+/// struct Token;
+/// ipe_runtime_rust::show_row!("Secret", Redacted(Withhold), [] Token, |_| String::new());
+/// ```
+#[doc(hidden)]
+#[macro_export]
 macro_rules! show_row {
-    ($leaf:literal, $policy:ident, [$($gen:tt)*] $ty:ty, |$v:pat_param| $body:expr) => {
+    (@facts $leaf:literal, $policy:ident, $dev:ident, [$($gen:tt)*] $ty:ty) => {
+        impl<$($gen)*> $crate::stringify::ShownRow for $ty {
+            const LEAF: &'static str = $leaf;
+            const POLICY: $crate::stringify::ShowPolicy =
+                $crate::stringify::ShowPolicy::$policy;
+            const DEV: $crate::stringify::DevView = $crate::stringify::DevView::$dev;
+        }
+        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a show row's leaf, policy or dev view is missing from `SHOWN_ROWS` [ledger #boundary]
+        const _: () = assert!(
+            $crate::stringify::leaf_listed(
+                $leaf,
+                $crate::stringify::ShowPolicy::$policy,
+                $crate::stringify::DevView::$dev,
+            ),
+            concat!("show row not listed with its policy and dev view: ", $leaf)
+        );
+    };
+    (@one $leaf:literal, $policy:ident, $dev:ident, [$($gen:tt)*] $ty:ty, |$v:pat_param| $body:expr) => {
         impl<$($gen)*> $crate::stringify::IpeStringify for $ty {
             fn ipe_show(&self) -> String {
                 let $v = self;
                 $body
             }
         }
-        impl<$($gen)*> $crate::stringify::ShownRow for $ty {
-            const LEAF: &'static str = $leaf;
-            const POLICY: $crate::stringify::ShowPolicy =
-                $crate::stringify::ShowPolicy::$policy;
+        $crate::show_row!(@facts $leaf, $policy, $dev, [$($gen)*] $ty);
+    };
+    ($leaf:literal, Value, $($rest:tt)*) => {
+        $crate::show_row!(@one $leaf, Value, Same, $($rest)*);
+    };
+    ($leaf:literal, Internals, $($rest:tt)*) => {
+        $crate::show_row!(@one $leaf, Internals, Same, $($rest)*);
+    };
+    ($leaf:literal, Refused, $($rest:tt)*) => {
+        $crate::show_row!(@one $leaf, Refused, Same, $($rest)*);
+    };
+    ($leaf:literal, Redacted(Withhold), $($rest:tt)*) => {
+        $crate::show_row!(@one $leaf, Redacted, Withhold, $($rest)*);
+    };
+    (
+        $leaf:literal, Redacted(Reveal), [$($gen:tt)*] $ty:ty,
+        shown: |$sv:pat_param| $shown:expr,
+        dev: |$dv:pat_param, $dview:pat_param| $dev:expr $(,)?
+    ) => {
+        impl<$($gen)*> $crate::stringify::IpeStringify for $ty {
+            fn ipe_show(&self) -> String {
+                $crate::stringify::IpeStringify::ipe_render(self, $crate::stringify::View::Shown)
+            }
+
+            fn ipe_render(&self, view: $crate::stringify::View) -> String {
+                match view {
+                    $crate::stringify::View::Shown => {
+                        let $sv = self;
+                        $shown
+                    }
+                    #[cfg(feature = "dev-posture")]
+                    $crate::stringify::View::Dev(_) => {
+                        let $dv = self;
+                        let $dview = view;
+                        $dev
+                    }
+                }
+            }
         }
-        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a show row's leaf or policy is missing from `SHOWN_RUNTIME_TYPES` [ledger #boundary]
-        const _: () = assert!(
-            $crate::stringify::leaf_listed($leaf, $crate::stringify::ShowPolicy::$policy),
-            concat!("show row not listed with its policy: ", $leaf)
-        );
+        $crate::show_row!(@facts $leaf, Redacted, Reveal, [$($gen)*] $ty);
+    };
+    ($leaf:literal, Redacted, $($rest:tt)*) => {
+        compile_error!(concat!(
+            "a Redacted show row states its dev view, Redacted(Reveal) or Redacted(Withhold): ",
+            $leaf
+        ));
     };
 }
-pub(crate) use show_row;
+pub(crate) use crate::show_row;
 
 /// The marker a `Redacted` leaf renders.
 pub const REDACTED_SHOW: &str = crate::redact::REDACTED;
@@ -139,33 +288,72 @@ pub const fn str_eq(a: &str, b: &str) -> bool {
     }
 }
 
-/// Every compiler leaf and its show policy, in the compiler's leaf order:
-/// `"Leaf" => Policy;`. Generates [`SHOWN_RUNTIME_TYPES`], asserted equal to
-/// the compiler's table at build time (`ipe-cli`). The table names no runtime
-/// type, so it compiles in every vendored module set; each `show_row!` asserts
-/// its own leaf and policy are listed here, and `tests/show_rows.rs` pins every
-/// listed leaf to the runtime type that renders it.
+/// A row's dev-view column: `Same` when the row states none.
+macro_rules! dev_column {
+    () => {
+        DevView::Same
+    };
+    ($dev:ident) => {
+        DevView::$dev
+    };
+}
+
+/// Every compiler leaf, its show policy and, for a `Redacted` leaf, its dev
+/// view, in the compiler's leaf order: `"Leaf" => Policy;` or
+/// `"Leaf" => Redacted(Dev);`. Generates [`SHOWN_RUNTIME_TYPES`], asserted
+/// equal to the compiler's table at build time (`ipe-cli`), and
+/// [`SHOWN_ROWS`], which adds the runtime-only dev column. The table names no
+/// runtime type, so it compiles in every vendored module set; each `show_row!`
+/// asserts its own leaf, policy and dev view are listed here, and
+/// `tests/show_rows.rs` pins every listed leaf to the runtime type that
+/// renders it.
 macro_rules! shown_leaves {
-    ($($leaf:literal => $policy:ident;)*) => {
+    ($($leaf:literal => $policy:ident $(($dev:ident))?;)*) => {
         /// Every compiler leaf and its show policy, in the compiler's leaf
         /// order.
         pub const SHOWN_RUNTIME_TYPES: [(&str, ShowPolicy); [$($leaf),*].len()] =
             [$(($leaf, ShowPolicy::$policy)),*];
+
+        /// Every compiler leaf with its show policy and dev view, in the
+        /// compiler's leaf order.
+        pub const SHOWN_ROWS: [(&str, ShowPolicy, DevView); [$($leaf),*].len()] =
+            [$(($leaf, ShowPolicy::$policy, dev_column!($($dev)?))),*];
     };
 }
 
-/// Whether [`SHOWN_RUNTIME_TYPES`] lists `leaf` with `policy`.
+/// Whether [`SHOWN_ROWS`] lists `leaf` with `policy` and `dev`.
 #[must_use]
-pub const fn leaf_listed(leaf: &str, policy: ShowPolicy) -> bool {
-    let mut rows: &[(&str, ShowPolicy)] = &SHOWN_RUNTIME_TYPES;
-    while let [(name, listed), rest @ ..] = rows {
-        if str_eq(name, leaf) && listed.tag() == policy.tag() {
+pub const fn leaf_listed(leaf: &str, policy: ShowPolicy, dev: DevView) -> bool {
+    let mut rows: &[(&str, ShowPolicy, DevView)] = &SHOWN_ROWS;
+    while let [(name, listed, listed_dev), rest @ ..] = rows {
+        if str_eq(name, leaf) && listed.tag() == policy.tag() && listed_dev.tag() == dev.tag() {
             return true;
         }
         rows = rest;
     }
     false
 }
+
+/// Whether every row's dev view agrees with its policy: a `Redacted` row
+/// states `Reveal` or `Withhold`, and every other row is `Same`.
+const fn dev_views_agree(rows: &[(&str, ShowPolicy, DevView)]) -> bool {
+    let mut rows = rows;
+    while let [(_, policy, dev), rest @ ..] = rows {
+        let redacted = policy.tag() == ShowPolicy::Redacted.tag();
+        let same = dev.tag() == DevView::Same.tag();
+        if redacted == same {
+            return false;
+        }
+        rows = rest;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a `Redacted` row states no dev view or another row states one [ledger #boundary]
+const _: () = assert!(
+    dev_views_agree(&SHOWN_ROWS),
+    "a Redacted row states Reveal or Withhold, every other row Same"
+);
 
 shown_leaves! {
     "Int" => Value;
@@ -191,7 +379,7 @@ shown_leaves! {
     "UrlRelative" => Value;
     "Locale" => Value;
     "EmailAddress" => Value;
-    "CryptoMac" => Value;
+    "CryptoMac" => Redacted(Reveal);
     "Color" => Value;
     "ColorError" => Value;
     "WcagLevel" => Value;
@@ -201,29 +389,29 @@ shown_leaves! {
     "CacheStats" => Value;
     "StreamId" => Value;
     "Json" => Value;
-    "Bytes" => Redacted;
-    "Url" => Redacted;
-    "Secret" => Redacted;
-    "CryptoKey" => Redacted;
-    "Principal" => Redacted;
-    "Dsn" => Redacted;
-    "SqlFragment" => Redacted;
-    "ServerRequest" => Redacted;
-    "ServerResponse" => Redacted;
-    "ServerCookie" => Redacted;
-    "WebReq" => Redacted;
-    "HttpRequest" => Redacted;
-    "AuthConfig" => Redacted;
-    "TokenSource" => Redacted;
-    "WebSocketClientCfg" => Redacted;
-    "ProcessRunWithCfg" => Redacted;
-    "ProcessRunInPtyCfg" => Redacted;
-    "CacheCfg" => Redacted;
-    "Regex" => Redacted;
-    "EmailMessage" => Redacted;
-    "EmailAttachment" => Redacted;
-    "EmailSesConfig" => Redacted;
-    "EmailSmtpConfig" => Redacted;
+    "Bytes" => Redacted(Reveal);
+    "Url" => Redacted(Reveal);
+    "Secret" => Redacted(Withhold);
+    "CryptoKey" => Redacted(Withhold);
+    "Principal" => Redacted(Reveal);
+    "Dsn" => Redacted(Reveal);
+    "SqlFragment" => Redacted(Reveal);
+    "ServerRequest" => Redacted(Reveal);
+    "ServerResponse" => Redacted(Reveal);
+    "ServerCookie" => Redacted(Reveal);
+    "WebReq" => Redacted(Reveal);
+    "HttpRequest" => Redacted(Reveal);
+    "AuthConfig" => Redacted(Reveal);
+    "TokenSource" => Redacted(Reveal);
+    "WebSocketClientCfg" => Redacted(Reveal);
+    "ProcessRunWithCfg" => Redacted(Reveal);
+    "ProcessRunInPtyCfg" => Redacted(Reveal);
+    "CacheCfg" => Redacted(Reveal);
+    "Regex" => Redacted(Reveal);
+    "EmailMessage" => Redacted(Reveal);
+    "EmailAttachment" => Redacted(Reveal);
+    "EmailSesConfig" => Redacted(Reveal);
+    "EmailSmtpConfig" => Redacted(Reveal);
     "Task" => Internals;
     "Cmd" => Internals;
     "Sub" => Internals;
@@ -324,8 +512,8 @@ interpolable_scalars! {
 // ─── Scalars ────────────────────────────────────────────────────────────────
 
 // A String returns verbatim (UNQUOTED).
-show_row!("String", Value, [] String, |s| s.clone());
-show_row!("Char", Value, [] char, |c| crate::string::string_from_char(*c));
+crate::show_row!("String", Value, [] String, |s| s.clone());
+crate::show_row!("Char", Value, [] char, |c| crate::string::string_from_char(*c));
 
 impl IpeStringify for str {
     fn ipe_show(&self) -> String {
@@ -333,9 +521,9 @@ impl IpeStringify for str {
     }
 }
 
-show_row!("Int", Value, [] i64, |n| n.to_string());
+crate::show_row!("Int", Value, [] i64, |n| n.to_string());
 
-show_row!("Float", Value, [] f64, |x| float_show(*x));
+crate::show_row!("Float", Value, [] f64, |x| float_show(*x));
 
 /// The `%g` rendering of a float.
 fn float_show(f: f64) -> String {
@@ -379,56 +567,181 @@ fn float_show(f: f64) -> String {
     }
 }
 
-show_row!("Bool", Value, [] bool, |b| crate::string::string_from_bool(*b));
+crate::show_row!("Bool", Value, [] bool, |b| crate::string::string_from_bool(*b));
 
 // Ipê `()` renders `{}`, an empty tuple.
-show_row!("Unit", Value, [](), |_| "{}".to_owned());
+crate::show_row!("Unit", Value, [](), |_| "{}".to_owned());
 
-// Bytes often carry key material or a file body: the length is shown, never
-// the content.
-show_row!("Bytes", Redacted, [] Vec<u8>, |b| format!("<{} bytes>", b.len()));
+// Bytes often carry key material or a file body: the shown view is the length,
+// the dev view the length and a bounded hex prefix.
+crate::show_row!(
+    "Bytes",
+    Redacted(Reveal),
+    [] Vec<u8>,
+    shown: |b| format!("<{} bytes>", b.len()),
+    dev: |b, _| dev_bytes(b),
+);
+
+// ─── Dev-view helpers ───────────────────────────────────────────────────────
+
+/// The most bytes of a `Bytes` value the dev view prints as hex.
+#[cfg(feature = "dev-posture")]
+pub const DEV_BYTES_SHOWN: usize = 64;
+
+/// The dev view of a byte string: its length and the hex of its first
+/// [`DEV_BYTES_SHOWN`] bytes, `…` marking a longer value.
+#[cfg(feature = "dev-posture")]
+#[must_use]
+pub fn dev_bytes(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(DEV_BYTES_SHOWN.saturating_mul(2));
+    for byte in b.iter().take(DEV_BYTES_SHOWN) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    let more = if b.len() > DEV_BYTES_SHOWN { "…" } else { "" };
+    format!("<{} bytes: {hex}{more}>", b.len())
+}
+
+/// A record in the dev view: `Name { a = .., b = .. }`.
+///
+/// Each value arrives already rendered by its caller, so a field the caller
+/// withholds is the marker here, and only the named fields appear.
+#[cfg(feature = "dev-posture")]
+#[must_use]
+pub fn dev_record(name: &str, fields: &[(&str, String)]) -> String {
+    if fields.is_empty() {
+        return format!("{name} {{}}");
+    }
+    let parts: Vec<String> = fields.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+    format!("{name} {{ {} }}", parts.join(", "))
+}
+
+/// The header names whose values carry a credential: their dev view is the
+/// marker, matched without regard to ASCII case.
+#[cfg(feature = "dev-posture")]
+pub const DEV_WITHHELD_HEADERS: [&str; 3] = ["authorization", "cookie", "set-cookie"];
+
+/// A header value in the dev view: the marker for a [`DEV_WITHHELD_HEADERS`]
+/// name, the value otherwise.
+#[cfg(feature = "dev-posture")]
+#[must_use]
+pub fn dev_header_value<'a>(name: &str, value: &'a str) -> &'a str {
+    if DEV_WITHHELD_HEADERS
+        .iter()
+        .any(|withheld| name.eq_ignore_ascii_case(withheld))
+    {
+        REDACTED_SHOW
+    } else {
+        value
+    }
+}
+
+/// A header map in the dev view: `map[k:v ..]` sorted by name, with every
+/// [`DEV_WITHHELD_HEADERS`] value withheld.
+#[cfg(feature = "dev-posture")]
+#[must_use]
+pub fn dev_header_map(headers: &HashMap<String, String>) -> String {
+    let mut entries: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), dev_header_value(k, v)))
+        .collect();
+    entries.sort_unstable();
+    let parts: Vec<String> = entries.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+    format!("map[{}]", parts.join(" "))
+}
+
+/// A header list in the dev view: `[{k v} ..]` in its own order, with every
+/// [`DEV_WITHHELD_HEADERS`] value withheld.
+#[cfg(feature = "dev-posture")]
+#[must_use]
+pub fn dev_header_list(headers: &[(String, String)]) -> String {
+    let parts: Vec<String> = headers
+        .iter()
+        .map(|(k, v)| format!("{{{k} {}}}", dev_header_value(k, v)))
+        .collect();
+    format!("[{}]", parts.join(" "))
+}
+
+/// A cookie map in the dev view: `map[name:<redacted> ..]` sorted by name.
+///
+/// A cookie value is a session id or a token, so only the names appear.
+#[cfg(feature = "dev-posture")]
+#[must_use]
+pub fn dev_cookie_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    let parts: Vec<String> = names
+        .iter()
+        .map(|name| format!("{name}:{REDACTED_SHOW}"))
+        .collect();
+    format!("map[{}]", parts.join(" "))
+}
 
 // ─── References / boxes (delegate) ───────────────────────────────────────────
 
 impl<T: IpeStringify + ?Sized> IpeStringify for &T {
     fn ipe_show(&self) -> String {
-        (**self).ipe_show()
+        self.ipe_render(View::Shown)
+    }
+
+    fn ipe_render(&self, view: View) -> String {
+        (**self).ipe_render(view)
     }
 }
 
 impl<T: IpeStringify + ?Sized> IpeStringify for Box<T> {
     fn ipe_show(&self) -> String {
-        (**self).ipe_show()
+        self.ipe_render(View::Shown)
+    }
+
+    fn ipe_render(&self, view: View) -> String {
+        (**self).ipe_render(view)
     }
 }
 
 // ─── Lists ───────────────────────────────────────────────────────────────────
 
+/// Elements rendered in `view`, space-separated in square brackets; empty is
+/// `[]`.
+fn bracketed<'a, T: IpeStringify + 'a>(items: impl Iterator<Item = &'a T>, view: View) -> String {
+    let parts: Vec<String> = items.map(|item| item.ipe_render(view)).collect();
+    format!("[{}]", parts.join(" "))
+}
+
 impl<T: IpeStringify> IpeStringify for Vec<T> {
-    // List: space-separated, square brackets, empty -> `[]`.
     fn ipe_show(&self) -> String {
-        let parts: Vec<String> = self.iter().map(IpeStringify::ipe_show).collect();
-        format!("[{}]", parts.join(" "))
+        self.ipe_render(View::Shown)
+    }
+
+    fn ipe_render(&self, view: View) -> String {
+        bracketed(self.iter(), view)
     }
 }
 
 impl<T: IpeStringify> IpeStringify for [T] {
     fn ipe_show(&self) -> String {
-        let parts: Vec<String> = self.iter().map(IpeStringify::ipe_show).collect();
-        format!("[{}]", parts.join(" "))
+        self.ipe_render(View::Shown)
+    }
+
+    fn ipe_render(&self, view: View) -> String {
+        bracketed(self.iter(), view)
     }
 }
 
 // ─── Maps ────────────────────────────────────────────────────────────────────
 
 impl<K: IpeStringify + Ord, V: IpeStringify> IpeStringify for HashMap<K, V> {
-    // Dict: `map[k1:v1 k2:v2]` with keys SORTED, space-separated.
     fn ipe_show(&self) -> String {
+        self.ipe_render(View::Shown)
+    }
+
+    // Dict: `map[k1:v1 k2:v2]` with keys SORTED, space-separated.
+    fn ipe_render(&self, view: View) -> String {
         let mut entries: Vec<(&K, &V)> = self.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         let parts: Vec<String> = entries
             .iter()
-            .map(|(k, v)| format!("{}:{}", k.ipe_show(), v.ipe_show()))
+            .map(|(k, v)| format!("{}:{}", k.ipe_render(view), v.ipe_render(view)))
             .collect();
         format!("map[{}]", parts.join(" "))
     }
@@ -437,10 +750,13 @@ impl<K: IpeStringify + Ord, V: IpeStringify> IpeStringify for HashMap<K, V> {
 // ─── Sets ────────────────────────────────────────────────────────────────────
 
 impl<T: IpeStringify> IpeStringify for BTreeSet<T> {
-    // Set: like a list, elements in ascending order.
     fn ipe_show(&self) -> String {
-        let parts: Vec<String> = self.iter().map(IpeStringify::ipe_show).collect();
-        format!("[{}]", parts.join(" "))
+        self.ipe_render(View::Shown)
+    }
+
+    // Set: like a list, elements in ascending order.
+    fn ipe_render(&self, view: View) -> String {
+        bracketed(self.iter(), view)
     }
 }
 
@@ -455,7 +771,11 @@ macro_rules! tuple_shows {
         $(
             impl<$($t: IpeStringify),+> IpeStringify for ($($t,)+) {
                 fn ipe_show(&self) -> String {
-                    let parts = [$(self.$i.ipe_show()),+];
+                    self.ipe_render(View::Shown)
+                }
+
+                fn ipe_render(&self, view: View) -> String {
+                    let parts = [$(self.$i.ipe_render(view)),+];
                     format!("{{{}}}", parts.join(" "))
                 }
             }
@@ -480,21 +800,29 @@ tuple_shows! {
 // ─── Ipê core ADTs ───────────────────────────────────────────────────────────
 
 impl<T: IpeStringify> IpeStringify for IpeMaybe<T> {
-    // Best-effort, total, human-useful: `Just <v>` / `Nothing`.
     fn ipe_show(&self) -> String {
+        self.ipe_render(View::Shown)
+    }
+
+    // Best-effort, total, human-useful: `Just <v>` / `Nothing`.
+    fn ipe_render(&self, view: View) -> String {
         match self {
-            IpeMaybe::Just(v) => format!("Just {}", v.ipe_show()),
+            IpeMaybe::Just(v) => format!("Just {}", v.ipe_render(view)),
             IpeMaybe::Nothing => "Nothing".to_string(),
         }
     }
 }
 
 impl<E: IpeStringify, A: IpeStringify> IpeStringify for IpeResult<E, A> {
-    // Best-effort (same ADT-layout residual as IpeMaybe): `Ok <a>` / `Err <e>`.
     fn ipe_show(&self) -> String {
+        self.ipe_render(View::Shown)
+    }
+
+    // Best-effort (same ADT-layout residual as IpeMaybe): `Ok <a>` / `Err <e>`.
+    fn ipe_render(&self, view: View) -> String {
         match self {
-            IpeResult::Ok(a) => format!("Ok {}", a.ipe_show()),
-            IpeResult::Err(e) => format!("Err {}", e.ipe_show()),
+            IpeResult::Ok(a) => format!("Ok {}", a.ipe_render(view)),
+            IpeResult::Err(e) => format!("Err {}", e.ipe_render(view)),
         }
     }
 }
@@ -722,8 +1050,8 @@ mod tests {
         assert_eq!(shown, "<redacted> <redacted>");
     }
 
-    // A URL's userinfo, query and fragment never reach its implicit
-    // rendering; its scheme, host, port and path do.
+    // A URL's userinfo, path, query and fragment never reach its implicit
+    // rendering, `Debug` included; its scheme, host and port do.
     #[cfg(feature = "url")]
     #[test]
     fn url_show_keeps_no_userinfo_query_or_fragment() {
@@ -739,7 +1067,9 @@ mod tests {
         let shown = url.ipe_show();
         assert!(!shown.contains("S3CR3T"), "{shown}");
         assert!(!shown.contains(['@', '?', '#']), "{shown}");
-        assert_eq!(shown, "https://example.com:8443/a/b");
+        assert!(!shown.contains("/a/b"), "{shown}");
+        assert_eq!(shown, "https://example.com:8443/<redacted>");
+        assert_eq!(format!("{url:?}"), format!("Url({shown})"));
     }
 
     // A credential that spilled out of the userinfo — a scheme-confused
@@ -765,7 +1095,10 @@ mod tests {
                 "https://S3CR3TUSER?S3CR3TPW@example.com",
                 format!("https:{r}"),
             ),
-            ("s3cr3tuser://example.com/a", format!("{r}://example.com/a")),
+            (
+                "s3cr3tuser://example.com/a",
+                format!("{r}://example.com/{r}"),
+            ),
         ];
         for (raw, expected) in cases {
             #[allow(clippy::expect_used)] // fixture: each literal is an absolute URL
@@ -780,6 +1113,7 @@ mod tests {
                 "{raw}: {shown}"
             );
             assert_eq!(shown, expected, "{raw}");
+            assert_eq!(format!("{url:?}"), format!("Url({expected})"), "{raw}");
         }
     }
 }

@@ -52,12 +52,12 @@
 //! time it checks (every tracked-function boundary — the `WillCheckCancellation`
 //! event salsa's own test suite pins). So:
 //!
-//! - the orchestrator NEVER calls `sync_source_root` while ALSO holding a
+//! - the orchestrator NEVER calls `LongLivedDb::sync` while ALSO holding a
 //!   worker's clone alive on its own thread — it hands the clone to the
-//!   worker THREAD and keeps only the original `db_main` on the orchestrator
+//!   worker THREAD and keeps only the owner `db_main` on the orchestrator
 //!   thread;
-//! - when a new settled batch arrives mid-build, `sync_source_root(&mut
-//!   db_main, …)` is called immediately — this call blocks (invisibly, from
+//! - when a new settled batch arrives mid-build, `db_main.sync(…)` is called
+//!   immediately — this call blocks (invisibly, from
 //!   the orchestrator's point of view) until the worker thread's query
 //!   unwinds and drops its cloned `Storage`, then returns; the worker thread
 //!   observes `Cancelled` via `salsa::Cancelled::catch`, reports it, and
@@ -341,7 +341,7 @@ struct RebuildTimings {
     /// the initial kickoff cycle and resolve-retry cycles, which carry no
     /// first-event timestamp.
     settle: Option<Duration>,
-    /// `resolve_project_sources` + FFI-catalog prep + `sync_source_root`
+    /// `resolve_project_sources` + FFI-catalog prep + `LongLivedDb::sync`
     /// (input mutation into the warm salsa db) — the orchestrator-thread work
     /// of the `FsBatch` arm before the compile worker is spawned.
     resolve: Option<Duration>,
@@ -441,7 +441,7 @@ impl RebuildTimings {
 /// (the one-shot driver) would consume, but returned to the CALLER instead
 /// of immediately compiled, so `ipe dev watch` can re-resolve on every settled
 /// batch and feed the result through a WARM, reused database via
-/// `ipe_db::sync_source_root` rather than constructing a fresh one per
+/// `ipe_db::LongLivedDb` rather than constructing a fresh one per
 /// build. Deliberately mirrors `run_build`'s own manifest-resolution
 /// dispatch (`crates/ipe/src/lib.rs`) without touching that code — the
 /// one-shot entry points stay exactly as tested by the golden suite; this
@@ -667,7 +667,7 @@ enum OrchestratorEvent {
     /// A settled batch of filesystem changes — the coalescer's output.
     /// Carries no paths: `ipe dev watch` re-resolves the WHOLE project on every
     /// cycle (cheap — a directory walk over a bounded file set) and lets
-    /// `sync_source_root`'s own byte-equal no-op boundary do the real
+    /// `LongLivedDb::sync`'s own byte-equal no-op boundary do the real
     /// dirty-vs-clean filtering, so there is no need to thread individual
     /// changed paths through the recompute step. `settle` carries the
     /// coalescer's edit→settled latency for `IPE_WATCH_TIMING` (`None` for the
@@ -1127,9 +1127,9 @@ fn run_inner(
     // such a crate directly, binding no proxy on the user's port.
     let mut proxy: Option<ipe_watch::DevProxy> = None;
 
-    let mut db_main = ipe_db::IpeDatabase::new();
-    let mut source_root: Option<ipe_db::SourceRoot> = None;
-    let mut config: Option<ipe_db::BuildConfig> = None;
+    // The one owner of the watch session's database, root and config: past
+    // its growth ceiling it drops the generation and rebuilds cold.
+    let mut db_main = ipe_db::LongLivedDb::new();
     let mut supervisor = ipe_watch::SupervisorState::fresh();
     let mut generation: u64 = 0;
     let mut compile_worker: Option<thread::JoinHandle<()>> = None;
@@ -1311,73 +1311,41 @@ fn run_inner(
                 // This call BLOCKS until any in-flight compile
                 // worker's cancelled query unwinds and drops its database
                 // clone — see the module doc's cancellation walkthrough.
-                let root = if let Some(root) = source_root {
-                    ipe_db::sync_source_root(&mut db_main, root, &desired);
-                    root
-                } else {
-                    let root = crate::create_source_root(
-                        &db_main,
-                        &sources,
-                        &injected,
-                        &ffi_prep.injected,
-                    );
-                    source_root = Some(root);
-                    root
-                };
+                let root = db_main.sync(&desired).root;
 
-                let cfg = if let Some(cfg) = config {
-                    if *cfg.db_driver(&db_main) != resolved.db_driver {
-                        use salsa::Setter as _;
-                        cfg.set_db_driver(&mut db_main).to(resolved.db_driver);
-                    }
-                    if cfg.wasm_public_env(&db_main) != &resolved.wasm_public_env {
-                        use salsa::Setter as _;
-                        cfg.set_wasm_public_env(&mut db_main)
-                            .to(resolved.wasm_public_env.clone());
-                    }
-                    if cfg.mount_base(&db_main) != &resolved.mount_base {
-                        use salsa::Setter as _;
-                        cfg.set_mount_base(&mut db_main)
-                            .to(resolved.mount_base.clone());
-                    }
-                    cfg
-                } else {
-                    // Pass ffi_prep.emit so the backend can write FFI
-                    // bindings (src/ffi.rs) into the emitted project — the
-                    // same slot `run_build` fills via BuildConfig (CO-INCR-005).
-                    let cfg = ipe_db::BuildConfig::new(
-                        &db_main,
-                        resolved.db_driver,
-                        ffi_prep.emit,
-                        REBUILD_TARGET,
-                        resolved.wasm_public_env.clone(),
-                        resolved.mount_base.clone(),
-                        false,
-                        REBUILD_INTENT,
-                        // Dependency-model emit: the project links the runtime as a
-                        // path dependency (what `ipe dev build` uses by default), so
-                        // no runtime source is vendored into `src/ipe_runtime/`.
-                        // `runtime_dep_root` is the verified crate root (holds
-                        // `Cargo.toml`), resolved once before the loop via
-                        // `runtime_embed::resolve()`, matching `ipe dev build`'s path.
-                        Some(ipe_backend_rust::RuntimeDep {
-                            root: runtime_dep_root.clone(),
-                        }),
-                        // `ipe dev watch --debugger` compiles the in-app debugger
-                        // overlay into the rebuilt runtime loop.
-                        opts.debugger,
-                        resolved.cargo_name.clone(),
-                        opts.hot_appearance,
-                        // `ipe dev watch` reloads the served-live web app; the
-                        // webview-native desktop delivery is not a watch target.
-                        false,
-                    );
-                    config = Some(cfg);
-                    cfg
-                };
+                // Every field is reconciled on every pass, so a warm config
+                // holds exactly what a cold rebuild would build.
+                let cfg = db_main.sync_config(ipe_db::BuildConfigFields {
+                    db_driver: resolved.db_driver,
+                    // The backend writes FFI bindings (src/ffi.rs) into the
+                    // emitted project — the same slot `run_build` fills.
+                    ffi: ffi_prep.emit,
+                    target: REBUILD_TARGET,
+                    wasm_public_env: resolved.wasm_public_env.clone(),
+                    mount_base: resolved.mount_base.clone(),
+                    wasm_hydrate_mode: false,
+                    intent: REBUILD_INTENT,
+                    // Dependency-model emit: the project links the runtime as a
+                    // path dependency (what `ipe dev build` uses by default), so
+                    // no runtime source is vendored into `src/ipe_runtime/`.
+                    // `runtime_dep_root` is the verified crate root (holds
+                    // `Cargo.toml`), resolved once before the loop via
+                    // `runtime_embed::resolve()`, matching `ipe dev build`'s path.
+                    runtime_dep: Some(ipe_backend_rust::RuntimeDep {
+                        root: runtime_dep_root.clone(),
+                    }),
+                    // `ipe dev watch --debugger` compiles the in-app debugger
+                    // overlay into the rebuilt runtime loop.
+                    debugger: opts.debugger,
+                    cargo_name: resolved.cargo_name.clone(),
+                    hot_appearance: opts.hot_appearance,
+                    // `ipe dev watch` reloads the served-live web app; the
+                    // webview-native desktop delivery is not a watch target.
+                    webview_host: false,
+                });
 
                 // The prior worker (if any) has already unwound by the time
-                // `sync_source_root` returned above; join to reclaim the
+                // `LongLivedDb::sync` returned above; join to reclaim the
                 // thread handle (fast — it already finished).
                 if let Some(h) = compile_worker.take() {
                     let _ = h.join();
@@ -1388,7 +1356,7 @@ fn run_inner(
                 // to handing off to the compile worker.
                 timings.resolve = Some(resolve_started.elapsed());
 
-                let db_worker = db_main.clone();
+                let db_worker = db_main.db().clone();
                 let entry_path = resolved.entry_path.clone();
                 let blame_path = resolved.blame_path.clone();
                 let worker_tx = evt_tx.clone();

@@ -42,7 +42,33 @@ pub struct Principal {
     claims: Redacted<BTreeMap<String, String>>,
 }
 
-crate::stringify::show_row!("Principal", Redacted, [] Principal, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "Principal",
+    Redacted(Reveal),
+    [] Principal,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |p, _| p.dev(),
+);
+
+impl Principal {
+    /// The principal as `Debug.log` prints it in a dev-posture build: its
+    /// subject and its claims in key order.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self) -> String {
+        let claims: Vec<String> = self
+            .claims
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect();
+        crate::stringify::dev_record(
+            "Principal",
+            &[
+                ("subject", self.subject.as_str().to_owned()),
+                ("claims", format!("map[{}]", claims.join(" "))),
+            ],
+        )
+    }
+}
 
 /// Mint a `Principal` with a subject and no claims — a unit-test fixture for
 /// the principal and revocation tests. Production minting goes through

@@ -30,6 +30,9 @@ pub use route::*;
 pub mod console;
 #[cfg(feature = "server")]
 pub mod csrf;
+// A cookieless page request proves its Fetch Metadata before a session is minted.
+#[cfg(feature = "server")]
+mod mint_proof;
 pub mod style_inject;
 // Custom-element (`CustomElement.node`) registration glue + SRI-pinned author-JS serving.
 // The generator lives at the crate top level (`crate::widget_assets`) so the
@@ -2462,6 +2465,12 @@ fn new_sid() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// A fresh sid for a request whose mint was proved first-party.
+#[cfg(feature = "server")]
+fn minted_sid(_proof: mint_proof::MintProof) -> String {
+    new_sid()
+}
+
 /// Normalise a raw `IPE_WEB_BASE_PATH` value: trim, drop a trailing slash,
 /// ensure a single leading slash. `""` / `"/"` collapse to `""` (root-mounted —
 /// no prefix).
@@ -4127,7 +4136,27 @@ mod handlers {
     use axum::response::{IntoResponse, Response};
 
     // ── GET page (root + any path) ────────────────────────────────────
+    /// Serve a page, every response varying on the headers a mint is judged by.
     pub(super) async fn page<Model, Msg, FInit, FUpdate, FView, FSubs>(
+        state: State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+    ) -> Response
+    where
+        Model: Clone + PartialEq + Send + 'static,
+        Msg: Clone + Send + std::fmt::Debug + crate::stringify::IpeStringify + 'static,
+        FInit: Fn(req::WebReq) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+        FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+        FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
+        FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
+    {
+        let mut resp = serve_page(state, method, uri, headers).await;
+        mint_proof::vary_on_mint_inputs(resp.headers_mut());
+        resp
+    }
+
+    async fn serve_page<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
@@ -4402,6 +4431,15 @@ mod handlers {
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((_, store::Rejoin::Miss)) | None => {
+                // Only a first-party arrival mints: a cross-site subresource or
+                // frame request is refused before any slot, `init` or cookie.
+                let proof = match mint_proof::MintProof::judge(
+                    &headers,
+                    mint_proof::Embedding::configured(),
+                ) {
+                    Ok(proof) => proof,
+                    Err(why) => return mint_proof::refused(why),
+                };
                 // Admission control (cookieless = brand-new session = the
                 // attack surface). Reserve a slot atomically: fetch_add-then-test
                 // avoids the load-then-add TOCTOU where N concurrent GETs all
@@ -4431,7 +4469,7 @@ mod handlers {
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
                 // Minted first so `init` and the entry run under it.
-                let scope = pubsub::SessionScope::new(new_sid());
+                let scope = pubsub::SessionScope::new(minted_sid(proof));
                 let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
                 let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, &path);
                 (
@@ -6293,9 +6331,7 @@ where
     // print the shutdown line, drain in-flight requests, and return cleanly so
     // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
     // SECOND signal force-exits 130 via the watchdog inside web_shutdown_signal.
-    match axum::serve(listener, app)
-        .with_graceful_shutdown(web_shutdown_signal(shutdown_store, grace))
-        .await
+    match crate::server::serve_app(listener, app, web_shutdown_signal(shutdown_store, grace)).await
     {
         Ok(()) => ok_res(()),
         Err(e) => IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
@@ -12286,6 +12322,136 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// `init` runs counted by [`counted_init`]; only the mint-gate test reads it.
+    static MINT_GATE_INITS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted_init(req: WebReq) -> (Model, IpeCmd<Msg>) {
+        MINT_GATE_INITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        init(req)
+    }
+
+    /// One cookieless `GET /` carrying `fetch_metadata`, bounded by a timeout.
+    #[allow(clippy::expect_used)] // test helper: request build / router failure / a hung handler is a test environment issue
+    async fn cookieless_get(
+        router: axum::Router,
+        fetch_metadata: [(&str, &str); 3],
+    ) -> axum::response::Response {
+        let mut b = Request::builder().method("GET").uri("/");
+        for (name, value) in fetch_metadata {
+            b = b.header(name, value);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            router.oneshot(b.body(Body::empty()).expect("build GET")),
+        )
+        .await
+        .expect("the page handler answers in time")
+        .expect("router responds")
+    }
+
+    fn vary_names(resp: &axum::response::Response) -> Vec<String> {
+        resp.headers()
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+            .collect()
+    }
+
+    /// Prove the refusal through the production page handler: a cross-site
+    /// subresource GET mints no session, runs no `init` and sets no cookie,
+    /// while the same request as a top-level navigation mints one; both vary on
+    /// the mint inputs.
+    #[test]
+    fn cross_site_subresource_get_mints_no_session() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let mut state = make_state(store.clone());
+            state.init = Arc::new(counted_init as fn(WebReq) -> (Model, IpeCmd<Msg>));
+            let sessions = state.session_count.clone();
+            #[allow(clippy::expect_used)] // test fixture: the test process sets no base path
+            let router = build_web_router::<
+                Model,
+                Msg,
+                fn(WebReq) -> (Model, IpeCmd<Msg>),
+                fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                fn(Model) -> Html<Msg>,
+                fn(Model) -> IpeSub<Msg>,
+            >(state, false)
+            .expect("the unset test base parses");
+            let ord = std::sync::atomic::Ordering::SeqCst;
+            let expected_vary = [
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-dest",
+                "x-ipe-nav",
+            ];
+
+            let refused = cookieless_get(
+                router.clone(),
+                [
+                    ("sec-fetch-site", "cross-site"),
+                    ("sec-fetch-mode", "no-cors"),
+                    ("sec-fetch-dest", "image"),
+                ],
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+            assert!(refused.headers().get(header::SET_COOKIE).is_none());
+            let names = vary_names(&refused);
+            for name in expected_vary {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "refusal Vary lacks {name}: {names:?}"
+                );
+            }
+            assert_eq!(
+                sessions.load(ord),
+                0,
+                "a refused mint reserves no session slot"
+            );
+            assert_eq!(MINT_GATE_INITS.load(ord), 0, "a refused mint runs no init");
+
+            let admitted = cookieless_get(
+                router,
+                [
+                    ("sec-fetch-site", "cross-site"),
+                    ("sec-fetch-mode", "navigate"),
+                    ("sec-fetch-dest", "document"),
+                ],
+            )
+            .await;
+            assert_eq!(admitted.status(), StatusCode::OK);
+            let session_prefix = format!("{}=", cookie_name_for(""));
+            assert!(
+                admitted
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .any(|v| v.starts_with(&session_prefix)),
+                "a top-level navigation mints a session cookie"
+            );
+            let names = vary_names(&admitted);
+            for name in expected_vary {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "page Vary lacks {name}: {names:?}"
+                );
+            }
+            assert_eq!(
+                MINT_GATE_INITS.load(ord),
+                1,
+                "the admitted mint runs init once"
+            );
+            assert_eq!(
+                sessions.load(ord),
+                1,
+                "the admitted mint holds one session slot"
+            );
+        });
+    }
+
     /// The production router over a state whose route matcher counts its runs:
     /// every page and SSE-reconcile request consults it first, so a zero count
     /// proves no handler logic ran.
@@ -12789,9 +12955,15 @@ mod route_entry_cmd_tests {
     /// The fixture router over `store`, counting its session drivers in `session_count`.
     #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
     fn router_counted(store: Store, session_count: Arc<AtomicUsize>) -> axum::Router {
+        build_web_router(fixture_state(store, session_count), false)
+            .expect("the fixture route table and base are well-formed")
+    }
+
+    /// The fixture app's state over `store`, counting its session drivers in `session_count`.
+    fn fixture_state(store: Store, session_count: Arc<AtomicUsize>) -> FixtureState {
         let (route_entry, _, route_matched) =
             routed_resolvers(routes(), Page::Home, set_page, render);
-        let state: FixtureState = WebState {
+        WebState {
             store,
             init: Arc::new(init),
             update: Arc::new(update),
@@ -12802,12 +12974,63 @@ mod route_entry_cmd_tests {
             route_matched,
             session_count,
             watch_build_status: Arc::new(Mutex::new(None)),
-        };
-        build_web_router(state, false).expect("the fixture route table and base are well-formed")
+        }
     }
 
     fn memory() -> Store {
         Arc::new(MemoryStore::<Model, Msg>::new(Duration::from_secs(60)))
+    }
+
+    /// A rebound name reaches no route of a real `serve_web`: the page GET
+    /// and the event POST both answer 421, no session driver starts and
+    /// `init` never runs; the same listener addressed by its IP literal
+    /// serves the page.
+    #[test]
+    fn dev_posture_pin_web_refuses_a_rebound_host() {
+        run(false, || async {
+            let port = crate::server::free_loopback_port().unwrap();
+            crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+            crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
+            crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+            crate::system::locked_set_var(
+                crate::env_registry::web::WEB_PORT.name(),
+                &port.to_string(),
+            );
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let served = serve_web::<crate::IpeError, _, _, _, _, _, _>(fixture_state(
+                memory(),
+                sessions.clone(),
+            ));
+            let checks = async {
+                let evil = format!("evil.example:{port}");
+                let page = format!("GET / HTTP/1.1\r\nHost: {evil}\r\nConnection: close\r\n\r\n");
+                let event = format!(
+                    "POST /_ipe/event HTTP/1.1\r\nHost: {evil}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+                for request in [page, event] {
+                    let resp = crate::server::raw_exchange(port, &request).await.unwrap();
+                    assert_eq!(crate::server::raw_status(&resp), 421, "{request}: {resp}");
+                    assert!(resp.contains("host_not_admitted"), "{resp}");
+                    assert!(!resp.to_ascii_lowercase().contains("set-cookie"), "{resp}");
+                }
+                assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(take_init_sids().is_empty());
+                let control = format!(
+                    "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                );
+                let resp = crate::server::raw_exchange(port, &control).await.unwrap();
+                assert_eq!(crate::server::raw_status(&resp), 200, "{resp}");
+            };
+            // The listener serves until shutdown; the checks finishing first is the pass.
+            let checked = tokio::select! {
+                _ = served => false,
+                () = checks => true,
+            };
+            assert!(checked, "serve_web returned before the checks ran");
+            crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
     }
 
     /// Run `body` on a current-thread runtime (deterministic task order); `paused` starts tokio's clock paused.
@@ -15447,13 +15670,13 @@ mod web_revocation_tests {
         assert!(
             owners
                 .iter()
-                .all(|o| matches!(o.as_deref(), Some("lookup_session" | "page"))),
+                .all(|o| matches!(o.as_deref(), Some("lookup_session" | "serve_page"))),
             "a live entry is read only by the resolver and the page rejoin it admits: {owners:?}"
         );
 
         let rejoins = call_owners(&code, &bodies, "store", "get_reconstructing");
         assert!(
-            !rejoins.is_empty() && rejoins.iter().all(|o| o.as_deref() == Some("page")),
+            !rejoins.is_empty() && rejoins.iter().all(|o| o.as_deref() == Some("serve_page")),
             "a session is reconstructed only by the page rejoin: {rejoins:?}"
         );
         let writes = call_owners(&code, &bodies, "store", "set");
@@ -15465,7 +15688,7 @@ mod web_revocation_tests {
         assert!(
             writes
                 .iter()
-                .all(|o| matches!(o.as_deref(), Some("checkpoint" | "page"))),
+                .all(|o| matches!(o.as_deref(), Some("checkpoint" | "serve_page"))),
             "an open session is written back only through the checkpoint: {writes:?}"
         );
         let sweeps = call_owners(&code, &bodies, "store", "web_sessions");

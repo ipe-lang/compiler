@@ -7,7 +7,8 @@
 //! argument: no `cmd /C start`, no `sh -c`, so no shell ever re-parses the
 //! URL. The byte set a `BrowserUrl` admits refuses the shell metacharacters as
 //! well (defence in depth): `&` stands only in the query, as its field
-//! separator.
+//! separator, and never reaches `xdg-open`, whose legacy xdg-utils paths may
+//! hand the URL to a shell.
 
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -182,6 +183,25 @@ pub enum OpenOutcome {
     Spawn(SpawnRefusal),
     /// Watching the started opener failed.
     WaitFailed(std::io::ErrorKind),
+    /// The platform's opener refused the URL before anything started.
+    Refused(OpenerRefusal),
+}
+
+/// Why the platform's opener refused a [`BrowserUrl`] before starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenerRefusal {
+    /// The query holds a raw `&`, which a shell-evaluating `xdg-open` splits on.
+    QueryAmpersand,
+}
+
+impl std::fmt::Display for OpenerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueryAmpersand => f.write_str(
+                "the URL holds `&`, which xdg-open may hand to a shell; open it by hand",
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for OpenOutcome {
@@ -192,6 +212,7 @@ impl std::fmt::Display for OpenOutcome {
             Self::OpenerMissing => f.write_str("no browser opener is installed"),
             Self::Spawn(refusal) => write!(f, "the browser opener could not start: {refusal}"),
             Self::WaitFailed(kind) => write!(f, "the browser opener could not be watched ({kind})"),
+            Self::Refused(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -228,13 +249,25 @@ impl Platform {
 }
 
 /// The opener program for `platform` and its one argument, the URL.
-const fn opener_argv(platform: Platform, url: &BrowserUrl) -> (&'static str, [&str; 1]) {
+///
+/// `xdg-open` refuses a URL holding `&`: a [`BrowserUrl`] admits `&` only in
+/// its query, and a `%26` escape stays admitted.
+///
+/// # Errors
+/// [`OpenerRefusal::QueryAmpersand`] for a raw `&` on [`Platform::Other`].
+fn opener_argv(
+    platform: Platform,
+    url: &BrowserUrl,
+) -> Result<(&'static str, [&str; 1]), OpenerRefusal> {
     let program = match platform {
         Platform::MacOs => "open",
         Platform::Windows => "explorer.exe",
+        Platform::Other if url.as_str().contains('&') => {
+            return Err(OpenerRefusal::QueryAmpersand);
+        }
         Platform::Other => "xdg-open",
     };
-    (program, [url.as_str()])
+    Ok((program, [url.as_str()]))
 }
 
 /// Open `url` in the desktop's browser through the platform opener, never through a shell.
@@ -243,14 +276,18 @@ const fn opener_argv(platform: Platform, url: &BrowserUrl) -> (&'static str, [&s
 /// stream null and is watched for at most [`OPENER_GRACE`]; one still running
 /// then is left running (an opener may wait on the browser it started) and
 /// the call returns, so it never holds the caller. A caller prints the URL
-/// whenever the outcome is not [`OpenOutcome::Opened`]. Call it from a thread
+/// whenever the outcome is not [`OpenOutcome::Opened`], a URL the opener
+/// refused before starting ([`OpenOutcome::Refused`]) included. Call it from a thread
 /// that outlives the opener: a spawning thread's exit signals the opener.
 ///
 /// On Windows, once the CLI has joined its own kill-on-close job, the opener
 /// breaks away from it, so the browser outlives the CLI; where a job the CLI
 /// was started in forbids breaking away, the opener starts inside the CLI's job.
 pub fn open_url(url: &BrowserUrl) -> OpenOutcome {
-    let (program, args) = opener_argv(Platform::HOST, url);
+    let (program, args) = match opener_argv(Platform::HOST, url) {
+        Ok(argv) => argv,
+        Err(refusal) => return OpenOutcome::Refused(refusal),
+    };
     let opener = || {
         let mut command = Command::new(program);
         command.args(args);
@@ -526,9 +563,10 @@ mod tests {
     #[test]
     fn the_windows_opener_never_runs_a_shell() {
         let url = github("https://github.com/login/device").expect("admitted");
-        let (program, args) = opener_argv(Platform::Windows, &url);
-        assert_eq!(program, "explorer.exe");
-        assert_eq!(args, [url.as_str()]);
+        assert_eq!(
+            opener_argv(Platform::Windows, &url),
+            Ok(("explorer.exe", [url.as_str()]))
+        );
     }
 
     #[test]
@@ -539,11 +577,53 @@ mod tests {
             (Platform::Windows, "explorer.exe"),
             (Platform::Other, "xdg-open"),
         ] {
-            let (program, args) = opener_argv(platform, &url);
-            assert_eq!(program, expected);
-            assert_eq!(args, [url.as_str()]);
-            assert!(!matches!(program, "cmd" | "cmd.exe" | "sh" | "bash"));
+            let argv = opener_argv(platform, &url);
+            assert_eq!(argv, Ok((expected, [url.as_str()])));
+            assert!(
+                !argv
+                    .is_ok_and(|(program, _)| matches!(program, "cmd" | "cmd.exe" | "sh" | "bash"))
+            );
         }
+    }
+
+    #[test]
+    fn xdg_open_refuses_a_raw_query_ampersand() {
+        let url = github("https://github.com/a?x=1&y=2").expect("admitted");
+        assert_eq!(
+            opener_argv(Platform::Other, &url),
+            Err(OpenerRefusal::QueryAmpersand)
+        );
+    }
+
+    #[test]
+    fn xdg_open_admits_a_percent_encoded_ampersand() {
+        let url = github("https://github.com/a?x=1%26y=2").expect("admitted");
+        assert_eq!(
+            opener_argv(Platform::Other, &url),
+            Ok(("xdg-open", ["https://github.com/a?x=1%26y=2"]))
+        );
+    }
+
+    #[test]
+    fn openers_without_a_shell_path_admit_a_query_ampersand() {
+        let url = github("https://github.com/a?x=1&y=2").expect("admitted");
+        for (platform, expected) in [
+            (Platform::MacOs, "open"),
+            (Platform::Windows, "explorer.exe"),
+        ] {
+            assert_eq!(
+                opener_argv(platform, &url),
+                Ok((expected, ["https://github.com/a?x=1&y=2"]))
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_url_names_its_by_hand_fallback() {
+        assert_eq!(
+            OpenOutcome::Refused(OpenerRefusal::QueryAmpersand).to_string(),
+            "the URL holds `&`, which xdg-open may hand to a shell; open it by hand"
+        );
     }
 
     #[test]

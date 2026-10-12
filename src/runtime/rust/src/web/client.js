@@ -761,8 +761,18 @@ var __ipeAutofocusSpent = (function() {
 ["focusin", "pointerdown", "mousedown", "touchstart", "keydown"].forEach(function(type) {
   __ipeDoc.on(type, function() { __ipeAutofocusSpent = true; }, true);
 });
+// The element the URL fragment names, resolved from the URL itself: `:target`
+// matches only once the browser has applied the fragment, which can follow the
+// first frame.
+function __ipeFragmentTarget() {
+  var raw = window.location.hash.slice(1);
+  if (!raw) return null;
+  var found = __ipeDoc.byId(raw);
+  if (found) return found;
+  try { return __ipeDoc.byId(decodeURIComponent(raw)); } catch (_) { return null; }
+}
 function __ipeAutofocusDue() {
-  return !__ipeMounted && !__ipeAutofocusSpent && !__ipeDoc.query(":target");
+  return !__ipeMounted && !__ipeAutofocusSpent && !__ipeFragmentTarget();
 }
 function __ipeFocusAutofocus(root) {
   var now = __ipeDoc.active();

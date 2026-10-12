@@ -2671,7 +2671,23 @@ pub struct ProcessRunWithCfg {
     pub env: Vec<(String, String)>,
 }
 
-crate::stringify::show_row!("ProcessRunWithCfg", Redacted, [] ProcessRunWithCfg, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "ProcessRunWithCfg",
+    Redacted(Reveal),
+    [] ProcessRunWithCfg,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, view| {
+        crate::stringify::dev_record(
+            "ProcessRunWithCfg",
+            &[
+                ("command", c.command.clone()),
+                ("args", c.args.ipe_render(view)),
+                ("cwd", c.cwd.ipe_render(view)),
+                ("env", c.env.ipe_render(view)),
+            ],
+        )
+    },
+);
 
 #[must_use]
 fn process_run_with_impl<
@@ -2715,7 +2731,25 @@ pub struct ProcessRunInPtyCfg {
     pub rows: i64,
 }
 
-crate::stringify::show_row!("ProcessRunInPtyCfg", Redacted, [] ProcessRunInPtyCfg, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "ProcessRunInPtyCfg",
+    Redacted(Reveal),
+    [] ProcessRunInPtyCfg,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, view| {
+        crate::stringify::dev_record(
+            "ProcessRunInPtyCfg",
+            &[
+                ("command", c.command.clone()),
+                ("args", c.args.ipe_render(view)),
+                ("cwd", c.cwd.ipe_render(view)),
+                ("env", c.env.ipe_render(view)),
+                ("cols", c.cols.to_string()),
+                ("rows", c.rows.to_string()),
+            ],
+        )
+    },
+);
 
 /// The structured result of a `runInPty` spawn: the child's exit code and the
 /// combined stream read from the pty master until the child exits. Exposed as a
