@@ -98,7 +98,7 @@ impl std::fmt::Debug for Secret {
 
 // ALWAYS the fixed placeholder: a `Secret` shown directly (without
 // `Secret.redacted`) renders the safe redacted output, never its content.
-crate::stringify::show_row!("Secret", Redacted, [] Secret, |_| REDACTED.to_owned());
+crate::stringify::show_row!("Secret", Redacted(Withhold), [] Secret, |_| REDACTED.to_owned());
 
 impl crate::retained::RetainedBytes for Secret {
     // The allocation's capacity is the whole measure: the payload is never read.

@@ -60,7 +60,19 @@ pub struct Regex {
     max_input: usize,
 }
 
-crate::stringify::show_row!("Regex", Redacted, [] Regex, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "Regex",
+    Redacted(Reveal),
+    [] Regex,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |r, _| crate::stringify::dev_record(
+        "Regex",
+        &[
+            ("pattern", r.re.as_str().to_owned()),
+            ("maxInput", r.max_input.to_string()),
+        ],
+    ),
+);
 
 /// `Regex.compile : String -> Result Error Regex` — THE construction boundary.
 /// Every [`Regex`] value traces back to one of these calls; an invalid pattern

@@ -166,7 +166,27 @@ pub struct HttpRequest {
     pub url: String,
 }
 
-crate::stringify::show_row!("HttpRequest", Redacted, [] HttpRequest, |_| crate::stringify::REDACTED_SHOW.to_owned());
+// The dev view names every field; a credential header's value renders as the
+// marker.
+crate::stringify::show_row!(
+    "HttpRequest",
+    Redacted(Reveal),
+    [] HttpRequest,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |r, view| {
+        crate::stringify::dev_record(
+            "HttpRequest",
+            &[
+                ("body", r.body.clone()),
+                ("headers", crate::stringify::dev_header_list(&r.headers)),
+                ("method", r.method.ipe_render(view)),
+                ("redirects", r.redirects.ipe_render(view)),
+                ("timeout", r.timeout.to_string()),
+                ("url", r.url.clone()),
+            ],
+        )
+    },
+);
 
 // The body, headers (`Authorization`) and URL (an API key in the query) can
 // carry a credential; the Ipê record fixes the field types, so the masking lives

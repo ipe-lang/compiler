@@ -108,7 +108,23 @@ pub struct WsClientCfg {
     pub pingInterval: i64,
 }
 
-crate::stringify::show_row!("WebSocketClientCfg", Redacted, [] WsClientCfg, |_| crate::stringify::REDACTED_SHOW.to_owned());
+// The dev view names every field; a credential header's value renders as the
+// marker.
+crate::stringify::show_row!(
+    "WebSocketClientCfg",
+    Redacted(Reveal),
+    [] WsClientCfg,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| crate::stringify::dev_record(
+        "WebSocketCfg",
+        &[
+            ("url", c.url.clone()),
+            ("headers", crate::stringify::dev_header_list(&c.headers)),
+            ("timeout", c.timeout.to_string()),
+            ("pingInterval", c.pingInterval.to_string()),
+        ],
+    ),
+);
 
 // The headers (`Authorization`) and URL (a token in the query) can carry a
 // credential; the Ipê record fixes the field types, so the masking lives in

@@ -286,7 +286,46 @@ pub struct Dsn {
     tls: TlsMode,
 }
 
-crate::stringify::show_row!("Dsn", Redacted, [] Dsn, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "Dsn",
+    Redacted(Reveal),
+    [] Dsn,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |d, _| d.dev(),
+);
+
+impl Dsn {
+    /// The descriptor as `Debug.log` prints it in a dev-posture build.
+    ///
+    /// Every field but the password, which renders as the marker.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self) -> String {
+        use crate::stringify::{REDACTED_SHOW, dev_record};
+        let target = match &self.target {
+            DsnTarget::Postgres(database) => format!("Postgres {}", database.as_str()),
+            DsnTarget::Sqlite(SqliteDb::Memory) => format!("Sqlite {SQLITE_MEMORY}"),
+            DsnTarget::Sqlite(SqliteDb::File(name)) => format!("Sqlite {name}"),
+        };
+        let tls = match self.tls {
+            TlsMode::Require => "Require",
+            TlsMode::Prefer => "Prefer",
+            TlsMode::Disable => "Disable",
+        };
+        let mut fields = vec![
+            ("target", target),
+            ("host", self.host.as_str().to_owned()),
+            ("port", self.port.to_string()),
+        ];
+        if let Some(credentials) = &self.credentials {
+            fields.push(("user", credentials.user.as_str().to_owned()));
+            if credentials.password.is_some() {
+                fields.push(("password", REDACTED_SHOW.to_owned()));
+            }
+        }
+        fields.push(("tls", tls.to_owned()));
+        dev_record("Dsn", &fields)
+    }
+}
 
 impl std::fmt::Debug for Dsn {
     /// Redact the whole descriptor. The password is already a `Secret` (its own
