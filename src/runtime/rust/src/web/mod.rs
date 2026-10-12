@@ -15670,13 +15670,13 @@ mod web_revocation_tests {
         assert!(
             owners
                 .iter()
-                .all(|o| matches!(o.as_deref(), Some("lookup_session" | "page"))),
+                .all(|o| matches!(o.as_deref(), Some("lookup_session" | "serve_page"))),
             "a live entry is read only by the resolver and the page rejoin it admits: {owners:?}"
         );
 
         let rejoins = call_owners(&code, &bodies, "store", "get_reconstructing");
         assert!(
-            !rejoins.is_empty() && rejoins.iter().all(|o| o.as_deref() == Some("page")),
+            !rejoins.is_empty() && rejoins.iter().all(|o| o.as_deref() == Some("serve_page")),
             "a session is reconstructed only by the page rejoin: {rejoins:?}"
         );
         let writes = call_owners(&code, &bodies, "store", "set");
@@ -15688,7 +15688,7 @@ mod web_revocation_tests {
         assert!(
             writes
                 .iter()
-                .all(|o| matches!(o.as_deref(), Some("checkpoint" | "page"))),
+                .all(|o| matches!(o.as_deref(), Some("checkpoint" | "serve_page"))),
             "an open session is written back only through the checkpoint: {writes:?}"
         );
         let sweeps = call_owners(&code, &bodies, "store", "web_sessions");

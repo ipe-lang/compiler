@@ -728,6 +728,7 @@ mod served {
 pub use served::{HostAdmission, HostAdmissionLayer, HostAdmissionService, HostRefusal};
 
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 
