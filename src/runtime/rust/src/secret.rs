@@ -100,6 +100,13 @@ impl std::fmt::Debug for Secret {
 // `Secret.redacted`) renders the safe redacted output, never its content.
 crate::stringify::show_row!("Secret", Redacted, [] Secret, |_| REDACTED.to_owned());
 
+impl crate::retained::RetainedBytes for Secret {
+    // The allocation's capacity is the whole measure: the payload is never read.
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        crate::retained::Bytes::inline::<Self>()?.plus_count(self.0.capacity())
+    }
+}
+
 impl Drop for Secret {
     /// Zeroize the backing buffer so the plaintext does not linger in freed
     /// heap memory. Ships now (security-tier hardening is pre-push), not
@@ -196,6 +203,20 @@ pub fn secret_redacted(s: Secret) -> String {
 mod tests {
     use super::*;
     use crate::stringify::IpeStringify;
+
+    // ── the retained measure reads capacity, never content ──────────────────
+
+    #[test]
+    fn a_secret_measures_its_capacity_never_its_content() {
+        use crate::retained::RetainedBytes;
+        let mut a = String::with_capacity(4096);
+        a.push_str("sk_live_aaaa");
+        let mut b = String::with_capacity(4096);
+        b.push('x');
+        let (a, b) = (secret_from_string(a), secret_from_string(b));
+        assert_eq!(a.retained_bytes(), b.retained_bytes());
+        assert!(a.retained_bytes().is_some_and(|n| n.get() >= 4096));
+    }
 
     // ── (a) normal safe usage works end-to-end ──────────────────────────────
 

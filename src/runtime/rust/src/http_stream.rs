@@ -57,6 +57,9 @@ pub struct IpeStreamId {
 // A stream id names a live registry slot; its key is never rendered.
 crate::stringify::show_row!("StreamId", Value, [] IpeStreamId, |_| "<stream>".to_owned());
 
+// A registry key held inline: the inline size is the whole measure.
+crate::retained::inline_measure!(IpeStreamId);
+
 /// The registry key behind a `StreamId`: nonzero, so no zeroed value names a stream.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct StreamKey(NonZeroU128);
@@ -183,6 +186,17 @@ pub enum ChunkEvent<E> {
 }
 
 crate::stringify::show_row!("ChunkEvent", Internals, [E] ChunkEvent<E>, |_| "<Ipe.Http.Stream.ChunkEvent>".to_owned());
+
+impl<E: crate::retained::RetainedBytes> crate::retained::RetainedBytes for ChunkEvent<E> {
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        let inline = crate::retained::Bytes::inline::<Self>()?;
+        match self {
+            Self::Chunk(text) => inline.plus(text),
+            Self::Done => Some(inline),
+            Self::Errored(err) => inline.plus(err),
+        }
+    }
+}
 
 /// Live upstream connections allowed at once: the live-table cap and the
 /// connection-permit count.

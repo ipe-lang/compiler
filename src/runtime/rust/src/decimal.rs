@@ -18,6 +18,9 @@ pub struct Decimal(pub RD);
 // The canonical renderer (normalized, no trailing zeros), as `Decimal.toString`.
 crate::stringify::show_row!("Decimal", Value, [] Decimal, |d| decimal_to_string(*d));
 
+// A fixed-size mantissa and scale: the inline size is the whole measure.
+crate::retained::inline_measure!(Decimal);
+
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::str::FromStr;

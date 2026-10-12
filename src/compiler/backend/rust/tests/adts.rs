@@ -720,3 +720,151 @@ fn build_and_assert(
     }
     Ok(())
 }
+
+/// The `for` type of every emitted `trait_name` impl, impl headers joined onto one line.
+fn impl_targets(out: &str, trait_name: &str) -> Vec<String> {
+    let joined = out.replace("\n    for ", " for ");
+    let needle = format!(" {trait_name} for ");
+    joined
+        .lines()
+        .filter(|line| line.starts_with("impl"))
+        .filter_map(|line| line.split_once(&needle))
+        .map(|(_, ty)| ty.trim_end_matches(" {").trim().to_owned())
+        .collect()
+}
+
+/// Every emitted `IpeStringify` impl has its `RetainedBytes` twin.
+///
+/// A variant or record holding a non-serde field measures `None`. CI job:
+/// `test`.
+#[test]
+fn every_stringify_impl_has_its_retained_twin() -> DResult<()> {
+    let mut interner = Interner::new();
+    let mut prog = maybe_program(&mut interner)?;
+    let handler = interner.intern("Handler")?;
+    let handle = interner.intern("Handle")?;
+    let named = interner.intern("Named")?;
+    let label = interner.intern("label")?;
+    let run = interner.intern("run")?;
+    let x = interner.intern("x")?;
+    let y = interner.intern("y")?;
+    let int_to_int = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
+    let module = prog
+        .modules
+        .first_mut()
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "adts test",
+            detail: "no module".to_owned(),
+        })?;
+    // type Handler = Handle (Int -> Int) | Named String Int
+    module.types.push(TypeDef::Enum(EnumDef {
+        name: handler,
+        type_params: vec![],
+        variants: vec![
+            Variant {
+                name: handle,
+                fields: vec![int_to_int.clone()],
+            },
+            Variant {
+                name: named,
+                fields: vec![IrType::Str, IrType::Int],
+            },
+        ],
+        home: ModPath(vec![]),
+    }));
+    module.records.push(IrType::Record(
+        [(x, IrType::Int), (y, IrType::Str)].into_iter().collect(),
+    ));
+    module.records.push(IrType::Record(
+        [(label, IrType::Str), (run, int_to_int)]
+            .into_iter()
+            .collect(),
+    ));
+    let mut tree_interner = Interner::new();
+    let tree = tree_program(&mut tree_interner)?;
+    let out = emit(&interner, &prog)?;
+    let tree_out = emit(&tree_interner, &tree)?;
+
+    for emitted in [&out, &tree_out] {
+        let shown = impl_targets(emitted, "IpeStringify");
+        let measured = impl_targets(emitted, "RetainedBytes");
+        assert!(
+            !shown.is_empty(),
+            "no IpeStringify impl emitted:\n{emitted}"
+        );
+        assert_eq!(
+            shown, measured,
+            "a shown type lacks its measure:\n{emitted}"
+        );
+    }
+    assert!(
+        out.contains("impl<T1: RetainedBytes> RetainedBytes for MainMaybe<T1> {"),
+        "a generic enum's measure must bound its parameters:\n{out}"
+    );
+    assert!(
+        out.contains("MainHandler::Handle(..) => None,"),
+        "a function-holding variant must measure None:\n{out}"
+    );
+    assert!(
+        out.contains("MainHandler::Named(p0, p1) => Bytes::inline::<Self>()?.plus(p0)?.plus(p1),"),
+        "a serde variant must measure every field:\n{out}"
+    );
+    assert!(
+        out.contains("fn retained_bytes(&self) -> Option<Bytes> {\n        None\n    }"),
+        "a function-holding record must measure None:\n{out}"
+    );
+    assert!(
+        tree_out.contains("MainTree::Node(p0, p1, p2) => Bytes::inline::<Self>()?"),
+        "a boxed self-edge must measure through its box:\n{tree_out}"
+    );
+    Ok(())
+}
+
+/// A tuple wider than the runtime's widest `RetainedBytes` tuple impl is serde
+/// but unmeasured: a field holding one, bare or inside a carrier, measures
+/// `None` rather than naming an impl that does not exist. CI job: `test`.
+#[test]
+fn a_wide_tuple_field_measures_none() -> DResult<()> {
+    let mut interner = Interner::new();
+    let mut prog = maybe_program(&mut interner)?;
+    let wide_name = interner.intern("wide")?;
+    let boxed_name = interner.intern("boxed")?;
+    let keep_name = interner.intern("keep")?;
+    let wide = IrType::Tuple(vec![IrType::Int; ipe_ir::MAX_SHOWN_TUPLE_ARITY + 1]);
+    let widest = IrType::Tuple(vec![IrType::Int; ipe_ir::MAX_SHOWN_TUPLE_ARITY]);
+    let module = prog
+        .modules
+        .first_mut()
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "adts test",
+            detail: "no module".to_owned(),
+        })?;
+    module.records.push(IrType::Record(
+        [(wide_name, wide.clone())].into_iter().collect(),
+    ));
+    module.records.push(IrType::Record(
+        [(boxed_name, IrType::List(Box::new(wide)))]
+            .into_iter()
+            .collect(),
+    ));
+    module
+        .records
+        .push(IrType::Record([(keep_name, widest)].into_iter().collect()));
+    let out = emit(&interner, &prog)?;
+    assert_eq!(
+        impl_targets(&out, "IpeStringify"),
+        impl_targets(&out, "RetainedBytes"),
+        "a shown type lacks its measure:\n{out}"
+    );
+    for field in ["wide", "boxed"] {
+        assert!(
+            !out.contains(&format!(".plus(&self.{field})")),
+            "a wide-tuple field must not be measured:\n{out}"
+        );
+    }
+    assert!(
+        out.contains(".plus(&self.keep)"),
+        "a tuple at the widest impl arity is measured:\n{out}"
+    );
+    Ok(())
+}

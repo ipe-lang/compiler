@@ -20,6 +20,31 @@ crate::stringify::show_row!("ProjectionTerm", Internals, [] ProjectionTerm, |_| 
 crate::stringify::show_row!("ProjectionOperand", Internals, [] ProjectionOperand, |_| "<Ipe.Db.ProjectionOperand>".to_owned());
 #[cfg(feature = "db")]
 crate::stringify::show_row!("ArithOp", Internals, [] ArithOp, |_| "<Ipe.Db.ArithOp>".to_owned());
+#[cfg(feature = "db")]
+crate::retained::inline_measure!(ArithOp);
+#[cfg(feature = "db")]
+impl crate::retained::RetainedBytes for ProjectionOperand {
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        let inline = crate::retained::Bytes::inline::<Self>()?;
+        match self {
+            Self::OperandColumn(dotted) => inline.plus(dotted),
+            Self::OperandLiteral => Some(inline),
+        }
+    }
+}
+#[cfg(feature = "db")]
+impl crate::retained::RetainedBytes for ProjectionTerm {
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        let inline = crate::retained::Bytes::inline::<Self>()?;
+        match self {
+            Self::ColumnTerm(alias, column) => inline.plus(alias)?.plus(column),
+            Self::LiteralTerm => Some(inline),
+            Self::UpperTerm(dotted) | Self::LowerTerm(dotted) => inline.plus(dotted),
+            Self::CoalesceTerm(a, b) => inline.plus(a)?.plus(b),
+            Self::ArithTerm(op, a, b) => inline.plus(op)?.plus(a)?.plus(b),
+        }
+    }
+}
 
 /// One term in a `Store.select` projection — the typed carrier that replaces the
 /// stringly-encoded `(tag, operand_a, operand_b)` triple.  Illegal states are

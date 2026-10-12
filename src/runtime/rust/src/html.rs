@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::css_safety;
+use crate::retained::{Bytes, RetainedBytes};
 
 /// Form data delivered to an `OnForm` handler (lower-cased keys; see dispatch).
 pub type FormData = HashMap<String, String>;
@@ -1359,6 +1360,75 @@ crate::stringify::show_row!("Html", Internals, [M] Html<M>, |_| "<Ipe.Html.Html>
 crate::stringify::show_row!("HtmlAttribute", Internals, [M] Attribute<M>, |_| "<Ipe.Html.Attribute>".to_owned());
 crate::stringify::show_row!("HtmlEvent", Internals, [M] Event<M>, |_| "<Ipe.Html.Events.Event>".to_owned());
 
+// ─── Retained measures for the Html runtime types ───────────────────────────
+
+impl<M: RetainedBytes> RetainedBytes for Html<M> {
+    // Walked with an explicit worklist, as `Drop` is, so a deep tree is measured
+    // without recursion. Each node counts its inline size once; an element adds
+    // its tag, its attributes and its children list's spare slots.
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let node = Bytes::inline::<Self>()?;
+        let mut total = Bytes::ZERO;
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(html) = pending.pop() {
+            total = total.checked_add(node)?;
+            match html {
+                Self::HElement(tag, attrs, children) => {
+                    let spare = children.capacity().checked_sub(children.len())?;
+                    total = total
+                        .plus(tag)?
+                        .plus(attrs)?
+                        .checked_add(Bytes::slots::<Self>(spare)?)?;
+                    pending.extend(children);
+                }
+                Self::HText(text) | Self::HRaw(text) => total = total.plus(text)?,
+            }
+        }
+        Some(total)
+    }
+}
+
+impl<M: RetainedBytes> RetainedBytes for Attribute<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            Self::Attr(key, value) => inline.plus(key)?.plus(value),
+            Self::BoolAttr(key, on) => inline.plus(key)?.plus(on),
+            Self::EventAttr(event) => inline.plus(event),
+            Self::NoAttr => Some(inline),
+        }
+    }
+}
+
+impl<M: RetainedBytes> RetainedBytes for Event<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
+            Self::OnString(name, handler) => {
+                inline.plus(name)?.checked_add(handler_bytes(handler)?)
+            }
+            Self::OnBool(name, handler) => inline.plus(name)?.checked_add(handler_bytes(handler)?),
+            Self::OnForm(name, handler) => inline.plus(name)?.checked_add(handler_bytes(handler)?),
+            Self::OnWidget(name, handler) => {
+                inline.plus(name)?.checked_add(handler_bytes(handler)?)
+            }
+        }
+    }
+}
+
+/// The bytes a shared event handler keeps alive, counted at every reference.
+///
+/// The pointer, the two reference counters and the closure's inline captures.
+/// Heap a capture owns (a captured `String`'s buffer) is not reachable through
+/// `dyn Fn` and is not counted, so this undercounts a closure capturing an
+/// allocation.
+fn handler_bytes<F: ?Sized>(handler: &std::sync::Arc<F>) -> Option<Bytes> {
+    Bytes::inline::<std::sync::Arc<F>>()?
+        .checked_add(Bytes::inline::<[usize; 2]>()?)?
+        .plus_count(std::mem::size_of_val::<F>(handler))
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
@@ -1366,6 +1436,28 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
+    }
+
+    // A tree far deeper than any recursion could walk is measured on the heap,
+    // and the measure covers every text byte it holds.
+    #[test]
+    fn a_deep_tree_is_measured_without_recursion() {
+        let depth = 200_000_usize;
+        let mut tree: Html<()> = Html::HText("x".repeat(64));
+        for _ in 0..depth {
+            tree = Html::HElement("div".into(), Vec::new(), vec![tree]);
+        }
+        let measured = tree.retained_bytes().map(Bytes::get);
+        let floor = u64::try_from(64 + 3 * depth).unwrap();
+        assert!(measured.is_some_and(|n| n >= floor), "{measured:?}");
+    }
+
+    // A message an event carries counts toward the attribute holding it.
+    #[test]
+    fn an_event_counts_its_message() {
+        let msg = "m".repeat(4096);
+        let attr: Attribute<String> = Attribute::EventAttr(Event::OnMsg("click".into(), msg));
+        assert!(attr.retained_bytes().is_some_and(|n| n.get() >= 4096));
     }
 
     // An attribute's `{:?}` names the attribute and hides its value.
