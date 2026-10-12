@@ -174,8 +174,8 @@ pub struct Policy {
     pub threshold: Threshold,
 }
 
-/// The distance within which another target makes a one-edit guess
-/// ambiguous, whether or not the site's threshold shows that target.
+/// The distance within which another target makes a case-only or one-edit
+/// guess ambiguous, whether or not the site's threshold shows that target.
 const RIVAL_EDITS: Distance = Distance(2);
 
 /// The longest folded query every rival comparison sees uncut.
@@ -204,17 +204,19 @@ impl Distance {
 }
 
 /// How sure the ranker is that a hit is what the query meant, best first.
+///
+/// Both confident verdicts share one rule: the hit is the best target, the
+/// scan was complete, no spelling was cut at [`SPELLING_CHARS`], the query is
+/// at most [`exact_query_chars`] long, and no other target sits within
+/// [`RIVAL_EDITS`] of the query by the one rival measure every spelling is
+/// scored with, whether the site's threshold shows it, hides it, or shows it
+/// farther. No unseen or miscounted spelling can then compete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
-    /// The query and a spelling differ only in letter case, no other target
-    /// sits at distance zero, and neither the scan nor the list was cut, so
-    /// no unseen spelling could compete.
+    /// The query and the hit differ only in letter case, and the hit stands
+    /// alone under the shared rule.
     CaseOnly,
-    /// The one hit at one edit, with no other target within [`RIVAL_EDITS`]
-    /// of the query (shown, kept out by the threshold, or shown farther by
-    /// segment yet that near whole), a complete scan, no spelling cut at
-    /// [`SPELLING_CHARS`], and a query of at most [`exact_query_chars`], so no
-    /// unseen or miscounted spelling could compete.
+    /// The hit is one edit away and stands alone under the shared rule.
     UniqueSingleEdit,
     /// Any other hit, including an exact spelling: the site's exact lookup
     /// answers that one before ranking.
@@ -298,13 +300,14 @@ pub fn rank<'a, T: Ord + Clone>(
     let query_segments: Vec<Vec<char>> = query.segments.iter().map(|s| cut_chars(s)).collect();
     let mut work = Work::default();
     let mut best: BTreeMap<T, Best> = BTreeMap::new();
-    // Targets within `RIVAL_EDITS` of the query by the rival measure that the
-    // site's threshold kept out or scored farther: each makes a one-edit
-    // guess ambiguous.
-    let mut rivals: BTreeSet<T> = BTreeSet::new();
+    // Every target within `RIVAL_EDITS` of the query by the one rival
+    // measure, scored for every spelling whatever the site's threshold made
+    // of it: any but the guess's own target makes a confident guess ambiguous.
+    let mut near: BTreeSet<T> = BTreeSet::new();
     // Whether every comparison saw its sides whole: a long query or a cut
     // spelling can hide a rival's real distance.
     let mut exact = query.folded.chars().nth(exact_query_chars()).is_none();
+    let rival = Threshold::Nearest { max: RIVAL_EDITS };
 
     let mut scan = universe.into_iter();
     for spelling in scan.by_ref().take(MAX_UNIVERSE) {
@@ -319,21 +322,18 @@ pub fn rank<'a, T: Ord + Clone>(
             policy.threshold,
             &mut work,
         );
-        if found.is_none_or(|f| f.distance > RIVAL_EDITS) {
-            let rival = Threshold::Nearest { max: RIVAL_EDITS };
-            if score(
-                query,
-                &query_whole,
-                &query_segments,
-                head,
-                cut,
-                rival,
-                &mut work,
-            )
-            .is_some()
-            {
-                rivals.insert(spelling.target.clone());
-            }
+        if score(
+            query,
+            &query_whole,
+            &query_segments,
+            head,
+            cut,
+            rival,
+            &mut work,
+        )
+        .is_some()
+        {
+            near.insert(spelling.target.clone());
         }
         let Some(found) = found else {
             continue;
@@ -351,26 +351,20 @@ pub fn rank<'a, T: Ord + Clone>(
     let mut ordered: Vec<(T, Best)> = best.into_iter().collect();
     ordered.sort_by(|(at, a), (bt, b)| a.cmp(b).then_with(|| at.cmp(bt)));
     let runner_up = ordered.get(1).map(|(_, b)| b.distance);
-    // A case-only match is unambiguous only when no other target also sits at
-    // distance zero and every competitor is visible: a cut scan or a cut list
-    // could hide another spelling of the same letters.
-    let exact_ties = ordered
-        .iter()
-        .take_while(|(_, b)| b.distance == Distance(0))
-        .count();
     let mut hits: Vec<Hit<T>> = ordered
         .into_iter()
         .enumerate()
         .map(|(at, (target, found))| {
-            let unique = at == 0
+            // One rule for every confident verdict: the best target of a
+            // whole, exact scan, with no other target within `RIVAL_EDITS`.
+            let alone = at == 0
                 && !truncated
                 && exact
-                && found.distance == Distance(1)
                 && runner_up.is_none_or(|next| next > RIVAL_EDITS)
-                && rivals.iter().all(|rival| *rival == target);
-            let confidence = if found.case_only {
+                && near.iter().all(|other| *other == target);
+            let confidence = if alone && found.case_only {
                 Confidence::CaseOnly
-            } else if unique {
+            } else if alone && found.distance == Distance(1) {
                 Confidence::UniqueSingleEdit
             } else {
                 Confidence::Plausible
@@ -387,15 +381,7 @@ pub fn rank<'a, T: Ord + Clone>(
             .cmp(&(b.distance, b.confidence))
             .then_with(|| a.target.cmp(&b.target))
     });
-    let capped = hits.len() > policy.cap.get();
     hits.truncate(policy.cap.get());
-    if truncated || capped || exact_ties > 1 {
-        for hit in &mut hits {
-            if hit.confidence == Confidence::CaseOnly {
-                hit.confidence = Confidence::Plausible;
-            }
-        }
-    }
     Ranked { hits, truncated }
 }
 
@@ -778,7 +764,47 @@ mod tests {
         );
         let first = ranked.hits.first().expect("a hit");
         assert_eq!(first.target, "Just");
-        assert_eq!(first.confidence, Confidence::CaseOnly);
+        assert_eq!(
+            first.confidence,
+            Confidence::Plausible,
+            "`Juts` is one edit from the folded query"
+        );
+    }
+
+    /// A case-only guess stands alone under the same rule as a one-edit
+    /// guess: a rival within two edits, shown or hidden by the threshold, or
+    /// a query too long to compare exactly, keeps it plausible.
+    #[test]
+    fn a_case_only_match_with_a_near_rival_is_plausible() {
+        let confidence = |raw: &str, names: &[&str]| {
+            rank(&query(raw, Shape::Flat), spellings(names), RELATIVE)
+                .hits
+                .first()
+                .map(|h| (h.target.to_owned(), h.confidence))
+        };
+        assert_eq!(
+            confidence("just", &["Just", "must"]),
+            Some(("Just".to_owned(), Confidence::Plausible)),
+            "a shown rival one edit away"
+        );
+        assert_eq!(targets("just", Shape::Flat, &["Just", "mast"]), ["Just"]);
+        assert_eq!(
+            confidence("just", &["Just", "mast"]),
+            Some(("Just".to_owned(), Confidence::Plausible)),
+            "a rival two edits away the threshold hides"
+        );
+        assert_eq!(
+            confidence("just", &["Just", "zzzz"]),
+            Some(("Just".to_owned(), Confidence::CaseOnly)),
+            "a far name is no rival"
+        );
+        let long = "a".repeat(DISTANCE_CHARS);
+        let upper = long.to_uppercase();
+        assert_eq!(
+            confidence(&long, &[upper.as_str()]),
+            Some((upper.clone(), Confidence::Plausible)),
+            "a query past the exact length is never confident"
+        );
     }
 
     /// A case-only guess that shares distance zero with another target, or
@@ -797,7 +823,7 @@ mod tests {
                 one
             )),
             Some(Confidence::Plausible),
-            "the cap hides a second case-only spelling"
+            "a second case-only spelling ties at distance zero, even when the cap hides it"
         );
         assert_eq!(
             confidence(rank(

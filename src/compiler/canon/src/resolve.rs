@@ -7743,7 +7743,8 @@ pub fn detect_kernel_alias(
 /// The ranked `did you mean` hits for an unresolved `typo` over the symbol
 /// universe `candidates`.
 ///
-/// A candidate the interner cannot resolve is skipped (it cannot be rendered)
+/// A candidate the interner cannot resolve is a competitor the ranker never
+/// measured, so it voids every hit (no guess can then claim to stand alone)
 /// rather than faulting the whole diagnostic.
 fn suggestions(
     typo: Symbol,
@@ -7754,11 +7755,22 @@ fn suggestions(
     let Some(typo_str) = interner.resolve(typo) else {
         return Box::new([]);
     };
-    ranked_names(
+    let unresolved = std::cell::Cell::new(false);
+    let hits = ranked_names(
         typo_str,
         shape,
-        candidates.filter_map(|c| interner.resolve(c)),
-    )
+        candidates.filter_map(|c| {
+            let name = interner.resolve(c);
+            if name.is_none() {
+                unresolved.set(true);
+            }
+            name
+        }),
+    );
+    if unresolved.get() {
+        return Box::new([]);
+    }
+    hits
 }
 
 /// The ranked `did you mean` hits for an unresolved `typo` over the name
@@ -8417,7 +8429,7 @@ mod suggestion_ranking_tests {
     //! including the IPE-N0020 module-not-found candidate universe (which is why
     //! an unrelated import cannot dump every project module as a "did you mean").
 
-    use super::{MAX_SUGGESTIONS, Shape, ranked_names};
+    use super::{Interner, MAX_SUGGESTIONS, Shape, Symbol, ranked_names, suggestions};
     use ipe_diagnostics::suggest::{Confidence, Hit};
 
     fn names(typo: &str, shape: Shape, universe: &[&str]) -> Vec<String> {
@@ -8497,6 +8509,24 @@ mod suggestion_ranking_tests {
             hits.first().map(Hit::confidence),
             Some(Confidence::Plausible)
         );
+    }
+
+    /// A candidate symbol the interner cannot resolve is a competitor the
+    /// ranker never measured: no guess beside it may stand alone.
+    #[test]
+    fn an_unresolvable_candidate_voids_every_guess() {
+        let mut interner = Interner::new();
+        let typo = interner.intern("lenght").expect("interning succeeds");
+        let length = interner.intern("length").expect("interning succeeds");
+        let alone = suggestions(typo, Shape::Flat, [length].into_iter(), &interner);
+        assert_eq!(
+            alone.first().map(Hit::confidence),
+            Some(Confidence::UniqueSingleEdit)
+        );
+        let unknown = Symbol::from_raw(u32::MAX);
+        assert!(interner.resolve(unknown).is_none());
+        let beside = suggestions(typo, Shape::Flat, [length, unknown].into_iter(), &interner);
+        assert!(beside.is_empty(), "got {beside:?}");
     }
 
     #[test]
