@@ -9,8 +9,15 @@
 //! all. A cross-site subresource or frame request never mints: no `init`, no
 //! session slot, no cookie.
 //!
-//! [`MintProof`] has one constructor, [`MintProof::judge`], so the only way the
-//! page handler reaches a fresh session id is through a judged request.
+//! A request carrying a session cookie is judged by the same parse: a
+//! cross-site or same-site subresource, a frame navigation while not
+//! embeddable, malformed metadata, or (while the cookie is `SameSite=None`) no
+//! metadata at all is refused before any session lookup.
+//!
+//! [`Arrival`] parses the metadata once; [`Arrival::mint`] is the one
+//! constructor of [`MintProof`] and [`Arrival::rejoin`] of [`RejoinProof`], so
+//! the page handler reaches neither a fresh session id nor a cookie's session
+//! except through a judged request.
 
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, VARY};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -192,32 +199,55 @@ fn client_router(headers: &HeaderMap) -> bool {
     matches!(field(headers, IPE_NAV), Field::Value("1"))
 }
 
-impl MintProof {
-    /// Judge whether a cookieless page request may mint a session.
-    ///
-    /// # Errors
-    ///
-    /// The [`MintRefusal`] naming why the request's Fetch Metadata does not
-    /// prove a first-party arrival.
-    pub fn judge(headers: &HeaderMap, embedding: Embedding) -> Result<Self, MintRefusal> {
+/// A page request's Fetch Metadata, parsed once into the arrival it proves.
+///
+/// Both session outcomes are judged from it: [`Arrival::rejoin`] admits a
+/// cookie's session key, [`Arrival::mint`] a fresh session.
+pub struct Arrival {
+    shape: Shape,
+    embedding: Embedding,
+}
+
+/// What a request's Fetch Metadata proves about where it came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    /// No Fetch Metadata header at all.
+    Absent,
+    /// Partial, duplicated, non-ASCII, or unrecognised Fetch Metadata.
+    Malformed,
+    /// A top-level navigation from any site.
+    TopLevel,
+    /// A same-origin frame navigation.
+    SameOriginFrame,
+    /// A same-site, cross-site, or user-started frame navigation.
+    ForeignFrame,
+    /// A same-origin request carrying the client router's `X-Ipe-Nav: 1`.
+    ClientRouter,
+    /// Any other same-origin request.
+    SameOriginOther,
+    /// A same-site, cross-site, or user-started request that is not a navigation.
+    Subresource,
+}
+
+impl Shape {
+    fn parse(headers: &HeaderMap) -> Self {
         let Some(metadata) = FetchMetadata::parse(headers) else {
-            return Err(MintRefusal::Malformed);
+            return Self::Malformed;
         };
         let FetchMetadata::Present { site, mode, dest } = metadata else {
-            return Ok(Self(()));
+            return Self::Absent;
         };
         if site == Initiator::Unknown || mode == Mode::Unknown || dest == Dest::Unknown {
-            return Err(MintRefusal::Malformed);
+            return Self::Malformed;
         }
         match (site, mode, dest) {
-            (_, Mode::Navigate, Dest::Document)
-            | (Initiator::SameOrigin, Mode::Navigate, Dest::Iframe | Dest::Frame) => Ok(Self(())),
-            (_, Mode::Navigate, Dest::Iframe | Dest::Frame) => match embedding {
-                Embedding::Embeddable => Ok(Self(())),
-                Embedding::NotEmbeddable => Err(MintRefusal::FrameNotEmbeddable),
-            },
-            (Initiator::SameOrigin, _, _) if client_router(headers) => Ok(Self(())),
-            (Initiator::SameOrigin, _, _) => Err(MintRefusal::UnprovenSameOrigin),
+            (_, Mode::Navigate, Dest::Document) => Self::TopLevel,
+            (Initiator::SameOrigin, Mode::Navigate, Dest::Iframe | Dest::Frame) => {
+                Self::SameOriginFrame
+            }
+            (_, Mode::Navigate, Dest::Iframe | Dest::Frame) => Self::ForeignFrame,
+            (Initiator::SameOrigin, _, _) if client_router(headers) => Self::ClientRouter,
+            (Initiator::SameOrigin, _, _) => Self::SameOriginOther,
             (
                 Initiator::SameSite | Initiator::CrossSite | Initiator::User | Initiator::Unknown,
                 Mode::Navigate
@@ -232,14 +262,94 @@ impl MintProof {
                 | Dest::Empty
                 | Dest::Other
                 | Dest::Unknown,
-            ) => Err(MintRefusal::CrossSiteSubresource),
+            ) => Self::Subresource,
         }
     }
 }
 
-/// The 403 a refused mint answers with: a fixed body, no cookie, never cached.
-#[must_use]
-pub fn refused(_why: MintRefusal) -> Response {
+/// Why a page request carrying a session cookie was refused its session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RejoinRefusal {
+    /// A same-site, cross-site, or user-started request that is not a navigation.
+    CrossSiteSubresource,
+    /// A same-site or cross-site frame navigation while the app is not embeddable.
+    FrameNotEmbeddable,
+    /// No Fetch Metadata while the cookie is `SameSite=None`.
+    Unattested,
+    /// Partial, duplicated, non-ASCII, or unrecognised Fetch Metadata.
+    Malformed,
+}
+
+/// Evidence that a request may act on the session its cookie names.
+///
+/// It holds that session's key, the only one the page handler looks up; it
+/// derives no `Debug`.
+pub struct RejoinProof(crate::web::store::SessionKey);
+
+impl RejoinProof {
+    /// The admitted session key.
+    #[must_use]
+    pub fn into_key(self) -> crate::web::store::SessionKey {
+        self.0
+    }
+}
+
+impl Arrival {
+    /// Parse a page request's Fetch Metadata under the app's embedding mode.
+    #[must_use]
+    pub fn judge(headers: &HeaderMap, embedding: Embedding) -> Self {
+        Self {
+            shape: Shape::parse(headers),
+            embedding,
+        }
+    }
+
+    /// Judge whether this request may act on the session `key` names.
+    ///
+    /// # Errors
+    ///
+    /// The [`RejoinRefusal`] naming why the request does not prove a
+    /// first-party arrival.
+    pub fn rejoin(&self, key: crate::web::store::SessionKey) -> Result<RejoinProof, RejoinRefusal> {
+        match (self.shape, self.embedding) {
+            (Shape::Absent, Embedding::NotEmbeddable)
+            | (
+                Shape::TopLevel
+                | Shape::SameOriginFrame
+                | Shape::ClientRouter
+                | Shape::SameOriginOther,
+                _,
+            )
+            | (Shape::ForeignFrame, Embedding::Embeddable) => Ok(RejoinProof(key)),
+            (Shape::Absent, Embedding::Embeddable) => Err(RejoinRefusal::Unattested),
+            (Shape::Malformed, _) => Err(RejoinRefusal::Malformed),
+            (Shape::ForeignFrame, Embedding::NotEmbeddable) => {
+                Err(RejoinRefusal::FrameNotEmbeddable)
+            }
+            (Shape::Subresource, _) => Err(RejoinRefusal::CrossSiteSubresource),
+        }
+    }
+
+    /// Judge whether this request may mint a session.
+    ///
+    /// # Errors
+    ///
+    /// The [`MintRefusal`] naming why the request does not prove a
+    /// first-party arrival.
+    pub const fn mint(&self) -> Result<MintProof, MintRefusal> {
+        match (self.shape, self.embedding) {
+            (Shape::Absent | Shape::TopLevel | Shape::SameOriginFrame | Shape::ClientRouter, _)
+            | (Shape::ForeignFrame, Embedding::Embeddable) => Ok(MintProof(())),
+            (Shape::Malformed, _) => Err(MintRefusal::Malformed),
+            (Shape::ForeignFrame, Embedding::NotEmbeddable) => Err(MintRefusal::FrameNotEmbeddable),
+            (Shape::SameOriginOther, _) => Err(MintRefusal::UnprovenSameOrigin),
+            (Shape::Subresource, _) => Err(MintRefusal::CrossSiteSubresource),
+        }
+    }
+}
+
+/// The fixed 403 a refused session answers with: no cookie, never cached.
+fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
         [
@@ -249,6 +359,18 @@ pub fn refused(_why: MintRefusal) -> Response {
         REFUSED_BODY,
     )
         .into_response()
+}
+
+/// The 403 a refused rejoin answers with, the same fixed response as a refused mint.
+#[must_use]
+pub fn refused_rejoin(_why: RejoinRefusal) -> Response {
+    forbidden()
+}
+
+/// The 403 a refused mint answers with: a fixed body, no cookie, never cached.
+#[must_use]
+pub fn refused(_why: MintRefusal) -> Response {
+    forbidden()
 }
 
 /// Merge the mint inputs into `headers`' `Vary`.
@@ -337,7 +459,7 @@ mod tests {
     }
 
     fn verdict(h: &HeaderMap, embedding: Embedding) -> Result<(), MintRefusal> {
-        MintProof::judge(h, embedding).map(|_| ())
+        Arrival::judge(h, embedding).mint().map(|_| ())
     }
 
     /// Prove the refusals: every subresource, unembeddable frame, unproven
@@ -449,6 +571,110 @@ mod tests {
             verdict(&h, Embedding::Embeddable),
             Err(MintRefusal::UnprovenSameOrigin)
         );
+    }
+
+    /// A [`Row`] read only for its headers.
+    const fn shape(
+        site: Option<&'static str>,
+        mode: Option<&'static str>,
+        dest: Option<&'static str>,
+    ) -> Row {
+        row(site, mode, dest, Ok(()))
+    }
+
+    /// The rejoin verdict for `r`'s headers under `embedding`.
+    fn rejoin_verdict(r: &Row, embedding: Embedding) -> Option<Result<(), RejoinRefusal>> {
+        let key =
+            crate::web::store::SessionKey::parse(&"a".repeat(crate::web::store::SESSION_ID_LEN))?;
+        Some(
+            Arrival::judge(&headers_for(r), embedding)
+                .rejoin(key)
+                .map(|_| ()),
+        )
+    }
+
+    /// Prove the rejoin refusals: under each embedding mode, every
+    /// subresource, malformed shape, unembeddable frame and (while embeddable)
+    /// metadata-less request is refused with its exact reason, beside the
+    /// admitted first-party shapes.
+    #[test]
+    fn rejoin_refusals() {
+        use Embedding::{Embeddable, NotEmbeddable};
+        use RejoinRefusal::{CrossSiteSubresource, FrameNotEmbeddable, Malformed, Unattested};
+        let cs = Some("cross-site");
+        let ss = Some("same-site");
+        let so = Some("same-origin");
+        let ok: Result<(), RejoinRefusal> = Ok(());
+        let sub = Err(CrossSiteSubresource);
+        // (headers, not-embeddable verdict, embeddable verdict)
+        let rows = [
+            (shape(cs, Some("no-cors"), Some("image")), sub, sub),
+            (shape(ss, Some("no-cors"), Some("image")), sub, sub),
+            (shape(cs, Some("cors"), Some("empty")), sub, sub),
+            (
+                shape(Some("none"), Some("no-cors"), Some("image")),
+                sub,
+                sub,
+            ),
+            (
+                Row {
+                    ipe_nav: true,
+                    ..shape(cs, Some("cors"), Some("empty"))
+                },
+                sub,
+                sub,
+            ),
+            (
+                shape(cs, Some("navigate"), Some("iframe")),
+                Err(FrameNotEmbeddable),
+                ok,
+            ),
+            (
+                shape(ss, Some("navigate"), Some("frame")),
+                Err(FrameNotEmbeddable),
+                ok,
+            ),
+            (shape(None, None, None), ok, Err(Unattested)),
+            (shape(cs, None, None), Err(Malformed), Err(Malformed)),
+            (
+                Row {
+                    duplicate_mode: true,
+                    ..shape(so, Some("navigate"), Some("document"))
+                },
+                Err(Malformed),
+                Err(Malformed),
+            ),
+            (
+                shape(Some("cross-origin"), Some("navigate"), Some("document")),
+                Err(Malformed),
+                Err(Malformed),
+            ),
+            // Admitted in both modes: a top-level navigation, a same-origin
+            // frame, and any same-origin request (client router or not).
+            (shape(cs, Some("navigate"), Some("document")), ok, ok),
+            (shape(so, Some("navigate"), Some("iframe")), ok, ok),
+            (shape(so, Some("cors"), Some("empty")), ok, ok),
+            (
+                Row {
+                    ipe_nav: true,
+                    ..shape(so, Some("cors"), Some("empty"))
+                },
+                ok,
+                ok,
+            ),
+        ];
+        for (i, (r, not_embeddable, embeddable)) in rows.iter().enumerate() {
+            assert_eq!(
+                rejoin_verdict(r, NotEmbeddable),
+                Some(*not_embeddable),
+                "row {i}, not embeddable"
+            );
+            assert_eq!(
+                rejoin_verdict(r, Embeddable),
+                Some(*embeddable),
+                "row {i}, embeddable"
+            );
+        }
     }
 
     fn vary_of(h: &HeaderMap) -> Vec<&str> {
