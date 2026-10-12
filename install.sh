@@ -14,7 +14,6 @@ set -eu
 {
 
 REPO="ipe-lang/compiler"
-INSTALL_DIR="${IPE_INSTALL_DIR:-$HOME/.local/bin}"
 # Set only by `ipe upgrade`'s own wrapper — see die_no_prebuilt below.
 WRAPPED="${IPE_UPGRADE_WRAPPED:-0}"
 TAG_FILE="${IPE_UPGRADE_TAG_FILE:-}"
@@ -423,6 +422,39 @@ release_tag_ok() {
 require_release_tag() {
   release_tag_ok "$1" || die 'The release tag %s is not a version tag (vX.Y.Z).' "$1"
 }
+
+# home_flaw DIR — set HOME_FLAW to the class of the first byte in DIR that a
+# shell reads as code, or as a line break, inside the double-quoted
+# `. "DIR/.ipe/env"` line the installer adds to a startup file, or to '' when
+# DIR holds none: a double quote, a dollar sign, a backtick, a backslash, a
+# newline, or any other C0 control byte or DEL. Spaces and non-ASCII characters
+# stay legal (`/c/Users/John Doe`, an accented user name). DIR is judged as
+# `od` byte numbers, so the verdict never depends on a tool's character model.
+home_flaw() {
+  HOME_FLAW=''
+  for _hf_byte in $(printf '%s' "$1" | od -An -v -tu1); do
+    case "$_hf_byte" in
+      34) HOME_FLAW='a double quote' ;;
+      36) HOME_FLAW='a dollar sign' ;;
+      96) HOME_FLAW='a backtick' ;;
+      92) HOME_FLAW='a backslash' ;;
+      10) HOME_FLAW='a newline' ;;
+      [0-9]|1[0-9]|2[0-9]|3[01]|127) HOME_FLAW='a control character' ;;
+    esac
+    [ -z "$HOME_FLAW" ] || return 0
+  done
+}
+
+# parse_home DIR — set USER_HOME to DIR, the home directory every later path
+# and every line the installer writes for a shell derives from; die when DIR is
+# empty or home_flaw finds a flaw in it.
+parse_home() {
+  [ -n "$1" ] || die 'HOME is not set. Set it to your home directory and try again.'
+  home_flaw "$1"
+  [ -z "$HOME_FLAW" ] \
+    || die 'Refusing HOME %s: it contains %s, which a shell would run as code from the line the installer adds to your startup file. Set HOME to a plain directory path and try again.' "$1" "$HOME_FLAW"
+  USER_HOME="$1"
+}
 # <<< input parsers
 
 # >>> private-scratch helpers
@@ -616,6 +648,11 @@ die_no_prebuilt() {
 # Each environment input is parsed here, before the first network request, so
 # every later use (URLs, env files, the tag file, messages) sees a checked value.
 #
+# HOME is read here and nowhere else: every later path and every line written
+# for a shell to source derives from USER_HOME, the value parse_home accepted.
+parse_home "${HOME:-}"
+INSTALL_DIR="${IPE_INSTALL_DIR:-$USER_HOME/.local/bin}"
+#
 # INSTALL_DIR ends up written verbatim into the ~/.ipe env files, which the
 # user's shell later sources (executes). Parse, don't validate: reject any path
 # carrying shell metacharacters here, ONCE, so every downstream sink can treat
@@ -781,7 +818,7 @@ if command -v cargo >/dev/null 2>&1; then
   fi
 else
   info 'Rust is not installed.'
-  if [ -f "$HOME/.cargo/env" ] && [ "$IS_TTY" = 1 ] && [ -r /dev/tty ]; then
+  if [ -f "$USER_HOME/.cargo/env" ] && [ "$IS_TTY" = 1 ] && [ -r /dev/tty ]; then
     say '\n    @B@Rust seems installed but not on your @0@PATH@B@.@0@'
     prompt '    Source @B@~/.cargo/env@0@ now? [Y/n] '
     ans=''
@@ -789,7 +826,7 @@ else
       case "$ans" in
         ''|[Yy]|[Yy][Ee][Ss])
           # shellcheck source=/dev/null
-          . "$HOME/.cargo/env"
+          . "$USER_HOME/.cargo/env"
           if command -v cargo >/dev/null 2>&1; then
             cargo_ok=1
             stage_ok 'Rust now available (%s).' "$(cargo version | cut -d' ' -f2)"
@@ -821,9 +858,9 @@ else
                 # `sh -s -- -y` hands `-y` to rustup-init (unattended install).
                 if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs 2>/dev/null \
                   | sh -s -- -y 2>/dev/null; then
-                  if [ -f "$HOME/.cargo/env" ]; then
+                  if [ -f "$USER_HOME/.cargo/env" ]; then
                     # shellcheck source=/dev/null
-                    . "$HOME/.cargo/env"
+                    . "$USER_HOME/.cargo/env"
                   fi
                   if command -v cargo >/dev/null 2>&1; then
                     cargo_ok=1
@@ -991,7 +1028,7 @@ stage_ok 'Installed ipe %s to %s/ipe' "$ver" "$INSTALL_DIR"
 # future update or uninstall rewrites or removes it cleanly, and the rc keeps a
 # single stable `. "$HOME/.ipe/env"` line.
 
-IPE_HOME="$HOME/.ipe"
+IPE_HOME="$USER_HOME/.ipe"
 ENV_POSIX="$IPE_HOME/env"
 ENV_FISH="$IPE_HOME/env.fish"
 
@@ -1003,13 +1040,13 @@ on_path() {
   esac
 }
 
-# canonical_home — $HOME with any symlinks and `..` resolved to a physical path,
+# canonical_home — USER_HOME with any symlinks and `..` resolved to a physical path,
 # computed once. The prefix test below compares physical paths, so a link whose
-# textual target begins with "$HOME/" but resolves elsewhere cannot slip past.
-canonical_home="$(cd -P "$HOME" 2>/dev/null && pwd -P)" || canonical_home="$HOME"
+# textual target begins with "$USER_HOME/" but resolves elsewhere cannot slip past.
+canonical_home="$(cd -P "$USER_HOME" 2>/dev/null && pwd -P)" || canonical_home="$USER_HOME"
 
 # refuse_symlink_escape PATH — die if PATH is a symlink whose target resolves
-# outside $HOME. A managed env file or dotfile must stay within the user's home;
+# outside USER_HOME. A managed env file or dotfile must stay within the user's home;
 # we never follow a link that would let us write elsewhere. The whole symlink
 # chain and every `..` are resolved (readlink -f where available, else a
 # physical-cd fallback) before the comparison, so a relative `../` target or a
@@ -1043,18 +1080,18 @@ refuse_symlink_escape() {
 resolve_shell_rc() {
   SH_NAME="$(basename "${SHELL:-sh}")"
   case "$SH_NAME" in
-    zsh)  RC_FILE="${ZDOTDIR:-$HOME}/.zshrc" ;;
+    zsh)  RC_FILE="${ZDOTDIR:-$USER_HOME}/.zshrc" ;;
     bash)
       # Prefer an existing file; else .bash_profile on macOS (login shells),
       # .bashrc elsewhere.
-      if   [ -f "$HOME/.bashrc" ];       then RC_FILE="$HOME/.bashrc"
-      elif [ -f "$HOME/.bash_profile" ]; then RC_FILE="$HOME/.bash_profile"
-      elif [ "$plat" = darwin ];         then RC_FILE="$HOME/.bash_profile"
-      else RC_FILE="$HOME/.bashrc"; fi
+      if   [ -f "$USER_HOME/.bashrc" ];       then RC_FILE="$USER_HOME/.bashrc"
+      elif [ -f "$USER_HOME/.bash_profile" ]; then RC_FILE="$USER_HOME/.bash_profile"
+      elif [ "$plat" = darwin ];         then RC_FILE="$USER_HOME/.bash_profile"
+      else RC_FILE="$USER_HOME/.bashrc"; fi
       ;;
-    fish) RC_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
-    ksh)  RC_FILE="$HOME/.kshrc" ;;
-    *)    RC_FILE="$HOME/.profile" ;;
+    fish) RC_FILE="${XDG_CONFIG_HOME:-$USER_HOME/.config}/fish/config.fish" ;;
+    ksh)  RC_FILE="$USER_HOME/.kshrc" ;;
+    *)    RC_FILE="$USER_HOME/.profile" ;;
   esac
   if [ "$SH_NAME" = fish ]; then
     RC_SOURCE_LINE="source \"$ENV_FISH\""
@@ -1075,7 +1112,7 @@ resolve_shell_rc() {
 # write_managed FILE CONTENT — write CONTENT to FILE by rendering to a fresh
 # exclusively-created (`mktemp`) temp file inside the validated $IPE_HOME and `mv`-ing it into place. `mv`
 # replaces a symlink at FILE rather than following it, so a final-component
-# symlink swapped in after our check cannot redirect the write outside $HOME
+# symlink swapped in after our check cannot redirect the write outside USER_HOME
 # (closing the check-then-write TOCTOU that a plain `>` redirect leaves open).
 write_managed() {
   wm_dest="$1"; wm_body="$2"
