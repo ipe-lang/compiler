@@ -210,10 +210,10 @@ struct State {
     /// a new `recompute` call joins (cancels) the previous one before spawning
     /// its replacement.
     worker: Option<thread::JoinHandle<()>>,
-    /// The in-flight worker's cancel flag, set before joining a superseded
-    /// worker so its lint tail (which never demands the db again, and so cannot
-    /// unwind via salsa `Cancelled`) exits within one module's lint time
-    /// instead of stalling the main loop for a full lint pass.
+    /// The in-flight worker's cancel flag, set by the input sync and again
+    /// before joining a superseded worker, so a lint stage still pending (it
+    /// never demands the db, and so cannot unwind via salsa `Cancelled`) is
+    /// skipped rather than run for a stale generation.
     worker_cancel: Option<Arc<AtomicBool>>,
     /// Last non-empty payload per URI, for change-suppression and clearing.
     last_published: BTreeMap<Url, Vec<lsp_types::Diagnostic>>,
@@ -1038,7 +1038,15 @@ fn module_name_fallback(path: &Path) -> String {
 
 /// Reconcile the salsa inputs with the current layout, open-buffer overlays
 /// shadowing disk text.
+///
+/// The outgoing worker is signalled before the first setter: every caller
+/// follows with `recompute`, whose newer worker owns the next publish, so the
+/// outgoing one stops at its next cancellation point instead of holding the
+/// setter for a full pass.
 fn sync_inputs(state: &mut State) {
+    if let Some(cancel) = &state.worker_cancel {
+        cancel.store(true, Ordering::Relaxed);
+    }
     let desired: BTreeMap<Vec<String>, (String, ModuleOrigin)> =
         state.served.layout().map_or_else(BTreeMap::new, |layout| {
             layout
@@ -1060,8 +1068,10 @@ fn sync_inputs(state: &mut State) {
                 .collect()
         });
     if state.db.root().is_some() || !desired.is_empty() {
-        // Blocks until any in-flight worker's cancelled query unwinds and
-        // drops its database clone — the cancellation edge.
+        // Each setter blocks until every other database clone drops. The
+        // worker holds its clone only through its demand stage, which unwinds
+        // with salsa `Cancelled` on its next query, so the wait is bounded by
+        // one in-flight query.
         state.db.sync(&desired);
     }
 }
@@ -1119,16 +1129,15 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
         return;
     };
 
-    // Cancel the previous worker by joining it. The worker holds a cloned
-    // `IpeDatabase`; `sync_source_root` (called on every edit before
-    // `recompute`) already mutates the shared salsa storage, causing the
-    // cloned snapshot's next query to unwind with `Cancelled`. Joining here
-    // ensures the old thread has exited and released its resources before we
-    // allocate the next clone.
+    // Retire the previous worker by joining it. A salsa setter blocks until
+    // every other database clone drops, and the worker's clone lives only
+    // through its demand stage, so an input sync waits at most for one
+    // in-flight query to unwind with `Cancelled`; the lint stage holds owned
+    // text alone. Joining here ensures the old thread has exited and released
+    // its resources before the next clone is allocated.
     if let Some(cancel) = state.worker_cancel.take() {
-        // Signal the outgoing worker before joining: the compiler-diagnostics
-        // phase unwinds via salsa `Cancelled` on the next demand, but the lint
-        // tail has no further demand, so this flag is what lets it stop early.
+        // Signal the outgoing worker before joining, so a lint stage still
+        // pending is skipped rather than run for a stale generation.
         cancel.store(true, Ordering::Relaxed);
     }
     if let Some(prev) = state.worker.take() {
@@ -1163,18 +1172,20 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
         .name("ipe-lsp-diagnostics".to_owned())
         .spawn(move || {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                // The demand stage consumes the clone; the lint stage runs
+                // only after it has dropped.
                 salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                    compute_batch(
-                        &db,
+                    demand_stage(
+                        db,
                         root,
                         entry_file,
                         &uri_of,
                         &entry_module,
                         encoding,
-                        &cancel,
                         &lint,
                     )
                 }))
+                .map(|demanded| lint_stage(demanded, &uri_of, encoding, &cancel, &lint))
             }));
             match outcome {
                 Ok(Ok(per_uri)) => {
@@ -1262,22 +1273,33 @@ fn lint_config_diagnostic(err: &ipe_lint::LintConfigLoadError) -> lsp_types::Dia
     }
 }
 
-/// Pure worker body: collect, attribute, and map diagnostics to URIs.
-/// A diagnostic owned by a module with no URI (injected stdlib) is
+/// What the demand stage hands the lint stage: owned data, never a database handle.
+struct Demanded {
+    /// The compiler diagnostics, keyed by document.
+    per_uri: BTreeMap<Url, Vec<lsp_types::Diagnostic>>,
+    /// The entry module's document, the fallback for unattributed findings.
+    entry_uri: Option<Url>,
+    /// Each user module's text, copied out only when the lint pass runs.
+    user_texts: BTreeMap<Vec<String>, String>,
+}
+
+/// Worker stage that demands the database and maps its diagnostics to URIs.
+///
+/// It consumes `db` and drops it before returning, so no clone outlives the
+/// worker's last salsa demand and an input setter never waits on the lint
+/// stage. A diagnostic owned by a module with no URI (injected stdlib) is
 /// re-attributed to the entry document rather than dropped.
-#[allow(clippy::too_many_arguments)] // all args are logically distinct; a struct wrapper adds ceremony
-fn compute_batch(
-    db: &ipe_db::IpeDatabase,
+fn demand_stage(
+    db: ipe_db::IpeDatabase,
     root: ipe_db::SourceRoot,
     entry_file: ipe_db::SourceFile,
     uri_of: &BTreeMap<Vec<String>, Url>,
     entry_module: &[String],
     encoding: PositionEncoding,
-    cancel: &AtomicBool,
     lint: &LintPass,
-) -> Vec<(Url, Vec<lsp_types::Diagnostic>)> {
-    let collected = diagnostics::collect(db, root, entry_file);
-    let files = root.files(db);
+) -> Demanded {
+    let collected = diagnostics::collect(&db, root, entry_file);
+    let files = root.files(&db);
     let entry_uri = uri_of.get(entry_module).cloned();
     let mut per_uri: BTreeMap<Url, Vec<lsp_types::Diagnostic>> = uri_of
         .values()
@@ -1296,7 +1318,7 @@ fn compute_batch(
         // Borrow the salsa-owned text rather than cloning the whole module.
         let text = files
             .get(&module_diags.module)
-            .map_or(&empty, |file| file.text(db));
+            .map_or(&empty, |file| file.text(&db));
         for diag in &module_diags.diagnostics {
             let mut lsp = diagnostics::to_lsp(diag, text, encoding);
             if re_attributed {
@@ -1310,20 +1332,52 @@ fn compute_batch(
             per_uri.entry(uri.clone()).or_default().push(lsp);
         }
     }
+    // Only modules the editor owns a file for are linted: injected stdlib is
+    // not the user's code.
+    let user_texts: BTreeMap<Vec<String>, String> = if matches!(lint, LintPass::Run(_)) {
+        uri_of
+            .keys()
+            .filter_map(|module| {
+                files
+                    .get(module)
+                    .map(|file| (module.clone(), file.text(&db).clone()))
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    drop(db);
+    Demanded {
+        per_uri,
+        entry_uri,
+        user_texts,
+    }
+}
 
-    // A superseded worker skips the whole lint pass — the expensive tail that
-    // never demands the db again and so cannot unwind via salsa `Cancelled`.
-    // The newer worker owns the next publish, so dropping this one's lint work
-    // is observationally identical.
+/// Worker stage over owned text that appends lint findings to the compiler diagnostics.
+///
+/// Lint findings flow through the SAME diagnostics transport, appended after
+/// the compiler's own diagnostics for each user document (the way clippy flows
+/// through rust-analyzer). A refused `lint.ipe` runs no rule: its diagnostic is
+/// published in place of every finding.
+fn lint_stage(
+    demanded: Demanded,
+    uri_of: &BTreeMap<Vec<String>, Url>,
+    encoding: PositionEncoding,
+    cancel: &AtomicBool,
+    lint: &LintPass,
+) -> Vec<(Url, Vec<lsp_types::Diagnostic>)> {
+    let Demanded {
+        mut per_uri,
+        entry_uri,
+        user_texts,
+    } = demanded;
+    // A superseded worker skips the whole lint pass. The newer worker owns the
+    // next publish, so dropping this one's lint work is observationally
+    // identical.
     if cancel.load(Ordering::Relaxed) {
         return per_uri.into_iter().collect();
     }
-
-    // Lint findings flow through the SAME diagnostics transport, appended after
-    // the compiler's own diagnostics for each user document (the way clippy flows
-    // through rust-analyzer). Only modules the editor owns a file for are linted —
-    // injected stdlib is not the user's code. A refused `lint.ipe` runs no rule:
-    // its diagnostic is published in place of every finding.
     let lint_config = match lint {
         LintPass::Run(config) => config,
         LintPass::Withheld { uri, diagnostic } => {
@@ -1337,14 +1391,6 @@ fn compute_batch(
         }
         LintPass::Skipped => return per_uri.into_iter().collect(),
     };
-    let user_texts: BTreeMap<Vec<String>, String> = uri_of
-        .keys()
-        .filter_map(|module| {
-            files
-                .get(module)
-                .map(|file| (module.clone(), file.text(db).clone()))
-        })
-        .collect();
     for (module, lints) in diagnostics::collect_lint(&user_texts, lint_config, encoding) {
         if let Some(uri) = uri_of.get(&module) {
             per_uri.entry(uri.clone()).or_default().extend(lints);
@@ -3220,6 +3266,100 @@ mod tests {
             diagnostics_for(&mut state, &lib_uri),
             before,
             "a generation reset must not change a stable file's diagnostics"
+        );
+    }
+
+    /// A served two-module project with its inputs synced.
+    fn synced_two_module_state(dir: &str) -> State {
+        let main_path = normalize(&Path::new(dir).join("Main.ipe"));
+        let loader = TwoModuleLoader {
+            fail_next: Arc::new(AtomicBool::new(false)),
+            lib_path: normalize(&Path::new(dir).join("Lib.ipe")),
+        };
+        let mut state = State::new(None, PositionEncoding::Utf16);
+        state.overlays.insert(
+            main_path.clone(),
+            Overlay {
+                text: MAIN_TEXT.to_owned(),
+                version: 0,
+            },
+        );
+        ensure_project_fresh(&mut state, &loader, &main_path);
+        sync_inputs(&mut state);
+        state
+    }
+
+    /// The demand stage drops its database clone before returning, so an input
+    /// setter issued while the lint stage is still pending never waits on it.
+    #[test]
+    fn lint_tail_holds_no_database_clone() {
+        let mut state = synced_two_module_state("/lsp-lint-tail-test");
+        let root = state.db.root().expect("a synced root");
+        let entry_module = state.entry_module().to_vec();
+        let entry_file = root
+            .files(state.db.db())
+            .get(&entry_module)
+            .copied()
+            .expect("the entry module's input");
+        let uri_of: BTreeMap<Vec<String>, Url> = state
+            .served
+            .layout()
+            .expect("a served layout")
+            .path_of_module
+            .iter()
+            .filter_map(|(module, path)| Some((module.clone(), Url::from_file_path(path).ok()?)))
+            .collect();
+        let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
+        let demanded = super::demand_stage(
+            state.db.db().clone(),
+            root,
+            entry_file,
+            &uri_of,
+            &entry_module,
+            state.encoding,
+            &lint,
+        );
+        assert!(
+            !demanded.user_texts.is_empty(),
+            "the lint stage receives owned user texts"
+        );
+
+        // The setter blocks while any other clone lives; it runs on its own
+        // thread so a held clone turns into a timed-out assertion, not a hang.
+        let mut db = std::mem::take(&mut state.db);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::Builder::new()
+            .spawn(move || {
+                salsa::Database::trigger_cancellation(db.db_mut());
+                let _ = tx.send(());
+            })
+            .expect("spawn setter thread");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "an input setter must not wait on the pending lint stage"
+        );
+
+        let batch = super::lint_stage(
+            demanded,
+            &uri_of,
+            state.encoding,
+            &AtomicBool::new(false),
+            &lint,
+        );
+        assert_eq!(batch.len(), uri_of.len(), "one entry per user document");
+    }
+
+    /// An input sync signals the outgoing worker before its first setter, so a
+    /// lint stage still pending on the old database is skipped.
+    #[test]
+    fn sync_inputs_cancels_the_outgoing_worker() {
+        let mut state = synced_two_module_state("/lsp-sync-cancels-test");
+        let cancel = Arc::new(AtomicBool::new(false));
+        state.worker_cancel = Some(cancel.clone());
+        sync_inputs(&mut state);
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "an input sync must cancel the outgoing worker"
         );
     }
 }
