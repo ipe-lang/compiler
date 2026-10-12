@@ -44,6 +44,11 @@
 //! LIMIT: each literal is matched alone. A spelling assembled from pieces at
 //! run time (`"{:?"` then `"}"`, a `char` pushed onto a `String`) is not seen.
 //!
+//! The dev view's reach is pinned by identifier: `DevToken` is named only in
+//! `stringify.rs`, and `dev_view` only there and in `debug.rs`, across the
+//! runtime sources and every emitted golden, test code and macro bodies
+//! included.
+//!
 //! A node is skipped only when its `cfg` is proven test-only, so an
 //! unrecognised shape keeps it scanned.
 #![cfg(not(target_arch = "wasm32"))]
@@ -1374,4 +1379,110 @@ fn a_flagged_field_outside_the_allowlist_is_not_allowed() {
         "host".to_owned(),
     );
     assert!(!allowed(&other_field));
+}
+
+/// The runtime files that may name `dev_view`: its definition and its one
+/// caller.
+const DEV_VIEW_FILES: &[&str] = &["stringify.rs", "debug.rs"];
+
+/// The one runtime file that may name `DevToken`.
+const DEV_TOKEN_FILES: &[&str] = &["stringify.rs"];
+
+/// Every identifier of `stream`, macro bodies included, raw prefix stripped.
+fn idents(stream: TokenStream, out: &mut Vec<String>) {
+    for tree in stream {
+        match tree {
+            TokenTree::Ident(ident) => {
+                let text = ident.to_string();
+                out.push(
+                    text.strip_prefix("r#")
+                        .map_or_else(|| text.clone(), str::to_owned),
+                );
+            }
+            TokenTree::Group(group) => idents(group.stream(), out),
+            TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+        }
+    }
+}
+
+/// The identifiers of `src`, test code included.
+#[allow(clippy::expect_used)] // an untokenizable source must fail the scan, never be skipped
+fn source_idents(src: &str) -> Vec<String> {
+    let stream: TokenStream = src.parse().expect("a scanned source tokenizes");
+    let mut names = Vec::new();
+    idents(stream, &mut names);
+    names
+}
+
+/// Each `file:ident` of `sources` naming `dev_view` or `DevToken` outside the
+/// files allowed to, matched on the exact relative path.
+fn stray_dev_view_names(sources: &[(String, String)]) -> Vec<String> {
+    let mut stray = Vec::new();
+    for (name, src) in sources {
+        for ident in source_idents(src) {
+            let allowed = match ident.as_str() {
+                "dev_view" => DEV_VIEW_FILES,
+                "DevToken" => DEV_TOKEN_FILES,
+                _ => continue,
+            };
+            if !allowed.contains(&name.as_str()) {
+                stray.push(format!("{name}:{ident}"));
+            }
+        }
+    }
+    stray
+}
+
+/// `DevToken` is named only in `stringify.rs` and `dev_view` only there and in
+/// `debug.rs`, across the runtime sources and every emitted golden, so the dev
+/// view has one constructor and one caller.
+#[test]
+fn dev_view_constructed_only_in_stringify_called_only_in_debug() {
+    let runtime = rust_sources(&e2e_support::manifest_dir!().join("src"));
+    let golden_root = e2e_support::manifest_dir!().join("../../../tests/golden");
+    assert!(
+        golden_root.is_dir(),
+        "no golden tree at {}",
+        golden_root.display()
+    );
+    let goldens: Vec<(String, String)> = rust_sources(&golden_root)
+        .into_iter()
+        .map(|(name, src)| (format!("golden/{name}"), src))
+        .collect();
+    assert!(!goldens.is_empty(), "the golden walk read no file");
+    for file in DEV_VIEW_FILES {
+        let named = runtime
+            .iter()
+            .find(|(name, _)| name == file)
+            .is_some_and(|(_, src)| source_idents(src).iter().any(|i| i == "dev_view"));
+        assert!(named, "stale dev-view file {file}");
+    }
+    assert_eq!(stray_dev_view_names(&runtime), Vec::<String>::new());
+    assert_eq!(stray_dev_view_names(&goldens), Vec::<String>::new());
+}
+
+#[test]
+fn a_dev_view_name_outside_its_files_is_refused() {
+    let src = "use crate::stringify::dev_view as dv;
+        fn pointer() -> fn() -> View { crate::stringify::dev_view }
+        fn forged() -> View { View::Dev(DevToken(())) }
+        fn in_macro() -> String { format!(\"{}\", r#dev_view().tag()) }
+        #[cfg(test)] mod tests { fn probe() -> View { dev_view() } }
+        fn plain() -> View { View::Shown }";
+    let sources = [
+        ("server.rs".to_owned(), src.to_owned()),
+        ("debug.rs".to_owned(), src.to_owned()),
+        ("dom/debug.rs".to_owned(), src.to_owned()),
+        ("golden/stringify.rs".to_owned(), src.to_owned()),
+    ];
+    let mut expected = Vec::new();
+    for file in ["server.rs", "dom/debug.rs", "golden/stringify.rs"] {
+        for ident in ["dev_view", "dev_view", "DevToken", "dev_view", "dev_view"] {
+            expected.push(format!("{file}:{ident}"));
+        }
+        if file == "server.rs" {
+            expected.push("debug.rs:DevToken".to_owned());
+        }
+    }
+    assert_eq!(stray_dev_view_names(&sources), expected);
 }

@@ -107,7 +107,36 @@ pub struct EmailMessage {
     pub replyTo: EmailAddress,
 }
 
-crate::stringify::show_row!("EmailMessage", Redacted, [] EmailMessage, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "EmailMessage",
+    Redacted(Reveal),
+    [] EmailMessage,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |m, view| m.dev(view),
+);
+
+impl EmailMessage {
+    /// The message as `Debug.log` prints it in a dev-posture build: every
+    /// field, each attachment through its own dev view.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        use crate::stringify::IpeStringify;
+        crate::stringify::dev_record(
+            "EmailMessage",
+            &[
+                ("from", self.from.ipe_render(view)),
+                ("to", self.to.ipe_render(view)),
+                ("cc", self.cc.ipe_render(view)),
+                ("bcc", self.bcc.ipe_render(view)),
+                ("subject", self.subject.clone()),
+                ("textBody", self.textBody.clone()),
+                ("htmlBody", self.htmlBody.clone()),
+                ("attachments", self.attachments.ipe_render(view)),
+                ("replyTo", self.replyTo.ipe_render(view)),
+            ],
+        )
+    }
+}
 
 /// Ipê.Email.Attachment — `content` carries the attachment body as raw bytes.
 ///
@@ -124,7 +153,20 @@ pub struct EmailAttachment {
     pub content: Vec<u8>,
 }
 
-crate::stringify::show_row!("EmailAttachment", Redacted, [] EmailAttachment, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "EmailAttachment",
+    Redacted(Reveal),
+    [] EmailAttachment,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |a, _| crate::stringify::dev_record(
+        "EmailAttachment",
+        &[
+            ("filename", a.filename.clone()),
+            ("mimeType", a.mimeType.clone()),
+            ("content", crate::stringify::dev_bytes(&a.content)),
+        ],
+    ),
+);
 
 /// Ipê.Email.SesConfig.
 ///
@@ -139,7 +181,22 @@ pub struct SesConfig {
     pub secret: Secret,
 }
 
-crate::stringify::show_row!("EmailSesConfig", Redacted, [] SesConfig, |_| crate::stringify::REDACTED_SHOW.to_owned());
+// The dev view names the region and the access-key id; the secret access key
+// renders as the marker.
+crate::stringify::show_row!(
+    "EmailSesConfig",
+    Redacted(Reveal),
+    [] SesConfig,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| crate::stringify::dev_record(
+        "SesConfig",
+        &[
+            ("region", c.region.clone()),
+            ("key", c.key.clone()),
+            ("secret", crate::stringify::REDACTED_SHOW.to_owned()),
+        ],
+    ),
+);
 
 /// Ipê.Email.SmtpConfig.
 ///
@@ -154,7 +211,23 @@ pub struct SmtpConfig {
     pub pass: Secret,
 }
 
-crate::stringify::show_row!("EmailSmtpConfig", Redacted, [] SmtpConfig, |_| crate::stringify::REDACTED_SHOW.to_owned());
+// The dev view names the host, port and user; the password renders as the
+// marker.
+crate::stringify::show_row!(
+    "EmailSmtpConfig",
+    Redacted(Reveal),
+    [] SmtpConfig,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| crate::stringify::dev_record(
+        "SmtpConfig",
+        &[
+            ("host", c.host.clone()),
+            ("port", c.port.to_string()),
+            ("user", c.user.clone()),
+            ("pass", crate::stringify::REDACTED_SHOW.to_owned()),
+        ],
+    ),
+);
 
 /// Ipê.Email.EmailProvider — the ADT; variant names match the Ipê ctors.
 ///

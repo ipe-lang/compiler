@@ -109,7 +109,7 @@ show_leaves! {
     URL_RELATIVE = "UrlRelative" => Value;
     LOCALE = "Locale" => Value;
     EMAIL_ADDRESS = "EmailAddress" => Value;
-    CRYPTO_MAC = "CryptoMac" => Value;
+    CRYPTO_MAC = "CryptoMac" => Redacted;
     COLOR = "Color" => Value;
     COLOR_ERROR = "ColorError" => Value;
     WCAG_LEVEL = "WcagLevel" => Value;

@@ -47,7 +47,7 @@ impl std::fmt::Debug for Key {
     }
 }
 
-crate::stringify::show_row!("CryptoKey", Redacted, [] Key, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!("CryptoKey", Redacted(Withhold), [] Key, |_| crate::stringify::REDACTED_SHOW.to_owned());
 
 /// `Crypto.Mac` — an opaque message authentication code returned by
 /// `Crypto.hmacSha256` / `Crypto.hmacSha512`, or parsed once by `Mac.fromHex`.
@@ -58,8 +58,9 @@ crate::stringify::show_row!("CryptoKey", Redacted, [] Key, |_| crate::stringify:
 /// representation; `Mac.toHex` is the only extraction path so a reviewer can
 /// grep for every MAC-reveal site.
 ///
-/// `Clone`: derived. `Debug`: hand-written, renders the lowercase hex tag (a
-/// tag is public output, not secret material). `PartialEq`: constant-time via
+/// `Clone`: derived. `Debug`: hand-written, renders `Mac(<redacted>)`, the
+/// same marker as its show row, so neither rendering reveals the tag; only the
+/// dev view of `Debug.log` renders its hex. `PartialEq`: constant-time via
 /// [`crate::ct_eq::ct_bytes_eq`] over the raw bytes — same posture as `Key` and
 /// `Secret`. The derived early-exit `PartialEq` is structurally excluded: adding
 /// `#[derive(PartialEq)]` alongside the `impl_ct_eq!` invocation is a hard E0119
@@ -98,13 +99,21 @@ impl Mac {
 
 impl std::fmt::Debug for Mac {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Mac").field(&self.to_hex()).finish()
+        f.debug_tuple("Mac")
+            .field(&crate::redact::Redacted::new(()))
+            .finish()
     }
 }
 
 crate::ct_eq::impl_ct_eq!(Mac);
 
-crate::stringify::show_row!("CryptoMac", Value, [] Mac, |m| m.to_hex());
+crate::stringify::show_row!(
+    "CryptoMac",
+    Redacted(Reveal),
+    [] Mac,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |m, _| m.to_hex(),
+);
 
 /// Crate-internal raw promotion of a `String` to a `Key`, with no validation.
 /// The ONLY sanctioned no-check path — the password-derivation kernels use it
@@ -900,12 +909,21 @@ TsgxkiXH9sjXrPHT1hXn2tKCv9MkR8MD1Ndh6jo7inBZUK0YG7H6Jx0CAwEAAQ==
     }
 
     /// A computed `Mac` survives `toHex` then `fromHex` as an equal `Mac`, and
-    /// its `Debug` rendering is the lowercase hex tag.
+    /// its `Debug` and shown renderings are the marker, never the hex tag.
     #[test]
     fn computed_mac_round_trips_through_hex() {
         let mac256 = crypto_hmac_sha256_key(rfc4231_key(), "Hi There".to_string());
         let mac512 = crypto_hmac_sha512_key(rfc4231_key(), "Hi There".to_string());
-        assert_eq!(format!("{mac256:?}"), format!("Mac({HMAC_SHA256_RFC1:?})"));
+        let debug = format!("{mac256:?}");
+        assert_eq!(debug, "Mac(<redacted>)");
+        assert!(
+            !debug.contains(HMAC_SHA256_RFC1),
+            "Debug must not reveal the tag"
+        );
+        assert_eq!(
+            crate::stringify::IpeStringify::ipe_show(&mac256),
+            crate::stringify::REDACTED_SHOW
+        );
         assert!(parsed_mac(&crypto_mac_to_hex(mac256.clone())).is_some_and(|m| m == mac256));
         assert!(parsed_mac(&crypto_mac_to_hex(mac512.clone())).is_some_and(|m| m == mac512));
         assert!(

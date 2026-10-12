@@ -57,7 +57,20 @@ pub struct CacheCfg {
     pub maxBytes: i64,
 }
 
-crate::stringify::show_row!("CacheCfg", Redacted, [] CacheCfg, |_| crate::stringify::REDACTED_SHOW.to_owned());
+crate::stringify::show_row!(
+    "CacheCfg",
+    Redacted(Reveal),
+    [] CacheCfg,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| crate::stringify::dev_record(
+        "CacheCfg",
+        &[
+            ("maxEntries", c.maxEntries.to_string()),
+            ("ttlMs", c.ttlMs.to_string()),
+            ("maxBytes", c.maxBytes.to_string()),
+        ],
+    ),
+);
 
 /// Mirrors Ipê's `stats` return record `{ hits, misses, evictions }`
 /// (`IrType::CacheStats`). `Debug + PartialEq` for the same fully-derivable

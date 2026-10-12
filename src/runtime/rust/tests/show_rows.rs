@@ -2,19 +2,30 @@
 //! it, under that type's own feature gate.
 //!
 //! Each pin is a compile-time check that the type's `show_row!` declares the
-//! listed leaf and policy, so a row moved to another leaf or policy fails to
-//! compile here. The coverage check is cfg-independent: every non-`Refused`
+//! listed leaf, policy and dev view, so a row moved to another leaf, policy or
+//! dev view fails to compile here. The coverage check is cfg-independent: every non-`Refused`
 //! leaf must carry at least one pin, whichever features are enabled.
 
-use ipe_runtime_rust::stringify::{SHOWN_RUNTIME_TYPES, ShowPolicy, ShownRow, str_eq};
+use ipe_runtime_rust::stringify::{DevView, SHOWN_RUNTIME_TYPES, ShowPolicy, ShownRow, str_eq};
+
+/// A pin's dev view: `Same` when the pin states none.
+macro_rules! pin_dev {
+    () => {
+        DevView::Same
+    };
+    ($dev:ident) => {
+        DevView::$dev
+    };
+}
 
 macro_rules! pins {
-    ($($(#[$cfg:meta])* $leaf:literal => $policy:ident: $ty:ty;)*) => {
+    ($($(#[$cfg:meta])* $leaf:literal => $policy:ident $(($dev:ident))?: $ty:ty;)*) => {
         $(
             $(#[$cfg])*
             const _: () = assert!(
                 str_eq(<$ty as ShownRow>::LEAF, $leaf)
-                    && <$ty as ShownRow>::POLICY.tag() == ShowPolicy::$policy.tag(),
+                    && <$ty as ShownRow>::POLICY.tag() == ShowPolicy::$policy.tag()
+                    && <$ty as ShownRow>::DEV.tag() == pin_dev!($($dev)?).tag(),
                 concat!("show row drifted from its pin: ", $leaf),
             );
         )*
@@ -53,7 +64,7 @@ pins! {
     #[cfg(feature = "email")]
     "EmailAddress" => Value: ipe_runtime_rust::email::EmailAddress;
     #[cfg(feature = "crypto-core")]
-    "CryptoMac" => Value: ipe_runtime_rust::crypto_core::Mac;
+    "CryptoMac" => Redacted(Reveal): ipe_runtime_rust::crypto_core::Mac;
     "Color" => Value: ipe_runtime_rust::color::Color;
     "ColorError" => Value: ipe_runtime_rust::color::ColorError;
     "WcagLevel" => Value: ipe_runtime_rust::color::WcagLevel;
@@ -67,48 +78,48 @@ pins! {
     "StreamId" => Value: ipe_runtime_rust::http_stream::IpeStreamId;
     #[cfg(feature = "json")]
     "Json" => Value: ipe_runtime_rust::json::JsonVal;
-    "Bytes" => Redacted: Vec<u8>;
+    "Bytes" => Redacted(Reveal): Vec<u8>;
     #[cfg(feature = "url")]
-    "Url" => Redacted: ipe_runtime_rust::url::Url;
+    "Url" => Redacted(Reveal): ipe_runtime_rust::url::Url;
     #[cfg(feature = "secret")]
-    "Secret" => Redacted: ipe_runtime_rust::secret::Secret;
+    "Secret" => Redacted(Withhold): ipe_runtime_rust::secret::Secret;
     #[cfg(feature = "crypto-core")]
-    "CryptoKey" => Redacted: ipe_runtime_rust::crypto_core::Key;
+    "CryptoKey" => Redacted(Withhold): ipe_runtime_rust::crypto_core::Key;
     #[cfg(any(feature = "server", feature = "db", feature = "jwt"))]
-    "Principal" => Redacted: ipe_runtime_rust::principal::Principal;
+    "Principal" => Redacted(Reveal): ipe_runtime_rust::principal::Principal;
     #[cfg(feature = "db")]
-    "Dsn" => Redacted: ipe_runtime_rust::dsn::Dsn;
+    "Dsn" => Redacted(Reveal): ipe_runtime_rust::dsn::Dsn;
     #[cfg(feature = "db")]
-    "SqlFragment" => Redacted: ipe_runtime_rust::db::SqlFragment;
+    "SqlFragment" => Redacted(Reveal): ipe_runtime_rust::db::SqlFragment;
     #[cfg(feature = "server")]
-    "ServerRequest" => Redacted: ipe_runtime_rust::server::ServerRequest;
+    "ServerRequest" => Redacted(Reveal): ipe_runtime_rust::server::ServerRequest;
     #[cfg(feature = "server")]
-    "ServerResponse" => Redacted: ipe_runtime_rust::server::ServerResponse;
+    "ServerResponse" => Redacted(Reveal): ipe_runtime_rust::server::ServerResponse;
     #[cfg(feature = "server")]
-    "ServerCookie" => Redacted: ipe_runtime_rust::server::ServerCookie;
-    "WebReq" => Redacted: ipe_runtime_rust::dom::req::WebReq;
+    "ServerCookie" => Redacted(Reveal): ipe_runtime_rust::server::ServerCookie;
+    "WebReq" => Redacted(Reveal): ipe_runtime_rust::dom::req::WebReq;
     #[cfg(any(feature = "http_client", all(target_arch = "wasm32", feature = "wasm-client")))]
-    "HttpRequest" => Redacted: ipe_runtime_rust::http_client::HttpRequest;
+    "HttpRequest" => Redacted(Reveal): ipe_runtime_rust::http_client::HttpRequest;
     #[cfg(all(feature = "server", feature = "jwt"))]
-    "AuthConfig" => Redacted: ipe_runtime_rust::server::AuthConfig;
+    "AuthConfig" => Redacted(Reveal): ipe_runtime_rust::server::AuthConfig;
     #[cfg(all(feature = "server", feature = "jwt"))]
-    "TokenSource" => Redacted: ipe_runtime_rust::server::TokenSource;
+    "TokenSource" => Redacted(Reveal): ipe_runtime_rust::server::TokenSource;
     #[cfg(any(feature = "websocket_client", all(target_arch = "wasm32", feature = "wasm-client")))]
-    "WebSocketClientCfg" => Redacted: ipe_runtime_rust::ws_client::WsClientCfg;
-    "ProcessRunWithCfg" => Redacted: ipe_runtime_rust::system::ProcessRunWithCfg;
-    "ProcessRunInPtyCfg" => Redacted: ipe_runtime_rust::system::ProcessRunInPtyCfg;
+    "WebSocketClientCfg" => Redacted(Reveal): ipe_runtime_rust::ws_client::WsClientCfg;
+    "ProcessRunWithCfg" => Redacted(Reveal): ipe_runtime_rust::system::ProcessRunWithCfg;
+    "ProcessRunInPtyCfg" => Redacted(Reveal): ipe_runtime_rust::system::ProcessRunInPtyCfg;
     #[cfg(feature = "cache_kernel")]
-    "CacheCfg" => Redacted: ipe_runtime_rust::cache::CacheCfg;
+    "CacheCfg" => Redacted(Reveal): ipe_runtime_rust::cache::CacheCfg;
     #[cfg(feature = "regex")]
-    "Regex" => Redacted: ipe_runtime_rust::regex_kernel::Regex;
+    "Regex" => Redacted(Reveal): ipe_runtime_rust::regex_kernel::Regex;
     #[cfg(feature = "email")]
-    "EmailMessage" => Redacted: ipe_runtime_rust::email::EmailMessage;
+    "EmailMessage" => Redacted(Reveal): ipe_runtime_rust::email::EmailMessage;
     #[cfg(feature = "email")]
-    "EmailAttachment" => Redacted: ipe_runtime_rust::email::EmailAttachment;
+    "EmailAttachment" => Redacted(Reveal): ipe_runtime_rust::email::EmailAttachment;
     #[cfg(feature = "email")]
-    "EmailSesConfig" => Redacted: ipe_runtime_rust::email::SesConfig;
+    "EmailSesConfig" => Redacted(Reveal): ipe_runtime_rust::email::SesConfig;
     #[cfg(feature = "email")]
-    "EmailSmtpConfig" => Redacted: ipe_runtime_rust::email::SmtpConfig;
+    "EmailSmtpConfig" => Redacted(Reveal): ipe_runtime_rust::email::SmtpConfig;
     "Task" => Internals: ipe_runtime_rust::core::IpeTask<ipe_runtime_rust::error::IpeError, ()>;
     #[cfg(any(feature = "tokio", all(target_arch = "wasm32", feature = "wasm-client")))]
     "Cmd" => Internals: ipe_runtime_rust::tea::IpeCmd<()>;
