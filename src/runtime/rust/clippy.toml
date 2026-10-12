@@ -60,6 +60,7 @@ disallowed-methods = [
     { path = "serde_urlencoded::from_bytes", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
     { path = "serde_urlencoded::from_reader", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
     { path = "url::Url::query_pairs", reason = "lenient; decode a query through `encoding::decode_form_query` (a driver-parity read goes through `ssrf::DriverParityQuery`)", allow-invalid = true },
+    { path = "axum::serve::serve", reason = "serve an app listener through server::serve_app (Host admission)", allow-invalid = true },
 ]
 
 disallowed-types = [
