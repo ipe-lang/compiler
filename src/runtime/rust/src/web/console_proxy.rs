@@ -229,9 +229,13 @@ struct ProxyState {
 
 static PROXY: OnceLock<ProxyState> = OnceLock::new();
 
-/// RFC 7230 §6.1 hop-by-hop headers (plus `host`, which reqwest derives from the
-/// upstream URL, and `content-length`, which we drop because every proxied
-/// response is re-encoded as a stream). Never forwarded in either direction.
+/// RFC 7230 §6.1 hop-by-hop headers (plus `content-length`, which we drop
+/// because every proxied response is re-encoded as a stream). Never forwarded in
+/// either direction.
+///
+/// `host` is forwarded: the child judges a request's `Origin` against the
+/// authority the browser addressed, which is the parent's, not the child's
+/// loopback port.
 fn is_hop_by_hop(name: &axum::http::HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -243,7 +247,6 @@ fn is_hop_by_hop(name: &axum::http::HeaderName) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-            | "host"
             | "content-length"
     )
 }
@@ -695,6 +698,48 @@ mod tests {
         use axum::http::header::{CONNECTION, CONTENT_TYPE};
         assert!(is_hop_by_hop(&CONNECTION));
         assert!(!is_hop_by_hop(&CONTENT_TYPE));
+    }
+
+    // The child sees the `Host` the browser addressed, so its `Origin` check
+    // compares the browser's origin against the parent's authority rather than
+    // refusing every console POST against the child's loopback port.
+    #[tokio::test]
+    async fn forward_keeps_the_browser_host() {
+        use axum::{Router, routing::any};
+
+        async fn echo_host(req: axum::extract::Request) -> String {
+            req.headers()
+                .get(axum::http::header::HOST)
+                .and_then(|host| host.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let port = listener.local_addr().expect("addr").port();
+        let app = Router::new().fallback(any(echo_host));
+        tokio::spawn(async move {
+            let _ = crate::server::serve_fixture(listener, app).await;
+        });
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/_ipe/console/_ipe/event")
+            .header(axum::http::header::HOST, "localhost:8000")
+            .header(axum::http::header::ORIGIN, "http://localhost:8000")
+            .body(axum::body::Body::empty())
+            .expect("build req");
+
+        let client = reqwest::Client::new();
+        let upstream = format!("http://127.0.0.1:{port}");
+        let resp = forward(&client, &upstream, req).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read resp body");
+        assert_eq!(bytes.as_ref(), b"localhost:8000");
     }
 
     // Spin a throwaway upstream that echoes "METHOD PATH BODY", forward a
