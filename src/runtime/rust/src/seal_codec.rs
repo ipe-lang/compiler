@@ -53,6 +53,8 @@ pub enum SealDecodeError {
     /// The JSON nests containers past the depth budget. Checked by a lexical
     /// scan before the parser runs, and again on the parsed value, so a
     /// deeply-nested document is refused here rather than blowing the stack.
+    /// An unterminated run of opening brackets is nesting too, so it reports
+    /// here rather than as `Malformed`.
     TooDeep { max: u8 },
     /// The JSON was syntactically invalid.
     Malformed { detail: String },

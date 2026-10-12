@@ -711,8 +711,9 @@ impl FromLimitExceeded for IpeError {
 
 /// A unit test's bare-`String` error sink keeps only the message.
 ///
-/// Kind assertions in tests use an `IpeError` sink.
-#[cfg(test)]
+/// Kind assertions in tests use an `IpeError` sink, so a `String` sink can
+/// never be mistaken for one that proves the `LimitExceeded` kind.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 impl FromLimitExceeded for String {
     fn from_limit_exceeded(message: String) -> Self {
         message

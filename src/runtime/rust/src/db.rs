@@ -3504,10 +3504,10 @@ impl SqlFragment {
     #[cfg(feature = "dev-posture")]
     fn dev(&self, view: crate::stringify::View) -> String {
         let binds: Vec<String> = self.binds.iter().map(|bind| bind.dev(view)).collect();
-        let invalid = self
-            .invalid
-            .as_ref()
-            .map_or_else(|| "Nothing".to_owned(), |reason| format!("Just {reason}"));
+        let invalid = self.invalid.as_ref().map_or_else(
+            || "Nothing".to_owned(),
+            |poison| format!("Just {}", poison.reason),
+        );
         crate::stringify::dev_record(
             "SqlFragment",
             &[

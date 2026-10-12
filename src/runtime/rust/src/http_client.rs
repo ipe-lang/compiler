@@ -1724,6 +1724,23 @@ mod tests {
             );
         }
 
+        /// The hop count is judged before the dial policy is consulted, so the
+        /// boundary is the same under `DenyPrivate`: `max` URLs may precede a
+        /// redirect target, the next one spends the budget.
+        #[test]
+        fn redirect_budget_boundary_is_independent_of_the_dial_policy() {
+            let budget = RedirectBudget::new(3);
+            assert!((1..=3).all(|visited| !budget.spent_by(visited)));
+            assert!(budget.refusal().is_none());
+            assert!(budget.spent_by(4));
+            assert_eq!(
+                budget.refusal().map(LimitRefusal::into_error),
+                Some(crate::IpeError::limit_exceeded(
+                    "http: too many redirects (max 3)"
+                ))
+            );
+        }
+
         /// `FollowRedirects n` follows exactly `n` hops; the hop past them is a
         /// `LimitExceeded` refusal, never an opaque transport error.
         #[tokio::test]
