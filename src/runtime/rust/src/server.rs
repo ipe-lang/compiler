@@ -7675,8 +7675,6 @@ mod tests {
         );
     }
 
-    // ── authenticated routes (fail-closed) ────────────────────────────
-    #[cfg(feature = "jwt")]
     /// `Server.listen` on a free loopback port with one `GET /` route, spawned.
     fn spawn_listen() -> Option<(u16, tokio::task::JoinHandle<IpeResult<String, ()>>)> {
         let port = free_loopback_port()?;
@@ -7735,6 +7733,8 @@ mod tests {
         crate::system::locked_remove_var("IPE_HTTP_BIND");
     }
 
+    // ── authenticated routes (fail-closed) ────────────────────────────
+    #[cfg(feature = "jwt")]
     mod authed {
         use super::*;
 
