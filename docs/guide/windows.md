@@ -36,12 +36,13 @@ SHA-256, installs `ipe.exe` to `%USERPROFILE%\.ipe\bin` (override with
 `IPE_INSTALL_DIR`) and offers to add that folder to your user `PATH`. Pin a
 release with `IPE_VERSION`. It also checks for Rust and a C linker and, when
 `winget` is available, offers to install what is missing (steps 1 and 2 are the
-manual equivalent). Run it from PowerShell or `cmd`; run it again to upgrade:
+manual equivalent). Paste this one line into PowerShell; run it again to upgrade:
 
 ```powershell
-curl.exe -fsSLO https://raw.githubusercontent.com/ipe-lang/compiler/main/install.bat
-.\install.bat
+curl.exe -fsSL -o install.bat https://raw.githubusercontent.com/ipe-lang/compiler/main/install.bat; if ($?) { .\install.bat }
 ```
+
+In `cmd`, replace `; if ($?) { .\install.bat }` with `&& install.bat`.
 
 Open a new terminal and check `ipe --version`. From Git Bash, the README's
 `install.sh` one-liner works too.
