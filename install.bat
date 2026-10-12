@@ -14,6 +14,7 @@ rem The PowerShell body below the marker line is copied to a temp .ps1 and run.
 set "IPE_BAT=%~f0"
 set "IPE_PS1=%TEMP%\ipe-install-%RANDOM%.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$l = Get-Content -LiteralPath $env:IPE_BAT; $n = [array]::IndexOf($l, '#PS' + '-BODY'); Set-Content -LiteralPath $env:IPE_PS1 -Value $l[($n + 1)..($l.Count - 1)]"
+echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%IPE_PS1%"
 set "IPE_RC=%errorlevel%"
 del "%IPE_PS1%" 2>nul
@@ -150,7 +151,6 @@ function Ask([string]$q) {
 }
 
 function Banner([string]$ver) {
-    Nl
     Put '  '
     Put "$Ipe language" 'Yellow'
     Put " - $ver" 'DarkGray'
@@ -249,7 +249,7 @@ function Fetch([string]$url, [string]$dest) {
 function CargoVersion {
     $ErrorActionPreference = 'Continue'
     try {
-        $o = (& cargo --version) -join ' '
+        $o = (& cargo --version 2>$null) -join ' '
         if ($o -match 'cargo (\d+\.\d+\.\d+)') { return [version]$Matches[1] }
     } catch {
         return $null
@@ -401,11 +401,11 @@ function Main {
                 $toolchain = if (HasMsvcTools) { 'stable-x86_64-pc-windows-msvc' } else { 'stable-x86_64-pc-windows-gnu' }
                 $ErrorActionPreference = 'Continue'
                 try {
-                    & winget install -e --id Rustlang.Rustup --accept-source-agreements --accept-package-agreements | Out-Null
+                    & winget install -e --id Rustlang.Rustup --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
                     $env:Path = "$cargoBin;$env:Path"
                     RefreshPath
-                    & rustup toolchain install $toolchain | Out-Null
-                    & rustup default $toolchain | Out-Null
+                    & rustup toolchain install $toolchain 2>&1 | Out-Null
+                    & rustup default $toolchain 2>&1 | Out-Null
                 } catch {
                     $null = $_
                 }
@@ -439,7 +439,7 @@ function Main {
                 StageStart "Installing a C linker via winget$Ell"
                 $ErrorActionPreference = 'Continue'
                 try {
-                    & winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT --accept-source-agreements --accept-package-agreements | Out-Null
+                    & winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
                 } catch {
                     $null = $_
                 }
