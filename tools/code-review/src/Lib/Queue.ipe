@@ -1,5 +1,6 @@
-module Lib.Queue exposing (HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, UnitPageState(..), decide, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, nextTicket, loadUnitView, pageHeaderText, queueStatusText, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, sourceStatusText, stateFromResult, unitPageFromResult, unitPageStatusText)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, startDecision, stateFromResult, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
+import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
 import Ipe.Error as Error
 import Ipe.List as List
@@ -7,30 +8,37 @@ import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Time.Timestamp exposing (Timestamp)
-import Lib.Db as LibDb exposing (HistoryCursor(..))
+import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
+import Lib.Epoch exposing (Epoch)
 import Lib.Format as Format
--- `Index.Unit` names `Highlight.Lang`, and an imported alias resolves its
--- qualified names in this module.
+-- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
+-- `Links.LinkSet`, and an imported alias resolves its qualified names in this
+-- module.
 import Lib.Highlight as Highlight
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Links as Links
+import Lib.PageSize as PageSize exposing (PageSize)
+import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
-import Lib.Settings as Settings
+import Lib.Settings as Settings exposing (AppSettings, IndexSettings)
+import Lib.Uid as Uid exposing (Uid)
 
 
--- A pending unit plus its resurfacing state. `changed` is Just the previous
+-- An open unit plus its resurfacing state. `change` is what the index
+-- recorded about its current body. `changed` is Just the previous counted
 -- review when this uid was already decided on an OLDER body hash: the author
 -- edited the code after the review, so the unit must be reviewed again.
 type alias QueuedUnit =
     { unit : Index.Unit
-    , changed : Maybe LibDb.ReviewRow
+    , change : Index.Change
+    , changed : Maybe LibDb.VerifiedRow
     }
 
 
 -- One loaded page of the queue. `total` counts the whole queue (never this
 -- page's length); `next` is the cursor of the following page, Nothing on the
--- last page; `dbName` is the index file's name, rendered once.
+-- last page; `dbName` is the index file's name, rendered once; `log` is the
+-- review log's verdict the page was read under.
 type alias QueuePage =
     { units : List QueuedUnit
     , total : Int
@@ -38,134 +46,180 @@ type alias QueuePage =
     , dbBytes : Int
     , next : Maybe Index.Cursor
     , progress : Progress
+    , log : LogShown
     }
 
 
 -- Review progress over the index as it stands, never from a session:
--- `reviewed` counts the units whose current body hash has a decision, `total`
--- the units reviewed or still queued. Both are one aggregate over the index's
--- `reviewed` table, the copy of the review database's decided pairs that each
--- drain extends; every load first checks the copy's row count against the
--- review database and rebuilds the copy on a mismatch. Deciding a unit moves
--- it from queued to reviewed, so `total` holds while the queue drains, and a
--- reload or a second tab reads the same numbers.
+-- `total` counts the index's units and `reviewed` those not open, so a unit
+-- is reviewed exactly when its current (uid, body_hash) pair has a decision.
+-- Both come from the same read as the page's rows, after the `reviewed`
+-- copy is proved current against the review log's head. Deciding a unit
+-- moves it from open to reviewed, so `total` holds while the queue drains,
+-- and a reload or a second tab reads the same numbers.
 type alias Progress =
     { reviewed : Int
     , total : Int
     }
 
 
--- The progress of the index, with the `reviewed` copy checked fresh first:
--- when its row count differs from the review database's decision count (a
--- decision whose drain failed, a replaced index file, a deleted review row),
--- the copy is rebuilt once and the row read again. It never loops.
-currentProgress : Db.Db -> Task.Task Error Progress
-currentProgress db =
-    do
-        first <- Index.loadProgress
-        decisions <- LibDb.countDecisions db
-        if first.mirrored == decisions then
-            Task.succeed (progressFrom first)
-
-        else
-            do
-                resyncReviewed db
-                second <- Index.loadProgress
-                Task.succeed (progressFrom second)
-
-
-progressFrom : Index.ProgressRow -> Progress
-progressFrom row =
-    { reviewed = row.reviewed, total = row.total }
-
-
 -- How far one rebuild of the `reviewed` copy may read: `pageCeiling` pages
--- of at most `pageSize` decided pairs each. A record, so the two counts are
--- named at every call and never swapped.
-type alias ResyncBound =
-    { pageSize : Int
-    , pageCeiling : Int
-    }
+-- of at most `pageSize` decided pairs each. Opaque: built only by
+-- `makeResyncBound` and `resyncBound`, so a ceiling below one page, or one
+-- whose decision count or loop limit passes the largest `Int`, has no
+-- representation and no rebuild re-checks it.
+type ResyncBound
+    = ResyncBound { pageSize : PageSize, pageCeiling : Int }
 
 
--- The most review-database pages one rebuild reads: a bound on one rebuild
--- transaction's work (`pageCeiling x pairPageSize` decisions), never a stack
--- limit — the walk runs at constant stack depth through `Task.loop`.
+-- The largest `Int`.
+maxInt : Int
+maxInt =
+    9223372036854775807
+
+
+-- `pageCeiling` pages of `size` pairs as a bound. A ceiling below one is
+-- refused, and so is one whose `pageCeiling x size` decisions or whose loop
+-- limit `pageCeiling + 1` would pass the largest `Int`; the check divides,
+-- so it never multiplies past the range it guards.
+makeResyncBound : PageSize -> Int -> Result Error ResyncBound
+makeResyncBound size pageCeiling =
+    if pageCeiling < 1 then
+        Err (Error.invalidInput "a review progress rebuild needs a page ceiling of at least 1")
+
+    else if pageCeiling > (maxInt - 1) // PageSize.toInt size then
+        Err (Error.invalidInput "a review progress rebuild's page ceiling times its page size passes the largest integer")
+
+    else
+        Ok (ResyncBound { pageSize = size, pageCeiling = pageCeiling })
+
+
+-- The most review-log pages each pass of one rebuild reads: a bound on one
+-- rebuild transaction's work (`pageCeiling x PageSize.pairs` rows), never a
+-- stack limit — every walk runs at constant stack depth through `Task.loop`.
 resyncPageCeiling : Int
 resyncPageCeiling =
-    10000
+    LibDb.logPageCeiling
 
 
 resyncBound : ResyncBound
 resyncBound =
-    { pageSize = LibDb.pairPageSize, pageCeiling = resyncPageCeiling }
+    ResyncBound { pageSize = PageSize.pairs, pageCeiling = resyncPageCeiling }
 
 
--- The `reviewed` copy rebuilt from the review database: one index
--- transaction empties it and drains every decided pair, so a pair's
--- undrained queue row leaves too. Returns the count of pairs copied.
-resyncReviewed : Db.Db -> Task.Task Error Int
-resyncReviewed db =
-    resyncReviewedWithin resyncBound db
+boundPageSize : ResyncBound -> PageSize
+boundPageSize bound =
+    case bound of
+        ResyncBound b ->
+            b.pageSize
 
 
--- `resyncReviewed` reading at most `bound.pageCeiling` pages of
--- `bound.pageSize` decided pairs. A review database holding more refuses
--- the rebuild and rolls it back, leaving the copy as it was. A bound below
--- one page of one pair is refused before the copy is touched.
-resyncReviewedWithin : ResyncBound -> Db.Db -> Task.Task Error Int
-resyncReviewedWithin bound db =
-    if bound.pageSize < 1 || bound.pageCeiling < 1 then
-        Task.fail (Error.invalidInput "a review progress rebuild needs a page size and a page ceiling of at least 1")
+boundCeiling : ResyncBound -> Int
+boundCeiling bound =
+    case bound of
+        ResyncBound b ->
+            b.pageCeiling
 
-    else
-        Index.rebuildReviewed (\conn -> refillPages bound db conn)
+
+-- The `reviewed` copy rebuilt from the review log under `key`: the log's
+-- verdict is taken, then one index transaction empties the copy and, only
+-- on a proven head, drains every row up to it whose mac verifies, so a
+-- pair's undrained queue row leaves too. The copy is stamped with that head
+-- and the verdict, signed under the key, so a log not proven drains nothing
+-- and every page shows why. With no key nothing is drained
+-- and the copy is stamped read-only. A decision recorded after the verdict
+-- moves the head past that stamp, so the next load rebuilds again rather
+-- than trust a copy that may lack it. Returns the count of pairs copied.
+resyncReviewed : ReviewKey -> IndexSettings -> Db.Db -> Task.Task Error Int
+resyncReviewed key settings db =
+    resyncReviewedWithin key settings resyncBound db
+
+
+-- `resyncReviewed` reading at most the bound's page ceiling of pages of its
+-- page size of review-log rows in each pass. A review log holding more
+-- refuses the rebuild and rolls it back, leaving the copy and its stamp as
+-- they were.
+resyncReviewedWithin : ReviewKey -> IndexSettings -> ResyncBound -> Db.Db -> Task.Task Error Int
+resyncReviewedWithin key settings bound db =
+    do
+        state <- LibDb.logVerdictWithin key db (boundPageSize bound) (boundCeiling bound) (resyncCeilingRefusal bound)
+        rebuildUnder settings bound state db
+
+
+-- The `reviewed` copy rebuilt in one index transaction under a verdict
+-- already taken: emptied, then refilled from the log only on a proven head,
+-- and stamped for that verdict. No walk of its own.
+rebuildUnder : IndexSettings -> ResyncBound -> LibDb.LogState -> Db.Db -> Task.Task Error Int
+rebuildUnder settings bound state db =
+    Index.rebuildReviewed settings (\conn -> refillLog bound state db conn)
+
+
+refillLog : ResyncBound -> LibDb.LogState -> Db.Db -> Db.Db -> Task.Task Error ( Index.Stamp, Int )
+refillLog bound state db conn =
+    case LibDb.stateVerdict state of
+        Proven proven ->
+            refillPages (LibDb.verifier state) bound proven db conn
+                |> Task.map (\copied -> ( LibDb.copyStamp state, copied ))
+
+        Broken _ ->
+            Task.succeed ( LibDb.copyStamp state, 0 )
+
+        KeyMismatch ->
+            Task.succeed ( LibDb.copyStamp state, 0 )
+
+        Unkeyed ->
+            Task.succeed ( LibDb.copyStamp state, 0 )
 
 
 -- The state one `refillPages` step carries: how many pages have been read,
--- how many pairs have been drained so far, and the cursor the next page
--- reads after.
+-- how many pairs have been drained so far, and the seq the next page reads
+-- after.
 type alias RefillState =
     { pagesRead : Int
     , copied : Int
-    , cursor : Maybe ( String, String )
+    , after : Int
     }
 
 
--- `resyncReviewed` draining the review database at constant stack depth,
--- however many pages it takes. The loop's own ceiling, `bound.pageCeiling +
--- 1`, is an unreachable backstop (defence in depth): the step itself refuses
--- a non-empty page once `pagesRead >= bound.pageCeiling`, so the loop's own
--- limit never has a chance to fire.
-refillPages : ResyncBound -> Db.Db -> Db.Db -> Task.Task Error Int
-refillPages bound db conn =
-    Task.loop (bound.pageCeiling + 1) { pagesRead = 0, copied = 0, cursor = Nothing } (refillStep bound db conn)
+-- The counted rows of the review log drained at constant stack depth,
+-- however many pages it takes. The loop's own ceiling, the page ceiling plus
+-- one, is an unreachable backstop (defence in depth): the step itself
+-- refuses a non-empty page once `pagesRead` reaches the page ceiling, so the
+-- loop's own limit never has a chance to fire.
+refillPages : LibDb.Verifier -> ResyncBound -> LibDb.ProvenHead -> Db.Db -> Db.Db -> Task.Task Error Int
+refillPages verify bound proven db conn =
+    Task.loop (boundCeiling bound + 1) { pagesRead = 0, copied = 0, after = 0 } (refillStep verify bound proven db conn)
 
 
--- One page of decided pairs after `state.cursor`, drained on `conn`: an
--- empty page ends the walk with the pairs copied so far; a non-empty page
--- past the ceiling fails the whole rebuild; otherwise the page drains, then
--- a short page ends the walk and a full page continues from its last pair.
-refillStep : ResyncBound -> Db.Db -> Db.Db -> RefillState -> Task.Task Error (Task.Step RefillState Int)
-refillStep bound db conn state =
+-- One page of review-log rows after `state.after`, up to the proven head: an empty
+-- page ends the walk with the pairs copied so far; a non-empty page past the
+-- ceiling fails the whole rebuild; otherwise the page's verified rows drain
+-- on `conn`, then a short page ends the walk and a full page continues from
+-- its last row.
+refillStep : LibDb.Verifier -> ResyncBound -> LibDb.ProvenHead -> Db.Db -> Db.Db -> RefillState -> Task.Task Error (Task.Step RefillState Int)
+refillStep verify bound proven db conn state =
     do
-        pairs <- LibDb.decidedPairsAfter db bound.pageSize state.cursor
-        if List.isEmpty pairs then
+        rows <- LibDb.logRowsAfter db (boundPageSize bound) proven state.after
+        if List.isEmpty rows then
             Task.succeed (Task.Done state.copied)
 
-        else if state.pagesRead >= bound.pageCeiling then
+        else if state.pagesRead >= boundCeiling bound then
             Task.fail (resyncCeilingRefusal bound)
 
         else
+            let
+                counted =
+                    LibDb.countedRows verify rows
+            in
             do
-                pairs
-                    |> List.map (\( uid, hash ) -> Index.drainPair conn uid hash)
+                counted
+                    |> List.map (\row -> Index.drainDecided conn (LibDb.verifiedPair row))
                     |> Task.sequence
                 let
                     copied =
-                        state.copied + List.length pairs
+                        state.copied + List.length counted
                 in
-                if List.length pairs < bound.pageSize then
+                if List.length rows < PageSize.toInt (boundPageSize bound) then
                     Task.succeed (Task.Done copied)
 
                 else
@@ -173,7 +227,7 @@ refillStep bound db conn state =
                         (Task.Continue
                             { pagesRead = state.pagesRead + 1
                             , copied = copied
-                            , cursor = List.head (List.reverse pairs)
+                            , after = Maybe.withDefault state.after (LibDb.lastSeq rows)
                             }
                         )
 
@@ -182,9 +236,9 @@ resyncCeilingRefusal : ResyncBound -> Error
 resyncCeilingRefusal bound =
     Error.invalidInput
         ("the review database holds more than "
-            ++ String.fromInt (bound.pageCeiling * bound.pageSize)
+            ++ String.fromInt (boundCeiling bound * PageSize.toInt (boundPageSize bound))
             ++ " decisions, past the "
-            ++ String.fromInt bound.pageCeiling
+            ++ String.fromInt (boundCeiling bound)
             ++ "-page ceiling of a review progress rebuild; the progress copy is left unchanged"
         )
 
@@ -231,25 +285,23 @@ ticketNumber ticket =
             n
 
 
--- A decided unit as the History page shows it: the review row plus the unit's
--- qualified name resolved from the index db, rendered (Nothing when the unit
--- no longer exists there).
+-- A review as the History page shows it: the review entry, counted or not,
+-- plus the unit's qualified name resolved from the index db, rendered
+-- (Nothing when the unit no longer exists there).
 type alias HistoryRow =
-    { uid : String
-    , bodyHash : String
-    , decision : String
-    , reason : Maybe LibDb.StoredReason
-    , reviewedAt : Timestamp
+    { entry : LibDb.ReviewEntry
     , name : Maybe SafeText
     }
 
 
--- One loaded History page: its rows, the cursor it was read from, and the
--- cursor of the page after it (Nothing on the last page).
+-- One loaded History page: its rows, the cursor it was read from, the
+-- cursor of the page after it (Nothing on the last page), and the review
+-- log's verdict every row was classified under.
 type alias HistoryPage =
     { rows : List HistoryRow
     , at : LibDb.HistoryCursor
     , next : Maybe LibDb.HistoryCursor
+    , log : LogShown
     }
 
 
@@ -289,86 +341,486 @@ historyStatusText state =
                     HistoryStart ->
                         Just "No reviews yet."
 
-                    HistoryAfter _ _ _ ->
+                    HistoryAfter _ _ ->
+                        Just "No more reviews."
+
+                    HistoryLegacyAfter _ _ _ ->
                         Just "No more reviews."
 
             else
                 Nothing
 
 
--- One History page from `cursor`, newest first, each row with the unit's
--- qualified name resolved from the index db. At most
--- `LibDb.historyPageSize` rows are read, and one name lookup runs per row.
-loadHistoryPage : LibDb.HistoryCursor -> Task.Task Error HistoryPage
-loadHistoryPage cursor =
+-- One History page from `cursor`, newest first, each row classified under
+-- the review log's verdict, taken once for the load with the `reviewed`
+-- copy proved current for it (rebuilt once when its stamp is not), with the
+-- unit's qualified name resolved from the index db named by `settings`. At
+-- most `PageSize.history` rows are read, and one name lookup runs per row.
+loadHistoryPage : AppSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
+loadHistoryPage settings cursor =
     do
-        db <- LibDb.open
-        page <- LibDb.historyPage db LibDb.historyPageSize cursor
-        conn <- Index.openRead
+        db <- LibDb.openAt settings.review
+        conn <- Index.readConnection settings.index
+        state <- freshStatus settings conn db
+        page <- LibDb.historyPage (LibDb.verifier state) db PageSize.history cursor
         rows <- Task.sequence (List.map (historyRow conn) page.rows)
-        Task.succeed { rows = rows, at = cursor, next = page.next }
+        Task.succeed { rows = rows, at = cursor, next = page.next, log = LibDb.logShown state }
 
 
-historyRow : Db.Db -> LibDb.ReviewRow -> Task.Task Error HistoryRow
-historyRow conn row =
-    Task.map
-        (\name ->
-            { uid = row.uid
-            , bodyHash = row.bodyHash
-            , decision = row.decision
-            , reason = row.reason
-            , reviewedAt = row.reviewedAt
-            , name = name
-            }
-        )
-        (Index.nameFor conn row.uid)
+historyRow : Db.Db -> LibDb.ReviewEntry -> Task.Task Error HistoryRow
+historyRow conn entry =
+    Task.map (\name -> { entry = entry, name = name }) (Index.nameFor conn (entryUid entry))
 
 
--- The one way a decision is recorded: only a shown source can be decided,
--- and only after `Index.reverify` re-proves it, so the hash written is the
--- hash of the bytes the reviewer saw. A stale or unreadable unit is refused
--- before any I/O.
-decide : Db.Db -> Index.Unit -> LibDb.Decision -> Task.Task Error ( Index.Attested, Int )
-decide db unit decision =
-    case unit.view of
-        Shown shown ->
+entryUid : LibDb.ReviewEntry -> Uid
+entryUid entry =
+    case entry of
+        Verified row ->
+            LibDb.verifiedUid row
+
+        Unverified row ->
+            row.uid
+
+
+-- The review log's verdict, taken once for the load, with the `reviewed`
+-- copy's stamp current for it: as read, or after one rebuild of the copy
+-- under that same verdict; a stamp still not current after the rebuild is a
+-- failed load. The verdict is taken before the stamp is read: a decision
+-- recorded after it moves the head on, so a match proves the copy holds
+-- every counted decision up to a head the log really had. One walk of the
+-- log per load.
+freshStatus : AppSettings -> Db.Db -> Db.Db -> Task.Task Error LibDb.LogState
+freshStatus settings conn db =
+    do
+        state <- LibDb.logVerdict settings.key db
+        first <- Index.readStamp conn
+        if LibDb.copyCurrent state first then
+            Task.succeed state
+
+        else
             do
-                attested <- Index.reverify shown
-                n <- LibDb.insertDecision db (Index.attestedUid attested) (Index.attestedHash attested) decision
-                Task.succeed ( attested, n )
+                rebuildUnder settings.index resyncBound state db
+                second <- Index.readStamp conn
+                if LibDb.copyCurrent state second then
+                    Task.succeed state
 
-        Stale _ ->
-            Task.fail notDecidable
-
-        Unreadable _ ->
-            Task.fail notDecidable
+                else
+                    Task.fail stillBehind
 
 
-notDecidable : Error
-notDecidable =
-    Error.conflict "this unit's source is not verified, so it cannot be decided"
+stillBehind : Error
+stillBehind =
+    Error.conflict "the review progress copy is still behind the review database after a rebuild; reload"
 
 
--- The unit page: loading, the unit with its links, no such unit, or a failed
--- load. A missing unit is its own state, never shown as still loading.
-type UnitPageState
-    = UnitLoading
-    | UnitLoaded Index.Unit (List Links.Link)
-    | UnitNotFound
-    | UnitFailed Error
+-- The banner a page shows when the review log is not proven under the
+-- server's key: where it breaks, or that another key signed it; Nothing for a
+-- proven log and for a server with no key.
+chainBanner : LogShown -> Maybe String
+chainBanner shown =
+    case shown of
+        ShownBroken (BreaksAt n) ->
+            Just ("The review log's chain breaks at entry " ++ String.fromInt n ++ ": a decision was removed, reordered or replaced outside this tool.")
+
+        ShownBroken (PastHead n) ->
+            Just ("The review log holds " ++ pastHeadText n ++ " past its head: a decision was added outside this tool.")
+
+        ShownBroken (BeforeFirst n) ->
+            Just ("The review log holds " ++ pastHeadText n ++ " before its first: a decision was added outside this tool.")
+
+        ShownBroken (RepeatsAt n) ->
+            Just ("The review log's entry " ++ String.fromInt n ++ " decides a pair an earlier entry decided: a decision was added outside this tool.")
+
+        ShownKeyMismatch ->
+            Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts.")
+
+        ShownProven ->
+            Nothing
+
+        ShownUnkeyed ->
+            Nothing
 
 
-unitPageFromResult : Result Error (Maybe ( Index.Unit, List Links.Link )) -> UnitPageState
-unitPageFromResult result =
+pastHeadText : Int -> String
+pastHeadText n =
+    if n == 1 then
+        "1 entry"
+
+    else
+        String.fromInt n ++ " entries"
+
+
+-- The one way a decision is recorded: only under a signing key, so a
+-- read-only server refuses before it reads anything; only a shown source
+-- can be decided, since only a verified view holds a `ShownSource`; and only
+-- after `Index.reverify` re-proves it, so the hash written is the hash of
+-- the bytes the reviewer saw.
+decide : ReviewKey -> IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+decide key settings db shown decision =
+    case key of
+        ReadOnly ->
+            Task.fail ReviewKey.readOnlyError
+
+        Signing macKey ->
+            do
+                attested <- Index.reverify settings shown
+                written <- LibDb.insertDecision macKey db attested decision
+                Task.succeed ( attested, written )
+
+
+-- The session's one source slot, shared by the selected queue card and the
+-- unit page: nothing selected, one read in flight
+-- (with the unit wanted once it returns, when the selection moved during the
+-- read), the loaded view, no unit with the read's uid, or a failed read. At
+-- most one read is in flight: a selection made during a read only records
+-- `wanted`, and a response for any uid but the in-flight one is dropped.
+-- `fresh` is False once the queue page reloaded or cleared during the read,
+-- so its result predates the page and never settles the view: the in-flight
+-- unit selected again is read afresh, and with nothing wanted the result is
+-- dropped. `owner` is the epoch whose process runs the read: slot ownership
+-- is tied to process lifetime, so a read owned by another epoch is
+-- `NoneSelected` to every transition.
+type SelectedView
+    = NoneSelected
+    | ViewLoading { uid : Uid, wanted : Maybe Uid, fresh : Bool, owner : Epoch }
+    | ViewShown Index.UnitView
+    | ViewMissing Uid
+    | ViewFailed Uid Error
+
+
+-- The slot as process `epoch` sees it: a read owned by another epoch has no
+-- completion left to settle it, so it is `NoneSelected`.
+ownedView : Epoch -> SelectedView -> SelectedView
+ownedView epoch state =
+    case state of
+        ViewLoading loading ->
+            if loading.owner == epoch then
+                state
+
+            else
+                NoneSelected
+
+        ViewShown _ ->
+            state
+
+        NoneSelected ->
+            state
+
+        ViewMissing _ ->
+            state
+
+        ViewFailed _ _ ->
+            state
+
+
+-- `uid` selected in process `epoch`, with the uid to read next, if any.
+-- During a read only the wanted unit is recorded; the shown unit selected
+-- again reads nothing.
+selectView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe Uid )
+selectView epoch uid state =
+    case ownedView epoch state of
+        ViewLoading loading ->
+            ( ViewLoading { uid = loading.uid, wanted = wantedAfter loading.uid loading.fresh uid, fresh = loading.fresh, owner = loading.owner }, Nothing )
+
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                ( ViewShown shown, Nothing )
+
+            else
+                startView epoch uid
+
+        NoneSelected ->
+            startView epoch uid
+
+        ViewMissing _ ->
+            startView epoch uid
+
+        ViewFailed _ _ ->
+            startView epoch uid
+
+
+-- `uid` selected after the queue page reloaded, so its view is read afresh
+-- even when it is the one shown; during a read it is read once that read
+-- returns.
+reloadView : Epoch -> Uid -> SelectedView -> ( SelectedView, Maybe Uid )
+reloadView epoch uid state =
+    case ownedView epoch state of
+        ViewLoading loading ->
+            ( ViewLoading { uid = loading.uid, wanted = Just uid, fresh = False, owner = loading.owner }, Nothing )
+
+        ViewShown _ ->
+            startView epoch uid
+
+        NoneSelected ->
+            startView epoch uid
+
+        ViewMissing _ ->
+            startView epoch uid
+
+        ViewFailed _ _ ->
+            startView epoch uid
+
+
+-- No unit to select. A read in flight stays recorded, with nothing wanted
+-- after it, so no second read can start beside it, and its result is
+-- dropped when it returns.
+clearView : Epoch -> SelectedView -> SelectedView
+clearView epoch state =
+    case ownedView epoch state of
+        ViewLoading loading ->
+            ViewLoading { uid = loading.uid, wanted = Nothing, fresh = False, owner = loading.owner }
+
+        ViewShown _ ->
+            NoneSelected
+
+        NoneSelected ->
+            NoneSelected
+
+        ViewMissing _ ->
+            NoneSelected
+
+        ViewFailed _ _ ->
+            NoneSelected
+
+
+-- The read of `uid` run by process `epoch` returned with `result`: when
+-- another unit was selected meanwhile its read starts, otherwise the result
+-- settles the view. A response for any uid but the in-flight one, or from
+-- any process but the read's owner, changes nothing.
+viewArrived : Epoch -> Uid -> Result Error (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe Uid )
+viewArrived epoch uid result state =
+    case state of
+        ViewLoading loading ->
+            if loading.uid /= uid || loading.owner /= epoch then
+                ( state, Nothing )
+
+            else
+                case loading.wanted of
+                    Just next ->
+                        startView epoch next
+
+                    Nothing ->
+                        if loading.fresh then
+                            ( settledView uid result, Nothing )
+
+                        else
+                            ( NoneSelected, Nothing )
+
+        ViewShown _ ->
+            ( state, Nothing )
+
+        NoneSelected ->
+            ( state, Nothing )
+
+        ViewMissing _ ->
+            ( state, Nothing )
+
+        ViewFailed _ _ ->
+            ( state, Nothing )
+
+
+startView : Epoch -> Uid -> ( SelectedView, Maybe Uid )
+startView epoch uid =
+    ( ViewLoading { uid = uid, wanted = Nothing, fresh = True, owner = epoch }, Just uid )
+
+
+-- The unit wanted after the in-flight read of `inFlight` when `uid` is
+-- selected: nothing when the in-flight unit is selected again and its read
+-- is fresh; a read that predates the page reads that unit again.
+wantedAfter : Uid -> Bool -> Uid -> Maybe Uid
+wantedAfter inFlight fresh uid =
+    if inFlight == uid && fresh then
+        Nothing
+
+    else
+        Just uid
+
+
+settledView : Uid -> Result Error (Maybe Index.UnitView) -> SelectedView
+settledView uid result =
     case result of
-        Ok (Just ( unit, links )) ->
-            UnitLoaded unit links
+        Ok (Just loaded) ->
+            ViewShown loaded
 
         Ok Nothing ->
-            UnitNotFound
+            ViewMissing uid
 
         Err e ->
-            UnitFailed e
+            ViewFailed uid e
+
+
+-- The loaded view of the selected unit `uid`; Nothing while it loads, when
+-- its read failed or found no unit, or when the view is another unit's.
+selectedViewOf : Uid -> SelectedView -> Maybe Index.UnitView
+selectedViewOf uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                Just shown
+
+            else
+                Nothing
+
+        ViewLoading _ ->
+            Nothing
+
+        NoneSelected ->
+            Nothing
+
+        ViewMissing _ ->
+            Nothing
+
+        ViewFailed _ _ ->
+            Nothing
+
+
+-- The one source a decision on `uid` may be made on: the selected unit's
+-- verified view. Nothing for a withheld view, a view not loaded, or another
+-- unit's view, so nothing else can reach `decide`.
+decidableSource : Uid -> SelectedView -> Maybe Index.ShownSource
+decidableSource uid state =
+    case selectedViewOf uid state of
+        Just loaded ->
+            case loaded.view of
+                Shown shown ->
+                    Just shown
+
+                Stale _ ->
+                    Nothing
+
+                Unreadable _ ->
+                    Nothing
+
+                TooLarge _ ->
+                    Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- The one-line text in place of the selected unit's source while it has no
+-- loaded view; Nothing once the view of `uid` is loaded.
+selectedViewStatusText : Uid -> SelectedView -> Maybe String
+selectedViewStatusText uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                Nothing
+
+            else
+                Just "Loading source…"
+
+        ViewLoading _ ->
+            Just "Loading source…"
+
+        NoneSelected ->
+            Just "Loading source…"
+
+        ViewMissing _ ->
+            Just "This unit is no longer in the index."
+
+        ViewFailed _ e ->
+            Just ("Source load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+
+
+-- The unit page: loading, the unit with its source and links, no such unit,
+-- a failed load, or an address whose unit id is not one. A missing unit is
+-- its own state, never shown as still loading.
+type UnitPageState
+    = UnitLoading
+    | UnitLoaded Index.UnitView
+    | UnitNotFound
+    | UnitFailed Error
+    | UnitIdRefused
+
+
+-- The unit id a unit page's address names, parsed once: an address whose
+-- segment is not a unit id is `UnitIdRefused`, so it reaches no query.
+unitPageEntry : String -> Result UnitPageState Uid
+unitPageEntry raw =
+    case Uid.parse raw of
+        Ok uid ->
+            Ok uid
+
+        Err _ ->
+            Err UnitIdRefused
+
+
+-- The unit page of `uid`, read from the session's one source slot, the same
+-- `SelectedView` the queue card reads through, so the two pages never hold
+-- two reads in flight. Only a view settled for `uid` itself shows; a read in
+-- flight, or a view settled for another unit, is still loading.
+unitPageOf : Uid -> SelectedView -> UnitPageState
+unitPageOf uid state =
+    case state of
+        ViewShown shown ->
+            if shown.unit.uid == uid then
+                UnitLoaded shown
+
+            else
+                UnitLoading
+
+        ViewMissing missing ->
+            if missing == uid then
+                UnitNotFound
+
+            else
+                UnitLoading
+
+        ViewFailed failed e ->
+            if failed == uid then
+                UnitFailed e
+
+            else
+                UnitLoading
+
+        ViewLoading _ ->
+            UnitLoading
+
+        NoneSelected ->
+            UnitLoading
+
+
+-- The session's one decision slot. A decision re-reads its source to re-prove
+-- it, so at most one is in flight: a decision asked while one is saving
+-- starts nothing. A saving decision records the epoch whose process runs it:
+-- slot ownership is tied to process lifetime, so one owned by another epoch
+-- is idle.
+type DecisionSlot
+    = DecisionIdle
+    | DecisionSaving Uid Epoch
+
+
+-- The slot holding a decision on `uid` run by process `epoch`; Nothing
+-- while another decision of that process is saving.
+startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
+startDecision epoch uid slot =
+    case slot of
+        DecisionIdle ->
+            Just (DecisionSaving uid epoch)
+
+        DecisionSaving _ owner ->
+            if owner == epoch then
+                Nothing
+
+            else
+                Just (DecisionSaving uid epoch)
+
+
+-- The decision on `uid` run by process `epoch` settled; a result for any
+-- other uid or from any other process leaves the slot.
+decisionSettled : Epoch -> Uid -> DecisionSlot -> DecisionSlot
+decisionSettled epoch uid slot =
+    case slot of
+        DecisionSaving saving owner ->
+            if saving == uid && owner == epoch then
+                DecisionIdle
+
+            else
+                slot
+
+        DecisionIdle ->
+            DecisionIdle
 
 
 -- The one-line text for a unit page that has no unit to show; Nothing once
@@ -385,7 +837,10 @@ unitPageStatusText state =
         UnitFailed e ->
             Just ("Unit load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
 
-        UnitLoaded _ _ ->
+        UnitIdRefused ->
+            Just "This address does not name a unit."
+
+        UnitLoaded _ ->
             Nothing
 
 
@@ -406,52 +861,41 @@ sourceStatusText view =
         Stale UnverifiableHash ->
             Just "This unit's hash predates source attestation; re-run `ipe-index index` to verify it."
 
-        Unreadable e ->
-            Just ("Source unreadable: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        Unreadable failure ->
+            Just ("Source unreadable: " ++ SafeText.toString (Index.readFailureText failure))
+
+        TooLarge (SpanLines o) ->
+            Just ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)
+
+        TooLarge (ViewBytes o) ->
+            Just ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)
+
+        TooLarge (ChildSpans o) ->
+            Just ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")
 
 
--- The unit page loads the unit by uid (decided units have no change_queue
--- row, so the page queries units directly) and resolves every identifier
--- token of its verified source against the index's qualified names. Nothing
--- when no unit has this uid.
-loadUnitView : String -> Task.Task Error (Maybe ( Index.Unit, List Links.Link ))
-loadUnitView uid =
+-- What a reviewer can do about a view past a ceiling.
+notShownRemedy : String
+notShownRemedy =
+    " It is not shown and cannot be decided here; split the unit to review it."
+
+
+-- A byte count in whole KiB, rounded up, so a size one byte past a ceiling
+-- never reads as the ceiling itself.
+kibText : Int -> String
+kibText n =
+    String.fromInt ((n + 1023) // 1024) ++ " KiB"
+
+
+-- One unit's view by uid through `Index.loadView`, the one source read the
+-- unit page and the selected queue card share (a decided unit is not open,
+-- so it queries units directly), on one connection from
+-- `settings`. Nothing when no unit has this uid.
+loadUnitView : IndexSettings -> Uid -> Task.Task Error (Maybe Index.UnitView)
+loadUnitView settings uid =
     do
-        mb <- Index.loadUnitByUid uid
-        case mb of
-            Just unit ->
-                do
-                    qs <- Index.qualifiedUids
-                    Task.succeed (Just ( unit, linksFor unit qs ))
-
-            Nothing ->
-                Task.succeed Nothing
-
-
--- Jump links come only from verified source; a withheld view links nothing.
--- The unit's own name, which never links, is its raw qualified name from the
--- same table the links resolve against (`unit.qualified` is display text).
-linksFor : Index.Unit -> List ( String, String ) -> List Links.Link
-linksFor unit qs =
-    case unit.view of
-        Shown shown ->
-            Links.resolve (ownQualified unit.uid qs) qs (Index.shownText shown)
-
-        Stale _ ->
-            []
-
-        Unreadable _ ->
-            []
-
-
-ownQualified : String -> List ( String, String ) -> String
-ownQualified uid qs =
-    case List.find (\( _, u ) -> u == uid) qs of
-        Just ( q, _ ) ->
-            q
-
-        Nothing ->
-            ""
+        conn <- Index.readConnection settings
+        Index.loadView conn settings.roots uid
 
 
 stateFromResult : Result Error QueuePage -> QueueState
@@ -486,7 +930,7 @@ queueStatusText state =
                 Nothing
 
 
--- The queue header: database name, size, and how many of the queued units
+-- The queue header: database name, size, and how many of the open units
 -- this page shows.
 pageHeaderText : QueuePage -> String
 pageHeaderText page =
@@ -501,46 +945,98 @@ pageHeaderText page =
         ]
 
 
--- One page of the queue at `cursor`, as the review app sees it:
+-- One page of the queue at `cursor`, as the review app sees it: the open
+-- units of the index (its current units whose (uid, body_hash) pair has no
+-- decision), with
 --
---   * a unit whose exact (uid, body_hash) pair was already decided is
---     hidden — the first review of a pair is final and the drain loop
---     already cleared it; a re-queued identical unit is a no-op;
 --   * a unit decided on an older hash resurfaced at the head, flagged with
 --     its previous review;
---   * never-seen units keep the index's enqueue order after resurfaced ones.
+--   * never-seen units keeping the index's enqueue order after resurfaced
+--     ones.
 --
--- Only one page of the queue is classified per load, so the resurfaced-first
--- order holds within the page.
+-- Only one page is classified per load, so the resurfaced-first order holds
+-- within the page.
 --
--- The page also carries the whole-queue count, the database size and the
--- review progress. Progress is read first, so a rebuild of the `reviewed`
--- copy that drains an undrained decided pair is already reflected in the
--- page's rows and count.
-loadPage : Index.Cursor -> Task.Task Error QueuePage
-loadPage cursor =
+-- The page rows, the open count, the progress and the database size come
+-- from one index read, trusted only when the `reviewed` copy's stamp is the
+-- one the server's key would write for the review log's head and the copy
+-- holds exactly the pairs the log's walk verified: any other copy (a failed
+-- drain, a replaced index or review file, a decision another process
+-- recorded, a pair written into the copy directly) rebuilds the copy
+-- and reads once more, and a stamp that still differs fails the load rather
+-- than show a stale queue. It never loops. The settings are the value
+-- resolved at startup and every index read runs on the one read connection
+-- opened from them.
+loadPage : AppSettings -> Index.Cursor -> Task.Task Error QueuePage
+loadPage settings cursor =
     do
-        settings <- Settings.indexSettings
-        db <- LibDb.open
-        progress <- currentProgress db
-        rows <- Index.loadPendingPage cursor
-        total <- Index.countPending
-        bytes <- Index.dbBytes
-        units <- classify db (List.map (\r -> r.unit) rows)
-        Task.succeed
-            { units = units
-            , total = total
-            , dbName = SafeText.renderForeign (Settings.dbFileName settings.db)
-            , dbBytes = bytes
-            , next = nextCursor rows
-            , progress = progress
-            }
+        conn <- Index.readConnection settings.index
+        db <- LibDb.openAt settings.review
+        fresh <- freshSnapshot settings conn db cursor
+        pageOf settings db fresh
+
+
+pageOf : AppSettings -> Db.Db -> ( LibDb.LogState, Index.Snapshot ) -> Task.Task Error QueuePage
+pageOf settings db fresh =
+    case fresh of
+        ( state, snap ) ->
+            do
+                units <- classify (LibDb.verifier state) db snap.rows
+                Task.succeed
+                    { units = units
+                    , total = snap.open
+                    , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db)
+                    , dbBytes = snap.bytes
+                    , next = nextCursor snap.rows
+                    , progress = { reviewed = snap.units - snap.open, total = snap.units }
+                    , log = LibDb.logShown state
+                    }
+
+
+-- The index read at `cursor` with the review log's verdict, taken once for
+-- the load, trusted only when the `reviewed` copy holds for it: a stamp
+-- current for the verdict and exactly the pairs of the entries its walk
+-- verified. It is read as is, or once more after one rebuild of the copy
+-- under that same verdict; a copy that still does not hold is a failed
+-- load. A pair written into the copy outside a drain is never counted: the
+-- load rebuilds the copy from the log first. The verdict is taken
+-- before the index is read: a decision recorded after it moves the head on,
+-- so a match proves the copy holds every counted decision up to a head the
+-- log really had, and an entry edited, removed or added outside this tool
+-- changes the verdict, so the copy is rebuilt on this load. One walk of the
+-- log per load.
+freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error ( LibDb.LogState, Index.Snapshot )
+freshSnapshot settings conn db cursor =
+    do
+        state <- LibDb.logVerdict settings.key db
+        first <- Index.readSnapshot settings.key conn cursor
+        if LibDb.copyHolds state first then
+            Task.succeed ( state, first )
+
+        else
+            do
+                rebuildUnder settings.index resyncBound state db
+                second <- Index.readSnapshot settings.key conn cursor
+                if LibDb.copyHolds state second then
+                    Task.succeed ( state, second )
+
+                else
+                    Task.fail stillBehind
+
+
+-- A decided unit drained from the index, then the queue page at `cursor`
+-- reloaded. The drain writes the index alone: the review database already
+-- holds the decision, and `written` says how it moved the log's head, so
+-- the drain moves the copy's stamp the same way.
+drainThenLoad : AppSettings -> Index.Attested -> Index.Written -> Index.Cursor -> Task.Task Error QueuePage
+drainThenLoad settings attested written cursor =
+    Index.drainUnit settings.index attested written |> Task.andThen (\_ -> loadPage settings cursor)
 
 
 -- A full page may have rows after it; a short page is the last one.
 nextCursor : List Index.PendingRow -> Maybe Index.Cursor
 nextCursor rows =
-    if List.length rows < Index.pageSize then
+    if List.length rows < PageSize.toInt PageSize.queue then
         Nothing
 
     else
@@ -550,45 +1046,52 @@ nextCursor rows =
             |> Maybe.map (\r -> Index.After { enqueuedAt = r.enqueuedAt, uid = r.unit.uid })
 
 
-classify : Db.Db -> List Index.Unit -> Task.Task Error (List QueuedUnit)
-classify db units =
-    units
-        |> List.map (classifyUnit db)
+classify : LibDb.Verifier -> Db.Db -> List Index.PendingRow -> Task.Task Error (List QueuedUnit)
+classify verify db rows =
+    rows
+        |> List.map (classifyUnit verify db)
         |> Task.sequence
         |> Task.map prioritize
 
 
-classifyUnit : Db.Db -> Index.Unit -> Task.Task Error (Maybe QueuedUnit)
-classifyUnit db unit =
+-- An open unit with the latest counted review of its uid when that review
+-- is of an older body: a review of the current body (one recorded after the
+-- page was read) is not a previous review, and a row that does not count is
+-- never one.
+classifyUnit : LibDb.Verifier -> Db.Db -> Index.PendingRow -> Task.Task Error QueuedUnit
+classifyUnit verify db row =
+    let
+        unit =
+            row.unit
+
+        current =
+            Index.storedHash unit.attested
+    in
     do
-        decided <- LibDb.findDecision db unit.uid (Index.storedHash unit.attested)
-        case decided of
-            Just _ ->
-                Task.succeed Nothing
-
-            Nothing ->
-                do
-                    old <- LibDb.findLatestForUid db unit.uid
-                    Task.succeed (Just { unit = unit, changed = old })
+        latest <- LibDb.findLatestForUid verify db unit.uid
+        Task.succeed
+            { unit = unit
+            , change = row.change
+            , changed = Maybe.andThen (previousReview current) latest
+            }
 
 
-prioritize : List (Maybe QueuedUnit) -> List QueuedUnit
+previousReview : String -> LibDb.VerifiedRow -> Maybe LibDb.VerifiedRow
+previousReview current row =
+    if LibDb.verifiedHash row == current then
+        Nothing
+
+    else
+        Just row
+
+
+prioritize : List QueuedUnit -> List QueuedUnit
 prioritize classified =
     let
         ( changed, fresh ) =
-            partition (List.concatMap collect classified)
+            partition classified
     in
     changed ++ fresh
-
-
-collect : Maybe QueuedUnit -> List QueuedUnit
-collect mb =
-    case mb of
-        Just q ->
-            [ q ]
-
-        Nothing ->
-            []
 
 
 -- Stable partition: resurfaced (changed) units first, fresh units after,

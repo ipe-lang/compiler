@@ -148,6 +148,8 @@ impl Builtins {
             BuiltinTag::Locale => self.locale,
             BuiltinTag::HttpMethod => self.http_method,
             BuiltinTag::RedirectPolicy => self.redirect_policy,
+            BuiltinTag::DbFailure => self.db_failure,
+            BuiltinTag::AuthError => self.auth_error,
             BuiltinTag::Duration => self.duration,
             BuiltinTag::CryptoKey => self.crypto_key,
             BuiltinTag::CryptoMac => self.crypto_mac,

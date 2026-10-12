@@ -592,9 +592,9 @@ fn classify(c: &Candidate, value_ty: Option<&Ty>, expected: Option<&Ty>) -> Comp
     let Some(expected) = expected else {
         return Compat::InScopeOnly;
     };
-    // An expected type variable is satisfied by any candidate — it constrains
-    // nothing, so keep the candidate but do not privilege it.
-    if matches!(expected, Ty::Var(_)) {
+    // An expected type variable or wildcard is satisfied by any candidate — it
+    // constrains nothing, so keep the candidate but do not privilege it.
+    if matches!(expected, Ty::Var(_) | Ty::Wildcard) {
         return Compat::Unifiable;
     }
     let Some((exp_mod, exp_name)) = con_head(expected) else {
@@ -649,7 +649,7 @@ fn result_of(ty: &Ty) -> &Ty {
 const fn con_head(ty: &Ty) -> Option<(&[Symbol], Symbol)> {
     match ty {
         Ty::Con { module, name, .. } => Some((module.as_slice(), *name)),
-        _ => None,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit | Ty::Fun(..) | Ty::Tuple(_) | Ty::Record(..) => None,
     }
 }
 

@@ -35,7 +35,7 @@ fade =
     ]
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 transition (shorthand value):

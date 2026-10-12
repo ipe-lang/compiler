@@ -114,7 +114,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Default gate: `ipe build` exits 0 and the emitted crate carries the whole
+/// Default gate: `ipe dev build` exits 0 and the emitted crate carries the whole
 /// transparent define surface — the app enum for the union, the crate-local
 /// conversion glue on every constructor forwarder, and the `_bindings.rs`
 /// definitions typed at the defined Rust types.

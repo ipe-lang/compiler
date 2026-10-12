@@ -1,4 +1,4 @@
-//! Regression: `ipe build` and `ipe run` must *stream* the emitted crate's
+//! Regression: `ipe dev build` and `ipe dev run` must *stream* the emitted crate's
 //! `cargo build` output as it happens — not swallow it and reveal it only once
 //! cargo has already finished (success or error). A `cargo build` can take
 //! minutes; a silent wait leaves the user unable to tell the command from a
@@ -50,7 +50,7 @@ fn write_progress_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
-/// `ipe build <entry>` must relay the emitted crate's `cargo build` stderr to
+/// `ipe dev build <entry>` must relay the emitted crate's `cargo build` stderr to
 /// its own stderr — the progress the user watches while cargo compiles.
 #[cfg(unix)]
 #[test]
@@ -58,8 +58,8 @@ fn build_streams_the_emitted_cargo_progress() {
     assert_relays_cargo_progress("build");
 }
 
-/// `ipe run <entry>` builds the same way before it execs the binary, so it must
-/// relay cargo's progress just as `ipe build` does. The fake `cargo build`
+/// `ipe dev run <entry>` builds the same way before it execs the binary, so it must
+/// relay cargo's progress just as `ipe dev build` does. The fake `cargo build`
 /// produces no `ipe-app` binary, so the exec step fails afterwards — but the
 /// progress line must already have been streamed before that, which is all this
 /// asserts.
@@ -94,7 +94,7 @@ fn assert_relays_cargo_progress(subcommand: &str) {
 
     // PATH holds ONLY the fake-bin dir, so the fake `cargo` is the one resolved.
     let out = std::process::Command::new(ipe_bin)
-        .args([subcommand, &entry.to_string_lossy(), "--out"])
+        .args(["dev", subcommand, &entry.to_string_lossy(), "--out"])
         .arg(&out_dir)
         .env("PATH", &bin_dir)
         .env("IPE_RUNTIME_DIR", &runtime_dir)

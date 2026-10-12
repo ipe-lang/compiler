@@ -584,3 +584,159 @@ fn an_unlistable_declaring_directory_fails_closed() {
     }
     assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
 }
+
+/// A rename that hides `process::exit` from the path check is itself a hit.
+#[test]
+fn a_renamed_process_or_std_root_is_a_hit() {
+    for (name, src) in [
+        (
+            "process_alias",
+            "use std::process as p;\npub fn f() {\n    p::exit(0);\n}\n",
+        ),
+        (
+            "process_self_alias",
+            "use std::process::{self as p};\npub fn f() {\n    p::exit(0);\n}\n",
+        ),
+        (
+            "std_crate_alias",
+            "extern crate std as s;\npub fn f() {\n    s::process::exit(0);\n}\n",
+        ),
+        (
+            "std_root_alias",
+            "use ::std as s;\npub fn f() {\n    s::fs::read(\"a\").ok();\n}\n",
+        ),
+    ] {
+        let root = scratch(name);
+        put(&root, "lib.rs", src);
+        let out = scan_in(&root, &["lib.rs"]);
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", streams(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("lib.rs:1:"), "{name}: {}", streams(&out));
+    }
+}
+
+/// A bare `#[test]` outside a `cfg(test)` scope is production code.
+///
+/// The same function inside a `#[cfg(test)] mod` is test code.
+#[test]
+fn a_bare_test_attribute_exempts_nothing() {
+    let root = scratch("bare_test_attr");
+    put(
+        &root,
+        "prod.rs",
+        "#[test]\nfn t() {\n    let o: Option<u8> = None;\n    o.unwrap();\n}\n",
+    );
+    let out = scan_in(&root, &["prod.rs"]);
+    assert_eq!(out.status.code(), Some(1), "{}", streams(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("prod.rs:4:"), "{}", streams(&out));
+
+    put(
+        &root,
+        "gated.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        let o: Option<u8> = None;\n        o.unwrap();\n    }\n}\n",
+    );
+    let out = scan_in(&root, &["gated.rs"]);
+    assert_eq!(out.status.code(), Some(0), "{}", streams(&out));
+}
+
+/// A macro-body `mod $n;` reaches a file only at expansion, so it is refused.
+#[test]
+fn a_metavariable_module_declaration_fails_closed() {
+    let root = scratch("macro_mod_metavar");
+    put(
+        &root,
+        "lib.rs",
+        "macro_rules! d {\n    ($n:ident) => {\n        mod $n;\n    };\n}\n",
+    );
+    let out = scan_in(&root, &["lib.rs"]);
+    assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
+}
+
+/// A rename inside a macro body binds the name its expansion reads, so it is
+/// a hit like a top-level one.
+#[test]
+fn a_macro_body_rename_is_a_hit() {
+    let root = scratch("macro_body_rename");
+    put(
+        &root,
+        "lib.rs",
+        "macro_rules! leave {\n    () => {\n        use std::process as p;\n    };\n}\nleave!();\npub fn f() {\n    p::exit(0);\n}\n",
+    );
+    let out = scan_in(&root, &["lib.rs"]);
+    assert_eq!(out.status.code(), Some(1), "{}", streams(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("lib.rs:3:"), "{}", streams(&out));
+}
+
+/// A source nested past the depth ceiling is refused with exit 2, never a crash.
+#[test]
+fn a_too_deep_file_fails_closed() {
+    let root = scratch("too_deep");
+    let depth = panic_scan::NestDepth::CEILING.get().saturating_add(1);
+    put(
+        &root,
+        "deep.rs",
+        &format!(
+            "pub fn f() -> bool {{\n    {}true\n}}\n",
+            "! ".repeat(depth)
+        ),
+    );
+    let out = scan_in(&root, &["deep.rs"]);
+    assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("too deep"), "{}", streams(&out));
+}
+
+/// A source one byte past the size ceiling is refused with exit 2.
+#[test]
+fn a_too_large_file_fails_closed() {
+    let root = scratch("too_large");
+    let padding = panic_scan::SourceBytes::CEILING
+        .get()
+        .saturating_sub(CLEAN_LIB.len())
+        .saturating_sub(1);
+    put(
+        &root,
+        "large.rs",
+        &format!("{CLEAN_LIB}//{}", "x".repeat(padding)),
+    );
+    let out = scan_in(&root, &["large.rs"]);
+    assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("too large"), "{}", streams(&out));
+}
+
+/// Rust under a `templates` directory ships verbatim, so its hits count.
+#[test]
+fn a_template_source_is_scanned() {
+    let root = scratch("template_hit");
+    put(&root, "src/lib.rs", CLEAN_LIB);
+    put(
+        &root,
+        "src/x/templates/mod.rs",
+        "pub fn f(o: Option<u8>) -> u8 {\n    o.unwrap()\n}\n",
+    );
+    for args in [&["src/x/templates/mod.rs"][..], &["--walk", "src"][..]] {
+        let out = scan_in(&root, args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", streams(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("templates/mod.rs:2:"),
+            "{args:?}: {}",
+            streams(&out)
+        );
+    }
+}
+
+/// A manifest under a `templates` directory is read like any other.
+#[test]
+fn a_template_manifest_is_checked() {
+    let root = scratch("template_manifest");
+    put(&root, "src/lib.rs", CLEAN_LIB);
+    put(&root, "src/templates/Cargo.toml", "[lib]\npath =\n");
+    let out = scan_in(&root, &["--walk", "src"]);
+    assert_eq!(out.status.code(), Some(2), "{}", streams(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("templates/Cargo.toml"), "{}", streams(&out));
+}

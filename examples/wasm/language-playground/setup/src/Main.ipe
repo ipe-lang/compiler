@@ -13,7 +13,7 @@ import Ipe.Task as Task
 --
 -- Run from examples/wasm/language-playground/setup:
 --
---     ipe run
+--     ipe dev run
 --
 -- This single program:
 --   1. Probes prerequisites (git, cargo, rustup, wasm-bindgen).
@@ -23,7 +23,7 @@ import Ipe.Task as Task
 --
 -- After setup completes, start the playground server with:
 --
---     cd ../server && ipe run
+--     cd ../server && ipe dev run
 --
 -- Every step uses a direct argv vector — no shell string interpolation.
 
@@ -189,7 +189,7 @@ done root =
         Io.println "Setup complete."
         Io.println ""
         Io.println "Start the playground server:"
-        Io.println ("  cd " ++ playgroundDir root ++ "/server && ipe run")
+        Io.println ("  cd " ++ playgroundDir root ++ "/server && ipe dev run")
         Io.println ""
         Io.println "Then open http://localhost:8000"
         Task.succeed ()

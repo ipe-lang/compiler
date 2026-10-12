@@ -23,8 +23,8 @@
 //! breakout. The close-tag strip applied to EVERY CSS fragment stays as
 //! belt-and-braces and must never be dropped. The selector uses the element's
 //! own ipe-id (`assign_ipe_ids`), never a user attr. That id holds only
-//! `[A-Za-z0-9_.:-]` (an unsafe tag contributes a fixed segment, a key is
-//! sanitised), so the quoted selector cannot be broken out of either.
+//! `[A-Za-z0-9_.:-]` (every tag and key byte outside `[A-Za-z0-9-]` is
+//! hex-escaped behind `.`), so the quoted selector cannot be broken out of either.
 //!
 //! Idempotent: a second run finds the markers already stripped and is a no-op
 //! (matches  idempotency contract), a belt-and-braces against a missed
@@ -36,10 +36,16 @@ use crate::html::{Attribute, Html, is_void};
 /// Covers void tags (they render no children) AND value-bearing tags whose
 /// children ARE their content: a `<textarea>`'s children are its text value and
 /// a `<select>`'s are its `<option>`s, so a child `<style>` would leak raw CSS
-/// into the field value / option list. For all of these the injection pass
-/// hoists the `<style>` to a sibling slot instead.
+/// into the field value / option list. A `<script>` or `<style>` is admitted
+/// only over trusted raw children (`crate::html::admit_element`), so a child
+/// `<style>` element would make the sink refuse the whole element. For all of
+/// these the injection pass hoists the `<style>` to a sibling slot instead.
+/// Names match without regard to ASCII case, as the tag gate's do.
 fn takes_no_style_child(tag: &str) -> bool {
-    is_void(tag) || tag == "textarea" || tag == "select"
+    is_void(tag)
+        || ["textarea", "select", "script", "style"]
+            .iter()
+            .any(|t| tag.eq_ignore_ascii_case(t))
 }
 
 /// Every style marker attr this module consumes, across all four passes. Used to
@@ -193,10 +199,10 @@ fn build_style_node<M>(
 }
 
 /// The ipe-id is spliced raw into `[ipe-id="…"]` inside an `HRaw` `<style>`
-/// body. `assign_ipe_ids` builds it from the tag names the renderer admits
-/// (`[A-Za-z0-9_:.-]`), the sanitised key, `:`, and the `!doctype-wrapper`
-/// pseudo-tag; an id with any other byte (a `"`, `]`, `{`, `<`, `\`) did not
-/// come from that stamper and gets no style block.
+/// body. `assign_ipe_ids` builds it from `[A-Za-z0-9_:.-]` alone (every tag
+/// and key byte outside `[A-Za-z0-9-]` is hex-escaped behind `.`); an id with
+/// any other byte (a `"`, `]`, `{`, `<`, `\`) did not come from that stamper
+/// and gets no style block.
 fn is_selector_safe_ipe_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -844,6 +850,48 @@ mod tests {
             !s.contains("data-ipe-pc-rules"),
             "pseudo-class marker must be consumed into a style rule: {s}"
         );
+    }
+
+    #[test]
+    fn raw_text_element_hoists_style_to_sibling_and_keeps_its_body() {
+        use crate::html::render_html;
+        // A `<script>` or `<style>` renders only over trusted raw children, so
+        // a prepended `<style>` child would make the sink refuse the element
+        // and drop its body: the scoped style must be hoisted instead.
+        for tag in ["script", "STYLE"] {
+            let mut tree: Html<()> = Html::HElement(
+                "div".to_string(),
+                vec![attr("ipe-id", "r")],
+                vec![Html::HElement(
+                    tag.to_string(),
+                    vec![
+                        attr("ipe-id", "r_0_x"),
+                        attr("data-ipe-pc-rules", "h|color: red"),
+                    ],
+                    vec![Html::HRaw("raw_body".to_string())],
+                )],
+            );
+            apply_style_injections(&mut tree);
+            let Html::HElement(_, _, kids) = &tree else {
+                assert!(matches!(tree, Html::HElement(..)), "{tag}: {tree:?}");
+                return;
+            };
+            assert_eq!(kids.len(), 2, "{tag}: element + hoisted style: {tree:?}");
+            assert!(
+                matches!(kids.first(), Some(Html::HElement(t, _, k))
+                    if t == tag && matches!(k.as_slice(), [Html::HRaw(b)] if b == "raw_body")),
+                "{tag}: the body must stay the one trusted raw child: {tree:?}"
+            );
+            assert!(
+                matches!(kids.get(1), Some(Html::HElement(t, _, _)) if t == "style"),
+                "{tag}: {tree:?}"
+            );
+            let s = render_html(&tree);
+            assert!(
+                s.contains("raw_body"),
+                "{tag}: element body must render: {s}"
+            );
+        }
     }
 
     #[test]

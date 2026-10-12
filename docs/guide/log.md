@@ -46,7 +46,7 @@ main =
         Io.println "done — four log records emitted above"
 ```
 
-Running it (`ipe run`) writes each record as a timestamped, level-tagged line —
+Running it (`ipe dev run`) writes each record as a timestamped, level-tagged line —
 the plain shape is `<timestamp> <LEVEL> <message>`:
 
 ```
@@ -102,7 +102,7 @@ Two env vars control runtime log output. Use `ipe doc <VAR>` for the full entry.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `IPE_LOG_LEVEL` | unset (info) | Minimum severity emitted: `debug`, `info`, `warn`, or `error`. |
+| `IPE_LOG_LEVEL` | unset (info) | Minimum severity emitted: `debug`, `info`, `warn`, or `error`; any other value refuses startup. |
 | `IPE_LOG_FORMAT` | unset (human) | Set to `json` for structured log lines suited to aggregation pipelines. |
 
 See the [**Observability** subsystem](../reference/env.md#observability) in the

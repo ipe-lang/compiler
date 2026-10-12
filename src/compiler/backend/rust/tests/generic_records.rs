@@ -4,7 +4,7 @@
 //! type variables ([`IrType::Generic`]) synthesises a GENERIC Rust struct:
 //!
 //! * `{ value : a }` → `pub struct RecValue<T1> { value: T1 }` with a generic
-//!   `IpeStringify` impl bounded `T1: IpeStringify + std::fmt::Debug`,
+//!   `IpeStringify` impl bounded `T1: IpeStringify`,
 //! * a function `wrap : a -> { value : a }` renders its signature with the
 //!   struct instantiated at the function's own generic (`RecValue<T1>`),
 //! * a same-field-set concrete record (`{ value : Int }`) deduplicates onto the
@@ -206,13 +206,12 @@ fn synthesises_generic_struct_and_signatures() -> DResult<()> {
         ),
         "generic struct definition missing or wrong shape:\n{out}"
     );
-    // Generic IpeStringify impl, bounded so the autoref dispatch resolves; rustfmt wraps format!.
+    // Generic IpeStringify impl, bounded so the field renders at the generic frame.
     assert!(
         out.contains(
-            "impl<T1: IpeStringify + std::fmt::Debug> IpeStringify for RecValue<T1> {\n    \
+            "impl<T1: IpeStringify> IpeStringify for RecValue<T1> {\n    \
              fn ipe_show(&self) -> String {\n        \
-             format!(\n            \"{{{}}}\",\n            \
-             (&ipe_runtime::stringify::Wrap(&self.value)).dispatch()\n        )"
+             format!(\"{{{}}}\", IpeStringify::ipe_show(&self.value))\n"
         ),
         "generic IpeStringify impl missing or wrong:\n{out}"
     );
@@ -344,11 +343,9 @@ fn two_type_parameter_record() -> DResult<()> {
         out.contains("pub struct RecFirstSecond<T1, T2> {\n    first: T1,\n    second: T2,\n}"),
         "two-parameter struct missing or wrong shape:\n{out}"
     );
-    // rustfmt line-wraps the long impl header before `for`.
     assert!(
         out.contains(
-            "impl<T1: IpeStringify + std::fmt::Debug, T2: IpeStringify + std::fmt::Debug> IpeStringify\n    \
-             for RecFirstSecond<T1, T2>\n{"
+            "impl<T1: IpeStringify, T2: IpeStringify> IpeStringify for RecFirstSecond<T1, T2> {"
         ),
         "two-parameter IpeStringify impl missing or wrong:\n{out}"
     );

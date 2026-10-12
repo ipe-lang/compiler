@@ -31,6 +31,12 @@ Three knots.
   allowed. Allowlisting a secret-shaped name is a build error, not a run-time
   refusal — so a credential cannot be embedded into a shipped browser bundle even by
   mistake.
+- **Path-root names, repeats and malformed names are refused too.** The temp-root
+  variables (`TMPDIR`, `TMP`, `TEMP`) steer where the runtime creates scratch
+  directories and the home variables (`HOME`, `USERPROFILE`, `HOMEDRIVE`,
+  `HOMEPATH`) steer where caches live, so neither can be allowlisted, in any case.
+  An entry must be a portable name (ASCII letters, digits and `_`, not starting
+  with a digit), and listing one name twice (ignoring case) is a build error.
 
 ## A worked example: public config in a browser app
 

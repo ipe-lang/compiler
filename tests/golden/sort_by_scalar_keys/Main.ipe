@@ -1,0 +1,38 @@
+module Main exposing (main)
+
+-- `List.sortBy` accepts every orderable scalar key: `Int`, `String`, `Float`,
+-- `Bool` and `Char`. Each sort is built and run; the output lists the labels in
+-- key order.
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+type alias Item =
+    { label : String, count : Int, name : String, weight : Float, done : Bool, grade : Char }
+
+
+items : List Item
+items =
+    [ { label = "x", count = 3, name = "carol", weight = 0.5, done = True, grade = 'b' }
+    , { label = "y", count = 1, name = "alice", weight = 2.5, done = False, grade = 'c' }
+    , { label = "z", count = 2, name = "bob", weight = 1.5, done = True, grade = 'a' }
+    ]
+
+
+labels : List Item -> String
+labels xs =
+    String.join "" (List.map (\i -> i.label) xs)
+
+
+main =
+    Io.println
+        (String.join " "
+            [ labels (List.sortBy (\i -> i.count) items)
+            , labels (List.sortBy (\i -> i.name) items)
+            , labels (List.sortBy (\i -> i.weight) items)
+            , labels (List.sortBy (\i -> i.done) items)
+            , labels (List.sortBy (\i -> i.grade) items)
+            ]
+        )

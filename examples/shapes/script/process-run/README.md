@@ -7,6 +7,6 @@ echoed verbatim, never expanded, because there is no shell. The worked example f
 the [Process guide](../../../../docs/guide/process.md).
 
 ```
-ipe build package.ipe
+ipe dev build package.ipe
 cargo run --manifest-path out/rust/Cargo.toml
 ```

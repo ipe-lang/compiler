@@ -51,7 +51,11 @@ fn time_format_arith_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     let outcome = crate::support::build_and_run_emitted("time_format_arith", &out);
     crate::support::assert_go_parity(

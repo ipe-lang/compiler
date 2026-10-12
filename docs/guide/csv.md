@@ -72,7 +72,7 @@ main =
 ```
 
 The export includes a quoted cell containing a comma — `"Doe, Jane"` — which the
-parser reads as a single field. Running it (`ipe run`) prints:
+parser reads as a single field. Running it (`ipe dev run`) prints:
 
 ```
 parsed rows: 4

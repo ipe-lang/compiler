@@ -59,7 +59,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for fixture {fixture}: {:?}",
+        "ipe dev build must succeed for fixture {fixture}: {:?}",
         built.err()
     );
 }
@@ -97,7 +97,7 @@ fn a1_ctor_map_bare() {
         let built = ipe::build(&entry, &out, &runtime);
         assert!(
             built.is_ok(),
-            "ipe build must succeed for ctor_map_bare: {:?}",
+            "ipe dev build must succeed for ctor_map_bare: {:?}",
             built.err()
         );
 
@@ -140,7 +140,7 @@ fn a2_ctor_partial_multiarg_with_clone() {
         let built = ipe::build(&entry, &out, &runtime);
         assert!(
             built.is_ok(),
-            "ipe build must succeed for ctor_partial: {:?}",
+            "ipe dev build must succeed for ctor_partial: {:?}",
             built.err()
         );
 
@@ -183,7 +183,7 @@ fn a3_ctor_stored_in_record_field() {
         let built = ipe::build(&entry, &out, &runtime);
         assert!(
             built.is_ok(),
-            "ipe build must succeed for ctor_field: {:?}",
+            "ipe dev build must succeed for ctor_field: {:?}",
             built.err()
         );
 

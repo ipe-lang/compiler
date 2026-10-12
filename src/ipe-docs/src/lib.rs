@@ -21,6 +21,7 @@
 //!
 //! Entry point: [`Index::build`].
 
+pub mod argv;
 pub mod env_vars;
 pub mod html;
 pub mod markdown;
@@ -473,7 +474,7 @@ impl IndexBuilder {
     /// default, purpose, subsystem, and class — all fields sourced from the
     /// single [`env_vars::EnvVar`] SSOT; no prose is authored here.
     pub fn add_env_vars(&mut self) {
-        for var in env_vars::ENV_VARS {
+        for var in env_vars::ENV_VARS.iter() {
             let text = format!(
                 "Name:      {}\nDefault:   {}\nSubsystem: {}\nClass:     {}\n\n{}",
                 var.name,

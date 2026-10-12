@@ -293,7 +293,7 @@ fn build_no_user_items(interner: &mut Interner) -> DResult<Program> {
 /// no `main.rs` functions (bindings immediately followed by the epilogue)
 /// emitted a double blank that only the rustfmt pass papered over — a silent
 /// drift from `cargo fmt --check`-clean the moment the pass is skipped (the
-/// `ipe watch` hot loop, and the whole `wasm32` playground, which cannot spawn
+/// `ipe dev watch` hot loop, and the whole `wasm32` playground, which cannot spawn
 /// rustfmt).
 ///
 /// Uses [`RustBackend::emit_spine`], which returns the raw pre-rustfmt spine

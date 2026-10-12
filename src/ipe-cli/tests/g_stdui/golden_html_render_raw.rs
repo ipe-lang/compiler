@@ -44,7 +44,7 @@ fn html_render_escapes_text_and_emits_raw_and_script() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for html_render_raw: {:?}",
+        "ipe dev build must succeed for html_render_raw: {:?}",
         built.err()
     );
 

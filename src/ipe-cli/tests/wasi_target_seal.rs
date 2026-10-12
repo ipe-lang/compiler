@@ -8,13 +8,13 @@
 //!   cargo-builds. Gated on `IPE_E2E=1` (the default `cargo test` stays fast +
 //!   offline).
 //! * **THE SEAL (user path):** the SAME guarantee through the real CLI selector
-//!   — `ipe build --target wasi` on a sealed-floor `Direct` program produces a
+//!   — `ipe dev build --target wasi` on a sealed-floor `Direct` program produces a
 //!   `wasm32-wasip1` module that built. This is the path an end user walks.
 //! * **The refusal (emit-side):** a program reaching a NON-viable family
 //!   (`Ipe.Http`, whose reqwest/`tokio/net` stack does not build on wasip1) is
 //!   turned away at `ipe` time with a typed diagnostic (IPE-N0029), never
 //!   emitted — so the unbuildable shape can never reach the wasip1 `cargo build`.
-//! * **The refusal (user path):** `ipe build --target wasi` on a non-WASI-viable
+//! * **The refusal (user path):** `ipe dev build --target wasi` on a non-WASI-viable
 //!   program is refused before any wasip1 `cargo build`, by one of two
 //!   independent, defense-in-depth gates:
 //!     - a TEA `Web` app is turned back at delivery-resolve time by the
@@ -272,7 +272,7 @@ fn wasi_http_shape_is_refused_fail_closed() {
     );
 }
 
-/// THE SEAL through the USER selector: `ipe build --target wasi` on a
+/// THE SEAL through the USER selector: `ipe dev build --target wasi` on a
 /// sealed-floor `Direct` program produces a `wasm32-wasip1` module that
 /// `cargo build`s. This exercises the real CLI path — parse `--target wasi`,
 /// resolve the compile target, gate through `admit_triple`, emit, and run the
@@ -295,6 +295,7 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
         .map_or_else(|| out.join("target"), PathBuf::from);
     if in_seal_child("ipe_build_target_wasi_user_path_cargo_builds", &target_dir) {
         let args = vec![
+            "dev".to_owned(),
             "build".to_owned(),
             entry.to_string_lossy().into_owned(),
             "--out".to_owned(),
@@ -311,7 +312,7 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
         let result = ipe::run_cli(&args);
         assert!(
             result.is_ok(),
-            "THE SEAL (user path): `ipe build --target wasi` on a sealed-floor Direct \
+            "THE SEAL (user path): `ipe dev build --target wasi` on a sealed-floor Direct \
              program must succeed (ipe-accepts ⇒ cargo-builds for wasm32-wasip1); got {result:?}",
         );
     } else if e2e_support::child_shared_target_from_env().is_none() {
@@ -319,7 +320,7 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
     }
 }
 
-/// The user-path refusal: `ipe build --target wasi` on a non-WASI-viable shape
+/// The user-path refusal: `ipe dev build --target wasi` on a non-WASI-viable shape
 /// (a `Web` TEA app) is refused fail-closed with a typed diagnostic at
 /// delivery-resolve time — never a permissive default, never an emit. Runs
 /// unconditionally (no cargo): the standing check the selector fails closed.
@@ -330,6 +331,7 @@ fn ipe_build_target_wasi_refuses_non_viable_shape_fail_closed() {
     let out = dir.join("out");
 
     let args = vec![
+        "dev".to_owned(),
         "build".to_owned(),
         entry.to_string_lossy().into_owned(),
         "--out".to_owned(),
@@ -355,9 +357,9 @@ fn ipe_build_target_wasi_refuses_non_viable_shape_fail_closed() {
     );
 }
 
-// ── the RUN path (`ipe run --target wasi`, embedded wasmtime) ────────────────
+// ── the RUN path (`ipe dev run --target wasi`, embedded wasmtime) ────────────────
 
-/// THE SEAL for the run path (feature on): `ipe run --target wasi` on a
+/// THE SEAL for the run path (feature on): `ipe dev run --target wasi` on a
 /// sealed-floor `Direct` program builds the `wasm32-wasip1` module AND executes
 /// it under the embedded wasmtime engine, confined by a WASI context derived
 /// from the program's declared capability floor. `run_cli` returns `Ok` ONLY
@@ -380,6 +382,7 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
         .map_or_else(|| out.join("target"), PathBuf::from);
     if in_seal_child("ipe_run_target_wasi_executes_under_wasmtime", &target_dir) {
         let args = vec![
+            "dev".to_owned(),
             "run".to_owned(),
             entry.to_string_lossy().into_owned(),
             "--out".to_owned(),
@@ -390,7 +393,7 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
         let result = ipe::run_cli(&args);
         assert!(
             result.is_ok(),
-            "THE SEAL (run path): `ipe run --target wasi` on a sealed-floor Direct \
+            "THE SEAL (run path): `ipe dev run --target wasi` on a sealed-floor Direct \
              program must build the wasm32-wasip1 module and run it to a clean exit \
              under embedded wasmtime; got {result:?}",
         );
@@ -399,9 +402,9 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
     }
 }
 
-/// The run-path refusal (non-viable shape): `ipe run --target wasi` on a `Web`
+/// The run-path refusal (non-viable shape): `ipe dev run --target wasi` on a `Web`
 /// TEA app is refused fail-closed at delivery-resolve time — the SAME
-/// `admit_triple` matrix `ipe build --target wasi` gates on, so the run path
+/// `admit_triple` matrix `ipe dev build --target wasi` gates on, so the run path
 /// never opens a looser door than build. Runs unconditionally (no cargo, no
 /// engine): the standing check that the selector fails closed for the run path.
 #[test]
@@ -411,6 +414,7 @@ fn ipe_run_target_wasi_refuses_non_viable_shape_fail_closed() {
     let out = dir.join("out");
 
     let args = vec![
+        "dev".to_owned(),
         "run".to_owned(),
         entry.to_string_lossy().into_owned(),
         "--out".to_owned(),
@@ -418,8 +422,9 @@ fn ipe_run_target_wasi_refuses_non_viable_shape_fail_closed() {
         "--target".to_owned(),
         "wasi".to_owned(),
     ];
-    let err = ipe::run_cli(&args)
-        .expect_err("a Web TEA app must be REFUSED for `ipe run --target wasi` (not WASI-viable)");
+    let err = ipe::run_cli(&args).expect_err(
+        "a Web TEA app must be REFUSED for `ipe dev run --target wasi` (not WASI-viable)",
+    );
 
     let rendered = format!("{err}");
     assert!(
@@ -432,7 +437,7 @@ fn ipe_run_target_wasi_refuses_non_viable_shape_fail_closed() {
     );
 }
 
-/// THE SEAL for the collapsed `server` bucket: `ipe build --target wasi` on a
+/// THE SEAL for the collapsed `server` bucket: `ipe dev build --target wasi` on a
 /// `Server.listen` app is refused fail-closed at `ipe` time by the per-kernel
 /// sealed floor (IPE-N0029), never a wasip1 `cargo build`. Since a server is now
 /// a `Direct` (`script`) shape, the `admit_triple` shape gate PASSES it — so the
@@ -449,6 +454,7 @@ fn ipe_build_target_wasi_refuses_live_server_fail_closed() {
     let out = dir.join("out");
 
     let args = vec![
+        "dev".to_owned(),
         "build".to_owned(),
         entry.to_string_lossy().into_owned(),
         "--out".to_owned(),
@@ -477,7 +483,7 @@ fn ipe_build_target_wasi_refuses_live_server_fail_closed() {
     );
 }
 
-/// The run-path mirror of the server refusal (feature ON): `ipe run --target
+/// The run-path mirror of the server refusal (feature ON): `ipe dev run --target
 /// wasi` on a `Server.listen` app is refused fail-closed at the per-kernel sealed
 /// floor (IPE-N0029) — the wasip1 module is built (and the `Server.listen` kernel
 /// turned back there) before the embedded engine could run it, so the run path
@@ -493,6 +499,7 @@ fn ipe_run_target_wasi_refuses_live_server_fail_closed() {
     let out = dir.join("out");
 
     let args = vec![
+        "dev".to_owned(),
         "run".to_owned(),
         entry.to_string_lossy().into_owned(),
         "--out".to_owned(),
@@ -501,7 +508,7 @@ fn ipe_run_target_wasi_refuses_live_server_fail_closed() {
         "wasi".to_owned(),
     ];
     let err = ipe::run_cli(&args).expect_err(
-        "a Server.listen app must be REFUSED for `ipe run --target wasi` (not WASI-viable)",
+        "a Server.listen app must be REFUSED for `ipe dev run --target wasi` (not WASI-viable)",
     );
 
     let rendered = format!("{err}");
@@ -519,7 +526,7 @@ fn ipe_run_target_wasi_refuses_live_server_fail_closed() {
     );
 }
 
-/// The run-path refusal (feature off): with `wasi_run` disabled, `ipe run
+/// The run-path refusal (feature off): with `wasi_run` disabled, `ipe dev run
 /// --target wasi` returns a typed refusal naming the missing feature — never a
 /// panic, never a silent native fallback, and never a (wasted) wasip1 build.
 /// Runs unconditionally when the feature is off; no cargo, no network.
@@ -531,6 +538,7 @@ fn ipe_run_target_wasi_feature_off_is_typed_refusal() {
     let out = dir.join("out");
 
     let args = vec![
+        "dev".to_owned(),
         "run".to_owned(),
         entry.to_string_lossy().into_owned(),
         "--out".to_owned(),
@@ -539,7 +547,7 @@ fn ipe_run_target_wasi_feature_off_is_typed_refusal() {
         "wasi".to_owned(),
     ];
     let err = ipe::run_cli(&args)
-        .expect_err("`ipe run --target wasi` without the wasi_run feature must be refused");
+        .expect_err("`ipe dev run --target wasi` without the wasi_run feature must be refused");
 
     assert!(
         matches!(err, CliError::WasiRunFeatureDisabled),
@@ -572,6 +580,7 @@ fn ipe_run_target_wasi_server_feature_off_is_typed_refusal() {
     let out = dir.join("out");
 
     let args = vec![
+        "dev".to_owned(),
         "run".to_owned(),
         entry.to_string_lossy().into_owned(),
         "--out".to_owned(),
@@ -580,7 +589,7 @@ fn ipe_run_target_wasi_server_feature_off_is_typed_refusal() {
         "wasi".to_owned(),
     ];
     let err = ipe::run_cli(&args).expect_err(
-        "a Server.listen app must be REFUSED for `ipe run --target wasi` without the wasi_run feature",
+        "a Server.listen app must be REFUSED for `ipe dev run --target wasi` without the wasi_run feature",
     );
 
     assert!(

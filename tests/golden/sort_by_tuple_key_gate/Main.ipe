@@ -1,0 +1,26 @@
+module Main exposing (main)
+
+-- A tuple key is not an orderable scalar: `List.sortBy` keyed on
+-- `( Int, String )` is rejected at type-check (IPE-T0001). Order by a compound
+-- key with `List.sortWith`.
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+type alias Person =
+    { age : Int, name : String }
+
+
+people : List Person
+people =
+    [ { age = 30, name = "b" }, { age = 25, name = "a" } ]
+
+
+main =
+    let
+        _unused =
+            List.sortBy (\p -> ( p.age, p.name )) people
+    in
+    Io.println (String.fromInt 0)

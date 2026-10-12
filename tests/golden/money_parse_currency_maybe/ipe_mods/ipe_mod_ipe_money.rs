@@ -62,6 +62,7 @@ pub(crate) enum IpeMoneyCurrency {
     USDC,
     CurrencyRaw(String),
 }
+
 impl IpeStringify for IpeMoneyCurrency {
     fn ipe_show(&self) -> String {
         match self {
@@ -123,13 +124,79 @@ impl IpeStringify for IpeMoneyCurrency {
             IpeMoneyCurrency::ETH => "ETH".to_string(),
             IpeMoneyCurrency::USDT => "USDT".to_string(),
             IpeMoneyCurrency::USDC => "USDC".to_string(),
-            IpeMoneyCurrency::CurrencyRaw(p0) => format!(
-                "CurrencyRaw {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
+            IpeMoneyCurrency::CurrencyRaw(p0) => {
+                format!("CurrencyRaw {}", IpeStringify::ipe_show(p0))
+            }
         }
     }
 }
+
+impl RetainedBytes for IpeMoneyCurrency {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        match self {
+            IpeMoneyCurrency::USD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::EUR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::GBP => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::JPY => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::CHF => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::AUD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::CAD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::NZD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::SEK => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::NOK => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::DKK => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::CNY => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::HKD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::SGD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::KRW => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::TWD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::INR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::THB => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::MYR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::IDR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::PHP => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::VND => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::BRL => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::MXN => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::ARS => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::CLP => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::ZAR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::TRY => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::RUB => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::UAH => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::PLN => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::CZK => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::HUF => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::RON => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::BGN => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::AED => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::SAR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::QAR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::KWD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::BHD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::OMR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::JOD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::ILS => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::EGP => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::NGN => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::KES => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::GHS => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::MAD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::TND => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::DZD => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::PKR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::BDT => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::LKR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::NPR => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::BTC => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::ETH => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::USDT => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::USDC => Bytes::inline::<Self>(),
+            IpeMoneyCurrency::CurrencyRaw(p0) => Bytes::inline::<Self>()?.plus(p0),
+        }
+    }
+}
+
 pub(crate) fn user_ipe_money_currency_code(c: IpeMoneyCurrency) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match c {
@@ -194,6 +261,7 @@ pub(crate) fn user_ipe_money_currency_code(c: IpeMoneyCurrency) -> String {
         IpeMoneyCurrency::CurrencyRaw(s) => s,
     }
 }
+
 pub(crate) fn user_ipe_money_parse_currency(code: String) -> IpeMaybe<IpeMoneyCurrency> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match (string_to_upper(string_trim(code))).as_str() {

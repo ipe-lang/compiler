@@ -14,6 +14,11 @@
 #![allow(clippy::module_name_repetitions)] // KernelId / KernelClass / FfiKernelId all contain "Kernel"
 #![forbid(unsafe_code)]
 
+mod builtin_type;
+pub use builtin_type::{
+    BUILTIN_TYPES, BuiltinRole, BuiltinRow, BuiltinType, KernelHome, SealClass,
+};
+
 mod capability;
 pub use capability::{Capability, ElementCapability, UnknownCapability, WebCapability};
 
@@ -266,7 +271,7 @@ pub struct SchemeKey(pub StdlibKernel);
 /// arguments (`List a`, `Maybe a`) are named here; the arity is carried by the
 /// argument slice of the [`TyShape::Con`] that references the tag, not by the
 /// tag itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumCount)]
 pub enum BuiltinTag {
     /// `Int` — the signed-integer primitive.
     Int,
@@ -438,6 +443,13 @@ pub enum BuiltinTag {
     HttpMethod,
     /// `RedirectPolicy` — the redirect-behaviour ADT (`NoRedirects | FollowRedirects Int`).
     RedirectPolicy,
+    /// `DbFailure` — the closed database-failure-cause ADT carried by `ErrorDetails.Database`.
+    DbFailure,
+    /// `AuthError` — the closed, payload-free refusal of `Auth.verifyToken`:
+    /// `Malformed | BadSignature | Expired | NotYetValid | MissingClaim |
+    /// Revoked | RevocationUnavailable | TooManyCredentials | SecretTooShort`,
+    /// each `Auth.`-qualified.
+    AuthError,
     /// `Duration` — the `Ipe.Duration.Duration` opaque non-negative time span
     /// (`Duration Int`, compiled-source), consumed by the `Http.withTimeout`
     /// kernel's typed timeout argument. Homed at `["Ipe", "Duration"]` (see
@@ -2127,15 +2139,6 @@ pub enum StdlibKernel {
     TaskWithMaxAttempts,
     /// `Task.withBaseMs : Int -> RetryPolicy e -> RetryPolicy e`
     TaskWithBaseMs,
-    // ── BackoffStrategy constructors ────────────────────────────────────────
-    /// `Task.Linear : BackoffStrategy` — constant delay, no jitter.
-    BackoffLinear,
-    /// `Task.LinearWithJitter : BackoffStrategy` — constant delay with jitter.
-    BackoffLinearWithJitter,
-    /// `Task.Exponential : BackoffStrategy` — doubling delay, no jitter.
-    BackoffExponential,
-    /// `Task.ExponentialWithJitter : BackoffStrategy` — doubling delay with jitter.
-    BackoffExponentialWithJitter,
     // ── Io ──────────────────────────────────────────────────────────────────
     IoReadLine,
     /// `Io.readSecret : String -> Task Error Secret` — write a prompt, then read
@@ -2447,6 +2450,17 @@ pub enum StdlibKernel {
     /// leaf. The accessor must name a `String` field; the pattern is a bound
     /// parameter (wildcards are data, never SQL text).
     StoreLike,
+    /// `Store.startsWith : (row -> String) -> String -> Cond` — accessor-typed
+    /// literal-prefix leaf.
+    ///
+    /// The accessor must name a `String` field. The prefix is literal: `%`,
+    /// `_` and `\` in it match themselves, and the match is case-sensitive on
+    /// every engine under a deterministic collation; a Postgres column
+    /// declared with a nondeterministic collation (a case-insensitive ICU one)
+    /// compares by that collation instead. It renders through `Sql.startsWith`,
+    /// so an empty prefix, one holding a NUL character, or one longer than
+    /// 16384 bytes is refused as a typed error before any SQL is sent.
+    StoreStartsWith,
     /// `Store.isNull : (row -> t) -> Cond` — accessor-typed IS NULL leaf.
     /// Arity 1: only the accessor (column name), no value.
     StoreIsNull,
@@ -2972,7 +2986,7 @@ pub enum StdlibKernel {
     HostLoopback,
     /// `Host.allInterfaces : HostMode` — bind every interface. Projects to tag `1`.
     HostAllInterfaces,
-    /// `Host.envDriven : HostMode` — defer to the environment / build profile.
+    /// `Host.envDriven : HostMode` — `IPE_HTTP_BIND` if set, else `127.0.0.1`.
     /// Projects to tag `2`.
     HostEnvDriven,
     /// `Level.debug : LogLevel` — the debug severity. Projects to tag `0`.
@@ -3507,7 +3521,27 @@ pub enum StdlibKernel {
     SqlInList,
     /// `Sql.like : SqlFragment -> String -> SqlFragment` — the pattern is
     /// always a bound param, never interpolated.
+    ///
+    /// It renders `LIKE ? ESCAPE '\'`: `%` and `_` in the pattern, including
+    /// any from user text, are wildcards, and `\%`, `\_`, `\\` match them
+    /// literally on every engine. A pattern ending in an unpaired `\` is
+    /// refused as a typed error. A literal prefix is `Sql.startsWith`.
     SqlLike,
+    /// `Sql.startsWith : SqlFragment -> String -> SqlFragment` — the rows whose
+    /// text begins with exactly the given prefix.
+    ///
+    /// The prefix is literal: `%`, `_` and `\` in it match themselves, and
+    /// the match is case-sensitive on every engine under a deterministic
+    /// collation; a Postgres column declared with a nondeterministic
+    /// collation (a case-insensitive ICU one) compares by that collation
+    /// instead. A `NULL` value never matches. An empty prefix, one holding a NUL character, or one longer
+    /// than 16384 bytes is refused as a typed error before any SQL is sent.
+    /// The predicate renders an escaped `LIKE ? ESCAPE '\'` beside an exact
+    /// `substr` comparison, so an index can serve the scan on Postgres (and
+    /// on SQLite only under `case_sensitive_like`; otherwise SQLite scans).
+    /// Under Postgres with `standard_conforming_strings = off`, `'\'` is a
+    /// syntax error, so such a server refuses the query.
+    SqlStartsWith,
     /// `Sql.exists : String -> SqlFragment -> SqlFragment` — a correlated-
     /// subquery existence test `EXISTS (SELECT 1 FROM <table> WHERE <inner>)`.
     /// The table is validated through the same bare-identifier gate as
@@ -3811,10 +3845,15 @@ pub enum StdlibKernel {
     CryptoKeyFromBytes,
     /// `Mac.toHex : Mac -> String` — the single extraction boundary for MAC output.
     CryptoMacToHex,
+    /// `Mac.fromHex : String -> Maybe Mac` — the single parse boundary for a stored tag.
+    CryptoMacFromHex,
     /// `Crypto.hmacSha256WithKey : Key -> String -> Mac` — typed HMAC-SHA256.
     CryptoHmacSha256WithKey,
     /// `Crypto.hmacSha512WithKey : Key -> String -> Mac` — typed HMAC-SHA512.
     CryptoHmacSha512WithKey,
+    /// `Crypto.verifyHmacSha256 : Key -> String -> Mac -> Bool` — recompute, then
+    /// compare in constant time.
+    CryptoVerifyHmacSha256,
 
     // ── Ipe.Email.EmailAddress — typed parse-don't-validate boundary ───
     // Additive API: `EmailAddress.parse` is the only constructor; downstream
@@ -4963,32 +5002,6 @@ impl StdlibKernel {
                 IpeOrder,
             ),
             Self::TaskWithBaseMs => d("Task", "withBaseMs", 2, Pure, "task_with_base_ms", IpeOrder),
-            // ── BackoffStrategy constructors ─────────────────────────────────
-            Self::BackoffLinear => d("Task", "Linear", 0, Pure, "backoff_linear", IpeOrder),
-            Self::BackoffLinearWithJitter => d(
-                "Task",
-                "LinearWithJitter",
-                0,
-                Pure,
-                "backoff_linear_with_jitter",
-                IpeOrder,
-            ),
-            Self::BackoffExponential => d(
-                "Task",
-                "Exponential",
-                0,
-                Pure,
-                "backoff_exponential",
-                IpeOrder,
-            ),
-            Self::BackoffExponentialWithJitter => d(
-                "Task",
-                "ExponentialWithJitter",
-                0,
-                Pure,
-                "backoff_exponential_with_jitter",
-                IpeOrder,
-            ),
             // ── Io ──────────────────────────────────────────────────────────
             Self::IoReadLine => d("Io", "readLine", 1, Pure, "io_read_line", IpeOrder),
             Self::IoReadSecret => d("Io", "readSecret", 1, Pure, "io_read_secret", IpeOrder),
@@ -5346,6 +5359,15 @@ impl StdlibKernel {
             Self::StoreLteBy => d("Store", "lteBy", 3, Pure, "store_lte_by", IpeOrder),
             // `Store.like` — arity 2 (accessor + pattern string).
             Self::StoreLike => d("Store", "like", 2, Pure, "store_like", IpeOrder),
+            // `Store.startsWith` — arity 2 (accessor + prefix string).
+            Self::StoreStartsWith => d(
+                "Store",
+                "startsWith",
+                2,
+                Pure,
+                "store_starts_with",
+                IpeOrder,
+            ),
             // `Store.isNull` / `Store.notNull` — arity 1 (accessor only).
             Self::StoreIsNull => d("Store", "isNull", 1, Pure, "store_is_null", IpeOrder),
             Self::StoreNotNull => d("Store", "notNull", 1, Pure, "store_not_null", IpeOrder),
@@ -7216,6 +7238,7 @@ impl StdlibKernel {
             Self::SqlIsNotNull => d("Sql", "isNotNull", 1, Db, "sql_is_not_null", IpeOrder),
             Self::SqlInList => d("Sql", "inList", 2, Db, "sql_in_list", IpeOrder),
             Self::SqlLike => d("Sql", "like", 2, Db, "sql_like", IpeOrder),
+            Self::SqlStartsWith => d("Sql", "startsWith", 2, Db, "sql_starts_with", IpeOrder),
             Self::SqlExists => d("Sql", "exists", 2, Db, "sql_exists", IpeOrder),
             Self::SqlMaskedColumn => d("Sql", "maskedColumn", 2, Db, "sql_masked_column", IpeOrder),
             Self::DbFindWhere => d("Db", "findWhere", 3, Db, "db_find_where", IpeOrder),
@@ -7478,6 +7501,7 @@ impl StdlibKernel {
                 IpeOrder,
             ),
             Self::CryptoMacToHex => d("Mac", "toHex", 1, Pure, "crypto_mac_to_hex", IpeOrder),
+            Self::CryptoMacFromHex => d("Mac", "fromHex", 1, Pure, "crypto_mac_from_hex", IpeOrder),
             Self::CryptoHmacSha256WithKey => d(
                 "Crypto",
                 "hmacSha256WithKey",
@@ -7492,6 +7516,14 @@ impl StdlibKernel {
                 2,
                 Pure,
                 "crypto_hmac_sha512_key",
+                IpeOrder,
+            ),
+            Self::CryptoVerifyHmacSha256 => d(
+                "Crypto",
+                "verifyHmacSha256",
+                3,
+                Pure,
+                "crypto_verify_hmac_sha256",
                 IpeOrder,
             ),
             // ── Ipe.Email.EmailAddress ─────────────────────────────────
@@ -7988,11 +8020,6 @@ impl StdlibKernel {
         Self::TaskDefaultRetryPolicy,
         Self::TaskWithMaxAttempts,
         Self::TaskWithBaseMs,
-        // BackoffStrategy constructors
-        Self::BackoffLinear,
-        Self::BackoffLinearWithJitter,
-        Self::BackoffExponential,
-        Self::BackoffExponentialWithJitter,
         // Io
         Self::IoReadLine,
         Self::IoReadSecret,
@@ -8139,6 +8166,7 @@ impl StdlibKernel {
         Self::StoreLteCol,
         Self::StoreLteBy,
         Self::StoreLike,
+        Self::StoreStartsWith,
         Self::StoreIsNull,
         Self::StoreNotNull,
         Self::StoreInListCol,
@@ -8742,6 +8770,7 @@ impl StdlibKernel {
         Self::SqlIsNotNull,
         Self::SqlInList,
         Self::SqlLike,
+        Self::SqlStartsWith,
         Self::SqlExists,
         Self::SqlMaskedColumn,
         Self::DbFindWhere,
@@ -8833,8 +8862,10 @@ impl StdlibKernel {
         Self::CryptoKeyFromString,
         Self::CryptoKeyFromBytes,
         Self::CryptoMacToHex,
+        Self::CryptoMacFromHex,
         Self::CryptoHmacSha256WithKey,
         Self::CryptoHmacSha512WithKey,
+        Self::CryptoVerifyHmacSha256,
         // ── Ipe.Email.EmailAddress ─────────────────────────────────────
         Self::EmailAddressParse,
         Self::EmailAddressToString,
@@ -10265,6 +10296,12 @@ impl StdlibKernel {
         const STRING_TO_CRYPTO_MAC: TyShape = TyShape::Fun(&STRING, &CRYPTO_MAC);
         const CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC: TyShape =
             TyShape::Fun(&CRYPTO_KEY, &STRING_TO_CRYPTO_MAC);
+        const MAYBE_CRYPTO_MAC: TyShape = TyShape::Con(BuiltinTag::Maybe, &[CRYPTO_MAC]);
+        const STRING_TO_MAYBE_CRYPTO_MAC: TyShape = TyShape::Fun(&STRING, &MAYBE_CRYPTO_MAC);
+        const CRYPTO_MAC_TO_BOOL: TyShape = TyShape::Fun(&CRYPTO_MAC, &BOOL);
+        const STRING_TO_CRYPTO_MAC_TO_BOOL: TyShape = TyShape::Fun(&STRING, &CRYPTO_MAC_TO_BOOL);
+        const CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC_TO_BOOL: TyShape =
+            TyShape::Fun(&CRYPTO_KEY, &STRING_TO_CRYPTO_MAC_TO_BOOL);
         const STRING_TO_STRING_TO_CRYPTO_KEY: TyShape =
             TyShape::Fun(&STRING, &STRING_TO_CRYPTO_KEY);
         const STRING_TO_RESULT_ERR_STRING: TyShape = TyShape::Fun(&STRING, &RESULT_ERR_STRING);
@@ -10286,7 +10323,12 @@ impl StdlibKernel {
         const AUTH_SIGN_TOKEN: TyShape =
             TyShape::Fun(&SECRET, &DICT_SS_TO_INT_TO_RESULT_ERR_STRING);
         const STRING_TO_RESULT_ERR_DICT_SS: TyShape = TyShape::Fun(&STRING, &RESULT_ERR_DICT_SS);
-        const AUTH_VERIFY_TOKEN: TyShape = TyShape::Fun(&SECRET, &STRING_TO_RESULT_ERR_DICT_SS);
+        // Auth.verifyToken : Secret -> String -> Result AuthError (Dict String String).
+        const AUTH_ERROR: TyShape = TyShape::Con(BuiltinTag::AuthError, &[]);
+        const RESULT_AUTH_ERROR_DICT_SS: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[AUTH_ERROR, DICT_STRING_STRING]);
+        const AUTH_VERIFY_TOKEN: TyShape =
+            TyShape::Fun(&SECRET, &TyShape::Fun(&STRING, &RESULT_AUTH_ERROR_DICT_SS));
         const STRING_TO_RESULT_ERR_BOOL: TyShape = TyShape::Fun(&STRING, &RESULT_ERR_BOOL);
         const STRING_TO_STRING_TO_RESULT_ERR_BOOL: TyShape =
             TyShape::Fun(&STRING, &STRING_TO_RESULT_ERR_BOOL);
@@ -10401,8 +10443,12 @@ impl StdlibKernel {
         // Server (route/cookie only — non-record arms).
         const STRING_TO_STRING_TO_ROUTE: TyShape =
             TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &SERVER_ROUTE));
-        const STRING_TO_STRING_TO_COOKIE: TyShape =
-            TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &SERVER_COOKIE));
+        // `Server.cookie : String -> String -> Result Error Cookie` (an empty
+        // name is an `Error`).
+        const RESULT_ERROR_COOKIE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, SERVER_COOKIE]);
+        const STRING_TO_STRING_TO_RESULT_COOKIE: TyShape =
+            TyShape::Fun(&STRING, &TyShape::Fun(&STRING, &RESULT_ERROR_COOKIE));
         const REQ_TO_STRING: TyShape = TyShape::Fun(&SERVER_REQUEST, &STRING);
         const STRING_TO_REQ_TO_MAYBE_STRING: TyShape =
             TyShape::Fun(&STRING, &TyShape::Fun(&SERVER_REQUEST, &MAYBE_STRING));
@@ -11396,11 +11442,15 @@ impl StdlibKernel {
         const HANDLER_TO_ROUTE: TyShape = TyShape::Fun(&RESP_HANDLER, &SERVER_ROUTE);
         const SERVER_ROUTE_KERNEL: TyShape = TyShape::Fun(&STRING, &HANDLER_TO_ROUTE);
         // Authed routes. `authConfig : Secret -> TokenSource -> AuthConfig`;
-        // `cookieToken : String -> TokenSource`; the route kernels take a
-        // two-argument handler `Request -> Principal -> Task Error Response`.
+        // `cookieToken : String -> Result Error TokenSource` (an empty name is
+        // an `Error`); the route kernels take a two-argument handler
+        // `Request -> Principal -> Task Error Response`.
         const SECRET_TO_TOKEN_SOURCE_TO_AUTH_CONFIG: TyShape =
             TyShape::Fun(&SECRET, &TyShape::Fun(&TOKEN_SOURCE, &AUTH_CONFIG));
-        const STRING_TO_TOKEN_SOURCE: TyShape = TyShape::Fun(&STRING, &TOKEN_SOURCE);
+        const RESULT_ERROR_TOKEN_SOURCE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, TOKEN_SOURCE]);
+        const STRING_TO_RESULT_TOKEN_SOURCE: TyShape =
+            TyShape::Fun(&STRING, &RESULT_ERROR_TOKEN_SOURCE);
         // `withRevocation : RevocationMode -> AuthConfig -> AuthConfig` — arms the gate.
         const REVOCATION_MODE_TO_AUTH_CONFIG_TO_AUTH_CONFIG: TyShape =
             TyShape::Fun(&REVOCATION_MODE, &TyShape::Fun(&AUTH_CONFIG, &AUTH_CONFIG));
@@ -11416,9 +11466,17 @@ impl StdlibKernel {
         const STRING_TO_RESPONSE: TyShape = TyShape::Fun(&STRING, &SERVER_RESPONSE);
         const RESPONSE_TO_RESPONSE: TyShape = TyShape::Fun(&SERVER_RESPONSE, &SERVER_RESPONSE);
         const SERVER_WITH_STATUS: TyShape = TyShape::Fun(&INT, &RESPONSE_TO_RESPONSE);
-        const STRING_TO_RESPONSE_TO_RESPONSE: TyShape =
-            TyShape::Fun(&STRING, &RESPONSE_TO_RESPONSE);
-        const SERVER_WITH_HEADER: TyShape = TyShape::Fun(&STRING, &STRING_TO_RESPONSE_TO_RESPONSE);
+        // `Server.withHeader : String -> String -> Response -> Result Error Response`
+        // (a name or value with no header representation is an `Error`).
+        const RESULT_ERROR_RESPONSE: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, SERVER_RESPONSE]);
+        const SERVER_WITH_HEADER: TyShape = TyShape::Fun(
+            &STRING,
+            &TyShape::Fun(
+                &STRING,
+                &TyShape::Fun(&SERVER_RESPONSE, &RESULT_ERROR_RESPONSE),
+            ),
+        );
         // Server withCookie : Cookie -> Response -> Response.
         const SERVER_WITH_COOKIE: TyShape = TyShape::Fun(&SERVER_COOKIE, &RESPONSE_TO_RESPONSE);
         // Middleware — every wrapper is a `Handler -> Handler` transform over the
@@ -11478,8 +11536,6 @@ impl StdlibKernel {
         const RETRY_ON: TyShape = TyShape::Fun(&A_TO_BOOL, &RETRY_POLICY_TO_RETRY_POLICY);
         // `retryWith : RetryPolicy Error -> Task e a -> Task e a`. var(0) = a.
         const RETRY_WITH: TyShape = TyShape::Fun(&RETRY_POLICY_ERROR, &TASK_A_TO_TASK_A);
-        // `BackoffStrategy` nullary constructors.
-        const BACKOFF_STRATEGY_CON: TyShape = TyShape::Con(BuiltinTag::BackoffStrategy, &[]);
         // App-entry whole signatures — `cfg -> Program <shape> msg`.
         // Each entry builder returns the uniform shape carrier `Program shape msg`
         // (not `Task ()`): the phantom `shape` tag distinguishes the surface at
@@ -11708,7 +11764,7 @@ impl StdlibKernel {
         const STORE_EQ_COL: TyShape = TyShape::Fun(&A_TO_B_GETTER, &B_TO_COND_A);
         // `*By : Codec t -> (row -> t) -> t -> Cond row`.
         const STORE_EQ_BY: TyShape = TyShape::Fun(&CODEC_B, &STORE_EQ_COL);
-        // `like : (row -> String) -> String -> Cond row`.
+        // `like / startsWith : (row -> String) -> String -> Cond row`.
         const A_TO_STRING_GETTER: TyShape = TyShape::Fun(&A, &STRING);
         const STRING_TO_COND_A: TyShape = TyShape::Fun(&STRING, &COND_A);
         const STORE_LIKE: TyShape = TyShape::Fun(&A_TO_STRING_GETTER, &STRING_TO_COND_A);
@@ -12344,6 +12400,8 @@ impl StdlibKernel {
                 Some(&STRING_TO_MAYBE_CRYPTO_KEY)
             }
             Self::CryptoMacToHex => Some(&CRYPTO_MAC_TO_STRING),
+            Self::CryptoMacFromHex => Some(&STRING_TO_MAYBE_CRYPTO_MAC),
+            Self::CryptoVerifyHmacSha256 => Some(&CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC_TO_BOOL),
             Self::CryptoHmacSha256WithKey | Self::CryptoHmacSha512WithKey => {
                 Some(&CRYPTO_KEY_TO_STRING_TO_CRYPTO_MAC)
             }
@@ -12495,7 +12553,7 @@ impl StdlibKernel {
 
             // ── Server (non-record route/cookie arms). ──
             Self::ServerStatic => Some(&STRING_TO_STRING_TO_ROUTE),
-            Self::ServerCookieNew => Some(&STRING_TO_STRING_TO_COOKIE),
+            Self::ServerCookieNew => Some(&STRING_TO_STRING_TO_RESULT_COOKIE),
             Self::ServerBody | Self::ServerPath | Self::ServerMethod => Some(&REQ_TO_STRING),
             Self::ServerParam
             | Self::ServerQueryParam
@@ -12521,7 +12579,7 @@ impl StdlibKernel {
                 Some(&SQLFRAGMENT_TO_SQLFRAGMENT)
             }
             Self::SqlInList => Some(&SQL_IN_LIST),
-            Self::SqlLike => Some(&SQL_LIKE),
+            Self::SqlLike | Self::SqlStartsWith => Some(&SQL_LIKE),
             Self::SqlExists => Some(&SQL_EXISTS),
             Self::SqlMaskedColumn => Some(&SQL_MASKED_COLUMN),
 
@@ -12849,7 +12907,7 @@ impl StdlibKernel {
             | Self::ServerDeleteAuthed => Some(&SERVER_AUTHED_ROUTE_KERNEL),
             Self::ServerAuthConfig => Some(&SECRET_TO_TOKEN_SOURCE_TO_AUTH_CONFIG),
             Self::ServerTokenBearer => Some(&TOKEN_SOURCE),
-            Self::ServerCookieToken => Some(&STRING_TO_TOKEN_SOURCE),
+            Self::ServerCookieToken => Some(&STRING_TO_RESULT_TOKEN_SOURCE),
             // `withRevocation : RevocationMode -> AuthConfig -> AuthConfig`
             Self::ServerWithRevocation => Some(&REVOCATION_MODE_TO_AUTH_CONFIG_TO_AUTH_CONFIG),
             Self::ServerText | Self::ServerJson | Self::ServerHtml | Self::ServerRedirect => {
@@ -12886,10 +12944,6 @@ impl StdlibKernel {
             Self::TaskDefaultRetryPolicy => Some(&RETRY_POLICY),
             Self::TaskWithMaxAttempts | Self::TaskWithBaseMs => Some(&INT_TO_RETRY_TO_RETRY),
             Self::TaskRetryWith => Some(&RETRY_WITH),
-            Self::BackoffLinear
-            | Self::BackoffLinearWithJitter
-            | Self::BackoffExponential
-            | Self::BackoffExponentialWithJitter => Some(&BACKOFF_STRATEGY_CON),
             // App-entry cfg records.
             Self::WebApp => Some(&WEB_APP),
             Self::WebEmbed => Some(&WEB_EMBED),
@@ -13013,7 +13067,7 @@ impl StdlibKernel {
             | Self::StoreGteBy
             | Self::StoreLtBy
             | Self::StoreLteBy => Some(&STORE_EQ_BY),
-            Self::StoreLike => Some(&STORE_LIKE),
+            Self::StoreLike | Self::StoreStartsWith => Some(&STORE_LIKE),
             Self::StoreIsNull | Self::StoreNotNull => Some(&STORE_IS_NULL),
             Self::StoreInListCol => Some(&STORE_IN_LIST_COL),
             Self::StoreInListBy => Some(&STORE_IN_LIST_BY),
@@ -13109,6 +13163,7 @@ impl StdlibKernel {
         Self::StoreLteCol,
         Self::StoreLteBy,
         Self::StoreLike,
+        Self::StoreStartsWith,
         Self::StoreIsNull,
         Self::StoreNotNull,
         Self::StoreInListCol,
@@ -13681,6 +13736,7 @@ impl StdlibKernel {
             | Self::StoreLteCol
             | Self::StoreLteBy
             | Self::StoreLike
+            | Self::StoreStartsWith
             | Self::StoreIsNull
             | Self::StoreNotNull
             | Self::StoreInListCol
@@ -14005,10 +14061,6 @@ impl StdlibKernel {
             | Self::TaskDefaultRetryPolicy
             | Self::TaskWithMaxAttempts
             | Self::TaskWithBaseMs
-            | Self::BackoffLinear
-            | Self::BackoffLinearWithJitter
-            | Self::BackoffExponential
-            | Self::BackoffExponentialWithJitter
             | Self::IoReadLine
             | Self::IoReadSecret
             | Self::IoWriteStdout
@@ -14441,6 +14493,7 @@ impl StdlibKernel {
             | Self::SqlIsNotNull
             | Self::SqlInList
             | Self::SqlLike
+            | Self::SqlStartsWith
             | Self::SqlExists
             | Self::SqlMaskedColumn
             | Self::SecretFromString
@@ -14556,8 +14609,10 @@ impl StdlibKernel {
             | Self::CryptoKeyFromString
             | Self::CryptoKeyFromBytes
             | Self::CryptoMacToHex
+            | Self::CryptoMacFromHex
             | Self::CryptoHmacSha256WithKey
             | Self::CryptoHmacSha512WithKey
+            | Self::CryptoVerifyHmacSha256
             // ── Ipe.Email.EmailAddress ─────────────────────────────────
             | Self::EmailAddressParse
             | Self::EmailAddressToString
@@ -15390,7 +15445,8 @@ impl StdlibKernel {
     /// SHA-2 hash (`sha256`/`sha512`), the HMAC family (`hmacSha256`/`hmacSha512`
     /// and their `Key`-typed `WithKey` forms), the constant-time compare, the
     /// entropy pair (`randomBytes`/`randomToken`), and the typed `Key`/`Mac`
-    /// newtype kernels (`Key.fromString` / `Key.fromBytes` / `Mac.toHex`).
+    /// newtype kernels (`Key.fromString` / `Key.fromBytes` / `Mac.toHex` /
+    /// `Mac.fromHex`), plus the typed tag check `Crypto.verifyHmacSha256`.
     ///
     /// EXCLUDES RSA sign/verify: although their emit symbols reside in
     /// `crypto_core.rs`, their bodies are `#[cfg(feature = "crypto")]` (they pull
@@ -15421,6 +15477,8 @@ impl StdlibKernel {
                 | Self::CryptoKeyFromString
                 | Self::CryptoKeyFromBytes
                 | Self::CryptoMacToHex
+                | Self::CryptoMacFromHex
+                | Self::CryptoVerifyHmacSha256
         )
     }
 
@@ -15579,30 +15637,16 @@ impl StdlibKernel {
     /// OFF the qualifier whitelist; their proven-pure members are admitted one
     /// by one by NAME ([`Self::is_reactor_free_time_or_system`]), so a new
     /// member of either defaults to reactor-requiring until it is audited and
-    /// listed. `Task` is likewise mixed and never gets a qualifier entry: its
-    /// reactor members are named below and its pure `BackoffStrategy`
-    /// constructors are named here.
+    /// listed. `Task` is likewise mixed and never gets a qualifier entry.
     ///
     /// Not `const`: the whole-family arms compare the kernel's canonical
     /// qualifier (`&str`), which stable Rust cannot match in a `const fn`.
     #[must_use]
     pub fn requires_async_runtime(self) -> bool {
-        // `BackoffStrategy` constructors are pure zero-arity values under the
-        // mixed `Task` qualifier; they carry no future and never touch the
-        // reactor, so they are admitted by name. Every other `Task` member —
-        // `Task.run` / `Task.perform` block on an inner task of unknown purity,
-        // `Task.parallel` spawns, `Task.retryWith` sleeps, `Task.attempt`
-        // bridges into the TEA loop — has no qualifier entry and falls to the
-        // reactor-requiring default below.
-        if matches!(
-            self,
-            Self::BackoffLinear
-                | Self::BackoffLinearWithJitter
-                | Self::BackoffExponential
-                | Self::BackoffExponentialWithJitter
-        ) {
-            return false;
-        }
+        // Every `Task` member — `Task.run` / `Task.perform` block on an inner
+        // task of unknown purity, `Task.parallel` spawns, `Task.retryWith`
+        // sleeps, `Task.attempt` bridges into the TEA loop — has no qualifier
+        // entry and falls to the reactor-requiring default below.
         // The proven-pure members of the mixed `Time` / `System` families are
         // admitted one by one by NAME, so a new member of either family
         // defaults to reactor-requiring below.
@@ -16075,7 +16119,7 @@ pub enum Target {
     /// The native host binary (server / CLI / TUI / desktop).
     #[default]
     Native,
-    /// A browser WASM bundle (`ipe build --target wasm`) — fully public,
+    /// A browser WASM bundle (`ipe dev build --target wasm`) — fully public,
     /// `wasm2wat`-inspectable; no server effect or secret may compile in.
     WasmClient,
     /// A co-located portable WASI bundle (`wasm32-wasip1`) — a `Direct`/`Script`
@@ -16916,13 +16960,6 @@ mod tests {
                     | StdlibKernel::SystemCwd
                     | StdlibKernel::SystemExit
             );
-            let pure_backoff = matches!(
-                k,
-                StdlibKernel::BackoffLinear
-                    | StdlibKernel::BackoffLinearWithJitter
-                    | StdlibKernel::BackoffExponential
-                    | StdlibKernel::BackoffExponentialWithJitter
-            );
             // The families that are pure in whole: every member resolves without
             // the reactor. Distinct from the qualifier list in production only
             // in that this test re-derives it from the audited-purity judgement
@@ -16958,7 +16995,7 @@ mod tests {
                     | "Io"
                     | "Sql"
             );
-            pure_time_system || pure_backoff || pure_whole_family
+            pure_time_system || pure_whole_family
         };
         for k in StdlibKernel::ALL {
             let q = k.decl().qualifier;

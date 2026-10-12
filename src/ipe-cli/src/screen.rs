@@ -30,7 +30,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::CliError;
-use crate::doc_bundle::DocSuggestion;
+use crate::doc_search::DocMiss;
 use crate::style::{self, GUTTER, Palette, REPORT_BUGS_PHRASE, TerminalSafe};
 
 /// The semantic role of a piece of human output, which fixes its colour.
@@ -149,6 +149,13 @@ pub fn emit_header(stream: Stream) {
     }
 }
 
+/// Write `banner`, a complete screen that is the product header alone, to
+/// `stream` byte for byte, and mark the header shown so no later screen repeats it.
+pub fn emit_banner(stream: Stream, banner: &str) {
+    let _ = claim_header();
+    stream.write(banner);
+}
+
 /// Write machine output (`--json`, `--plain`) to `stream` byte for byte —
 /// never framed, never coloured.
 pub fn emit_machine(stream: Stream, text: &str) {
@@ -159,7 +166,7 @@ pub fn emit_machine(stream: Stream, text: &str) {
 /// progress-bar redraw — with [`style::RELAY_INDENT`] before it reaches the
 /// terminal.
 ///
-/// This is the single routine both `ipe build`'s and `ipe watch`'s cargo relay
+/// This is the single routine both `ipe dev build`'s and `ipe dev watch`'s cargo relay
 /// loops call on every chunk `read_progress_chunk` hands them, so the relayed
 /// Cargo diagnostics and progress bar sit one column off the edge instead of
 /// flush against it — one shared indent for the one shared relay pattern,
@@ -422,8 +429,8 @@ pub fn error_screen(err: &CliError, color: bool) -> Option<Screen> {
     }
     let fault = err.fault();
     let mut screen = Screen::with_color(Stream::Stderr, color);
-    if let CliError::DocNotFound { query, suggestions } = err {
-        doc_not_found(&mut screen, query, suggestions);
+    if let CliError::DocNotFound { miss } = err {
+        doc_not_found(&mut screen, miss);
     } else if err.renders_own_screen() {
         // A self-rendering error (a help page, a gate report) is styled by
         // ipe's own renderers with the stderr palette, so its escapes pass
@@ -438,18 +445,23 @@ pub fn error_screen(err: &CliError, color: bool) -> Option<Screen> {
     Some(screen)
 }
 
-/// The `ipe doc` miss: the query in the user-error tone, then each suggestion
-/// as the exact command that opens it, with its title as auxiliary text.
-fn doc_not_found(screen: &mut Screen, query: &str, suggestions: &[DocSuggestion]) {
-    screen.line(Tone::UserError, &crate::text::cli_doc_not_found(&query));
-    if suggestions.is_empty() {
+/// The `ipe doc` miss: the query in the user-error tone, then the numbered
+/// entries, each as the exact command that opens it.
+fn doc_not_found(screen: &mut Screen, miss: &DocMiss) {
+    screen.line(
+        Tone::UserError,
+        &crate::text::cli_doc_not_found(&miss.query),
+    );
+    if miss.hits.is_empty() {
         return;
     }
-    screen
-        .blank()
-        .line(Tone::Text, crate::text::cli_doc_suggestions_header());
-    for line in crate::doc_bundle::suggestion_lines(suggestions) {
+    let (header, more) = crate::doc_pick::human_parts(miss);
+    screen.blank().line(Tone::Text, header);
+    for line in crate::doc_pick::human_lines(miss) {
         screen.line(Tone::Text, &line);
+    }
+    if let Some(more) = more {
+        screen.line(Tone::Aux, more);
     }
 }
 
@@ -620,12 +632,16 @@ mod tests {
     #[test]
     fn a_doc_miss_lists_its_suggestions_as_commands() {
         let err = CliError::DocNotFound {
-            query: "pipeline".to_owned(),
-            suggestions: vec![DocSuggestion {
-                key: "topic:pipelines".to_owned(),
-                kind: crate::doc_bundle::DocKind::Topic,
-                title: "Pipelines".to_owned(),
-            }],
+            miss: DocMiss {
+                query: style::TerminalLine::sanitize("pipeline"),
+                hits: vec![crate::doc_search::DocHit {
+                    term: style::TerminalLine::sanitize("topic:pipelines"),
+                    kind: crate::doc_bundle::DocKind::Topic,
+                    summary: style::TerminalLine::sanitize("Pipelines"),
+                }],
+                closeness: crate::doc_search::Closeness::Match,
+                truncated: true,
+            },
         };
         let out = error_screen(&err, false)
             .map(|s| s.render(Header::Omitted))
@@ -635,7 +651,11 @@ mod tests {
             "{out:?}"
         );
         assert!(
-            out.contains("    ipe doc topic:pipelines  Pipelines (topic)"),
+            out.contains("    1. ipe doc topic:pipelines  Pipelines (topic)"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("  More entries match; refine the term."),
             "{out:?}"
         );
         assert!(!out.contains(REPORT_BUGS_PHRASE), "{out:?}");
@@ -723,7 +743,7 @@ mod tests {
             matches!(
                 err,
                 Some(CliError::CommandUsage {
-                    command: "verify",
+                    command: crate::verb::CommandName::Command("verify"),
                     ..
                 })
             ),
@@ -736,9 +756,9 @@ mod tests {
     #[test]
     fn a_manifest_value_cannot_inject_escapes_into_the_help_screen() {
         let err = crate::driver::with_help_on_misuse(
-            "build",
+            crate::verb::Verb::DEV_BUILD,
             Err(CliError::Usage(crate::text::msg::command_refusal(
-                &"build",
+                &crate::verb::Verb::DEV_BUILD,
                 &format!("unknown manifest value `{HOSTILE}`"),
             ))),
         )
@@ -790,7 +810,7 @@ mod tests {
     #[test]
     fn machine_json_escapes_the_sanitised_message_exactly_once() {
         let err = CliError::Usage(crate::text::msg::command_refusal(
-            &"build",
+            &crate::verb::Verb::DEV_BUILD,
             &format!("bad value `a\"b\\c` {HOSTILE}"),
         ));
         let line = crate::machine_output::machine_error(
@@ -809,11 +829,11 @@ mod tests {
             });
         assert_eq!(
             message.as_deref(),
-            Some("ipe build: bad value `a\"b\\c` foo")
+            Some("ipe dev build: bad value `a\"b\\c` foo")
         );
     }
 
-    /// `indent_relay_chunk` is the single routine `ipe build` and `ipe watch`
+    /// `indent_relay_chunk` is the single routine `ipe dev build` and `ipe dev watch`
     /// both call on every relayed cargo stderr chunk. Pin its two terminator
     /// shapes (`\n`-ended lines and `\r`-ended progress-bar redraws) plus the
     /// blank-line exemption, so neither relay site can drift back to "no

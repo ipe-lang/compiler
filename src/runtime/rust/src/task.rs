@@ -120,7 +120,7 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let handle = tokio::task::spawn(future);
+    let handle = spawn_in_current_scope(future);
     let guard = AbortOnDrop::new(handle.abort_handle());
     let joined = handle.await;
     guard.defuse();
@@ -133,16 +133,119 @@ where
     }
 }
 
+/// The name of the entry thread [`block_on`] drives its task on.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+const BLOCK_ON_THREAD: &str = "ipe-block-on";
+
+/// `task`, carried into every task-local scope its caller runs in, so code
+/// that runs on another task or thread on the caller's behalf sees the scopes
+/// the caller sees (a credential it verifies binds to the Web session or the
+/// `Server` request that owns it).
+///
+/// Every caller-owned task-local scope is carried here and only here: a new
+/// one wraps the result, `carry_new_scope(carry_web_session(..))`, and every
+/// spawn through [`spawn_in_current_scope`] inherits it.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+#[allow(clippy::missing_const_for_fn)] // const only in builds that carry no scope
+fn on_behalf_of_caller<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    carry_web_session(carry_request_streams(carry_server_request(task)))
+}
+
+/// `task`, kept inside the Web session its caller runs on behalf of, so a
+/// credential it verifies binds to that session.
+#[cfg(all(
+    feature = "tokio",
+    feature = "web-core",
+    feature = "server",
+    not(target_arch = "wasm32")
+))]
+fn carry_web_session<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::web::pubsub::inherit_session_scope(task)
+}
+
+/// `task` as it is: without the served Web runtime no session scope exists.
+#[cfg(all(
+    feature = "tokio",
+    not(all(feature = "web-core", feature = "server")),
+    not(target_arch = "wasm32")
+))]
+const fn carry_web_session<F: std::future::Future>(task: F) -> F {
+    task
+}
+
+/// `task`, kept inside the stream table of the `Server` request its caller
+/// handles, so a `stream` it registers belongs to that request.
+#[cfg(all(feature = "tokio", feature = "server", not(target_arch = "wasm32")))]
+fn carry_request_streams<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::server_stream::inherit_stream_scope(task)
+}
+
+/// `task` as it is: without `server` no request stream table exists.
+#[cfg(all(
+    feature = "tokio",
+    not(feature = "server"),
+    not(target_arch = "wasm32")
+))]
+const fn carry_request_streams<F: std::future::Future>(task: F) -> F {
+    task
+}
+
+/// `task`, kept inside the binding set of the `Server` request its caller
+/// handles.
+#[cfg(all(
+    feature = "tokio",
+    feature = "server",
+    feature = "jwt",
+    not(target_arch = "wasm32")
+))]
+fn carry_server_request<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    crate::server::inherit_request_scope(task)
+}
+
+/// `task` as it is: without `server` and `jwt` no request scope exists.
+#[cfg(all(
+    feature = "tokio",
+    not(all(feature = "server", feature = "jwt")),
+    not(target_arch = "wasm32")
+))]
+const fn carry_server_request<F: std::future::Future>(task: F) -> F {
+    task
+}
+
+/// Spawn `task` on the runtime inside every scope its caller runs in.
+///
+/// The spawn every task of this module goes through, and the one a spawn for
+/// work on user code's behalf elsewhere in the runtime must use: a bare spawn
+/// starts the task outside the caller's task-locals, where a credential it
+/// verifies binds to nothing.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub(crate) fn spawn_in_current_scope<F>(task: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(on_behalf_of_caller(task))
+}
+
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromUnavailable + Send + 'static,
     A: Send + 'static,
 {
     let rt = match global_runtime() {
         Ok(r) => r,
         Err(e) => return IpeResult::Err(e.into()),
     };
+    let future = on_behalf_of_caller(future);
     // The spawned OS thread keeps the entry poll outside any runtime context
     // (a nested `block_on` inside a worker thread would panic) and lets a
     // panicking future be `.join()`-mapped to `Err` instead of aborting. The
@@ -154,15 +257,21 @@ where
     // floor first thing, so a guarded recursion entered directly from `block_on`
     // (a synchronous CLI computation) trips at the same depth as one entered on a
     // tokio worker, and the red-zone probe has a floor here too.
-    let spawned = std::thread::Builder::new()
-        .stack_size(crate::core::RUNTIME_THREAD_STACK_SIZE)
-        .spawn(move || {
+    let spawned = crate::threads::spawn_sized(
+        BLOCK_ON_THREAD,
+        crate::core::RUNTIME_THREAD_STACK_SIZE,
+        move || {
             crate::core::record_stack_floor(crate::core::RUNTIME_THREAD_STACK_SIZE);
             rt.block_on(future)
-        });
+        },
+    );
     let handle = match spawned {
         Ok(h) => h,
-        Err(e) => return IpeResult::Err(format!("failed to spawn block_on thread: {e}").into()),
+        Err(e) => {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(BLOCK_ON_THREAD, &e).into_error(),
+            );
+        }
     };
     match handle.join() {
         Ok(r) => r,
@@ -694,7 +803,7 @@ where
 // its entry differently (`spawn_local`), so it is excluded there but present on
 // `wasm32-wasip1`, where a `Direct` program's `main` calls it.
 #[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
-pub fn task_run<E: From<String> + Send + 'static, A: Send + 'static>(
+pub fn task_run<E: From<String> + crate::FromUnavailable + Send + 'static, A: Send + 'static>(
     task: IpeTask<E, A>,
 ) -> IpeResult<E, A> {
     block_on(task)
@@ -748,8 +857,9 @@ pub fn task_parallel<E: From<String> + Send + 'static, A: Send + 'static>(
         // Spawn every task up front so they run concurrently. `VecDeque` lets us
         // pop the front (input order) to await while the un-awaited tail stays
         // addressable for `abort()` on failure.
+        // Each spawned task stays inside the request scope this one runs in.
         let mut handles: std::collections::VecDeque<tokio::task::JoinHandle<IpeResult<E, A>>> =
-            tasks.into_iter().map(tokio::spawn).collect();
+            tasks.into_iter().map(spawn_in_current_scope).collect();
         let mut out = Vec::with_capacity(handles.len());
         while let Some(h) = handles.pop_front() {
             let result = match h.await {
@@ -837,6 +947,13 @@ pub enum BackoffStrategy {
     Exponential,
     ExponentialWithJitter,
 }
+
+crate::stringify::show_row!("BackoffStrategy", Value, [] BackoffStrategy, |b| match b {
+    BackoffStrategy::Linear => "Linear".to_owned(),
+    BackoffStrategy::LinearWithJitter => "LinearWithJitter".to_owned(),
+    BackoffStrategy::Exponential => "Exponential".to_owned(),
+    BackoffStrategy::ExponentialWithJitter => "ExponentialWithJitter".to_owned(),
+});
 
 // Task.retryWith : RetryPolicy e -> Task e a -> Task e a
 //
@@ -1257,6 +1374,24 @@ mod retry_tests {
 //   2. An all-`Ok` run returns the results in INPUT order regardless of the
 //      order in which the tasks actually complete.
 //
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+#[cfg(test)]
+mod block_on_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_entry_thread_is_an_unavailable_error() {
+        let _refusing = crate::threads::refusal_hook::refuse(BLOCK_ON_THREAD);
+        let task: IpeTask<crate::IpeError, i64> = Box::pin(async { IpeResult::Ok(1) });
+        match block_on(task) {
+            IpeResult::Err(e) => {
+                assert_eq!(crate::ipe_error_kind(e), crate::IpeErrorKind::Unavailable);
+            }
+            IpeResult::Ok(v) => panic!("a refused entry thread must not run the task, got Ok({v})"),
+        }
+    }
+}
+
 // Exercises the concurrent spawn-based `task_parallel` (`tokio::spawn` + abort),
 // so it compiles only when the `tokio` feature is on.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -1439,10 +1574,12 @@ mod std_block_on_tests {
                 }
                 self.armed = true;
                 let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    waker.wake();
-                });
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        waker.wake();
+                    })
+                    .expect("spawn test thread");
                 Poll::Pending
             }
         }
@@ -1771,6 +1908,199 @@ mod loop_tests {
             loop_spread <= LOOP_MAX_SPREAD,
             "Task.loop must hold the stack flat across {STEPS} steps \
              (spread {loop_spread} bytes)"
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod spawn_scope_scan_tests {
+    /// A spelling that starts a task on a runtime or a thread pool.
+    const RAW_SPAWNS: [&str; 7] = [
+        "tokio::spawn",
+        "task::spawn",
+        "spawn_local",
+        "spawn_blocking",
+        "JoinSet",
+        "Handle::spawn",
+        ".spawn(",
+    ];
+
+    /// The production source of this module: everything before its first
+    /// test module, refused if any non-test item follows that module.
+    fn production_source() -> &'static str {
+        let source = include_str!("task.rs");
+        let Some((production, tests)) = source.split_once("#[cfg(test)]") else {
+            panic!("task.rs carries its test modules");
+        };
+        for line in tests.lines() {
+            let top_level = !line.is_empty() && !line.starts_with(char::is_whitespace);
+            assert!(
+                !top_level
+                    || ["#[", "mod ", "}", ")", "//"]
+                        .iter()
+                        .any(|item| line.starts_with(item)),
+                "production code follows a test module in task.rs, so the spawn scan \
+                 cannot see it; move it above the first test module: {line}"
+            );
+        }
+        production
+    }
+
+    #[test]
+    fn task_spawns_only_through_the_scope_carrier() {
+        let mut carriers = 0;
+        for line in production_source().lines() {
+            let code = line.trim();
+            if code.starts_with("//") {
+                continue;
+            }
+            if code == "tokio::spawn(on_behalf_of_caller(task))" {
+                carriers += 1;
+                continue;
+            }
+            assert!(
+                !RAW_SPAWNS.iter().any(|raw| code.contains(raw)),
+                "a spawn in task.rs drops the caller's request scope; route it \
+                 through `spawn_in_current_scope`: {code}"
+            );
+            assert!(
+                !(code.starts_with("use ") && code.contains("tokio") && code.contains("spawn")),
+                "a spawn imported into task.rs escapes the scan: {code}"
+            );
+        }
+        assert_eq!(
+            carriers, 1,
+            "`spawn_in_current_scope` is the one runtime spawn"
+        );
+    }
+
+    #[test]
+    fn the_scope_carrier_carries_every_caller_scope() {
+        let production = production_source();
+        let carrier = production
+            .split_once("fn on_behalf_of_caller<")
+            .and_then(|(_, body)| body.split_once("\n}"))
+            .map(|(body, _)| body);
+        assert!(
+            carrier.is_some_and(|body| {
+                [
+                    "carry_web_session(",
+                    "carry_request_streams(",
+                    "carry_server_request(",
+                ]
+                .iter()
+                .all(|scope| body.contains(scope))
+            }),
+            "`on_behalf_of_caller` carries the Web session, the request stream table \
+             and the request binding set"
+        );
+    }
+
+    #[test]
+    fn block_on_thread_carries_the_scope() {
+        let production = production_source();
+        let carried = production.find("let future = on_behalf_of_caller(future);");
+        let spawned = production.find("crate::threads::spawn_sized(");
+        assert!(
+            matches!((carried, spawned), (Some(c), Some(s)) if c < s),
+            "`block_on` carries the caller's scope before its entry thread starts"
+        );
+        assert_eq!(
+            production.matches("spawn_sized(").count(),
+            1,
+            "`block_on` is the one thread spawn of task.rs"
+        );
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "tokio",
+    feature = "web-core",
+    feature = "server",
+    feature = "jwt",
+    not(target_arch = "wasm32")
+))]
+mod web_session_carrier_tests {
+    use super::*;
+    use crate::revocation::SessionBindings;
+    use crate::web::pubsub::{SessionScope, current_session_sid, session_bindings};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// The session sid and credential set a spawned child observes.
+    type Seen = (String, Option<Arc<Mutex<SessionBindings>>>);
+
+    /// How long a test waits before it counts a child as hung.
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn observe() -> Seen {
+        (current_session_sid(), session_bindings())
+    }
+
+    /// Whether `seen` is the session `sid` with exactly the credential set `bindings`.
+    fn binds_to(seen: &Seen, sid: &str, bindings: &Arc<Mutex<SessionBindings>>) -> bool {
+        seen.0 == sid
+            && seen
+                .1
+                .as_ref()
+                .is_some_and(|set| Arc::ptr_eq(set, bindings))
+    }
+
+    #[tokio::test]
+    async fn task_parallel_child_binds_to_web_session() {
+        let scope = SessionScope::new("sid-parallel".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let tasks: Vec<IpeTask<String, Seen>> = vec![
+            Box::pin(async { IpeResult::Ok(observe()) }),
+            Box::pin(async { IpeResult::Ok(observe()) }),
+        ];
+        let result = tokio::time::timeout(DEADLINE, scope.scoped(task_parallel(tasks))).await;
+        assert!(
+            matches!(&result, Ok(IpeResult::Ok(seen)) if seen.len() == 2
+                && seen.iter().all(|child| binds_to(child, "sid-parallel", &bindings))),
+            "every parallel child runs inside the dispatching session's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn ffi_spawn_child_binds_to_web_session() {
+        let scope = SessionScope::new("sid-ffi".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let child = ffi_spawn_guarded(async { observe() });
+        let result = tokio::time::timeout(DEADLINE, scope.scoped(child)).await;
+        assert!(
+            matches!(&result, Ok(Ok(seen)) if binds_to(seen, "sid-ffi", &bindings)),
+            "a guarded foreign task runs inside the dispatching session's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_keep_their_own_scope() {
+        let first = SessionScope::new("sid-first".to_owned());
+        let second = SessionScope::new("sid-second".to_owned());
+        let first_set = Arc::clone(first.bindings());
+        let second_set = Arc::clone(second.bindings());
+        let both = async {
+            tokio::join!(
+                first.scoped(ffi_spawn_guarded(async { observe() })),
+                second.scoped(ffi_spawn_guarded(async { observe() })),
+            )
+        };
+        let result = tokio::time::timeout(DEADLINE, both).await;
+        assert!(
+            matches!(&result, Ok((Ok(a), Ok(b)))
+                if binds_to(a, "sid-first", &first_set) && binds_to(b, "sid-second", &second_set)),
+            "a child binds to its own session, never a sibling session's credential set"
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_a_session_a_child_carries_no_session() {
+        let result = tokio::time::timeout(DEADLINE, ffi_spawn_guarded(async { observe() })).await;
+        assert!(
+            matches!(&result, Ok(Ok((sid, None))) if sid.is_empty()),
+            "a child spawned outside any session sees no session scope"
         );
     }
 }

@@ -37,7 +37,7 @@ fn redirect_builders_compile_and_run() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for http_builders_redirects: {:?}",
+        "ipe dev build must succeed for http_builders_redirects: {:?}",
         built.err()
     );
 

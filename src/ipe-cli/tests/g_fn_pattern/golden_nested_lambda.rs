@@ -24,7 +24,7 @@
 //! `Main.ipe` to stdout `6\n`, exit 0:
 //!
 //! ```text
-//! $ ipe run tests/golden/nested_lambda/Main.ipe
+//! $ ipe dev run tests/golden/nested_lambda/Main.ipe
 //! 6
 //! ```
 //!

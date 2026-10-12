@@ -35,7 +35,7 @@ fn runtime() -> PathBuf {
     e2e_support::require_runtime().into_path_buf()
 }
 
-/// Emit-only: `ipe build` of the transform fixture must succeed.
+/// Emit-only: `ipe dev build` of the transform fixture must succeed.
 #[test]
 fn css_transform_ssot_emits() {
     let dir = fixture_dir();
@@ -47,7 +47,7 @@ fn css_transform_ssot_emits() {
     let built = ipe::build(&entry, &out, &rt);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for css_transform_ssot: {:?}",
+        "ipe dev build must succeed for css_transform_ssot: {:?}",
         built.err()
     );
 }
@@ -71,7 +71,7 @@ fn css_transform_ssot_e2e_output_matches_expected() {
     let built = ipe::build(&entry, &out, &rt);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for css_transform_ssot E2E: {:?}",
+        "ipe dev build must succeed for css_transform_ssot E2E: {:?}",
         built.err()
     );
 

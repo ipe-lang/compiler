@@ -1,0 +1,1188 @@
+module SettingsTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Db as Db
+import Ipe.Db.Decode
+import Ipe.Db.Sql as Sql
+import Ipe.Dict as Dict
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Path as Path
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.EnvLookup as EnvLookup
+import Lib.Format as Format
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Links as Links exposing (Link(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
+import Lib.SafeText as SafeText
+import Lib.Settings as Settings
+import TestSupport exposing (tableExists, envReview, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains)
+
+
+-- An `IPE_INDEX_DB` value carrying hazards is refused by naming the variable,
+-- never by echoing the value.
+dbRefusalNamesOnlyVariable : Task.Task Error Bool
+dbRefusalNamesOnlyVariable =
+    do
+        cwd <- System.cwd ()
+        System.setenv "IPE_INDEX_ROOT" cwd
+        refusal <- settingsRefusal ("postgres://" ++ codeText 27 ++ "]0;pwn" ++ codeText 7 ++ "/index")
+        Task.succeed
+            (refusedFor "IPE_INDEX_DB" refusal
+                && not (refusedFor "]0;pwn" refusal)
+                && not (refusedFor "postgres://" refusal)
+                && (case refusal of
+                    Just message ->
+                        noHazard message
+
+                    Nothing ->
+                        False
+                )
+            )
+
+
+settingsRefusal : String -> Task.Task Error (Maybe String)
+settingsRefusal indexDb =
+    System.setenv "IPE_INDEX_DB" indexDb
+        |> Task.andThen (\_ -> envSettings)
+        |> Task.map (\_ -> Nothing)
+        |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
+
+
+settingsRefused : String -> String -> Task.Task Error Bool
+settingsRefused indexDb reason =
+    settingsRefusal indexDb |> Task.map (refusedFor reason)
+
+
+-- `IPE_INDEX_DB` values that cannot name a SQLite database stop at the parse,
+-- each for its own reason, and no refusal repeats the value it refused.
+badIndexDbRefused : Task.Task Error Bool
+badIndexDbRefused =
+    do
+        cwd <- System.cwd ()
+        System.setenv "IPE_INDEX_ROOT" cwd
+        blank <- settingsRefused "" "is empty"
+        otherScheme <- settingsRefused "postgres://localhost/index" "not `sqlite://`"
+        query <- settingsRefused "index.db?mode=rwc" "file path containing"
+        fragment <- settingsRefused "index.db#x" "file path containing"
+        percent <- settingsRefused "index%2e.db" "file path containing"
+        urlQuery <- settingsRefused "sqlite:///tmp/index.db?mode=rwc" "with a query"
+        urlOtherQuery <- settingsRefused "sqlite:///tmp/index.db?cache=shared" "with a query"
+        urlEmpty <- settingsRefused "sqlite://" "naming no database"
+        urlFragment <- settingsRefused "sqlite:///tmp/index.db#x" "with a query or fragment"
+        urlEncodedQuery <- settingsRefused "sqlite://file:/tmp/x.db%3Fmode=ro" "not absolute"
+        urlEncodedImmutable <- settingsRefused "sqlite://file:/x.db%3Fmode=ro%26immutable=1" "not absolute"
+        urlMemory <- settingsRefused "sqlite://:memory:" "not absolute"
+        urlRelative <- settingsRefused "sqlite://rel.db" "not absolute"
+        urlNested <- settingsRefused "sqlite://sqlite:" "not absolute"
+        urlBadEscape <- settingsRefused "sqlite:///tmp/index%zz.db" "malformed percent-escape"
+        urlNul <- settingsRefused "sqlite:///tmp/index%00.db" "not a valid file path"
+        urlAboveRoot <- settingsRefused "sqlite:///.." "root directory"
+        urlDeepAboveRoot <- settingsRefused "sqlite:///tmp/../../.." "root directory"
+        urlRoot <- settingsRefused "sqlite:///" "root directory"
+        pathAboveRoot <- settingsRefused "/.." "root directory"
+        urlDot <- settingsRefused "sqlite:///." "root directory"
+        urlDotSlash <- settingsRefused "sqlite:///./" "root directory"
+        urlDoubleSlash <- settingsRefused "sqlite:////" "root directory"
+        urlEncodedAboveRoot <- settingsRefused "sqlite:///%2e%2e" "root directory"
+        noSlashes <- settingsRefused "sqlite:index.db" "without `//`"
+        fileNoSlashes <- settingsRefused "file:index.db" "without `//`"
+        secret <- settingsRefusal "postgres://admin:s3cr3t-pw@db/index"
+        Task.succeed
+            (blank
+                && otherScheme
+                && query
+                && fragment
+                && percent
+                && urlQuery
+                && urlOtherQuery
+                && urlEmpty
+                && urlFragment
+                && urlEncodedQuery
+                && urlEncodedImmutable
+                && urlMemory
+                && urlRelative
+                && urlNested
+                && urlBadEscape
+                && urlNul
+                && urlAboveRoot
+                && urlDeepAboveRoot
+                && urlRoot
+                && pathAboveRoot
+                && urlDot
+                && urlDotSlash
+                && urlDoubleSlash
+                && urlEncodedAboveRoot
+                && noSlashes
+                && fileNoSlashes
+                && refusedFor "IPE_INDEX_DB" secret
+                && not (refusedFor "s3cr3t-pw" secret)
+                && not (refusedFor "admin" secret)
+            )
+
+
+-- Every open URL carries exactly the app's mode, for a file path and a
+-- `sqlite://` URL alike, and a `sqlite://` URL parses to the same location as
+-- the plain path it names; a `+` in the URL path is a literal `+`, never a
+-- space.
+dbUrlsCarryAppMode : Task.Task Error Bool
+dbUrlsCarryAppMode =
+    do
+        file <- Settings.parseDbLocation "IPE_INDEX_DB" "/tmp/a&b/index.db"
+        url <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///tmp/index%3F.db"
+        absUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///abs/x.db"
+        absPath <- Settings.parseDbLocation "IPE_INDEX_DB" "/abs/x.db"
+        plusUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///t/a+b.db"
+        escapedPlusUrl <- Settings.parseDbLocation "IPE_INDEX_DB" "sqlite:///t/a%2Bb.db"
+        plusPath <- Settings.parseDbLocation "IPE_INDEX_DB" "/t/a+b.db"
+        Task.succeed
+            (absUrl
+                == absPath
+                && plusUrl
+                == plusPath
+                && escapedPlusUrl
+                == plusPath
+                && Settings.reviewUrl plusUrl
+                == "sqlite:///t/a+b.db?mode=rwc"
+                && Settings.indexReadUrl absUrl
+                == "sqlite:///abs/x.db?mode=ro"
+                && Settings.indexReadUrl file
+                == "sqlite:///tmp/a&b/index.db?mode=ro"
+                && Settings.indexWriteUrl file
+                == "sqlite:///tmp/a&b/index.db?mode=rw"
+                && Settings.reviewUrl file
+                == "sqlite:///tmp/a&b/index.db?mode=rwc"
+                && Settings.indexReadUrl url
+                == "sqlite:///tmp/index%3F.db?mode=ro"
+                && Settings.indexWriteUrl url
+                == "sqlite:///tmp/index%3F.db?mode=rw"
+                && Settings.reviewUrl url
+                == "sqlite:///tmp/index%3F.db?mode=rwc"
+            )
+
+
+-- A working directory can hold `%`, `?` or `#`; each is escaped so the joined
+-- file path survives the URL as the same name, with `%` escaped first so the
+-- other escapes are not re-encoded.
+filePathsEncodeUrlSpecials : Bool
+filePathsEncodeUrlSpecials =
+    Settings.encodeFilePath "/w/a%b?c#d/index.db"
+        == "/w/a%25b%3Fc%23d/index.db"
+        && Settings.encodeFilePath "/w/%3F"
+        == "/w/%253F"
+        && Settings.encodeFilePath "/w/plain.db"
+        == "/w/plain.db"
+
+
+-- ── required resources probed before listen ─────────────────────────────
+--
+-- A nonexistent index file, a database that is not an index, and an
+-- unwritable review location each fail their probe naming the variable and
+-- the file; a seeded index passes. Red if `probe` stops opening the database
+-- or stops naming the variable.
+probesNameTheirVariable : Task.Task Error Bool
+probesNameTheirVariable =
+    do
+        at <- freshScratch "ipe-index-probe"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        good <- probeMessage (envSettings |> Task.andThen Index.probe)
+        missing <- missingIndexProbed at
+        notIndex <- foreignDbProbed at
+        review <- reviewProbed at
+        reviewDir <- reviewDirProbed at
+        System.setenv "IPE_INDEX_DB" at.indexDb
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (good == Nothing && missing && notIndex && review && reviewDir)
+
+
+-- An `IPE_INDEX_ROOT` that is a directory but not the tree the index was
+-- built from is refused at startup naming the variable, an indexed path and
+-- the fix; the right root passes, and so does the right root with one of
+-- its two indexed files deleted. Red if the startup probe stops joining an
+-- indexed path under the root.
+rootProbeJoinsIndexedPath : Task.Task Error Bool
+rootProbeJoinsIndexedPath =
+    do
+        at <- freshScratch "ipe-index-root-probe"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        good <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        removeFileIfAny (at.repo ++ "/src/Main.ipe")
+        oneGone <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        empty <- freshDir "ipe-index-root-probe-empty"
+        System.setenv "IPE_INDEX_ROOT" empty
+        wrong <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        System.setenv "IPE_INDEX_ROOT" at.repo
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (good
+                == Nothing
+                && oneGone
+                == Nothing
+                && Maybe.map (String.startsWith "IPE_INDEX_ROOT ") wrong
+                == Just True
+                && maybeContains "ipe:src/" wrong
+                && maybeContains empty wrong
+                && maybeContains " is not found under " wrong
+                && maybeContains "repository root the index was built from" wrong
+                && not (maybeContains "os error" wrong)
+            )
+
+
+-- An index whose units all carry a tag no configured root binds is refused
+-- at startup naming the configured tag, even though the root exists: none
+-- of its units could be read. An index with no units passes. Red if the
+-- root check samples only bound paths and passes when that sample is empty.
+rootProbeRefusesUntaggedIndex : Task.Task Error Bool
+rootProbeRefusesUntaggedIndex =
+    do
+        at <- freshScratch "ipe-index-root-untagged"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "UPDATE units SET path = 'other:' || substr(path, 5)" []
+        untagged <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        execIndex at.indexDb "DELETE FROM units" []
+        emptied <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (Maybe.map (String.startsWith "IPE_INDEX_DB ") untagged
+                == Just True
+                && maybeContains "no index path starts with a configured repo tag" untagged
+                && maybeContains "\"ipe:\"" untagged
+                && emptied
+                == Nothing
+            )
+
+
+-- A nonexistent index is refused with the build hint and is not created.
+missingIndexProbed : Scratch -> Task.Task Error Bool
+missingIndexProbed at =
+    let
+        missingDb =
+            at.repo ++ "/no-such-index.db"
+    in
+    do
+        removeFileIfAny missingDb
+        System.setenv "IPE_INDEX_DB" missingDb
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
+        created <- Task.fromResult (Path.fromString missingDb) |> Task.andThen File.exists
+        Task.succeed (probeNames "IPE_INDEX_DB" missingDb message && maybeContains "no file is there" message && maybeContains "ipe-index index" message && not created)
+
+
+-- A SQLite file with none of the index tables is refused.
+foreignDbProbed : Scratch -> Task.Task Error Bool
+foreignDbProbed at =
+    let
+        otherDb =
+            at.repo ++ "/not-an-index.db"
+    in
+    do
+        conn <- Db.open "sqlite" ("sqlite://" ++ otherDb ++ "?mode=rwc")
+        Db.exec conn "CREATE TABLE IF NOT EXISTS other (x INTEGER)" []
+        System.setenv "IPE_INDEX_DB" otherDb
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
+        removeFileIfAny otherDb
+        Task.succeed (probeNames "IPE_INDEX_DB" otherDb message && maybeContains "lacks a table" message)
+
+
+-- A review location under a missing directory is refused with its own fix.
+reviewProbed : Scratch -> Task.Task Error Bool
+reviewProbed at =
+    let
+        badReview =
+            at.repo ++ "/no-such-dir/review.db"
+    in
+    do
+        System.setenv "IPE_REVIEW_DB" badReview
+        message <- probeMessage (envReview |> Task.andThen (LibDb.probe ReadOnly))
+        Task.succeed (probeNames "IPE_REVIEW_DB" badReview message && maybeContains "cannot be created there" message && not (maybeContains "ipe-index index" message))
+
+
+-- A review location that is a directory is refused as a directory, with the
+-- fix to name a file, never as a permission the process lacks. Red if the
+-- directory reads as the not-permitted refusal its open fails with.
+reviewDirProbed : Scratch -> Task.Task Error Bool
+reviewDirProbed at =
+    let
+        dirReview =
+            at.repo ++ "/src"
+    in
+    do
+        System.setenv "IPE_REVIEW_DB" dirReview
+        message <- probeMessage (envReview |> Task.andThen (LibDb.probe ReadOnly))
+        Task.succeed (probeNames "IPE_REVIEW_DB" dirReview message && maybeContains "it is a directory, not a database file" message && not (maybeContains "may not write it" message))
+
+
+-- A database failure is classified once, by the typed `DbFailure` it carries,
+-- into one refusal. With no file at the location, a cause that names no
+-- narrower case of its own (`CannotOpen` and every `Unusable` row) is the
+-- missing-file refusal; a cause that names its own (locked, not SQLite, not
+-- permitted, missing schema) keeps it. A cause this tool names no narrower
+-- case for is `Unusable`. Every `DbFailure` has its own row, so a cause left
+-- out of the mapping cannot pass, and no row may refuse less than before.
+-- Red if any one row of the mapping changes, or a missing file reads as
+-- anything else.
+dbFailuresClassified : Bool
+dbFailuresClassified =
+    List.all classifiedAs dbFailureRows
+        && List.all classifiedAs (List.map absentRow dbFailureRows)
+
+
+-- The same row with no file at the location.
+absentRow : ( Bool, Db.DbFailure, Settings.DbRefusal ) -> ( Bool, Db.DbFailure, Settings.DbRefusal )
+absentRow ( _, failure, expected ) =
+    if failure == Db.CannotOpen || expected == Settings.Unusable then
+        ( False, failure, Settings.NoDatabaseFile )
+
+    else
+        ( False, failure, expected )
+
+
+-- Each cause with the refusal it names when a file is there.
+dbFailureRows : List ( Bool, Db.DbFailure, Settings.DbRefusal )
+dbFailureRows =
+    [ ( True, Db.CannotOpen, Settings.NotPermitted )
+    , ( True, Db.NotADatabase, Settings.NotSqliteFile )
+    , ( True, Db.Busy, Settings.Locked )
+    , ( True, Db.AccessDenied, Settings.NotPermitted )
+    , ( True, Db.ReadOnlyDatabase, Settings.NotPermitted )
+    , ( True, Db.InvalidStatement, Settings.MissingSchema )
+    , ( True, Db.UniqueViolation, Settings.Unusable )
+    , ( True, Db.ForeignKeyViolation, Settings.Unusable )
+    , ( True, Db.NotNullViolation, Settings.Unusable )
+    , ( True, Db.CheckViolation, Settings.Unusable )
+    , ( True, Db.TriggerRaised, Settings.Unusable )
+    , ( True, Db.OtherConstraint, Settings.Unusable )
+    , ( True, Db.Unreachable, Settings.Unusable )
+    , ( True, Db.OtherFailure, Settings.Unusable )
+    ]
+
+
+classifiedAs : ( Bool, Db.DbFailure, Settings.DbRefusal ) -> Bool
+classifiedAs ( present, failure, expected ) =
+    Settings.dbRefusalOf present (Error.withDetails (Database failure) (Error.unexpected "db failed")) == expected
+
+
+-- Only the typed cause decides the refusal, never the message: an error that
+-- carries no `DbFailure` is `Unusable` (`NoDatabaseFile` with no file), and a
+-- message that spells another cause, or a driver code, changes nothing. Red
+-- if the message is read, or an error with no `DbFailure` reads as a
+-- narrower case.
+dbRefusalIgnoresMessage : Bool
+dbRefusalIgnoresMessage =
+    Settings.dbRefusalOf True (Error.unexpected "db: database error [5]")
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "db: database error [14]")
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "pool timed out")
+        == Settings.Unusable
+        && Settings.dbRefusalOf False (Error.unexpected "pool timed out")
+        == Settings.NoDatabaseFile
+        && Settings.dbRefusalOf True (Error.withDetails (Custom "Busy") (Error.unexpected "db failed"))
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.OtherFailure) (Error.unexpected "db: database error [5]"))
+        == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.CannotOpen) (Error.unexpected "pool timed out"))
+        == Settings.NotPermitted
+
+
+-- A file that is not a SQLite database is refused as one, at either
+-- variable, with that database's own fix and no driver text. Red if an open
+-- failure reaches the operator as the driver's message or code.
+notSqliteRefused : Task.Task Error Bool
+notSqliteRefused =
+    do
+        base <- freshDir "ipe-db-not-sqlite"
+        cwd <- System.cwd ()
+        writeFileText (base ++ "/index.db") "plain text, not a database\n"
+        writeFileText (base ++ "/review.db") "plain text, not a database\n"
+        index <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd |> Task.andThen Index.probe)
+        review <- probeMessage (Settings.parseReviewDb (base ++ "/review.db") |> Task.andThen (LibDb.probe ReadOnly))
+        removeFileIfAny (base ++ "/index.db")
+        removeFileIfAny (base ++ "/review.db")
+        Task.succeed
+            (probeNames "IPE_INDEX_DB" (base ++ "/index.db") index
+                && maybeContains "not a SQLite database" index
+                && maybeContains "ipe-index index" index
+                && probeNames "IPE_REVIEW_DB" (base ++ "/review.db") review
+                && maybeContains "not a SQLite database" review
+                && maybeContains "review database this tool created" review
+            )
+
+
+-- Each `IPE_INDEX_DB` refusal states its problem and exactly one fix. Red if
+-- a problem that carries its own fix gets the generic one appended again.
+dbRefusalsStateOneFix : Task.Task Error Bool
+dbRefusalsStateOneFix =
+    do
+        cwd <- System.cwd ()
+        System.setenv "IPE_INDEX_ROOT" cwd
+        refusals <- [ ""
+        , "postgres://localhost/index"
+        , "sqlite:index.db"
+        , "index.db?mode=rwc"
+        , "sqlite:///tmp/index.db?mode=rwc"
+        , "sqlite:///tmp/index%zz.db"
+        , "sqlite://"
+        , "sqlite:///tmp/index%00.db"
+        , "sqlite://rel.db"
+        , "sqlite:///"
+        ]
+            |> List.map settingsRefusal
+            |> Task.sequence
+        Task.succeed
+            (List.all
+                (\refusal ->
+                    case refusal of
+                        Just m ->
+                            List.length (String.split "; " m) == 2
+
+                        Nothing ->
+                            False
+                )
+                refusals
+            )
+
+
+-- The environment is read and parsed at startup alone. Every name that can
+-- read the environment or the working directory, check a directory, or
+-- parse a configured location is counted in every module of `src`, and each
+-- module's count must equal its row in `admittedSites`: a new call, a
+-- wrapper around an admitted one, a second import of `Ipe.System`, or a read
+-- in a new module is red whatever it is spelled as or whatever variable it
+-- names. Every use of `Ipe.System` is counted as `System.`, its `getenv*`
+-- and `*cwd` readers again by name, and the only admitted import is the
+-- exact `import Ipe.System as System`, so an alias or an `exposing` import
+-- cannot dodge the count. In `Main`: the environment is read on exactly two
+-- code lines — `requireEnv`'s read and the `requireSettings` call in
+-- `main` — and `requireEnv` is named only by its declaration and its two
+-- literal-key calls, so no wrapper can pass it a key. `Settings` exports both
+-- parsers and neither the bare `indexSettings` nor `reviewDb`.
+startupReadsAdmittedOnly : Task.Task Error Bool
+startupReadsAdmittedOnly =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
+        settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
+        mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
+        Task.succeed
+            (layoutAdmits topNames libNames
+                && List.length sources
+                >= 12
+                && sitesAdmitted sources
+                && mainAdmits mainSource
+                && settingsExports settings
+            )
+
+
+readDirAt : String -> Task.Task Error (List String)
+readDirAt dir =
+    Task.fromResult (Path.fromString dir) |> Task.andThen File.readDir
+
+
+-- Every module of `src` by its path relative to `src`.
+moduleFiles : List String -> List String -> List String
+moduleFiles topNames libNames =
+    List.filter (String.endsWith ".ipe") topNames
+        ++ List.map (\name -> "Lib/" ++ name) (List.filter (String.endsWith ".ipe") libNames)
+
+
+-- `src` holds `.ipe` modules and the `Lib` directory, and `Lib` holds only
+-- `.ipe` modules, so every module is one `moduleFiles` lists. A dot-named
+-- entry is admitted: no module path can pass through it.
+layoutAdmits : List String -> List String -> Bool
+layoutAdmits topNames libNames =
+    List.member "Lib" topNames
+        && List.all (\name -> name == "Lib" || String.endsWith ".ipe" name || String.startsWith "." name) topNames
+        && List.all (\name -> String.endsWith ".ipe" name || String.startsWith "." name) libNames
+
+
+readLibSource : String -> Task.Task Error String
+readLibSource file =
+    Task.fromResult (Path.fromString file)
+        |> Task.andThen (\path -> File.readFileLimit path (ByteSize.kib 256))
+
+
+-- The source with every whole-line comment dropped, so prose naming a
+-- reader is never counted as a call.
+withoutCommentLines : String -> String
+withoutCommentLines source =
+    String.join "\n" (List.filter (\line -> not (String.startsWith "--" (String.trimStart line))) (String.lines source))
+
+
+occurrences : String -> String -> Int
+occurrences needle text =
+    List.length (String.split needle text) - 1
+
+
+-- Each needle and, for every module admitted to name it, the exact number of
+-- times its code does. A module absent from a needle's row names it zero
+-- times. `System.` counts every qualified use of the module: `Main`'s
+-- `getenv`, `getenvOr` and three `exit`s, `RepoPath`'s `cwd`, `ReviewKey`'s
+-- one `getenv` of the review key. `absolute`
+-- counts `Path.absolute`, which resolves against the working directory, beside
+-- the message text that names the word. `Ipe.Env` reads
+-- the live environment on the native target and `Ipe.Process` can run a
+-- child that prints it, so neither is admitted anywhere.
+admittedSites : List ( String, List ( String, Int ) )
+admittedSites =
+    [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
+    , ( "Ipe.Ffi", [] )
+    , ( "Ipe.Env", [] )
+    , ( "Ipe.Process", [] )
+    , ( "System.", [ ( "Main.ipe", 5 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
+    , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
+    , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
+    , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/Settings.ipe", 3 ) ] )
+    , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "parseDbLocation", [ ( "Lib/Settings.ipe", 5 ) ] )
+    , ( "parseIndexSettings", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "parseReviewDb", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "readReviewKey", [ ( "Lib/ReviewKey.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "parseMacKey", [ ( "Lib/ReviewKey.ipe", 4 ) ] )
+    ]
+
+
+admittedCount : String -> List ( String, Int ) -> Int
+admittedCount rel admitted =
+    case List.find (\( file, _ ) -> file == rel) admitted of
+        Just ( _, count ) ->
+            count
+
+        Nothing ->
+            0
+
+
+-- Every module names every needle exactly as often as `admittedSites`
+-- admits, every admitted module exists (a stale row is drift), and every
+-- import of `Ipe.System` is the exact admitted line.
+sitesAdmitted : List ( String, String ) -> Bool
+sitesAdmitted sources =
+    List.all
+        (\( needle, admitted ) ->
+            List.all (\( rel, text ) -> occurrences needle text == admittedCount rel admitted) sources
+                && List.all (\( file, _ ) -> List.any (\( rel, _ ) -> rel == file) sources) admitted
+        )
+        admittedSites
+        && List.all (\( _, text ) -> List.all systemImportAdmitted (String.lines text)) sources
+
+
+systemImportAdmitted : String -> Bool
+systemImportAdmitted line =
+    let
+        parts =
+            String.words line
+    in
+    List.take 2 parts /= [ "import", "Ipe.System" ] || parts == [ "import", "Ipe.System", "as", "System" ]
+
+
+-- The scan refuses each way around it: a reader behind an alias or an
+-- `exposing` import, `getcwd` beside `cwd`, a wrapper that calls an admitted
+-- parser from a request path, a reader in a module outside `src/Lib`, and a
+-- directory the inventory would not read. Red while the scan matches one
+-- qualified spelling per reader or reads `src/Lib` alone.
+startupScanRefusesEvasions : Task.Task Error Bool
+startupScanRefusesEvasions =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
+        Task.succeed
+            (sitesAdmitted sources
+                && evaded sources "Lib/Queue.ipe" "import Ipe.System as Sys\nroot = Sys.getcwd ()"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.System exposing (getenvOr)\nraw = getenvOr \"X\" \"\""
+                && evaded sources "Lib/RepoPath.ipe" "again = System.getcwd ()"
+                && evaded sources "Lib/RepoPath.ipe" "reparse raw = parseRoot raw"
+                && evaded sources "Lib/Settings.ipe" "again raw = RepoPath.absolutize raw"
+                && evaded sources "Lib/Queue.ipe" "reload = Settings.parseIndexSettings"
+                && evaded sources "Migrations.ipe" "import Ipe.System as System\nraw = System.getenvOr \"X\" \"\""
+                && evaded sources "Lib/Index.ipe" "fresh = File.isDir"
+                && evaded sources "Lib/ReviewKey.ipe" "again = System.getenv \"X\""
+                && evaded sources "Lib/Queue.ipe" "rekey = ReviewKey.readReviewKey"
+                && evaded sources "Lib/Index.ipe" "fresh = Path.absolute"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Env as Env\nraw = Env.public \"INDEX_DB\""
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Process as Process\nraw = Process.run \"printenv\" []"
+                && not (sitesAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/RepoPath.ipe") sources))
+                && not (layoutAdmits ("Pages" :: topNames) libNames)
+                && not (layoutAdmits topNames ("Extra" :: libNames))
+                && not (systemImportAdmitted "import  Ipe.System  as  System exposing (cwd)")
+                && mainAdmits (mainCode sources)
+                && not (mainAdmits (mainCode sources ++ "\nreread name = requireEnv name \"\""))
+                && not (mainAdmits (String.replace "rawDb <- requireEnv \"IPE_INDEX_DB\" " "rawDb <- readDb " (mainCode sources) ++ "\nreadDb = requireEnv \"IPE_INDEX_DB\""))
+            )
+
+
+-- The code of `Main`, empty when the inventory has no `Main`.
+mainCode : List ( String, String ) -> String
+mainCode sources =
+    moduleCode "Main.ipe" sources
+
+
+-- The code of module `rel`, empty when the inventory has no such module.
+moduleCode : String -> List ( String, String ) -> String
+moduleCode rel sources =
+    case List.find (\( name, _ ) -> name == rel) sources of
+        Just ( _, text ) ->
+            text
+
+        Nothing ->
+            ""
+
+
+-- The scan refuses `sources` once `extra` is appended to module `rel`.
+evaded : List ( String, String ) -> String -> String -> Bool
+evaded sources rel extra =
+    not (sitesAdmitted (appendTo rel extra sources))
+
+
+-- `sources` with `extra` appended to the code of module `rel`.
+appendTo : String -> String -> List ( String, String ) -> List ( String, String )
+appendTo rel extra sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, text ++ "\n" ++ extra )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+mainAdmits : String -> Bool
+mainAdmits text =
+    let
+        envLines =
+            List.filter (String.contains "getenv") (String.lines text)
+    in
+    List.length envLines
+        == 2
+        && List.any (String.contains "(System.getenv key)") envLines
+        && List.any (\line -> String.startsWith "settings <- requireSettings" (String.trim line)) envLines
+        && occurrences "getenv" text
+        == 2
+        && occurrences "requireEnv \"" text
+        == 2
+        && occurrences "requireEnv" text
+        == 4
+        && occurrences "requireSettings" text
+        == 3
+        && occurrences "parseIndexSettings" text
+        == 1
+        && occurrences "parseReviewDb" text
+        == 1
+        && List.all (\needle -> occurrences needle text == 0) [ "parseDbLocation", "parseRoot", "absolutize", "isDir", "System.cwd" ]
+        && mainPinned text
+
+
+-- `main` opens with the two literal-key `requireEnv` reads, the review
+-- key's read, the settings parse and the listen, in that order, so a partially applied `requireEnv`
+-- that a request could run cannot take the place of either read.
+mainPinned : String -> Bool
+mainPinned text =
+    case String.split "\nmain =\n    do\n" text of
+        [ _, body ] ->
+            case List.take 5 (String.lines body) of
+                [ dbLine, rootLine, keyLine, settingsLine, listenLine ] ->
+                    String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
+                        && String.startsWith "        rawRoot <- requireEnv \"IPE_INDEX_ROOT\" \"" rootLine
+                        && keyLine
+                        == "        key <- requireReviewKey"
+                        && settingsLine
+                        == "        settings <- requireSettings key rawDb rawRoot (System.getenvOr \"IPE_REVIEW_DB\" \"review.db\")"
+                        && listenLine
+                        == "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]"
+
+                _ ->
+                    False
+
+        _ ->
+            False
+
+
+-- True when the module header exports both parsers and neither the bare
+-- `indexSettings` nor `reviewDb`.
+settingsExports : String -> Bool
+settingsExports source =
+    case List.head (String.lines source) of
+        Just header ->
+            let
+                names =
+                    List.map (\part -> String.replace ")" "" (String.trim part)) (String.split "," header)
+            in
+            List.any (\name -> name == "parseIndexSettings") names
+                && List.any (\name -> name == "parseReviewDb") names
+                && not (List.any (\name -> name == "indexSettings" || name == "reviewDb") names)
+
+        Nothing ->
+            False
+
+
+-- The startup settings never ride in session state. The session `Model` is
+-- persisted, and every type it can hold is declared in a module of `src`,
+-- so no `type` declaration in `src` may name a settings-carrying type except
+-- the declarations that define the settings themselves (`admittedCarriers`).
+-- The scan reads each declaration whole (`typeDeclarations`) and judges
+-- every word by its unqualified name, so a
+-- qualified or wrapped spelling (`Settings.AppSettings`,
+-- `Maybe RepoPath.RootMap`) is caught alike. The `Model` is declared in
+-- `src/Lib/App.ipe`; its source is scanned for the declaration, and the scan
+-- must find `Model` there. Red while the `Model` holds a `settings` field.
+settingsNeverInSessionState : Task.Task Error Bool
+settingsNeverInSessionState =
+    do
+        cwd <- System.cwd ()
+        topNames <- readDirAt (cwd ++ "/src")
+        libNames <- readDirAt (cwd ++ "/src/Lib")
+        sources <- Task.sequence
+            (List.map
+                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                (moduleFiles topNames libNames)
+            )
+        Task.succeed
+            (layoutAdmits topNames libNames
+                && stateAdmitted sources
+                && not (stateAdmitted (withModelField sources))
+                && not (stateAdmitted (appendTo "Main.ipe" "type alias Held =\n    { settings : Settings.AppSettings\n    }" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Index.ipe" "type alias Held =\n    { roots : Maybe RepoPath.RootMap }" sources))
+                && not (stateAdmitted (appendTo "Lib/Db.ipe" "type Held\n    = Held (List Settings.DbLocation)" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n\t= Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note -}\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type\tHeld\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "{- note -} type Held\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (appendTo "Lib/Queue.ipe" "type Held\n{- note\nend -}\n    = Held IndexSettings" sources))
+                && not (stateAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/App.ipe") sources))
+                && statePinned sources
+                && not (statePinned (replaceIn "Main.ipe" "init : Web.WebReq -> ( Model, Cmd Msg )" "init : Web.WebReq -> ( ( Model, Settings.AppSettings ), Cmd Msg )" sources))
+                && not (statePinned (replaceIn "Lib/View.ipe" "view : Model -> Ui.Element Msg" "view : ( Model, Settings.AppSettings ) -> Ui.Element Msg" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , view = View.view\n" "        , view = View.view settings\n" sources))
+                && not (statePinned (replaceIn "Main.ipe" "        , update = App.update settings\n" "        , update = \\msg state -> App.update settings msg state\n" sources))
+                && not (statePinned (replaceIn "Lib/App.ipe" "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" "update : Msg -> ( Model, Settings.AppSettings ) -> ( Model, Cmd Msg )" sources))
+                && not (statePinned (appendTo "Lib/Queue.ipe" "other = Web.embed" sources))
+                && not (statePinned (replaceIn "Main.ipe" "reviewApp settings =\n    Web.embed\n" "reviewApp settings =\n    let\n        update = \\s msg state -> state\n    in\n    Web.embed\n" sources))
+            )
+
+
+-- The app's session state is `Model`: the app functions carry it by these
+-- exact annotations and the one `embed` in `src`, the body of `reviewApp`
+-- with no `let` that could shadow them, wires exactly these functions, so
+-- the state cannot be a tuple or record that pairs `Model` with the
+-- settings, which no `type` declaration would show.
+statePinned : List ( String, String ) -> Bool
+statePinned sources =
+    let
+        code =
+            mainCode sources
+    in
+    List.all (\( rel, line ) -> List.member line (String.lines (moduleCode rel sources))) stateAnnotations
+        && occurrences stateWiring code
+        == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources)
+        == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "mountApp" text) sources)
+        == 1
+
+
+stateAnnotations : List ( String, String )
+stateAnnotations =
+    [ ( "Main.ipe", "init : Web.WebReq -> ( Model, Cmd Msg )" )
+    , ( "Lib/App.ipe", "update : Settings.AppSettings -> Msg -> Model -> ( Model, Cmd Msg )" )
+    , ( "Lib/View.ipe", "view : Model -> Ui.Element Msg" )
+    , ( "Main.ipe", "subscriptions : Model -> Sub Msg" )
+    ]
+
+
+stateWiring : String
+stateWiring =
+    "reviewApp settings =\n    Web.embed\n        { init = init\n        , update = App.update settings\n        , view = View.view\n        , subscriptions = subscriptions\n"
+
+
+-- `sources` with `old` replaced by `new` in the code of module `rel`.
+replaceIn : String -> String -> String -> List ( String, String ) -> List ( String, String )
+replaceIn rel old new sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, String.replace old new text )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+-- `sources` with a `settings` field added to the `Model` declaration of
+-- `Lib.App`, the shape a session carrying the startup settings takes.
+withModelField : List ( String, String ) -> List ( String, String )
+withModelField sources =
+    List.map
+        (\( rel, text ) ->
+            if rel == "Lib/App.ipe" then
+                ( rel, String.replace "    { page : Page\n" "    { page : Page\n    , settings : Settings.AppSettings\n" text )
+
+            else
+                ( rel, text )
+        )
+        sources
+
+
+-- The types that carry a configured location, by unqualified name.
+settingsCarriers : List String
+settingsCarriers =
+    [ "AppSettings", "IndexSettings", "DbLocation", "RootMap", "Root", "Binding", "Entry" ]
+
+
+-- The declarations admitted to name a settings carrier: the ones that
+-- define the settings, each in its own module.
+admittedCarriers : List ( String, List String )
+admittedCarriers =
+    [ ( "Lib/Settings.ipe", [ "DbLocation", "IndexSettings", "AppSettings" ] )
+    , ( "Lib/RepoPath.ipe", [ "Root", "Entry", "Binding", "RootMap" ] )
+    ]
+
+
+-- `Lib.App` declares a `Model`, and no declaration outside `admittedCarriers`
+-- names a settings carrier.
+stateAdmitted : List ( String, String ) -> Bool
+stateAdmitted sources =
+    List.any (\( rel, text ) -> rel == "Lib/App.ipe" && List.any (\( name, _ ) -> name == "Model") (typeDeclarations text)) sources
+        && List.all
+            (\( rel, text ) ->
+                List.all
+                    (\( name, words ) -> declarationAdmitted rel name || not (List.any namesCarrier words))
+                    (typeDeclarations text)
+            )
+            sources
+
+
+declarationAdmitted : String -> String -> Bool
+declarationAdmitted rel name =
+    List.any (\( file, names ) -> file == rel && List.member name names) admittedCarriers
+
+
+-- A word naming a settings carrier, qualified or not.
+namesCarrier : String -> Bool
+namesCarrier word =
+    case List.head (List.reverse (String.split "." word)) of
+        Just last ->
+            List.member last settingsCarriers
+
+        Nothing ->
+            False
+
+
+-- A `type` declaration: its name and every word of it.
+type alias Declaration =
+    ( String, List String )
+
+
+-- The declarations closed so far, newest first, the one being read, and
+-- how many `{-` block comments are open after the last line.
+type alias DeclarationScan =
+    { closed : List Declaration
+    , current : Maybe Declaration
+    , depth : Int
+    }
+
+
+-- Every `type` declaration of `text`, from its `type` line up to the next
+-- line that starts a top-level item: a line at column 0 that is not inside
+-- or opening a block comment. A line indented by a space or a tab, a blank
+-- line, and any line of a block comment continue the declaration, so a
+-- comment or a tab between a declaration's head and its body cannot end the
+-- scan early. A miscounted comment can only add words to a declaration or
+-- start a spurious one, never drop a real one.
+typeDeclarations : String -> List Declaration
+typeDeclarations text =
+    let
+        scan =
+            List.foldl declarationStep { closed = [], current = Nothing, depth = 0 } (String.lines text)
+    in
+    List.reverse (closeDeclaration scan.current scan.closed)
+
+
+declarationStep : String -> DeclarationScan -> DeclarationScan
+declarationStep line scan =
+    let
+        depth =
+            commentDepthAfter scan.depth line
+    in
+    if startsDeclaration line then
+        { closed = closeDeclaration scan.current scan.closed, current = Just ( declarationName line, typeWords line ), depth = depth }
+
+    else if endsDeclaration scan.depth line then
+        { closed = closeDeclaration scan.current scan.closed, current = Nothing, depth = depth }
+
+    else
+        case scan.current of
+            Just ( name, words ) ->
+                { closed = scan.closed, current = Just ( name, words ++ typeWords line ), depth = depth }
+
+            Nothing ->
+                { scan | depth = depth }
+
+
+-- A line at column 0 holding the word `type` anywhere, so a block comment
+-- before the keyword cannot hide the declaration.
+startsDeclaration : String -> Bool
+startsDeclaration line =
+    not (indented line) && List.member "type" (String.words line)
+
+
+-- A line at column 0 outside a block comment, not opening one.
+endsDeclaration : Int -> String -> Bool
+endsDeclaration depth line =
+    depth == 0 && line /= "" && not (indented line) && not (String.startsWith "{-" line)
+
+
+indented : String -> Bool
+indented line =
+    String.startsWith " " line || String.startsWith "\t" line
+
+
+-- The open block-comment count after `line`, never below zero.
+commentDepthAfter : Int -> String -> Int
+commentDepthAfter depth line =
+    let
+        next =
+            depth + occurrences "{-" line - occurrences "-}" line
+    in
+    if next < 0 then
+        0
+
+    else
+        next
+
+
+closeDeclaration : Maybe Declaration -> List Declaration -> List Declaration
+closeDeclaration current closed =
+    case current of
+        Just declaration ->
+            declaration :: closed
+
+        Nothing ->
+            closed
+
+
+-- The word after `type`, or after `type alias`.
+declarationName : String -> String
+declarationName line =
+    afterType (String.words line)
+        |> List.filter (\word -> word /= "alias")
+        |> List.head
+        |> Maybe.withDefault ""
+
+
+-- The words after the first `type`.
+afterType : List String -> List String
+afterType words =
+    case words of
+        word :: rest ->
+            if word == "type" then
+                rest
+
+            else
+                afterType rest
+
+        [] ->
+            []
+
+
+-- The words of one declaration line, with type punctuation read as space.
+typeWords : String -> List String
+typeWords line =
+    String.words (List.foldl (\mark text -> String.replace mark " " text) line [ "->", "{", "}", "(", ")", "[", "]", ",", ":", "|", "=" ])
+
+
+-- The review key's one decode point refuses every value that is not
+-- exactly 64 hex digits — one short, one long, a non-hex digit, empty, and
+-- whitespace — each with the one exact `invalidInput` text, which never
+-- repeats the value; a valid key in upper and in lower case is one key,
+-- signing alike. Red if the length or the digit check is dropped, if the
+-- refusal echoes the value, or if case changes the key.
+macKeyParseRefuses : Bool
+macKeyParseRefuses =
+    let
+        valid =
+            "5c0ffee15dec1dedba5eba11c0de0f0a11c0ffee5ca1ab1e0ddba11fee1900d1"
+
+        expected =
+            "IPE_REVIEW_MAC_KEY must be exactly 64 hexadecimal characters (32 random bytes); the value set is not.\n  fix: generate one with `openssl rand -hex 32`."
+
+        refusedExactly raw =
+            case ReviewKey.parseMacKey raw of
+                Ok _ ->
+                    False
+
+                Err e ->
+                    Error.message e
+                        == expected
+                        && Error.kind e
+                        == Error.kind (Error.invalidInput "")
+                        && (String.trim raw == "" || not (String.contains raw (Error.toString e)))
+
+        signs raw =
+            Result.map (\key -> ReviewKey.sign key "message") (ReviewKey.parseMacKey raw)
+    in
+    List.all refusedExactly
+        [ String.dropRight 1 valid
+        , valid ++ "a"
+        , String.dropRight 1 valid ++ "g"
+        , ""
+        , String.repeat 64 " "
+        , " " ++ String.dropRight 1 valid
+        ]
+        && signs (String.toUpper valid)
+        == signs valid
+        && (case signs valid of
+            Ok _ ->
+                True
+
+            Err _ ->
+                False
+        )
+
+
+-- Only a `NotFound` failure reads as read-only, decided by the error's kind
+-- and never its text: the runtime's unset key reads as read-only; every other
+-- kind refuses with an error naming the variable and never the failure's
+-- text, an `Unexpected` failure carrying the old not-set wording included.
+-- Red if the kind check is replaced by a text match, if any other kind is
+-- read as unset, or if `NotFound` is no longer read as unset (an unset key
+-- would then refuse startup).
+keyLookupFailsClosed : Task.Task Error Bool
+keyLookupFailsClosed =
+    do
+        System.unsetenv ReviewKey.keyVar
+        unset <- ReviewKey.readReviewKey
+        Task.succeed
+            (keyReadOnly (Ok unset)
+                && keyReadOnly (ReviewKey.keyFromLookup (Err Error.notFound))
+                && List.all refusesNamingVar
+                    [ Error.invalidInput ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not valid unicode")
+                    , Error.unexpected ("environment variable \"" ++ ReviewKey.keyVar ++ "\" is not set")
+                    , Error.unexpected "environment variable \"OTHER_KEY\" is not set"
+                    , Error.permissionDenied
+                    ]
+            )
+
+
+-- A required variable's startup refusal says which way its read failed by
+-- the failure's kind, never its text: `NotFound` reads as not set; every
+-- other kind, an `Unexpected` failure carrying the not-set wording included,
+-- reads as could not be read. Each names the variable, ends with its fix and
+-- repeats no byte of the failure. Red if the refusal ignores the kind (a
+-- variable set to a value that is not valid Unicode then reads as unset) or
+-- echoes the failure.
+requiredVarRefusalByKind : Bool
+requiredVarRefusalByKind =
+    let
+        unset =
+            EnvLookup.requiredVarRefusal "IPE_INDEX_DB" "fix: set it" Error.notFound
+    in
+    namesVarAndFix unset
+        && String.contains "IPE_INDEX_DB is not set." unset
+        && not (String.contains "could not be read" unset)
+        && List.all unreadableRefusal
+            [ Error.invalidInput "environment variable \"IPE_INDEX_DB\" is set to zq9, not valid Unicode"
+            , Error.unexpected "environment variable \"IPE_INDEX_DB\" is not set zq9"
+            , Error.withMessage "zq9" Error.permissionDenied
+            ]
+
+
+unreadableRefusal : Error -> Bool
+unreadableRefusal failure =
+    let
+        refusal =
+            EnvLookup.requiredVarRefusal "IPE_INDEX_DB" "fix: set it" failure
+    in
+    namesVarAndFix refusal
+        && String.contains "IPE_INDEX_DB could not be read from the environment." refusal
+        && not (String.contains "is not set" refusal)
+
+
+namesVarAndFix : String -> Bool
+namesVarAndFix refusal =
+    String.startsWith "code-review: required environment variable IPE_INDEX_DB " refusal
+        && String.endsWith "\n  fix: set it" refusal
+        && not (String.contains "zq9" refusal)
+        && not (String.contains "Unicode" refusal)
+
+
+keyReadOnly : Result Error ReviewKey -> Bool
+keyReadOnly found =
+    case found of
+        Ok ReadOnly ->
+            True
+
+        Ok (Signing _) ->
+            False
+
+        Err _ ->
+            False
+
+
+refusesNamingVar : Error -> Bool
+refusesNamingVar failure =
+    case ReviewKey.keyFromLookup (Err failure) of
+        Ok _ ->
+            False
+
+        Err e ->
+            String.contains ReviewKey.keyVar (Error.message e)
+                && not (String.contains "unicode" (Error.message e))
+                && not (String.contains "OTHER_KEY" (Error.message e))
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ Task.succeed ( "db file paths escape url specials", filePathsEncodeUrlSpecials )
+        , Task.succeed ( "a review key that is not 64 hex digits is refused without echoing it", macKeyParseRefuses )
+        , check "only an unset review key reads as read-only; any other read failure refuses" keyLookupFailsClosed
+        , Task.succeed ( "a required variable's refusal says by kind whether it is unset or unreadable, never echoing", requiredVarRefusalByKind )
+        , check "index db refusal names only the variable" dbRefusalNamesOnlyVariable
+        , check "unusable index db locations refused" badIndexDbRefused
+        , check "db urls carry only the app's open mode" dbUrlsCarryAppMode
+        , check "each db refusal states one fix" dbRefusalsStateOneFix
+        , check "startup probes name the variable and the file" probesNameTheirVariable
+        , Task.succeed ( "a db open failure is classified by its typed failure", dbFailuresClassified )
+        , Task.succeed ( "a db refusal never reads the failure's message", dbRefusalIgnoresMessage )
+        , check "a file that is not a SQLite database is refused as one" notSqliteRefused
+        , check "a root holding none of the index's files is refused at startup" rootProbeJoinsIndexedPath
+        , check "an index with no unit under a configured tag is refused at startup" rootProbeRefusesUntaggedIndex
+        , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
+        , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
+        , check "no session state type carries the startup settings" settingsNeverInSessionState
+        ]

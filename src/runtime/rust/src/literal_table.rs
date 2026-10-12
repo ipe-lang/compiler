@@ -95,8 +95,8 @@ impl LiteralTable {
 // different defaults never sees it. The defaults never mutate — only the table
 // instance is patched — so the signature stays stable across re-renders.
 //
-// The overlay is inert unless [`dev_overlay_active`] holds (flag on AND
-// non-production). In a production build the flag is off and the dev control
+// The overlay is inert unless [`dev_overlay_active`] holds (flag on AND a
+// dev intent). In a production build the flag is off and the dev control
 // path is never mounted, so no patch is ever registered and `from_defaults`
 // never consults the overlay — one render semantics, dev == prod.
 
@@ -115,11 +115,13 @@ fn dev_overlay() -> &'static Mutex<DevOverlay> {
 }
 
 /// Whether the appearance-hot-swap overlay may affect a render: the
-/// `IPE_WATCH_HOT_APPEARANCE` flag is set to a truthy value AND the process is
-/// not production. Read on every `from_defaults`, so it is cached once.
+/// `IPE_WATCH_HOT_APPEARANCE` flag is set to a truthy value AND the process
+/// holds a [`DevIntent`](crate::telemetry::DevIntent). Read on every
+/// `from_defaults`, so it is cached once.
 ///
 /// This is the single gate that keeps the overlay a dev-only mechanism: with
-/// the flag off (the default) or in production it returns `false`, so
+/// the flag off (the default), or on a release build or in production, it
+/// returns `false`, so
 /// `from_defaults` returns the baked defaults untouched and the overlay is
 /// never even consulted.
 #[must_use]
@@ -134,8 +136,13 @@ pub fn dev_overlay_active() -> bool {
         let flag_on = crate::system::read_env_var("IPE_WATCH_HOT_APPEARANCE")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
-        flag_on && !crate::telemetry::production_from_env()
+        overlay_gate(flag_on, crate::telemetry::dev_intent_from_env().as_ref())
     })
+}
+
+/// The overlay gate under an explicit flag read and dev-intent proof.
+const fn overlay_gate(flag_on: bool, dev: Option<&crate::telemetry::DevIntent>) -> bool {
+    flag_on && dev.is_some()
 }
 
 /// Test-only override for [`dev_overlay_active`], so a test can exercise both the
@@ -264,6 +271,25 @@ mod tests {
     // serialise on one guard to avoid cross-test interference; each restores the
     // override to "unset" and clears the overlay on the way out.
     use super::overlay_test_lock as overlay_test_guard;
+
+    // The flag alone never activates the overlay: without a dev intent (a
+    // release build under `ENV=dev`) the gate is closed.
+    #[test]
+    fn overlay_inactive_on_release_under_env_dev() {
+        let dev = crate::telemetry::test_dev_intent();
+        assert!(!super::overlay_gate(true, None));
+        assert!(!super::overlay_gate(false, Some(&dev)));
+        assert!(super::overlay_gate(true, Some(&dev)));
+        if !cfg!(feature = "dev-posture") {
+            let _g = overlay_test_guard();
+            super::set_dev_overlay_active_for_test(None);
+            crate::system::locked_set_var("ENV", "dev");
+            crate::system::locked_set_var("IPE_WATCH_HOT_APPEARANCE", "1");
+            assert!(!super::dev_overlay_active());
+            crate::system::locked_remove_var("IPE_WATCH_HOT_APPEARANCE");
+            crate::system::locked_remove_var("ENV");
+        }
+    }
 
     #[test]
     fn overlay_inactive_by_default_renders_baked_defaults() {

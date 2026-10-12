@@ -21,9 +21,9 @@ Three knots.
   Test with `Math.isNaN`, the only correct way. The same holds for `inf`/`nan` as
   values you can name and compare structurally.
 - **`min`/`max` are polymorphic; the arithmetic operators are not `Math`.**
-  `Math.min`/`Math.max` work on any comparable type, not just numbers. But
-  everyday `+`, `-`, `*`, and integer `//`/`modBy` are language operators (see
-  `Ipe.Basics`), not `Math` functions — reach into `Math` for the
+  `Math.min`/`Math.max` work on any comparable scalar (`Int`, `Float`, `String`,
+  `Char`, `Bool`), not just numbers. But everyday `+`, `-`, `*`, and integer
+  `//`/`modBy` are language operators (see `Ipe.Basics`), not `Math` functions — reach into `Math` for the
   *scientific* operations, not for addition.
 
 ## A worked example: the length of a path
@@ -73,7 +73,7 @@ sqrtReport v =
         "sqrt " ++ String.fromFloat v ++ " = " ++ String.fromFloat r
 ```
 
-Running it (`ipe run`) prints — note the four rounding directions differ on a
+Running it (`ipe dev run`) prints — note the four rounding directions differ on a
 fractional length, and the negative square root is caught:
 
 ```

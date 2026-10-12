@@ -55,7 +55,7 @@ fn generic_succeed_capture_sync_bounds_emitted() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
     );
 
     // `Main`'s functions land in `src/main.rs` for a single-home program and in
@@ -89,7 +89,7 @@ fn generic_succeed_tail_sync_seal_runs() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
     );
 
     let outcome = crate::support::build_and_run_emitted(GOLDEN, &out);

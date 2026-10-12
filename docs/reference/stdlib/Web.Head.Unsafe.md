@@ -13,10 +13,10 @@ capability program-wide, so a dependency's raw-script sink is visible before
 the program runs.
 
 `unsafeJsonLd` emits `<script type="application/ld+json">…</script>` with the
-body spliced VERBATIM. The renderer treats `<script>` bodies as raw text
-(CDATA-like), so no escaper runs — the caller owns the XSS invariant. Only
-the surface home moved here from `Ipe.Web.Head`; the emitted output and the
-render sink are unchanged.
+body spliced VERBATIM as trusted raw markup (`Ipe.Html.Unsafe.unsafeRaw`):
+the safe surface refuses a `<script>` whose body is text, so the trusted body
+must come from the unsafe hatch. No escaper runs; the render sink only splits
+a literal `</script` breakout, and the caller owns the XSS invariant.
 
 ## `unsafeJsonLd`
 
@@ -25,9 +25,8 @@ unsafeJsonLd : String -> Html msg
 ```
 
 `unsafeJsonLd body` — emit `<script type="application/ld+json">…</script>`
-with the raw JSON body. The renderer treats `<script>` bodies as raw text
-(CDATA-like), so the body is emitted VERBATIM — an un-escaped raw-String
-injection into a scripting context.
+with the raw JSON body. The body is a trusted raw node, emitted VERBATIM —
+an un-escaped raw-String injection into a scripting context.
 
 The `unsafe` prefix names that risk at the surface: the caller MUST guarantee
 the body cannot contain `</script>` and is not user-controlled. Build the

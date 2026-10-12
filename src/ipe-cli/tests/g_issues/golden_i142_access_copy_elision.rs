@@ -42,7 +42,7 @@ fn emit_fixture(out_name: &str) -> String {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for copy_field_no_clone: {:?}",
+        "ipe dev build must succeed for copy_field_no_clone: {:?}",
         built.err()
     );
 

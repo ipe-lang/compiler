@@ -1,0 +1,5 @@
+first-insert:ok
+unique:UniqueViolation
+trigger:TriggerRaised
+read-only:ReadOnlyDatabase
+writable-again:ok

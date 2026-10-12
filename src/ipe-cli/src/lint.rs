@@ -2,7 +2,7 @@
 //! source.
 //!
 //! The command loads the project's own (user) modules through the SAME
-//! resolution path `ipe build` uses — never the injected stdlib — reads an
+//! resolution path `ipe dev build` uses — never the injected stdlib — reads an
 //! optional `lint.ipe`, runs every enabled rule over the parsed source, and
 //! renders each finding compiler-style. With `--fix` it applies every
 //! machine-applicable (semantics-preserving) rewrite and reports what changed;

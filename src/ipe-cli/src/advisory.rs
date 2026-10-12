@@ -451,7 +451,7 @@ fn read_advisory_dir(dir: &Path, pkg_name: &str) -> Result<Vec<Advisory>, CliErr
             // Skip non-TOML files (READMEs, etc.) without error.
             continue;
         }
-        let text = crate::io_bounded::read_to_string_capped(
+        let text = crate::io_bounded::read_leaf_capped(
             &path,
             crate::io_bounded::SMALL_FILE_READ_CAP,
         )

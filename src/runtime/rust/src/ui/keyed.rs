@@ -2,10 +2,11 @@
 //!
 //! Each `(key, child)` pair has the key attached to the child element as a
 //! `ipe-key` attribute.  The ipe-id stamper (`assign_ipe_ids_depth` /
-//! `ipe_id_key` in `html.rs`) reads that attribute to produce a STABLE ipe-id
-//! for the child — the same identity it would have regardless of its position in
-//! the list.  Without the attribute the stamper falls back to positional ids,
-//! which shift on reorder and mis-patch uncontrolled-input state / focus.
+//! `ipe_id_key` in `html.rs`) appends that key to the child's positional ipe-id,
+//! so two items at the same position with different keys are different nodes and
+//! the diff replaces their parent's children instead of patching one item in
+//! place under the other's identity.  Without the attribute, same-tag items at
+//! one position share an identity, and the diff patches one into the other.
 //!
 //! Sanctioned divergence §B-Keyed: ipe-key-stamp approach vs the reference VNode-key differ.
 //!

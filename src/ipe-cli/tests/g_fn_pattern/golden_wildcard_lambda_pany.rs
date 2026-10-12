@@ -57,7 +57,7 @@ fn wildcard_lambda_pany_ipec_cargo_and_run_zero() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for wildcard_lambda_pany (was: IPE-L0102 Polymorphism): {:?}",
+        "ipe dev build must succeed for wildcard_lambda_pany (was: IPE-L0102 Polymorphism): {:?}",
         built.err()
     );
 

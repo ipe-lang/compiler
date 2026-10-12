@@ -57,6 +57,10 @@ value even though the block is indented in the source.
   does NOT interpolate — `{{x}}` there is literal text. This is the common trap.
 - The four body shapes above are the whole grammar; a more complex body stays
   literal `{{…}}` rather than failing — bind it to a name and interpolate that.
+- A qualified body `{{Module.value}}` resolves exactly as it does outside a
+  string: the module must be imported under that qualifier, or the body is
+  refused (IPE-N0034, or IPE-N0004 for an unknown qualifier), never printed as
+  literal text.
 - `\{{` emits a literal `{{`. An unclosed `{{` with no matching `}}` is treated
   as literal content.
 - Interpolation joins with `++`, so an interpolated string is exactly the

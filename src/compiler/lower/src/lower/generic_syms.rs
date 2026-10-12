@@ -13,13 +13,10 @@ use ipe_ir::IrType;
 /// parameters that are actually referenced in the resolved `params` and `ret`
 /// of a [`Func`] — the principled definition of [`Func::type_params`].
 ///
-/// This fixes Bug-28 (`init : any -> (Model, Cmd Msg)`): `any` in PARAM
-/// position leaves `IrType::Generic(any_sym)` in `params`, so `any_sym`
-/// appears in `used_generics` and therefore in `type_params`.  The old blind
-/// filter (`resolve(v) != "any"`) over-removed `any_sym` even when it was
-/// structurally necessary.
-///
-/// See the Bug-28 / Bug-29 fix comments in [`lower_def`] for full motivation.
+/// A generic is declared iff it is structurally present: a param-position
+/// `any` (`init : any -> (Model, Cmd Msg)`) leaves its freshened generic in
+/// `params`, so it appears in `used_generics` and therefore in `type_params`,
+/// while a return-position `any` resolved away from `ret` does not.
 #[allow(clippy::too_many_lines)] // one arm per IrType variant, deliberately exhaustive
 pub(super) fn collect_ir_generic_syms(ty: &IrType, out: &mut BTreeSet<Symbol>) {
     match ty {

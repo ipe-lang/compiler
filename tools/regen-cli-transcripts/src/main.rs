@@ -48,6 +48,8 @@ fn main() -> ExitCode {
 /// tool or its environment — never a transcript, which is only a [`Transcript`].
 #[derive(Debug)]
 enum RegenError {
+    /// A command-line argument is not valid UTF-8.
+    NonUtf8Arg(ipe_docs::argv::NonUtf8Argument),
     /// A command-line argument is not a known flag.
     UnknownArg(String),
     /// A flag was given without its path value.
@@ -87,6 +89,7 @@ enum RegenError {
 impl fmt::Display for RegenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NonUtf8Arg(refused) => write!(f, "{refused}"),
             Self::UnknownArg(arg) => write!(f, "unknown argument `{arg}`"),
             Self::MissingValue(flag) => write!(f, "{flag} requires a path argument"),
             Self::IpeBin { path, error } => write!(f, "--ipe-bin {}: {error}", path.display()),
@@ -148,7 +151,12 @@ fn run() -> Result<usize, RegenError> {
         if spec.hidden {
             continue;
         }
-        let args = [spec.name.to_owned(), "--help".to_owned()];
+        let args: Vec<String> = spec
+            .name
+            .split(' ')
+            .chain(["--help"])
+            .map(str::to_owned)
+            .collect();
         let transcript = capture(&ipe_bin, &repo_root, &args)?;
         goldens.push((
             cli_transcript::help_golden_name(spec.name),
@@ -253,7 +261,9 @@ fn write_golden(dir: &Path, basename: &str, content: &str) -> Result<(), RegenEr
 fn parse_args() -> Result<Options, RegenError> {
     let mut repo_root = None;
     let mut ipe_bin = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = ipe_docs::argv::host_args()
+        .map_err(RegenError::NonUtf8Arg)?
+        .into_iter();
     while let Some(arg) = args.next() {
         let (flag, slot) = match arg.as_str() {
             "--repo-root" => ("--repo-root", &mut repo_root),

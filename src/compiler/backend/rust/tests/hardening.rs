@@ -20,7 +20,7 @@ use ipe_diagnostics::{DResult, Diagnostic, IPE_I0201, IPE_L0200, IPE_N0012};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
     Arm, BinOp, CallPin, Callee, EnumDef, Expr, Func, FuncId, IrType, Match, ModPath, Module,
-    OnFormKind, Pat, Program, TypeDef, Variant,
+    OnFormKind, Pat, Program, SliceOwnership, TypeDef, Variant,
 };
 
 /// A single-module program with the given types and funcs (no entry needed:
@@ -837,7 +837,7 @@ fn glued_ffi_wrapper_with_illegal_ident_fails_closed() -> DResult<()> {
 /// would never let through — built directly here) must fail closed as a
 /// `CompilerBug` when a later arm's pattern reaches past the column table
 /// sized from an earlier, narrower arm — never silently default the missing
-/// column to `str_mode: false, list_mode: false`, which can emit a binder of
+/// column to `str_mode: false, list: ListView::Off`, which can emit a binder of
 /// the wrong type (an exit-0-then-cargo-fail THE SEAL forbids).
 #[test]
 fn tuple_arm_wider_than_column_table_fails_closed() -> DResult<()> {
@@ -1004,6 +1004,331 @@ fn colliding_type_fold_disambiguates_and_emits() -> DResult<()> {
     assert!(
         all.contains("enum StdPaletteColor ") && all.contains("enum StdPaletteColor2 "),
         "both colliding types must emit under distinct names, got:\n{all}"
+    );
+    Ok(())
+}
+
+/// A one-parameter function `f(xs: List <elem>) -> Int` whose body is a flat
+/// list `case` on `xs` with the given arms.
+fn list_case_fn(name: Symbol, xs: Symbol, elem: IrType, arms: Vec<Arm>) -> DResult<Func> {
+    Ok(Func {
+        id: FuncId::from_raw(0),
+        name,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![(xs, IrType::List(Box::new(elem)))],
+        ret: IrType::Int,
+        body: Expr::Match(Match::new_flat(Expr::Var(xs), arms)?),
+    })
+}
+
+/// A slice pattern with the given prefix, rest, ownership and element type.
+fn slice(prefix: Vec<Pat>, rest: Option<Pat>, own: SliceOwnership, elem: &IrType) -> Pat {
+    Pat::Slice {
+        prefix,
+        rest: rest.map(Box::new),
+        own,
+        elem: elem.clone(),
+    }
+}
+
+/// The non-`Clone` element type `Task Int`.
+fn task_int() -> IrType {
+    IrType::Task(Box::new(IrType::Int))
+}
+
+/// The emitted text of the function whose `match` holds `marker`.
+fn fn_text<'s>(src: &'s str, marker: &str) -> &'s str {
+    let at = src.find(marker).unwrap_or(0);
+    let start = src.get(..at).and_then(|s| s.rfind("pub fn ")).unwrap_or(0);
+    let end = src
+        .get(at..)
+        .and_then(|s| s.find("\n}\n"))
+        .map_or(src.len(), |e| at + e);
+    src.get(start..end).unwrap_or(src)
+}
+
+/// An owned-move list `case` over a non-`Clone` element moves every binder out
+/// of the owned view: it emits no `.clone()`, `.to_vec()` or `.as_slice()`.
+#[test]
+fn owned_move_list_case_copies_no_binder() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("shape")?;
+    let xs = interner.intern("xs")?;
+    let x = interner.intern("x")?;
+    let y = interner.intern("y")?;
+    let rest = interner.intern("rest")?;
+    let other = interner.intern("other")?;
+    let own = SliceOwnership::OwnedMove;
+    let arms = vec![
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
+        Arm::new(
+            slice(vec![Pat::Var(x)], None, own, &task_int()),
+            Expr::Int(1),
+        ),
+        Arm::new(
+            slice(
+                vec![Pat::Var(x), Pat::Var(y)],
+                Some(Pat::Var(rest)),
+                own,
+                &task_int(),
+            ),
+            Expr::Int(2),
+        ),
+        Arm::new(Pat::Var(other), Expr::Int(3)),
+    ];
+    let task = IrType::Task(Box::new(IrType::Int));
+    let f = list_case_fn(func, xs, task, arms)?;
+    let src = emit(&interner, &program(main_mod, vec![], vec![f]))?;
+    assert!(
+        src.contains("ipe_runtime::list::ipe_list_view_owned::<_, 3>("),
+        "an owned list case matches through the owned view, got:\n{src}"
+    );
+    let body = fn_text(&src, "ipe_list_view_owned");
+    for copy in [".clone()", ".to_vec()", ".as_slice()"] {
+        assert!(
+            !body.contains(copy),
+            "an owned list case must not copy a binder ({copy}), got:\n{body}"
+        );
+    }
+    assert!(
+        body.contains("ipe_runtime::list::ipe_list_view_rest("),
+        "the rest and whole-list binders rebuild from the view, got:\n{body}"
+    );
+    Ok(())
+}
+
+/// Slice arms of one list column that disagree on their ownership are an
+/// internal error, never emitted text.
+#[test]
+fn mixed_slice_ownership_fails_closed() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("mixed")?;
+    let xs = interner.intern("xs")?;
+    let x = interner.intern("x")?;
+    let arms = vec![
+        Arm::new(
+            slice(vec![], None, SliceOwnership::OwnedMove, &task_int()),
+            Expr::Int(0),
+        ),
+        Arm::new(
+            slice(
+                vec![Pat::Var(x)],
+                None,
+                SliceOwnership::BorrowClone,
+                &task_int(),
+            ),
+            Expr::Int(1),
+        ),
+        Arm::new(Pat::Wildcard, Expr::Int(2)),
+    ];
+    let f = list_case_fn(func, xs, IrType::Task(Box::new(IrType::Int)), arms)?;
+    let res = emit(&interner, &program(main_mod, vec![], vec![f]));
+    assert!(
+        matches!(res, Err(Diagnostic::CompilerBug { .. })),
+        "mixed slice ownership must fail closed, got {res:?}"
+    );
+    Ok(())
+}
+
+/// An owned view consumes its variable scrutinee, so an arm that still reads
+/// the scrutinee is an internal error, never a use after move.
+#[test]
+fn owned_view_scrutinee_reuse_fails_closed() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("reuse")?;
+    let xs = interner.intern("xs")?;
+    let x = interner.intern("x")?;
+    let arms = vec![
+        Arm::new(
+            slice(
+                vec![Pat::Var(x)],
+                Some(Pat::Wildcard),
+                SliceOwnership::OwnedMove,
+                &task_int(),
+            ),
+            Expr::Var(xs),
+        ),
+        Arm::new(Pat::Wildcard, Expr::Int(0)),
+    ];
+    let f = list_case_fn(func, xs, IrType::Task(Box::new(IrType::Int)), arms)?;
+    let res = emit(&interner, &program(main_mod, vec![], vec![f]));
+    assert!(
+        matches!(res, Err(Diagnostic::CompilerBug { .. })),
+        "an owned view whose scrutinee an arm rereads must fail closed, got {res:?}"
+    );
+    Ok(())
+}
+
+/// A list `case` whose heads bind nothing borrows its scrutinee even over a
+/// non-`Clone` element: it moves no part, so the consume counter still calls
+/// the list live after it, and an owned view would move it.
+#[test]
+fn binder_free_owned_list_case_borrows_the_scrutinee() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("probe")?;
+    let xs = interner.intern("xs")?;
+    let own = SliceOwnership::OwnedMove;
+    let arms = vec![
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
+        Arm::new(
+            slice(vec![Pat::Wildcard], None, own, &task_int()),
+            Expr::Int(1),
+        ),
+        Arm::new(Pat::Wildcard, Expr::Int(2)),
+    ];
+    let f = list_case_fn(func, xs, IrType::Task(Box::new(IrType::Int)), arms)?;
+    let src = emit(&interner, &program(main_mod, vec![], vec![f]))?;
+    assert!(
+        src.contains("match (xs).as_slice() {"),
+        "a binder-free list case matches the borrowed slice, got:\n{src}"
+    );
+    assert!(
+        !src.contains("ipe_list_view_owned"),
+        "a binder-free list case takes no owned view, got:\n{src}"
+    );
+    assert!(
+        !src.contains(".clone()") && !src.contains(".to_vec()"),
+        "a binder-free list case copies nothing out, got:\n{src}"
+    );
+    Ok(())
+}
+
+/// A borrow-clone list `case` keeps its borrowed-slice emission: the slice
+/// scrutinee and the copy-out rebinds of each binder.
+#[test]
+fn borrow_clone_list_case_keeps_slice_emission() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("heads")?;
+    let xs = interner.intern("xs")?;
+    let x = interner.intern("x")?;
+    let rest = interner.intern("rest")?;
+    let own = SliceOwnership::BorrowClone;
+    let arms = vec![
+        Arm::new(slice(vec![], None, own, &IrType::Str), Expr::Int(0)),
+        Arm::new(
+            slice(vec![Pat::Var(x)], Some(Pat::Var(rest)), own, &IrType::Str),
+            Expr::Int(1),
+        ),
+    ];
+    let f = list_case_fn(func, xs, IrType::Str, arms)?;
+    let src = emit(&interner, &program(main_mod, vec![], vec![f]))?;
+    let body = fn_text(&src, "match (xs).as_slice()");
+    assert!(
+        body.contains("match (xs).as_slice() {"),
+        "a borrow-clone list case matches the borrowed slice, got:\n{src}"
+    );
+    assert!(
+        body.contains("[] => 0i64,") && body.contains("[x, rest @ ..] => {"),
+        "a borrow-clone list case renders native slice patterns, got:\n{body}"
+    );
+    assert!(
+        body.contains("let x = x.clone();") && body.contains("let rest = rest.to_vec();"),
+        "a borrow-clone list case copies each binder out, got:\n{body}"
+    );
+    assert!(
+        !body.contains("ipe_list_view"),
+        "a borrow-clone list case takes no owned view, got:\n{body}"
+    );
+    Ok(())
+}
+
+/// Is `res` the internal error of the emitter's element `Clone` proof?
+fn is_elem_clone_refusal(res: &DResult<String>) -> bool {
+    matches!(
+        res,
+        Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::elem_clone_proof",
+            ..
+        })
+    )
+}
+
+/// A borrowed list `case` that copies a binder out of a non-`Clone` element is
+/// an internal error, never a `.clone()` cargo rejects: an element binder and a
+/// whole-list binder alike.
+#[test]
+fn borrow_clone_binder_over_nonclone_elem_fails_closed() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("heads")?;
+    let xs = interner.intern("xs")?;
+    let x = interner.intern("x")?;
+    let whole = interner.intern("whole")?;
+    let own = SliceOwnership::BorrowClone;
+    let elem_binder = vec![
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
+        Arm::new(
+            slice(vec![Pat::Var(x)], Some(Pat::Wildcard), own, &task_int()),
+            Expr::Int(1),
+        ),
+    ];
+    let whole_binder = vec![
+        Arm::new(slice(vec![], None, own, &task_int()), Expr::Int(0)),
+        Arm::new(Pat::Var(whole), Expr::Int(1)),
+    ];
+    for arms in [elem_binder, whole_binder] {
+        let f = list_case_fn(func, xs, task_int(), arms)?;
+        let res = emit(&interner, &program(main_mod, vec![], vec![f]));
+        assert!(
+            is_elem_clone_refusal(&res),
+            "a copy-out over a non-`Clone` element must fail closed, got {res:?}"
+        );
+    }
+    Ok(())
+}
+
+/// An index read under a nested list pattern clones its element only after the
+/// emitter proves the element `Clone`: a `Task` element and an opaque foreign
+/// handle element are internal errors, an `Int` element emits the clone.
+#[test]
+fn list_index_clone_proves_its_element_clone() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("pick")?;
+    let xs = interner.intern("xs")?;
+    let rust = interner.intern("Rust")?;
+    let crate_seg = interner.intern("Bevy_ecs")?;
+    let world = interner.intern("World")?;
+    let handle = IrType::Enum {
+        home: ModPath(vec![rust, crate_seg]),
+        name: world,
+        args: vec![],
+    };
+    let pick = |elem: IrType| Func {
+        id: FuncId::from_raw(0),
+        name: func,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![(xs, IrType::List(Box::new(IrType::Int)))],
+        ret: IrType::Int,
+        body: Expr::ListIndexClone {
+            list: Box::new(Expr::Var(xs)),
+            index: 0,
+            elem,
+        },
+    };
+    for elem in [task_int(), handle] {
+        let res = emit(&interner, &program(main_mod, vec![], vec![pick(elem)]));
+        assert!(
+            is_elem_clone_refusal(&res),
+            "an index clone over a non-`Clone` element must fail closed, got {res:?}"
+        );
+    }
+    let src = emit(
+        &interner,
+        &program(main_mod, vec![], vec![pick(IrType::Int)]),
+    )?;
+    assert!(
+        src.contains("(xs)[0].clone()"),
+        "an index read over a `Clone` element clones it, got:\n{src}"
     );
     Ok(())
 }

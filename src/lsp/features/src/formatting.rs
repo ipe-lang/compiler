@@ -23,8 +23,11 @@ use lsp_types::{Range, TextEdit};
 
 use crate::offset::{PositionEncoding, offset_to_position, position_to_offset};
 
-/// Format the full text of `file`. Returns `None` when the file does not parse
-/// (the client should leave the buffer unchanged).
+/// Format the full text of `file`.
+///
+/// Returns `None` when the file does not parse, the engine's round-trip guard
+/// trips, or the output would pass its cap; the client leaves the buffer
+/// unchanged.
 #[must_use]
 pub fn format_document(
     db: &IpeDatabase,
@@ -34,9 +37,17 @@ pub fn format_document(
     let text = file.text(db);
     // The shared `ipe_fmt` engine preserves comments and doc-strings and guards
     // its own output with a re-parse + comment-count check, so a whole-document
-    // format is comment-safe. A parse failure — or the engine's round-trip guard
-    // tripping on a printer bug — yields no edit, leaving the buffer untouched.
-    let formatted = ipe_fmt::format_source(text).ok()?;
+    // format is comment-safe. A parse failure, the engine's round-trip guard
+    // tripping on a printer bug, or an output past its cap yields no edit,
+    // leaving the buffer untouched.
+    let formatted = match ipe_fmt::format_source(text) {
+        Ok(formatted) => formatted,
+        Err(
+            ipe_fmt::FmtError::Parse { .. }
+            | ipe_fmt::FmtError::RoundTrip { .. }
+            | ipe_fmt::FmtError::Limit(ipe_fmt::FmtLimit::OutputBytes { .. }),
+        ) => return None,
+    };
     if formatted == text.as_str() {
         return Some(Vec::new()); // already canonical — no edit
     }
@@ -916,6 +927,36 @@ mod tests {
         let f = file(&db, &["Main"], "this is not valid ipe source @@@@");
         let result = format_document(&db, f, PositionEncoding::Utf16);
         assert!(result.is_none(), "no edit for unparseable source");
+    }
+
+    /// A list of `items` ones written on one line two lets deep; formatting
+    /// puts every item on its own deeply indented line.
+    fn nested_long_list(items: usize) -> String {
+        let ones = vec!["1"; items].join(",");
+        format!(
+            "module Main exposing (x)\n\n\nx =\n    let\n        y =\n            let\n                z =\n                    [ {ones}\n                    ]\n            in\n            z\n    in\n    y\n"
+        )
+    }
+
+    /// A document whose formatted output would pass the engine's cap gets no
+    /// edit; the same shape small enough to fit is formatted.
+    #[test]
+    fn output_past_the_cap_returns_none() {
+        let db = IpeDatabase::new();
+        let small = file(&db, &["Main"], &nested_long_list(200));
+        assert!(
+            format_document(&db, small, PositionEncoding::Utf16).is_some_and(|e| !e.is_empty()),
+            "control: the small list formats"
+        );
+        let src = nested_long_list(10_000);
+        let engine = ipe_fmt::format_source(&src);
+        assert!(
+            matches!(engine, Err(ipe_fmt::FmtError::Limit(_))),
+            "precondition: the engine refuses on its cap: {engine:?}"
+        );
+        let f = file(&db, &["Main"], &src);
+        let result = format_document(&db, f, PositionEncoding::Utf16);
+        assert!(result.is_none(), "no edit when the output passes its cap");
     }
 
     /// Helper: format `src` once and return the resulting text (or `src`

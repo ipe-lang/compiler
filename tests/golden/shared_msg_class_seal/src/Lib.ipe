@@ -1,0 +1,25 @@
+module Lib exposing (b, wrap)
+
+import Ipe.Html as Html exposing (Html)
+
+
+-- Private and message-free: its message slot is the one union-find class it
+-- shares with every same-module helper that references it.
+nav =
+    Html.div [] [ Html.text "nav" ]
+
+
+-- Unannotated: shares `nav`'s message slot; pinned only by `Main.view`.
+wrap =
+    Html.div [] [ nav ]
+
+
+same : msg -> Html msg -> Html msg
+same x h =
+    h
+
+
+-- Its message slot is also a value parameter, so it always stays generic;
+-- `nav` shares that slot.
+b x =
+    same x (Html.div [] [ nav ])

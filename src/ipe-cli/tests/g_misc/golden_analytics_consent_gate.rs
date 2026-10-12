@@ -49,7 +49,7 @@ fn analytics_module_resolves_and_builds() {
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
-        "analytics_consent_gate: `ipe build` must exit 0 (Ipe.Analytics resolves \
+        "analytics_consent_gate: `ipe dev build` must exit 0 (Ipe.Analytics resolves \
          + consent-gate + Pii ADT accepted): {:?}",
         built.err()
     );
@@ -72,7 +72,7 @@ fn analytics_consent_gate_end_to_end() {
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
-        "analytics_consent_gate: `ipe build` must exit 0: {:?}",
+        "analytics_consent_gate: `ipe dev build` must exit 0: {:?}",
         built.err()
     );
 

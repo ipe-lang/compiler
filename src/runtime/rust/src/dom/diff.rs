@@ -1,4 +1,4 @@
-use crate::html::{Attribute, Html};
+use crate::html::{Attribute, ElementBody, Html, ParseContext, admit_rendered_in};
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -41,17 +41,21 @@ impl Patch {
 /// Structural diff between two `Html` trees that have already had `assign_ipe_ids`
 /// applied. Returns the minimal list of `Patch` operations needed to update the
 /// DOM from `old` to `new`:
-/// - Matched-tag element pair: diff attributes + events, then children.
-/// - Tag/kind mismatch, child-count change, or any mixed-child text change:
-///   whole-subtree `html` replace at the parent.
+/// - Same-node element pair (equal tag AND equal `ipe-id`): diff attributes +
+///   events, then children.
+/// - Tag/kind mismatch, server-identity (`ipe-id`) mismatch, child-count
+///   change, or any mixed-child text change: whole-subtree `html` replace at
+///   the parent, so every element in the DOM carries the `ipe-id` of the node
+///   it now renders.
 /// - Sole text-child change: `SetText` via `p.text` (fast path).
 /// - Event handlers toggled on/off: `ipe-<event>` attr set/remove + `data-ipe-hid`.
-/// - Keyed identity is carried by `assign_ipe_ids` (the `:{key}` segment) so a
-///   reordered keyed item keeps its ipe-id and only its moved attrs patch.
+/// - Keyed identity is carried by `assign_ipe_ids` (the `:{key}` segment): a
+///   position whose key differs between the trees holds a different node, so
+///   its parent's children are replaced rather than patched under the old id.
 #[must_use]
 pub fn diff<M>(old: &Html<M>, new: &Html<M>) -> Vec<Patch> {
     let mut out = vec![];
-    diff_node_depth(old, new, &mut out, 0);
+    diff_node_depth(old, new, ParseContext::Data, &mut out, 0);
     out
 }
 
@@ -70,37 +74,98 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
     None
 }
 
-/// Emit a whole-subtree innerHTML replace at `id` .
+/// True when `old` and `new` are the same node for in-place patching: both
+/// elements with equal tags and equal server identity (`ipe-id`). An element
+/// unstamped on both sides lies past the stamping depth ceiling, where
+/// `diff_node_depth` emits nothing.
+fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
+    match (old, new) {
+        (Html::HElement(ot, _, _), Html::HElement(nt, _, _)) => {
+            ot == nt && ipe_id(old) == ipe_id(new)
+        }
+        _ => false,
+    }
+}
+
+/// Emit a replace of every child of the element at `id`.
 ///
-/// `parent_tag` is the tag of the element whose children are being replaced.
-/// When it is `"script"` or `"style"`, the rendered body is passed through the
-/// same sink-neutralise that `render_into_ctx` applies on the first-paint path,
-/// so the SSE replace cannot smuggle a raw `</script>`/`</style>` into the DOM
-/// even if the `HRaw`-provenance invariant were to slip in a future change.
-fn push_html_replace<M>(id: &str, parent_tag: &str, new_kids: &[Html<M>], out: &mut Vec<Patch>) {
+/// `parent_body` is how `admit_rendered_in` admitted that element and
+/// `child_ctx` is the parse context it puts its children in. A markup body
+/// is sent as `Patch.html`, which the client parses as markup. A `<script>` or
+/// `<style>` body is a raw-text body: it is sent as `Patch.text`, which the
+/// client assigns to `textContent` without parsing, so the element holds the
+/// same neutralised bytes the first paint's raw-text parse produced. Sent as
+/// `html`, the body would be parsed in a `<div>` context, where an
+/// `<img onerror>` or a `<script src>` inside it is live markup and an entity
+/// such as `&amp;` is decoded.
+fn push_children_replace<M>(
+    id: &str,
+    parent_body: ElementBody,
+    child_ctx: ParseContext,
+    new_kids: &[Html<M>],
+    out: &mut Vec<Patch>,
+) {
     if id.is_empty() {
         return;
     }
     let mut p = Patch::for_id(id);
-    p.html = Some(render_children(parent_tag, new_kids));
+    let body = render_children(parent_body, child_ctx, new_kids);
+    match parent_body {
+        ElementBody::Markup => p.html = Some(body),
+        ElementBody::Script | ElementBody::Style => p.text = Some(body),
+    }
     out.push(p);
+}
+
+/// True when `node`, written in `ctx`, is an element the render sink's
+/// admission rule refuses, so the renderer leaves it out of the page.
+fn is_refused_element<M>(ctx: ParseContext, node: &Html<M>) -> bool {
+    match node {
+        Html::HElement(tag, _, kids) => admit_rendered_in(ctx, tag, kids).is_err(),
+        Html::HText(_) | Html::HRaw(_) => false,
+    }
 }
 
 /// Bounded-descent diff. Stops at `MAX_HTML_DEPTH` (same ceiling as
 /// `html.rs::render_into_ctx`) rather than recursing into an arbitrarily deep
-/// Model-derived tree that would overflow the thread stack.
-fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth: usize) {
+/// Model-derived tree that would overflow the thread stack. `ctx` is the parse
+/// context both nodes are written in, threaded from the root exactly as the
+/// render sink threads it.
+fn diff_node_depth<M>(
+    old: &Html<M>,
+    new: &Html<M>,
+    ctx: ParseContext,
+    out: &mut Vec<Patch>,
+    depth: usize,
+) {
     if depth >= crate::html::MAX_HTML_DEPTH {
         return;
     }
-    let (ot, oa, ok, _nt, na, nk) = match (old, new) {
-        (Html::HElement(ot, oa, ok), Html::HElement(nt, na, nk)) if ot == nt => {
+    let (ot, oa, ok, nt, na, nk) = match (old, new) {
+        (Html::HElement(ot, oa, ok), Html::HElement(nt, na, nk)) if same_node(old, new) => {
             (ot, oa, ok, nt, na, nk)
         }
-        // Tag/kind mismatch is handled by the parent (mixed-child / count branch).
-        // A top-level mismatch has no parent to address, so nothing to emit.
+        // A tag, kind, or identity mismatch is handled by the parent's
+        // per-position loop. A top-level mismatch has no parent to address,
+        // so nothing is emitted; every caller stamps both trees from the same
+        // root path, which a root's `ipe-id` equals, so a top-level identity
+        // mismatch does not arise.
         _ => return,
     };
+    // SECURITY: the render sink's own admission rule. A refused element is
+    // absent from the rendered page, so neither side of a refused pair has a
+    // DOM node to patch; a parent whose child changes admission replaces its
+    // whole subtree (see the per-position loop), which re-renders through the
+    // same rule. The `Html.doctype` wrapper is admitted as markup, so a view
+    // rooted at it is diffed through to its children.
+    let (Ok(new_rendered), Ok(_)) = (
+        admit_rendered_in(ctx, nt, nk),
+        admit_rendered_in(ctx, ot, ok),
+    ) else {
+        return;
+    };
+    let body = new_rendered.body();
+    let child_ctx = ctx.enter(nt);
     // Patch id targets the element currently in the DOM — the OLD tree's id
     // . Borrowed: `Patch::for_id` copies it only when
     // a Patch is actually built, so an unchanged element pair allocates
@@ -129,7 +194,7 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
 
     // Child-count change → replace the whole subtree.
     if ok.len() != nk.len() {
-        push_html_replace(id, ot, nk, out);
+        push_children_replace(id, body, child_ctx, nk, out);
         return;
     }
 
@@ -142,19 +207,31 @@ fn diff_node_depth<M>(old: &Html<M>, new: &Html<M>, out: &mut Vec<Patch>, depth:
                 // (single-text is the fast path above; anything else is a
                 // parent html-replace).
                 if o != n {
-                    push_html_replace(id, ot, nk, out);
+                    push_children_replace(id, body, child_ctx, nk, out);
                     return;
                 }
             }
-            // Raw-vs-raw: changed raw content is not patched (no-op); avoid
-            // emitting a spurious replace.
-            (Html::HRaw(_), Html::HRaw(_)) => {}
-            (Html::HElement(t1, _, _), Html::HElement(t2, _, _)) if t1 == t2 => {
-                diff_node_depth(oc, nc, out, child_depth);
+            // A changed trusted raw body (a dynamic `styleNode`, an
+            // `unsafeRaw` fragment) re-renders the parent's children through
+            // the same body class the first paint used.
+            (Html::HRaw(o), Html::HRaw(n)) => {
+                if o != n {
+                    push_children_replace(id, body, child_ctx, nk, out);
+                    return;
+                }
             }
-            // Tag / kind mismatch → replace the subtree at the parent.
+            (Html::HElement(..), Html::HElement(..)) if same_node(oc, nc) => {
+                // A child that gains or loses admission appears in or vanishes
+                // from the page, so the parent's subtree is replaced.
+                if is_refused_element(child_ctx, oc) != is_refused_element(child_ctx, nc) {
+                    push_children_replace(id, body, child_ctx, nk, out);
+                    return;
+                }
+                diff_node_depth(oc, nc, child_ctx, out, child_depth);
+            }
+            // Tag / kind / identity mismatch → replace the subtree at the parent.
             _ => {
-                push_html_replace(id, ot, nk, out);
+                push_children_replace(id, body, child_ctx, nk, out);
                 return;
             }
         }
@@ -245,49 +322,45 @@ fn diff_events<M>(old: &[Attribute<M>], new: &[Attribute<M>], p: &mut Patch) {
     };
     let (on, nn) = (names(old), names(new));
     let id = p.id.clone();
+    let hid = crate::html::HANDLER_ID_ATTR;
     for ev in &nn {
         if !on.contains(ev) {
-            insert_safe_attr(p, &ev_key(ev), ev);
-            insert_safe_attr(p, "data-ipe-hid", &id);
+            insert_marker_attr(p, &ev_key(ev), ev);
+            insert_marker_attr(p, hid, &id);
         }
     }
     for ev in &on {
         if !nn.contains(ev) {
-            insert_safe_attr(p, &ev_key(ev), "");
+            insert_marker_attr(p, &ev_key(ev), "");
             if nn.is_empty() {
-                insert_safe_attr(p, "data-ipe-hid", "");
+                insert_marker_attr(p, hid, "");
             }
         }
     }
 }
 
+/// Insert a listener marker of the event delta through
+/// [`crate::html::patch_marker_attr`]; a program-built attribute takes
+/// [`insert_safe_attr`] instead, which refuses every runtime wire-marker name.
+fn insert_marker_attr(p: &mut Patch, key: &str, val: &str) {
+    if let Some((k, v)) = crate::html::patch_marker_attr(key, val) {
+        p.attrs.insert(k.to_string(), v.to_string());
+    }
+}
+
 /// Render `kids` into an HTML string for an SSE innerHTML replace.
 ///
-/// When `parent_tag` is `"script"` or `"style"`, the raw-text body is rendered
-/// into a scratch buffer (text verbatim, not HTML-escaped) then passed through
-/// `neutralise_script_close` / `strip_style_close` — the same sink-neutralise
-/// the first-paint renderer applies — before it is returned. All other tags use
-/// the normal element-level render path via `render_into`.
-fn render_children<M>(parent_tag: &str, kids: &[Html<M>]) -> String {
-    // Write every child into ONE shared accumulator instead of allocating a
-    // throwaway String per child (efficiency-audit §6 medium).
+/// The children render through `render_children_into` with the parent's
+/// admitted body class, the same path the first-paint renderer takes, so a
+/// `<script>`/`<style>` body is neutralised and a refused child is left out.
+fn render_children<M>(
+    parent_body: ElementBody,
+    child_ctx: ParseContext,
+    kids: &[Html<M>],
+) -> String {
     let mut s = String::new();
-    if parent_tag == "script" {
-        for c in kids {
-            crate::html::render_into_raw_text(c, &mut s);
-        }
-        crate::css_safety::neutralise_script_close(&s)
-    } else if parent_tag == "style" {
-        for c in kids {
-            crate::html::render_into_raw_text(c, &mut s);
-        }
-        crate::css_safety::strip_style_close(&s)
-    } else {
-        for c in kids {
-            crate::html::render_into(c, &mut s);
-        }
-        s
-    }
+    crate::html::render_children_into(parent_body, child_ctx, kids, &mut s);
+    s
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -461,6 +534,40 @@ mod tests {
         assert_eq!(p[0].attrs.get("data-ipe-hid").map(String::as_str), Some(""));
     }
 
+    /// A program-built handler id is never patched onto an element: the
+    /// client would post the element's gestures under that forged id.
+    #[test]
+    fn program_built_handler_id_is_never_patched() {
+        let button = |hid: &str| -> Html<()> {
+            Html::HElement(
+                "button".into(),
+                vec![
+                    Attribute::Attr("data-ipe-hid".into(), hid.into()),
+                    Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+                ],
+                vec![],
+            )
+        };
+        let mut a = button("r_1_button");
+        let mut b = button("r_9_button");
+        ids(&mut a);
+        ids(&mut b);
+        assert!(diff(&a, &b).is_empty());
+        let mut patch = Patch {
+            id: "r".into(),
+            text: None,
+            html: None,
+            attrs: HashMap::new(),
+            remove: false,
+        };
+        diff_attrs::<()>(
+            &[],
+            &[Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
+            &mut patch,
+        );
+        assert!(patch.attrs.is_empty(), "{patch:?}");
+    }
+
     #[test]
     fn diff_mixed_child_text_change_replaces_parent() {
         // Parent with [<span>, text]; the text child changes → parent html-replace
@@ -551,54 +658,236 @@ mod tests {
     }
 
     // RT-SEC-001: SSE innerHTML-replace on a `<script>` element neutralises any
-    // `</script>` sequence in a text child — the injected close-tag cannot
+    // `</script>` sequence in a trusted raw child: the injected close-tag cannot
     // terminate the element early on the browser's HTML parser, even when the
     // patch is applied via `innerHTML`.
     #[test]
     fn diff_sse_script_replace_neutralises_close_tag() {
-        // Old: <script> with one text child "// safe"
-        // New: <script> with one text child containing an injected `</script>`
-        // Child-count is 1→2, so a whole-subtree innerHTML replace fires.
+        // Child-count is 1 -> 2, so a whole-subtree innerHTML replace fires.
         let mut old: Html<()> =
-            Html::HElement("script".into(), vec![], vec![Html::HText("// safe".into())]);
+            Html::HElement("script".into(), vec![], vec![Html::HRaw("// safe".into())]);
         let mut new: Html<()> = Html::HElement(
             "script".into(),
             vec![],
             vec![
-                Html::HText("// safe".into()),
-                Html::HText("</script><img onerror=alert(1)>".into()),
+                Html::HRaw("// safe".into()),
+                Html::HRaw("</script><img onerror=alert(1)>".into()),
             ],
         );
         ids(&mut old);
         ids(&mut new);
         let p = diff(&old, &new);
-        assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
-        let html = p[0].html.as_deref().expect("expected html field on patch");
+        assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
+        let Some(patch) = p.first() else {
+            return;
+        };
         assert!(
-            !html.contains("</script>"),
-            "`</script>` must not appear raw in the patch html; got: {html:?}"
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
         );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
         assert!(
-            !html.contains("</script"),
-            "`</script` byte run must be neutralised; got: {html:?}"
+            !text.to_ascii_lowercase().contains("</script"),
+            "`</script` byte run must be neutralised; got: {text:?}"
         );
     }
 
     // RT-SEC-002: SSE innerHTML-replace on a `<style>` element strips any
-    // `</style>` sequence in a text child.
+    // `</style>` sequence in a trusted raw child and opens no markup.
     #[test]
     fn diff_sse_style_replace_strips_close_tag() {
         let mut old: Html<()> = Html::HElement(
             "style".into(),
             vec![],
-            vec![Html::HText("body { color: red }".into())],
+            vec![Html::HRaw("body { color: red }".into())],
         );
         let mut new: Html<()> = Html::HElement(
             "style".into(),
             vec![],
             vec![
-                Html::HText("body { color: red }".into()),
-                Html::HText("</style><script>alert(1)</script>".into()),
+                Html::HRaw("body { color: red }".into()),
+                Html::HRaw("</style><script>alert(1)</script>".into()),
+            ],
+        );
+        ids(&mut old);
+        ids(&mut new);
+        let p = diff(&old, &new);
+        assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
+        let Some(patch) = p.first() else {
+            return;
+        };
+        assert!(
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
+        );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
+        assert!(
+            !text.contains("</style"),
+            "`</style` byte run must be stripped; got: {text:?}"
+        );
+        assert!(
+            !text.contains("<script"),
+            "no markup may open; got: {text:?}"
+        );
+    }
+
+    /// A `<script>`/`<style>` whose body is text is refused by the shared tag
+    /// gate, so the diff patches nothing into it: no `text` fast-path patch and
+    /// no `html` replace carrying the text.
+    #[test]
+    fn diff_refused_raw_text_element_emits_no_patch() {
+        for tag in ["script", "SCRIPT", "style", "Style"] {
+            let mut old: Html<()> =
+                Html::HElement(tag.into(), vec![], vec![Html::HText("a".into())]);
+            let mut new: Html<()> = Html::HElement(
+                tag.into(),
+                vec![],
+                vec![Html::HText("alert(document.cookie)".into())],
+            );
+            ids(&mut old);
+            ids(&mut new);
+            assert!(
+                diff(&old, &new).is_empty(),
+                "<{tag}> text body must not be patched"
+            );
+        }
+    }
+
+    /// A child `<script>` that turns from a trusted raw body into a text body
+    /// leaves the page: the parent is replaced, and the replacement html holds
+    /// no script element and no script text.
+    #[test]
+    fn diff_child_losing_admission_replaces_parent_without_it() {
+        let script = |kid: Html<()>| Html::HElement("script".into(), vec![], vec![kid]);
+        let mut old: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![script(Html::HRaw("init()".into()))],
+        );
+        let mut new: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![script(Html::HText("alert(document.cookie)".into()))],
+        );
+        ids(&mut old);
+        ids(&mut new);
+        let p = diff(&old, &new);
+        assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
+        let html = p[0].html.as_deref().expect("expected html field on patch");
+        assert!(
+            !html.contains("<script"),
+            "refused script must not render; got: {html:?}"
+        );
+        assert!(
+            !html.contains("alert"),
+            "refused body must not render; got: {html:?}"
+        );
+    }
+
+    /// A patch that inserts a trusted script under an `svg` parent emits no
+    /// script and none of its body, the verdict the first paint gives; under a
+    /// `div` (the control) the same script is patched in.
+    #[test]
+    fn diff_patch_under_svg_refuses_script() {
+        let script = || -> Html<()> {
+            Html::HElement(
+                "script".into(),
+                vec![],
+                vec![Html::HRaw("<img src=x onerror=alert(1)>".into())],
+            )
+        };
+        for (parent, admitted) in [
+            ("svg", false),
+            ("math", false),
+            ("textarea", false),
+            ("noscript", false),
+            ("div", true),
+        ] {
+            let mut old: Html<()> = Html::HElement(parent.into(), vec![], vec![]);
+            let mut new: Html<()> = Html::HElement(parent.into(), vec![], vec![script()]);
+            ids(&mut old);
+            ids(&mut new);
+            let patches = diff(&old, &new);
+            assert_eq!(patches.len(), 1, "{parent}: {patches:?}");
+            let [patch] = patches.as_slice() else {
+                return;
+            };
+            let html = patch.html.as_deref().unwrap_or_default();
+            assert_eq!(html.contains("<script"), admitted, "{parent}: {html}");
+            assert_eq!(html.contains("<img"), admitted, "{parent}: {html}");
+            let first_paint = crate::html::render_html(&new);
+            assert_eq!(first_paint.contains("<script"), admitted, "{first_paint}");
+        }
+    }
+
+    /// A patch two levels below `svg`, under its `foreignObject`, still treats
+    /// the subtree as foreign content: no script is patched in.
+    #[test]
+    fn diff_patch_under_foreign_object_refuses_script() {
+        let page = |kids: Vec<Html<()>>| -> Html<()> {
+            let fo = Html::HElement("foreignObject".into(), vec![], kids);
+            Html::HElement("svg".into(), vec![], vec![fo])
+        };
+        let script = Html::HElement(
+            "script".into(),
+            vec![],
+            vec![Html::HRaw("<img src=x onerror=alert(1)>".into())],
+        );
+        let mut old = page(vec![]);
+        let mut new = page(vec![script]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        for p in &patches {
+            let html = p.html.as_deref().unwrap_or_default();
+            assert!(!html.contains("<script"), "{html}");
+            assert!(!html.contains("<img"), "{html}");
+        }
+        assert!(!crate::html::render_html(&new).contains("<script"));
+    }
+
+    /// A trusted script body that changes under an `svg` parent is not on the
+    /// page, so the diff emits no patch for it.
+    #[test]
+    fn diff_changed_script_under_svg_emits_no_patch() {
+        let page = |body: &str| -> Html<()> {
+            let script = Html::HElement("script".into(), vec![], vec![Html::HRaw(body.into())]);
+            Html::HElement("svg".into(), vec![], vec![script])
+        };
+        let mut old = page("a();");
+        let mut new = page("<img src=x onerror=alert(1)>");
+        ids(&mut old);
+        ids(&mut new);
+        assert!(diff(&old, &new).is_empty());
+    }
+
+    /// A child-count change that adds a text-bodied `<script>` (or an empty,
+    /// not-yet-started one carrying a `src`) replaces the parent without it.
+    #[test]
+    fn diff_count_change_drops_refused_script_child() {
+        let mut old: Html<()> = Html::HElement("div".into(), vec![], vec![]);
+        let mut new: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![
+                Html::HElement(
+                    "script".into(),
+                    vec![],
+                    vec![Html::HText("alert(1)".into())],
+                ),
+                Html::HElement(
+                    "script".into(),
+                    vec![Attribute::Attr("src".into(), "/evil.js".into())],
+                    vec![],
+                ),
+                Html::HElement("p".into(), vec![], vec![Html::HText("ok".into())]),
             ],
         );
         ids(&mut old);
@@ -607,8 +896,280 @@ mod tests {
         assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
         let html = p[0].html.as_deref().expect("expected html field on patch");
         assert!(
-            !html.contains("</style"),
-            "`</style` byte run must be stripped; got: {html:?}"
+            !html.contains("<script"),
+            "refused scripts must not render; got: {html:?}"
+        );
+        assert!(
+            html.contains("ok</p>"),
+            "admitted sibling must render; got: {html:?}"
+        );
+    }
+
+    /// A view rooted at `Html.doctype` is diffed through the wrapper the render
+    /// sink admits, so a changed text deep inside it reaches the page.
+    #[test]
+    fn diff_doctype_root_patches_a_changed_text_child() {
+        let page = |text: &str| -> Html<()> {
+            let p = Html::HElement("p".into(), vec![], vec![Html::HText(text.into())]);
+            let body = Html::HElement("body".into(), vec![], vec![p]);
+            let html = Html::HElement("html".into(), vec![], vec![body]);
+            Html::HElement(crate::html::DOCTYPE_WRAPPER_TAG.into(), vec![], vec![html])
+        };
+        let mut old = page("before");
+        let mut new = page("after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_html_0_body_0_p");
+        assert_eq!(patch.text.as_deref(), Some("after"));
+    }
+
+    /// A doctype wrapper nested below the root is on the page too, so it is
+    /// not a refused child: a text change inside it patches only that text.
+    #[test]
+    fn diff_nested_doctype_is_not_a_refused_child() {
+        let tree = |text: &str| -> Html<()> {
+            let p = Html::HElement("p".into(), vec![], vec![Html::HText(text.into())]);
+            let doctype = Html::HElement(crate::html::DOCTYPE_WRAPPER_TAG.into(), vec![], vec![p]);
+            Html::HElement("div".into(), vec![], vec![doctype])
+        };
+        let mut old = tree("before");
+        let mut new = tree("after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.text.as_deref(), Some("after"));
+        assert!(
+            patch.html.is_none(),
+            "no subtree replace expected: {patch:?}"
+        );
+    }
+
+    /// True when `s` holds a `<` the HTML tokenizer would read as the start of
+    /// a tag, end tag, comment or declaration.
+    fn has_markup_opener(s: &str) -> bool {
+        s.as_bytes().windows(2).any(|w| {
+            matches!(w, [b'<', c] if c.is_ascii_alphabetic() || matches!(*c, b'/' | b'!' | b'?'))
+        })
+    }
+
+    /// A trusted raw `<script>` body (an `unsafeJsonLd`/`unsafeScript` value
+    /// holding user data but no `</script`) that changes is sent as text, the
+    /// neutralised bytes the first paint wrote, never as html the client would
+    /// parse into a live `<img onerror>` or `<script src>`.
+    #[test]
+    fn diff_changed_trusted_script_body_is_a_text_patch() {
+        let script = |body: &str| -> Html<()> {
+            Html::HElement("script".into(), vec![], vec![Html::HRaw(body.into())])
+        };
+        let body = r#"["<script src=//e><img src=x onerror=alert(1)>"]"#;
+        let mut old: Html<()> = Html::HElement("div".into(), vec![], vec![script("null")]);
+        let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![script(body)]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        assert!(
+            patches
+                .iter()
+                .all(|p| p.html.as_deref().is_none_or(|h| !has_markup_opener(h))),
+            "no html patch may carry a markup opener: {patches:?}"
+        );
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_script");
+        assert!(patch.html.is_none(), "{patch:?}");
+        assert_eq!(patch.text.as_deref(), Some(body), "{patch:?}");
+        assert!(
+            crate::html::render_html(&new).contains(body),
+            "the text patch holds the first paint's body bytes"
+        );
+    }
+
+    /// A trusted raw `<style>` body that changes between renders (a dynamic
+    /// `styleNode`) is sent as its neutralised text, which keeps an entity such
+    /// as `&amp;` as the bytes CSS reads instead of decoding it.
+    #[test]
+    fn diff_changed_trusted_style_body_replaces_it() {
+        let style = |css: &str| -> Html<()> {
+            Html::HElement("style".into(), vec![], vec![Html::HRaw(css.into())])
+        };
+        let mut old: Html<()> =
+            Html::HElement("div".into(), vec![], vec![style("p { color: red }")]);
+        let mut new: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![style(
+                "p::after { content: \"&amp;\"; color: blue }</style><img src=x>",
+            )],
+        );
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_style");
+        assert!(
+            patch.html.is_none(),
+            "raw-text body never rides html: {patch:?}"
+        );
+        let Some(text) = patch.text.as_deref() else {
+            assert!(patch.text.is_some(), "expected a text patch: {patch:?}");
+            return;
+        };
+        assert!(
+            text.contains("content: \"&amp;\"; color: blue"),
+            "new body must arrive byte for byte; got {text:?}"
+        );
+        assert!(
+            !text.contains("</style"),
+            "close tag must be neutralised; got {text:?}"
+        );
+        assert!(!has_markup_opener(text), "no markup may open; got {text:?}");
+        assert!(
+            crate::html::render_html(&new).contains(text),
+            "the text patch holds the first paint's body bytes"
+        );
+    }
+
+    /// An unchanged trusted raw body produces no patch.
+    #[test]
+    fn diff_unchanged_trusted_raw_body_is_empty() {
+        let tree = || -> Html<()> {
+            Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HRaw("<b>x</b>".into()), Html::HRaw("<i>y</i>".into())],
+            )
+        };
+        let mut old = tree();
+        let mut new = tree();
+        ids(&mut old);
+        ids(&mut new);
+        assert!(diff(&old, &new).is_empty());
+    }
+
+    fn keyed_li(key: &str, text: &str) -> Html<()> {
+        Html::HElement(
+            "li".into(),
+            vec![Attribute::Attr("ipe-key".into(), key.into())],
+            vec![Html::HText(text.into())],
+        )
+    }
+
+    /// A same-tag sibling whose key changes is a different node: the parent's
+    /// children are replaced, so the DOM element carries the new `ipe-id`,
+    /// and nothing is addressed to the old one.
+    #[test]
+    fn key_change_at_same_position_replaces_parent_children() {
+        let mut old: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "x")]);
+        let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("b", "x")]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r");
+        let Some(html) = patch.html.as_deref() else {
+            assert!(patch.html.is_some(), "expected an html replace: {patch:?}");
+            return;
+        };
+        assert!(
+            html.contains("ipe-id=\"r_0_li:b\""),
+            "the replace carries the new identity; got {html:?}"
+        );
+        assert!(
+            patches.iter().all(|p| p.id != "r_0_li:a"),
+            "no patch may address the old identity: {patches:?}"
+        );
+    }
+
+    /// Control: the same key with changed text keeps the in-place fast path.
+    #[test]
+    fn same_key_text_change_patches_in_place() {
+        let mut old: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "x")]);
+        let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "y")]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_li:a");
+        assert_eq!(patch.text.as_deref(), Some("y"));
+        assert!(patch.html.is_none(), "no html replace: {patch:?}");
+    }
+
+    /// Swapping two keyed items changes both ids at their positions, so the
+    /// parent's children are replaced in one patch.
+    #[test]
+    fn keyed_swap_replaces_parent_children() {
+        let list = |first: &str, second: &str| -> Html<()> {
+            Html::HElement(
+                "ul".into(),
+                vec![],
+                vec![keyed_li(first, first), keyed_li(second, second)],
+            )
+        };
+        let mut old = list("a", "b");
+        let mut new = list("b", "a");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r");
+        assert!(patch.html.is_some(), "html replace expected: {patch:?}");
+    }
+
+    /// A key change two levels down is replaced at the nearest parent that
+    /// holds the changed child, never above it.
+    #[test]
+    fn nested_key_change_replaces_at_the_nearest_parent() {
+        let tree = |key: &str| -> Html<()> {
+            Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HElement(
+                    "ul".into(),
+                    vec![],
+                    vec![keyed_li(key, "x")],
+                )],
+            )
+        };
+        let mut old = tree("a");
+        let mut new = tree("b");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_ul");
+        let Some(html) = patch.html.as_deref() else {
+            assert!(patch.html.is_some(), "expected an html replace: {patch:?}");
+            return;
+        };
+        assert!(
+            html.contains("ipe-id=\"r_0_ul_0_li:b\""),
+            "the replace carries the new identity; got {html:?}"
         );
     }
 }

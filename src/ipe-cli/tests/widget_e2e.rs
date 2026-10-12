@@ -114,7 +114,7 @@ const COUNTER_JS: &str = "export function mount(host, emit) {\n\
 
 // ── Build + spawn harness (mirrors live_e2e) ────────────────────────────────
 
-/// The `ipe build` dev-loop intent: these fixtures exercise the dev posture
+/// The `ipe dev build` dev-loop intent: these fixtures exercise the dev posture
 /// (plain cookie names, loopback upstreams), which a release binary refuses.
 fn dev_loop_options() -> ipe::BuildOptions {
     ipe::BuildOptions {
@@ -147,7 +147,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_with_options(&entry, &out_dir, &runtime, dev_loop_options())
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
@@ -226,14 +226,20 @@ fn spawn_and_wait_ready(
                     // listener after it has already bound — the connect then races
                     // an about-to-die server. Draining keeps the pipe open and
                     // empty, so the child never blocks or faults on a log write.
-                    std::thread::spawn(move || {
+                    let drain = std::thread::Builder::new().spawn(move || {
                         let mut sink = reader;
                         let mut buf = String::new();
                         while sink.read_line(&mut buf).is_ok_and(|n| n > 0) {
                             buf.clear();
                         }
                     });
-                    return Ok(ProcessGuard(child));
+                    // The guard owns the child before the drain verdict, so a
+                    // refused drain thread still kills and reaps the server.
+                    let guard = ProcessGuard(child);
+                    drain.map_err(|e| -> BoxError {
+                        format!("{test_name}: cannot start the stderr drain: {e}").into()
+                    })?;
+                    return Ok(guard);
                 }
             }
             Err(e) => {
@@ -264,6 +270,19 @@ fn wait_until_connectable(test_name: &str, addr: &str) -> Result<(), BoxError> {
             }
         }
     }
+}
+
+/// A well-formed tab id, as a browser tab mints once per page load.
+const TAB: &str = "00112233445566778899aabbccddeeff";
+
+/// The render epoch the page's boot data block carries.
+///
+/// An event carries it so the server resolves the handler id against the
+/// render that produced it.
+fn extract_epoch(test_name: &str, html: &str) -> Result<String, BoxError> {
+    e2e_support::live_page::boot_string(html, "epoch").ok_or_else(|| -> BoxError {
+        format!("{test_name}: no boot-block epoch in the page").into()
+    })
 }
 
 /// Send a raw HTTP/1.1 request; return `(raw_headers, body)`.
@@ -520,8 +539,9 @@ fn ui_widget_serves_sri_glue_and_round_trips_up_event() -> Result<(), BoxError> 
     // up-decoder. `Bumped 3` folds +3 into the count.
     let cookie_header = format!("ipe_sid={sid}");
     let up_valid = r#"{"Bumped":3}"#;
+    let epoch = extract_epoch(test_name, &body)?;
     let event_body = format!(
-        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":""}}"#,
+        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#,
         up = serde_json::to_string(up_valid).expect("string always serializes")
     );
     let (_, post_body) = http_send(
@@ -563,8 +583,9 @@ fn ui_widget_serves_sri_glue_and_round_trips_up_event() -> Result<(), BoxError> 
     // A payload that does not decode to the declared `up` type must be dropped
     // whole by the WP4 seal decoder — the model must NOT move off 3.
     let up_bogus = r#"{"Nonexistent":true}"#;
+    let epoch = extract_epoch(test_name, &body_after_valid)?;
     let bogus_body = format!(
-        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":""}}"#,
+        r#"{{"handlerId":"{widget_hid}","msg":"ipe-widget","args":[{up}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":2}}"#,
         up = serde_json::to_string(up_bogus).expect("string always serializes")
     );
     let _ = http_send(
@@ -681,7 +702,7 @@ fn emitted_source(out_dir: &std::path::Path) -> String {
 /// Two guarantees, two proofs:
 ///
 /// 1. **Compile seal** — `compile_and_build` reaching the built binary means
-///    `ipe build` accepted + emitted AND `cargo build` linked the runtime
+///    `ipe dev build` accepted + emitted AND `cargo build` linked the runtime
 ///    transport signatures (THE SEAL).
 /// 2. **Lowering shape** — the emitted Rust actually CONTAINS the transport
 ///    calls (`js_send(` outbound, `js_subscribe(` inbound). A green
@@ -701,7 +722,7 @@ fn js_port_seal_legal_lowers_and_builds() -> Result<(), BoxError> {
         return Ok(());
     }
     // `compile_and_build` returns the built binary path; reaching it means both
-    // `ipe build` (accept + emit) and `cargo build` (THE SEAL) succeeded.
+    // `ipe dev build` (accept + emit) and `cargo build` (THE SEAL) succeeded.
     let _exe = compile_and_build("js_port_seal", JS_PORT_APP)?;
 
     // The compile seal alone would pass even if the port calls were elided; the

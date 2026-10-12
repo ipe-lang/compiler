@@ -1,0 +1,103 @@
+module Main exposing (main)
+
+-- NEGATIVE golden: `Store.sub` applied to a non-numeric column must be
+-- rejected. The `title` field of `Book` is a `String`, not a numeric type;
+-- `sub` shares `add`'s numeric-bounded type variable, so unifying a `String`
+-- operand against it fails closed with a type-mismatch (IPE-T0001) before
+-- lowering. The stores and join are well-formed; only the `sub` operand type
+-- is at fault.
+
+
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Task as Task exposing (Task)
+
+
+type alias Book =
+    { id : String
+    , title : String
+    , authorId : String
+    }
+
+
+type alias Author =
+    { id : String
+    , name : String
+    , active : Bool
+    }
+
+
+blankBook : Book
+blankBook =
+    { id = "", title = "", authorId = "" }
+
+
+blankAuthor : Author
+blankAuthor =
+    { id = "", name = "", active = False }
+
+
+bookCodec : Codec Book
+bookCodec =
+    Codec.auto blankBook
+
+
+authorCodec : Codec Author
+authorCodec =
+    Codec.auto blankAuthor
+
+
+booksStore : Result Error (Store Book)
+booksStore =
+    Store.fromCodec "books" bookCodec
+        |> Result.map (\s -> Store.primaryKey .id s)
+        |> Result.map Store.public
+
+
+authorsStore : Result Error (Store Author)
+authorsStore =
+    Store.fromCodec "authors" authorCodec
+        |> Result.map (\s -> Store.primaryKey .id s)
+        |> Result.map Store.public
+
+
+-- `Store.sub` applied to a String column — must be rejected.
+badSub : Db -> Store Book -> Store Author -> Task Error (List String)
+badSub db books authors =
+    Store.selectToList db
+        (Store.select
+            (\( book, _ ) -> Store.sub book.title book.title)
+            (Store.join books .authorId authors .id)
+        )
+
+
+run : Db -> Task Error (List String)
+run db =
+    case booksStore of
+        Ok books ->
+            case authorsStore of
+                Ok authors ->
+                    badSub db books authors
+
+                Err e ->
+                    Task.fail e
+
+        Err e ->
+            Task.fail e
+
+
+main : Task Error ()
+main =
+    Task.andThen
+        (\_ -> Io.println "unreachable")
+        (Task.onError
+            (\_ -> Task.succeed ())
+            (Task.andThen
+                (\db -> Task.map (\_ -> ()) (run db))
+                (Db.connect ())
+            )
+        )

@@ -179,11 +179,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "refusal-tested",
-        "IPE-N0043",
-        "config binding not threaded not yet reached by any constant assertion or wire literal",
-    ),
-    (
-        "refusal-tested",
         "IPE-N0045",
         "runtime shape selection gate not yet reached by any constant assertion or wire literal",
     ),

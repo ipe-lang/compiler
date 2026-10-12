@@ -19,8 +19,9 @@
 //! - [`read_capped`] reads a stream through `take(cap + 1)`, so an oversized
 //!   body is refused without ever being buffered past `cap + 1` bytes.
 //! - [`Git`] and [`Curl`] run a child whose output lands on disk. The child is
-//!   started in its own process group (on Unix platforms with `waitid`), so a
-//!   refusal kills every process it started, not only the direct child; the
+//!   started in its own process group (on Unix platforms with `waitid`) or its
+//!   own kill-on-close job object (on Windows), so a refusal kills every
+//!   process it started, not only the direct child; the
 //!   interrupt, quit, hangup, stop and continue signals reaching the CLI are
 //!   relayed to that group, except a signal the CLI inherited as ignored, and a
 //!   termination request (`SIGTERM`) kills every group before the CLI acts on
@@ -33,6 +34,12 @@
 //!   acceptance, so an accepted transfer is always within budget. While it
 //!   runs, the disk may briefly hold more than the ceiling, by at most one
 //!   [`POLL_INTERVAL`] of transfer throughput.
+//!
+//! On Windows the CLI joins a kill-on-close job of its own before its first
+//! detached transfer, so every child it starts from then on dies with the CLI.
+//! A transfer whose job cannot be made or joined is refused with a
+//! `ContainmentRefusal` and its child killed and reaped: no uncontained
+//! transfer runs.
 //!
 //! [`Git`] and [`Curl`] are the only constructors of a `git` or `curl` child in
 //! the CLI; each fixes the hardened environment and arguments once.
@@ -47,13 +54,14 @@
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr as PipeStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
 use crate::CliError;
 use crate::package_name::PackageName;
+use crate::style::TerminalSafe;
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -227,6 +235,95 @@ impl WallBudget {
             .filter(|secs| secs.get() <= MAX_WALL_SECS)
             .map(Self)
     }
+
+    /// The ceiling as the wall a watcher enforces and a refusal names.
+    #[must_use]
+    pub const fn limit(self) -> WallSecs {
+        WallSecs(self.0)
+    }
+}
+
+/// Ceiling on every wall-time ceiling of a local child, in seconds.
+///
+/// The longest local child is a self-run of `ipe dev run`, which contains a
+/// full cargo build: the cargo build wall plus [`SELF_RUN_MARGIN_SECS`]. The
+/// jailed FFI inspector allows 900 seconds, so a local wall may exceed
+/// [`MAX_WALL_SECS`]; this is the type's ceiling, not a default.
+pub const MAX_LOCAL_WALL_SECS: u64 =
+    crate::cargo_step::CARGO_BUILD_WALL_SECS + SELF_RUN_MARGIN_SECS;
+
+// Every remote wall fits a local one, so a remote wall reused as a local
+// ceiling is in range by construction.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the remote wall ceiling outgrows the local one [ledger #boundary]
+const _: () = assert!(MAX_WALL_SECS <= MAX_LOCAL_WALL_SECS);
+
+/// The wall a watched child was held to: whole seconds, never zero.
+///
+/// Built only from a [`WallBudget`] or a [`LocalWall`], so the watcher's
+/// deadline and the refusal that names it are the same value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WallSecs(NonZeroU64);
+
+impl WallSecs {
+    /// The wall in whole seconds, never zero.
+    #[must_use]
+    pub const fn secs(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The wall as a duration.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        Duration::from_secs(self.0.get())
+    }
+}
+
+/// A wall-time ceiling of one local child: whole seconds in `1..=MAX_LOCAL_WALL_SECS`.
+///
+/// Built only as [`WallBudget`] is, with the local ceiling as its bound.
+///
+/// ```compile_fail,E0080
+/// let _ = ipe::remote_ingest::LocalWall::of_secs::<0>();
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = ipe::remote_ingest::LocalWall::of_secs::<3661>();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalWall(NonZeroU64);
+
+impl LocalWall {
+    /// The ceiling of `S` seconds, which the build refuses outside `1..=MAX_LOCAL_WALL_SECS`.
+    #[must_use]
+    pub const fn of_secs<const S: u64>() -> Self {
+        let secs = const {
+            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD when a named local wall is zero or above `MAX_LOCAL_WALL_SECS` [ledger #boundary]
+            assert!(S > 0 && S <= MAX_LOCAL_WALL_SECS);
+            match NonZeroU64::new(S) {
+                Some(secs) => secs,
+                None => NonZeroU64::MIN,
+            }
+        };
+        Self(secs)
+    }
+
+    /// The remote wall `wall` as a local one; every remote wall is in range.
+    #[must_use]
+    pub const fn of_remote(wall: WallBudget) -> Self {
+        Self(wall.0)
+    }
+
+    /// The ceiling in whole seconds, never zero.
+    #[must_use]
+    pub const fn secs(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The ceiling as the wall a watcher enforces and a refusal names.
+    #[must_use]
+    pub const fn limit(self) -> WallSecs {
+        WallSecs(self.0)
+    }
 }
 
 /// What a remote-ingest surface may leave on disk.
@@ -323,15 +420,387 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// CLI wait longer; the wait ends in [`RunError::PipeDrainTimeout`].
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// The ceilings of one local child: its stdout and its wall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalLimits {
+    stdout_bytes: ByteBudget,
+    wall: LocalWall,
+}
+
+/// The ceilings of a local child run through [`run_local`] or [`run_local_fed`].
+///
+/// Opaque: every production value is a named constant of this module, so a
+/// caller can neither build a ceiling nor widen one. A local child stages
+/// nothing on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalCeiling(LocalLimits);
+
+impl LocalCeiling {
+    /// Bytes the child's stdout may carry.
+    #[must_use]
+    pub const fn stdout_bytes(&self) -> ByteBudget {
+        self.0.stdout_bytes
+    }
+
+    /// Wall time the child may run.
+    #[must_use]
+    pub const fn wall(&self) -> LocalWall {
+        self.0.wall
+    }
+
+    /// This ceiling with its wall time set, for a test to drive the refusals.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_wall(self, wall: LocalWall) -> Self {
+        let Self(limits) = self;
+        Self(LocalLimits { wall, ..limits })
+    }
+
+    /// This ceiling with its stdout ceiling set, for a test to drive the refusals.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_stdout(self, stdout_bytes: ByteBudget) -> Self {
+        let Self(limits) = self;
+        Self(LocalLimits {
+            stdout_bytes,
+            ..limits
+        })
+    }
+
+    /// The ceilings the watcher enforces.
+    const fn limits(&self) -> RunLimits {
+        RunLimits {
+            staging: Staging::Nothing,
+            stdout_bytes: self.0.stdout_bytes,
+            wall: self.0.wall.limit(),
+        }
+    }
+}
+
 /// The ceilings of a local `git` query, which stages nothing on disk.
 ///
 /// Its stdout (a revision, a remote URL, a porcelain status) is held to 4 MiB
 /// and its run to one minute.
-const QUERY_LIMITS: Limits = Limits {
-    staging: Staging::Nothing,
+const QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     stdout_bytes: ByteBudget::of::<{ 4 * MIB }>(),
-    wall: WallBudget::of_secs::<60>(),
-};
+    wall: LocalWall::of_secs::<60>(),
+});
+
+/// The ceilings of an offline `cargo generate-lockfile`, which reads only the local registry cache.
+///
+/// Its stdout is held to 64 KiB and its run to two minutes, so a held
+/// `.package-cache` lock or a wedged resolve cannot hold the CLI.
+pub const LOCK_RESOLVE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<120>(),
+});
+
+/// The ceilings of a networked `cargo generate-lockfile`, which may fetch the registry index.
+///
+/// Its stdout is held to 64 KiB and its run to ten minutes, the wall of
+/// [`INDEX_CLONE`].
+pub const LOCK_FETCH_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_remote(INDEX_CLONE.wall),
+});
+
+/// The ceilings of `cargo metadata --no-deps`, which reads only the crate's manifests.
+///
+/// Its stdout (the metadata document) is held to 16 MiB and its run to two
+/// minutes, so a held cargo lock or a wedged config read cannot hold the CLI.
+pub const METADATA_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 16 * MIB }>(),
+    wall: LocalWall::of_secs::<120>(),
+});
+
+/// The ceilings of a toolchain query (`cargo-deny --version`, `rustup target list --installed`).
+///
+/// Its stdout (a version line, a target list) is held to 64 KiB and its run
+/// to one minute.
+pub const TOOL_QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<60>(),
+});
+
+/// The ceilings of a `cargo-deny check`, which may fetch the advisory database.
+///
+/// Its stdout is held to 1 MiB and its run to ten minutes, the wall of
+/// [`INDEX_CLONE`].
+pub const SUPPLY_CHAIN_SCAN_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<MIB>(),
+    wall: LocalWall::of_remote(INDEX_CLONE.wall),
+});
+
+/// The ceilings of a `rustc -vV` query.
+///
+/// Its stdout (a handful of `key: value` lines) is held to 64 KiB and its run
+/// to one minute.
+pub const RUSTC_QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<60>(),
+});
+
+/// The ceilings of the `ipe health` link probe, which compiles and links an empty program.
+///
+/// Its stdout is held to 64 KiB and its run to two minutes.
+pub const LINK_PROBE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<120>(),
+});
+
+/// The ceilings of the unsandboxed FFI inspector.
+///
+/// The jailed inspector's defaults: its stdout (the inspection report) is held
+/// to 256 MiB and its run to fifteen minutes.
+pub const FFI_INSPECT_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 256 * MIB }>(),
+    wall: LocalWall::of_secs::<900>(),
+});
+
+/// The ceilings of a wasm bundle tool (`wasm-bindgen`, `wasm-opt`).
+///
+/// Its stdout is held to 1 MiB and its run to ten minutes.
+pub const WASM_TOOL_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<MIB>(),
+    wall: LocalWall::of_secs::<600>(),
+});
+
+/// The seconds a self-run of this CLI may take beyond the `cargo build` it contains.
+pub const SELF_RUN_MARGIN_SECS: u64 = 60;
+
+/// The wall of a self-run of this CLI: the cargo build wall plus
+/// [`SELF_RUN_MARGIN_SECS`].
+const SELF_RUN_WALL: LocalWall =
+    LocalWall::of_secs::<{ crate::cargo_step::CARGO_BUILD_WALL_SECS + SELF_RUN_MARGIN_SECS }>();
+
+// A self-run contains a full cargo build, so its wall outlasts the build's own
+// wall: a hung build is refused by the build's typed timeout, never cut short
+// by the self-run wall first.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the self-run wall does not outlast the cargo build wall it contains [ledger #boundary]
+const _: () = assert!(SELF_RUN_WALL.secs() > crate::cargo_step::CARGO_BUILD_WALL.secs());
+
+/// The ceilings of a self-run of this CLI (`ipe dev run <snippet>`), which contains a full cargo build.
+///
+/// Its stdout (the snippet's output) is held to 1 MiB and its run to the
+/// cargo build wall plus [`SELF_RUN_MARGIN_SECS`].
+pub const SELF_RUN_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<MIB>(),
+    wall: SELF_RUN_WALL,
+});
+
+/// Run a local `command` detached in its own process group, held to `ceiling`.
+///
+/// Stdin is the null device; stdout is held to the ceiling and stderr
+/// truncated at [`CHILD_STDERR_MAX_BYTES`]. A crossed ceiling kills the
+/// child's group and is a [`LocalRefusal`] naming `source`.
+///
+/// # Errors
+/// See [`RunError`].
+pub fn run_local(
+    command: Command,
+    ceiling: LocalCeiling,
+    source: LocalSource,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    run_local_core(command, None, ceiling, source)
+}
+
+/// Run a local `command` as [`run_local`] does, with `stdin` fed to it as it reads.
+///
+/// # Errors
+/// See [`RunError`].
+pub fn run_local_fed(
+    command: Command,
+    stdin: Zeroizing<Vec<u8>>,
+    ceiling: LocalCeiling,
+    source: LocalSource,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    run_local_core(command, Some(stdin), ceiling, source)
+}
+
+/// The one body of [`run_local`] and [`run_local_fed`].
+fn run_local_core(
+    command: Command,
+    stdin: Option<Zeroizing<Vec<u8>>>,
+    ceiling: LocalCeiling,
+    source: LocalSource,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    run_core(
+        command,
+        stdin,
+        None,
+        &ceiling.limits(),
+        Instant::now(),
+        Mode::Detached,
+    )
+    .map_err(|e| {
+        e.map_refusal(|limit| LocalRefusal {
+            source,
+            limit,
+            name: None,
+        })
+    })
+}
+
+/// Why a child whose stdio is the terminal's needs no ceiling.
+///
+/// Its output never enters the CLI's memory (the bytes go straight to the
+/// terminal's descriptors), its input is the terminal or bytes already bounded
+/// upstream, and its duration is the user's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InheritedRole {
+    /// An install the user consented to and watches; a wall would kill a slow but legitimate one.
+    InteractiveInstall,
+    /// This CLI run again, which holds its own children to their ceilings.
+    SelfBuild,
+    /// The user's own program, which they asked to run and can interrupt.
+    UserProgram,
+}
+
+impl InheritedRole {
+    /// Whether a child in this role must read every byte it is fed.
+    ///
+    /// An installer that stops reading its script early ran only part of it,
+    /// whatever its exit status says; a build or the user's program may stop
+    /// reading when it has what it needs.
+    const fn consumes_all_input(self) -> bool {
+        match self {
+            Self::InteractiveInstall => true,
+            Self::SelfBuild | Self::UserProgram => false,
+        }
+    }
+}
+
+/// What an inherited child reads on its stdin.
+#[derive(Debug)]
+pub enum InheritedInput {
+    /// The CLI's own stdin, the user's terminal.
+    Terminal,
+    /// The null device: the child reads the end of its input at once.
+    Null,
+    /// These bytes, already held to a ceiling where they were read.
+    Bytes(Zeroizing<Vec<u8>>),
+}
+
+/// Why an inherited child produced no exit status the caller may accept.
+#[derive(Debug)]
+pub enum InheritedError {
+    /// The hardened spawner refused or failed to start the child.
+    Spawn(ipe_runtime_rust::system::SpawnRefusal),
+    /// The child, in a role that must read all of its input, exited 0 with part of it unwritten.
+    Feed(std::io::ErrorKind),
+    /// Waiting on the child failed.
+    Wait(std::io::Error),
+}
+
+impl std::fmt::Display for InheritedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(refusal) => refusal.fmt(f),
+            Self::Feed(kind) => write!(f, "the child stopped reading its input early ({kind})"),
+            Self::Wait(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<InheritedError> for std::io::Error {
+    fn from(error: InheritedError) -> Self {
+        match error {
+            InheritedError::Spawn(refusal) => refusal.into(),
+            InheritedError::Feed(kind) => kind.into(),
+            InheritedError::Wait(e) => e,
+        }
+    }
+}
+
+/// Run `command` with the terminal's stdout and stderr, in `role`, until it exits.
+///
+/// The child starts through the runtime's hardened spawner, so it inherits no
+/// descriptor besides stdio and, on Linux, dies with the CLI. No ceiling holds
+/// it; `role` names why none is needed. Stdout and stderr keep whatever the
+/// caller set on `command` (the terminal's by default). `input` is its stdin:
+/// the terminal, the null device, or bytes fed to a pipe while the CLI waits on
+/// the child, the pipe closed once they are written or the child exits.
+///
+/// A fed child that closes its stdin or exits before the CLI wrote every byte
+/// has not read its whole input. In a role that must read all of it
+/// ([`InheritedRole::InteractiveInstall`]) that is refused on exit 0, which
+/// cannot then mean the whole input ran; a non-zero exit is already a failure
+/// and is returned as the status that names it. Another role is judged by its
+/// exit status alone. Bytes written into the pipe and never read by an exiting
+/// child are not seen.
+///
+/// # Errors
+/// [`InheritedError::Spawn`] when the child cannot start;
+/// [`InheritedError::Feed`] when a child that must read all of its input
+/// exited 0 without reading it; [`InheritedError::Wait`] when waiting on it fails.
+pub fn run_inherited(
+    mut command: Command,
+    role: InheritedRole,
+    input: InheritedInput,
+) -> Result<ExitStatus, InheritedError> {
+    let bytes = match input {
+        InheritedInput::Terminal => {
+            command.stdin(Stdio::inherit());
+            None
+        }
+        InheritedInput::Null => {
+            command.stdin(Stdio::null());
+            None
+        }
+        InheritedInput::Bytes(bytes) => {
+            command.stdin(Stdio::piped());
+            Some(bytes)
+        }
+    };
+    let mut child =
+        ipe_runtime_rust::system::spawn_hardened(command).map_err(InheritedError::Spawn)?;
+    let Some(bytes) = bytes else {
+        return child.wait().map_err(InheritedError::Wait);
+    };
+    let (status, shortfall) = feed_until_exit(&mut child, bytes)?;
+    match shortfall {
+        Some(kind) if role.consumes_all_input() && status.success() => {
+            Err(InheritedError::Feed(kind))
+        }
+        Some(_) | None => Ok(status),
+    }
+}
+
+/// Feed `bytes` to `child`'s stdin while waiting for it, returning its status and how the feed fell short.
+///
+/// The write never blocks the wait: the feed is pumped between polls of the
+/// child, and once the child exits the pipe closes with whatever is left, so a
+/// child, or a descendant holding its stdin, that stops reading cannot hold
+/// the CLI past the child's own exit.
+fn feed_until_exit(
+    child: &mut Child,
+    bytes: Zeroizing<Vec<u8>>,
+) -> Result<(ExitStatus, Option<std::io::ErrorKind>), InheritedError> {
+    let feed = child
+        .stdin
+        .take()
+        .ok_or(std::io::ErrorKind::BrokenPipe)
+        .and_then(|pipe| pipes::Feed::new(pipe, bytes).map_err(|e| e.kind()));
+    let mut feed = match feed {
+        Ok(feed) => feed,
+        Err(kind) => {
+            let status = child.wait().map_err(InheritedError::Wait)?;
+            return Ok((status, Some(kind)));
+        }
+    };
+    let mut idle = IDLE_MIN;
+    let status = loop {
+        let moved = feed.pump();
+        if !feed.is_open() {
+            break child.wait().map_err(InheritedError::Wait)?;
+        }
+        if let Some(status) = child.try_wait().map_err(InheritedError::Wait)? {
+            break status;
+        }
+        idle = pause(moved, idle);
+    };
+    Ok((status, feed.shortfall()))
+}
 
 /// The declared ingest ceilings of one remote surface.
 ///
@@ -419,11 +888,11 @@ impl Budget {
     }
 
     /// The ceilings the watcher enforces, without the surface name.
-    const fn limits(&self) -> Limits {
-        Limits {
+    const fn limits(&self) -> RunLimits {
+        RunLimits {
             staging: self.staging,
             stdout_bytes: self.stdout_bytes,
-            wall: self.wall,
+            wall: self.wall.limit(),
         }
     }
 }
@@ -767,7 +1236,7 @@ pub enum IngestLimit {
     /// A directory-depth ceiling.
     Depth(u32),
     /// A wall-time ceiling.
-    Time(WallBudget),
+    Time(WallSecs),
     /// A file name that is not valid UTF-8, which the tree hash cannot name.
     NonUtf8Name,
     /// An entry that is neither a regular file, a directory nor a link.
@@ -877,6 +1346,26 @@ pub enum LocalSource {
     PackageTree,
     /// A `git` query on a local repository.
     GitQuery,
+    /// An offline `cargo generate-lockfile` resolving from the local registry cache.
+    LockResolve,
+    /// A networked `cargo generate-lockfile` resolving an emitted crate's graph.
+    LockFetch,
+    /// A `cargo metadata --no-deps` reading a crate's target directory.
+    CargoMetadata,
+    /// A toolchain query: a tool's version or its installed targets.
+    ToolQuery,
+    /// A `cargo-deny check` over an emitted crate's dependency graph.
+    SupplyChainScan,
+    /// A `rustc -vV` query of the active toolchain.
+    RustcQuery,
+    /// The `ipe health` probe that links an empty program.
+    LinkProbe,
+    /// The FFI inspector run without the jail.
+    FfiInspect,
+    /// A wasm bundle tool (`wasm-bindgen`, `wasm-opt`).
+    WasmTool,
+    /// This CLI run again on a snippet (`ipe dev run`).
+    SelfRun,
 }
 
 impl std::fmt::Display for LocalSource {
@@ -884,6 +1373,16 @@ impl std::fmt::Display for LocalSource {
         f.write_str(match self {
             Self::PackageTree => "package source tree",
             Self::GitQuery => "git query",
+            Self::LockResolve => "offline cargo lock resolve",
+            Self::LockFetch => "cargo lock resolve",
+            Self::CargoMetadata => "cargo metadata query",
+            Self::ToolQuery => "toolchain query",
+            Self::SupplyChainScan => "cargo-deny supply-chain scan",
+            Self::RustcQuery => "rustc version query",
+            Self::LinkProbe => "linker probe",
+            Self::FfiInspect => "FFI inspector",
+            Self::WasmTool => "wasm bundle tool",
+            Self::SelfRun => "self-run of a snippet",
         })
     }
 }
@@ -981,10 +1480,10 @@ pub struct Usage {
 
 /// The ceilings the watcher enforces on one child.
 #[derive(Debug, Clone, Copy)]
-struct Limits {
+struct RunLimits {
     staging: Staging,
     stdout_bytes: ByteBudget,
-    wall: WallBudget,
+    wall: WallSecs,
 }
 
 /// Measure `root` without following links, stopping once either disk ceiling of `budget` is passed.
@@ -1002,8 +1501,8 @@ pub fn measure(root: &Path, budget: &Budget) -> Result<Usage, (PathBuf, std::io:
     measure_limits(root, &budget.limits())
 }
 
-/// [`measure`] against bare [`Limits`].
-fn measure_limits(root: &Path, limits: &Limits) -> Result<Usage, (PathBuf, std::io::Error)> {
+/// [`measure`] against bare [`RunLimits`].
+fn measure_limits(root: &Path, limits: &RunLimits) -> Result<Usage, (PathBuf, std::io::Error)> {
     let mut usage = Usage::default();
     let root_meta = match std::fs::symlink_metadata(root) {
         Ok(meta) => meta,
@@ -1050,7 +1549,7 @@ fn measure_limits(root: &Path, limits: &Limits) -> Result<Usage, (PathBuf, std::
 /// The first disk ceiling of `limits` that `usage` passes, if any.
 ///
 /// A surface that stages nothing refuses its first staged byte or entry.
-const fn exceeded(usage: Usage, limits: &Limits) -> Option<IngestLimit> {
+const fn exceeded(usage: Usage, limits: &RunLimits) -> Option<IngestLimit> {
     let (bytes, entries) = match limits.staging {
         Staging::Nothing => (0, 0),
         Staging::Disk { bytes, entries } => (bytes.get(), entries.get()),
@@ -1071,8 +1570,49 @@ pub struct Captured {
     pub status: ExitStatus,
     /// The child's stdout, within the budget's stdout ceiling.
     pub stdout: Vec<u8>,
-    /// The child's stderr, truncated at [`CHILD_STDERR_MAX_BYTES`].
-    pub stderr: Vec<u8>,
+    /// The child's stderr, truncated at [`CHILD_STDERR_MAX_BYTES`] with the cut marked.
+    pub stderr: ChildStderr,
+}
+
+/// A child's stderr as kept: whole, or cut at [`CHILD_STDERR_MAX_BYTES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildStderr {
+    /// Every byte the child wrote.
+    Whole(Vec<u8>),
+    /// The first [`CHILD_STDERR_MAX_BYTES`] bytes; the rest was read and dropped.
+    Truncated(Vec<u8>),
+}
+
+impl ChildStderr {
+    /// The bytes kept, without the truncation marker.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Whole(bytes) | Self::Truncated(bytes) => bytes,
+        }
+    }
+
+    /// Whether the child wrote more than was kept.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        matches!(self, Self::Truncated(_))
+    }
+
+    /// The kept text, trimmed and sanitised for the terminal, with the cut named when one was made.
+    #[must_use]
+    pub fn to_terminal(&self) -> TerminalSafe {
+        let text = String::from_utf8_lossy(self.bytes());
+        let text = text.trim();
+        match self {
+            Self::Whole(_) => TerminalSafe::sanitize(text),
+            Self::Truncated(_) => {
+                let marker = crate::text::cli_child_stderr_truncated(&IngestLimit::Bytes(
+                    CHILD_STDERR_MAX_BYTES.get(),
+                ));
+                TerminalSafe::sanitize(&format!("{text}\n{marker}"))
+            }
+        }
+    }
 }
 
 /// One of a child's two output pipes.
@@ -1109,6 +1649,8 @@ pub enum RunError<R = IngestRefusal> {
     Exceeded(R),
     /// The child finished, but a process it started held this pipe open past the grace.
     PipeDrainTimeout(Stream),
+    /// Reading this pipe failed, so what was read is not the child's whole output.
+    PipeRead(Stream, std::io::ErrorKind),
 }
 
 impl<R> RunError<R> {
@@ -1120,6 +1662,7 @@ impl<R> RunError<R> {
             Self::Measure(path, e) => RunError::Measure(path, e),
             Self::Exceeded(refusal) => RunError::Exceeded(f(refusal)),
             Self::PipeDrainTimeout(stream) => RunError::PipeDrainTimeout(stream),
+            Self::PipeRead(stream, kind) => RunError::PipeRead(stream, kind),
         }
     }
 }
@@ -1133,6 +1676,9 @@ impl<R: std::fmt::Display> std::fmt::Display for RunError<R> {
             Self::Exceeded(refusal) => refusal.fmt(f),
             Self::PipeDrainTimeout(stream) => {
                 f.write_str(&crate::text::cli_child_pipe_held(stream))
+            }
+            Self::PipeRead(stream, kind) => {
+                f.write_str(&crate::text::cli_child_pipe_unread(stream, kind))
             }
         }
     }
@@ -1236,7 +1782,8 @@ fn transfer_start() -> Instant {
 /// Whether a watched child is detached from the terminal in its own process group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// Its own process group: a refusal kills every process it started.
+    /// Its own process group (its own job on Windows): a refusal kills every
+    /// process it started.
     Detached,
     /// The CLI's process group, keeping the terminal for a prompt (a signing
     /// passphrase); a refusal or a termination request kills the direct child.
@@ -1264,7 +1811,7 @@ fn run_core(
     mut command: Command,
     stdin: Option<Zeroizing<Vec<u8>>>,
     watch: Option<&Path>,
-    limits: &Limits,
+    limits: &RunLimits,
     started: Instant,
     mode: Mode,
 ) -> Result<Captured, RunError<IngestLimit>> {
@@ -1296,6 +1843,9 @@ fn run_core(
         if io.stdout.is_over() {
             return Err(stdout_over());
         }
+        if let Some((stream, kind)) = io.read_failure() {
+            return Err(RunError::PipeRead(stream, kind));
+        }
         if running.exited().map_err(RunError::Wait)? {
             break running.finish().map_err(RunError::Wait)?;
         }
@@ -1322,6 +1872,9 @@ fn run_core(
         if io.stdout.is_over() {
             return Err(stdout_over());
         }
+        if let Some((stream, kind)) = io.read_failure() {
+            return Err(RunError::PipeRead(stream, kind));
+        }
         let Some(stream) = io.open_stream() else {
             break;
         };
@@ -1331,10 +1884,15 @@ fn run_core(
         idle = pause(moved, idle);
     }
     let ChildIo { stdout, stderr, .. } = io;
+    let stderr = if stderr.is_over() {
+        ChildStderr::Truncated(stderr.into_kept())
+    } else {
+        ChildStderr::Whole(stderr.into_kept())
+    };
     Ok(Captured {
         status,
         stdout: stdout.into_kept(),
-        stderr: stderr.into_kept(),
+        stderr,
     })
 }
 
@@ -1348,10 +1906,10 @@ pub(crate) fn run_probe(
     stdout_bytes: ByteBudget,
     wall: WallBudget,
 ) -> Option<Captured> {
-    let limits = Limits {
+    let limits = RunLimits {
         staging: Staging::Nothing,
         stdout_bytes,
-        wall,
+        wall: wall.limit(),
     };
     run_core(command, None, None, &limits, Instant::now(), Mode::Probe).ok()
 }
@@ -1367,6 +1925,15 @@ pub(crate) const PROBE_STDOUT_MAX_BYTES: ByteBudget = ByteBudget::of::<256>();
 #[cfg(unix)]
 pub(crate) fn end_transfers() {
     group::end_all();
+}
+
+/// Whether the CLI has joined its own job, which lets a child break away from it.
+///
+/// Before the CLI joins, a breakaway request would answer only to a job the
+/// CLI was started in, which may refuse it.
+#[cfg(windows)]
+pub(crate) fn cli_job_joined() -> bool {
+    group::cli_joined()
 }
 
 /// The process-group primitives, for the signal owners' tests.
@@ -1416,12 +1983,16 @@ impl Running {
         })
     }
 
-    /// Whether the child has exited, leaving it unreaped where it leads a group.
+    /// Whether the child has exited, leaving it unreaped where it leads a process group.
+    ///
+    /// A Windows child is never reaped before it is dropped: the CLI holds its
+    /// process handle, which keeps its process ID from being reused.
     fn exited(&mut self) -> std::io::Result<bool> {
-        match self.group {
-            Some(id) => group::exited(id),
-            None => self.child.try_wait().map(|status| status.is_some()),
+        #[cfg(all(unix, not(any(target_os = "openbsd", target_os = "redox"))))]
+        if let Some(id) = self.group {
+            return group::exited(id);
         }
+        self.child.try_wait().map(|status| status.is_some())
     }
 
     /// Kill what the exited child left running in its group, then reap it.
@@ -1468,6 +2039,99 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+impl Running {
+    /// Kill the child's group, or the child where it leads none, leaving it unreaped.
+    fn kill(&mut self) {
+        match self.group {
+            Some(id) => group::kill(id),
+            None => {
+                // The child may already have exited; `reap` or `stop` reaps it.
+                let _ = self.child.kill();
+            }
+        }
+    }
+
+    /// Reap the exited child, leaving what it started in its group running.
+    ///
+    /// # Errors
+    /// Waiting failed, or a signal ended every transfer
+    /// ([`std::io::ErrorKind::Interrupted`]): its owner may have killed the
+    /// child, so its status is not the run's outcome.
+    fn reap(&mut self) -> std::io::Result<ExitStatus> {
+        if let Some(id) = self.group.take() {
+            group::forget(id);
+        }
+        if let Some(id) = self.attached.take() {
+            group::forget_attached(id);
+        }
+        let status = self.child.wait();
+        self.reaped = true;
+        if group::ended() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        status
+    }
+}
+
+/// A child leading its own process group, killed and reaped however it is left.
+///
+/// The group lets a wall stop every process the child started, not only the
+/// child. Outside the terminal's foreground group, the child hears an
+/// interrupt, a quit, a hangup, a stop and a continue only through the relay
+/// every detached group shares, and its group is killed on a termination
+/// request. On a platform without process groups it is a plain child.
+pub struct GroupedChild(Running);
+
+impl GroupedChild {
+    /// Spawn `command` as the leader of a new process group.
+    ///
+    /// The child starts through the runtime's hardened spawner.
+    ///
+    /// # Errors
+    /// The termination owner or the relay could not be installed, a signal
+    /// ended every detached group ([`std::io::ErrorKind::Interrupted`]), or
+    /// the spawn failed.
+    pub fn spawn(command: Command) -> std::io::Result<Self> {
+        Running::spawn(command, Mode::Detached).map(Self)
+    }
+
+    /// Take the child's stdout and stderr pipes, when piped.
+    pub const fn take_pipes(&mut self) -> (Option<ChildStdout>, Option<PipeStderr>) {
+        (self.0.child.stdout.take(), self.0.child.stderr.take())
+    }
+
+    /// Whether the child has exited, leaving it unreaped.
+    ///
+    /// # Errors
+    /// The platform could not report the child's state.
+    pub fn exited(&mut self) -> std::io::Result<bool> {
+        self.0.exited()
+    }
+
+    /// Kill the child and every process in its group, leaving the child unreaped.
+    pub fn kill(&mut self) {
+        self.0.kill();
+    }
+
+    /// Reap the exited child; what it started in its group is left running.
+    ///
+    /// # Errors
+    /// Waiting failed, or a signal ended every detached group
+    /// ([`std::io::ErrorKind::Interrupted`]), so its status is not the run's
+    /// outcome.
+    pub fn reap(&mut self) -> std::io::Result<ExitStatus> {
+        self.0.reap()
+    }
+
+    /// Kill the child's whole group and reap the child.
+    ///
+    /// # Errors
+    /// As [`Self::reap`].
+    pub fn finish(&mut self) -> std::io::Result<ExitStatus> {
+        self.0.finish()
     }
 }
 
@@ -1642,8 +2306,535 @@ mod group {
     }
 }
 
+/// A child's own kill-on-close job object, nested in the CLI's own job.
+///
+/// Closing a transfer's job terminates every process in it, so a refusal
+/// kills the whole tree the child started, and the reader threads of its
+/// pipes reach their end. The CLI joins its own job (kill on close, breakaway
+/// allowed) before its first transfer, so a CLI that dies takes every later
+/// child with it, a descendant started before its transfer's assignment
+/// included.
+#[cfg(windows)]
+mod group {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::process::{Child, Command};
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    use win32job::{ExtendedLimitInfo, Job};
+
+    use super::containment::{ContainmentRefusal, ContainmentStep, Jobs, spawn_contained};
+
+    /// A live transfer's ID: its child's process ID.
+    ///
+    /// The CLI holds the child's process handle until it is dropped, after the
+    /// job is closed, so the ID names no other process meanwhile.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GroupId(u32);
+
+    /// Uninhabited: an attached child is contained by the CLI's job only.
+    #[derive(Debug, Clone, Copy)]
+    pub enum AttachedId {}
+
+    /// Every live transfer's job; closing one terminates its tree.
+    static JOBS: Mutex<Jobs<Job>> = Mutex::new(Jobs::new());
+
+    /// The CLI's own job, joined once, or why it could not be.
+    static CLI_JOB: OnceLock<Result<Job, ContainmentRefusal>> = OnceLock::new();
+
+    /// Join the CLI to its own job, once per process.
+    fn join_cli() -> Result<(), ContainmentRefusal> {
+        let joined = CLI_JOB.get_or_init(|| {
+            let refused = |e: win32job::JobError| {
+                ContainmentRefusal::at(ContainmentStep::JoinCli, &std::io::Error::from(e))
+            };
+            let mut limits = ExtendedLimitInfo::new();
+            limits.limit_kill_on_job_close().limit_breakaway_ok();
+            let job = Job::create_with_limit_info(&limits).map_err(refused)?;
+            job.assign_current_process().map_err(refused)?;
+            Ok(job)
+        });
+        joined.as_ref().map(|_| ()).map_err(|refusal| *refusal)
+    }
+
+    /// Whether the CLI is in its own job, which lets a child break away from it.
+    pub fn cli_joined() -> bool {
+        CLI_JOB.get().is_some_and(Result::is_ok)
+    }
+
+    /// A new kill-on-close job a member cannot break away from.
+    fn transfer_job() -> std::io::Result<Job> {
+        let mut limits = ExtendedLimitInfo::new();
+        limits.limit_kill_on_job_close();
+        Job::create_with_limit_info(&limits).map_err(std::io::Error::from)
+    }
+
+    /// Put `child` in `job`.
+    fn assign(job: &Job, child: &Child) -> std::io::Result<()> {
+        let handle = child.as_raw_handle().expose_provenance();
+        job.assign_process(isize::from_ne_bytes(handle.to_ne_bytes()))
+            .map_err(std::io::Error::from)
+    }
+
+    /// Spawn `command` in a job of its own.
+    ///
+    /// # Errors
+    /// The CLI could not join its own job (nothing is spawned), the spawn
+    /// failed, or the child's job could not be made or assigned (the child is
+    /// killed and reaped first); a containment failure carries a
+    /// `ContainmentRefusal`.
+    pub fn spawn_detached(command: Command) -> std::io::Result<(Child, Option<GroupId>)> {
+        let (child, job) = spawn_contained(
+            join_cli,
+            || ipe_runtime_rust::system::spawn_hardened(command).map_err(std::io::Error::from),
+            transfer_job,
+            assign,
+        )?;
+        let id = GroupId(child.id());
+        JOBS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.0, job);
+        Ok((child, Some(id)))
+    }
+
+    /// Spawn `command` as a plain child, in the CLI's job once the CLI has joined it.
+    pub fn spawn_attached(command: Command) -> std::io::Result<(Child, Option<AttachedId>)> {
+        Ok((ipe_runtime_rust::system::spawn_hardened(command)?, None))
+    }
+
+    /// Unreachable: no `AttachedId` exists.
+    pub const fn forget_attached(id: AttachedId) {
+        match id {}
+    }
+
+    /// Close transfer `id`'s job, terminating every process in it.
+    pub fn kill(id: GroupId) {
+        let job = JOBS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id.0);
+        drop(job);
+    }
+
+    /// Deregister transfer `id`, closing its job if it is still open.
+    pub fn forget(id: GroupId) {
+        kill(id);
+    }
+
+    /// Never: no signal ends every transfer here.
+    pub const fn ended() -> bool {
+        false
+    }
+}
+
+/// A transfer's containment in a job, for the Windows process tree.
+///
+/// The job type is a parameter, so the refusal and the bookkeeping are the
+/// same code on every host and tested on each.
+#[cfg(any(windows, test))]
+mod containment {
+    use std::collections::BTreeMap;
+    use std::process::Child;
+
+    /// The containment step that failed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ContainmentStep {
+        /// Making the CLI's own job, or joining the CLI to it.
+        JoinCli,
+        /// Making the transfer's own job.
+        CreateTransferJob,
+        /// Putting the transfer's child in its job.
+        AssignTransfer,
+    }
+
+    impl std::fmt::Display for ContainmentStep {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Self::JoinCli => "the CLI could not join its own job",
+                Self::CreateTransferJob => "the transfer's job could not be made",
+                Self::AssignTransfer => "the transfer could not be put in its job",
+            })
+        }
+    }
+
+    /// A transfer refused because its process tree could not be contained.
+    ///
+    /// Nothing is left running: a child started before the failing step is
+    /// killed and reaped before this is returned.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ContainmentRefusal {
+        step: ContainmentStep,
+        kind: std::io::ErrorKind,
+        os: Option<i32>,
+    }
+
+    impl ContainmentRefusal {
+        /// The refusal of `step`, which failed with `error`.
+        pub fn at(step: ContainmentStep, error: &std::io::Error) -> Self {
+            Self {
+                step,
+                kind: error.kind(),
+                os: error.raw_os_error(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for ContainmentRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} ({}", self.step, self.kind)?;
+            if let Some(code) = self.os {
+                write!(f, ", os error {code}")?;
+            }
+            f.write_str("), so the transfer was refused before it ran")
+        }
+    }
+
+    impl std::error::Error for ContainmentRefusal {}
+
+    impl From<ContainmentRefusal> for std::io::Error {
+        fn from(refusal: ContainmentRefusal) -> Self {
+            Self::other(refusal)
+        }
+    }
+
+    /// Put `child` in a job that `create` makes and `assign` fills, or kill and reap it.
+    ///
+    /// # Errors
+    /// `create` or `assign` failed; the child is then killed and reaped.
+    pub fn contain<J>(
+        mut child: Child,
+        create: impl FnOnce() -> std::io::Result<J>,
+        assign: impl FnOnce(&J, &Child) -> std::io::Result<()>,
+    ) -> Result<(Child, J), ContainmentRefusal> {
+        let contained = create()
+            .map_err(|e| ContainmentRefusal::at(ContainmentStep::CreateTransferJob, &e))
+            .and_then(|job| {
+                assign(&job, &child)
+                    .map(|()| job)
+                    .map_err(|e| ContainmentRefusal::at(ContainmentStep::AssignTransfer, &e))
+            });
+        match contained {
+            Ok(job) => Ok((child, job)),
+            Err(refusal) => {
+                // The child may already have exited; either way it is reaped.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Join the CLI's own job, start the child, then contain it.
+    ///
+    /// The order is the guarantee: nothing starts before the CLI is in its own
+    /// job, and no job is made for a child that never started.
+    ///
+    /// # Errors
+    /// `join` refused (nothing is started), `start` failed, or [`contain`]
+    /// refused (the child is killed and reaped first); a containment failure
+    /// carries a [`ContainmentRefusal`].
+    pub fn spawn_contained<J>(
+        join: impl FnOnce() -> Result<(), ContainmentRefusal>,
+        start: impl FnOnce() -> std::io::Result<Child>,
+        create: impl FnOnce() -> std::io::Result<J>,
+        assign: impl FnOnce(&J, &Child) -> std::io::Result<()>,
+    ) -> std::io::Result<(Child, J)> {
+        join()?;
+        let child = start()?;
+        Ok(contain(child, create, assign)?)
+    }
+
+    /// The live transfers' jobs, keyed by their child's process ID.
+    pub struct Jobs<J> {
+        live: BTreeMap<u32, J>,
+    }
+
+    impl<J> Jobs<J> {
+        /// No live job.
+        pub const fn new() -> Self {
+            Self {
+                live: BTreeMap::new(),
+            }
+        }
+
+        /// Hold `job` for the transfer whose child is `id`.
+        ///
+        /// A job already held for `id` is dropped, which closes it.
+        pub fn insert(&mut self, id: u32, job: J) {
+            drop(self.live.insert(id, job));
+        }
+
+        /// Hand back the job of transfer `id`, if it is still held.
+        pub fn remove(&mut self, id: u32) -> Option<J> {
+            self.live.remove(&id)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::process::{Child, Command, Stdio};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        use super::{ContainmentRefusal, ContainmentStep, Jobs, contain, spawn_contained};
+
+        /// A job stand-in counting how often it was closed.
+        struct Counted(Arc<AtomicUsize>);
+
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// A child that runs for 30 seconds unless it is killed.
+        fn sleeper() -> Command {
+            if cfg!(windows) {
+                let mut command = Command::new("ping");
+                command.args(["-n", "30", "127.0.0.1"]);
+                command
+            } else {
+                let mut command = Command::new("sleep");
+                command.arg("30");
+                command
+            }
+        }
+
+        /// What [`contain`] did with a live sleeper.
+        struct Contained {
+            /// The refusal, or whether the handed-back child was still running.
+            result: Result<bool, ContainmentRefusal>,
+            /// How long the call took.
+            took: Duration,
+            /// On a refusal: the sleeper's stdout reached its end within 5 s
+            /// of the call, so the sleeper was dead when the call returned.
+            ended: bool,
+            /// On a refusal: no process with the sleeper's ID is left, not
+            /// even an unreaped one (Linux only; elsewhere `true`).
+            reaped: bool,
+        }
+
+        /// Whether no process `pid` is left, not even an unreaped one.
+        fn no_process_left(pid: u32) -> bool {
+            !cfg!(target_os = "linux") || !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+
+        /// Contain a live sleeper with `create` and `assign`.
+        ///
+        /// A contained sleeper is killed and reaped before this returns.
+        #[allow(clippy::expect_used)] // a host that cannot start the sleeper cannot run the test
+        fn contain_sleeper(
+            create: impl FnOnce() -> std::io::Result<()>,
+            assign: impl FnOnce(&(), &Child) -> std::io::Result<()>,
+        ) -> Contained {
+            let mut command = sleeper();
+            command.stdout(Stdio::piped());
+            let mut child =
+                ipe_runtime_rust::system::spawn_hardened(command).expect("spawn sleeper");
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            let pid = child.id();
+            let (tx, rx) = mpsc::channel();
+            // The reader ends when the sleeper does: at its kill, or after 30 s.
+            std::thread::Builder::new()
+                .name("ipe-test-sleeper-stdout".to_owned())
+                .spawn(move || {
+                    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+                    let _ = tx.send(());
+                })
+                .expect("start the stdout reader");
+            let started = Instant::now();
+            let contained = contain(child, create, assign);
+            let took = started.elapsed();
+            let refused = contained.is_err();
+            let ended = refused && rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let reaped = refused && no_process_left(pid);
+            let result = contained.map(|(mut child, ())| {
+                let running = matches!(child.try_wait(), Ok(None));
+                let _ = child.kill();
+                let _ = child.wait();
+                running
+            });
+            Contained {
+                result,
+                took,
+                ended,
+                reaped,
+            }
+        }
+
+        fn os_error(code: i32) -> std::io::Error {
+            std::io::Error::from_raw_os_error(code)
+        }
+
+        /// A refusal left the sleeper neither running nor unreaped, and did not wait it out.
+        fn assert_killed_and_reaped(contained: &Contained) {
+            assert!(
+                contained.took < Duration::from_secs(10),
+                "the child was waited on, not killed"
+            );
+            assert!(contained.ended, "the refused child was left running");
+            assert!(contained.reaped, "the refused child was left unreaped");
+        }
+
+        #[test]
+        fn a_job_that_cannot_be_made_refuses_the_spawn_and_reaps_the_child() {
+            let contained = contain_sleeper(|| Err(os_error(8)), |(), _| Ok(()));
+            assert_eq!(
+                contained.result,
+                Err(ContainmentRefusal::at(
+                    ContainmentStep::CreateTransferJob,
+                    &os_error(8)
+                ))
+            );
+            assert_killed_and_reaped(&contained);
+        }
+
+        #[test]
+        fn a_child_that_cannot_join_its_job_is_refused_and_reaped() {
+            let contained = contain_sleeper(|| Ok(()), |(), _| Err(os_error(5)));
+            assert_eq!(
+                contained.result,
+                Err(ContainmentRefusal::at(
+                    ContainmentStep::AssignTransfer,
+                    &os_error(5)
+                ))
+            );
+            assert_killed_and_reaped(&contained);
+        }
+
+        #[test]
+        fn a_contained_child_is_handed_back_running_with_its_job() {
+            let contained = contain_sleeper(|| Ok(()), |(), _| Ok(()));
+            assert_eq!(contained.result, Ok(true));
+        }
+
+        /// A CLI that cannot join its own job starts nothing and makes no transfer job.
+        #[test]
+        fn a_cli_that_cannot_join_its_job_starts_nothing() {
+            let calls = AtomicUsize::new(0);
+            let refusal = ContainmentRefusal::at(ContainmentStep::JoinCli, &os_error(5));
+            let result = spawn_contained(
+                || Err(refusal),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(std::io::ErrorKind::Other.into())
+                },
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |(), _| Ok(()),
+            );
+            let error = result.expect_err("a CLI outside its own job started a transfer");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a step ran after the refusal"
+            );
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ContainmentRefusal>()),
+                Some(carried) if *carried == refusal
+            ));
+        }
+
+        /// A child that never started gets no job, and its spawn error is its own.
+        #[test]
+        fn a_failed_start_makes_no_job() {
+            let made = AtomicUsize::new(0);
+            let result = spawn_contained(
+                || Ok(()),
+                || Err(std::io::ErrorKind::NotFound.into()),
+                || {
+                    made.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |(), _| Ok(()),
+            );
+            assert!(
+                matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+                "{result:?}"
+            );
+            assert_eq!(
+                made.load(Ordering::SeqCst),
+                0,
+                "a job was made for no child"
+            );
+        }
+
+        #[test]
+        fn a_refusal_rides_the_spawn_error_with_its_step_and_os_error() {
+            let refusal = ContainmentRefusal::at(ContainmentStep::AssignTransfer, &os_error(5));
+            let error = std::io::Error::from(refusal);
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ContainmentRefusal>()),
+                Some(carried) if *carried == refusal
+            ));
+            let text = error.to_string();
+            assert!(
+                text.contains("the transfer could not be put in its job"),
+                "{text}"
+            );
+            assert!(text.contains("os error 5"), "{text}");
+            assert!(text.contains("refused before it ran"), "{text}");
+        }
+
+        #[test]
+        fn every_step_names_what_could_not_be_contained() {
+            let named = [
+                (
+                    ContainmentStep::JoinCli,
+                    "the CLI could not join its own job",
+                ),
+                (
+                    ContainmentStep::CreateTransferJob,
+                    "the transfer's job could not be made",
+                ),
+                (
+                    ContainmentStep::AssignTransfer,
+                    "the transfer could not be put in its job",
+                ),
+            ];
+            for (step, phrase) in named {
+                let refusal = ContainmentRefusal::at(step, &std::io::ErrorKind::Other.into());
+                assert!(refusal.to_string().starts_with(phrase), "{refusal}");
+            }
+        }
+
+        #[test]
+        fn removing_a_job_hands_it_back_once() {
+            let closed = Arc::new(AtomicUsize::new(0));
+            let mut jobs = Jobs::new();
+            jobs.insert(7, Counted(Arc::clone(&closed)));
+            assert_eq!(closed.load(Ordering::SeqCst), 0);
+            drop(jobs.remove(7));
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+            assert!(jobs.remove(7).is_none());
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_job_displaced_under_the_same_id_is_closed() {
+            let closed = Arc::new(AtomicUsize::new(0));
+            let mut jobs = Jobs::new();
+            jobs.insert(7, Counted(Arc::clone(&closed)));
+            jobs.insert(7, Counted(Arc::clone(&closed)));
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+            drop(jobs);
+            assert_eq!(closed.load(Ordering::SeqCst), 2);
+        }
+    }
+}
+
 /// No process groups here: a refusal kills the direct child only.
-#[cfg(not(all(unix, not(any(target_os = "openbsd", target_os = "redox")))))]
+#[cfg(not(any(
+    all(unix, not(any(target_os = "openbsd", target_os = "redox"))),
+    windows
+)))]
 mod group {
     use std::process::{Child, Command};
 
@@ -1667,11 +2858,6 @@ mod group {
 
     /// Unreachable: no `AttachedId` exists.
     pub const fn forget_attached(id: AttachedId) {
-        match id {}
-    }
-
-    /// Unreachable: no `GroupId` exists.
-    pub const fn exited(id: GroupId) -> std::io::Result<bool> {
         match id {}
     }
 
@@ -1967,6 +3153,36 @@ fn pause(moved: bool, idle: Duration) -> Duration {
     idle.saturating_mul(2).min(POLL_INTERVAL)
 }
 
+/// What one output pipe left once it was read to its end.
+#[cfg(any(not(unix), test))]
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureOutcome {
+    /// Every byte the pipe carried, within the cap.
+    Complete(Vec<u8>),
+    /// The first `cap` bytes; more arrived and was read and dropped.
+    Overflowed(Vec<u8>),
+    /// A read failed before the end, so the bytes read are not the whole output.
+    ReadFailed(std::io::ErrorKind),
+}
+
+/// Keep at most `cap` bytes of `pipe`, then read the rest into a sink.
+///
+/// The pipe is drained to its end so the child never blocks on a full pipe. A
+/// failed read, on the kept part or the drained rest, is
+/// [`CaptureOutcome::ReadFailed`], never bytes that look complete.
+#[cfg(any(not(unix), test))]
+fn capture(mut pipe: impl Read, cap: ByteBudget) -> CaptureOutcome {
+    let mut kept = Vec::new();
+    if let Err(e) = (&mut pipe).take(cap.get()).read_to_end(&mut kept) {
+        return CaptureOutcome::ReadFailed(e.kind());
+    }
+    match std::io::copy(&mut pipe, &mut std::io::sink()) {
+        Err(e) => CaptureOutcome::ReadFailed(e.kind()),
+        Ok(0) => CaptureOutcome::Complete(kept),
+        Ok(_) => CaptureOutcome::Overflowed(kept),
+    }
+}
+
 /// A watched child's pipes, read and written by the thread that waits on it.
 ///
 /// Stdout is held to its ceiling, stderr is truncated at
@@ -2009,6 +3225,17 @@ impl ChildIo {
     /// Stop feeding stdin and close its pipe.
     fn close_stdin(&mut self) {
         self.stdin = None;
+    }
+
+    /// The first output pipe whose read failed, stdout before stderr, with how it failed.
+    const fn read_failure(&self) -> Option<(Stream, std::io::ErrorKind)> {
+        if let Some(kind) = self.stdout.failure() {
+            Some((Stream::Stdout, kind))
+        } else if let Some(kind) = self.stderr.failure() {
+            Some((Stream::Stderr, kind))
+        } else {
+            None
+        }
     }
 
     /// The first output pipe not yet at its end, stdout before stderr.
@@ -2069,6 +3296,8 @@ mod pipes {
         /// The pipe, until it reaches its end or fails.
         pipe: Option<File>,
         kept: Kept,
+        /// How the read failed, once it did.
+        failed: Option<ErrorKind>,
     }
 
     impl Reader {
@@ -2081,12 +3310,15 @@ mod pipes {
                     cap,
                     over: false,
                 },
+                failed: None,
             })
         }
 
         /// Read what the pipe has ready, returning whether any byte arrived.
         ///
-        /// The end of the pipe, or a failed read, closes it.
+        /// The end of the pipe closes it; a failed read closes it and is kept
+        /// as [`Self::failure`], so the bytes read so far never pass as the
+        /// whole output.
         pub fn pump(&mut self) -> bool {
             let Some(pipe) = self.pipe.as_mut() else {
                 return false;
@@ -2097,8 +3329,13 @@ mod pipes {
                 match pipe.read(&mut chunk) {
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
                         self.pipe = None;
+                        break;
+                    }
+                    Err(e) => {
+                        self.pipe = None;
+                        self.failed = Some(e.kind());
                         break;
                     }
                     Ok(n) => {
@@ -2120,6 +3357,11 @@ mod pipes {
             self.kept.over
         }
 
+        /// How reading the pipe failed, if it did.
+        pub const fn failure(&self) -> Option<ErrorKind> {
+            self.failed
+        }
+
         /// The bytes kept.
         pub fn into_kept(self) -> Vec<u8> {
             self.kept.bytes
@@ -2133,6 +3375,8 @@ mod pipes {
         bytes: Zeroizing<Vec<u8>>,
         /// How many of `bytes` were written.
         written: usize,
+        /// How the write failed, once it did.
+        failed: Option<ErrorKind>,
     }
 
     impl Feed {
@@ -2142,13 +3386,27 @@ mod pipes {
                 pipe: Some(nonblocking(pipe)?),
                 bytes,
                 written: 0,
+                failed: None,
             })
+        }
+
+        /// Whether the pipe is still open, the buffer neither written nor refused.
+        pub const fn is_open(&self) -> bool {
+            self.pipe.is_some()
+        }
+
+        /// How the feed fell short of the whole buffer, if it did.
+        ///
+        /// A buffer not wholly written with no failed write is a pipe the
+        /// child left before reading it: [`ErrorKind::BrokenPipe`].
+        pub fn shortfall(&self) -> Option<ErrorKind> {
+            (self.written < self.bytes.len())
+                .then_some(self.failed.unwrap_or(ErrorKind::BrokenPipe))
         }
 
         /// Write what the pipe takes, returning whether any byte was written.
         ///
-        /// A child that exits without reading its stdin is judged by its exit
-        /// status, so a failed write only closes the pipe.
+        /// A failed write closes the pipe and is kept for [`Self::shortfall`].
         pub fn pump(&mut self) -> bool {
             let Some(pipe) = self.pipe.as_mut() else {
                 return false;
@@ -2163,8 +3421,14 @@ mod pipes {
                 match pipe.write(rest) {
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
                         self.pipe = None;
+                        self.failed = Some(ErrorKind::WriteZero);
+                        break;
+                    }
+                    Err(e) => {
+                        self.pipe = None;
+                        self.failed = Some(e.kind());
                         break;
                     }
                     Ok(n) => {
@@ -2181,19 +3445,21 @@ mod pipes {
 /// A child's pipes read and written on threads, where the platform has no non-blocking pipes.
 #[cfg(not(unix))]
 mod pipes {
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::sync::mpsc;
 
     use zeroize::Zeroizing;
 
-    use super::ByteBudget;
+    use super::{ByteBudget, CaptureOutcome, POLL_INTERVAL, capture};
 
     /// One output pipe, read to its end on its own thread.
     pub struct Reader {
         /// The reading thread's result, until it arrives.
-        capture: Option<mpsc::Receiver<(Vec<u8>, bool)>>,
+        capture: Option<mpsc::Receiver<CaptureOutcome>>,
         kept: Vec<u8>,
         over: bool,
+        /// How the read failed, once it did.
+        failed: Option<ErrorKind>,
     }
 
     impl Reader {
@@ -2217,6 +3483,7 @@ mod pipes {
                 capture,
                 kept: Vec::new(),
                 over: false,
+                failed: None,
             })
         }
 
@@ -2226,15 +3493,24 @@ mod pipes {
                 return false;
             };
             match capture.try_recv() {
-                Ok((kept, over)) => {
-                    self.kept = kept;
-                    self.over = over;
+                Ok(outcome) => {
+                    match outcome {
+                        CaptureOutcome::Complete(kept) => self.kept = kept,
+                        CaptureOutcome::Overflowed(kept) => {
+                            self.kept = kept;
+                            self.over = true;
+                        }
+                        CaptureOutcome::ReadFailed(kind) => self.failed = Some(kind),
+                    }
                     self.capture = None;
                     true
                 }
                 Err(mpsc::TryRecvError::Empty) => false,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    // The reading thread ended without a result, so nothing
+                    // read stands for the whole output.
                     self.capture = None;
+                    self.failed = Some(ErrorKind::BrokenPipe);
                     false
                 }
             }
@@ -2250,27 +3526,23 @@ mod pipes {
             self.over
         }
 
+        /// How reading the pipe failed, if it did.
+        pub const fn failure(&self) -> Option<ErrorKind> {
+            self.failed
+        }
+
         /// The bytes kept.
         pub fn into_kept(self) -> Vec<u8> {
             self.kept
         }
     }
 
-    /// Keep at most `cap` bytes of `pipe`, then read the rest into a sink.
-    ///
-    /// The flag reports whether anything past `cap` arrived. The pipe is drained to
-    /// its end so the child never blocks on a full pipe.
-    fn capture(mut pipe: impl Read, cap: ByteBudget) -> (Vec<u8>, bool) {
-        let mut kept = Vec::new();
-        let _ = (&mut pipe).take(cap.get()).read_to_end(&mut kept);
-        let over = std::io::copy(&mut pipe, &mut std::io::sink()).is_ok_and(|rest| rest > 0);
-        (kept, over)
-    }
-
     /// A stdin pipe fed from a buffer on its own thread.
     pub struct Feed {
-        /// Signalled once the write ended, until it is seen.
-        done: Option<mpsc::Receiver<()>>,
+        /// Signalled with the write's outcome once it ended, until it is seen.
+        done: Option<mpsc::Receiver<Result<(), ErrorKind>>>,
+        /// The write's outcome, once seen.
+        outcome: Option<Result<(), ErrorKind>>,
     }
 
     impl Feed {
@@ -2283,24 +3555,52 @@ mod pipes {
             std::thread::Builder::new()
                 .name("ipe-child-stdin".to_owned())
                 .spawn(move || {
-                    // A child that exits without reading its stdin is judged by
-                    // its exit status, not by this write.
-                    let _ = pipe.write_all(&bytes);
-                    let _ = tx.send(());
+                    // The outcome reaches the waiting thread, which judges a
+                    // short write by the child's role.
+                    let _ = tx.send(pipe.write_all(&bytes).map_err(|e| e.kind()));
                 })?;
-            Ok(Self { done: Some(rx) })
+            Ok(Self {
+                done: Some(rx),
+                outcome: None,
+            })
         }
 
         /// Whether the write ended since the last pump.
         pub fn pump(&mut self) -> bool {
-            let ended = self
-                .done
-                .as_ref()
-                .is_some_and(|done| !matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
-            if ended {
-                self.done = None;
+            let Some(done) = self.done.as_ref() else {
+                return false;
+            };
+            let outcome = match done.try_recv() {
+                Ok(outcome) => outcome,
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => Err(ErrorKind::BrokenPipe),
+            };
+            self.outcome = Some(outcome);
+            self.done = None;
+            true
+        }
+
+        /// Whether the write is still running.
+        pub const fn is_open(&self) -> bool {
+            self.done.is_some()
+        }
+
+        /// How the feed fell short of the whole buffer, if it did.
+        ///
+        /// A write still running is given [`POLL_INTERVAL`] to end, since the
+        /// child it feeds has exited; one that does not end by then fell short.
+        pub fn shortfall(&mut self) -> Option<ErrorKind> {
+            if let Some(done) = self.done.take() {
+                self.outcome = Some(
+                    done.recv_timeout(POLL_INTERVAL)
+                        .unwrap_or(Err(ErrorKind::BrokenPipe)),
+                );
             }
-            ended
+            match self.outcome {
+                Some(Ok(())) => None,
+                Some(Err(kind)) => Some(kind),
+                None => Some(ErrorKind::BrokenPipe),
+            }
         }
     }
 }
@@ -2499,21 +3799,7 @@ impl Git {
     /// # Errors
     /// See [`RunError`]; a crossed ceiling is a [`LocalRefusal`] naming `source`.
     pub fn query(self, source: LocalSource) -> Result<Captured, RunError<LocalRefusal>> {
-        run_core(
-            self.command,
-            None,
-            None,
-            &QUERY_LIMITS,
-            Instant::now(),
-            Mode::Detached,
-        )
-        .map_err(|e| {
-            e.map_refusal(|limit| LocalRefusal {
-                source,
-                limit,
-                name: None,
-            })
-        })
+        run_local(self.command, QUERY_LIMITS, source)
     }
 
     /// The arguments given so far.
@@ -2640,7 +3926,7 @@ pub fn curl_refusal(
 ) -> Option<IngestRefusal> {
     let limit = match status.code()? {
         CURL_FILESIZE_EXCEEDED => IngestLimit::Bytes(response_bytes.get()),
-        CURL_OPERATION_TIMEDOUT => IngestLimit::Time(budget.wall),
+        CURL_OPERATION_TIMEDOUT => IngestLimit::Time(budget.wall.limit()),
         _ => return None,
     };
     Some(IngestRefusal {
@@ -2654,12 +3940,14 @@ pub fn curl_refusal(
 mod tests {
     use super::{
         ALL_BUDGETS, Budget, BudgetPairing, ByteBudget, CHILD_STDERR_MAX_BYTES, CappedReadError,
-        Captured, EntryBudget, FetchBudget, GITHUB_API, Git, IngestLimit, IngestRefusal,
-        IngestSource, LocalRefusal, LocalSource, MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES,
-        MAX_WALL_SECS, Mode, PACKAGE_SOURCE, PackageName, RefsCeiling, RunError, Staging, Stream,
-        Transfer, TreeCeiling, Usage, WallBudget, curl_limit_args, curl_refusal, measure,
-        read_capped, run_core,
+        CaptureOutcome, Captured, ChildStderr, EntryBudget, FetchBudget, GITHUB_API, Git,
+        IngestLimit, IngestRefusal, IngestSource, InheritedInput, InheritedRole, LocalRefusal,
+        LocalSource, LocalWall, MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES, MAX_WALL_SECS, Mode,
+        PACKAGE_SOURCE, PackageName, RefsCeiling, RunError, Staging, Stream, TOOL_QUERY_LIMITS,
+        Transfer, TreeCeiling, Usage, WallBudget, capture, curl_limit_args, curl_refusal, measure,
+        read_capped, run_core, run_inherited, run_local_fed,
     };
+    use std::io::Read;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -2994,8 +4282,8 @@ mod tests {
             (IngestLimit::Bytes(7), "7-byte"),
             (IngestLimit::Entries(3), "3-entry"),
             (IngestLimit::Depth(64), "64-level depth"),
-            (IngestLimit::Time(wall(9)), "9 seconds"),
-            (IngestLimit::Time(wall(1)), "1 second"),
+            (IngestLimit::Time(wall(9).limit()), "9 seconds"),
+            (IngestLimit::Time(wall(1).limit()), "1 second"),
             (IngestLimit::NonUtf8Name, "not valid UTF-8"),
             (IngestLimit::SpecialFile, "special file"),
             (IngestLimit::Symlink, "symbolic link"),
@@ -3082,7 +4370,7 @@ mod tests {
     /// network; a local query past its wall time does not blame the network.
     #[test]
     fn a_timed_out_refusal_says_it_did_not_finish() {
-        let limit = IngestLimit::Time(wall(9));
+        let limit = IngestLimit::Time(wall(9).limit());
         let remote = IngestRefusal {
             source: IngestSource::PackageFetch,
             limit,
@@ -3318,6 +4606,59 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
     }
 
+    /// `cmd /d /s /c <line>`: `/s` strips exactly the outer quotes around `line`.
+    #[cfg(windows)]
+    fn cmd(line: &str) -> Command {
+        use std::os::windows::process::CommandExt as _;
+        let mut command = Command::new("cmd");
+        command.raw_arg(format!("/d /s /c \"{line}\""));
+        command
+    }
+
+    /// A refusal closes the transfer's job, killing the grandchild writing the stage.
+    ///
+    /// The grandchild starts a second after the child, once the child is in its job.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_transfer_kills_the_grandchild() {
+        let dir = scratch();
+        let out = dir.path().join("out");
+        let line = format!(
+            "ping -n 2 127.0.0.1 > nul & ping -t 127.0.0.1 >> \"{}\"",
+            out.display()
+        );
+        let run = run(cmd(&line), None, None, &unstaged().with_wall(wall(4)));
+        assert!(
+            matches!(run, Err(RunError::Exceeded(IngestLimit::Time(_)))),
+            "{run:?}"
+        );
+        let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+        std::thread::sleep(Duration::from_millis(500));
+        let settled = size(&out);
+        assert!(
+            settled > 0,
+            "the grandchild never wrote, so nothing was killed"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(size(&out), settled, "the grandchild kept writing");
+    }
+
+    /// A grandchild holding the stderr pipe of a finished child dies with the job, so the pipe ends.
+    ///
+    /// Without the job the pipe stays open past the drain grace.
+    #[cfg(windows)]
+    #[test]
+    fn reader_threads_end_when_the_job_drops() {
+        let started = Instant::now();
+        let line = "ping -n 2 127.0.0.1 > nul & start /b ping -n 60 127.0.0.1 > nul";
+        let run = run(cmd(line), None, None, &unstaged());
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < super::PIPE_DRAIN_GRACE);
+    }
+
     /// An attached child's grandchild holding stdout ends in a typed drain timeout, not a byte refusal.
     #[cfg(unix)]
     #[test]
@@ -3341,7 +4682,7 @@ mod tests {
     #[test]
     fn a_second_step_is_held_to_the_first_steps_deadline() {
         let mut limits = unstaged().limits();
-        limits.wall = wall(2);
+        limits.wall = wall(2).limit();
         let started = Instant::now();
         let first = run_core(
             sh("sleep 1.2"),
@@ -3501,7 +4842,8 @@ mod tests {
         assert!(
             matches!(run, Ok(ref captured) if captured.status.success()
                 && captured.stdout.is_empty()
-                && u64::try_from(captured.stderr.len()).ok() == Some(cap)),
+                && captured.stderr.is_truncated()
+                && u64::try_from(captured.stderr.bytes().len()).ok() == Some(cap)),
             "{run:?}"
         );
     }
@@ -3518,6 +4860,321 @@ mod tests {
             "{run:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A live child writing exactly the stdout ceiling keeps running and exits on its own.
+    ///
+    /// The exit status is the discriminator: a kill at the cap instead of one
+    /// byte past it would leave a signal status, not success.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_of_exactly_the_cap_from_a_live_child_is_kept_without_a_kill() {
+        let budget = unstaged().with_wall(wall(10));
+        let run = run(
+            sh("head -c 16 /dev/zero; sleep 1; exit 0"),
+            None,
+            None,
+            &budget,
+        );
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()
+                && u64::try_from(captured.stdout.len()).ok() == Some(CAP)),
+            "{run:?}"
+        );
+    }
+
+    /// One byte past the stdout ceiling kills a still-running child well before its wall.
+    #[cfg(unix)]
+    #[test]
+    fn one_byte_past_the_cap_from_a_live_child_is_killed_early() {
+        let budget = unstaged().with_wall(wall(60));
+        let started = Instant::now();
+        let run = run(sh("head -c 17 /dev/zero; sleep 30"), None, None, &budget);
+        assert!(
+            matches!(run, Err(RunError::Exceeded(IngestLimit::Bytes(CAP)))),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A pipe that yields some bytes and then fails.
+    struct FailingPipe {
+        sent: bool,
+    }
+
+    impl Read for FailingPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                return Err(std::io::Error::other("pipe broke"));
+            }
+            self.sent = true;
+            let n = buf.len().min(8);
+            buf.iter_mut().take(n).for_each(|byte| *byte = b'x');
+            Ok(n)
+        }
+    }
+
+    /// A read error on an output pipe is a failed capture, never bytes that look complete.
+    #[test]
+    fn a_stdout_read_error_is_refused_not_truncated() {
+        let outcome = capture(FailingPipe { sent: false }, bytes(CAP));
+        assert_eq!(
+            outcome,
+            CaptureOutcome::ReadFailed(std::io::ErrorKind::Other)
+        );
+    }
+
+    /// A pipe read to its end within the cap is complete; past it, overflowed.
+    #[test]
+    fn a_capture_names_whether_the_pipe_overflowed() {
+        let within = capture([b'x'; 16].as_slice(), bytes(CAP));
+        assert_eq!(within, CaptureOutcome::Complete(vec![b'x'; 16]));
+        let past = capture([b'x'; 17].as_slice(), bytes(CAP));
+        assert_eq!(past, CaptureOutcome::Overflowed(vec![b'x'; 16]));
+    }
+
+    /// A failed read on a live output pipe is kept as a failure, never taken for the pipe's end.
+    ///
+    /// A read on a directory descriptor fails (`EISDIR`); the watcher then
+    /// names the pipe and how it failed, so the bytes read so far cannot pass
+    /// as the child's whole output.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_pipe_read_is_a_failure_not_an_end() {
+        let dir = std::fs::File::open("/").expect("open the root directory");
+        let mut io = super::ChildIo {
+            stdout: super::pipes::Reader::new(Some(dir), bytes(CAP)).expect("stdout reader"),
+            stderr: super::pipes::Reader::new(None::<std::fs::File>, bytes(CAP))
+                .expect("stderr reader"),
+            stdin: None,
+        };
+        let _ = io.pump();
+        assert!(io.open_stream().is_none(), "a failed pipe is closed");
+        assert_eq!(
+            io.read_failure(),
+            Some((Stream::Stdout, std::io::ErrorKind::IsADirectory))
+        );
+    }
+
+    /// Stderr one byte past its ceiling is kept to the ceiling and marked truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_stderr_past_its_ceiling_is_marked_truncated() {
+        let cap = CHILD_STDERR_MAX_BYTES.get();
+        let script = format!("head -c {} /dev/zero >&2", cap.saturating_add(1));
+        let run = run(sh(&script), None, None, &unstaged());
+        assert!(
+            matches!(run, Ok(ref captured) if captured.stderr.is_truncated()
+                && u64::try_from(captured.stderr.bytes().len()).ok() == Some(cap)),
+            "{run:?}"
+        );
+    }
+
+    /// Stderr of exactly its ceiling is whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_stderr_within_its_ceiling_is_whole() {
+        let cap = CHILD_STDERR_MAX_BYTES.get();
+        let script = format!("head -c {cap} /dev/zero >&2");
+        let run = run(sh(&script), None, None, &unstaged());
+        assert!(
+            matches!(run, Ok(ref captured) if !captured.stderr.is_truncated()
+                && u64::try_from(captured.stderr.bytes().len()).ok() == Some(cap)),
+            "{run:?}"
+        );
+    }
+
+    /// The rendered cut names the stderr ceiling; a whole stderr carries no marker.
+    #[test]
+    fn the_truncation_marker_names_the_stderr_ceiling() {
+        let ceiling = IngestLimit::Bytes(CHILD_STDERR_MAX_BYTES.get()).to_string();
+        let cut = ChildStderr::Truncated(b"boom".to_vec()).to_terminal();
+        assert!(cut.as_str().starts_with("boom"), "{}", cut.as_str());
+        assert!(cut.as_str().contains(&ceiling), "{}", cut.as_str());
+        let whole = ChildStderr::Whole(b"boom".to_vec()).to_terminal();
+        assert_eq!(whole.as_str(), "boom");
+    }
+
+    /// The unsandboxed FFI inspector is held to the jailed inspector's default stdout and wall caps.
+    #[test]
+    fn the_ffi_inspect_ceiling_is_the_jails_default() {
+        let jail = ipe_sandbox::ResourceLimits::default();
+        assert_eq!(
+            super::FFI_INSPECT_LIMITS.stdout_bytes().get(),
+            jail.out_cap_bytes
+        );
+        assert_eq!(super::FFI_INSPECT_LIMITS.wall().secs(), jail.wall_secs);
+    }
+
+    /// A fed local child reads the bytes it is given on its stdin.
+    #[cfg(unix)]
+    #[test]
+    fn a_fed_local_child_reads_its_stdin() {
+        let run = run_local_fed(
+            sh("cat"),
+            zeroize::Zeroizing::new(b"hello".to_vec()),
+            TOOL_QUERY_LIMITS,
+            LocalSource::ToolQuery,
+        );
+        assert!(
+            matches!(run, Ok(ref captured) if captured.status.success()
+                && captured.stdout == b"hello"),
+            "{run:?}"
+        );
+    }
+
+    /// A fed local child still running at its wall is killed and refused on time.
+    #[cfg(unix)]
+    #[test]
+    fn a_fed_local_child_past_its_wall_is_killed() {
+        let started = Instant::now();
+        let run = run_local_fed(
+            sh("exec sleep 30"),
+            zeroize::Zeroizing::new(b"hello".to_vec()),
+            TOOL_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            LocalSource::ToolQuery,
+        );
+        assert!(
+            matches!(
+                run,
+                Err(RunError::Exceeded(LocalRefusal {
+                    source: LocalSource::ToolQuery,
+                    limit: IngestLimit::Time(_),
+                    ..
+                }))
+            ),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// An inherited child gets stdio and nothing else the CLI holds open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_inherited_child_inherits_no_extra_descriptor() {
+        use std::os::fd::AsRawFd as _;
+        let held = rustix::fs::open(
+            "/dev/null",
+            rustix::fs::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open /dev/null");
+        assert!(
+            rustix::io::fcntl_getfd(&held)
+                .is_ok_and(|flags| !flags.contains(rustix::io::FdFlags::CLOEXEC)),
+            "the probe descriptor must be inheritable"
+        );
+        let script = format!("[ -e /dev/fd/{} ] && exit 3; exit 0", held.as_raw_fd());
+        let status = run_inherited(
+            sh(&script),
+            InheritedRole::UserProgram,
+            InheritedInput::Bytes(zeroize::Zeroizing::new(Vec::new())),
+        );
+        assert!(
+            matches!(status, Ok(ref status) if status.success()),
+            "{status:?}"
+        );
+        drop(held);
+    }
+
+    /// A first line, then more bytes than one pipe buffer holds, so a child that stops reading leaves some unwritten.
+    #[cfg(unix)]
+    fn script_past_pipe_buffer() -> zeroize::Zeroizing<Vec<u8>> {
+        let mut bytes = b"first\n".to_vec();
+        bytes.resize(256 * 1024, b'x');
+        zeroize::Zeroizing::new(bytes)
+    }
+
+    /// An installer that closes its stdin and exits 0 before reading its whole script is refused.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_that_leaves_its_script_unread_is_refused() {
+        let outcome = run_inherited(
+            sh("read -r line; exec 0<&-; exit 0"),
+            InheritedRole::InteractiveInstall,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Err(super::InheritedError::Feed(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// An installer that fails before reading its whole script keeps the exit status naming the failure.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_that_fails_early_reports_its_exit_status() {
+        let outcome = run_inherited(
+            sh("read -r line; exec 0<&-; exit 2"),
+            InheritedRole::InteractiveInstall,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.code() == Some(2)),
+            "{outcome:?}"
+        );
+    }
+
+    /// An installer that reads its whole script is judged by its exit status.
+    #[cfg(unix)]
+    #[test]
+    fn an_installer_that_reads_its_whole_script_is_accepted() {
+        let outcome = run_inherited(
+            sh("cat >/dev/null; exit 0"),
+            InheritedRole::InteractiveInstall,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
+    }
+
+    /// A child outside the installer role may stop reading its input; its exit status decides.
+    #[cfg(unix)]
+    #[test]
+    fn a_user_program_may_leave_its_input_unread() {
+        let outcome = run_inherited(
+            sh("read -r line; exec 0<&-; exit 0"),
+            InheritedRole::UserProgram,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
+    }
+
+    /// A descendant that holds the fed pipe without reading it cannot hold the CLI past the child's exit.
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_the_fed_pipe_does_not_outlive_the_child() {
+        let started = Instant::now();
+        let outcome = run_inherited(
+            sh("exec 3<&0; sleep 20 <&3 >/dev/null 2>&1 & exit 0"),
+            InheritedRole::UserProgram,
+            InheritedInput::Bytes(script_past_pipe_buffer()),
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
+    }
+
+    /// A child given the null device reads the end of its input at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_null_input_child_reads_end_of_input() {
+        let outcome = run_inherited(
+            sh("read -r line && exit 3; exit 0"),
+            InheritedRole::UserProgram,
+            InheritedInput::Null,
+        );
+        assert!(
+            matches!(outcome, Ok(ref status) if status.success()),
+            "{outcome:?}"
+        );
     }
 
     /// The isolated git reads no user or system configuration and runs no hook.
@@ -3650,7 +5307,7 @@ mod tests {
             curl_refusal(exit(28), bytes(7), &GITHUB_API),
             Some(IngestRefusal {
                 source: IngestSource::GithubApi,
-                limit: IngestLimit::Time(GITHUB_API.wall),
+                limit: IngestLimit::Time(GITHUB_API.wall.limit()),
                 name: None,
             })
         );
@@ -3671,5 +5328,16 @@ mod tests {
                 GITHUB_API.wall.secs().to_string(),
             ]
         );
+    }
+
+    /// A self-run outlasts the cargo build it contains by its whole margin, so a
+    /// hung build is refused as the build's typed timeout, never cut first by
+    /// the self-run wall.
+    #[test]
+    fn a_self_run_outlasts_its_cargo_build_wall_by_the_whole_margin() {
+        let build = crate::cargo_step::CARGO_BUILD_WALL.secs();
+        let self_run = super::SELF_RUN_LIMITS.wall().secs();
+        assert_eq!(self_run, build + super::SELF_RUN_MARGIN_SECS);
+        assert!(self_run <= super::MAX_LOCAL_WALL_SECS);
     }
 }

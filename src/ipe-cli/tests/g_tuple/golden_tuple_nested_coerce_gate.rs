@@ -62,7 +62,7 @@ fn assert_l0115_gate(fixture: &str, out_suffix: &str) {
 }
 
 /// PROBE E: a string literal (`PStr`) nested inside a nested-tuple column now
-/// LOWERS (fast gate — `ipe build` succeeds).
+/// LOWERS (fast gate — `ipe dev build` succeeds).
 #[test]
 fn nested_tuple_str_column_builds() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tuple_nested_coerce_str_gate");
@@ -92,7 +92,7 @@ fn nested_tuple_str_column_cargo_builds_and_runs() {
     let built = ipe::build(&fixture_entry("i_tuple_nested_coerce_str"), &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for i_tuple_nested_coerce_str: {:?}",
+        "ipe dev build must succeed for i_tuple_nested_coerce_str: {:?}",
         built.err()
     );
     let outcome = crate::support::build_and_run_emitted("i_tuple_nested_coerce_str", &out);

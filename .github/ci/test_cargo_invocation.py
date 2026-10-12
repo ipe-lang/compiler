@@ -234,6 +234,18 @@ class TestShellLexScopes(unittest.TestCase):
         # No pass reads past a closer into the quoted text after it.
         self.assertEqual(sum(w == ["cargo", "build"] for w in words), 1, words)
 
+    def test_quote_inside_a_quoted_substitution_ends_nothing(self) -> None:
+        # Inside `"$(..)"` quotes delimit again: the `"` in `'s/"//'` neither
+        # ends the outer span nor hides the commands after the line.
+        text = 'c="$(sed \'s/"//\' f | head -n1)"\ng""it checkout main\n'
+        got = [(c.words, c.subshell) for c in shell_lex.split_commands(text)]
+        self.assertIn((["git", "checkout", "main"], ()), got)
+        self.assertEqual(got[0], (["c=$(sed 's/\"//' f | head -n1)"], ()))
+
+    def test_quoted_substitution_nesting_is_bounded(self) -> None:
+        text = 'x="' + '$("' * 5000 + '"\ncargo build\n'
+        shell_lex.split_commands(text)
+
 
 if __name__ == "__main__":
     unittest.main()

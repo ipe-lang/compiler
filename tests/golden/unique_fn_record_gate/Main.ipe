@@ -1,0 +1,31 @@
+module Main exposing (main)
+
+-- `dedupe` forwards to `List.unique` over a generic element `a`, which inherits
+-- the equality obligation. Instantiating it at a record holding a function is
+-- rejected at type-check (IPE-T0014).
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+type alias Step =
+    { name : String, run : Int -> Int }
+
+
+dedupe : List a -> List a
+dedupe xs =
+    List.unique xs
+
+
+steps : List Step
+steps =
+    [ { name = "inc", run = \n -> n + 1 } ]
+
+
+main =
+    let
+        _unused =
+            dedupe steps
+    in
+    Io.println (String.fromInt 0)

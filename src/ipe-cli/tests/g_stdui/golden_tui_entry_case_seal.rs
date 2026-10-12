@@ -1,4 +1,4 @@
-//! Regression for a `24-tui-kitchen-sink` SEAL violation: `ipe build` exits 0
+//! Regression for a `24-tui-kitchen-sink` SEAL violation: `ipe dev build` exits 0
 //! on a case-branched entry-point while the emitted crate fails `cargo build`
 //! with two INDEPENDENT E0308 errors.
 //! The `tui_entry_case_taskrun` fixture minimises both defects to plain

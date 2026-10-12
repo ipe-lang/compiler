@@ -20,7 +20,7 @@ Modes:
             otherwise, and exit 0; the workflow reruns only on the exact word
             `true`. An unwritable $GITHUB_OUTPUT exits 1 with no output set.
   --lint    fail unless the signature table, the retry ban, and
-            rerun-failed-once.yml's wiring all hold. manifest-guard runs it.
+            rerun-failed-once.yml's wiring all hold. artifact-guard runs it.
 """
 
 from __future__ import annotations

@@ -233,7 +233,11 @@ fn walk_expr(
             walk_expr(head, direct_calls, types);
             walk_expr(tail, direct_calls, types);
         }
-        Expr::ListIndexClone { list, index: _ }
+        Expr::ListIndexClone {
+            list,
+            index: _,
+            elem: _,
+        }
         | Expr::ListLenCheck {
             list,
             len: _,
@@ -352,7 +356,7 @@ fn walk_pat(pat: &Pat, types: &mut BTreeSet<(ModPath, Symbol)>) {
                 walk_pat(sub, types);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 walk_pat(p, types);
             }

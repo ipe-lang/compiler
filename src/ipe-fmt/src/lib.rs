@@ -41,6 +41,68 @@ pub enum FmtError {
     /// The formatter's own output failed to re-parse or did not round-trip to
     /// the same AST — a formatter bug, surfaced rather than written to disk.
     RoundTrip { detail: String },
+    /// The formatted output would pass a ceiling; nothing is returned, so the
+    /// caller leaves the file as it was.
+    Limit(FmtLimit),
+}
+
+/// A ceiling the formatter refuses to pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmtLimit {
+    /// The formatted output would be longer than `cap`.
+    OutputBytes { cap: OutputCap },
+}
+
+/// The most bytes of formatted output one source may produce.
+///
+/// Eight times the input, never under 64 KiB and never over 16 MiB: real
+/// code formats to about its own size, while a crafted input whose layout
+/// multiplies its size (a long flat list at deep indent) is turned back
+/// before its output is written anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OutputCap(usize);
+
+impl OutputCap {
+    /// The output a small input may always produce.
+    pub const FLOOR: usize = 64 << 10;
+    /// The output no input may pass.
+    pub const CEILING: usize = 16 << 20;
+    /// How many output bytes one input byte may become.
+    pub const GROWTH: usize = 8;
+
+    /// The cap for a source of `input_len` bytes.
+    #[must_use]
+    pub const fn for_input(input_len: usize) -> Self {
+        let grown = input_len.saturating_mul(Self::GROWTH);
+        let floored = if grown < Self::FLOOR {
+            Self::FLOOR
+        } else {
+            grown
+        };
+        Self(if floored > Self::CEILING {
+            Self::CEILING
+        } else {
+            floored
+        })
+    }
+
+    /// The cap in bytes.
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        self.0
+    }
+
+    /// Whether `output` fits under the cap.
+    #[must_use]
+    pub const fn admits(self, output: &str) -> bool {
+        output.len() <= self.0
+    }
+}
+
+impl fmt::Display for OutputCap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 impl fmt::Display for FmtError {
@@ -49,6 +111,9 @@ impl fmt::Display for FmtError {
             Self::Parse { src, diag } => f.write_str(&render(diag, "<source>", src)),
             Self::RoundTrip { detail } => {
                 write!(f, "ipe fmt: internal error while formatting: {detail}")
+            }
+            Self::Limit(FmtLimit::OutputBytes { cap }) => {
+                write!(f, "ipe fmt: formatted output would exceed {cap} bytes")
             }
         }
     }
@@ -64,6 +129,8 @@ struct Comment {
     /// delimiters, with no trailing whitespace). A line comment keeps any
     /// interior spacing; a block comment keeps its full multi-line body.
     text: String,
+    /// The offset of the comment's first byte in its source.
+    start: usize,
     /// Where the comment attaches: the start offset of the first token after
     /// it that can begin a printed node, or `None` past the last token.
     ///
@@ -123,6 +190,7 @@ fn scan_trivia(src: &str) -> Option<Trivia> {
         .into_iter()
         .map(|(lo, hi)| Comment {
             text: src.get(lo..hi).unwrap_or_default().trim_end().to_owned(),
+            start: lo,
             anchor: anchor_after(&code, hi),
         })
         .collect();
@@ -328,9 +396,17 @@ fn skip_block_comment_body(mut rest: &str) -> &str {
 /// # Errors
 /// [`FmtError::Parse`] if `src` does not parse; [`FmtError::RoundTrip`] if the
 /// formatted output loses, adds or alters a comment, or does not re-parse to
-/// the same AST (a formatter bug — caught rather than written).
+/// the same AST (a formatter bug — caught rather than written);
+/// [`FmtError::Limit`] if the output would pass [`OutputCap::for_input`].
 pub fn format_source(src: &str) -> Result<String, FmtError> {
-    format_guarded(src, render_module)
+    format_guarded(src, OutputCap::for_input(src.len()), render_module)
+}
+
+/// [`format_source`] under an explicit `cap`, so a test drives the refusal
+/// with a small input.
+#[cfg(test)]
+fn format_source_capped(src: &str, cap: OutputCap) -> Result<String, FmtError> {
+    format_guarded(src, cap, render_module)
 }
 
 /// The printer's rendering of a whole module: what [`format_source`] writes.
@@ -338,13 +414,14 @@ fn render_module(printer: &Printer<'_>, module: &Module) -> String {
     printer.module(module)
 }
 
-/// Print `src` with `render`, then refuse the output unless it carries the
-/// input's comments and re-parses to the input's AST.
+/// Print `src` with `render`, then refuse the output unless it fits `cap`,
+/// carries the input's comments and re-parses to the input's AST.
 ///
 /// [`format_source`] renders with [`Printer::module`]; a test passes a faulty
 /// renderer to drive each refusal through the same guards.
 fn format_guarded(
     src: &str,
+    cap: OutputCap,
     render: impl FnOnce(&Printer<'_>, &Module) -> String,
 ) -> Result<String, FmtError> {
     let mut interner = Interner::new();
@@ -355,7 +432,16 @@ fn format_guarded(
     let input = scan_trivia(src).ok_or_else(|| FmtError::RoundTrip {
         detail: "source parsed but did not lex".to_owned(),
     })?;
-    let out = render(&Printer::new(&interner, &input, Some(src)), &module);
+    let printer = Printer::new(&interner, &input, Some(src), cap);
+    let out = render(&printer, &module);
+
+    // Output guard: the formatted text fits the cap, and no pad was refused
+    // its bytes on the way (a refused pad rendered empty, so the text alone
+    // under-counts). It fires first so an over-cap output is never lexed,
+    // re-parsed or returned.
+    if printer.pads.exceeded() || !cap.admits(&out) {
+        return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
+    }
 
     // Comment guard: the formatted output carries exactly the input's comments.
     // It fires BEFORE the AST equivalence check so a comment bug surfaces as a
@@ -384,7 +470,7 @@ fn format_guarded(
     let mut verify_interner = Interner::new();
     match ipe_parse::parse_module(&out, &mut verify_interner) {
         Ok(reparsed) => {
-            if !modules_equivalent(&module, &interner, &reparsed, &verify_interner) {
+            if !modules_equivalent(&module, &interner, &reparsed, &verify_interner, cap)? {
                 return Err(FmtError::RoundTrip {
                     detail: "formatted output parsed to a different AST".to_owned(),
                 });
@@ -412,7 +498,13 @@ pub(crate) fn format_source_unchecked(src: &str) -> Result<String, FmtError> {
     let input = scan_trivia(src).ok_or_else(|| FmtError::RoundTrip {
         detail: "source parsed but did not lex".to_owned(),
     })?;
-    Ok(Printer::new(&interner, &input, Some(src)).module(&module))
+    Ok(Printer::new(
+        &interner,
+        &input,
+        Some(src),
+        OutputCap::for_input(src.len()),
+    )
+    .module(&module))
 }
 
 #[cfg(test)]
@@ -457,9 +549,19 @@ fn render_call_count() -> u64 {
 /// value depends on its column: the canonical text prints that value, so a
 /// formatter that moves the string to another margin is refused rather than
 /// changing what the program means.
-fn modules_equivalent(a: &Module, ai: &Interner, b: &Module, bi: &Interner) -> bool {
-    ModuleText::of(a, ai) == ModuleText::of(b, bi)
-        && ModuleTree::of(a, ai).is_some_and(|tree| ModuleTree::of(b, bi) == Some(tree))
+///
+/// # Errors
+/// [`FmtError::Limit`] when either canonical text would pass `cap`: the
+/// projection is a print like any other and is charged the same ceiling.
+fn modules_equivalent(
+    a: &Module,
+    ai: &Interner,
+    b: &Module,
+    bi: &Interner,
+    cap: OutputCap,
+) -> Result<bool, FmtError> {
+    Ok(ModuleText::of(a, ai, cap)? == ModuleText::of(b, bi, cap)?
+        && ModuleTree::of(a, ai).is_some_and(|tree| ModuleTree::of(b, bi) == Some(tree)))
 }
 
 /// Every field of a module's AST, with byte positions erased and symbols
@@ -573,7 +675,7 @@ fn split_digits(s: &str) -> Option<(&str, &str)> {
 struct ModuleText(String);
 
 impl ModuleText {
-    fn of(m: &Module, i: &Interner) -> Self {
+    fn of(m: &Module, i: &Interner, cap: OutputCap) -> Result<Self, FmtError> {
         // Reuse the printer with NO trivia: the projection is a canonical string
         // form, and two ASTs are equivalent iff their comment-free canonical
         // forms are byte-identical. (Comments are checked separately by the
@@ -582,7 +684,12 @@ impl ModuleText {
             comments: Vec::new(),
             code: Vec::new(),
         };
-        Self(Printer::new(i, &none, None).module(m))
+        let printer = Printer::new(i, &none, None, cap);
+        let text = printer.module(m);
+        if printer.pads.exceeded() || !cap.admits(&text) {
+            return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
+        }
+        Ok(Self(text))
     }
 }
 
@@ -614,17 +721,46 @@ struct Printer<'a> {
     /// trial render (to measure a layout) never consumes a comment its final
     /// render then lacks.
     claimed: Cell<Option<(usize, usize)>>,
+    /// The body offset of the lambda whose parameter comments the node being
+    /// printed has already claimed.
+    ///
+    /// Set and restored around each render, like `claimed`, so the outermost
+    /// claim of a lambda takes those comments once.
+    lambda_head: Cell<Option<usize>>,
+    /// The indentation this print may still emit; every pad renders through it.
+    pads: PadBudget,
 }
 
 impl<'a> Printer<'a> {
-    const fn new(interner: &'a Interner, trivia: &'a Trivia, src: Option<&'a str>) -> Self {
+    const fn new(
+        interner: &'a Interner,
+        trivia: &'a Trivia,
+        src: Option<&'a str>,
+        cap: OutputCap,
+    ) -> Self {
         Self {
             interner,
             comments: trivia.comments.as_slice(),
             code: trivia.code.as_slice(),
             src,
             claimed: Cell::new(None),
+            lambda_head: Cell::new(None),
+            pads: PadBudget::new(cap),
         }
+    }
+
+    /// Four spaces per indent level, charged to this print's budget.
+    const fn pad(&self, indent: usize) -> Pad<'_> {
+        self.pads.pad(indent)
+    }
+
+    /// The indentation of the leading-comma continuation lines inside a
+    /// multiline record / list / tuple.
+    ///
+    /// elm-format aligns the `,` with the opening bracket, which sits at the
+    /// construct's own indent.
+    const fn pad_in(&self, indent: usize) -> Pad<'_> {
+        self.pads.pad(indent)
     }
 
     fn sym(&self, s: ipe_intern::Symbol) -> String {
@@ -795,8 +931,30 @@ impl<'a> Printer<'a> {
         (comments, rendered)
     }
 
+    /// [`Self::claim`] for the expression `e`, which also owns the comments
+    /// among a lambda's parameters.
+    ///
+    /// Those print above the lambda, with the comments at its first token: a
+    /// second pass reads them there as the lambda's leading comments, so the
+    /// layout is a fixed point. The outermost claim of a lambda takes them.
+    fn claim_expr<T>(&self, e: &Expr, render: impl FnOnce() -> T) -> (Comments<'a>, T) {
+        let outer = self.lambda_head.get();
+        let head = lambda_head(e).filter(|&(_, hi)| outer != Some(hi));
+        if let Some((_, hi)) = head {
+            self.lambda_head.set(Some(hi));
+        }
+        let (mut comments, rendered) = self.claim(e.span.lo as usize, Self::closer_of(e), render);
+        self.lambda_head.set(outer);
+        if let Some((lo, hi)) = head {
+            comments.extend(self.anchored_in(lo, hi));
+            comments.sort_by_key(|c| c.start);
+        }
+        (comments, rendered)
+    }
+
     /// `body` preceded by `comments`, one per line, continuing at `indent`.
     fn with_comments<'c>(
+        &self,
         comments: impl IntoIterator<Item = &'c Comment>,
         body: &str,
         indent: usize,
@@ -805,7 +963,7 @@ impl<'a> Printer<'a> {
         if comments.peek().is_none() {
             return body.to_owned();
         }
-        let pad = pad(indent);
+        let pad = self.pad(indent);
         let mut out = String::new();
         for c in comments {
             let _ = write!(out, "{}\n{pad}", c.text);
@@ -840,13 +998,70 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Render the import block, each import with the comments `owned_from` its
+    /// keyword gives it.
+    ///
+    /// elm-format sorts imports by module path and prints them directly under
+    /// the header (one blank line separates the header from the first import
+    /// only when imports exist). An import prints on one line, so every
+    /// comment it owns travels above it through the sort, except the comments
+    /// written directly above the FIRST import in the source, which describe
+    /// the module (or the whole import block) and stay above the block. That
+    /// block keeps the source's blank lines between its comments and before
+    /// the first import, so the comments of an import sorted to the front
+    /// print the same on every pass: the second pass reads them as part of the
+    /// block, with the same blank lines.
+    fn import_block<'c>(
+        &self,
+        out: &mut String,
+        imports: &[Import],
+        owned_from: impl Fn(usize) -> &'c [Comment],
+    ) {
+        if imports.is_empty() {
+            return;
+        }
+        let first_in_source = imports
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, imp)| imp.import_kw.lo)
+            .map(|(i, _)| i);
+        out.push('\n');
+        if let Some(first) = first_in_source.and_then(|i| imports.get(i)) {
+            let kw = first.import_kw.lo as usize;
+            let above = self.anchored(kw);
+            if !above.is_empty() {
+                self.push_comment_block(out, above);
+                if self.blank_line_before(kw) {
+                    out.push('\n');
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..imports.len()).collect();
+        order.sort_by_key(|&i| imports.get(i).map(|imp| self.dotted(&imp.name.value)));
+        for i in order {
+            let Some(imp) = imports.get(i) else { continue };
+            let kw = imp.import_kw.lo as usize;
+            let owned = owned_from(kw);
+            // The first import's comments above its keyword head the block.
+            let travels = if Some(i) == first_in_source {
+                owned.get(self.anchored(kw).len()..).unwrap_or_default()
+            } else {
+                owned
+            };
+            let line = self.import(imp);
+            push_comment_lines(out, unplaced(travels, &line));
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
     /// Render a whole module.
     fn module(&self, m: &Module) -> String {
         // Destructured field by field, with no `..`: a new kind of top-level
         // declaration is a build error here until it is printed, never a
         // silently dropped declaration.
         let Module {
-            module_kw,
+            module_kw: _,
             name,
             exposing,
             imports,
@@ -855,83 +1070,74 @@ impl<'a> Printer<'a> {
             aliases,
             foreigns,
         } = m;
-        let mut out = String::new();
-
-        // Any comment before the module header — or inside it, since the header
-        // prints on its own fixed lines — prints first, on its own line(s).
-        // elm-format then separates the comment block from the header with
-        // exactly two blank lines, however the source spaced them.
-        let header_hi = exposing.span.hi.max(name.span.hi) as usize;
-        let pre_header = self.anchored_in(module_kw.lo as usize, header_hi);
-        if !pre_header.is_empty() {
-            push_comment_lines(&mut out, pre_header);
-            out.push_str("\n\n");
-        }
-
-        // module <Name> exposing (…)
-        out.push_str("module ");
-        out.push_str(&self.dotted(&name.value));
-        out.push_str(&self.module_exposing(exposing));
-        out.push('\n');
-
-        // Import block: elm-format sorts imports by module path and prints them
-        // directly under the header (one blank line separates the header from
-        // the first import only when imports exist). A comment above an import
-        // — or inside it, since an import prints on one line — travels with it
-        // through the sort, except the comments above the FIRST import in the
-        // source, which describe the module (or the whole import block) and
-        // stay above the block. A blank line between those comments and the
-        // block is kept exactly when the source had one, so the comments of an
-        // import sorted to the front print the same on every pass.
-        if !imports.is_empty() {
-            let first_in_source = imports
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, imp)| imp.import_kw.lo)
-                .map(|(i, _)| i);
-            out.push('\n');
-            if let Some(first) = first_in_source.and_then(|i| imports.get(i)) {
-                let above = self.anchored_in(first.import_kw.lo as usize, first.span.hi as usize);
-                if !above.is_empty() {
-                    push_comment_lines(&mut out, above);
-                    if self.blank_line_before(first.import_kw.lo as usize) {
-                        out.push('\n');
-                    }
-                }
-            }
-            let mut order: Vec<usize> = (0..imports.len()).collect();
-            order.sort_by_key(|&i| imports.get(i).map(|imp| self.dotted(&imp.name.value)));
-            for i in order {
-                let Some(imp) = imports.get(i) else { continue };
-                if Some(i) != first_in_source {
-                    let above = self.anchored_in(imp.import_kw.lo as usize, imp.span.hi as usize);
-                    push_comment_lines(&mut out, above);
-                }
-                out.push_str(&self.import(imp));
-                out.push('\n');
-            }
-        }
-
-        // Declarations in source order, each preceded by two blank lines
-        // (elm-format's top-level spacing). Unions / aliases / values /
-        // foreign declarations interleave by their span order.
+        // Every anchored comment has exactly one owner among the module's
+        // items: the header owns those anchored before the first import or
+        // declaration, an import those from its `import` keyword up to the next
+        // item, a declaration those from its first token up to the next one.
+        // An owner prints each comment its rendering did not place above that
+        // rendering (see `unplaced`), so no comment position the parser admits
+        // falls between owners and is lost.
         let mut decls: Vec<Decl<'_>> = Vec::new();
         decls.extend(unions.iter().map(Decl::Union));
         decls.extend(aliases.iter().map(Decl::Alias));
         decls.extend(values.iter().map(Decl::Value));
         decls.extend(foreigns.iter().map(Decl::Foreign));
         decls.sort_by_key(Decl::lo);
+        let mut starts: Vec<usize> = imports
+            .iter()
+            .map(|imp| imp.import_kw.lo as usize)
+            .chain(decls.iter().map(|d| self.decl_start(d)))
+            .collect();
+        starts.sort_unstable();
+        let owner_end = |lo: usize| {
+            let next = starts.partition_point(|&s| s <= lo);
+            starts.get(next).copied().unwrap_or(usize::MAX)
+        };
+        let owned_from = |lo: usize| self.anchored_in(lo, owner_end(lo));
+        let mut out = String::new();
 
+        // module <Name> exposing (…). A comment the header does not place
+        // (before `module`, inside the header line, above its first exposed
+        // item) prints first, on its own line(s); elm-format then separates the
+        // comment block from the header with exactly two blank lines, however
+        // the source spaced them.
+        let header = format!(
+            "module {}{}",
+            self.dotted(&name.value),
+            self.module_exposing(exposing)
+        );
+        let header_owned = self.anchored_in(0, starts.first().copied().unwrap_or(usize::MAX));
+        let above_header = unplaced(header_owned, &header);
+        if !above_header.is_empty() {
+            push_comment_lines(&mut out, above_header);
+            out.push_str("\n\n");
+        }
+        out.push_str(&header);
+        out.push('\n');
+
+        self.import_block(&mut out, imports, owned_from);
+
+        // Declarations in source order, each preceded by two blank lines
+        // (elm-format's top-level spacing). Unions / aliases / values /
+        // foreign declarations interleave by their span order.
         for decl in &decls {
             out.push_str("\n\n");
             // Leading comments: those anchored at the declaration's first
             // token, or at a head token before its name (`type`, `alias`, a
             // signature's name). Nothing depends on where the previous
             // declaration's span ends, which a desugared body underestimates.
+            // A comment the declaration owns but its rendering does not place
+            // follows them, so a second pass reads it as leading too.
             let lo = decl.lo() as usize;
             let start = self.decl_start(decl);
-            push_comment_lines(&mut out, self.anchored_in(start, lo.saturating_add(1)));
-            out.push_str(&self.decl(decl));
+            let leading = self.anchored_in(start, lo.saturating_add(1));
+            let mut item = String::new();
+            push_comment_lines(&mut item, leading);
+            let body = self.decl(decl, owner_end(start));
+            let missed = unplaced(owned_from(start), &format!("{item}{body}"));
+            push_comment_lines(&mut item, missed);
+            item.push_str(&body);
+            out.push_str(&item);
             out.push('\n');
         }
 
@@ -971,44 +1177,67 @@ impl<'a> Printer<'a> {
     /// GROUPING: exposed items that shared a source line stay on one line, so
     /// the `@docs`-section grouping survives a reformat. The grouping is
     /// recovered from each item's span line.
+    ///
+    /// A comment above a later exposed item, or above the closing `)`, prints
+    /// in place on its own line, and the commented item opens a new group; such
+    /// a clause is always multi-line. Every other comment of the header prints
+    /// above it (the header owner's [`unplaced`] rule).
     fn module_exposing(&self, e: &Located<Exposing>) -> String {
         let items = match &e.value {
             Exposing::All => return " exposing (..)".to_owned(),
             Exposing::List(items) => items,
         };
+        let above = |i: usize, it: &Located<Exposed>| {
+            if i == 0 {
+                &[][..]
+            } else {
+                self.anchored(it.span.lo as usize)
+            }
+        };
+        let closing = self.closing_comments(e.span);
+        let commented = !closing.is_empty()
+            || items
+                .iter()
+                .enumerate()
+                .any(|(i, it)| !above(i, it).is_empty());
         // The clause is multi-line iff its items do not all begin on the same
-        // source line (a lone `(` or `)` line does not make it multi-line).
-        let multiline = items
-            .first()
-            .zip(items.last())
-            .is_some_and(|(a, b)| self.line_of(a.span.lo) != self.line_of(b.span.lo));
+        // source line (a lone `(` or `)` line does not make it multi-line), or
+        // it carries a comment it places.
+        let multiline = commented
+            || items
+                .first()
+                .zip(items.last())
+                .is_some_and(|(a, b)| self.line_of(a.span.lo) != self.line_of(b.span.lo));
         if !multiline || items.is_empty() {
             return format!(" exposing {}", self.exposing(&e.value));
         }
-        // Group consecutive items that began on the same source line.
-        let mut groups: Vec<Vec<String>> = Vec::new();
+        // Group consecutive items that began on the same source line; a
+        // comment above an item ends the group before it.
+        let mut lines: Vec<String> = Vec::new();
+        let mut group: Vec<String> = Vec::new();
+        let mut groups = 0usize;
         let mut cur_line: Option<usize> = None;
-        for it in items {
+        for (i, it) in items.iter().enumerate() {
             let line = self.line_of(it.span.lo);
-            let rendered = self.exposed(&it.value);
-            if let (Some(g), true) = (groups.last_mut(), Some(line) == cur_line) {
-                g.push(rendered);
-                continue;
+            let comments = above(i, it);
+            if !comments.is_empty() || Some(line) != cur_line {
+                push_exposing_group(&mut lines, &mut group, &mut groups);
             }
+            lines.extend(comments.iter().map(|c| format!("    {}", c.text)));
             cur_line = Some(line);
-            groups.push(vec![rendered]);
+            group.push(self.exposed(&it.value));
         }
+        push_exposing_group(&mut lines, &mut group, &mut groups);
+        lines.extend(closing.iter().map(|c| format!("    {}", c.text)));
         let mut out = String::from(" exposing\n");
-        for (i, g) in groups.iter().enumerate() {
-            let lead = if i == 0 { "    ( " } else { "    , " };
-            let _ = writeln!(out, "{lead}{}", g.join(", "));
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
         }
         out.push_str("    )");
         out
     }
 
-    /// The 1-based source line containing byte offset `pos` (0 when no source is
-    /// threaded, as in the round-trip guard).
     /// Whether a blank line ends right before byte `pos` in the source: the
     /// whitespace directly before it holds two newlines.
     fn blank_line_before(&self, pos: usize) -> bool {
@@ -1024,6 +1253,21 @@ impl<'a> Printer<'a> {
             .is_some()
     }
 
+    /// Push `comments` one per line, keeping a blank line the source had
+    /// between two of them.
+    fn push_comment_block(&self, out: &mut String, comments: &[Comment]) {
+        for (i, c) in comments.iter().enumerate() {
+            if i > 0 && self.blank_line_before(c.start) {
+                out.push('\n');
+            }
+            out.push_str(&c.text);
+            out.push('\n');
+        }
+    }
+
+    /// The 0-based source line containing byte offset `pos`.
+    ///
+    /// It is 0 when no source is threaded, as in the round-trip guard.
     fn line_of(&self, pos: u32) -> usize {
         let Some(src) = self.src else { return 0 };
         let pos = (pos as usize).min(src.len());
@@ -1058,9 +1302,10 @@ impl<'a> Printer<'a> {
         s
     }
 
-    fn decl(&self, d: &Decl<'_>) -> String {
+    /// Render a declaration whose comments are those anchored before `owner_end`.
+    fn decl(&self, d: &Decl<'_>, owner_end: usize) -> String {
         match d {
-            Decl::Union(u) => self.union(u),
+            Decl::Union(u) => self.union(u, owner_end),
             Decl::Alias(a) => self.alias(&a.value),
             Decl::Value(v) => self.value(&v.value),
             Decl::Foreign(f) => self.foreign(&f.value),
@@ -1108,7 +1353,7 @@ impl<'a> Printer<'a> {
     /// `type Name vars = A | B c | …` — leading-pipe multiline when it does not
     /// fit, matching elm-format (each constructor on its own line, four-space
     /// indented, aligned `= …` / `| …`).
-    fn union(&self, u: &Located<Union>) -> String {
+    fn union(&self, u: &Located<Union>, owner_end: usize) -> String {
         let uv = &u.value;
         let vars = self.type_vars(&uv.vars);
         // elm-format ALWAYS breaks a union declaration onto multiple lines —
@@ -1121,10 +1366,16 @@ impl<'a> Printer<'a> {
         // line just before that constructor's `| Ctor` line, keeping the
         // author's grouping inside the type. A comment inside a constructor's
         // arguments travels above that constructor too, since a constructor
-        // prints on one line.
+        // prints on one line. A constructor's span is its name alone, so its
+        // comments run up to the next constructor, or for the last one to the
+        // end of the declaration's own comments.
         for (idx, c) in uv.ctors.iter().enumerate() {
             let lead = if idx == 0 { "=" } else { "|" };
-            for cm in self.type_comments(&c.value.args, c.span.lo as usize, c.span.hi as usize) {
+            let hi = uv
+                .ctors
+                .get(idx + 1)
+                .map_or(owner_end, |next| next.span.lo as usize);
+            for cm in self.type_comments(&c.value.args, c.span.lo as usize, hi) {
                 let _ = write!(s, "\n    {}", cm.text);
             }
             let _ = write!(s, "\n    {lead} {}", self.ctor(&c.value));
@@ -1245,6 +1496,7 @@ impl<'a> Printer<'a> {
             // Force a single line irrespective of width (elm-format keeps a
             // single-line signature single-line however wide it is). An arrow
             // chain is joined with ` -> `; anything else prints as one atom.
+            let mark = self.pads.mark();
             let one = match ann {
                 TypeAnnotation::TLambda(_, _) => self.arrow_chain(ann, 0).join(" -> "),
                 _ => self.type_app(ann, 0),
@@ -1254,6 +1506,7 @@ impl<'a> Printer<'a> {
             if !one.contains('\n') {
                 return format!("{name} : {one}");
             }
+            self.pads.rewind(mark, one);
         }
         // Multi-line: `name :` then the type indented one level.
         let body = self.type_multiline(ann, 1);
@@ -1266,7 +1519,7 @@ impl<'a> Printer<'a> {
     /// indents each argument one level under the applied head); anything else is
     /// a single indented line.
     fn type_multiline(&self, t: &TypeAnnotation, indent: usize) -> String {
-        let cur_pad = pad(indent);
+        let cur_pad = self.pad(indent);
         match t {
             TypeAnnotation::TLambda(_, _) => {
                 let parts = self.arrow_chain(t, indent);
@@ -1279,13 +1532,15 @@ impl<'a> Printer<'a> {
                 out
             }
             TypeAnnotation::TType(q, segs, args) if !args.is_empty() => {
+                let mark = self.pads.mark();
                 let one = self.type_app(t, indent);
                 if fits(&one, indent * 4) {
                     return format!("{cur_pad}{one}");
                 }
+                self.pads.rewind(mark, one);
                 // Break the application: head on its own line, each argument one
                 // level deeper on its own line.
-                let arg_pad = pad(indent + 1);
+                let arg_pad = self.pad(indent + 1);
                 let mut out = format!("{cur_pad}{}", self.type_head(*q, segs));
                 for a in args {
                     let _ = write!(out, "\n{arg_pad}{}", self.type_atom_indent(a, indent + 1));
@@ -1308,7 +1563,7 @@ impl<'a> Printer<'a> {
                 } else {
                     // Multiline arrow: each arrow on its own line, four-space
                     // indented past the current level, `->` leading.
-                    let pad = pad(indent + 1);
+                    let pad = self.pad(indent + 1);
                     let mut it = parts.into_iter();
                     let first = it.next().unwrap_or_default();
                     let mut out = first;
@@ -1452,8 +1707,8 @@ impl<'a> Printer<'a> {
         if !force_multi && !has_field_comments && !one.contains('\n') {
             return one;
         }
-        let pad = pad(indent);
-        let inner = pad_in(indent);
+        let pad = self.pad(indent);
+        let inner = self.pad_in(indent);
         let mut out = String::from("{");
         for (i, (part, lead)) in parts.iter().zip(&leading).enumerate() {
             // The comment block precedes the field it annotates, mirroring the
@@ -1560,10 +1815,12 @@ impl<'a> Printer<'a> {
     fn expr(&self, e: &Expr, indent: usize) -> String {
         #[cfg(test)]
         count_render_call();
-        let (comments, body) = self.claim(e.span.lo as usize, Self::closer_of(e), || {
-            self.expr_shape(e, indent)
-        });
-        Self::with_comments(comments, &body, indent)
+        if self.pads.exceeded() {
+            // The print is refused whole: rendering more is wasted work.
+            return String::new();
+        }
+        let (comments, body) = self.claim_expr(e, || self.expr_shape(e, indent));
+        self.with_comments(comments, &body, indent)
     }
 
     /// Format an expression without its leading comments.
@@ -1690,20 +1947,20 @@ impl<'a> Printer<'a> {
     /// The result expression comes last; comments written between statements
     /// keep their place.
     fn do_block(&self, view: &DoView<'_>, indent: usize) -> String {
-        let stmt_pad = pad(indent + 1);
+        let stmt_pad = self.pad(indent + 1);
         // A parenthesised block's node starts at its `(`: a comment between
         // the `(` and the keyword attaches to the keyword.
         let keyword_lo = view.keyword_end.saturating_sub("do".len());
         let mut out = if self.is_claimed(keyword_lo) {
             String::from("do")
         } else {
-            Self::with_comments(self.anchored(keyword_lo), "do", indent)
+            self.with_comments(self.anchored(keyword_lo), "do", indent)
         };
         for step in &view.steps {
             // A bound or pure statement starts at its binder; a bare run is an
             // expression and carries its own comments.
             let line = match step {
-                DoStep::Bind(pat, task) => Self::with_comments(
+                DoStep::Bind(pat, task) => self.with_comments(
                     self.anchored(pat.span.lo as usize),
                     &format!(
                         "{} <- {}",
@@ -1712,7 +1969,7 @@ impl<'a> Printer<'a> {
                     ),
                     indent + 1,
                 ),
-                DoStep::Let(pat, value) => Self::with_comments(
+                DoStep::Let(pat, value) => self.with_comments(
                     self.anchored(pat.span.lo as usize),
                     &format!(
                         "{} = {}",
@@ -1797,10 +2054,12 @@ impl<'a> Printer<'a> {
     fn expr_atom(&self, e: &Expr, indent: usize) -> String {
         #[cfg(test)]
         count_render_call();
-        let (comments, body) = self.claim(e.span.lo as usize, Self::closer_of(e), || {
-            self.atom_shape(e, indent)
-        });
-        Self::with_comments(comments, &body, indent)
+        if self.pads.exceeded() {
+            // The print is refused whole: rendering more is wasted work.
+            return String::new();
+        }
+        let (comments, body) = self.claim_expr(e, || self.atom_shape(e, indent));
+        self.with_comments(comments, &body, indent)
     }
 
     /// An expression in atom position, without its leading comments.
@@ -1822,7 +2081,7 @@ impl<'a> Printer<'a> {
                 // directly, continuation lines keep their indentation, and the
                 // closing `)` sits on its own line at this atom's indent —
                 // elm-format's parenthesised-block layout.
-                format!("({}\n{})", inner, pad(indent))
+                format!("({}\n{})", inner, self.pad(indent))
             } else {
                 format!("({inner})")
             }
@@ -1864,7 +2123,7 @@ impl<'a> Printer<'a> {
         //     only broke on width, elm-format instead stacks all of them.
         //   * otherwise (Case 3): the function stands alone and EVERY argument
         //     goes on its own indented line.
-        let inner = pad(indent + 1);
+        let inner = self.pad(indent + 1);
         // `split_first` avoids indexing/slicing panics and cleanly expresses the
         // "first argument joins the head line" branch.
         // The first argument hugs the function line — elm-format's `FAJoinFirst`
@@ -1898,9 +2157,7 @@ impl<'a> Printer<'a> {
                 _ => (head_s, arg_one_strs.as_slice()),
             };
         for s in rest_strs {
-            out.push('\n');
-            out.push_str(&inner);
-            out.push_str(s);
+            let _ = write!(out, "\n{inner}{s}");
         }
         out
     }
@@ -1954,59 +2211,72 @@ impl<'a> Printer<'a> {
         indent: usize,
         span: ipe_diagnostics::Span,
     ) -> String {
-        // Each operator with the operand to its right. A comment above an
-        // operator line attaches to that right operand, so it is claimed here
-        // and printed above the operator.
-        let first_operand = chain.first().map_or(last, |(operand, _)| operand);
-        let rights: Vec<(String, &Expr, bool)> = chain
-            .iter()
-            .enumerate()
-            .map(|(i, (_, op))| {
-                let right = chain.get(i + 1).map_or((last, true), |(o, _)| (o, false));
-                (self.sym(op.value), right.0, right.1)
-            })
-            .collect();
-        let right_operand = |operand: &Expr, is_last: bool, at: usize| {
-            self.claim(operand.span.lo as usize, Self::closer_of(operand), || {
-                if is_last {
-                    self.binop_last_operand(operand, at)
-                } else {
-                    self.binop_operand(operand, at)
-                }
-            })
-        };
-        // Build the flat operand/operator sequence.
-        let mut one = self.binop_operand(first_operand, indent);
-        let mut commented = false;
-        for (op, operand, is_last) in &rights {
-            let (comments, s) = right_operand(operand, *is_last, indent);
-            commented |= !comments.is_empty();
-            let _ = write!(one, " {op} {s}");
-        }
-        // Modal, like every other construct: a chain written on one line stays
-        // single-line however wide (elm-format keeps 900-column `::` chains
-        // intact), and only a source-multiline chain — or one whose operand
-        // itself broke, or that carries a comment — lays out one operator per
-        // continuation line.
-        if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
-            return one;
-        }
         // The backward pipe `<|` breaks differently from every other operator:
         // it is right-associative and elm-format leaves it at the END of the
         // left operand's line, dropping the right-hand side onto the next line
         // indented one level (`f x <|\n    g y`). A whole chain of `<|` nests
         // this way. Every other operator (`|>`, `::`, `++`, `==`, …) begins the
         // continuation line instead.
-        let all_backward = chain.iter().all(|(_, op)| self.sym(op.value) == "<|");
-        let inner = pad(indent + 1);
+        let ops: Vec<String> = chain.iter().map(|(_, op)| self.sym(op.value)).collect();
+        let all_backward = ops.iter().all(|op| op == "<|");
+        let first_operand = chain.first().map_or(last, |(operand, _)| operand);
+
+        // Every operand is rendered exactly ONCE, at the indent it takes in
+        // the broken layout, and the flat-versus-broken choice reads those
+        // renderings. A rendering with no layout newline reads identically at
+        // any indent (padding is only ever inserted after a newline), so the
+        // same string serves the flat layout too. Rendering a flat candidate
+        // first and every operand again for the broken layout costs two
+        // renders per node per ENCLOSING chain, which is exponential in
+        // nesting depth.
+        //
+        // Each operator carries the operand to its right. A comment above an
+        // operator line attaches to that right operand, so it is claimed here
+        // and printed above the operator.
+        let first_s = self.binop_operand(first_operand, indent);
+        let rights: Vec<(&str, Comments<'a>, String)> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                let (operand, is_last) = chain.get(i + 1).map_or((last, true), |(o, _)| (o, false));
+                let at = if all_backward && !is_last {
+                    indent
+                } else {
+                    indent + 1
+                };
+                let (comments, s) = self.claim_expr(operand, || {
+                    if is_last {
+                        self.binop_last_operand(operand, at)
+                    } else {
+                        self.binop_operand(operand, at)
+                    }
+                });
+                (op.as_str(), comments, s)
+            })
+            .collect();
+
+        // Modal, like every other construct: a chain written on one line stays
+        // single-line however wide (elm-format keeps 900-column `::` chains
+        // intact), and only a source-multiline chain — or one whose operand
+        // itself broke, or that carries a comment — lays out one operator per
+        // continuation line.
+        let commented = rights.iter().any(|(_, comments, _)| !comments.is_empty());
+        if !commented && !self.was_multiline(span) {
+            let mut one = first_s.clone();
+            for (op, _, s) in &rights {
+                let _ = write!(one, " {op} {s}");
+            }
+            if !has_layout_newline(&one) {
+                return one;
+            }
+        }
+        let inner = self.pad(indent + 1);
         if all_backward {
             // Each right operand opens the next line one level in; its
             // comments head that line.
-            let mut out = self.binop_operand(first_operand, indent);
-            for (op, operand, is_last) in &rights {
-                let at = if *is_last { indent + 1 } else { indent };
-                let (comments, s) = right_operand(operand, *is_last, at);
-                let line = Self::with_comments(comments, &s, indent + 1);
+            let mut out = first_s;
+            for (op, comments, s) in &rights {
+                let line = self.with_comments(comments.iter().copied(), s, indent + 1);
                 let _ = write!(out, " {op}\n{inner}{line}");
             }
             return out;
@@ -2017,9 +2287,8 @@ impl<'a> Printer<'a> {
         //   { … }
         //       |> Vector
         // keeps the record at the base indent and only the `|>` step indents.
-        let mut out = self.binop_operand(first_operand, indent);
-        for (op, operand, is_last) in &rights {
-            let (comments, s) = right_operand(operand, *is_last, indent + 1);
+        let mut out = first_s;
+        for (op, comments, s) in &rights {
             for c in comments {
                 let _ = write!(out, "\n{inner}{}", c.text);
             }
@@ -2063,9 +2332,9 @@ impl<'a> Printer<'a> {
         span: ipe_diagnostics::Span,
     ) -> String {
         let ps: Vec<String> = params.iter().map(|p| self.pattern_atom(&p.value)).collect();
-        // A comment among the parameters prints above the lambda.
-        let inside = self.anchored_in(span.lo as usize + 1, body.span.lo as usize);
-        let head = Self::with_comments(inside, &format!("\\{} ->", ps.join(" ")), indent);
+        // A comment among the parameters prints above the lambda, through
+        // its `claim_expr`.
+        let head = format!("\\{} ->", ps.join(" "));
         // A block-form body (`let` / `case` / `if`) always drops to the next
         // line, indented one level: an inline `-> let …` would place the `let`
         // keyword mid-line, breaking its layout-sensitive block on re-parse.
@@ -2097,14 +2366,14 @@ impl<'a> Printer<'a> {
         if !block_body && !self.was_multiline(span) && !has_layout_newline(&body_s) {
             format!("{head} {body_s}")
         } else {
-            format!("{head}\n{}{body_s}", pad(indent + 1))
+            format!("{head}\n{}{body_s}", self.pad(indent + 1))
         }
     }
 
     fn case(&self, scrut: &Expr, arms: &[(Pattern, Expr)], indent: usize) -> String {
         let scrut_s = self.expr(scrut, indent);
-        let arm_pad = pad(indent + 1);
-        let body_pad = pad(indent + 2);
+        let arm_pad = self.pad(indent + 1);
+        let body_pad = self.pad(indent + 2);
         let mut out = format!("case {scrut_s} of");
         for (i, (pat, body)) in arms.iter().enumerate() {
             // A comment above an arm attaches to its pattern and sits on its
@@ -2112,18 +2381,20 @@ impl<'a> Printer<'a> {
             // section comments inside a `case`. The blank line between arms is
             // always emitted; after a comment, another blank line keeps the
             // next arm visually separated.
+            // A comment inside the pattern prints above the arm too, in the
+            // same run, so a second pass reads it as one above the pattern.
             if i > 0 {
                 out.push('\n');
             }
-            for c in self.anchored(pat.span.lo as usize) {
+            let lo = pat.span.lo as usize;
+            let above = self.anchored(lo).iter();
+            let inside = self.anchored_in(lo + 1, body.span.lo as usize);
+            for c in above.chain(inside) {
                 let _ = write!(out, "\n{arm_pad}{}", c.text);
                 if i > 0 {
                     out.push('\n');
                 }
             }
-            // A comment inside the pattern prints directly above the arm.
-            let inside = self.anchored_in(pat.span.lo as usize + 1, body.span.lo as usize);
-            push_indented_comments(&mut out, inside, &arm_pad);
             let body_s = self.expr(body, indent + 2);
             let _ = write!(
                 out,
@@ -2135,20 +2406,14 @@ impl<'a> Printer<'a> {
     }
 
     fn let_(&self, bindings: &[LetBinding], body: &Expr, indent: usize) -> String {
-        let bind_pad = pad(indent + 1);
-        let body_val_pad = pad(indent + 2);
+        let bind_pad = self.pad(indent + 1);
+        let body_val_pad = self.pad(indent + 2);
         let mut out = String::from("let");
         for (i, b) in bindings.iter().enumerate() {
             // elm-format separates successive `let` bindings with a blank
             // line; the comments above a binding, attached to its binder,
             // replace that blank line.
             let above = self.anchored(b.pat.span.lo as usize);
-            if i > 0 && above.is_empty() {
-                out.push('\n');
-            }
-            for c in above {
-                let _ = write!(out, "\n{bind_pad}{}", c.text);
-            }
             // A `let` binder that destructures with a constructor pattern must
             // stay parenthesised — `(Decoder d) = …`. Without the parens the
             // re-parse reads `Decoder` as the (illegal, uppercase) binding name.
@@ -2163,17 +2428,20 @@ impl<'a> Printer<'a> {
                 body
             });
             // A comment inside the binder or among the parameters prints
-            // above the binding.
+            // above the binding too, in the same run, so a second pass reads
+            // it as one above the binder.
             let head_lo = b.pat.span.lo as usize + 1;
-            for c in self.anchored_in(head_lo, value.span.lo as usize) {
-                let _ = write!(out, "\n{bind_pad}{}", c.text);
+            let inside = self.anchored_in(head_lo, value.span.lo as usize);
+            if i > 0 && above.is_empty() && inside.is_empty() {
+                out.push('\n');
             }
+            push_indented_comments(&mut out, above.iter().chain(inside), bind_pad);
             // elm-format ALWAYS drops a `let` binding's value onto its own
             // four-space-indented line, however short — `x =\n    1`.
             let val = self.expr(value, indent + 2);
             let _ = write!(out, "\n{bind_pad}{binder} =\n{body_val_pad}{val}");
         }
-        let in_pad = pad(indent);
+        let in_pad = self.pad(indent);
         let _ = write!(out, "\n{in_pad}in\n{in_pad}{}", self.expr(body, indent));
         out
     }
@@ -2189,7 +2457,7 @@ impl<'a> Printer<'a> {
     }
 
     fn if_(&self, branches: &[(Expr, Expr)], else_: &Expr, indent: usize) -> String {
-        let inner = pad(indent + 1);
+        let inner = self.pad(indent + 1);
         let mut out = String::new();
         for (i, (cond, body)) in branches.iter().enumerate() {
             let lead = if i == 0 { "if" } else { "else if" };
@@ -2200,7 +2468,7 @@ impl<'a> Printer<'a> {
                     .token_before(cond.span.lo as usize)
                     .filter(|t| matches!(t.kind, TokenKind::If));
                 for c in keyword.map_or(&[][..], |t| self.anchored(t.lo)) {
-                    let _ = write!(out, "{}\n{}", c.text, pad(indent));
+                    let _ = write!(out, "{}\n{}", c.text, self.pad(indent));
                 }
             }
             let _ = write!(
@@ -2208,7 +2476,7 @@ impl<'a> Printer<'a> {
                 "{lead} {} then\n{inner}{}\n\n{}",
                 self.expr(cond, indent),
                 self.expr(body, indent + 1),
-                pad(indent)
+                self.pad(indent)
             );
         }
         let _ = write!(out, "else\n{inner}{}", self.expr(else_, indent + 1));
@@ -2233,7 +2501,7 @@ impl<'a> Printer<'a> {
 
     fn list(&self, elems: &[Expr], indent: usize, span: ipe_diagnostics::Span) -> String {
         if elems.is_empty() {
-            return Self::with_comments(self.closing_comments(span), "[]", indent);
+            return self.with_comments(self.closing_comments(span), "[]", indent);
         }
         let items = self.elements(elems, indent);
         self.collection("[", "]", &items, span, indent)
@@ -2246,7 +2514,7 @@ impl<'a> Printer<'a> {
         span: ipe_diagnostics::Span,
     ) -> String {
         if fields.is_empty() {
-            return Self::with_comments(self.closing_comments(span), "{}", indent);
+            return self.with_comments(self.closing_comments(span), "{}", indent);
         }
         let items = self.fields(fields, indent);
         self.collection("{", "}", &items, span, indent)
@@ -2256,11 +2524,7 @@ impl<'a> Printer<'a> {
     fn elements(&self, elems: &[Expr], indent: usize) -> Vec<Item<'a>> {
         elems
             .iter()
-            .map(|e| {
-                self.claim(e.span.lo as usize, Self::closer_of(e), || {
-                    self.expr(e, indent)
-                })
-            })
+            .map(|e| self.claim_expr(e, || self.expr(e, indent)))
             .collect()
     }
 
@@ -2298,7 +2562,7 @@ impl<'a> Printer<'a> {
         if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
             return one;
         }
-        comma_multiline(open, close, items, closing, indent)
+        comma_multiline(&self.pads, open, close, items, closing, indent)
     }
 
     fn update(
@@ -2323,15 +2587,15 @@ impl<'a> Printer<'a> {
         // `, field` lines indented ONE LEVEL DEEPER than the brace (elm-format
         // aligns the update pipe under the record body, not under the `{`), and
         // the closing `}` back at the brace column.
-        let close_pad = pad(indent);
-        let inner = pad(indent + 1);
+        let close_pad = self.pad(indent);
+        let inner = self.pad(indent + 1);
         let mut out = format!("{{ {base_s}");
         for (i, (comments, p)) in items.iter().enumerate() {
             let lead = if i == 0 { "|" } else { "," };
-            push_indented_comments(&mut out, comments.iter().copied(), &inner);
+            push_indented_comments(&mut out, comments.iter().copied(), inner);
             let _ = write!(out, "\n{inner}{lead} {p}");
         }
-        push_indented_comments(&mut out, closing, &inner);
+        push_indented_comments(&mut out, closing, inner);
         let _ = write!(out, "\n{close_pad}}}");
         out
     }
@@ -2465,18 +2729,64 @@ type Item<'c> = (Comments<'c>, String);
 type Comments<'c> = Vec<&'c Comment>;
 
 /// Push each comment on its own line, ending each with a newline.
-fn push_comment_lines(out: &mut String, comments: &[Comment]) {
+fn push_comment_lines<'c>(out: &mut String, comments: impl IntoIterator<Item = &'c Comment>) {
     for c in comments {
         out.push_str(&c.text);
         out.push('\n');
     }
 }
 
+/// Close the exposed-item `group` as one line of a multi-line exposing clause:
+/// `( ` before the first group, `, ` before each later one.
+fn push_exposing_group(lines: &mut Vec<String>, group: &mut Vec<String>, groups: &mut usize) {
+    if group.is_empty() {
+        return;
+    }
+    let lead = if *groups == 0 { "( " } else { ", " };
+    lines.push(format!("    {lead}{}", group.join(", ")));
+    group.clear();
+    *groups += 1;
+}
+
+/// The comments of `owned` that `rendered` does not print, in source order.
+///
+/// `rendered` is one owner's printing; the comments it prints are matched by
+/// text, the multiset the comment guard compares. A rendering that does not
+/// lex places nothing here: the guard then refuses the whole output.
+fn unplaced<'c>(owned: &'c [Comment], rendered: &str) -> Vec<&'c Comment> {
+    if owned.is_empty() {
+        return Vec::new();
+    }
+    let Some(printed) = scan_trivia(rendered) else {
+        return Vec::new();
+    };
+    let mut printed = comment_multiset(&printed.comments);
+    let mut missing = Vec::new();
+    for c in owned {
+        match printed.binary_search(&c.text.as_str()) {
+            Ok(i) => {
+                printed.remove(i);
+            }
+            Err(_) => missing.push(c),
+        }
+    }
+    missing
+}
+
+/// The byte range of a lambda's parameters, from the first one to its body.
+fn lambda_head(e: &Expr) -> Option<(usize, usize)> {
+    let Expr_::Lambda(params, body) = &e.value else {
+        return None;
+    };
+    let lo = params.first().map_or(body.span.lo, |p| p.span.lo);
+    Some((lo as usize, body.span.lo as usize))
+}
+
 /// Push each comment on a fresh line at `pad`.
 fn push_indented_comments<'c>(
     out: &mut String,
     comments: impl IntoIterator<Item = &'c Comment>,
-    pad: &str,
+    pad: Pad<'_>,
 ) {
     for c in comments {
         let _ = write!(out, "\n{pad}{}", c.text);
@@ -2493,18 +2803,19 @@ fn push_indented_comments<'c>(
 /// with comments then drops below the bracket. `closing` comments sit above
 /// the closing bracket.
 fn comma_multiline(
+    pads: &PadBudget,
     open: &str,
     close: &str,
     items: &[Item<'_>],
     closing: &[Comment],
     indent: usize,
 ) -> String {
-    let pad = pad(indent);
-    let inner = pad_in(indent);
+    let pad = pads.pad(indent);
+    let inner = pads.pad(indent);
     let mut out = String::from(open);
     for (i, (comments, part)) in items.iter().enumerate() {
-        push_indented_comments(&mut out, comments.iter().copied(), &inner);
-        let part = hang_element(part);
+        push_indented_comments(&mut out, comments.iter().copied(), inner);
+        let part = hang_element(pads, part);
         match (i, comments.is_empty()) {
             (0, true) => {
                 let _ = write!(out, " {part}");
@@ -2517,7 +2828,7 @@ fn comma_multiline(
             }
         }
     }
-    push_indented_comments(&mut out, closing, &inner);
+    push_indented_comments(&mut out, closing, inner);
     let _ = write!(out, "\n{pad}{close}");
     out
 }
@@ -2530,7 +2841,10 @@ fn comma_multiline(
 /// line up under its opener. Only such a "leading-bracket" element is shifted;
 /// an application or pipe element already indents correctly by four, so shifting
 /// it would over-indent its continuation lines.
-fn hang_element(part: &str) -> String {
+///
+/// Each shift is charged to `pads`: nested collections shift one line once
+/// per enclosing level, so the shift multiplies like indentation does.
+fn hang_element(pads: &PadBudget, part: &str) -> String {
     let starts_collection = part.starts_with("{ ") || part.starts_with("[ ");
     if !starts_collection || !part.contains('\n') {
         return part.to_owned();
@@ -2553,8 +2867,8 @@ fn hang_element(part: &str) -> String {
             let trimmed = line.trim_start();
             let is_own_structure = this_indent == base_indent
                 && (trimmed.starts_with(", ") || trimmed == "}" || trimmed == "]");
-            if is_own_structure {
-                out.push_str("  ");
+            if is_own_structure && pads.charge(HANG_UNIT.len()) {
+                out.push_str(HANG_UNIT);
             }
         }
         out.push_str(line);
@@ -2595,16 +2909,106 @@ impl Decl<'_> {
 // Small formatting helpers
 // ---------------------------------------------------------------------------
 
-/// Four spaces per indent level.
-fn pad(indent: usize) -> String {
-    "    ".repeat(indent)
+/// One indent level.
+const INDENT_UNIT: &str = "    ";
+
+/// The two columns a nested collection element hangs past its bracket.
+const HANG_UNIT: &str = "  ";
+
+/// The indentation bytes one print may still emit.
+///
+/// A layout repeats one indentation on every line it breaks, so indentation
+/// is the output an input multiplies: every rendering of a [`Pad`], and every
+/// [`HANG_UNIT`] a nested collection adds to a line, is charged its bytes
+/// here, against the print's [`OutputCap`]. A candidate layout that is thrown
+/// away gives its bytes back ([`PadBudget::rewind`]), so only the kept text is
+/// charged. Past the budget a pad renders nothing, the print is marked
+/// exceeded for good, and every later render returns at once: the caller
+/// refuses the whole print.
+struct PadBudget {
+    left: Cell<usize>,
+    exceeded: Cell<bool>,
 }
 
-/// The indentation of the leading-comma continuation lines inside a multiline
-/// record / list / tuple: elm-format aligns the `,` with the opening bracket,
-/// which sits at the construct's own indent.
-fn pad_in(indent: usize) -> String {
-    "    ".repeat(indent)
+impl PadBudget {
+    const fn new(cap: OutputCap) -> Self {
+        Self {
+            left: Cell::new(cap.bytes()),
+            exceeded: Cell::new(false),
+        }
+    }
+
+    /// The indentation of `level` levels, charged each time it renders.
+    const fn pad(&self, level: usize) -> Pad<'_> {
+        Pad {
+            level,
+            budget: self,
+        }
+    }
+
+    /// Take `bytes` from the budget.
+    ///
+    /// `false`, and exceeded from then on, when they do not fit.
+    fn charge(&self, bytes: usize) -> bool {
+        if self.exceeded.get() {
+            return false;
+        }
+        let Some(left) = self.left.get().checked_sub(bytes) else {
+            self.left.set(0);
+            self.exceeded.set(true);
+            return false;
+        };
+        self.left.set(left);
+        true
+    }
+
+    /// Whether some pad did not fit the budget.
+    const fn exceeded(&self) -> bool {
+        self.exceeded.get()
+    }
+
+    /// The budget left now, to return to if what renders next is discarded.
+    const fn mark(&self) -> PadMark {
+        PadMark(self.left.get())
+    }
+
+    /// Drop `discarded`, a candidate rendered since `mark` that the print
+    /// does not keep, and give back the bytes it was charged.
+    ///
+    /// The candidate is taken by value, so no text those bytes paid for
+    /// outlives the refund. An exceeded budget stays exceeded: a print that
+    /// once ran past its cap is refused whole.
+    fn rewind(&self, mark: PadMark, discarded: String) {
+        drop(discarded);
+        if !self.exceeded.get() {
+            self.left.set(mark.0);
+        }
+    }
+}
+
+/// The budget a [`PadBudget`] held at one point of a print.
+#[derive(Clone, Copy)]
+struct PadMark(usize);
+
+/// Indentation of a number of levels, rendered through its [`PadBudget`].
+#[derive(Clone, Copy)]
+struct Pad<'b> {
+    level: usize,
+    budget: &'b PadBudget,
+}
+
+impl fmt::Display for Pad<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self
+            .budget
+            .charge(self.level.saturating_mul(INDENT_UNIT.len()))
+        {
+            for _ in 0..self.level {
+                f.write_str(INDENT_UNIT)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether `s`, placed at column `col`, fits within [`MAX_WIDTH`]. A multi-line
@@ -3392,9 +3796,342 @@ mod tests {
         assert!(scan_comments("-- a\n").len() < input.len());
     }
 
+    /// A module whose one value is a list of `items` ones, written on one
+    /// line two lets deep: the formatter puts every item on its own line at
+    /// that depth, so each two-byte item grows to over twenty output bytes.
+    fn nested_long_list(items: usize) -> String {
+        let ones = vec!["1"; items].join(",");
+        format!(
+            "module M exposing (x)\n\n\nx =\n    let\n        y =\n            let\n                z =\n                    [ {ones}\n                    ]\n            in\n            z\n    in\n    y\n"
+        )
+    }
+
+    /// The output one more item of [`nested_long_list`] adds, measured on
+    /// inputs small enough to format under the floor.
+    fn nested_long_list_growth_per_item() -> usize {
+        let small = format_source(&nested_long_list(200)).expect("formats under the floor");
+        let large = format_source(&nested_long_list(400)).expect("formats under the floor");
+        large.len().saturating_sub(small.len()) / 200
+    }
+
+    /// An input whose rendering passes eight times its size is refused with
+    /// the cap for that input, while the same shape at a size under the floor
+    /// formats.
+    #[test]
+    fn output_cap_refuses_past_cap() {
+        let growth = nested_long_list_growth_per_item();
+        assert!(
+            growth > 2 * OutputCap::GROWTH,
+            "precondition: an item of two input bytes must grow past the cap, got {growth}"
+        );
+        let src = nested_long_list(10_000);
+        let cap = OutputCap::for_input(src.len());
+        assert_eq!(cap.bytes(), src.len() * OutputCap::GROWTH);
+        let refused = format_source(&src);
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap: c })) if c == cap),
+            "{refused:?}"
+        );
+    }
+
+    /// One byte under the output's length refuses; the output's length admits.
+    #[test]
+    fn output_cap_refuses_one_byte_past_the_output() {
+        let src = "module M exposing (x)\n\n\nx =\n    [ 1, 2, 3 ]\n";
+        let out = format_source(src).expect("formats");
+        let tight = OutputCap(out.len());
+        assert_eq!(
+            format_source_capped(src, tight).ok().as_deref(),
+            Some(out.as_str())
+        );
+        let short = OutputCap(out.len() - 1);
+        let refused = format_source_capped(src, short);
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap })) if cap == short),
+            "{refused:?}"
+        );
+    }
+
+    /// A module whose one value is a list of `items` names written on one line
+    /// `depth` lets deep: the formatter puts every name on its own line at
+    /// that depth, so the indentation of each line dominates the output.
+    fn nested_deep_list(depth: usize, items: usize) -> String {
+        let names = vec!["aaaaaaaaaaaaaaa"; items].join(",");
+        let mut head = String::from("module M exposing (x)\n\n\nx =\n");
+        let mut tail = String::new();
+        for k in 0..depth {
+            let b = " ".repeat(4 + 8 * k);
+            let _ = write!(head, "{b}let\n{b}    v{k} =\n");
+            tail = format!("{b}in\n{b}v{k}\n{tail}");
+        }
+        let b = " ".repeat(4 + 8 * depth);
+        format!("{head}{b}[ {names}\n{b}]\n{tail}")
+    }
+
+    /// An 8 MiB source whose layout repeats one deep indentation on every
+    /// line is refused, and the indentation past the cap is never rendered:
+    /// the printer's text stays within the cap plus the source's own bytes
+    /// twice, where rendering every pad would hold over 100 MiB.
+    #[test]
+    fn pad_past_the_cap_is_refused_unrendered() {
+        let src = nested_deep_list(24, (8 << 20) / 16);
+        let cap = OutputCap::for_input(src.len());
+        assert_eq!(cap.bytes(), OutputCap::CEILING);
+        let rendered = Cell::new(0usize);
+        let refused = format_guarded(&src, cap, |p, m| {
+            let out = p.module(m);
+            rendered.set(out.len());
+            out
+        });
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap: c })) if c == cap),
+            "{refused:?}"
+        );
+        let bound = cap.bytes() + 2 * src.len();
+        assert!(
+            rendered.get() <= bound,
+            "the printer rendered {} bytes past the pad budget (bound {bound})",
+            rendered.get()
+        );
+    }
+
+    /// The same shape small enough to fit formats under a cap of exactly its
+    /// output, pads included, and refuses one byte under it.
+    #[test]
+    fn deep_list_formats_at_its_exact_output_cap() {
+        let src = nested_deep_list(24, 40);
+        let out = format_source(&src).expect("a small deep list formats");
+        assert!(
+            out.contains(&format!("\n{}, aaaaaaaaaaaaaaa", INDENT_UNIT.repeat(49))),
+            "precondition: the items sit 49 levels deep: {out}"
+        );
+        let exact = OutputCap(out.len());
+        assert_eq!(
+            format_source_capped(&src, exact).ok().as_deref(),
+            Some(out.as_str())
+        );
+        let short = OutputCap(out.len() - 1);
+        let refused = format_source_capped(&src, short);
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap })) if cap == short),
+            "{refused:?}"
+        );
+    }
+
+    /// A pad renders only while the budget holds its bytes; once one does not
+    /// fit, every later pad renders empty and the budget stays exceeded.
+    #[test]
+    fn pad_budget_charges_every_rendering() {
+        let budget = PadBudget::new(OutputCap(8));
+        let pad = budget.pad(1);
+        assert_eq!(format!("{pad}{pad}"), "        ");
+        assert!(!budget.exceeded());
+        assert_eq!(format!("{pad}"), "");
+        assert!(budget.exceeded());
+        assert_eq!(format!("{}", budget.pad(0)), "");
+        assert!(budget.exceeded());
+    }
+
+    /// A rewind gives back what was charged since its mark, and an exceeded
+    /// budget stays exceeded through one.
+    #[test]
+    fn pad_budget_rewind_refunds_only_an_unexceeded_budget() {
+        let budget = PadBudget::new(OutputCap(8));
+        let mark = budget.mark();
+        let discarded = format!("{}", budget.pad(2));
+        assert_eq!(discarded, "        ");
+        budget.rewind(mark, discarded);
+        assert_eq!(format!("{}", budget.pad(2)), "        ");
+        let mark = budget.mark();
+        assert_eq!(format!("{}", budget.pad(1)), "");
+        assert!(budget.exceeded());
+        budget.rewind(mark, String::new());
+        assert!(budget.exceeded());
+        assert_eq!(format!("{}", budget.pad(0)), "");
+    }
+
+    /// A module whose value is `depth` source-multiline pipes, each into a
+    /// lambda whose body is the next pipe.
+    fn nested_pipe_lambdas(depth: usize) -> String {
+        let pad = |n: usize| INDENT_UNIT.repeat(n);
+        let mut body = format!("{}b", pad(1 + 3 * depth));
+        for k in (0..depth).rev() {
+            let i = 1 + 3 * k;
+            body = format!(
+                "{}a\n{}|> f\n{}(\\v{k} ->\n{body}\n{})",
+                pad(i),
+                pad(i + 1),
+                pad(i + 2),
+                pad(i + 2)
+            );
+        }
+        format!("module M exposing (x)\n\n\nx =\n{body}\n")
+    }
+
+    /// Only the layout a print keeps is charged: an operator chain renders
+    /// no flat candidate beside its broken layout, so nested pipes format
+    /// under a cap of exactly their output.
+    #[test]
+    fn discarded_operator_layout_is_not_charged() {
+        let depth = 12;
+        let src = nested_pipe_lambdas(depth);
+        let out = format_source_capped(&src, OutputCap(usize::MAX)).expect("nested pipes format");
+        assert_eq!(
+            out.matches("|> f").count(),
+            depth,
+            "precondition: every chain is printed: {out}"
+        );
+        assert!(
+            out.lines().all(|l| !l.contains("a |> f")),
+            "precondition: every chain stays broken: {out}"
+        );
+        assert_eq!(
+            format_source_capped(&src, OutputCap(out.len()))
+                .ok()
+                .as_deref(),
+            Some(out.as_str())
+        );
+        assert_eq!(format_source(&src).ok().as_deref(), Some(out.as_str()));
+    }
+
+    /// A module whose value is one source line of `depth` pipes, each carrying
+    /// a block comment before its right operand and nesting the next pipe in a
+    /// lambda. The comment breaks every chain, whatever the source layout.
+    fn nested_commented_pipes(depth: usize) -> String {
+        let mut body = "b".to_owned();
+        for k in (0..depth).rev() {
+            body = format!("a |> {{- c -}} f (\\v{k} -> {body})");
+        }
+        format!("module M exposing (x)\n\n\nx =\n    {body}\n")
+    }
+
+    /// A named generator of a nested module by depth.
+    type NamedShape = (&'static str, fn(usize) -> String);
+
+    /// The render calls one format of `src` makes. A refused format has
+    /// rendered all the same, so the outcome is not read.
+    fn render_calls_of(src: &str) -> u64 {
+        reset_render_call_count();
+        let _ = format_source(src);
+        render_call_count()
+    }
+
+    /// Each operand of an operator chain renders once, so the render count of
+    /// nested chains grows with their depth, not with its power of two.
+    ///
+    /// A chain that renders a flat candidate and then every operand again for
+    /// its broken layout renders the chain below it twice per level; depth 16
+    /// would then cost about 4096 times depth 4 where this bound allows 8. The
+    /// count is a work counter, never wall time, so the test cannot flake.
+    #[test]
+    fn nested_operator_chains_render_each_operand_once() {
+        let shapes: [NamedShape; 2] = [
+            ("source-multiline", nested_pipe_lambdas),
+            ("commented", nested_commented_pipes),
+        ];
+        for (name, shape) in shapes {
+            let small = render_calls_of(&shape(4));
+            let big = render_calls_of(&shape(16));
+            assert!(
+                small >= 4,
+                "{name}: precondition: every level renders at least once: {small}"
+            );
+            assert!(
+                big <= small * 8,
+                "{name}: render calls grew super-linearly with depth: \
+                 {small} at depth 4, {big} at depth 16"
+            );
+        }
+    }
+
+    /// A module whose value is `depth` lists nested in their first element,
+    /// the innermost holding `items` ones: every line of the innermost list
+    /// hangs two columns once per enclosing list.
+    fn nested_first_lists(depth: usize, items: usize) -> String {
+        let ones = vec!["1"; items].join(",");
+        let open = "[ ".repeat(depth);
+        let close = "]".repeat(depth);
+        format!("module M exposing (x)\n\n\nx =\n    {open}{ones}\n    {close}\n")
+    }
+
+    /// The hang a nested collection adds to each line is charged like
+    /// indentation: past the cap the printer stops rendering, so its text
+    /// stays within the cap plus four times the source, where rendering every
+    /// hang would hold the source's items times twice its depth.
+    #[test]
+    fn hang_past_the_cap_is_charged() {
+        let depth = 20;
+        let small = format_source(&nested_first_lists(depth, 50)).expect("a small nest formats");
+        let deepest = small
+            .lines()
+            .filter(|l| l.trim_start().starts_with(", 1"))
+            .map(|l| l.len() - l.trim_start().len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            deepest >= 2 * (depth - 1),
+            "precondition: the innermost items hang once per enclosing list: {small}"
+        );
+        let larger = format_source(&nested_first_lists(depth, 100)).expect("a small nest formats");
+        let growth = larger.len().saturating_sub(small.len()) / 50;
+
+        let items = 20_000;
+        let src = nested_first_lists(depth, items);
+        let cap = OutputCap::for_input(src.len());
+        let bound = cap.bytes() + 4 * src.len();
+        assert!(
+            growth * items > bound,
+            "precondition: rendering every hang passes the bound: {growth} * {items} <= {bound}"
+        );
+        let rendered = Cell::new(0usize);
+        let refused = format_guarded(&src, cap, |p, m| {
+            let out = p.module(m);
+            rendered.set(out.len());
+            out
+        });
+        assert!(
+            matches!(refused, Err(FmtError::Limit(FmtLimit::OutputBytes { cap: c })) if c == cap),
+            "{refused:?}"
+        );
+        assert!(
+            rendered.get() <= bound,
+            "the printer rendered {} bytes past the budget (bound {bound})",
+            rendered.get()
+        );
+    }
+
+    /// The cap stops at 16 MiB: a 3 MiB input may not grow to 24 MiB.
+    #[test]
+    fn output_cap_is_sixteen_mib_at_most() {
+        assert_eq!(OutputCap::for_input(3 << 20).bytes(), 16 << 20);
+        assert_eq!(OutputCap::for_input(2 << 20).bytes(), 16 << 20);
+        assert_eq!(OutputCap::for_input((2 << 20) - 1).bytes(), (16 << 20) - 8);
+        assert_eq!(OutputCap::for_input(usize::MAX).bytes(), 16 << 20);
+    }
+
+    /// A tiny input may still produce 64 KiB, so the cap never refuses a small
+    /// file or an empty one.
+    #[test]
+    fn output_cap_floor_admits_tiny_input() {
+        assert_eq!(OutputCap::for_input(7).bytes(), 64 << 10);
+        assert_eq!(OutputCap::for_input(0).bytes(), 64 << 10);
+        assert_eq!(OutputCap::for_input(8 << 10).bytes(), 64 << 10);
+        assert_eq!(OutputCap::for_input((8 << 10) + 1).bytes(), (64 << 10) + 8);
+        let src = "module M exposing (x)\n\n\nx =\n    1\n";
+        let blank_tail = "\n".repeat(src.len() * OutputCap::GROWTH);
+        let padded = format_guarded(src, OutputCap::for_input(src.len()), |p, m| {
+            format!("{}{blank_tail}", p.module(m))
+        });
+        assert!(
+            matches!(&padded, Ok(out) if out.len() > src.len() * OutputCap::GROWTH),
+            "the floor admits a tiny input's output past eight times its size: {padded:?}"
+        );
+        assert!(OutputCap::for_input(0).admits(""));
+    }
+
     /// The `RoundTrip` detail of formatting `src` with `render`.
     fn refusal(src: &str, render: impl FnOnce(&Printer<'_>, &Module) -> String) -> String {
-        match format_guarded(src, render) {
+        match format_guarded(src, OutputCap::for_input(src.len()), render) {
             Err(FmtError::RoundTrip { detail }) => detail,
             other => format!("not a refusal: {other:?}"),
         }

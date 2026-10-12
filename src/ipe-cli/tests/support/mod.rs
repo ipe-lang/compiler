@@ -693,6 +693,24 @@ pub fn build_and_run_emitted_capturing_stderr(
     golden_name: &str,
     emitted_dir: &Path,
 ) -> RunOutcomeWithStderr {
+    build_and_run_emitted_capturing_stderr_with_env(golden_name, emitted_dir, &[])
+}
+
+/// Build the emitted project and run its binary with `env` added to its
+/// environment, capturing stdout, stderr, AND the exit code.
+///
+/// The variables are set on the spawned child only, never on the test process.
+///
+/// # Panics
+/// Fails the calling test if `cargo build` fails (surfacing cargo's stderr), the
+/// binary cannot be located, or it cannot be spawned.
+#[must_use]
+#[allow(dead_code)] // only the recursion-guard and regex-ceiling goldens use it
+pub fn build_and_run_emitted_capturing_stderr_with_env(
+    golden_name: &str,
+    emitted_dir: &Path,
+    env: &[(&str, &str)],
+) -> RunOutcomeWithStderr {
     let exe = e2e_support::build_rust_binary(golden_name, emitted_dir);
     assert!(
         exe.is_ok(),
@@ -706,7 +724,7 @@ pub fn build_and_run_emitted_capturing_stderr(
             exit_code: None,
         };
     };
-    let output = Command::new(&exe).output();
+    let output = Command::new(&exe).envs(env.iter().copied()).output();
     assert!(
         output.is_ok(),
         "{golden_name}: failed to spawn `{exe}`: {:?}",

@@ -43,6 +43,9 @@ pub fn emit_record(
         // record alias; default it so the struct literal is complete.
         parts.push("cookies: Vec::new()".to_owned());
     }
+    if parts.is_empty() {
+        return Ok(format!("{struct_name} {{}}"));
+    }
     Ok(format!("{struct_name} {{ {} }}", parts.join(", ")))
 }
 

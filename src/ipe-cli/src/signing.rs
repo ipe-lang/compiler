@@ -443,27 +443,28 @@ pub fn parse_trust_policy_toml(text: &str) -> Result<TrustPolicy, CliError> {
 /// of both (either file may tighten the policy; neither can loosen the other).
 /// A file that is absent contributes the empty deny-by-default policy; a file
 /// that is present but malformed is a hard error (never silently ignored).
+/// Each file is opened beneath its directory, never through a symlink.
 ///
 /// # Errors
-/// [`CliError::Resolve`] when a present config file cannot be read or its
-/// `[registry.trust]` is malformed.
+/// [`CliError::Resolve`] when a present config file's `[registry.trust]` is
+/// malformed; [`CliError::SourceRefused`] when it is a symlink or not a
+/// regular file; [`CliError::Io`] when it cannot otherwise be read.
 pub fn load_trust_policy(project_root: &std::path::Path) -> Result<TrustPolicy, CliError> {
     let mut identities: Vec<Identity> = Vec::new();
     let mut require_signature = false;
 
-    let mut absorb = |path: std::path::PathBuf| -> Result<(), CliError> {
-        let text = match crate::io_bounded::read_to_string_capped(
-            &path,
-            crate::io_bounded::SMALL_FILE_READ_CAP,
-        ) {
-            Ok(t) => t,
-            Err(CliError::Io { ref source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
+    let mut absorb = |dir: &std::path::Path, name: &str| -> Result<(), CliError> {
+        let text =
+            match crate::io_bounded::read_named_in(dir, &[name], crate::io_bounded::SMALL_FILE_CAP)
             {
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
+                Ok(t) => t,
+                Err(CliError::Io { ref source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
         let policy = parse_trust_policy_toml(&text)?;
         require_signature = require_signature || policy.require_signature();
         for id in policy.trusted_identities() {
@@ -476,9 +477,9 @@ pub fn load_trust_policy(project_root: &std::path::Path) -> Result<TrustPolicy, 
 
     // Global config first, then the project — order is immaterial to the union.
     if let Ok(home) = crate::runtime_embed::ipe_home() {
-        absorb(home.join("config.toml"))?;
+        absorb(&home, "config.toml")?;
     }
-    absorb(project_root.join("ipe.toml"))?;
+    absorb(project_root, "ipe.toml")?;
 
     Ok(TrustPolicy::new(identities, require_signature))
 }

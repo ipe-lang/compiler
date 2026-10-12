@@ -57,7 +57,7 @@ Time.isLeapYear 2024                                     -- True
 Time.daysInMonth 2024 2                                  -- 29
 ```
 
-Running it (`ipe run`) prints the two UTC instants, then:
+Running it (`ipe dev run`) prints the two UTC instants, then:
 
 ```
 window span: 120 minutes

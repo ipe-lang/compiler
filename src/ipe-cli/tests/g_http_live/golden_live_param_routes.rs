@@ -208,10 +208,10 @@ fn param_route_wrong_adt_ctor_is_ipe_t0001() {
 /// subsequent GET races it. Belt-and-braces alongside `IPE_CONSOLE_EMBED=off`.
 ///
 /// The needle keys on the `:{port}` suffix, not the host: the runtime resolves
-/// its bind host through `resolve_host_bind` (loopback `127.0.0.1` off a dev
-/// run, `0.0.0.0` only in production or under `IPE_HTTP_BIND`), so pinning the
-/// host would miss the readiness line and hang. The port is the app's own and
-/// is what disambiguates it from the console child's line.
+/// its bind host through `resolve_host_bind` (`127.0.0.1` unless
+/// `IPE_HTTP_BIND` or a `Host.bind Host.allInterfaces` setting names another),
+/// so pinning the host would miss the readiness line and hang. The port is the
+/// app's own and is what disambiguates it from the console child's line.
 fn wait_ready(child: &mut std::process::Child, port: u16) -> bool {
     let Some(stderr) = child.stderr.take() else {
         return false;

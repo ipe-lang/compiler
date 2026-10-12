@@ -147,7 +147,11 @@ fn admitted_once_positions_build_and_run() {
         &out,
         &e2e_support::require_runtime().into_path_buf(),
     );
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
     let outcome = crate::support::build_and_run_emitted(fixture, &out);
     assert_eq!(
         outcome.exit_code,

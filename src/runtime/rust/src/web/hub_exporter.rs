@@ -20,7 +20,9 @@
 //! full), push failures fall back to the spool, the spool itself is bounded
 //! (oldest batch evicted when full). No `unwrap`/`expect`/indexing.
 
-use super::push_exporter::{ExporterEnv, OutcomeLog, PushOutcome};
+use super::push_exporter::{
+    ExporterEnv, FlushDeadline, OutcomeLog, PushOutcome, drain_before_exit, record_exporter_runtime,
+};
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -134,6 +136,7 @@ pub async fn enable_from_env() {
             super::push_exporter::redacted_origin(&base)
         ),
     );
+    record_exporter_runtime();
     tokio::spawn(batcher(
         rx,
         HubTarget {
@@ -174,7 +177,7 @@ struct HubTarget {
 fn exporter_client(base: &str) -> Option<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
         .redirect(reqwest::redirect::Policy::none());
     super::push_exporter::routed(builder, base).build().ok()
 }
@@ -221,17 +224,20 @@ async fn batcher(mut rx: mpsc::Receiver<Entry>, target: HubTarget, interval_ms: 
     }
 }
 
-/// Best-effort pre-exit flush: sends a `Flush` sentinel and waits up to
-/// `cap_ms` milliseconds for the batcher to drain its buffer and the spool.
-/// No-op when the exporter is disabled or the channel is full. Never panics.
-pub async fn flush_now(cap_ms: u64) {
-    let Some(tx) = SENDER.get() else { return };
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
-    // try_send: non-blocking; best-effort (telemetry only).
-    if tx.try_send(Entry::Flush(ack_tx)).is_err() {
-        return;
-    }
-    let _ = tokio::time::timeout(Duration::from_millis(cap_ms), ack_rx).await;
+/// Connect ceiling of the hub client, in milliseconds.
+///
+/// The client builder and `FLUSH_DEADLINE` both read it, so the shutdown
+/// flush always outlasts a connect in flight.
+const CONNECT_TIMEOUT_MS: u64 = 5_000;
+
+/// How long the shutdown flush waits for the hub batcher's buffer and spool.
+const FLUSH_DEADLINE: FlushDeadline = FlushDeadline::after_connect::<CONNECT_TIMEOUT_MS>();
+
+/// Best-effort pre-exit flush of the hub exporter, bounded by `FLUSH_DEADLINE`.
+///
+/// No-op when the exporter is disabled. Never panics.
+pub async fn flush_now() {
+    drain_before_exit(SENDER.get(), Entry::Flush, FLUSH_DEADLINE).await;
 }
 
 /// Encode the accumulated logs/spans into OTLP batches, then push the spool
@@ -496,7 +502,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(capture)).with_state(rec.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
 
         let base = format!("http://127.0.0.1:{port}");
@@ -574,7 +580,7 @@ mod tests {
             .fallback(any(leak))
             .with_state(leak_hits.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(leak_listener, leak_app).await;
+            let _ = crate::server::serve_fixture(leak_listener, leak_app).await;
         });
 
         // The hub: answers every push with a 307 redirect to the leak target.
@@ -595,7 +601,7 @@ mod tests {
             .fallback(any(redirect))
             .with_state(leak_base.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(hub_listener, hub_app).await;
+            let _ = crate::server::serve_fixture(hub_listener, hub_app).await;
         });
 
         let base = format!("http://127.0.0.1:{hub_port}");
@@ -655,7 +661,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(refuse)).with_state(hits.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
         let base = format!("http://127.0.0.1:{port}");
         let target = HubTarget {

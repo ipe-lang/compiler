@@ -21,8 +21,12 @@ mod pairing;
 mod pretty;
 pub mod record_shapes;
 pub mod seq_clone;
+mod show_policy;
 
-pub use enum_facts::{EnumTraits, RuntimeBridgedEnum, payload_leaf_is_clone};
+pub use enum_facts::{
+    EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS, home_is_ffi_interface,
+    is_store_row_phantom_union, payload_leaf_is_clone,
+};
 pub use held::{
     EnumPayloadTable, MAX_HELD_WALK_DEPTH, Reach, enum_payload_holds, enum_payload_table,
     ir_type_holds, ir_type_reaches,
@@ -30,13 +34,18 @@ pub use held::{
 pub use ir::{
     Arm, BinOp, BoundSet, CallPin, Callee, Carried, CarrierLeaf, EnumDef, EvalOrder, Expr, Func,
     FuncId, HtmlEventShape, IrType, KernelClass, KernelFn, Match, ModPath, Module, OnFormKind, Pat,
-    Program, RowParam, RuntimeFeatureId, RuntimeModule, TypeDef, UiCtor, UiPlain, Variant,
-    carrier_is_clone, carrier_leaf, fun_value_arc_promotable, ir_type_feature_requirement,
-    ir_type_has_effect_carrier, ir_type_is_derivable, ir_type_is_serde, is_dispatch_free,
-    is_irrefutable,
+    Program, RowParam, RuntimeFeatureId, RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain,
+    Variant, carrier_is_clone, carrier_is_clone_bounded, carrier_leaf, fun_value_arc_promotable,
+    ir_type_feature_requirement, ir_type_has_effect_carrier, ir_type_is_derivable,
+    ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 pub use pairing::{PairedChildren, paired_children};
 pub use pretty::{MAX_IR_RENDER_DEPTH, pretty};
+pub use show_policy::{
+    DEEP_VALUE_MARKER, FUNCTION_MARKER, MAX_SHOWN_TUPLE_ARITY, NamedShow, RUNTIME_ALIASED_ENUMS,
+    SHOWN_LEAVES, ShowLeaf, ShowPolicy, ShowShape, WIDE_TUPLE_MARKER, ir_type_holds_refused,
+    named_enum_shape, refused_marker, runtime_aliased_enum, show_leaf,
+};
 
 /// The compilation target (kernel-availability axis) — re-exported so
 /// backend/db consumers reach it through the IR crate like `KernelFn`.

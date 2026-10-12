@@ -1,23 +1,29 @@
 //! Name resolution: `ipe_syntax` source tree → canonical AST. Port of the
 //! supported subset of `Ipe.Canonicalise.{Module,Expression,Pattern,Type}`.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 use ipe_diagnostics::{
-    AliasExpansionKind, CmdSubShapeMismatch, CodecAutoRejection, DResult, Diagnostic, Located,
-    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, SealRejection,
-    SortedNames, Span, TypeError,
+    AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
+    DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
+    ModulePlacementRejection, NameError, ParseError, SealRejection, SortedNames, Span, StdlibReach,
+    TypeError,
 };
 use ipe_intern::{Interner, Symbol};
-use ipe_kernels::{AppSurface, StdlibKernel, WebCapability};
+use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
 use ipe_syntax as src;
-use ipe_syntax::fixity::{Assoc, Fixity, fixity};
+use ipe_syntax::fixity::{OperatorModule, PARSER_OPERATOR_MODULE};
+use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
 use crate::env::{
-    CtorHome, CtorIdentity, CtorLookup, Env, VarHome, WildcardCtorOrigin, WildcardOrigin,
+    AbsentQualifier, ClaimForm, CmdOrSub, CtorHome, CtorIdentity, Env, ImportAliases,
+    ModuleIdentity, QualifierClaim, TeaShape, VarHome,
+};
+use crate::scope::{
+    AliasBody, Clash, ExprTarget, Identity, ModuleScope, Origin, Resolved, Tier,
+    TypeTarget as ScopeType, ValueIdentity,
 };
 
 /// The maximum number of `did you mean` suggestions attached to an unresolved
@@ -82,551 +88,64 @@ const CUSTOM_ELEMENT_CTOR: &str = "fromFile";
 /// `Ipe.Ffi.Js.CustomElement` module the constructor is reached through.
 const CUSTOM_ELEMENT_TYPE: &str = "CustomElement";
 
-/// Type-constructor names the compiler reserves for built-ins. A user `type` /
-/// `type alias` whose name is one of these is rejected at declaration
-/// ([`NameError::ReservedBuiltinType`], IPE-N0026).
+/// The empty-home builtin row an unqualified type name resolves to, if any.
 ///
-/// This is the exact set that `ipe_lower`'s `ir_type_from_ty` matches *ahead of*
-/// its user-enum lookup (`enum_variants` guard). Because that match keys on the
-/// type name alone, a user declaration of any of these names would be silently
-/// overridden by the built-in IR mapping and miscompile with **no diagnostic** —
-/// so the shadow must be rejected here, at the parse/canon boundary, rather than
-/// validated downstream (parse-don't-validate; make-invalid-states-
-/// unrepresentable).
-///
-/// Every entry is cited to its `crates/ipe_lower/src/lower.rs::ir_type_from_ty`
-/// arm (HEAD line numbers):
-///
-/// ```text
-/// Int 2069, Float 2070, Bool 2071, String/Error 2077, Char 2078, Bytes 2081,
-/// Task 2084, Maybe 2103, Result 2108, List 2114, Dict 2119, Set 2133,
-/// Decoder 2148, Db 2162, Cmd 2167, Sub 2179, SqlValue/SqlField 2195,
-/// Request 2203, Response 2204, Route 2205, Cookie 2206, Html 2221,
-/// Element 2236, Attribute 2254, Event 2279, Length 2295, HAlign 2297,
-/// VAlign 2298, Location 2299, PseudoClass 2300, Description 2301,
-/// LayoutContext 2302, WebReq 2304.
-/// ```
-///
-/// `SqlFragment` is not in this citation list; see its own arm in
-/// `ir_type_from_ty` / `ir_type_from_canon`.
-///
-/// Several names that `ir_type_from_ty` also matches are deliberately EXCLUDED,
-/// because they sit BELOW the `enum_variants` guard in BOTH lowering
-/// paths (ty + canon), so a program union of that name wins by its
-/// `(home, name)` identity and only a genuine opaque builtin (no union entry)
-/// reaches the fallback arm:
-///   * `Value` — matched *after* the `enum_variants` guard, so a user
-///     `type Value` already wins; it is not a silent-override hole.
-///   * `Color`, `Length`, `HAlign`, `VAlign`, `Location`, `PseudoClass`,
-///     `Description`, `LayoutContext`, `WebReq` — the nullary Ipe.Ui / Ipe.Web
-///     opaque names. Leaving them UNRESERVED is what lets a user ADT — and,
-///     crucially, a compiled-source `Ipe.Css` type (`Color` / `Length` / …) —
-///     declare them; the home-aware guard keeps the genuine Ipe.Ui
-///     builtin resolving to `UiPlain`. Multiple shipped `.ipe` fixtures
-///     (`dict_adt_gate`, `set_adt_fn_gate`, `mm_local_pkg`, …) already
-///     declare `type Color` as a benign sample ADT and now lower correctly.
-pub const RESERVED_BUILTIN_TYPES: &[&str] = &[
-    "Int",
-    "Float",
-    "Bool",
-    "String",
-    "Error",
-    "Char",
-    "Bytes",
-    "Task",
-    "Maybe",
-    "Result",
-    "List",
-    "Dict",
-    "Set",
-    "Decoder",
-    "Db",
-    "Cmd",
-    "Sub",
-    "SqlValue",
-    "SqlField",
-    // `Ipe.Db.Store`'s typed projection-descriptor ADTs.  Reserved so user code
-    // cannot declare a same-named union and silently override the synthetic
-    // `EnumDef` the lowerer injects (same precedent as `SqlValue`/`SqlField`).
-    "ProjectionTerm",
-    "ProjectionOperand",
-    "ArithOp",
-    // `Ipe.Db.Sql`'s opaque WHERE-fragment type — reserved (not
-    // `EXTRA_BUILTIN_TYPE_NAMES`) so user shadowing of this security-tier type
-    // is a hard canon error, matching the `SqlValue`/`SqlField` precedent.
-    "SqlFragment",
-    // `Ipe.Secret`'s opaque sealed secret-string type —
-    // reserved for the same reason as `SqlFragment`: a security-tier type
-    // must not be shadowable by user code.
-    "Secret",
-    // `Ipe.Jwt`'s opaque signing-algorithm descriptor — shares the `Secret`
-    // runtime representation (sealed, no Debug/Display surface on key material).
-    // Reserved because its lowerer arm sits above the `enum_variants` guard
-    // in both `ir_type_from_canon` and `ir_type_from_ty`, fixing a silent
-    // SEAL break where a user `type Algorithm` would be mis-lowered.
-    "Algorithm",
-    // `Ipe.Path`'s opaque validated filesystem-path type — reserved for the
-    // same reason: a security-tier type (the traversal/NUL-rejection boundary)
-    // must not be shadowable by user code.
-    "Path",
-    // `Ipe.Regex`'s opaque compiled-pattern type — reserved so `Regex.compile`'s
-    // typed-`Err`-on-invalid-pattern guarantee cannot be defeated by a user
-    // `type Regex` shadowing the built-in handle.
-    "Regex",
-    // `Ipe.Url`'s opaque validated URL type — reserved for the same reason: a
-    // security-tier type (the scheme/SSRF parse boundary) must not be
-    // shadowable by user code defeating `Url.fromString`'s parse guarantee.
-    "Url",
-    // `Ipe.Url`'s opaque same-origin relative reference — reserved for the same
-    // reason: a security-tier type (the browser-href SSRF boundary) must not be
-    // shadowable by user code defeating `Url.relative`'s parse guarantee.
-    "Relative",
-    // `Ipe.Db.Dsn`'s opaque validated connection descriptor — reserved for the
-    // same reason: a security-tier type (the DSN parse boundary, carrying a
-    // `Secret` password and a fail-closed TLS posture) must not be shadowable by
-    // user code, or a forged look-alike `Dsn` could smuggle a host/credential
-    // past the parser once a connect step consumes it.
-    "Dsn",
-    // `Ipe.Crypto`'s opaque role-typed crypto key — reserved because a user
-    // `type Key` would be silently mis-lowered to `IrType::CryptoKey` (the
-    // lowerer arm sits above the `enum_variants` guard), causing SEAL breaks
-    // wherever the user's ADT constructors are used.
-    "Key",
-    // `Ipe.Crypto`'s opaque HMAC output — reserved for the same reason as `Key`.
-    "Mac",
-    // `Ipe.Email`'s opaque validated email address — reserved because its lowerer
-    // arm sits above the `enum_variants` guard; a user `type EmailAddress` would
-    // be silently mis-lowered to `IrType::EmailAddress`, breaking the SEAL.
-    "EmailAddress",
-    // `Ipe.Locale`'s opaque BCP-47 locale handle — reserved for the same reason:
-    // its lowerer arm sits above the `enum_variants` guard and a user
-    // `type Locale` would be mis-lowered.
-    "Locale",
-    // `Ipe.Auth`'s opaque authenticated subject — reserved because it is a
-    // security-tier type: a user `type Principal` could forge a look-alike that
-    // an `…As` row-security op would trust as an authenticated caller. It has no
-    // Ipê constructor, so the type name being unshadowable keeps the mint the
-    // sole origin.
-    "Principal",
-    // `Ipe.Db`'s external-connection handle `Connection mode` and its two phantom
-    // access-mode markers. Reserved because the read-only-by-type guarantee is the
-    // load-bearing security property: a user `type Connection …` or a shadowed
-    // `ReadOnly`/`ReadWrite` could forge a read-write handle to a foreign DB from a
-    // read-only one, defeating the compile-time write barrier. The markers appear
-    // only as `Connection`'s argument (phantom), never as a standalone value.
-    "Connection",
-    "ReadOnly",
-    "ReadWrite",
-    // The JS-interop visual-widget boundary type. A binding typed
-    // `CustomElement down up` names, in its two concrete type parameters, the
-    // sealed down-state and up-event that cross the Ipê↔JS seam — every value
-    // is decoded on the way in / encoded on the way out, never an untyped blob.
-    // Reserved so user code cannot declare its own `type CustomElement …` and
-    // smuggle an untyped widget past the seal: the reservation is what makes the
-    // typed boundary the ONLY spelling of the boundary (Security #1, fail-closed
-    // by construction). A USE of the name in an annotation resolves in
-    // `canonicalise_type` only through two fail-closed gates — exactly two type
-    // parameters (arity, IPE-N0031) and a plain-value SEAL on each (IPE-N0039).
-    // `CustomElement down up` is the shipped typed JS-widget boundary.
-    // Its two type parameters name the sealed down-state and up-event.
-    "CustomElement",
-    // `Ipe.PubSub`'s phantom topic handle type — reserved so user code cannot
-    // define `type Topic` and silently bypass the lowerer's `Topic a → Str` arm.
-    // `PubSub.ipe` (EmbeddedStdlib) may declare it without penalty.
-    "Topic",
-    "StreamId",
-    "ChunkEvent",
-    // `Ipe.Http`'s closed HTTP-verb ADT. Reserved because it drives
-    // exhaustiveness (`exhaust_union`) and lowers to a fixed
-    // `IrType::HttpMethod` enum; a user `type HttpMethod` would be hijacked by
-    // the bare-name lowerer arm and mis-lower.
-    "HttpMethod",
-    "Request",
-    "Response",
-    "Route",
-    "Cookie",
-    // `Ipe.Server`'s opaque authed-route descriptors. Reserved because they are
-    // security-tier: `AuthConfig` carries the token-verification `Secret`, and a
-    // user look-alike `type AuthConfig …`/`type TokenSource …` could smuggle a
-    // forged configuration into an authed route and defeat the fail-closed auth
-    // gate. Built only through the `Server` auth kernels, never an Ipê term.
-    "AuthConfig",
-    "TokenSource",
-    // `Ipe.App`'s runtime-config carrier `Setting shape`. Reserved because it is
-    // security-tier: a setting may carry a `Secret` (a `Db.url` credential), and
-    // the phantom `shape` marker is the load-bearing guarantee that a `Web`-only
-    // setting cannot be smuggled into another shape's settings list. A user
-    // `type Setting …` could forge a look-alike and defeat that shape barrier.
-    // Built only through the setting kernels, never an Ipê term.
-    "Setting",
-    // `Program shape msg` — the TEA shape carrier, the uniform result of every
-    // `<Shape>.app` entry. Reserved so a user `type Program …` cannot forge a
-    // look-alike carrier and cross a `main`'s shape barrier; built only by the
-    // app-entry kernels, never an Ipê term. The phantom `shape` tag and `msg`
-    // both erase at lower.
-    "Program",
-    // The closed config-tag ADTs — the argument types of `Host.bind` /
-    // `Log.level` / `Web.csrf`. Reserved so a user `type HostMode …` cannot forge
-    // a look-alike with an out-of-range or CSRF-disabling variant that the setting
-    // builders would then accept; each is built only through its constructor
-    // kernels, never an Ipê term. `CsrfMode` in particular has no disabling
-    // variant, so a setting cannot express turning CSRF off.
-    "HostMode",
-    "LogLevel",
-    "CsrfMode",
-    // `RevocationMode` — nullary closed revocation-gate ADT (`Off` / `Store`).
-    // Reserved so a user `type RevocationMode …` cannot forge a look-alike with an
-    // out-of-range or enabling variant; built only through `Web.revocationOff` /
-    // `Web.revocationStore` constructor kernels.
-    "RevocationMode",
-    "Html",
-    // `View engine msg` — the engine-tagged view carrier and SSOT surface.
-    // Reserved so a user `type View …` cannot shadow the builtin and forge a
-    // view over an out-of-set engine tag, defeating the closed `{Web, Tui, Cli}`
-    // engine gate.
-    "View",
-    "Element",
-    // `Ipe.Ui.Tui`'s Tui-only view type `Screen msg`. Reserved so a user
-    // `type Screen …` cannot shadow the builtin and defeat the shape-gate that
-    // prevents Web/Cli builders from appearing in a `view : M -> Screen Msg`
-    // function. Built only through `Ipe.Ui.Tui.*` kernels. `Cells` is
-    // reserved alongside it — the internal rendering-model spelling.
-    "Screen",
-    "Cells",
-    // `Ipe.Ui.Tui`'s cell-native attribute type `Attribute msg` (interned
-    // `TuiAttr`). Reserved so a user `type TuiAttr …` cannot forge a look-alike
-    // that would admit a DOM attribute into a `Screen` view.
-    "TuiAttr",
-    // `Ipe.Ui.Cli`'s line-oriented view type `Lines msg` and its line-native
-    // attribute type `Attribute msg` (interned `CliAttr`). Reserved so a user
-    // `type Lines …` / `type CliAttr …` cannot shadow the builtins and defeat the
-    // shape-gate that keeps DOM and 2D cell builders out of a `Lines` view. Built
-    // only through `Ipe.Ui.Cli.*` kernels.
-    "Lines",
-    "CliAttr",
-    // `Ipe.Color`'s opaque companion types. The unified colour value type `Color`
-    // is user-shadowable via the empty-home `Ui.Color` name (its lowerer arm sits
-    // below the `enum_variants` guard); these companions instead carry a fixed
-    // `ipe_runtime::color::*` identity and are built ONLY through `Ipe.Color`
-    // kernels — the typed parse-error channel (`ColorError`), the terminal
-    // capability profile and down-sampled result (`TermProfile` / `AnsiColor`),
-    // and the accessibility bands (`WcagLevel` / `TextSize` / `Deficiency`).
-    // Reserved so a user type of the same name cannot forge a look-alike over the
-    // opaque runtime carrier.
-    "ColorError",
-    "TermProfile",
-    "AnsiColor",
-    "WcagLevel",
-    "TextSize",
-    "Deficiency",
-    "Attribute",
-    "Event",
-    "Length",
-    "HAlign",
-    "VAlign",
-    "Location",
-    "PseudoClass",
-    "Description",
-    "LayoutContext",
-    "WebReq",
-    // `Ipe.Ffi.Js`'s opaque session-stream handle — reserved for the same reason as
-    // the other security-tier opaque handles (`Principal` / `Connection`): the
-    // handle is the SOLE address of a bounded session, obtained only from
-    // `Js.openSession`, and a user `type SessionHandle …` could forge a look-alike
-    // to address a session it never opened, defeating the fail-closed cross-handle
-    // routing. It has no Ipê constructor, so reserving the name keeps the mint the
-    // sole origin. Its lowerer arm sits ABOVE the `enum_variants` guard.
-    "SessionHandle",
-];
-
-/// Extra built-in type names that are handled by the lowerer's explicit arms
-/// (`ipe_lower::ir_type_from_canon`) but are NOT listed in
-/// [`RESERVED_BUILTIN_TYPES`] (and therefore may NOT be user-defined).
-///
-/// These names must receive the empty-home sentinel (`Vec::new()`) from
-/// `canonicalise_type` just like the reserved builtins — omitting them would
-/// cause `canonicalise_type` to emit [`NameError::TypeNotFound`] for a
-/// legitimate builtin annotation such as `relay : Order` or `ws : WebSocketServer`.
-///
-/// The names below are absent from `RESERVED_BUILTIN_TYPES` because they are
-/// either:
-/// * Nullary Ipe.Ui/Ipe.Web opaque names whose lowerer arm sits BELOW the
-///   `enum_variants` guard (so a user `type Color` wins by its real home) — and
-///   therefore can never be shadowed in a user annotation either; OR
-/// * Additional opaque kernel types added after the original reservation list
-///   was drawn up.
-///
-/// Keeping this list in sync with `ir_type_from_canon`'s explicit arms is the
-/// only invariant. Any name handled by an explicit arm with `home = []` that
-/// is NOT in `RESERVED_BUILTIN_TYPES` belongs here.
-const EXTRA_BUILTIN_TYPE_NAMES: &[&str] = &[
-    // Three-way comparison result (`lt`/`eq`/`gt`).
-    "Order",
-    // Ipe.Ui plain types — lowerer guard is BELOW `enum_variants` so user ADTs
-    // of the same name win via their real home; but annotations that name them
-    // without a program-level definition still need the empty-home sentinel.
-    "Color",
-    "Length",
-    "HAlign",
-    "VAlign",
-    "Location",
-    "PseudoClass",
-    "Description",
-    "LayoutContext",
-    "WebReq",
-    // Ipe.Web / Ipe.Http.Server / Ipe.Http.Server.WebSocket opaque types.
-    "WebRoute",
-    "StreamWriter",
-    "HttpRequest",
-    "WebSocketServer",
-    "WebSocketServerCfg",
-    // Ipe.Ui.Input parametric label/placeholder types.
-    "Label",
-    "Placeholder",
-    // Ipe.Decimal opaque arbitrary-precision decimal type.
-    // Lowerer arm: `ir_type_from_canon` `"Decimal" => IrType::Decimal`.
-    "Decimal",
-    // `Ipe.Db.Migration` record alias `{ name : String, sql : String }`
-    // (reference `Ipe/Db.ipe:237`). Structural record — `normalize_annotation_ty`
-    // expands the name to the record; the lowerer keeps it a synthesised struct
-    // (no opaque arm), so it is user-shadowable-safe like `HttpRequest`.
-    "Migration",
-    // `Ipe.Error`'s `ErrorKind` / `ErrorDetails` unions. Both have an
-    // `ir_type_from_canon` arm (`"ErrorKind" => IrType::ErrorKind` /
-    // `"ErrorDetails" => IrType::ErrorDetails`) and are declared in the shared
-    // built-in table (`crate::builtins::BUILTIN_UNIONS`), so an annotation such
-    // as `classify : ErrorKind -> String` must resolve to the empty-home
-    // sentinel rather than IPE-N0002.
-    "ErrorKind",
-    "ErrorDetails",
-    // `Ipe.Error`'s NOMINAL payload types (see
-    // `docs/adr/0001-language-semantics-and-types.md`).
-    // Opaque nominal Cons backed
-    // by `ipe_runtime::error::{IpePanicInfo, IpeTypeInfo, IpeErrorInfo}`, so
-    // annotations such as `describePanic : PanicInfo -> String` must resolve.
-    // Lowerer arms: `ir_type_from_canon` / `ir_type_from_ty`
-    // `"PanicInfo" => IrType::PanicInfo` (etc.).
-    "PanicInfo",
-    "TypeInfo",
-    "ErrorInfo",
-    // `CustomElement down up` — the JS-widget boundary type (reserved in
-    // `RESERVED_BUILTIN_TYPES`). Registered here too so a bare annotation
-    // `codeEditor : CustomElement EditorState EditorEvent` resolves to the
-    // empty-home sentinel rather than IPE-N0002; `canonicalise_type` then gates
-    // it fail-closed on arity (IPE-N0031) and the plain-value SEAL (IPE-N0039),
-    // and the typed seam is fully emittable.
-    "CustomElement",
-];
-
-/// Kernel-implicit built-in type names that are globally in scope in
-/// every Ipê program but are NOT declared by any compiled `.ipe` source file —
-/// they are resolved by the runtime as opaque handles.
-///
-/// Without these entries, bare annotations
-/// like `handleHome : Handler` fail with `TypeNotFound` / IPE-N0002 even
-/// though they are legitimate kernel builtins. Each entry receives the
-/// empty-home sentinel (`Vec::new()`) just like `RESERVED_BUILTIN_TYPES` and
-/// `EXTRA_BUILTIN_TYPE_NAMES`.
-///
-/// Note: not all of these have explicit arms in `ipe_lower::ir_type_from_canon`
-/// yet (`Handler` / `Middleware` / `Session` / `Store` /
-/// `VNode`). Registering them here is the canon-level fix; lowerer arms complete
-/// the end-to-end path.
-///
-/// **User-shadowable**: every name here may be declared by a user `.ipe` module
-/// without a canon error. The lowerer arm for each sits BELOW the
-/// `enum_variants` guard, so a user ADT wins via its real home — the same
-/// `Color`/`Length` precedent used by [`EXTRA_BUILTIN_TYPE_NAMES`]. Names
-/// whose lowerer arm sits ABOVE the guard with a fixed `IrType` mapping
-/// (`HttpMethod`, `Connection`, …) live in [`RESERVED_BUILTIN_TYPES`] instead.
-const KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES: &[&str] = &[
-    // `Request -> Task Error Response` alias from Ipe.Http.Server.
-    "Handler",
-    // `Html msg` — the top-level rendered HTML node type from Ipe.Html / Ipe.Ui.
-    // Needed so `viewFoo : Model -> Html Msg` annotations typecheck without
-    // `import Ipe.Html exposing (Html)`.
-    "Html",
-    // Opaque JSON value type (`Value = any` in Ipê). The lowerer handles this
-    // via an explicit arm placed after the `enum_variants` guard — so a user
-    // `type Value` still wins, but a bare annotation compiles.
-    "Value",
-    // `Handler -> Handler` middleware alias from Ipe.Http.Middleware.
-    "Middleware",
-    // Ipe.Web session object.
-    "Session",
-    // Ipe.Web session store.
-    "Store",
-    // Virtual DOM node (Ipe.Web diff engine).
-    "VNode",
-];
+/// Every builtin-name question canon asks — is it a builtin, may a user declare
+/// it, its fixed arity, its boundary seal class — reads this one row of
+/// [`ipe_kernels::BUILTIN_TYPES`]. A row with a module home is never returned:
+/// such a head is reached only by its qualified `(home, name)`.
+fn bare_builtin(name: &str) -> Option<&'static BuiltinRow> {
+    BuiltinType::of_bare_name(name).map(BuiltinType::row)
+}
 
 /// `true` when `name` is any known Ipê built-in type name.
 ///
-/// Covers the union of the reserved set, the lowerer's extra explicit-arm
-/// names, and the kernel-implicit names. Answers "is this a known built-in
-/// at all?".
-///
-/// Used for annotation resolution (the empty-home sentinel in
+/// Answers "is this a known empty-home built-in at all?", whatever its
+/// [`ipe_kernels::BuiltinRole`]. Used for annotation resolution (the empty-home sentinel in
 /// `resolve_unqualified_type_home`) and for re-export tracking in stdlib
 /// modules. NOT the right predicate for "may a user declare this name?" —
 /// use [`is_user_type_declaration_forbidden`] for that gate.
 #[must_use]
 pub fn is_reserved_builtin_type_name(name: &str) -> bool {
-    builtin_type_name_set().contains(name)
-}
-
-/// The union of every built-in type-name table, as an O(1)-membership set built
-/// once. The three source slices stay the single source of truth; this only
-/// caches their union so per-node membership tests avoid three linear scans.
-fn builtin_type_name_set() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        RESERVED_BUILTIN_TYPES
-            .iter()
-            .chain(EXTRA_BUILTIN_TYPE_NAMES)
-            .chain(KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES)
-            .copied()
-            .collect()
-    })
+    bare_builtin(name).is_some()
 }
 
 /// `true` when a user `.ipe` module (or an FFI-generated shadow module) may
 /// NOT soundly declare a type with this name.
 ///
-/// Only [`RESERVED_BUILTIN_TYPES`] names are forbidden: those are types whose
-/// lowerer arm in `ir_type_from_ty` / `ir_type_from_canon` sits ABOVE the
-/// `enum_variants` guard with a fixed `IrType` mapping. A competing user ADT
-/// would be silently overridden and mis-lower — IPE-N0026 blocks it.
+/// Only a [`ipe_kernels::BuiltinRole::Reserved`] row is forbidden: its lowerer arm in
+/// `ir_type_from_ty` / `ir_type_from_canon` sits ABOVE the `enum_variants`
+/// guard with a fixed `IrType` mapping, keyed on the name alone, so a competing
+/// user ADT would be silently overridden and mis-lower — IPE-N0026 blocks it.
 ///
-/// [`EXTRA_BUILTIN_TYPE_NAMES`] and [`KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES`]
-/// names are explicitly NOT forbidden: their lowerer arms sit below the guard
-/// (the user ADT wins via its own home). A user `type Handler a`, `type Store`,
-/// or `type Color` is valid and lowers correctly. An FFI interface wrapping a
+/// [`ipe_kernels::BuiltinRole::LoweredBelowGuard`] and
+/// [`ipe_kernels::BuiltinRole::KernelImplicit`] rows
+/// are NOT forbidden: their lowerer arms sit below the guard, so the user ADT
+/// wins via its own home. A user `type Handler a`, `type Store`, or
+/// `type Color` is valid and lowers correctly; an FFI interface wrapping a
 /// foreign `struct Handler` or `struct Store` is equally sound.
 ///
 /// Both [`reject_reserved_builtin_type`] (the canon resolve gate, IPE-N0026)
-/// and the FFI shadow gate call this predicate — it is the SSOT for "is this
-/// user-declaration forbidden?".
+/// and the FFI shadow gate call this predicate.
 #[must_use]
 pub fn is_user_type_declaration_forbidden(name: &str) -> bool {
-    RESERVED_BUILTIN_TYPES.contains(&name)
+    bare_builtin(name).is_some_and(|row| row.role().forbids_user_declaration())
 }
 
 /// Fixed type-argument arity for empty-home builtins, or `None`.
 ///
 /// Drives the IPE-N0031 canon gate: a mis-arity application would otherwise
-/// fall through to the lowerer's empty-home ICE catch-all (IPE-I0001). This
-/// is the single source of truth for the fixed-arity gate; the lower-side
-/// and seal-side tables derive from it so any future addition closes the gate
-/// at all sites at once.
+/// fall through to the lowerer's empty-home ICE catch-all (IPE-I0001). The
+/// arity is the row's [`BuiltinRow::fixed_arity`] column, which the kernels
+/// table proves reserved, so a fixed-arity head can never be user-shadowed.
 ///
-/// Members:
-/// * closed containers (`List`/`Maybe`/`Set`, `Dict`/`Result`);
-/// * `Connection mode` — `Ipe.Db`'s external-connection handle (arity 1);
-/// * `Setting shape` — `Ipe.App`'s runtime-config carrier (arity 1);
-/// * `ReadOnly`/`ReadWrite` — nullary phantom access-mode markers;
-/// * `HostMode`/`LogLevel`/`CsrfMode`/`RevocationMode` — nullary closed config-tag ADTs (the
-///   argument types of `Host.bind`/`Log.level`/`Web.csrf`/`Web.withRevocation`).
-/// * `ColorError`/`TermProfile`/`AnsiColor`/`WcagLevel`/`TextSize`/`Deficiency` —
-///   the nullary opaque `Ipe.Color` companion types, each carrying an
-///   `ipe_runtime::color::*` identity.
-///
-/// `Task`/`Cmd`/`Sub` are absent (their gate is in `ipe_types::constrain`).
-/// `CustomElement` is absent (name-based gate, fused with its boundary SEAL).
+/// `Task`/`Cmd`/`Sub` carry no arity here (their gate is in
+/// `ipe_types::constrain`); `CustomElement` carries none either (its
+/// name-based gate is fused with its boundary SEAL).
 #[must_use]
 pub fn builtin_empty_home_arity(name: Option<&str>) -> Option<usize> {
-    match name? {
-        "List" | "Maybe" | "Set" | "Connection" | "Setting" => Some(1),
-        // `Program shape msg` — the TEA shape carrier (arity 2); the phantom
-        // `shape` tag and `msg` both erase at lower. Widened here FIRST so a
-        // `Program`-carrier application resolves through the IPE-N0031 arity gate
-        // instead of falling into the lowerer's empty-home ICE (IPE-I0001).
-        // `View engine msg` — the engine-tagged view carrier (arity 2); the
-        // phantom `engine` tag erases at lower to the per-engine `IrType::Ui`
-        // ctor. Gated here so a mis-arity `View` application resolves through
-        // IPE-N0031 rather than the lowerer's empty-home ICE.
-        "Dict" | "Result" | "Program" | "View" => Some(2),
-        "ReadOnly" | "ReadWrite" | "HostMode" | "LogLevel" | "CsrfMode" | "RevocationMode"
-        | "ProjectionTerm" | "ProjectionOperand" | "ArithOp" | "ColorError" | "TermProfile"
-        | "AnsiColor" | "WcagLevel" | "TextSize" | "Deficiency" => Some(0),
-        _ => None,
-    }
+    bare_builtin(name?)?.fixed_arity().map(usize::from)
 }
-
-/// Built-in primitive value types that ARE plain, closed, and serialisable —
-/// the leaves the boundary seal (§2.1) accepts directly. Every crossing value is
-/// encoded/decoded as canonical JSON, so this is exactly the set of primitives
-/// with a total JSON denotation.
-const SEAL_PLAIN_PRIMITIVES: &[&str] = &["Int", "Float", "Bool", "String", "Char", "Bytes"];
-
-/// All value containers the boundary seal recurses into, listed once.
-///
-/// `Connection` is deliberately absent even though it appears in
-/// [`builtin_empty_home_arity`]: it is an opaque DB handle, not a value
-/// container the seal should recurse into. The test
-/// `seal_container_arity_derives_from_builtin_arity` asserts this split.
-const SEAL_VALUE_CONTAINERS: &[&str] = &["List", "Set", "Maybe", "Dict", "Result"];
-
-/// The arity a value-container name contributes to the boundary seal recursion.
-///
-/// Returns the expected argument count for names in [`SEAL_VALUE_CONTAINERS`].
-/// Returns `None` for anything outside that set (including `Connection`, which
-/// has an entry in [`builtin_empty_home_arity`] but is intentionally excluded
-/// from seal recursion as an opaque handle).
-///
-/// Derived from [`builtin_empty_home_arity`] to keep the two tables in sync:
-/// any arity added there for a value container must be mirrored here, and the
-/// test `seal_container_arity_derives_from_builtin_arity` will red if they diverge.
-fn seal_container_arity(name: &str) -> Option<usize> {
-    if SEAL_VALUE_CONTAINERS.contains(&name) {
-        builtin_empty_home_arity(Some(name))
-    } else {
-        None
-    }
-}
-
-/// Built-in effect carriers — never a boundary DATA value.
-const SEAL_EFFECT_CARRIERS: &[&str] = &["Cmd", "Sub", "Task"];
-
-/// Built-in view / `Ipe.Ui` value types — clonable but not a boundary
-/// serialisable data value.
-const SEAL_VIEW_TYPES: &[&str] = &[
-    "Html",
-    "View",
-    "Element",
-    "Attribute",
-    "Event",
-    "Color",
-    "Length",
-    "HAlign",
-    "VAlign",
-    "Location",
-    "PseudoClass",
-    "Description",
-    "LayoutContext",
-];
-
-/// Built-in `Secret` / reserved-sink / opaque security-boundary handle types.
-/// A secret- or sink-privileged value, or an opaque validated handle, must never
-/// be serialised across the JS seam — these mirror the non-serde leaves of the
-/// `HydrationState` plain-value gate
-/// (`ipe_backend_rust::project::ir_type_contains_non_serde`), extended with the
-/// explicit `Secret` / sink exclusion the boundary seal adds.
-const SEAL_SECRET_OR_SINK: &[&str] = &[
-    "Secret",
-    "SqlFragment",
-    "SqlValue",
-    "SqlField",
-    "Regex",
-    "Path",
-    "Url",
-    "Relative",
-    "Dsn",
-    "Key",
-    "Mac",
-    "EmailAddress",
-    "Locale",
-];
 
 /// The boundary-seal legality check over a canonicalised type (§2.1). Returns
 /// `Some(reason)` when `ty` may NOT cross the Ipê↔JS seam, `None` when it is a
@@ -650,7 +169,9 @@ fn boundary_seal_rejection(ty: &canon::Type, interner: &Interner) -> Option<Seal
     match ty {
         // The seal is monomorphic and concrete: a type variable has no single
         // codec, and an open row is not a closed value type.
-        canon::Type::Var(_) | canon::Type::RecordOpen(_, _) => Some(SealRejection::NonConcrete),
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::RecordOpen(_, _) => {
+            Some(SealRejection::NonConcrete)
+        }
         // A function is not a plain value and is not serialisable.
         canon::Type::Lambda(_, _) => Some(SealRejection::Function),
         // Unit, tuples, and closed records are plain when every element is.
@@ -667,34 +188,25 @@ fn boundary_seal_rejection(ty: &canon::Type, interner: &Interner) -> Option<Seal
                 // fail closed rather than treat it as plain.
                 return Some(SealRejection::NotProvenPlain);
             };
-            if SEAL_PLAIN_PRIMITIVES.contains(&text) {
-                return None;
-            }
-            if SEAL_EFFECT_CARRIERS.contains(&text) {
-                return Some(SealRejection::EffectCarrier);
-            }
-            if SEAL_VIEW_TYPES.contains(&text) {
-                return Some(SealRejection::ViewValue);
-            }
-            if SEAL_SECRET_OR_SINK.contains(&text) {
-                return Some(SealRejection::SecretOrSink);
-            }
-            if seal_container_arity(text).is_some() {
-                return args
+            match bare_builtin(text).map(BuiltinRow::seal) {
+                Some(SealClass::EffectCarrier) => Some(SealRejection::EffectCarrier),
+                Some(SealClass::View) => Some(SealRejection::ViewValue),
+                Some(SealClass::SecretOrSink) => Some(SealRejection::SecretOrSink),
+                Some(SealClass::ValueContainer) => args
                     .iter()
-                    .find_map(|a| boundary_seal_rejection(a, interner));
+                    .find_map(|a| boundary_seal_rejection(a, interner)),
+                // An empty-home builtin no class above admits (an opaque handle
+                // such as `Db`, `Decoder`, a server type, or `CustomElement`
+                // itself) is NOT proven plain — fail closed. A same-named head
+                // with a real defining home is a user ADT.
+                Some(SealClass::SealedHandle | SealClass::Opaque) if home.is_empty() => {
+                    Some(SealRejection::NotProvenPlain)
+                }
+                // A plain primitive crosses the seam. A user-declared ADT
+                // reference is accepted at this layer (its payloads are
+                // re-verified by the generated codec later).
+                Some(SealClass::Plain | SealClass::SealedHandle | SealClass::Opaque) | None => None,
             }
-            // A user-declared ADT reference: accepted at this layer (its payloads
-            // are re-verified by the generated codec later). Distinguished from an
-            // unknown/opaque builtin by having a real defining home OR by not
-            // being any known builtin type name. An empty-home name that IS a
-            // known builtin but reached none of the arms above (an opaque handle
-            // such as `Db`, `Decoder`, a server type, or `CustomElement` itself)
-            // is NOT proven plain — fail closed.
-            if home.is_empty() && is_reserved_builtin_type_name(text) {
-                return Some(SealRejection::NotProvenPlain);
-            }
-            None
         }
     }
 }
@@ -705,6 +217,7 @@ fn boundary_seal_rejection(ty: &canon::Type, interner: &Interner) -> Option<Seal
 fn canon_type_display(ty: &canon::Type, interner: &Interner) -> Box<str> {
     match ty {
         canon::Type::Var(v) => interner.resolve(*v).unwrap_or("_").into(),
+        canon::Type::Wildcard => canon::WILDCARD_SPELLING.into(),
         canon::Type::Lambda(_, _) => "a function type".into(),
         canon::Type::Unit => "()".into(),
         canon::Type::Tuple(_) => "a tuple type".into(),
@@ -721,7 +234,8 @@ fn canon_type_display(ty: &canon::Type, interner: &Interner) -> Box<str> {
     }
 }
 
-/// The subset of [`RESERVED_BUILTIN_TYPES`] that a trusted
+/// The subset of the reserved builtin names
+/// ([`is_user_type_declaration_forbidden`]) that a trusted
 /// [`ModuleOrigin::EmbeddedStdlib`] module is permitted to DEFINE, while a
 /// [`ModuleOrigin::User`] module stays rejected (IPE-N0026).
 ///
@@ -759,7 +273,8 @@ const STDLIB_DEFINABLE_UI_TYPES: &[&str] = &[
     "WebReq",
 ];
 
-/// The subset of [`RESERVED_BUILTIN_TYPES`] that a trusted
+/// The subset of the reserved builtin names
+/// ([`is_user_type_declaration_forbidden`]) that a trusted
 /// [`ModuleOrigin::EmbeddedStdlib`] module may DEFINE as the source-level
 /// re-declaration of a shared opaque BOXED-WRAPPER carrier — as opposed to the
 /// nullary Ipe.Ui plain names in [`STDLIB_DEFINABLE_UI_TYPES`].
@@ -809,8 +324,7 @@ pub fn is_stdlib_shared_carrier_type(name: &str) -> bool {
 }
 
 /// Reject a `type` / `type alias` whose name shadows a reserved built-in type
-/// constructor. See [`RESERVED_BUILTIN_TYPES`] and
-/// [`is_user_type_declaration_forbidden`].
+/// constructor. See [`is_user_type_declaration_forbidden`].
 ///
 /// A [`ModuleOrigin::EmbeddedStdlib`] module is exempt for the
 /// [`STDLIB_DEFINABLE_UI_TYPES`] subset (nullary Ipe.Ui plain names — `Ipe.Css`)
@@ -876,116 +390,22 @@ pub enum ModuleOrigin {
     FfiInterface,
 }
 
-/// A `type alias` in scope, awaiting expansion at its use sites.
+/// The aliases a dependency exports, keyed by their qualified spelling.
 ///
-/// A local alias keeps its source body and expands in this module's own scope;
-/// an imported alias arrives already resolved in its defining module's scope, so
-/// no importer ever re-resolves another module's alias source text.
-#[derive(Clone)]
-enum AliasDef {
-    /// Declared in the module being canonicalised. `params` are the declared
-    /// type parameters in source order; each use site substitutes its own
-    /// arguments for them and expands `body` in place.
-    Local {
-        params: Vec<Symbol>,
-        body: src::TypeAnnotation,
-    },
-    /// Exported by a dependency, its body canonical in the dependency's scope,
-    /// brought in by an import of the given tier.
-    Imported {
-        exported: crate::ExportedAlias,
-        tier: ImportTier,
-    },
-    /// A bare name two imports of one tier bring in from different homes. A
-    /// bare use is IPE-N0024; the import alone is not, exactly as for an
-    /// open-import value.
-    Ambiguous {
-        homes: [Vec<Symbol>; 2],
-        tier: ImportTier,
-    },
-}
-
-/// The precedence tier of an imported name: an explicit `exposing (Name)` list
-/// outranks an open `exposing (..)` import.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ImportTier {
-    /// Named in an explicit exposing list, or reached through a qualifier.
-    Explicit,
-    /// Brought in by an open `exposing (..)` stdlib import.
-    Open,
-}
-
-/// Bring a dep's exported alias into bare-name scope under `name`.
-///
-/// The same alias reached twice (a diamond import) is one entry. An explicit
-/// import outranks an open one regardless of import order; a second home for
-/// the name in the same tier turns the entry [`AliasDef::Ambiguous`], so a bare
-/// use can never silently expand whichever import came first.
-fn inject_unqualified_alias(
-    injected_aliases: &mut BTreeMap<Symbol, AliasDef>,
-    name: Symbol,
-    exported: &crate::ExportedAlias,
-    tier: ImportTier,
-) {
-    let fresh = || AliasDef::Imported {
-        exported: exported.clone(),
-        tier,
-    };
-    let entry = match injected_aliases.get(&name) {
-        None => fresh(),
-        Some(AliasDef::Imported {
-            exported: prior,
-            tier: prior_tier,
-        }) => match (*prior_tier, tier) {
-            (ImportTier::Open, ImportTier::Explicit) => fresh(),
-            (ImportTier::Explicit, ImportTier::Open) => return,
-            (ImportTier::Explicit, ImportTier::Explicit) | (ImportTier::Open, ImportTier::Open) => {
-                if prior.home == exported.home {
-                    return;
-                }
-                AliasDef::Ambiguous {
-                    homes: [prior.home.clone(), exported.home.clone()],
-                    tier,
-                }
-            }
-        },
-        Some(AliasDef::Ambiguous {
-            tier: prior_tier, ..
-        }) => match (*prior_tier, tier) {
-            (ImportTier::Open, ImportTier::Explicit) => fresh(),
-            (ImportTier::Explicit, ImportTier::Explicit | ImportTier::Open)
-            | (ImportTier::Open, ImportTier::Open) => return,
-        },
-        // A local declaration is registered after imports, so it is never
-        // present here; were it, it would outrank every import.
-        Some(AliasDef::Local { .. }) => return,
-    };
-    injected_aliases.insert(name, entry);
-}
-
-/// Type-name homes in scope, kept by precedence tier so an import's order can
-/// never change which one a bare name resolves to.
-#[derive(Default)]
-struct TypeHomes {
-    /// Local unions and explicitly imported types (tiers 1–2) → home. An absent
-    /// entry means the name is an open-import type, a builtin (empty home), or
-    /// a free type variable.
-    type_home_map: BTreeMap<Symbol, Vec<Symbol>>,
-    /// Types brought in by an open `exposing (..)` stdlib import (tier 3): type
-    /// name → defining home → importing module paths. Two defining homes for
-    /// one bare use are IPE-N0024 at that use.
-    wildcard_type_homes: BTreeMap<Symbol, BTreeMap<Vec<Symbol>, BTreeSet<Vec<Symbol>>>>,
-}
+/// Each key is the interned `"Q.Name"` for an import qualifier `Q` and an alias
+/// `Name` its module exports, so `Q.Name` expands in place. A bare alias name
+/// is never keyed here: it resolves through the type namespace of
+/// [`ModuleScope`].
+type QualifiedAliases = BTreeMap<Symbol, crate::ExportedAlias>;
 
 /// The immutable context threaded through [`canonicalise_type`]. Bundling the
 /// read-only references keeps the recursive call under clippy's argument-count
 /// ceiling while leaving the per-call mutable state (`free_vars`, `visited`,
-/// `subst`) explicit at each call site.
+/// `params`) explicit at each call site.
 struct TypeCtx<'a> {
+    /// The module environment; a bare type name resolves through its
+    /// [`ModuleScope`] type namespace.
     env: &'a Env,
-    /// Every union type name in scope mapped to its home module path, by tier
-    /// (see [`TypeHomes`]); [`resolve_unqualified_type_name`] reads it.
-    type_homes: &'a TypeHomes,
     /// Maps each import qualifier (the short name used in `Q.TypeName` type
     /// annotations) to the full dep-module path.  Built from the module's
     /// `import` declarations in [`canonicalise_module_with_origin`].
@@ -995,21 +415,32 @@ struct TypeCtx<'a> {
     /// for the resulting `Con` node — so `Counter.Msg` correctly gets
     /// `home = ["Counter"]` regardless of whether the current module also
     /// defines a local `type Msg`.  On a miss (kernel / stdlib qualifier) the
-    /// lookup falls back to `type_home_map` as before.
+    /// lookup falls back to the bare type namespace.
     qualifier_paths: &'a BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &'a BTreeMap<Symbol, AliasDef>,
+    /// The dependency aliases reachable as `Q.Name`.
+    qualified_aliases: &'a QualifiedAliases,
     interner: &'a Interner,
-    /// The interned `"any"` wildcard type-variable symbol. A bare builtin
-    /// parametric UI annotation (`view : Html`, `attr : Attribute`) is
-    /// arity-filled to `Html any` / `Attribute any` at the [`src::TypeAnnotation::TType`]
-    /// arm using this symbol, so its lone message parameter is inferred rather
-    /// than reaching the lowerer as a zero-arg `Html` (IPE-I0001). Pre-interned
-    /// by the module entry point (where the interner is mutable); the `TType` arm
-    /// runs under an immutable interner and cannot mint it.
-    ui_wildcard_msg: Symbol,
     /// Span of the enclosing value annotation, used as the location for an
     /// alias-arity error (the type AST itself carries no inner spans).
     ann_span: Span,
+}
+
+/// The aliases each imported module is written under, keyed by its dotted
+/// path: the one table IPE-N0034 reads to name an alias to use.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if an alias symbol is not interned.
+fn import_alias_table(imports: &[src::Import], interner: &Interner) -> DResult<ImportAliases> {
+    let mut table: BTreeMap<Box<str>, BTreeSet<Box<str>>> = BTreeMap::new();
+    for import in imports {
+        if let Some(alias) = import.alias {
+            table
+                .entry(path_to_dot_string(interner, &import.name.value))
+                .or_default()
+                .insert(name_str(interner, alias)?);
+        }
+    }
+    Ok(Rc::new(table))
 }
 
 /// Canonicalise a parsed module into its name-resolved form.
@@ -1026,22 +457,23 @@ struct TypeCtx<'a> {
 pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::Module> {
     let home = m.name.value.clone();
     let mut env = Env::initial(home, interner)?;
+    env.import_aliases = import_alias_table(&m.imports, interner)?;
     // Register `import Ipê.… as Alias` / `import Ipe.… as Alias` qualifiers.
     // The single-module path does no dep injection, but stdlib qualifier
     // aliases must still resolve (`import Ipe.Json.Encode as Encode` →
     // `Encode.string`), so run the same registration the multi-module path uses.
     register_stdlib_import_aliases(&m.imports, &mut env, interner)?;
-    // type_home_map and extra_aliases both start empty; canonicalise_with_env
-    // populates type_home_map from this module's unions and merges extra_aliases
-    // (empty here) with the module's own aliases.
-    let mut type_homes = TypeHomes::default();
-    let extra_aliases: BTreeMap<Symbol, AliasDef> = BTreeMap::new();
+    // The single-module path has no deps, so only stdlib kernel imports bind
+    // bare names, in source order, before any local declaration.
+    for import in &m.imports {
+        bind_stdlib_kernel_import(import, &mut env, interner)?;
+    }
     // Single-module has no deps, so no user qualifiers to map — but a Html-family
     // STDLIB import qualifier (`import Ipe.Html.Attributes as Attr`) still needs
     // its `["Html"]` type home folded so a qualified `Attr.Attribute` lowers to
     // `html::Attribute`.
     let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    fold_html_stdlib_qualifier_homes(&m.imports, &mut qualifier_paths, interner)?;
+    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
     // The bare single-module entry is always ordinary USER source: the trust tag
     // can only be raised via `canonicalise_module_with_origin`.
     // The single-module entry does not build a `ModuleExports`, so the kernel-
@@ -1049,9 +481,8 @@ pub fn canonicalise(m: &src::Module, interner: &mut Interner) -> DResult<canon::
     canonicalise_with_env(
         m,
         &mut env,
-        &mut type_homes,
         &qualifier_paths,
-        extra_aliases,
+        &QualifiedAliases::new(),
         ModuleOrigin::User,
         interner,
     )
@@ -1107,22 +538,11 @@ pub fn canonicalise_module_with_origin(
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
     // Legacy entry point: dep exports arrive as an owned map and the
-    // known-module universe for IPE-N0020 did-you-mean IS that map's key set —
-    // the pre-incremental behaviour, preserved for non-driver callers.
+    // importable-module catalog is that map's key set plus the kernel paths.
     let dep_refs: BTreeMap<Vec<Symbol>, &crate::ModuleExports> =
         deps.iter().map(|(k, v)| (k.clone(), v)).collect();
-    let known_modules: BTreeSet<Box<str>> = deps
-        .keys()
-        .map(|p| path_to_dot_string(interner, p))
-        .collect();
-    canonicalise_module_in_project(
-        m,
-        expected_path,
-        &dep_refs,
-        &known_modules,
-        origin,
-        interner,
-    )
+    let catalog = crate::ModuleCatalog::new(deps.keys().map(|p| path_to_dot_string(interner, p)));
+    canonicalise_module_in_project(m, expected_path, &dep_refs, &catalog, origin, interner)
 }
 
 /// Canonicalise a module against per-dep export references plus an explicit
@@ -1164,7 +584,7 @@ pub fn canonicalise_module_in_project(
     m: &src::Module,
     expected_path: &[Symbol],
     deps: &BTreeMap<Vec<Symbol>, &crate::ModuleExports>,
-    known_modules: &BTreeSet<Box<str>>,
+    catalog: &crate::ModuleCatalog,
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(canon::Module, crate::ModuleExports)> {
@@ -1209,15 +629,16 @@ pub fn canonicalise_module_in_project(
 
     let mut env = Env::initial(home.clone(), interner)?;
     env.origin = origin;
+    env.module_catalog = catalog.clone();
+    env.import_aliases = import_alias_table(&m.imports, interner)?;
     // Fail closed at the boundary on an `Ipe.*` import that names neither a
     // kernel stdlib module nor a compiled-source dep (a typo such as
     // `Ipe.Strng`), before alias registration and the dep loop silently skip it.
-    // Runs first so the did-you-mean can rank over the project's known modules.
-    let known_module_pool: Vec<Box<str>> = known_modules.iter().cloned().collect();
+    // Runs first so the did-you-mean can rank over the importable-module catalog.
     reject_unknown_ipe_import_with_candidates(
         &m.imports,
         |p| deps.contains_key(p),
-        &known_module_pool,
+        catalog,
         interner,
     )?;
     // Register user import aliases for stdlib (`Ipê.*` / `Ipe.*`) modules BEFORE
@@ -1225,27 +646,20 @@ pub fn canonicalise_module_in_project(
     // (they need no dep injection), so alias registration is a separate,
     // self-contained pass keyed off the same authoritative path table.
     register_stdlib_import_aliases(&m.imports, &mut env, interner)?;
-    // type_home_map is extended first by dep-imported types, then by this
-    // module's own unions in canonicalise_with_env. Having deps in the map first
-    // means this module can reference imported types in its own type annotations.
-    let mut type_homes = TypeHomes::default();
-    // Mirrors `qualifier_first_span`: first-seen import span for each dep type
-    // name so a duplicate injection can point `DuplicateType::first` at it.
-    let mut type_first_span: BTreeMap<Symbol, Span> = BTreeMap::new();
-    // Aliases from dep modules (injected via `import … exposing (..)`).
-    let mut injected_aliases: BTreeMap<Symbol, AliasDef> = BTreeMap::new();
-    // Tracks which names have been brought into unqualified scope and from which
-    // dep module path (for AmbiguousImport detection).
-    let mut unqual_origins: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
+    // The dependency aliases reachable as `Q.Name`, filled by the qualifier
+    // loop below.
+    let mut qualified_aliases = QualifiedAliases::new();
 
-    // Process each import declaration, injecting the dep module's exports into
-    // the current env.
-    let mut unqual_ctor_origins: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
+    // Process each import declaration in source order, binding the names it
+    // brings into scope in the module scope. Every import binds before any
+    // local declaration does.
     // The `Ipe` root symbol, used below to discriminate a stdlib-kernel import
     // (absent from `deps`, qualifier-resolved) from a compiled-source stdlib dep.
     let ipe_sym = interner.intern("Ipe")?;
     for import in &m.imports {
         let dep_path = &import.name.value;
+        // A stdlib kernel module binds from its pre-installed qualifier tables.
+        bind_stdlib_kernel_import(import, &mut env, interner)?;
         // IPE-kernel vs compiled-source discrimination (fail-closed).
         //
         // A `Ipê.*` / `Ipe.*` import is EITHER a kernel module whose qualifiers
@@ -1273,27 +687,17 @@ pub fn canonicalise_module_in_project(
             // only — never intern on this path). An unrelated import
             // (`Rust.Firestore` against the project's own modules) is beyond the
             // edit-distance ceiling, so it yields none rather than the whole list.
-            let sugg = rank_suggestions(&name, known_modules.iter().map(Box::as_ref));
+            let sugg = rank_suggestions(&name, catalog.paths());
             Diagnostic::Name {
                 span: import.name.span,
                 msg: NameError::ModuleNotFound {
+                    suggestions: Candidates::at(EditTarget::whole(import.name.span, &name), sugg),
                     name,
-                    suggestions: sugg,
                 },
             }
         })?;
 
-        inject_dep_exports(
-            import,
-            dep,
-            &mut env,
-            &mut type_homes,
-            &mut type_first_span,
-            &mut injected_aliases,
-            &mut unqual_origins,
-            &mut unqual_ctor_origins,
-            interner,
-        )?;
+        inject_dep_exports(import, dep, &mut env, interner)?;
     }
 
     // Auto-inject the driver-generated `Rust.Ffi` forwarder module when a
@@ -1338,105 +742,38 @@ pub fn canonicalise_module_in_project(
                         src::Exposing::List(vec![]),
                     ),
                 };
-                inject_dep_exports(
-                    &synthetic_import,
-                    rust_ffi_dep,
-                    &mut env,
-                    &mut type_homes,
-                    &mut type_first_span,
-                    &mut injected_aliases,
-                    &mut unqual_origins,
-                    &mut unqual_ctor_origins,
-                    interner,
-                )?;
+                inject_dep_exports(&synthetic_import, rust_ffi_dep, &mut env, interner)?;
             }
         }
     }
 
-    // Build qualifier → dep-path map so `TType(qualifier, …)` annotations in
-    // type sigs resolve `home` from the dep path, not from the unqualified
-    // `type_home_map`.  Example: `import Counter` with no `exposing` clause
-    // adds no entry to `type_home_map`, so without this map `Counter.Msg`
-    // would look up "Msg" and find the LOCAL `type Msg` instead of Counter's.
-    //
-    // Qualifier = explicit `as Alias` if present, else last segment of the
-    // module path — mirrors `inject_dep_exports`'s `env.qual_vars` logic.
-    let mut qualifier_paths: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
-    // AUD-14: track each qualifier's FIRST-seen import span so a genuine clash
-    // (below) can point back to it, mirroring `DuplicateValue`/`DuplicateType`'s
-    // `first` field convention.
-    let mut qualifier_first_span: BTreeMap<Symbol, Span> = BTreeMap::new();
-    for import in &m.imports {
-        let dep_path = &import.name.value;
-        // Skip stdlib kernel imports (not in `deps`).
-        if dep_path.first().copied().is_some_and(|s| s == ipe_sym) && !deps.contains_key(dep_path) {
+    // The type home and dependency aliases of each qualifier, read from the
+    // owner `Env::install_import` decided for it, so a qualified type reaches
+    // exactly the module its qualified values reach.
+    let mut qualifier_paths = source_qualifier_homes(&env);
+    for (&qualifier, path) in &qualifier_paths {
+        let Some(dep) = deps.get(path) else {
             continue;
-        }
-        // Qualifiers this import is reachable under (see `import_qualifiers`).
-        let reachable_qualifiers = import_qualifiers(import.alias, dep_path, interner)?;
-        for qualifier in reachable_qualifiers {
-            // AUD-14: `import App.Utils` + `import Lib.Utils` (both default to the
-            // qualifier `Utils`), or an explicit `as` alias reused across two
-            // distinct dep modules, previously overwrote silently here — every
-            // `Utils.format` call downstream then resolved to whichever import
-            // came LAST in source order, with no diagnostic. Re-importing the
-            // SAME dep module under the same qualifier (a diamond dependency)
-            // stays a no-op, matching `inject_dep_type`'s identical-re-injection
-            // rule; only a clash between two DIFFERENT dep modules is rejected.
-            if let Some(existing_path) = qualifier_paths.get(&qualifier) {
-                if existing_path != dep_path {
-                    let qualifier_s = name_str(interner, qualifier)?;
-                    let first = qualifier_first_span
-                        .get(&qualifier)
-                        .copied()
-                        .unwrap_or(import.name.span);
-                    return Err(Diagnostic::Name {
-                        span: import.name.span,
-                        msg: NameError::DuplicateQualifier {
-                            qualifier: qualifier_s,
-                            first,
-                        },
-                    });
-                }
-                continue;
-            }
-            qualifier_paths.insert(qualifier, dep_path.clone());
-            qualifier_first_span.insert(qualifier, import.name.span);
-
-            // Register every exported alias of the dep under a synthetic
-            // `Qualifier.Name` key so a QUALIFIED annotation (`Money.Price`)
-            // expands the alias exactly as an `exposing`-injected one would —
-            // qualified access needs no exposure, and the qualified key can never
-            // collide with a bare local name (bare symbols carry no dot).
-            if let Some(dep) = deps.get(dep_path) {
-                let qualifier_s = name_str(interner, qualifier)?;
-                for (&alias_name, ea) in &dep.aliases {
-                    let alias_s = name_str(interner, alias_name)?;
-                    let key = interner.intern(&format!("{qualifier_s}.{alias_s}"))?;
-                    injected_aliases
-                        .entry(key)
-                        .or_insert_with(|| AliasDef::Imported {
-                            exported: ea.clone(),
-                            tier: ImportTier::Explicit,
-                        });
-                }
-            }
+        };
+        // Every exported alias of the dep registers under a synthetic
+        // `Qualifier.Name` key so a qualified annotation (`Money.Price`)
+        // expands the alias exactly as an `exposing`-injected one would; the
+        // qualified key never collides with a bare local name (bare symbols
+        // carry no dot).
+        let qualifier_s = name_str(interner, qualifier)?;
+        for (&alias_name, ea) in &dep.aliases {
+            let alias_s = name_str(interner, alias_name)?;
+            let key = interner.intern(&format!("{qualifier_s}.{alias_s}"))?;
+            qualified_aliases.entry(key).or_insert_with(|| ea.clone());
         }
     }
-
-    // Fold Html-family STDLIB import qualifiers into `qualifier_paths` (→
-    // `["Html"]`) so a qualified `Attr.Attribute` (`import Ipe.Html.Attributes as
-    // Attr`) resolves to the `html::Attribute` home. Runs AFTER the
-    // user-dep loop so a user qualifier that also names a Html dep keeps its real
-    // dep path (`entry(..).or_insert` inside the helper is a no-op on a hit).
-    fold_html_stdlib_qualifier_homes(&m.imports, &mut qualifier_paths, interner)?;
+    fold_html_stdlib_qualifier_homes(&m.imports, &env, &mut qualifier_paths, interner)?;
 
     let (mut canon_mod, kernel_aliases, own_aliases) = canonicalise_with_env(
         m,
         &mut env,
-        &mut type_homes,
         &qualifier_paths,
-        injected_aliases,
+        &qualified_aliases,
         origin,
         interner,
     )?;
@@ -1639,15 +976,17 @@ fn thread_config_into_entry(
     names: &ConfigThreadNames,
     home: &[Symbol],
 ) -> bool {
-    // Peel `\… -> …` / `let … in …` wrappers to the head call, matching the TEA
-    // entry classification (`main_head_is_tea_entry`). Only a `main` whose head
-    // is a `Web` entry `Call` is threadable; a bare kernel reference with no cfg
-    // argument is not a valid entry and is left for the type-checker.
+    // Walk the same steps as `main_result_step` to the head call. Only a `main`
+    // whose head is a `Web` entry `Call` is threadable; a bare kernel reference
+    // with no cfg argument is not a valid entry and is left for the type-checker.
     match &mut body.value {
         canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => {
             thread_config_into_entry(inner, names, home)
         }
         canon::Expr_::Call(callee, args) => {
+            if let Some(rest) = task_bind_rest_mut(callee, args) {
+                return thread_config_into_entry(rest, names, home);
+            }
             let canon::Expr_::VarKernel { module, name, .. } = &callee.value else {
                 return false;
             };
@@ -1813,14 +1152,95 @@ const _: () = {
     }
 };
 
+/// Whether `callee` is the `Task.andThen` kernel, by registry id. A user
+/// binding named `andThen`, or `Task.andThen` through a user alias, resolves to
+/// a `VarTopLevel` and never matches; only a stdlib-origin module can mint the
+/// kernel alias.
+const fn is_task_and_then(callee: &canon::Expr) -> bool {
+    matches!(
+        callee.value,
+        canon::Expr_::VarKernel {
+            id: Some(StdlibKernel::TaskAndThen),
+            ..
+        }
+    )
+}
+
+/// The continuation body of a `do` bind, `Task.andThen (\p -> rest) task`:
+/// `rest` when `callee args` is the kernel applied to exactly a one-parameter
+/// continuation lambda and the task, in the kernel's argument order. The task
+/// argument is never returned: it runs before the continuation, so `main`'s
+/// result never comes from it.
+fn task_bind_rest<'e>(callee: &canon::Expr, args: &'e [canon::Expr]) -> Option<&'e canon::Expr> {
+    if !is_task_and_then(callee) {
+        return None;
+    }
+    let [continuation, _task] = args else {
+        return None;
+    };
+    match &continuation.value {
+        canon::Expr_::Lambda(params, rest) if params.len() == 1 => Some(rest.as_ref()),
+        _ => None,
+    }
+}
+
+/// [`task_bind_rest`] for the in-place `config` rewrite.
+fn task_bind_rest_mut<'e>(
+    callee: &canon::Expr,
+    args: &'e mut [canon::Expr],
+) -> Option<&'e mut canon::Expr> {
+    if !is_task_and_then(callee) {
+        return None;
+    }
+    let [continuation, _task] = args else {
+        return None;
+    };
+    match &mut continuation.value {
+        canon::Expr_::Lambda(params, rest) if params.len() == 1 => Some(rest.as_mut()),
+        _ => None,
+    }
+}
+
+/// One step from a `main` body toward its result expression, or `None` at the
+/// head.
+///
+/// A `do` bind steps into its continuation body ([`task_bind_rest`]); any other
+/// application steps into its callee (`entry cfg` -> `entry`); a lambda
+/// (`\req -> …`) and a `let … in` (a `do` bare run included) step into their
+/// body. Every resolver classification of `main` walks with this step, so a
+/// `do` block's tail is the head whether or not the block binds.
+fn main_result_step(node: &canon::Expr) -> Option<&canon::Expr> {
+    match &node.value {
+        canon::Expr_::Call(callee, args) => {
+            let head: &canon::Expr = callee;
+            Some(task_bind_rest(callee, args).unwrap_or(head))
+        }
+        canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => {
+            let body: &canon::Expr = inner;
+            Some(body)
+        }
+        _ => None,
+    }
+}
+
+/// The head of `main`'s result expression: the node [`main_result_step`]
+/// cannot step past.
+fn main_result_head(body: &canon::Expr) -> &canon::Expr {
+    let mut node = body;
+    while let Some(next) = main_result_step(node) {
+        node = next;
+    }
+    node
+}
+
 /// IPE-N0045: reject a `main` that selects its shape at run time.
 ///
 /// A program's shape is pinned by the head of `main` at compile time (§ static
 /// pinning): `main = Web.tea …` is a web app, `main = Tui.tea …` a
 /// terminal app, a `Task Error ()` `main` a script. It is never chosen from a
-/// value, so a `main` whose head — after peeling application / `let` / `\… ->`,
-/// exactly as the shape classifier peels it — is an `if` or `case` with a branch
-/// that reaches an app entry is a run-time shape choice, refused here.
+/// value, so a `main` whose result head ([`main_result_head`]) is an `if` or
+/// `case` with a branch that reaches an app entry is a run-time shape choice,
+/// refused here.
 ///
 /// Only a branch that reaches a shape entry trips this. A plain program whose
 /// `main` is a `Task` computed through an `if` / `case` (no branch heads on an
@@ -1842,81 +1262,61 @@ fn check_main_not_runtime_branched(canon_mod: &canon::Module, interner: &Interne
     let body = match main_def {
         canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
-    // Peel to the head the shape classifier reads, keeping the located node so a
-    // rejection blames the branching head itself.
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::If(arms, else_) => {
-                let any_shape = arms
-                    .iter()
-                    .map(|(_, branch)| branch)
-                    .chain(std::iter::once(else_.as_ref()))
-                    .any(|branch| branch_head_reaches_tea_entry(branch, interner));
-                return if any_shape {
-                    Err(Diagnostic::Name {
-                        span: node.span,
-                        msg: NameError::RuntimeBranchedMain,
-                    })
-                } else {
-                    Ok(())
-                };
-            }
-            canon::Expr_::Case(_, branches) => {
-                let any_shape = branches
-                    .iter()
-                    .any(|b| branch_head_reaches_tea_entry(&b.body, interner));
-                return if any_shape {
-                    Err(Diagnostic::Name {
-                        span: node.span,
-                        msg: NameError::RuntimeBranchedMain,
-                    })
-                } else {
-                    Ok(())
-                };
-            }
-            _ => return Ok(()),
-        }
+    // The head the shape classifier reads, kept located so a rejection blames
+    // the branching head itself.
+    let head = main_result_head(body);
+    let any_shape = match &head.value {
+        canon::Expr_::If(arms, else_) => arms
+            .iter()
+            .map(|(_, branch)| branch)
+            .chain(std::iter::once(else_.as_ref()))
+            .any(|branch| branch_head_reaches_tea_entry(branch, interner)),
+        canon::Expr_::Case(_, branches) => branches
+            .iter()
+            .any(|b| branch_head_reaches_tea_entry(&b.body, interner)),
+        _ => false,
+    };
+    if any_shape {
+        Err(Diagnostic::Name {
+            span: head.span,
+            msg: NameError::RuntimeBranchedMain,
+        })
+    } else {
+        Ok(())
     }
 }
 
 /// Does a branch of `main`'s `if` / `case` head-reach a TEA app entry?
 ///
-/// Peels the same forms as the shape classifier (application / `let` / `\… ->`)
-/// and, for a nested `if` / `case`, recurses into every sub-branch — so
+/// Walks to the branch's result head ([`main_result_head`]) and, for a nested
+/// `if` / `case`, recurses into every sub-branch — so
 /// `if a then Web.tea c else if b then Cli … else …` is caught at any depth. A
 /// branch whose head is a plain expression (a `Task`, a value) reaches no entry
 /// and does not, on its own, mark the `main` a shape choice.
 fn branch_head_reaches_tea_entry(branch: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = branch;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::If(arms, else_) => {
-                return arms
-                    .iter()
-                    .map(|(_, inner)| inner)
-                    .chain(std::iter::once(else_.as_ref()))
-                    .any(|inner| branch_head_reaches_tea_entry(inner, interner));
-            }
-            canon::Expr_::Case(_, sub) => {
-                return sub
-                    .iter()
-                    .any(|b| branch_head_reaches_tea_entry(&b.body, interner));
-            }
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return TEA_APP_ENTRIES.contains(&(m, n));
-            }
-            _ => return false,
-        }
+    let head = main_result_head(branch);
+    match &head.value {
+        canon::Expr_::If(arms, else_) => arms
+            .iter()
+            .map(|(_, inner)| inner)
+            .chain(std::iter::once(else_.as_ref()))
+            .any(|inner| branch_head_reaches_tea_entry(inner, interner)),
+        canon::Expr_::Case(_, sub) => sub
+            .iter()
+            .any(|b| branch_head_reaches_tea_entry(&b.body, interner)),
+        _ => is_tea_entry_head(head, interner),
     }
+}
+
+/// `true` iff `head` is a resolved TEA app-entry kernel ([`TEA_APP_ENTRIES`]).
+fn is_tea_entry_head(head: &canon::Expr, interner: &Interner) -> bool {
+    let canon::Expr_::VarKernel { module, name, .. } = &head.value else {
+        return false;
+    };
+    let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name)) else {
+        return false;
+    };
+    TEA_APP_ENTRIES.contains(&(m, n))
 }
 
 /// IPE-N0033: reject a Program (plain-`main` module) that imports any
@@ -1969,15 +1369,12 @@ fn check_program_tea_import_gate(
         return Ok(());
     };
 
-    // The module is a TEA app iff its `main` head-calls a shape entry.
-    let main_is_app_entry = {
-        let body = match main_def {
-            canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
-        };
-        main_head_is_tea_entry(body, interner)
+    let main_body = match main_def {
+        canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
 
-    if main_is_app_entry {
+    // The module is a TEA app iff its `main` head-calls a shape entry.
+    if main_head_is_tea_entry(main_body, interner) {
         return Ok(());
     }
 
@@ -1987,12 +1384,7 @@ fn check_program_tea_import_gate(
     // (shape-model §9). Such a `main` head-calls `Server.listen`, not a TEA
     // shape entry, so it would otherwise trip this gate; exempt it. The embedded
     // app is a VALUE consumed by the Server, not the module's own app shape.
-    if main_head_is_server_listen(
-        match main_def {
-            canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
-        },
-        interner,
-    ) {
+    if main_head_is_server_listen(main_body) {
         return Ok(());
     }
 
@@ -2005,61 +1397,31 @@ fn check_program_tea_import_gate(
 }
 
 /// Does this `main` body head-call `Server.listen` — the declarative
-/// `Ipe.Http.Server` entry? Same head-peeling as [`main_head_is_tea_entry`]. A
+/// `Ipe.Http.Server` entry? The head is [`main_result_head`]; the kernel is
+/// matched by its registry id, never by spelling. A
 /// Server program that embeds a web app (`Web.embed` + `Server.mountApp`) is a
 /// Program at the module level, not a TEA app, so it is exempt from the
 /// `Ipe.Tea.*`-import gate (IPE-N0033).
-fn main_head_is_server_listen(body: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return m == "Server" && n == "listen";
-            }
-            _ => return false,
+fn main_head_is_server_listen(body: &canon::Expr) -> bool {
+    matches!(
+        main_result_head(body).value,
+        canon::Expr_::VarKernel {
+            id: Some(StdlibKernel::ServerListen),
+            ..
         }
-    }
+    )
 }
 
 /// Does this `main` body head-call a TEA shape entry ([`TEA_APP_ENTRIES`])?
 ///
-/// Peels the forms a TEA `main` takes — an application `entry { … }`, a
-/// point-free `main = \… -> entry …` lambda, and a `let cfg = { … } in entry
-/// cfg` — down to the head expression, then checks whether it is a shape-entry
-/// `VarKernel`. Only the head matters: a Program's `main` never reduces to a
-/// shape-entry kernel at its head. Peeling `let` keeps a let-bound-config app
-/// classified as a TEA app so its malformed config reaches the precise
-/// `IPE-L0119` lowering diagnostic instead of the coarser IPE-N0033 gate.
+/// The head is [`main_result_head`]: it reaches the entry under an application
+/// `entry { … }`, a point-free `\… -> entry …` lambda, a `let cfg = { … } in
+/// entry cfg` and a `do` block's tail. Only the head matters: a Program's `main`
+/// never reduces to a shape-entry kernel at its head. A let-bound-config app
+/// stays a TEA app, so its malformed config reaches the precise `IPE-L0119`
+/// lowering diagnostic instead of the coarser IPE-N0033 gate.
 fn main_head_is_tea_entry(body: &canon::Expr, interner: &Interner) -> bool {
-    let mut node = body;
-    loop {
-        match &node.value {
-            // `entry { cfg }` / `entry a b` — the callee is the head.
-            canon::Expr_::Call(callee, _) => node = callee,
-            // `main = \req -> entry { cfg }` — the lambda body is the head.
-            canon::Expr_::Lambda(_, inner) => node = inner,
-            // `main = let cfg = { … } in entry cfg` — the `in` body is the head.
-            // A let-bound config is still a TEA-app entry (the head-called shape
-            // kernel is under the `in`), so a malformed one reaches its precise
-            // `IPE-L0119` lowering diagnostic rather than being misread as a
-            // Program under IPE-N0033.
-            canon::Expr_::Let(_, body) => node = body,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (Some(m), Some(n)) = (interner.resolve(*module), interner.resolve(*name))
-                else {
-                    return false;
-                };
-                return TEA_APP_ENTRIES.contains(&(m, n));
-            }
-            _ => return false,
-        }
-    }
+    is_tea_entry_head(main_result_head(body), interner)
 }
 
 /// The TEA app surface a `main` proves from its entry kernel.
@@ -2069,21 +1431,14 @@ fn main_head_is_tea_entry(body: &canon::Expr, interner: &Interner) -> bool {
 /// shape-entry app — the cross-shape gate then does not apply (a plain-`main`
 /// Program importing `Ipe.Tea.*` is already rejected by IPE-N0033).
 fn app_shape_name(body: &canon::Expr, interner: &Interner) -> Option<AppSurface> {
-    let mut node = body;
-    loop {
-        match &node.value {
-            canon::Expr_::Call(callee, _) => node = callee,
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            canon::Expr_::VarKernel { module, name, .. } => {
-                let (m, n) = (interner.resolve(*module)?, interner.resolve(*name)?);
-                return TEA_APP_ENTRIES
-                    .iter()
-                    .find(|(em, en)| *em == m && *en == n)
-                    .and_then(|(shape, _member)| AppSurface::from_segment(shape));
-            }
-            _ => return None,
-        }
-    }
+    let canon::Expr_::VarKernel { module, name, .. } = &main_result_head(body).value else {
+        return None;
+    };
+    let (m, n) = (interner.resolve(*module)?, interner.resolve(*name)?);
+    TEA_APP_ENTRIES
+        .iter()
+        .find(|(em, en)| *em == m && *en == n)
+        .and_then(|(shape, _member)| AppSurface::from_segment(shape))
 }
 
 /// IPE-N0035: reject a TEA app that imports another shape's `Cmd` / `Sub`.
@@ -2205,22 +1560,20 @@ fn check_input_fields_are_subscriptions(
     let body = match main_def {
         canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => body,
     };
-    // Peel to the entry call the shape classifier reads.
+    // Walk `main_result_step` to the entry call the shape classifier reads.
     let mut node = body;
     let (entry, surface, cfg) = loop {
-        match &node.value {
-            canon::Expr_::Call(callee, args) => {
-                if let canon::Expr_::VarKernel { id: Some(k), .. } = &callee.value
-                    && let Some(surface) = k.app_entry_surface()
-                    && let [cfg] = args.as_slice()
-                {
-                    break (*k, surface, cfg);
-                }
-                node = callee;
-            }
-            canon::Expr_::Lambda(_, inner) | canon::Expr_::Let(_, inner) => node = inner,
-            _ => return Ok(()),
+        if let canon::Expr_::Call(callee, args) = &node.value
+            && let canon::Expr_::VarKernel { id: Some(k), .. } = &callee.value
+            && let Some(surface) = k.app_entry_surface()
+            && let [cfg] = args.as_slice()
+        {
+            break (*k, surface, cfg);
         }
+        let Some(next) = main_result_step(node) else {
+            return Ok(());
+        };
+        node = next;
     };
     // The config record: inline, or a same-module top-level binding.
     let fields = match &cfg.value {
@@ -2399,9 +1752,9 @@ const fn map_placement_reason(reason: &crate::shape_runtime::DenyReason) -> Modu
 /// ([`crate::env::is_kernel_stdlib_module`]) or a compiled-source module the
 /// build driver supplied as a dep (`is_known_dep`). Anything else is a typo
 /// (`Ipe.Strng`) that must fail closed at the boundary rather than being
-/// silently dropped. Suggestions are ranked over the kernel dot-paths plus
-/// `extra_candidates` (the project's known user + compiled-source module
-/// dot-paths), strings only — never interning.
+/// silently dropped. Suggestions are ranked over the importable-module
+/// `catalog` (kernel, compiled-source, and project dot-paths), strings only —
+/// never interning.
 ///
 /// Only the project entry (which carries the resolved `deps` universe) can
 /// classify a compiled-source `Ipe.*` module, so this runs there. The bare
@@ -2414,7 +1767,7 @@ const fn map_placement_reason(reason: &crate::shape_runtime::DenyReason) -> Modu
 fn reject_unknown_ipe_import_with_candidates(
     imports: &[src::Import],
     is_known_dep: impl Fn(&[Symbol]) -> bool,
-    extra_candidates: &[Box<str>],
+    catalog: &crate::ModuleCatalog,
     interner: &mut Interner,
 ) -> DResult<()> {
     let ipe_sym = interner.intern("Ipe")?;
@@ -2427,310 +1780,447 @@ fn reject_unknown_ipe_import_with_candidates(
             continue;
         }
         let name = path_to_dot_string(interner, dep_path);
-        let mut candidates: Vec<Box<str>> = crate::env::stdlib_module_dot_paths();
-        candidates.extend(extra_candidates.iter().cloned());
-        let sugg = rank_suggestions(&name, candidates.iter().map(Box::as_ref));
+        let sugg = rank_suggestions(&name, catalog.paths());
         return Err(Diagnostic::Name {
             span: import.name.span,
             msg: NameError::ModuleNotFound {
+                suggestions: Candidates::at(EditTarget::whole(import.name.span, &name), sugg),
                 name,
-                suggestions: sugg,
             },
         });
     }
     Ok(())
 }
 
-/// Register user import aliases for stdlib (`Ipê.*` / `Ipe.*`) modules.
+/// Install the qualifiers every stdlib kernel-module import brings into scope.
 ///
-/// For every stdlib import, resolve its full path to the canonical qualifier
-/// (via [`Env::canonical_stdlib_qualifier`]) and register the user's *effective*
-/// qualifier — the explicit `as Alias`, else the Elm last-segment default —
-/// against the canonical qualifier's kernel members. This is what makes
-/// `import Ipe.Json.Encode as Encode` register `Encode` → the `JsonEnc`
-/// members, and `import Ipe.Ui as U` register `U` → the `Ui` members.
+/// Each `Ipe.*` import naming a kernel module installs that module's pooled
+/// members through [`Env::install_import`], under exactly the spellings the
+/// import writes (Elm-exact):
 ///
-/// Idempotent when the effective qualifier already equals the canonical name
-/// (the common `import Ipe.Log as Log` case — `Log` is already registered).
+/// * `import Ipe.X as A` installs `A` only. An alias naming a DIFFERENT
+///   kernel module's canonical qualifier is refused, since it would hand that
+///   module's spelling to another module's members.
+/// * A bare `import Ipe.X` installs the canonical qualifier, the last segment
+///   when [`crate::env::kernel_import_binds_last_segment`] allows it, and the
+///   exact dotted path when it is a
+///   [`crate::env::DOTTED_QUALIFIER_SPELLINGS`] row.
+/// * A shape module import (any form) also installs `Cmd` and `Sub` with that
+///   shape's own members, and records the shape.
 ///
-/// A path that names no known stdlib module is left unregistered (fail-closed,
-/// per [`Env::canonical_stdlib_qualifier`]): any later `Alias.member` reference
-/// surfaces the ordinary `UnknownModule` diagnostic at its use site rather than
-/// resolving against an invented qualifier. This preserves the pre-existing
-/// behaviour for as-yet-unported stdlib modules (e.g. `Ipe.Css`).
+/// A path naming no kernel module installs nothing (fail-closed): a later
+/// `Alias.member` reference surfaces its diagnostic at the use site.
 ///
 /// # Errors
-/// [`Diagnostic::CompilerBug`] if interning `Ipe` or a canonical name
-/// exhausts the interner.
+/// [`NameError::DuplicateQualifier`] (IPE-N0027) for two explicit spellings
+/// of different modules or an alias onto a foreign canonical;
+/// [`NameError::TwoShapeImports`] / [`NameError::WrongShapeCmdSub`]
+/// (IPE-N0035) for a second shape or a `Cmd` / `Sub` module the shape does not
+/// admit; [`Diagnostic::CompilerBug`] if interning exhausts the interner.
 fn register_stdlib_import_aliases(
     imports: &[src::Import],
     env: &mut Env,
     interner: &mut Interner,
 ) -> DResult<()> {
     let ipe_sym = interner.intern("Ipe")?;
-    // Which canonical qualifier each EXPLICIT `as Alias` was registered against,
-    // plus the span of the import that first claimed it. Two stdlib imports
-    // aliased to one name (`… as J` twice) would otherwise extend-merge member
-    // tables last-wins with no diagnostic; this rejects the second with the same
-    // DuplicateQualifier the user-dep path raises. Bare imports are absent — a
-    // bare import is spoken under its CANONICAL qualifier, so two bare imports
-    // that merely share a last path segment (`Ipe.Json.Decode` + `Ipe.Db.Decode`,
-    // both segment `Decode`) do not collide and stay legitimate.
-    let mut explicit_alias_canonical: BTreeMap<Symbol, (Symbol, Span)> = BTreeMap::new();
+    let shape = record_import_shape(imports, env, interner)?;
     for import in imports {
         let dep_path = &import.name.value;
         // Only `Ipe.*` imports name compiler stdlib modules.
         if dep_path.first().copied().is_none_or(|s| s != ipe_sym) {
             continue;
         }
-        let Some(canonical) = env.canonical_stdlib_qualifier(dep_path, interner)? else {
-            // Unknown stdlib path: register nothing (fail-closed).
+        let Some(module) = env.kernel_module(dep_path, interner)? else {
             continue;
         };
-        // Elm convention: an explicit `as Alias` names the qualifier, otherwise
-        // the module is exposed under the LAST path segment.
-        let alias = import
-            .alias
-            .unwrap_or_else(|| dep_path.last().copied().unwrap_or_else(name_zero));
-        if let Some(explicit) = import.alias {
-            // Reject an explicit alias already claimed by a prior explicit alias
-            // for a DIFFERENT module (`import … as J` twice), or one that names a
-            // DIFFERENT stdlib module's canonical qualifier
-            // (`import Ipe.Json.Encode as Crypto`). Either way a silent
-            // extend-merge would resolve `Alias.member` last-wins across modules
-            // with no diagnostic, and aliasing onto a gated canonical would also
-            // unlock that canonical's must-import gate. Re-aliasing the same
-            // module under the same name stays a no-op.
-            if let Some(&(prev_canonical, first)) = explicit_alias_canonical.get(&explicit) {
-                if prev_canonical != canonical {
-                    return Err(Diagnostic::Name {
-                        span: import.name.span,
-                        msg: NameError::DuplicateQualifier {
-                            qualifier: name_str(interner, explicit)?,
-                            first,
-                        },
-                    });
-                }
-            } else if explicit != canonical
-                && crate::env::is_stdlib_canonical_qualifier(interner, explicit)
-            {
+        let span = import.name.span;
+        let canonical = module.symbol();
+        let canonical_s = name_str(interner, canonical)?;
+        if let Some((segment, family)) = crate::env::cmd_sub_module(&canonical_s)
+            && let Some((shape, _)) = shape
+            && !shape.admits_cmd_sub_of(segment)
+        {
+            return Err(wrong_shape_cmd_sub(span, segment, family, shape.surface()));
+        }
+        if let Some(alias) = import.alias {
+            if alias != canonical && crate::env::is_stdlib_canonical_qualifier(interner, alias) {
                 return Err(Diagnostic::Name {
-                    span: import.name.span,
+                    span,
                     msg: NameError::DuplicateQualifier {
-                        qualifier: name_str(interner, explicit)?,
-                        first: import.name.span,
+                        qualifier: name_str(interner, alias)?,
+                        first: span,
                     },
                 });
             }
-            explicit_alias_canonical.insert(explicit, (canonical, import.name.span));
+            env.install_kernel_import(module, ClaimForm::Alias, alias, span, interner)?;
+        } else {
+            env.install_kernel_import(module, ClaimForm::Path, canonical, span, interner)?;
+            if let Some(&last) = dep_path.last()
+                && last != canonical
+                && crate::env::kernel_import_binds_last_segment(
+                    &name_str(interner, last)?,
+                    &canonical_s,
+                )
+            {
+                env.install_kernel_import(module, ClaimForm::LastSegment, last, span, interner)?;
+            }
+            let dotted = path_to_dot_string(interner, dep_path);
+            let segments: Vec<&str> = dotted.split('.').collect();
+            if crate::env::is_dotted_qualifier_spelling(&segments) {
+                let spelling = interner.intern(&dotted)?;
+                env.install_kernel_import(module, ClaimForm::Path, spelling, span, interner)?;
+            }
         }
-        // Tier-C import gate (ADR 0001): this `import Ipe.X [as Alias]` brings the
-        // qualifier into scope under the name the user will type. Mark that name
-        // (the alias, or — via the fall-through below — the canonical) so a later
-        // `Alias.member` / `X.member` resolves instead of raising N0034. An
-        // explicit alias that collides with a gated canonical was rejected above,
-        // so marking an explicit alias here can never unlock an unrelated gate.
-        //
-        // A BARE import exposes the module under its last path segment. When that
-        // segment equals a DIFFERENT module's gated canonical qualifier
-        // (`import Ipe.Http.Stream` → segment `Stream` = server `Stream`'s
-        // canonical; `import Ipe.Server.Http` → segment `Http` = client `Http`'s
-        // canonical), marking it would unlock the foreign module's privileged
-        // kernels with no import of that module — a capability smuggle. Fail
-        // closed: skip the mark for that foreign-canonical case. The member-clone
-        // below still runs, so the bare import's own members resolve, and its
-        // canonical is still marked via the `import.alias.is_none()` branch.
-        let alias_is_foreign_gated_canonical = import.alias.is_none()
-            && alias != canonical
-            && crate::env::is_stdlib_canonical_qualifier(interner, alias);
-        if !alias_is_foreign_gated_canonical {
-            env.mark_stdlib_qualifier_imported(alias);
-        }
-        // A bare `import Ipe.X.Y` (no explicit `as`) also names the module under
-        // its CANONICAL qualifier — for a dotted-canonical module such as
-        // `Ipe.Db.Decode` (canonical `Db.Decode`) that is the multi-segment form
-        // the parser produces from `Db.Decode.member`, which no `as` alias can
-        // spell. Marking the canonical too keeps `X.Y.member` resolving without an
-        // alias. An explicit `as Alias` names a single qualifier on purpose, so it
-        // does not pull the canonical into scope.
-        if import.alias.is_none() {
-            env.mark_stdlib_qualifier_imported(canonical);
-        }
-        if alias == canonical {
-            // Already registered under its canonical name — nothing to clone.
-            continue;
-        }
-        // Clone the canonical qualifier's members under the alias key. The cloned
-        // `VarHome::Kernel` entries carry the CANONICAL module + name symbols, so
-        // a later `Alias.member` resolves to the same `VarKernel` a canonical
-        // reference would (the lowerer's kernel match arms are unaffected).
-        if let Some(members) = env.qual_vars.get(&canonical).cloned() {
-            std::rc::Rc::make_mut(&mut env.qual_vars)
-                .entry(alias)
-                .or_default()
-                .extend(members);
+        if let Some(shape) = TeaShape::from_canonical(&canonical_s) {
+            install_shape_cmd_sub(shape, span, env, interner)?;
         }
     }
     Ok(())
 }
 
-/// Bring the stdlib VALUE members named in an explicit
-/// `import Ipê.*/Ipe.* exposing (n1, n2, …)` list into UNQUALIFIED scope.
-///
-/// `import M exposing (member)` for a stdlib module registers value members
-/// into unqualified scope. Stdlib imports are skipped by the dep-injection loop
-/// ([`inject_dep_exports`] never runs for them), so without this a bare `member`
-/// reference would fall through to `IPE-N0001`. This is the exposing-list
-/// counterpart of the stdlib
-/// alias registration ([`register_stdlib_import_aliases`]): it reuses the same
-/// authoritative path→qualifier table via [`Env::canonical_stdlib_qualifier`].
-///
-/// Scope and soundness:
-///
-/// * Only **VALUE** exposures ([`src::Exposed::Value`], lowercase names) are
-///   handled. Capitalized **TYPE** exposures (`exposing (Element)`,
-///   `exposing (Error)`) are kernel-implicit built-in types resolved by a
-///   separate mechanism and are deliberately left untouched — treating them as
-///   value members would spuriously reject every `exposing (SomeType)`. The
-///   CONSTRUCTORS a `Type(..)` exposure opens are injected separately by
-///   [`inject_stdlib_exposed_ctors`].
-/// * The registered [`VarHome::Kernel`] is **cloned verbatim** from the
-///   canonical qualifier's member table, so the cloned entry carries the SAME
-///   kernel id + canonical module + name a qualified `M.member` reference
-///   resolves to. Lowering is therefore identical whether the call site is
-///   qualified or unqualified (exactly like the stdlib alias clones).
-/// * **Fail-closed.** A lowercase exposed name that is NOT a real value member
-///   of the module yields [`NameError::NameNotExposed`] with a did-you-mean over
-///   the module's actual members — never a silently invented unqualified
-///   binding. A path that names no known/ported stdlib module registers nothing
-///   (matching [`register_stdlib_import_aliases`]); a later unqualified use
-///   surfaces the ordinary `IPE-N0001` at its use site.
-/// * Exposed names fold into `seen_values`, so a user top-level value (or a
-///   synth record-alias ctor) of the same name surfaces
-///   [`NameError::DuplicateValue`] rather than silently shadowing — matching the
-///   Elm rule that explicitly importing a name and defining it locally is a
-///   conflict.
-///
-/// `exposing (..)` (open import) on a stdlib module is intentionally a **no-op**
-/// here: open imports have low priority (a local definition shadows them without
-/// error), which is a different, non-strict insertion discipline than the
-/// explicit list above. Flooding every member into `seen_values` would wrongly
-/// turn a legal local shadow of an ambient name (e.g. a user `map`) into a
-/// `DuplicateValue` and regress the corpus. The ambient Tier-A (`Ipe.Basics`)
-/// and Tier-B (`Maybe`/`Result`/`List` + their constructors) names already
-/// resolve via the pre-installed built-ins + qualified access, so no open
-/// value-flood import is needed for them.
+/// Install `Cmd` and `Sub` with the members of `shape`'s own modules.
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] / [`NameError::DuplicateValue`]; or
-/// [`Diagnostic::CompilerBug`] if interning `Ipe` / a name exhausts the
-/// interner.
-fn inject_stdlib_exposed_values(
-    m: &src::Module,
+/// As [`Env::install_import`].
+fn install_shape_cmd_sub(
+    shape: TeaShape,
+    span: Span,
     env: &mut Env,
-    seen_values: &mut BTreeMap<Symbol, Span>,
     interner: &mut Interner,
 ) -> DResult<()> {
-    let ipe_sym = interner.intern("Ipe")?;
-    for import in &m.imports {
-        let dep_path = &import.name.value;
-        // Only `Ipê.*` / `Ipe.*` imports name compiler stdlib modules.
-        if dep_path.first().copied().is_none_or(|s| s != ipe_sym) {
-            continue;
-        }
-        // Open imports (`exposing (..)`) are a no-op — see the doc comment.
-        let src::Exposing::List(items) = &import.exposing.value else {
+    for family in CmdOrSub::ALL {
+        let Some(module_name) = shape.cmd_sub(family) else {
             continue;
         };
-        let Some(canonical) = env.canonical_stdlib_qualifier(dep_path, interner)? else {
-            // No kernel qualifier for this `Ipe.*` path. In a project build this
-            // is a COMPILED-SOURCE stdlib module (`Ipe.Palette`, `Ipe.Css`, …)
-            // whose `exposing` members were already injected by the dep loop —
-            // and a typo'd `Ipe.*` import was already rejected with IPE-N0020 by
-            // `reject_unknown_ipe_import_with_candidates`. Either way this pass
-            // registers nothing.
+        let module_sym = interner.intern(module_name)?;
+        let Some(module) = env.kernel_module_of(module_sym) else {
             continue;
         };
-        for item in items {
-            // Only VALUE members are brought unqualified; TYPE exposures resolve
-            // through the kernel-implicit type mechanism and are left as-is.
-            let src::Exposed::Value(name) = &item.value else {
-                continue;
-            };
-            let name = *name;
-            // Resolve against the canonical qualifier's member table, cloning the
-            // kernel home out so the immutable borrow ends before the mutation.
-            let member = env
-                .qual_vars
-                .get(&canonical)
-                .and_then(|members| members.get(&name))
-                .cloned();
-            let Some(home) = member else {
-                // Fail-closed: not a real value member of this module.
-                let name_s = name_str(interner, name)?;
-                let module_s = path_to_dot_string(interner, dep_path);
-                let candidates: Vec<Symbol> = env
-                    .qual_vars
-                    .get(&canonical)
-                    .map(|members| members.keys().copied().collect())
-                    .unwrap_or_default();
-                let sugg = suggestions(name, candidates.into_iter(), interner);
+        let spelling = interner.intern(family.qualifier())?;
+        env.install_kernel_import(module, ClaimForm::Path, spelling, span, interner)?;
+    }
+    Ok(())
+}
+
+/// Record the one TEA shape module this module imports.
+///
+/// The shape is read from the module identity each import reaches, never
+/// from the import's spelling.
+///
+/// # Errors
+/// [`NameError::TwoShapeImports`] (IPE-N0035) at the first import of a
+/// second, different shape; [`Diagnostic::CompilerBug`] if interning exhausts
+/// the interner.
+fn record_import_shape(
+    imports: &[src::Import],
+    env: &mut Env,
+    interner: &mut Interner,
+) -> DResult<Option<(TeaShape, Span)>> {
+    let mut found: Option<(TeaShape, Span)> = None;
+    for import in imports {
+        let Some(module) = env.kernel_module(&import.name.value, interner)? else {
+            continue;
+        };
+        let Some(shape) = interner
+            .resolve(module.symbol())
+            .and_then(TeaShape::from_canonical)
+        else {
+            continue;
+        };
+        match found {
+            None => found = Some((shape, import.name.span)),
+            Some((first_shape, first)) if first_shape != shape => {
                 return Err(Diagnostic::Name {
-                    span: item.span,
-                    msg: NameError::NameNotExposed {
-                        module: module_s,
-                        name: name_s,
-                        suggestions: sugg,
-                    },
-                });
-            };
-            // Fold into the value namespace with DuplicateValue detection.
-            if let Some(&first) = seen_values.get(&name) {
-                return Err(Diagnostic::Name {
-                    span: item.span,
-                    msg: NameError::DuplicateValue {
-                        name: name_str(interner, name)?,
+                    span: import.name.span,
+                    msg: NameError::TwoShapeImports {
+                        first_module: format!("Ipe.Tea.{}", first_shape.canonical())
+                            .into_boxed_str(),
+                        second_module: format!("Ipe.Tea.{}", shape.canonical()).into_boxed_str(),
                         first,
                     },
                 });
             }
-            seen_values.insert(name, item.span);
-            env.vars.insert(name, home);
+            Some(_) => {}
+        }
+    }
+    if let Some((shape, span)) = found {
+        env.set_cmd_sub_shape(shape, span);
+    }
+    Ok(found)
+}
+
+/// IPE-N0035 for an `Ipe.Tea.<segment>.{Cmd,Sub}` import an `app` surface does
+/// not admit.
+fn wrong_shape_cmd_sub(span: Span, segment: &str, family: CmdOrSub, app: AppSurface) -> Diagnostic {
+    let leaf = family.qualifier();
+    let app_name = app.name();
+    Diagnostic::Name {
+        span,
+        msg: NameError::WrongShapeCmdSub(Box::new(CmdSubShapeMismatch {
+            imported: format!("Ipe.Tea.{segment}.{leaf}").into_boxed_str(),
+            imported_shape: segment.into(),
+            app_shape: app_name.into(),
+            expected: format!("Ipe.Tea.{app_name}.{leaf}").into_boxed_str(),
+        })),
+    }
+}
+
+/// Bind the bare names a stdlib kernel-module import brings into scope.
+///
+/// A kernel module (`Ipe.List`, `Ipe.Html`, …) has no `deps` entry: its members
+/// live in the kernel pools [`Env::kernel_members`] and [`Env::kernel_ctors`],
+/// filled by [`Env::initial`]. This is the kernel
+/// counterpart of [`inject_dep_exports`] and binds at the same tiers:
+///
+/// * `exposing (..)` binds every value member at [`Tier::Open`].
+/// * `exposing (name, …)` binds each named value at [`Tier::Explicit`]. A
+///   lowercase name that is not a value member of the module is
+///   [`NameError::NameNotExposed`], never an invented binding.
+/// * `exposing (Type(..))` or `Type(A, …)` binds the constructors the filter
+///   admits of a built-in union with a qualified home (`HttpMethod`'s
+///   `Get`/`Post`) at [`Tier::Explicit`]. Those constructors are otherwise
+///   reachable only qualified (`Http.Post`), so a bare `Post` with no import
+///   never shadows a user constructor.
+///
+/// Each binding is cloned verbatim from the qualified table, so a bare use
+/// lowers exactly as the qualified `M.member` does. A capitalised type exposure
+/// names a kernel-implicit built-in type and binds no value. A path naming no
+/// kernel module binds nothing: a compiled-source stdlib module is bound by
+/// [`inject_dep_exports`], and an unknown `Ipe.*` path was already refused.
+///
+/// # Errors
+/// [`NameError::NameNotExposed`]; [`NameError::AmbiguousImport`] for an explicit
+/// name another explicit import already binds to a different definition; or
+/// [`Diagnostic::CompilerBug`] if interning exhausts the interner.
+fn bind_stdlib_kernel_import(
+    import: &src::Import,
+    env: &mut Env,
+    interner: &mut Interner,
+) -> DResult<()> {
+    let dep_path = &import.name.value;
+    let ipe_sym = interner.intern("Ipe")?;
+    // Only `Ipê.*` / `Ipe.*` imports name compiler stdlib modules.
+    if dep_path.first().copied().is_none_or(|s| s != ipe_sym) {
+        return Ok(());
+    }
+    let Some(module) = env.kernel_module(dep_path, interner)? else {
+        return Ok(());
+    };
+    let (member_map, ctor_map) = env.kernel_module_members(module);
+    let members: Vec<(Symbol, VarHome)> = member_map.into_iter().collect();
+    match &import.exposing.value {
+        src::Exposing::All => {
+            for (name, home) in members {
+                let identity = value_identity(&home, name)?;
+                let origin = imported(
+                    ExprTarget::Value(home),
+                    identity,
+                    dep_path,
+                    import.name.span,
+                );
+                bind_expr(env, name, Tier::Open, origin, interner)?;
+            }
+        }
+        src::Exposing::List(items) => {
+            for item in items {
+                match &item.value {
+                    src::Exposed::Value(name) => {
+                        let name = *name;
+                        let Some(home) = members
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, h)| h.clone())
+                        else {
+                            let name_s = name_str(interner, name)?;
+                            return Err(Diagnostic::Name {
+                                span: item.span,
+                                msg: NameError::NameNotExposed {
+                                    module: path_to_dot_string(interner, dep_path),
+                                    name: name_s.clone(),
+                                    suggestions: Candidates::at(
+                                        EditTarget::whole(item.span, &name_s),
+                                        suggestions(
+                                            name,
+                                            members.iter().map(|(n, _)| *n),
+                                            interner,
+                                        ),
+                                    ),
+                                },
+                            });
+                        };
+                        let identity = value_identity(&home, name)?;
+                        let origin =
+                            imported(ExprTarget::Value(home), identity, dep_path, item.span);
+                        bind_expr(env, name, Tier::Explicit, origin, interner)?;
+                    }
+                    src::Exposed::Type(type_name, privacy) => {
+                        let filter = exposed_ctor_filter(privacy);
+                        let ctors: Vec<CtorHome> = ctor_map
+                            .values()
+                            .filter(|c| c.type_name == *type_name && filter.admits(c.name))
+                            .cloned()
+                            .collect();
+                        for ctor in ctors {
+                            let name = ctor.name;
+                            let origin = imported(
+                                ExprTarget::Ctor(ctor.clone()),
+                                ctor_identity(&ctor),
+                                dep_path,
+                                item.span,
+                            );
+                            bind_expr(env, name, Tier::Explicit, origin, interner)?;
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Bring the CONSTRUCTORS of a built-in union with a `qualified_home`
-/// (e.g. `HttpMethod` under `Http`) into UNQUALIFIED scope for an explicit
-/// `import Ipê.*/Ipe.* exposing (Type(..))` (or `Type(A, B)`) list.
-///
-/// Such a union is registered by [`Env::install_builtin_ctors`] into
-/// [`Env::qual_ctors`] ONLY — never the ambient unqualified [`Env::ctors`] —
-/// so a bare `Post`/`Get` with no import does NOT resolve to the HTTP verb and
-/// cannot shadow a user's own same-spelled constructor. An **explicit** open
-/// import is the sanctioned request to unqualify them: it is the whole meaning
-/// of `exposing (Type(..))`. This is the constructor counterpart of
-/// [`inject_stdlib_exposed_values`] (which handles only lowercase VALUE members)
-/// and mirrors the user-dep path ([`inject_ctors_for_type`]).
-///
-/// Scope and soundness:
-///
-/// * The ctors are **cloned verbatim** from the canonical qualifier's
-///   [`Env::qual_ctors`] entry, so an unqualified `Post` carries the SAME
-///   [`CtorHome`] (type, index, arity) a qualified `Http.Post` resolves to;
-///   downstream lowering is identical either way.
-/// * Only a `Type(..)`/`Type(A, …)` exposure ([`src::Privacy::Public`] /
-///   [`src::Privacy::PublicCtors`]) opens the constructors; an opaque
-///   `Type` ([`src::Privacy::Private`]) exposes none — matching the user-dep
-///   privacy rule.
-/// * A path naming no known/ported stdlib module, or a type with no
-///   `qualified_home` constructors, injects nothing (fail-closed); the type
-///   name itself resolves through the kernel-implicit type mechanism as before.
+/// The module-level identity of a value bound at `home`.
 ///
 /// # Errors
-/// [`Diagnostic::CompilerBug`] if interning `Ipe` or a type name exhausts the
-/// interner.
+/// [`Diagnostic::CompilerBug`] for a lexical home, which never binds at module level.
+fn value_identity(home: &VarHome, name: Symbol) -> DResult<Identity> {
+    ValueIdentity::of(home, name)
+        .map(Identity::Value)
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "ipe_canon::value_identity",
+            detail: "a module-level value carries a lexical home".into(),
+        })
+}
+
+/// The defining identity of a constructor: its type's home and name.
+fn ctor_identity(ctor: &CtorHome) -> Identity {
+    Identity::Ctor(CtorIdentity {
+        home: ctor.home.clone(),
+        type_name: ctor.type_name,
+    })
+}
+
+/// An import binding reached through `importer`, introduced at `span`.
+fn imported<T>(target: T, identity: Identity, importer: &[Symbol], span: Span) -> Origin<T> {
+    Origin {
+        target,
+        identity,
+        importers: BTreeSet::from([importer.to_vec()]),
+        span,
+    }
+}
+
+/// A binding declared in the module being canonicalised, at `span`.
+const fn declared<T>(target: T, identity: Identity, span: Span) -> Origin<T> {
+    Origin {
+        target,
+        identity,
+        importers: BTreeSet::new(),
+        span,
+    }
+}
+
+/// The importing module paths, rendered for a diagnostic.
+fn importer_names(importers: &BTreeSet<Vec<Symbol>>, interner: &Interner) -> SortedNames {
+    SortedNames::new(importers.iter().map(|p| path_to_dot_string(interner, p)))
+}
+
+/// The duplicate-declaration error for an expression-namespace name.
+const fn duplicate_expr(is_ctor: bool, name: Box<str>, first: Span) -> NameError {
+    if is_ctor {
+        NameError::DuplicateConstructor { name, first }
+    } else {
+        NameError::DuplicateValue { name, first }
+    }
+}
+
+/// Bind a bare value or constructor name at `tier`, refusing a clash.
+///
+/// - Two explicit imports of different definitions are IPE-N0024 at the later
+///   import, naming every importing module.
+/// - Two local declarations are IPE-N0010 (value) or IPE-N0011 (constructor)
+///   at the later one.
+/// - A local declaration spelling an explicitly imported name is refused at the
+///   declaration with the same code, `first` pointing at the import item.
+///
+/// # Errors
+/// The clash's [`Diagnostic::Name`]; [`Diagnostic::CompilerBug`] if a name
+/// symbol is not interned.
+fn bind_expr(
+    env: &mut Env,
+    name: Symbol,
+    tier: Tier,
+    origin: Origin<ExprTarget>,
+    interner: &Interner,
+) -> DResult<()> {
+    let span = origin.span;
+    let is_ctor = matches!(origin.target, ExprTarget::Ctor(_));
+    let mut importers = origin.importers.clone();
+    let Err(clash) = Rc::make_mut(&mut env.module_scope)
+        .expr
+        .bind(name, tier, origin)
+    else {
+        return Ok(());
+    };
+    let name_s = name_str(interner, name)?;
+    let (span, msg) = match clash {
+        Clash::SameTier { .. } if tier == Tier::Explicit => {
+            if let Resolved::Found(prior, _) = env.module_scope.expr.resolve(name) {
+                importers.extend(prior.importers.iter().cloned());
+            }
+            let modules = importer_names(&importers, interner);
+            (
+                span,
+                NameError::AmbiguousImport {
+                    name: name_s,
+                    modules,
+                },
+            )
+        }
+        Clash::SameTier { first } => (span, duplicate_expr(is_ctor, name_s, first)),
+        Clash::LocalOverExplicit { local, import } => {
+            (local, duplicate_expr(is_ctor, name_s, import))
+        }
+    };
+    Err(Diagnostic::Name { span, msg })
+}
+
+/// Bind a bare union or alias name at `tier`, refusing a clash.
+///
+/// Two explicit imports of different definitions, two local declarations, and
+/// a local declaration spelling an explicitly imported type are each IPE-N0012:
+/// at the later binding, or at the local declaration with `first` pointing at
+/// the import item.
+///
+/// # Errors
+/// [`NameError::DuplicateType`]; [`Diagnostic::CompilerBug`] if a name symbol
+/// is not interned.
+fn bind_type(
+    env: &mut Env,
+    name: Symbol,
+    tier: Tier,
+    origin: Origin<ScopeType>,
+    interner: &Interner,
+) -> DResult<()> {
+    let span = origin.span;
+    let Err(clash) = Rc::make_mut(&mut env.module_scope)
+        .ty
+        .bind(name, tier, origin)
+    else {
+        return Ok(());
+    };
+    let (span, first) = match clash {
+        Clash::SameTier { first } => (span, first),
+        Clash::LocalOverExplicit { local, import } => (local, import),
+    };
+    Err(Diagnostic::Name {
+        span,
+        msg: NameError::DuplicateType {
+            name: name_str(interner, name)?,
+            first,
+        },
+    })
+}
+
 /// Which of a type's constructors an `exposing` clause opens into unqualified
 /// scope. Derived once from a [`src::Privacy`] by [`exposed_ctor_filter`] so both
 /// the built-in and user-dep injectors select the same set by construction: a
@@ -2765,55 +2255,6 @@ fn exposed_ctor_filter(privacy: &src::Privacy) -> CtorFilter {
     }
 }
 
-fn inject_stdlib_exposed_ctors(
-    m: &src::Module,
-    env: &mut Env,
-    interner: &mut Interner,
-) -> DResult<()> {
-    let ipe_sym = interner.intern("Ipe")?;
-    for import in &m.imports {
-        let dep_path = &import.name.value;
-        if dep_path.first().copied().is_none_or(|s| s != ipe_sym) {
-            continue;
-        }
-        let src::Exposing::List(items) = &import.exposing.value else {
-            continue;
-        };
-        let Some(canonical) = env.canonical_stdlib_qualifier(dep_path, interner)? else {
-            continue;
-        };
-        for item in items {
-            let src::Exposed::Type(type_name, privacy) = &item.value else {
-                continue;
-            };
-            let filter = exposed_ctor_filter(privacy);
-            // An opaque `Type` exposure opens no constructors.
-            if matches!(filter, CtorFilter::None) {
-                continue;
-            }
-            let type_sym = *type_name;
-            // Copy the exposed constructors of this type from the qualified table;
-            // a `Type(A, B)` subset copies only the named ones, and a built-in
-            // union with no `qualified_home` contributes nothing here.
-            let ctors: Vec<CtorHome> = env
-                .qual_ctors
-                .get(&canonical)
-                .map(|members| {
-                    members
-                        .values()
-                        .filter(|home| home.type_name == type_sym && filter.admits(home.name))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            for ctor_home in ctors {
-                std::rc::Rc::make_mut(&mut env.ctors).insert(ctor_home.name, ctor_home);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Builtin type names whose lowering (`ipe_lower::ir_type_from_{ty,canon}`)
 /// disambiguates by the `home` path — `Attribute` exists in BOTH `Ipe.Ui`
 /// (→ `ipe_runtime::ui::element::Attribute`) and `Ipe.Html.Attributes`
@@ -2827,8 +2268,8 @@ const HOME_SENSITIVE_BUILTIN_TYPES: &[&str] = &["Attribute", "Event"];
 /// Record the canonical `["Html"]` `home` for a home-sensitive builtin TYPE
 /// (`Attribute` / `Event`) brought UNQUALIFIED into scope via an explicit
 /// `import <Html-family> exposing (Attribute, …)` list — the TYPE
-/// counterpart of [`inject_stdlib_exposed_values`] (which handles only lowercase
-/// VALUE members).
+/// counterpart of [`bind_stdlib_kernel_import`] (which binds only kernel
+/// values and constructors).
 ///
 /// ## Why
 ///
@@ -2840,8 +2281,8 @@ const HOME_SENSITIVE_BUILTIN_TYPES: &[&str] = &["Attribute", "Event"];
 /// `Ipe.Web.Head.pairToAttr : (String,String) -> Attribute msg` shape
 /// mis-lowers to `ui::element::Attribute` while its `Attr.attribute` body
 /// produces `html::Attribute` — an exit-0-then-cargo-fail E0308 SEAL violation.
-/// The bare path resolves via `resolve_unqualified_type_home`, which consults
-/// `type_home_map` first, so recording `["Html"]` here disambiguates it.
+/// Binding the bare name at the explicit tier with the `["Html"]` home
+/// disambiguates it.
 ///
 /// ## Why `["Html"]` and not the full dep path
 ///
@@ -2860,19 +2301,23 @@ const HOME_SENSITIVE_BUILTIN_TYPES: &[&str] = &["Attribute", "Event"];
 ///   by [`fold_html_stdlib_qualifier_homes`] (keyed on the QUALIFIER, so the two
 ///   stay distinct); this pass must touch ONLY names exposed UNQUALIFIED, or it
 ///   would also hijack a qualified `Ui.Attribute` in the same module (whose
-///   fallback also reads `type_home_map`) — the exact regression in
+///   fallback also reads the bare type namespace) — the exact regression in
 ///   `26-ui-showcase/RegressionGates.testId : Ui.Attribute msg`.
 /// * **Conflict guard.** If the SAME module ALSO brings the Ui `Attribute` type
 ///   into UNQUALIFIED scope (`import Ipe.Ui … exposing (Attribute)` or `exposing
 ///   (..)`), a bare `Attribute` is genuinely ambiguous, so we record NOTHING and
 ///   leave the sentinel rather than silently pinning one home.
 /// * Runs BEFORE any value body is canonicalised.
-/// * A later LOCAL `type Attribute` is already rejected by
-///   `reject_reserved_builtin_type` (IPE-N0026); re-inserting the same `["Html"]`
-///   is idempotent (`entry(..).or_insert`).
+/// * A LOCAL `type Attribute` is already rejected by
+///   `reject_reserved_builtin_type` (IPE-N0026). A name a local declaration or
+///   an explicit import already binds is left as it is, and binding the same
+///   `["Html"]` home twice is one binding.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if interning `Html` exhausts the interner.
 fn inject_stdlib_exposed_type_homes(
     m: &src::Module,
-    type_home_map: &mut BTreeMap<Symbol, Vec<Symbol>>,
+    env: &mut Env,
     interner: &mut Interner,
 ) -> DResult<()> {
     let html_sym = interner.intern("Html")?;
@@ -2929,9 +2374,7 @@ fn inject_stdlib_exposed_type_homes(
             if !HOME_SENSITIVE_BUILTIN_TYPES.contains(&resolved) {
                 continue;
             }
-            type_home_map
-                .entry(*type_name)
-                .or_insert_with(|| vec![html_sym]);
+            bind_html_type_home(env, *type_name, html_sym, &[], item.span, interner)?;
         }
     }
 
@@ -2957,12 +2400,51 @@ fn inject_stdlib_exposed_type_homes(
             if !HOME_SENSITIVE_BUILTIN_TYPES.contains(&resolved) {
                 continue;
             }
-            type_home_map
-                .entry(*type_name)
-                .or_insert_with(|| vec![html_sym]);
+            bind_html_type_home(
+                env,
+                *type_name,
+                html_sym,
+                &import.name.value,
+                item.span,
+                interner,
+            )?;
         }
     }
     Ok(())
+}
+
+/// Bind a home-sensitive builtin type at the explicit tier under the `["Html"]`
+/// home, unless a local declaration or an explicit import already binds it.
+///
+/// An empty `importer` is the module's own `exposing` list.
+///
+/// # Errors
+/// [`NameError::DuplicateType`] is unreachable past the guard;
+/// [`Diagnostic::CompilerBug`] if a name symbol is not interned.
+fn bind_html_type_home(
+    env: &mut Env,
+    name: Symbol,
+    html_sym: Symbol,
+    importer: &[Symbol],
+    span: Span,
+    interner: &Interner,
+) -> DResult<()> {
+    if env.module_scope.ty.eager_bound(name) {
+        return Ok(());
+    }
+    let home = vec![html_sym];
+    let importers = if importer.is_empty() {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([importer.to_vec()])
+    };
+    let origin = Origin {
+        target: ScopeType::Union(home.clone()),
+        identity: Identity::Type(home),
+        importers,
+        span,
+    };
+    bind_type(env, name, Tier::Explicit, origin, interner)
 }
 
 /// Fold each Html-family STDLIB import qualifier into `qualifier_paths`, mapping
@@ -2970,8 +2452,8 @@ fn inject_stdlib_exposed_type_homes(
 ///
 /// Stdlib kernel imports are skipped by the ordinary `qualifier_paths`
 /// construction (they carry no `deps` entry), so a QUALIFIED `Attr.Attribute`
-/// (from `import Ipe.Html.Attributes as Attr`) used to fall through to the
-/// by-name `type_home_map.get("Attribute")` — a single entry that cannot tell
+/// (from `import Ipe.Html.Attributes as Attr`) would fall through to the
+/// bare `Attribute` type binding — a single binding that cannot tell
 /// `Attr.Attribute` (Html) from `Ui.Attribute` (Ui), so both mis-lowered to the
 /// same newtype. Registering the qualifier here — `Attr` (and the canonical
 /// `Html`) → `["Html"]` — makes the `TType` arm resolve `Attr.Attribute` to the
@@ -2995,7 +2477,7 @@ fn inject_stdlib_exposed_type_homes(
 /// at the `TType` consumer: it homes only the reserved builtin view-type NAMES
 /// (`Attribute`/`Html`). A compiled-source ADT declared in `Ipe.Html.Attributes`
 /// (e.g. `Attr.LinkTarget`) is not a reserved builtin, so the consumer keeps its
-/// real `["Ipe","Html","Attributes"]` home from `type_home_map` rather than this
+/// real `["Ipe","Html","Attributes"]` home rather than this
 /// `["Html"]` sentinel. Value members are likewise unaffected — they resolve
 /// through the compiled-source module, not `qualifier_paths`.
 ///
@@ -3003,6 +2485,7 @@ fn inject_stdlib_exposed_type_homes(
 /// [`Diagnostic::CompilerBug`] if interning `Html` exhausts the interner.
 fn fold_html_stdlib_qualifier_homes(
     imports: &[src::Import],
+    env: &Env,
     qualifier_paths: &mut BTreeMap<Symbol, Vec<Symbol>>,
     interner: &mut Interner,
 ) -> DResult<()> {
@@ -3020,6 +2503,11 @@ fn fold_html_stdlib_qualifier_homes(
         let qualifier = import
             .alias
             .unwrap_or_else(|| dep_path.last().copied().unwrap_or_else(name_zero));
+        // The spelling must denote this import's module: one another import
+        // owns, or one left ambiguous, takes no home from this import.
+        if !owned_by_import(env, qualifier, dep_path, interner)? {
+            continue;
+        }
         // Register the qualifier's REAL dep path (or the bare `["Html"]` builtin
         // home for a builtin-only module such as `Ipe.Html` that carries no
         // compiled source). The `TType` consumer force-homes the builtin
@@ -3046,91 +2534,39 @@ fn fold_html_stdlib_qualifier_homes(
     Ok(())
 }
 
-/// Flood EVERY value member of a stdlib module named in
-/// `import Ipê.*/Ipe.* exposing (..)` into the LOW-PRIORITY wildcard tier
-/// ([`Env::wildcard_vars`]) so bare `div` / `text` / … resolve unqualified.
+/// The dependency path of every spelling a source module owns in `env`'s scope.
 ///
-/// This is the open-import counterpart of [`inject_stdlib_exposed_values`]. The
-/// two paths differ ONLY in insertion discipline, and the difference is the whole
-/// point of the wildcard/explicit distinction:
-///
-/// * **Explicit `exposing (name)`** folds into `seen_values` + `env.vars` — a
-///   local of the same name is a hard [`NameError::DuplicateValue`] ("I demand
-///   this name"), and the name resolves at the same priority as a top-level
-///   binding.
-/// * **Wildcard `exposing (..)`** inserts into `env.wildcard_vars` ONLY — never
-///   into `seen_values`, so a local / explicit-exposed / synth-ctor / built-in
-///   name of the same spelling SILENTLY shadows it at resolve time ("fill in the
-///   rest"). [`resolve_var`] consults this tier last.
-///
-/// Ambiguity is NOT decided here: two wildcards exposing the same name are both
-/// legal at import time. The clash is recorded (both origins kept, keyed by the
-/// module's full dotted path) and only surfaces as [`NameError::AmbiguousImport`]
-/// if a bare use of the name actually occurs and no higher-priority binding
-/// shadows it — matching the deferred-conflict rule Elm applies to open imports.
-///
-/// Soundness: each cloned [`VarHome::Kernel`] carries the canonical module + name
-/// (and kernel id) of the qualified member, so an unqualified wildcard reference
-/// lowers byte-identically to a qualified `M.member` reference. Keying by the
-/// full dotted path means importing the same module twice (or once under an
-/// alias) collapses to a single origin — never a spurious self-ambiguity — while
-/// two distinct modules that share a leaf segment stay separate origins.
-///
-/// A path that names no known/ported stdlib module floods nothing (fail-closed,
-/// via [`Env::canonical_stdlib_qualifier`]); a later bare use surfaces the
-/// ordinary `IPE-N0001` at its use site.
+/// Read from [`crate::env::ImportScope::qualifier_owner`], the one record of
+/// which module each spelling denotes, so a spelling a kernel import owns or
+/// one left ambiguous carries no dependency home.
+fn source_qualifier_homes(env: &Env) -> BTreeMap<Symbol, Vec<Symbol>> {
+    env.import_scope
+        .qualifier_owner
+        .iter()
+        .filter_map(|(&spelling, claim)| match &claim.owner {
+            ModuleIdentity::Source(path) => Some((spelling, path.clone())),
+            ModuleIdentity::Kernel(_) => None,
+        })
+        .collect()
+}
+
+/// Whether `spelling` is owned in `env`'s scope by the module `dep_path` names.
 ///
 /// # Errors
-/// [`Diagnostic::CompilerBug`] if interning `Ipe` exhausts the interner.
-fn inject_stdlib_wildcard_values(
-    m: &src::Module,
-    env: &mut Env,
+/// [`Diagnostic::CompilerBug`] if interning a canonical exhausts the interner.
+fn owned_by_import(
+    env: &Env,
+    spelling: Symbol,
+    dep_path: &[Symbol],
     interner: &mut Interner,
-) -> DResult<()> {
-    let ipe_sym = interner.intern("Ipe")?;
-    for import in &m.imports {
-        let dep_path = &import.name.value;
-        // Only `Ipê.*` / `Ipe.*` imports name compiler stdlib modules.
-        if dep_path.first().copied().is_none_or(|s| s != ipe_sym) {
-            continue;
-        }
-        // Only open imports (`exposing (..)`) flood the wildcard tier; the
-        // explicit-list case is handled by `inject_stdlib_exposed_values`.
-        if !matches!(&import.exposing.value, src::Exposing::All) {
-            continue;
-        }
-        let Some(canonical) = env.canonical_stdlib_qualifier(dep_path, interner)? else {
-            // Unknown / unported stdlib path: flood nothing (fail-closed).
-            continue;
-        };
-        // Snapshot the canonical qualifier's members (clone out so the immutable
-        // borrow of `env.qual_vars` ends before we mutate `env.wildcard_vars`).
-        let Some(members) = env.qual_vars.get(&canonical).cloned() else {
-            continue;
-        };
-        let dep_owned = dep_path.clone();
-        // The canonical qualifier gated the flood above (fail-closed on an
-        // unknown module); it plays no further part now that the origin key is
-        // the full dotted path.
-        let _ = canonical;
-        for (name, home) in members {
-            // Key by the module's FULL dotted path: a second import of the SAME
-            // module overwrites its own prior origin (same key → no self-
-            // ambiguity), while two distinct modules sharing a leaf segment stay
-            // separate origins and remain distinguishable at a bare use site.
-            std::rc::Rc::make_mut(&mut env.wildcard_vars)
-                .entry(name)
-                .or_default()
-                .insert(
-                    dep_owned.clone(),
-                    WildcardOrigin {
-                        home,
-                        dep_path: dep_owned.clone(),
-                    },
-                );
-        }
-    }
-    Ok(())
+) -> DResult<bool> {
+    let Some(claim) = env.import_scope.qualifier_owner.get(&spelling) else {
+        return Ok(false);
+    };
+    Ok(match &claim.owner {
+        ModuleIdentity::Source(path) => path.as_slice() == dep_path,
+        ModuleIdentity::Kernel(module) => env.kernel_module(dep_path, interner)? == Some(*module),
+    })
 }
 
 /// The canonical module, its kernel aliases, and its own aliases resolved in its scope.
@@ -3143,30 +2579,32 @@ type CanonicalisedModule = (
 /// Shared resolution body used by both [`canonicalise`] and
 /// [`canonicalise_module`].
 ///
-/// Both callers provide a pre-initialised `env` (with builtins already
-/// installed) and an optionally pre-populated `type_home_map` (dep-imported
-/// types) and `extra_aliases` (dep-imported type aliases). This function:
+/// Both callers provide a pre-initialised `env` whose module scope already
+/// binds every imported name, and the dependency aliases reachable as `Q.Name`.
+/// This function:
 ///
-/// 1. Registers this module's own union types (with duplicate rejection).
-/// 2. Merges `extra_aliases` with this module's own `type alias` declarations
-///    and resolves each own alias body once, in this module's scope.
+/// 1. Binds this module's own union types and constructors at the local tier.
+/// 2. Binds this module's own `type alias` declarations at the local tier and
+///    resolves each own alias body once, in this module's scope.
 /// 3. Canonicalises constructor payload field types (second union pass).
-/// 4. Registers top-level value names (with duplicate rejection).
+/// 4. Binds top-level value names at the local tier.
 /// 5. Canonicalises each value declaration body.
+///
+/// A local declaration spelling a name an explicit import already binds, in the
+/// same namespace, is refused at the declaration.
 ///
 /// # Errors
 /// Same set as [`canonicalise`].
 // A linear resolution pipeline (register types → collect aliases → synthesize
 // record-alias ctors → register values → canonicalise bodies); splitting the
-// stages into separate functions would thread the same six mutable maps through
-// each and obscure the ordering the stages depend on.
+// stages into separate functions would thread the same resolution context
+// through each and obscure the ordering the stages depend on.
 #[allow(clippy::too_many_lines)]
 fn canonicalise_with_env(
     m: &src::Module,
     env: &mut Env,
-    type_homes: &mut TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    extra_aliases: BTreeMap<Symbol, AliasDef>,
+    qualified_aliases: &QualifiedAliases,
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<CanonicalisedModule> {
@@ -3184,106 +2622,27 @@ fn canonicalise_with_env(
     // the `unsafe` fact above, computed here where the source import list survives.
     let imported_web_capabilities = imported_web_capabilities_of(&m.imports, interner);
 
-    // The `"any"` wildcard symbol used to arity-fill a bare builtin parametric
-    // UI annotation (`view : Html` → `view : Html any`). Interned once here where
-    // the interner is mutable; the deeper `canonicalise_type` TType arm runs under
-    // an immutable `&Interner` and threads this symbol via `TypeCtx`.
-    let ui_wildcard_msg = interner.intern("any")?;
-
-    // A LOCAL type/alias declaration whose name already has a
-    // `type_home_map` entry from a DIFFERENT home is a dep-imported type being
-    // shadowed. Reject it here, at the declaration, with the SAME
-    // `NameError::DuplicateType` (IPE-N0012) `inject_dep_type` already uses for a
-    // dep-vs-dep clash — closing the asymmetry where THAT clash was caught
-    // cleanly but this one silently mis-registered the environment (the local
-    // ctors won, but the type-home map kept pointing at the dep's home),
-    // surfacing three functions later as an unrelated IPE-T0001 type mismatch
-    // (docs/adr/0002-codegen-soundness-and-the-seal.md, item D).
-    //
-    // This standalone pre-pass READS `type_home_map` but does NOT yet write this
-    // module's own entries — the two loops below still own that. Running it first
-    // (unions before aliases, both before the `entry/or_insert` loop mutates the
-    // map) avoids a two-declarations-in-one-module case spuriously seeing its own
-    // freshly-inserted entry and misreporting a shadow. Same-module duplicates
-    // (`type X = A; type X = B` in ONE module) are still caught — with a better,
-    // first-declared span — by the `seen_types` loops below, which run after this
-    // pre-pass has already ruled out the dep-shadow case.
-    for u in &m.unions {
-        let type_name = u.value.name.value;
-        if let Some(existing) = type_homes.type_home_map.get(&type_name)
-            && existing.as_slice() != home.as_slice()
-        {
-            return Err(Diagnostic::Name {
-                span: u.value.name.span,
-                msg: NameError::DuplicateType {
-                    name: name_str(interner, type_name)?,
-                    // No source span survives from the dep side here — matches
-                    // `inject_dep_type`'s established convention for this clash.
-                    first: Span::DUMMY,
-                },
-            });
-        }
-    }
-    for a in &m.aliases {
-        let alias_name = a.value.name.value;
-        if let Some(existing) = type_homes.type_home_map.get(&alias_name)
-            && existing.as_slice() != home.as_slice()
-        {
-            return Err(Diagnostic::Name {
-                span: a.value.name.span,
-                msg: NameError::DuplicateType {
-                    name: name_str(interner, alias_name)?,
-                    first: Span::DUMMY,
-                },
-            });
-        }
-    }
-
-    // Add this module's own types to the type-home map. Dep-imported types were
-    // already added by inject_dep_exports before this call; the dep-shadow
-    // pre-pass above has already rejected any local type whose name clashes with
-    // a DIFFERENT home, so `entry/or_insert` here only ever inserts a genuinely
-    // local (or same-home) type.
-    for u in &m.unions {
-        type_homes
-            .type_home_map
-            .entry(u.value.name.value)
-            .or_insert_with(|| home.clone());
-    }
-
-    // Build the type-home map: every type name in scope mapped to its home
-    // module path. For the single-module path, only this module's own unions are
-    // registered (each maps to this module's home). The multi-module path also
-    // adds imported types via `canonicalise_module`. The map is consulted by
-    // `canonicalise_type` to set the `home` field of a `Type::Con`.
-    //
-    // Register unions + their constructors into the environment, rejecting any
-    // duplicate type or constructor name (closes the silent last-wins that the
-    // bare `insert` used to hide). The canonical `canon::Union` records (with
-    // their canonicalised payload field types) are built in a second pass below,
-    // once type aliases are collected — a field type may reference an alias.
-    let mut seen_types: BTreeMap<Symbol, Span> = BTreeMap::new();
-    let mut seen_ctors: BTreeMap<Symbol, Span> = BTreeMap::new();
+    // Bind this module's own unions and their constructors at the local tier,
+    // rejecting a duplicate type or constructor name, and a name an explicit
+    // import already binds. The canonical `canon::Union` records (with their
+    // canonicalised payload field types) are built in a second pass below, once
+    // type aliases are bound — a field type may reference an alias.
     for u in &m.unions {
         let type_name = u.value.name.value;
         let type_span = u.value.name.span;
         // IPE-N0026: reject a user type whose name shadows a reserved built-in
         // before it can silently override the lowerer's builtin-name mapping.
         reject_reserved_builtin_type(type_name, type_span, origin, interner)?;
-        if let Some(&first) = seen_types.get(&type_name) {
-            return Err(Diagnostic::Name {
-                span: type_span,
-                msg: NameError::DuplicateType {
-                    name: name_str(interner, type_name)?,
-                    first,
-                },
-            });
-        }
-        seen_types.insert(type_name, type_span);
-        register_union(&u.value, &home, env, &mut seen_ctors, interner)?;
+        let origin = declared(
+            ScopeType::Union(home.clone()),
+            Identity::Type(home.clone()),
+            type_span,
+        );
+        bind_type(env, type_name, Tier::Local, origin, interner)?;
+        register_union(&u.value, &home, env, interner)?;
     }
 
-    // Collect type aliases. Both the non-parametric form (`type alias Count =
+    // Bind type aliases. Both the non-parametric form (`type alias Count =
     // Int`) and the parametric form (`type alias Pair a = ( a, a )`) are
     // supported: a parametric alias records its declared parameters and is
     // expanded by substituting each use site's type arguments for the parameters
@@ -3292,46 +2651,36 @@ fn canonicalise_with_env(
     // annotation and expanded in place at every use site by `canonicalise_type`;
     // an imported one arrives canonical from its defining module. Either way no
     // later stage ever sees an alias.
-    //
-    // Start from `extra_aliases` (dep aliases injected by imports); local
-    // definitions are added below and may shadow dep aliases of the same name.
-    let mut aliases: BTreeMap<Symbol, AliasDef> = extra_aliases;
+    let slots = alias_param_slots(
+        m.aliases
+            .iter()
+            .map(|a| a.value.vars.len())
+            .max()
+            .unwrap_or(0),
+        interner,
+    )?;
     for a in &m.aliases {
         let alias_name = a.value.name.value;
         let alias_span = a.value.name.span;
         // IPE-N0026: `type alias` names are gated the same as `type` names — an
         // alias shadowing a built-in would be silently overridden too.
         reject_reserved_builtin_type(alias_name, alias_span, origin, interner)?;
-        if let Some(&first) = seen_types.get(&alias_name) {
-            return Err(Diagnostic::Name {
-                span: alias_span,
-                msg: NameError::DuplicateType {
-                    name: name_str(interner, alias_name)?,
-                    first,
-                },
-            });
-        }
-        seen_types.insert(alias_name, alias_span);
-        aliases.insert(
-            alias_name,
-            AliasDef::Local {
-                params: a.value.vars.iter().map(|v| v.value).collect(),
-                body: a.value.body.value.clone(),
-            },
+        let body = AliasBody::Local {
+            params: alias_params(&a.value, &slots),
+            body: a.value.body.value.clone(),
+        };
+        let origin = declared(
+            ScopeType::Alias(body),
+            Identity::Type(home.clone()),
+            alias_span,
         );
+        bind_type(env, alias_name, Tier::Local, origin, interner)?;
     }
 
     // Each own alias body resolved once, in this module's scope: the form an
     // importer receives through `ModuleExports::aliases`.
-    let own_aliases = resolve_own_aliases(
-        m,
-        env,
-        type_homes,
-        qualifier_paths,
-        &aliases,
-        interner,
-        ui_wildcard_msg,
-    )?;
+    let own_aliases =
+        resolve_own_aliases(m, &slots, env, qualifier_paths, qualified_aliases, interner)?;
 
     // Second union pass: now that aliases are collected, canonicalise every
     // constructor's payload field types (a field may reference an alias or
@@ -3341,11 +2690,9 @@ fn canonicalise_with_env(
         unions.push(canonicalise_union(
             &u.value,
             env,
-            type_homes,
             qualifier_paths,
-            &aliases,
+            qualified_aliases,
             interner,
-            ui_wildcard_msg,
         )?);
     }
 
@@ -3366,55 +2713,32 @@ fn canonicalise_with_env(
         m,
         &home,
         env,
-        type_homes,
         qualifier_paths,
-        &aliases,
-        &seen_ctors,
+        qualified_aliases,
         &user_value_names,
         interner,
-        ui_wildcard_msg,
     )?;
 
-    // Register every top-level value name so bindings can be referenced before
-    // their definition (mutual / forward references), rejecting duplicates.
-    // Seed with the synthesized record-alias constructors first so their names
-    // are reserved in the value namespace.
-    let mut seen_values: BTreeMap<Symbol, Span> = BTreeMap::new();
+    // Bind every top-level value name at the local tier so bindings can be
+    // referenced before their definition (mutual / forward references),
+    // rejecting duplicates. The synthesized record-alias constructors bind
+    // first so their names are reserved in the value namespace.
     for d in &synth_ctor_defs {
         let name = d.name();
-        seen_values.insert(name.value, name.span);
-        env.vars.insert(name.value, VarHome::TopLevel(home.clone()));
+        let target = VarHome::TopLevel(home.clone());
+        let identity = value_identity(&target, name.value)?;
+        let origin = declared(ExprTarget::Value(target), identity, name.span);
+        bind_expr(env, name.value, Tier::Local, origin, interner)?;
     }
-    // Bring stdlib VALUE members named in an explicit `import Ipê.*/Ipe.* exposing
-    // (name, …)` list into UNQUALIFIED scope. Runs after the synth-ctor
-    // seeding and before the local-value pre-pass so an exposed name and a local
-    // of the same name collide as `DuplicateValue` (mirrors the ctor-collision
-    // rule). Fail-closed: a lowercase name that is not a real value member of the
-    // module surfaces `NameNotExposed`, never a dangling binding.
-    inject_stdlib_exposed_values(m, env, &mut seen_values, interner)?;
-    // Record the `["Html"]` origin home for a home-sensitive builtin TYPE
+    // Bind the `["Html"]` origin home for a home-sensitive builtin TYPE
     // brought UNQUALIFIED via `import <Html-family> exposing (Attribute)`, so the
     // bare `Attribute msg` annotation lowers to the SAME newtype (`html::Attribute`
     // vs `ui::element::Attribute`) its body produces. Runs before any value body
-    // is canonicalised so `resolve_unqualified_type_home` (which consults
-    // `type_home_map` first) sees the recorded home rather than the empty-home
-    // sentinel that always mis-selects `UiAttribute`.
-    inject_stdlib_exposed_type_homes(m, &mut type_homes.type_home_map, interner)?;
-    // Bring a qualified-home built-in union's CONSTRUCTORS (e.g. `HttpMethod`'s
-    // `Get`/`Post`/…) into UNQUALIFIED scope for an explicit
-    // `import Ipe.Http exposing (HttpMethod(..))`. Those ctors are registered
-    // qualified-only (`Http.Post`) so a bare `Post` with no import stays
-    // unresolved and never shadows a user's own ctor; an explicit `exposing
-    // (Type(..))` is the sanctioned request to unqualify them.
-    inject_stdlib_exposed_ctors(m, env, interner)?;
-    // Flood every member of an `import Ipê.*/Ipe.* exposing (..)` stdlib
-    // module into the LOW-PRIORITY wildcard tier. Deliberately does NOT touch
-    // `seen_values` — a local / explicit-exposed / synth-ctor / built-in name of
-    // the same spelling silently shadows a wildcard member (see the fn doc);
-    // cross-wildcard clashes surface only at an ambiguous use site.
-    inject_stdlib_wildcard_values(m, env, interner)?;
+    // is canonicalised so `resolve_unqualified_type_name` sees the bound home
+    // rather than the empty-home sentinel that always mis-selects `UiAttribute`.
+    inject_stdlib_exposed_type_homes(m, env, interner)?;
     // Stage-4 kernel aliases discovered in this module: `f = Kernel.kernel "K_n"`.
-    // Each is registered as a `VarHome::Kernel` (so every reference — in-module
+    // Each is bound as a `VarHome::Kernel` (so every reference — in-module
     // `f` or cross-module `Alias.f` — routes straight to the kernel) and its
     // body is NOT canonicalised into a top-level def (the alias emits no runtime
     // function; it IS the kernel). The map is returned so the project entry can
@@ -3423,27 +2747,19 @@ fn canonicalise_with_env(
     for v in &m.values {
         let name = v.value.name.value;
         let name_span = v.value.name.span;
-        if let Some(&first) = seen_values.get(&name) {
-            return Err(Diagnostic::Name {
-                span: name_span,
-                msg: NameError::DuplicateValue {
-                    name: name_str(interner, name)?,
-                    first,
-                },
-            });
-        }
-        seen_values.insert(name, name_span);
         // FAIL-CLOSED (THE SEAL): `detect_kernel_alias` errors when the binding
         // is a kernel alias naming an unregistered kernel — never a silent
         // TopLevel fall-through that would emit a dangling call.
-        if let Some(alias) = detect_kernel_alias(&v.value, env, interner)? {
-            env.vars.insert(
-                name,
-                VarHome::Kernel(alias.id, alias.module, alias.function),
-            );
+        let alias = detect_kernel_alias(&v.value, env, interner)?;
+        let target = alias.as_ref().map_or_else(
+            || VarHome::TopLevel(home.clone()),
+            |alias| VarHome::Kernel(alias.id, alias.module, alias.function),
+        );
+        let identity = value_identity(&target, name)?;
+        let origin = declared(ExprTarget::Value(target), identity, name_span);
+        bind_expr(env, name, Tier::Local, origin, interner)?;
+        if let Some(alias) = alias {
             kernel_aliases.insert(name, alias);
-        } else {
-            env.vars.insert(name, VarHome::TopLevel(home.clone()));
         }
     }
 
@@ -3453,15 +2769,8 @@ fn canonicalise_with_env(
     // witness's fields at its call site by lookup alone. Built here — the single
     // point where the module's values, aliases, imports, and type context all
     // coexist — and stored on the env, which every value body's resolution clones.
-    let codec_auto = build_codec_auto_context(
-        m,
-        env,
-        type_homes,
-        qualifier_paths,
-        &aliases,
-        interner,
-        ui_wildcard_msg,
-    )?;
+    let codec_auto =
+        build_codec_auto_context(m, env, qualifier_paths, qualified_aliases, interner)?;
     env.codec_auto = Rc::new(codec_auto);
 
     // Canonicalise each value declaration. A kernel alias has no runtime body —
@@ -3475,11 +2784,9 @@ fn canonicalise_with_env(
         defs.push(canonicalise_value(
             &v.value,
             env,
-            type_homes,
             qualifier_paths,
-            &aliases,
+            qualified_aliases,
             interner,
-            ui_wildcard_msg,
         )?);
     }
     // The synthesized constructor defs are already fully canonical.
@@ -3506,43 +2813,34 @@ fn canonicalise_with_env(
 /// resolution of source names against the importer's imports. An alias whose
 /// body names something this module cannot see is refused here, at its
 /// declaration, whether or not any module uses it.
+///
+/// # Errors
+/// Any refusal the body's canonicalisation raises, and
+/// [`Diagnostic::CompilerBug`] when a resolved body mentions a variable that is
+/// neither one of its slots nor a variable it leaves free.
 #[allow(clippy::too_many_arguments)] // the resolution context `canonicalise_type` reads
 fn resolve_own_aliases(
     m: &src::Module,
+    slots: &[Symbol],
     env: &Env,
-    type_homes: &TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &BTreeMap<Symbol, AliasDef>,
-    interner: &mut Interner,
-    ui_wildcard_msg: Symbol,
+    qualified_aliases: &QualifiedAliases,
+    interner: &Interner,
 ) -> DResult<BTreeMap<Symbol, crate::ExportedAlias>> {
-    let max_params = m
-        .aliases
-        .iter()
-        .map(|a| a.value.vars.len())
-        .max()
-        .unwrap_or(0);
-    let slots = alias_param_slots(max_params, interner)?;
-    let interner: &Interner = interner;
     let mut resolved = BTreeMap::new();
     for a in &m.aliases {
         let decl = &a.value;
+        // The same pairing the scope registered, so the exported body and every
+        // local use site name the same slot symbols.
+        let params = alias_params(decl, slots);
         let ctx = TypeCtx {
             env,
-            type_homes,
             qualifier_paths,
-            aliases,
+            qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann_span: decl.body.span,
         };
-        let param_slots: Vec<Symbol> = slots.iter().copied().take(decl.vars.len()).collect();
-        let subst: BTreeMap<Symbol, canon::Type> = decl
-            .vars
-            .iter()
-            .map(|v| v.value)
-            .zip(param_slots.iter().copied().map(canon::Type::Var))
-            .collect();
+        let param_slots: Vec<Symbol> = params.iter().map(|&(_, slot)| slot).collect();
         let mut free_vars = BTreeSet::new();
         // Seeded with the alias itself, exactly as a use-site expansion pushes
         // it, so a self-reference stops rather than recursing.
@@ -3551,12 +2849,17 @@ fn resolve_own_aliases(
         let body = canonicalise_type(
             &decl.body.value,
             &ctx,
-            &subst,
+            &ParamSlots::new(&params),
             &mut free_vars,
             &mut visited,
             &mut budget,
             0,
         )?;
+        // The check walks the finished body, which the canonicalisation above
+        // already bounded by the node ceiling, so it gets a ceiling of its own
+        // rather than halving the one the body may use.
+        let mut check_budget = TYPE_EXPANSION_NODE_LIMIT;
+        refuse_unbound_alias_body_vars(&body, &param_slots, &free_vars, &ctx, &mut check_budget)?;
         resolved.insert(
             decl.name.value,
             crate::ExportedAlias {
@@ -3571,6 +2874,63 @@ fn resolve_own_aliases(
     Ok(resolved)
 }
 
+/// Check that every variable a resolved alias body mentions is one of its slots or left free.
+///
+/// Each `Var` and each open record's row must be a parameter slot or a variable
+/// the body leaves free (quantified at a use site); a `Wildcard` names none. A
+/// body holding any other variable would carry a name no use site binds, so it
+/// fails closed here, at the declaration. The walk uses an explicit stack and
+/// spends one node of `budget` per body node.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] on a variable outside that set;
+/// [`NameError::TypeExpansionTooDeep`] when the walk exhausts the budget.
+fn refuse_unbound_alias_body_vars(
+    body: &canon::Type,
+    param_slots: &[Symbol],
+    free_vars: &BTreeSet<Symbol>,
+    ctx: &TypeCtx,
+    budget: &mut u32,
+) -> DResult<()> {
+    let bound = |v: &Symbol| param_slots.contains(v) || free_vars.contains(v);
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        spend_budget_node(ctx, budget)?;
+        let var = match node {
+            canon::Type::Var(v) => Some(v),
+            canon::Type::RecordOpen(row, fields) => {
+                pending.extend(fields.iter().map(|(_, ty)| ty));
+                Some(row)
+            }
+            canon::Type::Record(fields) => {
+                pending.extend(fields.iter().map(|(_, ty)| ty));
+                None
+            }
+            canon::Type::Lambda(a, b) => {
+                pending.push(a);
+                pending.push(b);
+                None
+            }
+            canon::Type::Con { args, .. } | canon::Type::Tuple(args) => {
+                pending.extend(args);
+                None
+            }
+            canon::Type::Unit | canon::Type::Wildcard => None,
+        };
+        if let Some(v) = var.filter(|v| !bound(v)) {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_canon::resolve_own_aliases::body_closed",
+                detail: format!(
+                    "the resolved alias body mentions `{}`, which is neither a parameter nor a \
+                     free variable",
+                    ctx.interner.resolve(*v).unwrap_or("?")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The placeholder variables standing for an exported alias's parameters, by position.
 ///
 /// Each name contains spaces, which no source type variable can spell, so a
@@ -3583,19 +2943,64 @@ fn alias_param_slots(count: usize, interner: &mut Interner) -> DResult<Vec<Symbo
     Ok(slots)
 }
 
-/// Expand an imported alias at a use site by substituting `args` for its parameter slots.
+/// Pair each of `decl`'s type parameters, in source order, with its slot.
 ///
-/// The body is already canonical in its defining module, so this is a pure
-/// structural substitution: no name is resolved against the importer's scope.
-/// Every node spends from the same `budget` and `depth` ceilings as a source
-/// expansion, so a body that grows across a chain of modules stays bounded.
+/// The one pairing both the scope entry and [`resolve_own_aliases`] use, so a
+/// local use site and the exported body rename a parameter to the same slot.
+/// `slots` holds at least as many slots as the module's widest alias declares.
+fn alias_params(decl: &src::TypeAlias, slots: &[Symbol]) -> Vec<(Symbol, Symbol)> {
+    decl.vars
+        .iter()
+        .map(|v| v.value)
+        .zip(slots.iter().copied())
+        .collect()
+}
+
+/// The slot each in-scope alias parameter is renamed to while its body is canonicalised.
+///
+/// [`canonicalise_type`] only renames: a parameter becomes `Var(slot)`, in
+/// value and row position alike, and [`instantiate_alias`] is the one walker
+/// that replaces a slot with an argument. The map's codomain is a symbol, never
+/// a type, so no source walk can substitute half of an alias's positions.
+struct ParamSlots(BTreeMap<Symbol, Symbol>);
+
+impl ParamSlots {
+    /// No parameters in scope: every type variable is free.
+    const fn empty() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// The parameters of one alias, each paired with its slot.
+    fn new(params: &[(Symbol, Symbol)]) -> Self {
+        Self(params.iter().copied().collect())
+    }
+
+    /// The slot `param` is renamed to, when it is a parameter in scope.
+    fn slot(&self, param: Symbol) -> Option<Symbol> {
+        self.0.get(&param).copied()
+    }
+}
+
+/// Expand an alias at a use site by substituting `args` for its parameter slots.
+///
+/// `body` is canonical with its parameters already renamed to their slots: an
+/// imported alias's exported body, or a local alias's body renamed at this use
+/// site. This is the one walker that substitutes an alias argument, and every
+/// variable-carrying arm (`Var` and an open record's row) consults `args`. The
+/// substitution is simultaneous and an argument is copied without being
+/// walked, so an argument that itself holds a slot (an enclosing alias's
+/// parameter, mid-rename) is never substituted again. Every node spends from
+/// the same `budget` and `depth` ceilings as a source expansion, so a body
+/// that grows across a chain of modules stays bounded.
 ///
 /// # Errors
 /// [`NameError::TypeExpansionTooDeep`] when the expansion exceeds the depth or
-/// node ceiling.
-fn instantiate_imported_alias(
+/// node ceiling; [`NameError::AliasRowArgument`] when a row argument is not a
+/// record or repeats one of the alias's labels.
+fn instantiate_alias(
+    alias: Symbol,
     body: &canon::Type,
-    slots: &BTreeMap<Symbol, canon::Type>,
+    args: &BTreeMap<Symbol, canon::Type>,
     ctx: &TypeCtx,
     budget: &mut u32,
     depth: u32,
@@ -3603,19 +3008,24 @@ fn instantiate_imported_alias(
     spend_expansion_node(ctx, budget, depth)?;
     let next = depth.saturating_add(1);
     Ok(match body {
-        canon::Type::Var(v) => match slots.get(v) {
+        canon::Type::Var(v) => match args.get(v) {
             Some(arg) => copy_substituted_arg(arg, ctx, budget)?,
             None => canon::Type::Var(*v),
         },
+        canon::Type::Wildcard => canon::Type::Wildcard,
         canon::Type::Unit => canon::Type::Unit,
         canon::Type::Lambda(a, b) => canon::Type::Lambda(
-            Box::new(instantiate_imported_alias(a, slots, ctx, budget, next)?),
-            Box::new(instantiate_imported_alias(b, slots, ctx, budget, next)?),
+            Box::new(instantiate_alias(alias, a, args, ctx, budget, next)?),
+            Box::new(instantiate_alias(alias, b, args, ctx, budget, next)?),
         ),
-        canon::Type::Con { home, name, args } => {
-            let mut can_args = Vec::with_capacity(args.len());
-            for a in args {
-                can_args.push(instantiate_imported_alias(a, slots, ctx, budget, next)?);
+        canon::Type::Con {
+            home,
+            name,
+            args: con_args,
+        } => {
+            let mut can_args = Vec::with_capacity(con_args.len());
+            for a in con_args {
+                can_args.push(instantiate_alias(alias, a, args, ctx, budget, next)?);
             }
             canon::Type::Con {
                 home: home.clone(),
@@ -3626,25 +3036,28 @@ fn instantiate_imported_alias(
         canon::Type::Tuple(elems) => {
             let mut can_elems = Vec::with_capacity(elems.len());
             for e in elems {
-                can_elems.push(instantiate_imported_alias(e, slots, ctx, budget, next)?);
+                can_elems.push(instantiate_alias(alias, e, args, ctx, budget, next)?);
             }
             canon::Type::Tuple(can_elems)
         }
         canon::Type::Record(fields) => {
-            canon::Type::Record(instantiate_fields(fields, slots, ctx, budget, next)?)
+            canon::Type::Record(instantiate_fields(alias, fields, args, ctx, budget, next)?)
         }
-        // The row variable is kept as declared, matching a source expansion,
-        // which never substitutes an open record's row variable.
         canon::Type::RecordOpen(row, fields) => {
-            canon::Type::RecordOpen(*row, instantiate_fields(fields, slots, ctx, budget, next)?)
+            let own = instantiate_fields(alias, fields, args, ctx, budget, next)?;
+            match args.get(row) {
+                None => canon::Type::RecordOpen(*row, own),
+                Some(arg) => extend_row(alias, copy_substituted_arg(arg, ctx, budget)?, own, ctx)?,
+            }
         }
     })
 }
 
 /// Substitute parameter slots through each field type of a record body.
 fn instantiate_fields(
+    alias: Symbol,
     fields: &[(Symbol, canon::Type)],
-    slots: &BTreeMap<Symbol, canon::Type>,
+    args: &BTreeMap<Symbol, canon::Type>,
     ctx: &TypeCtx,
     budget: &mut u32,
     depth: u32,
@@ -3653,10 +3066,86 @@ fn instantiate_fields(
     for (name, ty) in fields {
         out.push((
             *name,
-            instantiate_imported_alias(ty, slots, ctx, budget, depth)?,
+            instantiate_alias(alias, ty, args, ctx, budget, depth)?,
         ));
     }
     Ok(out)
+}
+
+/// Fill an alias's open-record row with its argument, extending the argument by `own`.
+///
+/// A type variable stays the row; a closed or open record contributes its
+/// fields ahead of the alias's own. Anything else has no fields to extend.
+///
+/// # Errors
+/// [`NameError::AliasRowArgument`] when `arg` is not a record or a type
+/// variable, or shares a label with `own`.
+fn extend_row(
+    alias: Symbol,
+    arg: canon::Type,
+    own: Vec<(Symbol, canon::Type)>,
+    ctx: &TypeCtx,
+) -> DResult<canon::Type> {
+    match arg {
+        canon::Type::Var(row) => Ok(canon::Type::RecordOpen(row, own)),
+        canon::Type::Record(fields) => Ok(canon::Type::Record(join_row_fields(
+            alias, fields, own, ctx,
+        )?)),
+        canon::Type::RecordOpen(row, fields) => Ok(canon::Type::RecordOpen(
+            row,
+            join_row_fields(alias, fields, own, ctx)?,
+        )),
+        found @ (canon::Type::Unit
+        | canon::Type::Wildcard
+        | canon::Type::Tuple(_)
+        | canon::Type::Lambda(..)
+        | canon::Type::Con { .. }) => Err(alias_row_refusal(
+            alias,
+            AliasRowFault::NotARecord {
+                found: canon_type_display(&found, ctx.interner),
+            },
+            ctx,
+        )?),
+    }
+}
+
+/// The row argument's fields followed by the alias's own, refusing a shared label.
+///
+/// # Errors
+/// [`NameError::AliasRowArgument`] ([`AliasRowFault::FieldClash`]) when a
+/// label of `own` is already in `arg`.
+fn join_row_fields(
+    alias: Symbol,
+    mut arg: Vec<(Symbol, canon::Type)>,
+    own: Vec<(Symbol, canon::Type)>,
+    ctx: &TypeCtx,
+) -> DResult<Vec<(Symbol, canon::Type)>> {
+    let arg_labels: BTreeSet<Symbol> = arg.iter().map(|(label, _)| *label).collect();
+    if let Some((label, _)) = own.iter().find(|(label, _)| arg_labels.contains(label)) {
+        return Err(alias_row_refusal(
+            alias,
+            AliasRowFault::FieldClash {
+                field: name_str(ctx.interner, *label)?,
+            },
+            ctx,
+        )?);
+    }
+    arg.extend(own);
+    Ok(arg)
+}
+
+/// The IPE-N0053 refusal of `alias`'s row argument, at the enclosing annotation.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when `alias` is not interned.
+fn alias_row_refusal(alias: Symbol, fault: AliasRowFault, ctx: &TypeCtx) -> DResult<Diagnostic> {
+    Ok(Diagnostic::Name {
+        span: ctx.ann_span,
+        msg: NameError::AliasRowArgument {
+            alias: name_str(ctx.interner, alias)?,
+            fault,
+        },
+    })
 }
 
 /// Does any `import` name an `Ipe.<M>.Unsafe` submodule?
@@ -3830,7 +3319,7 @@ fn field_type_nonderivable(interner: &Interner, t: &canon::Type) -> bool {
         canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => fields
             .iter()
             .any(|(_, f)| field_type_nonderivable(interner, f)),
-        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
     }
 }
 
@@ -3853,11 +3342,9 @@ fn field_type_nonderivable(interner: &Interner, t: &canon::Type) -> bool {
 fn build_codec_auto_context(
     m: &src::Module,
     env: &Env,
-    type_homes: &TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &BTreeMap<Symbol, AliasDef>,
+    qualified_aliases: &QualifiedAliases,
     interner: &mut Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<crate::env::CodecAutoContext> {
     // Qualifiers bound to `Ipe.Codec`: any import qualifier whose resolved path
     // is exactly `["Ipe", "Codec"]`. A compiled-source stdlib module is a build
@@ -3884,11 +3371,9 @@ fn build_codec_auto_context(
         if let Some(fields) = witness_record_fields(
             &ann.value,
             env,
-            type_homes,
             qualifier_paths,
-            aliases,
+            qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann.span,
         )? {
             witness_records.insert(v.value.name.value, fields);
@@ -3910,20 +3395,16 @@ fn build_codec_auto_context(
 fn witness_record_fields(
     ann: &src::TypeAnnotation,
     env: &Env,
-    type_homes: &TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &BTreeMap<Symbol, AliasDef>,
+    qualified_aliases: &QualifiedAliases,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
     ann_span: Span,
 ) -> DResult<Option<Vec<(Symbol, canon::Type)>>> {
     let ctx = TypeCtx {
         env,
-        type_homes,
         qualifier_paths,
-        aliases,
+        qualified_aliases,
         interner,
-        ui_wildcard_msg,
         ann_span,
     };
     // The source-level fields to canonicalise, and the alias name (if any) to
@@ -3943,28 +3424,18 @@ fn witness_record_fields(
                 resolve_or_bug(interner, *qualifier, "ipe_canon::witness_record_fields")?;
             let alias = if qualifier.is_empty() {
                 match resolve_unqualified_type_name(name, &ctx, &[])? {
-                    TypeName::LocalOrExplicitAlias(alias) => Some((name, alias)),
-                    TypeName::OpenAlias(exported) => {
-                        Some((name, ResolvedAlias::Imported(exported)))
-                    }
-                    TypeName::LocalOrExplicitUnion(_)
-                    | TypeName::OpenUnion(_)
+                    TypeName::Alias(alias) => Some((name, alias)),
+                    TypeName::Union(_)
                     | TypeName::Ambiguous { .. }
                     | TypeName::Builtin
                     | TypeName::Missing => None,
                 }
             } else {
-                alias_lookup_key(qualifier, name, aliases, interner)?
-                    .and_then(|key| aliases.get(&key).map(|alias| (key, alias)))
-                    .and_then(|(key, alias)| match alias {
-                        AliasDef::Local { params, body } => {
-                            Some((key, ResolvedAlias::Local { params, body }))
-                        }
-                        AliasDef::Imported { exported, .. } => {
-                            Some((key, ResolvedAlias::Imported(exported)))
-                        }
-                        AliasDef::Ambiguous { .. } => None,
-                    })
+                alias_lookup_key(qualifier, name, qualified_aliases, interner)?.and_then(|key| {
+                    qualified_aliases
+                        .get(&key)
+                        .map(|exported| (key, ResolvedAlias::Imported(exported)))
+                })
             };
             match alias {
                 Some((
@@ -3991,7 +3462,10 @@ fn witness_record_fields(
         }
         _ => return Ok(None),
     };
-    let subst = BTreeMap::new();
+    // The fields are canonicalised one by one, not through the `TRecord` arm,
+    // so the label check that arm makes is made here too.
+    refuse_duplicate_record_labels(src_fields, interner)?;
+    let no_params = ParamSlots::empty();
     let mut free_set = BTreeSet::new();
     let mut visited = seed;
     let mut can_fields = Vec::with_capacity(src_fields.len());
@@ -4000,7 +3474,7 @@ fn witness_record_fields(
         let cty = canonicalise_type(
             fty,
             &ctx,
-            &subst,
+            &no_params,
             &mut free_set,
             &mut visited,
             &mut budget,
@@ -4179,7 +3653,7 @@ fn field_leaf_codecs(
     if let canon::Type::Con { name, args, .. } = ty
         && args.is_empty()
         && let Some(text) = interner.resolve(*name)
-        && SEAL_SECRET_OR_SINK.contains(&text)
+        && bare_builtin(text).is_some_and(|row| row.seal() == SealClass::SecretOrSink)
     {
         return Err(bad(CodecAutoRejection::SecretField, &field_name));
     }
@@ -4368,11 +3842,11 @@ fn derive_record_codec(
 /// Recognising `Codec.auto` at the call site proves the module imports
 /// `Ipe.Codec` under some qualifier, but that import need not
 /// `exposing (Codec(..), Shape(..), ColType(..))` — a plain `import Ipe.Codec as
-/// Codec` leaves those constructors out of the unqualified `ctors` table
+/// Codec` leaves those constructors out of the bare expression namespace
 /// entirely. They are always present QUALIFIED, though: `inject_dep_exports`
 /// registers every dep constructor under its qualifier in `qual_ctors`
 /// regardless of the `exposing` clause. So resolve through the recognised codec
-/// qualifier first, and only then fall back to the unqualified table — the derive
+/// qualifier first, and only then fall back to the bare name — the derive
 /// works from the qualifier alone, never demanding the user expose the codec
 /// internals, and behaves identically whether it runs in the entry module or any
 /// dependency module of a multi-module program.
@@ -4381,11 +3855,17 @@ fn lookup_codec_ctor(env: &Env, ctor: Symbol) -> Option<&CtorHome> {
         .qualifiers
         .iter()
         .find_map(|q| env.qual_ctors.get(q).and_then(|m| m.get(&ctor)))
-        .or_else(|| match env.lookup_ctor(ctor) {
-            CtorLookup::Found(found) => Some(found),
+        .or_else(|| match env.module_scope.expr.resolve(ctor) {
+            Resolved::Found(
+                Origin {
+                    target: ExprTarget::Ctor(found),
+                    ..
+                },
+                _,
+            ) => Some(found),
             // An ambiguous bare name is no building block: the derive fails
             // closed with its underivable diagnostic, never picking one origin.
-            CtorLookup::Ambiguous(_) | CtorLookup::Missing => None,
+            Resolved::Found(..) | Resolved::Ambiguous { .. } | Resolved::Missing => None,
         })
 }
 
@@ -4593,6 +4073,25 @@ fn project_codec_enc_dec(
     Ok((enc, dec))
 }
 
+/// Every constructor this module declares.
+fn local_ctors(env: &Env) -> impl Iterator<Item = &CtorHome> {
+    env.module_scope
+        .expr
+        .locals()
+        .filter_map(|(_, origin)| match &origin.target {
+            ExprTarget::Ctor(ctor) => Some(ctor),
+            ExprTarget::Value(_) => None,
+        })
+}
+
+/// Whether `name` is a constructor this module declares.
+fn is_local_ctor(scope: &ModuleScope, name: Symbol) -> bool {
+    matches!(
+        scope.expr.resolve(name),
+        Resolved::Found(origin, Tier::Local) if matches!(origin.target, ExprTarget::Ctor(_))
+    )
+}
+
 /// A canonical function application node `f a0 a1 …`.
 fn call_expr(f: canon::Expr, args: Vec<canon::Expr>, span: Span) -> canon::Expr {
     Located::new(span, canon::Expr_::Call(Box::new(f), args))
@@ -4603,13 +4102,10 @@ fn synthesize_record_alias_ctors(
     m: &src::Module,
     home: &[Symbol],
     env: &Env,
-    type_homes: &TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &BTreeMap<Symbol, AliasDef>,
-    seen_ctors: &BTreeMap<Symbol, Span>,
+    qualified_aliases: &QualifiedAliases,
     user_value_names: &BTreeSet<Symbol>,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<Vec<canon::Def>> {
     let mut synth = Vec::new();
     for a in &m.aliases {
@@ -4631,21 +4127,19 @@ fn synthesize_record_alias_ctors(
         }
 
         // Canonicalise every field type ONCE, in declared (source) order. The
-        // alias's own params fall through to `Type::Var` (empty `subst`), so a
+        // alias's own params fall through to `Type::Var` (no parameters in scope), so a
         // param used in a field generalises and a phantom param drops out. The
         // alias name is pre-seeded into `visited` so a self-referential field
         // (`{ next : List T }`) expands exactly as `x : T` would — the ctor's
         // return record is byte-identical to the annotation expansion.
         let ctx = TypeCtx {
             env,
-            type_homes,
             qualifier_paths,
-            aliases,
+            qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann_span: a.value.body.span,
         };
-        let subst = BTreeMap::new();
+        let no_params = ParamSlots::empty();
         let mut free_set = BTreeSet::new();
         let mut visited = vec![alias_name];
         let mut can_fields: Vec<(Symbol, canon::Type)> = Vec::with_capacity(fields.len());
@@ -4654,7 +4148,7 @@ fn synthesize_record_alias_ctors(
             let cty = canonicalise_type(
                 fty,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_set,
                 &mut visited,
                 &mut budget,
@@ -4707,19 +4201,17 @@ fn synthesize_record_alias_ctors(
         // the alias name into `_vars` via `Map.insert` without ANY check against
         // `_ctors` — the two occupy separate namespaces and coexist peacefully.
         //
-        // `resolve_var` here also checks `env.ctors` BEFORE `env.vars`, so if we
-        // DID synthesise the alias auto-ctor entry into `env.vars`, the ADT ctor
-        // would always win in expression position anyway.  Skipping synthesis
-        // achieves the same effect more cleanly: the ADT constructor is the sole
-        // winner, and there is no competing entry in `env.vars` that a user could
-        // accidentally reference.
+        // A constructor and a value share one expression-namespace ladder, so
+        // the local constructor and the auto-constructor would be two local
+        // bindings of one name. Skipping synthesis keeps the ADT constructor the
+        // sole local binding, which every expression and pattern reads.
         //
         // The old code emitted IPE-N0010 (DuplicateValue) here, which was wrong
         // and broke the `type Tab = Overview | …` + `type alias Overview = { … }`
         // pattern found in examples/25-ipe-console/src/State.ipe.
         //
         // Ref: `Ipe.Canonicalise.Module.registerAliases` upstream, lines 1759–1775.
-        if seen_ctors.contains_key(&alias_name) {
+        if is_local_ctor(&env.module_scope, alias_name) {
             continue;
         }
 
@@ -4761,170 +4253,144 @@ fn synthesize_record_alias_ctors(
     Ok(synth)
 }
 
-/// Register a dep-imported type name into `type_home_map`, rejecting a clash
-/// with a DIFFERENT already-imported home under [`NameError::DuplicateType`]
-/// (IPE-N0012).
+/// The home a dependency's exported value `name` resolves to.
 ///
-/// The two types are genuinely distinct nominal identities `(home, name)` —
-/// each emits its own Rust enum — but bringing both into scope
-/// under the same UNQUALIFIED type name (`import ModA exposing (ColorA)` +
-/// `import ModB exposing (ColorA)`) leaves `ColorA` unresolvable to a single
-/// type. This is the type-level analogue of the value-import ambiguity gate
-/// ([`check_and_inject_value`], IPE-N0024). A re-injection of the SAME
-/// `(name, home)` — e.g. a diamond dependency reaching one home by two paths —
-/// is idempotent and accepted.
-fn inject_dep_type(
-    type_home_map: &mut BTreeMap<Symbol, Vec<Symbol>>,
-    type_first_span: &mut BTreeMap<Symbol, Span>,
-    type_name: Symbol,
-    home: &[Symbol],
+/// A value that is a kernel alias in the dependency resolves as its kernel, the
+/// same bare as qualified — never a `TopLevel` def the alias module never emits.
+fn dep_value_home(dep: &crate::ModuleExports, name: Symbol) -> VarHome {
+    dep.kernel_aliases.get(&name).map_or_else(
+        || VarHome::TopLevel(dep.path.clone()),
+        |a| VarHome::Kernel(a.id, a.module, a.function),
+    )
+}
+
+/// Bind a dependency's exported value `name` at `tier`.
+///
+/// # Errors
+/// The clash [`bind_expr`] reports.
+fn bind_dep_value(
+    dep: &crate::ModuleExports,
+    name: Symbol,
+    tier: Tier,
     span: Span,
+    env: &mut Env,
     interner: &Interner,
 ) -> DResult<()> {
-    if let Some(existing) = type_home_map.get(&type_name)
-        && existing.as_slice() != home
-    {
-        let first = type_first_span
-            .get(&type_name)
-            .copied()
-            .unwrap_or(Span::DUMMY);
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::DuplicateType {
-                name: name_str(interner, type_name)?,
-                first,
-            },
-        });
+    let home = dep_value_home(dep, name);
+    let identity = value_identity(&home, name)?;
+    let origin = imported(ExprTarget::Value(home), identity, &dep.path, span);
+    bind_expr(env, name, tier, origin, interner)
+}
+
+/// Bind a dependency's union `type_name` and the constructors `filter` admits at
+/// `tier`.
+///
+/// # Errors
+/// The clash [`bind_type`] or [`bind_expr`] reports.
+#[allow(clippy::too_many_arguments)] // each argument is one independent fact of the binding
+fn bind_dep_union(
+    dep: &crate::ModuleExports,
+    type_name: Symbol,
+    home: &[Symbol],
+    filter: &CtorFilter,
+    tier: Tier,
+    span: Span,
+    env: &mut Env,
+    interner: &Interner,
+) -> DResult<()> {
+    let origin = imported(
+        ScopeType::Union(home.to_vec()),
+        Identity::Type(home.to_vec()),
+        &dep.path,
+        span,
+    );
+    bind_type(env, type_name, tier, origin, interner)?;
+    for ctor in dep.ctors.values() {
+        if ctor.type_name == type_name && filter.admits(ctor.name) {
+            let origin = imported(
+                ExprTarget::Ctor(ctor.clone()),
+                ctor_identity(ctor),
+                &dep.path,
+                span,
+            );
+            bind_expr(env, ctor.name, tier, origin, interner)?;
+        }
     }
-    type_home_map.insert(type_name, home.to_vec());
-    type_first_span.entry(type_name).or_insert(span);
     Ok(())
 }
 
-/// Inject a dep module's exports into the resolving module's environment.
+/// Bind a dependency's alias `alias_name` at `tier`. The alias arrives
+/// canonical in the dependency's own scope, so a body naming a type only the
+/// dependency imports needs no import here.
+///
+/// # Errors
+/// The clash [`bind_type`] reports.
+fn bind_dep_alias(
+    dep: &crate::ModuleExports,
+    alias_name: Symbol,
+    ea: &crate::ExportedAlias,
+    tier: Tier,
+    span: Span,
+    env: &mut Env,
+    interner: &Interner,
+) -> DResult<()> {
+    let origin = imported(
+        ScopeType::Alias(AliasBody::Imported(ea.clone())),
+        Identity::Type(ea.home.clone()),
+        &dep.path,
+        span,
+    );
+    bind_type(env, alias_name, tier, origin, interner)
+}
+
+/// Bind a dep module's exports in the resolving module's scope.
 ///
 /// Called once per `import` declaration, in source order. Handles:
 ///
-/// * Unqualified value/type/ctor injection for `exposing (..)` or an explicit
-///   `exposing (name, Type(..))` list.
+/// * `exposing (..)`: every exported value, union, constructor and alias binds
+///   at the open tier, where two definitions under one name are IPE-N0024 only
+///   at a bare use no higher tier answers.
+/// * An explicit `exposing (name, Type(..))` list: each item binds at the
+///   explicit tier, where a second definition under one name is refused at the
+///   import (IPE-N0024 for a value or constructor, IPE-N0012 for a type).
 /// * IPE-N0022 (`NameNotExposed`) when the exposing list names a value or type
 ///   the dep does not export.
-/// * IPE-N0024 (`AmbiguousImport`) when the same unqualified name was already
-///   injected from a different dep module (applies to both VALUES and
-///   CONSTRUCTORS — previously only values were checked).
-/// * Qualifier registration (`import M as Q` or auto-qualifier = last segment).
+/// * Qualifier installation through [`Env::install_import`] (`import M as Q`,
+///   or the last segment and dotted path of a bare import).
 ///
 /// # Errors
-/// [`NameError::NameNotExposed`] / [`NameError::AmbiguousImport`]; or
+/// [`NameError::NameNotExposed`] / [`NameError::AmbiguousImport`] /
+/// [`NameError::DuplicateType`] / [`NameError::DuplicateQualifier`]; or
 /// [`Diagnostic::CompilerBug`] on an unresolvable symbol.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // declarative injection table — splitting would obscure flow
+#[allow(clippy::too_many_lines)] // declarative injection table — splitting would obscure flow
 fn inject_dep_exports(
     import: &src::Import,
     dep: &crate::ModuleExports,
     env: &mut Env,
-    type_homes: &mut TypeHomes,
-    type_first_span: &mut BTreeMap<Symbol, Span>,
-    injected_aliases: &mut BTreeMap<Symbol, AliasDef>,
-    unqual_origins: &mut BTreeMap<Symbol, Vec<Symbol>>,
-    unqual_ctor_origins: &mut BTreeMap<Symbol, Vec<Symbol>>,
     interner: &mut Interner,
 ) -> DResult<()> {
     let dep_path = &dep.path;
 
-    // A compiled-source STDLIB dep (`Ipe.*`) imported open (`exposing (..)`)
-    // floods the DEFERRED wildcard tier, not the eager `env.vars`: an `import
-    // Ipe.Html exposing (..)` + `import Ipe.Html.Attributes exposing (..)` both
-    // expose a bare `title` (the `<title>` element vs the `title=` attribute),
-    // but that overlap is only a conflict if the program actually uses bare
-    // `title` — the deferred Elm open-import rule (see `resolve_wildcard_var`).
-    // Types, constructors and aliases take the same deferred tier. A user
-    // multi-file dep keeps the eager import-time ambiguity check.
-    let is_stdlib_dep = dep_path.first().and_then(|s| interner.resolve(*s)) == Some("Ipe");
-
     match &import.exposing.value {
-        src::Exposing::All if is_stdlib_dep => {
-            // Deferred wildcard flood — keyed by the dep's FULL dotted path so two
-            // distinct stdlib modules exposing the same bare name register as two
-            // origins (ambiguous only at a bare use site), while a re-import of the
-            // SAME module collapses to one origin (never a self-ambiguity). Keying
-            // on the leaf segment alone would let `Ipe.A.Input` and `Ipe.B.Input`
-            // collide on `Input` and silently mask that ambiguity.
-            for &name in &dep.values {
-                let home = dep.kernel_aliases.get(&name).map_or_else(
-                    || VarHome::TopLevel(dep_path.clone()),
-                    |a| VarHome::Kernel(a.id, a.module, a.function),
-                );
-                std::rc::Rc::make_mut(&mut env.wildcard_vars)
-                    .entry(name)
-                    .or_default()
-                    .insert(
-                        dep_path.clone(),
-                        WildcardOrigin {
-                            home,
-                            dep_path: dep_path.clone(),
-                        },
-                    );
-            }
-            // Types, constructors and aliases take the same deferred tier: two
-            // stdlib modules sharing a type or constructor name (`Ipe.Parser` and
-            // `Ipe.Ui.Transition` both declare `Step`) conflict only at a bare
-            // use the local and explicit tiers do not shadow. Each origin is
-            // keyed by its DEFINING home, so one type reached through two
-            // modules (a reserved builtin `Attribute` re-exported by `Ipe.Ui`
-            // and `Ipe.Html`, or a module imported twice) is one origin.
-            for (&type_name, home) in &dep.types {
-                type_homes
-                    .wildcard_type_homes
-                    .entry(type_name)
-                    .or_default()
-                    .entry(home.clone())
-                    .or_default()
-                    .insert(dep_path.clone());
-                inject_wildcard_ctors_for_type(type_name, dep, env);
-            }
-            for (&alias_name, ea) in &dep.aliases {
-                inject_unqualified_alias(injected_aliases, alias_name, ea, ImportTier::Open);
-            }
-        }
         src::Exposing::All => {
-            // Inject all dep values unqualified.
+            let span = import.name.span;
             for &name in &dep.values {
-                check_and_inject_value(
-                    name,
-                    dep_path,
-                    import.name.span,
-                    env,
-                    unqual_origins,
-                    dep.kernel_aliases.get(&name),
-                    interner,
-                )?;
+                bind_dep_value(dep, name, Tier::Open, span, env, interner)?;
             }
-            // Inject all dep types (union homes) + all ctors.
             for (&type_name, home) in &dep.types {
-                inject_dep_type(
-                    &mut type_homes.type_home_map,
-                    type_first_span,
+                bind_dep_union(
+                    dep,
                     type_name,
                     home,
-                    import.name.span,
-                    interner,
-                )?;
-                inject_ctors_for_type(
-                    type_name,
                     &CtorFilter::All,
-                    dep,
+                    Tier::Open,
+                    span,
                     env,
-                    import.name.span,
-                    unqual_ctor_origins,
                     interner,
                 )?;
             }
-            // Inject all dep aliases. Each arrives canonical in the dep's own
-            // scope, so a body naming a type only the dep imports needs no
-            // import here. A user dep's open import keeps the eager tier, the
-            // same tier as its types and constructors above.
             for (&alias_name, ea) in &dep.aliases {
-                inject_unqualified_alias(injected_aliases, alias_name, ea, ImportTier::Explicit);
+                bind_dep_alias(dep, alias_name, ea, Tier::Open, span, env, interner)?;
             }
         }
         src::Exposing::List(items) => {
@@ -4939,25 +4405,20 @@ fn inject_dep_exports(
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: module_s,
+                                    suggestions: Candidates::at(
+                                        EditTarget::whole(item.span, &name_s),
+                                        sugg,
+                                    ),
                                     name: name_s,
-                                    suggestions: sugg,
                                 },
                             });
                         }
-                        check_and_inject_value(
-                            *name,
-                            dep_path,
-                            item.span,
-                            env,
-                            unqual_origins,
-                            dep.kernel_aliases.get(name),
-                            interner,
-                        )?;
+                        bind_dep_value(dep, *name, Tier::Explicit, item.span, env, interner)?;
                     }
                     src::Exposed::Type(type_name, privacy) => {
-                        let is_union = dep.types.contains_key(type_name);
-                        let is_alias = dep.aliases.contains_key(type_name);
-                        if !is_union && !is_alias {
+                        let union_home = dep.types.get(type_name);
+                        let alias = dep.aliases.get(type_name);
+                        if union_home.is_none() && alias.is_none() {
                             let name_s = name_str(interner, *type_name)?;
                             let module_s = path_to_dot_string(interner, dep_path);
                             let all_names = dep.types.keys().chain(dep.aliases.keys()).copied();
@@ -4966,59 +4427,48 @@ fn inject_dep_exports(
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
                                     module: module_s,
+                                    suggestions: Candidates::at(
+                                        EditTarget::prefix(item.span, &name_s),
+                                        sugg,
+                                    ),
                                     name: name_s,
-                                    suggestions: sugg,
                                 },
                             });
                         }
-                        if is_union {
-                            if let Some(home) = dep.types.get(type_name) {
-                                inject_dep_type(
-                                    &mut type_homes.type_home_map,
-                                    type_first_span,
-                                    *type_name,
-                                    home,
-                                    item.span,
-                                    interner,
-                                )?;
-                            }
-                            let filter = exposed_ctor_filter(privacy);
-                            if !matches!(filter, CtorFilter::None) {
-                                inject_ctors_for_type(
-                                    *type_name,
-                                    &filter,
-                                    dep,
-                                    env,
-                                    item.span,
-                                    unqual_ctor_origins,
-                                    interner,
-                                )?;
-                            }
+                        if let Some(home) = union_home {
+                            bind_dep_union(
+                                dep,
+                                *type_name,
+                                home,
+                                &exposed_ctor_filter(privacy),
+                                Tier::Explicit,
+                                item.span,
+                                env,
+                                interner,
+                            )?;
                         }
-                        if is_alias && let Some(ea) = dep.aliases.get(type_name) {
-                            inject_unqualified_alias(
-                                injected_aliases,
+                        if let Some(ea) = alias {
+                            bind_dep_alias(
+                                dep,
                                 *type_name,
                                 ea,
-                                ImportTier::Explicit,
-                            );
+                                Tier::Explicit,
+                                item.span,
+                                env,
+                                interner,
+                            )?;
                             // A record alias also exports a value-level
                             // auto-constructor under the same name; when the
                             // dep exposed it (present in `dep.values`), bring it
-                            // into the value namespace too so `exposing (Account)`
-                            // makes `Account` usable as a constructor.
+                            // into the expression namespace too so `exposing
+                            // (Account)` makes `Account` usable as a constructor.
                             if dep.values.contains(type_name) {
-                                // A record-alias auto-constructor is never a kernel
-                                // alias (kernel aliases are lowercase values, not
-                                // type names), so this lookup is always `None`;
-                                // passed for uniformity with the value paths.
-                                check_and_inject_value(
+                                bind_dep_value(
+                                    dep,
                                     *type_name,
-                                    dep_path,
+                                    Tier::Explicit,
                                     item.span,
                                     env,
-                                    unqual_origins,
-                                    dep.kernel_aliases.get(type_name),
                                     interner,
                                 )?;
                             }
@@ -5029,178 +4479,51 @@ fn inject_dep_exports(
         }
     }
 
-    // Qualifiers this import is reachable under (see `import_qualifiers`).
+    // The dep's qualified members: every exported value (a Stage-4 kernel alias
+    // resolves as its kernel, so `Alias.f` routes straight to the kernel
+    // dispatch, never to a def the alias module never emits) and every
+    // constructor, regardless of the `exposing` clause — qualified access needs
+    // no exposure.
+    let mut vars: BTreeMap<Symbol, VarHome> = BTreeMap::new();
+    for &v in &dep.values {
+        let home = dep.kernel_aliases.get(&v).map_or_else(
+            || VarHome::TopLevel(dep_path.clone()),
+            |alias| VarHome::Kernel(alias.id, alias.module, alias.function),
+        );
+        vars.insert(v, home);
+    }
+    let ctors: BTreeMap<Symbol, CtorHome> = dep
+        .ctors
+        .iter()
+        .map(|(&name, home)| (name, home.clone()))
+        .collect();
+    // Install them under every spelling this import is reachable under (see
+    // `import_qualifiers`), owned by this dep's own identity: a spelling another
+    // module already owns is decided by `Env::install_import`, never merged.
+    let forms = import_qualifier_forms(import.alias.is_some(), dep_path.len());
     let reachable_qualifiers = import_qualifiers(import.alias, dep_path, interner)?;
-    for &qualifier in &reachable_qualifiers {
-        // A user dep module whose qualifier collides with a gated stdlib short-name
-        // (e.g. a project-local `import Auth` over the stdlib `Auth`) shadows the
-        // Tier-C import gate: its members now live in `qual_vars` under that
-        // qualifier, so `Qualifier.member` must resolve against the imported local
-        // module rather than raise IPE-N0034 for the un-imported stdlib module of
-        // the same name. Marking the qualifier imported makes the gate defer here.
-        env.mark_stdlib_qualifier_imported(qualifier);
-        let qual_map = std::rc::Rc::make_mut(&mut env.qual_vars)
-            .entry(qualifier)
-            .or_default();
-        for &v in &dep.values {
-            // A dep value that is a Stage-4 kernel alias resolves as its kernel, so a
-            // qualified `Alias.f` routes straight to the kernel dispatch — never a
-            // `TopLevel(dep_path)` reference to a def the alias module never emits.
-            if let Some(alias) = dep.kernel_aliases.get(&v) {
-                qual_map.insert(v, VarHome::Kernel(alias.id, alias.module, alias.function));
-            } else {
-                qual_map.insert(v, VarHome::TopLevel(dep_path.clone()));
-            }
-        }
-        // Register qualified constructors so `Alias.CtorName` resolves correctly.
-        // Needed for compiled-source ADTs (e.g. `Money.USD` from `import Ipe.Money
-        // as Money`) where constructors are not stdlib kernels and never enter
-        // `qual_vars`.  We register ALL ctors from this dep regardless of the
-        // user's `exposing (...)` clause — qualified access does not require the
-        // name to be in the exposing list (only unqualified access does).
-        if !dep.ctors.is_empty() {
-            let qual_ctor_map = std::rc::Rc::make_mut(&mut env.qual_ctors)
-                .entry(qualifier)
-                .or_default();
-            for (ctor_sym, ctor_home) in &dep.ctors {
-                qual_ctor_map
-                    .entry(*ctor_sym)
-                    .or_insert_with(|| ctor_home.clone());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Bring a single unqualified value name from `dep_path` into scope, checking
-/// for ambiguity with a prior import from a different module.
-///
-/// # Errors
-/// [`NameError::AmbiguousImport`] when the name was already exposed unqualified
-/// by a different dep module.
-fn check_and_inject_value(
-    name: Symbol,
-    dep_path: &[Symbol],
-    span: Span,
-    env: &mut Env,
-    unqual_origins: &mut BTreeMap<Symbol, Vec<Symbol>>,
-    kernel_alias: Option<&crate::ExportedKernelAlias>,
-    interner: &Interner,
-) -> DResult<()> {
-    if let Some(prior_path) = unqual_origins.get(&name) {
-        if prior_path.as_slice() != dep_path {
-            let name_s = name_str(interner, name)?;
-            let prior_s = path_to_dot_string(interner, prior_path);
-            let dep_s = path_to_dot_string(interner, dep_path);
-            return Err(Diagnostic::Name {
-                span,
-                msg: NameError::AmbiguousImport {
-                    name: name_s,
-                    modules: SortedNames::new([prior_s, dep_s]),
-                },
-            });
-        }
-        // Same module exposed again — harmless.
-        return Ok(());
-    }
-    unqual_origins.insert(name, dep_path.to_vec());
-    // A kernel alias resolves unqualified to its kernel, same as it would
-    // qualified — otherwise `import Ipe.PubSub exposing (publish)` would bind
-    // `publish` to a non-existent `TopLevel` def.
-    let home = kernel_alias.map_or_else(
-        || VarHome::TopLevel(dep_path.to_vec()),
-        |a| VarHome::Kernel(a.id, a.module, a.function),
-    );
-    env.vars.insert(name, home);
-    Ok(())
-}
-
-/// Inject all constructors belonging to `type_name` from `dep` into `env`,
-/// applying the same IPE-N0024 ambiguity check that [`check_and_inject_value`]
-/// applies to values.
-///
-/// `unqual_ctor_origins` is the parallel tracking map for constructors: each
-/// constructor name maps to the dep-module path that first exposed it
-/// unqualified.  A second dep exposing the same unqualified constructor name
-/// triggers [`NameError::AmbiguousImport`].
-///
-/// # Errors
-/// [`NameError::AmbiguousImport`] when a constructor name was already exposed
-/// unqualified by a different dep module.
-fn inject_ctors_for_type(
-    type_name: Symbol,
-    filter: &CtorFilter,
-    dep: &crate::ModuleExports,
-    env: &mut Env,
-    span: ipe_diagnostics::Span,
-    unqual_ctor_origins: &mut BTreeMap<Symbol, Vec<Symbol>>,
-    interner: &Interner,
-) -> DResult<()> {
-    let dep_path = &dep.path;
-    for ctor_home in dep.ctors.values() {
-        if ctor_home.type_name == type_name && filter.admits(ctor_home.name) {
-            if let Some(prior_path) = unqual_ctor_origins.get(&ctor_home.name) {
-                if prior_path.as_slice() != dep_path.as_slice() {
-                    // Two different dep modules both expose this constructor
-                    // unqualified — IPE-N0024 (same code as for value ambiguity).
-                    let name_s = name_str(interner, ctor_home.name)?;
-                    let prior_s = path_to_dot_string(interner, prior_path);
-                    let dep_s = path_to_dot_string(interner, dep_path);
-                    return Err(Diagnostic::Name {
-                        span,
-                        msg: NameError::AmbiguousImport {
-                            name: name_s,
-                            modules: SortedNames::new([prior_s, dep_s]),
-                        },
-                    });
-                }
-                // Same module exposed again — harmless, no-op.
-            } else {
-                unqual_ctor_origins.insert(ctor_home.name, dep_path.clone());
-                std::rc::Rc::make_mut(&mut env.ctors).insert(ctor_home.name, ctor_home.clone());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Enter every constructor of `dep`'s `type_name` into the open-import tier
-/// ([`Env::wildcard_ctors`]), keyed by its defining identity.
-///
-/// No import-time check: two identities under one name are IPE-N0024 only at a
-/// bare use ([`Env::lookup_ctor`]), and the same identity reached again only
-/// records one more importing path.
-fn inject_wildcard_ctors_for_type(type_name: Symbol, dep: &crate::ModuleExports, env: &mut Env) {
-    let wildcard = std::rc::Rc::make_mut(&mut env.wildcard_ctors);
-    for ctor_home in dep.ctors.values() {
-        if ctor_home.type_name != type_name {
-            continue;
-        }
-        let identity = CtorIdentity {
-            home: ctor_home.home.clone(),
-            type_name: ctor_home.type_name,
+    for (&qualifier, form) in reachable_qualifiers.iter().zip(forms) {
+        let form = match form {
+            QualifierForm::Alias => ClaimForm::Alias,
+            QualifierForm::LastSegment => ClaimForm::LastSegment,
+            QualifierForm::DottedPath => ClaimForm::Path,
         };
-        wildcard
-            .entry(ctor_home.name)
-            .or_default()
-            .entry(identity)
-            .or_insert_with(|| WildcardCtorOrigin {
-                ctor: ctor_home.clone(),
-                dep_paths: BTreeSet::new(),
-            })
-            .dep_paths
-            .insert(dep.path.clone());
+        env.install_import(
+            QualifierClaim {
+                spelling: qualifier,
+                owner: ModuleIdentity::Source(dep_path.clone()),
+                form,
+                span: import.name.span,
+            },
+            (vars.clone(), ctors.clone()),
+            interner,
+        )?;
     }
+
+    Ok(())
 }
 
-/// Build a [`crate::ModuleExports`] from the module's own declarations filtered
-/// by its `exposing (…)` clause.
-///
-/// Only names declared in THIS module are considered as exportable; re-exporting
-/// an imported name is not yet supported (and would require a separate pass after
-/// imports are resolved, which the current design defers to a later milestone).
-/// The `type_home_map` home a compiled-source stdlib module records for a
+/// The type home a compiled-source stdlib module records for a
 /// reserved builtin TYPE it re-exports (`Ipe.Ui exposing (Attribute)`,
 /// `Ipe.Html exposing (Attribute)`, `Ipe.Path exposing (Path)`).
 ///
@@ -5241,6 +4564,12 @@ fn reexported_builtin_type_home(
     }
 }
 
+/// Build a [`crate::ModuleExports`] from the module's own declarations filtered
+/// by its `exposing (…)` clause.
+///
+/// Only names declared in THIS module are considered as exportable; re-exporting
+/// an imported name is not yet supported (and would require a separate pass after
+/// imports are resolved, which the current design defers to a later milestone).
 fn build_module_exports(
     home: &[Symbol],
     m: &src::Module,
@@ -5264,8 +4593,8 @@ fn build_module_exports(
             exports.values = own_values;
             for &type_name in &own_types {
                 exports.types.insert(type_name, home.to_owned());
-                for ctor_home in env.ctors.values() {
-                    if ctor_home.type_name == type_name && ctor_home.home == home {
+                for ctor_home in local_ctors(env) {
+                    if ctor_home.type_name == type_name {
                         exports.ctors.insert(ctor_home.name, ctor_home.clone());
                     }
                 }
@@ -5277,8 +4606,7 @@ fn build_module_exports(
                 // A record alias also exports its value-level auto-constructor
                 // — but ONLY when one was actually synthesized (a
                 // function-field alias is gated out). The synthesized `Def` lives
-                // in this module's `defs`, so the importer's
-                // `check_and_inject_value` path registers the name as
+                // in this module's `defs`, so the importer binds the name as
                 // `TopLevel(dep_path)` with no re-synthesis.
                 if synth_ctor_names.contains(&a.value.name.value) {
                     exports.values.insert(a.value.name.value);
@@ -5298,9 +4626,8 @@ fn build_module_exports(
                             exports.types.insert(*type_name, home.to_owned());
                             let filter = exposed_ctor_filter(privacy);
                             if !matches!(filter, CtorFilter::None) {
-                                for ctor_home in env.ctors.values() {
+                                for ctor_home in local_ctors(env) {
                                     if ctor_home.type_name == *type_name
-                                        && ctor_home.home == home
                                         && filter.admits(ctor_home.name)
                                     {
                                         exports.ctors.insert(ctor_home.name, ctor_home.clone());
@@ -5430,53 +4757,38 @@ pub const fn import_qualifier_forms(has_alias: bool, path_len: usize) -> &'stati
     }
 }
 
-/// Register a union's constructors into the environment.
+/// Bind a union's constructors at the local tier.
 ///
 /// This is the *name-resolution* half: each constructor's home / type / index /
-/// arity is recorded in `env.ctors` so a `VarCtor` reference or a constructor
-/// pattern can resolve before any value body is canonicalised. The payload field
-/// *types* are canonicalised separately in [`canonicalise_union`] (after type
-/// aliases are collected, so a field type may itself reference an alias).
-///
-/// `seen_ctors` carries every constructor name already registered across the
-/// module so a name reused in the same or a different union is rejected
-/// ([`NameError::DuplicateConstructor`]) instead of silently overwriting the
-/// earlier `env.ctors` entry.
+/// arity is bound in the expression namespace so a `VarCtor` reference or a
+/// constructor pattern can resolve before any value body is canonicalised. The
+/// payload field *types* are canonicalised separately in [`canonicalise_union`]
+/// (after type aliases are collected, so a field type may itself reference an
+/// alias).
 ///
 /// # Errors
-/// [`NameError::DuplicateConstructor`] on a repeated constructor name;
+/// [`NameError::DuplicateConstructor`] on a constructor name the module already
+/// declares, or one an explicit import already binds;
 /// [`Diagnostic::CompilerBug`] if a constructor symbol is not interned.
 fn register_union(
     u: &src::Union,
     home: &[Symbol],
     env: &mut Env,
-    seen_ctors: &mut BTreeMap<Symbol, Span>,
     interner: &Interner,
 ) -> DResult<()> {
     let type_name = u.name.value;
     for (index, c) in u.ctors.iter().enumerate() {
         let name = c.value.name;
-        let arity = c.value.args.len();
-        if let Some(&first) = seen_ctors.get(&name) {
-            return Err(Diagnostic::Name {
-                span: c.span,
-                msg: NameError::DuplicateConstructor {
-                    name: name_str(interner, name)?,
-                    first,
-                },
-            });
-        }
-        seen_ctors.insert(name, c.span);
-        std::rc::Rc::make_mut(&mut env.ctors).insert(
+        let ctor = CtorHome {
+            home: home.to_vec(),
+            type_name,
             name,
-            CtorHome {
-                home: home.to_vec(),
-                type_name,
-                name,
-                index,
-                arity,
-            },
-        );
+            index,
+            arity: c.value.args.len(),
+        };
+        let identity = ctor_identity(&ctor);
+        let origin = declared(ExprTarget::Ctor(ctor), identity, c.span);
+        bind_expr(env, name, Tier::Local, origin, interner)?;
     }
     Ok(())
 }
@@ -5496,42 +4808,41 @@ fn register_union(
 fn canonicalise_union(
     u: &src::Union,
     env: &Env,
-    type_homes: &TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &BTreeMap<Symbol, AliasDef>,
+    qualified_aliases: &QualifiedAliases,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<canon::Union> {
     let type_name = u.name.value;
     let vars: Vec<Symbol> = u.vars.iter().map(|v| v.value).collect();
+    // Each declared parameter is in scope under its own name, so a parameter
+    // spelled `any` is a bound `Type::Var`, never the wildcard.
+    let identity: Vec<(Symbol, Symbol)> = vars.iter().map(|&v| (v, v)).collect();
+    let declared = ParamSlots::new(&identity);
     let mut ctors = Vec::with_capacity(u.ctors.len());
     for (index, c) in u.ctors.iter().enumerate() {
         let name = c.value.name;
         let arity = c.value.args.len();
         let ctx = TypeCtx {
             env,
-            type_homes,
             qualifier_paths,
-            aliases,
+            qualified_aliases,
             interner,
-            ui_wildcard_msg,
             ann_span: c.span,
         };
         let mut args = Vec::with_capacity(c.value.args.len());
         for a in &c.value.args {
-            // A constructor field type is canonicalised under an empty
-            // substitution: each free type variable it mentions is one of the
-            // union's `vars` and resolves to a `Type::Var`. The `free_vars` set is
-            // local (the union's quantification, not a binding's), so it is
-            // discarded — the declared `vars` are the authoritative parameter list.
+            // A constructor field type is canonicalised with the union's
+            // declared `vars` in scope, each bound to itself. The `free_vars`
+            // set is local (the union's quantification, not a binding's), so it
+            // is discarded: the declared `vars` are the authoritative parameter
+            // list.
             let mut free_vars = BTreeSet::new();
             let mut visited = Vec::new();
-            let subst = BTreeMap::new();
             let mut budget = TYPE_EXPANSION_NODE_LIMIT;
             args.push(canonicalise_type(
                 a,
                 &ctx,
-                &subst,
+                &declared,
                 &mut free_vars,
                 &mut visited,
                 &mut budget,
@@ -5559,26 +4870,18 @@ fn canonicalise_union(
 fn canonicalise_value(
     val: &src::Value,
     env: &Env,
-    type_homes: &TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &BTreeMap<Symbol, AliasDef>,
+    qualified_aliases: &QualifiedAliases,
     interner: &mut Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<canon::Def> {
     // The reserved `CustomElement.fromFile "<js-path>"` constructor is recognised BEFORE
     // the body is canonicalised: its qualified head is otherwise an unknown member,
     // and only this position (the whole body of a `CustomElement`-annotated
     // binding) is legal. A malformed use fails closed here (IPE-N0044); any other
     // appearance of the qualified name is rejected downstream by `resolve_qual_var`.
-    if let Some(def) = detect_custom_element_constructor(
-        val,
-        env,
-        type_homes,
-        qualifier_paths,
-        aliases,
-        interner,
-        ui_wildcard_msg,
-    )? {
+    if let Some(def) =
+        detect_custom_element_constructor(val, env, qualifier_paths, qualified_aliases, interner)?
+    {
         return Ok(def);
     }
 
@@ -5607,19 +4910,17 @@ fn canonicalise_value(
             let mut visited = Vec::new();
             let ctx = TypeCtx {
                 env,
-                type_homes,
                 qualifier_paths,
-                aliases,
+                qualified_aliases,
                 interner,
-                ui_wildcard_msg,
                 ann_span: ann.span,
             };
-            let subst = BTreeMap::new();
+            let no_params = ParamSlots::empty();
             let mut budget = TYPE_EXPANSION_NODE_LIMIT;
             let ty = canonicalise_type(
                 &ann.value,
                 &ctx,
-                &subst,
+                &no_params,
                 &mut free_vars,
                 &mut visited,
                 &mut budget,
@@ -5827,6 +5128,40 @@ fn collect_binders_no_dup(
     Ok(())
 }
 
+/// Resolve a constructor pattern's bare name. A pattern reads the expression
+/// namespace's one ladder: a value its first answering tier binds (a record
+/// alias's auto-constructor) shadows any lower-tier constructor, and is no
+/// constructor to match on. `unqualified` is whether the pattern's source token
+/// is the bare name, so a did-you-mean may edit it.
+fn resolve_pattern_ctor<'e>(
+    name: Symbol,
+    unqualified: bool,
+    span: Span,
+    env: &'e Env,
+    interner: &Interner,
+) -> DResult<&'e CtorHome> {
+    match env.module_scope.expr.resolve(name) {
+        Resolved::Found(
+            Origin {
+                target: ExprTarget::Ctor(ctor),
+                ..
+            },
+            _,
+        ) => Ok(ctor),
+        Resolved::Ambiguous { importers } => {
+            let modules = importer_names(&importers, interner);
+            Err(ambiguous_import(name, span, modules, interner)?)
+        }
+        Resolved::Found(..) | Resolved::Missing => Err(ctor_pattern_not_found(
+            name,
+            unqualified,
+            span,
+            env,
+            interner,
+        )?),
+    }
+}
+
 /// Canonicalise a pattern. Supports wildcard, var, and constructor patterns.
 fn canonicalise_pattern(
     p: &src::Pattern,
@@ -5839,22 +5174,8 @@ fn canonicalise_pattern(
         src::Pattern_::PDebugAnything => canon::Pattern_::PDebugAnything,
         src::Pattern_::PUnit => canon::Pattern_::PUnit,
         src::Pattern_::PVar(name) => canon::Pattern_::PVar(*name),
-        src::Pattern_::PCtor(name, _, args) => {
-            let ctor = match env.lookup_ctor(*name) {
-                CtorLookup::Found(ctor) => ctor,
-                CtorLookup::Ambiguous(origins) => {
-                    return Err(ambiguous_ctor(*name, span, origins, interner)?);
-                }
-                CtorLookup::Missing => {
-                    return Err(Diagnostic::Name {
-                        span,
-                        msg: NameError::ConstructorNotFound {
-                            name: name_str(interner, *name)?,
-                            suggestions: suggestions(*name, env.ctor_names(), interner),
-                        },
-                    });
-                }
-            };
+        src::Pattern_::PCtor(name, segments, args) => {
+            let ctor = resolve_pattern_ctor(*name, segments.is_empty(), span, env, interner)?;
             let home = ctor.home.clone();
             let type_name = ctor.type_name;
             let index = ctor.index;
@@ -6129,48 +5450,29 @@ fn canonicalise_fields(
     Ok(can_fields)
 }
 
-/// Resolve a bare name through one precedence: the local and explicit tiers
-/// (constructors, then values such as a record alias's auto-constructor), then
-/// the open-import tier (constructors and values together), then the ambient
-/// built-in constructors. Unknown → error.
+/// Resolve a bare name: a lexical binder first, then the expression
+/// namespace's one ladder (local, explicit, open, ambient), where a constructor
+/// and a value of one spelling compete as equals. Unknown → error.
+///
+/// # Errors
+/// [`NameError::AmbiguousImport`] for two open-import definitions no higher
+/// tier shadows; [`NameError::ValueNotFound`] when no tier binds the name.
 fn resolve_var(name: Symbol, span: Span, env: &Env, interner: &Interner) -> DResult<canon::Expr_> {
-    if let Some(ctor) = env.ctors.get(&name) {
-        return Ok(ctor_expr(ctor));
-    }
     if let Some(home) = env.lookup_var(name) {
-        // A local / top-level / explicit-exposed / built-in binding wins over any
-        // open-import or ambient member of the same spelling (silent shadow).
+        // A lexical binder shadows every module-level binding of its spelling.
         return Ok(var_home_to_expr(name, home));
     }
-    let open_values = env.wildcard_vars.get(&name).filter(|o| !o.is_empty());
-    match env.lookup_open_ctor(name) {
-        CtorLookup::Found(ctor) => {
-            // An open constructor and an open value of one spelling come from
-            // distinct modules (a module never synthesises a record alias's
-            // auto-constructor over its own constructor): IPE-N0024.
-            if let Some(values) = open_values {
-                let modules = SortedNames::new(
-                    values
-                        .values()
-                        .map(|o| path_to_dot_string(interner, &o.dep_path))
-                        .chain(std::iter::once(path_to_dot_string(interner, &ctor.home))),
-                );
-                return Err(ambiguous_import(name, span, modules, interner)?);
-            }
-            return Ok(ctor_expr(ctor));
+    match env.module_scope.expr.resolve(name) {
+        Resolved::Found(origin, _) => Ok(match &origin.target {
+            ExprTarget::Ctor(ctor) => ctor_expr(ctor),
+            ExprTarget::Value(home) => var_home_to_expr(name, home),
+        }),
+        Resolved::Ambiguous { importers } => {
+            let modules = importer_names(&importers, interner);
+            Err(ambiguous_import(name, span, modules, interner)?)
         }
-        CtorLookup::Ambiguous(origins) => {
-            return Err(ambiguous_ctor(name, span, origins, interner)?);
-        }
-        CtorLookup::Missing => {}
+        Resolved::Missing => Err(value_not_found(name, span, env, interner)?),
     }
-    if open_values.is_none()
-        && let Some(ctor) = env.ambient_ctors.get(&name)
-    {
-        return Ok(ctor_expr(ctor));
-    }
-    // The open value tier, or the not-found diagnostic when every tier misses.
-    resolve_wildcard_var(name, span, env, interner)
 }
 
 /// The canonical reference to a resolved constructor.
@@ -6183,30 +5485,9 @@ fn ctor_expr(ctor: &CtorHome) -> canon::Expr_ {
     }
 }
 
-/// The IPE-N0024 for a bare constructor two open imports bring in from distinct
-/// defining homes, naming every importing module.
-///
-/// # Errors
-/// [`Diagnostic::CompilerBug`] if `name` is not interned.
-fn ambiguous_ctor(
-    name: Symbol,
-    span: Span,
-    origins: &BTreeMap<CtorIdentity, WildcardCtorOrigin>,
-    interner: &Interner,
-) -> DResult<Diagnostic> {
-    let modules = SortedNames::new(
-        origins
-            .values()
-            .flat_map(|origin| &origin.dep_paths)
-            .map(|path| path_to_dot_string(interner, path)),
-    );
-    ambiguous_import(name, span, modules, interner)
-}
-
-/// Map a resolved [`VarHome`] to its canonical [`canon::Expr_`] form. Total over
-/// all three variants so both the primary tiers and the wildcard tier share one
-/// lowering rule (a wildcard clone is always a `Kernel`, but keeping the mapping
-/// total avoids any partial assumption).
+/// Map a resolved [`VarHome`] to its canonical [`canon::Expr_`] form, total over
+/// every variant so a lexical binder and every ladder tier share one lowering
+/// rule.
 fn var_home_to_expr(name: Symbol, home: &VarHome) -> canon::Expr_ {
     match home {
         VarHome::Local => canon::Expr_::VarLocal(name),
@@ -6229,68 +5510,33 @@ fn var_home_to_expr(name: Symbol, home: &VarHome) -> canon::Expr_ {
     }
 }
 
-/// Resolve a bare name against the low-priority wildcard tier
-/// ([`Env::wildcard_vars`]), or fail with the ordinary `IPE-N0001` when it is
-/// absent there too.
-///
-/// * Exactly one surviving origin → resolve to its cloned kernel home (identical
-///   to the qualified reference).
-/// * Two or more distinct origins → [`NameError::AmbiguousImport`] (IPE-N0024) at
-///   THIS use site, listing every contributing module — never a silent
-///   last-wins.
-fn resolve_wildcard_var(
-    name: Symbol,
-    span: Span,
-    env: &Env,
-    interner: &Interner,
-) -> DResult<canon::Expr_> {
-    // Only a non-empty origin set participates; an empty entry (never produced by
-    // the injector) falls through to `ValueNotFound`.
-    if let Some(origins) = env.wildcard_vars.get(&name).filter(|o| !o.is_empty()) {
-        if origins.len() == 1 {
-            if let Some(origin) = origins.values().next() {
-                return Ok(var_home_to_expr(name, &origin.home));
-            }
-            // Unreachable (len == 1 ⇒ non-empty), but stay total — no `unwrap`.
-            return Err(value_not_found(name, span, env, interner)?);
-        }
-        // Two or more distinct modules expose this name unqualified → ambiguous.
-        let modules = SortedNames::new(
-            origins
-                .values()
-                .map(|o| path_to_dot_string(interner, &o.dep_path)),
-        );
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::AmbiguousImport {
-                name: name_str(interner, name)?,
-                modules,
-            },
-        });
-    }
-    Err(value_not_found(name, span, env, interner)?)
-}
-
 /// Build the ordinary `IPE-N0001` [`NameError::ValueNotFound`] for a bare name.
 ///
 /// A bare value name can resolve to either a value binding or a constructor used
-/// as a value, so the suggestion pool spans both namespaces (value bindings
-/// first, then constructor names).
+/// as a value, so the suggestion pool spans the lexical binders and every
+/// module-level value and constructor name.
 fn value_not_found(
     name: Symbol,
     span: Span,
     env: &Env,
     interner: &Interner,
 ) -> DResult<Diagnostic> {
+    let name_s = name_str(interner, name)?;
     Ok(Diagnostic::Name {
         span,
         msg: NameError::ValueNotFound {
-            name: name_str(interner, name)?,
-            suggestions: suggestions(
-                name,
-                env.vars.keys().copied().chain(env.ctor_names()),
-                interner,
+            suggestions: Candidates::at(
+                EditTarget::whole(span, &name_s),
+                suggestions(
+                    name,
+                    env.vars
+                        .keys()
+                        .copied()
+                        .chain(env.module_scope.expr.names()),
+                    interner,
+                ),
             ),
+            name: name_s,
         },
     })
 }
@@ -6340,9 +5586,200 @@ fn reject_bare_reserved_constructor(
     None
 }
 
-/// Resolve a qualified name `Qualifier.name`. Distinguishes an unknown
-/// qualifier ([`NameError::UnknownModule`]) from a known qualifier missing the
-/// member ([`NameError::NoSuchMember`]).
+/// The diagnostic for a constructor pattern naming no constructor in scope.
+///
+/// An unqualified constructor pattern starts with its name, so a sole
+/// did-you-mean may overwrite that prefix; a qualified one starts with the
+/// module, so it has no edit region.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `name` is not interned.
+fn ctor_pattern_not_found(
+    name: Symbol,
+    unqualified: bool,
+    span: Span,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    let name_s = name_str(interner, name)?;
+    let region = if unqualified {
+        EditTarget::prefix(span, &name_s)
+    } else {
+        None
+    };
+    let ctor_names = env
+        .module_scope
+        .expr
+        .names_where(|target| matches!(target, ExprTarget::Ctor(_)));
+    Ok(Diagnostic::Name {
+        span,
+        msg: NameError::ConstructorNotFound {
+            suggestions: Candidates::at(region, suggestions(name, ctor_names, interner)),
+            name: name_s,
+        },
+    })
+}
+
+/// `span` when it is exactly the source token `qualifier.member`.
+///
+/// A reference the parser synthesised (an operator desugared to a qualified
+/// name) carries a span of a different width; it gets no edit region.
+fn qualified_token(span: Span, qualifier: Option<&str>, member: Option<&str>) -> Option<Span> {
+    let width = qualifier?
+        .len()
+        .checked_add(1)?
+        .checked_add(member?.len())?;
+    (usize::try_from(span.hi.checked_sub(span.lo)?).ok()? == width).then_some(span)
+}
+
+/// The diagnostic for a qualifier no import or ambient table binds.
+///
+/// A qualifier a bare `import` of some catalog module would bind is IPE-N0034
+/// naming every such module; anything else is IPE-N0004 ranked over the
+/// qualifiers this module can actually use. `token` is the `qualifier.member`
+/// source token when one exists (value position), giving the did-you-mean its
+/// edit region; a type annotation has none.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `qualifier` is not interned.
+fn unbound_qualifier(
+    qualifier: Symbol,
+    span: Span,
+    token: Option<Span>,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    let qualifier_s = name_str(interner, qualifier)?;
+    let home = path_to_dot_string(interner, &env.home);
+    let modules = env.module_catalog.modules_bound_by(&qualifier_s, &home);
+    if !modules.is_empty() {
+        return Ok(import_required(qualifier_s, modules, span, env));
+    }
+    Ok(Diagnostic::Name {
+        span,
+        msg: NameError::UnknownModule {
+            suggestions: Candidates::at(
+                token.and_then(|t| EditTarget::prefix(t, &qualifier_s)),
+                suggestions(qualifier, env.usable_qualifiers(), interner),
+            ),
+            qualifier: qualifier_s,
+        },
+    })
+}
+
+/// Every module a bare `import` of which binds the Tier-C gated `qualifier`.
+///
+/// The catalog ([`crate::ModuleCatalog::modules_bound_by`]) is the one source:
+/// it lists every kernel AND compiled-source module the qualifier names, so a
+/// compiled `Ipe.Ui.Tui` stands beside the kernel `Ipe.Tea.Tui` for `Tui`.
+/// `gate_path`, the gate's own kernel path, is always one of them; it is
+/// unioned in so the set is never empty even over a kernel-only catalog.
+/// Sorted and deduplicated.
+fn gated_import_candidates(
+    qualifier: &str,
+    gate_path: &[Symbol],
+    env: &Env,
+    interner: &Interner,
+) -> Box<[Box<str>]> {
+    let home = path_to_dot_string(interner, &env.home);
+    let mut modules: BTreeSet<Box<str>> = env
+        .module_catalog
+        .modules_bound_by(qualifier, &home)
+        .into_vec()
+        .into_iter()
+        .collect();
+    modules.insert(path_to_dot_string(interner, gate_path));
+    modules.into_iter().collect()
+}
+
+/// IPE-N0034 for `qualifier`, which a bare `import` of each of `modules`
+/// (non-empty, sorted) would bind but no import in this module binds.
+///
+/// A module already imported under an `as` alias is still not reachable under
+/// `qualifier` (an alias installs only itself); the diagnostic then names the
+/// alias to write instead.
+fn import_required(
+    qualifier: Box<str>,
+    modules: Box<[Box<str>]>,
+    span: Span,
+    env: &Env,
+) -> Diagnostic {
+    let imported_as = modules.iter().find_map(|module| {
+        env.import_aliases
+            .get(module)
+            .and_then(|aliases| aliases.first())
+            .map(|alias| {
+                Box::new(ImportedAs {
+                    module: module.clone(),
+                    alias: alias.clone(),
+                })
+            })
+    });
+    Diagnostic::Name {
+        span,
+        msg: NameError::ImportRequired {
+            reached: StdlibReach::Qualifier(qualifier),
+            candidates: modules,
+            imported_as,
+        },
+    }
+}
+
+/// The verdict for a qualified use of `qualifier`, which holds no members here.
+///
+/// The one reading of [`Env::classify_absent`]: a spelling two imports share
+/// is IPE-N0027 naming both; a kernel module's canonical, or `Cmd` / `Sub`,
+/// that no import installed is IPE-N0034 naming the import to add; anything
+/// else is [`unbound_qualifier`]. `token` is the `qualifier.member` source
+/// token when one exists.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if `qualifier` is not interned.
+fn absent_qualifier(
+    qualifier: Symbol,
+    span: Span,
+    token: Option<Span>,
+    env: &Env,
+    interner: &Interner,
+) -> DResult<Diagnostic> {
+    match env.classify_absent(qualifier, interner) {
+        AbsentQualifier::Ambiguous(ambiguous) => Ok(Diagnostic::Name {
+            span: ambiguous.second,
+            msg: NameError::DuplicateQualifier {
+                qualifier: name_str(interner, qualifier)?,
+                first: ambiguous.first,
+            },
+        }),
+        AbsentQualifier::KnownStdlib(path) => {
+            let qualifier_s = name_str(interner, qualifier)?;
+            let modules = gated_import_candidates(&qualifier_s, &path, env, interner);
+            Ok(import_required(qualifier_s, modules, span, env))
+        }
+        AbsentQualifier::InternalCmdSub(_) => {
+            let modules: Box<[Box<str>]> = {
+                let mut shapes: Vec<Box<str>> = TeaShape::ALL
+                    .iter()
+                    .map(|shape| format!("Ipe.Tea.{}", shape.canonical()).into_boxed_str())
+                    .collect();
+                shapes.sort();
+                shapes.into_boxed_slice()
+            };
+            Ok(import_required(
+                name_str(interner, qualifier)?,
+                modules,
+                span,
+                env,
+            ))
+        }
+        AbsentQualifier::Unknown => unbound_qualifier(qualifier, span, token, env, interner),
+    }
+}
+
+/// Resolve a qualified name `Qualifier.name`: the one reader of the
+/// import-installed qualifier scope.
+///
+/// Distinguishes a qualifier no import installed ([`absent_qualifier`]) from
+/// an installed qualifier missing the member ([`NameError::NoSuchMember`]).
 fn resolve_qual_var(
     qualifier: Symbol,
     name: Symbol,
@@ -6407,31 +5844,12 @@ fn resolve_qual_var(
             name,
         });
     }
-    // Tier-C import gate (ADR 0001): a known stdlib qualifier used WITHOUT its
-    // import is the teachable must-import diagnostic (IPE-N0034), naming the exact
-    // `Ipe.*` module to add — NOT a silent resolve against the pre-installed
-    // catalog, and NOT the generic "unknown module" (the module is known; the
-    // import is missing). Checked before the member lookup, since the catalog
-    // members are present regardless of import.
-    if let Some(import_path) = env.stdlib_import_required(qualifier) {
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::StdlibImportRequired {
-                qualifier: name_str(interner, qualifier)?,
-                import_path: path_to_dot_string(interner, import_path),
-            },
-        });
-    }
+    // A spelling holds members only when an import of this module installed
+    // it, so the member table is the import gate: an absent spelling is
+    // classified once (IPE-N0027 / IPE-N0034 / IPE-N0004).
+    let token = qualified_token(span, qualifier_text, name_text);
     let Some(members) = env.qual_members(qualifier) else {
-        // The qualifier itself is unknown: suggest from the known qualifiers
-        // (kernel modules + import aliases).
-        return Err(Diagnostic::Name {
-            span,
-            msg: NameError::UnknownModule {
-                qualifier: name_str(interner, qualifier)?,
-                suggestions: suggestions(qualifier, env.qual_vars.keys().copied(), interner),
-            },
-        });
+        return Err(absent_qualifier(qualifier, span, token, env, interner)?);
     };
     match members.get(&name) {
         Some(VarHome::Kernel(id, m, f)) => Ok(canon::Expr_::VarKernel {
@@ -6464,19 +5882,23 @@ fn resolve_qual_var(
                     index: ch.index,
                 });
             }
+            let member = name_str(interner, name)?;
             Err(Diagnostic::Name {
                 span,
                 msg: NameError::NoSuchMember {
                     module: name_str(interner, qualifier)?,
-                    member: name_str(interner, name)?,
-                    suggestions: suggestions(
-                        name,
-                        members
-                            .keys()
-                            .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
-                            .copied(),
-                        interner,
+                    suggestions: Candidates::at(
+                        token.and_then(|t| EditTarget::suffix(t, &member)),
+                        suggestions(
+                            name,
+                            members
+                                .keys()
+                                .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
+                                .copied(),
+                            interner,
+                        ),
                     ),
+                    member,
                 },
             })
         }
@@ -6489,7 +5911,12 @@ fn resolve_qual_var(
 /// `(operand, operator)` pairs plus a trailing operand, without consulting
 /// precedence. Here we re-associate it via precedence climbing (port of
 /// `Ipe.Canonicalise.Expression.canonicaliseBinops`), reading each operator's
-/// precedence + associativity from [`fixity`].
+/// precedence + associativity from [`BinOp::fixity`].
+///
+/// Each operator's text is parsed once into the closed [`BinOp`] set. The
+/// parser records only operators of that set, so a text outside it is a
+/// broken internal invariant: a [`Diagnostic::CompilerBug`], never a default
+/// fixity.
 ///
 /// Unlike the reference compiler parser — which nests `Src.Binops` pairwise and so needs a
 /// flattening pre-pass — the Rust parser already emits one flat chain per
@@ -6510,17 +5937,17 @@ fn canonicalise_binops(
     let basics = interner.intern("Basics")?;
 
     // Canonicalise every operand once, left to right, into a front-poppable
-    // queue; pair each operator with its precedence + associativity.
+    // queue; parse each operator into the closed set.
     let mut operands: VecDeque<canon::Expr> = VecDeque::with_capacity(pairs.len() + 1);
-    let mut ops: VecDeque<(Located<Symbol>, Fixity)> = VecDeque::with_capacity(pairs.len());
+    let mut ops: VecDeque<Located<BinOp>> = VecDeque::with_capacity(pairs.len());
     for (operand, op) in pairs {
         operands.push_back(canonicalise_expr(operand, env, interner)?);
-        let op_fixity = fixity(resolve_or_bug(
-            interner,
-            op.value,
-            "ipe_canon::canonicalise_binops",
-        )?);
-        ops.push_back((*op, op_fixity));
+        let text = resolve_or_bug(interner, op.value, "ipe_canon::canonicalise_binops")?;
+        let bin_op = BinOp::from_text(text).ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "ipe_canon::canonicalise_binops",
+            detail: format!("operator `{text}` is outside the closed operator set"),
+        })?;
+        ops.push_back(Located::new(op.span, bin_op));
     }
     operands.push_back(canonicalise_expr(final_, env, interner)?);
 
@@ -6530,7 +5957,7 @@ fn canonicalise_binops(
             where_: "ipe_canon::canonicalise_binops",
             detail: "binop chain with operators but no operands".to_owned(),
         })?;
-    let tree = climb_binops(left, &mut operands, &mut ops, basics, interner)?;
+    let tree = climb_binops(left, &mut operands, &mut ops, basics, env, interner)?;
     Ok(tree.value)
 }
 
@@ -6553,15 +5980,17 @@ fn canonicalise_binops(
 fn climb_binops(
     left0: canon::Expr,
     operands: &mut VecDeque<canon::Expr>,
-    ops: &mut VecDeque<(Located<Symbol>, Fixity)>,
+    ops: &mut VecDeque<Located<BinOp>>,
     basics: Symbol,
+    env: &Env,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
     // Pending frames: left operand + operator + its precedence, awaiting their
     // right subtree once higher-precedence operators to the right are reduced.
-    let mut pending: Vec<(canon::Expr, Located<Symbol>, u8)> = Vec::new();
+    let mut pending: Vec<(canon::Expr, Located<BinOp>, u8)> = Vec::new();
     let mut left = left0;
-    while let Some(&(op, op_fixity)) = ops.front() {
+    while let Some(&op) = ops.front() {
+        let op_fixity = op.value.fixity();
         let prec = op_fixity.prec();
         // Reduce any pending frame whose operator binds at least as tightly as
         // the incoming `op` (left/non-assoc) or strictly tighter (right-assoc).
@@ -6577,7 +6006,7 @@ fn climb_binops(
                 where_: "ipe_canon::climb_binops",
                 detail: "pending stack empty after last() confirmed non-empty".to_owned(),
             })?;
-            left = combine_binop(l, top_op, left, basics, interner)?;
+            left = combine_binop(l, top_op, left, basics, env, interner)?;
         }
         ops.pop_front();
         let next = operands
@@ -6592,7 +6021,7 @@ fn climb_binops(
     // Drain remaining pending frames right-to-left (rightmost operator was
     // pushed last; LIFO pop folds left correctly).
     while let Some((l, op, _)) = pending.pop() {
-        left = combine_binop(l, op, left, basics, interner)?;
+        left = combine_binop(l, op, left, basics, env, interner)?;
     }
     Ok(left)
 }
@@ -6620,137 +6049,169 @@ fn resolve_or_bug<'a>(
 }
 
 /// Build a single resolved binary-operation node.
+///
+/// An operator that desugars into a source module (`|=` and `|.` into
+/// `Ipe.Parser`) is reachable only when `env` imports that module, in any
+/// form; otherwise the use is IPE-N0034 at its span.
 fn combine_binop(
     lhs: canon::Expr,
-    op: Located<Symbol>,
+    op: Located<BinOp>,
     rhs: canon::Expr,
     basics: Symbol,
+    env: &Env,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
     let span = Span::new(lhs.span.lo, rhs.span.hi);
-    // The cons operator `::` is not a kernel binop — it builds a list node so
-    // the type checker can give it the proper `a -> List a -> List a` discipline
-    // and the backend can lower it to the runtime list prepend.
-    if interner.resolve(op.value) == Some("::") {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Cons(Box::new(lhs), Box::new(rhs)),
-        ));
-    }
-    // Parser-pipeline operators desugar to calls into `Ipe.Parser`.
-    // `a |= b`  keeps b's result:  `Ipe.Parser.ignore a b`
-    // `a |. b`  keeps a's result:  `Ipe.Parser.keep   a b`
-    //
-    // Argument order matches the combinators: `ignore dropped kept` and
-    // `keep kept dropped`, so passing (lhs, rhs) in source order is correct —
-    // lhs is the left operand, rhs the right, and each combinator runs them
-    // left-to-right internally via `map2`.
-    {
-        // Resolve the operator text to an owned string first so the immutable
-        // borrow on `interner` ends before the `intern` calls below.
-        let pipe_kind: Option<&'static str> = match interner.resolve(op.value) {
-            Some("|=") => Some("ignore"),
-            Some("|.") => Some("keep"),
-            _ => None,
-        };
-        if let Some(fn_name) = pipe_kind {
-            let mod_ipe = interner.intern("Ipe")?;
-            let mod_parser = interner.intern("Parser")?;
-            let fn_sym = interner.intern(fn_name)?;
+    let node = match resolve_op_func(op.value) {
+        // The cons operator `::` is not a kernel binop — it builds a list node so
+        // the type checker can give it the proper `a -> List a -> List a`
+        // discipline and the backend can lower it to the runtime list prepend.
+        OpForm::Cons => canon::Expr_::Cons(Box::new(lhs), Box::new(rhs)),
+        // Parser-pipeline operators desugar to calls into `Ipe.Parser`.
+        // `a |= b`  keeps b's result:  `Ipe.Parser.ignore a b`
+        // `a |. b`  keeps a's result:  `Ipe.Parser.keep   a b`
+        //
+        // Argument order matches the combinators: `ignore dropped kept` and
+        // `keep kept dropped`, so passing (lhs, rhs) in source order is correct —
+        // lhs is the left operand, rhs the right, and each combinator runs them
+        // left-to-right internally via `map2`.
+        //
+        // The call names its module directly, so the module must be one this
+        // file imports: an unimported module never reaches the dependency
+        // graph, and the call would otherwise fail only after linking.
+        OpForm::ModuleCall { module, func } => {
+            let module_path = module
+                .segments()
+                .iter()
+                .map(|segment| interner.intern(segment))
+                .collect::<DResult<Vec<Symbol>>>()?;
+            if !env
+                .import_scope
+                .imported_modules
+                .contains(&ModuleIdentity::Source(module_path.clone()))
+            {
+                return Err(Diagnostic::Name {
+                    span: op.span,
+                    msg: NameError::OperatorImportRequired {
+                        operator: op.value.text().into(),
+                        module: module.dotted().into(),
+                    },
+                });
+            }
+            let fn_sym = interner.intern(func)?;
             let callee = Located::new(
                 span,
                 canon::Expr_::VarTopLevel {
-                    module: vec![mod_ipe, mod_parser],
+                    module: module_path,
                     name: fn_sym,
                 },
             );
-            return Ok(Located::new(
-                span,
-                canon::Expr_::Call(Box::new(callee), vec![lhs, rhs]),
-            ));
+            canon::Expr_::Call(Box::new(callee), vec![lhs, rhs])
         }
-    }
-    // Pipe operators desugar to function application — no new AST node needed.
-    // `x |> f`  ≡  `f x`  ⇒  Call(rhs, [lhs])
-    // `f <| x`  ≡  `f x`  ⇒  Call(lhs, [rhs])
-    // Correct in a curried language: `(g a) x ≡ g a x`, so a chain
-    // `[1,2,3] |> List.map inc` becomes Call(Call(List.map,[inc]),[[1,2,3]]),
-    // a shape already handled by the existing Call lowering path.
-    if interner.resolve(op.value) == Some("|>") {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Call(Box::new(rhs), vec![lhs]),
-        ));
-    }
-    if interner.resolve(op.value) == Some("<|") {
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Call(Box::new(lhs), vec![rhs]),
-        ));
-    }
-    // Composition operators eta-expand to a lambda over one fresh parameter:
-    //   `f >> g`  ≡  `\x -> g (f x)`   (left-to-right composition)
-    //   `f << g`  ≡  `\x -> f (g x)`   (right-to-left composition)
-    // The parameter name is derived from the operator's source span, so it is
-    // unique per occurrence. Its `compose_` prefix is distinct from every fresh
-    // pool the lowerer mints (`eta_`/`cap_`/`arg_`/…), so it cannot alias an
-    // eta-expansion name; a user binding the same name would be harmlessly
-    // shadowed, since this lambda's body references only the (already-resolved)
-    // `f`/`g` operands and its own parameter.
-    let op_text = interner.resolve(op.value);
-    if op_text == Some(">>") || op_text == Some("<<") {
-        let forward = op_text == Some(">>");
-        let param = interner.intern(&format!("compose_{}_{}", span.lo, span.hi))?;
-        // `>>` applies `f` (lhs) first then `g` (rhs); `<<` applies `g` (rhs)
-        // first then `f` (lhs). `inner` is the first application, `outer` wraps it.
-        let (first, second) = if forward { (lhs, rhs) } else { (rhs, lhs) };
-        let arg = Located::new(span, canon::Expr_::VarLocal(param));
-        let inner = Located::new(span, canon::Expr_::Call(Box::new(first), vec![arg]));
-        let outer = Located::new(span, canon::Expr_::Call(Box::new(second), vec![inner]));
-        let pat = Located::new(span, canon::Pattern_::PVar(param));
-        return Ok(Located::new(
-            span,
-            canon::Expr_::Lambda(vec![pat], Box::new(outer)),
-        ));
-    }
-    let func = resolve_op_func(op.value, interner)?;
-    Ok(Located::new(
-        span,
-        canon::Expr_::Binop {
-            op: op.value,
+        // Pipe operators desugar to function application — no new AST node.
+        // `x |> f`  ≡  `f x`  ⇒  Call(rhs, [lhs])
+        // `f <| x`  ≡  `f x`  ⇒  Call(lhs, [rhs])
+        // Correct in a curried language: `(g a) x ≡ g a x`, so a chain
+        // `[1,2,3] |> List.map inc` becomes Call(Call(List.map,[inc]),[[1,2,3]]),
+        // a shape already handled by the existing Call lowering path.
+        OpForm::Apply(Toward::Right) => canon::Expr_::Call(Box::new(rhs), vec![lhs]),
+        OpForm::Apply(Toward::Left) => canon::Expr_::Call(Box::new(lhs), vec![rhs]),
+        // Composition operators eta-expand to a lambda over one fresh parameter:
+        //   `f >> g`  ≡  `\x -> g (f x)`   (left-to-right composition)
+        //   `f << g`  ≡  `\x -> f (g x)`   (right-to-left composition)
+        // The parameter name is derived from the operator's source span, so it
+        // is unique per occurrence. Its `compose_` prefix is distinct from every
+        // fresh pool the lowerer mints (`eta_`/`cap_`/`arg_`/…), so it cannot
+        // alias an eta-expansion name; a user binding the same name would be
+        // harmlessly shadowed, since this lambda's body references only the
+        // (already-resolved) `f`/`g` operands and its own parameter.
+        OpForm::Compose(direction) => {
+            let param = interner.intern(&format!("compose_{}_{}", span.lo, span.hi))?;
+            // `>>` applies `f` (lhs) first then `g` (rhs); `<<` applies `g` (rhs)
+            // first then `f` (lhs). `inner` is the first application, `outer`
+            // wraps it.
+            let (first, second) = match direction {
+                Toward::Right => (lhs, rhs),
+                Toward::Left => (rhs, lhs),
+            };
+            let arg = Located::new(span, canon::Expr_::VarLocal(param));
+            let inner = Located::new(span, canon::Expr_::Call(Box::new(first), vec![arg]));
+            let outer = Located::new(span, canon::Expr_::Call(Box::new(second), vec![inner]));
+            let pat = Located::new(span, canon::Pattern_::PVar(param));
+            canon::Expr_::Lambda(vec![pat], Box::new(outer))
+        }
+        OpForm::Kernel(func_name) => canon::Expr_::Binop {
+            op: interner.intern(op.value.text())?,
             op_span: op.span,
             home: basics,
-            func,
+            func: interner.intern(func_name)?,
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
         },
-    ))
+    };
+    Ok(Located::new(span, node))
 }
 
-/// Map an operator symbol to its kernel function name. Supported subset of
-/// `Expression.resolveOpName`.
-fn resolve_op_func(op: Symbol, interner: &mut Interner) -> DResult<Symbol> {
-    let func: Option<&'static str> = match interner.resolve(op) {
-        Some("+") => Some("add"),
-        Some("-") => Some("sub"),
-        Some("*") => Some("mul"),
-        Some("/") => Some("fdiv"),
-        Some("//") => Some("idiv"),
-        Some("==") => Some("eq"),
-        Some("/=") => Some("neq"),
-        Some("<") => Some("lt"),
-        Some(">") => Some("gt"),
-        Some("<=") => Some("le"),
-        Some(">=") => Some("ge"),
-        Some("&&") => Some("and"),
-        Some("||") => Some("or"),
-        Some("++") => Some("append"),
-        // Unknown operators map to their own name under Basics, matching the
-        // the compiler fall-through (`_ -> Can.VarKernel "Basics" op`).
-        _ => None,
-    };
-    // The immutable borrow above ends here, so interning is now permitted.
-    func.map_or(Ok(op), |name| interner.intern(name))
+/// The direction an application or composition operator flows.
+#[derive(Clone, Copy)]
+enum Toward {
+    /// `|>` / `>>`: the left operand feeds the right.
+    Right,
+    /// `<|` / `<<`: the right operand feeds the left.
+    Left,
+}
+
+/// The canonical form one [`BinOp`] desugars to.
+#[derive(Clone, Copy)]
+enum OpForm {
+    /// `::` builds a list node.
+    Cons,
+    /// `|=` / `|.` call the combinator `func` of `module`.
+    ModuleCall {
+        module: OperatorModule,
+        func: &'static str,
+    },
+    /// `|>` / `<|` apply one operand to the other.
+    Apply(Toward),
+    /// `>>` / `<<` eta-expand to a composed lambda.
+    Compose(Toward),
+    /// A `Basics` kernel binop with this function name.
+    Kernel(&'static str),
+}
+
+/// Map an operator to the canonical form it desugars to.
+///
+/// Exhaustive over the closed set, so every operator has exactly one form.
+const fn resolve_op_func(op: BinOp) -> OpForm {
+    match op {
+        BinOp::Cons => OpForm::Cons,
+        BinOp::ParserKeeper => OpForm::ModuleCall {
+            module: PARSER_OPERATOR_MODULE,
+            func: "ignore",
+        },
+        BinOp::ParserIgnorer => OpForm::ModuleCall {
+            module: PARSER_OPERATOR_MODULE,
+            func: "keep",
+        },
+        BinOp::PipeRight => OpForm::Apply(Toward::Right),
+        BinOp::PipeLeft => OpForm::Apply(Toward::Left),
+        BinOp::ComposeRight => OpForm::Compose(Toward::Right),
+        BinOp::ComposeLeft => OpForm::Compose(Toward::Left),
+        BinOp::Add => OpForm::Kernel("add"),
+        BinOp::Sub => OpForm::Kernel("sub"),
+        BinOp::Mul => OpForm::Kernel("mul"),
+        BinOp::FloatDiv => OpForm::Kernel("fdiv"),
+        BinOp::IntDiv => OpForm::Kernel("idiv"),
+        BinOp::Eq => OpForm::Kernel("eq"),
+        BinOp::Neq => OpForm::Kernel("neq"),
+        BinOp::Lt => OpForm::Kernel("lt"),
+        BinOp::Gt => OpForm::Kernel("gt"),
+        BinOp::Le => OpForm::Kernel("le"),
+        BinOp::Ge => OpForm::Kernel("ge"),
+        BinOp::And => OpForm::Kernel("and"),
+        BinOp::Or => OpForm::Kernel("or"),
+        BinOp::Append => OpForm::Kernel("append"),
+    }
 }
 
 /// An alias a bare or qualified type reference expands through.
@@ -6758,7 +6219,7 @@ fn resolve_op_func(op: Symbol, interner: &mut Interner) -> DResult<Symbol> {
 enum ResolvedAlias<'a> {
     /// Declared in this module: its source body expands in this module's scope.
     Local {
-        params: &'a [Symbol],
+        params: &'a [(Symbol, Symbol)],
         body: &'a src::TypeAnnotation,
     },
     /// Exported by a dependency, its body already canonical.
@@ -6768,15 +6229,11 @@ enum ResolvedAlias<'a> {
 /// What a bare type name resolves to, by one precedence: local, explicit
 /// import, open (`exposing (..)`) import, reserved builtin.
 enum TypeName<'a> {
-    /// A local alias or one named in an explicit exposing list.
-    LocalOrExplicitAlias(ResolvedAlias<'a>),
-    /// A local union or one named in an explicit exposing list, with its home.
-    LocalOrExplicitUnion(Vec<Symbol>),
-    /// The one alias an open import brings in under the name.
-    OpenAlias(&'a crate::ExportedAlias),
-    /// The one union an open import brings in under the name, with its home.
-    OpenUnion(Vec<Symbol>),
-    /// Two imports of one tier bring in the name from distinct homes.
+    /// The alias the ladder's first answering tier binds.
+    Alias(ResolvedAlias<'a>),
+    /// The union the ladder's first answering tier binds, with its home.
+    Union(Vec<Symbol>),
+    /// Two open imports bring in the name from distinct homes.
     Ambiguous { modules: SortedNames },
     /// A reserved builtin type name (the empty-home sentinel).
     Builtin,
@@ -6786,70 +6243,34 @@ enum TypeName<'a> {
 
 /// Resolve a bare type name to the alias or union it names.
 ///
-/// One ladder covers aliases and unions alike, so a lower tier can never beat
-/// a higher one: a local or explicitly imported alias or union first, then the
-/// open-import tier, whose aliases and unions form one origin set (two distinct
-/// defining homes are [`TypeName::Ambiguous`], never a silent pick), then a
-/// reserved builtin. A name in `visited` is a local alias mid-expansion: its
-/// recursive use skips the alias tiers and the open tier the local alias
-/// shadows.
+/// One ladder covers aliases and unions alike ([`crate::scope::Scope::resolve`]),
+/// so a lower tier can never beat a higher one; then a reserved builtin. A name
+/// in `visited` is a local alias mid-expansion: its recursive use skips the
+/// ladder, whose local tier that alias occupies.
 fn resolve_unqualified_type_name<'a>(
     name: Symbol,
     ctx: &TypeCtx<'a>,
     visited: &[Symbol],
 ) -> DResult<TypeName<'a>> {
-    let recursive = visited.contains(&name);
-    let mut open_alias: Option<&'a AliasDef> = None;
-    if !recursive {
-        match ctx.aliases.get(&name) {
-            Some(AliasDef::Local { params, body }) => {
-                return Ok(TypeName::LocalOrExplicitAlias(ResolvedAlias::Local {
-                    params,
-                    body,
-                }));
-            }
-            Some(AliasDef::Imported {
-                exported,
-                tier: ImportTier::Explicit,
-            }) => {
-                return Ok(TypeName::LocalOrExplicitAlias(ResolvedAlias::Imported(
-                    exported,
-                )));
-            }
-            Some(AliasDef::Ambiguous {
-                homes,
-                tier: ImportTier::Explicit,
-            }) => {
-                return Ok(TypeName::Ambiguous {
-                    modules: SortedNames::new(
-                        homes
-                            .iter()
-                            .map(|home| path_to_dot_string(ctx.interner, home)),
-                    ),
+    if !visited.contains(&name) {
+        match ctx.env.module_scope.ty.resolve(name) {
+            Resolved::Found(origin, _) => {
+                return Ok(match &origin.target {
+                    ScopeType::Union(home) => TypeName::Union(home.clone()),
+                    ScopeType::Alias(AliasBody::Local { params, body }) => {
+                        TypeName::Alias(ResolvedAlias::Local { params, body })
+                    }
+                    ScopeType::Alias(AliasBody::Imported(exported)) => {
+                        TypeName::Alias(ResolvedAlias::Imported(exported))
+                    }
                 });
             }
-            Some(
-                open @ (AliasDef::Imported {
-                    tier: ImportTier::Open,
-                    ..
-                }
-                | AliasDef::Ambiguous {
-                    tier: ImportTier::Open,
-                    ..
-                }),
-            ) => open_alias = Some(open),
-            None => {}
-        }
-    }
-    if let Some(home) = ctx.type_homes.type_home_map.get(&name) {
-        return Ok(TypeName::LocalOrExplicitUnion(home.clone()));
-    }
-    if !recursive {
-        match open_tier_type(name, open_alias, ctx) {
-            OpenTier::None => {}
-            OpenTier::Alias(exported) => return Ok(TypeName::OpenAlias(exported)),
-            OpenTier::Union(home) => return Ok(TypeName::OpenUnion(home.to_vec())),
-            OpenTier::Ambiguous(modules) => return Ok(TypeName::Ambiguous { modules }),
+            Resolved::Ambiguous { importers } => {
+                return Ok(TypeName::Ambiguous {
+                    modules: importer_names(&importers, ctx.interner),
+                });
+            }
+            Resolved::Missing => {}
         }
     }
     let name_s = resolve_or_bug(
@@ -6864,55 +6285,6 @@ fn resolve_unqualified_type_name<'a>(
     Ok(TypeName::Missing)
 }
 
-/// The open-import tier's answer for one type name.
-enum OpenTier<'a> {
-    /// No open import brings the name in.
-    None,
-    /// Exactly one origin, an alias.
-    Alias(&'a crate::ExportedAlias),
-    /// Exactly one origin, a union with this home.
-    Union(&'a [Symbol]),
-    /// Two or more distinct defining homes, naming the importing modules.
-    Ambiguous(SortedNames),
-}
-
-/// Resolve `name` in the open-import tier: the open aliases (`open_alias`) and
-/// open unions under the name are one origin set keyed by defining home.
-fn open_tier_type<'a>(
-    name: Symbol,
-    open_alias: Option<&'a AliasDef>,
-    ctx: &TypeCtx<'a>,
-) -> OpenTier<'a> {
-    let unions = ctx.type_homes.wildcard_type_homes.get(&name);
-    let alias_homes: &'a [Vec<Symbol>] = match open_alias {
-        Some(AliasDef::Imported { exported, .. }) => std::slice::from_ref(&exported.home),
-        Some(AliasDef::Ambiguous { homes, .. }) => homes,
-        Some(AliasDef::Local { .. }) | None => &[],
-    };
-    let union_homes = unions.into_iter().flat_map(BTreeMap::keys);
-    let distinct: BTreeSet<&[Symbol]> = union_homes.chain(alias_homes).map(Vec::as_slice).collect();
-    let mut each = distinct.iter();
-    match (each.next(), each.next()) {
-        (None, _) => OpenTier::None,
-        (Some(&home), None) => match open_alias {
-            Some(AliasDef::Imported { exported, .. }) => OpenTier::Alias(exported),
-            Some(AliasDef::Ambiguous { .. } | AliasDef::Local { .. }) | None => {
-                OpenTier::Union(home)
-            }
-        },
-        (Some(_), Some(_)) => {
-            let importers = unions
-                .into_iter()
-                .flat_map(BTreeMap::values)
-                .flatten()
-                .chain(alias_homes);
-            OpenTier::Ambiguous(SortedNames::new(
-                importers.map(|path| path_to_dot_string(ctx.interner, path)),
-            ))
-        }
-    }
-}
-
 /// The IPE-N0002 for a bare type name no tier binds, ranked over every type
 /// name in scope.
 ///
@@ -6920,18 +6292,12 @@ fn open_tier_type<'a>(
 /// [`Diagnostic::CompilerBug`] if `name` is not interned.
 fn type_not_found(name: Symbol, ctx: &TypeCtx) -> DResult<Diagnostic> {
     let name_s = resolve_or_bug(ctx.interner, name, "ipe_canon::type_not_found")?;
-    let candidates = ctx
-        .type_homes
-        .type_home_map
-        .keys()
-        .chain(ctx.type_homes.wildcard_type_homes.keys())
-        .chain(ctx.aliases.keys())
-        .copied();
+    let candidates = ctx.env.module_scope.ty.names();
     Ok(Diagnostic::Name {
         span: ctx.ann_span,
         msg: NameError::TypeNotFound {
             name: name_s.into(),
-            suggestions: suggestions(name, candidates, ctx.interner),
+            suggestions: Candidates::hints(suggestions(name, candidates, ctx.interner)),
         },
     })
 }
@@ -6965,9 +6331,9 @@ fn ambiguous_import(
 /// The home of a qualified union reference `qualifier.name` that names no alias.
 ///
 /// A dep qualifier gives the dep's path. Any other qualifier (a stdlib kernel
-/// module) falls back to the bare name's union home: a local or explicitly
-/// imported one, else the one open-import home, else the empty-home sentinel.
-/// Two open-import homes for the name are IPE-N0024, never a silent pick.
+/// module) falls back to the union home the bare name's ladder answers with,
+/// else the empty-home sentinel. Two open-import homes for the name are
+/// IPE-N0024, never a silent pick.
 ///
 /// Html-family builtin force-home: `fold_html_stdlib_qualifier_homes` registers
 /// an Html-family stdlib qualifier's real dep path, but the reserved builtin
@@ -6986,16 +6352,20 @@ fn ambiguous_import(
 fn qualified_type_home(qualifier: Symbol, name: Symbol, ctx: &TypeCtx) -> DResult<Vec<Symbol>> {
     let qualifier_home = if let Some(path) = ctx.qualifier_paths.get(&qualifier) {
         path.clone()
-    } else if let Some(home) = ctx.type_homes.type_home_map.get(&name) {
-        home.clone()
     } else {
-        match open_tier_type(name, None, ctx) {
-            OpenTier::Union(home) => home.to_vec(),
-            OpenTier::Ambiguous(modules) => {
+        match ctx.env.module_scope.ty.resolve(name) {
+            Resolved::Found(
+                Origin {
+                    target: ScopeType::Union(home),
+                    ..
+                },
+                _,
+            ) => home.clone(),
+            Resolved::Ambiguous { importers } => {
+                let modules = importer_names(&importers, ctx.interner);
                 return Err(ambiguous_import(name, ctx.ann_span, modules, ctx.interner)?);
             }
-            // No alias is passed in, so only an absent name reaches here.
-            OpenTier::None | OpenTier::Alias(_) => Vec::new(),
+            Resolved::Found(..) | Resolved::Missing => Vec::new(),
         }
     };
     let qualifier_is_html_family = qualifier_home
@@ -7079,7 +6449,7 @@ fn copy_substituted_arg(
     while let Some(node) = pending.pop() {
         spend_budget_node(ctx, budget)?;
         match node {
-            canon::Type::Var(_) | canon::Type::Unit => {}
+            canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => {}
             canon::Type::Lambda(a, b) => {
                 pending.push(a);
                 pending.push(b);
@@ -7093,7 +6463,36 @@ fn copy_substituted_arg(
     Ok(arg.clone())
 }
 
-/// The `aliases` key a type reference `qualifier.name` expands through, if any.
+/// Refuse a record type that repeats a label, at the repeated label (IPE-N0010).
+///
+/// A canonical record type has unique labels; checking at the source arms that
+/// build one keeps a later `BTreeMap` collect of its fields from silently
+/// dropping a label.
+///
+/// # Errors
+/// [`NameError::DuplicateValue`] on the second occurrence of a label.
+fn refuse_duplicate_record_labels(
+    fields: &[(Located<Symbol>, src::TypeAnnotation)],
+    interner: &Interner,
+) -> DResult<()> {
+    let mut seen: BTreeMap<Symbol, Span> = BTreeMap::new();
+    for (label, _) in fields {
+        if let Some(&first) = seen.get(&label.value) {
+            return Err(Diagnostic::Name {
+                span: label.span,
+                msg: NameError::DuplicateValue {
+                    name: name_str(interner, label.value)?,
+                    first,
+                },
+            });
+        }
+        seen.insert(label.value, label.span);
+    }
+    Ok(())
+}
+
+/// The `qualified_aliases` key a type reference `qualifier.name` expands
+/// through, if any.
 ///
 /// A bare reference looks up its own name. A QUALIFIED reference (`Money.Price`)
 /// expands the dep's exported alias through its synthetic `Qualifier.Name` key
@@ -7107,7 +6506,7 @@ fn copy_substituted_arg(
 fn alias_lookup_key(
     qualifier: &str,
     name: Symbol,
-    aliases: &BTreeMap<Symbol, AliasDef>,
+    aliases: &QualifiedAliases,
     interner: &Interner,
 ) -> DResult<Option<Symbol>> {
     if qualifier.is_empty() {
@@ -7119,15 +6518,25 @@ fn alias_lookup_key(
         .filter(|sym| aliases.contains_key(sym)))
 }
 
+/// Whether a type variable no binder binds is spelled as the wildcard `any`.
+///
+/// The one place the compiler reads the wildcard's spelling: every later
+/// stage sees [`canon::Type::Wildcard`], never a name.
+fn is_wildcard_spelling(v: Symbol, interner: &Interner) -> bool {
+    interner.resolve(v) == Some(canon::WILDCARD_SPELLING)
+}
+
 /// Canonicalise a type annotation. Supported subset of `Canonicalise.Type`, extended
 /// with `type alias` expansion (non-parametric and parametric): a `TType`
 /// whose unqualified name registers as an alias is replaced in place by its
 /// body, with the use site's type arguments substituted for the alias's declared
 /// parameters, so no later stage observes the alias name.
 ///
-/// `subst` maps an in-scope alias parameter to the (already canonicalised) type
-/// argument bound to it; a `TVar` found in `subst` resolves to that type instead
-/// of remaining free. `visited` carries the chain of aliases currently being
+/// `params` renames each in-scope alias parameter to its slot, in value and
+/// open-record row position alike; a variable not in `params` is free. The
+/// arguments are substituted for the slots afterwards by [`instantiate_alias`],
+/// the one walker that substitutes, so this walk never copies an argument.
+/// `visited` carries the chain of aliases currently being
 /// expanded along this path — a name already in the chain is a recursive alias,
 /// whose expansion stops (the name is left as an opaque constructor) rather than
 /// recursing forever (soundness over completeness: a cyclic alias is exotic, but
@@ -7137,12 +6546,15 @@ fn alias_lookup_key(
 /// [`Diagnostic::Name`] ([`NameError::AliasArity`]) when an alias is applied to a
 /// number of type arguments that differs from its declared parameter count; the
 /// span is the enclosing annotation (the type AST carries no inner spans).
+/// [`NameError::DuplicateValue`] when a record type repeats a label, at the
+/// repeated label; [`NameError::AliasRowArgument`] when an alias's row argument
+/// cannot extend its record.
 /// [`Diagnostic::CompilerBug`] if a name symbol is not interned.
 #[allow(clippy::too_many_lines)] // exhaustive type-annotation walker
 fn canonicalise_type(
     t: &src::TypeAnnotation,
     ctx: &TypeCtx,
-    subst: &BTreeMap<Symbol, canon::Type>,
+    params: &ParamSlots,
     free_vars: &mut BTreeSet<Symbol>,
     visited: &mut Vec<Symbol>,
     budget: &mut u32,
@@ -7154,7 +6566,7 @@ fn canonicalise_type(
             Box::new(canonicalise_type(
                 a,
                 ctx,
-                subst,
+                params,
                 free_vars,
                 visited,
                 budget,
@@ -7163,7 +6575,7 @@ fn canonicalise_type(
             Box::new(canonicalise_type(
                 b,
                 ctx,
-                subst,
+                params,
                 free_vars,
                 visited,
                 budget,
@@ -7171,17 +6583,18 @@ fn canonicalise_type(
             )?),
         )),
         src::TypeAnnotation::TVar(v) => {
-            // A variable bound to an alias argument resolves to that argument; its
-            // own free variables were recorded when the argument was canonicalised
-            // at the use site, so it does not re-enter `free_vars` here. An unbound
+            // A parameter in scope (an alias slot, a declared union parameter)
+            // is renamed to its slot and never enters `free_vars`. An unbound
+            // `any` is the wildcard, which no binder quantifies. Any other
             // variable is genuinely free and is quantified by the binding.
-            subst.get(v).map_or_else(
-                || {
+            match params.slot(*v) {
+                Some(slot) => Ok(canon::Type::Var(slot)),
+                None if is_wildcard_spelling(*v, ctx.interner) => Ok(canon::Type::Wildcard),
+                None => {
                     free_vars.insert(*v);
                     Ok(canon::Type::Var(*v))
-                },
-                |arg| copy_substituted_arg(arg, ctx, budget),
-            )
+                }
+            }
         }
         src::TypeAnnotation::TUnit => Ok(canon::Type::Unit),
         src::TypeAnnotation::TTuple(elems) => {
@@ -7190,7 +6603,7 @@ fn canonicalise_type(
                 can_elems.push(canonicalise_type(
                     e,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -7200,10 +6613,12 @@ fn canonicalise_type(
             Ok(canon::Type::Tuple(can_elems))
         }
         src::TypeAnnotation::TRecord(fields) => {
-            // Each field type is canonicalised under the current substitution, so
-            // a field variable bound by an enclosing alias argument resolves to it
-            // and an unbound one is collected into `free_vars` (quantified by the
-            // binding) — exactly the [`TVar`] handling above, applied per field.
+            refuse_duplicate_record_labels(fields, ctx.interner)?;
+            // Each field type is canonicalised with the same parameters in
+            // scope, so a field variable that is an alias parameter is renamed
+            // to its slot and any other is collected into `free_vars`
+            // (quantified by the binding) — exactly the [`TVar`] handling above,
+            // applied per field.
             let mut can_fields = Vec::with_capacity(fields.len());
             for (name, fty) in fields {
                 can_fields.push((
@@ -7211,7 +6626,7 @@ fn canonicalise_type(
                     canonicalise_type(
                         fty,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -7222,15 +6637,16 @@ fn canonicalise_type(
             Ok(canon::Type::Record(can_fields))
         }
         src::TypeAnnotation::TRecordOpen(row_var, fields) => {
-            // The row variable names the open tail; like any unbound annotation
-            // variable it is quantified by the binding, so it is collected into
-            // `free_vars` (unless an enclosing alias argument already bound it,
-            // in which case the substitution resolves it). Each constrained
-            // field type is canonicalised exactly as in the closed `TRecord`
-            // arm above.
-            if !subst.contains_key(row_var) {
+            // The row variable names the open tail. An alias parameter is
+            // renamed to its slot, exactly as in the `TVar` arm, so the use
+            // site's argument fills the row; any other row variable is free and
+            // quantified by the binding. Each constrained field type is
+            // canonicalised exactly as in the closed `TRecord` arm above.
+            refuse_duplicate_record_labels(fields, ctx.interner)?;
+            let row = params.slot(*row_var).unwrap_or_else(|| {
                 free_vars.insert(*row_var);
-            }
+                *row_var
+            });
             let mut can_fields = Vec::with_capacity(fields.len());
             for (name, fty) in fields {
                 can_fields.push((
@@ -7238,7 +6654,7 @@ fn canonicalise_type(
                     canonicalise_type(
                         fty,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
@@ -7246,7 +6662,7 @@ fn canonicalise_type(
                     )?,
                 ));
             }
-            Ok(canon::Type::RecordOpen(*row_var, can_fields))
+            Ok(canon::Type::RecordOpen(row, can_fields))
         }
         src::TypeAnnotation::TType(qualifier, segments, args) => {
             let name = segments.last().copied().unwrap_or_else(|| {
@@ -7255,12 +6671,12 @@ fn canonicalise_type(
                 ctx.env.home.last().copied().unwrap_or_else(name_zero)
             });
             // Tier-1 qualified-type validation: when the parser produced a
-            // non-empty qualifier (e.g. `JsonDec.Decoder`), verify it names a
-            // known module qualifier in `env.qual_vars`. Tier-2 (resolving the
+            // non-empty qualifier (e.g. `JsonDec.Decoder`), verify an import
+            // installed it. Tier-2 (resolving the
             // actual type name via a `qual_types` map) is a follow-up once the
             // multi-module import layer builds that map; for now, a valid
             // qualifier is sufficient to accept the annotation and look the type
-            // up in `type_home_map` as usual.
+            // up in the bare type namespace as usual.
             // An unqualified type carries a genuinely-interned empty-string
             // qualifier, so `""` is a valid result here; only an unresolvable
             // symbol is the compiler-bug case.
@@ -7269,32 +6685,16 @@ fn canonicalise_type(
                 *qualifier,
                 "ipe_canon::canonicalise_type::qualifier",
             )?;
-            if !qualifier_str.is_empty() {
-                // Tier-C import gate (ADR 0001): a KNOWN stdlib module qualifier on
-                // a type (`Dict.Dict`, `JsonDec.Decoder`) used without importing it
-                // is the teachable IPE-N0034, naming the module to add — checked
-                // before the unknown-qualifier fallback, since the catalog
-                // qualifier is present in `qual_vars` regardless of import.
-                if let Some(import_path) = ctx.env.stdlib_import_required(*qualifier) {
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::StdlibImportRequired {
-                            qualifier: qualifier_str.into(),
-                            import_path: path_to_dot_string(ctx.interner, import_path),
-                        },
-                    });
-                }
-                if !ctx.env.qual_vars.contains_key(qualifier) {
-                    let sugg =
-                        suggestions(*qualifier, ctx.env.qual_vars.keys().copied(), ctx.interner);
-                    return Err(Diagnostic::Name {
-                        span: ctx.ann_span,
-                        msg: NameError::UnknownModule {
-                            qualifier: qualifier_str.into(),
-                            suggestions: sugg,
-                        },
-                    });
-                }
+            if !qualifier_str.is_empty() && ctx.env.qual_members(*qualifier).is_none() {
+                // A type qualifier (`Dict.Dict`, `JsonDec.Decoder`) is installed
+                // only by an import, exactly as a value qualifier is.
+                return Err(absent_qualifier(
+                    *qualifier,
+                    ctx.ann_span,
+                    None,
+                    ctx.env,
+                    ctx.interner,
+                )?);
             }
             // `View engine msg` — the engine-tagged view carrier and SSOT view
             // surface. It canonicalises to a real 2-argument `Con(View, [engine
@@ -7309,8 +6709,8 @@ fn canonicalise_type(
             // The engine tag is read syntactically here (never routed through
             // type-home resolution); any tag outside the closed set has no view
             // denotation and is rejected fail-closed as an unresolved type name.
-            // Only the `msg` argument is a real type, canonicalised under the
-            // current substitution.
+            // Only the `msg` argument is a real type, canonicalised with the
+            // current parameters in scope.
             if qualifier_str.is_empty()
                 && ctx.interner.resolve(name) == Some("View")
                 && args.len() == 2
@@ -7335,18 +6735,18 @@ fn canonicalise_type(
                             span: ctx.ann_span,
                             msg: NameError::TypeNotFound {
                                 name: name_str(ctx.interner, engine)?,
-                                suggestions: Box::new([]),
+                                suggestions: Candidates::default(),
                             },
                         });
                     }
                 }
-                // The message argument is canonicalised under the current
-                // substitution exactly as any use-site argument; the engine tag
+                // The message argument is canonicalised with the current
+                // parameters in scope exactly as any use-site argument; the engine tag
                 // becomes a nullary `Con` carrying the interned engine name.
                 let msg = canonicalise_type(
                     msg_ann,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -7412,13 +6812,13 @@ fn canonicalise_type(
                     Some(msg_ann) => canonicalise_type(
                         msg_ann,
                         ctx,
-                        subst,
+                        params,
                         free_vars,
                         visited,
                         budget,
                         depth.saturating_add(1),
                     )?,
-                    None => canon::Type::Var(ctx.ui_wildcard_msg),
+                    None => canon::Type::Wildcard,
                 };
                 return Ok(canon::Type::Con {
                     home: Vec::new(),
@@ -7433,15 +6833,15 @@ fn canonicalise_type(
                     ],
                 });
             }
-            // Type arguments are canonicalised under the current substitution
-            // (they appear at the use site) regardless of whether `name` is an
+            // Type arguments are canonicalised with the current parameters in
+            // scope (they appear at the use site) regardless of whether `name` is an
             // alias or an ordinary constructor.
             let mut can_args = Vec::with_capacity(args.len());
             for a in args {
                 can_args.push(canonicalise_type(
                     a,
                     ctx,
-                    subst,
+                    params,
                     free_vars,
                     visited,
                     budget,
@@ -7455,13 +6855,8 @@ fn canonicalise_type(
             // synthetic key, and otherwise names a union of the qualifier.
             let target = if qualifier_str.is_empty() {
                 match resolve_unqualified_type_name(name, ctx, visited)? {
-                    TypeName::LocalOrExplicitAlias(alias) => TypeTarget::Alias(name, alias),
-                    TypeName::OpenAlias(exported) => {
-                        TypeTarget::Alias(name, ResolvedAlias::Imported(exported))
-                    }
-                    TypeName::LocalOrExplicitUnion(home) | TypeName::OpenUnion(home) => {
-                        TypeTarget::Home(home)
-                    }
+                    TypeName::Alias(alias) => TypeTarget::Alias(name, alias),
+                    TypeName::Union(home) => TypeTarget::Home(home),
                     TypeName::Builtin => TypeTarget::Home(Vec::new()),
                     TypeName::Ambiguous { modules } => {
                         return Err(ambiguous_import(name, ctx.ann_span, modules, ctx.interner)?);
@@ -7469,26 +6864,11 @@ fn canonicalise_type(
                     TypeName::Missing => return Err(type_not_found(name, ctx)?),
                 }
             } else if let Some(alias_key) =
-                alias_lookup_key(qualifier_str, name, ctx.aliases, ctx.interner)?
+                alias_lookup_key(qualifier_str, name, ctx.qualified_aliases, ctx.interner)?
                 && !visited.contains(&alias_key)
-                && let Some(alias) = ctx.aliases.get(&alias_key)
+                && let Some(exported) = ctx.qualified_aliases.get(&alias_key)
             {
-                match alias {
-                    AliasDef::Local { params, body } => {
-                        TypeTarget::Alias(alias_key, ResolvedAlias::Local { params, body })
-                    }
-                    AliasDef::Imported { exported, .. } => {
-                        TypeTarget::Alias(alias_key, ResolvedAlias::Imported(exported))
-                    }
-                    AliasDef::Ambiguous { homes, .. } => {
-                        let modules = SortedNames::new(
-                            homes
-                                .iter()
-                                .map(|home| path_to_dot_string(ctx.interner, home)),
-                        );
-                        return Err(ambiguous_import(name, ctx.ann_span, modules, ctx.interner)?);
-                    }
-                }
+                TypeTarget::Alias(alias_key, ResolvedAlias::Imported(exported))
             } else {
                 TypeTarget::Home(qualified_type_home(*qualifier, name, ctx)?)
             };
@@ -7511,26 +6891,45 @@ fn canonicalise_type(
                         })
                     };
                     return match alias {
-                        // A local alias: its declared parameters are bound to the
-                        // canonicalised arguments and the source body is
-                        // canonicalised under that fresh substitution, in this
-                        // module's own scope.
-                        ResolvedAlias::Local { params, body } => {
-                            check_arity(params.len())?;
-                            let body_subst: BTreeMap<Symbol, canon::Type> =
-                                params.iter().copied().zip(can_args).collect();
+                        // A local alias: its source body is canonicalised in this
+                        // module's own scope with its parameters renamed to their
+                        // slots, then the arguments are substituted for the slots
+                        // by the same walker an imported alias expands through.
+                        ResolvedAlias::Local {
+                            params: alias_params,
+                            body,
+                        } => {
+                            check_arity(alias_params.len())?;
                             visited.push(alias_key);
-                            let expanded = canonicalise_type(
+                            let slotted = canonicalise_type(
                                 body,
                                 ctx,
-                                &body_subst,
+                                &ParamSlots::new(alias_params),
                                 free_vars,
                                 visited,
                                 budget,
                                 depth.saturating_add(1),
                             );
                             visited.pop();
-                            expanded
+                            // With no parameters there is nothing to substitute:
+                            // the renamed body is the expansion, and walking it
+                            // again would charge its nodes to the ceiling twice.
+                            if alias_params.is_empty() {
+                                return slotted;
+                            }
+                            let args: BTreeMap<Symbol, canon::Type> = alias_params
+                                .iter()
+                                .map(|&(_, slot)| slot)
+                                .zip(can_args)
+                                .collect();
+                            instantiate_alias(
+                                alias_key,
+                                &slotted?,
+                                &args,
+                                ctx,
+                                budget,
+                                depth.saturating_add(1),
+                            )
                         }
                         // An imported alias: its body is already canonical in the
                         // defining module's scope, so the arguments are
@@ -7539,11 +6938,12 @@ fn canonicalise_type(
                         ResolvedAlias::Imported(exported) => {
                             check_arity(exported.param_slots.len())?;
                             free_vars.extend(exported.free_vars.iter().copied());
-                            let slots: BTreeMap<Symbol, canon::Type> =
+                            let args: BTreeMap<Symbol, canon::Type> =
                                 exported.param_slots.iter().copied().zip(can_args).collect();
-                            instantiate_imported_alias(
+                            instantiate_alias(
+                                alias_key,
                                 &exported.body,
-                                &slots,
+                                &args,
                                 ctx,
                                 budget,
                                 depth.saturating_add(1),
@@ -7573,7 +6973,7 @@ fn canonicalise_type(
                         detail: "a terminal attribute builtin name is not interned".into(),
                     })?;
                 let args = if can_args.is_empty() {
-                    vec![canon::Type::Var(ctx.ui_wildcard_msg)]
+                    vec![canon::Type::Wildcard]
                 } else {
                     can_args
                 };
@@ -7674,7 +7074,7 @@ fn canonicalise_type(
                 && can_args.is_empty()
                 && matches!(ctx.interner.resolve(name), Some("Html" | "Attribute"))
             {
-                vec![canon::Type::Var(ctx.ui_wildcard_msg)]
+                vec![canon::Type::Wildcard]
             } else {
                 can_args
             };
@@ -7893,6 +7293,28 @@ fn canonicalise_asserted_call(
     // surface spelling is the full `Rust.Ffi.call`.
     let ffi_qualifier = interner.intern("Ffi")?;
     let raw_path = path.as_str().to_owned();
+    // `Ffi` must denote the generated module itself: a spelling another import
+    // owns (`import App.Shim as Ffi`) would otherwise answer the forwarder's
+    // name with an ordinary definition of that module. Read by `lookup`, never
+    // `intern`, for the interning-sequence reason above.
+    let rust = interner.lookup("Rust");
+    let foreign_ffi = env
+        .import_scope
+        .qualifier_owner
+        .get(&ffi_qualifier)
+        .is_some_and(|claim| match (&claim.owner, rust) {
+            (ModuleIdentity::Source(owner), Some(rust)) => {
+                owner.as_slice() != [rust, ffi_qualifier].as_slice()
+            }
+            (ModuleIdentity::Source(_) | ModuleIdentity::Kernel(_), _) => true,
+        });
+    if foreign_ffi {
+        return Err(malformed(format!(
+            "`Ffi` names another module here, so `{raw_path}` has no asserted \
+             binding — a native binding resolves through the generated `Rust.Ffi` \
+             module, which no other import may spell `Ffi`"
+        )));
+    }
     let target = resolve_qual_var(ffi_qualifier, def_sym, span, env, interner).map_err(|_| {
         malformed(format!(
             "no asserted binding exists for `{raw_path}` — a native binding needs \
@@ -7999,11 +7421,9 @@ fn annotation_head_name<'a>(ann: &src::TypeAnnotation, interner: &'a Interner) -
 fn detect_custom_element_constructor(
     val: &src::Value,
     env: &Env,
-    type_homes: &TypeHomes,
     qualifier_paths: &BTreeMap<Symbol, Vec<Symbol>>,
-    aliases: &BTreeMap<Symbol, AliasDef>,
+    qualified_aliases: &QualifiedAliases,
     interner: &Interner,
-    ui_wildcard_msg: Symbol,
 ) -> DResult<Option<canon::Def>> {
     // Peel the outermost application head. The constructor head is the qualified
     // `CustomElement.fromFile` member (reached through `import
@@ -8069,19 +7489,17 @@ fn detect_custom_element_constructor(
     let mut visited = Vec::new();
     let ctx = TypeCtx {
         env,
-        type_homes,
         qualifier_paths,
-        aliases,
+        qualified_aliases,
         interner,
-        ui_wildcard_msg,
         ann_span: ann.span,
     };
-    let subst = BTreeMap::new();
+    let no_params = ParamSlots::empty();
     let mut budget = TYPE_EXPANSION_NODE_LIMIT;
     let ty = canonicalise_type(
         &ann.value,
         &ctx,
-        &subst,
+        &no_params,
         &mut free_vars,
         &mut visited,
         &mut budget,
@@ -8515,7 +7933,8 @@ fn chunk_to_expr(
 /// Handles four shapes:
 ///   `foo`          — bare identifier → local var (or kernel if in scope)
 ///   `record.field` — field access → `Access(VarLocal(record), field)`
-///   `Module.func`  — qualified name → `VarKernel` (if known) or literal fallback
+///   `Module.func`  — qualified name → resolved through the qualified reader;
+///                    an unresolved one is refused
 ///   `func arg`     — single function call → `Call(resolve(func), [resolve(arg)])`
 /// Anything more complex falls back to a literal `{{...}}` string (clear signal
 /// to the developer that only simple expressions are interpolable).
@@ -8539,6 +7958,53 @@ fn resolve_interp_ref(
         }
     }
     resolve_simple_interp_ref(s, span, env, interner)
+}
+
+/// Resolve a qualified interpolation reference `Q.member` (`Q` may be dotted).
+///
+/// The qualifier is the maximal leading run of uppercase-initial segments and
+/// the member the one segment after it, read through [`resolve_qual_var`]
+/// exactly as a qualified reference outside an interpolation is: a qualifier
+/// no import installed, or a missing member, is refused. A reference with
+/// further segments after the member is not a simple reference and stays a
+/// literal `{{...}}` string.
+///
+/// # Errors
+/// As [`resolve_qual_var`]; [`Diagnostic::CompilerBug`] if interning exhausts
+/// the interner.
+fn resolve_interp_qualified(
+    s: &str,
+    span: Span,
+    env: &Env,
+    interner: &mut Interner,
+) -> DResult<canon::Expr> {
+    let segments: Vec<&str> = s.split('.').collect();
+    let qualifier_len = segments
+        .iter()
+        .take_while(|segment| segment.starts_with(char::is_uppercase))
+        .count();
+    let qualifier_segments = segments.get(..qualifier_len).unwrap_or_default();
+    let (Some(&member), true) = (
+        segments.get(qualifier_len),
+        segments.len() == qualifier_len + 1,
+    ) else {
+        return Ok(Located::new(
+            span,
+            canon::Expr_::Str(format!("{{{{{s}}}}}")),
+        ));
+    };
+    if qualifier_segments.is_empty() || member.is_empty() {
+        return Ok(Located::new(
+            span,
+            canon::Expr_::Str(format!("{{{{{s}}}}}")),
+        ));
+    }
+    let qualifier = interner.intern(&qualifier_segments.join("."))?;
+    let name = interner.intern(member)?;
+    Ok(Located::new(
+        span,
+        resolve_qual_var(qualifier, name, span, env, interner)?,
+    ))
 }
 
 /// Inner resolver for an interpolation reference without a space (no call form).
@@ -8593,22 +8059,8 @@ fn resolve_simple_interp_ref(
                 canon::Expr_::Str(format!("{{{{{s}}}}}")),
             ));
         }
-        let first_char = first.chars().next().unwrap_or('_');
-        if first_char.is_uppercase() {
-            // Qualified reference `Module.func`.
-            let qual_sym = interner.intern(first)?;
-            // Look up the qualifier in the current environment.
-            if let Some(members) = env.qual_vars.get(&qual_sym) {
-                let name_sym = interner.intern(rest)?;
-                if let Some(home) = members.get(&name_sym) {
-                    return Ok(Located::new(span, var_home_to_expr(name_sym, home)));
-                }
-            }
-            // Unknown module or member — literal fallback (clear signal to dev).
-            return Ok(Located::new(
-                span,
-                canon::Expr_::Str(format!("{{{{{s}}}}}")),
-            ));
+        if first.starts_with(char::is_uppercase) {
+            return resolve_interp_qualified(s, span, env, interner);
         }
         // Lowercase `record.field` → `Access(VarLocal(record), field)`.
         let rec_sym = interner.intern(first)?;
@@ -9023,8 +8475,8 @@ mod suggestion_ranking_tests {
 #[cfg(test)]
 mod exposed_ctor_subset_tests {
     //! `exposing (Type(subset))` opens ONLY the named constructors unqualified.
-    //! Both constructor injectors ([`inject_ctors_for_type`], the user-dep path,
-    //! and [`inject_stdlib_exposed_ctors`], the built-in path) route their
+    //! Both constructor binders ([`bind_dep_union`], the user-dep path, and
+    //! [`bind_stdlib_kernel_import`], the built-in path) route their
     //! selection through [`exposed_ctor_filter`], so a withheld sibling stays
     //! out of unqualified scope by construction — it remains reachable only
     //! through its qualifier.
@@ -9186,44 +8638,41 @@ mod exposed_ctor_subset_tests {
 }
 
 #[cfg(test)]
-mod seal_container_arity_tests {
-    use super::{SEAL_VALUE_CONTAINERS, builtin_empty_home_arity, seal_container_arity};
+mod seal_container_tests {
+    use ipe_kernels::{BUILTIN_TYPES, KernelHome, SealClass};
 
-    /// Every name in `SEAL_VALUE_CONTAINERS` has a matching entry in
-    /// `builtin_empty_home_arity`. This test reds if an arity changes in the
-    /// gate but the seal list is not updated, or vice versa.
+    use super::builtin_empty_home_arity;
+
+    /// Every value container the seal recurses into has a gate arity.
     #[test]
-    fn seal_container_arity_derives_from_builtin_arity() {
-        for name in SEAL_VALUE_CONTAINERS {
-            let gate_arity = builtin_empty_home_arity(Some(name));
-            let seal_arity = seal_container_arity(name);
-            assert_eq!(
-                gate_arity, seal_arity,
-                "`{name}`: gate arity {gate_arity:?} != seal arity {seal_arity:?}"
-            );
+    fn every_value_container_has_a_gate_arity() {
+        let containers = BUILTIN_TYPES
+            .iter()
+            .filter(|row| row.home() == KernelHome::Builtin)
+            .filter(|row| row.seal() == SealClass::ValueContainer);
+        let mut count = 0_usize;
+        for row in containers {
+            let name = row.name();
             assert!(
-                gate_arity.is_some(),
-                "`{name}` is in SEAL_VALUE_CONTAINERS but has no gate arity"
+                builtin_empty_home_arity(Some(name)).is_some(),
+                "`{name}` is a value container with no gate arity"
             );
+            count += 1;
         }
+        assert_eq!(count, 5, "List, Set, Maybe, Dict and Result");
     }
 
-    /// `Connection` has a gate arity entry (it is a builtin container) but must
-    /// NOT appear in `SEAL_VALUE_CONTAINERS` — it is an opaque DB handle, not
-    /// a value container the seal recurses into.
+    /// `Connection` has a gate arity but is a sealed handle, not a value
+    /// container the seal recurses into.
     #[test]
     fn connection_excluded_from_seal_value_containers() {
-        assert!(
-            builtin_empty_home_arity(Some("Connection")).is_some(),
-            "Connection must have a gate arity (arity=1)"
-        );
-        assert!(
-            !SEAL_VALUE_CONTAINERS.contains(&"Connection"),
-            "Connection must NOT be in SEAL_VALUE_CONTAINERS"
-        );
-        assert!(
-            seal_container_arity("Connection").is_none(),
-            "seal_container_arity(Connection) must return None"
+        assert_eq!(builtin_empty_home_arity(Some("Connection")), Some(1));
+        let connection = BUILTIN_TYPES
+            .iter()
+            .find(|row| row.home() == KernelHome::Builtin && row.name() == "Connection");
+        assert_eq!(
+            connection.map(ipe_kernels::BuiltinRow::seal),
+            Some(SealClass::SealedHandle)
         );
     }
 }
@@ -9392,6 +8841,140 @@ mod config_threading_tests {
             untouched,
             "no config threaded when none is declared (single cfg arg stands)"
         );
+    }
+}
+
+#[cfg(test)]
+mod main_result_head_tests {
+    //! Unit coverage for [`main_result_step`] / [`main_result_head`]: a `do`
+    //! bind (`Task.andThen (\p -> rest) task`) steps into its continuation body
+    //! only, and only when the callee is the `Task.andThen` kernel by id.
+
+    use super::*;
+    use ipe_diagnostics::Located;
+
+    fn sym(i: &mut Interner, s: &str) -> Symbol {
+        i.intern(s).expect("intern must succeed")
+    }
+
+    const fn at(e: canon::Expr_) -> canon::Expr {
+        Located::new(Span::DUMMY, e)
+    }
+
+    const fn unit() -> canon::Expr {
+        at(canon::Expr_::Unit)
+    }
+
+    fn kernel(i: &mut Interner, id: Option<StdlibKernel>, module: &str, name: &str) -> canon::Expr {
+        let module = sym(i, module);
+        let name = sym(i, name);
+        at(canon::Expr_::VarKernel { id, module, name })
+    }
+
+    fn call(callee: canon::Expr, args: Vec<canon::Expr>) -> canon::Expr {
+        at(canon::Expr_::Call(Box::new(callee), args))
+    }
+
+    fn lambda(params: usize, body: canon::Expr) -> canon::Expr {
+        let params =
+            std::iter::repeat_with(|| Located::new(Span::DUMMY, canon::Pattern_::PAnything))
+                .take(params)
+                .collect();
+        at(canon::Expr_::Lambda(params, Box::new(body)))
+    }
+
+    fn and_then(i: &mut Interner) -> canon::Expr {
+        kernel(i, Some(StdlibKernel::TaskAndThen), "Task", "andThen")
+    }
+
+    /// `Task.andThen (\_ -> rest) task` — the parser's `do` bind desugar.
+    fn bind(i: &mut Interner, rest: canon::Expr, task: canon::Expr) -> canon::Expr {
+        call(and_then(i), vec![lambda(1, rest), task])
+    }
+
+    /// `Server.listen () ()` — the listen entry applied to two stand-in args.
+    fn listen(i: &mut Interner) -> canon::Expr {
+        let head = kernel(i, Some(StdlibKernel::ServerListen), "Server", "listen");
+        call(head, vec![unit(), unit()])
+    }
+
+    #[test]
+    fn bind_follows_continuation_to_listen() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = bind(&mut i, tail, unit());
+        assert!(main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn nested_binds_and_runs_reach_tail() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let inner = bind(&mut i, tail, unit());
+        let run = at(canon::Expr_::Let(Vec::new(), Box::new(inner)));
+        let body = bind(&mut i, run, unit());
+        assert!(main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn task_argument_is_never_followed() {
+        let mut i = Interner::new();
+        let task = listen(&mut i);
+        let body = bind(&mut i, unit(), task);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(matches!(main_result_head(&body).value, canon::Expr_::Unit));
+    }
+
+    #[test]
+    fn user_and_then_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let main_mod = sym(&mut i, "Main");
+        let name = sym(&mut i, "andThen");
+        let user = at(canon::Expr_::VarTopLevel {
+            module: vec![main_mod],
+            name,
+        });
+        let body = call(user, vec![lambda(1, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn unbacked_and_then_name_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let unbacked = kernel(&mut i, None, "Task", "andThen");
+        let body = call(unbacked, vec![lambda(1, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+    }
+
+    #[test]
+    fn partial_and_then_stops_on_kernel() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = call(and_then(&mut i), vec![lambda(1, tail)]);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(is_task_and_then(main_result_head(&body)));
+    }
+
+    #[test]
+    fn two_param_continuation_is_not_followed() {
+        let mut i = Interner::new();
+        let tail = listen(&mut i);
+        let body = call(and_then(&mut i), vec![lambda(2, tail), unit()]);
+        assert!(!main_head_is_server_listen(&body));
+        assert!(is_task_and_then(main_result_head(&body)));
+    }
+
+    #[test]
+    fn bind_tail_tea_entry_classifies_as_app() {
+        let mut i = Interner::new();
+        let entry = kernel(&mut i, None, "Web", "tea");
+        let tail = call(entry, vec![unit()]);
+        let body = bind(&mut i, tail, unit());
+        assert!(main_head_is_tea_entry(&body, &i));
+        assert!(app_shape_name(&body, &i).is_some());
+        assert!(!main_head_is_server_listen(&body));
     }
 }
 
@@ -9838,6 +9421,105 @@ mod duplicate_pattern_binder_tests {
         assert!(
             reject_duplicate_pattern_binders(&pat, &i).is_ok(),
             "`_` binds nothing, so `( _, _ )` is fine"
+        );
+    }
+}
+
+#[cfg(test)]
+mod closed_operator_set_tests {
+    //! A chain operator is parsed into the closed [`BinOp`] set once, in
+    //! [`canonicalise_binops`]. A text outside the set has no fixity and no
+    //! desugaring, so it is a compiler bug, never a `9 L` default operator.
+    #![allow(clippy::expect_used)] // test setup: a failed parse/intern IS the failure
+
+    use super::*;
+
+    const SOURCE: &str = "module Main exposing (v)\n\nv : Int\nv =\n    1 + 2\n";
+
+    /// `SOURCE` parsed, with its one chain operator respelled as `op_text`.
+    fn module_with_operator(op_text: &str, i: &mut Interner) -> src::Module {
+        let mut parsed = ipe_parse::parse_module(SOURCE, i).expect("SOURCE parses");
+        let op_sym = i.intern(op_text).expect("intern must succeed");
+        let value = parsed.values.first_mut().expect("SOURCE declares `v`");
+        if let src::Expr_::Binops(pairs, _) = &mut value.value.body.value
+            && let Some((_, op)) = pairs.first_mut()
+        {
+            op.value = op_sym;
+        }
+        parsed
+    }
+
+    fn canonicalise(op_text: &str) -> DResult<(canon::Module, crate::ModuleExports)> {
+        let mut i = Interner::new();
+        let parsed = module_with_operator(op_text, &mut i);
+        let main_path = vec![i.intern("Main").expect("intern must succeed")];
+        canonicalise_module(&parsed, &main_path, &BTreeMap::new(), &mut i)
+    }
+
+    #[test]
+    fn operator_inside_the_closed_set_canonicalises() {
+        let result = canonicalise("+");
+        assert!(result.is_ok(), "`1 + 2` canonicalises: {result:?}");
+    }
+
+    #[test]
+    fn operator_text_outside_the_closed_set_is_a_compiler_bug() {
+        for text in ["%", "<?>", "&"] {
+            let result = canonicalise(text);
+            assert!(
+                matches!(
+                    &result,
+                    Err(Diagnostic::CompilerBug {
+                        where_: "ipe_canon::canonicalise_binops",
+                        detail,
+                    }) if detail.contains("closed operator set")
+                ),
+                "`{text}` must be a compiler bug, never a default-fixity operator: {result:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod wildcard_spelling_tests {
+    //! The spelling `any` is the wildcard only where nothing declares it.
+
+    use super::*;
+
+    /// The first constructor's field types of the union named `name`.
+    fn ctor_fields(source: &str, name: &str) -> Vec<canon::Type> {
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(source, &mut i).expect("parse");
+        let module = canonicalise(&parsed, &mut i).expect("canonicalise");
+        module
+            .unions
+            .iter()
+            .find(|u| i.resolve(u.name) == Some(name))
+            .and_then(|u| u.ctors.first())
+            .map(|c| c.args.clone())
+            .expect("the union and its first constructor")
+    }
+
+    #[test]
+    fn declared_any_canonicalises_to_var_undeclared_to_wildcard() {
+        // A union parameter spelled `any` is declared: the field is that
+        // parameter, an ordinary type variable.
+        let declared = ctor_fields(
+            "module Main exposing (Box)\n\ntype Box any\n    = Box any\n",
+            "Box",
+        );
+        assert!(
+            matches!(declared.as_slice(), [canon::Type::Var(_)]),
+            "a declared `any` must canonicalise to `Type::Var`, got {declared:?}"
+        );
+        // An undeclared `any` beside a declared `a` is the wildcard.
+        let undeclared = ctor_fields(
+            "module Main exposing (Box)\n\ntype Box a\n    = Box any\n",
+            "Box",
+        );
+        assert!(
+            matches!(undeclared.as_slice(), [canon::Type::Wildcard]),
+            "an undeclared `any` must canonicalise to `Type::Wildcard`, got {undeclared:?}"
         );
     }
 }

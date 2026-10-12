@@ -11,9 +11,9 @@
 //! non-derivable type by construction.
 //!
 //! These tests assert the emitted *text*. A non-derivable type carries no
-//! `#[derive(` attribute and renders its non-derivable fields as a `<fn>`
-//! placeholder in `IpeStringify`; a normal all-primitive record still carries
-//! the full derive and the autoref dispatch (byte-shape unchanged).
+//! `#[derive(` attribute; its `IpeStringify` renders a function field as the
+//! `<function>` marker and every other field through its own impl. A normal
+//! all-primitive record still carries the full derive.
 
 use std::collections::BTreeMap;
 
@@ -140,8 +140,9 @@ fn rec_struct_name(src: &str) -> Option<String> {
 }
 
 /// A record `{ dec : Decoder Int, n : Int }` in a signature: non-derivable
-/// (Decoder is `Box<dyn Fn>`-backed) → no derive, `<fn>` placeholder for `dec`,
-/// autoref dispatch for `n`.
+/// (Decoder is `Box<dyn Fn>`-backed) → no derive; both fields still render
+/// through their `IpeStringify` impls (a `Decoder` has a show row), so
+/// derivability no longer decides rendering.
 #[test]
 fn decoder_field_record_has_no_derive() -> DResult<()> {
     let mut interner = Interner::new();
@@ -180,18 +181,22 @@ fn decoder_field_record_has_no_derive() -> DResult<()> {
     assert!(!name.is_empty(), "a Rec struct must be synthesised:\n{src}");
     assert_no_full_derive(&src, "struct", &name);
     assert!(
-        src.contains("\"<fn>\""),
-        "non-derivable field renders `<fn>` placeholder in IpeStringify:\n{src}"
+        src.contains("IpeStringify::ipe_show(&self.dec)"),
+        "a non-derivable field with a show row renders through its impl:\n{src}"
     );
     assert!(
-        src.contains("(&ipe_runtime::stringify::Wrap(&self.n)).dispatch()"),
-        "derivable sibling field keeps dispatch:\n{src}"
+        src.contains("IpeStringify::ipe_show(&self.n)"),
+        "the derivable sibling field renders through its impl:\n{src}"
+    );
+    assert!(
+        !src.contains("\"<function>\""),
+        "no field of this record is a function:\n{src}"
     );
     Ok(())
 }
 
-/// A normal all-primitive record keeps the full unconditional derive and the
-/// dispatch on every field (byte-shape unchanged — no seal regression).
+/// A normal all-primitive record keeps the full unconditional derive and
+/// renders every field through its impl.
 #[test]
 fn normal_record_keeps_full_derive() -> DResult<()> {
     let mut interner = Interner::new();
@@ -230,14 +235,14 @@ fn normal_record_keeps_full_derive() -> DResult<()> {
         "normal `{name}` must keep the full derive:\n{src}"
     );
     assert!(
-        !src.contains("\"<fn>\""),
-        "a normal record must not emit any `<fn>` placeholder:\n{src}"
+        !src.contains("\"<function>\""),
+        "a normal record must not emit any `<function>` marker:\n{src}"
     );
     Ok(())
 }
 
 /// An enum with a variant carrying a function payload → non-derivable → no
-/// derive, `<fn>` placeholder + `_` binder for the function field.
+/// derive, `<function>` marker + `_` binder for the function field.
 #[test]
 fn enum_with_function_payload_has_no_derive() -> DResult<()> {
     let mut interner = Interner::new();
@@ -269,12 +274,64 @@ fn enum_with_function_payload_has_no_derive() -> DResult<()> {
     assert!(src.contains("pub enum MainHolder"), "enum emitted:\n{src}");
     assert_no_full_derive(&src, "enum", "MainHolder");
     assert!(
-        src.contains("\"<fn>\""),
-        "function payload renders `<fn>` placeholder:\n{src}"
+        src.contains("\"<function>\""),
+        "function payload renders the `<function>` marker:\n{src}"
     );
     assert!(
         src.contains("MainHolder::Wrap(_)"),
         "function payload binds `_` in the IpeStringify arm:\n{src}"
+    );
+    Ok(())
+}
+
+/// A record `{ b : Bytes, f : Int -> Int, u : Url }`: each field with a show
+/// row renders through its own `IpeStringify` impl, the function field renders
+/// as the `<function>` marker, and no rendering falls back to `Debug`.
+#[test]
+fn record_fields_render_through_their_show_rows() -> DResult<()> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let b = interner.intern("b")?;
+    let f = interner.intern("f")?;
+    let u = interner.intern("u")?;
+    let par = interner.intern("r")?;
+    let get = interner.intern("getB")?;
+
+    let mut fields = BTreeMap::new();
+    fields.insert(b, IrType::Bytes);
+    fields.insert(f, IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)));
+    fields.insert(u, IrType::Url);
+    let rec = IrType::Record(fields);
+
+    let func = Func {
+        id: FuncId::from_raw(0),
+        name: get,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![(par, rec)],
+        ret: IrType::Bytes,
+        body: Expr::Access {
+            record: Box::new(Expr::Var(par)),
+            field: b,
+            field_ty: IrType::Bytes,
+        },
+    };
+    let src = emit(&interner, &program(main_mod, vec![], vec![func]))?;
+
+    for field in ["b", "u"] {
+        assert!(
+            src.contains(&format!("IpeStringify::ipe_show(&self.{field})")),
+            "field `{field}` renders through its show row:\n{src}"
+        );
+    }
+    assert!(
+        src.contains("\"<function>\""),
+        "the function field renders the `<function>` marker:\n{src}"
+    );
+    assert!(
+        !src.contains("stringify::Wrap") && !src.contains("IpeStringify + std::fmt::Debug"),
+        "no rendering falls back to `Debug`:\n{src}"
     );
     Ok(())
 }

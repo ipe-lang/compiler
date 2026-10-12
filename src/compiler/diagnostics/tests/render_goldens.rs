@@ -17,8 +17,8 @@
 use std::path::PathBuf;
 
 use ipe_diagnostics::{
-    AliasExpansionKind, Construct, Diagnostic, Expected, ExpectedSet, Feature, LowerError,
-    NameError, ParseError, SortedNames, Span, TokenKind, TyDoc, TypeError,
+    AliasExpansionKind, Candidates, Construct, Diagnostic, EditTarget, Expected, ExpectedSet,
+    Feature, LowerError, NameError, ParseError, SortedNames, Span, TokenKind, TyDoc, TypeError,
 };
 
 // ---------------------------------------------------------------------------
@@ -166,7 +166,10 @@ fn golden_name_value_not_found_single_suggestion() -> Result<(), Box<dyn std::er
         span: Span::new(40, 46),
         msg: NameError::ValueNotFound {
             name: "lenght".into(),
-            suggestions: Box::new(["length".into()]),
+            suggestions: Candidates::at(
+                EditTarget::whole(Span::new(40, 46), "lenght"),
+                Box::new(["length".into()]),
+            ),
         },
     };
     check_golden(
@@ -186,7 +189,7 @@ fn golden_name_module_not_found_multi_suggestion() -> Result<(), Box<dyn std::er
         span: Span::new(34, 39),
         msg: NameError::ModuleNotFound {
             name: "Httpp".into(),
-            suggestions: Box::new(["Http".into(), "Https".into()]),
+            suggestions: Candidates::hints(Box::new(["Http".into(), "Https".into()])),
         },
     };
     check_golden(
@@ -350,7 +353,10 @@ fn golden_name_value_not_found_tab_indented() -> Result<(), Box<dyn std::error::
         span: Span::new(37, 43),
         msg: NameError::ValueNotFound {
             name: "lenght".into(),
-            suggestions: Box::new(["length".into()]),
+            suggestions: Candidates::at(
+                EditTarget::whole(Span::new(37, 43), "lenght"),
+                Box::new(["length".into()]),
+            ),
         },
     };
     check_golden("name_value_not_found_tab_indented", &d, "test.ipe", source)
@@ -366,7 +372,7 @@ fn golden_name_value_not_found_wide_chars() -> Result<(), Box<dyn std::error::Er
         span: Span::new(48, 49),
         msg: NameError::ValueNotFound {
             name: "x".into(),
-            suggestions: Box::new([]),
+            suggestions: Candidates::default(),
         },
     };
     check_golden("name_value_not_found_wide_chars", &d, "test.ipe", source)

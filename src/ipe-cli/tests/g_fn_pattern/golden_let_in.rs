@@ -7,7 +7,7 @@
 //! `Main.ipe` to stdout `22\n`, exit 0:
 //!
 //! ```text
-//! $ ipe run tests/golden/let_in/Main.ipe
+//! $ ipe dev run tests/golden/let_in/Main.ipe
 //! 22
 //! ```
 //!

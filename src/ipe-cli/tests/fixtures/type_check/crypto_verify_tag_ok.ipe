@@ -1,0 +1,30 @@
+module Main exposing (main)
+
+import Ipe.Crypto as Crypto
+import Ipe.Io as Io
+
+-- SECURITY: the typed stored-tag path. A stored hex tag is parsed once at the
+-- boundary (`macFromHex : String -> Maybe Mac`); `verifyHmacSha256` then takes
+-- that `Mac`, recomputes the tag and compares in constant time. This program
+-- must type-check.
+check : Crypto.Key -> String -> String -> Bool
+check key message stored =
+    case Crypto.macFromHex stored of
+        Just mac ->
+            Crypto.verifyHmacSha256 key message mac
+
+        Nothing ->
+            False
+
+main : Task ()
+main =
+    case Crypto.keyFromString "s3cret-signing-key" of
+        Just key ->
+            if check key "message" (Crypto.macToHex (Crypto.hmacSha256 key "message")) then
+                Io.println "valid"
+
+            else
+                Io.println "invalid"
+
+        Nothing ->
+            Io.println "empty key rejected at the boundary"

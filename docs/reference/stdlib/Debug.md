@@ -7,7 +7,7 @@
 Ipe.Debug — development-only escape hatches.
 
 Every member of this module is rejected by `ipe release` (IPE-L0140).
-Use `ipe build` or `ipe run` during development.
+Use `ipe dev build` or `ipe dev run` during development.
 
 ## `log`
 
@@ -17,8 +17,9 @@ Use `ipe build` or `ipe run` during development.
         Debug.log "subtotal" subtotal + tax
 
 `log label value` prints `"label: value"` to stderr and returns `value`
-unchanged. The value is rendered by the total debug stringifier (the one
-behind `Error.toString`), so any non-function value renders.
+unchanged. The value is rendered by the total debug stringifier, so any
+non-function value renders. A development build prints the dev view of a
+redacted value; `Error.toString` always keeps the redacted rendering.
 
 ## `todo`
 
@@ -61,8 +62,12 @@ log : String -> a -> a
 ```
 
 `log label value` — print `"label: value"` to stderr, return `value`.
-The value is rendered by the total debug stringifier (the one behind
-`Error.toString`), so any non-function value renders.
+In a development build the value prints in its dev view: a redacted
+runtime value (a `Url`'s path and query, a request, `Bytes`, a config)
+shows its contents, while a `Secret`, a crypto key and every credential
+field (a password, a signing secret, an `Authorization` or `Cookie`
+header, a cookie value) stay `<redacted>`. `Error.toString`, logs and the
+debugger keep the redacted rendering.
 
 ## `todo`
 

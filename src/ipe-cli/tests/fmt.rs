@@ -10,7 +10,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use ipe::CliError;
+use ipe::cli_args::OutputFormat;
 use ipe::fmt::{self, format_source};
+use ipe::machine_output::machine_error;
 
 /// A curated fixture set covering records, lists, tuples, `case`, `let`, `if`,
 /// and comments. Each must be a fixed point of `format_source` after one pass.
@@ -330,4 +333,178 @@ fn code_review_db_bare_run_formats() {
     // Idempotent: re-parsing and re-formatting the output is a fixed point.
     let out2 = format_source(&out).expect("second pass must also format");
     assert_eq!(out, out2, "do-block bare-run formatting is not idempotent");
+}
+
+/// `i64::MIN` spelled as a literal, in expression and pattern position,
+/// formats to source that re-parses, and a second pass changes nothing.
+#[test]
+fn int_min_literal_round_trips() {
+    let src = "module M exposing (smallest, classify)\n\n\n\
+               smallest : Int\nsmallest =\n    -9223372036854775808\n\n\n\
+               classify : Int -> Int\nclassify n =\n    case n of\n        \
+               -9223372036854775808 ->\n            1\n\n        \
+               _ ->\n            0\n";
+    let once = format_source(src).unwrap();
+    assert!(
+        once.contains("-9223372036854775808"),
+        "the literal survives formatting:\n{once}"
+    );
+    let twice = format_source(&once).unwrap();
+    assert_eq!(once, twice, "fmt(fmt(x)) != fmt(x)");
+}
+
+/// An out-of-range Int literal is refused with IPE-P0013, and `run_fmt` leaves
+/// the file untouched.
+#[test]
+fn int_literal_out_of_range_is_refused_unwritten() {
+    let src = "module M exposing (x)\n\nx =\n  9223372036854775808\n";
+    let refused = format_source(src);
+    assert!(
+        matches!(&refused, Err(fmt::FmtError::Parse { diag, .. }) if diag.code().as_str() == "IPE-P0013"),
+        "unnegated 2^63 must be refused with IPE-P0013: {refused:?}"
+    );
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fmt_int_range");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("M.ipe");
+    fs::write(&file, src).unwrap();
+    let res = fmt::run_fmt(&[file.to_string_lossy().into_owned()]);
+    assert!(res.is_err(), "fmt accepted an out-of-range literal");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        src,
+        "a refused file must not be rewritten"
+    );
+}
+
+/// A module whose one value is a list of `items` ones written on one line two
+/// lets deep; formatting puts every item on its own deeply indented line.
+fn nested_long_list(items: usize) -> String {
+    let ones = vec!["1"; items].join(",");
+    format!(
+        "module M exposing (x)\n\n\nx =\n    let\n        y =\n            let\n                z =\n                    [ {ones}\n                    ]\n            in\n            z\n    in\n    y\n"
+    )
+}
+
+/// A file whose formatted output would pass its cap is refused: the screen
+/// names the file, the cap and the remedy, and the file is left unchanged.
+/// The same shape small enough to fit formats, so the refusal is the cap's.
+#[test]
+fn fmt_output_too_large_screen() {
+    let small = nested_long_list(200);
+    let small_out = format_source(&small).expect("a small list formats under the floor");
+    let growth = small_out.len() / 200;
+    assert!(
+        growth > 2 * fmt::OutputCap::GROWTH,
+        "precondition: each two-byte item must grow past the cap, got {growth}"
+    );
+
+    let src = nested_long_list(10_000);
+    let cap = fmt::OutputCap::for_input(src.len());
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fmt_output_cap");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("M.ipe");
+    fs::write(&file, &src).unwrap();
+    let res = fmt::run_fmt(&[file.to_string_lossy().into_owned()]);
+    let screen = res
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(
+        matches!(&res, Err(CliError::FmtOutputTooLarge { file: f, cap: c }) if f.ends_with("M.ipe") && *c == cap),
+        "fmt must refuse with the typed output-cap error: {res:?}"
+    );
+    let kind = res.as_ref().err().map(CliError::machine_kind);
+    assert_eq!(kind, Some("fmt-output-too-large"));
+    let json = machine_error(OutputFormat::Json, "fmt", kind.unwrap(), &screen);
+    assert!(
+        json.contains("\"kind\":\"fmt-output-too-large\""),
+        "the JSON refusal carries its kind: {json}"
+    );
+    let plain = machine_error(OutputFormat::Plain, "fmt", kind.unwrap(), &screen);
+    assert!(
+        plain.contains("Split it"),
+        "the plain refusal carries the message: {plain}"
+    );
+    assert!(
+        screen.contains(&file.display().to_string()),
+        "the refusal names the file: {screen}"
+    );
+    assert!(
+        screen.contains(&cap.to_string()),
+        "the refusal names the cap: {screen}"
+    );
+    assert!(
+        screen.contains("Split it"),
+        "the refusal names the remedy: {screen}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        src,
+        "a refused file must not be rewritten"
+    );
+}
+
+/// The output-cap refusal sanitizes the file path it renders.
+///
+/// A control byte in a directory name never reaches the screen. Unix only: Windows refuses a control byte in a file name.
+#[cfg(unix)]
+#[test]
+fn fmt_output_too_large_screen_sanitizes_the_path() {
+    let src = nested_long_list(10_000);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fmt_output_cap_\u{1b}[31m");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("M.ipe");
+    fs::write(&file, &src).unwrap();
+    let res = fmt::run_fmt(&[file.to_string_lossy().into_owned()]);
+    assert!(
+        matches!(&res, Err(CliError::FmtOutputTooLarge { .. })),
+        "{res:?}"
+    );
+    let screen = res
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(
+        !screen.contains('\u{1b}'),
+        "a raw ESC reached the screen: {screen:?}"
+    );
+    assert!(
+        screen.contains("M.ipe"),
+        "the refusal names the file: {screen}"
+    );
+}
+
+/// A source of exactly `len` bytes: one small module padded with newlines.
+fn stdin_source_of(len: usize) -> Vec<u8> {
+    let mut src = b"module M exposing (x)\n\n\nx =\n    1\n".to_vec();
+    src.resize(len, b'\n');
+    src
+}
+
+/// Stdin one byte past the source read cap is refused before it is formatted.
+#[test]
+fn fmt_stdin_past_the_read_cap_is_refused() {
+    let cap = usize::try_from(ipe::io_bounded::SOURCE_READ_CAP).unwrap();
+    let res = fmt::format_stdin_from(stdin_source_of(cap + 1).as_slice());
+    assert!(
+        matches!(&res, Err(CliError::FileTooLarge { max, .. }) if *max == ipe::io_bounded::SOURCE_READ_CAP),
+        "{res:?}"
+    );
+}
+
+/// Stdin of exactly the source read cap is read in full and handed to the
+/// formatter, never refused as too large.
+#[test]
+fn fmt_stdin_at_the_read_cap_is_read() {
+    let cap = usize::try_from(ipe::io_bounded::SOURCE_READ_CAP).unwrap();
+    let res = fmt::format_stdin_from(stdin_source_of(cap).as_slice());
+    assert!(
+        !matches!(&res, Err(CliError::FileTooLarge { .. })),
+        "{res:?}"
+    );
+    if let Ok(out) = &res {
+        assert_eq!(out.source.len(), cap, "the whole input was read");
+    }
 }

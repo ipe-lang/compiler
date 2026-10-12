@@ -41,7 +41,7 @@
 //!
 //! Every parse-time check the manifest must carry runs here against the
 //! extracted literal, via the *same* shared functions the rest of the CLI uses —
-//! the `publicEnv` secret-name denylist, semver parsing, capability validation,
+//! the `publicEnv` name parse (`PublicEnvName`), semver parsing, capability validation,
 //! the allocator vocabulary, and the wrapper path jail.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,13 +54,14 @@ use ipe_syntax::{Expr, Expr_, Module};
 
 use ipe_backend_rust::static_build::StaticTriple;
 use ipe_kernels::WebCapability;
+use ipe_runtime_rust::encoding::{MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
 
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::project::{
     BrowserDelivery, Capability, DeliveryConfig, DesktopDelivery, EntryShape, IpeDep,
-    MobileDelivery, Program, ProjectManifest, RustDep, ScreenOrientation, WasmConfig,
-    is_denylisted_public_env_name,
+    MobileDelivery, Program, ProjectManifest, PublicEnvAllowlist, PublicEnvName, RustDep,
+    ScreenOrientation, WasmConfig,
 };
 use crate::text;
 
@@ -86,6 +87,30 @@ const SCHEMA_MODULE: &str = "Ipe.Package";
 /// shape or a failed field validation; [`CliError::Usage`] if the source root
 /// directory does not exist.
 pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, CliError> {
+    let text =
+        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
+    parse_package_manifest_source(&text, manifest_path).map(|(manifest, _)| manifest)
+}
+
+/// The source root of a manifest that names none.
+const DEFAULT_SOURCE_ROOT: &str = "src";
+
+/// Parse the text of the `package.ipe` at `manifest_path`, already read, beside
+/// the source root exactly as the manifest spells it.
+///
+/// The project root is the parent of `manifest_path`. This is
+/// [`parse_package_manifest`] minus the file read, so a caller that holds the
+/// manifest's bytes judges them rather than a second read of the path. The
+/// spelling is the root-relative path before any filesystem lookup: a caller
+/// holding a captured tree locates the source root in that tree by it, never
+/// by a live resolution of the path.
+///
+/// # Errors
+/// As [`parse_package_manifest`], minus the file-read error.
+pub fn parse_package_manifest_source(
+    text: &str,
+    manifest_path: &Path,
+) -> Result<(ProjectManifest, String), CliError> {
     // A bare `package.ipe` has an EMPTY parent (`Some("")`), not `None`; both an
     // empty and an absent parent mean the current directory. An empty root never
     // canonicalises, so normalise it to `.` before path containment.
@@ -93,11 +118,13 @@ pub fn parse_package_manifest(manifest_path: &Path) -> Result<ProjectManifest, C
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let text = crate::io_bounded::read_to_string_capped(
-        manifest_path,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
-    read_package_manifest(&text, &root, manifest_path)
+    let fields = read_manifest_fields(text, manifest_path)?;
+    let spelled = fields
+        .src_rel
+        .as_deref()
+        .unwrap_or(DEFAULT_SOURCE_ROOT)
+        .to_owned();
+    Ok((fields.into_manifest(&root)?, spelled))
 }
 
 /// The total core: `&str -> Result<ProjectManifest, CliError>`, given the
@@ -113,6 +140,14 @@ pub fn read_package_manifest(
     root: &Path,
     manifest_path: &Path,
 ) -> Result<ProjectManifest, CliError> {
+    read_manifest_fields(src, manifest_path)?.into_manifest(root)
+}
+
+/// Parse `src` and read the record of its sole `package` binding into fields.
+///
+/// # Errors
+/// As [`read_package_manifest`], minus the whole-manifest validations.
+fn read_manifest_fields(src: &str, manifest_path: &Path) -> Result<ManifestFields, CliError> {
     let mut interner = Interner::new();
     let module =
         ipe_parse::parse_module(src, &mut interner).map_err(|diag| CliError::Pipeline {
@@ -126,8 +161,28 @@ pub fn read_package_manifest(
         src,
         manifest_path,
     };
-    let fields = reader.read_module(&module)?;
-    fields.into_manifest(root)
+    reader.read_module(&module)
+}
+
+/// The manifest refusal for a `delivery.browser.basePath` that
+/// [`MountBase::parse`] turned away, one catalog message per refusal.
+///
+/// The base is author text, so it renders through `{:?}` (escaped); a too-long
+/// base is not echoed at all.
+fn base_path_refusal(raw: &str, refusal: &MountBaseRefusal) -> text::Message {
+    let base = format!("{raw:?}");
+    match refusal {
+        MountBaseRefusal::TooLong { len } => {
+            text::msg::manifest_base_path_too_long(len, &MAX_MOUNT_BASE_LEN)
+        }
+        MountBaseRefusal::NoLeadingSlash => text::msg::manifest_base_path_no_leading_slash(&base),
+        MountBaseRefusal::TrailingSlash => text::msg::manifest_base_path_trailing_slash(&base),
+        MountBaseRefusal::EmptySegment => text::msg::manifest_base_path_empty_segment(&base),
+        MountBaseRefusal::DotSegment => text::msg::manifest_base_path_dot_segment(&base),
+        MountBaseRefusal::Reserved { byte } => {
+            text::msg::manifest_base_path_reserved_byte(&base, &format!("0x{byte:02X}"))
+        }
+    }
 }
 
 /// Borrowed context every walk step shares: the interner to resolve [`Symbol`]s
@@ -174,7 +229,7 @@ impl ManifestFields {
         let name = self
             .name
             .ok_or(CliError::Usage(text::msg::package_manifest_name_required()))?;
-        let src_rel_raw = self.src_rel.as_deref().unwrap_or("src");
+        let src_rel_raw = self.src_rel.as_deref().unwrap_or(DEFAULT_SOURCE_ROOT);
         let src_root_contained = crate::contained_path::ContainedRelPath::parse(root, src_rel_raw)
             .map_err(|reason| CliError::PathEscape {
                 raw: src_rel_raw.to_owned(),
@@ -924,12 +979,18 @@ impl Reader<'_> {
         }
     }
 
-    /// Read `delivery.browser = { basePath }`.
+    /// Read `delivery.browser = { basePath }`; `basePath` parses into a
+    /// [`MountBase`], and an absent one is [`MountBase::root`].
     fn read_browser(&self, expr: &Expr) -> Result<BrowserDelivery, CliError> {
         let mut b = BrowserDelivery::default();
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
-                "basePath" => b.base_path = self.expect_string(value)?,
+                "basePath" => {
+                    let raw = self.expect_string(value)?;
+                    b.base = MountBase::parse(&raw).map_err(|refusal| {
+                        self.reject(value.span, &base_path_refusal(&raw, &refusal))
+                    })?;
+                }
                 other => {
                     return Err(self.reject(
                         fname.span,
@@ -961,8 +1022,8 @@ impl Reader<'_> {
     }
 
     /// Read the `wasm` field: `Off` (no bundle) or `On { mode, entry, mount,
-    /// publicEnv, optLevel }`. The `publicEnv` list runs the UNCHANGED secret-name
-    /// denylist. Fields other than `mode` default to absent.
+    /// publicEnv, optLevel }`. The `publicEnv` list parses into a
+    /// [`PublicEnvAllowlist`]. Fields other than `mode` default to absent.
     fn read_wasm(&self, expr: &Expr) -> Result<WasmConfig, CliError> {
         let (ctor, args) = self.expect_ctor_app(expr, "a wasm setting")?;
         match ctor {
@@ -991,11 +1052,7 @@ impl Reader<'_> {
                 }
                 "entry" => wasm.entry = Some(self.expect_string(value)?),
                 "mount" => wasm.mount = Some(self.expect_string(value)?),
-                "publicEnv" => {
-                    let names = self.expect_string_list(value)?;
-                    self.check_public_env(value.span, &names)?;
-                    wasm.public_env = names;
-                }
+                "publicEnv" => wasm.public_env = self.read_public_env(value)?,
                 "optLevel" => wasm.opt_level = Some(self.expect_string(value)?),
                 other => {
                     return Err(self.reject(
@@ -1120,25 +1177,21 @@ impl Reader<'_> {
         Ok(modules)
     }
 
-    /// Run the UNCHANGED `publicEnv` secret-name denylist over the extracted
-    /// names. A denylisted name is a read-time build error — the single most
-    /// security-load-bearing check, preserved via the shared
-    /// [`is_denylisted_public_env_name`].
-    fn check_public_env(&self, span: Span, names: &[String]) -> Result<(), CliError> {
-        for name in names {
-            if is_denylisted_public_env_name(name) {
-                return Err(self.reject(
-                    span,
-                    &format!(
-                        "`publicEnv` lists {name:?}, which matches the secret-name denylist \
-                         (a SECRET / TOKEN / KEY / PASSWORD / PASSWD / CREDENTIAL / AUTH / APIKEY \
-                         word, DATABASE_URL, or the internal IPE_* namespace) — a secret \
-                         environment variable can never be allowlisted into the public wasm bundle"
-                    ),
-                ));
-            }
+    /// Parse the `publicEnv` list into the typed allowlist.
+    ///
+    /// Each entry goes through [`PublicEnvName::parse`] (the name grammar, the
+    /// secret-name denylist, the temp-root and home names) and
+    /// [`PublicEnvAllowlist::insert`] (no repeat); a refusal is a read-time
+    /// build error at that entry's span.
+    fn read_public_env(&self, expr: &Expr) -> Result<PublicEnvAllowlist, CliError> {
+        let mut allowlist = PublicEnvAllowlist::default();
+        for item in self.expect_list(expr)? {
+            let raw = self.expect_string(item)?;
+            PublicEnvName::parse(&raw)
+                .and_then(|name| allowlist.insert(name))
+                .map_err(|refusal| self.reject(item.span, &refusal.reason()))?;
         }
-        Ok(())
+        Ok(allowlist)
     }
 
     /// Read a `[ Network, Clock, … ]` list into the typed capability set. An
@@ -1331,7 +1384,7 @@ pub fn render_manifest_record(manifest: &ProjectManifest) -> String {
         fields.push(format!("version = {}", quote(&version.to_string())));
     }
     if let Some(src_rel) = manifest_src_rel(manifest)
-        && src_rel != "src"
+        && src_rel != DEFAULT_SOURCE_ROOT
     {
         fields.push(format!("sourceRoot = {}", quote(&src_rel)));
     }
@@ -1596,7 +1649,7 @@ fn render_wasm(wasm: &WasmConfig) -> Option<String> {
         let names = wasm
             .public_env
             .iter()
-            .map(|n| quote(n))
+            .map(|n| quote(n.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
         parts.push(format!("publicEnv = [ {names} ]"));
@@ -1728,10 +1781,8 @@ pub fn upsert_index_dependency(
     name: &str,
     req: &semver::VersionReq,
 ) -> Result<(), CliError> {
-    let text = crate::io_bounded::read_to_string_capped(
-        manifest_path,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
+    let text =
+        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
     let entry = format!("dep {} {}", quote(name), quote(&req.to_string()));
     let updated = edit_dependencies_list(&text, manifest_path, name, Some(&entry))?;
     write_manifest_file(manifest_path, &updated)
@@ -1747,10 +1798,8 @@ pub fn upsert_index_dependency(
 /// As [`upsert_index_dependency`], minus the escape-collision refusal (a remove
 /// legitimately drops any matching entry, escape or index).
 pub fn remove_manifest_dependency(manifest_path: &Path, name: &str) -> Result<(), CliError> {
-    let text = crate::io_bounded::read_to_string_capped(
-        manifest_path,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
+    let text =
+        crate::io_bounded::read_leaf_capped(manifest_path, crate::io_bounded::MANIFEST_READ_CAP)?;
     let updated = edit_dependencies_list(&text, manifest_path, name, None)?;
     write_manifest_file(manifest_path, &updated)
 }
@@ -2066,7 +2115,35 @@ mod tests {
 
     const HEADER: &str = "module Package exposing (package)\n\n";
 
-    /// A bare `package.ipe` filename (as `ipe build package.ipe` passes it from
+    /// A project's `package.ipe` that is a link is refused, never followed to its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_package_ipe_is_refused() {
+        let root = fresh_project("symlinked_package_ipe");
+        let real = root.join("real-package.ipe");
+        std::fs::write(
+            &real,
+            format!("{HEADER}package =\n    {{ name = \"linked\" }}\n"),
+        )
+        .expect("write the link target");
+        let path = root.join(PACKAGE_IPE);
+        std::os::unix::fs::symlink(&real, &path).expect("plant the package.ipe link");
+        let result = parse_package_manifest(&path);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                result,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a linked package.ipe must be refused: {:?}",
+            result.map(|m| m.name)
+        );
+    }
+
+    /// A bare `package.ipe` filename (as `ipe dev build package.ipe` passes it from
     /// inside the project dir) has an EMPTY parent, not an absolute one. The
     /// path-containment root must resolve to the current directory, so a
     /// legitimate in-tree `src/` is accepted rather than refused as an escape.
@@ -2081,7 +2158,7 @@ mod tests {
             format!("{HEADER}package =\n    {{ name = \"bare\" }}\n"),
         )
         .expect("write package.ipe");
-        // `ipe build package.ipe` runs with cwd == project root and a bare path.
+        // `ipe dev build package.ipe` runs with cwd == project root and a bare path.
         let _guard = CWD_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2205,7 +2282,10 @@ mod tests {
         assert_eq!(m.wasm.mode.as_deref(), Some("solo"));
         assert_eq!(m.wasm.entry.as_deref(), Some("src/Client.ipe"));
         assert_eq!(m.wasm.mount.as_deref(), Some("#app"));
-        assert_eq!(m.wasm.public_env, vec!["API_BASE_URL", "APP_VERSION"]);
+        assert_eq!(
+            m.wasm.public_env.to_names(),
+            vec!["API_BASE_URL", "APP_VERSION"]
+        );
         assert_eq!(m.wasm.opt_level.as_deref(), Some("z"));
     }
 
@@ -2295,6 +2375,313 @@ mod tests {
                 "error names the secret: {msg}"
             );
         }
+    }
+
+    /// Read a manifest whose `delivery.browser.basePath` is the string `raw`.
+    ///
+    /// `raw` is printable ASCII without `"` or `\`, so its Rust `{:?}` form is
+    /// also its Ipê string literal.
+    fn read_base_path(test_name: &str, raw: &str) -> Result<ProjectManifest, CliError> {
+        read(
+            test_name,
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ browser = {{ basePath = {raw:?} }} }} }}\n"
+            ),
+        )
+    }
+
+    /// The refusal text a `basePath` read returned, or `None` when it was
+    /// accepted or refused through another channel.
+    fn base_path_refusal_text(test_name: &str, raw: &str) -> Option<String> {
+        match read_base_path(test_name, raw) {
+            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn manifest_base_path_refused_with_key() {
+        let refusal = base_path_refusal_text("base_path_refused_with_key", "app/");
+        let expected = text::msg::manifest_base_path_no_leading_slash(&"\"app/\"").to_string();
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|msg| msg.contains("delivery.browser.basePath")
+                    && msg.contains(&expected)
+                    && msg.contains("package.ipe:")),
+            "`basePath = \"app/\"` is a located manifest refusal naming the key and \
+             the missing leading slash: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_base_path_absent_is_root() {
+        let manifest = read(
+            "base_path_absent_is_root",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ desktop = {{ title = \"t\" }} }} }}\n"
+            ),
+        )
+        .expect("a manifest without `browser` parses");
+        assert_eq!(manifest.delivery.browser.base, MountBase::root());
+        let bare = read(
+            "base_path_absent_no_delivery",
+            &format!("{HEADER}package =\n    {{ name = \"x\" }}\n"),
+        )
+        .expect("a manifest without `delivery` parses");
+        assert_eq!(bare.delivery.browser.base, MountBase::root());
+    }
+
+    /// Which refusal a row exercises; the exhaustive `match` makes a new
+    /// [`MountBaseRefusal`] variant a build error here until it has a row.
+    const fn refusal_slot(refusal: &MountBaseRefusal) -> usize {
+        match refusal {
+            MountBaseRefusal::TooLong { .. } => 0,
+            MountBaseRefusal::NoLeadingSlash => 1,
+            MountBaseRefusal::TrailingSlash => 2,
+            MountBaseRefusal::EmptySegment => 3,
+            MountBaseRefusal::DotSegment => 4,
+            MountBaseRefusal::Reserved { .. } => 5,
+        }
+    }
+
+    #[test]
+    fn manifest_base_path_refuses_each_variant() {
+        let too_long = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN));
+        let quoted = |raw: &str| format!("{raw:?}");
+        let rows: [(&str, &str, MountBaseRefusal, text::Message); 9] = [
+            (
+                "base_path_too_long",
+                too_long.as_str(),
+                MountBaseRefusal::TooLong {
+                    len: MAX_MOUNT_BASE_LEN.saturating_add(1),
+                },
+                text::msg::manifest_base_path_too_long(
+                    &(MAX_MOUNT_BASE_LEN.saturating_add(1)),
+                    &MAX_MOUNT_BASE_LEN,
+                ),
+            ),
+            (
+                "base_path_no_leading_slash",
+                "app",
+                MountBaseRefusal::NoLeadingSlash,
+                text::msg::manifest_base_path_no_leading_slash(&quoted("app")),
+            ),
+            (
+                "base_path_trailing_slash",
+                "/app/",
+                MountBaseRefusal::TrailingSlash,
+                text::msg::manifest_base_path_trailing_slash(&quoted("/app/")),
+            ),
+            (
+                "base_path_double_slash",
+                "//",
+                MountBaseRefusal::TrailingSlash,
+                text::msg::manifest_base_path_trailing_slash(&quoted("//")),
+            ),
+            (
+                "base_path_empty_segment",
+                "/a//b",
+                MountBaseRefusal::EmptySegment,
+                text::msg::manifest_base_path_empty_segment(&quoted("/a//b")),
+            ),
+            (
+                "base_path_dot_dot_segment",
+                "/..",
+                MountBaseRefusal::DotSegment,
+                text::msg::manifest_base_path_dot_segment(&quoted("/..")),
+            ),
+            (
+                "base_path_dot_segment",
+                "/a/./b",
+                MountBaseRefusal::DotSegment,
+                text::msg::manifest_base_path_dot_segment(&quoted("/a/./b")),
+            ),
+            (
+                "base_path_percent",
+                "/a%2Fb",
+                MountBaseRefusal::Reserved { byte: b'%' },
+                text::msg::manifest_base_path_reserved_byte(&quoted("/a%2Fb"), &"0x25"),
+            ),
+            (
+                "base_path_query",
+                "/a?b",
+                MountBaseRefusal::Reserved { byte: b'?' },
+                text::msg::manifest_base_path_reserved_byte(&quoted("/a?b"), &"0x3F"),
+            ),
+        ];
+        let mut covered = [false; 6];
+        for (test_name, raw, refusal, expected) in &rows {
+            assert_eq!(
+                MountBase::parse(raw).as_ref().err(),
+                Some(refusal),
+                "row {test_name} exercises the refusal it names"
+            );
+            if let Some(slot) = covered.get_mut(refusal_slot(refusal)) {
+                *slot = true;
+            }
+            let got = base_path_refusal_text(test_name, raw);
+            assert!(
+                got.as_deref()
+                    .is_some_and(|msg| msg.contains("delivery.browser.basePath")
+                        && msg.contains(expected.as_str())),
+                "{test_name}: expected {expected:?}, got {got:?}"
+            );
+        }
+        assert!(
+            covered.iter().all(|seen| *seen),
+            "every refusal variant reaches the manifest: {covered:?}"
+        );
+        assert!(
+            base_path_refusal_text("base_path_too_long_quiet", &too_long)
+                .is_some_and(|msg| !msg.contains(&too_long)),
+            "a too-long base is not echoed back"
+        );
+    }
+
+    #[test]
+    fn manifest_base_path_admits_the_grammar() {
+        let at_limit = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN.saturating_sub(1)));
+        let rows: [(&str, &str, &str); 5] = [
+            ("base_path_root_slash", "/", ""),
+            ("base_path_root_empty", "", ""),
+            ("base_path_one_segment", "/app", "/app"),
+            ("base_path_unreserved", "/a-b.c_d~e/f9", "/a-b.c_d~e/f9"),
+            ("base_path_at_limit", at_limit.as_str(), at_limit.as_str()),
+        ];
+        for (test_name, raw, prefix) in rows {
+            let manifest = read_base_path(test_name, raw);
+            assert!(
+                manifest
+                    .as_ref()
+                    .is_ok_and(|m| m.delivery.browser.base.prefix() == prefix),
+                "{test_name}: `basePath = {raw:?}` is admitted with prefix {prefix:?}: {:?}",
+                manifest.as_ref().err()
+            );
+        }
+    }
+
+    /// Read a manifest whose `wasm` field allowlists `entries` (each already a
+    /// quoted Ipê string literal).
+    fn read_public_env_list(
+        test_name: &str,
+        entries: &[&str],
+    ) -> Result<ProjectManifest, CliError> {
+        let list = entries.join(", ");
+        read(
+            test_name,
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", wasm = On {{ mode = Solo, publicEnv = [ {list} ] }} }}\n"
+            ),
+        )
+    }
+
+    /// The refusal reason a `publicEnv` read returned, or `None` when it was
+    /// accepted or refused through another channel.
+    fn public_env_refusal(test_name: &str, entries: &[&str]) -> Option<String> {
+        match read_public_env_list(test_name, entries) {
+            Err(CliError::Usage(msg)) => Some(msg.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn reject_temp_root_public_env_in_any_case() {
+        for (i, name) in ["TMPDIR", "TMP", "TEMP", "tmpdir", "Temp"]
+            .iter()
+            .enumerate()
+        {
+            let msg = public_env_refusal(&format!("reject_temp_env_{i}"), &[&format!("{name:?}")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains(*name) && m.contains("temp root")),
+                "{name} must be refused as the temp root, naming it: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_home_public_env() {
+        for (i, name) in ["HOME", "USERPROFILE", "HomePath"].iter().enumerate() {
+            let msg = public_env_refusal(&format!("reject_home_env_{i}"), &[&format!("{name:?}")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains(*name) && m.contains("home directory")),
+                "{name} must be refused as a home variable, naming it: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_ill_formed_public_env_name() {
+        for (i, name) in ["", "1ST", "A-B", "A B", "A=B", "\u{c9}TAT"]
+            .iter()
+            .enumerate()
+        {
+            let msg = public_env_refusal(&format!("reject_bad_env_{i}"), &[&format!("\"{name}\"")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains("not an environment variable name")),
+                "{name:?} must be refused as ill-formed: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_duplicate_public_env_ignoring_case() {
+        for (i, pair) in [
+            ["\"APP_VERSION\"", "\"APP_VERSION\""],
+            ["\"APP_VERSION\"", "\"app_version\""],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg = public_env_refusal(&format!("reject_dup_env_{i}"), pair);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains("repeats") && m.contains("APP_VERSION")),
+                "a repeated entry must be refused, naming the first: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_public_env_refusals_are_unchanged() {
+        for (i, name) in [
+            "DATABASE_URL",
+            "STRIPE_SECRET_KEY",
+            "IPE_ANYTHING",
+            "api_key",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg =
+                public_env_refusal(&format!("reject_secret_env_{i}"), &[&format!("{name:?}")]);
+            assert!(
+                msg.as_deref()
+                    .is_some_and(|m| m.contains(*name) && m.contains("secret-name denylist")),
+                "{name} must be refused by the secret-name denylist: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn neighbouring_public_env_names_stay_allowed() {
+        let m = read_public_env_list(
+            "ok_env_neighbours",
+            &[
+                "\"TMPDIR_HINT\"",
+                "\"TEMPLATE_ID\"",
+                "\"HOME_URL\"",
+                "\"_X1\"",
+            ],
+        )
+        .expect("names that only embed a refused name are accepted");
+        assert_eq!(
+            m.wasm.public_env.to_names(),
+            vec!["TMPDIR_HINT", "TEMPLATE_ID", "HOME_URL", "_X1"]
+        );
     }
 
     #[test]
@@ -2469,7 +2856,7 @@ mod tests {
             ),
         );
         let m = r.expect("allowed env must parse");
-        assert_eq!(m.wasm.public_env, vec!["API_BASE_URL"]);
+        assert_eq!(m.wasm.public_env.to_names(), vec!["API_BASE_URL"]);
     }
 
     #[test]

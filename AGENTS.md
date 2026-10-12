@@ -113,7 +113,7 @@ When a lint or gate fires, fix the code — never the lint level, never the gate
   `BorrowedFd::borrow_raw`, so a child inherits only stdio and its `NamedFds` —
   reached only through `system::spawn_hardened{,_tokio,_naming}` on the
   process-lifetime spawner thread and `system::exec_naming`; every
-  child-spawner, `console_proxy` and `ipe watch` alike, routes through it), and the per-function allows in the Win32 module
+  child-spawner, `console_proxy` and `ipe dev watch` alike, routes through it), and the per-function allows in the Win32 module
   `run_jail::windows::windows_jail`, only on the functions calling a Win32 entry
   point no vetted safe crate wraps (the Job Object lifecycle goes through
   `win32job`); that module denies `unsafe` everywhere else. Every other module is

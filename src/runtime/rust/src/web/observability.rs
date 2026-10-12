@@ -136,10 +136,8 @@ pub async fn track(
             1,
         );
         let ok = status < 500;
-        // Bound + sanitise the (attacker-controllable) raw path before it enters
-        // the in-RAM log ring / OTLP push: cap the length and strip control bytes
-        // so a `/<huge-or-control-char path>` can't inject ANSI/control sequences
-        // into the operator console or amplify per-entry memory.
+        // The attacker-controllable raw path enters the in-RAM log ring / OTLP
+        // push only escaped and capped (see `sanitise_path`).
         let safe_path = sanitise_path(&path);
         super::super::telemetry::record_span(&format!("{method} {safe_path}"), dur_us, ok);
         let level = if status >= 500 { "error" } else { "info" };
@@ -178,24 +176,16 @@ fn normalize_method(method: &str) -> &'static str {
     }
 }
 
-/// Cap the request path to a sane length and strip control characters before it
-/// is recorded into the telemetry rings / federation push. Mirrors the Ipe.Tui
-/// `sanitiseRune` discipline — the path is user-supplied and otherwise
-/// unbounded, a low-grade log-injection / memory-amplification vector.
+/// The request path as recorded into the telemetry rings / federation push.
+///
+/// The path is remote-supplied and otherwise unbounded, a log-injection,
+/// record-spoofing and memory-amplification vector. Every log hazard
+/// (`crate::system::is_log_hazard`, Unicode `Cc ∪ Cf ∪ Zl ∪ Zp`) becomes a
+/// visible escape rather than vanishing, so `/adm<U+200B>in` can never record as
+/// `/admin`, and the escaped form is capped at 256 bytes.
 fn sanitise_path(path: &str) -> String {
     const MAX_PATH_BYTES: usize = 256;
-    let mut out = String::with_capacity(path.len().min(MAX_PATH_BYTES));
-    for ch in path.chars() {
-        if crate::system::is_log_hazard(ch) {
-            continue;
-        }
-        if out.len() + ch.len_utf8() > MAX_PATH_BYTES {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-    }
-    out
+    crate::system::scrub_log_controls_capped(path, MAX_PATH_BYTES)
 }
 
 /// Internal observability/transport paths that must NOT be auto-instrumented:
@@ -240,11 +230,22 @@ mod tests {
     }
 
     #[test]
-    fn sanitise_path_drops_every_log_hazard() {
+    fn sanitise_path_escapes_every_log_hazard_visibly() {
         assert_eq!(
             sanitise_path("/a\u{202E}b\u{200B}c\u{E0041}d\u{2028}e\u{1B}[31mf\n"),
-            "/abcde[31mf"
+            "/a\\u{202e}b\\u{200b}c\\u{e0041}d\\u{2028}e\\u{1b}[31mf\\n"
         );
+        // A hidden character never lets one path record as another.
+        assert_ne!(sanitise_path("/adm\u{200B}in"), sanitise_path("/admin"));
+        assert_eq!(sanitise_path("/admin"), "/admin");
+        // The cap bounds the escaped form, not the raw path.
+        let long = sanitise_path(&format!("/{}", "\u{202E}".repeat(200)));
+        assert!(
+            long.len() <= 256 + crate::system::SCRUB_TRUNCATED.len(),
+            "{}",
+            long.len()
+        );
+        assert!(long.ends_with(crate::system::SCRUB_TRUNCATED), "{long:?}");
     }
 
     #[test]

@@ -74,7 +74,7 @@ roster block =
         |> List.filterMap parseLine
 ```
 
-Running it (`ipe run`) drops the two malformed lines, lowercases `Ada@Example.COM`,
+Running it (`ipe dev run`) drops the two malformed lines, lowercases `Ada@Example.COM`,
 and prints the clean roster:
 
 ```

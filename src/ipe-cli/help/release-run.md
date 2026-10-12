@@ -1,0 +1,16 @@
+Build the production artifact (cached), then run exactly that artifact, jailed to its capabilities.
+
+```
+ipe release run [<path>|<artifact-dir>]
+```
+
+## Arguments
+
+A source file, a project directory, or a package.ipe (default: the current project), or a built artifact directory holding `ipe-wrapper`. Every run is confined: the default single binary jails itself, a bundle is verified against the floor embedded in its app and then jailed, and a pure-native binary runs jailed to its consented capabilities. An artifact directory runs as built, so it takes no build options. A `--target wasm` or `web solo|desktop|ios|android` build has no run form and is refused: build it with `ipe release build`.
+
+## Options
+
+- `[--out <dir>]` — put the artifact under <dir>/release/ (default: out/ in the project)
+- @--target
+- `[--runtime <dir>]` — vendor the Ipê runtime source from <dir>
+- `[-- <args>...]` — forward <args> to the artifact

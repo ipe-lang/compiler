@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
 
 use crate::core::{IpeResult, IpeTask, ok_res};
-use crate::tea::{IpeCmd, IpeSub};
+use crate::tea::{IpeCmd, IpeSub, SourceTask};
 
 /// Per-topic broadcast buffer. A subscriber that lags more than this many
 /// messages gets `RecvError::Lagged` (handled by skipping, never panicking).
@@ -201,31 +201,126 @@ where
     }))
 }
 
-tokio::task_local! {
-    /// The session sid in scope while a session's subscriptions are being
-    /// (re)materialised. Read synchronously inside the IpeSub::Source closure
-    /// so the spawned recv loop captures the owning session's sid for
-    /// SkipOrigin filtering. Unset (→ "") outside a session.
-    static SESSION_SID: String;
-}
-
-/// Run `f` with `sid` available to `current_session_sid()`. The Web dispatch
-/// loop wraps subscription (re)materialisation in this scope.
-pub fn with_session_sid<R>(sid: String, f: impl FnOnce() -> R) -> R {
-    SESSION_SID.sync_scope(sid, f)
-}
-
-/// The sid of the session whose subscriptions/commands are being materialised
-/// in the current task-local scope, or an empty string outside any session.
+/// The session a call into user code runs on behalf of.
 ///
-/// Public so the `Ipe.Ffi.Js` port transport can bind each `js_subscribe` /
-/// `js_send` to the OWNING session's channel (read synchronously while
-/// [`with_session_sid`] is in scope), making cross-session port delivery
-/// unrepresentable: a port channel handle is only ever obtained from the sid
-/// in this scope, never from a process-global registry keyed by port name.
+/// `sid` keys pub/sub echo-suppression and the port transport; `bindings` is
+/// the session's credential set, the one `Auth.verifyToken` binds an admitted
+/// token into and the driver rechecks before applying each action. Cloning a
+/// scope shares the set (an `Arc`), so a spawned `Cmd` binds into the same
+/// session that dispatched it.
+#[derive(Clone)]
+pub struct SessionScope {
+    sid: String,
+    #[cfg(feature = "jwt")]
+    bindings: Arc<Mutex<crate::revocation::SessionBindings>>,
+}
+
+impl SessionScope {
+    /// A scope for `sid` with a fresh, empty credential set.
+    ///
+    /// Used where no live session entry exists yet; the Web runtime builds a
+    /// live session's scope with [`SessionScope::with_bindings`] so the set is
+    /// the entry's own.
+    #[must_use]
+    pub fn new(sid: String) -> Self {
+        Self {
+            sid,
+            #[cfg(feature = "jwt")]
+            bindings: Arc::default(),
+        }
+    }
+
+    /// A scope for `sid` sharing the session entry's credential set.
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn with_bindings(
+        sid: String,
+        bindings: Arc<Mutex<crate::revocation::SessionBindings>>,
+    ) -> Self {
+        Self { sid, bindings }
+    }
+
+    /// The session id this scope runs on behalf of.
+    #[must_use]
+    pub fn sid(&self) -> &str {
+        &self.sid
+    }
+
+    /// The session's shared credential set.
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn bindings(&self) -> &Arc<Mutex<crate::revocation::SessionBindings>> {
+        &self.bindings
+    }
+
+    /// Run `fut` with this scope in effect across every poll.
+    ///
+    /// The async twin of [`with_session`]: a `Cmd` future spawned by the Web
+    /// runtime is wrapped in it, so a `verifyToken` the future reaches binds
+    /// to the dispatching session instead of failing closed as unscoped.
+    pub fn scoped<F: std::future::Future>(
+        self,
+        fut: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        SESSION.scope(self, fut)
+    }
+}
+
+tokio::task_local! {
+    /// The session in scope while user code runs on its behalf. Read
+    /// synchronously when a topic subscription is built so its recv loop
+    /// keeps the owning session's sid for SkipOrigin filtering, and by
+    /// `Auth.verifyToken` to bind an admitted token. Unset outside a session.
+    static SESSION: SessionScope;
+}
+
+/// Run `f` with `scope` available to [`current_session_sid`] and the
+/// credential binder.
+///
+/// The Web runtime wraps every synchronous call into user code on behalf of a
+/// session (`init`, `update`, `view`, `subscriptions`, route entry, debugger
+/// replay) in this scope.
+pub fn with_session<R>(scope: &SessionScope, f: impl FnOnce() -> R) -> R {
+    SESSION.sync_scope(scope.clone(), f)
+}
+
+/// The sid of the session in the current task-local scope.
+///
+/// Empty outside any session. Public so the `Ipe.Ffi.Js` port transport can
+/// bind each `js_subscribe` / `js_send` to the OWNING session's channel (read
+/// synchronously while [`with_session`] is in scope), making cross-session
+/// port delivery unrepresentable: a port channel handle is only ever obtained
+/// from the sid in this scope, never from a process-global registry keyed by
+/// port name.
 #[must_use]
 pub fn current_session_sid() -> String {
-    SESSION_SID.try_with(|s| s.clone()).unwrap_or_default()
+    SESSION.try_with(|s| s.sid.clone()).unwrap_or_default()
+}
+
+/// `task`, run inside the session scope its caller runs in, or as it is
+/// outside any session.
+///
+/// The scope is read when this is called, on the caller's task, so a task
+/// spawned on a session's behalf keeps the session's sid and credential set
+/// across every poll: a token it verifies binds to that session, where
+/// revocation and expiry can close it.
+pub(crate) fn inherit_session_scope<F: std::future::Future>(
+    task: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let scope = SESSION.try_with(SessionScope::clone).ok();
+    async move {
+        match scope {
+            Some(scope) => SESSION.scope(scope, task).await,
+            None => task.await,
+        }
+    }
+}
+
+/// The credential set of the session in scope, or `None` outside any session.
+#[cfg(feature = "jwt")]
+#[must_use]
+pub fn session_bindings() -> Option<Arc<Mutex<crate::revocation::SessionBindings>>> {
+    SESSION.try_with(|s| Arc::clone(&s.bindings)).ok()
 }
 
 /// `Sub.subscribeTopic topic toMsg` — receive `topic` broadcasts as `Msg`s.
@@ -233,22 +328,23 @@ pub fn current_session_sid() -> String {
 /// from the materialisation scope. SkipOrigin is filtered here, receiver-side.
 ///
 /// IMPORTANT: `current_session_sid()` is called SYNCHRONOUSLY here (at call
-/// time, while `with_session_sid` is in scope), not inside the spawn closure.
-/// The captured `owner_sid` is then moved into the spawn closure so the async
-/// recv loop has the correct sid even after the task-local scope has ended.
+/// time, while `with_session` is in scope), not inside the source body.
+/// The captured `owner_sid` is then moved into the body so the async recv
+/// loop has the correct sid even after the task-local scope has ended. The
+/// loop starts the body inside the scope it reconciles in.
 pub fn sub_subscribe_topic<T, M, F>(topic: String, to_msg: F) -> IpeSub<M>
 where
     T: Clone + Send + 'static,
     M: Send + 'static,
-    // `to_msg` is moved exclusively into the spawned task (never shared across
+    // `to_msg` is moved exclusively into the source body (never shared across
     // threads), so `Send` is the minimum contract — `Sync` is not required.
     F: Fn(T) -> M + Send + 'static,
 {
-    // Read sid synchronously while with_session_sid's sync_scope is active.
+    // Read sid synchronously while with_session's sync_scope is active.
     let owner_sid = current_session_sid();
     IpeSub::Source(Box::new(move |emit| {
         let mut rx = broker::<T>().subscribe(&topic);
-        tokio::spawn(async move {
+        SourceTask::Tracked(Box::pin(async move {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
@@ -266,7 +362,7 @@ where
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        })
+        }))
     }))
 }
 
@@ -316,21 +412,21 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    // Drive a subscriber the way the Web loop does: inside with_session_sid,
+    // Drive a subscriber the way the Web loop does: inside with_session,
     // materialise the Source, then collect emitted Msgs.
     async fn collect_one(
         owner_sid: &str,
         topic: &str,
-    ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+    ) -> (crate::tea::RunningSource, Arc<Mutex<Vec<String>>>) {
         let got = Arc::new(Mutex::new(Vec::<String>::new()));
         let got2 = got.clone();
         let emit: Arc<dyn Fn(String) + Send + Sync> =
             Arc::new(move |m| got2.lock().unwrap().push(m));
-        let sub = with_session_sid(owner_sid.to_string(), || {
+        let sub = with_session(&SessionScope::new(owner_sid.to_string()), || {
             sub_subscribe_topic::<String, String, _>(topic.to_string(), |p| p)
         });
         let handle = match sub {
-            IpeSub::Source(spawn) => spawn(emit),
+            IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
             _ => unreachable!("subscribeTopic builds a Source"),
         };
         tokio::time::sleep(std::time::Duration::from_millis(20)).await; // let it subscribe
@@ -343,7 +439,7 @@ mod tests {
         broker::<String>().publish("echo-topic", "m".to_string(), "sid-A", false);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(*got.lock().unwrap(), vec!["m".to_string()]); // origin RECEIVES (echo)
-        h.abort();
+        drop(h);
     }
 
     #[tokio::test]
@@ -373,7 +469,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(got_a.lock().unwrap().is_empty()); // A suppressed
         assert_eq!(*got_b.lock().unwrap(), vec!["m".to_string()]); // B receives
-        ha.abort();
-        hb.abort();
+        drop(ha);
+        drop(hb);
     }
 }

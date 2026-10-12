@@ -49,7 +49,7 @@ package =
     }
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 Same string, escaped (safe) then verbatim (unsafe):

@@ -152,6 +152,11 @@ pub enum CliError {
         /// caller resolved one — named in a runtime-feature-gap message.
         runtime: Option<RuntimeContext>,
     },
+    /// A `cargo build` ran past its wall and was stopped with every process it started.
+    CargoBuildTimedOut {
+        /// The wall the build ran past.
+        wall: remote_ingest::LocalWall,
+    },
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     /// Carries the (trimmed) input and a deterministic did-you-mean list over
     /// the known codes, ranked by `(Levenshtein, code)`.
@@ -161,12 +166,9 @@ pub enum CliError {
     },
     /// `ipe doc <query>` named no documentation entry.
     ///
-    /// Carries the query and the closest entries of any kind (ranked, bounded, never empty while
-    /// any documentation exists), so a miss always points somewhere.
-    DocNotFound {
-        query: String,
-        suggestions: Vec<crate::doc_bundle::DocSuggestion>,
-    },
+    /// Carries the shown query and the ranked entries to offer instead (bounded, never empty
+    /// while any documentation exists), each as the exact term that opens it.
+    DocNotFound { miss: crate::doc_search::DocMiss },
     /// A static-build request was refused (typed reason — see
     /// [`build_plan::Refusal`]). Refusal means NO artifact: the build asked
     /// to be static is never silently degraded to a dynamic one.
@@ -252,8 +254,8 @@ pub enum CliError {
     /// (the dispatcher wraps a raw [`Self::Usage`] into
     /// this only for a command it recognised).
     CommandUsage {
-        /// The command whose help page to show (a known command name).
-        command: &'static str,
+        /// The command whose help page to show (a known command or grouped verb).
+        command: crate::verb::CommandName,
         /// The specific reason for the misuse (e.g. an unknown flag).
         reason: TerminalSafe,
     },
@@ -268,6 +270,34 @@ pub enum CliError {
         /// The token the user typed after the group name.
         attempted: TerminalSafe,
     },
+    /// A verb name typed without the umbrella group it lives under (`ipe
+    /// build`), or a group typed with no member verb (`ipe release`).
+    ///
+    /// The legacy names have no handler: this refusal is their one
+    /// representation. [`fmt::Display`] names what was typed, then one hint
+    /// per grouped form.
+    GroupRequired {
+        /// What the user typed: the legacy verb or the bare group word.
+        attempted: TerminalSafe,
+        /// The grouped forms the hint offers; empty for a group with no page.
+        forms: &'static [crate::verb::Verb],
+        /// The arguments that followed `attempted`, carried onto each hinted
+        /// form; empty when there were none.
+        tail: TerminalSafe,
+    },
+    /// `ipe release run` was given a target whose artifact has no run form.
+    ///
+    /// [`fmt::Display`] names the target, then hints the `ipe release build`
+    /// form that produces its artifact.
+    NoRunForm {
+        /// The target with no run form.
+        target: crate::cli_args::NoRunTarget,
+    },
+    /// A native-bearing release refused the `ipe_wrapper` source it builds.
+    ///
+    /// Nothing was built: the wrapper builds only from the verified compiler
+    /// workspace this binary was compiled from.
+    WrapperSourceRefused(Box<crate::wrapper_source::WrapperSourceRefusal>),
     /// A stage of `ipe verify` failed. Carries the stage name and the stage's
     /// own already-rendered report. Like [`Self::DocCoverage`], this is a
     /// legitimate gate result — the `verify` invocation was valid and the
@@ -322,7 +352,7 @@ pub enum CliError {
     /// exits non-zero after the report and never shows the `lint` command's
     /// `--help` page. Carries nothing: the printed findings are the message.
     LintGateFailed,
-    /// `ipe eject` was asked to eject a program it cannot make self-contained.
+    /// `ipe release eject` was asked to eject a program it cannot make self-contained.
     /// Eject vendors ONLY the embedded runtime source; a program that binds a
     /// foreign Rust crate (FFI) would need those external crates pulled from a
     /// registry, which the self-contained, source-only eject contract forbids.
@@ -337,13 +367,22 @@ pub enum CliError {
     /// nothing left to print — the JSON line is the complete machine output.
     DiagnosticJsonEmitted,
     /// A file exceeded the per-surface read ceiling in
-    /// [`io_bounded::read_to_string_capped`]. The read was stopped at the cap;
+    /// [`io_bounded::read_leaf_capped`]. The read was stopped at the cap;
     /// no unbounded allocation was made.
     FileTooLarge {
         /// The path of the oversized file.
         path: PathBuf,
         /// The ceiling (bytes) that was enforced.
         max: u64,
+    },
+    /// `ipe fmt` refused a file whose formatted output would pass its cap.
+    ///
+    /// The file is left unchanged.
+    FmtOutputTooLarge {
+        /// The file whose output passed the cap.
+        file: PathBuf,
+        /// The output ceiling that was enforced.
+        cap: ipe_fmt::OutputCap,
     },
     /// A remote transfer crossed its declared ingest budget and was stopped.
     ///
@@ -355,6 +394,15 @@ pub enum CliError {
     ///
     /// A process the child started still held it; that process was stopped.
     ChildPipeHeld(remote_ingest::Stream),
+    /// The OS refused a thread the command needs.
+    ///
+    /// Anything the command had started for that thread was stopped first.
+    ThreadRefused {
+        role: crate::threads::ThreadRole,
+        source: std::io::Error,
+    },
+    /// Reading a child's output pipe failed, so its output was not used.
+    ChildPipeUnread(remote_ingest::Stream, std::io::ErrorKind),
     /// A signal ended a remote transfer before it finished.
     ///
     /// Nothing it staged reached the lock, the manifest or the package cache.
@@ -399,6 +447,12 @@ pub enum CliError {
     /// Either one steers or compiles into the build unsandboxed, so one some
     /// other user could have written is refused rather than obeyed.
     TrustRefused(crate::owner_trust::TrustRefusal),
+    /// FFI preparation refused the installed catalog or a project's use of it.
+    ///
+    /// The cause is a variant of [`crate::ffi::FfiPrepError`], never message
+    /// text, so a consumer decides how to handle it from its type. It is not
+    /// command misuse, so no help page is attached to it.
+    FfiPrep(Box<crate::ffi::FfiPrepError>),
     /// A discovered source file's module path uses a Windows reserved device name.
     ///
     /// `Aux.ipe` opens the `AUX` device on Windows, so the same tree would
@@ -450,7 +504,7 @@ pub enum CliError {
         /// What was wrong with the file.
         detail: String,
     },
-    /// `ipe run --target wasi` was invoked on an `ipe` binary built WITHOUT the
+    /// `ipe dev run --target wasi` was invoked on an `ipe` binary built WITHOUT the
     /// `wasi_run` feature, so no embedded wasmtime engine is linked to execute
     /// the emitted `wasm32-wasip1` module. A typed refusal naming the feature —
     /// never a panic, never a silent fall-through to a native run — so the
@@ -467,7 +521,7 @@ pub enum CliError {
     },
     /// The emitted `wasm32-wasip1` module ran to completion under embedded
     /// wasmtime and returned a non-zero WASI exit code. Propagated as `ipe
-    /// run`'s own non-zero exit, mirroring how the native run surfaces a child's
+    /// dev run`'s own non-zero exit, mirroring how the native run surfaces a child's
     /// non-zero status — the guest's own outcome, not a driver fault.
     WasiRunExited {
         /// The module's WASI exit code (non-zero).
@@ -493,6 +547,14 @@ impl From<api_surface::DiffError> for CliError {
 impl From<build_plan::Refusal> for CliError {
     fn from(refusal: build_plan::Refusal) -> Self {
         Self::StaticRefusal(refusal)
+    }
+}
+
+impl From<ipe_docs::argv::NonUtf8Argument> for CliError {
+    /// A command-line argument that is not UTF-8 is command-line misuse; the
+    /// refusal names its position, never its bytes.
+    fn from(refused: ipe_docs::argv::NonUtf8Argument) -> Self {
+        Self::Usage(text::Message::relay(&refused))
     }
 }
 
@@ -537,6 +599,13 @@ pub fn emit_machine_error(
         CliError::Pipeline { file, src, diag } if format == OutputFormat::Json => {
             render_json(diag, &file.to_string_lossy(), src)
         }
+        CliError::DocNotFound { miss } => crate::doc_pick::machine_miss(
+            format,
+            command,
+            err.machine_kind(),
+            &text::cli_doc_not_found(&miss.query),
+            miss,
+        ),
         _ => machine_output::machine_error(format, command, err.machine_kind(), &err.to_string()),
     };
     // Best-effort write; if stderr is closed we still exit non-zero.
@@ -545,6 +614,18 @@ pub fn emit_machine_error(
 }
 
 impl CliError {
+    /// A consent gate's refusal, framed by the shared diagnostic renderer.
+    ///
+    /// The refusal has no source location, so the entry path and source are empty.
+    #[must_use]
+    pub fn consent_refused(msg: ipe_diagnostics::ConsentError) -> Self {
+        Self::Pipeline {
+            file: PathBuf::new(),
+            src: String::new(),
+            diag: Box::new(Diagnostic::Consent { msg }),
+        }
+    }
+
     /// The manifest refusal for a program entry that [`parse_entry`] turned away.
     ///
     /// The entry and the refused segment are author text, so both render through
@@ -584,7 +665,7 @@ impl CliError {
     #[must_use]
     pub const fn machine_kind(&self) -> &'static str {
         match self {
-            Self::Usage(_) => "usage",
+            Self::Usage(_) | Self::FfiPrep(_) => "usage",
             Self::UnknownCommand { .. } => "unknown-command",
             Self::Io { .. } => "io",
             Self::ScratchUnavailable { .. } => "scratch-unavailable",
@@ -597,6 +678,7 @@ impl CliError {
             Self::RuntimeMaterializeFailed { .. } => "runtime-materialize-failed",
             Self::RuntimeVersionMismatch { .. } => "runtime-version-mismatch",
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
+            Self::CargoBuildTimedOut { .. } => "cargo-build-timed-out",
             Self::UnknownCode { .. } => "unknown-code",
             Self::DocNotFound { .. } => "doc-not-found",
             Self::StaticRefusal(_) => "static-refusal",
@@ -613,6 +695,9 @@ impl CliError {
             Self::DocExamplesFailed(_) => "doc-examples-failed",
             Self::CommandUsage { .. } => "command-usage",
             Self::UnknownGroupSub { .. } => "unknown-group-sub",
+            Self::GroupRequired { .. } => "group-required",
+            Self::NoRunForm { .. } => "no-run-form",
+            Self::WrapperSourceRefused(_) => "wrapper-source-refused",
             Self::VerifyFailed { .. } => "verify-failed",
             Self::TestFailed { .. } => "test-failed",
             Self::UpgradeNoPrebuilt { .. } => "upgrade-no-prebuilt",
@@ -622,9 +707,12 @@ impl CliError {
             Self::EjectUnsupported { .. } => "eject-unsupported",
             Self::DiagnosticJsonEmitted => "diagnostic-json-emitted",
             Self::FileTooLarge { .. } => "file-too-large",
+            Self::FmtOutputTooLarge { .. } => "fmt-output-too-large",
             Self::RemoteIngestExceeded(_) => "remote-ingest-exceeded",
             Self::LocalLimitExceeded(_) => "local-limit-exceeded",
             Self::ChildPipeHeld(_) => "child-pipe-held",
+            Self::ThreadRefused { .. } => "thread-refused",
+            Self::ChildPipeUnread(..) => "child-pipe-unread",
             Self::Interrupted => "interrupted",
             Self::SourceRefused { .. } => "source-refused",
             Self::PathEscape { .. } => "path-escape",
@@ -666,6 +754,7 @@ impl CliError {
                 }
             }
             Self::RuntimeVersionMismatch { .. } => Internal,
+            Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
             Self::Usage(_)
             | Self::UnknownCommand { .. }
             | Self::Io { .. }
@@ -693,6 +782,9 @@ impl CliError {
             | Self::DocExamplesFailed(_)
             | Self::CommandUsage { .. }
             | Self::UnknownGroupSub { .. }
+            | Self::GroupRequired { .. }
+            | Self::NoRunForm { .. }
+            | Self::WrapperSourceRefused(_)
             | Self::VerifyFailed { .. }
             | Self::TestFailed { .. }
             | Self::UpgradeNoPrebuilt { .. }
@@ -702,9 +794,13 @@ impl CliError {
             | Self::EjectUnsupported { .. }
             | Self::DiagnosticJsonEmitted
             | Self::FileTooLarge { .. }
+            | Self::FmtOutputTooLarge { .. }
             | Self::RemoteIngestExceeded(_)
             | Self::LocalLimitExceeded(_)
+            | Self::CargoBuildTimedOut { .. }
             | Self::ChildPipeHeld(_)
+            | Self::ThreadRefused { .. }
+            | Self::ChildPipeUnread(..)
             | Self::Interrupted
             | Self::SourceRefused { .. }
             | Self::PathEscape { .. }
@@ -739,6 +835,8 @@ impl CliError {
             Self::UnknownCommand { .. }
                 | Self::CommandUsage { .. }
                 | Self::UnknownGroupSub { .. }
+                | Self::GroupRequired { .. }
+                | Self::NoRunForm { .. }
                 | Self::DocCoverage(_)
                 | Self::DocExamplesFailed(_)
                 | Self::VerifyFailed { .. }
@@ -822,16 +920,7 @@ impl std::fmt::Display for CliError {
                 expected,
                 actual,
             )),
-            Self::DocNotFound { query, suggestions } => {
-                f.write_str(&text::cli_doc_not_found(query))?;
-                if !suggestions.is_empty() {
-                    write!(f, "\n{}", text::cli_doc_suggestions_header())?;
-                    for line in crate::doc_bundle::suggestion_lines(suggestions) {
-                        write!(f, "\n{line}")?;
-                    }
-                }
-                Ok(())
-            }
+            Self::DocNotFound { miss } => f.write_str(&crate::doc_pick::miss_text(miss)),
             Self::UnknownCode { input, suggestions } => {
                 f.write_str(&text::cli_unknown_code(input))?;
                 match suggestions.split_first() {
@@ -866,7 +955,7 @@ impl std::fmt::Display for CliError {
             // top-level screen rather than panicking.
             Self::CommandUsage { command, reason } => {
                 writeln!(f, "{}", crate::style::gutter(reason.as_str()))?;
-                let page = help::command(command, &std::io::stderr())
+                let page = help::command(command.as_str(), &std::io::stderr())
                     .unwrap_or_else(|| help::top_level(&std::io::stderr()));
                 f.write_str(page.trim_end_matches('\n'))
             }
@@ -891,6 +980,46 @@ impl std::fmt::Display for CliError {
                     .unwrap_or_else(|| help::top_level(&std::io::stderr()));
                 f.write_str(page.trim_end_matches('\n'))
             }
+            // What was typed, then one hint per grouped form. A bare group
+            // states it needs a subcommand; its members stay discoverable
+            // through `ipe <group> --help`.
+            Self::GroupRequired {
+                attempted,
+                forms,
+                tail,
+            } => {
+                let headline = if help::is_group(attempted.as_str()) {
+                    text::cli_subcommand_required(attempted)
+                } else {
+                    text::cli_group_required(attempted)
+                };
+                f.write_str(&crate::style::gutter(&headline))?;
+                for form in *forms {
+                    let shown = if tail.as_str().is_empty() {
+                        form.to_string()
+                    } else {
+                        format!("{form} {tail}")
+                    };
+                    writeln!(f)?;
+                    f.write_str(&crate::style::gutter(&text::cli_group_required_form(
+                        &shown,
+                    )))?;
+                }
+                Ok(())
+            }
+            Self::NoRunForm { target } => {
+                f.write_str(&crate::style::gutter(&text::cli_no_run_form(
+                    &target.word(),
+                )))?;
+                writeln!(f)?;
+                f.write_str(&crate::style::gutter(&text::cli_no_run_form_hint(
+                    &target.build_form(),
+                )))
+            }
+            Self::WrapperSourceRefused(refusal) => f.write_str(&text::cli_wrapper_source_refused(
+                &refusal.root.display(),
+                &refusal.defect,
+            )),
             Self::VerifyFailed { stage, report } => {
                 writeln!(f, "{}", text::cli_verify_failed(stage))?;
                 f.write_str(report.as_str().trim_end_matches('\n'))
@@ -938,9 +1067,22 @@ impl std::fmt::Display for CliError {
                 let path = path.display();
                 f.write_str(&text::cli_file_too_large(&path, max))
             }
+            Self::FmtOutputTooLarge { file, cap } => {
+                let file = file.display();
+                f.write_str(&text::fmt_output_too_large(&file, cap))
+            }
             Self::RemoteIngestExceeded(refusal) => refusal.fmt(f),
             Self::LocalLimitExceeded(refusal) => refusal.fmt(f),
+            Self::CargoBuildTimedOut { wall } => f.write_str(&text::cli_cargo_build_timed_out(
+                &remote_ingest::IngestLimit::Time(wall.limit()),
+            )),
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
+            Self::ThreadRefused { role, source } => {
+                f.write_str(&text::cli_thread_refused(role, &source.kind()))
+            }
+            Self::ChildPipeUnread(stream, kind) => {
+                f.write_str(&text::cli_child_pipe_unread(stream, kind))
+            }
             Self::Interrupted => f.write_str(text::cli_transfer_interrupted()),
             Self::SourceRefused { path, reason } => {
                 let path = path.display();
@@ -963,6 +1105,7 @@ impl std::fmt::Display for CliError {
                 f.write_str(&text::cli_discovery_limit_reached(detail))
             }
             Self::TrustRefused(refusal) => f.write_str(&refusal.message()),
+            Self::FfiPrep(refusal) => std::fmt::Display::fmt(refusal, f),
             Self::DeviceNamedModule { path, segment } => {
                 f.write_str(&text::cli_device_named_module(&path.display(), segment))
             }
@@ -998,7 +1141,7 @@ impl std::fmt::Display for CliError {
                 write!(f, "{}{}", style::GUTTER, text::cli_wasi_run_failed(detail))
             }
             // The guest ran to completion and returned a non-zero WASI exit; this
-            // one-line verdict pairs with `ipe run`'s own non-zero exit, mirroring
+            // one-line verdict pairs with `ipe dev run`'s own non-zero exit, mirroring
             // the native run's child-exit surfacing.
             Self::WasiRunExited { code } => {
                 write!(f, "{}{}", style::GUTTER, text::cli_wasi_run_exited(code))
@@ -1244,6 +1387,26 @@ pub fn missing_runtime_feature(stderr: &str) -> Option<String> {
 
 impl std::error::Error for CliError {}
 
+/// Who an FFI prep refusal belongs to.
+///
+/// An emit left empty after asserted calls validated breaks a promise ipe
+/// makes ([`crate::ffi::FfiPrepError::AssertedWithoutCatalog`]); every other
+/// refusal is the user's to fix.
+const fn ffi_prep_fault(refusal: &crate::ffi::FfiPrepError) -> crate::screen::Fault {
+    use crate::ffi::FfiPrepError;
+    match refusal {
+        FfiPrepError::AssertedWithoutCatalog => crate::screen::Fault::Internal,
+        FfiPrepError::ModuleClaimed { .. }
+        | FfiPrepError::ReservedModuleExists
+        | FfiPrepError::AssertedRefused(_)
+        | FfiPrepError::AssertedShimSeal(_)
+        | FfiPrepError::DefineOpaqueCollision { .. }
+        | FfiPrepError::DependencyMerge(_)
+        | FfiPrepError::CatalogSeal(_)
+        | FfiPrepError::TransparentWithoutShape { .. } => crate::screen::Fault::User,
+    }
+}
+
 // `CliError` is the `Err` type of every driver `Result`, so its size is paid
 // in the `Err` slot of ~200 functions. Boxing the wide payloads (the `Pipeline`
 // diagnostic) keeps it under clippy's `result_large_err` threshold; the bound
@@ -1375,5 +1538,31 @@ mod tests {
         assert!(!shown.contains("/planted/root"), "{shown:?}");
         assert!(!shown.contains('\u{1b}'), "{shown:?}");
         assert_eq!(err.machine_kind(), "scratch-unavailable");
+    }
+
+    /// An FFI prep refusal keeps the `usage` machine kind, renders inside the
+    /// error frame, and is the user's fault except the internal-invariant breach.
+    #[test]
+    fn ffi_prep_machine_kind_and_fault() {
+        use crate::ffi::FfiPrepError;
+        use crate::screen::Fault;
+        let lift = |refusal| CliError::FfiPrep(Box::new(refusal));
+        let internal = lift(FfiPrepError::AssertedWithoutCatalog);
+        assert_eq!(internal.fault(), Fault::Internal);
+        for user in [
+            FfiPrepError::ReservedModuleExists,
+            FfiPrepError::DefineOpaqueCollision {
+                slug: "a".to_owned(),
+                name: "T".to_owned(),
+            },
+            FfiPrepError::ModuleClaimed {
+                module: "Rust.A".to_owned(),
+                slug: "a".to_owned(),
+            },
+        ] {
+            assert_eq!(lift(user).fault(), Fault::User);
+        }
+        assert_eq!(internal.machine_kind(), "usage");
+        assert!(!internal.renders_own_screen());
     }
 }

@@ -58,7 +58,7 @@ fn server_handler_lambda_boxes_with_arc_not_box() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for the server-handler fixture: {:?}",
+        "ipe dev build must succeed for the server-handler fixture: {:?}",
         built.err()
     );
 
@@ -109,7 +109,7 @@ fn ws_on_error_callback_boxes_with_arc_not_box() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for the WS onError fixture: {:?}",
+        "ipe dev build must succeed for the WS onError fixture: {:?}",
         built.err()
     );
 

@@ -47,11 +47,7 @@ impl std::fmt::Display for EmailAddress {
     }
 }
 
-impl crate::stringify::IpeStringify for EmailAddress {
-    fn ipe_show(&self) -> String {
-        self.0.clone()
-    }
-}
+crate::stringify::show_row!("EmailAddress", Value, [] EmailAddress, |a| a.0.clone());
 
 /// `EmailAddress.parse : String -> Maybe EmailAddress` — the single parse
 /// boundary. Returns `None` when the string is not a structurally valid
@@ -111,6 +107,37 @@ pub struct EmailMessage {
     pub replyTo: EmailAddress,
 }
 
+crate::stringify::show_row!(
+    "EmailMessage",
+    Redacted(Reveal),
+    [] EmailMessage,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |m, view| m.dev(view),
+);
+
+impl EmailMessage {
+    /// The message as `Debug.log` prints it in a dev-posture build: every
+    /// field, each attachment through its own dev view.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        use crate::stringify::IpeStringify;
+        crate::stringify::dev_record(
+            "EmailMessage",
+            &[
+                ("from", self.from.ipe_render(view)),
+                ("to", self.to.ipe_render(view)),
+                ("cc", self.cc.ipe_render(view)),
+                ("bcc", self.bcc.ipe_render(view)),
+                ("subject", self.subject.clone()),
+                ("textBody", self.textBody.clone()),
+                ("htmlBody", self.htmlBody.clone()),
+                ("attachments", self.attachments.ipe_render(view)),
+                ("replyTo", self.replyTo.ipe_render(view)),
+            ],
+        )
+    }
+}
+
 /// Ipê.Email.Attachment — `content` carries the attachment body as raw bytes.
 ///
 /// The Ipê `Attachment.content` field is typed `Bytes` (`Vec<u8>` on Rust),
@@ -126,6 +153,21 @@ pub struct EmailAttachment {
     pub content: Vec<u8>,
 }
 
+crate::stringify::show_row!(
+    "EmailAttachment",
+    Redacted(Reveal),
+    [] EmailAttachment,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |a, _| crate::stringify::dev_record(
+        "EmailAttachment",
+        &[
+            ("filename", a.filename.clone()),
+            ("mimeType", a.mimeType.clone()),
+            ("content", crate::stringify::dev_bytes(&a.content)),
+        ],
+    ),
+);
+
 /// Ipê.Email.SesConfig.
 ///
 /// `secret` is the SES secret access key — a sealed [`Secret`], revealed only
@@ -138,6 +180,23 @@ pub struct SesConfig {
     pub key: String,
     pub secret: Secret,
 }
+
+// The dev view names the region and the access-key id; the secret access key
+// renders as the marker.
+crate::stringify::show_row!(
+    "EmailSesConfig",
+    Redacted(Reveal),
+    [] SesConfig,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| crate::stringify::dev_record(
+        "SesConfig",
+        &[
+            ("region", c.region.clone()),
+            ("key", c.key.clone()),
+            ("secret", crate::stringify::REDACTED_SHOW.to_owned()),
+        ],
+    ),
+);
 
 /// Ipê.Email.SmtpConfig.
 ///
@@ -152,6 +211,24 @@ pub struct SmtpConfig {
     pub pass: Secret,
 }
 
+// The dev view names the host, port and user; the password renders as the
+// marker.
+crate::stringify::show_row!(
+    "EmailSmtpConfig",
+    Redacted(Reveal),
+    [] SmtpConfig,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |c, _| crate::stringify::dev_record(
+        "SmtpConfig",
+        &[
+            ("host", c.host.clone()),
+            ("port", c.port.to_string()),
+            ("user", c.user.clone()),
+            ("pass", crate::stringify::REDACTED_SHOW.to_owned()),
+        ],
+    ),
+);
+
 /// Ipê.Email.EmailProvider — the ADT; variant names match the Ipê ctors.
 ///
 /// The Resend / SendGrid API keys are sealed [`Secret`]s; the SES / SMTP
@@ -165,6 +242,8 @@ pub enum EmailProvider {
     SendGrid(Secret),
     Smtp(SmtpConfig),
 }
+
+crate::stringify::show_row!("EmailProvider", Internals, [] EmailProvider, |_| "<Ipe.Email.EmailProvider>".to_owned());
 
 fn email_gen_id() -> String {
     let nanos = SystemTime::now()
@@ -289,7 +368,10 @@ async fn read_email_body_capped<E: From<String>>(
         }
         buf.extend_from_slice(&bytes);
     }
-    #[allow(clippy::disallowed_methods)] // a provider response is display text, not a URL component
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a provider response is display text, not a URL component"
+    )]
     let text = String::from_utf8_lossy(&buf).into_owned();
     Ok(text)
 }
@@ -1048,7 +1130,7 @@ mod tests {
             "http://10.0.0.1/",
             crate::http_client::RedirectPolicy::NoRedirects,
             crate::ssrf::DialPolicy::DenyPrivate,
-            crate::http_client::VettingResolver::system(),
+            crate::http_client::VettingResolver::system().expect("the default deadline parses"),
         )
         .await
         .err()

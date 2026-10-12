@@ -333,7 +333,7 @@ OK, but compare with Go
 OK, but compare with Go
 
 ## 38-composite-ui-multibackend
-"$IPEC_BIN" build src/Main.ipe --out out/rust && cargo +nightly build -Z unstable-options --manifest-path out/rust/Cargo.toml --artifact-dir ./out/rust/target/debug/ &&  ./out/rust/target/debug/ipe-app 
+"$IPEC_BIN" dev build src/Main.ipe --out out/rust && cargo +nightly build -Z unstable-options --manifest-path out/rust/Cargo.toml --artifact-dir ./out/rust/target/debug/ &&  ./out/rust/target/debug/ipe-app 
 warning[IPE-L0124]: `Web.tea` routes list is non-empty but Model has no `page` field
    --> src/View.ipe:123:48
     |

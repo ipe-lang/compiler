@@ -1,7 +1,8 @@
 //! The Prelude built-in unions — the SINGLE source of truth for every
 //! constructor that resolves without a user `type` declaration.
 //!
-//! `Maybe`/`Result`/`Bool`/`Order`, the Db `SqlValue`/`SqlField` ADTs, the
+//! `Maybe`/`Result`/`Bool`/`Order`, the Db `SqlValue`/`SqlField`/`DbFailure` ADTs, the
+//! Auth `AuthError` ADT, the
 //! `Ipe.Http.Stream` `ChunkEvent`/`StreamId` ADTs, and the `Error`/`ErrorKind`/
 //! `ErrorDetails` ADTs all appear in typed Ipê code as if declared, but carry no
 //! `type` decl in any Ipê source file. Three stages must agree on their exact
@@ -25,6 +26,9 @@ use std::collections::BTreeMap;
 
 use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
+use ipe_kernels::{BUILTIN_TYPES, BuiltinRow, KernelHome};
+
+use crate::env::const_str_eq;
 
 /// One Prelude built-in union: its type name plus its constructors, each with a
 /// declaration index and payload arity.
@@ -199,7 +203,7 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
         exhaust_union: true,
         qualified_home: None,
     },
-    // `ErrorDetails` — the 5-variant enrichment union carried on
+    // `ErrorDetails` — the 6-variant enrichment union carried on
     // `ErrorInfo.details : Maybe ErrorDetails`. Index order matches
     // `ipe_types::constrain`'s ctor scheme registration and the runtime's
     // `IpeErrorDetails` enum.
@@ -211,11 +215,141 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
             ("HttpStatus", 2, 1),
             ("JsonDecode", 3, 1),
             ("Custom", 4, 1),
+            ("Database", 5, 1),
         ],
         exhaust_union: true,
         qualified_home: None,
     },
+    // ── DbFailure (Ipe.Db) ─────────────────────────────────────────────────
+    // The closed set of database failure causes, carried as
+    // `ErrorDetails.Database`. Qualified-only (`Db.UniqueViolation`), so a
+    // user's own same-spelled constructor is never shadowed. Index order
+    // matches the runtime's `IpeDbFailure` enum.
+    BuiltinUnion {
+        type_name: "DbFailure",
+        ctors: DB_FAILURE_CTORS,
+        exhaust_union: true,
+        qualified_home: Some("Db"),
+    },
+    // ── AuthError (Ipe.Auth) ───────────────────────────────────────────────
+    // The closed set of `Auth.verifyToken` refusals. Qualified-only
+    // (`Auth.Expired`), so a user's own same-spelled constructor is never
+    // shadowed. Index order matches the runtime's `IpeAuthError` enum.
+    BuiltinUnion {
+        type_name: "AuthError",
+        ctors: AUTH_ERROR_CTORS,
+        exhaust_union: true,
+        qualified_home: Some("Auth"),
+    },
 ];
+
+/// The `DbFailure` constructors, in the runtime `IpeDbFailure` declaration order.
+const DB_FAILURE_CTORS: &[(&str, usize, usize)] = &[
+    ("UniqueViolation", 0, 0),
+    ("ForeignKeyViolation", 1, 0),
+    ("NotNullViolation", 2, 0),
+    ("CheckViolation", 3, 0),
+    ("TriggerRaised", 4, 0),
+    ("OtherConstraint", 5, 0),
+    ("Busy", 6, 0),
+    ("ReadOnlyDatabase", 7, 0),
+    ("AccessDenied", 8, 0),
+    ("CannotOpen", 9, 0),
+    ("NotADatabase", 10, 0),
+    ("InvalidStatement", 11, 0),
+    ("Unreachable", 12, 0),
+    ("OtherFailure", 13, 0),
+];
+
+/// The `AuthError` constructors, in the runtime `IpeAuthError` declaration order.
+const AUTH_ERROR_CTORS: &[(&str, usize, usize)] = &[
+    ("Malformed", 0, 0),
+    ("BadSignature", 1, 0),
+    ("Expired", 2, 0),
+    ("NotYetValid", 3, 0),
+    ("MissingClaim", 4, 0),
+    ("Revoked", 5, 0),
+    ("RevocationUnavailable", 6, 0),
+    ("TooManyCredentials", 7, 0),
+    ("SecretTooShort", 8, 0),
+];
+
+/// Whether `union` may name `row`: the row's role admits constructors, and a
+/// qualifier the constructors are reachable through also spells the type.
+const fn union_fits_row(union: &BuiltinUnion, row: &BuiltinRow) -> bool {
+    if !row.role().admits_ctors() {
+        return false;
+    }
+    let Some(qualifier) = union.qualified_home else {
+        return true;
+    };
+    let mut spellings = row.qualified_via();
+    while let Some((&spelling, rest)) = spellings.split_first() {
+        if const_str_eq(spelling, qualifier) {
+            return true;
+        }
+        spellings = rest;
+    }
+    false
+}
+
+/// Whether every union names a [`BUILTIN_TYPES`] row that fits it.
+///
+/// A union's row is the empty-home row of its `type_name`, else the one
+/// module-home row of that name. One pass over the rows folds each union's
+/// outcome into bitmasks (one bit per union), compared once at the end.
+const fn unions_agree(unions: &[BuiltinUnion], mut rows: &[BuiltinRow]) -> bool {
+    if unions.len() > 64 {
+        return false;
+    }
+    let mut bare_seen = 0_u64;
+    let mut bare_bad = 0_u64;
+    let mut homed_seen = 0_u64;
+    let mut homed_dup = 0_u64;
+    let mut homed_bad = 0_u64;
+    while let Some((row, rest)) = rows.split_first() {
+        let mut bit = 1_u64;
+        let mut pending = unions;
+        while let Some((union, more)) = pending.split_first() {
+            if const_str_eq(union.type_name, row.name()) {
+                let fits = union_fits_row(union, row);
+                if matches!(row.home(), KernelHome::Builtin) {
+                    bare_seen |= bit;
+                    if !fits {
+                        bare_bad |= bit;
+                    }
+                } else {
+                    if homed_seen & bit != 0 {
+                        homed_dup |= bit;
+                    }
+                    homed_seen |= bit;
+                    if !fits {
+                        homed_bad |= bit;
+                    }
+                }
+            }
+            bit <<= 1;
+            pending = more;
+        }
+        rows = rest;
+    }
+    let mut every = 0_u64;
+    let mut pending = unions;
+    while let Some((_, more)) = pending.split_first() {
+        every = (every << 1) | 1;
+        pending = more;
+    }
+    let bare_ok = bare_seen & !bare_bad;
+    let homed_ok = !bare_seen & homed_seen & !homed_dup & !homed_bad;
+    ((bare_ok | homed_ok) & every) == every
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a builtin union's type is not a `BUILTIN_TYPES` row admitting constructors, or its constructor qualifier does not spell the type [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    unions_agree(BUILTIN_UNIONS, BUILTIN_TYPES),
+    "every BUILTIN_UNIONS entry must name a BUILTIN_TYPES row that admits its constructors",
+);
 
 /// One interned built-in constructor: its owning union's interned type name plus
 /// its declaration index and payload arity.
@@ -285,8 +419,59 @@ pub fn intern_builtins(interner: &mut Interner) -> DResult<InternedBuiltins> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUILTIN_UNIONS, intern_builtins};
+    use super::{
+        AUTH_ERROR_CTORS, BUILTIN_UNIONS, BuiltinUnion, DB_FAILURE_CTORS, intern_builtins,
+        unions_agree,
+    };
     use ipe_intern::Interner;
+    use ipe_kernels::BUILTIN_TYPES;
+
+    const fn stub_union(
+        type_name: &'static str,
+        qualified_home: Option<&'static str>,
+    ) -> BuiltinUnion {
+        BuiltinUnion {
+            type_name,
+            ctors: &[],
+            exhaust_union: false,
+            qualified_home,
+        }
+    }
+
+    #[test]
+    fn unions_agree_with_the_builtin_type_table() {
+        assert!(unions_agree(BUILTIN_UNIONS, BUILTIN_TYPES));
+        assert!(unions_agree(
+            &[
+                stub_union("HttpMethod", Some("Http")),
+                stub_union("RedirectPolicy", None),
+                stub_union("DbFailure", Some("Db")),
+                stub_union("AuthError", Some("Auth")),
+            ],
+            BUILTIN_TYPES
+        ));
+    }
+
+    #[test]
+    fn unions_agree_refuses_a_union_the_table_does_not_admit() {
+        for (bad, why) in [
+            (stub_union("NoSuchType", None), "a type with no row"),
+            (
+                stub_union("Handler", None),
+                "a kernel-implicit row admits no constructors",
+            ),
+            (
+                stub_union("Maybe", Some("Http")),
+                "a qualifier the row does not list",
+            ),
+            (
+                stub_union("Draft", Some("Http")),
+                "a module-home row without the qualifier",
+            ),
+        ] {
+            assert!(!unions_agree(&[bad], BUILTIN_TYPES), "{why}");
+        }
+    }
 
     #[test]
     fn every_union_index_is_dense_from_zero() {
@@ -313,6 +498,75 @@ mod tests {
             "every built-in constructor must intern to a distinct symbol — a duplicate name across \
              unions would silently collapse two entries"
         );
+    }
+
+    /// The `DbFailure` row lists the runtime `IpeDbFailure` variants by name,
+    /// in declaration order, every one nullary.
+    #[test]
+    fn db_failure_row_names_the_runtime_variants() {
+        let names: Vec<&str> = DB_FAILURE_CTORS.iter().map(|&(name, _, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "UniqueViolation",
+                "ForeignKeyViolation",
+                "NotNullViolation",
+                "CheckViolation",
+                "TriggerRaised",
+                "OtherConstraint",
+                "Busy",
+                "ReadOnlyDatabase",
+                "AccessDenied",
+                "CannotOpen",
+                "NotADatabase",
+                "InvalidStatement",
+                "Unreachable",
+                "OtherFailure",
+            ]
+        );
+        assert!(DB_FAILURE_CTORS.iter().all(|&(_, _, arity)| arity == 0));
+    }
+
+    /// The `AuthError` row lists the runtime `IpeAuthError` variants by name,
+    /// in declaration order, every one nullary.
+    #[test]
+    fn auth_error_row_names_the_runtime_variants() {
+        let names: Vec<&str> = AUTH_ERROR_CTORS.iter().map(|&(name, _, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "Malformed",
+                "BadSignature",
+                "Expired",
+                "NotYetValid",
+                "MissingClaim",
+                "Revoked",
+                "RevocationUnavailable",
+                "TooManyCredentials",
+                "SecretTooShort",
+            ]
+        );
+        assert!(AUTH_ERROR_CTORS.iter().all(|&(_, _, arity)| arity == 0));
+    }
+
+    /// No two builtin constructors share a name, across every union.
+    #[test]
+    fn builtin_ctor_names_are_globally_distinct() {
+        let mut seen = std::collections::BTreeMap::new();
+        for union in BUILTIN_UNIONS {
+            for &(name, _, _) in union.ctors {
+                let earlier = seen.insert(name, union.type_name);
+                assert!(
+                    earlier.is_none(),
+                    "`{name}` is a constructor of both {earlier:?} and {}",
+                    union.type_name
+                );
+            }
+        }
+        // The control: the `ErrorKind` and `DbFailure` names nearest a clash are each present.
+        for name in ["PermissionDenied", "Unavailable", "AccessDenied", "Busy"] {
+            assert!(seen.contains_key(name), "{name}");
+        }
     }
 
     #[test]

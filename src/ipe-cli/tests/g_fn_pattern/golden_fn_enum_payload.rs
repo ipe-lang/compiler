@@ -4,7 +4,7 @@
 //! tree, mirroring the Phase-1 record rule. So a variant-of-functions builds:
 //! construct a variant carrying a lambda, `case`-match it out, and call it. The
 //! synthesised enum gets a hand-written `impl Clone` (an `Arc::clone` refcount
-//! bump per fn slot) and renders a `<fn>` placeholder in its `IpeStringify`, so
+//! bump per fn slot) and renders a `<function>` placeholder in its `IpeStringify`, so
 //! the enum is duplicable — a `Box` carrier would fail closed at `cargo build`
 //! (E0599) the moment the value is cloned.
 //!

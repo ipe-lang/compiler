@@ -132,14 +132,16 @@ fn stdio_server_serves_live_diagnostics_for_a_real_project() {
 
     // Reader thread → channel, so every wait is timeout-bounded.
     let (tx, rx) = mpsc::channel::<serde_json::Value>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        while let Some(msg) = read_msg(&mut reader) {
-            if tx.send(msg).is_err() {
-                return;
+    std::thread::Builder::new()
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Some(msg) = read_msg(&mut reader) {
+                if tx.send(msg).is_err() {
+                    return;
+                }
             }
-        }
-    });
+        })
+        .expect("spawn test thread");
 
     write_msg(
         &mut stdin,

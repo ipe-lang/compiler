@@ -1,0 +1,11 @@
+[
+  { "path": "ipe:tools/app/src/links.rs", "kind": "fn", "name": "caller", "qualified": "app::caller", "callee": "helper", "candidates": ["helper", "app::helper"] },
+  { "path": "ipe:tools/app/src/links.rs", "kind": "fn", "name": "caller", "qualified": "app::caller", "callee": "util::exact", "candidates": ["util::exact"] },
+  { "path": "ipe:tools/app/src/links.rs", "kind": "fn", "name": "caller", "qualified": "app::caller", "callee": "crate::util::g", "candidates": ["app::util::g"] },
+  { "path": "ipe:tools/app/src/links.rs", "kind": "fn", "name": "caller", "qualified": "app::caller", "callee": "helper::<T>", "candidates": ["helper", "app::helper"] },
+  { "path": "ipe:tools/app/src/links.rs", "kind": "fn", "name": "caller", "qualified": "app::caller#2", "callee": "helper", "candidates": ["helper", "app::helper"] },
+  { "path": "ipe:tools/app/src/links.rs", "kind": "impl", "name": "Store", "qualified": "app::Store", "callee": "open", "candidates": ["open", "app::open"] },
+  { "path": "ipe:tools/app/src/a/b.rs", "kind": "fn", "name": "h", "qualified": "app::a::h", "callee": "k", "candidates": ["k", "app::a::k"] },
+  { "path": "ipe:src/lib.rs", "kind": "fn", "name": "f", "qualified": "crate::f", "callee": "crate::g", "candidates": ["crate::g"] },
+  { "path": "ipe:src/lib.rs", "kind": "fn", "name": "f", "qualified": "crate::f", "callee": "g", "candidates": ["g", "crate::g"] }
+]

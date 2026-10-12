@@ -45,7 +45,7 @@ field fieldName label focus =
         ]
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 Rendered form (required is driven by a Bool, autofocus omitted when off):

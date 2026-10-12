@@ -51,6 +51,51 @@ pub struct WebViewWindowCfg {
 /// call site, never built in Rust). See the codegen `markerCfgAliases`.
 pub struct WebViewAppCfg;
 
+// Bridge JS: delegated event listeners on the document forward DOM events on
+// `[ipe-id]` elements to the IPC channel as `{ipeId, event, args}`. Re-bound
+// implicitly via event delegation, so a full innerHTML swap needs no re-bind.
+#[cfg(any(feature = "webview", all(test, not(target_arch = "wasm32"))))]
+const BRIDGE_JS: &str = r#"
+(function(){
+  // The document members the bridge reads, bound from the prototypes before any
+  // page content is consulted: an `img`, `form`, `embed`, `object` or `iframe`
+  // named after a document member shadows that member with the element.
+  var doc=(function(d){
+    var body=Object.getOwnPropertyDescriptor(Document.prototype,'body');
+    return { body:function(){ return body.get.call(d); }, on:EventTarget.prototype.addEventListener.bind(d) };
+  })(document);
+  function send(ipeId, ev, args){ try{ window.ipc.postMessage(JSON.stringify({ipeId:ipeId, event:ev, args:args})); }catch(e){} }
+  function idOf(el){ return el && el.getAttribute ? el.getAttribute('ipe-id') : null; }
+  // Match the wire-event arg table the HandlerIndex consumes: a checkbox/radio
+  // reports its toggle STATE (OnBool reads "true"/"false"), not its static
+  // `value` attribute (default "on"); everything else reports `value`
+  // (OnString) — number/range deliver the numeric value as its string form.
+  function valOf(t){ return (t && (t.type==='checkbox'||t.type==='radio')) ? String(!!t.checked) : ((t && t.value)||''); }
+  doc.on('click', function(e){ var id=idOf(e.target.closest('[ipe-id]')); if(id) send(id,'click',[]); });
+  doc.on('input', function(e){ var id=idOf(e.target.closest('[ipe-id]')); if(id) send(id,'input',[valOf(e.target)]); }, true);
+  doc.on('change', function(e){ var id=idOf(e.target.closest('[ipe-id]')); if(id) send(id,'change',[valOf(e.target)]); }, true);
+  // INVARIANT: `html` is produced by `render_html` (the shared Ipe.Web renderer),
+  // which HTML-escapes every text + attribute node — so this innerHTML assignment
+  // is not an XSS sink for user data. Any future RAW-html node added to the
+  // renderer becomes the XSS boundary and must be audited there.
+  window.__ipeApply = function(html){ var b=doc.body(); if(b) b.innerHTML = html; };
+})();
+"#;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    /// The bridge reads no document member through the document's own lookup.
+    #[test]
+    fn bridge_reads_the_document_only_through_the_bound_table() {
+        assert_eq!(
+            crate::js_document_scan::unbound_document_reads(super::BRIDGE_JS),
+            Vec::<String>::new(),
+            "the webview bridge names `document` only in its bound table"
+        );
+        assert_eq!(super::BRIDGE_JS.matches("})(document);").count(), 1);
+    }
+}
+
 #[cfg(not(feature = "webview"))]
 mod imp {
     use super::*;
@@ -95,29 +140,6 @@ mod imp {
     use crate::html::{assign_ipe_ids, render_html};
     use crate::web::dispatch::build_index;
     use crate::web::page_shell;
-
-    // Bridge JS: delegated event listeners on the document forward DOM events on
-    // `[ipe-id]` elements to the IPC channel as `{ipeId, event, args}`. Re-bound
-    // implicitly via event delegation, so a full innerHTML swap needs no re-bind.
-    const BRIDGE_JS: &str = r#"
-(function(){
-  function send(ipeId, ev, args){ try{ window.ipc.postMessage(JSON.stringify({ipeId:ipeId, event:ev, args:args})); }catch(e){} }
-  function idOf(el){ return el && el.getAttribute ? el.getAttribute('ipe-id') : null; }
-  // Match the wire-event arg table the HandlerIndex consumes: a checkbox/radio
-  // reports its toggle STATE (OnBool reads "true"/"false"), not its static
-  // `value` attribute (default "on"); everything else reports `value`
-  // (OnString) — number/range deliver the numeric value as its string form.
-  function valOf(t){ return (t && (t.type==='checkbox'||t.type==='radio')) ? String(!!t.checked) : ((t && t.value)||''); }
-  document.addEventListener('click', function(e){ var id=idOf(e.target.closest('[ipe-id]')); if(id) send(id,'click',[]); });
-  document.addEventListener('input', function(e){ var id=idOf(e.target.closest('[ipe-id]')); if(id) send(id,'input',[valOf(e.target)]); }, true);
-  document.addEventListener('change', function(e){ var id=idOf(e.target.closest('[ipe-id]')); if(id) send(id,'change',[valOf(e.target)]); }, true);
-  // INVARIANT: `html` is produced by `render_html` (the shared Ipe.Web renderer),
-  // which HTML-escapes every text + attribute node — so this innerHTML assignment
-  // is not an XSS sink for user data. Any future RAW-html node added to the
-  // renderer becomes the XSS boundary and must be audited there.
-  window.__ipeApply = function(html){ document.body.innerHTML = html; };
-})();
-"#;
 
     /// Encode `s` as a JSON string literal for embedding in `evaluate_script`.
     /// Delegates to serde (already a dep here via `parse_ipc`) so there is one

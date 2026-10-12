@@ -13,7 +13,7 @@
 //! applies at *mount-instance* granularity: each `wasm::mount_app` call gets
 //! a fresh origin token (`with_origin`, set by the scheduler around every
 //! `subscriptions(model)` materialisation — the direct analogue of native's
-//! `with_session_sid`), so `Cmd.publishNoEcho` from one mounted app
+//! `with_session`), so `Cmd.publishNoEcho` from one mounted app
 //! instance suppresses only THAT instance's own `Sub.subscribeTopic`
 //! listeners, never a different instance's (the multi-mount-in-one-tab case,
 //! e.g. several `Ipe.WebView`-style embeds on one page). `PubSub.publish`
@@ -147,7 +147,7 @@ fn broker<T: Clone + 'static>() -> Rc<Broker<T>> {
     })
 }
 
-// ─── Mount-instance origin (the `with_session_sid` analogue) ───────────────
+// ─── Mount-instance origin (the `with_session` analogue) ───────────────
 
 thread_local! {
     static CURRENT_ORIGIN: RefCell<String> = RefCell::new(String::new());
@@ -155,7 +155,7 @@ thread_local! {
 
 /// Run `f` with `origin` available to [`current_origin`] — the wasm scheduler
 /// wraps every `subscriptions(model)` call in this scope (mirroring native's
-/// `with_session_sid`), so `sub_subscribe_topic` below can read its owning
+/// `with_session`), so `sub_subscribe_topic` below can read its owning
 /// mount instance's origin synchronously at subscribe time.
 pub(crate) fn with_origin<R>(origin: &str, f: impl FnOnce() -> R) -> R {
     CURRENT_ORIGIN.with(|c| *c.borrow_mut() = origin.to_owned());

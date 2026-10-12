@@ -59,7 +59,7 @@ fn build_run_dualattr() -> (PathBuf, crate::support::RunOutcome) {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for stdui_dualattr: {:?}",
+        "ipe dev build must succeed for stdui_dualattr: {:?}",
         built.err()
     );
 

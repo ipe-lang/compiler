@@ -42,7 +42,7 @@ fn html_element_family_renders_correct_tags() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for html_elements: {:?}",
+        "ipe dev build must succeed for html_elements: {:?}",
         built.err()
     );
 

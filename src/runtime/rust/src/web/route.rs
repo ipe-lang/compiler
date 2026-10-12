@@ -127,7 +127,8 @@ impl std::fmt::Display for RoutePatternRefusal {
         write!(
             f,
             "route pattern `{}` is malformed: {}",
-            self.pattern, self.refusal
+            crate::system::scrub_log_controls(&self.pattern),
+            self.refusal
         )
     }
 }
@@ -146,6 +147,8 @@ pub struct Route<Page> {
     pattern: Result<RoutePattern, RoutePatternRefusal>,
     pub build: Arc<dyn Fn(Vec<String>) -> Option<Page> + Send + Sync>,
 }
+
+crate::stringify::show_row!("WebRoute", Internals, [Page] Route<Page>, |_| "<Ipe.Web.Route>".to_owned());
 
 impl<Page> Route<Page> {
     /// Register `pattern`, parsing it once ([`RoutePattern::parse`]).
@@ -191,15 +194,168 @@ pub fn check_route_table<Page>(routes: &[Route<Page>]) -> Result<(), RoutePatter
         .try_for_each(|rt| rt.pattern().map(drop).map_err(Clone::clone))
 }
 
-/// [`check_route_table`] as the startup refusal a routed app reports: the
-/// server's `web_app_routed` and the browser's routed mount both fail with
-/// this message, before any bind or DOM access.
+/// Why a client-supplied path names no page of the app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathMiss {
+    /// The platform could not report the current path.
+    Unreadable,
+    /// A segment does not decode.
+    Malformed(DecodeRefusal),
+    /// The text is not a bare absolute path: no leading `/`, or a `?`/`#`.
+    NotBarePath,
+    /// The path does not lie below the app's base.
+    OutsideBase,
+}
+
+/// A client-supplied path located below the app base, or why it is not.
+pub type LocatedPath = Result<DecodedPath, PathMiss>;
+
+/// Locate a client-supplied path below the app's `base`.
+///
+/// The one path-to-route entry the server's SSE reconnect and the browser
+/// client's mount and history navigation share. Every failure is a typed
+/// [`PathMiss`] that a caller resolves as the `notFound` page or a no-op,
+/// never as some other page.
 ///
 /// # Errors
 ///
-/// The rendered refusal of the first malformed pattern, in declaration order.
-pub fn refuse_route_table<Page>(routes: &[Route<Page>]) -> Result<(), String> {
-    check_route_table(routes).map_err(|refusal| refusal.to_string())
+/// `Malformed` for a segment that does not decode, `NotBarePath` for text
+/// that is not a bare absolute path, `OutsideBase` for a path not below
+/// `base`.
+pub fn app_path(raw: &str, base: &DecodedPath) -> LocatedPath {
+    let path = DecodedPath::parse(raw).map_err(PathMiss::Malformed)?;
+    if !raw.starts_with('/') || raw.contains('?') || raw.contains('#') {
+        return Err(PathMiss::NotBarePath);
+    }
+    path.strip_base(base).ok_or(PathMiss::OutsideBase)
+}
+
+/// Locate the platform's report of the current path below `base`.
+///
+/// `raw` is `None` when the platform could not report a path: that is
+/// [`PathMiss::Unreadable`], never the empty path and never the root page.
+///
+/// # Errors
+///
+/// `Unreadable` for an absent report; otherwise as [`app_path`].
+pub fn located(raw: Option<&str>, base: &DecodedPath) -> LocatedPath {
+    raw.map_or(Err(PathMiss::Unreadable), |raw| app_path(raw, base))
+}
+
+/// Enter the page a mount's located path names: a miss enters `not_found`.
+pub fn enter_located<Page: Clone, M, C>(
+    routes: &[Route<Page>],
+    located: &LocatedPath,
+    not_found: &Page,
+    model: M,
+    entry: impl Fn(Page, M) -> (M, C),
+    render: impl Fn(&Page) -> Result<RoutePath, RenderRefusal>,
+) -> Entered<M, C> {
+    let matched = located
+        .as_ref()
+        .map_or(Matched::Miss, |path| resolve(routes, path, render));
+    enter(matched, not_found, model, entry)
+}
+
+/// Enter the page a history navigation names, or `None` when it names no
+/// route.
+///
+/// An unrouted navigation (a path outside the base, an unreadable path, a
+/// path no route builds) leaves the live page alone: entering `not_found`
+/// would rebuild the handler index and orphan the shown page's handlers. An
+/// empty table serves only `/`, as on the server.
+pub fn navigate<Page: Clone, M, C>(
+    routes: &[Route<Page>],
+    located: &LocatedPath,
+    not_found: &Page,
+    model: M,
+    entry: impl Fn(Page, M) -> (M, C),
+    render: impl Fn(&Page) -> Result<RoutePath, RenderRefusal>,
+) -> Option<Entered<M, C>> {
+    let path = located.as_ref().ok()?;
+    let matched = resolve(routes, path, render);
+    let routed = matches!(matched, Matched::Hit { .. }) || (routes.is_empty() && path.is_root());
+    routed.then(|| enter(matched, not_found, model, entry))
+}
+
+/// One browser-console diagnostic line: `[ipe-wasm:<class>] <detail>`, or
+/// `[ipe-wasm] <detail>` without a class.
+///
+/// Both parts are scrubbed of bidi and control characters, so a platform or
+/// app message can neither forge a second line nor restyle the console.
+pub fn console_line(class: Option<&str>, detail: &str) -> String {
+    use crate::system::scrub_log_controls as scrub;
+    match class {
+        Some(class) => format!("[ipe-wasm:{}] {}", scrub(class), scrub(detail)),
+        None => format!("[ipe-wasm] {}", scrub(detail)),
+    }
+}
+
+/// Why the browser client refused to mount an app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MountRefusal {
+    /// The route table holds a malformed pattern.
+    RouteTable(RoutePatternRefusal),
+    /// The app base path does not decode.
+    BasePath(DecodeRefusal),
+    /// No `window` (not a browser context).
+    NoWindow,
+    /// The window has no `document`.
+    NoDocument,
+    /// The document has no `<body>`.
+    NoBody,
+    /// Registering a listener for `event` failed.
+    Listener {
+        /// The DOM event name.
+        event: &'static str,
+        /// The platform's report.
+        detail: String,
+    },
+    /// A DOM construction step failed.
+    Dom {
+        /// The step that failed.
+        step: &'static str,
+        /// The platform's report, when it gave one.
+        detail: Option<String>,
+    },
+}
+
+impl std::fmt::Display for MountRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::system::scrub_log_controls as scrub;
+        match self {
+            Self::RouteTable(refusal) => write!(f, "{refusal}"),
+            Self::BasePath(refusal) => write!(f, "app base path is malformed: {refusal}"),
+            Self::NoWindow => f.write_str("no window (not a browser context)"),
+            Self::NoDocument => f.write_str("the window has no document"),
+            Self::NoBody => f.write_str("the document has no <body>"),
+            Self::Listener { event, detail } => write!(
+                f,
+                "addEventListener({}) failed: {}",
+                scrub(event),
+                scrub(detail)
+            ),
+            Self::Dom { step, detail: None } => write!(f, "{} failed", scrub(step)),
+            Self::Dom {
+                step,
+                detail: Some(detail),
+            } => write!(f, "{} failed: {}", scrub(step), scrub(detail)),
+        }
+    }
+}
+
+impl From<MountRefusal> for crate::error::IpeError {
+    fn from(refusal: MountRefusal) -> Self {
+        let message = refusal.to_string();
+        match refusal {
+            MountRefusal::RouteTable(_) | MountRefusal::BasePath(_) => Self::invalid_input(message),
+            MountRefusal::NoWindow
+            | MountRefusal::NoDocument
+            | MountRefusal::NoBody
+            | MountRefusal::Listener { .. }
+            | MountRefusal::Dom { .. } => Self::unavailable(message),
+        }
+    }
 }
 
 /// The decoded values a route pattern's `:param` segments captured, in
@@ -1067,22 +1223,245 @@ mod tests {
     /// The startup refusal both routed hosts report names the first malformed
     /// pattern; a well-formed table is admitted.
     #[test]
-    fn refuse_route_table_names_the_malformed_pattern() {
+    fn route_table_mount_refusal_names_the_malformed_pattern() {
         let ok: Vec<Route<Page>> = vec![
             Route::new("/", |_| Some(Page::Home)),
             Route::new("/apps/:slug", |_| Some(Page::Home)),
         ];
-        assert_eq!(refuse_route_table(&ok), Ok(()));
+        assert_eq!(check_route_table(&ok), Ok(()));
         let bad: Vec<Route<Page>> = vec![
             Route::new("/", |_| Some(Page::Home)),
             Route::new("/%zz", |_| Some(Page::Home)),
             Route::new("/:id/:id", |_| Some(Page::Home)),
         ];
-        let refused = refuse_route_table(&bad);
+        let refused = check_route_table(&bad).map_err(MountRefusal::RouteTable);
         assert!(
-            matches!(&refused, Err(message) if message.contains("route pattern `/%zz` is malformed")),
+            matches!(&refused, Err(MountRefusal::RouteTable(r)) if r.pattern == "/%zz"),
             "a malformed route table must be refused: {refused:?}"
         );
+        let message = refused.err().map(|r| r.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("route pattern `/%zz` is malformed"),
+            "the refusal names the first malformed pattern: {message}"
+        );
+        let crate::error::IpeError::Error(kind, _) =
+            crate::error::IpeError::from(MountRefusal::RouteTable(RoutePatternRefusal {
+                pattern: "/%zz".to_owned(),
+                refusal: RouteSegmentRefusal::Decode(bad_escape()),
+            }));
+        assert_eq!(kind, crate::error::IpeErrorKind::InvalidInput);
+    }
+
+    /// The refusal a malformed percent-escape decodes to.
+    fn bad_escape() -> DecodeRefusal {
+        DecodedPath::parse("/%zz").err().unwrap()
+    }
+
+    /// Hostile text inside a refusal: a bidi override, a newline, an ESC.
+    const HOSTILE: &str = "x\u{202e}y\nz\u{1b}[31m";
+
+    fn assert_scrubbed(rendered: &str) {
+        assert!(
+            !rendered.contains('\u{202e}')
+                && !rendered.contains('\n')
+                && !rendered.contains('\u{1b}'),
+            "a refusal must render hostile text as visible escapes: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn route_pattern_refusal_scrubs_bidi_and_controls() {
+        let refusal = RoutePatternRefusal {
+            pattern: HOSTILE.to_owned(),
+            refusal: RouteSegmentRefusal::Decode(bad_escape()),
+        };
+        assert_scrubbed(&refusal.to_string());
+    }
+
+    #[test]
+    fn mount_refusal_scrubs_bidi_and_controls() {
+        let every = [
+            MountRefusal::RouteTable(RoutePatternRefusal {
+                pattern: HOSTILE.to_owned(),
+                refusal: RouteSegmentRefusal::Decode(bad_escape()),
+            }),
+            MountRefusal::BasePath(bad_escape()),
+            MountRefusal::NoWindow,
+            MountRefusal::NoDocument,
+            MountRefusal::NoBody,
+            MountRefusal::Listener {
+                event: "click",
+                detail: HOSTILE.to_owned(),
+            },
+            MountRefusal::Dom {
+                step: "createElement(div)",
+                detail: Some(HOSTILE.to_owned()),
+            },
+            MountRefusal::Dom {
+                step: "root cast to HtmlElement",
+                detail: None,
+            },
+        ];
+        for refusal in every {
+            let rendered = refusal.to_string();
+            assert!(!rendered.is_empty());
+            assert_scrubbed(&rendered);
+            let crate::error::IpeError::Error(kind, _) =
+                crate::error::IpeError::from(refusal.clone());
+            let expected = if matches!(
+                refusal,
+                MountRefusal::RouteTable(_) | MountRefusal::BasePath(_)
+            ) {
+                crate::error::IpeErrorKind::InvalidInput
+            } else {
+                crate::error::IpeErrorKind::Unavailable
+            };
+            assert_eq!(kind, expected, "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn app_path_locates_below_the_base() {
+        let root = dp("/");
+        let app = dp("/app");
+        assert_eq!(app_path("/", &root), Ok(dp("/")));
+        assert_eq!(app_path("/apps/x", &root), Ok(dp("/apps/x")));
+        assert_eq!(app_path("/app", &app), Ok(dp("/")));
+        assert_eq!(app_path("/app/apps/x", &app), Ok(dp("/apps/x")));
+    }
+
+    #[test]
+    fn app_path_refuses_every_miss() {
+        let root = dp("/");
+        let app = dp("/app");
+        assert!(matches!(
+            app_path("/%zz", &root),
+            Err(PathMiss::Malformed(_))
+        ));
+        assert_eq!(app_path("apps/x", &root), Err(PathMiss::NotBarePath));
+        assert_eq!(app_path("/apps?x=1", &root), Err(PathMiss::NotBarePath));
+        assert_eq!(app_path("/apps#top", &root), Err(PathMiss::NotBarePath));
+        assert_eq!(app_path("/apple", &app), Err(PathMiss::OutsideBase));
+        assert_eq!(app_path("/", &app), Err(PathMiss::OutsideBase));
+        assert_eq!(app_path("/other/app", &app), Err(PathMiss::OutsideBase));
+    }
+
+    /// A path the platform could not report is `Unreadable`: a mount enters
+    /// `notFound` and a history navigation enters no page at all.
+    #[test]
+    fn unreadable_path_enters_no_page() {
+        let rs = routes();
+        let root = dp("/");
+        let none = located(None, &root);
+        assert_eq!(none, Err(PathMiss::Unreadable));
+        let entry = |page: Page, (): ()| ((), page);
+        assert!(
+            navigate(&rs, &none, &Page::NF, (), entry, render).is_none(),
+            "an unreadable path must not navigate"
+        );
+        assert_eq!(
+            enter_located(&rs, &none, &Page::NF, (), entry, render).cmd,
+            Page::NF,
+            "an unreadable path must mount notFound, never the root page"
+        );
+        assert_eq!(located(Some("/"), &root), Ok(dp("/")));
+    }
+
+    /// The empty text is not a bare path: it never locates as the root.
+    #[test]
+    fn empty_path_text_is_not_a_bare_path() {
+        let root = dp("/");
+        assert_eq!(app_path("", &root), Err(PathMiss::NotBarePath));
+        assert_eq!(located(Some(""), &root), Err(PathMiss::NotBarePath));
+        let entry = |page: Page, (): ()| ((), page);
+        let nav = navigate(
+            &routes(),
+            &located(Some(""), &root),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert!(nav.is_none(), "the empty text must not navigate");
+    }
+
+    /// History navigation enters a routed page and leaves an unrouted one
+    /// alone; an empty table serves only the root.
+    #[test]
+    fn navigate_enters_only_routed_paths() {
+        let rs = routes();
+        let app = dp("/app");
+        let entry = |page: Page, (): ()| ((), page);
+        let hit = navigate(
+            &rs,
+            &app_path("/app/apps/x", &app),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert_eq!(hit.map(|e| e.cmd), Some(Page::App("x".into())));
+        for raw in ["/app/nope", "/elsewhere", "/app/%zz"] {
+            let nav = navigate(&rs, &app_path(raw, &app), &Page::NF, (), entry, render);
+            assert!(nav.is_none(), "{raw} must not navigate");
+        }
+        let empty: Vec<Route<Page>> = Vec::new();
+        let at_root = navigate(
+            &empty,
+            &app_path("/app", &app),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert_eq!(at_root.map(|e| e.cmd), Some(Page::NF));
+        let below = navigate(
+            &empty,
+            &app_path("/app/x", &app),
+            &Page::NF,
+            (),
+            entry,
+            render,
+        );
+        assert!(below.is_none(), "an empty table serves only the root");
+    }
+
+    /// A hostile class or detail cannot forge a console line or carry a raw
+    /// control or bidi character.
+    #[test]
+    fn console_line_scrubs_hostile_text() {
+        let hostile = "a\n\r\u{1b}[31mred\u{0}\u{7f}\u{85}\u{9b}\u{202e}rlo\u{2066}\u{200b}\u{2028}[ipe-wasm:Forged] x";
+        for line in [
+            console_line(Some(hostile), hostile),
+            console_line(None, hostile),
+        ] {
+            assert!(
+                !line.chars().any(crate::system::is_log_hazard),
+                "a raw control survived: {line:?}"
+            );
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        }
+        assert_eq!(
+            console_line(Some("EntryFailed"), "boom"),
+            "[ipe-wasm:EntryFailed] boom"
+        );
+        assert_eq!(console_line(None, "boom"), "[ipe-wasm] boom");
+    }
+
+    /// A miss resolves as the `notFound` page, never as the root page.
+    #[test]
+    fn located_miss_enters_not_found() {
+        let rs = routes();
+        let app = dp("/app");
+        for raw in ["/elsewhere", "/apple", "/%zz", "apps/x"] {
+            let located = app_path(raw, &app);
+            assert!(located.is_err(), "{raw}");
+            let matched = located
+                .as_ref()
+                .map_or(Matched::Miss, |p| resolve(&rs, p, render));
+            let entered = enter(matched, &Page::NF, (), |page, ()| ((), page));
+            assert_eq!(entered.cmd, Page::NF, "{raw}");
+        }
     }
 
     /// `enter` hands back the entry fn's Cmd beside its model, so no caller can

@@ -1,0 +1,10 @@
+module Package exposing (package)
+
+import Ipe.Package exposing (..)
+
+
+package : Package
+package =
+    { name = "wrapped_threaded_msg_seal"
+    , version = "0.1.0"
+    }

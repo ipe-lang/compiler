@@ -33,7 +33,7 @@ row label count ratio enabled =
     """{{label}}: count={{count}} ratio={{ratio}} enabled={{enabled}}"""
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 alpha: count=3 ratio=0.75 enabled=true

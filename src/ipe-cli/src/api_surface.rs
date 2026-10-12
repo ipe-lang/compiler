@@ -206,7 +206,7 @@ pub fn read_tree(root: &Path) -> Result<WalkedTree, DiffError> {
         let src = if walked_dir {
             crate::io_bounded::read_walked_source(m.path())?
         } else {
-            crate::io_bounded::read_to_string_capped(m.path(), crate::io_bounded::SOURCE_READ_CAP)?
+            crate::io_bounded::read_user_named(m.path(), crate::io_bounded::SOURCE_CAP)?
         };
         let (path, module_path) = m.into_paths();
         sources.insert(module_path, (path, src));
@@ -235,9 +235,16 @@ fn signature_doc(ty: &Ty, interner: &ipe_intern::Interner) -> Result<TyDoc, Diag
     ty_to_doc(ty, interner, &mut namer)
 }
 
-/// Project one module's [`TypedInterface`] into a [`ModuleApi`].
+/// Project one module's [`TypedInterface`] plus its exported kernel aliases into
+/// a [`ModuleApi`].
+///
+/// A kernel alias (`f = Kernel.kernel "Module_function"`) emits no body, so the
+/// typed interface omits it; its public scheme is the kernel's own, from the
+/// kernel type table. Both enter the same `values` map, so every exported value
+/// reaches the surface whichever way it is bound.
 fn project_interface(
     interface: &TypedInterface,
+    kernel_aliases: &[(ipe_intern::Symbol, Ty)],
     interner: &ipe_intern::Interner,
     module: &ModulePath,
 ) -> Result<ModuleApi, DiffError> {
@@ -253,6 +260,17 @@ fn project_interface(
             continue;
         };
         let doc = signature_doc(&scheme.ty, interner).map_err(typecheck_err)?;
+        values.insert(name.to_owned(), render_ty(&doc));
+        value_types.insert(name.to_owned(), doc);
+    }
+    for (name, ty) in kernel_aliases {
+        let Some(name) = interner.resolve(*name) else {
+            continue;
+        };
+        if values.contains_key(name) {
+            continue;
+        }
+        let doc = signature_doc(ty, interner).map_err(typecheck_err)?;
         values.insert(name.to_owned(), render_ty(&doc));
         value_types.insert(name.to_owned(), doc);
     }
@@ -345,6 +363,7 @@ fn canon_type_to_string(
     };
     match ty {
         Type::Var(sym) => Ok(vars.name_of(*sym)),
+        Type::Wildcard => Ok(ipe_canon::ast::WILDCARD_SPELLING.to_owned()),
         Type::Con { home, name, args } => {
             let mut head = String::new();
             for seg in home {
@@ -443,8 +462,18 @@ pub fn extract_tree(root: &Path) -> Result<PublicApi, DiffError> {
 /// # Errors
 /// [`DiffError`] on a typecheck failure or an open interface.
 pub fn extract_walked(tree: &WalkedTree) -> Result<PublicApi, DiffError> {
-    let sources = &tree.modules;
+    extract_sources(&tree.modules)
+}
 
+/// Extract the public API surface of exactly the module `sources` given.
+///
+/// The one extraction every caller reaches, so the API a verdict judges comes
+/// from the very text the caller holds (a [`project::PackageSnapshot`]'s
+/// sources) and never from a second read of the files.
+///
+/// # Errors
+/// [`DiffError`] on a typecheck failure or an open interface.
+pub fn extract_sources(sources: &project::ModuleSources) -> Result<PublicApi, DiffError> {
     let db = ipe_db::IpeDatabase::new();
     let mut prepared: BTreeMap<Vec<String>, (PathBuf, String)> = sources.clone();
     let mut discovered: Vec<project::DiscoveredModule> = sources
@@ -520,42 +549,89 @@ fn extract_from_db(
         if !user_modules.contains(path) {
             continue;
         }
-        match ipe_db::typed_interface(db, source_root, *file) {
-            Some(interface) => {
-                // Scope the interner lock to the projection only — it must not
-                // outlive this arm, and the mutex is not reentrant.
-                let module_api = {
-                    let interner = db.interner().lock();
-                    project_interface(interface, &interner, path)?
-                };
-                modules.insert(path.clone(), module_api);
-            }
-            None => {
-                // `None` is either an open interface or a red program. Demand the
-                // scoped types to tell them apart: a red module yields a typed
-                // diagnostic (fail closed on a package that does not typecheck);
-                // a green-but-open module reports the open-interface refusal.
-                match ipe_db::typecheck_module(db, source_root, *file, *file) {
-                    Ok(_) => {
-                        return Err(DiffError::OpenInterface {
-                            module: path.clone(),
-                        });
-                    }
-                    Err((diag, _home)) => {
-                        return Err(DiffError::Typecheck {
-                            module: path.clone(),
-                            diag: Box::new(diag.clone()),
-                        });
-                    }
-                }
-            }
-        }
+        let Some(interface) = ipe_db::typed_interface(db, source_root, *file) else {
+            return Err(closed_interface_refusal(db, source_root, *file, path));
+        };
+        // Demanded before the interner lock: both queries lock it themselves.
+        let kernel_aliases = exported_kernel_aliases(db, source_root, *file, path)?;
+        // Scope the interner lock to the projection only — it must not outlive
+        // this statement, and the mutex is not reentrant.
+        let module_api = {
+            let interner = db.interner().lock();
+            project_interface(interface, &kernel_aliases, &interner, path)?
+        };
+        modules.insert(path.clone(), module_api);
     }
 
     if modules.is_empty() {
         return Err(DiffError::OpenInterface { module: Vec::new() });
     }
     Ok(PublicApi { modules })
+}
+
+/// The exported kernel aliases of `file`, each paired with its kernel's scheme.
+///
+/// An alias whose kernel has no scheme in the table is left out: it is not
+/// callable, and the surface carries only values with a checker signature.
+fn exported_kernel_aliases(
+    db: &ipe_db::IpeDatabase,
+    source_root: ipe_db::SourceRoot,
+    file: ipe_db::SourceFile,
+    path: &[String],
+) -> Result<Vec<(ipe_intern::Symbol, Ty)>, DiffError> {
+    let typecheck_err = |diag: Diagnostic| DiffError::Typecheck {
+        module: path.to_vec(),
+        diag: Box::new(diag),
+    };
+    let canonical = ipe_db::canonicalize(db, source_root, file)
+        .clone()
+        .map_err(typecheck_err)?;
+    if canonical.exports.kernel_aliases.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = ipe_db::kernel_types(db, source_root)
+        .clone()
+        .map_err(typecheck_err)?;
+    Ok(canonical
+        .exports
+        .kernel_aliases
+        .iter()
+        .filter_map(|(name, alias)| {
+            table
+                .iter()
+                .find(|(kernel, _)| *kernel == alias.id)
+                .map(|(_, ty)| (*name, ty.clone()))
+        })
+        .collect())
+}
+
+/// Why a module has no typed interface: a red program or an open one.
+///
+/// `linked_program` is demanded first so a parse or resolve error anywhere in
+/// the program refuses the package even when this module's own scoped solve
+/// stands. A red module yields its typed diagnostic (fail closed on a package that does
+/// not typecheck); a green-but-open module reports the open-interface refusal.
+fn closed_interface_refusal(
+    db: &ipe_db::IpeDatabase,
+    source_root: ipe_db::SourceRoot,
+    file: ipe_db::SourceFile,
+    path: &[String],
+) -> DiffError {
+    if let Err(diag) = ipe_db::linked_program(db, source_root, file) {
+        return DiffError::Typecheck {
+            module: path.to_vec(),
+            diag: Box::new(diag.clone()),
+        };
+    }
+    match ipe_db::typecheck_module(db, source_root, file, file) {
+        Ok(_) => DiffError::OpenInterface {
+            module: path.to_vec(),
+        },
+        Err(err) => DiffError::Typecheck {
+            module: path.to_vec(),
+            diag: Box::new(err.diagnostic().clone()),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -585,5 +661,50 @@ mod tests {
             crate::CliError::from(err),
             crate::CliError::DiscoveryLimitReached { .. }
         ));
+    }
+
+    /// A single `.ipe` file the user named through a link is read through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_user_named_single_file_link_is_followed() {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe-api-surface-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(std::fs::create_dir_all(&root).is_ok(), "make scratch dir");
+        let target = root.join("Real.ipe");
+        let link = root.join("Lib.ipe");
+        assert!(
+            std::fs::write(&target, "module Lib exposing (one)\n\none = 1\n").is_ok(),
+            "write module"
+        );
+        assert!(
+            std::os::unix::fs::symlink(&target, &link).is_ok(),
+            "make link"
+        );
+        let result = read_tree(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            result.as_ref().is_ok_and(|tree| tree.modules.len() == 1),
+            "a named single-file link must be followed: {result:?}"
+        );
+    }
+
+    /// Extracting from the sources a tree holds is the same extraction as the tree's own.
+    #[test]
+    fn extract_sources_equals_extract_walked() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-api-surface-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mk src");
+        std::fs::write(
+            root.join("src").join("Main.ipe"),
+            "module Main exposing (answer)\n\nanswer : Int\nanswer =\n    42\n",
+        )
+        .expect("write Main");
+        let tree = read_tree(&root).expect("read tree");
+        let _ = std::fs::remove_dir_all(&root);
+        let walked = extract_walked(&tree).expect("walked api");
+        let sources = extract_sources(&tree.modules).expect("sources api");
+        assert_eq!(walked, sources);
     }
 }

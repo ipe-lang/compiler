@@ -1210,11 +1210,13 @@ Ipe.Crypto — cryptographic primitives.
 | `randomToken` | (no summary) |
 | `Key` | An opaque cryptographic key.  Construct only via `keyFromString` |
 | `Mac` | An opaque message authentication code (HMAC output).  Inspect via |
-| `keyFromString` | Parse a hex-encoded or raw string into a `Key`.  Returns `Nothing` |
+| `keyFromString` | Wrap a string as a `Key`: the string's bytes are the key material as |
 | `keyFromBytes` | Parse raw bytes (as Ipe `String`/`Bytes`) into a `Key`. |
 | `macToHex` | Render a `Mac` as a lowercase hex string for storage or display. |
+| `macFromHex` | Parse a stored hex tag back into a `Mac`: exactly 64 hex digits (an |
 | `hmacSha256` | `hmacSha256 key message` — HMAC-SHA-256.  Returns a typed `Mac`. |
 | `hmacSha512` | `hmacSha512 key message` — HMAC-SHA-512.  Returns a typed `Mac`. |
+| `verifyHmacSha256` | `verifyHmacSha256 key message mac` — `True` exactly when `mac` is the |
 
 ## Css
 
@@ -1550,6 +1552,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `lte` | `lte accessor value` — the rows where the column named by `accessor` is |
 | `lteBy` | `lteBy codec accessor value` — the accessor-typed less-than-or-equal leaf |
 | `like` | `like accessor pattern` — the rows where the `String` column named by |
+| `startsWith` | `startsWith accessor prefix` — the rows where the `String` column named by |
 | `isNull` | `isNull accessor` — the rows where the column named by `accessor` is SQL |
 | `notNull` | `notNull accessor` — the rows where the column named by `accessor` is NOT |
 | `inList` | `inList accessor values` — the rows where the column named by `accessor` |
@@ -1840,7 +1843,7 @@ Ipe.Env — build-time-embedded public config.
 
 [Full reference](stdlib/Error.md)
 
-Ipe.Error — the structured `Error` type (Layer-3 Ipe source).
+Ipe.Error — the structured `Error` type.
 
 | Export | Summary |
 |--------|----------|
@@ -2006,7 +2009,7 @@ Ipe.Html — HTML element builders.
 | `iframe` | (no summary) |
 | `progress` | (no summary) |
 | `meter` | (no summary) |
-| `script` | (no summary) |
+| `script` | `script attrs children` — a `<script>` element. It renders only over a |
 | `h1` | (no summary) |
 | `h2` | (no summary) |
 | `h3` | (no summary) |
@@ -2197,7 +2200,7 @@ Ipe.Level — the `LogLevel` severity-tag ADT.
 
 [Full reference](stdlib/List.md)
 
-`Ipe.List` — transform, filter, and combine lists (compiled-source Layer-3).
+`Ipe.List` — transform, filter, and combine lists.
 
 | Export | Summary |
 |--------|----------|
@@ -2518,7 +2521,7 @@ Ipe.PubSub — Task-shaped publish, callable wherever a bus runs.
 
 [Full reference](stdlib/Random.md)
 
-Ipe.Random — entropy-driven and seeded random helpers (compiled-source
+Ipe.Random — entropy-driven and seeded random helpers.
 
 | Export | Summary |
 |--------|----------|
@@ -2573,7 +2576,7 @@ Ipe.Regex — RE2 regex helpers.
 
 [Full reference](stdlib/Result.md)
 
-Ipe.Result — combinators over the Result ADT (Layer-3 compiled source).
+Ipe.Result — combinators over the Result ADT.
 
 | Export | Summary |
 |--------|----------|
@@ -2660,11 +2663,11 @@ Ipe.Set — unordered collection of unique elements.
 | `contains` | `contains needle haystack` — `True` when `needle` appears inside `haystack`. |
 | `startsWith` | `startsWith prefix s` — `True` when `s` begins with `prefix`. |
 | `endsWith` | `endsWith suffix s` — `True` when `s` ends with `suffix`. |
-| `containsIn` | `containsIn needle haystack` — `True` when `needle` appears in `haystack`. |
-| `startsWithIn` | `startsWithIn prefix haystack` — `True` when `haystack` starts with `prefix`. |
-| `endsWithIn` | `endsWithIn suffix haystack` — `True` when `haystack` ends with `suffix`. |
-| `casefold` | `casefold s` — case-fold `s` for case-insensitive comparison. |
-| `equalFold` | `equalFold s1 s2` — case-insensitive equality comparison. |
+| `containsIn` | `containsIn haystack needle` — `True` when `needle` appears in `haystack`: `contains` with the arguments swapped. |
+| `startsWithIn` | `startsWithIn haystack prefix` — `True` when `haystack` starts with `prefix`: `startsWith` with the arguments swapped. |
+| `endsWithIn` | `endsWithIn haystack suffix` — `True` when `haystack` ends with `suffix`: `endsWith` with the arguments swapped. |
+| `casefold` | `casefold s` — Unicode default full case folding, for case-insensitive comparison and keys. |
+| `equalFold` | `equalFold a b` — case-insensitive equality: `casefold a == casefold b`. |
 | `isEmail` | `isEmail s` — `True` when `s` looks like a valid email address. |
 | `isUrl` | `isUrl s` — `True` when `s` looks like a valid URL. |
 | `words` | `words s` — split `s` into words on whitespace boundaries. |
@@ -2699,10 +2702,10 @@ Ipe.System -- process environment + args + termination
 |--------|----------|
 | `args` | `args ()` -- the command-line arguments after the program name. |
 | `getArg` | `getArg n` -- zero-indexed positional arg lookup over the whole |
-| `getenv` | (no summary) |
+| `getenv` | `getenv key` -- the value of the environment variable `key`. |
 | `getenvOr` | `getenvOr key default` -- returns the env value if present, |
-| `getenvInt` | (no summary) |
-| `getenvBool` | (no summary) |
+| `getenvInt` | `getenvInt key` -- the environment variable `key` as an integer. |
+| `getenvBool` | `getenvBool key` -- the environment variable `key` as a boolean. |
 | `setenv` | (no summary) |
 | `unsetenv` | (no summary) |
 | `cwd` | (no summary) |
@@ -2958,7 +2961,7 @@ Ipe.Tuple — helpers for 2-tuples (pairs).
 | `descComplementary` | (no summary) |
 | `descLivePolite` | (no summary) |
 | `descLiveAssertive` | (no summary) |
-| `descHeading` | (no summary) |
+| `descHeading` | `descHeading n` — a heading of level `n`. Levels 1–6 render `<h1>`–`<h6>`; |
 | `descLabel` | (no summary) |
 | `iconButton` | (no summary) |
 | `Role` | (no summary) |

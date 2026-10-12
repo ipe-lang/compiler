@@ -6,7 +6,7 @@
 
 use crate::dict::IpeDict;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WebReq {
     pub path: String,
     pub query: String,
@@ -15,6 +15,37 @@ pub struct WebReq {
     pub headers: IpeDict<String>,
     pub cookies: IpeDict<String>,
 }
+
+// The dev view names every field; a credential header's value and every
+// cookie value render as the marker.
+crate::stringify::show_row!(
+    "WebReq",
+    Redacted(Reveal),
+    [] WebReq,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |r, view| {
+        use crate::stringify::{dev_cookie_names, dev_header_map, dev_record};
+        dev_record(
+            "WebReq",
+            &[
+                ("path", r.path.clone()),
+                ("query", r.query.clone()),
+                ("method", r.method.clone()),
+                ("params", r.params.ipe_render(view)),
+                ("headers", dev_header_map(&r.headers)),
+                ("cookies", dev_cookie_names(r.cookies.keys().map(String::as_str))),
+            ],
+        )
+    },
+);
+
+// Every field but the method is client-supplied data that can carry a credential
+// (a session cookie, an `Authorization` header, a token in the path or query);
+// the Ipê record fixes the field types, so the masking lives in `Debug`.
+crate::redact::redacting_debug!(WebReq {
+    shown: [method],
+    masked: [path, query, params, headers, cookies],
+});
 
 impl WebReq {
     /// The initial-load request for a host with no incoming HTTP request — a
@@ -33,5 +64,28 @@ impl WebReq {
             headers: IpeDict::new(),
             cookies: IpeDict::new(),
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_req_debug_prints_only_the_method() {
+        let one = |v: &str| IpeDict::from([("k".to_owned(), v.to_owned())]);
+        let req = WebReq {
+            path: "/reset/P4THT0K".to_owned(),
+            query: "token=QT0K3N".to_owned(),
+            method: "GET".to_owned(),
+            params: one("PR4M"),
+            headers: one("Bearer H34D3R"),
+            cookies: one("C00K13"),
+        };
+        let shown = format!("{req:?}");
+        for planted in ["P4THT0K", "QT0K3N", "PR4M", "H34D3R", "C00K13"] {
+            assert!(!shown.contains(planted), "{planted} leaked: {shown}");
+        }
+        assert!(shown.contains("\"GET\""), "{shown}");
     }
 }

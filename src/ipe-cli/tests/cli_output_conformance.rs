@@ -168,21 +168,21 @@ const MACHINE_CONFORMANCE: &[MachineConformance] = &[
         ),
     },
     MachineConformance {
-        command: "build",
+        command: "dev build",
         success: MachineSuccess::ExemptWithReason(
-            "build runs cargo; heavy, covered by the build_* integration tests",
+            "dev build runs cargo; heavy, covered by the build_* integration tests",
         ),
     },
     MachineConformance {
-        command: "run",
+        command: "dev run",
         success: MachineSuccess::ExemptWithReason(
-            "run builds and executes; heavy, covered by run_subcommand.rs",
+            "dev run builds and executes; heavy, covered by run_subcommand.rs",
         ),
     },
     MachineConformance {
-        command: "release",
+        command: "release build",
         success: MachineSuccess::ExemptWithReason(
-            "release runs cargo; heavy, covered by release_subcommand.rs",
+            "release build runs cargo; heavy, covered by release_subcommand.rs",
         ),
     },
     MachineConformance {
@@ -321,9 +321,10 @@ fn machine_failure_quadrant_is_clean_for_every_command() {
         let cmd = entry.command;
         // `doc` and `explain` take a leading positional before flags; a bare
         // `--plain --json` still resolves to the format conflict for the others.
+        // A grouped verb's name (`dev build`) is its argv words.
         let args: Vec<&str> = match cmd {
             "doc" => vec!["doc", "IPE-L0131", "--plain", "--json"],
-            _ => vec![cmd, "--plain", "--json"],
+            _ => cmd.split(' ').chain(["--plain", "--json"]).collect(),
         };
         let r = run(&args);
         assert!(
@@ -544,13 +545,14 @@ fn human_failure_quadrant_shows_the_guttered_help_surface() {
 /// envelope on stderr — never the human `--help` banner. The stdout stream stays
 /// clean, the output carries no ANSI, and the JSON is well-formed. This is the
 /// exact leak issue #2591 closed: a parse error must not fall to the human banner
-/// when the caller asked for a machine surface. `build` and `type-check` are two
+/// when the caller asked for a machine surface. `dev build` and `type-check` are two
 /// independent machine-mode command bodies, both proven.
 #[test]
 fn parse_error_under_json_renders_the_machine_envelope() {
-    for cmd in ["build", "type-check"] {
+    for cmd in ["dev build", "type-check"] {
         // The unknown flag makes the parse fail; `--json` was resolved first.
-        let r = run(&[cmd, "--bad-flag", "--json"]);
+        let args: Vec<&str> = cmd.split(' ').chain(["--bad-flag", "--json"]).collect();
+        let r = run(&args);
         assert!(
             !r.ok,
             "`ipe {cmd} --bad-flag --json` must exit non-zero on the parse error",
@@ -592,8 +594,9 @@ fn parse_error_under_json_renders_the_machine_envelope() {
 /// surface. Proven for the same two command bodies.
 #[test]
 fn parse_error_under_plain_renders_a_flush_left_reason() {
-    for cmd in ["build", "type-check"] {
-        let r = run(&[cmd, "--bad-flag", "--plain"]);
+    for cmd in ["dev build", "type-check"] {
+        let args: Vec<&str> = cmd.split(' ').chain(["--bad-flag", "--plain"]).collect();
+        let r = run(&args);
         assert!(
             !r.ok,
             "`ipe {cmd} --bad-flag --plain` must exit non-zero on the parse error",

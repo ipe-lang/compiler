@@ -20,29 +20,10 @@ use super::*;
 // a large/slow file can't stall the tokio worker thread. This module is
 // gated on the raw `csv` Cargo feature (`#[cfg(feature = "csv")]` in
 // `mod.rs`), NOT the composite `csv_kernel = ["csv", "tokio"]` feature, so
-// `tokio` is not guaranteed present — same constraint `file.rs` documents
-// for its own `run_blocking` helper (see
+// `tokio` is not guaranteed present (see
 // `docs/adr/0003-security-render-and-data-access-invariants.md` §2.2).
-#[cfg(feature = "tokio")]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(_) => Err("background csv task panicked".to_string()),
-    }
-}
-
-#[cfg(not(feature = "tokio"))]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    f()
-}
+// The offload is `threads::run_blocking`: a pool that cannot start a thread is
+// an `Unavailable` error, and a build without the pool runs the parse inline.
 
 /// Runtime representation of the Ipê `Ipe.Csv.Csv` record. Field names + types
 /// must match the Ipê alias exactly (List String -> Vec<String>, etc.).
@@ -51,6 +32,12 @@ pub struct CsvDoc {
     pub header: Vec<String>,
     pub rows: Vec<Vec<String>>,
 }
+
+crate::stringify::show_row!("CsvDoc", Value, [] CsvDoc, |d| format!(
+    "{{{} {}}}",
+    crate::stringify::IpeStringify::ipe_show(&d.header),
+    crate::stringify::IpeStringify::ipe_show(&d.rows)
+));
 
 /// Validate that `delim` is exactly one ASCII byte, as required by the csv
 /// crate. A multi-byte string (e.g. a UTF-8 character) or an empty string is
@@ -292,16 +279,25 @@ fn csv_parse_stream_from_file_sync(path: &str) -> Result<Vec<Vec<String>>, Strin
 /// extracted once before the async move.
 ///
 /// file I/O + incremental CSV parsing (bounded by `IPE_CSV_MAX_ROWS` AND
-/// `IPE_CSV_MAX_BYTES`) is offloaded to tokio's blocking pool via `run_blocking`
-/// — see the module-level doc comment on `run_blocking` above.
-pub fn csv_parse_stream_from_file<E: From<String> + Send + 'static>(
+/// `IPE_CSV_MAX_BYTES`) is offloaded to tokio's blocking pool via
+/// `threads::run_blocking`.
+pub fn csv_parse_stream_from_file<E: From<String> + crate::FromUnavailable + Send + 'static>(
     path: crate::path::Path,
 ) -> IpeTask<E, Vec<Vec<String>>> {
     let path = path.into_string();
     Box::pin(async move {
-        match run_blocking(move || csv_parse_stream_from_file_sync(&path)).await {
+        let parsed = crate::threads::run_blocking(
+            "Csv.parseStreamFromFile",
+            "Csv.parseStreamFromFile: background csv task panicked",
+            move || {
+                csv_parse_stream_from_file_sync(&path)
+                    .map_err(|e| format!("Csv.parseStreamFromFile: {e}"))
+            },
+        )
+        .await;
+        match parsed {
             Ok(v) => ok_res(v),
-            Err(e) => IpeResult::Err(format!("Csv.parseStreamFromFile: {}", e).into()),
+            Err(e) => IpeResult::Err(e),
         }
     })
 }
@@ -401,8 +397,8 @@ mod tests {
         sealed.expect("test fixture path passes the seal")
     }
 
-    /// Functional correctness (independent of whether `run_blocking` takes
-    /// the real `spawn_blocking` path or the no-tokio-feature fallback —
+    /// Functional correctness (independent of whether the offload takes
+    /// the blocking pool or the no-tokio-feature inline fallback —
     /// both paths must return the same rows).
     #[test]
     fn parse_stream_from_file_reads_all_rows() {
@@ -483,8 +479,7 @@ mod stream_from_file_spawn_blocking_tests {
     /// blocking file read + CSV parse inside `csv_parse_stream_from_file`
     /// would starve every other task on that runtime until it completes
     /// (worse still, pre-fix this work ran EAGERLY before the returned
-    /// future was even polled — see the module-level doc comment on
-    /// `run_blocking` above). This proves the work is offloaded to tokio's
+    /// future was even polled). This proves the work is offloaded to tokio's
     /// blocking-thread pool: a concurrently-spawned cheap ticker task must
     /// make progress (ticks > 0) WHILE the parse is in flight.
     ///

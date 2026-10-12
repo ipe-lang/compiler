@@ -182,7 +182,7 @@ fn rust_fn_resolves_without_import_rust_ffi() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-/// Default gate: `ipe build` exits 0 and the emitted crate carries the SAME
+/// Default gate: `ipe dev build` exits 0 and the emitted crate carries the SAME
 /// asserted surface the legacy spelling emits — the `Rust.Ffi` forwarder module
 /// and the `ipe_asserted` shim region with exact carriers, the panic boundary,
 /// and no coercion. The two spellings share one forwarder by construction.

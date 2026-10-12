@@ -67,7 +67,7 @@ sheet =
     Css.stylesheet [ card, wideCard, injected ]
 ```
 
-Running it (`ipe run`) prints the card rule and its media-query override, with
+Running it (`ipe dev run`) prints the card rule and its media-query override, with
 the injected rule absent from the output.
 
 ## The why

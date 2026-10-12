@@ -3,7 +3,7 @@
 //! total function of the record's shape, not a containment-gated promotion. So a
 //! dispatch-table record of functions builds: read a field out, call it, reuse
 //! the whole table. The synthesised struct gets a hand-written `impl Clone`
-//! (an `Arc::clone` refcount bump per fn slot) and renders a `<fn>` placeholder
+//! (an `Arc::clone` refcount bump per fn slot) and renders a `<function>` placeholder
 //! in its `IpeStringify`.
 //!
 //! `run ops 4` = `ops.add 4 + ops.mul 4` = `(4 + 10) + (4 * 3)` = `14 + 12`

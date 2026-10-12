@@ -51,7 +51,7 @@
 //! `cfg`-gate promotion. Also deferred: run-time sandbox isolation hardening.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,6 +62,10 @@ use crate::cli_args::OutputFormat;
 use crate::project::{self, ProjectManifest};
 use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
+use crate::remote_ingest::{
+    Captured, LocalCeiling, LocalRefusal, LocalSource, RunError, SUPPLY_CHAIN_SCAN_LIMITS,
+    TOOL_QUERY_LIMITS, run_local,
+};
 use crate::scratch::ScratchDir;
 use crate::text;
 
@@ -671,7 +675,7 @@ fn prepare(path: &Path) -> Result<Prepared, CliError> {
     // `audit_scratch_dir` creates the directory exclusively with 128-bit OS
     // entropy — no stale-dir removal needed; a fresh exclusive dir is always empty.
     let emitted_dir = audit_scratch_dir(&manifest.name)?;
-    // Resolve the runtime exactly as `ipe build` does — one resolver for every
+    // Resolve the runtime exactly as `ipe dev build` does — one resolver for every
     // command. Under the default dependency model the emitted project names the
     // runtime as a path dependency, which the build materializes from the
     // embedded source under `IPE_HOME`; no vendored module tree is needed, so an
@@ -916,15 +920,17 @@ fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliEr
         if !is_bindings {
             continue;
         }
-        if let Some(hit) = first_hit(&file)? {
+        if let Some(hit) = first_hit(&cache_root, &file)? {
             return Ok(Some(hit));
         }
     }
     Ok(None)
 }
 
-/// Run the shared [`panic_scan`] token scanner over one file, returning its first
+/// Run the shared [`panic_scan`] token scanner over one file below `root`, returning its first
 /// hit (lowest line) if any.
+///
+/// The file is read beneath `root`, every level held and never followed.
 ///
 /// Fail closed on a non-lexing file: a `_bindings.rs` the scanner cannot
 /// tokenise is opaque — the no-panic audit cannot attest its content. The
@@ -934,17 +940,42 @@ fn scan_author_ffi_rust(prepared: &Prepared) -> Result<Option<LocatedHit>, CliEr
 /// before the file reaches `cargo`.
 ///
 /// # Errors
-/// [`CliError::Io`] on a file-read failure; [`CliError::PackageAudit`] when
-/// the file does not parse as Rust.
-fn first_hit(file: &Path) -> Result<Option<LocatedHit>, CliError> {
-    let src =
-        crate::io_bounded::read_to_string_capped(file, crate::io_bounded::FFI_CACHE_READ_CAP)?;
-    let hits = panic_scan::scan_str(&src).map_err(|_| {
+/// [`CliError::Io`] on a file-read failure; [`CliError::PackageAudit`]
+/// ([`Check::Provenance`]) when the file is over a scan ceiling (too large, too
+/// deep, too many tokens) or does not parse as Rust.
+fn first_hit(root: &Path, file: &Path) -> Result<Option<LocatedHit>, CliError> {
+    let src = crate::io_bounded::read_beneath(root, file, crate::io_bounded::FFI_CACHE_CAP)?;
+    let hits = panic_scan::scan_str(&src).map_err(|error| {
+        let why = match error {
+            panic_scan::ScanError::TooLarge { bytes, ceiling } => format!(
+                "is too large to audit (at least {bytes} bytes, over the {ceiling}-byte ceiling)"
+            ),
+            panic_scan::ScanError::TooDeep {
+                line,
+                depth,
+                ceiling,
+            } => format!(
+                "nests too deep to audit (line {line} nests {depth} units, over the ceiling of \
+                 {ceiling})"
+            ),
+            panic_scan::ScanError::TooManyTokens { count, ceiling } => {
+                format!("holds too many tokens to audit ({count}, over the ceiling of {ceiling})")
+            }
+            panic_scan::ScanError::Parse { line, source } => {
+                format!("does not parse as Rust (line {line}: {source})")
+            }
+            panic_scan::ScanError::Thread(source) => {
+                format!("could not be audited: the parse thread could not start ({source})")
+            }
+            panic_scan::ScanError::Aborted => {
+                "could not be audited: the parse thread aborted".to_owned()
+            }
+        };
         reject(
             Check::Provenance,
             format!(
-                "emitted `{}` does not parse as Rust — the no-panic audit cannot attest \
-                 its content; the file is refused rather than admitted",
+                "emitted `{}` {why} — the no-panic audit cannot attest its content; the \
+                 file is refused rather than admitted",
                 file.display()
             ),
         )
@@ -1091,32 +1122,34 @@ fn derive_disclosure(
     let entry = crate::driver::analysis_root_of(&prepared.manifest)?;
 
     // A library ships no runnable `Main.ipe`; `analysis_root_of` then points at
-    // the first exposed module (or a non-existent default). Absent an entry file,
-    // the package drives nothing of its own — an honest absence, not a fail-open
-    // default.
-    if !entry.is_file() {
+    // the first exposed module (or a non-existent default). Only an ABSENT entry
+    // is an honest absence; any other read failure (a link, a FIFO, a denied or
+    // oversized file) fails the audit closed rather than disclosing a permissive
+    // default for a source we cannot classify.
+    let read = crate::io_bounded::read_beneath(
+        &prepared.manifest.src_root,
+        &entry,
+        crate::io_bounded::SOURCE_CAP,
+    );
+    if let Err(CliError::Io { source, .. }) = &read
+        && source.kind() == std::io::ErrorKind::NotFound
+    {
         return Ok(Disclosure {
             control_model: ControlModelDisclosure::NotApplicable,
             capabilities: inferred,
         });
     }
-
-    // The entry file exists. Read + parse it. A read or parse failure fails the
-    // audit closed rather than disclosing a permissive default for a source we
-    // cannot classify.
-    let source =
-        crate::io_bounded::read_to_string_capped(&entry, crate::io_bounded::SOURCE_READ_CAP)
-            .map_err(|_| {
-                reject(
-                    Check::Capability,
-                    format!(
-                        "the package's entry source (`{}`) could not be read, so its control model \
+    let source = read.map_err(|_| {
+        reject(
+            Check::Capability,
+            format!(
+                "the package's entry source (`{}`) could not be read, so its control model \
                      cannot be derived. A program whose self-driving model the audit cannot state \
                      is refused rather than certified with an assumed model.",
-                        entry.display()
-                    ),
-                )
-            })?;
+                entry.display()
+            ),
+        )
+    })?;
     let mut interner = ipe_intern::Interner::new();
     let module = ipe_parse::parse_module(&source, &mut interner).map_err(|_| {
         reject(
@@ -1351,33 +1384,22 @@ fn stable_baseline<'a>(
 // 1d. Supply chain
 // ===========================================================================
 
-/// Run `cargo-deny` over the emitted project's dependency graph, and re-assert
-/// the content-hash integrity of any Ipê package dependencies against their index
-/// pins.
-///
-/// `cargo-deny check` applies the workspace's supply-chain posture (advisories,
-/// bans, licenses, sources — see `deny.toml`) to the emitted Cargo project; a
-/// non-zero exit is a reject. The Ipê-package hash re-assertion reuses the
-/// resolver's lockfile pins so a fetched dependency whose bytes drifted from the
-/// registered hash is caught here too (the resolver verifies at install; the gate
-/// re-verifies at publish).
-///
-/// When `cargo-deny` is not installed, the advisory/bans scan is skipped with a
-/// loud warning (a missing dev tool is not an unsafe package), while the
-/// hash-integrity half still runs. The authoritative index-CI gate always
-/// installs cargo-deny, so enforcement is never actually skipped there.
-///
-/// # Errors
-/// [`CliError::PackageAudit`] when `cargo-deny` reports a violation, fails to run
-/// for any reason other than not being installed, or a locked dependency's hash
-/// no longer verifies.
+/// The program the supply-chain scan runs: `cargo-deny` itself, never the
+/// `cargo deny` subcommand, so a machine without it yields a `NotFound` spawn
+/// error instead of cargo reporting "no such subcommand".
+const CARGO_DENY: &str = "cargo-deny";
+
 /// Detect the installed cargo-deny minor version by parsing `cargo-deny --version`.
 ///
-/// Returns the minor component of the version (e.g. `20` for `cargo-deny 0.20.2`).
-/// On any parse failure defaults to `20` — the current "latest" release — so
-/// absent or unreadable version output uses the newer global-flag placement.
-fn detect_cargo_deny_minor() -> u32 {
-    let Ok(out) = Command::new("cargo-deny").arg("--version").output() else {
+/// The probe runs under [`TOOL_QUERY_LIMITS`]. Returns the minor component of
+/// the version (e.g. `20` for `cargo-deny 0.20.2`). A probe that fails, crosses
+/// a ceiling, or prints no parsable version defaults to `20` — the current
+/// "latest" release — so it uses the newer global-flag placement; the scan
+/// itself then runs under its own ceilings.
+fn detect_cargo_deny_minor(cargo_deny: &OsStr, ceiling: LocalCeiling) -> u32 {
+    let mut probe = Command::new(cargo_deny);
+    probe.arg("--version");
+    let Ok(out) = run_local(probe, ceiling, LocalSource::ToolQuery) else {
         return 20;
     };
     // Output is `cargo-deny X.Y.Z\n`; split on whitespace, take last token.
@@ -1388,6 +1410,21 @@ fn detect_cargo_deny_minor() -> u32 {
         .and_then(|v| v.split('.').nth(1))
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(20)
+}
+
+/// Run `cargo-deny` with `args`, detached in its own process group and held to `ceiling`.
+///
+/// # Errors
+/// See [`RunError`]: a crossed ceiling kills the child's group and is a
+/// [`LocalRefusal`] naming [`LocalSource::SupplyChainScan`].
+fn run_cargo_deny(
+    cargo_deny: &OsStr,
+    args: &[OsString],
+    ceiling: LocalCeiling,
+) -> Result<Captured, RunError<LocalRefusal>> {
+    let mut command = Command::new(cargo_deny);
+    command.args(args);
+    run_local(command, ceiling, LocalSource::SupplyChainScan)
 }
 
 /// Build the cargo-deny argument vector for `advisories bans sources`.
@@ -1423,6 +1460,32 @@ fn deny_args(cargo_deny_minor: u32, manifest: &Path, config: Option<&Path>) -> V
     args
 }
 
+/// Run `cargo-deny` over the emitted project's dependency graph, and re-assert
+/// the content-hash integrity of any Ipê package dependencies against their index
+/// pins.
+///
+/// `cargo-deny check` applies the workspace's supply-chain posture (advisories,
+/// bans, licenses, sources — see `deny.toml`) to the emitted Cargo project; a
+/// non-zero exit is a reject. It may fetch the advisory database, so it runs
+/// under [`SUPPLY_CHAIN_SCAN_LIMITS`]. The Ipê-package hash re-assertion reuses
+/// the resolver's lockfile pins so a fetched dependency whose bytes drifted from
+/// the registered hash is caught here too (the resolver verifies at install; the
+/// gate re-verifies at publish).
+///
+/// When `cargo-deny` is not installed, the advisory/bans scan is skipped with a
+/// loud warning (a missing dev tool is not an unsafe package), while the
+/// hash-integrity half still runs. The authoritative index-CI gate always
+/// installs cargo-deny, so enforcement is never actually skipped there.
+///
+/// # Errors
+/// - [`CliError::PackageAudit`] when `cargo-deny` reports a violation, fails to
+///   run for any reason other than not being installed, or a locked
+///   dependency's hash no longer verifies.
+/// - [`CliError::LocalLimitExceeded`] when `cargo-deny` crosses a ceiling; its
+///   process group is killed.
+/// - [`CliError::ChildPipeHeld`] when a process `cargo-deny` started holds a
+///   pipe open.
+/// - [`CliError::ChildPipeUnread`] when reading one of its output pipes fails.
 fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     let manifest = prepared.emitted_dir.join("Cargo.toml");
     if !manifest.is_file() {
@@ -1431,11 +1494,6 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
         return verify_locked_dependency_hashes(prepared);
     }
 
-    // Spawn `cargo-deny` directly rather than the `cargo deny` subcommand, so
-    // that a machine without cargo-deny yields a `NotFound` spawn error (handled
-    // as a skip below) instead of `cargo` running and reporting "no such
-    // subcommand", which would masquerade as a supply-chain violation.
-    //
     // Apply the SAME advisory/bans/sources posture the workspace uses — its
     // `deny.toml` ledgers advisories the vendored runtime's dependency tree
     // legitimately carries. Without it the check would default-reject every
@@ -1445,26 +1503,24 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
     // `--config` placement is version-dependent: global (before `check`) for
     // cargo-deny >= 0.20, on the `check` subcommand for < 0.20.
     let derived_config = derive_deny_config(&prepared.emitted_dir)?;
-    let minor = detect_cargo_deny_minor();
+    let cargo_deny = OsStr::new(CARGO_DENY);
+    let minor = detect_cargo_deny_minor(cargo_deny, TOOL_QUERY_LIMITS);
     let args = deny_args(minor, &manifest, derived_config.as_deref());
-    let mut command = Command::new("cargo-deny");
-    command.args(&args);
-    let output = command.output();
 
-    match output {
+    match run_cargo_deny(cargo_deny, &args, SUPPLY_CHAIN_SCAN_LIMITS) {
         Ok(out) if out.status.success() => verify_locked_dependency_hashes(prepared),
         Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = out.stderr.to_terminal();
             Err(reject(
                 Check::SupplyChain,
                 format!(
                     "cargo-deny reported a supply-chain violation over the package's Rust \
                      dependency graph:\n{}",
-                    stderr.trim()
+                    stderr.as_str().trim()
                 ),
             ))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(RunError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             // cargo-deny is not installed. This is a missing dev tool, not an
             // unsafe package: conflating the two would fail every audit run on a
             // machine without cargo-deny. The authoritative gate — the package
@@ -1480,7 +1536,10 @@ fn supply_chain(prepared: &Prepared) -> Result<(), CliError> {
             );
             verify_locked_dependency_hashes(prepared)
         }
-        Err(e) => Err(reject(
+        Err(RunError::Exceeded(refusal)) => Err(CliError::LocalLimitExceeded(refusal)),
+        Err(RunError::PipeDrainTimeout(stream)) => Err(CliError::ChildPipeHeld(stream)),
+        Err(RunError::PipeRead(stream, kind)) => Err(CliError::ChildPipeUnread(stream, kind)),
+        Err(RunError::Spawn(e) | RunError::Wait(e) | RunError::Measure(_, e)) => Err(reject(
             Check::SupplyChain,
             format!(
                 "could not run `cargo deny` ({e}) — install cargo-deny \
@@ -1623,11 +1682,14 @@ fn check_one_dep_advisories(
     }
 }
 
+/// The workspace's cargo-deny config file name.
+const DENY_CONFIG: &str = "deny.toml";
+
 /// Locate the workspace's `deny.toml` so the supply-chain check applies the same
 /// posture the workspace CI does. Walks up from the current directory, then from
 /// the resolved runtime tree's ancestry (the runtime lives inside the workspace,
-/// so `deny.toml` sits at the workspace root above it). Returns `None` when no
-/// `deny.toml` is found.
+/// so `deny.toml` sits at the workspace root above it). Returns the directory
+/// holding it, or `None` when no `deny.toml` is found.
 fn locate_workspace_deny_config() -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
@@ -1639,9 +1701,8 @@ fn locate_workspace_deny_config() -> Option<PathBuf> {
     for root in roots {
         let mut here: Option<&Path> = Some(root.as_path());
         while let Some(dir) = here {
-            let candidate = dir.join("deny.toml");
-            if candidate.is_file() {
-                return Some(candidate);
+            if dir.join(DENY_CONFIG).is_file() {
+                return Some(dir.to_path_buf());
             }
             here = dir.parent();
         }
@@ -1663,11 +1724,14 @@ fn locate_workspace_deny_config() -> Option<PathBuf> {
 /// # Errors
 /// [`CliError::Io`] on a read/write failure.
 fn derive_deny_config(emitted_dir: &Path) -> Result<Option<PathBuf>, CliError> {
-    let Some(source) = locate_workspace_deny_config() else {
+    let Some(workspace) = locate_workspace_deny_config() else {
         return Ok(None);
     };
-    let text =
-        crate::io_bounded::read_to_string_capped(&source, crate::io_bounded::SMALL_FILE_READ_CAP)?;
+    let text = crate::io_bounded::read_named_in(
+        &workspace,
+        &[DENY_CONFIG],
+        crate::io_bounded::SMALL_FILE_CAP,
+    )?;
 
     // Line-filter out the `[graph]` table (up to the next top-level `[section]`).
     // The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
@@ -2388,7 +2452,7 @@ mod tests {
         // Unterminated raw string — proc-macro2 cannot tokenise this.
         std::fs::write(&file, r#"fn f() { let x = r##"unterminated"#)
             .expect("write non-lexing fixture");
-        let result = super::first_hit(&file);
+        let result = super::first_hit(&dir, &file);
         assert!(
             result.is_err(),
             "a non-lexing _bindings.rs must return Err (refuse), not Ok(None)"
@@ -2403,7 +2467,7 @@ mod tests {
         let file = dir.join("x_bindings.rs");
         std::fs::write(&file, "pub fn add(a: i64, b: i64) -> i64 { a + b }")
             .expect("write clean fixture");
-        let result = super::first_hit(&file);
+        let result = super::first_hit(&dir, &file);
         assert!(result.is_ok(), "a clean file must return Ok(_)");
         assert!(
             result.unwrap().is_none(),
@@ -2418,12 +2482,59 @@ mod tests {
         let dir = make_test_dir("first-hit-panic");
         let file = dir.join("x_bindings.rs");
         std::fs::write(&file, "pub fn f() { panic!(\"oops\"); }").expect("write panic fixture");
-        let result = super::first_hit(&file);
+        let result = super::first_hit(&dir, &file);
         assert!(result.is_ok(), "a lexing file must return Ok(_)");
         assert!(
             result.unwrap().is_some(),
             "a panic-bearing file must return Ok(Some(_))"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `_bindings.rs` whose body is `n` nested `!` operators.
+    fn nested_not_bindings(n: usize) -> String {
+        format!("pub fn f() -> bool {{ {}true }}\n", "! ".repeat(n))
+    }
+
+    #[test]
+    fn first_hit_too_deep_source_is_a_provenance_refusal() {
+        // Past the scanner's depth ceiling the parse would overflow its stack;
+        // the audit must refuse with a typed reject, never crash or admit.
+        let dir = make_test_dir("first-hit-too-deep");
+        let file = dir.join("x_bindings.rs");
+        let over = panic_scan::NestDepth::CEILING.get().saturating_add(1);
+        std::fs::write(&file, nested_not_bindings(over)).expect("write deep fixture");
+        let result = super::first_hit(&dir, &file);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::PackageAudit(Rejection {
+                    check: Check::Provenance,
+                    message,
+                })) if message.contains("too deep")
+            ),
+            "{:?}",
+            result.as_ref().err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_hit_source_at_the_depth_ceiling_is_audited() {
+        // Each `!` adds one measure unit, so the base depth plus the remaining
+        // budget lands exactly on the ceiling.
+        let ceiling = panic_scan::NestDepth::CEILING.get();
+        let base = panic_scan::measure(&nested_not_bindings(0))
+            .expect("the base fixture lexes")
+            .depth;
+        let at = nested_not_bindings(ceiling.saturating_sub(base));
+        let measured = panic_scan::measure(&at).expect("the control lexes").depth;
+        assert_eq!(measured, ceiling, "the control must sit at the ceiling");
+        let dir = make_test_dir("first-hit-at-ceiling");
+        let file = dir.join("x_bindings.rs");
+        std::fs::write(&file, at).expect("write control fixture");
+        let result = super::first_hit(&dir, &file);
+        assert!(matches!(result, Ok(None)), "{:?}", result.as_ref().err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2509,6 +2620,31 @@ mod tests {
             "a library with no runnable entry discloses no control model"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A library whose entry module is a FIFO is refused, never disclosed as having no entry.
+    #[cfg(unix)]
+    #[test]
+    fn disclosure_refuses_a_fifo_entry_rather_than_disclosing_absence() {
+        let dir = make_test_dir("disclosure-fifo");
+        let src = dir.join("src");
+        assert!(std::fs::create_dir_all(&src).is_ok(), "create src/");
+        let made = std::process::Command::new("mkfifo")
+            .arg(src.join("MyLib.ipe"))
+            .status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "mkfifo creates the fixture"
+        );
+        let mut prepared = make_prepared(&dir);
+        prepared.manifest.exposed_modules = vec!["MyLib".to_owned()];
+        let result = derive_disclosure(&prepared, BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&result, Err(CliError::PackageAudit(r)) if r.check == Check::Capability),
+            "a FIFO entry must fail the audit closed: {:?}",
+            result.as_ref().map(|d| &d.control_model)
+        );
     }
 
     #[test]
@@ -2951,7 +3087,7 @@ mod tests {
 
     // ── Runtime resolution ───────────────────────────────────────────────────
 
-    /// `prepare` resolves the runtime through the SAME path `ipe build` uses — the
+    /// `prepare` resolves the runtime through the SAME path `ipe dev build` uses — the
     /// materialize-capable resolver — never a separate walk-up that cannot
     /// materialize. Under the default dependency model no vendored module tree is
     /// needed, so with `IPE_RUNTIME_DIR` unset the resolution succeeds with an
@@ -3040,6 +3176,124 @@ mod tests {
                 !args.iter().any(|a| a.to_str() == Some("--config")),
                 "minor {minor}: --config must not appear when config is None"
             );
+        }
+    }
+
+    /// A `cargo-deny` driven through a stub that runs a shell `body`.
+    #[cfg(unix)]
+    mod stubbed_cargo_deny {
+        use super::super::{
+            LocalRefusal, LocalSource, RunError, SUPPLY_CHAIN_SCAN_LIMITS, TOOL_QUERY_LIMITS,
+            detect_cargo_deny_minor, run_cargo_deny,
+        };
+        use crate::remote_ingest::{IngestLimit, LocalWall};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        /// A fresh scratch base for `tag` holding a stub `cargo-deny` that runs `body`.
+        fn stub(tag: &str, body: &str) -> PathBuf {
+            let base = ipe_test_temp::temp_root()
+                .join(format!("ipe-audit-deny-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).expect("scratch base");
+            let path = base.join("cargo-deny");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("stub executable");
+            path
+        }
+
+        /// Remove the scratch base holding the stub at `path`.
+        fn clean(path: &std::path::Path) {
+            if let Some(base) = path.parent() {
+                let _ = std::fs::remove_dir_all(base);
+            }
+        }
+
+        #[test]
+        fn a_scan_past_its_wall_is_refused() {
+            let deny = stub("scan-wall", "exec sleep 30");
+            let started = Instant::now();
+            let ran = run_cargo_deny(
+                deny.as_os_str(),
+                &[],
+                SUPPLY_CHAIN_SCAN_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert!(
+                matches!(
+                    &ran,
+                    Err(RunError::Exceeded(LocalRefusal {
+                        source: LocalSource::SupplyChainScan,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }))
+                ),
+                "a scan past its wall is a typed refusal, got {ran:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the refusal lands at the wall, not at the child's exit"
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_scan_flooding_stdout_is_refused() {
+            let deny = stub("scan-flood", "head -c 2097152 /dev/zero");
+            let ran = run_cargo_deny(deny.as_os_str(), &[], SUPPLY_CHAIN_SCAN_LIMITS);
+            assert!(
+                matches!(
+                    &ran,
+                    Err(RunError::Exceeded(LocalRefusal {
+                        source: LocalSource::SupplyChainScan,
+                        limit: IngestLimit::Bytes(_),
+                        ..
+                    }))
+                ),
+                "a scan past its stdout ceiling is a typed refusal, got {ran:?}"
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_version_probe_reads_the_minor() {
+            let deny = stub("probe-ok", "echo 'cargo-deny 0.14.3'");
+            assert_eq!(
+                detect_cargo_deny_minor(deny.as_os_str(), TOOL_QUERY_LIMITS),
+                14
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_version_probe_past_its_wall_falls_back_to_the_latest_placement() {
+            let deny = stub("probe-wall", "echo 'cargo-deny 0.14.3'\nexec sleep 30");
+            let started = Instant::now();
+            let minor = detect_cargo_deny_minor(
+                deny.as_os_str(),
+                TOOL_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert_eq!(minor, 20, "a probe stopped at its wall reads no version");
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the probe is stopped at its wall, not at the child's exit"
+            );
+            clean(&deny);
+        }
+
+        #[test]
+        fn a_version_probe_flooding_stdout_falls_back_to_the_latest_placement() {
+            let deny = stub(
+                "probe-flood",
+                "head -c 131072 /dev/zero | tr '\\0' ' '\necho 'cargo-deny 0.14.3'",
+            );
+            assert_eq!(
+                detect_cargo_deny_minor(deny.as_os_str(), TOOL_QUERY_LIMITS),
+                20,
+                "a probe past its stdout ceiling reads no version"
+            );
+            clean(&deny);
         }
     }
 }

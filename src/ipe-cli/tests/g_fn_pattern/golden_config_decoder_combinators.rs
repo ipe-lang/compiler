@@ -39,7 +39,7 @@ fn config_decoder_combinators_ipec_cargo_and_run_zero() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for config_decoder_combinators: {:?}",
+        "ipe dev build must succeed for config_decoder_combinators: {:?}",
         built.err()
     );
 

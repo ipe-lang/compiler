@@ -107,9 +107,9 @@ public-API change, then a `bump\t<compatibility>\t<required>\t<floor>` verdict
 row. `--json` prints
 `{"compatibility": …, "required": …, "floor": …, "changes": [<detail>, …]}`.
 
-## `ipe run` passes the program through
+## `ipe dev run` passes the program through
 
-`ipe run` compiles your program and then runs it. **Your program's stdout is
+`ipe dev run` compiles your program and then runs it. **Your program's stdout is
 passed through untouched** — no gutter, no colour, no wrapping — so a program
 that emits its own machine output stays pipeable. `ipe`'s own messages (compile
 progress, errors) go to **stderr**, out of the way of that stdout.

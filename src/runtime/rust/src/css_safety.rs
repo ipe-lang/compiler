@@ -961,13 +961,59 @@ pub(crate) fn strip_style_close(s: &str) -> String {
     }
 }
 
-/// Split any ASCII-case-insensitive `</script` breakout in a `<script>` body so
-/// it cannot terminate the enclosing element early. The browser's HTML parser
-/// ends a script element only at a literal `</script` byte run; inserting a `\`
-/// after the `<` (`<\/script`) keeps the JavaScript semantically identical (a
-/// redundant escape inside a string/regex, inert outside one) while removing the
-/// exact byte run the parser scans for. Non-`</script` text is untouched, so
-/// ordinary script bodies pass through unchanged.
+/// Neutralise a `<style>` body so it can open or close no markup in any context.
+///
+/// A `<style>` is raw text only while it sits in ordinary HTML. Inside an
+/// `<svg>` or `<math>` subtree its body is parsed as markup, and inside a
+/// `<textarea>`, `<title>`, `<noscript>`, `<iframe>`, `<xmp>`, `<noembed>` or
+/// `<noframes>` ancestor the ancestor's own close tag ends it. Stripping
+/// `</style` alone therefore leaves `x{}</textarea><img onerror=...>` able to
+/// break out. After `strip_style_close`, every `<` that the HTML tokenizer would
+/// read as the start of a tag, end tag, comment or declaration (a `<` followed
+/// by an ASCII letter, `/`, `!` or `?`) gets a space inserted after it, which
+/// the tokenizer reads as plain text. CSS reads the space as whitespace, so a
+/// range media feature such as `(400px<width)` keeps its meaning. Inside a CSS
+/// string, a `url(...)` or a comment the space is kept and a `</style` run is
+/// gone, so `url("data:image/svg+xml,<svg ...>")` reaches CSS as `< svg`: a
+/// divergence `Ipe.Html.styleNode` documents, as security outranks
+/// byte-for-byte output.
+///
+/// Total and a fixpoint: no output `<` is followed by a tag-opening byte.
+pub(crate) fn neutralise_style_body(css: &str) -> String {
+    let stripped = strip_style_close(css);
+    let mut out = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '<'
+            && chars
+                .peek()
+                .is_some_and(|&n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'))
+        {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// Split every way a `<script>` body could leave script-data state early.
+///
+/// The browser's HTML parser ends a script element at a literal
+/// ASCII-case-insensitive `</script` byte run, and a `<!--` followed later by
+/// `<script` puts it in the double-escaped state, where the renderer's own
+/// `</script>` no longer closes the element. `</script` becomes `<\/script` and
+/// `<!--` becomes `<!--`: each spells the same characters as a JavaScript
+/// or JSON escape, and neither holds a byte run the parser scans for. Inside a
+/// JavaScript string, the cooked value of a template literal, a regex (with or
+/// without the `u` or `v` flag) or a JSON string the escape decodes to the
+/// original character, so the program and the data are unchanged; only a
+/// template literal's raw value (`String.raw`) sees the escape spelled out. A
+/// `<!--` in code position (a legacy HTML-like comment, or `a<!--b`) becomes a
+/// `SyntaxError`, which fails closed with no markup. Other text is untouched,
+/// so ordinary script bodies pass through unchanged.
+///
+/// Total and a fixpoint: every `<` it writes specially is followed by `\`, so
+/// its output holds neither byte run and a second pass changes nothing.
 ///
 /// Sibling of `strip_style_close`: both neutralise a raw-text element's own
 /// close tag at the sink so no attacker-influenced body can break out. `<script>`
@@ -978,17 +1024,28 @@ pub(crate) fn strip_style_close(s: &str) -> String {
 /// Total (never panics; only ASCII single-byte characters are ever compared or
 /// emitted specially, and every multi-byte `char` is copied whole).
 pub(crate) fn neutralise_script_close(body: &str) -> String {
-    const NEEDLE: &[u8] = b"</script";
+    /// Each byte run that leaves script-data state: the run, how many leading
+    /// bytes the split form replaces, and that split form. The remaining bytes
+    /// of the run are copied in their original case so a data string keeps its
+    /// value.
+    const SPLITS: [(&[u8], usize, &str); 2] =
+        [(b"</script", 2, "<\\/"), (b"<!--", 4, "<\\u0021--")];
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i < bytes.len() {
-        let matches_here = bytes
-            .get(i..i.saturating_add(NEEDLE.len()))
-            .is_some_and(|w| w.eq_ignore_ascii_case(NEEDLE));
-        if matches_here {
-            out.push_str("<\\/script");
-            i = i.saturating_add(NEEDLE.len());
+        let split_here = SPLITS.iter().find(|(needle, _, _)| {
+            bytes
+                .get(i..i.saturating_add(needle.len()))
+                .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+        });
+        if let Some((needle, keep, split)) = split_here {
+            out.push_str(split);
+            let end = i.saturating_add(needle.len());
+            if let Some(rest) = body.get(i.saturating_add(*keep)..end) {
+                out.push_str(rest);
+            }
+            i = end;
         } else {
             // A multi-byte UTF-8 char never starts with `<`, so the needle branch
             // only fires on single-byte ASCII; here we copy the next whole char
@@ -1009,6 +1066,53 @@ pub(crate) fn neutralise_script_close(body: &str) -> String {
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+
+    /// A `<style>` body cannot end an RCDATA/RAWTEXT ancestor or open a tag
+    /// inside foreign content: every tag-opening `<` gains a space, and the
+    /// result is a fixpoint.
+    #[test]
+    fn neutralise_style_body_opens_and_closes_no_markup() {
+        for (body, banned) in [
+            ("x{}</textarea><img src=x onerror=alert(1)>", "</textarea"),
+            ("x{}</title><script>alert(1)</script>", "<script"),
+            ("x{}</noscript><img src=x onerror=alert(1)>", "</noscript"),
+            ("x{}<img src=x onerror=alert(1)>", "<img"),
+            ("x{}</svg><img src=x onerror=alert(1)>", "</svg"),
+            ("x{}<!--", "<!"),
+            ("x{}<?php", "<?"),
+            ("x{}</StYlE ><script>", "<script"),
+        ] {
+            let out = neutralise_style_body(body);
+            assert!(
+                !out.to_ascii_lowercase().contains(banned),
+                "{body:?} -> {out:?}"
+            );
+            let opens_markup = out.as_bytes().windows(2).any(|w| {
+                w.first() == Some(&b'<')
+                    && w.get(1)
+                        .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, b'/' | b'!' | b'?'))
+            });
+            assert!(!opens_markup, "{body:?} -> {out:?}");
+            assert_eq!(neutralise_style_body(&out), out, "not a fixpoint: {body:?}");
+        }
+    }
+
+    /// Ordinary CSS, a spaced comparison and a range media feature keep their
+    /// meaning: a `<` before a digit or a space is untouched, and a `<` before a
+    /// name only gains whitespace CSS ignores.
+    #[test]
+    fn neutralise_style_body_keeps_benign_css() {
+        let plain = ".card { color: red; padding: 8px }\n@media (width < 40em) { a { b: c } }";
+        assert_eq!(neutralise_style_body(plain), plain);
+        assert_eq!(
+            neutralise_style_body("@media (width<600px) {}"),
+            "@media (width<600px) {}"
+        );
+        assert_eq!(
+            neutralise_style_body("@media (400px<width) {}"),
+            "@media (400px< width) {}"
+        );
+    }
 
     #[test]
     fn value_rejects_expression_and_scheme_sinks() {
@@ -1355,7 +1459,7 @@ mod tests {
             neutralise_script_close("a</script><img src=x onerror=alert(1)>"),
             "a<\\/script><img src=x onerror=alert(1)>"
         );
-        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/script >");
+        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/SCRIPT >");
         let out = neutralise_script_close("x</script>y</ScRiPt>z");
         assert!(!out.to_ascii_lowercase().contains("</script"));
         // Non-breakout text (incl. multibyte UTF-8) is untouched.
@@ -1369,6 +1473,42 @@ mod tests {
         // no-op — the capability-gated path keeps its exact bytes.
         let once = neutralise_script_close("x</script>y");
         assert_eq!(neutralise_script_close(&once), once);
+    }
+
+    /// A `<!--` in a script body is split like a `</script`, and the split
+    /// output holds neither byte run on any later pass.
+    #[test]
+    fn neutralise_script_close_splits_comment_open() {
+        assert_eq!(
+            neutralise_script_close("a<!--<script>"),
+            "a<\\u0021--<script>"
+        );
+        for body in [
+            "<!--<script>",
+            "<<!--",
+            "<!<!--",
+            "</scr</script>ipt>",
+            "<!---->",
+            "</SCRIPT<!--",
+        ] {
+            let once = neutralise_script_close(body);
+            assert!(!once.contains("<!--"), "{once}");
+            assert!(!once.to_ascii_lowercase().contains("</script"), "{once}");
+            assert_eq!(neutralise_script_close(&once), once);
+        }
+    }
+
+    /// A JSON data block (`application/json`, an import map) keeps its value
+    /// after both splits: each one is a valid JSON string escape of the
+    /// characters it replaces.
+    #[test]
+    fn neutralise_script_close_keeps_json_strings_valid() {
+        let body = r#"{"a":"<!--<script>","b":"</SCRIPT>"}"#;
+        let out = neutralise_script_close(body);
+        assert!(!out.contains("<!--"), "{out}");
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&out);
+        let expected = serde_json::json!({"a": "<!--<script>", "b": "</SCRIPT>"});
+        assert_eq!(parsed.ok(), Some(expected), "{out}");
     }
 
     /// Legacy script-execution CSS properties are blocked in both the value

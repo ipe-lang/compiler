@@ -7,7 +7,7 @@ downstream consumer may import.
 Build it:
 
 ```sh
-ipe build
+ipe dev build
 ```
 
 Add more public modules under `src/` and list each in both the module's own

@@ -563,3 +563,104 @@ fn sql_param_wildcard_builds_at_two_types() {
     );
     assert_accepted("wildcard_sql_param_two_types", &src, "ok\n");
 }
+
+/// A wildcard parameter in the `Db.findProjection` bind list stays an
+/// `Into<SqlParam>` generic, so one helper binds an `Int` and a `String` and the
+/// emitted crate builds. The statement itself fails at run time (no such
+/// table); `Task.onError` absorbs it, so the program prints `ok`.
+#[test]
+fn find_projection_bind_wildcard_builds_at_two_types() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         import Ipe.Db\n\
+         import Ipe.Db.Sql as Sql\n\
+         import Ipe.Task\n\
+         projectOne : Db -> any -> Task Error ()\n\
+         projectOne conn v =\n\
+         \x20   Task.onError\n\
+         \x20       (\\_ -> Task.succeed ())\n\
+         \x20       (Task.map\n\
+         \x20           (\\_ -> ())\n\
+         \x20           (Db.findProjection conn \"t\" \"a0\" \"u\" \"a1\" (Sql.eq (Sql.column \"a0.id\") (Sql.int 1)) [] [ v ])\n\
+         \x20       )\n\
+         main =\n\
+         \x20   Task.andThen\n\
+         \x20       (\\conn ->\n\
+         \x20           do\n\
+         \x20               projectOne conn 1\n\
+         \x20               projectOne conn \"s\"\n\
+         \x20               Io.println \"ok\"\n\
+         \x20       )\n\
+         \x20       (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+    );
+    assert_accepted("find_projection_wildcard_two_types", &src, "ok\n");
+}
+
+/// `-9223372036854775808` (`i64::MIN`) is a literal in every position it can
+/// occur — a let value, a list and a tuple element, a top-level and a `Just`
+/// payload `case` arm, under unary minus (which wraps back to `i64::MIN`), and
+/// as the left operand of `+` — and a negative literal on the left of `+`
+/// (`-1 + x`) keeps its sign. The program type-checks, its crate builds, and
+/// it prints the arithmetic's values.
+#[test]
+fn int_min_literal_builds() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         import Ipe.List\n\
+         import Ipe.String\n\n\
+         smallest : Int\n\
+         smallest =\n\
+         \x20   -9223372036854775808\n\n\
+         classify : Int -> String\n\
+         classify n =\n\
+         \x20   case n of\n\
+         \x20       -9223372036854775808 ->\n\
+         \x20           \"min\"\n\n\
+         \x20       _ ->\n\
+         \x20           \"other\"\n\n\
+         classifyMaybe : Maybe Int -> String\n\
+         classifyMaybe m =\n\
+         \x20   case m of\n\
+         \x20       Just (-9223372036854775808) ->\n\
+         \x20           \"just min\"\n\n\
+         \x20       Just _ ->\n\
+         \x20           \"other\"\n\n\
+         \x20       Nothing ->\n\
+         \x20           \"nothing\"\n\n\
+         pairFirst : ( Int, Int ) -> Int\n\
+         pairFirst pair =\n\
+         \x20   case pair of\n\
+         \x20       ( a, _ ) ->\n\
+         \x20           a\n\n\
+         shift : Int -> Int\n\
+         shift x =\n\
+         \x20   -1 + x\n\n\
+         main =\n\
+         \x20   Io.println\n\
+         \x20       (String.join \"\\n\"\n\
+         \x20           [ String.fromInt smallest\n\
+         \x20           , String.join \",\" (List.map String.fromInt [ -9223372036854775808, 0 ])\n\
+         \x20           , String.fromInt (pairFirst ( -9223372036854775808, 1 ))\n\
+         \x20           , classify smallest\n\
+         \x20           , classifyMaybe (Just (-9223372036854775808))\n\
+         \x20           , String.fromInt (-smallest)\n\
+         \x20           , String.fromInt ((-9223372036854775808) + 1)\n\
+         \x20           , String.fromInt (shift smallest)\n\
+         \x20           , String.fromInt (shift 5)\n\
+         \x20           ]\n\
+         \x20       )\n"
+    );
+    assert_accepted(
+        "int_min_literal",
+        &src,
+        "-9223372036854775808\n\
+         -9223372036854775808,0\n\
+         -9223372036854775808\n\
+         min\n\
+         just min\n\
+         -9223372036854775808\n\
+         -9223372036854775807\n\
+         9223372036854775807\n\
+         4\n",
+    );
+}

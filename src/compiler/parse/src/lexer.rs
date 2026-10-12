@@ -10,10 +10,45 @@
 //! yields a typed, coded [`ParseError`] — [`ParseError::UnknownChar`] for an
 //! unrecognised byte, [`ParseError::StrayDot`] for a lone `.`,
 //! [`ParseError::NumberJoinedToName`] for `123abc`, and
-//! [`ParseError::IntLiteralOutOfRange`] for an `i64` overflow.
+//! [`ParseError::IntLiteralOutOfRange`] for a magnitude past `2^63` (the
+//! parser refuses `2^63` itself unless a unary minus makes it `i64::MIN`).
 
 use ipe_diagnostics::{DResult, Diagnostic, ParseError, Span};
 use ipe_syntax::ESCAPES;
+
+/// Unsigned magnitude of an integer literal as lexed, bounded to `0 ..= 2^63`.
+///
+/// The sign is not yet known at lex time, so the bound admits `2^63`, the
+/// magnitude of `i64::MIN`. The parser turns a magnitude into an `i64` only
+/// through [`IntMagnitude::positive`] (partial: `None` exactly for `2^63`) or
+/// [`IntMagnitude::negated`] (total). The field is private, so
+/// [`IntMagnitude::from_digits`] is the only constructor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntMagnitude(u64);
+
+impl IntMagnitude {
+    /// The largest magnitude a literal may spell: `2^63`, which is `i64::MIN` negated.
+    const LIMIT: u64 = i64::MIN.unsigned_abs();
+
+    /// The magnitude ASCII `digits` spell, or `None` when it exceeds `2^63`.
+    pub fn from_digits(digits: &str) -> Option<Self> {
+        let magnitude = digits.parse::<u64>().ok()?;
+        (magnitude <= Self::LIMIT).then_some(Self(magnitude))
+    }
+
+    /// The literal without a sign; `None` exactly for `2^63`.
+    pub fn positive(self) -> Option<i64> {
+        i64::try_from(self.0).ok()
+    }
+
+    /// The literal under unary minus.
+    ///
+    /// Total: the magnitude is at most `2^63`, so `0 - magnitude` never passes
+    /// `i64::MIN` and the saturation point is reached only by `2^63` itself.
+    pub const fn negated(self) -> i64 {
+        0i64.saturating_sub_unsigned(self.0)
+    }
+}
 
 /// A lexical token kind.
 ///
@@ -113,8 +148,8 @@ pub enum Tok {
     // Literals / names.
     /// A (possibly dotted) identifier, e.g. `count`, `Msg`, `String.fromInt`.
     Ident(String),
-    /// An integer literal.
-    Int(i64),
+    /// An integer literal's unsigned magnitude; the parser applies the sign.
+    Int(IntMagnitude),
     /// A floating-point literal `1.5`, `3.0`, `1.5e3`, `2e-2`. The carried
     /// [`f64`] is the parsed value; the lexer only builds well-formed Elm-style
     /// float lexemes (a leading digit is required, so `.5` is not a float), so
@@ -549,13 +584,15 @@ fn lex_number(lx: &mut Lexer, lo: u32) -> DResult<Tok> {
         }
         Ok(Tok::Float(f))
     } else {
-        // The integer part only pushed ASCII digits, so the sole parse failure
-        // is an `i64` overflow — never an empty or malformed literal.
-        let n = text.parse::<i64>().map_err(|_| Diagnostic::Parse {
-            span: Span::new(lo, hi),
-            msg: ParseError::IntLiteralOutOfRange,
-        })?;
-        Ok(Tok::Int(n))
+        // The integer part only pushed ASCII digits, so the sole refusal is a
+        // magnitude past `2^63` — never an empty or malformed literal.
+        let Some(magnitude) = IntMagnitude::from_digits(text) else {
+            return Err(Diagnostic::Parse {
+                span: Span::new(lo, hi),
+                msg: ParseError::IntLiteralOutOfRange,
+            });
+        };
+        Ok(Tok::Int(magnitude))
     }
 }
 

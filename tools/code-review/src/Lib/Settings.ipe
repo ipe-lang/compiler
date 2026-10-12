@@ -1,13 +1,18 @@
-module Lib.Settings exposing (DbLocation, IndexSettings, dbFileName, encodeFilePath, indexReadUrl, indexSettings, indexWriteUrl, ipeTag, openFailure, parseDbLocation, reviewDb, reviewUrl)
+module Lib.Settings exposing (AppSettings, DbLocation, DbRefusal(..), DbRole(..), IndexSettings, brokenLog, dbFileName, dbRefusalOf, encodeFilePath, indexReadUrl, indexWriteUrl, ipeTag, openFailure, parseDbLocation, parseIndexSettings, parseReviewDb, reviewUrl)
 
+import Ipe.Db as Db exposing (DbFailure(..))
 import Ipe.Encoding as Encoding
 import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.List as List
+import Ipe.Maybe as Maybe
 import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
-import Ipe.System as System
 import Ipe.Task as Task
+import Lib.Epoch exposing (Epoch)
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
+import Lib.ReviewKey exposing (ReviewKey)
 import Lib.SafeText as SafeText exposing (SafeText)
 
 
@@ -28,6 +33,20 @@ type alias IndexSettings =
     }
 
 
+-- Every location the app serves from: the index and the review database,
+-- each parsed once at startup, the key that signs and verifies the review
+-- log (or `ReadOnly` when none is set), read once at startup, and the epoch
+-- of the process serving them, minted once at startup. A request reads this
+-- value and never the environment. The key lives here and nowhere else: it
+-- never enters the model, a session, a view or a log line.
+type alias AppSettings =
+    { index : IndexSettings
+    , review : DbLocation
+    , key : ReviewKey
+    , epoch : Epoch
+    }
+
+
 -- The repo tag `IPE_INDEX_ROOT` binds: `ipe`, the tag of ipe-index's default
 -- `--repo ipe:.`. It is the only bound tag, so a unit stored under any other
 -- tag is refused as `UnknownTag` rather than read from this root.
@@ -36,30 +55,29 @@ ipeTag =
     RepoPath.parseTag "ipe"
 
 
--- The one boundary that turns the index environment into typed values. It
--- reads the environment on every call (the embedded app has no flags, and the
--- tests re-point the variables between cases), and `main` runs it once at
--- startup so a bad value stops the server before it listens.
-indexSettings : Task.Task Error IndexSettings
-indexSettings =
+-- The one boundary that turns the index environment's text into typed values.
+-- `main` reads `IPE_INDEX_DB` and `IPE_INDEX_ROOT` once at startup and parses
+-- them here, so a bad value stops the server before it listens. The value it
+-- returns is the one every request reads: no request reads the environment or
+-- checks the root again, so a request never serves a tree other than the one
+-- startup validated.
+parseIndexSettings : String -> String -> Task.Task Error IndexSettings
+parseIndexSettings rawDb rawRoot =
     do
-        rawDb <- System.getenv "IPE_INDEX_DB"
-        rawRoot <- System.getenv "IPE_INDEX_ROOT"
         db <- parseDbLocation "IPE_INDEX_DB" rawDb
         root <- RepoPath.parseRoot rawRoot
-        roots <-
-            ipeTag
-                |> Result.andThen (\tag -> RepoPath.rootMap [ ( tag, root ) ])
-                |> Result.mapError RepoPath.toError
-                |> Task.fromResult
+        roots <- ipeTag
+            |> Result.andThen (\tag -> RepoPath.rootMap [ ( tag, root ) ])
+            |> Result.mapError RepoPath.toError
+            |> Task.fromResult
         Task.succeed { db = db, roots = roots }
 
 
--- The review database location from `IPE_REVIEW_DB`, `review.db` in the
--- working directory when unset.
-reviewDb : Task.Task Error DbLocation
-reviewDb =
-    parseDbLocation "IPE_REVIEW_DB" (System.getenvOr "IPE_REVIEW_DB" "review.db")
+-- The review database location from the raw `IPE_REVIEW_DB` value `main`
+-- reads once at startup (`review.db` in the working directory when unset).
+parseReviewDb : String -> Task.Task Error DbLocation
+parseReviewDb raw =
+    parseDbLocation "IPE_REVIEW_DB" raw
 
 
 -- A file path is refused when blank or when it carries `?`, `#` or `%` (each
@@ -146,28 +164,252 @@ dbFix =
     "set it to a SQLite file path or a `sqlite://` URL"
 
 
--- A parsed location that failed to open or to pass its startup probe: the
--- variable, the resolved file, the cause and one fix. A parsed location is a
--- plain absolute file path (`parseDbLocation` refuses a URL with a host,
--- credentials or a query), so naming it leaks no secret; it is still
--- rendered, since it came from the environment. `var` and `fix` are this
--- tool's own text.
-openFailure : String -> SafeText -> DbLocation -> Error -> Error
-openFailure var fix loc e =
-    Error.withMessage
+-- The database a startup refusal is about, which names its variable and
+-- picks the fix that fits it.
+type DbRole
+    = IndexDb
+    | ReviewDb
+
+
+-- Why a configured database cannot be used, decided once from the typed
+-- `DbFailure` its open or startup probe failed with. The failure's message is
+-- never read: only the cause it carries decides the case, and no driver text
+-- or code is ever shown.
+type DbRefusal
+    = NoDatabaseFile
+    | NotSqliteFile
+    | Locked
+    | NotPermitted
+    | NotAFile
+    | MissingSchema
+    | Unusable
+
+
+-- The refusal for a failed open or probe of `loc`: whether a file is there
+-- and the `DbFailure` the error carries decide the case. An error that
+-- carries no `DbFailure` is `Unusable`, never a guess at a narrower case.
+dbRefusalOf : Bool -> Error -> DbRefusal
+dbRefusalOf present e =
+    case e of
+        Error _ info ->
+            case info.details of
+                Just (Database failure) ->
+                    refusalOfFailure present failure
+
+                Just (Custom _) ->
+                    absentOr present Unusable
+
+                Just (FfiPanic _) ->
+                    absentOr present Unusable
+
+                Just (HttpStatus _) ->
+                    absentOr present Unusable
+
+                Just (JsonDecode _) ->
+                    absentOr present Unusable
+
+                Just (TypeMismatch _) ->
+                    absentOr present Unusable
+
+                Nothing ->
+                    absentOr present Unusable
+
+
+-- Every `DbFailure` has its own row, so a cause the driver layer adds is a
+-- compile error here until it is given a refusal. A cause this tool names no
+-- narrower case for is `Unusable`.
+refusalOfFailure : Bool -> DbFailure -> DbRefusal
+refusalOfFailure present failure =
+    case failure of
+        CannotOpen ->
+            absentOr present NotPermitted
+
+        NotADatabase ->
+            NotSqliteFile
+
+        Busy ->
+            Locked
+
+        AccessDenied ->
+            NotPermitted
+
+        ReadOnlyDatabase ->
+            NotPermitted
+
+        InvalidStatement ->
+            MissingSchema
+
+        UniqueViolation ->
+            absentOr present Unusable
+
+        ForeignKeyViolation ->
+            absentOr present Unusable
+
+        NotNullViolation ->
+            absentOr present Unusable
+
+        CheckViolation ->
+            absentOr present Unusable
+
+        TriggerRaised ->
+            absentOr present Unusable
+
+        OtherConstraint ->
+            absentOr present Unusable
+
+        Unreachable ->
+            absentOr present Unusable
+
+        OtherFailure ->
+            absentOr present Unusable
+
+
+-- `NoDatabaseFile` when nothing is at the location, `fallback` when a file
+-- is there.
+absentOr : Bool -> DbRefusal -> DbRefusal
+absentOr present fallback =
+    if present then
+        fallback
+
+    else
+        NoDatabaseFile
+
+
+-- A parsed location that failed to open or to pass its startup probe,
+-- refused as one `DbRefusal`: the variable, the resolved file, the problem
+-- and one fix, never the driver's own text or code. A parsed location is a
+-- plain file path (`parseDbLocation` refuses a URL with a host, credentials
+-- or a query), so naming it leaks no secret; it is still quoted, since it
+-- came from the environment. A directory at the location is `NotAFile`
+-- whatever the driver reported, since no access grant makes it a database.
+openFailure : DbRole -> DbLocation -> Error -> Task.Task Error a
+openFailure role loc e =
+    locationRefusal (locationFile loc) e
+        |> Task.andThen (\refusal -> Task.fail (useRefusal role loc (refusalProblem role refusal)))
+
+
+locationRefusal : Path -> Error -> Task.Task Error DbRefusal
+locationRefusal file e =
+    File.isDir file
+        |> Task.onError (\_ -> Task.succeed False)
+        |> Task.andThen
+            (\directory ->
+                if directory then
+                    Task.succeed NotAFile
+
+                else
+                    File.exists file
+                        |> Task.onError (\_ -> Task.succeed True)
+                        |> Task.map (\present -> dbRefusalOf present e)
+            )
+
+
+-- A migrated review file that opens and reads but whose log is broken: an
+-- append-only trigger gone, or its head row missing. No change of access
+-- repairs it, so the fix is a sound copy or a fresh log.
+brokenLog : DbLocation -> String -> Error
+brokenLog loc problem =
+    useRefusal ReviewDb loc ( problem, "restore it from a copy whose log is intact, or point IPE_REVIEW_DB at a new file to start a fresh log" )
+
+
+useRefusal : DbRole -> DbLocation -> ( String, String ) -> Error
+useRefusal role loc ( problem, fix ) =
+    Error.invalidInput
         (SafeText.toString
             (SafeText.concat
-                [ SafeText.literal var
-                , SafeText.literal ": cannot open "
+                [ SafeText.literal (roleVar role)
+                , SafeText.literal ": cannot use "
                 , SafeText.quoted (locationPath loc)
-                , SafeText.literal " ("
-                , SafeText.render (Error.message e)
-                , SafeText.literal "); "
-                , fix
+                , SafeText.literal ": "
+                , SafeText.literal problem
+                , SafeText.literal "; "
+                , SafeText.literal fix
                 ]
             )
         )
-        e
+
+
+roleVar : DbRole -> String
+roleVar role =
+    case role of
+        IndexDb ->
+            "IPE_INDEX_DB"
+
+        ReviewDb ->
+            "IPE_REVIEW_DB"
+
+
+-- Each refusal's problem and its one fix, per database.
+refusalProblem : DbRole -> DbRefusal -> ( String, String )
+refusalProblem role refusal =
+    case role of
+        IndexDb ->
+            case refusal of
+                NoDatabaseFile ->
+                    ( "no file is there", indexBuildFix )
+
+                NotSqliteFile ->
+                    ( "it is not a SQLite database, or it is damaged", indexBuildFix )
+
+                Locked ->
+                    ( "another process holds a lock on it", "let that process, such as an `ipe-index index` run, finish and start again" )
+
+                NotPermitted ->
+                    ( "this process may not open it", "grant read access to the file and its directory, or point IPE_INDEX_DB at a readable copy" )
+
+                NotAFile ->
+                    ( "it is a directory, not a database file", "point IPE_INDEX_DB at the index file itself, not the directory holding it" )
+
+                MissingSchema ->
+                    ( "it lacks a table, view or column this tool reads", indexBuildFix )
+
+                Unusable ->
+                    ( "it could not be opened or read", indexBuildFix )
+
+        ReviewDb ->
+            case refusal of
+                NoDatabaseFile ->
+                    ( "it cannot be created there", reviewWritableFix )
+
+                NotSqliteFile ->
+                    ( "it is not a SQLite database, or it is damaged", reviewLogFix )
+
+                Locked ->
+                    ( "another process holds a lock on it", "stop the other code-review server using it and start again" )
+
+                NotPermitted ->
+                    ( "this process may not write it", reviewWritableFix )
+
+                NotAFile ->
+                    ( "it is a directory, not a database file", "point IPE_REVIEW_DB at a file path, such as a `review.db` inside that directory" )
+
+                MissingSchema ->
+                    ( "its tables are not this tool's review log", reviewLogFix )
+
+                Unusable ->
+                    ( "it could not be opened, migrated or read", reviewWritableFix )
+
+
+indexBuildFix : String
+indexBuildFix =
+    "build it from the repo root with `tools/scripts/ipe-index index`, or point IPE_INDEX_DB at an existing index"
+
+
+reviewWritableFix : String
+reviewWritableFix =
+    "create its directory and grant this process write access, or point IPE_REVIEW_DB at a writable location"
+
+
+reviewLogFix : String
+reviewLogFix =
+    "point IPE_REVIEW_DB at the review database this tool created, or at a new file to start a fresh log"
+
+
+locationFile : DbLocation -> Path
+locationFile loc =
+    case loc of
+        DbFile path ->
+            path
 
 
 locationPath : DbLocation -> String

@@ -11,6 +11,7 @@ pub(crate) fn main_show_result(m: IpeMaybe<IpeMoneyCurrency>) -> String {
         IpeMaybe::Nothing => "Nothing".to_string(),
     }
 }
+
 pub(crate) fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     io_println(format!(

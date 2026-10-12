@@ -2,7 +2,7 @@
 //! itself a function (`Decoder (a -> b)` curry chain) exercises the OWNED /
 //! linear decoder-payload path.
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build`. The
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build`. The
 //! backend's `IrType::Fun` renderer stamped `Box<dyn Fn(..) -> R + Send + Sync>`
 //! on the decoder payload, but the runtime represents a `Decoder (a -> b)`
 //! payload as a Send-ONLY curry chain `Box<dyn FnOnce(a) -> b + Send>` (exactly
@@ -56,7 +56,7 @@ fn i195_ipec_accepts_and_renders_send_only_fnonce_payload() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for json_decode_pipeline: {:?}",
+        "ipe dev build must succeed for json_decode_pipeline: {:?}",
         built.err()
     );
 
@@ -115,7 +115,7 @@ fn i195_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for json_decode_pipeline: {:?}",
+        "ipe dev build must succeed for json_decode_pipeline: {:?}",
         built.err()
     );
 

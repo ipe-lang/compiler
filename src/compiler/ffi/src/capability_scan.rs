@@ -16,7 +16,7 @@
 //! answers one load-bearing yes/no: does this wrapper reach ANY
 //! capability whose effects Ipê cannot yet contain at run? Because there is no
 //! runtime sandbox around the emitted app in this release (the wrapper's Rust
-//! runs with the user's full ambient authority at `ipe run`), a wrapper that
+//! runs with the user's full ambient authority at `ipe dev run`), a wrapper that
 //! reaches such a capability CANNOT be soundly admitted — the install refuses it
 //! rather than admit an unenforced capability. See [`ScanOutcome`].
 //!
@@ -839,7 +839,7 @@ impl std::fmt::Display for RefuseReason {
             Self::DeclaredUnenforceable { cap } => write!(
                 f,
                 "declares `{}`, which has no runtime enforcement in this release — a wrapper's \
-                 Rust runs unsandboxed at `ipe run`, so this capability cannot be contained yet",
+                 Rust runs unsandboxed at `ipe dev run`, so this capability cannot be contained yet",
                 cap.as_str()
             ),
             Self::InferredUnenforceable { cap } => write!(
@@ -1350,7 +1350,7 @@ mod tests {
     #[test]
     fn a_declared_network_wrapper_is_refused_no_runtime_jail() {
         // Even an HONESTLY declared network wrapper cannot install: there is no
-        // runtime sandbox to contain the socket at `ipe run`.
+        // runtime sandbox to contain the socket at `ipe dev run`.
         let scan = scan_source(
             "lib.rs",
             "pub fn f() { std::net::TcpStream::connect(\"x\"); }",

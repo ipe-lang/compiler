@@ -3,9 +3,10 @@
 //! reader, as a second layer beneath the clippy `disallowed-methods` deny.
 //!
 //! An unset, empty, or relative `HOME` resolves against whatever the current
-//! working directory is, so every home read goes through one validated accessor
-//! that yields an absolute path or nothing: `ipe_sandbox::home::home_dir` on the
-//! compiler side and `system::home_dir` in the standalone runtime. Every other
+//! working directory is, so every home read goes through one parsing accessor
+//! that yields a `HomeDir` or the refusal its value earns:
+//! `ipe_sandbox::home::home_dir` on the compiler side and `system::home_dir` in
+//! the standalone runtime. Every other
 //! compiler-side variable is read through `ipe_env`, which refuses each home
 //! name however it is spelled or computed, and a jail's granted variables are
 //! forwarded verbatim by the sandbox-private `ipe_sandbox::host_env::granted`,
@@ -57,30 +58,36 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// Pinned per site, not per file: a new allow in a listed file changes its
 /// count and fails the scan like an allow anywhere else. The sites are the
 /// [`ENV_ALLOW_FILES`] readers (`ipe_env`'s `var`/`var_os`/`vars_os`, the
-/// sandbox home reader, the jail passthrough); the dev-only temp-root test
-/// reader; and in the runtime crate, which has its own `clippy.toml`, the build
+/// sandbox home reader, the jail passthrough); the sandbox's thread-spawn ban
+/// proofs; the database crate's ambient-input ban proofs;
+/// the dev-only temp-root test reader; and in the runtime crate, which has its own `clippy.toml`, the build
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
-/// crate-private accessor, the lenient-decoder ban proofs, and the audited
-/// lossy-UTF-8 sites that render bytes already refused or never parsed.
+/// crate-private accessor, the ban proofs, the one blocking-pool start, the one
+/// process exit, the one app serve site and its test fixture, the non-Unicode
+/// environ probe test, and the
+/// audited lossy-UTF-8 sites that render bytes already refused or never parsed.
 const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/env/src/lib.rs", 3),
     ("src/compiler/sandbox/src/home.rs", 1),
     ("src/compiler/sandbox/src/host_env.rs", 1),
+    ("src/compiler/sandbox/src/clippy_paths_resolve.rs", 2),
+    ("src/compiler/db/src/clippy_paths_resolve.rs", 40),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
-    ("src/runtime/rust/src/clippy_paths_resolve.rs", 10),
+    ("src/runtime/rust/src/clippy_paths_resolve.rs", 15),
     ("src/runtime/rust/src/core.rs", 1),
     ("src/runtime/rust/src/csv.rs", 1),
     ("src/runtime/rust/src/dom/form.rs", 1),
     ("src/runtime/rust/src/email.rs", 1),
     ("src/runtime/rust/src/http_client.rs", 2),
-    ("src/runtime/rust/src/http_stream.rs", 2),
+    ("src/runtime/rust/src/http_stream.rs", 1),
     ("src/runtime/rust/src/scratch_core.rs", 2),
-    ("src/runtime/rust/src/server.rs", 2),
+    ("src/runtime/rust/src/server.rs", 4),
     ("src/runtime/rust/src/ssrf.rs", 1),
-    ("src/runtime/rust/src/system.rs", 9),
+    ("src/runtime/rust/src/system.rs", 11),
     ("src/runtime/rust/src/terminal_access.rs", 1),
+    ("src/runtime/rust/src/threads.rs", 1),
     ("src/runtime/rust/src/tui/key.rs", 1),
     ("src/runtime/rust/src/url.rs", 1),
     ("src/runtime/rust/tests/debug_behavior.rs", 1),
@@ -108,10 +115,12 @@ const JAIL_ENV_FN: &str = "granted_env";
 const RAW_PASSTHROUGH_PATHS: &[&str] = &["host_env::granted", "host_env::{", "host_env::*"];
 
 /// The files that may name the shared home-name constants: their one source
-/// (`home_core`), the two home accessors, and the two hosts of the shared
-/// scratch core's Windows scratch-root check.
+/// (`home_core`), the two home accessors, the agreement table both accessors'
+/// tests `include!`, and the two hosts of the shared scratch core's Windows
+/// scratch-root check.
 const HOME_VAR_FILES: &[&str] = &[
     "src/runtime/rust/src/home_core.rs",
+    "src/runtime/rust/tests/data/home_cases.rs",
     "src/compiler/sandbox/src/home.rs",
     "src/runtime/rust/src/system.rs",
     "src/compiler/sandbox/src/scratch.rs",
@@ -449,11 +458,13 @@ fn reaches_raw_passthrough(src: &str) -> bool {
 }
 
 /// Whether `src` names a procfs environment file (`/proc/self/environ`, a
-/// `join("environ")`): literals included, line comments not.
+/// `join("environ")`): literals included, line comments not. The literal's
+/// last path component must be exactly `environ`, so a key that merely ends in
+/// those letters (`exportableenviron`) is not a procfs read.
 fn reads_proc_environ(src: &str) -> bool {
     src.lines()
         .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
-        .any(|line| line.contains("environ\""))
+        .any(|line| line.contains("\"environ\"") || line.contains("/environ\""))
 }
 
 /// How many times `src`'s code (comments and literals aside) names the
@@ -479,6 +490,99 @@ fn inner_disallowed_methods_allow(src: &str) -> bool {
                 .and_then(|hash| code.get(hash + 1..))
                 .is_some_and(|rest| rest.starts_with('!'))
         })
+}
+
+/// The database crate's sources, held to INV-1 by its own `clippy.toml`.
+const DB_ROOT: &str = "src/compiler/db/";
+
+/// `(workspace-relative file, attribute count)` of every attribute in
+/// [`DB_ROOT`] that names `clippy::disallowed_types`: the ban proofs' five
+/// expectations. Any other naming, an `allow` on a type alias included, would
+/// let an ambient type through the crate's ban.
+const DB_TYPE_BAN_SITES: &[(&str, usize)] = &[("src/compiler/db/src/clippy_paths_resolve.rs", 5)];
+
+/// The lint names that silence a `disallowed_*` ban as a group member.
+const DB_BAN_GROUPS: &[&str] = &["warnings", "clippy::all", "clippy::style"];
+
+/// The attributes (`#[..]` and `#![..]`) of `src`'s code, each with whether it
+/// is inner.
+fn attributes(src: &str) -> Vec<(bool, String)> {
+    let code = code_only(src);
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices('#') {
+        let Some(rest) = code.get(at + 1..) else {
+            continue;
+        };
+        let inner = rest.starts_with('!');
+        let rest = rest.strip_prefix('!').unwrap_or(rest);
+        if !rest.starts_with('[') {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (k, c) in rest.char_indices() {
+            if c == '[' {
+                depth += 1;
+            } else if c == ']' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end = k + 1;
+                    break;
+                }
+            }
+        }
+        out.push((inner, rest.get(..end).unwrap_or(rest).to_owned()));
+    }
+    out
+}
+
+/// Whether `code` names the lint `name` as a whole path, so `clippy::all`
+/// is not found in `clippy::all_x` and `warnings` not in `my_warnings`.
+fn names_lint(code: &str, name: &str) -> bool {
+    code.match_indices(name)
+        .any(|(at, _)| !ident_before(code, at) && !ident_after(code, at + name.len()))
+}
+
+/// Every way the database sources in `files` silence the crate's type or
+/// method bans past [`DB_TYPE_BAN_SITES`].
+fn db_ban_violations(files: &[(String, String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (rel, text) in files.iter().filter(|(rel, _)| rel.starts_with(DB_ROOT)) {
+        let attrs = attributes(text);
+        let types = attrs
+            .iter()
+            .filter(|(_, attr)| names_lint(attr, "clippy::disallowed_types"))
+            .count();
+        let pinned = DB_TYPE_BAN_SITES
+            .iter()
+            .find(|(file, _)| *file == rel.as_str())
+            .map_or(0, |(_, count)| *count);
+        if types != pinned {
+            violations.push(format!(
+                "{rel}: {types} attributes name `clippy::disallowed_types`, pinned {pinned}"
+            ));
+        }
+        for (inner, attr) in &attrs {
+            if *inner && names_lint(attr, "clippy::disallowed_types") {
+                violations.push(format!("{rel}: a module-wide `{attr}`"));
+            }
+            for group in DB_BAN_GROUPS {
+                if names_lint(attr, group) {
+                    violations.push(format!(
+                        "{rel}: `{attr}` names `{group}`, which silences the INV-1 bans"
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// `files` with a file at `rel` holding `text` added.
+fn appended(files: &[(String, String)], rel: &str, text: &str) -> Vec<(String, String)> {
+    let mut out = files.to_vec();
+    out.push((rel.to_owned(), text.to_owned()));
+    out
 }
 
 /// The pinned allow count for workspace-relative `rel` (0 when unlisted).
@@ -795,6 +899,88 @@ fn the_env_escape_hatch_is_pinned_to_the_audited_readers() {
 }
 
 #[test]
+fn the_database_crate_silences_no_ban_past_its_proofs() {
+    let files = workspace_sources(true);
+    for (file, _) in DB_TYPE_BAN_SITES {
+        assert!(
+            files.iter().any(|(rel, _)| rel == file),
+            "pinned type-ban file `{file}` is not scanned"
+        );
+    }
+    let violations = db_ban_violations(&files);
+    assert!(
+        violations.is_empty(),
+        "the database crate silences an INV-1 ban: {violations:#?}"
+    );
+}
+
+#[test]
+fn a_planted_database_ban_silencer_is_detected() {
+    let proof = "src/compiler/db/src/clippy_paths_resolve.rs";
+    let pinned = "#[expect(clippy::disallowed_types)] type T = u8;".repeat(5);
+    let control = vec![(proof.to_owned(), pinned.clone())];
+    assert!(
+        db_ban_violations(&control).is_empty(),
+        "the control tree must be clean"
+    );
+    let other = "src/compiler/db/src/planted.rs";
+    let planted = [
+        (
+            other,
+            "#[allow(clippy::disallowed_types)] type Clock = std::time::Instant;",
+        ),
+        (
+            other,
+            "#[expect(clippy :: disallowed_types)] type Clock = std::time::Instant;",
+        ),
+        (other, "#![allow(clippy::disallowed_types)]"),
+        (other, "#[allow(clippy::style)] fn f() {}"),
+        (other, "#[allow(clippy::all)] fn f() {}"),
+        (other, "#[expect(warnings)] fn f() {}"),
+        (other, "#![cfg_attr(test, allow(dead_code, warnings))]"),
+        (
+            "src/compiler/db/tests/planted.rs",
+            "#[allow(clippy::disallowed_types)] type Clock = std::time::Instant;",
+        ),
+        (
+            proof,
+            "#[allow(clippy::disallowed_types)] type Clock = std::time::Instant;",
+        ),
+    ];
+    for (rel, text) in planted {
+        let tree = if rel == proof {
+            vec![(proof.to_owned(), format!("{pinned}{text}"))]
+        } else {
+            appended(&control, rel, text)
+        };
+        assert!(
+            !db_ban_violations(&tree).is_empty(),
+            "a planted ban silencer in {rel} went unseen: {text:?}"
+        );
+    }
+    let clean = [
+        "#[allow(dead_code)] fn f() { let warnings = 1; }",
+        "// #[allow(clippy::all)]",
+        "const S: &str = \"#[allow(warnings)]\";",
+        "#[allow(clippy::all_like_this)] fn f() {}",
+    ];
+    for text in clean {
+        assert!(
+            db_ban_violations(&appended(&control, other, text)).is_empty(),
+            "a non-silencer was flagged: {text:?}"
+        );
+    }
+    let outside = vec![(
+        "src/compiler/types/src/planted.rs".to_owned(),
+        "#[allow(clippy::disallowed_types)] type T = u8;".to_owned(),
+    )];
+    assert!(
+        db_ban_violations(&outside).is_empty(),
+        "a crate outside the database root is held to its own policy"
+    );
+}
+
+#[test]
 fn the_jail_passthrough_stays_in_the_sandbox() {
     let files = workspace_sources(true);
     let offenders: Vec<_> = files
@@ -870,6 +1056,10 @@ fn a_planted_passthrough_or_procfs_bypass_is_detected() {
     assert!(!names_ident("let e = granted_envs;", JAIL_ENV_FN));
     assert!(!reads_proc_environ("// read /proc/self/environ\"x\""));
     assert!(!reads_proc_environ("let e = \"the environment\";"));
+    assert!(!reads_proc_environ(
+        "(\"experimental.exportableenviron\", INERT),"
+    ));
+    assert!(!reads_proc_environ("let k = \"hooks.subenviron\";"));
 }
 
 #[test]
@@ -1194,6 +1384,21 @@ mod lexical {
             reason: "callers pass `IPE_*_TOKEN` literals, which the literal rule scans",
         },
         Allowed {
+            file: "src/runtime/rust/src/env_registry/mod.rs",
+            func: "check",
+            reason: "reads one registry entry, and every registered name carries the `IPE_` prefix",
+        },
+        Allowed {
+            file: "src/runtime/rust/src/env_registry/mod.rs",
+            func: "read",
+            reason: "reads one registry entry, and every registered name carries the `IPE_` prefix",
+        },
+        Allowed {
+            file: "src/runtime/rust/src/log.rs",
+            func: "env_threshold",
+            reason: "reads the registered `IPE_LOG_LEVEL` entry named in its own body",
+        },
+        Allowed {
             file: "src/runtime/rust/src/web/push_exporter.rs",
             func: "raw",
             reason: "reads `ExporterEnv::name`, a closed match over fixed `IPE_*` literals",
@@ -1280,8 +1485,8 @@ mod lexical {
         },
         Allowed {
             file: "src/runtime/rust/src/system.rs",
-            func: "read",
-            reason: "reads an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
+            func: "lookup",
+            reason: "the one raw reader of an `EnvCeiling`'s `&'static str` name; every ceiling is built from a literal the literal rule scans",
         },
     ];
 

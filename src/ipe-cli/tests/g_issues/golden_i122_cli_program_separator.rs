@@ -43,7 +43,11 @@ fn console_app_glues_consecutive_renders_matching_go_oracle() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     // Two stdin lines → two loop-body renders (count 0 → 1 → 2), then EOF.
     let outcome = crate::support::build_and_run_emitted_with_stdin(

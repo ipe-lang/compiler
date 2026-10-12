@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ipe_diagnostics::ConsentError;
 use ipe_ir::Capability;
 
 use crate::CliError;
@@ -169,17 +170,17 @@ pub fn gate(
 /// The typed, fail-closed refusal naming each ungranted native crossing, its
 /// disclosing crate/module(s), and the remedy.
 fn refusal(disclosures: &[crate::text::Message]) -> CliError {
-    CliError::Usage(crate::text::Message::lines(
-        std::iter::once(crate::text::msg::native_ffi_consent_header())
-            .chain(
-                disclosures
-                    .iter()
-                    .map(|item| crate::text::msg::consent_item(item)),
-            )
+    let body = crate::text::Message::lines(
+        disclosures
+            .iter()
+            .map(|item| crate::text::msg::consent_item(item))
             .chain(std::iter::once(
                 crate::text::msg::native_ffi_consent_remedy(),
             )),
-    ))
+    );
+    CliError::consent_refused(ConsentError::NativeCrossingUngranted {
+        body: body.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -233,6 +234,10 @@ mod tests {
         assert!(msg.contains("IPE-S0003"), "carries the code: {msg}");
         assert!(msg.contains("Rust.Csum"), "names the crate: {msg}");
         assert!(msg.contains("Dep.Widget"), "names the discloser: {msg}");
+        assert!(
+            msg.contains("`NativeFfi` to `declares = [ … ]` in"),
+            "the remedy names the manifest field the gate reads: {msg}"
+        );
     }
 
     #[test]

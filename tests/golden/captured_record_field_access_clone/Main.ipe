@@ -7,7 +7,7 @@ import Ipe.String
 -- A captured record whose FIRST use inside a lambda is a field access, and
 -- which is then ALSO used whole. The lambda must clone the record, not move it.
 --
--- Pre-fix, `ipe build` exits 0 but the emitted Rust fails `cargo build` with
+-- Pre-fix, `ipe dev build` exits 0 but the emitted Rust fails `cargo build` with
 -- E0507 (`cannot move out of \`row\`, a captured variable in an \`Fn\` closure`).
 --
 -- Root cause: the dotted access `row.lineStart` was parsed as a chain of nodes

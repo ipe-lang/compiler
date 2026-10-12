@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! SIGTERM-handling proofs for `ipe watch` (`crate::watch`).
+//! SIGTERM-handling proofs for `ipe dev watch` (`crate::watch`).
 //!
 //! Three scenarios around the `run()`-only SIGTERM shutdown subscriber:
 //!
@@ -28,7 +28,7 @@ mod support;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// Budget for `ipe watch` to build and serve after the dep graph has been
+/// Budget for `ipe dev watch` to build and serve after the dep graph has been
 /// pre-warmed by [`warm_server_fixture_deps`]. All deps are already compiled;
 /// the watch only pays a link step plus server startup — well under a minute on
 /// any loaded box. The functional guard is the SIGTERM assertion that follows,
@@ -82,15 +82,15 @@ fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
 }
 
 /// Pre-compile the server fixture's cargo dependencies into the shared target
-/// so subsequent `ipe watch` cold builds pay only the link step.
+/// so subsequent `ipe dev watch` cold builds pay only the link step.
 ///
-/// `ipe watch` spawns its own `cargo build` subprocess in an emitted project
+/// `ipe dev watch` spawns its own `cargo build` subprocess in an emitted project
 /// directory. On a sccache-off box with a cold cargo target that full dep compile
 /// (axum, tokio, tower-http, …) can take many minutes, making the timed
 /// `wait_for_body` guard unreliable regardless of the budget. This function
 /// emits the same server fixture once and runs `cargo build` on it, warming
 /// every dependency in the shared target the global `~/.cargo/config.toml`
-/// points to. After this returns, `ipe watch`'s own build only needs to link —
+/// points to. After this returns, `ipe dev watch`'s own build only needs to link —
 /// seconds, not minutes.
 ///
 /// `RUSTC_WRAPPER` is cleared so sccache does not interfere with the warm-up
@@ -115,10 +115,10 @@ fn warm_server_fixture_deps() -> Result<(), BoxError> {
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
     ipe::build(&entry, &out_dir, &runtime_dir)
-        .map_err(|e| -> BoxError { format!("warm: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("warm: ipe dev build failed: {e}").into() })?;
 
     // Non-zero cargo exit is intentionally ignored: warming is best-effort.
-    // A fluke build failure here means `ipe watch` pays the full cold build
+    // A fluke build failure here means `ipe dev watch` pays the full cold build
     // time itself — the SIGTERM assertion is unaffected.
     //
     // Run with the same environment the watch's own cargo build inherits (no
@@ -149,9 +149,9 @@ fn try_warm(timeout: Duration) -> Result<(), BoxError> {
     // Run the warm-up on a background thread so we can enforce the timeout
     // without blocking the test process indefinitely.
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), BoxError>>();
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         let _ = tx.send(warm_server_fixture_deps());
-    });
+    })?;
     rx.recv_timeout(timeout).unwrap_or_else(|_| Ok(()))
 }
 
@@ -201,7 +201,7 @@ fn pid_is_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// The supervised app binary is a direct child of the `ipe watch` process. In
+/// The supervised app binary is a direct child of the `ipe dev watch` process. In
 /// blue-green mode the child binds an INTERNAL loopback port (the proxy holds
 /// the user-facing one), so it cannot be found by the configured `--port`;
 /// discover it by parent PID instead. Returns the first `/proc` entry whose
@@ -246,7 +246,7 @@ fn wait_for_child_of(ipe_pid: u32, timeout: Duration) -> Option<u32> {
     }
 }
 
-/// Spawn a REAL `ipe watch` subprocess (the `run()` path, `external_stop =
+/// Spawn a REAL `ipe dev watch` subprocess (the `run()` path, `external_stop =
 /// None` — the only caller the SIGTERM shutdown subscriber is registered for). When
 /// `capture_stderr` is set the child's stderr is piped so the caller can
 /// synchronize on the [`ipe::watch::SIGTERM_TEARDOWN_MARKER`] ack; otherwise it
@@ -260,7 +260,8 @@ fn spawn_ipe_watch(
 ) -> Result<std::process::Child, BoxError> {
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let mut cmd = std::process::Command::new(support::ipe_bin());
-    cmd.arg("watch")
+    cmd.arg("dev")
+        .arg("watch")
         .arg(entry)
         .arg("--out")
         .arg(out_dir)
@@ -275,14 +276,14 @@ fn spawn_ipe_watch(
             std::process::Stdio::null()
         });
     // Forward CI's warm shared target (exported ONLY as IPE_ORACLE_SHARED_TARGET)
-    // as the child `ipe watch`'s CARGO_TARGET_DIR, so its rebuild links against a
+    // as the child `ipe dev watch`'s CARGO_TARGET_DIR, so its rebuild links against a
     // pre-compiled dep tree — the SAME target `warm_server_fixture_deps` warms.
     // Absent (a bare local run) the child stays isolated exactly as before.
     if let Some(target) = e2e_support::child_shared_target_from_env() {
         cmd.env("CARGO_TARGET_DIR", target);
     }
     cmd.spawn()
-        .map_err(|e| -> BoxError { format!("ipe watch must spawn: {e}").into() })
+        .map_err(|e| -> BoxError { format!("ipe dev watch must spawn: {e}").into() })
 }
 
 /// Take the child's piped stderr and, on a reader thread, scan it line-by-line
@@ -306,7 +307,7 @@ fn watch_marker_seen(
         .take()
         .ok_or("child stderr must be piped to observe the teardown ack")?;
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         let mut reader = std::io::BufReader::new(stderr);
         let mut announced = false;
         let mut line = String::new();
@@ -327,7 +328,7 @@ fn watch_marker_seen(
         if !announced {
             let _ = tx.send(false);
         }
-    });
+    })?;
     Ok(rx)
 }
 
@@ -432,7 +433,8 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })?;
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
     let opts = ipe::watch::WatchOptions::new(ipe_dir.join("Main.ipe"), out_dir, runtime_dir);
-    let (join, handle) = ipe::watch::spawn(opts);
+    let (join, handle) = ipe::watch::spawn(opts)
+        .map_err(|e| -> BoxError { format!("spawn the watch session: {e}").into() })?;
 
     // Let the orchestrator finish setup and enter its event loop.
     std::thread::sleep(Duration::from_millis(300));

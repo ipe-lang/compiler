@@ -1,0 +1,2 @@
+module ModA exposing (..)
+type Shape = Square | Circle

@@ -116,10 +116,6 @@ mod registry_phase_c_tests {
             K::TaskDefaultRetryPolicy,
             K::TaskWithMaxAttempts,
             K::TaskWithBaseMs,
-            K::BackoffLinear,
-            K::BackoffLinearWithJitter,
-            K::BackoffExponential,
-            K::BackoffExponentialWithJitter,
             // Io (3)
             K::IoReadLine,
             K::IoWriteStdout,
@@ -1108,7 +1104,7 @@ mod registry_phase_c_tests {
             K::MoneyGetRate,
             K::MoneyHasRate,
             K::MoneyClearRates,
-            // ── Ipe.Db.Sql — SqlFragment builder (20) ──────────────
+            // ── Ipe.Db.Sql — SqlFragment builder (23) ──────────────
             K::SqlColumn,
             // Ipe.Db.Unsafe.unsafeFragment — the un-validated anti-`Sql.column`.
             K::SqlUnsafeFragment,
@@ -1130,6 +1126,7 @@ mod registry_phase_c_tests {
             K::SqlIsNotNull,
             K::SqlInList,
             K::SqlLike,
+            K::SqlStartsWith,
             // Correlated-subquery existence test (Ipê-new, no legacy oracle).
             K::SqlExists,
             // Column-masking projection term (Ipê-new, no legacy oracle).
@@ -1178,6 +1175,7 @@ mod registry_phase_c_tests {
             K::StoreLteCol,
             K::StoreLteBy,
             K::StoreLike,
+            K::StoreStartsWith,
             K::StoreIsNull,
             K::StoreNotNull,
             K::StoreInListCol,
@@ -1289,12 +1287,14 @@ mod registry_phase_c_tests {
             K::ConfigLoadFromFile,
             // ── Ipe.Email (1) ──────────────────────────────────────────
             K::EmailSend,
-            // ── Ipe.Crypto typed-key newtypes (5) ──────────────────────
+            // ── Ipe.Crypto typed-key newtypes (7) ──────────────────────
             K::CryptoKeyFromString,
             K::CryptoKeyFromBytes,
             K::CryptoMacToHex,
+            K::CryptoMacFromHex,
             K::CryptoHmacSha256WithKey,
             K::CryptoHmacSha512WithKey,
+            K::CryptoVerifyHmacSha256,
             // ── Ipe.Email.EmailAddress (2) ──────────────────────────────
             K::EmailAddressParse,
             K::EmailAddressToString,
@@ -1902,6 +1902,9 @@ mod registry_phase_c_tests {
         let dummy = interner.intern("_").expect("intern placeholder symbol");
         let mut uf = UnionFind::<Content>::new();
         let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        // A kernel reference is constrained inside a def, so it walks with that
+        // def's module as its home.
+        builder.current_home = crate::ModuleHome::new(vec![dummy]);
 
         // Non-keyed Set/Dict/Cache kernels: selected by the module qualifier but
         // absent from OBLIGATION_SLOTS → must return Ok (no key bound), not L0108.
@@ -1938,6 +1941,49 @@ mod registry_phase_c_tests {
                 "{k:?}: keyed kernel must still resolve, got {r:?}"
             );
         }
+    }
+
+    /// `constrain_def` scopes its home to the walk: once a def is constrained,
+    /// a record minted outside any def is refused rather than stamped with the
+    /// last def's module, which would frame its span in the wrong file.
+    #[test]
+    fn home_does_not_outlive_its_def() {
+        let mut interner = Interner::new();
+        let builtins = make_builder(&mut interner);
+        let dep = interner.intern("Dep").expect("intern Dep");
+        let name = interner.intern("one").expect("intern one");
+        let mut uf = UnionFind::<Content>::new();
+        let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        let def = super::super::canon::Def::Untyped {
+            home: vec![dep],
+            name: ipe_diagnostics::Located {
+                span: Span::DUMMY,
+                value: name,
+            },
+            patterns: Vec::new(),
+            body: ipe_diagnostics::Located {
+                span: Span::DUMMY,
+                value: super::super::canon::Expr_::Int(1),
+            },
+        };
+        let shared = builder.flex().expect("mint the binding's shared var");
+        builder.untyped.insert((vec![dep], name), shared);
+        builder
+            .constrain_def(&def)
+            .expect("an Int literal def constrains");
+        let err = builder
+            .home()
+            .expect_err("no def is being constrained once constrain_def returns");
+        assert!(
+            matches!(
+                err,
+                Diagnostic::CompilerBug {
+                    where_: "ipe_types::Builder::home",
+                    ..
+                }
+            ),
+            "expected the homeless-mint refusal, got {err:?}",
+        );
     }
 
     /// The HOF callback-result classifier agrees with every resolved kernel scheme.
@@ -1978,7 +2024,7 @@ mod registry_phase_c_tests {
                         collect(f, found);
                     }
                 }
-                Ty::Var(_) | Ty::Unit => {}
+                Ty::Var(_) | Ty::Wildcard | Ty::Unit => {}
             }
         }
         fn oracle(scheme: &Ty, arity: u8) -> BTreeSet<u32> {
@@ -2124,7 +2170,7 @@ mod registry_phase_c_tests {
                         out.insert(*n);
                     }
                 }
-                Ty::Unit => {}
+                Ty::Wildcard | Ty::Unit => {}
             }
         }
 
@@ -2159,6 +2205,205 @@ mod registry_phase_c_tests {
             "OBLIGATION_SLOTS must pin exactly {EXPECTED_OBLIGATION_SLOT_COUNT} \
              obligation slots; adding/removing one must update this pin",
         );
+    }
+
+    /// Every `Db` kernel taking a `List a` argument carries a `SqlParam` slot on it.
+    ///
+    /// Walks `StdlibKernel::ALL`: each `Db`-qualified kernel whose scheme has an
+    /// argument shaped `List <var>` is a bind-list kernel, and that var must be a
+    /// pinned `SqlParam` slot of the kernel in `OBLIGATION_SLOTS`. The converse
+    /// holds too (a `SqlParam` row on a kernel with no such argument is stale),
+    /// and the walk must find at least one kernel, so it cannot pass vacuously.
+    /// A bind list reaching the emitted `Vec<SqlParam>` without the bound would
+    /// pass `ipe` and fail `cargo` (E0277).
+    #[test]
+    fn every_db_list_var_argument_has_a_sql_param_slot() {
+        use super::super::constrain_ast::{OBLIGATION_SLOTS, ObligationKind};
+
+        // Raw var ids of every `List <var>` argument along the arrow spine
+        // (the result type is not an argument, so `Task (List b)` is skipped).
+        fn list_var_arguments(t: &Ty, list: ipe_intern::Symbol) -> Vec<u32> {
+            let mut found = Vec::new();
+            let mut cur = t;
+            while let Ty::Fun(arg, ret) = cur {
+                if let Ty::Con { name, args, .. } = arg.as_ref()
+                    && *name == list
+                    && let [Ty::Var(n)] = args.as_slice()
+                {
+                    found.push(*n);
+                }
+                cur = ret.as_ref();
+            }
+            found
+        }
+
+        let mut interner = Interner::new();
+        let builtins = make_builder(&mut interner);
+        let list = builtins.list;
+        let mut uf = UnionFind::<Content>::new();
+        let builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+
+        let sql_param_slots = |k: StdlibKernel| -> Vec<u32> {
+            OBLIGATION_SLOTS
+                .iter()
+                .filter(|(kk, _, kind)| *kk == k && matches!(kind, ObligationKind::SqlParam))
+                .map(|(_, slot, _)| *slot)
+                .collect()
+        };
+
+        let mut bind_list_kernels: Vec<StdlibKernel> = Vec::new();
+        for &k in StdlibKernel::ALL {
+            if k.def().qualifier != "Db" {
+                continue;
+            }
+            let scheme = builder.resolve_scheme(k.def().scheme);
+            assert!(
+                scheme.is_some(),
+                "{k:?} is a Db kernel with no resolvable scheme"
+            );
+            let Some(scheme) = scheme else { continue };
+            let list_vars = list_var_arguments(&scheme, list);
+            if list_vars.is_empty() {
+                assert!(
+                    sql_param_slots(k).is_empty(),
+                    "{k:?} pins a SqlParam slot but has no `List a` argument",
+                );
+                continue;
+            }
+            bind_list_kernels.push(k);
+            let slots = sql_param_slots(k);
+            for var in list_vars {
+                assert!(
+                    slots.contains(&var),
+                    "{k:?} takes a `List` of scheme var {var} but OBLIGATION_SLOTS has \
+                     no SqlParam row for it: a record or function bind list would pass \
+                     `ipe` and fail `cargo` (E0277)",
+                );
+            }
+        }
+        // `exec`, `unsafeQuery`, `queryDecode`, `queryDecodeOn`, `findProjection`
+        // and `findProjectionOrdered`: a walk that finds fewer has stopped
+        // recognising the scheme shape.
+        assert!(
+            bind_list_kernels.len() >= 6,
+            "the walk matched only {} `Db` kernels with a `List a` argument, \
+             expected at least 6 — the detection no longer recognises the scheme shape",
+            bind_list_kernels.len(),
+        );
+        for &(k, _, kind) in OBLIGATION_SLOTS {
+            if matches!(kind, ObligationKind::SqlParam) {
+                assert!(
+                    bind_list_kernels.contains(&k),
+                    "{k:?} has a SqlParam row but was not found as a bind-list kernel",
+                );
+            }
+        }
+    }
+
+    /// Every bound-carrying `OBLIGATION_SLOTS` row reaches the constrained kernel reference.
+    ///
+    /// Drives the real `constrain_var_kernel` for each kernel with a row whose
+    /// kind has a `generic_bound`, finds the row's scheme var in the
+    /// instantiated structure by walking the scheme alongside it, and asserts a
+    /// recorded constraint ties that var to a super-typed var owing at least the
+    /// row's bound. A row the tie site skips fails here. The `List.sortBy` key
+    /// and the `List.member` / `List.unique` element must each be checked, so
+    /// the walk cannot pass vacuously.
+    #[test]
+    fn kernel_obligation_rows_reach_constrained_scheme() {
+        use super::super::constrain_ast::OBLIGATION_SLOTS;
+        use super::super::{FlatType, VarId};
+
+        // The instantiated var at the first aligned occurrence of `Ty::Var(slot)`.
+        fn slot_var(
+            uf: &mut UnionFind<Content>,
+            var: VarId,
+            scheme: &Ty,
+            slot: u32,
+        ) -> Option<VarId> {
+            match scheme {
+                Ty::Var(n) => (*n == slot).then_some(var),
+                Ty::Fun(arg, res) => {
+                    let root = uf.find(var).ok()?;
+                    let Content::Structure(FlatType::Fun(x, y)) = uf.content(root).ok()? else {
+                        return None;
+                    };
+                    slot_var(uf, x, arg, slot).or_else(|| slot_var(uf, y, res, slot))
+                }
+                Ty::Con { args, .. } | Ty::Tuple(args) => {
+                    let root = uf.find(var).ok()?;
+                    let Content::Structure(
+                        FlatType::Con { args: items, .. } | FlatType::Tuple(items),
+                    ) = uf.content(root).ok()?
+                    else {
+                        return None;
+                    };
+                    args.iter()
+                        .zip(items)
+                        .find_map(|(t, v)| slot_var(uf, v, t, slot))
+                }
+                Ty::Wildcard | Ty::Record(..) | Ty::Unit => None,
+            }
+        }
+
+        let mut interner = Interner::new();
+        let builtins = make_builder(&mut interner);
+        let dummy = interner.intern("_").expect("intern placeholder symbol");
+        let mut uf = UnionFind::<Content>::new();
+        let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        builder.current_home = crate::ModuleHome::new(vec![dummy]);
+
+        let mut checked: Vec<StdlibKernel> = Vec::new();
+        for &(k, slot, kind) in OBLIGATION_SLOTS {
+            let Some(want) = kind.generic_bound() else {
+                continue;
+            };
+            let scheme = builder.resolve_scheme(k.def().scheme);
+            assert!(
+                scheme.is_some(),
+                "{k:?} carries a {kind:?} row and must be schemed"
+            );
+            let Some(scheme) = scheme else { continue };
+            let reference = builder.constrain_var_kernel(Some(k), dummy, dummy, Span::DUMMY);
+            assert!(reference.is_ok(), "{k:?} must constrain, got {reference:?}");
+            let Ok(reference) = reference else { continue };
+            let constraints = std::mem::take(&mut builder.constraints);
+
+            let found = slot_var(builder.uf, reference, &scheme, slot);
+            assert!(
+                found.is_some(),
+                "{k:?} ({kind:?}): raw var {slot} has no aligned position in the \
+                 instantiated reference",
+            );
+            let Some(found) = found else { continue };
+            let found_root = builder.uf.find(found).expect("find slot root");
+            let tied = constraints.iter().any(|c| {
+                let lhs = builder.uf.find(c.lhs).expect("find lhs root");
+                let rhs = builder.uf.find(c.rhs).expect("find rhs root");
+                let rhs_content = builder.uf.content(rhs).expect("read rhs content");
+                lhs == found_root
+                    && matches!(
+                        rhs_content,
+                        Content::Super { bounds, .. } if bounds.union(want) == bounds
+                    )
+            });
+            assert!(
+                tied,
+                "{k:?} ({kind:?}): raw var {slot} is not tied to a super-typed var \
+                 owing {want:?} — the runtime trait bound would reach `cargo` unmet",
+            );
+            checked.push(k);
+        }
+        for k in [
+            StdlibKernel::ListSortBy,
+            StdlibKernel::ListMember,
+            StdlibKernel::ListUnique,
+        ] {
+            assert!(
+                checked.contains(&k),
+                "{k:?} must carry a checked bound-obligation row",
+            );
+        }
     }
 
     /// A stdlib record alias is expanded by `normalize_annotation_ty` keyed on
@@ -2228,8 +2473,8 @@ mod registry_phase_c_tests {
 }
 
 #[cfg(test)]
-mod aud13_solver_var_tag_tests {
-    use super::super::{Builder, Builtins, Content, Interner, Ty, UnionFind};
+mod wildcard_instantiation_tests {
+    use super::super::{Builder, Builtins, Content, Interner, Ty, UnionFind, from_canon};
     use crate::ty::tag_solver_var;
     use std::collections::BTreeMap;
 
@@ -2237,15 +2482,13 @@ mod aud13_solver_var_tag_tests {
         Builtins::new(interner).expect("Builtins::new must not fail in tests")
     }
 
-    /// AUD-13 regression: `instantiate_in`'s wildcard-`"any"` check must not
-    /// misfire on a solver-representative id that happens to numerically
-    /// equal the interned raw of the string `"any"`. Constructs the exact
-    /// collision by reusing `any`'s own raw, tagged as solver-space —
-    /// `zonk` (see `constrain.rs`'s `Content::Flex | Rigid | Super` arm)
-    /// tags every surviving `VarId` this way before it can ever reach
-    /// `instantiate_in` again.
+    /// A variable spelled `any` is an ordinary variable: every occurrence shares one unknown.
+    ///
+    /// Only [`Ty::Wildcard`] instantiates fresh per occurrence, so an
+    /// annotation-space raw equal to the interned `any` symbol, and a tagged
+    /// solver raw with the same numeric value, both share through `vars`.
     #[test]
-    fn tagged_solver_var_sharing_any_raw_is_not_treated_as_wildcard_any() {
+    fn var_spelled_any_shares_one_variable() {
         let mut interner = Interner::new();
         let any_sym = interner
             .intern("any")
@@ -2256,54 +2499,86 @@ mod aud13_solver_var_tag_tests {
         let mut uf = UnionFind::<Content>::new();
         let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
 
-        // Tagged: the SAME raw as `any`'s interned symbol, but marked
-        // solver-space. Two references through one `vars` map must resolve
-        // to the SAME variable (ordinary shared-var behavior) — if the tag
-        // were ignored, the wildcard-`any` path would instead mint a FRESH
-        // flex var per occurrence.
-        let tagged = Ty::Var(tag_solver_var(any_raw));
-        let mut vars = BTreeMap::new();
-        let first = builder
-            .instantiate_in(&tagged, &mut vars, false)
-            .expect("instantiate_in must not fail");
-        let second = builder
-            .instantiate_in(&tagged, &mut vars, false)
-            .expect("instantiate_in must not fail");
-        assert_eq!(
-            first, second,
-            "a tagged solver-var raw sharing any's numeric value must still \
-             share ONE variable across occurrences, proving it was NOT \
-             routed through the wildcard-any fresh-per-occurrence path",
-        );
+        for ty in [Ty::Var(any_raw), Ty::Var(tag_solver_var(any_raw))] {
+            let mut vars = BTreeMap::new();
+            let first = builder
+                .instantiate_in(&ty, &mut vars, false)
+                .expect("instantiate_in must not fail");
+            let second = builder
+                .instantiate_in(&ty, &mut vars, false)
+                .expect("instantiate_in must not fail");
+            assert_eq!(
+                first, second,
+                "{ty:?} names a variable and must share ONE unknown across occurrences",
+            );
+        }
     }
 
-    /// Control: the SAME raw value, untagged, is genuine annotation-space
-    /// `"any"` and must keep its documented wildcard semantics — each
-    /// occurrence gets an independent fresh flex variable.
+    /// The wildcard instantiates to an independent fresh unknown per occurrence.
     #[test]
-    fn untagged_any_raw_still_gets_wildcard_semantics() {
+    fn wildcard_gets_a_fresh_variable_per_occurrence() {
         let mut interner = Interner::new();
-        let any_sym = interner
-            .intern("any")
-            .expect("interning \"any\" must not fail");
-        let any_raw = any_sym.as_raw();
-
         let builtins = make_builder(&mut interner);
         let mut uf = UnionFind::<Content>::new();
         let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
 
-        let untagged = Ty::Var(any_raw);
         let mut vars = BTreeMap::new();
         let first = builder
-            .instantiate_in(&untagged, &mut vars, false)
+            .instantiate_in(&Ty::Wildcard, &mut vars, false)
             .expect("instantiate_in must not fail");
         let second = builder
-            .instantiate_in(&untagged, &mut vars, false)
+            .instantiate_in(&Ty::Wildcard, &mut vars, false)
             .expect("instantiate_in must not fail");
         assert_ne!(
             first, second,
-            "untagged \"any\" must keep independent-fresh-var-per-occurrence \
-             wildcard semantics",
+            "the wildcard must keep independent-fresh-var-per-occurrence semantics",
+        );
+        assert!(vars.is_empty(), "the wildcard must never enter `vars`");
+    }
+
+    /// A union parameter declared as `any` is one variable in the field and the result.
+    ///
+    /// `type Box any = Box any`'s constructor scheme is `any -> Box any` with
+    /// both `any`s the declared parameter, so one instantiation map links the
+    /// field to the result's argument.
+    #[test]
+    fn declared_any_param_ctor_scheme_shares_one_var() {
+        let mut interner = Interner::new();
+        let src =
+            "module Main exposing (main)\n\ntype Box any\n    = Box any\n\nmain =\n    Box 1\n";
+        let parsed = ipe_parse::parse_module(src, &mut interner).expect("fixture must parse");
+        let module =
+            ipe_canon::canonicalise(&parsed, &mut interner).expect("fixture must canonicalise");
+        let union = module.unions.first().expect("fixture declares one union");
+        let field = union
+            .ctors
+            .first()
+            .and_then(|c| c.args.first())
+            .map(from_canon)
+            .expect("fixture's constructor has one field");
+        let result_arg = union
+            .vars
+            .first()
+            .map(|v| Ty::Var(v.as_raw()))
+            .expect("fixture's union declares one parameter");
+        assert_eq!(
+            field, result_arg,
+            "a field written as the declared parameter `any` must be that parameter",
+        );
+
+        let builtins = make_builder(&mut interner);
+        let mut uf = UnionFind::<Content>::new();
+        let mut builder = Builder::for_scheme_table(&mut uf, &interner, builtins);
+        let mut vars = BTreeMap::new();
+        let field_var = builder
+            .instantiate_in(&field, &mut vars, false)
+            .expect("instantiate_in must not fail");
+        let result_var = builder
+            .instantiate_in(&result_arg, &mut vars, false)
+            .expect("instantiate_in must not fail");
+        assert_eq!(
+            field_var, result_var,
+            "the constructor's field and result argument must share one unknown",
         );
     }
 }

@@ -1,0 +1,24 @@
+module Main exposing (main)
+
+-- `Lib.nav` and `Lib.badge` <- `Mid.wrap` <- `Main.view`, and `Lib.menu` <-
+-- `Mid.frame` <- `Main.view`: the concrete `Msg` reaches each `Lib` helper's
+-- message slot only through a `Mid` helper's. ipe MUST exit 0 AND the emitted
+-- project MUST cargo-build (THE SEAL): each pair must agree on its message
+-- type in the emitted Rust.
+
+import Ipe.Html as Html exposing (Html)
+import Ipe.Io as Io
+import Mid exposing (frame, wrap)
+
+
+type Msg
+    = Click
+
+
+view : Html Msg
+view =
+    Html.div [] [ wrap, frame ]
+
+
+main =
+    Io.println (Html.render view)

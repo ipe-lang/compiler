@@ -11,7 +11,7 @@ import Ipe.Task as Task
 
 -- Builds the in-browser Ipê compiler (the `ipe-wasm` crate) and generates the
 -- wasm-bindgen JS glue into examples/wasm/language-playground/pkg/, which
--- index.html loads directly. Run with:  cd build && ipe run
+-- index.html loads directly. Run with:  cd build && ipe dev run
 --
 -- Every observable step is a `Task Error a`; a missing tool exits non-zero
 -- with a styled install hint instead of a raw OS error.
@@ -125,7 +125,7 @@ done root =
         Io.println ""
         Io.println ("Done — pkg/ipe_wasm.js + pkg/ipe_wasm_bg.wasm generated under " ++ playgroundDir root ++ "/pkg")
         Io.println "Run the playground server:"
-        Io.println ("  cd " ++ playgroundDir root ++ "/server && ipe run")
+        Io.println ("  cd " ++ playgroundDir root ++ "/server && ipe dev run")
         Task.succeed ()
 
 

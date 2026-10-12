@@ -25,6 +25,8 @@ pub enum IpeCmd<M> {
     Publish(Box<dyn FnOnce(&str) -> i64 + Send>),
 }
 
+crate::stringify::show_row!("Cmd", Internals, [M] IpeCmd<M>, |_| "<Ipe.Cmd>".to_owned());
+
 /// The boxed message-producing thunk inside [`IpeCmd::Perform`]. Same
 /// cfg-split rationale as `IpeTask` (`core.rs`): wasm futures touch the DOM
 /// and are `!Send`; the native bound backs `tokio::spawn`.
@@ -33,16 +35,36 @@ pub type PerformThunk<M> = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = M> + 
 #[cfg(target_arch = "wasm32")]
 pub type PerformThunk<M> = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = M>>>>;
 
-/// A custom subscription event source: given an `emit` callback, spawn a task
-/// that pushes messages into the loop, returning its JoinHandle (aborted on
-/// re-subscribe). Keeps IpeSub decoupled from source-specific runtimes (e.g. the
-/// WebSocket client builds one of these for `onMessage`).
+/// The future a subscription source asks the loop to run.
+#[cfg(not(target_arch = "wasm32"))]
+pub type SourceBody = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// What a subscription source asks the loop to run, and for how long.
+///
+/// The loop starts the body itself, inside every scope it runs in, so a source
+/// has no task of its own to pick a spawn for.
+#[cfg(not(target_arch = "wasm32"))]
+pub enum SourceTask {
+    /// Runs while the source is requested; stopped on every re-evaluation.
+    Tracked(SourceBody),
+    /// Started once (the source dedups its own restarts); outlives
+    /// re-evaluation and ends on its own.
+    Detached(SourceBody),
+    /// Nothing to run: the source acted synchronously or is already running.
+    Idle,
+}
+
+/// A custom subscription event source.
+///
+/// Given an `emit` callback, it returns the [`SourceTask`] that pushes messages
+/// into the loop. Keeps `IpeSub` decoupled from source-specific runtimes (e.g.
+/// the WebSocket client builds one of these for `onMessage`).
 #[cfg(not(target_arch = "wasm32"))]
 pub type SubSpawn<M> =
-    Box<dyn FnOnce(std::sync::Arc<dyn Fn(M) + Send + Sync>) -> tokio::task::JoinHandle<()> + Send>;
+    Box<dyn FnOnce(std::sync::Arc<dyn Fn(M) + Send + Sync>) -> SourceTask + Send>;
 /// wasm: single-threaded, no tokio — a source registers its emit callback and
 /// returns a teardown closure the scheduler runs on re-subscribe/unmount (the
-/// wasm analogue of aborting the native `JoinHandle`). The M4 pub/sub broker
+/// wasm analogue of stopping a native tracked source). The M4 pub/sub broker
 /// (`wasm::pubsub::sub_subscribe_topic`) is the first constructor of this
 /// type on wasm; every source MUST return a real unregister thunk (never a
 /// no-op) so the scheduler's teardown-then-respawn of sources on every
@@ -83,6 +105,8 @@ pub enum IpeSub<M> {
     #[cfg(not(target_arch = "wasm32"))]
     OnLine(LineHandler<M>),
 }
+
+crate::stringify::show_row!("Sub", Internals, [M] IpeSub<M>, |_| "<Ipe.Sub>".to_owned());
 
 // ─── Cmd kernels ──────────────────────────────────────────────────────────
 
@@ -526,14 +550,37 @@ pub(crate) trait SubSink<M>: Clone + Send + Sync + 'static {
     fn emit(&self, msg: M);
 }
 
-/// A spawned task aborted when its owner drops it.
+/// The guard that aborts `task` when its owner drops it.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+fn abort_on_drop(task: &tokio::task::JoinHandle<()>) -> crate::task::AbortOnDrop {
+    crate::task::AbortOnDrop::new(task.abort_handle())
+}
 
+/// A subscription source the loop has started.
+///
+/// Every requested source is kept, so [`SubRuntime::live`] counts it whether or
+/// not the loop owns its task.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
+pub(crate) enum RunningSource {
+    /// A tracked body, stopped when this is dropped.
+    Tracked { _task: crate::task::AbortOnDrop },
+    /// A detached body or an idle source: nothing for the loop to stop.
+    Untracked,
+}
+
+/// Start `task` inside every scope the caller runs in.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+#[must_use]
+pub(crate) fn start_source(task: SourceTask) -> RunningSource {
+    match task {
+        SourceTask::Tracked(body) => RunningSource::Tracked {
+            _task: abort_on_drop(&crate::task::spawn_in_current_scope(body)),
+        },
+        SourceTask::Detached(body) => {
+            drop(crate::task::spawn_in_current_scope(body));
+            RunningSource::Untracked
+        }
+        SourceTask::Idle => RunningSource::Untracked,
     }
 }
 
@@ -545,7 +592,7 @@ type TickMsgs<M> = std::sync::Arc<std::sync::Mutex<Vec<M>>>;
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 struct NativeEvery<M> {
     msgs: TickMsgs<M>,
-    _task: AbortOnDrop,
+    _task: crate::task::AbortOnDrop,
 }
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -562,13 +609,14 @@ impl<M> EveryTimer<M> for NativeEvery<M> {
 ///
 /// Timers persist across re-evaluation through [`EveryTimers`]. A subscription
 /// source has no identity to match a re-evaluated one against, so every
-/// re-evaluation stops the running sources and spawns the requested ones.
-/// Dropping the runtime stops everything.
+/// re-evaluation stops the running tracked sources and starts the requested
+/// ones; a detached source body outlives it. Dropping the runtime stops every
+/// timer and tracked source.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) struct SubRuntime<M, S> {
     sink: S,
     every: EveryTimers<NativeEvery<M>>,
-    sources: Vec<AbortOnDrop>,
+    sources: Vec<RunningSource>,
 }
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -597,7 +645,7 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
             let sink = sink.clone();
             let period = std::time::Duration::from_millis(interval.millis());
             // First tick one period after the interval is first requested.
-            let task = tokio::spawn(async move {
+            let task = crate::task::spawn_in_current_scope(async move {
                 loop {
                     tokio::time::sleep(period).await;
                     let batch = tick_msgs
@@ -613,7 +661,7 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
             });
             NativeEvery {
                 msgs,
-                _task: AbortOnDrop(task),
+                _task: abort_on_drop(&task),
             }
         });
         self.sources.clear();
@@ -621,11 +669,12 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
             let sink = self.sink.clone();
             let emit: std::sync::Arc<dyn Fn(M) + Send + Sync> =
                 std::sync::Arc::new(move |msg| sink.emit(msg));
-            self.sources.push(AbortOnDrop(spawn(emit)));
+            self.sources.push(start_source(spawn(emit)));
         }
     }
 
-    /// The number of running timers and sources, each of which can still deliver.
+    /// The number of running timers and requested sources, each of which can
+    /// still deliver.
     pub(crate) fn live(&self) -> usize {
         self.every.len().saturating_add(self.sources.len())
     }
@@ -941,7 +990,7 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
             // counter on the fault path (drop guard) to preserve the EOF
             // invariant. Structured-warn observability on this path is a known
             // follow-up (would require awaiting the JoinHandle's JoinError).
-            tokio::spawn(async move {
+            crate::task::spawn_in_current_scope(async move {
                 // Decrement on any exit from this task (normal or panic-unwind)
                 // so a faulting effect can never wedge the EOF-drain invariant.
                 struct OutstandingGuard(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
@@ -982,6 +1031,10 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
 
 // ─── Ipe.Terminal — line-oriented TEA loop ─────────────────────────────────────
 
+/// The name of the `console_app` stdin reader thread.
+#[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
+const STDIN_READER_THREAD: &str = "ipe-stdin-reader";
+
 /// Cli.tea { init, update, view, subscriptions } : Task Error ().
 ///
 /// init -> fire cmd -> subs -> view; then fold each event (a stdin line through
@@ -1017,7 +1070,7 @@ pub fn console_app<
     #[cfg(feature = "debugger")] codec: Codec,
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromUnavailable + Send + 'static,
     Model: Clone + Send + crate::stringify::IpeStringify + 'static,
     Msg: Clone + Send + crate::stringify::IpeStringify + 'static,
     FInit: Fn(()) -> (Model, IpeCmd<Msg>) + Send + 'static,
@@ -1056,8 +1109,11 @@ where
         // shutdown flag wouldn't help since the read blocks until the next line
         // regardless. Do NOT compose `console_app` under a cancelling parent or
         // invoke it twice in one process without first accounting for this.
+        //
+        // A refused reader thread ends the app with an `Unavailable` error
+        // before any input is read.
         let line_tx = tx.clone();
-        std::thread::spawn(move || {
+        let started = crate::threads::spawn_named(STDIN_READER_THREAD, move || {
             let budget = InputBudget::new(MAX_QUEUED_INPUT);
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
@@ -1077,6 +1133,11 @@ where
             }
             let _ = line_tx.send(CliEvent::Eof);
         });
+        if let Err(e) = started {
+            return IpeResult::Err(
+                crate::threads::ThreadRefused::os(STDIN_READER_THREAD, &e).into_error(),
+            );
+        }
 
         // Count of one-shot `Perform` effects that were issued but whose Msg has
         // not yet been folded through `update`. EOF must not terminate the loop
@@ -1207,6 +1268,9 @@ pub type MountBuilder = Box<
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WebApp(pub WebAppKind);
 
+#[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("WebApp", Internals, [] WebApp, |_| "<Ipe.Web.App>".to_owned());
+
 /// The two run modes a `WebApp` leaf can carry.
 ///
 /// * `Standalone` — from `Web.tea`: a fully-built server task that binds its
@@ -1260,6 +1324,9 @@ impl WebApp {
 pub struct WebViewApp(pub IpeTask<crate::error::IpeError, ()>);
 
 #[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("WebApp", Internals, [] WebViewApp, |_| "<Ipe.Web.App>".to_owned());
+
+#[cfg(not(target_arch = "wasm32"))]
 impl WebViewApp {
     /// Blocking entry on the CURRENT thread (required by tao/Cocoa on macOS).
     pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
@@ -1273,6 +1340,9 @@ impl WebViewApp {
 pub struct TuiApp(pub IpeTask<crate::error::IpeError, ()>);
 
 #[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("TuiApp", Internals, [] TuiApp, |_| "<Ipe.Tui.App>".to_owned());
+
+#[cfg(not(target_arch = "wasm32"))]
 impl TuiApp {
     /// Blocking entry: drives the underlying task to completion.
     pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
@@ -1284,6 +1354,9 @@ impl TuiApp {
 /// Backed by a boxed `IpeTask<IpeError, ()>`; run via `run_blocking`.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct CliApp(pub IpeTask<crate::error::IpeError, ()>);
+
+#[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("CliApp", Internals, [] CliApp, |_| "<Ipe.Cli.App>".to_owned());
 
 #[cfg(not(target_arch = "wasm32"))]
 impl CliApp {
@@ -1329,7 +1402,7 @@ fn worker_run_cmd<M: Send + 'static>(
             let tx = tx.clone();
             let counter = outstanding.clone();
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tokio::spawn(async move {
+            crate::task::spawn_in_current_scope(async move {
                 // Decrement on any exit (normal or panic-unwind) so a faulting
                 // effect can never wedge the drain invariant — the same
                 // Task-boundary recover contract the Cli loop uses.
@@ -1488,6 +1561,9 @@ where
 pub struct WorkerApp(pub IpeTask<crate::error::IpeError, ()>);
 
 #[cfg(not(target_arch = "wasm32"))]
+crate::stringify::show_row!("WorkerApp", Internals, [] WorkerApp, |_| "<Ipe.Worker.App>".to_owned());
+
+#[cfg(not(target_arch = "wasm32"))]
 impl WorkerApp {
     /// Blocking entry: drives the underlying task to completion.
     pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
@@ -1552,9 +1628,9 @@ mod map_tests {
         // callback must receive Parent::FromChild(Child::Tick(9)).
         let src: IpeSub<Child> = IpeSub::Source(Box::new(
             |emit: std::sync::Arc<dyn Fn(Child) + Send + Sync>| {
-                tokio::spawn(async move {
+                SourceTask::Tracked(Box::pin(async move {
                     emit(Child::Tick(9));
-                })
+                }))
             },
         ));
         let mapped = sub_map(src, wrap);
@@ -1563,19 +1639,21 @@ mod map_tests {
             .build()
             .expect("runtime");
         let got = rt.block_on(async move {
-            let (tx, rx) = std::sync::mpsc::channel::<Parent>();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Parent>();
             let emit: std::sync::Arc<dyn Fn(Parent) + Send + Sync> =
                 std::sync::Arc::new(move |m| {
                     let _ = tx.send(m);
                 });
             let IpeSub::Source(spawn) = mapped else {
-                panic!("expected Source");
+                return None;
             };
-            let handle = spawn(emit);
-            let _ = handle.await;
-            rx.recv().expect("one message")
+            let _running = start_source(spawn(emit));
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .ok()
+                .flatten()
         });
-        assert_eq!(got, Parent::FromChild(Child::Tick(9)));
+        assert_eq!(got, Some(Parent::FromChild(Child::Tick(9))));
     }
 
     #[test]
@@ -1999,4 +2077,687 @@ mod bounded_input_tests {
         drop(first);
         assert!(budget.acquire(|| true).is_some());
     }
+}
+
+// A subscription source runs inside the scopes of the loop that starts it: a
+// tracked body only while requested, a detached body past every re-evaluation.
+#[cfg(all(
+    test,
+    feature = "web-core",
+    feature = "server",
+    feature = "jwt",
+    not(target_arch = "wasm32")
+))]
+mod source_scope_tests {
+    use super::*;
+    use crate::revocation::SessionBindings;
+    use crate::web::pubsub::{
+        SessionScope, broker, current_session_sid, session_bindings, sub_subscribe_topic,
+        with_session,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+    /// The session sid and credential set a source body observes.
+    type Seen = (String, Option<Arc<Mutex<SessionBindings>>>);
+
+    type Runtime = SubRuntime<Seen, UnboundedSender<WorkerEvent<Seen>>>;
+
+    /// How long a test waits before it counts a source as hung.
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    fn observe() -> Seen {
+        (current_session_sid(), session_bindings())
+    }
+
+    /// Whether `seen` is the session `sid` with exactly the credential set `bindings`.
+    fn binds_to(seen: &Seen, sid: &str, bindings: &Arc<Mutex<SessionBindings>>) -> bool {
+        seen.0 == sid
+            && seen
+                .1
+                .as_ref()
+                .is_some_and(|set| Arc::ptr_eq(set, bindings))
+    }
+
+    fn runtime() -> (Runtime, UnboundedReceiver<WorkerEvent<Seen>>) {
+        let (tx, rx) = unbounded_channel();
+        (SubRuntime::new(tx), rx)
+    }
+
+    /// A source whose body waits for `gate`, then emits what it observes.
+    fn observing(lifetime: fn(SourceBody) -> SourceTask, gate: Arc<Notify>) -> IpeSub<Seen> {
+        IpeSub::Source(Box::new(move |emit: Arc<dyn Fn(Seen) + Send + Sync>| {
+            lifetime(Box::pin(async move {
+                gate.notified().await;
+                emit(observe());
+            }))
+        }))
+    }
+
+    /// The next message the loop receives, or `None` once `within` passes.
+    async fn next_msg(
+        rx: &mut UnboundedReceiver<WorkerEvent<Seen>>,
+        within: Duration,
+    ) -> Option<Seen> {
+        let Ok(Some(WorkerEvent::Msg(seen))) = tokio::time::timeout(within, rx.recv()).await else {
+            return None;
+        };
+        Some(seen)
+    }
+
+    #[tokio::test]
+    async fn tracked_source_runs_in_owner_scope() {
+        let scope = SessionScope::new("sid-tracked".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let gate = Arc::new(Notify::new());
+        let (mut subs, mut rx) = runtime();
+        with_session(&scope, || {
+            subs.reconcile(observing(SourceTask::Tracked, Arc::clone(&gate)));
+        });
+        gate.notify_one();
+        let seen = next_msg(&mut rx, DEADLINE).await;
+        assert!(
+            seen.is_some_and(|seen| binds_to(&seen, "sid-tracked", &bindings)),
+            "a tracked source body runs inside the owning session's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_source_outlives_reconcile_in_owner_scope() {
+        let scope = SessionScope::new("sid-detached".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let gate = Arc::new(Notify::new());
+        let (mut subs, mut rx) = runtime();
+        with_session(&scope, || {
+            subs.reconcile(observing(SourceTask::Detached, Arc::clone(&gate)));
+        });
+        with_session(&scope, || subs.reconcile(IpeSub::None));
+        gate.notify_one();
+        let seen = next_msg(&mut rx, DEADLINE).await;
+        assert!(
+            seen.is_some_and(|seen| binds_to(&seen, "sid-detached", &bindings)),
+            "a detached source body survives re-evaluation inside the owning session's scope"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracked_source_stops_on_reconcile() {
+        let scope = SessionScope::new("sid-stopped".to_owned());
+        let gate = Arc::new(Notify::new());
+        let (mut subs, mut rx) = runtime();
+        with_session(&scope, || {
+            subs.reconcile(observing(SourceTask::Tracked, Arc::clone(&gate)));
+        });
+        with_session(&scope, || subs.reconcile(IpeSub::None));
+        gate.notify_one();
+        let late = next_msg(&mut rx, Duration::from_millis(100)).await;
+        assert!(late.is_none(), "re-evaluation stops a tracked source body");
+    }
+
+    #[tokio::test]
+    async fn idle_and_detached_sources_count_as_live() {
+        let gate = Arc::new(Notify::new());
+        let (mut subs, _rx) = runtime();
+        let idle: IpeSub<Seen> =
+            IpeSub::Source(Box::new(|_emit: Arc<dyn Fn(Seen) + Send + Sync>| {
+                SourceTask::Idle
+            }));
+        subs.reconcile(IpeSub::Batch(vec![
+            observing(SourceTask::Tracked, Arc::clone(&gate)),
+            observing(SourceTask::Detached, Arc::clone(&gate)),
+            idle,
+        ]));
+        assert_eq!(
+            subs.live(),
+            3,
+            "every requested source counts, whatever its lifetime"
+        );
+        subs.reconcile(IpeSub::None);
+        assert_eq!(subs.live(), 0);
+    }
+
+    /// Reconciles `sub` in `scope`, publishes once on `topic`, and returns what
+    /// the subscriber's `to_msg` observed.
+    async fn topic_delivery(scope: &SessionScope, topic: &str, sub: IpeSub<Seen>) -> Option<Seen> {
+        let (mut subs, mut rx) = runtime();
+        with_session(scope, || subs.reconcile(sub));
+        let receivers = broker::<u8>().publish(topic, 1, "sid-publisher", false);
+        assert_eq!(receivers, 1, "the subscription is live before the publish");
+        next_msg(&mut rx, DEADLINE).await
+    }
+
+    #[tokio::test]
+    async fn sub_to_msg_binds_to_web_session() {
+        let scope = SessionScope::new("sid-topic".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let topic = "source-scope-topic";
+        let sub = with_session(&scope, || {
+            sub_subscribe_topic::<u8, Seen, _>(topic.to_owned(), |_| observe())
+        });
+        let seen = topic_delivery(&scope, topic, sub).await;
+        assert!(
+            seen.is_some_and(|seen| binds_to(&seen, "sid-topic", &bindings)),
+            "a topic subscription's toMsg runs inside the owning session's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_map_inherits_source_scope() {
+        let scope = SessionScope::new("sid-mapped".to_owned());
+        let bindings = Arc::clone(scope.bindings());
+        let topic = "source-scope-mapped-topic";
+        let sub = with_session(&scope, || {
+            sub_map(
+                sub_subscribe_topic::<u8, Seen, _>(topic.to_owned(), |_| observe()),
+                |seen: Seen| seen,
+            )
+        });
+        let seen = topic_delivery(&scope, topic, sub).await;
+        assert!(
+            seen.is_some_and(|seen| binds_to(&seen, "sid-mapped", &bindings)),
+            "a mapped source runs inside the owning session's scope"
+        );
+    }
+}
+
+// Every subscription source returns its body as a `SourceTask`; only the loop
+// starts it, through the scope carrier. Scans the production text of the
+// runtime files that build a source.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod source_spawn_scan_tests {
+    use std::iter::Peekable;
+    use std::str::Chars;
+
+    /// The runtime files that build a subscription source, by path under `src/`.
+    const SOURCE_FILES: [(&str, &str); 5] = [
+        ("web/pubsub.rs", include_str!("web/pubsub.rs")),
+        ("http_stream.rs", include_str!("http_stream.rs")),
+        ("ws_client.rs", include_str!("ws_client.rs")),
+        ("js_port.rs", include_str!("js_port.rs")),
+        ("tea.rs", include_str!("tea.rs")),
+    ];
+
+    /// Every task-starting name the production text of these files may hold,
+    /// by file, enclosing fn and name: the loop's own starts through the scope
+    /// carrier, its stdin reader thread, the source closure the loop and
+    /// `sub_map` invoke (a binding named `spawn`), and the socket pumps, which
+    /// run no user code. Sorted.
+    const ADMITTED_SPAWNS: [(&str, &str, &str); 16] = [
+        ("tea.rs", "add", "spawn"),
+        ("tea.rs", "add", "spawn"),
+        ("tea.rs", "apply", "spawn"),
+        ("tea.rs", "apply", "spawn"),
+        ("tea.rs", "apply", "spawn_in_current_scope"),
+        ("tea.rs", "cli_run_cmd_tracked", "spawn_in_current_scope"),
+        ("tea.rs", "console_app", "spawn_named"),
+        ("tea.rs", "start_source", "spawn_in_current_scope"),
+        ("tea.rs", "start_source", "spawn_in_current_scope"),
+        ("tea.rs", "sub_map_arc", "spawn"),
+        ("tea.rs", "sub_map_arc", "spawn"),
+        ("tea.rs", "sub_map_rc", "spawn"),
+        ("tea.rs", "sub_map_rc", "spawn"),
+        ("tea.rs", "worker_run_cmd", "spawn_in_current_scope"),
+        ("ws_client.rs", "do_connect", "spawn"),
+        ("ws_client.rs", "do_connect", "spawn"),
+    ];
+
+    /// Source files under `src/` that build a subscription source and are not
+    /// scanned: the browser broker, which has no tokio task to start.
+    const UNSCANNED_SOURCE_FILES: [&str; 1] = ["wasm/pubsub.rs"];
+
+    fn is_ident(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// Skips a string literal's body, closing quote included.
+    fn skip_string(chars: &mut Peekable<Chars<'_>>) {
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => return,
+                _ => {}
+            }
+        }
+    }
+
+    /// Skips a raw string literal's body, closed by a quote and `hashes` hash signs.
+    fn skip_raw_string(chars: &mut Peekable<Chars<'_>>, hashes: usize) {
+        while let Some(c) = chars.next() {
+            if c == '"' {
+                let mut ahead = chars.clone();
+                if (0..hashes).all(|_| ahead.next() == Some('#')) {
+                    *chars = ahead;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Skips a block comment's body, nested comments included.
+    fn skip_block_comment(chars: &mut Peekable<Chars<'_>>) {
+        let mut depth = 1_usize;
+        let mut last = ' ';
+        while depth > 0 {
+            let Some(c) = chars.next() else {
+                return;
+            };
+            match (last, c) {
+                ('/', '*') => {
+                    depth = depth.saturating_add(1);
+                    last = ' ';
+                }
+                ('*', '/') => {
+                    depth = depth.saturating_sub(1);
+                    last = ' ';
+                }
+                _ => last = c,
+            }
+        }
+    }
+
+    /// `src` with every comment blanked and every string or char literal emptied.
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars().peekable();
+        // The length and first char of the identifier the cursor is inside.
+        let mut word = (0_usize, ' ');
+        while let Some(c) = chars.next() {
+            // `r"`, `br"` and `cr"` open a raw literal; `xr"` is an identifier.
+            let raw_prefix = word.0 == 0 || (word.0 == 1 && matches!(word.1, 'b' | 'c'));
+            word = match (c, chars.peek().copied()) {
+                ('/', Some('/')) => {
+                    if chars.by_ref().any(|skipped| skipped == '\n') {
+                        out.push('\n');
+                    }
+                    (0, ' ')
+                }
+                ('/', Some('*')) => {
+                    chars.next();
+                    skip_block_comment(&mut chars);
+                    out.push(' ');
+                    (0, ' ')
+                }
+                ('"', _) => {
+                    skip_string(&mut chars);
+                    out.push_str("\"\"");
+                    (0, ' ')
+                }
+                ('r', Some('#' | '"')) if raw_prefix => {
+                    let mut hashes = 0_usize;
+                    while chars.next_if_eq(&'#').is_some() {
+                        hashes = hashes.saturating_add(1);
+                    }
+                    if chars.next_if_eq(&'"').is_some() {
+                        skip_raw_string(&mut chars, hashes);
+                        out.push_str("\"\"");
+                    } else {
+                        out.push('r');
+                        out.extend(std::iter::repeat_n('#', hashes));
+                    }
+                    (0, ' ')
+                }
+                ('\'', Some('\\')) => {
+                    chars.next();
+                    chars.next();
+                    let _closed = chars.by_ref().any(|skipped| skipped == '\'');
+                    out.push_str("' '");
+                    (0, ' ')
+                }
+                ('\'', Some(_)) if chars.clone().nth(1) == Some('\'') => {
+                    chars.next();
+                    chars.next();
+                    out.push_str("' '");
+                    (0, ' ')
+                }
+                _ => {
+                    out.push(c);
+                    match (is_ident(c), word.0) {
+                        (false, _) => (0, ' '),
+                        (true, 0) => (1, c),
+                        (true, len) => (len.saturating_add(1), word.1),
+                    }
+                }
+            };
+        }
+        out
+    }
+
+    /// The byte length of the bracketed attribute `s` starts with.
+    fn bracket_span(s: &str) -> usize {
+        let mut depth = 0_usize;
+        for (at, c) in s.char_indices() {
+            match c {
+                '[' => depth = depth.saturating_add(1),
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return at.saturating_add(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        s.len()
+    }
+
+    /// The byte length of the item `s` starts with.
+    ///
+    /// The item ends at its first top-level `;` or at the end of its first
+    /// braced block.
+    fn item_span(s: &str) -> usize {
+        let mut depth = 0_usize;
+        for (at, c) in s.char_indices() {
+            match c {
+                '{' => depth = depth.saturating_add(1),
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return at.saturating_add(1);
+                    }
+                }
+                ';' if depth == 0 => return at.saturating_add(1),
+                _ => {}
+            }
+        }
+        s.len()
+    }
+
+    /// The comma-separated items of `list` at bracket depth zero.
+    fn top_level_items(list: &str) -> Vec<&str> {
+        let mut items = Vec::new();
+        let mut depth = 0_usize;
+        let mut start = 0_usize;
+        for (at, c) in list.char_indices() {
+            match c {
+                '(' => depth = depth.saturating_add(1),
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    items.push(list.get(start..at).unwrap_or_default());
+                    start = at.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        items.push(list.get(start..).unwrap_or_default());
+        items
+    }
+
+    /// Whether the `cfg` attribute `attr` compiles its item only under test.
+    ///
+    /// Only a `test` predicate, or an `all(..)` with `test` among its own
+    /// conjuncts, does; any other predicate (`any(test, ..)`, `not(test)`)
+    /// keeps the item in production.
+    fn gates_test(attr: &str) -> bool {
+        let compact: String = attr.chars().filter(|c| !c.is_whitespace()).collect();
+        let Some(predicate) = compact
+            .strip_prefix("#[cfg(")
+            .and_then(|rest| rest.strip_suffix(")]"))
+        else {
+            return false;
+        };
+        predicate == "test"
+            || predicate
+                .strip_prefix("all(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .is_some_and(|conjuncts| top_level_items(conjuncts).contains(&"test"))
+    }
+
+    /// `code` without the items a test-only `cfg` attribute gates.
+    fn production(code: &str) -> String {
+        let mut out = String::with_capacity(code.len());
+        let mut rest = code;
+        while let Some(at) = rest.find("#[cfg(") {
+            let Some((before, attr_on)) = rest.split_at_checked(at) else {
+                break;
+            };
+            out.push_str(before);
+            let Some((attr, after)) = attr_on.split_at_checked(bracket_span(attr_on)) else {
+                break;
+            };
+            if gates_test(attr) {
+                rest = after.get(item_span(after)..).unwrap_or_default();
+            } else {
+                out.push_str(attr);
+                rest = after;
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The name of the last `fn` declared before byte `at` of `code`.
+    fn enclosing_fn(code: &str, at: usize) -> &str {
+        let head = code.get(..at).unwrap_or_default();
+        let mut end = head.len();
+        while let Some(found) = head.get(..end).and_then(|h| h.rfind("fn")) {
+            end = found;
+            let before = head.get(..found).and_then(|h| h.chars().next_back());
+            let after = head.get(found.saturating_add(2)..).unwrap_or_default();
+            if before.is_none_or(|c| !is_ident(c)) && after.starts_with(char::is_whitespace) {
+                let name = after.trim_start();
+                let len = name.find(|c: char| !is_ident(c)).unwrap_or(name.len());
+                if len > 0 {
+                    return name.get(..len).unwrap_or_default();
+                }
+            }
+        }
+        ""
+    }
+
+    /// Whether `ident` names a way to start a task or thread: `spawn` (a free
+    /// fn, a method, a re-export, an alias source) or any `spawn_*`.
+    fn starts_a_task(ident: &str) -> bool {
+        ident == "spawn" || ident.starts_with("spawn_")
+    }
+
+    /// Every task-starting identifier of `code` with its enclosing fn.
+    fn spawn_idents(code: &str) -> Vec<(&str, &str)> {
+        let mut found = Vec::new();
+        let mut start: Option<usize> = None;
+        let mut prev_ident = false;
+        for (at, c) in code
+            .char_indices()
+            .chain(std::iter::once((code.len(), ' ')))
+        {
+            let ident = is_ident(c);
+            match (ident, prev_ident, start) {
+                (true, false, _) => start = Some(at),
+                (false, true, Some(from)) => {
+                    let word = code.get(from..at).unwrap_or_default();
+                    if starts_a_task(word) {
+                        found.push((enclosing_fn(code, from), word));
+                    }
+                    start = None;
+                }
+                _ => {}
+            }
+            prev_ident = ident;
+        }
+        found
+    }
+
+    /// Every production task-starting identifier in `files`, by file, enclosing
+    /// fn and name, sorted.
+    fn spawn_sites(files: &[(&str, &str)]) -> Vec<(String, String, String)> {
+        let mut found: Vec<(String, String, String)> = files
+            .iter()
+            .flat_map(|&(file, src)| {
+                let code = production(&code_only(src));
+                spawn_idents(&code)
+                    .into_iter()
+                    .map(|(name, word)| (file.to_owned(), name.to_owned(), word.to_owned()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Every runtime source file, by path under `src/` with `/` separators.
+    fn runtime_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root.clone()];
+        let mut files = Vec::new();
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for path in entries.flatten().map(|entry| entry.path()) {
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && let (Ok(rel), Ok(src)) =
+                        (path.strip_prefix(&root), std::fs::read_to_string(&path))
+                {
+                    let rel: Vec<String> = rel
+                        .components()
+                        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    files.push((rel.join("/"), src));
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn sub_sources_never_spawn() {
+        let admitted: Vec<(String, String, String)> = ADMITTED_SPAWNS
+            .iter()
+            .map(|&(file, name, word)| (file.to_owned(), name.to_owned(), word.to_owned()))
+            .collect();
+        assert_eq!(
+            spawn_sites(&SOURCE_FILES),
+            admitted,
+            "a subscription source returns its body; only the loop starts it"
+        );
+
+        let tea = production(&code_only(include_str!("tea.rs")));
+        let scoped: Vec<&str> = spawn_idents(&tea)
+            .into_iter()
+            .filter(|&(_, word)| word == "spawn_in_current_scope")
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            scoped.contains(&"start_source") && scoped.contains(&"apply"),
+            "the loop starts sources and timers through the scope carrier: {scoped:?}"
+        );
+
+        let source_types: Vec<&str> = tea
+            .match_indices("type SubSpawn<M>")
+            .filter_map(|(at, _)| tea.get(at..))
+            .filter_map(|decl| decl.split(';').next())
+            .collect();
+        assert!(
+            source_types.iter().any(|decl| decl.contains("SourceTask")),
+            "the native source returns a typed task: {source_types:?}"
+        );
+        assert!(
+            source_types.iter().all(|decl| !decl.contains("JoinHandle")),
+            "no source returns a task handle: {source_types:?}"
+        );
+    }
+
+    #[test]
+    fn every_source_building_file_is_scanned() {
+        let sources = runtime_sources();
+        assert!(sources.len() > 3, "the scan walked the runtime sources");
+        let unscanned: Vec<String> = sources
+            .iter()
+            .filter(|(_, src)| production(&code_only(src)).contains("IpeSub::Source("))
+            .map(|(file, _)| file.clone())
+            .filter(|file| {
+                !SOURCE_FILES
+                    .iter()
+                    .any(|&(scanned, _)| scanned == file.as_str())
+                    && !UNSCANNED_SOURCE_FILES.contains(&file.as_str())
+            })
+            .collect();
+        assert!(
+            unscanned.is_empty(),
+            "a file that builds a subscription source joins `SOURCE_FILES`: {unscanned:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_scan_sees_through_literals_and_test_modules() {
+        let bare = "pub fn sub_fake() { IpeSub::Source(Box::new(move |emit| { \
+                    tokio::spawn(async move {}); SourceTask::Idle })) }";
+        assert_eq!(
+            spawn_sites(&[("fake.rs", bare)]),
+            vec![(
+                "fake.rs".to_owned(),
+                "sub_fake".to_owned(),
+                "spawn".to_owned()
+            )],
+            "a bare spawn in a source constructor is found"
+        );
+        let quoted = r##"pub fn sub_quoted() {
+    let s = "tokio::spawn(";
+    let r = r#"tokio::spawn("#;
+    let c = '"';
+    // tokio::spawn(
+    /* tokio::spawn( */
+}
+#[cfg(test)]
+mod tests {
+    fn t() { tokio::spawn(async {}); }
+}
+#[cfg(all(feature = "x", test))]
+fn u() { tokio::spawn(async {}); }
+"##;
+        assert!(
+            spawn_sites(&[("fake.rs", quoted)]).is_empty(),
+            "a spawn in a literal, a comment, or a test-only item is not production code"
+        );
+    }
+
+    #[test]
+    fn spawn_scan_finds_every_way_to_start_a_task() {
+        let starts = r##"
+fn by_byte_raw() { let b = br#"x"y"#; tokio::spawn(async {}); }
+fn by_c_raw() { let c = cr#"x"y"#; tokio::spawn(async {}); }
+fn by_path() { tokio::task::spawn(async {}); }
+fn by_alias() { use tokio::spawn as go; go(async {}); }
+fn by_handle() { tokio::runtime::Handle::current().spawn(async {}); }
+fn by_blocking() { tokio::task::spawn_blocking(|| ()); }
+fn by_thread() { std::thread::spawn(|| ()); }
+#[cfg(any(test, feature = "x"))]
+fn by_any_test() { tokio::spawn(async {}); }
+#[cfg(not(test))]
+fn by_not_test() { tokio::spawn(async {}); }
+"##;
+        let found: Vec<(String, String)> = spawn_sites(&[("fake.rs", starts)])
+            .into_iter()
+            .map(|(_, name, word)| (name, word))
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("by_alias", "spawn"),
+            ("by_any_test", "spawn"),
+            ("by_blocking", "spawn_blocking"),
+            ("by_byte_raw", "spawn"),
+            ("by_c_raw", "spawn"),
+            ("by_handle", "spawn"),
+            ("by_not_test", "spawn"),
+            ("by_path", "spawn"),
+            ("by_thread", "spawn"),
+        ]
+        .iter()
+        .map(|&(name, word)| (name.to_owned(), word.to_owned()))
+        .collect();
+        assert_eq!(
+            found, expected,
+            "a task started by any path, alias, method or production cfg is found"
+        );
+    }
+
+    /// The crate root re-exports one task guard: a second `AbortOnDrop` reached
+    /// through `pub use tea::*` makes the root name ambiguous and stops this
+    /// from compiling.
+    const _ROOT_TASK_GUARD: fn(tokio::task::AbortHandle) -> crate::AbortOnDrop =
+        crate::AbortOnDrop::new;
 }

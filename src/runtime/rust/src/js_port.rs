@@ -24,7 +24,7 @@
 //!   sink, held in a registry keyed by the session's sid. A `js_subscribe` reads the
 //!   owning session's sid from the same task-local scope the pub/sub broker uses
 //!   (`pubsub::current_session_sid`, read synchronously while the driver's
-//!   `with_session_sid` scope is active) and drains ONLY that session's inbound
+//!   `with_session` scope is active) and drains ONLY that session's inbound
 //!   channel; a `js_send` delivers ONLY to the origin session's outbound sink (the
 //!   origin sid the dispatch loop supplies). The server's inbound route
 //!   (`/_ipe/port`) authenticates by session cookie + CSRF, decodes the body
@@ -59,9 +59,11 @@ use crate::tea::{IpeCmd, IpeSub};
 /// boundary — the per-call `is_empty()` guards in the native registry fall
 /// away entirely.
 ///
-/// `Display`/`Debug` expose the raw hex string so the store can use it as a
-/// map key and the dispatch loop can pass it to [`js_send`] via
-/// `IpeCmd::Publish`'s `origin: &str` argument.
+/// `Display` and [`SessionId::as_str`] expose the raw hex string so the store
+/// can use it as a map key and the dispatch loop can pass it to [`js_send`] via
+/// `IpeCmd::Publish`'s `origin: &str` argument. `Debug` prints
+/// `SessionId(<redacted>)`: the id is a bearer credential, so no `{:?}` (a log
+/// line, the stringify fallback) can print it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
 
@@ -97,7 +99,9 @@ impl std::fmt::Display for SessionId {
 
 impl std::fmt::Debug for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.debug_tuple("SessionId")
+            .field(&crate::redact::Redacted::new(()))
+            .finish()
     }
 }
 
@@ -181,6 +185,7 @@ mod native {
     use crate::error::IpeError;
     use crate::json::{Decoder, JsonVal};
     use crate::seal_codec::seal_decode;
+    use crate::tea::SourceTask;
     use std::collections::HashMap;
     use std::sync::{
         Arc, Mutex, OnceLock,
@@ -284,7 +289,7 @@ mod native {
 
     /// The sid of the session whose subscriptions/commands are being materialised
     /// in the current scope. Under the `web` server this reads the same task-local
-    /// the pub/sub broker sets (via `pubsub::with_session_sid`), so a `js_subscribe`
+    /// the pub/sub broker sets (via `pubsub::with_session`), so a `js_subscribe`
     /// binds to the OWNING session. Outside a live server (e.g. a `tokio`-only test
     /// build with no `web` feature) there is no session scope, so it returns `None`
     /// and callers fall back to an inert private channel.
@@ -526,13 +531,13 @@ mod native {
     /// `to_msg(a)` on a clean decode. A rejected payload is dropped whole.
     ///
     /// The owning session's sid is read SYNCHRONOUSLY here (while the driver's
-    /// `with_session_sid` scope is active), then moved into the spawned task, so
+    /// `with_session` scope is active), then moved into the source body, so
     /// the recv loop drains exactly that session's channel and can never observe
     /// another session's inbound frames. A subscription materialised with no
     /// session sid in scope (no valid [`SessionId`]) binds an inert per-call
     /// channel that no route feeds, so it receives nothing.
     ///
-    /// `to_msg` is moved into exactly one detached task and never shared behind an
+    /// `to_msg` is moved into exactly one source body and never shared behind an
     /// `Arc`, so `Send` (not `Send + Sync`) is the exact contract — the same
     /// bound `sub_subscribe_ws_message` carries.
     pub fn js_subscribe<T, M, F>(decoder: Decoder<IpeError, T>, to_msg: F) -> IpeSub<M>
@@ -556,7 +561,7 @@ mod native {
         };
         IpeSub::Source(Box::new(move |emit| {
             let mut rx = rx;
-            tokio::spawn(async move {
+            SourceTask::Tracked(Box::pin(async move {
                 loop {
                     match rx.recv().await {
                         Ok(raw) => {
@@ -574,7 +579,7 @@ mod native {
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            })
+            }))
         }))
     }
 
@@ -796,7 +801,7 @@ mod native {
         };
         IpeSub::Source(Box::new(move |emit| {
             let mut rx = rx;
-            tokio::spawn(async move {
+            SourceTask::Tracked(Box::pin(async move {
                 loop {
                     match rx.recv().await {
                         Ok(raw) => {
@@ -808,7 +813,7 @@ mod native {
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            })
+            }))
         }))
     }
 
@@ -1513,6 +1518,13 @@ mod tests {
         assert_eq!(sid.to_string(), raw);
     }
 
+    #[test]
+    fn session_id_debug_prints_no_token() {
+        let raw = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+        let shown = format!("{:?}", SessionId::parse(raw));
+        assert_eq!(shown, "Some(SessionId(<redacted>))");
+    }
+
     // ── Feature-independent: canonical seal encoding ───────────────────────────
     #[test]
     fn outbound_encodes_record_canonically() {
@@ -1526,14 +1538,14 @@ mod tests {
     // The native port transport binds each `js_subscribe`/`js_send` to the OWNING
     // session's channel, read from the pub/sub session-sid task-local. These tests
     // drive that real scope, so they compile only under `web` (which provides
-    // `pubsub::with_session_sid`).
+    // `pubsub::with_session`).
     #[cfg(feature = "web")]
     mod per_session {
         use super::super::*;
         use crate::IpeResult;
         use crate::error::IpeError;
         use crate::json::{Decoder, JsonVal, json_decode_int};
-        use crate::web::pubsub::with_session_sid;
+        use crate::web::pubsub::{SessionScope, with_session};
         use std::sync::{Arc, Mutex};
 
         fn int_decoder() -> Decoder<IpeError, i64> {
@@ -1556,21 +1568,21 @@ mod tests {
         }
 
         // Materialise a `js_subscribe` Source the way the Web driver does —
-        // INSIDE `with_session_sid(sid, …)`, so the subscription binds `sid`'s
+        // INSIDE `with_session(scope, …)`, so the subscription binds `sid`'s
         // inbound channel — and collect the emitted Msgs.
         fn collect_for(
             sid: &SessionId,
             decoder: Decoder<IpeError, i64>,
-        ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<i64>>>) {
+        ) -> (crate::tea::RunningSource, Arc<Mutex<Vec<i64>>>) {
             let got = Arc::new(Mutex::new(Vec::<i64>::new()));
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
                 Arc::new(move |m| got2.lock().unwrap_or_else(|e| e.into_inner()).push(m));
-            let sub = with_session_sid(sid.to_string(), || {
+            let sub = with_session(&SessionScope::new(sid.to_string()), || {
                 js_subscribe::<i64, i64, _>(decoder, |a| a)
             });
             let handle = match sub {
-                IpeSub::Source(spawn) => spawn(emit),
+                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
                 _ => unreachable!("js_subscribe builds a Source"),
             };
             (handle, got)
@@ -1585,7 +1597,7 @@ mod tests {
             deliver_inbound_for(&sid, "7".to_string());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(*got.lock().unwrap_or_else(|e| e.into_inner()), vec![7]);
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1599,7 +1611,7 @@ mod tests {
             deliver_inbound_for(&sid, "{not json".to_string()); // malformed
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // both dropped, no panic, no partial
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1613,7 +1625,7 @@ mod tests {
             deliver_inbound_for(&sid, "2".to_string());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1716,7 +1728,7 @@ mod tests {
 
             // Open a session INSIDE the sid scope so `js_close_session` finds a
             // live stream to install its terminal waiter on.
-            let handle = match with_session_sid(sid.to_string(), || {
+            let handle = match with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -1728,7 +1740,7 @@ mod tests {
             // Reopen window: no out-sink bound. Fire the close Cmd — its future
             // awaits the terminal, so drive it on a spawned task; we only need it
             // to reach the outbound-delivery step, then observe the buffered frame.
-            let close_fut = with_session_sid(sid.to_string(), || {
+            let close_fut = with_session(&SessionScope::new(sid.to_string()), || {
                 js_close_session::<i64, i64>(handle, 1_i64, int_decoder())
             });
             let task = tokio::spawn(close_fut);
@@ -1872,8 +1884,8 @@ mod tests {
             ); // A's sink
             assert!(out_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // B's sink saw NOTHING (no leak)
 
-            ha.abort();
-            hb.abort();
+            drop(ha);
+            drop(hb);
             session_close(&sid_a);
             session_close(&sid_b);
         }
@@ -1885,21 +1897,21 @@ mod tests {
         async fn unscoped_subscription_receives_nothing() {
             let sid = test_sid("a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2");
             session_open(&sid);
-            // NOTE: materialised OUTSIDE with_session_sid → owner sid is absent.
+            // NOTE: materialised OUTSIDE with_session → owner sid is absent.
             let got = Arc::new(Mutex::new(Vec::<i64>::new()));
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
                 Arc::new(move |m| got2.lock().unwrap_or_else(|e| e.into_inner()).push(m));
             let sub = js_subscribe::<i64, i64, _>(int_decoder(), |a| a);
             let h = match sub {
-                IpeSub::Source(spawn) => spawn(emit),
+                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
                 _ => unreachable!(),
             };
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(&sid, "5".to_string());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty()); // inert drain — nothing delivered
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1925,7 +1937,7 @@ mod tests {
                     intercept(s);
                 }),
             );
-            with_session_sid(sid.to_string(), || {
+            with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -1947,7 +1959,7 @@ mod tests {
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "unknown-id reply must not reach subscribers"
             );
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -1999,7 +2011,7 @@ mod tests {
                     }
                 }),
             );
-            let result = with_session_sid(sid.to_string(), || {
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2032,7 +2044,7 @@ mod tests {
                 }
             }
             // The next request must be refused immediately.
-            let result = with_session_sid(sid.to_string(), || {
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2081,10 +2093,10 @@ mod tests {
             );
 
             let (ra, rb) = tokio::join!(
-                with_session_sid(sid_a.to_string(), || {
+                with_session(&SessionScope::new(sid_a.to_string()), || {
                     js_request::<i64, i64>(0_i64, int_decoder())
                 }),
-                with_session_sid(sid_b.to_string(), || {
+                with_session(&SessionScope::new(sid_b.to_string()), || {
                     js_request::<i64, i64>(0_i64, int_decoder())
                 }),
             );
@@ -2120,7 +2132,7 @@ mod tests {
                     }
                 }),
             );
-            let result = with_session_sid(sid.to_string(), || {
+            let result = with_session(&SessionScope::new(sid.to_string()), || {
                 js_request::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2144,7 +2156,7 @@ mod tests {
             deliver_inbound_for(&sid, "1".to_string()); // no channel → dropped
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert!(got.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-            h.abort();
+            drop(h);
         }
 
         // ── Session-stream primitive: routing + refusals ─────────────────────
@@ -2163,7 +2175,7 @@ mod tests {
                         .push(s.to_string());
                 }),
             );
-            let handle = match with_session_sid(sid.to_string(), || {
+            let handle = match with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -2179,16 +2191,16 @@ mod tests {
         fn collect_frames(
             sid: &SessionId,
             handle: i64,
-        ) -> (tokio::task::JoinHandle<()>, Arc<Mutex<Vec<i64>>>) {
+        ) -> (crate::tea::RunningSource, Arc<Mutex<Vec<i64>>>) {
             let got = Arc::new(Mutex::new(Vec::<i64>::new()));
             let got2 = got.clone();
             let emit: Arc<dyn Fn(i64) + Send + Sync> =
                 Arc::new(move |m| got2.lock().unwrap_or_else(|e| e.into_inner()).push(m));
-            let sub = with_session_sid(sid.to_string(), || {
+            let sub = with_session(&SessionScope::new(sid.to_string()), || {
                 js_session_frames::<i64, i64, _>(handle, int_decoder(), |a| a)
             });
             let h = match sub {
-                IpeSub::Source(spawn) => spawn(emit),
+                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
                 _ => unreachable!("js_session_frames builds a Source"),
             };
             (h, got)
@@ -2206,7 +2218,7 @@ mod tests {
             deliver_inbound_for(&sid, format!(r#"{{"__ipe_session":{handle},"payload":7}}"#));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             assert_eq!(*got.lock().unwrap_or_else(|e| e.into_inner()), vec![7]);
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -2226,7 +2238,7 @@ mod tests {
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "foreign session-id frame must not reach the subscriber"
             );
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -2249,7 +2261,7 @@ mod tests {
                 got.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "a frame after close must be dropped"
             );
-            h.abort();
+            drop(h);
             session_close(&sid);
         }
 
@@ -2261,7 +2273,7 @@ mod tests {
             session_open(&sid);
             // Mint a session directly and shrink its remaining budget to 0 so the
             // NEXT frame overflows (driving 100k frames in a unit test is wasteful).
-            let handle = match with_session_sid(sid.to_string(), || {
+            let handle = match with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await
@@ -2281,9 +2293,10 @@ mod tests {
             // Park a close waiter, then push the overflowing frame; the close Task
             // must resolve Err (session terminated, not a silent drop).
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session_sid(sid.to_string(), move || {
-                js_close_session::<i64, i64>(handle, 0_i64, int_decoder())
-            }));
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,
@@ -2305,7 +2318,7 @@ mod tests {
             session_open(&sid);
             register_out_sink_for(&sid, Arc::new(|_s: &str| {}));
             for _ in 0..MAX_OPEN_SESSIONS {
-                let r = with_session_sid(sid.to_string(), || {
+                let r = with_session(&SessionScope::new(sid.to_string()), || {
                     js_open_session::<i64, i64>(0_i64, int_decoder())
                 })
                 .await;
@@ -2314,7 +2327,7 @@ mod tests {
                     "under ceiling must open"
                 );
             }
-            let over = with_session_sid(sid.to_string(), || {
+            let over = with_session(&SessionScope::new(sid.to_string()), || {
                 js_open_session::<i64, i64>(0_i64, int_decoder())
             })
             .await;
@@ -2332,9 +2345,10 @@ mod tests {
             session_open(&sid);
             let (handle, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session_sid(sid.to_string(), move || {
-                js_close_session::<i64, i64>(handle, 0_i64, int_decoder())
-            }));
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,
@@ -2356,9 +2370,10 @@ mod tests {
             session_open(&sid);
             let (handle, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session_sid(sid.to_string(), move || {
-                js_close_session::<i64, i64>(handle, 0_i64, int_decoder())
-            }));
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             deliver_inbound_for(
                 &sid_clone,
@@ -2394,8 +2409,8 @@ mod tests {
                 got_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
                 "session B must not see session A's frame"
             );
-            ha.abort();
-            hb.abort();
+            drop(ha);
+            drop(hb);
             session_close(&sid);
         }
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Ipê FIRST-PARTY `ipe type-check` FLOOR — the cheap, gating compile floor.
 #
-# Runs `ipe type-check` (type-check ONLY — no `ipe build`, no cargo) over every
+# Runs `ipe type-check` (type-check ONLY — no `ipe dev build`, no cargo) over every
 # shipped first-party example (first_party_check_set in tools/scripts/lib/examples.sh:
 # examples/shapes/** + examples/wasm/**, minus the FFI-gated ones). A shipped
 # example that fails to type-check FAILS this floor LOUD, naming each broken
@@ -9,7 +9,7 @@
 # instead of rotting silently in the tree.
 #
 # This is a FLOOR, complementary to (not a duplicate of) the heavier check:
-#   • ci.yml's `shapes-examples` build gate — `ipe type-check` + `ipe build` +
+#   • ci.yml's `shapes-examples` build gate — `ipe type-check` + `ipe dev build` +
 #     cargo over the shape examples. This floor is check-only but WIDER: it also
 #     covers examples/wasm/**, which otherwise only reaches `ipe type-check` in the
 #     non-gating nightly E2E suite.

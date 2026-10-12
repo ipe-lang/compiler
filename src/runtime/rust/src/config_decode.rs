@@ -153,29 +153,10 @@ pub fn config_decode_yaml<E: From<String> + 'static, T>(
 // can't stall the tokio worker thread polling this future. This module is
 // gated on the `config` Cargo feature (`config = ["json", "toml",
 // "serde_yaml"]`, runtime/Cargo.toml), which does NOT pull in `tokio`, so
-// `tokio` is not guaranteed present here — same constraint `file.rs`
-// documents for its own `run_blocking` helper (see
+// `tokio` is not guaranteed present here (see
 // `docs/adr/0003-security-render-and-data-access-invariants.md` §2.2).
-#[cfg(feature = "tokio")]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r,
-        Err(_) => Err("background config-file task panicked".to_string()),
-    }
-}
-
-#[cfg(not(feature = "tokio"))]
-async fn run_blocking<T, F>(f: F) -> Result<T, String>
-where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    f()
-}
+// The offload is `threads::run_blocking`: a pool that cannot start a thread is
+// an `Unavailable` error, and a build without the pool reads inline.
 
 fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
     // Open first, then enforce the cap THROUGH a capped reader rather than
@@ -215,12 +196,15 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
 // Config.loadFromFile : String -> Decoder a -> Task Error a
 // Extension dispatch: .toml / .yaml|.yml / .json (default json).
 //
-// the file read is offloaded via `run_blocking` (see the module-level
-// doc comment above) so a large/slow config read can't stall the tokio
+// the file read is offloaded via `threads::run_blocking` (see the module-level
+// comment above) so a large/slow config read can't stall the tokio
 // worker thread. The decode dispatch itself runs back on the calling task
 // after the read completes — decoding an already-in-memory, size-capped
 // (≤16 MiB default) string is fast enough not to warrant its own offload.
-pub fn config_load_from_file<E: From<String> + Send + 'static, T: Send + 'static>(
+pub fn config_load_from_file<
+    E: From<String> + crate::FromUnavailable + Send + 'static,
+    T: Send + 'static,
+>(
     path: crate::path::Path,
     decoder: Decoder<E, T>,
 ) -> IpeTask<E, T> {
@@ -236,14 +220,18 @@ pub fn config_load_from_file<E: From<String> + Send + 'static, T: Send + 'static
             Ok(cap) => cap,
             Err(refusal) => return IpeResult::Err(str_err(&refusal.to_string())),
         };
-        let contents = match run_blocking({
-            let path = path.clone();
-            move || config_read_capped(&path, cap)
-        })
+        let contents = match crate::threads::run_blocking::<_, E, _>(
+            "Config.loadFromFile",
+            "background config-file task panicked",
+            {
+                let path = path.clone();
+                move || config_read_capped(&path, cap)
+            },
+        )
         .await
         {
             Ok(c) => c,
-            Err(e) => return IpeResult::Err(str_err(&e)),
+            Err(e) => return IpeResult::Err(e),
         };
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".toml") {
@@ -290,8 +278,8 @@ mod load_from_file_tests {
         sealed.expect("test fixture path passes the seal")
     }
 
-    /// Functional correctness (independent of whether `run_blocking` takes
-    /// the real `spawn_blocking` path or the no-tokio-feature fallback —
+    /// Functional correctness (independent of whether the offload takes
+    /// the blocking pool or the no-tokio-feature inline fallback —
     /// both paths must return the same decoded result).
     #[test]
     fn loads_and_decodes_json() {

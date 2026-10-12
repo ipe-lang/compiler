@@ -4,6 +4,7 @@
 //! a reader auditing the profile model never needs the per-platform arms.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 use ipe_kernels::Capability;
 
@@ -62,9 +63,150 @@ pub enum FilesystemScope {
     /// writable tempdir. The maximally-isolated filesystem view.
     Isolated,
     /// `filesystem` granted: the working tree is bound read-write (still coarse
-    /// — any path under it — per the first-cut map).
+    /// — any path under it — per the first-cut map), except its version-control
+    /// metadata ([`crate::VcsKind::ALL`]), which stays read-only: the host runs
+    /// code that metadata names. An arm that cannot keep it read-only refuses
+    /// a tree holding it. Metadata the program creates after the jail starts is
+    /// not carved on every arm, so a tree is trusted only as far as the next
+    /// tool the developer runs over it.
     WorkingTreeReadWrite,
 }
+
+// ── the process-count ceiling ───────────────────────────────────────────────
+
+/// A jail's process-count ceiling, from 1 to [`ProcCap::MAX`].
+///
+/// Every jail arm takes its cap from this one type: `prlimit --nproc` on
+/// Linux, the Job Object `ActiveProcessLimit` on Windows (through
+/// [`ProcCap::job_limit`]). Zero and any value past [`ProcCap::MAX`] have no
+/// representation, so no cap reads as "no process" or as "unbounded".
+///
+/// The unit differs per kernel: Linux charges tasks (threads included), while
+/// the Windows Job Object counts processes.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct ProcCap(NonZeroU32);
+
+impl ProcCap {
+    /// The highest cap a profile or an operator override may ask for.
+    ///
+    /// Linux counts threads against it, so it leaves room for a threaded build
+    /// while still bounding a fork bomb far below a host's task table.
+    pub const MAX: Self = Self(NonZeroU32::MIN.saturating_add(4095));
+
+    /// The cap every jail runs under unless its caller asks for another.
+    pub const DEFAULT: Self = Self(NonZeroU32::MIN.saturating_add(511));
+
+    /// Parse a requested cap, refusing zero and every value past [`Self::MAX`].
+    ///
+    /// # Errors
+    ///
+    /// [`ProcCapError::Zero`] for `0`; [`ProcCapError::PastCeiling`] for a
+    /// value above [`Self::MAX`]. A value is never clamped into range.
+    pub fn parse(requested: u64) -> Result<Self, ProcCapError> {
+        let narrow = u32::try_from(requested).map_err(|_| ProcCapError::PastCeiling)?;
+        let cap = NonZeroU32::new(narrow).ok_or(ProcCapError::Zero)?;
+        if cap > Self::MAX.0 {
+            return Err(ProcCapError::PastCeiling);
+        }
+        Ok(Self(cap))
+    }
+
+    /// A cap known at compile time; a count outside `1..=MAX` fails the build.
+    #[must_use]
+    pub const fn of<const N: u32>() -> Self {
+        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a literal cap is zero or past the ceiling [ledger #boundary]
+        const { assert!(N >= 1 && N <= Self::MAX.get()) };
+        Self(NonZeroU32::MIN.saturating_add(N - 1))
+    }
+
+    /// The cap as a count.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The Win32 Job Object `ActiveProcessLimit` for a jail.
+    ///
+    /// With `subprocess` withheld only the payload itself may run, so the
+    /// limit is 1; with it granted the limit is the cap. Both are at most
+    /// [`Self::MAX`], so the job is never unbounded.
+    #[must_use]
+    pub const fn job_limit(self, subprocess: bool) -> u32 {
+        if subprocess { self.get() } else { 1 }
+    }
+}
+
+// The documented range and default are the constants themselves.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the process-cap ceiling or default drifts from its documented value [ledger #boundary]
+const _: () = assert!(ProcCap::MAX.get() == 4096 && ProcCap::DEFAULT.get() == 512);
+
+impl std::fmt::Display for ProcCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl TryFrom<u64> for ProcCap {
+    type Error = ProcCapError;
+
+    fn try_from(requested: u64) -> Result<Self, Self::Error> {
+        Self::parse(requested)
+    }
+}
+
+impl From<ProcCap> for u64 {
+    fn from(cap: ProcCap) -> Self {
+        Self::from(cap.get())
+    }
+}
+
+impl std::str::FromStr for ProcCap {
+    type Err = ProcCapError;
+
+    /// Parse decimal digits only: a sign, a space or an empty text refuses.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ProcCapError::NotANumber);
+        }
+        // Digits only, so the one way `u64` parsing fails is an overflow.
+        text.parse::<u64>()
+            .map_err(|_| ProcCapError::PastCeiling)
+            .and_then(Self::parse)
+    }
+}
+
+/// Why a requested process cap was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcCapError {
+    /// The text is not a whole decimal number.
+    NotANumber,
+    /// A cap of 0 admits no process at all.
+    Zero,
+    /// The cap is above [`ProcCap::MAX`].
+    PastCeiling,
+}
+
+impl std::fmt::Display for ProcCapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max = ProcCap::MAX;
+        match self {
+            Self::NotANumber => write!(f, "a process cap must be a whole number from 1 to {max}"),
+            Self::Zero => write!(
+                f,
+                "a process cap of 0 admits no process; it must be from 1 to {max}"
+            ),
+            Self::PastCeiling => write!(
+                f,
+                "a process cap above {max} is refused; it must be from 1 to {max}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProcCapError {}
 
 /// The resource caps for a run-jailed app.
 ///
@@ -87,7 +229,7 @@ pub struct RunResourceLimits {
     /// Open-file-descriptor cap.
     pub fd_cap: u64,
     /// Process-count cap.
-    pub proc_cap: u64,
+    pub proc_cap: ProcCap,
 }
 
 impl Default for RunResourceLimits {
@@ -100,7 +242,7 @@ impl Default for RunResourceLimits {
             cpu_secs: 86_400,
             wall_secs: None,
             fd_cap: 4096,
-            proc_cap: 512,
+            proc_cap: ProcCap::DEFAULT,
         }
     }
 }
@@ -259,15 +401,16 @@ impl SandboxProfile {
     /// from these), so a tampered `ipe.profile` can neither claim fewer axes nor
     /// swap *which* env vars it grants below what the binary was built for.
     ///
-    /// Format: `ipe-capfloor 1 net=<b> fs=<isolated|rw> sub=<b> env=<names>` where
-    /// `<names>` is the sorted, comma-joined set of granted env names (empty when
-    /// none). The names are bound by identity, so the floor compares env by the
+    /// Format: `ipe-capfloor 1 net=<b> fs=<isolated|rw> sub=<b> env=<names>
+    /// intent=<release|development>` where `<names>` is the sorted, comma-joined
+    /// set of granted env names (empty when none) and `intent` names the build
+    /// pipeline that embedded the floor ([`FloorIntent`]). The names are bound by identity, so the floor compares env by the
     /// SAME ⊆ subset check as the other axes — a same-count name swap no longer
     /// passes. Env var names are POSIX identifiers (`[A-Za-z_][A-Za-z0-9_]*`), so
     /// they never contain a comma or whitespace; [`parse_capfloor`] fails closed
     /// on any name that does.
     #[must_use]
-    pub fn to_capfloor_line(&self) -> String {
+    pub fn to_capfloor_line(&self, intent: FloorIntent) -> String {
         let fs = match self.filesystem {
             FilesystemScope::Isolated => "isolated",
             FilesystemScope::WorkingTreeReadWrite => "rw",
@@ -276,11 +419,113 @@ impl SandboxProfile {
         names.sort_unstable();
         names.dedup();
         format!(
-            "ipe-capfloor 1 net={} fs={fs} sub={} env={}",
+            "ipe-capfloor 1 net={} fs={fs} sub={} env={} intent={}",
             self.network,
             self.subprocess,
-            names.join(",")
+            names.join(","),
+            intent.token()
         )
+    }
+}
+
+/// The build pipeline that embedded an app's capability floor.
+///
+/// `ipe release run` and the release wrapper run only a [`FloorIntent::Release`]
+/// app: a development build carries debug assertions, an unoptimised profile
+/// and development-only behaviour that a deployment must not ship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorIntent {
+    /// Embedded by a development build (`ipe dev`), or by a floor line that
+    /// names no intent.
+    Development,
+    /// Embedded by `ipe release build`.
+    Release,
+}
+
+impl FloorIntent {
+    /// The `intent=` token of the capfloor line.
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Release => "release",
+        }
+    }
+}
+
+/// A capability floor read from a binary: the axes it grants at most, and
+/// the pipeline that embedded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapFloor {
+    /// The grants the floor caps a profile at (limits are not part of a floor).
+    pub axes: SandboxProfile,
+    /// The build pipeline that embedded the floor.
+    pub intent: FloorIntent,
+}
+
+/// Why a release app was refused against its profile before it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorRefusal {
+    /// The app carries no readable capability floor.
+    Unreadable,
+    /// The floor was embedded by a development build (`ipe dev`), not
+    /// `ipe release build`.
+    NotRelease,
+    /// The profile grants more than the floor the app was built with.
+    ProfileWider,
+}
+
+impl std::fmt::Display for FloorRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = super::RunJailDefect::ProfileWeakerThanFloor.code();
+        match self {
+            Self::Unreadable => write!(
+                f,
+                "{}: the binary embeds no readable capability floor — refusing to run an \
+                 artifact whose confinement cannot be verified: rebuild it with \
+                 `ipe release build`",
+                code.as_str()
+            ),
+            Self::NotRelease => write!(
+                f,
+                "{}: the app is a development build (`ipe dev`), not an \
+                 `ipe release build` artifact — a release runs only a release build: \
+                 rebuild it with `ipe release build`",
+                code.as_str()
+            ),
+            Self::ProfileWider => {
+                write!(f, "{}", super::RunJailDefect::ProfileWeakerThanFloor)
+            }
+        }
+    }
+}
+
+impl std::error::Error for FloorRefusal {}
+
+/// Verify a release app's bytes against the profile it is to run under.
+///
+/// The one check `ipe release run` and the release wrapper both apply: the
+/// app must embed a readable floor ([`scan_capfloor`]), that floor must be a
+/// release build's, and the profile must grant no more than it
+/// ([`SandboxProfile::satisfies_capfloor`]).
+///
+/// # Errors
+///
+/// [`FloorRefusal::Unreadable`] with no readable floor;
+/// [`FloorRefusal::NotRelease`] for a development build's floor;
+/// [`FloorRefusal::ProfileWider`] when the profile exceeds the floor.
+pub fn verify_release_floor(
+    profile: &SandboxProfile,
+    app_bytes: &[u8],
+) -> Result<(), FloorRefusal> {
+    let floor = scan_capfloor(app_bytes).ok_or(FloorRefusal::Unreadable)?;
+    match floor.intent {
+        FloorIntent::Release => {}
+        FloorIntent::Development => return Err(FloorRefusal::NotRelease),
+    }
+    if profile.satisfies_capfloor(&floor.axes) {
+        Ok(())
+    } else {
+        Err(FloorRefusal::ProfileWider)
     }
 }
 
@@ -373,8 +618,10 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
 
 /// Strictly parse a capfloor line into the *comparison floor*.
 ///
-/// The result is a [`SandboxProfile`] whose axes AND env allowlist are the floor
-/// the binary was built with. The env names are parsed from the sorted,
+/// The result's [`CapFloor::axes`] is a [`SandboxProfile`] whose axes AND env
+/// allowlist are the floor the binary was built with; its
+/// [`CapFloor::intent`] is the pipeline that embedded it, and a line naming
+/// no intent is a [`FloorIntent::Development`] floor, never a release one. The env names are parsed from the sorted,
 /// comma-joined `env=<names>` field ([`SandboxProfile::to_capfloor_line`]), so
 /// the launcher can verify the profile grants only env vars the floor also
 /// grants — an exact name subset, not a count.
@@ -385,8 +632,8 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
 /// parsed means the binary's authoritative floor is unreadable, so the launcher
 /// must refuse (never treat an unreadable floor as "no floor"). An env name that
 /// is empty or carries a comma/whitespace (impossible for a POSIX env name) is a
-/// malformed floor and refuses.
-pub fn parse_capfloor(line: &str) -> Result<SandboxProfile, ParseError> {
+/// malformed floor and refuses, as is an unknown or repeated `intent`.
+pub fn parse_capfloor(line: &str) -> Result<CapFloor, ParseError> {
     let malformed = |detail: String| ParseError::Malformed { detail };
     let line = line.trim();
     let mut parts = line.split_whitespace();
@@ -397,6 +644,7 @@ pub fn parse_capfloor(line: &str) -> Result<SandboxProfile, ParseError> {
     let mut filesystem = FilesystemScope::Isolated;
     let mut subprocess = false;
     let mut env_allowlist: Vec<String> = Vec::new();
+    let mut intent: Option<FloorIntent> = None;
     for field in parts {
         let (k, v) = field
             .split_once('=')
@@ -414,15 +662,28 @@ pub fn parse_capfloor(line: &str) -> Result<SandboxProfile, ParseError> {
             "env" => {
                 env_allowlist = parse_capfloor_env_names(v)?;
             }
+            "intent" => {
+                let parsed = match v {
+                    "release" => FloorIntent::Release,
+                    "development" => FloorIntent::Development,
+                    other => return Err(malformed(format!("unknown intent {other:?}"))),
+                };
+                if intent.replace(parsed).is_some() {
+                    return Err(malformed("repeated intent field".to_owned()));
+                }
+            }
             other => return Err(malformed(format!("unknown capfloor field {other:?}"))),
         }
     }
-    Ok(SandboxProfile {
-        network,
-        filesystem,
-        subprocess,
-        env_allowlist,
-        limits: RunResourceLimits::default(),
+    Ok(CapFloor {
+        axes: SandboxProfile {
+            network,
+            filesystem,
+            subprocess,
+            env_allowlist,
+            limits: RunResourceLimits::default(),
+        },
+        intent: intent.unwrap_or(FloorIntent::Development),
     })
 }
 
@@ -565,6 +826,15 @@ pub fn profile_from_capabilities(
 /// this marker, which survives `strip` (`.rodata` is allocated).
 pub const CAPFLOOR_MARKER: &str = "ipe-capfloor 1 ";
 
+/// Ceiling on the bytes of a release app read for its floor scan.
+///
+/// 512 MiB is far above any statically-linked app while refusing a planted
+/// device node or multi-GiB file before it is buffered whole.
+pub const APP_READ_CAP: u64 = 512 * 1024 * 1024;
+
+/// Ceiling on the bytes of a release bundle's `ipe.profile`.
+pub const PROFILE_READ_CAP: u64 = 1024 * 1024;
+
 /// Scan a binary's bytes for the embedded capability-floor line and parse it —
 /// the tamper-safe floor read that does NOT execute the binary and survives
 /// `strip`.
@@ -582,11 +852,14 @@ pub const CAPFLOOR_MARKER: &str = "ipe-capfloor 1 ";
 /// permissive floor line cannot raise the ceiling and relax the jail. Concretely
 /// the floors are intersected (an axis is in the merged floor only if EVERY
 /// occurrence grants it, and an env name survives only if EVERY occurrence grants
-/// it — the name-set intersection).
+/// it — the name-set intersection). The merged intent is
+/// [`FloorIntent::Release`] only if every occurrence names it, so a forged
+/// release line beside a development floor cannot pass a development build
+/// off as a release one.
 #[must_use]
-pub fn scan_capfloor(bytes: &[u8]) -> Option<SandboxProfile> {
+pub fn scan_capfloor(bytes: &[u8]) -> Option<CapFloor> {
     let marker = CAPFLOOR_MARKER.as_bytes();
-    let mut floors: Vec<SandboxProfile> = Vec::new();
+    let mut floors: Vec<CapFloor> = Vec::new();
     // Every window that starts with the marker begins a candidate floor line.
     for (start, _) in bytes
         .windows(marker.len())
@@ -610,9 +883,22 @@ pub fn scan_capfloor(bytes: &[u8]) -> Option<SandboxProfile> {
     // occurrence grants it; the env ceiling is the NAME-SET intersection (a name
     // survives only if every occurrence grants it). A forged permissive copy
     // cannot raise the ceiling nor swap in a name the legitimate floor omits.
-    let mut merged = first.clone();
-    let mut env_names: BTreeSet<&str> = first.env_allowlist.iter().map(String::as_str).collect();
-    for f in rest {
+    let mut merged = first.axes.clone();
+    let mut intent = first.intent;
+    let mut env_names: BTreeSet<&str> = first
+        .axes
+        .env_allowlist
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for CapFloor {
+        axes: f,
+        intent: occurrence_intent,
+    } in rest
+    {
+        if *occurrence_intent == FloorIntent::Development {
+            intent = FloorIntent::Development;
+        }
         if !f.network {
             merged.network = false;
         }
@@ -626,12 +912,86 @@ pub fn scan_capfloor(bytes: &[u8]) -> Option<SandboxProfile> {
         env_names.retain(|n| occurrence.contains(n));
     }
     merged.env_allowlist = env_names.into_iter().map(str::to_owned).collect();
-    Some(merged)
+    Some(CapFloor {
+        axes: merged,
+        intent,
+    })
 }
 
 #[cfg(test)]
 mod limit_mapping_tests {
-    use super::RunResourceLimits;
+    use super::{ProcCap, ProcCapError, RunResourceLimits};
+
+    #[test]
+    fn proc_cap_refuses_zero_and_past_ceiling() {
+        assert_eq!(ProcCap::parse(0), Err(ProcCapError::Zero));
+        let one_past = u64::from(ProcCap::MAX.get()) + 1;
+        assert_eq!(ProcCap::parse(one_past), Err(ProcCapError::PastCeiling));
+        assert_eq!(
+            ProcCap::parse(u64::from(u32::MAX) + 1),
+            Err(ProcCapError::PastCeiling)
+        );
+        assert_eq!(ProcCap::parse(u64::MAX), Err(ProcCapError::PastCeiling));
+        assert_eq!(ProcCap::try_from(0_u64), Err(ProcCapError::Zero));
+        // The text form refuses the same values, and anything but digits.
+        assert_eq!("0".parse::<ProcCap>(), Err(ProcCapError::Zero));
+        assert_eq!("4097".parse::<ProcCap>(), Err(ProcCapError::PastCeiling));
+        assert_eq!(
+            "99999999999999999999999".parse::<ProcCap>(),
+            Err(ProcCapError::PastCeiling)
+        );
+        for not_digits in ["", "+64", "-1", " 64", "64 ", "0x40", "6.4", "\u{663}"] {
+            assert_eq!(
+                not_digits.parse::<ProcCap>(),
+                Err(ProcCapError::NotANumber),
+                "{not_digits:?}"
+            );
+        }
+        // Controls: the default, the ceiling and the floor admit unchanged.
+        assert_eq!(ProcCap::parse(512).map(ProcCap::get), Ok(512));
+        assert_eq!(ProcCap::parse(512), Ok(ProcCap::DEFAULT));
+        assert_eq!(ProcCap::parse(4096), Ok(ProcCap::MAX));
+        assert_eq!(ProcCap::parse(1).map(ProcCap::get), Ok(1));
+        assert_eq!("4096".parse::<ProcCap>(), Ok(ProcCap::MAX));
+        // A leading zero is still a decimal number, as in the other overrides.
+        assert_eq!("0512".parse::<ProcCap>(), Ok(ProcCap::DEFAULT));
+        assert_eq!(u64::from(ProcCap::MAX), 4096);
+        assert_eq!(ProcCap::MAX.to_string(), "4096");
+        assert_eq!(RunResourceLimits::default().proc_cap, ProcCap::DEFAULT);
+    }
+
+    #[test]
+    fn a_deserialized_proc_cap_refuses_zero_and_past_ceiling() {
+        // Serde mints the cap through `ProcCap::parse`, so a profile read from
+        // text cannot carry a cap the type refuses.
+        let limits = |proc_cap: &str| {
+            toml::from_str::<RunResourceLimits>(&format!(
+                "as_bytes = 1\ncpu_secs = 1\nfd_cap = 1\nproc_cap = {proc_cap}\n"
+            ))
+        };
+        for refused in ["0", "4097", "-1", "4294967296"] {
+            assert!(limits(refused).is_err(), "proc_cap = {refused}");
+        }
+        // Controls: the floor and the ceiling deserialize unchanged.
+        assert_eq!(limits("1").ok().map(|l| l.proc_cap.get()), Some(1));
+        assert_eq!(limits("4096").ok().map(|l| l.proc_cap), Some(ProcCap::MAX));
+    }
+
+    #[test]
+    fn active_process_cap_never_exceeds_the_proc_cap_ceiling() {
+        // The Windows Job Object limit comes from the typed cap alone, so it is
+        // never past `ProcCap::MAX` and never 0, granted or withheld.
+        for cap in [ProcCap::parse(1), Ok(ProcCap::DEFAULT), Ok(ProcCap::MAX)] {
+            let cap = cap.expect("a cap in range");
+            assert_eq!(cap.job_limit(true), cap.get());
+            assert!(cap.job_limit(true) <= ProcCap::MAX.get());
+            assert_eq!(cap.job_limit(false), 1);
+        }
+        // Controls: a granted job runs under the cap it asked for.
+        let eight = ProcCap::parse(8).expect("8 is in range");
+        assert_eq!(eight.job_limit(true), 8);
+        assert_eq!(ProcCap::MAX.job_limit(true), 4096);
+    }
 
     #[test]
     fn cpu_seconds_map_to_hundred_nanosecond_ticks() {

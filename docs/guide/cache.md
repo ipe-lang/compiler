@@ -63,7 +63,7 @@ lookupText key found =
 ```
 
 With both slots full, writing a third key evicts the least-recently-used one.
-Running it (`ipe run`) prints:
+Running it (`ipe dev run`) prints:
 
 ```
 hit  alice -> editor

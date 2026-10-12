@@ -13,7 +13,7 @@ Anything else prints a friendly hint and leaves the state unchanged.
 ## Run
 
 ```
-ipe run examples/shapes/terminal/http-shell
+ipe dev run examples/shapes/terminal/http-shell
 ```
 
 Then type, for example:
@@ -25,5 +25,5 @@ get https://example.com
 You can also drive it non-interactively by piping commands in:
 
 ```
-printf 'get https://example.com\nquit\n' | ipe run examples/shapes/terminal/http-shell
+printf 'get https://example.com\nquit\n' | ipe dev run examples/shapes/terminal/http-shell
 ```

@@ -19,6 +19,7 @@ pub mod advisory;
 pub mod api_surface;
 pub mod audit;
 pub mod audit_native;
+mod browser;
 pub mod build_plan;
 mod cache;
 mod cargo_step;
@@ -34,6 +35,8 @@ pub mod delivery_set;
 pub mod diff;
 pub mod doc;
 pub mod doc_bundle;
+pub mod doc_pick;
+pub mod doc_search;
 pub mod doc_type_search;
 pub mod env_dir;
 pub mod ffi;
@@ -79,11 +82,14 @@ pub mod style;
 #[cfg(unix)]
 mod terminate;
 pub mod text;
+pub mod threads;
 pub mod toolchain;
 pub mod unsafe_ack;
+pub mod verb;
 pub mod version_check;
 pub mod wasi_run;
 pub mod web_consent;
+pub mod wrapper_source;
 /// The embedded Ipê standard-library source now lives in the dependency-free
 /// [`ipe_stdlib`] leaf crate so the WebAssembly frontend can share one copy.
 /// Re-exported here so `crate::stdlib::…` call sites resolve unchanged.
@@ -114,6 +120,45 @@ const _: () = assert!(
     "the interpolable scalar set must match the runtime's IpeInterpolate impls"
 );
 
+// The compiler's show-leaf table and the runtime's show-row table name the
+// same leaves with the same policies in the same order, and agree on the
+// widest rendered tuple: a leaf the compiler shows is a leaf the runtime
+// renders, and a drift on either side breaks this crate's build instead of
+// reaching an emitted `cargo` E0277.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the show-leaf table drifts from the runtime's show rows, the stringify SEAL [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    shown_eq(
+        &ipe_ir::SHOWN_LEAVES,
+        &ipe_runtime_rust::stringify::SHOWN_RUNTIME_TYPES,
+    ) && ipe_ir::MAX_SHOWN_TUPLE_ARITY == ipe_runtime_rust::stringify::MAX_SHOWN_TUPLE_ARITY
+        && ipe_types::MAX_SHOWN_TUPLE_ARITY == ipe_ir::MAX_SHOWN_TUPLE_ARITY,
+    "the compiler's show leaves must match the runtime's show rows"
+);
+
+/// Ordered element-wise equality of the two show tables, name and policy tag, in one pass.
+const fn shown_eq(
+    compiler: &[(&str, ipe_ir::ShowPolicy)],
+    runtime: &[(&str, ipe_runtime_rust::stringify::ShowPolicy)],
+) -> bool {
+    let (mut left, mut right) = (compiler, runtime);
+    loop {
+        match (left, right) {
+            ([], []) => return true,
+            ([(lname, lpolicy), left_rest @ ..], [(rname, rpolicy), right_rest @ ..]) => {
+                if !text::bytes_eq(lname.as_bytes(), rname.as_bytes())
+                    || lpolicy.tag() != rpolicy.tag()
+                {
+                    return false;
+                }
+                left = left_rest;
+                right = right_rest;
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Element-wise `&str`-slice equality in a `const` context.
 const fn names_eq(a: &[&str], b: &[&str]) -> bool {
     match (a, b) {
@@ -125,6 +170,152 @@ const fn names_eq(a: &[&str], b: &[&str]) -> bool {
     }
 }
 
+// The resolver's `DbFailure` row and the runtime's `IpeDbFailure` name the
+// same nullary constructors at the same dense indices: a constructor the type
+// checker accepts in a `case` is a variant the emitted match can name, and a
+// drift on either side breaks this crate's build instead of reaching an
+// emitted `cargo` E0599 or E0004.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the canon DbFailure row drifts from the runtime IpeDbFailure variants, the database-failure SEAL [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    nullary_union_eq(
+        ipe_canon::builtins::BUILTIN_UNIONS,
+        b"DbFailure",
+        &ipe_runtime_rust::IpeDbFailure::ROWS,
+    ),
+    "the canon DbFailure row must match the runtime IpeDbFailure variants"
+);
+
+// The same agreement for the `Auth.verifyToken` refusal union: the resolver's
+// `AuthError` row and the runtime's `IpeAuthError` name the same nullary
+// constructors at the same dense indices.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the canon AuthError row drifts from the runtime IpeAuthError variants, the token-refusal SEAL [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    nullary_union_eq(
+        ipe_canon::builtins::BUILTIN_UNIONS,
+        b"AuthError",
+        &ipe_runtime_rust::IpeAuthError::ROWS,
+    ),
+    "the canon AuthError row must match the runtime IpeAuthError variants"
+);
+
+/// Whether the `type_name` row of `unions` lists `runtime`'s
+/// `(constructor name, discriminant)` rows in order, each nullary, with its
+/// declaration index and its discriminant both equal to its position.
+const fn nullary_union_eq(
+    unions: &[ipe_canon::builtins::BuiltinUnion],
+    type_name: &[u8],
+    runtime: &[(&str, usize)],
+) -> bool {
+    let mut unions = unions;
+    let ctors = loop {
+        match unions {
+            [] => return false,
+            [union, rest @ ..] => {
+                if text::bytes_eq(union.type_name.as_bytes(), type_name) {
+                    break union.ctors;
+                }
+                unions = rest;
+            }
+        }
+    };
+    let (mut left, mut right, mut position) = (ctors, runtime, 0_usize);
+    loop {
+        match (left, right) {
+            ([], []) => return true,
+            (
+                [(name, index, arity), left_rest @ ..],
+                [(variant, discriminant), right_rest @ ..],
+            ) => {
+                if !text::bytes_eq(name.as_bytes(), variant.as_bytes())
+                    || *index != position
+                    || *discriminant != position
+                    || *arity != 0
+                {
+                    return false;
+                }
+                position = match position.checked_add(1) {
+                    Some(next) => next,
+                    None => return false,
+                };
+                left = left_rest;
+                right = right_rest;
+            }
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod nullary_union_tests {
+    use super::nullary_union_eq;
+    use ipe_canon::builtins::BuiltinUnion;
+
+    const fn union(ctors: &'static [(&'static str, usize, usize)]) -> BuiltinUnion {
+        BuiltinUnion {
+            type_name: "Pair",
+            ctors,
+            exhaust_union: true,
+            qualified_home: None,
+        }
+    }
+
+    const ROWS: [(&str, usize); 2] = [("First", 0), ("Second", 1)];
+
+    /// The control: a row naming the runtime variants in order agrees.
+    #[test]
+    fn a_matching_row_agrees() {
+        let unions = [union(&[("First", 0, 0), ("Second", 1, 0)])];
+        assert!(nullary_union_eq(&unions, b"Pair", &ROWS));
+    }
+
+    /// Every drift the build-time assertion exists to catch is a disagreement.
+    #[test]
+    fn every_drift_disagrees() {
+        type Drift<'a> = (&'a [BuiltinUnion], &'a [(&'a str, usize)], &'a str);
+        let cases: [Drift; 6] = [
+            (
+                &[union(&[("Second", 0, 0), ("First", 1, 0)])],
+                &ROWS,
+                "a reordered row",
+            ),
+            (
+                &[union(&[("First", 0, 0), ("Other", 1, 0)])],
+                &ROWS,
+                "a renamed constructor",
+            ),
+            (&[union(&[("First", 0, 0)])], &ROWS, "a shorter canon row"),
+            (
+                &[union(&[("First", 0, 0), ("Second", 1, 0)])],
+                &[("First", 0)],
+                "a shorter runtime row",
+            ),
+            (
+                &[union(&[("First", 0, 0), ("Second", 1, 1)])],
+                &ROWS,
+                "a constructor with a payload",
+            ),
+            (
+                &[union(&[("First", 0, 0), ("Second", 1, 0)])],
+                &[("First", 0), ("Second", 2)],
+                "a discriminant off its position",
+            ),
+        ];
+        for (unions, runtime, why) in cases {
+            assert!(!nullary_union_eq(unions, b"Pair", runtime), "{why}");
+        }
+    }
+
+    /// A type name no row carries is a disagreement, never a vacuous match.
+    #[test]
+    fn an_absent_type_name_disagrees() {
+        let unions = [union(&[("First", 0, 0), ("Second", 1, 0)])];
+        assert!(!nullary_union_eq(&unions, b"Absent", &ROWS));
+        assert!(!nullary_union_eq(&[], b"Pair", &[]));
+    }
+}
+
 mod driver;
 
 pub use driver::{
@@ -132,7 +323,7 @@ pub use driver::{
     RuntimeContext, UPGRADE_TAG_FILE_ENV, UPGRADE_WRAPPED_ENV, apply_fixes, bluegreen_enabled,
     build, build_loose_file, build_loose_file_with_options, build_project,
     build_project_with_options, build_with_options, code_index, compile_prepared,
-    create_source_root, emit_ir_text, explain_lookup, hot_appearance_enabled,
+    create_source_root, emit_ir_text, explain_lookup, front_check_entry, hot_appearance_enabled,
     infer_package_capabilities, infer_package_capabilities_in, resolve_runtime, run_cli,
     run_upgrade, runtime_dep_from_env, select_non_overlapping, verify_capabilities,
     watch_banner_enabled,
@@ -141,10 +332,10 @@ pub use driver::{
 // (`watch`, `pkg`, …). Kept `pub(crate)` so no originally-private helper widens
 // to public API; the block above re-exports the genuine public surface as `pub`.
 pub(crate) use driver::{
-    RewriteKind, build_source_graph, capabilities_including_served_widgets, default_entry,
-    find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err, lower_entry_via_graph,
-    read_progress_chunk, read_yes_no, read_yes_no_default, resolve_vendored_runtime_dir,
-    rewrite_user_file, rewrite_walked_file, run_build, run_capabilities, run_eject, run_exec,
-    run_fix, run_installer, run_package, run_release, run_run, run_test, run_type_check,
-    run_verify, run_version, run_watch, typecheck_entry_via_graph, write_emitted_project,
+    DevMarkedCrate, RewriteKind, build_source_graph, capabilities_including_served_widgets,
+    default_entry, find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err,
+    lower_entry_via_graph, read_progress_chunk, read_yes_no, read_yes_no_default,
+    resolve_vendored_runtime_dir, rewrite_user_file, rewrite_walked_file, run_capabilities,
+    run_fix, run_installer, run_package, run_test, run_type_check, run_verify, run_version,
+    typecheck_entry_via_graph, write_emitted_project,
 };

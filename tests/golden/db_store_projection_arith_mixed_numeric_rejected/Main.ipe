@@ -1,0 +1,107 @@
+module Main exposing (main)
+
+-- NEGATIVE golden: `Store.add` applied to two numeric columns of DIFFERENT
+-- numeric types must be rejected. `book.quantity` is an `Int`; `author.price`
+-- is a `Float`. Both are individually within the `Int | Float` numeric
+-- bound, but `add` shares ONE type variable across both operands, so an
+-- `Int`/`Float` mismatch fails closed with a type-mismatch (IPE-T0001) before
+-- lowering. The stores and join are well-formed; only the operand pairing is
+-- at fault.
+
+
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Task as Task exposing (Task)
+
+
+type alias Book =
+    { id : String
+    , title : String
+    , authorId : String
+    , quantity : Int
+    }
+
+
+type alias Author =
+    { id : String
+    , name : String
+    , active : Bool
+    , price : Float
+    }
+
+
+blankBook : Book
+blankBook =
+    { id = "", title = "", authorId = "", quantity = 0 }
+
+
+blankAuthor : Author
+blankAuthor =
+    { id = "", name = "", active = False, price = 0.0 }
+
+
+bookCodec : Codec Book
+bookCodec =
+    Codec.auto blankBook
+
+
+authorCodec : Codec Author
+authorCodec =
+    Codec.auto blankAuthor
+
+
+booksStore : Result Error (Store Book)
+booksStore =
+    Store.fromCodec "books" bookCodec
+        |> Result.map (\s -> Store.primaryKey .id s)
+        |> Result.map Store.public
+
+
+authorsStore : Result Error (Store Author)
+authorsStore =
+    Store.fromCodec "authors" authorCodec
+        |> Result.map (\s -> Store.primaryKey .id s)
+        |> Result.map Store.public
+
+
+-- `Store.add` applied to an Int column and a Float column — must be
+-- rejected: both are numeric, but they do not share one numeric type.
+badAdd : Db -> Store Book -> Store Author -> Task Error (List Int)
+badAdd db books authors =
+    Store.selectToList db
+        (Store.select
+            (\( book, author ) -> Store.add book.quantity author.price)
+            (Store.join books .authorId authors .id)
+        )
+
+
+run : Db -> Task Error (List Int)
+run db =
+    case booksStore of
+        Ok books ->
+            case authorsStore of
+                Ok authors ->
+                    badAdd db books authors
+
+                Err e ->
+                    Task.fail e
+
+        Err e ->
+            Task.fail e
+
+
+main : Task Error ()
+main =
+    Task.andThen
+        (\_ -> Io.println "unreachable")
+        (Task.onError
+            (\_ -> Task.succeed ())
+            (Task.andThen
+                (\db -> Task.map (\_ -> ()) (run db))
+                (Db.connect ())
+            )
+        )

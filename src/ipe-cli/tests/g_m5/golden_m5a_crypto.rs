@@ -15,6 +15,11 @@
 //!   RFC 4231 case-1 key (`0x0b × 20` via `keyFromBytes`) and message `"Hi
 //!   There"`; known test vectors; byte-parity.
 //!
+//! * `crypto_mac_verify` — `macFromHex` then `verifyHmacSha256` on the RFC
+//!   4231 case-1 key: the right tag (either case) and a freshly computed tag
+//!   verify; the wrong message, a flipped digit and an HMAC-SHA-512 tag do not;
+//!   a `0x`-prefixed tag does not parse.
+//!
 //! * `crypto_constant_time` — `constantTimeEqual "abc" "abc"` → `true`;
 //!   `constantTimeEqual "abc" "abd"` → `false`.
 //!
@@ -94,6 +99,14 @@ fn crypto_sha_hash() {
 #[test]
 fn crypto_hmac() {
     assert_runs_and_matches_oracle("crypto_hmac");
+}
+
+/// A stored tag parsed by `Crypto.macFromHex` is checked by
+/// `Crypto.verifyHmacSha256`, which recomputes it: the emitted program accepts
+/// the right tag and refuses each tampered, wrong-message and wrong-width one.
+#[test]
+fn crypto_mac_verify() {
+    assert_runs_and_matches_oracle("crypto_mac_verify");
 }
 
 // ── constantTimeEqual ────────────────────────────────────────────────────────

@@ -38,7 +38,7 @@ fn eta_inline_arg_capture_ipec_clones_capture() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for eta_inline_arg_capture: {:?}",
+        "ipe dev build must succeed for eta_inline_arg_capture: {:?}",
         built.err()
     );
 
@@ -65,7 +65,11 @@ fn eta_inline_arg_capture_cargo_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     let outcome = crate::support::build_and_run_emitted("eta_inline_arg_capture", &out);
     assert_eq!(

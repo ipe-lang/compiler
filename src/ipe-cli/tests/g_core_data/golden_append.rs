@@ -21,7 +21,7 @@
 //! `Main.ipe` files to the same stdout:
 //!
 //! ```text
-//! $ ipe run Main.ipe
+//! $ ipe dev run Main.ipe
 //! hi, world!   # append
 //! abcd         # append_chain
 //! ```

@@ -1,22 +1,24 @@
 use super::{
-    BuildOptions, CliError, OutTarget, attribute_canon_errors, attribute_post_link_error,
-    build_loose_file_into, build_project_into, build_source_graph, build_test_into,
-    capabilities_including_served_widgets, classify_entry_shape, create_source_root, default_entry,
-    discover_manifest, emit_machine_error, emitted_bin_filename, home_to_source_map,
-    program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir, run_build,
-    runtime_context_for_message, source_graph_for_target, typecheck_target,
+    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, attribute_canon_errors,
+    attribute_post_link_error, build_loose_file_into, build_project_into, build_source_graph,
+    build_test_into, capabilities_including_served_widgets, classify_entry_shape,
+    create_source_root, default_entry, discover_manifest, emit_machine_error, emitted_bin_filename,
+    frame_infer_error, home_to_source_map, program_constructs_a_widget, resolve_runtime,
+    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, source_graph_for_target,
+    typecheck_target,
 };
-use crate::cargo_step::{
-    CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, Verbosity,
-};
+use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::publisher::{AttestedActor, BlessedPublisher};
+use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
+use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
     audit, cli_args, contained_path, delivery, ffi, fmt, fs, index, pack, progress, project,
     publish, resolve, scratch, style, text, toolchain, version_check,
 };
+use zeroize::Zeroizing;
 
 /// Whether a delivery-routed bundle is a fast development build or a production
 /// distributable. `build web <host>` yields [`BundleProfile::Dev`]; `release web
@@ -33,6 +35,15 @@ pub enum BundleProfile {
 }
 
 impl BundleProfile {
+    /// The bundle profile a native build finished in `finish` packages: a
+    /// release bundle only behind the release consent witness.
+    pub(crate) const fn of(finish: &NativeFinish<'_>) -> Self {
+        match finish {
+            NativeFinish::Dev => Self::Dev,
+            NativeFinish::Release { .. } => Self::Release,
+        }
+    }
+
     /// The build intent the bundle's crate is emitted with.
     ///
     /// The `release` bundle is a shipped artifact, so it is a release build;
@@ -42,14 +53,6 @@ impl BundleProfile {
             Self::Dev => ipe_backend_rust::BuildIntent::Development,
             Self::Release => ipe_backend_rust::BuildIntent::Release,
         }
-    }
-
-    /// The cargo build the bundle's binary is compiled with: a plain debug build
-    /// for [`Self::Dev`], an optimised `--release` build for [`Self::Release`].
-    /// The one place the profile decides the compile, so the two bundle verbs
-    /// stay a single packager parameterised by profile, not two code paths.
-    const fn cargo_release(self) -> bool {
-        matches!(self, Self::Release)
     }
 
     /// The emitted crate's area under the output root.
@@ -75,7 +78,7 @@ impl BundleProfile {
     }
 
     /// The compiled binary's `target/` profile subdirectory (`debug` / `release`),
-    /// matching [`Self::cargo_release`].
+    /// matching the cargo profile [`FlooredBuild`] picks for the same posture.
     const fn target_subdir(self) -> &'static str {
         match self {
             Self::Dev => "debug",
@@ -138,12 +141,12 @@ impl BundleHost {
 /// the underlying build's errors; [`CliError::Io`] on any filesystem failure.
 pub fn bundle_delivery(
     host: BundleHost,
-    profile: BundleProfile,
+    finish: NativeFinish<'_>,
     path: Option<&str>,
 ) -> Result<(), CliError> {
     match host {
-        BundleHost::Desktop => pack_desktop(profile, path),
-        BundleHost::Mobile(os) => pack_mobile(os, profile, path),
+        BundleHost::Desktop => pack_desktop(finish, path),
+        BundleHost::Mobile(os) => pack_mobile(os, BundleProfile::of(&finish), path),
     }
 }
 
@@ -269,7 +272,10 @@ struct BundleAssembler<'a> {
 /// for the wrapped assembler. The ONLY way to obtain one is
 /// [`BundleAssembler::gate_desktop`], which runs the gate first; its
 /// [`assemble`](GatedDesktop::assemble) is the sole entry to desktop assembly.
-pub struct GatedDesktop<'a>(BundleAssembler<'a>);
+pub struct GatedDesktop<'a> {
+    assembler: BundleAssembler<'a>,
+    finish: NativeFinish<'a>,
+}
 
 /// A mobile-shape gate witness: proof that [`validate_mobile_shape`] passed for
 /// the wrapped assembler. The ONLY way to obtain one is
@@ -285,7 +291,7 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.0.assemble_desktop(os)
+        self.assembler.assemble_desktop(os, self.finish)
     }
 }
 
@@ -328,11 +334,14 @@ impl<'a> BundleAssembler<'a> {
     pub fn gate_desktop(
         manifest: &'a project::ProjectManifest,
         manifest_path: &'a Path,
-        profile: BundleProfile,
+        finish: NativeFinish<'a>,
         root: &Path,
     ) -> Result<GatedDesktop<'a>, CliError> {
         validate_desktop_shape(manifest.default_program().and_then(|p| p.shape), root)?;
-        Ok(GatedDesktop(Self::new(manifest, manifest_path, profile)))
+        Ok(GatedDesktop {
+            assembler: Self::new(manifest, manifest_path, BundleProfile::of(&finish)),
+            finish,
+        })
     }
 
     /// Run the mobile shape gate ([`validate_mobile_shape`]) and, only when it
@@ -366,7 +375,11 @@ impl<'a> BundleAssembler<'a> {
     /// # Errors
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
-    fn assemble_desktop(&self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
+    fn assemble_desktop(
+        &self,
+        os: pack::desktop::DesktopOs,
+        finish: NativeFinish<'_>,
+    ) -> Result<(), CliError> {
         use std::fmt::Write as _;
 
         let manifest = self.manifest;
@@ -401,16 +414,13 @@ impl<'a> BundleAssembler<'a> {
         )?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
-        CargoBuild {
+        // A `release web desktop` bundle carries an optimised binary and its
+        // consented floor; the `build` dev bundle carries a plain debug one and
+        // the development marker.
+        FlooredBuild {
             cargo: &cargo_bin,
-            krate: CargoCrate::Emitted(&crate_dir),
-            // A `release web desktop` bundle carries an optimised binary; the
-            // `build` dev bundle carries a plain debug one.
-            profile: if self.profile.cargo_release() {
-                CargoProfile::Release
-            } else {
-                CargoProfile::Dev
-            },
+            crate_dir: &crate_dir,
+            finish,
             target: CargoTarget::Host,
             output: CargoOutput::Human(Verbosity::Progress),
             what: "the desktop app",
@@ -422,7 +432,7 @@ impl<'a> BundleAssembler<'a> {
         // a global CARGO_TARGET_DIR), then materialise (Linux) or describe
         // (macOS/Windows).
         let target_dir = crate::cargo_step::target_directory(&cargo_bin, crate_dir.path())?;
-        let bin_name = emitted_bin_filename(crate_dir.path());
+        let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = target_dir
             .join(self.profile.target_subdir())
             .join(&bin_name);
@@ -462,11 +472,18 @@ impl<'a> BundleAssembler<'a> {
     /// layout, and materialise the shell on disk. Private: reached only through
     /// a [`GatedMobile`] witness, so the shape gate is already proven passed.
     ///
+    /// The shell is laid out for the manifest's mount base, the one the wasm
+    /// build bakes into the bundle's URLs; a base that changes while the build
+    /// runs is refused before any shell is written.
+    ///
     /// # Errors
-    /// The wasm build's own errors; [`CliError::Io`] on any filesystem failure
+    /// The wasm build's own errors; [`CliError::Usage`] wrapping
+    /// [`pack::mobile::MobileRefusal::ManifestChanged`] when the manifest's mount
+    /// base changed during the build; [`CliError::Io`] on any filesystem failure
     /// while collecting the bundle or materialising the shell.
     fn assemble_mobile(&self, os: pack::mobile::MobileOs) -> Result<(), CliError> {
         let manifest = self.manifest;
+        let base = &manifest.delivery.browser.base;
         let identity = pack::desktop::BundleIdentity::new(
             &manifest.name,
             manifest
@@ -485,7 +502,9 @@ impl<'a> BundleAssembler<'a> {
         // hostable bundle; invoking it through this binary keeps that pipeline
         // authoritative rather than re-implemented here.
         let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
-        build_wasm_for_mobile(self.manifest_path, output.path(), self.profile)?;
+        build_under_fixed_base(self.manifest_path, base, || {
+            build_wasm_for_mobile(self.manifest_path, output.path(), self.profile)
+        })?;
         // The SPA is read from the owned crate; a symlinked `www/` is refused so
         // the shell can never pick up files from outside the build output.
         let www_dir = output
@@ -495,18 +514,16 @@ impl<'a> BundleAssembler<'a> {
         let bundle = pack::mobile::SpaBundle::from_www_dir(&www_dir)
             .map_err(|e| CliError::Usage(crate::text::Message::relay(&e)))?;
 
-        let layout = pack::mobile::layout(os, &identity, accepts, &bundle, icon)?;
+        let layout =
+            pack::mobile::layout(os, self.profile, &identity, accepts, &bundle, icon, base)?;
 
         let dist = self.profile.dist_dir(&output)?.child(os.as_str())?;
         let shell_root = pack::mobile::materialise(&layout, icon, &dist)?;
 
         let note = if os.build_runs_on_linux() {
-            "note: an Android shell project is written here; run `./gradlew assembleDebug` \
-             inside it with the Android SDK to produce an APK."
+            crate::text::mobile_android_note()
         } else {
-            "note: the iOS shell project layout is written here, but a signed, runnable \
-             .ipa must be produced on a macOS runner with Xcode + a signing identity \
-             (out of scope)."
+            crate::text::mobile_ios_note()
         };
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
@@ -540,7 +557,7 @@ impl<'a> BundleAssembler<'a> {
 /// [`CliError::Usage`] wrapping a [`pack::desktop::DesktopRefusal`];
 /// build/emit errors from the underlying compile; [`CliError::Io`] on any
 /// filesystem failure while materialising the bundle.
-pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), CliError> {
+pub fn pack_desktop(finish: NativeFinish<'_>, path: Option<&str>) -> Result<(), CliError> {
     // The desktop bundle is the host OS's webview-native app; the delivery
     // grammar carries no per-OS override (a cross-OS artifact is finished on that
     // OS's own runner), so the packager always targets this host's OS.
@@ -561,7 +578,7 @@ pub fn pack_desktop(profile: BundleProfile, path: Option<&str>) -> Result<(), Cl
     // naming its shape. The witness constructor runs the gate and is the only
     // way to obtain a runnable assembler — assembling an ungated shape has no
     // representation.
-    BundleAssembler::gate_desktop(&manifest, &manifest_path, profile, &root)?.assemble(os)
+    BundleAssembler::gate_desktop(&manifest, &manifest_path, finish, &root)?.assemble(os)
 }
 
 /// `build|release web solo <os> [<path>]` — build the client-wasm SPA and lay out
@@ -608,8 +625,8 @@ pub fn pack_mobile(
 
 /// Build the hostable SPA bundle under `output_root` through this binary.
 ///
-/// `ipe build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
-/// release --target wasm` for a production one (`<root>/release/rust/www/`).
+/// `ipe dev build --target wasm` for a dev bundle (`<root>/rust/www/`), `ipe
+/// release build --target wasm` for a production one (`<root>/release/rust/www/`).
 ///
 /// Invoking the same binary keeps the wasm bundle pipeline (emit + cargo +
 /// wasm-bindgen) authoritative — the mobile shell hosts exactly the bundle a
@@ -618,7 +635,8 @@ pub fn pack_mobile(
 ///
 /// # Errors
 /// [`CliError::Usage`] when this binary's path cannot be resolved or the
-/// wasm build exits non-zero; [`CliError::Io`] when the build cannot be spawned.
+/// wasm build exits non-zero; [`CliError::Io`] when the build cannot be spawned
+/// or waited on.
 pub fn build_wasm_for_mobile(
     manifest_path: &Path,
     output_root: &Path,
@@ -627,21 +645,18 @@ pub fn build_wasm_for_mobile(
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Usage(text::msg::wasm_ipe_binary_unknown(&e)))?;
     let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    // A dev shell hosts a `build --target wasm` bundle; a release shell hosts a
-    // production `release --target wasm` bundle (Debug.* gated, optimised).
-    let verb = match profile {
-        BundleProfile::Dev => "build",
-        BundleProfile::Release => "release",
-    };
-    let status = std::process::Command::new(&exe)
-        .arg(verb)
+    let mut build = std::process::Command::new(&exe);
+    build
+        .args(wasm_build_verb(profile).argv())
         .arg(project_dir)
         .args(["--target", "wasm", "--out"])
-        .arg(output_root)
-        .status()
-        .map_err(|source| CliError::Io {
-            path: exe.clone(),
-            source,
+        .arg(output_root);
+    let status =
+        run_inherited(build, InheritedRole::SelfBuild, InheritedInput::Terminal).map_err(|e| {
+            CliError::Io {
+                path: exe,
+                source: e.into(),
+            }
         })?;
     if !status.success() {
         return Err(CliError::Usage(text::msg::mobile_wasm_build_failed(
@@ -651,7 +666,49 @@ pub fn build_wasm_for_mobile(
     Ok(())
 }
 
-/// `build|release --emit-permissions <ios|macos|android> [<path>]` — the
+/// Run `build`, then re-read the manifest at `manifest_path` and refuse when its
+/// mount base is no longer `planned`: the bundle the build produced and the shell
+/// laid out for `planned` must name one mount path.
+///
+/// # Errors
+/// `build`'s own error; the manifest re-read's error; [`CliError::Usage`]
+/// wrapping [`pack::mobile::MobileRefusal::ManifestChanged`] when the base
+/// differs.
+fn build_under_fixed_base(
+    manifest_path: &Path,
+    planned: &ipe_runtime_rust::encoding::MountBase,
+    build: impl FnOnce() -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    build()?;
+    let after = project::parse_manifest(manifest_path)?
+        .delivery
+        .browser
+        .base;
+    if after == *planned {
+        return Ok(());
+    }
+    Err(CliError::Usage(text::Message::relay(
+        &pack::mobile::MobileRefusal::ManifestChanged {
+            before: planned.clone(),
+            after,
+        },
+    )))
+}
+
+/// The verb a mobile shell's wasm bundle is built with.
+///
+/// A dev shell hosts a `dev build --target wasm` bundle; a release shell hosts
+/// a production `release build --target wasm` bundle (Debug.* gated,
+/// optimised).
+#[must_use]
+pub const fn wasm_build_verb(profile: BundleProfile) -> Verb {
+    match profile {
+        BundleProfile::Dev => Verb::DEV_BUILD,
+        BundleProfile::Release => Verb::RELEASE_BUILD,
+    }
+}
+
+/// `release build --emit-permissions <ios|macos|android> [<path>]` — the
 /// read-only inspection face of the packager's permission derivation
 /// ([`pack::permissions::derive_permissions`]), the single source of truth for
 /// what a bundled app may do. Resolves the project manifest, reads its accepted
@@ -1100,58 +1157,43 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// Resolve a `check`/analysis `<path>` argument to the entry `.ipe` file the
-/// source-graph pipeline reads. Same argument convention as `ipe build`:
-///
-/// 1. a directory → its `package.ipe`'s `src`-root `Main.ipe`;
-/// 2. a `.ipe` file → itself.
-///
-/// A project's entry module is always `Main` (`project` module doc), so the
-/// entry file is `<src_root>/Main.ipe`.
-///
-/// # Errors
-/// [`CliError::Usage`] for a directory with no `package.ipe`; the manifest's own
-/// parse errors otherwise.
-pub fn resolve_analysis_entry(path: &Path) -> Result<PathBuf, CliError> {
-    let manifest = discover_manifest(path)?;
-    match manifest {
-        Some(m) => {
-            let parsed = project::parse_manifest(&m)?;
-            analysis_root_of(&parsed)
-        }
-        None => Ok(path.to_path_buf()),
-    }
-}
-
 /// The source file `ipe type-check` uses as its analysis root for a manifest
 /// project.
 ///
-/// An application uses `<src_root>/Main.ipe`. A library (a manifest declaring
-/// `exposedModules` with no `src/Main.ipe` and no runnable program) has no
-/// `main` to check, so its analysis root is its first exposed module's file —
-/// checking the public surface is a library's meaningful verification. A
-/// declared-program entry (when a `programs` stage names one) takes precedence,
-/// resolved through the same [`contained_path::ContainedRelPath`] gate the build
-/// path uses so an absolute or `..` entry cannot escape the source root.
+/// The entry is the build's ([`project::ProjectManifest::resolved_entry`]): a
+/// declared program's entry module (when a `programs` stage names one) wins, its
+/// file resolved through the [`contained_path::ContainedRelPath`] gate so it
+/// cannot escape the source root; otherwise
+/// `<src_root>/Main.ipe`. A library (a manifest declaring `exposedModules` with
+/// no `src/Main.ipe` and no runnable program) has no `main` to check, so its
+/// analysis root is its first exposed module's file — checking the public
+/// surface is a library's meaningful verification.
 ///
 /// # Errors
-/// [`CliError::PathEscape`] when a declared program's entry resolves outside the
-/// source root.
+/// [`CliError::Usage`] when a declared program's entry names no module (the
+/// build's own refusal); [`CliError::PathEscape`] when its file resolves outside
+/// the source root.
 pub fn analysis_root_of(parsed: &project::ProjectManifest) -> Result<PathBuf, CliError> {
+    if let Some(program) = parsed.default_program() {
+        // The build's own module path for the entry, never the raw `entry`
+        // string: an entry the build refuses is refused here.
+        let module = parsed.resolved_entry()?;
+        let rel = format!("{}.ipe", module.join("/"));
+        let contained =
+            contained_path::ContainedRelPath::parse(&parsed.src_root, &rel).map_err(|reason| {
+                CliError::PathEscape {
+                    raw: program.entry.clone(),
+                    reason,
+                }
+            })?;
+        return Ok(contained.resolved().to_path_buf());
+    }
+    // No declared program: `Main.ipe`, else the first exposed module's file.
+    // Fall back to `Main.ipe` (the caller surfaces a clean missing-entry
+    // diagnostic) when the manifest names neither.
     let main = parsed.src_root.join("Main.ipe");
     if main.is_file() {
         return Ok(main);
-    }
-    // No Main: prefer a declared program's entry file, else the first exposed
-    // module's file. Fall back to `Main.ipe` (the caller surfaces a clean
-    // missing-entry diagnostic) when the manifest names neither.
-    if let Some(program) = parsed.default_program() {
-        let contained = contained_path::ContainedRelPath::parse(&parsed.src_root, &program.entry)
-            .map_err(|reason| CliError::PathEscape {
-            raw: program.entry.clone(),
-            reason,
-        })?;
-        return Ok(contained.resolved().to_path_buf());
     }
     if let Some(module) = parsed.exposed_modules.first() {
         let rel: PathBuf = module.split('.').collect();
@@ -1168,26 +1210,25 @@ const TESTS_DIR_NAME: &str = "tests";
 /// The analysis an `ipe type-check`-family `<path>` argument resolved to.
 ///
 /// A FILE argument is always analysed as itself. It is project-rooted
-/// ([`Self::SourceFile`] or [`Self::TestFile`]) exactly when its canonical path
+/// ([`Self::Source`] or [`Self::Test`]) exactly when its canonical path
 /// lies under the governing manifest's canonical `src/` or `tests/` root, and
-/// loose ([`Self::LooseFile`]) otherwise. Only a DIRECTORY argument (or none)
-/// resolves to the project's own entry, [`Self::Project`].
+/// loose ([`Self::Loose`]) otherwise. A DIRECTORY argument (or none) names
+/// the project's own entry file, which is then classified exactly like a file
+/// argument — so every form shares one root resolution, the build's `src` root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisTarget {
-    /// A directory (or omitted) argument: the project's own entry file.
-    Project(PathBuf),
     /// A file no manifest roots, canonicalised like every other file
     /// variant so each diagnostic names it the same way.
-    LooseFile(ResolvedPath),
+    Loose(ResolvedPath),
     /// A file under a governing manifest's `src/` root.
-    SourceFile {
+    Source {
         /// The named file.
         file: ResolvedPath,
         /// The governing manifest's `src/` root.
         src_root: ResolvedPath,
     },
     /// A file under a governing manifest's `tests/` root.
-    TestFile {
+    Test {
         /// The named test file.
         file: ResolvedPath,
         /// The governing manifest's `src/` root.
@@ -1200,25 +1241,53 @@ pub enum AnalysisTarget {
 
 /// Resolve a `check`/analysis `<path>` argument to its [`AnalysisTarget`].
 ///
-/// A directory (or no) argument resolves to the project's own entry. A FILE
-/// argument is canonicalised once; the manifest governing that canonical path
-/// is found, and the file is project-rooted only when its canonical path lies
-/// strictly under that manifest's canonical `tests/` or `src/` root.
+/// A directory (or no) argument names its own manifest's entry
+/// ([`analysis_root_of`]), classified against that same manifest's roots (never
+/// one nested nearer the entry), so the directory form analyses the same
+/// `src`-rooted module set the build compiles rather than a closure rooted at
+/// the entry's own directory. A FILE argument is canonicalised once; the
+/// manifest governing that canonical path is found, and the file is
+/// project-rooted only when its canonical path lies strictly under that
+/// manifest's canonical `tests/` or `src/` root.
 ///
 /// # Errors
-/// Same as [`resolve_analysis_entry`] for a directory argument;
-/// [`CliError::Io`] when a file argument cannot be canonicalised (`NotFound`
-/// for a missing file), or a project, `src/`, or existing `tests/` root cannot
-/// be; a manifest's own parse errors for a file under a governing manifest.
+/// A manifest's own parse errors for a directory argument;
+/// [`CliError::Io`] when the file (a named one, or a directory's entry) cannot
+/// be canonicalised (`NotFound` when it is missing), or a project, `src/`, or
+/// existing `tests/` root cannot be; a manifest's own parse errors for a file
+/// under a governing manifest.
 pub fn resolve_analysis_target(path: &Path) -> Result<AnalysisTarget, CliError> {
     if path.is_dir() {
-        return Ok(AnalysisTarget::Project(resolve_analysis_entry(path)?));
+        let Some(manifest_path) = discover_manifest(path)? else {
+            return resolve_file_target(path);
+        };
+        // The directory's own manifest roots its entry, as it roots the build;
+        // the entry is never re-governed by a manifest nested beneath it.
+        let parsed = project::parse_manifest(&manifest_path)?;
+        let entry = analysis_root_of(&parsed)?;
+        let file = ResolvedPath::of(&entry).map_err(|e| io_err(&entry, e))?;
+        return classify_under_manifest(file, &parsed);
     }
+    resolve_file_target(path)
+}
+
+/// Classify a FILE against the manifest governing its canonical path.
+fn resolve_file_target(path: &Path) -> Result<AnalysisTarget, CliError> {
     let file = ResolvedPath::of(path).map_err(|e| io_err(path, e))?;
     let Some(manifest_path) = discover_manifest(file.as_path())? else {
-        return Ok(AnalysisTarget::LooseFile(file));
+        return Ok(AnalysisTarget::Loose(file));
     };
     let parsed = project::parse_manifest(&manifest_path)?;
+    classify_under_manifest(file, &parsed)
+}
+
+/// Classify a canonical `file` against `parsed`'s canonical `tests/` and `src/`
+/// roots: the one root resolution every [`resolve_analysis_target`] form
+/// routes through.
+fn classify_under_manifest(
+    file: ResolvedPath,
+    parsed: &project::ProjectManifest,
+) -> Result<AnalysisTarget, CliError> {
     let project_root = ResolvedPath::of(&parsed.root).map_err(|e| io_err(&parsed.root, e))?;
     let src_root = ResolvedPath::of(&parsed.src_root).map_err(|e| io_err(&parsed.src_root, e))?;
     let tests_dir = parsed.root.join(TESTS_DIR_NAME);
@@ -1229,20 +1298,20 @@ pub fn resolve_analysis_target(path: &Path) -> Result<AnalysisTarget, CliError> 
     }
     .filter(|root| root.is_strictly_under(&project_root));
     if let Some(tests_root) = tests_root.filter(|root| file.is_strictly_under(root)) {
-        return Ok(AnalysisTarget::TestFile {
+        return Ok(AnalysisTarget::Test {
             file,
             src_root,
             tests_root,
         });
     }
     if file.is_strictly_under(&src_root) {
-        return Ok(AnalysisTarget::SourceFile { file, src_root });
+        return Ok(AnalysisTarget::Source { file, src_root });
     }
-    Ok(AnalysisTarget::LooseFile(file))
+    Ok(AnalysisTarget::Loose(file))
 }
 
 /// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
-/// injection-aware source graph `ipe build` uses, but demands only the
+/// injection-aware source graph `ipe dev build` uses, but demands only the
 /// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
 /// 0 with a friendly framed success line when the program type-checks, or
 /// non-zero carrying the first rendered diagnostic when it does not.
@@ -1342,7 +1411,7 @@ pub fn verify_check(path: Option<&str>) -> Result<(), CliError> {
     run_type_check(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
 
-/// Stage 3: the build — the same compilation as `ipe build`.
+/// Stage 3: the build — the same compilation as `ipe dev build`.
 pub fn verify_build(path: Option<&str>) -> Result<(), CliError> {
     run_build(&path.map(str::to_owned).into_iter().collect::<Vec<_>>())
 }
@@ -1532,10 +1601,10 @@ pub fn build_and_run_test_entry(
     };
 
     // Compile the emitted Rust project.
-    CargoBuild {
+    FlooredBuild {
         cargo: cargo_bin,
-        krate: CargoCrate::Emitted(&crate_dir),
-        profile: CargoProfile::Dev,
+        crate_dir: &crate_dir,
+        finish: NativeFinish::Dev,
         target: CargoTarget::Host,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
@@ -1546,36 +1615,14 @@ pub fn build_and_run_test_entry(
     // Locate the compiled binary via `cargo metadata` so a user-level
     // `CARGO_TARGET_DIR` pin or workspace override is respected. The binary
     // name matches the emitted crate's package name (read from `Cargo.toml`).
-    let test_bin_name = emitted_bin_filename(out_dir);
+    let test_bin_name = emitted_bin_filename(out_dir)?;
     let mut bin = crate::cargo_step::target_directory(cargo_bin, out_dir)?;
     bin.push("debug");
     bin.push(&test_bin_name);
 
     // Run the test binary. `Ipe.Test.runMain` exits 0 on all-pass, 1 on any
-    // failure — propagate that as a stage error. Under `--json` the child's own
-    // human summary is captured and re-emitted on OUR stderr, so our stdout stays
-    // a single JSON line a consumer can parse.
-    let run_status = match stdio {
-        TestStdio::Inherit => {
-            std::process::Command::new(&bin)
-                .status()
-                .map_err(|e| CliError::Io {
-                    path: bin.clone(),
-                    source: e,
-                })?
-        }
-        TestStdio::Quiet => {
-            let output = std::process::Command::new(&bin)
-                .stdout(std::process::Stdio::piped())
-                .output()
-                .map_err(|e| CliError::Io {
-                    path: bin.clone(),
-                    source: e,
-                })?;
-            let _ = std::io::stderr().write_all(&output.stdout);
-            output.status
-        }
-    };
+    // failure — propagate that as a stage error.
+    let run_status = run_test_binary(bin, stdio, std::io::stderr)?;
 
     if run_status.success() {
         Ok(TestOutcome::AllPassed)
@@ -1585,6 +1632,52 @@ pub fn build_and_run_test_entry(
         // failure; classify the absent code as a failure, never a pass.
         let code = run_status.code().unwrap_or(1);
         Err(CliError::TestFailed { code })
+    }
+}
+
+/// Run the compiled test binary `bin` to its exit, its output placed as `stdio` says.
+///
+/// [`TestStdio::Inherit`] leaves the terminal's stdout and stderr in place.
+/// [`TestStdio::Quiet`] points both of the binary's streams at `cli_stderr`
+/// (the CLI's own stderr in production), so the CLI's stdout carries only its
+/// machine verdict while the binary's summary and its own stderr still reach
+/// the user. Nothing the binary writes passes through the CLI's memory.
+///
+/// # Errors
+/// [`CliError::Io`] naming `bin` when the binary cannot be started or waited on.
+fn run_test_binary<S: Into<std::process::Stdio>>(
+    bin: PathBuf,
+    stdio: TestStdio,
+    cli_stderr: impl Fn() -> S,
+) -> Result<std::process::ExitStatus, CliError> {
+    let command = match stdio {
+        TestStdio::Inherit => std::process::Command::new(&bin),
+        TestStdio::Quiet => {
+            let mut command = std::process::Command::new(&bin);
+            command.stdout(cli_stderr()).stderr(cli_stderr());
+            command
+        }
+    };
+    let ran = run_inherited(
+        command,
+        InheritedRole::UserProgram,
+        test_binary_stdin(stdio),
+    );
+    ran.map_err(|e| CliError::Io {
+        path: bin,
+        source: e.into(),
+    })
+}
+
+/// What the compiled test binary reads on its stdin when its output is placed as `stdio` says.
+///
+/// An inherited run is the user's, at the terminal. A quiet run serves a
+/// machine consumer of the CLI's stdout, so the binary reads the null device
+/// rather than the stdin that consumer may still be writing to or holding open.
+const fn test_binary_stdin(stdio: TestStdio) -> InheritedInput {
+    match stdio {
+        TestStdio::Inherit => InheritedInput::Terminal,
+        TestStdio::Quiet => InheritedInput::Null,
     }
 }
 
@@ -1893,7 +1986,15 @@ pub fn run_version(rest: &[String]) -> Result<(), CliError> {
     if let Some(extra) = positional.first() {
         return Err(cli_args::usage_unexpected_argument("version", extra));
     }
-    crate::screen::emit_report(format, &render_version(format, &std::io::stdout()));
+    let text = render_version(format, &std::io::stdout());
+    match format {
+        cli_args::OutputFormat::Human => {
+            crate::screen::emit_banner(crate::screen::Stream::Stdout, &text);
+        }
+        cli_args::OutputFormat::Plain | cli_args::OutputFormat::Json => {
+            crate::screen::emit_machine(crate::screen::Stream::Stdout, &text);
+        }
+    }
     Ok(())
 }
 
@@ -2162,6 +2263,7 @@ fn download_installer() -> Result<crate::scratch::ScratchFile, CliError> {
             RunError::Measure(path, source) => CliError::Io { path, source },
             RunError::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
             RunError::PipeDrainTimeout(stream) => CliError::ChildPipeHeld(stream),
+            RunError::PipeRead(stream, kind) => CliError::ChildPipeUnread(stream, kind),
         })?;
     if let Some(refusal) =
         remote_ingest::curl_refusal(output.status, remote_ingest::INSTALLER_MAX_BYTES, budget)
@@ -2170,19 +2272,50 @@ fn download_installer() -> Result<crate::scratch::ScratchFile, CliError> {
     }
     if !output.status.success() {
         return Err(CliError::Usage(
-            text::msg::upgrade_installer_download_failed(&crate::style::TerminalSafe::sanitize(
-                String::from_utf8_lossy(&output.stderr).trim(),
-            )),
+            text::msg::upgrade_installer_download_failed(&output.stderr.to_terminal()),
         ));
     }
     Ok(script)
 }
 
+/// Read the downloaded installer `script` back, held to the download's byte ceiling.
+///
+/// The download measured the file against `INSTALLER_MAX_BYTES`; reading it
+/// back under the same ceiling bounds the bytes held in memory at the read
+/// itself, whatever the file holds by then.
+///
+/// # Errors
+/// [`CliError::Io`] when the file cannot be rewound or read;
+/// [`CliError::RemoteIngestExceeded`] when it holds more than the ceiling.
+fn read_installer_script(
+    mut script: crate::scratch::ScratchFile,
+) -> Result<Zeroizing<Vec<u8>>, CliError> {
+    use crate::remote_ingest::{self, CappedReadError};
+    script.rewind().map_err(|source| CliError::Io {
+        path: script.path().to_path_buf(),
+        source,
+    })?;
+    remote_ingest::read_capped(
+        &script.file,
+        remote_ingest::INSTALLER_MAX_BYTES,
+        remote_ingest::INSTALLER.source(),
+    )
+    .map(Zeroizing::new)
+    .map_err(|e| match e {
+        CappedReadError::Io(source) => CliError::Io {
+            path: script.path().to_path_buf(),
+            source,
+        },
+        CappedReadError::Exceeded(refusal) => CliError::RemoteIngestExceeded(refusal),
+    })
+}
+
 /// Download the installer script, then run it and wait for it to finish.
 ///
-/// The script reaches `sh` on its standard input from the retained handle of
-/// the file it was downloaded into, exactly as a `curl | sh` pipe would, so the
-/// bytes run are the bytes that were downloaded and measured. The installer
+/// The script is read back through the retained handle of the file it was
+/// downloaded into, held to the download's own byte ceiling, and reaches `sh`
+/// on its standard input exactly as a `curl | sh` pipe would, so the bytes run
+/// are the bytes that were downloaded and measured. The installer
 /// exits 2 when no prebuilt binary exists for the current platform; any other
 /// non-zero exit is a generic failure.
 ///
@@ -2199,17 +2332,7 @@ pub fn run_installer() -> Result<(), CliError> {
     }
 
     let download = progress::Stage::start(std::io::stderr(), "Downloading the release installer…");
-    let script = match download_installer().and_then(|mut script| {
-        script.rewind().map_err(|source| CliError::Io {
-            path: script.path().to_path_buf(),
-            source,
-        })?;
-        let stdin = script.file.try_clone().map_err(|source| CliError::Io {
-            path: script.path().to_path_buf(),
-            source,
-        })?;
-        Ok((script, stdin))
-    }) {
+    let script = match download_installer().and_then(read_installer_script) {
         Ok(script) => {
             download.success("Installer downloaded.");
             script
@@ -2219,48 +2342,41 @@ pub fn run_installer() -> Result<(), CliError> {
             return Err(e);
         }
     };
-    let (_script, script_stdin) = script;
 
-    // Render the hand-off to the installer as a stage on stderr: a running
-    // light-yellow line while we spawn `sh`, settled to a green success (or a
-    // red failure) BEFORE the child inherits the terminal, so the installer's
-    // own staged output begins on a fresh, uncorrupted line.
+    // Render the hand-off to the installer as a stage on stderr, settled BEFORE
+    // the child inherits the terminal, so the installer's own staged output
+    // begins on a fresh, uncorrupted line. A launch that fails after the
+    // hand-off is reported as the command's error.
     let stage = progress::Stage::start(std::io::stderr(), "Launching the release installer…");
     // IPE_UPGRADE_WRAPPED tells install.sh it is running under us: on its
     // "no prebuilt binary" failure it skips its own stderr banner (we render
     // the one failure message ourselves, below) and writes the tag it actually
     // resolved and probed into the private (0600, unpredictably named) file
     // named by IPE_UPGRADE_TAG_FILE, so we report the real target version
-    // instead of guessing. The script arrives on stdin from its private file;
-    // stdout and stderr stay inherited, untouched. Without a
-    // tag file install.sh keeps its own banner.
+    // instead of guessing. The script arrives on stdin; stdout and stderr stay
+    // inherited, untouched. Without a tag file install.sh keeps its own banner.
     let mut tag_file = crate::scratch::ScratchFile::create("ipe-upgrade-tag").ok();
     let mut installer = std::process::Command::new("sh");
-    installer
-        .arg("-s")
-        .stdin(script_stdin)
-        .env(UPGRADE_WRAPPED_ENV, "1");
+    installer.arg("-s").env(UPGRADE_WRAPPED_ENV, "1");
     match &tag_file {
         Some(file) => installer.env(UPGRADE_TAG_FILE_ENV, file.path()),
         None => installer.env_remove(UPGRADE_TAG_FILE_ENV),
     };
-    let child = installer.spawn();
-    let mut child = match child {
-        Ok(child) => {
-            stage.success("Installer launched — following its progress below.");
-            child
+    stage.success("Handing off to the installer — following its progress below.");
+    let status = run_inherited(
+        installer,
+        InheritedRole::InteractiveInstall,
+        InheritedInput::Bytes(script),
+    )
+    .map_err(|e| match e {
+        InheritedError::Spawn(refusal) => {
+            CliError::Usage(text::msg::upgrade_installer_launch_failed(&refusal))
         }
-        Err(e) => {
-            stage.failure(format!("Could not launch the installer (needs `sh`): {e}"));
-            return Err(CliError::Usage(text::msg::upgrade_installer_launch_failed(
-                &e,
-            )));
+        InheritedError::Feed(kind) => {
+            CliError::Usage(text::msg::upgrade_installer_short_feed(&kind))
         }
-    };
-
-    let status = child
-        .wait()
-        .map_err(|e| CliError::Usage(text::msg::upgrade_installer_wait_failed(&e)))?;
+        InheritedError::Wait(e) => CliError::Usage(text::msg::upgrade_installer_wait_failed(&e)),
+    })?;
     if status.success() {
         return Ok(());
     }
@@ -2377,14 +2493,12 @@ pub fn render_upgrade(
 
 /// Render the ipe version in the requested [`OutputFormat`].
 ///
-/// - Human (default): a guttered `ipe <version>` line.
+/// - Human (default): the product header alone, a blank line before and after;
+///   the version rides in the header.
 /// - `--plain`: the bare version string, flush-left, nothing else.
 /// - `--json`: the shared `{schema, status, command, payload}` machine envelope,
 ///   with the version under `payload.version` (`ipe.cli.version/1`).
-pub fn render_version(
-    format: cli_args::OutputFormat,
-    _stream: &impl std::io::IsTerminal,
-) -> String {
+pub fn render_version(format: cli_args::OutputFormat, stream: &impl std::io::IsTerminal) -> String {
     use cli_args::OutputFormat::{Human, Json, Plain};
     let version = env!("CARGO_PKG_VERSION");
     match format {
@@ -2397,7 +2511,7 @@ pub fn render_version(
             crate::machine_output::MachineOutput::ok("ipe.cli.version/1", "version", payload)
                 .render_json()
         }
-        Human => style::frame(&style::gutter(&format!("ipe {version}\n"))),
+        Human => style::command_header(style::use_color(stream)),
     }
 }
 
@@ -2462,7 +2576,7 @@ pub fn verify_capabilities(
 /// is refused and nothing is disclosed, because a union over only the entries
 /// that lowered would silently drop the failing entry's capabilities from the
 /// consumer's consent surface. Every entry links the WHOLE package source tree,
-/// exactly as `ipe build` does, so a module that does not compile at all (a
+/// exactly as `ipe dev build` does, so a module that does not compile at all (a
 /// name or type error, imported or not) fails every entry and is refused the
 /// same way.
 ///
@@ -2661,14 +2775,13 @@ fn infer_entry(
             package,
             program,
         )),
-        Err((diag, home)) => Err(attribute_entry_lowering_error(
+        Err(err) => Err(attribute_entry_lowering_error(
             db,
             source_root,
             package,
             module,
             entry_file,
-            diag.clone(),
-            home,
+            err.clone(),
         )),
     }
 }
@@ -2797,7 +2910,7 @@ fn aggregate_entry_inferences(
 /// The build's own attribution: a canon error is blamed on its own module's
 /// file via [`attribute_canon_errors`] (the root holds every package module, so
 /// an unimported sibling that fails to canonicalize fails every entry, exactly
-/// as `ipe build` refuses it); a post-link error goes through
+/// as `ipe dev build` refuses it); a post-link error goes through
 /// [`attribute_post_link_error`]. Demanded after `lower_program`, so every
 /// query here is a memo hit.
 fn attribute_entry_lowering_error(
@@ -2806,8 +2919,7 @@ fn attribute_entry_lowering_error(
     package: &PackageSourceSet,
     entry: &project::DiscoveredModule,
     entry_file: ipe_db::SourceFile,
-    diag: Diagnostic,
-    home: &[ipe_intern::Symbol],
+    err: ipe_db::PipelineError,
 ) -> CliError {
     if let Err(canon_err) =
         attribute_canon_errors(db, source_root, &package.sources, entry_file, entry.path())
@@ -2823,16 +2935,22 @@ fn attribute_entry_lowering_error(
             .unwrap_or_default(),
     );
     let home_to_source = home_to_source_map(ipe_db::Db::interner(db), &package.sources);
-    if let Ok(linked) = ipe_db::linked_program(db, source_root, entry_file) {
-        attribute_post_link_error(&linked.module, &home_to_source, &entry_source, diag, home)
-    } else {
-        // A link failure has no linked program to scan: frame the lowering
-        // diagnostic against its home module when known, else the entry.
-        let (file, src) = home_to_source.get(home).cloned().unwrap_or(entry_source);
-        CliError::Pipeline {
-            file,
-            src,
-            diag: Box::new(diag),
+    match (ipe_db::linked_program(db, source_root, entry_file), err) {
+        (Ok(linked), err) => {
+            attribute_post_link_error(&linked.module, &home_to_source, &entry_source, err)
+        }
+        (Err(_), ipe_db::PipelineError::Infer(infer)) => {
+            frame_infer_error(&home_to_source, &entry_source, infer)
+        }
+        (Err(_), ipe_db::PipelineError::Lower(diag, home)) => {
+            // A link failure has no linked program to scan: frame the lowering
+            // diagnostic against its home module when known, else the entry.
+            let (file, src) = home_to_source.get(&home).cloned().unwrap_or(entry_source);
+            CliError::Pipeline {
+                file,
+                src,
+                diag: Box::new(diag),
+            }
         }
     }
 }
@@ -2905,15 +3023,15 @@ pub fn select_non_overlapping(mut suggestions: Vec<Suggestion>, src_len: usize) 
 /// Apply `fixes` to `src`, returning the patched text.
 ///
 /// `fixes` are assumed non-overlapping and ordered back-to-front. Returns `None`
-/// if any span is out of bounds or not on a UTF-8 char boundary. Never indexes
-/// raw bytes.
+/// if any span is out of bounds, not on a UTF-8 char boundary, or holds text
+/// other than the suggestion's `replaces`. Never indexes raw bytes.
 #[must_use]
 pub fn apply_fixes(src: &str, fixes: &[Suggestion]) -> Option<String> {
     let mut out = src.to_owned();
     for s in fixes {
         let lo = usize::try_from(s.span.lo).ok()?;
         let hi = usize::try_from(s.span.hi).ok()?;
-        if lo > hi || hi > out.len() || !out.is_char_boundary(lo) || !out.is_char_boundary(hi) {
+        if out.get(lo..hi) != Some(&*s.replaces) {
             return None;
         }
         let before = out.get(..lo)?;
@@ -2960,8 +3078,7 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// # Errors
 /// Returns [`CliError::Io`] on a filesystem failure.
 pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let source =
-        crate::io_bounded::read_to_string_capped(entry, crate::io_bounded::SOURCE_READ_CAP)?;
+    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
 
     let Some(diag) = pipeline_first_diagnostic(&source) else {
         writeln!(
@@ -3362,6 +3479,107 @@ mod installer_tag_tests {
 }
 
 #[cfg(test)]
+mod self_reinvocation_tests {
+    use super::*;
+
+    /// The mobile shell's wasm build re-invokes `ipe` with the argv of the
+    /// verb its profile names, so the spelling comes from [`Verb`] alone.
+    #[test]
+    fn self_reinvocation_argv_from_verb() {
+        assert_eq!(wasm_build_verb(BundleProfile::Dev).argv(), ["dev", "build"]);
+        assert_eq!(
+            wasm_build_verb(BundleProfile::Release).argv(),
+            ["release", "build"]
+        );
+        for profile in [BundleProfile::Dev, BundleProfile::Release] {
+            let verb = wasm_build_verb(profile);
+            assert_eq!(verb.intent(), profile.build_intent(), "{verb}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mobile_base_tests {
+    use super::*;
+    use ipe_runtime_rust::encoding::MountBase;
+
+    /// Write a project whose `delivery.browser.basePath` is `base_path` and
+    /// return its `package.ipe`. `base_path` is printable ASCII without `"` or
+    /// `\`, so its Rust `{:?}` form is also its Ipê string literal.
+    fn write_project(test_name: &str, base_path: &str) -> PathBuf {
+        let root = ipe_test_temp::temp_root().join(format!("ipe_mobile_base_{test_name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("create src/");
+        std::fs::write(
+            src.join("Main.ipe"),
+            "module Main exposing (main)\nmain = 0\n",
+        )
+        .expect("write Main.ipe");
+        let manifest = root.join(crate::package_manifest::PACKAGE_IPE);
+        write_base_path(&manifest, base_path);
+        manifest
+    }
+
+    fn write_base_path(manifest: &Path, base_path: &str) {
+        std::fs::write(
+            manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = \"x\", \
+                 delivery = {{ browser = {{ basePath = {base_path:?} }} }} }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+    }
+
+    fn base(raw: &str) -> MountBase {
+        MountBase::parse(raw).expect("a legal mount base")
+    }
+
+    /// The stub build rewrites the manifest's base; the pack refuses, naming
+    /// both bases, before any shell is laid out.
+    #[test]
+    fn mobile_pack_refuses_manifest_changed_during_build() {
+        let manifest = write_project("changed", "/app");
+        let planned = project::parse_manifest(&manifest)
+            .expect("manifest")
+            .delivery
+            .browser
+            .base;
+        assert_eq!(planned, base("/app"));
+
+        let result = build_under_fixed_base(&manifest, &planned, || {
+            write_base_path(&manifest, "/v2");
+            Ok(())
+        });
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+
+        let refusal = text::Message::relay(&pack::mobile::MobileRefusal::ManifestChanged {
+            before: base("/app"),
+            after: base("/v2"),
+        });
+        assert!(
+            matches!(&result, Err(CliError::Usage(shown)) if *shown == refusal),
+            "a base changed during the build must be refused, got {result:?}"
+        );
+    }
+
+    /// An unchanged base passes once the build has run.
+    #[test]
+    fn mobile_pack_accepts_an_unchanged_base_after_the_build() {
+        let manifest = write_project("unchanged", "/app");
+        let built = std::cell::Cell::new(false);
+        let result = build_under_fixed_base(&manifest, &base("/app"), || {
+            built.set(true);
+            Ok(())
+        });
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(built.get(), "the build step runs before the re-read");
+    }
+}
+
+#[cfg(test)]
 mod pack_gate_tests {
     use super::*;
 
@@ -3733,5 +3951,92 @@ mod capability_fold_tests {
             matches!(&verdict, Ok(set) if *set == expected),
             "expected the union {expected:?}, got {verdict:?}"
         );
+    }
+}
+
+// A quiet test binary writes its summary and its own stderr to the CLI's
+// stderr: neither stream is dropped, and nothing is held in the CLI's memory.
+
+#[cfg(all(test, unix))]
+mod test_binary_tests {
+    use super::*;
+    use crate::scratch::{ScratchDir, ScratchFile};
+
+    /// A compiled test runner stood in for by the `sh` script `body`, inside `dir`.
+    #[allow(clippy::expect_used)] // a fixture that cannot be written fails the test
+    fn stub_binary(dir: &ScratchDir, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = dir.path().join("runner");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write the stub binary");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("mark the stub binary executable");
+        bin
+    }
+
+    /// Run `bin` quiet with a scratch file as the CLI's stderr; the outcome and what reached that file.
+    #[allow(clippy::expect_used)] // a fixture that cannot be read fails the test
+    fn run_quiet(bin: PathBuf) -> (Result<std::process::ExitStatus, CliError>, String) {
+        let mut sink = ScratchFile::create("ipe-test-binary-stderr").expect("scratch sink");
+        let ran = run_test_binary(bin, TestStdio::Quiet, || {
+            sink.file.try_clone().expect("clone the sink handle")
+        });
+        let written = sink.read_all().expect("read the sink");
+        (ran, String::from_utf8_lossy(&written).into_owned())
+    }
+
+    /// A quiet run keeps the binary off the stdin a machine consumer of the CLI holds.
+    #[test]
+    fn a_quiet_test_binary_reads_the_null_device() {
+        assert!(matches!(
+            test_binary_stdin(TestStdio::Quiet),
+            InheritedInput::Null
+        ));
+        assert!(matches!(
+            test_binary_stdin(TestStdio::Inherit),
+            InheritedInput::Terminal
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that cannot be created fails the test
+    fn a_quiet_test_binary_stdout_reaches_the_cli_stderr() {
+        let dir = ScratchDir::new("ipe-test-binary").expect("scratch dir");
+        let (ran, written) = run_quiet(stub_binary(&dir, "printf 'summary-on-stdout'"));
+        assert!(
+            matches!(&ran, Ok(status) if status.success()),
+            "the stub exits 0: {ran:?}"
+        );
+        assert!(
+            written.contains("summary-on-stdout"),
+            "the binary's stdout must reach the CLI's stderr, got {written:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that cannot be created fails the test
+    fn a_quiet_test_binary_keeps_its_stderr() {
+        let dir = ScratchDir::new("ipe-test-binary").expect("scratch dir");
+        let (ran, written) = run_quiet(stub_binary(&dir, "printf 'failure-on-stderr' >&2\nexit 3"));
+        assert!(
+            matches!(&ran, Ok(status) if status.code() == Some(3)),
+            "the stub's own exit code is the outcome: {ran:?}"
+        );
+        assert!(
+            written.contains("failure-on-stderr"),
+            "the binary's stderr must reach the CLI's stderr, got {written:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that cannot be created fails the test
+    fn a_test_binary_that_cannot_start_is_an_io_error_naming_it() {
+        let dir = ScratchDir::new("ipe-test-binary").expect("scratch dir");
+        let absent = dir.path().join("absent-runner");
+        let (ran, _) = run_quiet(absent.clone());
+        let Err(CliError::Io { path, .. }) = ran else {
+            assert!(matches!(ran, Err(CliError::Io { .. })), "got {ran:?}");
+            return;
+        };
+        assert_eq!(path, absent);
     }
 }

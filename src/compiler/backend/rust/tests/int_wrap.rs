@@ -213,6 +213,26 @@ fn end_to_end_int_mul_wraps_on_overflow() -> DResult<()> {
     run_wrap(BinOp::IntMul, i64::MAX, 2, "ipe_int_wrap_mul_e2e", "-2\n")
 }
 
+/// A negative literal left operand of generic `Add` must emit parenthesised.
+///
+/// Generic (polymorphic `Number a`) `Add` routes through `.ipe_wrapping_add`,
+/// a method call: a negative left operand must emit as a parenthesised
+/// primary expression (`(-5i64).ipe_wrapping_add(r)`), never a bare
+/// `-5i64.ipe_wrapping_add(r)` (which parses as `-(5i64.ipe_wrapping_add(r))`,
+/// the wrong value, or as `-(9223372036854775808i64…)` for `i64::MIN`, which
+/// trips the deny-by-default `overflowing_literals` lint and fails the build).
+#[test]
+fn generic_add_negative_literal_receiver() -> DResult<()> {
+    run_wrap(BinOp::Add, -5, 3, "ipe_generic_add_neg_lit_e2e", "-2\n")?;
+    run_wrap(
+        BinOp::Add,
+        i64::MIN,
+        1,
+        "ipe_generic_add_min_lit_e2e",
+        "-9223372036854775807\n",
+    )
+}
+
 // ── negate ───────────────────────────────────────────────────────────────────
 
 /// `main = Io.println (String.fromInt (Basics.negate x))` where `x = value`.

@@ -385,7 +385,7 @@ mod held {
 
     use super::{CacheLoadError, Invoker, MAX_CACHE_ENTRIES, Stamp, TrustRefusal, breach};
     use crate::CliError;
-    use crate::io_bounded::{FFI_CACHE_READ_CAP, read_opened_capped};
+    use crate::io_bounded::{FFI_CACHE_CAP, prove_regular, read_proven};
 
     /// The FFI cache directory, held open once every component passed the owner rule.
     #[derive(Debug)]
@@ -596,7 +596,8 @@ mod held {
                     path.clone(),
                 )));
             }
-            read_opened_capped(&file, &path, FFI_CACHE_READ_CAP)
+            prove_regular(file, &path)
+                .and_then(|file| read_proven(file, &path, FFI_CACHE_CAP))
                 .map(Some)
                 .map_err(CacheLoadError::Cli)
         }

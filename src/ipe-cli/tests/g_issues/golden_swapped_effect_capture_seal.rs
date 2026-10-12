@@ -6,7 +6,7 @@
 //! evaluates arguments left-to-right, so the effect runs BEFORE `f`'s closure
 //! is built: a non-Copy `label` the effect moves (`loadLabel label`) is gone
 //! when the closure's `let label = label.clone()` capture reads it — `ipe
-//! build` exit 0, then `cargo build` E0382. Each is declared
+//! dev build` exit 0, then `cargo build` E0382. Each is declared
 //! `ArgOrder::ContainerFirst`, so the lowerer's last-use clone rewrite walks it
 //! in evaluation order and clones the effect's read.
 //!

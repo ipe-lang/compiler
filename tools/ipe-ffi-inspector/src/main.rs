@@ -812,7 +812,7 @@ edition = "2021"
         // so this can only ever be more conservative. On a nightly gate (or
         // an unverifiable check) drop to default features and re-run rustdoc
         // THERE, so the bound wrappers ↔ propagated features stay consistent
-        // and the `ipe build ⇒ cargo build` floor holds.
+        // and the `ipe dev build ⇒ cargo build` floor holds.
         Ok((j, v)) if auto_injected && verify_stable => {
             match injected_stable_check(&manifest, &target_verify_dir) {
                 StableCheck::Builds => (j, v, injected.clone(), manifest),
@@ -5439,7 +5439,7 @@ fn parse_fn_item(
         // block (it IS captured, not merely the dispatch target). `spawn` requires
         // the future to be `Send`, hence the receiver must be `Send`. An async
         // instance method on a `Clone + !Send` (Rc/Cell-backed) receiver yields a
-        // non-Send future → E0277 at cargo build (type-checks in `ipe build`,
+        // non-Send future → E0277 at cargo build (type-checks in `ipe dev build`,
         // fails `cargo`). Drop it. Sync methods are unaffected — no spawn, no
         // captured-future Send requirement. Reuses the #52 Send-proof machinery
         // (`recv_provably_async_send` → PROVABLY_SEND_RECV_NAMES built from the
@@ -18941,7 +18941,7 @@ mod tests {
     // (Rc-backed) receiver MUST be dropped: the async wrapper captures the
     // receiver by-MOVE into `async move { arg0.m().await }`, so a !Send receiver
     // → non-Send future → E0277 at `tokio::task::spawn` (type-checks in
-    // `ipe build`, fails `cargo`). NO non-self params here — the param gate can't
+    // `ipe dev build`, fails `cargo`). NO non-self params here — the param gate can't
     // catch it; the receiver gate must. A provably-Send receiver still binds; a
     // SYNC method on a !Send receiver is unaffected (no spawn).
     //

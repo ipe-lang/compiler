@@ -73,7 +73,7 @@ update msg model =
             ( { model | count = model.count - 1 }, Cmd.none )
 ```
 
-`ipe build` emits a web app; the buttons dispatch `Increment` / `Decrement` and
+`ipe dev build` emits a web app; the buttons dispatch `Increment` / `Decrement` and
 the count updates live.
 
 ## Keyboard navigation and focus

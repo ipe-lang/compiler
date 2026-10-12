@@ -248,6 +248,10 @@ mod tests {
             ),
             ("mod tests;", IncludeForm::ModDecl),
             ("pub mod Tests;", IncludeForm::ModDecl),
+            (
+                "#[test]\nfn t() { include!(\"tests/p.rs\"); }",
+                IncludeForm::IncludeMacro,
+            ),
         ] {
             let found = includes(src);
             assert!(
@@ -331,7 +335,7 @@ mod tests {
             "#[cfg(all(test, unix))]\ninclude!(\"tests/p.rs\");",
             "#[cfg_attr(test, path = \"tests/p.rs\")]\nmod p;",
             "#[cfg(test)]\nmod t {\n    include!(\"tests/p.rs\");\n}",
-            "#[test]\nfn t() { include!(\"tests/p.rs\"); }",
+            "#[cfg(test)]\n#[test]\nfn t() { include!(\"tests/p.rs\"); }",
             "#[cfg(test)]\nmod tests;",
             "const S: &str = \"include!(\\\"tests/p.rs\\\")\";",
             "include_str!(\"tests/data.txt\");",

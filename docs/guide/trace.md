@@ -56,7 +56,7 @@ reserveStock qty =
     Task.succeed (Debug.log "reserved" qty)
 ```
 
-Running it (`ipe run`) prints the computed total on stdout:
+Running it (`ipe dev run`) prints the computed total on stdout:
 
 ```
 checkout total (cents): 3000

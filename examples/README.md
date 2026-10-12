@@ -2,7 +2,7 @@
 
 This directory contains the Ipê-native first-party examples. Each is a
 self-contained Ipê project (a `package.ipe` manifest plus source under `src/`)
-that builds with `ipe build` and targets the Rust backend.
+that builds with `ipe dev build` and targets the Rust backend.
 
 ## First-party examples
 
@@ -14,7 +14,7 @@ that builds with `ipe build` and targets the Rust backend.
 | `wasm/env-public` | wasm/live | `Ipe.Env.public` build-time config embedding: an allowlisted `API_BASE_URL` variable injected at compile time and readable in WASM at run time. |
 | `wasm/spa` | wasm | SPA target: a pure-client single-page application with full TEA loop running in the browser. Uses `Web.tea` which emits `wasm_app` under `--target wasm`. |
 | `wasm/hydration` | wasm | SSR hydration: server-side initial render (paint) followed by WASM client takeover. |
-| `wasm/language-playground` | n/a (`ipe-wasm`) | The Ipê compiler frontend (parse → typecheck → lower → emit) compiled to WebAssembly: an ACE editor whose contents are compiled to Rust in the browser as you type, showing the emitted Rust or the diagnostics. A companion `Ipe.Http.Server` app (`server/`) plus a bwrap-jailed `jail-runner` workspace member add a sandboxed `POST /run` that builds and executes the emitted Rust. Built via the Ipê build program under `build/` (`cd build && ipe run`). See its `README.md`. |
+| `wasm/language-playground` | n/a (`ipe-wasm`) | The Ipê compiler frontend (parse → typecheck → lower → emit) compiled to WebAssembly: an ACE editor whose contents are compiled to Rust in the browser as you type, showing the emitted Rust or the diagnostics. A companion `Ipe.Http.Server` app (`server/`) plus a bwrap-jailed `jail-runner` workspace member add a sandboxed `POST /run` that builds and executes the emitted Rust. Built via the Ipê build program under `build/` (`cd build && ipe dev run`). See its `README.md`. |
 
 ## Shape demos
 
@@ -45,9 +45,9 @@ example sweep.
 ## Running an example
 
 Each example is a self-contained Ipê project. Build it with
-`ipe build package.ipe` (requires a built `ipe` binary from
+`ipe dev build package.ipe` (requires a built `ipe` binary from
 `cargo build --release -p ipe`), then run the emitted crate with
 `cargo run --manifest-path out/rust/Cargo.toml`.
 
-For a WASM example, pass `--target wasm` to `ipe build` and serve
+For a WASM example, pass `--target wasm` to `ipe dev build` and serve
 `out/rust/www/` with any HTTP server.

@@ -1,6 +1,6 @@
 //! The confined watcher's typed scope (INV-4, H18).
 //!
-//! `ipe watch` must observe only a strict, typed allowlist. For a package:
+//! `ipe dev watch` must observe only a strict, typed allowlist. For a package:
 //! `package.ipe`, the entry point's directory (watched recursively), and
 //! `tests/` if present — never `target/`, `.git/`, `node_modules/`, or any
 //! generated output directory, whose churn would self-trigger a rebuild loop.
@@ -40,7 +40,7 @@ const EXCLUDED_DIR_NAMES: &[&str] = &[
     // (`.ipe/lowered/`, `.ipe/source.hash`) and its build-cache sibling.
     ".ipe",
     ".ipe-cache",
-    // Generated build output directories a `ipe build`/`ipe watch` produces.
+    // Generated build output directories a `ipe dev build`/`ipe dev watch` produces.
     "out",
 ];
 
@@ -198,7 +198,7 @@ enum ScopeMode {
 
 /// Bound on the number of `.ipe` files a single watch session will track.
 ///
-/// A defence against a pathological tree (accidentally pointing `ipe watch`
+/// A defence against a pathological tree (accidentally pointing `ipe dev watch`
 /// at a directory with millions of files, e.g. a vendored `node_modules`
 /// that slipped past the exclusion list, or a symlink loop that inflates the
 /// walk). Exceeding it is a hard, loud refusal, never a silent truncation.

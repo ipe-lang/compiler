@@ -23,9 +23,9 @@ abs : Int -> Int
 `abs x` — the absolute (non-negative) value of an integer.
 
 ```ipe
-abs (-7) --> 7
-abs 7 --> 7
-abs 0 --> 0
+Math.abs (-7) --> 7
+Math.abs 7 --> 7
+Math.abs 0 --> 0
 ```
 
 ## `min`
@@ -36,12 +36,12 @@ min : a -> a -> a
 
 `min a b` — the smaller of two comparable values.
 
-Works on any comparable type (`Int`, `Float`, `String`, …).
+Works on any comparable scalar: `Int`, `Float`, `String`, `Char`, or `Bool`.
 
 ```ipe
-min 3 5 --> 3
-min 5 3 --> 3
-min 3.0 3.0 --> 3.0
+Math.min 3 5 --> 3
+Math.min 5 3 --> 3
+Math.min 3.0 3.0 --> 3.0
 ```
 
 ## `max`
@@ -52,12 +52,12 @@ max : a -> a -> a
 
 `max a b` — the larger of two comparable values.
 
-Works on any comparable type (`Int`, `Float`, `String`, …).
+Works on any comparable scalar: `Int`, `Float`, `String`, `Char`, or `Bool`.
 
 ```ipe
-max 3 5 --> 5
-max 5 3 --> 5
-max 3.0 3.0 --> 3.0
+Math.max 3 5 --> 5
+Math.max 5 3 --> 5
+Math.max 3.0 3.0 --> 3.0
 ```
 
 ## `sqrt`
@@ -73,9 +73,9 @@ result, pass non-negative values; for integer square roots combine with
 `floor`, `ceil`, or `round`.
 
 ```ipe
-sqrt 9.0 --> 3.0
-sqrt 2.0 --> 1.4142135623730951
-sqrt 0.0 --> 0.0
+Math.sqrt 9.0 --> 3.0
+Math.sqrt 2.0 --> 1.4142135623730951
+Math.sqrt 0.0 --> 0.0
 ```
 
 ## `pow`

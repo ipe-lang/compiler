@@ -53,41 +53,88 @@ pub fn gate_allows() -> bool {
     !(needs_credential && !admin_credential().is_configured())
 }
 
-/// `GET /_ipe/console` — the plain-HTML dashboard shell (no framework, no CSS
-/// deps). Polls the api endpoints below.
-pub async fn console_html() -> impl IntoResponse {
-    let body = r#"<!doctype html><html><head><meta charset="utf-8">
-<title>Ipe Console</title>
-<style>
+/// The console page's one inline stylesheet; the console policy admits it by
+/// its hash.
+pub const CONSOLE_CSS: &str = r#"
  body{font-family:ui-monospace,monospace;background:#12141c;color:#dfe3ee;margin:0;padding:16px}
  h1{font-size:16px;color:#8ec8a8} .tab{cursor:pointer;padding:4px 10px;margin-right:6px;border:1px solid #2a2f40;border-radius:4px;display:inline-block}
  .tab.on{background:#2a2f40} pre{background:#0c0e14;padding:10px;border-radius:4px;overflow:auto;max-height:70vh}
  .err{color:#e88} .lvl{color:#7a86a8}
-</style></head><body>
-<h1>Ipe Console</h1>
-<div id="ov"></div>
-<div><span class="tab on" data-t="logs">Logs</span><span class="tab" data-t="errors">Errors</span></div>
-<pre id="out">loading…</pre>
-<script>
+"#;
+
+/// The console page's one inline script; the console policy admits it by its
+/// hash.
+pub const CONSOLE_JS: &str = r#"
  let tab="logs";
  async function j(u){try{const r=await fetch(u);return await r.json()}catch(e){return null}}
  async function ov(){const o=await j("/_ipe/console/api/overview");if(o)document.getElementById("ov").textContent=
    "requests="+o.requests+"  errors="+o.errors;}
- function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
+ function esc(s){return String(s).replace(/&/g,"&amp;").replace(/\x3c/g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");}
  function fmt(es){return (es||[]).map(e=>{const d=new Date(e.ts).toISOString().slice(11,19);
-   return "<span class='lvl'>"+esc(d)+" "+esc(e.level)+"</span> "+(e.level=="error"?"<span class='err'>":"")+
-   esc(e.message)+(e.level=="error"?"</span>":"");}).join("\n");}
+   return "<span class='lvl'>"+esc(d)+" "+esc(e.level)+"<\/span> "+(e.level=="error"?"<span class='err'>":"")+
+   esc(e.message)+(e.level=="error"?"<\/span>":"");}).join("\n");}
  async function refresh(){const es=await j("/_ipe/console/api/"+tab);
    document.getElementById("out").innerHTML=fmt(es);ov();}
  document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));t.classList.add("on");
    tab=t.dataset.t;refresh();});
  refresh();setInterval(refresh,2000);
-</script></body></html>"#;
-    (
+"#;
+
+/// Whether `text` holds `</` or `<!--`, either of which can end or re-mode a
+/// raw-text `<script>` or `<style>` element before its own close tag.
+const fn ends_raw_text_early(text: &str) -> bool {
+    let mut rest = text.as_bytes();
+    while let [first, tail @ ..] = rest {
+        if *first == b'<' && matches!(tail, [b'/', ..] | [b'!', b'-', b'-', ..]) {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an inline console constant could end its element early, serving bytes its policy hash does not cover [ledger #boundary]
+const _: () = assert!(!ends_raw_text_early(CONSOLE_JS) && !ends_raw_text_early(CONSOLE_CSS));
+
+/// The console page: [`CONSOLE_CSS`] and [`CONSOLE_JS`] embedded verbatim, so
+/// the policy hashes match the bytes served.
+fn console_page() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| {
+        format!(
+            r#"<!doctype html><html><head><meta charset="utf-8">
+<title>Ipe Console</title>
+<style>{CONSOLE_CSS}</style></head><body>
+<h1>Ipe Console</h1>
+<div id="ov"></div>
+<div><span class="tab on" data-t="logs">Logs</span><span class="tab" data-t="errors">Errors</span></div>
+<pre id="out">loading…</pre>
+<script>{CONSOLE_JS}</script></body></html>"#
+        )
+    })
+}
+
+/// `GET /_ipe/console` — the plain-HTML dashboard shell (no framework, no CSS
+/// deps). Polls the api endpoints below.
+///
+/// The response carries the console policy, the shared security headers and
+/// `no-store`; a refused framing configuration answers `500`.
+pub async fn console_html() -> axum::response::Response {
+    let resp = (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        body,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        console_page(),
+    )
+        .into_response();
+    crate::server::with_security_headers(
+        resp,
+        telemetry::security_headers(telemetry::HeaderProfile::Policy(
+            crate::csp::Profile::Console,
+        )),
     )
 }
 
@@ -461,7 +508,7 @@ pub async fn ingest(headers: axum::http::HeaderMap, body: String) -> axum::respo
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Drop every log-hazard character and cap the length of UNTRUSTED ingest text.
+/// Escape every log-hazard character and cap the length of UNTRUSTED ingest text.
 ///
 /// The text enters the operator console rings, which render to a terminal AND
 /// re-export over OTLP. A malicious or compromised sub-app could otherwise
@@ -469,13 +516,13 @@ pub async fn ingest(headers: axum::http::HeaderMap, body: String) -> axum::respo
 /// overrides, zero-width splits or hidden tag-block text — forged log lines,
 /// clear-screen, cursor moves, reordered or invisible content — into the
 /// operator's terminal. The set is the runtime's one predicate,
-/// `system::is_log_hazard`. First-party `Log.*` does NOT route through
+/// `system::is_log_hazard`; each hazard becomes a visible escape
+/// (`system::scrub_log_controls_capped`), so a record with a hidden character
+/// never reads as one without it. First-party `Log.*` does NOT route through
 /// ingest, so it is unaffected.
 fn sanitise_ingest(s: &str) -> String {
-    s.chars()
-        .filter(|c| !crate::system::is_log_hazard(*c))
-        .take(2048)
-        .collect()
+    const MAX_INGEST_BYTES: usize = 8192;
+    crate::system::scrub_log_controls_capped(s, MAX_INGEST_BYTES)
 }
 
 /// Fold one ingested log object `{level, message}` into the local rings.
@@ -515,7 +562,7 @@ fn is_cross_origin_ingest(headers: &axum::http::HeaderMap) -> bool {
 
 /// The ingest gate over the process environment: the configured
 /// `IPE_INGEST_TOKEN` (env, then in-code `Console.ingestToken`) and
-/// [`telemetry::dev_open_from_env`].
+/// [`telemetry::dev_surface_from_env`].
 fn ingest_token_blocked(headers: &axum::http::HeaderMap) -> Option<axum::response::Response> {
     let want = crate::system::read_env_var("IPE_INGEST_TOKEN")
         .ok()
@@ -526,18 +573,22 @@ fn ingest_token_blocked(headers: &axum::http::HeaderMap) -> Option<axum::respons
             crate::app_config::resolve_console_token(crate::app_config::ConsoleTokenKind::Ingest)
                 .filter(|t| !t.is_empty())
         });
-    ingest_decision(headers, want.as_deref(), telemetry::dev_open_from_env())
+    ingest_decision(
+        headers,
+        want.as_deref(),
+        telemetry::dev_surface_from_env().as_ref(),
+    )
 }
 
 /// `Some(401)` when a token is configured and the `X-Ipê-Ingest-Token` header
 /// is absent or wrong (constant-time compare). With no token, `Some(401)`
-/// unless `dev_open` holds (a dev-intent binary in a dev posture on a loopback
-/// listener); there, a cross-origin browser POST (log-injection CSRF shape —
+/// unless `dev` proves a dev surface (a dev-intent binary in a dev posture
+/// whose every listener is loopback); there, a cross-origin browser POST (log-injection CSRF shape —
 /// see `is_cross_origin_ingest`) is still refused.
 pub(super) fn ingest_decision(
     headers: &axum::http::HeaderMap,
     want: Option<&str>,
-    dev_open: bool,
+    dev: Option<&telemetry::DevSurface>,
 ) -> Option<axum::response::Response> {
     let want = match want {
         Some(t) => t,
@@ -546,7 +597,7 @@ pub(super) fn ingest_decision(
             // straight into the operator console (log-injection); a client
             // that sends no Origin passes the same-origin check below, so
             // only a loopback dev listener may run without a token.
-            if !dev_open {
+            if dev.is_none() {
                 return Some(
                     (
                         StatusCode::UNAUTHORIZED,
@@ -594,7 +645,9 @@ pub(super) fn ingest_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::{BuildPosture, ListenScope, RawEnv};
+    use crate::telemetry::{
+        BuildPosture, ProcessScope, RawEnv, dev_intent, dev_surface, test_dev_surface,
+    };
 
     /// Parse `IPE_CONSOLE_AUTH` as a dev-intent binary on a loopback listener
     /// would.
@@ -603,7 +656,7 @@ mod tests {
             raw,
             BuildPosture::Development,
             posture,
-            ListenScope::Loopback,
+            ProcessScope::Loopback,
         )
     }
 
@@ -639,16 +692,90 @@ mod tests {
         }
     }
 
-    // A dev posture on a listener not installed as loopback fails closed.
+    // `ENV=dev` with no loopback listener recorded fails closed: a release
+    // binary resolves production, a dev-intent one has no dev surface.
     #[test]
     fn dev_posture_off_loopback_keeps_console_closed() {
         seed_console_env(&[("ENV", "dev")]);
         let resolved = ConsoleAuthResolution::from_env();
-        assert_eq!(resolved.posture, Posture::Dev);
+        let posture = if cfg!(feature = "dev-posture") {
+            Posture::Dev
+        } else {
+            Posture::Production
+        };
+        assert_eq!(resolved.posture, posture);
         assert_eq!(resolved.mode, ConsoleAuthMode::UnsetProd);
         assert!(!gate_allows());
         assert!(gate_blocked(Surface::Console, &axum::http::HeaderMap::new()).is_some());
         seed_console_env(&[]);
+    }
+
+    /// The text between the first `open` in `page` and the first `close`
+    /// after it, as a browser's raw-text element parse would end it.
+    fn element_text<'a>(page: &'a str, open: &str, close: &str) -> Option<&'a str> {
+        page.split_once(open)
+            .and_then(|(_, rest)| rest.split_once(close))
+            .map(|(inner, _)| inner)
+    }
+
+    /// The console response carries the console policy, `nosniff`,
+    /// `no-store` and same-origin framing, and the policy admits exactly the
+    /// hash of each inline element's text as served.
+    #[tokio::test]
+    async fn console_csp_and_headers() {
+        let resp = console_html().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let get = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let want =
+            crate::csp::ContentSecurityPolicy::for_profile(crate::csp::Profile::Console, None)
+                .header_value();
+        let served_csp = get("content-security-policy");
+        assert_eq!(served_csp, Some(want.clone()));
+        assert!(want.contains("script-src 'sha256-"), "{want}");
+        assert!(!want.contains("'unsafe-inline'"), "{want}");
+        assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"));
+        assert_eq!(get("cache-control").as_deref(), Some("no-store"));
+        assert_eq!(get("x-frame-options").as_deref(), Some("SAMEORIGIN"));
+        assert!(get("referrer-policy").is_some());
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await;
+        assert!(body.is_ok(), "the console page fits 64 KiB");
+        let Ok(body) = body else { return };
+        let served = std::str::from_utf8(&body);
+        assert!(served.is_ok(), "the console page is UTF-8");
+        let Ok(served) = served else { return };
+        assert_eq!(served.matches("<script").count(), 1, "{served}");
+        assert_eq!(served.matches("<style").count(), 1, "{served}");
+        let csp = served_csp.unwrap_or_default();
+        for (directive, open, close, constant) in [
+            ("script-src", "<script>", "</script>", CONSOLE_JS),
+            ("style-src", "<style>", "</style>", CONSOLE_CSS),
+        ] {
+            let inner = element_text(served, open, close);
+            assert_eq!(inner, Some(constant), "{open} element text as served");
+            let Some(inner) = inner else { return };
+            let admitted = format!("{directive} {}", crate::csp::CspHash::of(inner).as_str());
+            assert!(
+                csp.split("; ").any(|d| d == admitted),
+                "{admitted} missing from {csp}"
+            );
+        }
+    }
+
+    /// `</` and `<!--` anywhere in a constant are refused; a bare `<` is not.
+    #[test]
+    fn raw_text_enders_are_detected() {
+        for text in ["</script>", "a</b", "x<!--y", "</", "<!--"] {
+            assert!(ends_raw_text_early(text), "{text:?}");
+        }
+        for text in ["", "a < b", "<\\/span>", "<!-x", "<", "<!", "<!-"] {
+            assert!(!ends_raw_text_early(text), "{text:?}");
+        }
+        assert!(!ends_raw_text_early(CONSOLE_JS) && !ends_raw_text_early(CONSOLE_CSS));
     }
 
     #[test]
@@ -1083,15 +1210,21 @@ mod tests {
     fn ingest_gate_without_token() {
         // A loopback dev build: open when same-origin or Origin-less (curl, a
         // same-process push); a cross-origin browser POST is refused.
-        assert!(ingest_decision(&origin_headers(None), None, true).is_none());
+        let dev = test_dev_surface();
+        assert!(ingest_decision(&origin_headers(None), None, Some(&dev)).is_none());
         assert!(
-            ingest_decision(&origin_headers(Some("https://victim.example")), None, true).is_none()
+            ingest_decision(
+                &origin_headers(Some("https://victim.example")),
+                None,
+                Some(&dev)
+            )
+            .is_none()
         );
         assert_eq!(
             status_of(ingest_decision(
                 &origin_headers(Some("https://evil.example")),
                 None,
-                true
+                Some(&dev)
             )),
             Some(StatusCode::FORBIDDEN)
         );
@@ -1102,19 +1235,23 @@ mod tests {
             origin_headers(Some("https://victim.example")),
         ] {
             assert_eq!(
-                status_of(ingest_decision(&headers, None, false)),
+                status_of(ingest_decision(&headers, None, None)),
                 Some(StatusCode::UNAUTHORIZED)
             );
         }
     }
 
     // `ENV=dev` alone never opens a token-less ingest through the env-driven
-    // gate. A Release build fails the build axis; a dev-posture build fails
-    // the scope axis, since no loopback listener is installed here.
+    // gate. A Release build fails the build axis even on a recorded loopback
+    // listener; a dev-posture build fails the scope axis, since no listener
+    // is recorded there.
     #[test]
     fn env_dev_alone_does_not_open_token_less_ingest() {
         crate::system::locked_set_var("ENV", "dev");
         crate::system::locked_remove_var("IPE_INGEST_TOKEN");
+        if !cfg!(feature = "dev-posture") {
+            crate::telemetry::record_bind(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
         assert_eq!(
             status_of(ingest_token_blocked(&origin_headers(None))),
             Some(StatusCode::UNAUTHORIZED)
@@ -1127,37 +1264,51 @@ mod tests {
     // push out, on every compiled build.
     #[test]
     fn each_closed_axis_alone_refuses_token_less_ingest() {
-        use crate::telemetry::dev_open;
-        let open = dev_open(
+        let surface = |build, posture, scope| {
+            dev_intent(build, posture).and_then(|intent| dev_surface(intent, scope))
+        };
+        let open = surface(
             BuildPosture::Development,
             Posture::Dev,
-            ListenScope::Loopback,
+            ProcessScope::Loopback,
         );
-        assert!(ingest_decision(&origin_headers(None), None, open).is_none());
+        assert!(ingest_decision(&origin_headers(None), None, open.as_ref()).is_none());
         for (axis, closed) in [
             (
                 "build",
-                dev_open(BuildPosture::Release, Posture::Dev, ListenScope::Loopback),
+                surface(BuildPosture::Release, Posture::Dev, ProcessScope::Loopback),
             ),
             (
                 "posture",
-                dev_open(
+                surface(
                     BuildPosture::Development,
                     Posture::Production,
-                    ListenScope::Loopback,
+                    ProcessScope::Loopback,
                 ),
             ),
             (
-                "scope",
-                dev_open(
+                "scope unbound",
+                surface(
                     BuildPosture::Development,
                     Posture::Dev,
-                    ListenScope::Exposed,
+                    ProcessScope::Unbound,
+                ),
+            ),
+            (
+                "scope exposed",
+                surface(
+                    BuildPosture::Development,
+                    Posture::Dev,
+                    ProcessScope::Exposed,
                 ),
             ),
         ] {
             assert_eq!(
-                status_of(ingest_decision(&origin_headers(None), None, closed)),
+                status_of(ingest_decision(
+                    &origin_headers(None),
+                    None,
+                    closed.as_ref()
+                )),
                 Some(StatusCode::UNAUTHORIZED),
                 "{axis} axis"
             );
@@ -1166,16 +1317,17 @@ mod tests {
 
     #[test]
     fn ingest_gate_with_token() {
-        for dev_open in [true, false] {
+        let surface = test_dev_surface();
+        for dev in [Some(&surface), None] {
             let want = Some("secret123");
             assert!(
-                ingest_decision(&origin_headers(None), want, dev_open).is_some(),
+                ingest_decision(&origin_headers(None), want, dev).is_some(),
                 "missing header blocked"
             );
             let mut h = axum::http::HeaderMap::new();
             h.insert("x-ipe-ingest-token", "wrong".parse().unwrap());
             assert!(
-                ingest_decision(&h, want, dev_open).is_some(),
+                ingest_decision(&h, want, dev).is_some(),
                 "wrong token blocked"
             );
             // Correct token → allowed, even cross-origin (bearer-token auth
@@ -1183,14 +1335,25 @@ mod tests {
             let mut h = origin_headers(Some("https://evil.example"));
             h.insert("x-ipe-ingest-token", "secret123".parse().unwrap());
             assert!(
-                ingest_decision(&h, want, dev_open).is_none(),
+                ingest_decision(&h, want, dev).is_none(),
                 "correct token allowed even cross-origin"
             );
         }
     }
 
     #[test]
-    fn ingest_drops_every_log_hazard() {
-        assert_eq!(sanitise_ingest("a\u{2028}b\u{200B}c\u{E0041}d"), "abcd");
+    fn ingest_escapes_every_log_hazard_visibly() {
+        assert_eq!(
+            sanitise_ingest("a\u{2028}b\u{200B}c\u{E0041}d"),
+            "a\\u{2028}b\\u{200b}c\\u{e0041}d"
+        );
+        assert_ne!(sanitise_ingest("adm\u{200B}in"), sanitise_ingest("admin"));
+        let long = sanitise_ingest(&"\u{1b}".repeat(4096));
+        assert!(
+            long.len() <= 8192 + crate::system::SCRUB_TRUNCATED.len(),
+            "{}",
+            long.len()
+        );
+        assert!(long.ends_with(crate::system::SCRUB_TRUNCATED), "{long:?}");
     }
 }

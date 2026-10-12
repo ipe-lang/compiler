@@ -29,9 +29,10 @@ the type and, in a [`case`](#exhaustive-match), how you take it apart.
 
 ## doc-string
 
-The `-- |` comment immediately above a definition in `.ipe` source. It is the
-single source of a symbol's documentation: `ipe doc`, the Markdown reference, and
-the served site are all generated from it.
+The `{-| … -}` (or `-- |`) comment immediately above a definition in `.ipe`
+source. It is the single source of a symbol's documentation: `ipe doc`, the
+Markdown reference, and the served site are all generated from it. Only the
+`{-| … -}` form has its ```` ```ipe ```` examples checked by `ipe doc --check-examples`.
 
 ## exhaustive match
 

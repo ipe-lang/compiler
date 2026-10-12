@@ -74,7 +74,10 @@ fn run_todo_subprocess() {
 fn todo_writes_located_message_to_stderr_and_exits_nonzero() {
     // Guard: if we are the subprocess, run the todo — `system_exit` terminates
     // the child process.  The test runner never reaches this in the parent.
-    #[allow(clippy::disallowed_methods)] // an integration test has no crate-private env accessor
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an integration test has no crate-private env accessor"
+    )]
     let is_child = std::env::var_os(SUBPROCESS_SENTINEL).is_some();
     if is_child {
         run_todo_subprocess();

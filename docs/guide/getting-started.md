@@ -80,7 +80,7 @@ Reading it top to bottom:
 ## Run it
 
 ```
-ipe run
+ipe dev run
 ```
 
 The first run compiles the project and its dependencies, then executes it. The
@@ -90,7 +90,7 @@ output is:
 Hello, Ada and Linus and Grace!
 ```
 
-To build the executable without running it, use `ipe build`.
+To build the executable without running it, use `ipe dev build`.
 
 ## Change it
 

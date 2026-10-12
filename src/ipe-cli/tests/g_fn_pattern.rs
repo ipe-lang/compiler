@@ -36,6 +36,8 @@ mod golden_eta_inline_arg_capture;
 mod golden_eta_once_closure;
 #[path = "g_fn_pattern/golden_firstclass.rs"]
 mod golden_firstclass;
+#[path = "g_fn_pattern/golden_fn_capture_boundary.rs"]
+mod golden_fn_capture_boundary;
 #[path = "g_fn_pattern/golden_fn_enum_payload.rs"]
 mod golden_fn_enum_payload;
 #[path = "g_fn_pattern/golden_fn_pattern_binder_forward.rs"]

@@ -1,0 +1,12 @@
+startsWith acme: acme-2
+startsWith ACME: ACME
+startsWith 50%: 50%off
+startsWith a_b: a_b-x
+startsWith !b: !bang
+startsWith a\: a\b
+startsWith ab: ab
+startsWith and eq: ab
+eq and startsWith: a_b-x
+empty prefix: Unexpected: db.findWhere: Sql.startsWith: the prefix is empty
+longest prefix: 
+too-long prefix: Unexpected: db.findWhere: Sql.startsWith: the prefix is longer than 16384 bytes

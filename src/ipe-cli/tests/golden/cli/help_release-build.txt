@@ -1,0 +1,21 @@
+exit: 0
+---
+
+  Ipê language - v<VERSION> - https://github.com/ipe-lang/compiler
+
+  Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
+
+  ipe release build [<path>] [<shape>] [<runtime>] [<host>]
+
+  Arguments:
+    A source file, a project directory, or a package.ipe (default: the current project). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in package.ipe (`dev build` builds only the default one).
+
+  Options:
+    [--out <dir>]                             put the artifact under <dir>/release/ (default: out/ in the project)
+    [--target <wasm|wasi|triple>]             compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
+    [--static]                                produce a statically linked binary
+    [--emit-permissions <ios|macos|android>]  read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
+    [--runtime <dir>]                         vendor the Ipê runtime source from <dir>
+    [--bundle]                                native-bearing only: multi-file opt-out — wrapper + app + profile as siblings (app binary can be run directly, bypassing the sandbox)
+    [--embed]                                 native-bearing only: default single self-jailing binary (app + profile fused into wrapper)
+    [--plain|--json]                          the layout of a refusal: the terse flush-left record or one stable JSON object

@@ -14,11 +14,10 @@
 //! structure) and [`Builder::zonk`] (a settled union-find variable → [`Ty`]).
 
 pub use crate::doc::{VarNamer, canon_type_to_doc, ty_to_doc};
+pub use crate::homed::{InferError, ModuleHome};
 pub use crate::solve::{Budget, Constraint};
-pub use crate::ty::{
-    Content, FlatType, RowTail, Ty, TyBounds, from_canon, is_solver_var, tag_solver_var,
-};
-pub use crate::unify::unify;
+pub use crate::ty::{Content, FlatType, RowTail, Ty, TyBounds, from_canon, tag_solver_var};
+pub use crate::unify::unify_at;
 pub use crate::unionfind::{UnionFind, VarId};
 pub use ipe_canon::ast as canon;
 pub use ipe_diagnostics::{DResult, Diagnostic, Feature, LowerError, Span, TypeError};
@@ -31,65 +30,52 @@ pub use std::rc::Rc;
 /// `where_` tag for any `CompilerBug` raised during constraint generation.
 pub const STAGE: &str = "ipe_types::constrain";
 
-/// Recursively replace every `Ty::Var(v)` where `v` resolves to the `"any"`
-/// wildcard AND `v` is NOT one of the union's declared type parameters with
-/// `Dict String String` — the concrete pub/sub wire carrier.
+/// Replace every [`Ty::Wildcard`] with `Dict String String`, the concrete pub/sub wire carrier.
 ///
-/// Mirrors the reference's `any`-wildcard semantics for union-ctor field types:
-/// the the compiler/the backend carries `any` payloads as dynamic `interface{}`; the
-/// Rust backend pins them to `Dict String String`, the sole concrete carrier that
-/// satisfies `Clone + Debug + PartialEq + Serialize + DeserializeOwned`.
-pub fn pin_any_in_ty(
-    ty: Ty,
-    union_vars: &[Symbol],
-    interner: &Interner,
-    dict: Symbol,
-    string: Symbol,
-) -> Ty {
+/// A union constructor field written `any` that no declared parameter binds is
+/// a wildcard; a declared parameter spelled `any` is a [`Ty::Var`] and is left
+/// alone. Mirrors the reference's `any`-wildcard semantics for union-ctor
+/// field types: the Rust backend pins them to `Dict String String`, the sole
+/// concrete carrier that satisfies `Clone + Debug + PartialEq + Serialize +
+/// DeserializeOwned`.
+pub fn pin_any_in_ty(ty: Ty, dict: Symbol, string: Symbol) -> Ty {
     match ty {
-        Ty::Var(v) => {
-            let is_any = interner
-                .resolve(Symbol::from_raw(v))
-                .is_some_and(|n| n == "any");
-            let is_declared = union_vars.iter().any(|uv| uv.as_raw() == v);
-            if is_any && !is_declared {
-                let mk_str = || Ty::Con {
-                    module: Vec::new(),
-                    name: string,
-                    args: Vec::new(),
-                };
-                Ty::Con {
-                    module: Vec::new(),
-                    name: dict,
-                    args: vec![mk_str(), mk_str()],
-                }
-            } else {
-                Ty::Var(v)
+        Ty::Wildcard => {
+            let mk_str = || Ty::Con {
+                module: Vec::new(),
+                name: string,
+                args: Vec::new(),
+            };
+            Ty::Con {
+                module: Vec::new(),
+                name: dict,
+                args: vec![mk_str(), mk_str()],
             }
         }
+        Ty::Var(v) => Ty::Var(v),
         Ty::Fun(a, b) => Ty::Fun(
-            Box::new(pin_any_in_ty(*a, union_vars, interner, dict, string)),
-            Box::new(pin_any_in_ty(*b, union_vars, interner, dict, string)),
+            Box::new(pin_any_in_ty(*a, dict, string)),
+            Box::new(pin_any_in_ty(*b, dict, string)),
         ),
         Ty::Con { module, name, args } => Ty::Con {
             module,
             name,
             args: args
                 .into_iter()
-                .map(|a| pin_any_in_ty(a, union_vars, interner, dict, string))
+                .map(|a| pin_any_in_ty(a, dict, string))
                 .collect(),
         },
         Ty::Unit => Ty::Unit,
         Ty::Tuple(elems) => Ty::Tuple(
             elems
                 .into_iter()
-                .map(|e| pin_any_in_ty(e, union_vars, interner, dict, string))
+                .map(|e| pin_any_in_ty(e, dict, string))
                 .collect(),
         ),
         Ty::Record(fields, tail) => Ty::Record(
             fields
                 .into_iter()
-                .map(|(k, v)| (k, pin_any_in_ty(v, union_vars, interner, dict, string)))
+                .map(|(k, v)| (k, pin_any_in_ty(v, dict, string)))
                 .collect(),
             tail,
         ),
@@ -166,9 +152,10 @@ pub struct Builder<'a> {
     /// top-level body, a lambda not in an annotated context) is absent, and the
     /// completion provider degrades to scope-only ranking there.
     pub expected: BTreeMap<(Vec<Symbol>, Span), VarId>,
-    /// Home module path of the def currently being constrained.  Set at the
-    /// start of each `constrain_def` call; read by every `regions.insert`.
-    pub current_home: Vec<Symbol>,
+    /// The module owning the def currently being constrained, set at the start
+    /// of each `constrain_def` call. `None` before the first def: minting a
+    /// home-carrying record then is a [`Diagnostic::CompilerBug`].
+    pub current_home: Option<ModuleHome>,
     /// Equality constraints to be discharged by the solver.
     pub constraints: Vec<Constraint>,
     /// Annotation-derived types of every top-level binding, for cross-binding
@@ -214,7 +201,7 @@ pub struct Builder<'a> {
     /// instantiated arrow var + the binding it references. Tied to the binding's
     /// body by [`Self::tie_wildcard_any_uses_to_bodies`] once every def is
     /// constrained.
-    pub wildcard_any_use_results: Vec<(VarId, (Vec<Symbol>, Symbol))>,
+    pub wildcard_any_use_results: Vec<WildcardAnyUse>,
     /// The type scheme of every data constructor in the program, keyed by the
     /// constructor's fully-qualified identity `(home, type_name, name)` — the
     /// declaring module path, its type, and the constructor name. A constructor
@@ -239,6 +226,10 @@ pub struct Builder<'a> {
     /// The `Rc` holds byte-identical data — same fresh vars, same constraints,
     /// same errors. Fully internal to `Builder`.
     pub ctors: BTreeMap<CtorKey, Rc<CtorScheme>>,
+    /// Builtin capability-handle constructors (`StreamId`) source may never
+    /// name. A constructor here has no scheme in [`Self::ctors`]; a reference
+    /// or pattern naming it is refused with `ConstructorNotFound`.
+    pub sealed_ctors: BTreeSet<CtorKey>,
     /// One entry per typed binding: its `(home, name)` and the rigid (skolem)
     /// variable each of its annotation type variables instantiated to while its
     /// body was checked. Read post-solve to recover each variable's super-type
@@ -262,14 +253,10 @@ pub struct Builder<'a> {
     /// obligation rejects a type containing a function, which Rust cannot
     /// compare, with IPE-T0014 rather than emitting code `cargo` rejects).
     ///
-    /// The `home` is the module path of the def the operator lives in
-    /// (`current_home` at mint time). A post-solve obligation failure
-    /// (`super_unsatisfied`) attributes to this home DIRECTLY, so a
-    /// kernel/operator-synthesized obligation error frames against its own
-    /// source file rather than falling into the byte-offset heuristic — which
-    /// can pick a wrong, order-unstable file for a cross-module program (the
-    /// IPE-T0014/T0001 span-collision class).
-    pub super_vars: Vec<(VarId, TyBounds, Span, Vec<Symbol>)>,
+    /// The home is the module owning the operator (`current_home` at mint
+    /// time); a post-solve obligation failure (`super_unsatisfied`) is sited
+    /// there, so it frames against its own source file.
+    pub super_vars: Vec<SuperVar>,
     /// The fresh flex of every wildcard `any` occurrence in a typed binding's
     /// OWN checked signature. Each is a generic parameter of that binding (the
     /// lowerer emits it as a bounded type parameter, and each use site
@@ -327,7 +314,7 @@ pub struct PendingInstantiation {
     /// The fresh, isolated `Flex` var minted at the reference site.
     pub placeholder: VarId,
     /// The module that owns the reference (for blame attribution).
-    pub use_home: Vec<Symbol>,
+    pub use_home: ModuleHome,
     /// The reference's source span (for blame attribution).
     pub span: Span,
 }
@@ -348,6 +335,9 @@ pub struct SchemeApp {
     /// module (matches the `(home, name)` key shape `SolvedTypes::env` /
     /// `SolvedTypes::regions` already use for the identical reason).
     pub home: Vec<Symbol>,
+    /// The module owning the reference, where an unsatisfied bound at `span`
+    /// is sited (the referenced binding's `home` may be another module).
+    pub use_home: ModuleHome,
     /// The referenced binding's name.
     pub name: Symbol,
     /// Scheme type-variable raw id → the fresh variable it instantiated to here.
@@ -399,14 +389,10 @@ pub struct FieldAccess {
     pub result: VarId,
     /// The access expression's source span, for blame.
     pub span: Span,
-    /// The home module path of the def this access lives in. After `link::link`
-    /// merges modules, a bare byte-offset span cannot identify the source file;
-    /// the home lets a post-solve error (IPE-T0012) attribute to the correct
-    /// module instead of the byte-offset heuristic's best guess (which can pick
-    /// a numerically-closer def in a *different* file — the span-collision
-    /// class, here surfacing as an `info.message` error blamed on an unrelated
-    /// `class` call in another module).
-    pub home: Vec<Symbol>,
+    /// The module owning the access. After `link::link` merges modules a bare
+    /// byte-offset span cannot identify its file, so every post-solve error
+    /// at `span` (IPE-T0012, IPE-T0001) is sited here.
+    pub home: ModuleHome,
 }
 
 /// A deferred record-update obligation `{ base | field = value, ... }`.
@@ -424,9 +410,8 @@ pub struct RecordUpdate {
     pub fields: Vec<(Symbol, VarId)>,
     /// The update expression's source span, for blame.
     pub span: Span,
-    /// The home module path of the def this update lives in — see
-    /// [`FieldAccess::home`].
-    pub home: Vec<Symbol>,
+    /// The module owning the update — see [`FieldAccess::home`].
+    pub home: ModuleHome,
 }
 
 /// A deferred post-solve check for routed `Web.tea` configurations.
@@ -458,8 +443,8 @@ pub struct RoutedWebCheck {
     pub cfg_tail_var: VarId,
     /// The `Web.tea { … }` call span; used to blame a type mismatch.
     pub span: Span,
-    /// The module path owning the call, so a finding at `span` names its file.
-    pub home: Vec<Symbol>,
+    /// The module owning the call, so a finding at `span` names its file.
+    pub home: ModuleHome,
 }
 
 /// A deferred per-route page-witness check for `Web.route`.
@@ -501,6 +486,32 @@ pub struct RouteWitnessCheck {
     pub page_var: VarId,
     /// The `Web.route` reference span; used to blame a type mismatch.
     pub span: Span,
+    /// The module owning the reference, so a mismatch at `span` names its file.
+    pub home: ModuleHome,
+}
+
+/// A super-type obligation minted for an operator or kernel variable.
+pub struct SuperVar {
+    /// The obligated variable.
+    pub var: VarId,
+    /// The class bounds the variable must satisfy once solved.
+    pub bounds: TyBounds,
+    /// The source span blamed on an unsatisfied bound.
+    pub span: Span,
+    /// The module owning `span`.
+    pub home: ModuleHome,
+}
+
+/// A reference to a wildcard-`any`-return binding, tied to its body later.
+pub struct WildcardAnyUse {
+    /// The use's instantiated arrow variable.
+    pub arrow: VarId,
+    /// The referenced binding's `(home, name)`.
+    pub binding: (Vec<Symbol>, Symbol),
+    /// The reference's source span, blamed on a failing tie.
+    pub span: Span,
+    /// The module owning the reference.
+    pub use_home: ModuleHome,
 }
 
 /// The output of constraint generation, consumed by the solver + read-back.
@@ -528,7 +539,7 @@ pub struct Generated {
     pub route_witness_checks: Vec<RouteWitnessCheck>,
     pub typed_rigids: Vec<PolyVarEntry>,
     pub scheme_apps: Vec<SchemeApp>,
-    pub super_vars: Vec<(VarId, TyBounds, Span, Vec<Symbol>)>,
+    pub super_vars: Vec<SuperVar>,
     /// The fresh flex of every wildcard `any` occurrence in a typed binding's
     /// OWN checked signature. Each is a generic parameter of that binding (the
     /// lowerer emits it as a bounded type parameter, and each use site

@@ -1,0 +1,9 @@
+module Mid exposing (mid)
+
+import Ipe.Html as Html exposing (Html)
+import Lib exposing (wrap)
+
+
+-- Unannotated: threads `Lib.wrap`'s message slot; pinned only by `Main.view`.
+mid =
+    Html.div [] [ wrap ]

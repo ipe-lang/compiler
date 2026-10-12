@@ -1,5 +1,5 @@
 
-CREATE TABLE IF NOT EXISTS files   (path TEXT PRIMARY KEY, lang TEXT, role TEXT, size INTEGER, sha TEXT);
+CREATE TABLE IF NOT EXISTS files   (path TEXT PRIMARY KEY, lang TEXT, role TEXT, size INTEGER, sha TEXT CHECK (length(sha) = 71 AND substr(sha, 1, 7) = 'blake3:' AND NOT substr(sha, 8) GLOB '*[^0-9a-f]*'));
 CREATE TABLE IF NOT EXISTS symbols (file TEXT, name TEXT, kind TEXT, line INTEGER, col INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS edges   (src TEXT, dst TEXT, kind TEXT, resolved TEXT);
 CREATE TABLE IF NOT EXISTS meta    (k TEXT PRIMARY KEY, v TEXT);
@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS callgraph (
 );
 CREATE INDEX IF NOT EXISTS i_cg_caller ON callgraph(caller_uid);
 CREATE INDEX IF NOT EXISTS i_cg_callee ON callgraph(callee_uid);
+CREATE TABLE IF NOT EXISTS call_sites (
+  caller_uid TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  exact      TEXT NOT NULL CHECK (exact <> ''),
+  local      TEXT CHECK (local IS NULL OR local <> '')
+);
+CREATE INDEX IF NOT EXISTS i_cs_path ON call_sites(path);
 CREATE TABLE IF NOT EXISTS change_queue (
   uid          TEXT PRIMARY KEY,
   change       TEXT NOT NULL CHECK (change IN ('new','modified','deleted')),
@@ -54,3 +61,25 @@ CREATE TABLE IF NOT EXISTS reviewed (
   body_hash TEXT NOT NULL,
   PRIMARY KEY (uid, body_hash)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS repos (
+  tag    TEXT PRIMARY KEY,
+  outer  TEXT,
+  prefix TEXT,
+  CHECK ((outer IS NULL) = (prefix IS NULL))
+);
+CREATE TABLE IF NOT EXISTS reviewed_stamp (
+  one  INTEGER PRIMARY KEY CHECK (one = 1),
+  head TEXT NOT NULL CHECK (typeof(head) = 'text' AND head <> '')
+);
+DROP VIEW IF EXISTS open_units;
+CREATE VIEW open_units AS
+  SELECT u.uid, u.path, u.kind, u.name, u.qualified, u.line_start, u.line_end,
+         u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang,
+         q.change, q.old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at
+  FROM units u
+  LEFT JOIN files f ON f.path = u.path
+  LEFT JOIN change_queue q
+         ON q.uid = u.uid AND q.new_hash = u.body_hash
+        AND q.change IN ('new', 'modified')
+  WHERE NOT EXISTS (SELECT 1 FROM reviewed r
+                    WHERE r.uid = u.uid AND r.body_hash = u.body_hash);

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! `ipe_watch` — the confined filesystem watcher + process supervisor that
-//! power `ipe watch`.
+//! power `ipe dev watch`.
 //!
 //! This crate is deliberately salsa-agnostic: it knows nothing about
 //! `ipe_db`, `IpeDatabase`, or the compile pipeline. It provides

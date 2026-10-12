@@ -28,12 +28,12 @@ use ipe_diagnostics::{
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_syntax::{
-    Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module,
-    Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
+    BinOp, Ctor, DocString, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding,
+    Module, Pattern, Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value,
 };
 
 use crate::layout;
-use crate::lexer::{Tok, Token};
+use crate::lexer::{IntMagnitude, Tok, Token};
 
 /// Maximum recursion depth before the parser bails with
 /// [`ParseError::NestingTooDeep`].
@@ -174,12 +174,35 @@ enum DoStmt {
 /// the token immediately after the `-`, together with its span. The caller
 /// is responsible for negating the value and for consuming the token.
 enum NegLeaf {
-    /// Raw `i64` magnitude from an adjacent `Int` token. `checked_neg()` on
-    /// this value produces the final negative integer; if it returns `None`
-    /// the caller emits `IntLiteralOutOfRange`.
-    Int(i64, Span),
+    /// Magnitude from an adjacent `Int` token; [`int_value`] with
+    /// [`Sign::Minus`] gives the final integer.
+    Int(IntMagnitude, Span),
     /// Raw `f64` magnitude from an adjacent `Float` token. Caller negates it.
     Float(f64, Span),
+}
+
+/// The sign an integer literal's magnitude is read under.
+#[derive(Clone, Copy)]
+enum Sign {
+    /// No adjacent unary minus: the literal as spelled.
+    Plus,
+    /// An adjacent unary minus folded into the literal.
+    Minus,
+}
+
+/// The `i64` an integer literal denotes: the single conversion from a lexed
+/// [`IntMagnitude`], shared by expression and pattern position.
+///
+/// Under [`Sign::Minus`] every magnitude fits (`2^63` is `i64::MIN`); under
+/// [`Sign::Plus`] `2^63` is refused with `IntLiteralOutOfRange` at `span`.
+fn int_value(magnitude: IntMagnitude, sign: Sign, span: Span) -> DResult<i64> {
+    match sign {
+        Sign::Minus => Ok(magnitude.negated()),
+        Sign::Plus => magnitude.positive().ok_or(Diagnostic::Parse {
+            span,
+            msg: ParseError::IntLiteralOutOfRange,
+        }),
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -1354,7 +1377,7 @@ impl<'a> Parser<'a> {
             if depth.saturating_add(u32::try_from(ops.len()).unwrap_or(u32::MAX)) >= MAX_DEPTH {
                 return Err(self.too_deep(Construct::Expression));
             }
-            let op_sym = self.intern(op)?;
+            let op_sym = self.intern(op.text())?;
             self.bump(Construct::Expression)?;
             ops.push((operand, Located::new(op_span, op_sym)));
             operand = self.parse_app(threshold, depth + 1)?;
@@ -1406,38 +1429,39 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// Peek a binary operator that continues the current block. Recognises the
-    /// full core set: arithmetic (`+ - * /`), string append (`++`),
-    /// comparison (`== /= < > <= >=`), and boolean (`&& ||`). Precedence +
-    /// associativity are resolved later, at canonicalisation, from the flat
-    /// chain this records.
-    fn peek_binop(&self, threshold: u32) -> Option<(&'static str, Span)> {
+    /// Peek a binary operator that continues the current block.
+    ///
+    /// The token-to-operator map is closed: each operator token is one
+    /// [`BinOp`], and any other token ends the chain, so no operator outside
+    /// the set is ever recorded. Precedence + associativity are resolved later,
+    /// at canonicalisation, from the flat chain this records.
+    fn peek_binop(&self, threshold: u32) -> Option<(BinOp, Span)> {
         let tok = self.peek()?;
         if !layout::continues_block(tok, threshold) {
             return None;
         }
         let op = match tok.kind {
-            Tok::Plus => "+",
-            Tok::PlusPlus => "++",
-            Tok::Minus => "-",
-            Tok::Star => "*",
-            Tok::Slash => "/",
-            Tok::SlashEq => "/=",
-            Tok::SlashSlash => "//",
-            Tok::EqEq => "==",
-            Tok::Lt => "<",
-            Tok::Gt => ">",
-            Tok::Le => "<=",
-            Tok::Ge => ">=",
-            Tok::AmpAmp => "&&",
-            Tok::PipePipe => "||",
-            Tok::PipeGt => "|>",
-            Tok::LtPipe => "<|",
-            Tok::GtGt => ">>",
-            Tok::LtLt => "<<",
-            Tok::ColonColon => "::",
-            Tok::PipeEq => "|=",
-            Tok::PipeDot => "|.",
+            Tok::Plus => BinOp::Add,
+            Tok::PlusPlus => BinOp::Append,
+            Tok::Minus => BinOp::Sub,
+            Tok::Star => BinOp::Mul,
+            Tok::Slash => BinOp::FloatDiv,
+            Tok::SlashEq => BinOp::Neq,
+            Tok::SlashSlash => BinOp::IntDiv,
+            Tok::EqEq => BinOp::Eq,
+            Tok::Lt => BinOp::Lt,
+            Tok::Gt => BinOp::Gt,
+            Tok::Le => BinOp::Le,
+            Tok::Ge => BinOp::Ge,
+            Tok::AmpAmp => BinOp::And,
+            Tok::PipePipe => BinOp::Or,
+            Tok::PipeGt => BinOp::PipeRight,
+            Tok::LtPipe => BinOp::PipeLeft,
+            Tok::GtGt => BinOp::ComposeRight,
+            Tok::LtLt => BinOp::ComposeLeft,
+            Tok::ColonColon => BinOp::Cons,
+            Tok::PipeEq => BinOp::ParserKeeper,
+            Tok::PipeDot => BinOp::ParserIgnorer,
             _ => return None,
         };
         Some((op, tok.span))
@@ -1524,7 +1548,10 @@ impl<'a> Parser<'a> {
             Tok::LParen => self.parse_paren_or_tuple(span, depth + 1),
             Tok::LBrace => self.parse_record(span, depth + 1),
             Tok::LBracket => self.parse_list(span, depth + 1),
-            Tok::Int(n) => Ok(Located::new(span, Expr_::Int(n))),
+            Tok::Int(n) => Ok(Located::new(
+                span,
+                Expr_::Int(int_value(n, Sign::Plus, span)?),
+            )),
             Tok::Float(f) => Ok(Located::new(span, Expr_::Float(f))),
             // String payloads move directly into the AST node — no secondary copy.
             Tok::Str(s) => Ok(Located::new(span, Expr_::Str(s))),
@@ -1684,20 +1711,10 @@ impl<'a> Parser<'a> {
         match self.peek_adjacent_neg_literal(minus_span) {
             Some(NegLeaf::Int(n, lit_span)) => {
                 self.bump(Construct::Expression)?;
-                // A positive `Int` token is bounded to [0, i64::MAX] at lex
-                // time (the lexer parses as `i64`, so the magnitude
-                // 9223372036854775808 — i64::MIN's absolute value — overflows
-                // and errors before reaching here). Therefore `checked_neg`
-                // always returns `Some`; the `Err` branch is the fail-closed
-                // guard ensuring the parser stays panic-free if that bound
-                // ever changes.
-                let value = n.checked_neg().ok_or_else(|| Diagnostic::Parse {
-                    span: Self::span_merge(minus_span, lit_span),
-                    msg: ParseError::IntLiteralOutOfRange,
-                })?;
+                let span = Self::span_merge(minus_span, lit_span);
                 return Ok(Located::new(
-                    Self::span_merge(minus_span, lit_span),
-                    Expr_::Int(value),
+                    span,
+                    Expr_::Int(int_value(n, Sign::Minus, span)?),
                 ));
             }
             Some(NegLeaf::Float(f, lit_span)) => {
@@ -2771,7 +2788,10 @@ impl<'a> Parser<'a> {
             // literal is intentionally NOT a pattern leaf — equality on `f64`
             // is unsound to match on (Rust forbids float patterns), so a
             // `Tok::Float` falls through to the fail-closed catch-all below.
-            Tok::Int(n) => Ok(Located::new(tok.span, Pattern_::PInt(*n))),
+            Tok::Int(n) => Ok(Located::new(
+                tok.span,
+                Pattern_::PInt(int_value(*n, Sign::Plus, tok.span)?),
+            )),
             Tok::Str(s) => Ok(Located::new(tok.span, Pattern_::PStr(s.clone()))),
             // A triple-quoted string in pattern position matches the same
             // margin-stripped value its expression form produces, so the strip
@@ -2788,15 +2808,10 @@ impl<'a> Parser<'a> {
             Tok::Minus => match self.peek_adjacent_neg_literal(tok.span) {
                 Some(NegLeaf::Int(n, lit_span)) => {
                     self.bump(Construct::Pattern)?;
-                    // `n` is in [0, i64::MAX] at lex time; `checked_neg` is
-                    // the fail-closed guard in case that bound ever widens.
-                    let value = n.checked_neg().ok_or_else(|| Diagnostic::Parse {
-                        span: Self::span_merge(tok.span, lit_span),
-                        msg: ParseError::IntLiteralOutOfRange,
-                    })?;
+                    let span = Self::span_merge(tok.span, lit_span);
                     Ok(Located::new(
-                        Self::span_merge(tok.span, lit_span),
-                        Pattern_::PInt(value),
+                        span,
+                        Pattern_::PInt(int_value(n, Sign::Minus, span)?),
                     ))
                 }
                 // Float patterns are unsound (f64 equality is not well-defined

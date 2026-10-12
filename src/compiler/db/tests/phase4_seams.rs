@@ -233,15 +233,59 @@ fn lower_program_short_circuits_on_typecheck_error() {
 
     let typecheck_err = ipe_db::typecheck(&db, root, entry)
         .clone()
-        .expect_err("annotated Int binding with a String body must be rejected")
-        .0;
+        .expect_err("annotated Int binding with a String body must be rejected");
     let lower_err = ipe_db::lower_program(&db, root, entry)
         .clone()
-        .expect_err("lower_program must refuse to lower an ill-typed program")
-        .0;
+        .expect_err("lower_program must refuse to lower an ill-typed program");
+    assert!(
+        matches!(typecheck_err, ipe_db::TypecheckError::Infer(_)),
+        "a type error is the type checker's refusal, got {typecheck_err:?}"
+    );
     assert_eq!(
-        typecheck_err, lower_err,
+        ipe_db::PipelineError::from(typecheck_err),
+        lower_err,
         "lower_program's short-circuit must surface typecheck's own diagnostic verbatim"
+    );
+}
+
+/// A link refusal reaches `typecheck`, `typecheck_module`, and `lower_program`
+/// as the link diagnostic itself, demanded cold: never re-classified as a
+/// type-checker error and never an internal compiler error.
+#[test]
+fn typecheck_carries_a_link_refusal_verbatim() {
+    const UNBOUND_ENTRY: &str = "module Entry exposing (e)\n\ne = notDefinedAnywhere\n";
+    let (db, _log) = logged_db();
+    let entry = file(&db, &["Entry"], UNBOUND_ENTRY);
+    let root = root_of(&db, &[(&["Entry"], entry)]);
+
+    let module_err = ipe_db::typecheck_module(&db, root, entry, entry)
+        .clone()
+        .expect_err("an unbound name must refuse the module's types");
+    let typecheck_err = ipe_db::typecheck(&db, root, entry)
+        .clone()
+        .expect_err("an unbound name must refuse the program");
+    let link_err = ipe_db::linked_program(&db, root, entry)
+        .clone()
+        .expect_err("an unbound name must refuse the link");
+    assert!(
+        matches!(link_err, ipe_diagnostics::Diagnostic::Name { .. }),
+        "an unbound name is a name error, got {link_err:?}"
+    );
+    assert_eq!(
+        typecheck_err,
+        ipe_db::TypecheckError::Link(link_err.clone()),
+        "typecheck must carry the link diagnostic verbatim"
+    );
+    assert_eq!(
+        module_err, typecheck_err,
+        "the per-module query serves the same link refusal"
+    );
+    assert_eq!(
+        ipe_db::lower_program(&db, root, entry)
+            .clone()
+            .expect_err("lowering must refuse an unlinked program"),
+        ipe_db::PipelineError::Lower(link_err, Vec::new()),
+        "lower_program reports the link refusal with no blamed module"
     );
 }
 

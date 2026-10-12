@@ -17,8 +17,7 @@ ipe_lower = { path = "../lower" }
 ipe_ir = { path = "../ir" }
 ipe_backend = { path = "../backend" }
 ipe_backend_rust = { path = "../backend/rust" }
-
-[dev-dependencies]
+# The importable-module catalog lists `COMPILED_STD_MODULES` (IPE-N0034).
 ipe_stdlib = { path = "../../stdlib" }
 
 [lints]

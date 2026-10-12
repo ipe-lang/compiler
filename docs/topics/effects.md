@@ -66,7 +66,7 @@ Both forms are equivalent. See [`do`](do) for the full syntax.
 Binding a `Task` to `_` in a `let` expression silently discards the effect
 outside the `Task` discipline. The compiler rejects it (IPE-L0141):
 
-```ipe ipe:error
+```ipe ipe:error IPE-L0141
 -- Wrong: the effect is described but never run
 main : Task Error ()
 main =
@@ -92,7 +92,7 @@ A trailing `Io.println` after other logic looks right but leaves the earlier
 steps unconnected. Every step must be part of the same `Task.andThen` / `do`
 chain:
 
-```ipe ipe:error
+```ipe ipe:error IPE-T0001
 -- Wrong: the readLine Task is never connected to the println
 badMain : Task Error ()
 badMain =

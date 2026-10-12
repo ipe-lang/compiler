@@ -61,7 +61,7 @@ describe userId =
     userId ++ ": " ++ resolved
 ```
 
-Running it (`ipe run`) over four users prints — one resolves, three miss at three
+Running it (`ipe dev run`) over four users prints — one resolves, three miss at three
 *different* links, and all three land on the same fallback:
 
 ```

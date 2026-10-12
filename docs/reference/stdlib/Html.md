@@ -26,6 +26,9 @@ node : String -> List (Attribute msg) -> List (Html msg) -> Html msg
 ```
 
 `node tag attrs children` — a container element `<tag …>children</tag>`.
+A `script` or `style` tag renders only over trusted raw children (see
+`Ipe.Html.Unsafe` and `styleNode`), and `plaintext` or an unsafe tag name
+never renders: a refused element renders nothing.
 
 ## `voidNode`
 
@@ -69,7 +72,12 @@ styleNode : List (Attribute msg) -> String -> Html msg
 ```
 
 `styleNode attrs css` — a `<style>` element whose CSS body is
-close-tag-neutralised once at construction (parse, don't validate).
+neutralised once at construction so it can open or close no markup: every
+`</style` is removed, and a space follows every `<` that comes before a
+letter, `/`, `!` or `?`. CSS reads that space as whitespace, but inside a
+CSS string or `url(...)` it is kept, so
+`url("data:image/svg+xml,<svg ...>")` arrives as `< svg` and a string
+holding `</style>` loses that run.
 
 ## `render`
 
@@ -435,6 +443,10 @@ meter : List (Attribute msg) -> List (Html msg) -> Html msg
 ```ipe
 script : List (Attribute msg) -> List (Html msg) -> Html msg
 ```
+
+`script attrs children` — a `<script>` element. It renders only over a
+trusted body (`Ipe.Html.Unsafe.unsafeRaw`, or use `unsafeScript`); a text,
+element or empty body is refused and renders nothing, so data never runs.
 
 ## `h1`
 

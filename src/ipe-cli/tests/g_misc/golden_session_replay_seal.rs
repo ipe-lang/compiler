@@ -1,9 +1,9 @@
-//! Seal — `ipe run --record` / `--replay` for a `Cli.tea` app, end to end.
+//! Seal — `ipe dev run --record` / `--replay` for a `Cli.tea` app, end to end.
 //!
 //! Builds the `console_app_seal` fixture with the debugger compiled in (its
 //! `Msg` and `Model` both encode, so it gets the `Full` session codec and the
 //! serde derives the typed log needs), then drives the binary the way
-//! `ipe run` does, through the runtime's own env wire names:
+//! `ipe dev run` does, through the runtime's own env wire names:
 //!
 //! * a recording run writes the plain trace AND the typed log beside it;
 //! * a replay run prints `start` + one line per step + `final`, control bytes
@@ -70,7 +70,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
     let built = ipe::build_with_options(&entry, &out, &runtime, options);
     assert!(
         built.is_ok(),
-        "ipe build --debugger must succeed: {:?}",
+        "ipe dev build --debugger must succeed: {:?}",
         built.err()
     );
 

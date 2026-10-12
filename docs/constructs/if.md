@@ -55,7 +55,7 @@ sign n =
 The compiler checks that `then` and `else` produce the same type. If they
 disagree you get IPE-T0001 (type mismatch):
 
-```ipe ipe:error
+```ipe ipe:error IPE-T0001
 badBranch : Bool -> Int
 badBranch flag =
     if flag then

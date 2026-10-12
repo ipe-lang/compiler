@@ -1,4 +1,4 @@
-//! End-to-end proof for `ipe watch`'s appearance hot-swap classifier.
+//! End-to-end proof for `ipe dev watch`'s appearance hot-swap classifier.
 //!
 //! Under `IPE_WATCH_HOT_APPEARANCE`, an edit to a hoisted style-value literal in
 //! a web `view` is classified `AppearanceOnly` and pushed to the running app as a
@@ -488,6 +488,7 @@ impl EventSink {
     }
 }
 
+#[allow(clippy::expect_used)] // a refused session thread is a harness setup failure
 fn start_watch(
     entry: &Path,
     out_dir: &Path,
@@ -513,7 +514,7 @@ fn start_watch(
     // into the watch rebuild so it links against a pre-compiled dep tree; absent,
     // the watch stays isolated exactly as before.
     opts.target_dir = e2e_support::child_shared_target_from_env().map(PathBuf::from);
-    ipe::watch::spawn(opts)
+    ipe::watch::spawn(opts).expect("spawn the watch session")
 }
 
 fn stop_and_join(

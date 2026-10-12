@@ -81,7 +81,7 @@ fn f1_firstclass_curried_and_shadow() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for firstclass_curried: {:?}",
+        "ipe dev build must succeed for firstclass_curried: {:?}",
         built.err()
     );
 
@@ -139,7 +139,7 @@ fn f2_firstclass_arity0() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for firstclass_arity0: {:?}",
+        "ipe dev build must succeed for firstclass_arity0: {:?}",
         built.err()
     );
 
@@ -178,7 +178,7 @@ fn f3_partial_noncopy() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for partial_noncopy: {:?}",
+        "ipe dev build must succeed for partial_noncopy: {:?}",
         built.err()
     );
 
@@ -227,7 +227,7 @@ fn f4_lambda_capture_noncopy_and_f11_shadow() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for lambda_capture_noncopy: {:?}",
+        "ipe dev build must succeed for lambda_capture_noncopy: {:?}",
         built.err()
     );
 
@@ -269,7 +269,7 @@ fn f5_capture_fn_called_control() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for capture_fn_called (control): {:?}",
+        "ipe dev build must succeed for capture_fn_called (control): {:?}",
         built.err()
     );
 
@@ -353,7 +353,7 @@ fn f7_succeed_curried() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for succeed_curried: {:?}",
+        "ipe dev build must succeed for succeed_curried: {:?}",
         built.err()
     );
 
@@ -396,7 +396,7 @@ fn f8_curried_three_arrows() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for curried_three_arrows: {:?}",
+        "ipe dev build must succeed for curried_three_arrows: {:?}",
         built.err()
     );
 
@@ -443,7 +443,7 @@ fn f9_decoder_thunk_capture() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for decoder_thunk_capture: {:?}",
+        "ipe dev build must succeed for decoder_thunk_capture: {:?}",
         built.err()
     );
 
@@ -513,7 +513,7 @@ fn f10_generic_curried_capture_builds_and_runs() {
 /// the independent-review-found gap: `is_pipeline_next_decoder_kernel`
 /// (`crates/ipe_lower/src/lower.rs`) listed only five of the six
 /// `Decoder<E, Box<dyn FnOnce(_) -> _>>`-shaped kernels, omitting
-/// `KernelFn::JsonDecPCustom`.  Without the fix, `ipe build` exits 0 but the emitted
+/// `KernelFn::JsonDecPCustom`.  Without the fix, `ipe dev build` exits 0 but the emitted
 /// `decode_pipeline_custom` call site fails `cargo build` with 2×E0308
 /// (`expected trait 'Fn', found trait 'FnOnce'`).
 #[test]
@@ -536,7 +536,7 @@ fn f11_pipeline_custom_curried() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for pipeline_custom_curried: {:?}",
+        "ipe dev build must succeed for pipeline_custom_curried: {:?}",
         built.err()
     );
 

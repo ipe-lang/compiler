@@ -199,8 +199,9 @@ impl Served {
 struct State {
     workspace_root: Option<PathBuf>,
     encoding: PositionEncoding,
-    db: ipe_db::IpeDatabase,
-    root: Option<ipe_db::SourceRoot>,
+    /// The one owner of the session's database and root: past its growth
+    /// ceiling it drops the generation and rebuilds cold.
+    db: ipe_db::LongLivedDb,
     /// Open editor buffers, keyed by normalized path.
     overlays: BTreeMap<PathBuf, Overlay>,
     served: Served,
@@ -247,13 +248,13 @@ impl State {
     }
 
     /// Resolve a document URI to its module path and input handle. The handle's
-    /// text is read by borrowing `file.text(&state.db)` at the use site, so the
+    /// text is read by borrowing `file.text(state.db.db())` at the use site, so the
     /// full document is never cloned just to satisfy the borrow checker.
     fn locate(&self, uri: &Url) -> Option<(Vec<String>, ipe_db::SourceFile)> {
         let path = normalize(&uri.to_file_path().ok()?);
         let module = self.module_of_path(&path)?.clone();
-        let root = self.root?;
-        let file = root.files(&self.db).get(&module).copied()?;
+        let root = self.db.root()?;
+        let file = root.files(self.db.db()).get(&module).copied()?;
         Some((module, file))
     }
 
@@ -273,8 +274,7 @@ impl State {
         Self {
             workspace_root,
             encoding,
-            db: ipe_db::IpeDatabase::new(),
-            root: None,
+            db: ipe_db::LongLivedDb::new(),
             overlays: BTreeMap::new(),
             served: Served::Unloaded,
             generation: 0,
@@ -468,11 +468,11 @@ fn position_ctx<'db>(
     position: lsp_types::Position,
 ) -> Result<PosCtx<'db>, FeatureOutcome> {
     let (module, file) = locate_ctx(state, uri)?;
-    let text = file.text(&state.db);
-    let Some(root) = state.root else {
+    let text = file.text(state.db.db());
+    let Some(root) = state.db.root() else {
         return Err(FeatureOutcome::NoResult);
     };
-    let Some(entry_file) = root.files(&state.db).get(state.entry_module()).copied() else {
+    let Some(entry_file) = root.files(state.db.db()).get(state.entry_module()).copied() else {
         return Err(FeatureOutcome::NoResult);
     };
     let byte = offset::position_to_offset(text, position, state.encoding);
@@ -499,7 +499,7 @@ fn hover_result(state: &State, params: &serde_json::Value) -> FeatureOutcome {
         return FeatureOutcome::NoResult;
     };
     ipe_lsp_features::hover::hover(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         ctx.file,
@@ -549,12 +549,12 @@ fn document_links_result(state: &State, params: &serde_json::Value) -> FeatureOu
     let Some((_module, file)) = state.locate(&params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let text = file.text(&state.db);
-    let Some(root) = state.root else {
+    let text = file.text(state.db.db());
+    let Some(root) = state.db.root() else {
         return FeatureOutcome::NoResult;
     };
     let links: Vec<lsp_types::DocumentLink> =
-        ipe_lsp_features::links::document_links(&state.db, root, file)
+        ipe_lsp_features::links::document_links(state.db.db(), root, file)
             .into_iter()
             .filter_map(|link| {
                 let target = state.uri_for_module(&link.target_module)?;
@@ -580,7 +580,7 @@ fn folding_ranges_result(state: &State, params: &serde_json::Value) -> FeatureOu
     let Ok((_module, file)) = locate_ctx(state, &params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let ranges = ipe_lsp_features::folding::folding_ranges(&state.db, file, state.encoding);
+    let ranges = ipe_lsp_features::folding::folding_ranges(state.db.db(), file, state.encoding);
     FeatureOutcome::payload(ranges)
 }
 
@@ -595,7 +595,7 @@ fn document_symbols_result(state: &State, params: &serde_json::Value) -> Feature
     let Ok((_module, file)) = locate_ctx(state, &params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let symbols = ipe_lsp_features::symbols::document_symbols(&state.db, file, state.encoding);
+    let symbols = ipe_lsp_features::symbols::document_symbols(state.db.db(), file, state.encoding);
     FeatureOutcome::payload(lsp_types::DocumentSymbolResponse::Nested(symbols))
 }
 
@@ -616,7 +616,7 @@ fn completion_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     // fallback to the unqualified path). Only a byte that is not on such a
     // trigger at all falls through to whole-scope completion.
     let items = ipe_lsp_features::completion::qualified_completions(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &ctx.module,
@@ -626,7 +626,7 @@ fn completion_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     )
     .unwrap_or_else(|| {
         ipe_lsp_features::completion::completions(
-            &state.db,
+            state.db.db(),
             ctx.root,
             ctx.entry_file,
             &ctx.module,
@@ -655,7 +655,7 @@ fn definition_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
         return FeatureOutcome::NoResult;
     };
     let Some(def) = ipe_lsp_features::navigation::goto_definition(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &ctx.module,
@@ -670,9 +670,9 @@ fn definition_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     let empty = String::new();
     let def_text = ctx
         .root
-        .files(&state.db)
+        .files(state.db.db())
         .get(&def.module)
-        .map_or(&empty, |f| f.text(&state.db));
+        .map_or(&empty, |f| f.text(state.db.db()));
     let range = ipe_lsp_features::offset::span_to_range(def_text, def.span, state.encoding);
     let location = lsp_types::Location {
         uri: def_uri,
@@ -697,7 +697,7 @@ fn type_definition_result(state: &State, params: &serde_json::Value) -> FeatureO
         return FeatureOutcome::NoResult;
     };
     let Some(def) = ipe_lsp_features::navigation::type_definition(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &ctx.module,
@@ -711,9 +711,9 @@ fn type_definition_result(state: &State, params: &serde_json::Value) -> FeatureO
     let empty = String::new();
     let def_text = ctx
         .root
-        .files(&state.db)
+        .files(state.db.db())
         .get(&def.module)
-        .map_or(&empty, |f| f.text(&state.db));
+        .map_or(&empty, |f| f.text(state.db.db()));
     let range = ipe_lsp_features::offset::span_to_range(def_text, def.span, state.encoding);
     FeatureOutcome::payload(lsp_types::Location {
         uri: def_uri,
@@ -732,7 +732,7 @@ fn references_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     };
     // Resolve via goto_definition to get the canonical (home, name) pair.
     let Some(def) = ipe_lsp_features::navigation::goto_definition(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &ctx.module,
@@ -742,8 +742,8 @@ fn references_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     };
     // Borrow each module's salsa-owned text rather than cloning the whole file:
     // once for the definition, and once per module a reference lands in.
-    let files = ctx.root.files(&state.db);
-    let text_of = |module: &[String]| files.get(module).map(|f| f.text(&state.db));
+    let files = ctx.root.files(state.db.db());
+    let text_of = |module: &[String]| files.get(module).map(|f| f.text(state.db.db()));
     let Some(def_text) = text_of(&def.module) else {
         return FeatureOutcome::NoResult;
     };
@@ -753,7 +753,7 @@ fn references_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
         return FeatureOutcome::NoResult;
     };
     let refs = ipe_lsp_features::navigation::find_references(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &def.module,
@@ -800,7 +800,7 @@ fn prepare_rename_result(state: &State, params: &serde_json::Value) -> FeatureOu
         return FeatureOutcome::NoResult;
     };
     let Some(prep) = ipe_lsp_features::rename::prepare_rename(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &ctx.module,
@@ -826,7 +826,7 @@ fn rename_result(state: &State, params: &serde_json::Value) -> FeatureOutcome {
     let Ok(ctx) = position_ctx(state, &position.text_document.uri, position.position) else {
         return FeatureOutcome::NoResult;
     };
-    let db = &state.db;
+    let db = state.db.db();
     let uri_of = |m: &[String]| state.uri_for_module(m);
     let text_of =
         |m: &[String]| -> Option<String> { ctx.root.files(db).get(m).map(|f| f.text(db).clone()) };
@@ -1059,21 +1059,10 @@ fn sync_inputs(state: &mut State) {
                 })
                 .collect()
         });
-    if let Some(root) = state.root {
+    if state.db.root().is_some() || !desired.is_empty() {
         // Blocks until any in-flight worker's cancelled query unwinds and
         // drops its database clone — the cancellation edge.
-        ipe_db::sync_source_root(&mut state.db, root, &desired);
-    } else if !desired.is_empty() {
-        let files: BTreeMap<Vec<String>, ipe_db::SourceFile> = desired
-            .iter()
-            .map(|(module, (text, origin))| {
-                (
-                    module.clone(),
-                    ipe_db::SourceFile::new(&state.db, module.clone(), text.clone(), *origin),
-                )
-            })
-            .collect();
-        state.root = Some(ipe_db::SourceRoot::new(&state.db, files));
+        state.db.sync(&desired);
     }
 }
 
@@ -1103,8 +1092,11 @@ fn apply_content_change(
 /// at most one live worker at any time, so fast edits cannot accumulate
 /// unbounded threads or memory.
 fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
-    let served = state.root.and_then(|root| {
-        let entry_file = root.files(&state.db).get(state.entry_module()).copied()?;
+    let served = state.db.root().and_then(|root| {
+        let entry_file = root
+            .files(state.db.db())
+            .get(state.entry_module())
+            .copied()?;
         Some((root, entry_file))
     });
 
@@ -1145,7 +1137,7 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
     }
 
     let generation = state.generation;
-    let db = state.db.clone();
+    let db = state.db.db().clone();
     let encoding = state.encoding;
     let entry_module = state.entry_module().to_vec();
     let mut uri_of: BTreeMap<Vec<String>, Url> = BTreeMap::new();
@@ -1167,34 +1159,49 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
     let cancel = Arc::new(AtomicBool::new(false));
     state.worker_cancel = Some(cancel.clone());
     let tx = diag_tx.clone();
-    state.worker = Some(thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            salsa::Cancelled::catch(AssertUnwindSafe(|| {
-                compute_batch(
-                    &db,
-                    root,
-                    entry_file,
-                    &uri_of,
-                    &entry_module,
-                    encoding,
-                    &cancel,
-                    &lint,
-                )
-            }))
-        }));
-        match outcome {
-            Ok(Ok(per_uri)) => {
-                let _ = tx.send(DiagnosticsBatch {
-                    generation,
-                    per_uri,
-                });
+    let spawned = thread::Builder::new()
+        .name("ipe-lsp-diagnostics".to_owned())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                    compute_batch(
+                        &db,
+                        root,
+                        entry_file,
+                        &uri_of,
+                        &entry_module,
+                        encoding,
+                        &cancel,
+                        &lint,
+                    )
+                }))
+            }));
+            match outcome {
+                Ok(Ok(per_uri)) => {
+                    let _ = tx.send(DiagnosticsBatch {
+                        generation,
+                        per_uri,
+                    });
+                }
+                Ok(Err(_cancelled)) => {} // superseded — the newer worker owns the push
+                Err(_panic) => {
+                    eprintln!("[ipe lsp] internal error: diagnostics worker panicked");
+                }
             }
-            Ok(Err(_cancelled)) => {} // superseded — the newer worker owns the push
-            Err(_panic) => {
-                eprintln!("[ipe lsp] internal error: diagnostics worker panicked");
-            }
+        });
+    match spawned {
+        Ok(handle) => state.worker = Some(handle),
+        Err(e) => {
+            // No worker is running for this generation; the next edit's
+            // recompute spawns a fresh one, so this is a skipped cycle, not a
+            // stuck one.
+            state.worker = None;
+            eprintln!(
+                "[ipe lsp] internal error: diagnostics worker thread refused: {:?}",
+                e.kind()
+            );
         }
-    }));
+    }
 }
 
 /// The diagnostic a refused project load publishes on the refused path.
@@ -1356,7 +1363,7 @@ fn formatting_result(state: &State, params: &serde_json::Value) -> FeatureOutcom
     let Ok((_module, file)) = locate_ctx(state, &params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let edits = ipe_lsp_features::formatting::format_document(&state.db, file, state.encoding);
+    let edits = ipe_lsp_features::formatting::format_document(state.db.db(), file, state.encoding);
     FeatureOutcome::payload(edits)
 }
 
@@ -1372,8 +1379,12 @@ fn range_formatting_result(state: &State, params: &serde_json::Value) -> Feature
     let Ok((_module, file)) = locate_ctx(state, &params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let edits =
-        ipe_lsp_features::formatting::format_range(&state.db, file, params.range, state.encoding);
+    let edits = ipe_lsp_features::formatting::format_range(
+        state.db.db(),
+        file,
+        params.range,
+        state.encoding,
+    );
     FeatureOutcome::payload(edits)
 }
 
@@ -1385,15 +1396,15 @@ fn code_action_result(state: &State, params: &serde_json::Value) -> FeatureOutco
     let Some((module, file)) = state.locate(&params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let text = file.text(&state.db);
-    let Some(root) = state.root else {
+    let text = file.text(state.db.db());
+    let Some(root) = state.db.root() else {
         return FeatureOutcome::NoResult;
     };
-    let Some(entry_file) = root.files(&state.db).get(state.entry_module()).copied() else {
+    let Some(entry_file) = root.files(state.db.db()).get(state.entry_module()).copied() else {
         return FeatureOutcome::NoResult;
     };
     let view = ipe_lsp_features::code_actions::DbView {
-        db: &state.db,
+        db: state.db.db(),
         root,
         entry: entry_file,
     };
@@ -1461,8 +1472,11 @@ fn semantic_tokens_full_result(state: &State, params: &serde_json::Value) -> Fea
     let Ok((_module, file)) = locate_ctx(state, &params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let result =
-        ipe_lsp_features::semantic_tokens::semantic_tokens_full(&state.db, file, state.encoding);
+    let result = ipe_lsp_features::semantic_tokens::semantic_tokens_full(
+        state.db.db(),
+        file,
+        state.encoding,
+    );
     FeatureOutcome::payload(result)
 }
 
@@ -1479,7 +1493,7 @@ fn signature_help_result(state: &State, params: &serde_json::Value) -> FeatureOu
         return FeatureOutcome::NoResult;
     };
     FeatureOutcome::maybe(ipe_lsp_features::signature_help::signature_help(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &ctx.module,
@@ -1496,14 +1510,14 @@ fn inlay_hints_result(state: &State, params: &serde_json::Value) -> FeatureOutco
     let Some((module, _file)) = state.locate(&params.text_document.uri) else {
         return FeatureOutcome::NoResult;
     };
-    let Some(root) = state.root else {
+    let Some(root) = state.db.root() else {
         return FeatureOutcome::NoResult;
     };
-    let Some(entry_file) = root.files(&state.db).get(state.entry_module()).copied() else {
+    let Some(entry_file) = root.files(state.db.db()).get(state.entry_module()).copied() else {
         return FeatureOutcome::NoResult;
     };
     let hints = ipe_lsp_features::inlay_hints::inlay_hints(
-        &state.db,
+        state.db.db(),
         root,
         entry_file,
         &module,
@@ -1528,7 +1542,7 @@ fn document_highlight_result(state: &State, params: &serde_json::Value) -> Featu
     };
     // Resolve to the canonical (home, name) pair via goto_definition.
     let Some(def) = ipe_lsp_features::navigation::goto_definition(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &ctx.module,
@@ -1536,8 +1550,8 @@ fn document_highlight_result(state: &State, params: &serde_json::Value) -> Featu
     ) else {
         return FeatureOutcome::NoResult;
     };
-    let files = ctx.root.files(&state.db);
-    let text_of = |m: &[String]| files.get(m).map(|f| f.text(&state.db));
+    let files = ctx.root.files(state.db.db());
+    let text_of = |m: &[String]| files.get(m).map(|f| f.text(state.db.db()));
     let Some(def_text) = text_of(&def.module) else {
         return FeatureOutcome::NoResult;
     };
@@ -1548,7 +1562,7 @@ fn document_highlight_result(state: &State, params: &serde_json::Value) -> Featu
     };
     // Collect references across all modules, then filter to the requested document.
     let refs = ipe_lsp_features::navigation::find_references(
-        &state.db,
+        state.db.db(),
         ctx.root,
         ctx.entry_file,
         &def.module,
@@ -1588,18 +1602,18 @@ fn workspace_symbol_result(state: &State, params: &serde_json::Value) -> Feature
     else {
         return FeatureOutcome::InvalidParams("invalid params for workspace/symbol".into());
     };
-    let Some(root) = state.root else {
+    let Some(root) = state.db.root() else {
         return FeatureOutcome::NoResult;
     };
     let query = params.query.to_lowercase();
-    let files = root.files(&state.db);
+    let files = root.files(state.db.db());
     let mut results: Vec<lsp_types::WorkspaceSymbol> = Vec::new();
     // Iterate all modules with a known URI; skip modules with no on-disk path.
     for (module_path, &file) in files {
         let Some(uri) = state.uri_for_module(module_path) else {
             continue;
         };
-        let syms = ipe_lsp_features::symbols::document_symbols(&state.db, file, state.encoding);
+        let syms = ipe_lsp_features::symbols::document_symbols(state.db.db(), file, state.encoding);
         for sym in syms {
             if query.is_empty() || sym.name.to_lowercase().contains(&query) {
                 let location = lsp_types::OneOf::Left(lsp_types::Location {
@@ -1649,7 +1663,7 @@ fn selection_range_result(state: &State, params: &serde_json::Value) -> FeatureO
         return FeatureOutcome::NoResult;
     };
     let ranges = ipe_lsp_features::selection_range::selection_ranges(
-        &state.db,
+        state.db.db(),
         file,
         &params.positions,
         state.encoding,
@@ -1670,7 +1684,7 @@ fn semantic_tokens_range_result(state: &State, params: &serde_json::Value) -> Fe
         return FeatureOutcome::NoResult;
     };
     let result = ipe_lsp_features::semantic_tokens::semantic_tokens_range(
-        &state.db,
+        state.db.db(),
         file,
         params.range,
         state.encoding,
@@ -1722,11 +1736,12 @@ mod tests {
     use crossbeam_channel::RecvTimeoutError;
 
     use super::{
-        Connection, DiagnosticsBatch, DidChangeTextDocument, DidChangeWatchedFiles, FeatureOutcome,
-        Layout, LoadedFile, LoadedProject, Message, ModuleOrigin, Notification, Overlay, Path,
-        PathBuf, PositionEncoding, ProjectLoader, PublishDiagnostics, PublishDiagnosticsParams,
-        Served, State, TextDocumentContentChangeEvent, Url, code_action_result,
-        ensure_project_fresh, handle_notification, normalize, publish, recompute, sync_inputs,
+        Connection, DiagnosticsBatch, DidChangeTextDocument, DidChangeWatchedFiles,
+        DidCloseTextDocument, DidOpenTextDocument, FeatureOutcome, Layout, LoadedFile,
+        LoadedProject, Message, ModuleOrigin, Notification, Overlay, Path, PathBuf,
+        PositionEncoding, ProjectLoader, PublishDiagnostics, PublishDiagnosticsParams, Served,
+        State, TextDocumentContentChangeEvent, Url, code_action_result, ensure_project_fresh,
+        handle_notification, normalize, publish, recompute, sync_inputs,
     };
     use crate::loader::{LimitSource, LoadDisposition, LoadError};
     use ipe_lint::{LintConfigLoadError, WorkspaceReadError, load_lint_config};
@@ -1796,9 +1811,11 @@ mod tests {
             .status();
         assert!(matches!(made, Ok(s) if s.success()), "mkfifo: {made:?}");
         let (tx, rx) = crossbeam_channel::bounded(1);
-        std::thread::spawn(move || {
-            let _ = tx.send(load_lint_config(&dir));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(load_lint_config(&dir));
+            })
+            .expect("spawn test thread");
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(10)),
             Ok(Err(LintConfigLoadError::Read(WorkspaceReadError::NotAFile)))
@@ -2136,6 +2153,7 @@ mod tests {
                 detail: detail(),
             },
             LoadError::FfiUntrusted(detail()),
+            LoadError::FfiCatalogRefused(detail()),
             LoadError::ManifestUntrusted(detail()),
         ] {
             assert_eq!(
@@ -2162,13 +2180,14 @@ mod tests {
     }
 
     /// Every refusal a load can end in, one per refusing variant.
-    fn every_refusal() -> [LoadError; 3] {
+    fn every_refusal() -> [LoadError; 4] {
         [
             LoadError::Limit {
                 lifted_by: LimitSource::Filesystem,
                 detail: "ceiling".to_owned(),
             },
             LoadError::FfiUntrusted("untrusted".to_owned()),
+            LoadError::FfiCatalogRefused("inconsistent".to_owned()),
             LoadError::ManifestUntrusted("untrusted".to_owned()),
         ]
     }
@@ -2608,7 +2627,10 @@ mod tests {
             "no request may be answered from the dropped fallback"
         );
         assert_eq!(
-            state.root.map_or(0, |root| root.files(&state.db).len()),
+            state
+                .db
+                .root()
+                .map_or(0, |root| root.files(state.db.db()).len()),
             0,
             "the analyzed module set must be empty"
         );
@@ -3075,6 +3097,129 @@ mod tests {
         assert!(
             bare_signatures.is_empty(),
             "handler(s) still return bare serde_json::Value: {bare_signatures:?}"
+        );
+    }
+
+    /// A loader serving `Main`, the static `Lib` with a type error, the
+    /// stdlib, and any other open buffer as its own module.
+    struct ChurnLoader {
+        main_path: PathBuf,
+        lib_path: PathBuf,
+    }
+
+    impl ProjectLoader for ChurnLoader {
+        fn load(
+            &self,
+            workspace_root: Option<&Path>,
+            open_file: &Path,
+            open_text: Option<&str>,
+        ) -> Result<LoadedProject, LoadError> {
+            let two = TwoModuleLoader {
+                fail_next: Arc::new(AtomicBool::new(false)),
+                lib_path: self.lib_path.clone(),
+            };
+            let mut project = two.load(workspace_root, &self.main_path, None)?;
+            if let (Some(text), Some(stem)) = (
+                open_text.filter(|_| open_file != self.main_path),
+                open_file.file_stem().and_then(|stem| stem.to_str()),
+            ) {
+                project.files.insert(
+                    vec![stem.to_owned()],
+                    LoadedFile {
+                        path: open_file.to_path_buf(),
+                        text: text.to_owned(),
+                        origin: ModuleOrigin::User,
+                    },
+                );
+            }
+            Ok(project)
+        }
+    }
+
+    /// Sync and recompute `state`, returning the batch's diagnostics for `uri`.
+    #[allow(clippy::expect_used)] // test fixture: the worker always sends one batch
+    fn diagnostics_for(state: &mut State, uri: &Url) -> Vec<lsp_types::Diagnostic> {
+        let (diag_tx, diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
+        sync_inputs(state);
+        recompute(state, &diag_tx);
+        let batch = diag_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("diagnostics batch");
+        batch
+            .per_uri
+            .into_iter()
+            .find_map(|(at, diagnostics)| (at == *uri).then_some(diagnostics))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: an absolute path always has a file URI
+    fn buffer_churn_resets_the_generation_without_changing_diagnostics() {
+        let main_path = normalize(Path::new("/lsp-long-lived-test/Main.ipe"));
+        let lib_path = normalize(Path::new("/lsp-long-lived-test/Lib.ipe"));
+        let lib_uri = Url::from_file_path(&lib_path).expect("lib uri");
+        let loader = ChurnLoader {
+            main_path: main_path.clone(),
+            lib_path,
+        };
+        let mut state = State::new(None, PositionEncoding::Utf16);
+        // Any warm stdlib generation stands past one symbol, so every buffer
+        // that adds an input forces a cold rebuild.
+        state.db = ipe_db::LongLivedDb::with_ceiling(ipe_db::GrowthCeiling {
+            symbols: 1,
+            symbol_bytes: u64::MAX,
+            inputs: u64::MAX,
+        });
+        state.overlays.insert(
+            main_path.clone(),
+            Overlay {
+                text: MAIN_TEXT.to_owned(),
+                version: 0,
+            },
+        );
+        ensure_project_fresh(&mut state, &loader, &main_path);
+        let before = diagnostics_for(&mut state, &lib_uri);
+        assert!(!before.is_empty(), "Lib's type error must publish");
+        assert_eq!(state.db.resets(), 0);
+
+        let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
+        for round in 0..3 {
+            let path = normalize(Path::new(&format!(
+                "/lsp-long-lived-test/Scratch{round}.ipe"
+            )));
+            let uri = Url::from_file_path(&path).expect("scratch uri");
+            let text = format!(
+                "module Scratch{round} exposing (value{round})\n\nvalue{round} = {round}\n"
+            );
+            let open = lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "ipe".to_owned(),
+                    version: 1,
+                    text: text.clone(),
+                },
+            };
+            let note = Notification::new(DidOpenTextDocument::METHOD.to_owned(), open);
+            handle_notification(&mut state, &loader, &note, &diag_tx);
+            did_change(
+                &mut state,
+                &loader,
+                &path,
+                &format!("{text}\nedited{round} = 1\n"),
+                &diag_tx,
+            );
+            let close = lsp_types::DidCloseTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+            };
+            let note = Notification::new(DidCloseTextDocument::METHOD.to_owned(), close);
+            handle_notification(&mut state, &loader, &note, &diag_tx);
+        }
+
+        assert!(state.db.resets() >= 2, "resets: {}", state.db.resets());
+        assert_eq!(
+            diagnostics_for(&mut state, &lib_uri),
+            before,
+            "a generation reset must not change a stable file's diagnostics"
         );
     }
 }

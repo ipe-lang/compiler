@@ -185,7 +185,7 @@ Trade-offs:
 
 On Linux, `split-debuginfo = "unpacked"` is the value to prefer; `"off"` turns
 debug info off entirely; `"packed"` (the default on macOS) writes a single
-`.dSYM` bundle. Cargo and `ipe build` accept all three values on Linux.
+`.dSYM` bundle. Cargo and `ipe dev build` accept all three values on Linux.
 
 These flags affect rebuild latency (`opt-level`, `codegen-units`, `incremental`)
 and link latency (`debug`, `split-debuginfo`). They do not affect release builds
@@ -208,19 +208,19 @@ reach under 5 seconds for a one-line change.
 
 ---
 
-## The dev loop: `ipe watch`
+## The dev loop: `ipe dev watch`
 
-Once the build is fast, `ipe watch` keeps it running:
+Once the build is fast, `ipe dev watch` keeps it running:
 
 ```
-ipe watch
+ipe dev watch
 ```
 
-`ipe watch` listens for source changes, runs an incremental rebuild through the
-salsa-aware pipeline, and restarts the process. The combination of `ipe watch`
+`ipe dev watch` listens for source changes, runs an incremental rebuild through the
+salsa-aware pipeline, and restarts the process. The combination of `ipe dev watch`
 and the flags above gives you sub-second feedback on most edits.
 
-For a running app **that has a view surface**, `ipe watch` goes further on edits
+For a running app **that has a view surface**, `ipe dev watch` goes further on edits
 that only change what the view *looks like*: a change to a static style value,
 attribute, or text — and to the static *structure* of a subtree, such as adding,
 removing, or reordering static elements or attributes — is hot-swapped into the
@@ -255,7 +255,7 @@ via a recompile rather than an in-place patch.
 
 ### Build-status banner (dev only)
 
-For `Ipe.Tea.Web` apps, `ipe watch` surfaces build results directly in the
+For `Ipe.Tea.Web` apps, `ipe dev watch` surfaces build results directly in the
 browser via the existing status banner at the bottom of the page:
 
 - **Success** — a green "Reloaded ✓" toast appears briefly (auto-hides after
@@ -271,4 +271,4 @@ entirely with `IPE_WEB_BANNER=off`.
 
 See [Getting started](getting-started.md) for a first project, and
 [The Elm Architecture](the-elm-architecture.md) for the program model that
-`ipe watch` loops over.
+`ipe dev watch` loops over.

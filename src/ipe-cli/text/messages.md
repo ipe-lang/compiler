@@ -70,7 +70,7 @@ unsupported target `{target}` — supported: wasm, wasi, {supported}
 
 ## run-wasm-target
 
-ipe run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe build --target wasm` to produce a browser bundle
+ipe dev run builds and executes a native binary; --target wasm has no native artifact to run — use `ipe dev build --target wasm` to produce a browser bundle
 
 ## run-wasi-native-flags
 
@@ -78,11 +78,11 @@ ipe run builds and executes a native binary; --target wasm has no native artifac
 
 ## eject-out-required
 
-ipe eject: --out <dir> is required (the directory to write the standalone project to)
+ipe release eject: --out <dir> is required (the directory to write the standalone project to)
 
 ## release-no-wasi
 
-ipe release produces a browser bundle (`--target wasm`) or a native binary; it does not produce a WASI module — build one with `ipe build --target wasi`
+ipe release build produces a browser bundle (`--target wasm`) or a native binary; it does not produce a WASI module — build one with `ipe dev build --target wasi`
 
 ## release-embed-bundle-exclusive
 
@@ -218,7 +218,7 @@ refusing to use the project manifest `{path}` found above the entry file: it is 
 
 ## manifest-unverifiable
 
-refusing to use the project manifest `{path}` found above the entry file: its ownership cannot be verified on this platform. Pass the project directory instead of the file (for example `ipe build path/to/project`), whose `package.ipe` is then used as named
+refusing to use the project manifest `{path}` found above the entry file: its ownership cannot be verified on this platform. Pass the project directory instead of the file (for example `ipe dev build path/to/project`), whose `package.ipe` is then used as named
 
 ## no-entry
 
@@ -235,6 +235,10 @@ internal: module in topo order not in source map
 ## library-package-no-entry
 
 this is a library package (it declares `exposedModules` and no runnable program) — there is no entry to build. Use `ipe type-check` to verify its public surface, or add a `Package.programs [ … ]` stage to declare a runnable entry
+
+## debugger-needs-runtime-dep
+
+`--debugger` needs the runtime crate: the vendored runtime source (`IPE_RUNTIME_VENDORED=1`) carries no debugger. Unset `IPE_RUNTIME_VENDORED` to build with it
 
 ## pkg-not-found-in-dir
 
@@ -566,7 +570,15 @@ Closest matches:
 
 ## cli-doc-suggestion-line
 
-  ipe doc {key}  {title} ({kind})
+  {index}. ipe doc {term}  {summary} ({kind})
+
+## cli-doc-nearest-header
+
+No close match; the nearest entries:
+
+## cli-doc-more-matches
+
+More entries match; refine the term.
 
 ## cli-unknown-code
 
@@ -595,6 +607,18 @@ unknown `ipe {group}` verb `{attempted}`
 ## cli-unknown-group-suggestion
 
 = help: maybe `ipe {group} {sugg}`?
+
+## cli-group-required
+
+`ipe {attempted}` is not a command on its own — it lives under a group
+
+## cli-subcommand-required
+
+`ipe {group}` needs a subcommand
+
+## cli-group-required-form
+
+= help: `ipe {form}`
 
 ## cli-verify-failed
 
@@ -655,6 +679,10 @@ a signal ended the transfer — stopped; nothing was recorded
 
 {source}: did not finish within {limit} — stopped; nothing was recorded
 
+## cli-cargo-build-timed-out
+
+cargo build did not finish within {wall} — stopped with every process it started; run `cargo build -vv` in the crate to see the step that hangs
+
 ## cli-local-tree-refused
 
 {source}: holds {shape}, which ipe does not accept — stopped; nothing was recorded
@@ -662,6 +690,28 @@ a signal ended the transfer — stopped; nothing was recorded
 ## cli-child-pipe-held
 
 {stream} of a finished child stayed open past the grace — a process it started still holds it; stopped
+
+## cli-child-pipe-unread
+
+reading the {stream} of a child failed ({kind}) — its output is incomplete, so it was not used; stopped
+
+## cli-child-stderr-truncated
+
+… stderr cut at the {limit} ceiling; the rest was dropped
+
+## ffi-inspector-exited
+
+ipe add: the FFI inspector exited with code {code}
+{stderr}
+
+## ffi-inspector-signalled
+
+ipe add: a signal ended the FFI inspector
+{stderr}
+
+## ffi-inspector-not-utf8
+
+ipe add: the FFI inspector's report is not valid UTF-8
 
 ## cli-source-not-regular-file
 
@@ -673,7 +723,7 @@ a signal ended the transfer — stopped; nothing was recorded
 
 ## cli-source-symlink
 
-{path}: reached through a symlink — ipe never follows a symlink while walking a loose file's imports; replace the link with the real file or directory
+{path}: is a symlink or is reached through one — ipe never follows a symlink to a file it finds by convention or while walking imports; replace the link with the real file or directory
 
 ## cli-path-escape
 
@@ -712,12 +762,12 @@ advisory file {path} is malformed — refusing to treat the dep as safe:
 
 ## cli-wasi-run-feature-disabled
 
-ipe run --target wasi needs the embedded wasmtime engine, but this `ipe` binary was built without the `wasi_run` feature.
-  = help: build the module with `ipe build --target wasi` and run it under a WASI runtime, or reinstall an `ipe` compiled with `--features wasi_run` (the default in release packaging).
+ipe dev run --target wasi needs the embedded wasmtime engine, but this `ipe` binary was built without the `wasi_run` feature.
+  = help: build the module with `ipe dev build --target wasi` and run it under a WASI runtime, or reinstall an `ipe` compiled with `--features wasi_run` (the default in release packaging).
 
 ## cli-wasi-run-failed
 
-ipe run --target wasi: the emitted wasm32-wasip1 module could not be run under the embedded wasmtime engine — {detail}
+ipe dev run --target wasi: the emitted wasm32-wasip1 module could not be run under the embedded wasmtime engine — {detail}
 
 ## cli-wasi-run-exited
 
@@ -742,6 +792,46 @@ could not access `{path}` — {kind}
 ## cli-scratch-unavailable
 
 could not create a private scratch directory under the OS temp directory — {kind}
+
+## cli-thread-refused
+
+the OS refused a thread for the {role} — {kind}
+
+## thread-role-watch-session
+
+watch session
+
+## thread-role-watch-coalesce
+
+watch change coalescer
+
+## thread-role-watch-fs-relay
+
+watch filesystem relay
+
+## thread-role-watch-stop-relay
+
+watch stop relay
+
+## thread-role-watch-resolve-retry
+
+watch dependency-resolve retry
+
+## thread-role-watch-compile
+
+watch compile worker
+
+## thread-role-watch-cargo-waiter
+
+watch cargo-build waiter
+
+## thread-role-wasi-wall-clock
+
+WASI wall-clock deadline
+
+## watch-thread-refused
+
+[ipe dev watch] warning: {detail}; the dependency-resolve retry is skipped
 
 # Publish refusals
 
@@ -768,6 +858,10 @@ no commit-signing key is configured, so the publish commit could only be pushed 
 ## publish-unresolvable-identity
 
 could not resolve your GitHub identity for the index-PR commit — the curated index requires signed commits marked "Verified", which is only possible when the commit's committer is your authenticated GitHub account's verified noreply identity. Run `ipe login` so publish can sign the index PR under your verified GitHub identity, then publish again. Nothing was published.
+
+## publish-fork-entry-not-plain
+
+{path} in the checkout of your index fork is a symbolic link or not a plain file or directory — publish never writes through one, so nothing was published. Remove it from your fork (the index holds only plain `packages/<name>.toml` entries), then publish again.
 
 # Lockfile refusals
 
@@ -952,6 +1046,10 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 {out} is inside {owner}, which ipe owns and may delete (`ipe clean`) — an ejected project must live outside ipe's output and cache; choose another --out
 
+## output-inside-claim
+
+{out} is inside {owner}, which an ipe process is claiming as its output (it holds `{claim}`) — an ejected project must live outside ipe's output; choose another --out, or delete `{claim}` in {owner} when no ipe process is active there
+
 ## output-inside-vcs
 
 {out} is inside a `.git` directory — build output must stay out of version-control metadata; choose another --out
@@ -995,6 +1093,26 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 ## output-in-use
 
 {path} is held open by another program (an editor, a file indexer, or antivirus) — close it there or let that program finish, then run the command again
+
+## output-claim-busy
+
+{path} is being claimed by another ipe process, still in progress after {waited}s — let that run finish, then run the command again; if no ipe process is active, another program holds `{claim}` locked: delete `{claim}` in {path} and run the command again
+
+## output-claim-lock-unavailable
+
+{path} is on a filesystem that refused a file lock ({kind}), so ipe cannot claim it safely — choose an --out on a local disk
+
+## output-claim-interrupted
+
+{path} holds a claim an ipe process left unfinished, with files ipe did not write beside it — check what is there, then delete `{marker}` and `{claim}` in it and run the command again
+
+## output-claim-marker-unfinished
+
+{path} holds a `{marker}` an interrupted ipe process left unfinished — check it is not a file of yours, then delete `{marker}` in it and run the command again
+
+## output-claim-in-flight
+
+{path} is being claimed by an ipe process, or holds a claim an interrupted run left — the next build finishes the claim; run the command again then
 
 # Publisher identity
 
@@ -1111,6 +1229,10 @@ stdin is not formatted (run `ipe fmt --stdin` to fix)
 
 fmt: no such file or directory: {root}
 
+## fmt-output-too-large
+
+formatted output of `{file}` would exceed {cap} bytes; the file is left unchanged. Split it into smaller modules.
+
 ## health-home-unknown
 
 health: cannot locate your home directory (neither CARGO_HOME nor HOME is an absolute path)
@@ -1197,13 +1319,75 @@ package.ipe: program entry {entry} has a path segment {segment} that is not a va
 
 package.ipe: program entry {entry} names no module
 
+## manifest-base-path-too-long
+
+`delivery.browser.basePath` is {len} bytes, past the {max}-byte limit. Serve the bundle under a shorter path, e.g. `/app`.
+
+## manifest-base-path-no-leading-slash
+
+`delivery.browser.basePath` {base} does not start with `/`. Write `/` for the origin root, or an absolute path such as `/app`.
+
+## manifest-base-path-trailing-slash
+
+`delivery.browser.basePath` {base} ends with `/`, and only the root is `/`. Drop the trailing slash, e.g. `/app`.
+
+## manifest-base-path-empty-segment
+
+`delivery.browser.basePath` {base} has an empty segment (`//`). Join segments with a single `/`, e.g. `/apps/admin`.
+
+## manifest-base-path-dot-segment
+
+`delivery.browser.basePath` {base} has a `.` or `..` segment, which a browser resolves away. Name the path directly, e.g. `/app`.
+
+## manifest-base-path-reserved-byte
+
+`delivery.browser.basePath` {base} holds the byte {byte}. A segment holds only `A-Z a-z 0-9 - . _ ~`, and segments are joined by `/`, e.g. `/my-app`.
+
 ## manifest-not-package-ipe
 
 {path}: not a package.ipe manifest. {hint}
 
 ## bundle-name-not-a-component
 
-package.ipe: name `{name}` cannot be a macOS bundle directory — a bundle root must be a single path component, but this name introduces a path separator, a `..` traversal, or an absolute path. Choose a name without `/`, `\`, or `..`.
+package.ipe: name `{name}` cannot be a macOS bundle directory — a bundle root must be one directory name that reads back as itself, and this name holds a path separator, a `..` traversal, an absolute path, a NUL byte, or a form the host file system would rewrite (on Windows: a trailing `.` or space, a control character, one of `:*?"<>|`, or a device name such as `NUL`). Choose a plain name without `/`, `\`, `..`, or control characters.
+
+# Mobile shell bundles
+
+## mobile-bundle-no-index
+
+no index.html in the emitted wasm bundle at {dir} — expected a `--target wasm` SPA (index.html + boot script + pkg/*.wasm)
+
+## mobile-bundle-unplaceable
+
+cannot bundle {path} from the emitted wasm bundle: {reason}
+
+## mobile-bundle-too-deep
+
+the emitted wasm bundle nests directories deeper than {limit} levels at {path}
+
+## mobile-bundle-too-many
+
+the emitted wasm bundle holds more than {limit} entries
+
+## mobile-bundle-replaced
+
+the emitted wasm bundle at {path} was replaced after it was collected — build and package again
+
+## mobile-bundle-io
+
+reading {path}: {detail}
+
+## mobile-asset-not-utf8
+
+its name is not valid UTF-8, which a shell asset path cannot carry
+
+## mobile-asset-bad-name
+
+its name is not one plain entry name
+
+## mobile-asset-kind
+
+it is {kind}; only regular files and directories are bundled
 
 # ipe doc
 
@@ -1236,11 +1420,29 @@ ipe doc: bundle build error: {detail}
 ipe doc: `{prefix}` is not a known documentation kind
 Known kinds: module, symbol, diagnostic, construct, idiom, topic, guide, cli
 
-## doc-no-entry-for-key
+## doc-query-empty
 
-ipe doc: no `{kind}` entry for key `{key}`
-Nearby keys:
-{nearby}
+ipe doc: the term is empty; name a module, symbol, or `kind:key` entry
+
+## doc-query-too-long
+
+ipe doc: the term is longer than {max} characters
+
+## doc-query-control
+
+ipe doc: the term contains a control character or escape sequence
+
+## doc-pick-prompt
+
+Open which entry? [1-{count}, Enter to cancel]
+
+## doc-pick-retry
+
+Not a listed number.
+
+## doc-pick-none
+
+ipe doc: no entry opened
 
 ## doc-ambiguous-module
 
@@ -1779,15 +1981,19 @@ ipe package publish: `--fresh` is only permitted on a reserved-namespace package
 
 ## run-main-anchor-absent
 
-ipe build: the emitted `fn main` anchor is absent, so the capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+the emitted `fn main` anchor is absent, so the embedded capability floor cannot be retained past linker GC — refusing to write an unenforceable artifact
+
+## run-main-anchor-ambiguous
+
+the emitted source holds more than one `fn main` anchor, so the embedded capability floor has no single place to be retained from — refusing to write an ambiguous artifact
+
+## run-floor-block-malformed
+
+the emitted source carries a capability floor block other than the one ipe writes — refusing to embed a floor beside one it cannot account for
 
 ## run-profile-unparsable
 
 {code}: {detail} — refusing to run (a profile that does not parse is not honored)
-
-## run-floor-unreadable
-
-{code}: the binary carries no readable capability floor — refusing to run an artifact whose floor cannot be verified
 
 ## build-entry-not-main
 
@@ -1795,11 +2001,11 @@ program entry module `{module}` is not yet buildable — a declared `programs` e
 
 ## pack-retired
 
-ipe pack has been retired — app bundling is now the delivery grammar. Use `ipe build web desktop` / `ipe build web ios` / `ipe build web android` for a fast dev bundle, or `ipe release web desktop|ios|android` for a production distributable. For the OS-permission dry-run, use `ipe build --emit-permissions <ios|macos|android>`.
+ipe pack has been retired — app bundling is now the delivery grammar. Use `ipe dev build web desktop` / `ipe dev build web ios` / `ipe dev build web android` for a fast dev bundle, or `ipe release build web desktop|ios|android` for a production distributable. For the OS-permission dry-run, use `ipe release build --emit-permissions <ios|macos|android>`.
 
 ## build-binary-missing
 
-ipe build: expected binary at {path} — cargo build succeeded but the binary is missing
+ipe dev build: expected binary at {path} — cargo build succeeded but the binary is missing
 
 ## release-binary-missing
 
@@ -1809,9 +2015,65 @@ ipe release: expected binary at {path} — cargo build succeeded but binary is m
 
 ipe release: expected app binary at {path} — cargo build succeeded but binary is missing
 
-## release-workspace-root-unknown
+## emitted-crate-name-unreadable
 
-ipe release: cannot locate workspace root (no Cargo.toml with [workspace] found in any parent directory)
+the emitted crate manifest {path} names no plain `[package] name`, so its built binary cannot be located — rebuild the program to re-emit the crate
+
+## cli-wrapper-source-refused
+
+ipe release: the jail wrapper source at {root} is not verified: {reason}. A native-bearing release builds its wrapper only from the compiler source tree this `ipe` was built from; build `ipe` from its source checkout to release a native-bearing app
+
+## wrapper-source-no-build-root
+
+the build-time crate path has no workspace root above it
+
+## wrapper-source-unsupported
+
+this host cannot prove directory ownership
+
+## wrapper-source-unproven
+
+{path} is absent or not owner-trusted
+
+## wrapper-source-unreadable
+
+{path} could not be read as UTF-8 within the manifest size cap
+
+## wrapper-source-unparsable
+
+{path} is not valid TOML
+
+## wrapper-source-not-workspace
+
+its Cargo.toml has no [workspace] table
+
+## wrapper-source-member-undeclared
+
+the workspace members do not include {member}
+
+## wrapper-source-package-mismatch
+
+the wrapper member's package is not {package}
+
+## cli-no-run-form
+
+`ipe release run` runs a native program; the {target} target has no run form
+
+## cli-no-run-form-hint
+
+= help: build it with `ipe release build {form}`
+
+## release-run-artifact-flags
+
+ipe release run: {dir} is a built artifact directory; it runs as built and takes no build arguments
+
+## release-run-bundle-incomplete
+
+ipe release run: the bundle at {dir} has no {missing}; a bundle runs only with its wrapper, app and profile together
+
+## release-run-wrapper-unverifiable
+
+ipe release run: {dir} holds a wrapper with no app and profile beside it, so there is nothing to verify; ipe release run runs a bundle directory or a project
 
 ## wasm-bindgen-failed
 
@@ -1823,43 +2085,31 @@ the wasm32-wasip1 build reported no `.wasm` artifact for {dir} — cargo's JSON 
 
 ## session-no-recordable
 
-ipe run {flag}: {name} has no recordable session — recording and replay capture the update loop of a `Cli.tea` or `Worker.tea` app
+ipe dev run {flag}: {name} has no recordable session — recording and replay capture the update loop of a `Cli.tea` or `Worker.tea` app
 
 ## session-native-only
 
-ipe run {flag}: works on a native run only — drop `--target wasi`
+ipe dev run {flag}: works on a native run only — drop `--target wasi`
 
-## session-jailed
+## session-ffi-unproven
 
-ipe run {flag}: a native-bearing program runs jailed, where the session log cannot be reached — record and replay a pure Ipê build of the app
+ipe dev run {flag}: a program with Rust FFI cannot be recorded or replayed, since its replay is not proven deterministic — run it without {flag}
 
 ## session-flags-exclusive
 
-ipe run: {first} and {second} cannot be combined — record a session, then replay it
+ipe dev run: {first} and {second} cannot be combined — record a session, then replay it
 
 ## replay-no-default-log
 
-ipe run --replay: no session log at {typed} or trace at {trace} — record one with `ipe run --record`
+ipe dev run --replay: no session log at {typed} or trace at {trace} — record one with `ipe dev run --record`
 
 ## replay-log-missing
 
-ipe run --replay: no session log at {path} — record one with `ipe run --record`
+ipe dev run --replay: no session log at {path} — record one with `ipe dev run --record`
 
 ## program-exited
 
 {program} exited with code {code}
-
-## exec-no-artifact-dir
-
-ipe exec: no artifact directory at {dir}
-
-## exec-no-binary
-
-ipe exec: no built binary at {path} — run `ipe build` first
-
-## exec-profile-missing
-
-ipe exec: {path} embeds a capability floor but carries no ipe.profile — the artifact is incomplete or tampered; refusing to run native code without its jail profile
 
 ## cargo-metadata-failed
 
@@ -1924,6 +2174,10 @@ upgrade: the installer could not be downloaded — nothing was changed: {detail}
 
 upgrade: the installer could not be waited on: {detail}
 
+## upgrade-installer-short-feed
+
+upgrade: the installer exited before reading its whole script, so the upgrade cannot be confirmed: {detail}
+
 ## upgrade-installer-failed
 
 upgrade: the installer exited non-zero — nothing was changed
@@ -1958,15 +2212,19 @@ released → {path} (single self-jailing binary; run `--capabilities` to audit)
 
 released (bundle) → {path} (run `./ipe-wrapper -- <args>`; WARNING: ipe-app can be run directly, bypassing the sandbox — prefer embed mode for production)
 
+## mobile-android-note
+
+note: an unsigned Android Gradle project is written here. `./gradlew assembleDebug` (with the Android SDK) builds an APK signed with the SDK's debug key, for local install only; a store build needs your own keystore — add a `signingConfig` for it to `app/build.gradle`, then run `./gradlew assembleRelease`.
+
+## mobile-ios-note
+
+note: the iOS shell project layout is written here, but a signed, runnable .ipa must be produced on a macOS runner with Xcode + a signing identity (out of scope).
+
 # Consent refusals
 
 ## consent-item
 
   = {item}
-
-## web-consent-header
-
-error[IPE-S0002]: this program reaches a browser web capability the app has not granted
 
 ## web-consent-disclosure
 
@@ -1979,12 +2237,9 @@ error[IPE-S0002]: this program reaches a browser web capability the app has not 
 ## web-consent-remedy
 
   = a web capability is granted ONLY by the top-level app's package.ipe; a dependency
-    discloses but cannot self-authorise. Grant it after review by adding the axis to
-    `accept = [ … ]` under [capabilities] in package.ipe, or drop the dependency.
-
-## native-ffi-consent-header
-
-error[IPE-S0003]: this program crosses into native `Rust.` code the app has not granted
+    discloses but cannot self-authorise. Grant it after review by adding the axis,
+    spelled `JsPort <Axis>`, to `accepts = [ … ]` in the `capabilities` record of
+    package.ipe, or drop the dependency.
 
 ## native-ffi-crossing
 
@@ -1999,17 +2254,17 @@ a native crossing the build could not attribute to a crate
   = a native crossing is granted ONLY by the top-level app's package.ipe; a dependency
     crosses but cannot self-authorise. Its true effects are opaque to Ipê and
     contained at run by the OS jail, but the crossing itself needs the consumer's
-    consent. Grant it after review by adding `native-ffi` to `declared = [ … ]` under
-    [capabilities] in package.ipe, or drop the dependency.
+    consent. Grant it after review by adding `NativeFfi` to `declares = [ … ]` in
+    the `capabilities` record of package.ipe, or drop the dependency.
 
 ## control-model-consent-refusal
 
-error[IPE-S0004]: `{entry_module}` runs the `{model}` control model, which the declared `acceptsControl` set does not cover
+`{entry_module}` runs the `{model}` control model, which the declared `acceptsControl` set does not cover
   = the package opted into control-model consent by declaring `acceptsControl`,
     so that set must cover the program's actual control model; it does not
     list `{model}`, so the declared acceptance is stale.
-  = cover it after review by adding `{ctor}` to `acceptsControl = [ … ]`
-    under [capabilities] in package.ipe, or switch the entry to a listed
+  = cover it after review by adding `{ctor}` to `acceptsControl = [ … ]` in
+    the `capabilities` record of package.ipe, or switch the entry to a listed
     control model.
 
 ## permission-consent-header

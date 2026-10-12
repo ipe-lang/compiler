@@ -12,6 +12,40 @@ use std::collections::HashMap;
 
 pub type Db = DbPool;
 
+#[cfg(feature = "db")]
+crate::stringify::show_row!("Db", Internals, [] Db, |_| "<Ipe.Db.Db>".to_owned());
+#[cfg(feature = "db")]
+crate::stringify::show_row!("ProjectionTerm", Internals, [] ProjectionTerm, |_| "<Ipe.Db.ProjectionTerm>".to_owned());
+#[cfg(feature = "db")]
+crate::stringify::show_row!("ProjectionOperand", Internals, [] ProjectionOperand, |_| "<Ipe.Db.ProjectionOperand>".to_owned());
+#[cfg(feature = "db")]
+crate::stringify::show_row!("ArithOp", Internals, [] ArithOp, |_| "<Ipe.Db.ArithOp>".to_owned());
+#[cfg(feature = "db")]
+crate::retained::inline_measure!(ArithOp);
+#[cfg(feature = "db")]
+impl crate::retained::RetainedBytes for ProjectionOperand {
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        let inline = crate::retained::Bytes::inline::<Self>()?;
+        match self {
+            Self::OperandColumn(dotted) => inline.plus(dotted),
+            Self::OperandLiteral => Some(inline),
+        }
+    }
+}
+#[cfg(feature = "db")]
+impl crate::retained::RetainedBytes for ProjectionTerm {
+    fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+        let inline = crate::retained::Bytes::inline::<Self>()?;
+        match self {
+            Self::ColumnTerm(alias, column) => inline.plus(alias)?.plus(column),
+            Self::LiteralTerm => Some(inline),
+            Self::UpperTerm(dotted) | Self::LowerTerm(dotted) => inline.plus(dotted),
+            Self::CoalesceTerm(a, b) => inline.plus(a)?.plus(b),
+            Self::ArithTerm(op, a, b) => inline.plus(op)?.plus(a)?.plus(b),
+        }
+    }
+}
+
 /// One term in a `Store.select` projection — the typed carrier that replaces the
 /// stringly-encoded `(tag, operand_a, operand_b)` triple.  Illegal states are
 /// unrepresentable: the variant set is closed, there is no tag-string re-derivation,
@@ -79,41 +113,131 @@ pub enum ProjectionOperand {
     OperandLiteral,
 }
 
-/// Build a Ipê-visible `Error` from a sqlx error WITHOUT leaking row/column
-/// VALUES. The `Display` of a driver error (PostgreSQL/MySQL especially) embeds
-/// the offending value in a constraint-violation message — e.g.
-/// `... Key (email)=(victim@example.com) already exists` — so funnelling the raw
-/// `format!("{}", e)` into the returned `Error` leaks private row data the moment
-/// an app surfaces or logs it (PRINCIPLES #1). For a database-level error we
-/// therefore build a STRUCTURAL message from the safe-to-expose fields only:
-/// the SQLSTATE code (a correlation id operators can trace) and the constraint
-/// NAME (a schema identifier, not row data) — never the value. Non-database
-/// errors (pool acquisition, connect, decode, IO) carry no row values, so their
-/// `Display` is kept for diagnosability. Total — no unwrap/index/panic.
-fn ipe_err<E: From<String> + Send>(e: &sqlx::Error) -> E {
-    if let Some(dbe) = e.as_database_error() {
-        let mut msg = String::from("db: database error");
-        if let Some(code) = dbe.code() {
-            // SQLSTATE / driver code — structural, value-free.
-            msg.push_str(&format!(" [{}]", code));
-        }
-        if let Some(constraint) = dbe.constraint() {
-            // Constraint NAME is a schema identifier (e.g. `users_email_key`),
-            // not the offending value — safe to expose and useful for the caller.
-            msg.push_str(&format!(" (constraint {})", constraint));
-        }
-        return str_err(&msg);
-    }
-    // Non-database errors generally carry no row VALUES, but `ColumnDecode` /
-    // `Decode` can embed `source` text that may include a column value — keep
-    // those structural (index / variant only). Io / Tls / Protocol /
-    // PoolTimedOut / RowNotFound carry no row data, so their `Display` is kept.
+/// The longest constraint name an error message carries.
+const MAX_CONSTRAINT_NAME_LEN: usize = 63;
+
+/// A constraint name reduced to identifier characters, for display only.
+///
+/// The name is schema-author text: anything outside ASCII alphanumerics and
+/// `_ . - $` is dropped, so it can never inject a line, a bracket or a code
+/// shape into the message.
+fn display_constraint(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '$'))
+        .take(MAX_CONSTRAINT_NAME_LEN)
+        .collect()
+}
+
+/// The fixed, value-free label of a driver error that carries no database code.
+const fn transport_label(e: &sqlx::Error) -> &'static str {
     match e {
-        sqlx::Error::ColumnDecode { index, .. } => {
-            str_err(&format!("db: column decode error at index {index}"))
+        sqlx::Error::Configuration(_) => "invalid connection configuration",
+        sqlx::Error::Io(_) => "connection I/O error",
+        sqlx::Error::Tls(_) => "TLS error",
+        sqlx::Error::Protocol(_) => "protocol error",
+        sqlx::Error::RowNotFound => "no row returned",
+        sqlx::Error::TypeNotFound { .. } => "type not found",
+        sqlx::Error::ColumnIndexOutOfBounds { .. } => "column index out of bounds",
+        sqlx::Error::ColumnNotFound(_) => "column not found",
+        sqlx::Error::Decode(_) => "decode error",
+        sqlx::Error::PoolTimedOut => "connection pool timed out",
+        sqlx::Error::PoolClosed => "connection pool closed",
+        sqlx::Error::WorkerCrashed => "driver worker stopped",
+        sqlx::Error::InvalidArgument(_) => "invalid argument",
+        sqlx::Error::Encode(_) => "encode error",
+        sqlx::Error::InvalidSavePointStatement => "invalid savepoint statement",
+        sqlx::Error::BeginFailed => "transaction could not begin",
+        // `sqlx::Error` is `#[non_exhaustive]`: a variant added upstream gets
+        // the generic label.
+        _ => "driver error",
+    }
+}
+
+/// The Ipê-visible message for a classified driver failure.
+///
+/// Carries the failure's fixed phrase and, when given, the scrubbed constraint
+/// name. An `OtherFailure` also carries a correlation id: the driver code goes
+/// to the operator log under that id, never into the message.
+fn failure_message(
+    context: &str,
+    engine: DbEngine,
+    failure: IpeDbFailure,
+    raw_code: Option<&str>,
+    constraint: Option<&str>,
+) -> String {
+    let mut msg = format!("{context}{}", failure.phrase());
+    if let Some(name) = constraint.map(display_constraint).filter(|n| !n.is_empty()) {
+        msg.push_str(&format!(" (constraint {name})"));
+    }
+    if failure == IpeDbFailure::OtherFailure {
+        let err_id = crate::core::note_foreign_error((engine.name(), raw_code));
+        msg.push_str(&format!(" (ref {err_id})"));
+    }
+    msg
+}
+
+/// The Ipê `Error` for a driver failure, classified under its own kind.
+///
+/// The message is built from the classification, never the driver's
+/// `Display`: a driver message can embed the offending row value (for example
+/// `Key (email)=(victim@example.com) already exists`) or the connection URL.
+pub(crate) fn driver_error<E: crate::FromIpeError>(
+    context: &str,
+    engine: DbEngine,
+    e: &sqlx::Error,
+) -> E {
+    let failure = classify_failure(engine, e);
+    let message = if let Some(dbe) = e.as_database_error() {
+        let code = dbe.code();
+        failure_message(
+            context,
+            engine,
+            failure,
+            well_formed_code(code.as_deref()),
+            dbe.constraint(),
+        )
+    } else if let sqlx::Error::ColumnDecode { index, .. } = e {
+        format!("{context}column decode error at index {index}")
+    } else {
+        format!("{context}{}", transport_label(e))
+    };
+    E::from_ipe_error(IpeError::database(failure, message))
+}
+
+/// The Ipê `Error` for a failed statement on this build's database.
+fn ipe_err<E: crate::FromIpeError>(engine: DbEngine, e: &sqlx::Error) -> E {
+    driver_error("db: ", engine, e)
+}
+
+/// The Ipê `Error` for a refused connect.
+///
+/// A driver failure keeps its classification; every other refusal is a
+/// configuration or policy refusal and keeps its plain message. `context`
+/// prefixes the message.
+pub(crate) fn connect_refusal<E: From<String> + crate::FromIpeError>(
+    context: &str,
+    engine: DbEngine,
+    refused: &DbConnectError,
+) -> E {
+    match refused {
+        DbConnectError::Unreachable(failure) | DbConnectError::VersionUnreadable(failure) => {
+            let message = failure_message(
+                &format!("{context}db: "),
+                engine,
+                failure.failure(),
+                failure.raw_code(),
+                None,
+            );
+            E::from_ipe_error(IpeError::database(failure.failure(), message))
         }
-        sqlx::Error::Decode(_) => str_err("db: decode error"),
-        other => str_err(&format!("{other}")),
+        DbConnectError::InvalidUrl
+        | DbConnectError::MisplacedUserinfo
+        | DbConnectError::TooManyDialTargets { .. }
+        | DbConnectError::UnsupportedScheme
+        | DbConnectError::EngineMismatch { .. }
+        | DbConnectError::HostRefused(_)
+        | DbConnectError::RelayUnavailable
+        | DbConnectError::EngineRefused(_) => str_err(&format!("{context}{refused}")),
     }
 }
 
@@ -143,6 +267,23 @@ fn ipe_err<E: From<String> + Send>(e: &sqlx::Error) -> E {
 /// The concrete sqlx database backend for this build (sqlite / postgres / mysql),
 /// derived from the configured `DbRow` so the helpers stay driver-agnostic.
 type DbDatabase = <DbRow as sqlx::Row>::Database;
+
+/// A driver whose engine is known at compile time.
+trait StaticEngine: sqlx::Database {
+    /// The engine this driver speaks.
+    const ENGINE: DbEngine;
+}
+
+impl StaticEngine for sqlx::Sqlite {
+    const ENGINE: DbEngine = DbEngine::Sqlite;
+}
+
+impl StaticEngine for sqlx::Postgres {
+    const ENGINE: DbEngine = DbEngine::Postgres;
+}
+
+/// The engine this build's `Db` pool speaks.
+pub(crate) const KERNEL_ENGINE: DbEngine = <DbDatabase as StaticEngine>::ENGINE;
 
 /// A dedicated sqlx `Transaction`, shared across the body via `Arc<Mutex<..>>`
 /// so re-entrant body ops serialise on it (sqlx connections are `&mut`-exclusive).
@@ -534,7 +675,7 @@ where
     for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
 {
     let cols = row.columns();
-    let mut map = serde_json::Map::with_capacity(cols.len());
+    let mut map = serde_json::Map::new();
     for (i, col) in cols.iter().enumerate() {
         map.insert(col.name().to_string(), read_cell(row, i)?.into_json());
     }
@@ -1244,72 +1385,140 @@ fn check_engine_version(engine: DbEngine, raw: &str) -> Result<EngineVersion, En
     Ok(found)
 }
 
-/// A driver failure, classified from the `sqlx::Error` variant alone.
-///
-/// Holds no driver payload: a driver's message can echo the connection URL —
-/// host, user, password — so the payload is dropped here and can never reach a
-/// log line or an error value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DbFailure {
-    /// The server answered with an error; `code` is its SQLSTATE / driver code.
-    Database { code: Option<String> },
-    /// The connection options were rejected.
-    Configuration,
-    /// Reaching or talking to the server failed at the I/O layer.
-    Io,
-    /// TLS negotiation failed.
-    Tls,
-    /// No pooled connection became available in time.
-    PoolTimedOut,
-    /// The pool was already closed.
-    PoolClosed,
-    /// Any other driver failure.
-    Other,
-}
-
-/// Longest SQLSTATE / driver code [`DbFailure`] keeps.
+/// Longest driver code the classifier reads; a longer one is `OtherFailure`.
 const MAX_DB_FAILURE_CODE_LEN: usize = 16;
 
-impl DbFailure {
-    /// Classify `e`, keeping only its variant and a well-formed error code.
-    #[must_use]
-    pub fn of(e: &sqlx::Error) -> Self {
-        if let Some(dbe) = e.as_database_error() {
-            // A remote server picks the code; keep it only in the short
-            // alphanumeric shape SQLSTATE and SQLite result codes take.
-            let code = dbe
-                .code()
-                .filter(|c| {
-                    !c.is_empty()
-                        && c.len() <= MAX_DB_FAILURE_CODE_LEN
-                        && c.bytes().all(|b| b.is_ascii_alphanumeric())
-                })
-                .map(std::borrow::Cow::into_owned);
-            return Self::Database { code };
-        }
-        match e {
-            sqlx::Error::Configuration(_) => Self::Configuration,
-            sqlx::Error::Io(_) => Self::Io,
-            sqlx::Error::Tls(_) => Self::Tls,
-            sqlx::Error::PoolTimedOut => Self::PoolTimedOut,
-            sqlx::Error::PoolClosed => Self::PoolClosed,
-            _ => Self::Other,
-        }
+/// A driver code in the short alphanumeric shape SQLSTATE and SQLite codes take.
+///
+/// A remote server picks the code, so an empty, overlong or otherwise shaped
+/// code is dropped rather than read.
+fn well_formed_code(code: Option<&str>) -> Option<&str> {
+    code.filter(|c| {
+        !c.is_empty()
+            && c.len() <= MAX_DB_FAILURE_CODE_LEN
+            && c.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// Classify a driver failure into the closed [`IpeDbFailure`] set.
+///
+/// The one producer of an Ipê `DbFailure` value. `engine` selects the code
+/// space, so a code from the other engine's space is `OtherFailure`, and a
+/// code that is absent, malformed or out of range never reaches a row.
+pub(crate) fn classify_failure(engine: DbEngine, e: &sqlx::Error) -> IpeDbFailure {
+    if let Some(dbe) = e.as_database_error() {
+        let code = dbe.code();
+        return match well_formed_code(code.as_deref()) {
+            None => IpeDbFailure::OtherFailure,
+            Some(code) => match engine {
+                DbEngine::Sqlite => code
+                    .parse::<i32>()
+                    .map_or(IpeDbFailure::OtherFailure, sqlite_row),
+                DbEngine::Postgres => postgres_row(code),
+            },
+        };
+    }
+    match e {
+        sqlx::Error::PoolTimedOut => IpeDbFailure::Busy,
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Configuration(_)
+        | sqlx::Error::PoolClosed => IpeDbFailure::Unreachable,
+        // `sqlx::Error` is `#[non_exhaustive]`: every other arm, present or
+        // future, is the explicit `OtherFailure` row.
+        _ => IpeDbFailure::OtherFailure,
     }
 }
 
-impl std::fmt::Display for DbFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Database { code: Some(code) } => write!(f, "database error [{code}]"),
-            Self::Database { code: None } => f.write_str("database error"),
-            Self::Configuration => f.write_str("invalid connection configuration"),
-            Self::Io => f.write_str("connection I/O error"),
-            Self::Tls => f.write_str("TLS error"),
-            Self::PoolTimedOut => f.write_str("connection pool timed out"),
-            Self::PoolClosed => f.write_str("connection pool closed"),
-            Self::Other => f.write_str("driver error"),
+/// The SQLite row for a result code: the full extended code first, then the
+/// primary code (`code & 0xFF`).
+const fn sqlite_row(code: i32) -> IpeDbFailure {
+    match code {
+        2067 | 1555 => IpeDbFailure::UniqueViolation,
+        787 => IpeDbFailure::ForeignKeyViolation,
+        1299 => IpeDbFailure::NotNullViolation,
+        275 => IpeDbFailure::CheckViolation,
+        1811 => IpeDbFailure::TriggerRaised,
+        extended => match extended & 0xFF {
+            19 => IpeDbFailure::OtherConstraint,
+            5 | 6 => IpeDbFailure::Busy,
+            8 => IpeDbFailure::ReadOnlyDatabase,
+            3 | 23 => IpeDbFailure::AccessDenied,
+            14 => IpeDbFailure::CannotOpen,
+            26 | 11 => IpeDbFailure::NotADatabase,
+            1 => IpeDbFailure::InvalidStatement,
+            _ => IpeDbFailure::OtherFailure,
+        },
+    }
+}
+
+/// The PostgreSQL row for a SQLSTATE: the exact codes first, then the
+/// two-character class of a five-character code.
+fn postgres_row(code: &str) -> IpeDbFailure {
+    match code {
+        "23505" => IpeDbFailure::UniqueViolation,
+        "23503" => IpeDbFailure::ForeignKeyViolation,
+        "23502" => IpeDbFailure::NotNullViolation,
+        "23514" => IpeDbFailure::CheckViolation,
+        "P0001" => IpeDbFailure::TriggerRaised,
+        "55P03" | "40P01" | "40001" => IpeDbFailure::Busy,
+        "25006" => IpeDbFailure::ReadOnlyDatabase,
+        "42501" => IpeDbFailure::AccessDenied,
+        "3D000" => IpeDbFailure::CannotOpen,
+        "XX001" | "XX002" => IpeDbFailure::NotADatabase,
+        sqlstate if sqlstate.len() != 5 => IpeDbFailure::OtherFailure,
+        sqlstate => match sqlstate.get(..2) {
+            Some("23") => IpeDbFailure::OtherConstraint,
+            Some("28") => IpeDbFailure::AccessDenied,
+            Some("08") => IpeDbFailure::Unreachable,
+            Some("42") => IpeDbFailure::InvalidStatement,
+            _ => IpeDbFailure::OtherFailure,
+        },
+    }
+}
+
+/// A driver failure: its classification and its well-formed driver code.
+///
+/// Holds no driver message: a driver's message can echo the connection URL —
+/// host, user, password — so it is dropped here and can never reach a log line
+/// or an error value. `Display` renders the classification's phrase alone; the
+/// code is kept for the operator log only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriverFailure {
+    failure: IpeDbFailure,
+    raw_code: Option<String>,
+}
+
+impl DriverFailure {
+    /// Classify `e` for `engine`, keeping only a well-formed driver code.
+    #[must_use]
+    pub fn of(engine: DbEngine, e: &sqlx::Error) -> Self {
+        let raw_code = e.as_database_error().and_then(|dbe| {
+            let code = dbe.code();
+            well_formed_code(code.as_deref()).map(str::to_owned)
+        });
+        Self {
+            failure: classify_failure(engine, e),
+            raw_code,
         }
+    }
+
+    /// The closed classification.
+    #[must_use]
+    pub const fn failure(&self) -> IpeDbFailure {
+        self.failure
+    }
+
+    /// The well-formed driver code, for the operator log only.
+    #[must_use]
+    pub fn raw_code(&self) -> Option<&str> {
+        self.raw_code.as_deref()
+    }
+}
+
+impl std::fmt::Display for DriverFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.failure.phrase())
     }
 }
 
@@ -1350,12 +1559,12 @@ pub enum DbConnectError {
     /// The SSRF gate refused a target the URL dials.
     HostRefused(crate::ssrf::SsrfRefusal),
     /// The driver could not open the pool.
-    Unreachable(DbFailure),
+    Unreachable(DriverFailure),
     /// The local relay that pins a TLS dial to its vetted address could not
     /// be opened, so the dial is refused rather than unpinned.
     RelayUnavailable,
     /// The server's version query failed.
-    VersionUnreadable(DbFailure),
+    VersionUnreadable(DriverFailure),
     /// The engine is unsupported, or its version is unparseable or too old.
     EngineRefused(EngineVersionError),
 }
@@ -1419,7 +1628,7 @@ where
     let raw: String = sqlx::query_scalar::<DB, String>(engine.version_query())
         .fetch_one(pool)
         .await
-        .map_err(|e| DbConnectError::VersionUnreadable(DbFailure::of(&e)))?;
+        .map_err(|e| DbConnectError::VersionUnreadable(DriverFailure::of(engine, &e)))?;
     check_engine_version(engine, &raw).map_err(DbConnectError::EngineRefused)
 }
 
@@ -1846,13 +2055,14 @@ where
     ///
     /// [`DbConnectError`] when a gate refuses or the driver cannot connect.
     pub async fn connect(url: &DbUrl, max_connections: u32) -> Result<Self, DbConnectError> {
+        let engine = DbEngine::for_driver::<DB>().map_err(DbConnectError::EngineRefused)?;
         let mut relay = None;
         let options = DB::gated_connect_options(url, max_connections, &mut relay).await?;
         let pool = sqlx::pool::PoolOptions::<DB>::new()
             .max_connections(max_connections)
             .connect_with(options)
             .await
-            .map_err(|e| DbConnectError::Unreachable(DbFailure::of(&e)))?;
+            .map_err(|e| DbConnectError::Unreachable(DriverFailure::of(engine, &e)))?;
         if let Err(refused) = enforce_engine_floor_on(&pool).await {
             pool.close().await;
             return Err(refused);
@@ -1876,7 +2086,9 @@ where
 /// URL selects a shared SQLite file, the same value that chose the driver's gate.
 /// Lock contention waits for [`SQLITE_BUSY_TIMEOUT`], which every connection
 /// carries from its connect options.
-async fn build_pool<E: Send + From<String> + 'static>(url: &str) -> IpeResult<E, Db> {
+async fn build_pool<E: Send + From<String> + crate::FromIpeError + 'static>(
+    url: &str,
+) -> IpeResult<E, Db> {
     let db_url = match DbUrl::parse(url) {
         Ok(db_url) => db_url,
         Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
@@ -1887,7 +2099,7 @@ async fn build_pool<E: Send + From<String> + 'static>(url: &str) -> IpeResult<E,
     };
     let pool: Db = match VettedPool::<DbDatabase>::connect(&db_url, max_connections).await {
         Ok(vetted) => vetted.into_pool(),
-        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
+        Err(refused) => return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
     };
     if db_url.is_shared_sqlite_file() {
         let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
@@ -1899,7 +2111,9 @@ async fn build_pool<E: Send + From<String> + 'static>(url: &str) -> IpeResult<E,
 /// pool is built with NO lock held (never block other tasks on connect I/O); a
 /// concurrent miss that built a redundant pool loses the `entry` race and its
 /// extra pool drops (closes) — steady state keeps exactly one pool per URL.
-async fn connect_cached<E: Send + From<String> + 'static>(url: String) -> IpeResult<E, Db> {
+async fn connect_cached<E: Send + From<String> + crate::FromIpeError + 'static>(
+    url: String,
+) -> IpeResult<E, Db> {
     let max_pools: usize = match DB_POOLS_CEILING.read() {
         Ok(cap) => cap,
         Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
@@ -1932,7 +2146,9 @@ async fn connect_cached<E: Send + From<String> + 'static>(url: String) -> IpeRes
     }
 }
 
-pub fn db_connect<E: Send + From<String> + 'static>(_unit: ()) -> IpeTask<E, Db> {
+pub fn db_connect<E: Send + From<String> + crate::FromIpeError + 'static>(
+    _unit: (),
+) -> IpeTask<E, Db> {
     Box::pin(connect_cached(ipe_db_url()))
 }
 
@@ -1942,7 +2158,10 @@ pub fn db_connect<E: Send + From<String> + 'static>(_unit: ()) -> IpeTask<E, Db>
 /// `sqlite://…?mode=rwc` URL (create-if-missing); other drivers pass `path`
 /// through as the connection string. (Was wrongly `(_unit: ())` → ignored both
 /// args → E0061 at every `Db.open "sqlite" "x.db"` call site.)
-pub fn db_open<E: Send + From<String> + 'static>(driver: String, path: String) -> IpeTask<E, Db> {
+pub fn db_open<E: Send + From<String> + crate::FromIpeError + 'static>(
+    driver: String,
+    path: String,
+) -> IpeTask<E, Db> {
     let url = if driver == "sqlite" && !path.contains(':') {
         format!("sqlite://{}?mode=rwc", path)
     } else {
@@ -1951,11 +2170,16 @@ pub fn db_open<E: Send + From<String> + 'static>(driver: String, path: String) -
     Box::pin(connect_cached(url))
 }
 
-pub fn db_open_with_path<E: Send + From<String> + 'static>(path: String) -> IpeTask<E, Db> {
+pub fn db_open_with_path<E: Send + From<String> + crate::FromIpeError + 'static>(
+    path: String,
+) -> IpeTask<E, Db> {
     Box::pin(connect_cached(path))
 }
 
-pub fn db_exec_raw<E: Send + From<String> + 'static>(conn: Db, sql: String) -> IpeTask<E, i64> {
+pub fn db_exec_raw<E: Send + From<String> + crate::FromIpeError + 'static>(
+    conn: Db,
+    sql: String,
+) -> IpeTask<E, i64> {
     Box::pin(async move {
         // `unsafeExecRaw : Db -> String -> Task Error Int` — the verbatim-SQL
         // escape hatch (its surface name marks the raw-SQL injection surface;
@@ -1964,12 +2188,12 @@ pub fn db_exec_raw<E: Send + From<String> + 'static>(conn: Db, sql: String) -> I
         // rows-affected can never realistically exceed i64::MAX.
         match exec_routed(&conn, sqlx::query(&sql)).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
-pub fn db_exec<E: Send + From<String> + 'static>(
+pub fn db_exec<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     sql: String,
     params: Vec<String>,
@@ -1986,12 +2210,12 @@ pub fn db_exec<E: Send + From<String> + 'static>(
         }
         match exec_routed(&conn, q).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
-pub fn db_query<E: Send + From<String> + 'static>(
+pub fn db_query<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     sql: String,
     params: Vec<String>,
@@ -2004,7 +2228,7 @@ pub fn db_query<E: Send + From<String> + 'static>(
         }
         match fetch_all_routed(&conn, q).await {
             Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -2025,7 +2249,7 @@ pub fn db_query<E: Send + From<String> + 'static>(
 // binding — values are NEVER interpolated (sqlx owns escaping); the SQL string is
 // app-authored, exactly as in the String path and.
 
-pub fn db_exec_params<E: Send + From<String> + 'static>(
+pub fn db_exec_params<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     sql: String,
     params: Vec<SqlParam>,
@@ -2039,12 +2263,12 @@ pub fn db_exec_params<E: Send + From<String> + 'static>(
         // Rows-affected , same as db_exec.
         match exec_routed(&conn, q).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
-pub fn db_query_params<E: Send + From<String> + 'static>(
+pub fn db_query_params<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     sql: String,
     params: Vec<SqlParam>,
@@ -2057,7 +2281,7 @@ pub fn db_query_params<E: Send + From<String> + 'static>(
         }
         match fetch_all_routed(&conn, q).await {
             Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -2193,17 +2417,17 @@ fn migrate_checksum(sql: &str) -> String {
 ///
 /// DB-ops mode (`Db_migrateApply`): when the `IPE_DB_OP` env var
 /// is set — the CLI `ipe db status` / `ipe db migrate --backend rust` sets it — the
-/// task PRINTS a human report and `process::exit`s instead of returning, so the
+/// task PRINTS a human report and ends the process through `system::exit_process` instead of returning, so the
 /// surrounding app never starts serving:
 ///
 /// - `status`: print applied / pending / drifted, exit 0 (1 if drift)
 /// - `migrate`: apply pending, print summary, exit 0 (1 on error, to stderr)
 /// - unset: normal Task behaviour (apply, return Ok/Err) — UNCHANGED
 ///
-/// `process::exit` is reachable ONLY under the CLI-set env op (never from a normal
+/// The exit is reachable ONLY under the CLI-set env op (never from a normal
 /// well-typed Ipê `Db.migrate` call), and it is a deliberate CLI termination, not a
 /// panic — the no-runtime-panic thesis is about faults, not intentional exits.
-pub fn db_migrate_apply<E: Send + From<String> + 'static>(
+pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
     db: Db,
     migrations: Vec<(String, String)>,
 ) -> IpeTask<E, Vec<String>> {
@@ -2219,8 +2443,8 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                 if op == "migrate" {
                     crate::system::write_stderr_line(&format!("db: {} failed", $ctx));
                     let _ = std::io::Write::flush(&mut std::io::stderr());
-                    // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` CLI-op boundary: a migration infra failure exits the process (library path returns a Task Err instead) [ledger #boundary]
-                    std::process::exit(1);
+                    // `ipe db migrate` CLI-op boundary: a migration infra failure exits the process (library path returns a Task Err instead)
+                    crate::system::exit_process(1);
                 }
                 return IpeResult::Err($err);
             }};
@@ -2306,11 +2530,11 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                     "\ndb: drift detected — an applied migration's SQL was edited. \
                      Restore its original text, or ship a new compensating migration.",
                 );
-                // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` status-op boundary: drift detected, exit non-zero [ledger #boundary]
-                std::process::exit(1);
+                // `ipe db migrate` status-op boundary: drift detected, exit non-zero
+                crate::system::exit_process(1);
             }
-            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` status-op boundary: clean status, exit zero [ledger #boundary]
-            std::process::exit(0);
+            // `ipe db migrate` status-op boundary: clean status, exit zero
+            crate::system::exit_process(0);
         }
 
         // 3. Apply pending migrations in declaration order.
@@ -2326,8 +2550,8 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                             "db: migration '{name}' changed after it was applied — checksum mismatch"
                         ));
                         let _ = std::io::Write::flush(&mut std::io::stderr());
-                        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero [ledger #boundary]
-                        std::process::exit(1);
+                        // `ipe db migrate` CLI-op boundary: applied migration changed (checksum mismatch), exit non-zero
+                        crate::system::exit_process(1);
                     }
                     return IpeResult::Err(
                         format!(
@@ -2394,8 +2618,8 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
                 ));
             }
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — `ipe db migrate` CLI-op boundary: migrations applied, exit zero [ledger #boundary]
-            std::process::exit(0);
+            // `ipe db migrate` CLI-op boundary: migrations applied, exit zero
+            crate::system::exit_process(0);
         }
         IpeResult::Ok(out)
     })
@@ -2406,7 +2630,7 @@ pub fn db_migrate_apply<E: Send + From<String> + 'static>(
 /// `close : Db -> Task Error ()` — sqlx::Pool drops on its own; this is
 /// a graceful explicit close (any in-flight queries finish, then the
 /// pool is closed).
-pub fn db_close<E: Send + From<String> + 'static>(db: Db) -> IpeTask<E, ()> {
+pub fn db_close<E: Send + From<String> + crate::FromIpeError + 'static>(db: Db) -> IpeTask<E, ()> {
     Box::pin(async move {
         db.close().await;
         ok_res(())
@@ -2500,7 +2724,7 @@ fn extract_returning_id(r: &DbRow) -> Result<i64, String> {
 
 /// `insertRow : Db -> String -> Dict String String -> Task Error Int` —
 /// returns the inserted row's id (lastInsertRowid for sqlite).
-pub fn db_insert_row<E: Send + From<String> + 'static>(
+pub fn db_insert_row<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     row: HashMap<String, String>,
@@ -2552,7 +2776,7 @@ pub fn db_insert_row<E: Send + From<String> + 'static>(
                     Ok(id) => ok_res(id),
                     Err(msg) => IpeResult::Err(format!("db.insertRow: {msg}").into()),
                 },
-                Err(e) => IpeResult::Err(ipe_err(&e)),
+                Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             }
         } else {
             let sql = db_format_sql(base);
@@ -2562,14 +2786,14 @@ pub fn db_insert_row<E: Send + From<String> + 'static>(
             }
             match exec_routed(&conn, q).await {
                 Ok(res) => ok_res(db_last_insert_id(&res)),
-                Err(e) => IpeResult::Err(ipe_err(&e)),
+                Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             }
         }
     })
 }
 
 /// `getById : Db -> String -> String -> Task Error (Maybe (Dict String String))`.
-pub fn db_get_by_id<E: Send + From<String> + 'static>(
+pub fn db_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     id: String,
@@ -2590,14 +2814,14 @@ pub fn db_get_by_id<E: Send + From<String> + 'static>(
         match fetch_optional_routed(&conn, sqlx::query(&sql).bind(id)).await {
             Ok(Some(r)) => ok_res(IpeMaybe::Just(row_to_map(&r))),
             Ok(None) => ok_res(IpeMaybe::Nothing),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
 /// `updateById : Db -> String -> String -> Dict String String -> Task Error Int` —
 /// returns the affected row count.
-pub fn db_update_by_id<E: Send + From<String> + 'static>(
+pub fn db_update_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     id: String,
@@ -2639,14 +2863,14 @@ pub fn db_update_by_id<E: Send + From<String> + 'static>(
         q = q.bind(id);
         match exec_routed(&conn, q).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
 /// `deleteById : Db -> String -> String -> Task Error Int` — returns
 /// the affected row count (0 or 1).
-pub fn db_delete_by_id<E: Send + From<String> + 'static>(
+pub fn db_delete_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     id: String,
@@ -2663,13 +2887,13 @@ pub fn db_delete_by_id<E: Send + From<String> + 'static>(
         let sql = db_format_sql(format!("DELETE FROM {} WHERE id = ?", qtable.as_str()));
         match exec_routed(&conn, sqlx::query(&sql).bind(id)).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
 /// `findOneByField : Db -> String -> String -> String -> Task Error (Maybe (Dict String String))`.
-pub fn db_find_one_by_field<E: Send + From<String> + 'static>(
+pub fn db_find_one_by_field<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     field: String,
@@ -2697,13 +2921,13 @@ pub fn db_find_one_by_field<E: Send + From<String> + 'static>(
         match fetch_optional_routed(&conn, sqlx::query(&sql).bind(value)).await {
             Ok(Some(r)) => ok_res(IpeMaybe::Just(row_to_map(&r))),
             Ok(None) => ok_res(IpeMaybe::Nothing),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
 /// `findManyByField : Db -> String -> String -> String -> Task Error (List (Dict String String))`.
-pub fn db_find_many_by_field<E: Send + From<String> + 'static>(
+pub fn db_find_many_by_field<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     field: String,
@@ -2730,14 +2954,14 @@ pub fn db_find_many_by_field<E: Send + From<String> + 'static>(
         ));
         match fetch_all_routed(&conn, sqlx::query(&sql).bind(value)).await {
             Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
 /// `findByConditions : Db -> String -> Dict String String -> Task Error (List (Dict String String))` —
 /// AND-joined equality on every key/value pair.
-pub fn db_find_by_conditions<E: Send + From<String> + 'static>(
+pub fn db_find_by_conditions<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     conditions: HashMap<String, String>,
@@ -2792,7 +3016,7 @@ pub fn db_find_by_conditions<E: Send + From<String> + 'static>(
         }
         match fetch_all_routed(&conn, q).await {
             Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -2805,7 +3029,10 @@ pub fn db_find_by_conditions<E: Send + From<String> + 'static>(
 /// The `Decoder<E,A>` is `Box<dyn Fn(&JsonVal) -> IpeResult<E,A> + Send>`. Moving
 /// it into the async block is sound: it is `Send`, and calling `decoder(&jv)` is
 /// a shared-reference call (no move out of the box). No `Arc` needed.
-pub fn db_query_decode<E: Send + From<String> + 'static, A: Send + 'static>(
+pub fn db_query_decode<
+    E: Send + From<String> + crate::FromIpeError + 'static,
+    A: Send + 'static,
+>(
     conn: Db,
     sql: String,
     params: Vec<String>,
@@ -2819,13 +3046,13 @@ pub fn db_query_decode<E: Send + From<String> + 'static, A: Send + 'static>(
         }
         let rows = match fetch_all_routed(&conn, q).await {
             Ok(r) => r,
-            Err(e) => return IpeResult::Err(ipe_err(&e)),
+            Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         };
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let jv = match row_to_json(row) {
                 Ok(v) => v,
-                Err(e) => return IpeResult::Err(ipe_err(&e)),
+                Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             };
             match (decoder.run)(&jv) {
                 IpeResult::Ok(a) => out.push(a),
@@ -2842,7 +3069,10 @@ pub fn db_query_decode<E: Send + From<String> + 'static, A: Send + 'static>(
 /// is `SqlValue` (ExprEmitter `isSqlValueListArg`); a homogeneous `List String`
 /// keeps the `db_query_decode` (Vec<String>) path. Same fetch_all_routed +
 /// row_to_json + decoder loop; same positional binding (never interpolated).
-pub fn db_query_decode_params<E: Send + From<String> + 'static, A: Send + 'static>(
+pub fn db_query_decode_params<
+    E: Send + From<String> + crate::FromIpeError + 'static,
+    A: Send + 'static,
+>(
     conn: Db,
     sql: String,
     params: Vec<SqlParam>,
@@ -2856,13 +3086,13 @@ pub fn db_query_decode_params<E: Send + From<String> + 'static, A: Send + 'stati
         }
         let rows = match fetch_all_routed(&conn, q).await {
             Ok(r) => r,
-            Err(e) => return IpeResult::Err(ipe_err(&e)),
+            Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         };
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let jv = match row_to_json(row) {
                 Ok(v) => v,
-                Err(e) => return IpeResult::Err(ipe_err(&e)),
+                Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             };
             match (decoder.run)(&jv) {
                 IpeResult::Ok(a) => out.push(a),
@@ -2879,7 +3109,10 @@ pub fn db_query_decode_params<E: Send + From<String> + 'static, A: Send + 'stati
 ///
 /// Security: `id` is bound via a parameterised placeholder (`?`), NEVER
 /// string-interpolated into SQL.
-pub fn db_get_by_id_decode<E: Send + From<String> + 'static, A: Send + 'static>(
+pub fn db_get_by_id_decode<
+    E: Send + From<String> + crate::FromIpeError + 'static,
+    A: Send + 'static,
+>(
     conn: Db,
     table: String,
     id: i64,
@@ -2904,14 +3137,14 @@ pub fn db_get_by_id_decode<E: Send + From<String> + 'static, A: Send + 'static>(
             Ok(Some(row)) => {
                 let jv = match row_to_json(&row) {
                     Ok(v) => v,
-                    Err(e) => return IpeResult::Err(ipe_err(&e)),
+                    Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
                 };
                 match (decoder.run)(&jv) {
                     IpeResult::Ok(a) => ok_res(IpeMaybe::Just(a)),
                     IpeResult::Err(e) => IpeResult::Err(e),
                 }
             }
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -2956,7 +3189,10 @@ pub fn db_get_by_id_decode<E: Send + From<String> + 'static, A: Send + 'static>(
 /// task-local shadow/restore (the outer transaction's task-local value is
 /// restored once this inner scope's future completes), not by any manual
 /// stack bookkeeping.
-pub fn db_with_transaction<E: Send + From<String> + 'static, A: Send + 'static>(
+pub fn db_with_transaction<
+    E: Send + From<String> + crate::FromIpeError + 'static,
+    A: Send + 'static,
+>(
     conn: Db,
     body: impl FnOnce(Db) -> IpeTask<E, A> + Send + 'static,
 ) -> IpeTask<E, A> {
@@ -2974,7 +3210,7 @@ pub fn db_with_transaction<E: Send + From<String> + 'static, A: Send + 'static>(
         // body ops serialise on it.
         let tx = match conn.begin().await {
             Ok(t) => t,
-            Err(e) => return IpeResult::Err(ipe_err(&e)),
+            Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         };
         let tx_conn: TxnConn = std::sync::Arc::new(tokio::sync::Mutex::new(tx));
 
@@ -3011,7 +3247,7 @@ pub fn db_with_transaction<E: Send + From<String> + 'static, A: Send + 'static>(
         match outcome {
             IpeResult::Ok(a) => match tx.commit().await {
                 Ok(()) => ok_res(a),
-                Err(e) => IpeResult::Err(ipe_err(&e)),
+                Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             },
             IpeResult::Err(e) => {
                 // Best-effort deterministic rollback; the body's Err is reported.
@@ -3061,7 +3297,11 @@ pub fn db_with_transaction<E: Send + From<String> + 'static, A: Send + 'static>(
 /// constituent field type here (`String`, `i64`, `f64`, `bool`, `Vec<u8>`) is
 /// already `PartialEq`, so the derive below is total and structural — no
 /// hand-written impl needed.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Debug` prints the variant and never the bound value: a bind may carry a
+/// revealed secret or a client-supplied credential, and every type that holds a
+/// `SqlParam` (a fragment, a statement, a refusal) prints through this impl.
+#[derive(Clone, PartialEq)]
 pub enum SqlParam {
     /// `SqlString s` — binds as TEXT.
     Text(String),
@@ -3088,6 +3328,20 @@ pub enum SqlParam {
     /// type-mismatch error. Boxed to keep construction cheap (one variant,
     /// rarely on a hot loop) without inflating every other variant's size.
     Null(Box<SqlParam>),
+}
+
+impl std::fmt::Debug for SqlParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked = crate::redact::Redacted::new(());
+        match self {
+            Self::Text(_) => f.debug_tuple("Text").field(&masked).finish(),
+            Self::Int(_) => f.debug_tuple("Int").field(&masked).finish(),
+            Self::Float(_) => f.debug_tuple("Float").field(&masked).finish(),
+            Self::Bool(_) => f.debug_tuple("Bool").field(&masked).finish(),
+            Self::Bytes(_) => f.debug_tuple("Bytes").field(&masked).finish(),
+            Self::Null(witness) => f.debug_tuple("Null").field(witness).finish(),
+        }
+    }
 }
 
 // ── `From<T> for SqlParam` — primitive Ipê types ────────────────────────────
@@ -3207,6 +3461,52 @@ pub struct SqlFragment {
     sql: String,
     binds: Vec<SqlParam>,
     invalid: Option<String>,
+}
+
+crate::stringify::show_row!(
+    "SqlFragment",
+    Redacted(Reveal),
+    [] SqlFragment,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |f, view| f.dev(view),
+);
+
+impl SqlFragment {
+    /// The fragment as `Debug.log` prints it in a dev-posture build: its SQL
+    /// text, each bind value and the poison marker.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        let binds: Vec<String> = self.binds.iter().map(|bind| bind.dev(view)).collect();
+        let invalid = self
+            .invalid
+            .as_ref()
+            .map_or_else(|| "Nothing".to_owned(), |reason| format!("Just {reason}"));
+        crate::stringify::dev_record(
+            "SqlFragment",
+            &[
+                ("sql", self.sql.clone()),
+                ("binds", format!("[{}]", binds.join(" "))),
+                ("invalid", invalid),
+            ],
+        )
+    }
+}
+
+impl SqlParam {
+    /// The bind as `Debug.log` prints it in a dev-posture build: its
+    /// constructor and its value, each value through its own show row.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        use crate::stringify::IpeStringify;
+        match self {
+            Self::Text(s) => format!("SqlString {}", s.ipe_render(view)),
+            Self::Int(n) => format!("SqlInt {}", n.ipe_render(view)),
+            Self::Float(x) => format!("SqlFloat {}", x.ipe_render(view)),
+            Self::Bool(b) => format!("SqlBool {}", b.ipe_render(view)),
+            Self::Bytes(b) => format!("SqlBytes {}", b.ipe_render(view)),
+            Self::Null(_) => "SqlNull".to_owned(),
+        }
+    }
 }
 
 impl std::fmt::Debug for SqlFragment {
@@ -3359,13 +3659,180 @@ pub fn sql_is_not_null(a: SqlFragment) -> SqlFragment {
 ///
 /// The pattern is always a bound param (never interpolated), so it cannot
 /// inject SQL. It is still a `LIKE` pattern: a `%` or `_` in the bound value
-/// is a wildcard, so untrusted text passed here can widen the match. SQLite's
-/// `LIKE` also folds ASCII case; Postgres's does not.
+/// is a wildcard, so untrusted text passed here can widen the match; a literal
+/// prefix is [`sql_starts_with`]. Every engine reads the pattern under
+/// `ESCAPE '\'` ([`LIKE_ESCAPE`]): `\%`, `\_` and `\\` match `%`, `_` and `\`
+/// literally. A pattern ending in an unpaired `\` poisons the fragment, since
+/// SQLite reads it as no match and Postgres as an error. SQLite's `LIKE` also
+/// folds ASCII case; Postgres's does not.
 pub fn sql_like(a: SqlFragment, pattern: String) -> SqlFragment {
+    if ends_with_unpaired_escape(&pattern) {
+        return SqlFragment {
+            sql: String::new(),
+            binds: Vec::new(),
+            invalid: a.invalid.or_else(|| {
+                Some(format!(
+                    "Sql.like: the pattern ends with the escape character {LIKE_ESCAPE}"
+                ))
+            }),
+        };
+    }
     let mut binds = a.binds;
     binds.push(SqlParam::Text(pattern));
     SqlFragment {
-        sql: format!("({} LIKE ?)", a.sql),
+        sql: format!("({})", like_escape_sql(&a.sql)),
+        binds,
+        invalid: a.invalid,
+    }
+}
+
+/// The escape character every rendered `LIKE` names in its `ESCAPE` clause.
+///
+/// `\` escapes the same way on SQLite and on Postgres (whose default escape it
+/// is). Under Postgres with `standard_conforming_strings = off`, the literal
+/// `'\'` is an unterminated string, so such a server refuses the query rather
+/// than reading the pattern another way.
+const LIKE_ESCAPE: char = '\\';
+
+/// Ceiling on a [`LikePrefix`], in UTF-8 bytes.
+const MAX_LIKE_PREFIX_BYTES: usize = 16 * 1024;
+
+/// SQLite's default `SQLITE_MAX_LIKE_PATTERN_LENGTH`, in bytes.
+const SQLITE_DEFAULT_MAX_LIKE_PATTERN_LENGTH: usize = 50_000;
+
+// Every reserved character escaped doubles, plus the trailing `%`: the longest
+// pattern a `LikePrefix` renders stays inside SQLite's pattern ceiling.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the prefix ceiling outgrows SQLite's LIKE pattern ceiling [ledger #boundary]
+const _: () = assert!(2 * MAX_LIKE_PREFIX_BYTES < SQLITE_DEFAULT_MAX_LIKE_PATTERN_LENGTH);
+// The escape character is neither a wildcard nor a character that ends or
+// opens the quoted `ESCAPE` literal or a placeholder.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the LIKE escape character is a wildcard, quote or placeholder [ledger #boundary]
+const _: () = assert!(!matches!(LIKE_ESCAPE, '%' | '_' | '\'' | '"' | '?'));
+
+/// `<subject> LIKE ? ESCAPE '\'`: the one rendering of a `LIKE` predicate.
+fn like_escape_sql(subject_sql: &str) -> String {
+    format!("{subject_sql} LIKE ? ESCAPE '{LIKE_ESCAPE}'")
+}
+
+/// Whether `pattern` ends in an escape character that escapes nothing.
+fn ends_with_unpaired_escape(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .fold(false, |escaping, c| !escaping && c == LIKE_ESCAPE)
+}
+
+/// A literal text prefix, parsed once: non-empty, NUL-free, at most
+/// [`MAX_LIKE_PREFIX_BYTES`] bytes.
+///
+/// It owns the one `LIKE` escaper, so the pattern it renders matches its text
+/// literally and nothing else.
+struct LikePrefix(String);
+
+/// Why a text is not a [`LikePrefix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LikePrefixError {
+    /// The text is empty, which would match every non-`NULL` row.
+    Empty,
+    /// The text holds a NUL character.
+    Nul,
+    /// The text is longer than [`MAX_LIKE_PREFIX_BYTES`].
+    TooLong,
+}
+
+impl LikePrefixError {
+    /// The poison text of a refused `Sql.startsWith`; it never echoes the prefix.
+    fn message(self) -> String {
+        match self {
+            Self::Empty => "Sql.startsWith: the prefix is empty".to_string(),
+            Self::Nul => "Sql.startsWith: the prefix contains a NUL character".to_string(),
+            Self::TooLong => {
+                format!("Sql.startsWith: the prefix is longer than {MAX_LIKE_PREFIX_BYTES} bytes")
+            }
+        }
+    }
+}
+
+impl LikePrefix {
+    /// Parse `raw`, refusing an empty, NUL-bearing or over-long text, in that order.
+    fn parse(raw: String) -> Result<Self, LikePrefixError> {
+        if raw.is_empty() {
+            Err(LikePrefixError::Empty)
+        } else if raw.contains('\0') {
+            Err(LikePrefixError::Nul)
+        } else if raw.len() > MAX_LIKE_PREFIX_BYTES {
+            Err(LikePrefixError::TooLong)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    /// The `LIKE` pattern: each `%`, `_` and [`LIKE_ESCAPE`] preceded by
+    /// [`LIKE_ESCAPE`], then a trailing `%`.
+    fn like_pattern(&self) -> String {
+        let mut pattern = String::with_capacity(self.0.len() + 1);
+        for c in self.0.chars() {
+            match c {
+                '%' | '_' | LIKE_ESCAPE => {
+                    pattern.push(LIKE_ESCAPE);
+                    pattern.push(c);
+                }
+                other => pattern.push(other),
+            }
+        }
+        pattern.push('%');
+        pattern
+    }
+
+    /// The prefix text.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `substr(<subject>, 1, length(?)) = ?`: the exact-prefix shape, written once.
+///
+/// `substr` and `length` count characters on SQLite and Postgres alike, and
+/// `=` compares bytes under a binary or deterministic collation, so the shape
+/// carries no wildcard and no case folding.
+pub(crate) fn text_prefix_equals_sql(subject_sql: &str) -> String {
+    format!("substr({subject_sql}, 1, length(?)) = ?")
+}
+
+/// `Sql.startsWith : SqlFragment -> String -> SqlFragment` — the rows whose
+/// `a` text begins with exactly `prefix`, character for character.
+///
+/// Renders `((<a> LIKE ? ESCAPE '\') AND (substr(<a>, 1, length(?)) = ?))`
+/// with binds `a.binds ++ [pattern] ++ a.binds ++ [prefix, prefix]`. The
+/// escaped `LIKE` conjunct lets an index serve the scan; the `substr` conjunct
+/// makes the match exact and case-sensitive on every engine under a
+/// deterministic collation (a Postgres column declared with a
+/// nondeterministic collation makes `=` compare by that collation). A `NULL` `a` never
+/// matches. An empty, NUL-bearing or over-long prefix poisons the fragment, and
+/// an upstream poison in `a` wins over it.
+pub fn sql_starts_with(a: SqlFragment, prefix: String) -> SqlFragment {
+    let prefix = match LikePrefix::parse(prefix) {
+        Ok(prefix) => prefix,
+        Err(refused) => {
+            return SqlFragment {
+                sql: String::new(),
+                binds: Vec::new(),
+                invalid: a.invalid.or_else(|| Some(refused.message())),
+            };
+        }
+    };
+    let sql = format!(
+        "(({}) AND ({}))",
+        like_escape_sql(&a.sql),
+        text_prefix_equals_sql(&a.sql)
+    );
+    let mut binds = Vec::with_capacity(2 * a.binds.len() + 3);
+    binds.extend(a.binds.iter().cloned());
+    binds.push(SqlParam::Text(prefix.like_pattern()));
+    binds.extend(a.binds);
+    binds.push(SqlParam::Text(prefix.as_str().to_string()));
+    binds.push(SqlParam::Text(prefix.0));
+    SqlFragment {
+        sql,
         binds,
         invalid: a.invalid,
     }
@@ -3483,7 +3950,7 @@ pub fn sql_masked_column(pred: SqlFragment, col: String) -> SqlFragment {
 /// so `frag.sql` is always `?`-placeholder text with a matching `frag.binds`
 /// list — there is no representable way to smuggle untrusted string content
 /// into the SQL text.
-pub fn db_find_where<E: Send + From<String> + 'static>(
+pub fn db_find_where<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     frag: SqlFragment,
@@ -3509,7 +3976,7 @@ pub fn db_find_where<E: Send + From<String> + 'static>(
         }
         match fetch_all_routed(&conn, q).await {
             Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -3539,7 +4006,10 @@ pub fn db_find_where<E: Send + From<String> + 'static>(
 /// `CASE` predicates carry their `$subject` binds; those bind FIRST (SELECT terms
 /// precede the WHERE), mirroring `db_find_projection`'s literal-then-where order,
 /// so placeholders and binds stay in lockstep.
-pub fn db_find_where_masked<E: Send + From<String> + 'static, A: Send + 'static>(
+pub fn db_find_where_masked<
+    E: Send + From<String> + crate::FromIpeError + 'static,
+    A: Send + 'static,
+>(
     conn: Db,
     table: String,
     projections: Vec<SqlFragment>,
@@ -3594,13 +4064,13 @@ pub fn db_find_where_masked<E: Send + From<String> + 'static, A: Send + 'static>
         }
         let rows = match fetch_all_routed(&conn, q).await {
             Ok(r) => r,
-            Err(e) => return IpeResult::Err(ipe_err(&e)),
+            Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         };
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let jv = match row_to_json(row) {
                 Ok(v) => v,
-                Err(e) => return IpeResult::Err(ipe_err(&e)),
+                Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             };
             match (decoder.run)(&jv) {
                 IpeResult::Ok(a) => out.push(a),
@@ -3721,7 +4191,7 @@ fn split_join_row(row: &HashMap<String, String>, left_prefix: &str, right_prefix
 /// split back into the two sides' plain-keyed maps by that prefix, so a caller
 /// decodes each side through its existing per-store codec.
 #[allow(clippy::too_many_arguments)] // one flat arg per validated identifier group; a struct arg would only move the same seven values behind an emit-side constructor.
-pub fn db_find_join<E: Send + From<String> + 'static>(
+pub fn db_find_join<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     left_table: String,
     left_alias: String,
@@ -3759,7 +4229,7 @@ pub fn db_find_join<E: Send + From<String> + 'static>(
                     .map(|r| split_join_row(&row_to_map(r), &left_prefix, &right_prefix))
                     .collect(),
             ),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -3881,7 +4351,7 @@ impl ProjectionColumn {
 /// emit `? AS p<index>` in the SELECT; their bound values bind before the WHERE
 /// `?` parameters so no value is ever interpolated.
 #[allow(clippy::too_many_arguments)] // one flat arg per validated identifier group; a struct arg would only move the same values behind an emit-side constructor.
-pub fn db_find_projection<E: Send + From<String> + 'static>(
+pub fn db_find_projection<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     left_table: String,
     left_alias: String,
@@ -3925,7 +4395,7 @@ pub fn db_find_projection<E: Send + From<String> + 'static>(
         }
         match fetch_all_routed(&conn, q).await {
             Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -3939,7 +4409,7 @@ pub fn db_find_projection<E: Send + From<String> + 'static>(
 /// ascending direction. Every identifier passes `SqlIdent::parse_plain`; the
 /// first that does not fails the whole read closed. No value is interpolated.
 #[allow(clippy::too_many_arguments)]
-pub fn db_find_join_ordered<E: Send + From<String> + 'static>(
+pub fn db_find_join_ordered<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     left_table: String,
     left_alias: String,
@@ -3984,7 +4454,7 @@ pub fn db_find_join_ordered<E: Send + From<String> + 'static>(
                     .map(|r| split_join_row(&row_to_map(r), &left_prefix, &right_prefix))
                     .collect(),
             ),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -4001,7 +4471,7 @@ pub fn db_find_join_ordered<E: Send + From<String> + 'static>(
 /// column name, and ascending direction. Every non-empty identifier passes
 /// `SqlIdent::parse_plain`; the first that does not fails the whole read closed.
 #[allow(clippy::too_many_arguments)]
-pub fn db_find_projection_ordered<E: Send + From<String> + 'static>(
+pub fn db_find_projection_ordered<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     left_table: String,
     left_alias: String,
@@ -4056,7 +4526,7 @@ pub fn db_find_projection_ordered<E: Send + From<String> + 'static>(
         }
         match fetch_all_routed(&conn, q).await {
             Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -4280,7 +4750,7 @@ fn build_projection_statement_ordered(
 
 /// `Db.deleteWhere : Db -> String -> SqlFragment -> Task Error Int` — the
 /// row-count deletion counterpart to [`db_find_where`].
-pub fn db_delete_where<E: Send + From<String> + 'static>(
+pub fn db_delete_where<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     frag: SqlFragment,
@@ -4314,7 +4784,7 @@ pub fn db_delete_where<E: Send + From<String> + 'static>(
         }
         match exec_routed(&conn, q).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -4385,7 +4855,7 @@ fn build_update_where_sql(
 /// bound (`SqlParam`); the WHERE text is always `?`-placeholder with a matching
 /// bind list, so no caller value or identifier reaches the SQL text. An
 /// all-`OmitField` SET writes nothing and returns `0`.
-pub fn db_update_where<E: Send + From<String> + 'static>(
+pub fn db_update_where<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     set_fields: Vec<(String, Option<SqlParam>)>,
@@ -4404,7 +4874,7 @@ pub fn db_update_where<E: Send + From<String> + 'static>(
         }
         match exec_routed(&conn, q).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -4527,7 +4997,7 @@ async fn settle_checked_write(
 }
 
 /// Runs a built checked write on `conn`'s routed target and maps the count.
-async fn run_checked_write<E: From<String> + Send>(
+async fn run_checked_write<E: From<String> + crate::FromIpeError + Send>(
     conn: &Db,
     sql: String,
     args: Vec<SqlParam>,
@@ -4539,7 +5009,7 @@ async fn run_checked_write<E: From<String> + Send>(
     }
     match route_for(conn).checked_write(q).await {
         Ok(n) => ok_res(i64::try_from(n).unwrap_or(i64::MAX)),
-        Err(e) => IpeResult::Err(ipe_err(&e)),
+        Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
     }
 }
 
@@ -4550,7 +5020,7 @@ async fn run_checked_write<E: From<String> + Send>(
 /// it through [`QueryTarget::checked_write`]: the row stays only when `check`
 /// holds over it as stored. Returns `1` when kept and `0` when the check refused
 /// it (nothing is written). A poisoned or empty `check` is refused before any SQL.
-pub fn db_insert_fields_checked<E: Send + From<String> + 'static>(
+pub fn db_insert_fields_checked<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     fields: Vec<(String, Option<SqlParam>)>,
@@ -4573,7 +5043,7 @@ pub fn db_insert_fields_checked<E: Send + From<String> + 'static>(
 /// when every updated row satisfies `check` as stored after the write. Returns
 /// the updated-row count, or `0` when no row matched or the check refused
 /// (nothing is written). An all-`OmitField` SET returns `0` without SQL.
-pub fn db_update_where_checked<E: Send + From<String> + 'static>(
+pub fn db_update_where_checked<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     set_fields: Vec<(String, Option<SqlParam>)>,
@@ -4727,7 +5197,7 @@ where
 /// Accepts `Connection a` (any access mode: a read is available on read-only and
 /// read-write alike); the phantom mode is erased at emit.
 #[cfg(feature = "db")]
-pub fn db_conn_find_where<E: Send + From<String> + 'static>(
+pub fn db_conn_find_where<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: ExternalConnection,
     table: String,
     frag: SqlFragment,
@@ -4752,7 +5222,7 @@ pub fn db_conn_find_where<E: Send + From<String> + 'static>(
                 }
                 match q.fetch_all(&pool).await {
                     Ok(rows) => ok_res(rows.iter().map(external_row_to_map).collect()),
-                    Err(e) => IpeResult::Err(ipe_err(&e)),
+                    Err(e) => IpeResult::Err(ipe_err(DbEngine::Postgres, &e)),
                 }
             }
             ExternalConnection::Sqlite(pool) => {
@@ -4762,7 +5232,7 @@ pub fn db_conn_find_where<E: Send + From<String> + 'static>(
                 }
                 match q.fetch_all(&pool).await {
                     Ok(rows) => ok_res(rows.iter().map(external_row_to_map).collect()),
-                    Err(e) => IpeResult::Err(ipe_err(&e)),
+                    Err(e) => IpeResult::Err(ipe_err(DbEngine::Sqlite, &e)),
                 }
             }
         }
@@ -4776,14 +5246,17 @@ pub fn db_conn_find_where<E: Send + From<String> + 'static>(
 /// `Decoder<E, A>`. The caller-supplied SQL is bound-parameter-only (the safe
 /// path); verbatim external SQL remains the disclosed `unsafeExecRawOn` door.
 #[cfg(feature = "db")]
-pub fn db_conn_query_decode_params<E: Send + From<String> + 'static, A: Send + 'static>(
+pub fn db_conn_query_decode_params<
+    E: Send + From<String> + crate::FromIpeError + 'static,
+    A: Send + 'static,
+>(
     conn: ExternalConnection,
     sql: String,
     params: Vec<SqlParam>,
     decoder: Decoder<E, A>,
 ) -> IpeTask<E, Vec<A>> {
     Box::pin(async move {
-        let rows_json: Result<Vec<JsonVal>, sqlx::Error> = match conn {
+        let rows_json: Result<Vec<JsonVal>, (DbEngine, sqlx::Error)> = match conn {
             ExternalConnection::Postgres(pool) => {
                 let final_sql = external_format_sql_postgres(&sql);
                 let mut q = sqlx::query(&final_sql);
@@ -4791,8 +5264,11 @@ pub fn db_conn_query_decode_params<E: Send + From<String> + 'static, A: Send + '
                     q = external_bind_sql_param(q, p);
                 }
                 match q.fetch_all(&pool).await {
-                    Ok(rows) => rows.iter().map(row_to_json).collect(),
-                    Err(e) => Err(e),
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|row| row_to_json(row).map_err(|e| (DbEngine::Postgres, e)))
+                        .collect(),
+                    Err(e) => Err((DbEngine::Postgres, e)),
                 }
             }
             ExternalConnection::Sqlite(pool) => {
@@ -4801,14 +5277,17 @@ pub fn db_conn_query_decode_params<E: Send + From<String> + 'static, A: Send + '
                     q = external_bind_sql_param(q, p);
                 }
                 match q.fetch_all(&pool).await {
-                    Ok(rows) => rows.iter().map(row_to_json).collect(),
-                    Err(e) => Err(e),
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|row| row_to_json(row).map_err(|e| (DbEngine::Sqlite, e)))
+                        .collect(),
+                    Err(e) => Err((DbEngine::Sqlite, e)),
                 }
             }
         };
         let jsons = match rows_json {
             Ok(v) => v,
-            Err(e) => return IpeResult::Err(ipe_err(&e)),
+            Err((engine, e)) => return IpeResult::Err(ipe_err(engine, &e)),
         };
         let mut out = Vec::with_capacity(jsons.len());
         for jv in &jsons {
@@ -4825,7 +5304,7 @@ pub fn db_conn_query_decode_params<E: Send + From<String> + 'static, A: Send + '
 /// — the external counterpart to [`db_get_by_id`]. The id binds as a positional
 /// parameter (never interpolated); the table passes the same [`SqlIdent`] gate.
 #[cfg(feature = "db")]
-pub fn db_conn_get_by_id<E: Send + From<String> + 'static>(
+pub fn db_conn_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: ExternalConnection,
     table: String,
     id: String,
@@ -4846,14 +5325,14 @@ pub fn db_conn_get_by_id<E: Send + From<String> + 'static>(
                 match sqlx::query(&sql).bind(id).fetch_optional(&pool).await {
                     Ok(Some(r)) => ok_res(IpeMaybe::Just(external_row_to_map(&r))),
                     Ok(None) => ok_res(IpeMaybe::Nothing),
-                    Err(e) => IpeResult::Err(ipe_err(&e)),
+                    Err(e) => IpeResult::Err(ipe_err(DbEngine::Postgres, &e)),
                 }
             }
             ExternalConnection::Sqlite(pool) => {
                 match sqlx::query(&base).bind(id).fetch_optional(&pool).await {
                     Ok(Some(r)) => ok_res(IpeMaybe::Just(external_row_to_map(&r))),
                     Ok(None) => ok_res(IpeMaybe::Nothing),
-                    Err(e) => IpeResult::Err(ipe_err(&e)),
+                    Err(e) => IpeResult::Err(ipe_err(DbEngine::Sqlite, &e)),
                 }
             }
         }
@@ -5040,7 +5519,7 @@ fn build_insert_sql(
 /// fabricates `id = 0` on a non-integer primary key — surfaces a clear `Err`
 /// instead (mirrors [`db_insert_row`]'s fix for the same bug class).
 #[cfg(feature = "db")]
-pub fn db_insert_fields<E: Send + From<String> + 'static>(
+pub fn db_insert_fields<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     fields: Vec<(String, Option<SqlParam>)>,
@@ -5066,7 +5545,7 @@ pub fn db_insert_fields<E: Send + From<String> + 'static>(
                     Ok(id) => ok_res(id),
                     Err(msg) => IpeResult::Err(format!("db.insertFields: {msg}").into()),
                 },
-                Err(e) => IpeResult::Err(ipe_err(&e)),
+                Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             }
         } else {
             let sql = db_format_sql(base_sql);
@@ -5076,7 +5555,7 @@ pub fn db_insert_fields<E: Send + From<String> + 'static>(
             }
             match exec_routed(&conn, q).await {
                 Ok(res) => ok_res(db_last_insert_id(&res)),
-                Err(e) => IpeResult::Err(ipe_err(&e)),
+                Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             }
         }
     })
@@ -5096,7 +5575,7 @@ pub fn db_insert_fields<E: Send + From<String> + 'static>(
 /// values are bound positionally — never interpolated into SQL.
 /// Totality: every error path returns `IpeResult::Err`; no panic/unwrap.
 #[cfg(feature = "db")]
-pub fn db_update_fields<E: Send + From<String> + 'static>(
+pub fn db_update_fields<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     where_cols: Vec<(String, SqlParam)>,
@@ -5171,7 +5650,7 @@ pub fn db_update_fields<E: Send + From<String> + 'static>(
         }
         match exec_routed(&conn, q).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -5320,7 +5799,7 @@ fn build_upsert_sql(
 /// positionally — never interpolated into SQL.
 /// Totality: every error path returns `IpeResult::Err`; no panic/unwrap.
 #[cfg(feature = "db")]
-pub fn db_upsert_fields<E: Send + From<String> + 'static>(
+pub fn db_upsert_fields<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     conflict_target: Vec<String>,
@@ -5338,7 +5817,7 @@ pub fn db_upsert_fields<E: Send + From<String> + 'static>(
         }
         match exec_routed(&conn, q).await {
             Ok(res) => ok_res(res.rows_affected() as i64),
-            Err(e) => IpeResult::Err(ipe_err(&e)),
+            Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
@@ -5363,7 +5842,10 @@ pub fn db_upsert_fields<E: Send + From<String> + 'static>(
 /// so the risk class is different — same as `queryDecode`'s SQL string trust model).
 /// Totality: every error path returns `IpeResult::Err`; no panic/unwrap.
 #[cfg(feature = "db")]
-pub fn db_insert_fields_returning<E: Send + From<String> + 'static, A: Send + 'static>(
+pub fn db_insert_fields_returning<
+    E: Send + From<String> + crate::FromIpeError + 'static,
+    A: Send + 'static,
+>(
     conn: Db,
     table: String,
     fields: Vec<(String, Option<SqlParam>)>,
@@ -5403,13 +5885,13 @@ pub fn db_insert_fields_returning<E: Send + From<String> + 'static, A: Send + 's
         }
         let rows = match fetch_all_routed(&conn, q).await {
             Ok(r) => r,
-            Err(e) => return IpeResult::Err(ipe_err(&e)),
+            Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         };
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let jv = match row_to_json(row) {
                 Ok(v) => v,
-                Err(e) => return IpeResult::Err(ipe_err(&e)),
+                Err(e) => return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
             };
             match (decoder.run)(&jv) {
                 IpeResult::Ok(a) => out.push(a),
@@ -5428,6 +5910,24 @@ mod tests {
     fn env_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(DB_CONNECTIONS_CEILING);
         crate::system::assert_env_ceiling_contract(DB_POOLS_CEILING);
+    }
+
+    #[test]
+    fn sql_param_debug_prints_no_bound_value() {
+        let params = vec![
+            SqlParam::Text("Bearer S3CR3T".to_owned()),
+            SqlParam::Int(424_242),
+            SqlParam::Float(1.5),
+            SqlParam::Bool(true),
+            SqlParam::Bytes(b"T0K3N".to_vec()),
+            SqlParam::Null(Box::new(SqlParam::Text("PW0RD".to_owned()))),
+        ];
+        let shown = format!("{params:?}");
+        for planted in ["S3CR3T", "424242", "1.5", "true", "84, 48", "PW0RD"] {
+            assert!(!shown.contains(planted), "{planted} leaked: {shown}");
+        }
+        assert!(shown.contains("Text(<redacted>)"), "{shown}");
+        assert!(shown.contains("Null(Text(<redacted>))"), "{shown}");
     }
 
     /// Every target `url` makes the driver dial, as [`PostgresUrl::parse`] reads them.
@@ -5691,10 +6191,9 @@ mod tests {
     #[tokio::test]
     async fn ipe_err_redacts_db_row_values() {
         // A UNIQUE-constraint failure must NOT echo the offending row VALUE into
-        // the Ipê-visible Error (PRINCIPLES #1 info-leak). `ipe_err` builds a
-        // structural message (SQLSTATE/driver code + constraint name) from the
-        // structured error fields instead of the raw Display, which on
-        // PostgreSQL/MySQL embeds `Key (email)=(victim@…) already exists`.
+        // the Ipê-visible Error. `ipe_err` builds the message from the
+        // classification and the constraint name, never the raw `Display`, which
+        // on PostgreSQL embeds `Key (email)=(victim@…) already exists`.
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .min_connections(1)
             .max_connections(1)
@@ -5713,16 +6212,12 @@ mod tests {
             "first insert should succeed"
         );
         let r2: IpeResult<String, i64> = db_exec(pool.clone(), insert, Vec::new()).await;
-        match r2 {
-            IpeResult::Err(e) => {
-                assert!(!e.contains(secret), "row value leaked into db error: {e}");
-                assert!(
-                    e.starts_with("db: database error"),
-                    "expected redacted structural form, got: {e}"
-                );
-            }
-            IpeResult::Ok(_) => panic!("duplicate insert should violate the UNIQUE constraint"),
-        }
+        assert!(
+            matches!(&r2, IpeResult::Err(e)
+                if !e.contains(secret)
+                    && e.starts_with("Conflict: db: unique constraint violated")),
+            "expected the redacted classified form, got: {r2:?}"
+        );
     }
 
     const SECRET_URL: &str = "postgres://admin:s3cr3t-pw@db.internal:5432/prod";
@@ -5780,16 +6275,16 @@ mod tests {
         let cases = [
             (
                 sqlx::Error::Configuration(boxed()),
-                "db: invalid connection configuration",
+                "db: database unreachable",
             ),
             (
                 sqlx::Error::Io(std::io::Error::other(SECRET_URL)),
-                "db: connection I/O error",
+                "db: database unreachable",
             ),
-            (sqlx::Error::Tls(boxed()), "db: TLS error"),
+            (sqlx::Error::Tls(boxed()), "db: database unreachable"),
             (
                 sqlx::Error::Protocol(SECRET_URL.to_string()),
-                "db: driver error",
+                "db: database error",
             ),
             (
                 sqlx::Error::Database(Box::new(EchoingDbError)),
@@ -5801,10 +6296,11 @@ mod tests {
                 raw.to_string().contains("s3cr3t-pw"),
                 "the raw driver error must be the leaking form this guards: {raw}"
             );
-            let refused = DbConnectError::Unreachable(DbFailure::of(&raw));
+            let refused = DbConnectError::Unreachable(DriverFailure::of(DbEngine::Postgres, &raw));
             assert_credential_free(&refused);
             assert_eq!(refused.to_string(), expected);
-            let unreadable = DbConnectError::VersionUnreadable(DbFailure::of(&raw));
+            let unreadable =
+                DbConnectError::VersionUnreadable(DriverFailure::of(DbEngine::Postgres, &raw));
             assert_credential_free(&unreadable);
         }
     }
@@ -5840,16 +6336,423 @@ mod tests {
                 sqlx::error::ErrorKind::Other
             }
         }
-        let classify = |code| DbFailure::of(&sqlx::Error::Database(Box::new(Coded(code))));
-        assert_eq!(
-            classify("28P01"),
-            DbFailure::Database {
-                code: Some("28P01".to_string())
-            }
-        );
+        let classify = |code| {
+            DriverFailure::of(
+                DbEngine::Postgres,
+                &sqlx::Error::Database(Box::new(Coded(code))),
+            )
+        };
+        let kept = classify("28P01");
+        assert_eq!(kept.raw_code(), Some("28P01"));
+        assert_eq!(kept.failure(), IpeDbFailure::AccessDenied);
         for malformed in ["", "28P01\n[forged] line", "0123456789abcdefX"] {
-            assert_eq!(classify(malformed), DbFailure::Database { code: None });
+            let dropped = classify(malformed);
+            assert_eq!(dropped.raw_code(), None, "{malformed:?}");
+            assert_eq!(
+                dropped.failure(),
+                IpeDbFailure::OtherFailure,
+                "{malformed:?}"
+            );
         }
+    }
+
+    /// A database error carrying a chosen code and constraint name.
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: Option<&'static str>,
+        constraint: Option<&'static str>,
+    }
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("fake driver message 2067 [19] victim@example.com")
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "fake driver message 2067 [19] victim@example.com"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.map(std::borrow::Cow::Borrowed)
+        }
+        fn constraint(&self) -> Option<&str> {
+            self.constraint
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn coded(code: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError {
+            code,
+            constraint: None,
+        }))
+    }
+
+    /// Every SQLite row, exact and primary, classifies to its variant.
+    #[test]
+    fn classify_failure_sqlite_rows() {
+        use IpeDbFailure as F;
+        let rows = [
+            ("2067", F::UniqueViolation),
+            ("1555", F::UniqueViolation),
+            ("787", F::ForeignKeyViolation),
+            ("1299", F::NotNullViolation),
+            ("275", F::CheckViolation),
+            ("1811", F::TriggerRaised),
+            ("19", F::OtherConstraint),
+            ("3091", F::OtherConstraint),
+            ("5", F::Busy),
+            ("517", F::Busy),
+            ("6", F::Busy),
+            ("262", F::Busy),
+            ("8", F::ReadOnlyDatabase),
+            ("1032", F::ReadOnlyDatabase),
+            ("3", F::AccessDenied),
+            ("23", F::AccessDenied),
+            ("14", F::CannotOpen),
+            ("1038", F::CannotOpen),
+            ("26", F::NotADatabase),
+            ("11", F::NotADatabase),
+            ("1", F::InvalidStatement),
+            ("2", F::OtherFailure),
+            ("13", F::OtherFailure),
+        ];
+        for (code, expected) in rows {
+            assert_eq!(
+                classify_failure(DbEngine::Sqlite, &coded(Some(code))),
+                expected,
+                "SQLite code {code}"
+            );
+        }
+    }
+
+    /// Every PostgreSQL row, exact and class, classifies to its variant; an
+    /// exact row wins over its class.
+    #[test]
+    fn classify_failure_postgres_rows() {
+        use IpeDbFailure as F;
+        let rows = [
+            ("23505", F::UniqueViolation),
+            ("23503", F::ForeignKeyViolation),
+            ("23502", F::NotNullViolation),
+            ("23514", F::CheckViolation),
+            ("P0001", F::TriggerRaised),
+            ("23P01", F::OtherConstraint),
+            ("23000", F::OtherConstraint),
+            ("55P03", F::Busy),
+            ("40P01", F::Busy),
+            ("40001", F::Busy),
+            ("25006", F::ReadOnlyDatabase),
+            ("42501", F::AccessDenied),
+            ("28P01", F::AccessDenied),
+            ("28000", F::AccessDenied),
+            ("3D000", F::CannotOpen),
+            ("XX001", F::NotADatabase),
+            ("XX002", F::NotADatabase),
+            ("42P01", F::InvalidStatement),
+            ("42703", F::InvalidStatement),
+            ("42601", F::InvalidStatement),
+            ("42883", F::InvalidStatement),
+            ("08006", F::Unreachable),
+            ("08001", F::Unreachable),
+            ("22012", F::OtherFailure),
+            ("XX000", F::OtherFailure),
+            ("53300", F::OtherFailure),
+        ];
+        for (code, expected) in rows {
+            assert_eq!(
+                classify_failure(DbEngine::Postgres, &coded(Some(code))),
+                expected,
+                "SQLSTATE {code}"
+            );
+        }
+    }
+
+    /// The non-database `sqlx::Error` arms classify by variant.
+    #[test]
+    fn classify_failure_non_database_rows() {
+        use IpeDbFailure as F;
+        for engine in [DbEngine::Sqlite, DbEngine::Postgres] {
+            let rows = [
+                (sqlx::Error::PoolTimedOut, F::Busy),
+                (sqlx::Error::PoolClosed, F::Unreachable),
+                (sqlx::Error::Io(std::io::Error::other("io")), F::Unreachable),
+                (sqlx::Error::Tls("tls".into()), F::Unreachable),
+                (sqlx::Error::Configuration("cfg".into()), F::Unreachable),
+                (sqlx::Error::RowNotFound, F::OtherFailure),
+                (sqlx::Error::Protocol("p".to_owned()), F::OtherFailure),
+                (sqlx::Error::Decode("d".into()), F::OtherFailure),
+                (sqlx::Error::WorkerCrashed, F::OtherFailure),
+            ];
+            for (raw, expected) in rows {
+                assert_eq!(classify_failure(engine, &raw), expected, "{raw:?}");
+            }
+        }
+    }
+
+    /// A code from the other engine's space is `OtherFailure`, never a
+    /// neighbouring row.
+    #[test]
+    fn classify_failure_refuses_wrong_engine_codes() {
+        assert_eq!(
+            classify_failure(DbEngine::Postgres, &coded(Some("23505"))),
+            IpeDbFailure::UniqueViolation
+        );
+        assert_eq!(
+            classify_failure(DbEngine::Sqlite, &coded(Some("23505"))),
+            IpeDbFailure::OtherFailure
+        );
+        assert_eq!(
+            classify_failure(DbEngine::Sqlite, &coded(Some("2067"))),
+            IpeDbFailure::UniqueViolation
+        );
+        assert_eq!(
+            classify_failure(DbEngine::Postgres, &coded(Some("2067"))),
+            IpeDbFailure::OtherFailure
+        );
+    }
+
+    /// An absent, empty, non-numeric, out-of-range, overlong or oddly shaped
+    /// code is `OtherFailure`, never a primary-code match.
+    #[test]
+    fn classify_failure_refuses_malformed_codes() {
+        let seventeen = "23505234567890123";
+        assert_eq!(seventeen.len(), MAX_DB_FAILURE_CODE_LEN + 1);
+        let malformed = [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("99999999999"),
+            Some("-2067"),
+            Some(" 2067"),
+            Some("2067\n"),
+            Some("23505 "),
+            Some(seventeen),
+            Some("2350"),
+            Some("235050"),
+        ];
+        for engine in [DbEngine::Sqlite, DbEngine::Postgres] {
+            for code in malformed {
+                assert_eq!(
+                    classify_failure(engine, &coded(code)),
+                    IpeDbFailure::OtherFailure,
+                    "{engine:?} code {code:?}"
+                );
+            }
+        }
+        // The control: one step back inside the bound still reads its row.
+        assert_eq!(
+            classify_failure(DbEngine::Sqlite, &coded(Some("0000000000002067"))),
+            IpeDbFailure::UniqueViolation
+        );
+    }
+
+    /// One driver code per failure, each mapping to that failure.
+    const ONE_CODE_PER_FAILURE: [(DbEngine, &str, IpeDbFailure); 14] = [
+        (DbEngine::Sqlite, "2067", IpeDbFailure::UniqueViolation),
+        (
+            DbEngine::Postgres,
+            "23503",
+            IpeDbFailure::ForeignKeyViolation,
+        ),
+        (DbEngine::Sqlite, "1299", IpeDbFailure::NotNullViolation),
+        (DbEngine::Postgres, "23514", IpeDbFailure::CheckViolation),
+        (DbEngine::Sqlite, "1811", IpeDbFailure::TriggerRaised),
+        (DbEngine::Sqlite, "3091", IpeDbFailure::OtherConstraint),
+        (DbEngine::Sqlite, "517", IpeDbFailure::Busy),
+        (DbEngine::Sqlite, "1032", IpeDbFailure::ReadOnlyDatabase),
+        (DbEngine::Postgres, "28P01", IpeDbFailure::AccessDenied),
+        (DbEngine::Sqlite, "1038", IpeDbFailure::CannotOpen),
+        (DbEngine::Sqlite, "26", IpeDbFailure::NotADatabase),
+        (DbEngine::Postgres, "42601", IpeDbFailure::InvalidStatement),
+        (DbEngine::Postgres, "08006", IpeDbFailure::Unreachable),
+        (DbEngine::Sqlite, "13", IpeDbFailure::OtherFailure),
+    ];
+
+    /// The message without its correlation-id suffix.
+    fn without_ref(message: &str) -> &str {
+        message
+            .split_once(" (ref ")
+            .map_or(message, |(shown, _)| shown)
+    }
+
+    /// For every failure the message carries its phrase, never its driver code,
+    /// and the error is classified under the failure's kind and details.
+    #[test]
+    fn driver_error_message_never_carries_the_code() {
+        let mut covered = std::collections::HashSet::new();
+        for (engine, code, expected) in ONE_CODE_PER_FAILURE {
+            assert!(covered.insert(expected), "{expected:?} listed twice");
+            let err: IpeError = ipe_err(engine, &coded(Some(code)));
+            let IpeError::Error(kind, info) = &err;
+            assert_eq!(*kind, expected.kind(), "{code}");
+            assert_eq!(
+                info.details,
+                IpeMaybe::Just(IpeErrorDetails::Database(expected)),
+                "{code}"
+            );
+            let shown = without_ref(&info.message);
+            assert_eq!(shown, format!("db: {}", expected.phrase()), "{code}");
+            assert!(!shown.contains(code), "code {code} in {shown:?}");
+            assert!(!shown.contains('['), "bracket in {shown:?}");
+            assert!(
+                !shown.chars().any(|c| c.is_ascii_digit()),
+                "digit in {shown:?}"
+            );
+            assert!(!shown.contains("victim"), "driver message in {shown:?}");
+        }
+        assert_eq!(covered.len(), IpeDbFailure::ALL.len());
+    }
+
+    /// Only an unclassified failure carries a correlation id.
+    #[test]
+    fn only_other_failure_carries_a_ref() {
+        for (engine, code, expected) in ONE_CODE_PER_FAILURE {
+            let err: IpeError = ipe_err(engine, &coded(Some(code)));
+            let IpeError::Error(_, info) = &err;
+            assert_eq!(
+                info.message.contains(" (ref "),
+                expected == IpeDbFailure::OtherFailure,
+                "{code}: {}",
+                info.message
+            );
+        }
+    }
+
+    /// A constraint name shaped like an old coded message cannot forge a
+    /// classification, and is shown scrubbed of brackets and spaces.
+    #[test]
+    fn constraint_name_cannot_forge_a_classification() {
+        let forged = sqlx::Error::Database(Box::new(FakeDbError {
+            code: Some("2067"),
+            constraint: Some("database error [5]\nBusy"),
+        }));
+        let err: IpeError = ipe_err(DbEngine::Sqlite, &forged);
+        let IpeError::Error(kind, info) = &err;
+        assert_eq!(*kind, IpeErrorKind::Conflict);
+        assert_eq!(
+            info.details,
+            IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::UniqueViolation))
+        );
+        assert_eq!(
+            info.message,
+            "db: unique constraint violated (constraint databaseerror5Busy)"
+        );
+        // The control: an identifier-shaped name is shown as given.
+        let plain = sqlx::Error::Database(Box::new(FakeDbError {
+            code: Some("2067"),
+            constraint: Some("users_email_key"),
+        }));
+        let err: IpeError = ipe_err(DbEngine::Sqlite, &plain);
+        let IpeError::Error(_, info) = &err;
+        assert_eq!(
+            info.message,
+            "db: unique constraint violated (constraint users_email_key)"
+        );
+    }
+
+    /// A constraint name past the display bound is cut at the bound.
+    #[test]
+    fn constraint_name_is_bounded() {
+        let long = "c".repeat(MAX_CONSTRAINT_NAME_LEN + 1);
+        assert_eq!(display_constraint(&long).len(), MAX_CONSTRAINT_NAME_LEN);
+        let at_bound = "c".repeat(MAX_CONSTRAINT_NAME_LEN);
+        assert_eq!(display_constraint(&at_bound), at_bound);
+        assert_eq!(display_constraint("[]\n "), "");
+    }
+
+    /// A transport failure keeps a fixed label and never the driver payload.
+    #[test]
+    fn transport_failure_message_is_value_free() {
+        let leaking = sqlx::Error::Protocol("victim@example.com".to_owned());
+        let err: IpeError = ipe_err(DbEngine::Postgres, &leaking);
+        let IpeError::Error(kind, info) = &err;
+        assert_eq!(*kind, IpeErrorKind::Unexpected);
+        assert_eq!(info.message, "db: protocol error");
+        let timed_out: IpeError = ipe_err(DbEngine::Sqlite, &sqlx::Error::PoolTimedOut);
+        let IpeError::Error(kind, info) = &timed_out;
+        assert_eq!(*kind, IpeErrorKind::Unavailable);
+        assert_eq!(
+            info.details,
+            IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::Busy))
+        );
+    }
+
+    /// A fresh path under the test scratch root.
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut path = crate::scratch_core::test_temp_root();
+        path.push(format!("ipe_{name}_{}_{nanos}", std::process::id()));
+        path
+    }
+
+    /// The first failure of opening `path` and reading it: the open, else the
+    /// first query.
+    async fn first_failure(path: &std::path::Path) -> Option<IpeError> {
+        let opened: IpeResult<IpeError, Db> =
+            db_open("sqlite".to_owned(), path.display().to_string()).await;
+        match opened {
+            IpeResult::Err(e) => Some(e),
+            IpeResult::Ok(pool) => {
+                let read: IpeResult<IpeError, _> =
+                    db_query(pool, "SELECT * FROM sqlite_master".to_owned(), vec![]).await;
+                match read {
+                    IpeResult::Err(e) => Some(e),
+                    IpeResult::Ok(_) => None,
+                }
+            }
+        }
+    }
+
+    /// `Db.open` on a directory fails as `CannotOpen`.
+    #[tokio::test]
+    async fn open_on_a_directory_is_cannot_open() {
+        let dir = scratch_path("dir_db");
+        let made = std::fs::create_dir_all(&dir);
+        assert!(made.is_ok(), "{made:?}");
+        let failure = first_failure(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&failure, Some(IpeError::Error(IpeErrorKind::NotFound, info))
+                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen))),
+            "{failure:?}"
+        );
+    }
+
+    /// A file that is not a database fails as `NotADatabase`; a real database
+    /// file is the control.
+    #[tokio::test]
+    async fn open_on_a_non_database_file_is_not_a_database() {
+        let file = scratch_path("not_a_db");
+        let written = std::fs::write(&file, "this file is not a database ".repeat(64));
+        assert!(written.is_ok(), "{written:?}");
+        let failure = first_failure(&file).await;
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            matches!(&failure, Some(IpeError::Error(IpeErrorKind::Unexpected, info))
+                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::NotADatabase))),
+            "{failure:?}"
+        );
+        let fresh = scratch_path("real_db");
+        let control = first_failure(&fresh).await;
+        let _ = std::fs::remove_file(&fresh);
+        assert!(control.is_none(), "{control:?}");
     }
 
     /// A real PostgreSQL driver failure on a URL carrying credentials never
@@ -8270,11 +9173,11 @@ mod tests {
         );
         assert_eq!(
             app("SELECT pinf AS x FROM cells").await,
-            IpeResult::Err("db: column decode error at index 0".to_string())
+            IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
         );
         assert_eq!(
             app("SELECT ninf AS x FROM cells").await,
-            IpeResult::Err("db: column decode error at index 0".to_string())
+            IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
         );
 
         let external = |sql: &str| {
@@ -8291,7 +9194,7 @@ mod tests {
         );
         assert_eq!(
             external("SELECT pinf AS x FROM cells").await,
-            IpeResult::Err("db: column decode error at index 0".to_string())
+            IpeResult::Err("Unexpected: db: column decode error at index 0".to_string())
         );
     }
 
@@ -10500,20 +11403,28 @@ mod tests {
     /// Dial a fake TLS PostgreSQL server as `host` under `verify-full`, only
     /// through a relay pinned to the server's address.
     #[cfg(unix)]
-    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DbFailure>, Option<TlsSeen>) {
+    async fn dial_pg_tls_through_relay(host: &str) -> (Result<(), DriverFailure>, Option<TlsSeen>) {
+        let io_failure = || {
+            DriverFailure::of(
+                DbEngine::Postgres,
+                &sqlx::Error::Io(std::io::Error::other("test setup")),
+            )
+        };
         use sqlx::ConnectOptions;
         let listener = std::net::TcpListener::bind("127.0.0.1:0");
         assert!(listener.is_ok(), "{:?}", listener.as_ref().err());
         let Ok(listener) = listener else {
-            return (Err(DbFailure::Io), None);
+            return (Err(io_failure()), None);
         };
         let Ok(server) = listener.local_addr() else {
-            return (Err(DbFailure::Io), None);
+            return (Err(io_failure()), None);
         };
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let _sent = seen_tx.send(serve_one_pg_tls_client(&listener));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _sent = seen_tx.send(serve_one_pg_tls_client(&listener));
+            })
+            .expect("spawn test thread");
         let relay = crate::ssrf::PinnedRelay::open(
             crate::ssrf::VettedAddr::assume_vetted_for_test(server),
             5432,
@@ -10521,7 +11432,7 @@ mod tests {
         );
         assert!(relay.is_ok(), "{:?}", relay.as_ref().err());
         let Ok(relay) = relay else {
-            return (Err(DbFailure::Io), None);
+            return (Err(io_failure()), None);
         };
         let options = sqlx::postgres::PgConnectOptions::new()
             .host(host)
@@ -10535,8 +11446,11 @@ mod tests {
         let connected = tokio::time::timeout(limit, options.connect()).await;
         let outcome = match connected {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(DbFailure::of(&e)),
-            Err(_) => Err(DbFailure::PoolTimedOut),
+            Ok(Err(e)) => Err(DriverFailure::of(DbEngine::Postgres, &e)),
+            Err(_) => Err(DriverFailure::of(
+                DbEngine::Postgres,
+                &sqlx::Error::PoolTimedOut,
+            )),
         };
         let seen = tokio::time::timeout(limit, seen_rx)
             .await
@@ -10569,7 +11483,10 @@ mod tests {
     async fn relayed_tls_dial_refuses_a_certificate_for_another_name() {
         let (outcome, seen) = dial_pg_tls_through_relay("other.example.test").await;
         assert!(
-            matches!(outcome, Err(DbFailure::Tls | DbFailure::Io)),
+            matches!(
+                &outcome,
+                Err(f) if f.failure() == IpeDbFailure::Unreachable
+            ),
             "{outcome:?}"
         );
         assert!(
@@ -11591,7 +12508,10 @@ mod tests {
             pool.close().await;
             assert_eq!(
                 enforce_engine_floor_on(&pool).await,
-                Err(DbConnectError::VersionUnreadable(DbFailure::PoolClosed))
+                Err(DbConnectError::VersionUnreadable(DriverFailure::of(
+                    DbEngine::Sqlite,
+                    &sqlx::Error::PoolClosed
+                )))
             );
         }
     }
@@ -11619,9 +12539,10 @@ mod tests {
     #[test]
     fn engine_floor_query_failure_is_credential_free() {
         let raw = sqlx::Error::Io(std::io::Error::other(SECRET_URL));
-        let refused = DbConnectError::VersionUnreadable(DbFailure::of(&raw));
+        let refused =
+            DbConnectError::VersionUnreadable(DriverFailure::of(DbEngine::Postgres, &raw));
         assert_credential_free(&refused);
-        assert_eq!(refused.to_string(), "db: connection I/O error");
+        assert_eq!(refused.to_string(), "db: database unreachable");
     }
 
     /// The floors are stated once, in their consts: no doc comment in this file
@@ -11641,5 +12562,278 @@ mod tests {
                 "a comment restates the {engine} floor {rendered}; reference the const instead"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod like_prefix_tests {
+    use super::*;
+
+    fn text(s: &str) -> SqlParam {
+        SqlParam::Text(s.to_string())
+    }
+
+    fn pattern_of(raw: &str) -> Result<String, LikePrefixError> {
+        LikePrefix::parse(raw.to_string()).map(|p| p.like_pattern())
+    }
+
+    /// One in-memory SQLite connection holding `names(name TEXT NULL)`.
+    #[allow(clippy::expect_used)] // test fixture: a failed in-memory setup is a broken test host
+    async fn names_db(rows: &[Option<&str>]) -> Db {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        sqlx::query("CREATE TABLE names (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create table");
+        for row in rows {
+            sqlx::query("INSERT INTO names (name) VALUES (?)")
+                .bind(*row)
+                .execute(&pool)
+                .await
+                .expect("insert row");
+        }
+        pool
+    }
+
+    /// The sorted `name` values `frag` selects from `names`.
+    async fn names_where(db: &Db, frag: SqlFragment) -> Result<Vec<String>, String> {
+        let found: IpeResult<String, Vec<HashMap<String, String>>> =
+            db_find_where(db.clone(), "names".into(), frag).await;
+        match found {
+            IpeResult::Ok(rows) => {
+                let mut names: Vec<String> = rows
+                    .iter()
+                    .filter_map(|row| row.get("name").cloned())
+                    .collect();
+                names.sort();
+                Ok(names)
+            }
+            IpeResult::Err(e) => Err(e),
+        }
+    }
+
+    const U11_ROWS: [Option<&str>; 13] = [
+        Some("Acme-1"),
+        Some("acme-2"),
+        Some("ACME"),
+        Some("50%off"),
+        Some("50 cents"),
+        Some("500"),
+        Some("a_b-x"),
+        Some("axb-y"),
+        Some("!bang"),
+        Some("!x"),
+        Some("a\\b"),
+        Some("ab"),
+        None,
+    ];
+
+    #[test]
+    fn like_prefix_refuses_empty_with_full_text() {
+        assert!(matches!(
+            LikePrefix::parse(String::new()),
+            Err(LikePrefixError::Empty)
+        ));
+        assert_eq!(
+            LikePrefixError::Empty.message(),
+            "Sql.startsWith: the prefix is empty"
+        );
+    }
+
+    #[test]
+    fn like_prefix_refuses_nul_with_full_text() {
+        assert!(matches!(
+            LikePrefix::parse("a\0b".to_string()),
+            Err(LikePrefixError::Nul)
+        ));
+        assert_eq!(
+            LikePrefixError::Nul.message(),
+            "Sql.startsWith: the prefix contains a NUL character"
+        );
+    }
+
+    #[test]
+    fn like_prefix_length_ceiling_is_exact() {
+        assert!(matches!(
+            LikePrefix::parse("a".repeat(MAX_LIKE_PREFIX_BYTES + 1)),
+            Err(LikePrefixError::TooLong)
+        ));
+        assert_eq!(
+            LikePrefixError::TooLong.message(),
+            "Sql.startsWith: the prefix is longer than 16384 bytes"
+        );
+        assert_eq!(
+            pattern_of(&"a".repeat(MAX_LIKE_PREFIX_BYTES)).map(|p| p.len()),
+            Ok(MAX_LIKE_PREFIX_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn like_prefix_escapes_wildcards_and_the_escape_character() {
+        assert_eq!(pattern_of("50%"), Ok("50\\%%".to_string()));
+        assert_eq!(pattern_of("a_b"), Ok("a\\_b%".to_string()));
+        assert_eq!(pattern_of("\\x"), Ok("\\\\x%".to_string()));
+        assert_eq!(pattern_of("!x"), Ok("!x%".to_string()));
+        assert_eq!(pattern_of("ab"), Ok("ab%".to_string()));
+    }
+
+    #[test]
+    fn starts_with_renders_both_conjuncts_and_binds_the_prefix() {
+        let frag = sql_starts_with(sql_column("n".to_string()), "ab".to_string());
+        assert_eq!(
+            frag.sql,
+            "((n LIKE ? ESCAPE '\\') AND (substr(n, 1, length(?)) = ?))"
+        );
+        assert_eq!(frag.binds, vec![text("ab%"), text("ab"), text("ab")]);
+        assert_eq!(frag.invalid, None);
+    }
+
+    #[test]
+    fn starts_with_repeats_subject_binds_in_lockstep() {
+        let frag = sql_starts_with(sql_param("s".to_string()), "a%".to_string());
+        assert_eq!(
+            frag.sql,
+            "((? LIKE ? ESCAPE '\\') AND (substr(?, 1, length(?)) = ?))"
+        );
+        assert_eq!(
+            frag.binds,
+            vec![text("s"), text("a\\%%"), text("s"), text("a%"), text("a%")]
+        );
+    }
+
+    #[test]
+    fn starts_with_upstream_poison_wins() {
+        let frag = sql_starts_with(sql_column("bad name".to_string()), String::new());
+        assert_eq!(
+            frag.invalid,
+            Some("Sql.column: invalid identifier \"bad name\"".to_string())
+        );
+        assert_eq!(frag.sql, "");
+        assert!(frag.binds.is_empty());
+    }
+
+    #[test]
+    fn starts_with_refused_prefix_poisons_without_binds() {
+        let frag = sql_starts_with(sql_column("n".to_string()), "a\0".to_string());
+        assert_eq!(
+            frag.invalid,
+            Some("Sql.startsWith: the prefix contains a NUL character".to_string())
+        );
+        assert_eq!(frag.sql, "");
+        assert!(frag.binds.is_empty());
+    }
+
+    #[test]
+    fn text_prefix_equals_shape_is_the_tenant_shape() {
+        assert_eq!(
+            text_prefix_equals_sql("service_name"),
+            "substr(service_name, 1, length(?)) = ?"
+        );
+    }
+
+    #[tokio::test]
+    async fn starts_with_matches_the_literal_prefix_only() {
+        let db = names_db(&U11_ROWS).await;
+        let cases: [(&str, &[&str]); 8] = [
+            ("acme", &["acme-2"]),
+            ("50%", &["50%off"]),
+            ("a_b", &["a_b-x"]),
+            ("!b", &["!bang"]),
+            ("!x", &["!x"]),
+            ("a\\", &["a\\b"]),
+            ("ab", &["ab"]),
+            ("ACME", &["ACME"]),
+        ];
+        for (prefix, expected) in cases {
+            let exact = sql_starts_with(sql_column("name".to_string()), prefix.to_string());
+            let expected: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                names_where(&db, exact).await,
+                Ok(expected.clone()),
+                "{prefix:?}"
+            );
+
+            // The LIKE conjunct alone may only widen by ASCII case, never by a
+            // wildcard: every row it keeps starts with the prefix up to case.
+            let pattern = match pattern_of(prefix) {
+                Ok(pattern) => pattern,
+                Err(refused) => panic!("{prefix:?}: {refused:?}"),
+            };
+            let like_only =
+                match names_where(&db, sql_like(sql_column("name".to_string()), pattern)).await {
+                    Ok(names) => names,
+                    Err(e) => panic!("{prefix:?}: {e:?}"),
+                };
+            let folded = prefix.to_ascii_lowercase();
+            assert!(
+                like_only
+                    .iter()
+                    .all(|name| name.to_ascii_lowercase().starts_with(folded.as_str())),
+                "{prefix:?} -> {like_only:?}"
+            );
+            assert!(
+                expected.iter().all(|name| like_only.contains(name)),
+                "{prefix:?}"
+            );
+        }
+    }
+
+    /// `Sql.like` sends one engine-independent text, `ESCAPE '\'`, to SQLite and
+    /// Postgres alike; the Postgres rewrite keeping it intact is pinned in
+    /// `config_postgres_test`.
+    #[test]
+    fn like_escape_backslash_same_on_sqlite_and_postgres() {
+        let frag = sql_like(sql_column("n".to_string()), "a%".to_string());
+        assert_eq!(frag.sql, "(n LIKE ? ESCAPE '\\')");
+        assert_eq!(frag.binds, vec![text("a%")]);
+        assert_eq!(frag.invalid, None);
+    }
+
+    #[test]
+    fn like_pattern_ending_in_unpaired_escape_poisons() {
+        let frag = sql_like(sql_column("n".to_string()), "a\\".to_string());
+        assert_eq!(
+            frag.invalid,
+            Some("Sql.like: the pattern ends with the escape character \\".to_string())
+        );
+        assert_eq!(frag.sql, "");
+        assert!(frag.binds.is_empty());
+
+        let paired = sql_like(sql_column("n".to_string()), "a\\\\".to_string());
+        assert_eq!(paired.invalid, None);
+        assert_eq!(paired.binds, vec![text("a\\\\")]);
+    }
+
+    #[tokio::test]
+    async fn like_pattern_with_backslash_matches_literal() {
+        let db = names_db(&[Some("a%x"), Some("abx"), Some("a\\x"), Some("a_x")]).await;
+        let column = || sql_column("name".to_string());
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a\\%%".to_string())).await,
+            Ok(vec!["a%x".to_string()])
+        );
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a\\_%".to_string())).await,
+            Ok(vec!["a_x".to_string()])
+        );
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a\\\\%".to_string())).await,
+            Ok(vec!["a\\x".to_string()])
+        );
+        // Unescaped wildcards stay wildcards.
+        assert_eq!(
+            names_where(&db, sql_like(column(), "a_x".to_string())).await,
+            Ok(vec![
+                "a%x".to_string(),
+                "a\\x".to_string(),
+                "a_x".to_string(),
+                "abx".to_string()
+            ])
+        );
     }
 }

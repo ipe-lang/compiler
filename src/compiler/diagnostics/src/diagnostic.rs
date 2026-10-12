@@ -25,13 +25,13 @@ use crate::code::{
     IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033,
     IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042,
     IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050,
-    IPE_N0051, IPE_N0052, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012,
-    IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021,
-    IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062,
-    IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070,
-    IPE_S0001, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012,
-    IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020,
-    IPE_T0021, Severity,
+    IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011,
+    IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
+    IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
+    IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
+    IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003,
+    IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016,
+    IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
 use crate::terminal::TerminalSafe;
@@ -446,38 +446,53 @@ pub enum NameError {
     /// A bare value name resolves to nothing. [IPE-N0001]
     ValueNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// A type name is undefined. [IPE-N0002]
     TypeNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// A constructor is undefined/misspelled. [IPE-N0003]
     ConstructorNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// A qualifier names no module/import alias. [IPE-N0004]
     UnknownModule {
         qualifier: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
-    /// A KNOWN Tier-C stdlib qualifier is used without importing its module
-    /// (ADR 0001): `String.join` with no `import Ipe.String`. Distinct from
-    /// [`Self::UnknownModule`] (a genuinely unknown qualifier): here the module
-    /// exists and the fix is deterministic — add the named import. `qualifier` is
-    /// the short-name at the use site; `import_path` is the exact
-    /// `import` line to add (e.g. `Ipe.String`). [IPE-N0034]
-    StdlibImportRequired {
-        qualifier: Box<str>,
-        import_path: Box<str>,
+    /// A qualifier names a known module the importing module never imported.
+    ///
+    /// `String.join` with no `import Ipe.String`, or `Util.f` with no
+    /// `import Util`. Distinct from [`Self::UnknownModule`] (a genuinely unknown
+    /// qualifier): here the module exists and the fix is to add its import.
+    /// `reached` is how the use site reached the module; `candidates` holds
+    /// every importable module whose bare import binds that spelling, sorted
+    /// and deduplicated (never empty). `imported_as` is set when one of the
+    /// candidates IS imported, under an alias the use site did not write.
+    /// [IPE-N0034]
+    ImportRequired {
+        reached: StdlibReach,
+        candidates: Box<[Box<str>]>,
+        imported_as: Option<Box<ImportedAs>>,
+    },
+    /// An operator desugars into a call to a module the using module never
+    /// imported: `p |= q` with no `import Ipe.Parser`.
+    ///
+    /// `operator` is the spelling the use site wrote and `module` the one
+    /// module it desugars into; any import form of `module` brings `operator`
+    /// into reach. [IPE-N0034]
+    OperatorImportRequired {
+        operator: Box<str>,
+        module: Box<str>,
     },
     /// The qualifier resolves but the member is absent. [IPE-N0005]
     NoSuchMember {
         module: Box<str>,
         member: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// Two top-level values share a name; `first` is the earlier span. [IPE-N0010]
     DuplicateValue { name: Box<str>, first: Span },
@@ -497,7 +512,7 @@ pub enum NameError {
     /// `suggestions` lists close matches by Levenshtein distance. [IPE-N0020]
     ModuleNotFound {
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// The import graph for the project contains a cycle; `path` lists the
     /// module names in cycle order (last element imports the first). [IPE-N0021]
@@ -507,7 +522,7 @@ pub enum NameError {
     NameNotExposed {
         module: Box<str>,
         name: Box<str>,
-        suggestions: Box<[Box<str>]>,
+        suggestions: Candidates,
     },
     /// The `module` declaration at the top of a `.ipe` file does not match the
     /// path I derived from the file's location under `source_root`. [IPE-N0023]
@@ -618,6 +633,17 @@ pub enum NameError {
     /// import path; `imported_shape` and `app_shape` name the two shapes;
     /// `expected` is the correct import path for the app's shape. [IPE-N0035]
     WrongShapeCmdSub(Box<CmdSubShapeMismatch>),
+    /// One module imports two different TEA shape modules.
+    ///
+    /// A module builds at most one app shape, and each shape import brings
+    /// that shape's own `Cmd` / `Sub`, so a second shape has no denotation.
+    /// `first_module` is the earlier shape import (at `first`);
+    /// `second_module` is the import refused. [IPE-N0035]
+    TwoShapeImports {
+        first_module: Box<str>,
+        second_module: Box<str>,
+        first: Span,
+    },
     /// A surface binding that has been intentionally removed from the stdlib.
     /// `qualifier.name` is the call site; `replacement` is the migration hint
     /// (empty when no direct replacement exists). [IPE-N0036]
@@ -806,6 +832,24 @@ pub enum NameError {
         field: Box<str>,
         sub_module: Box<str>,
     },
+    /// A row-parameter argument of a type alias cannot extend the alias's record.
+    ///
+    /// `alias` is the alias applied (`Named` for `type alias Named r = { r |
+    /// name : String }`) and `fault` says why its row argument is refused.
+    /// [IPE-N0053]
+    AliasRowArgument {
+        alias: Box<str>,
+        fault: AliasRowFault,
+    },
+}
+
+/// Why a [`NameError::AliasRowArgument`] refuses a row-parameter argument.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AliasRowFault {
+    /// The argument is not a record or a type variable; `found` names it.
+    NotARecord { found: Box<str> },
+    /// The argument's record already has the alias's own label `field`.
+    FieldClash { field: Box<str> },
 }
 
 /// How a [`NameError::GenericAppEntry`] refusal relates the entry to its
@@ -924,6 +968,34 @@ pub enum SealRejection {
     /// an async/decoder type, a not-yet-classified builtin). Fail-closed: the
     /// conservative branch refuses it rather than guess.
     NotProvenPlain,
+}
+
+/// How a use site reached a module it never imported, reported by IPE-N0034.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StdlibReach {
+    /// A qualified reference `Qualifier.member`, by its qualifier spelling.
+    Qualifier(Box<str>),
+}
+
+impl StdlibReach {
+    /// The spelling the use site wrote.
+    #[must_use]
+    pub fn spelling(&self) -> &str {
+        match self {
+            Self::Qualifier(qualifier) => qualifier,
+        }
+    }
+}
+
+/// A candidate module the importing module already imports under an alias.
+///
+/// Boxed inside [`NameError::ImportRequired`] so `NameError` stays small.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ImportedAs {
+    /// The imported module path.
+    pub module: Box<str>,
+    /// The alias it is imported as.
+    pub alias: Box<str>,
 }
 
 /// The four names IPE-N0035 reports.
@@ -1661,6 +1733,21 @@ pub enum LowerError {
         /// The dotted kernel name that was partially applied (e.g. `Store.eq`).
         kernel: Box<str>,
     },
+    /// An intercept-only `Store.*` kernel was applied outside its rewrite context.
+    ///
+    /// `Store.add`, `Store.literal`, `Store.coalesce`, … have no runtime
+    /// function: `Store.select` reads them structurally as projection elements,
+    /// and the accessor leaves are rewritten only as a saturated direct call. A
+    /// call anywhere else (a plain forwarder `bump a b = Store.add a b`, an
+    /// over-application) would emit the never-defined placeholder symbol
+    /// (`store_add`, …), a `cargo` E0425. `kernel` is the dotted name; `context`
+    /// is the one place its rewrite runs. [IPE-L0146]
+    AccessorKernelOffIntercept {
+        /// The dotted kernel name that was misplaced (e.g. `Store.add`).
+        kernel: Box<str>,
+        /// The only context in which this kernel's rewrite runs.
+        context: InterceptContext,
+    },
     /// A kernel whose handler the backend re-wraps per call was used unsaturated.
     ///
     /// `Stream.stream` rebuilds its handler for every request and clones each
@@ -1752,6 +1839,36 @@ pub enum StoreEqAccessorDefect {
         /// The derived column name that failed the identifier charset gate.
         column: Box<str>,
     },
+}
+
+/// The only context in which an intercept-only `Store.*` kernel is rewritten.
+///
+/// Carried by [`LowerError::AccessorKernelOffIntercept`] so the help text is
+/// chosen by the kernel's role, never by matching its name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum InterceptContext {
+    /// A projection element (`Store.add`, `Store.literal`, `Store.upper`, …),
+    /// valid only as a direct element of a `Store.select` projection body.
+    SelectProjection,
+    /// An accessor leaf or builder (`Store.eq`, `Store.serial`, …), valid only
+    /// as a saturated direct call.
+    SaturatedCall,
+}
+
+/// Where an intercept-only `Store.*` kernel may appear, as one phrase.
+///
+/// The single wording source for [`InterceptContext`], shared by the help line
+/// and the rendered prose and label.
+#[must_use]
+pub const fn intercept_context_phrase(context: InterceptContext) -> &'static str {
+    match context {
+        InterceptContext::SelectProjection => {
+            "valid only as a direct element of a `Store.select` projection body"
+        }
+        InterceptContext::SaturatedCall => {
+            "valid only as a saturated direct call, with its accessor and every argument"
+        }
+    }
 }
 
 /// Why a `Store.select` projection lambda was rejected at lowering. Each variant
@@ -1921,6 +2038,26 @@ pub enum ConsentError {
         /// The pre-formatted risk disclosure (which modules, what risk).
         body: String,
     },
+    /// A disclosed browser web axis the top-level app has not granted
+    /// (`IPE-S0002`).
+    WebAxisUngranted {
+        /// The pre-formatted disclosure: each axis, the modules that disclose it,
+        /// and the remedy.
+        body: String,
+    },
+    /// A native `Rust.` crossing the top-level app has not granted
+    /// (`IPE-S0003`).
+    NativeCrossingUngranted {
+        /// The pre-formatted disclosure: each crate crossed, the modules that
+        /// cross it, and the remedy.
+        body: String,
+    },
+    /// A derived control model the declared `acceptsControl` set does not cover
+    /// (`IPE-S0004`).
+    ControlModelUncovered {
+        /// The pre-formatted refusal: the entry module, the model, and the remedy.
+        body: String,
+    },
 }
 
 // ===========================================================================
@@ -1963,8 +2100,8 @@ pub enum Diagnostic {
     Sandbox {
         msg: SandboxError,
     },
-    /// The unsafe-escape-hatch consent gate refused (`IPE-S0001`). Span-free:
-    /// the refusal is at build/run invocation time, not at a source location.
+    /// A consent gate refused (`IPE-S0001` through `IPE-S0004`). Span-free: the
+    /// refusal is at build/run invocation time, not at a source location.
     Consent {
         msg: ConsentError,
     },
@@ -2044,17 +2181,100 @@ pub enum Applicability {
 
 /// A typed, span-scoped source edit the compiler proposes as a fix.
 ///
-/// The span is the region to replace; `replacement` is the literal text to write
-/// there. Only [`Applicability::MachineApplicable`] suggestions are auto-applied;
-/// the others are shown but require explicit per-edit confirmation.
+/// The span is the region to replace; `replaces` is the text the producer
+/// expects to find there and `replacement` the literal text to write over it.
+/// An applier must refuse the edit when the source at `span` is not exactly
+/// `replaces`. Only [`Applicability::MachineApplicable`] suggestions are
+/// auto-applied; the others are shown but require explicit per-edit
+/// confirmation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Suggestion {
     /// The source region the edit replaces.
     pub span: Span,
+    /// The source text the edit expects to find at `span`.
+    pub replaces: Box<str>,
     /// The literal text to substitute for the region.
     pub replacement: Box<str>,
     /// How safe the edit is to apply automatically.
     pub applicability: Applicability,
+}
+
+/// A source region paired with the exact text a producer proved sits there.
+///
+/// The fields are private: a target is only built by [`Self::whole`],
+/// [`Self::prefix`] or [`Self::suffix`], which refuse a region whose width is
+/// not the text's length or that leaves its token. A machine-applicable edit
+/// therefore never inherits a wider diagnostic span, and an applier re-checks
+/// the expected text against the source before writing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EditTarget {
+    span: Span,
+    replaces: Box<str>,
+}
+
+impl EditTarget {
+    /// The whole of `token`, which must be exactly `text` wide.
+    #[must_use]
+    pub fn whole(token: Span, text: &str) -> Option<Self> {
+        let width = u32::try_from(text.len()).ok()?;
+        (token.hi.checked_sub(token.lo)? == width && width > 0).then(|| Self {
+            span: token,
+            replaces: text.into(),
+        })
+    }
+
+    /// The leading `text` of `token` (a qualifier of a qualified name).
+    #[must_use]
+    pub fn prefix(token: Span, text: &str) -> Option<Self> {
+        let width = u32::try_from(text.len()).ok()?;
+        let hi = token.lo.checked_add(width)?;
+        (width > 0 && hi <= token.hi).then(|| Self {
+            span: Span::new(token.lo, hi),
+            replaces: text.into(),
+        })
+    }
+
+    /// The trailing `text` of `token` (the member of a qualified name).
+    #[must_use]
+    pub fn suffix(token: Span, text: &str) -> Option<Self> {
+        let width = u32::try_from(text.len()).ok()?;
+        let lo = token.hi.checked_sub(width)?;
+        (width > 0 && lo >= token.lo).then(|| Self {
+            span: Span::new(lo, token.hi),
+            replaces: text.into(),
+        })
+    }
+}
+
+/// Ranked did-you-mean names for an unresolved name, plus where a fix may land.
+///
+/// `region` is `None` when the producer cannot prove the exact sub-span the
+/// replacement would overwrite (a type annotation carries one span for the
+/// whole annotation); such candidates only ever render as "did you mean"
+/// lines, never as an applicable edit.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Candidates {
+    /// The region a sole candidate replaces, when provable.
+    pub region: Option<EditTarget>,
+    /// The candidate names, best first.
+    pub names: Box<[Box<str>]>,
+}
+
+impl Candidates {
+    /// Candidates with a proven (or absent) replace region.
+    #[must_use]
+    pub const fn at(region: Option<EditTarget>, names: Box<[Box<str>]>) -> Self {
+        Self { region, names }
+    }
+
+    /// Candidates that are hints only: no region, so never machine-applicable.
+    #[must_use]
+    pub const fn hints(names: Box<[Box<str>]>) -> Self {
+        Self {
+            region: None,
+            names,
+        }
+    }
 }
 
 /// One line of help under a diagnostic. Names are carried as owned `Box<str>`;
@@ -2107,7 +2327,7 @@ impl Diagnostic {
             Self::CompilerBug { where_, .. } => bug_code(where_),
             Self::Ffi { msg } => ffi_code(msg),
             Self::Sandbox { msg } => sandbox_code(msg),
-            Self::Consent { .. } => IPE_S0001,
+            Self::Consent { msg } => consent_code(msg),
             Self::RegistryUnreachable { .. } => IPE_E0001,
         }
     }
@@ -2187,7 +2407,7 @@ impl Diagnostic {
     pub fn help(&self) -> Vec<HelpLine> {
         match self {
             Self::Parse { msg, .. } => parse_help(msg),
-            Self::Name { msg, span } => name_help(msg, *span),
+            Self::Name { msg, .. } => name_help(msg),
             Self::Type { msg, .. } => type_help(msg),
             Self::Lower { msg, .. } => lower_help(msg),
             Self::Ffi { msg } => ffi_help(msg),
@@ -2277,6 +2497,9 @@ const _: () = assert!(
         && matches!(ffi_code_family().family(), Family::Ffi)
         && matches!(bug_code_family().family(), Family::Internal)
         && matches!(IPE_S0001.family(), Family::Security)
+        && matches!(IPE_S0002.family(), Family::Security)
+        && matches!(IPE_S0003.family(), Family::Security)
+        && matches!(IPE_S0004.family(), Family::Security)
         && matches!(IPE_E0001.family(), Family::Environment),
     "diagnostic code family drift: a producer returns a code outside its family",
 );
@@ -2341,7 +2564,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::TypeNotFound { .. } => IPE_N0002,
         NameError::ConstructorNotFound { .. } => IPE_N0003,
         NameError::UnknownModule { .. } => IPE_N0004,
-        NameError::StdlibImportRequired { .. } => IPE_N0034,
+        NameError::ImportRequired { .. } | NameError::OperatorImportRequired { .. } => IPE_N0034,
         NameError::NoSuchMember { .. } => IPE_N0005,
         NameError::DuplicateValue { .. } => IPE_N0010,
         NameError::DuplicateConstructor { .. } => IPE_N0011,
@@ -2361,7 +2584,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::BuiltinTypeArity { .. } => IPE_N0031,
         NameError::TypeExpansionTooDeep { .. } => IPE_N0032,
         NameError::ProgramImportsTeaShape { .. } => IPE_N0033,
-        NameError::WrongShapeCmdSub(..) => IPE_N0035,
+        NameError::WrongShapeCmdSub(..) | NameError::TwoShapeImports { .. } => IPE_N0035,
         NameError::RemovedSurface { .. } => IPE_N0036,
         NameError::AssertedCallMalformed { .. } => IPE_N0038,
         NameError::BoundarySealIllegal { .. } => IPE_N0039,
@@ -2378,6 +2601,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::ScriptImportsShapeView { .. } => IPE_N0050,
         NameError::GenericAppEntry { .. } | NameError::UnpinnedAppEntry { .. } => IPE_N0051,
         NameError::InputFieldIsSubscription { .. } => IPE_N0052,
+        NameError::AliasRowArgument { .. } => IPE_N0053,
     })
 }
 
@@ -2433,7 +2657,8 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::WildcardAnyFieldTypeMismatch { .. } => IPE_L0143,
         LowerError::WildcardAnyArgNotRecord { .. } => IPE_L0144,
         LowerError::StoreEqAccessorInvalid(_) => IPE_L0145,
-        LowerError::PointFreeAccessorKernel { .. } => IPE_L0146,
+        LowerError::PointFreeAccessorKernel { .. }
+        | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
@@ -2539,7 +2764,7 @@ fn parse_help(msg: &ParseError) -> Vec<HelpLine> {
     }
 }
 
-fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
+fn name_help(msg: &NameError) -> Vec<HelpLine> {
     match msg {
         NameError::ValueNotFound { suggestions, .. }
         | NameError::TypeNotFound { suggestions, .. }
@@ -2547,12 +2772,13 @@ fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
         | NameError::UnknownModule { suggestions, .. }
         | NameError::NoSuchMember { suggestions, .. }
         | NameError::ModuleNotFound { suggestions, .. }
-        | NameError::NameNotExposed { suggestions, .. } => did_you_mean(suggestions, span),
+        | NameError::NameNotExposed { suggestions, .. } => did_you_mean(suggestions),
         NameError::DuplicateValue { first, .. }
         | NameError::DuplicateConstructor { first, .. }
         | NameError::DuplicateType { first, .. }
         | NameError::DuplicatePatternBinder { first, .. }
-        | NameError::DuplicateQualifier { first, .. } => vec![HelpLine::SecondarySpan {
+        | NameError::DuplicateQualifier { first, .. }
+        | NameError::TwoShapeImports { first, .. } => vec![HelpLine::SecondarySpan {
             span: *first,
             role: SpanRole::FirstDefinition,
         }],
@@ -2593,7 +2819,8 @@ fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
         | NameError::ServerModuleReachableFromWasmClient { .. }
         | NameError::TypeExpansionTooDeep { .. }
         | NameError::ProgramImportsTeaShape { .. }
-        | NameError::StdlibImportRequired { .. }
+        | NameError::ImportRequired { .. }
+        | NameError::OperatorImportRequired { .. }
         | NameError::RemovedSurface { .. }
         | NameError::AssertedCallMalformed { .. }
         | NameError::BoundarySealIllegal { .. }
@@ -2608,6 +2835,7 @@ fn name_help(msg: &NameError, span: Span) -> Vec<HelpLine> {
         | NameError::GenericAppEntry { .. }
         | NameError::UnpinnedAppEntry { .. }
         | NameError::InputFieldIsSubscription { .. }
+        | NameError::AliasRowArgument { .. }
         | NameError::WebInitPolyArg => Vec::new(), // no span-based help
     }
 }
@@ -2850,7 +3078,7 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::DevOnlyKernelInProduction { kernel } => vec![HelpLine::Note(
             format!(
                 "`{kernel}` is a development-only debugging tool. Remove it before \
-                 releasing, or switch to `ipe build` / `ipe run` for development. \
+                 releasing, or switch to `ipe dev build` / `ipe dev run` for development. \
                  To log in production, use `Io.eprintln` or `Log.info`."
             )
             .into_boxed_str(),
@@ -2905,6 +3133,9 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::WildcardAnyArgNotRecord { .. } => wildcard_any_arg_not_record_help(),
         LowerError::StoreEqAccessorInvalid(defect) => store_eq_accessor_invalid_help(defect),
         LowerError::PointFreeAccessorKernel { kernel } => point_free_accessor_kernel_help(kernel),
+        LowerError::AccessorKernelOffIntercept { kernel, context } => {
+            accessor_kernel_off_intercept_help(kernel, *context)
+        }
         LowerError::UnsaturatedHandlerKernel { kernel } => unsaturated_handler_kernel_help(kernel),
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
@@ -2966,6 +3197,29 @@ fn point_free_accessor_kernel_help(kernel: &str) -> Vec<HelpLine> {
              .field value`. If you need a function value (say for `List.map` or \
              `Result.map`), wrap it in a lambda that supplies the accessor: \
              `\\x -> {kernel} .field x`."
+        )
+        .into_boxed_str(),
+    )]
+}
+
+/// The help lines for [`LowerError::AccessorKernelOffIntercept`], factored out
+/// so [`lower_help`] stays a thin per-variant dispatcher.
+fn accessor_kernel_off_intercept_help(kernel: &str, context: InterceptContext) -> Vec<HelpLine> {
+    let phrase = intercept_context_phrase(context);
+    let fix = match context {
+        InterceptContext::SelectProjection => format!(
+            "move it into the projection lambda, for example \
+             `Store.select (\\( item, _ ) -> {kernel} item.price (Store.literal 1))`; \
+             outside a query, write the plain expression instead"
+        ),
+        InterceptContext::SaturatedCall => {
+            format!("apply it directly, for example `{kernel} .field value`")
+        }
+    };
+    vec![HelpLine::Note(
+        format!(
+            "`{kernel}` has no runtime function: the compiler rewrites it in place, \
+             so it is {phrase}. Here it is called somewhere else; {fix}."
         )
         .into_boxed_str(),
     )]
@@ -3213,56 +3467,67 @@ fn sandbox_help(msg: &SandboxError) -> Vec<HelpLine> {
              to enable the isolation jail for compiling untrusted crates"
                 .into(),
         )],
-        SandboxError::RunJail { .. } => vec![
-            HelpLine::Note(
-                "this program reaches native Rust code whose effects cannot be proven \
-                 safe; install bubblewrap (bwrap on Linux) or sandbox-exec (macOS) to \
-                 confine it"
-                    .into(),
-            ),
-            HelpLine::Note(
-                "set IPE_ALLOW_UNSANDBOXED=1 to run unconfined at your own risk \
-                 (never in CI)"
-                    .into(),
-            ),
-        ],
+        SandboxError::RunJail { .. } => vec![HelpLine::Note(
+            "this program reaches native Rust code whose effects cannot be proven \
+             safe; install bubblewrap (bwrap on Linux) or sandbox-exec (macOS) to \
+             confine it"
+                .into(),
+        )],
     }
 }
 
 fn consent_help(msg: &ConsentError) -> Vec<HelpLine> {
-    let remedy = HelpLine::Note(
-        "re-run with --accept-risks to take responsibility and proceed, or add \
-         `accept = [\"unsafe\"]` under [capabilities] in package.ipe for durable consent"
+    let unsafe_remedy = HelpLine::Note(
+        "add `accept = [\"unsafe\"]` under [capabilities] in package.ipe to take \
+         responsibility and proceed"
             .into(),
     );
     match msg {
         ConsentError::NonInteractive { .. } => vec![
-            remedy,
+            unsafe_remedy,
             HelpLine::Note(
                 "this is a non-interactive build; it will not prompt — \
-                 pre-accept with --accept-risks or the manifest token"
+                 pre-accept with the manifest token"
                     .into(),
             ),
         ],
-        ConsentError::InteractiveDenied { .. } => vec![remedy],
+        ConsentError::InteractiveDenied { .. } => vec![unsafe_remedy],
+        // The remedy for these refusals is part of the disclosed body: it names
+        // the manifest field and value to add.
+        ConsentError::WebAxisUngranted { .. }
+        | ConsentError::NativeCrossingUngranted { .. }
+        | ConsentError::ControlModelUncovered { .. } => Vec::new(),
+    }
+}
+
+/// The code each consent refusal carries.
+const fn consent_code(msg: &ConsentError) -> Code {
+    match msg {
+        ConsentError::NonInteractive { .. } | ConsentError::InteractiveDenied { .. } => IPE_S0001,
+        ConsentError::WebAxisUngranted { .. } => IPE_S0002,
+        ConsentError::NativeCrossingUngranted { .. } => IPE_S0003,
+        ConsentError::ControlModelUncovered { .. } => IPE_S0004,
     }
 }
 
 // --- did_you_mean ------------------------------------------------------------
 
-/// Turns already-sorted suggestion names into help lines. A single candidate is
-/// confident enough to offer as a [`Applicability::MachineApplicable`]
-/// suggestion over `span` (the misspelled name's region); two or more stay
-/// non-committal "did you mean" lines. The producer is responsible for the
-/// stable `(Levenshtein, name)` ordering.
-fn did_you_mean(suggestions: &[Box<str>], span: Span) -> Vec<HelpLine> {
-    match suggestions {
-        [only] => vec![HelpLine::Suggest(Suggestion {
-            span,
+/// Turns already-sorted candidates into help lines.
+///
+/// A single candidate with a proven [`EditTarget`] is confident enough to offer
+/// as a [`Applicability::MachineApplicable`] suggestion over exactly that
+/// region; any other shape (several candidates, or no provable region) stays a
+/// non-committal "did you mean" line per name. The producer is responsible for
+/// the stable `(Levenshtein, name)` ordering.
+fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
+    match (&*candidates.names, &candidates.region) {
+        ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
+            span: target.span,
+            replaces: target.replaces.clone(),
             replacement: only.clone(),
             applicability: Applicability::MachineApplicable,
         })],
-        many => many
+        (many, _) => many
             .iter()
             .map(|s| HelpLine::DidYouMean(s.clone()))
             .collect(),
@@ -3333,6 +3598,30 @@ mod code_family_tests {
             (
                 Diagnostic::Consent {
                     msg: ConsentError::NonInteractive {
+                        body: "test".to_owned(),
+                    },
+                },
+                Family::Security,
+            ),
+            (
+                Diagnostic::Consent {
+                    msg: ConsentError::WebAxisUngranted {
+                        body: "test".to_owned(),
+                    },
+                },
+                Family::Security,
+            ),
+            (
+                Diagnostic::Consent {
+                    msg: ConsentError::NativeCrossingUngranted {
+                        body: "test".to_owned(),
+                    },
+                },
+                Family::Security,
+            ),
+            (
+                Diagnostic::Consent {
+                    msg: ConsentError::ControlModelUncovered {
                         body: "test".to_owned(),
                     },
                 },

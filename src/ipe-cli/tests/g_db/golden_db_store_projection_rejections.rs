@@ -35,7 +35,11 @@ fn rejection_code(golden: &str) -> ipe_diagnostics::Code {
 /// Build `golden` and return the pipeline [`Diagnostic`] it was rejected with.
 ///
 /// A build that succeeds, or fails without a pipeline diagnostic, fails the
-/// test: the refusal is the property under proof.
+/// test: the refusal is the property under proof. Every caller gets the
+/// no-emission proof for free: a rejected build must never have written
+/// `src/main.rs`, so the diagnostic is proven to have stopped the pipeline
+/// before codegen, not merely to have been returned alongside an emitted
+/// crate.
 fn rejection_diagnostic(golden: &str) -> Diagnostic {
     let root = repo_root();
     let entry = fixture_entry(&root, golden);
@@ -43,10 +47,18 @@ fn rejection_diagnostic(golden: &str) -> Diagnostic {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
+    let diag = match ipe::build(&entry, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => *diag,
         other => panic!("{golden}: must be rejected with a pipeline diagnostic, got {other:?}"),
-    }
+    };
+
+    let emitted = out.join("src").join("main.rs");
+    assert!(
+        !emitted.exists(),
+        "{golden}: a rejected build must emit no Rust, but {} exists",
+        emitted.display()
+    );
+    diag
 }
 
 /// A SINGLE-column projection body that computes a value (`String.append …`)
@@ -125,6 +137,65 @@ fn arith_on_non_numeric_column_is_rejected() {
         code,
         ipe_diagnostics::IPE_T0001,
         "Store.add on a non-numeric column must fail with a type-mismatch IPE-T0001"
+    );
+}
+
+/// `Store.sub` applied to a non-numeric column (here `String`) must be
+/// rejected. `sub` shares `add`'s numeric-bounded type variable, so unifying
+/// a `String` operand against it is a type mismatch (IPE-T0001), fail-closed
+/// before lowering.
+#[test]
+fn sub_on_non_numeric_column_is_rejected() {
+    let code = rejection_code("db_store_projection_sub_non_numeric_rejected");
+    assert_eq!(
+        code,
+        ipe_diagnostics::IPE_T0001,
+        "Store.sub on a non-numeric column must fail with a type-mismatch IPE-T0001"
+    );
+}
+
+/// `Store.mul` applied to a non-numeric column (here `Bool`) must be
+/// rejected. `mul` shares `add`'s numeric-bounded type variable, so unifying
+/// a `Bool` operand against it is a type mismatch (IPE-T0001), fail-closed
+/// before lowering.
+#[test]
+fn mul_on_non_numeric_column_is_rejected() {
+    let code = rejection_code("db_store_projection_mul_non_numeric_rejected");
+    assert_eq!(
+        code,
+        ipe_diagnostics::IPE_T0001,
+        "Store.mul on a non-numeric column must fail with a type-mismatch IPE-T0001"
+    );
+}
+
+/// `Store.add` applied to two numeric columns of DIFFERENT numeric types
+/// (`Int` against `Float`) must be rejected. `add` shares ONE type variable
+/// across both operands, so an `Int`/`Float` pairing is a type mismatch
+/// (IPE-T0001) even though each operand alone is within the numeric bound.
+/// This proves the obligation ties both operands to the SAME numeric type,
+/// not merely to "numeric" independently.
+#[test]
+fn arith_mixed_numeric_operands_is_rejected() {
+    let code = rejection_code("db_store_projection_arith_mixed_numeric_rejected");
+    assert_eq!(
+        code,
+        ipe_diagnostics::IPE_T0001,
+        "Store.add over an Int operand and a Float operand must fail with a type-mismatch IPE-T0001"
+    );
+}
+
+/// `Store.coalesce` applied to two operands of DIFFERENT scalar types
+/// (`String` against `Bool`) must be rejected. `coalesce` shares ONE type
+/// variable across both operands, so a mismatched pair is a type mismatch
+/// (IPE-T0001) — this pins the docs' claim that `coalesce`'s operands must
+/// share one scalar type.
+#[test]
+fn coalesce_operand_type_mismatch_is_rejected() {
+    let code = rejection_code("db_store_projection_coalesce_mismatch_rejected");
+    assert_eq!(
+        code,
+        ipe_diagnostics::IPE_T0001,
+        "Store.coalesce over mismatched operand types must fail with a type-mismatch IPE-T0001"
     );
 }
 

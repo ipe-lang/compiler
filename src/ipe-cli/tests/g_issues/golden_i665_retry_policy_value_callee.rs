@@ -1,5 +1,5 @@
 //! Regression: `Task.retryOn` / `Task.withRetryOn` used in a pipe were
-//! type-checked (ipe exit 0) but then rejected by `ipe build` with IPE-L0107
+//! type-checked (ipe exit 0) but then rejected by `ipe dev build` with IPE-L0107
 //! (storing a function value in a record field).
 //!
 //! `Task.retryOn : (e -> Bool) -> RetryPolicy e -> RetryPolicy e` returns a
@@ -49,7 +49,7 @@ fn built(root: &Path, out: &Path) -> Result<(), ipe::CliError> {
 
 /// Emit assertion (default gate): the frontend must accept the piped
 /// `retryOn` program and emit its crate — the exit-0-then-cargo-fail this
-/// regression closed was invisible here (the failure was at emit/`ipe build`,
+/// regression closed was invisible here (the failure was at emit/`ipe dev build`,
 /// not at type-check), so an accept alone is not enough; see the SEAL test.
 #[test]
 fn retry_policy_value_callee_emits() {

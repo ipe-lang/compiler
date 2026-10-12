@@ -52,7 +52,7 @@ configPort raw =
     Result.withDefault Net.min (Net.fromInt raw)
 ```
 
-Running it (`ipe run`) accepts the in-range ports, rejects `0`, `70000`, and `-1`,
+Running it (`ipe dev run`) accepts the in-range ports, rejects `0`, `70000`, and `-1`,
 and shows the default fallback:
 
 ```

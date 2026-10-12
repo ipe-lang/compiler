@@ -12,7 +12,7 @@
 //!
 //! ## What is tested
 //!
-//! * `ipe build` compiles `tests/golden/ui_mediaquery/Main.ipe`
+//! * `ipe dev build` compiles `tests/golden/ui_mediaquery/Main.ipe`
 //!   (canon → types → lower → Rust backend) — i.e. `Ui.mediaQuery` is a
 //!   backed kernel end to end, not a reachable-but-unbacked reserved member.
 //! * The emitted Rust project `cargo build`s and the binary runs and exits 0.
@@ -60,7 +60,7 @@ fn ui_mediaquery_compiles_builds_and_renders_markers() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for ui_mediaquery: {:?}",
+        "ipe dev build must succeed for ui_mediaquery: {:?}",
         built.err()
     );
 

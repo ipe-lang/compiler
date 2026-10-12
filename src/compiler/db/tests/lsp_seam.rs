@@ -7,10 +7,10 @@
 //! JSON-RPC framing, or editor integration — it proves the salsa database
 //! `ipe_db` already ships is directly reusable, unmodified, by an LSP-shaped
 //! request loop: in-memory buffer inputs (no disk read), `Send`-safe
-//! cross-thread reuse (one worker thread per demand, exactly `ipe watch`'s
+//! cross-thread reuse (one worker thread per demand, exactly `ipe dev watch`'s
 //! orchestrator/worker split — see `crates/ipe/src/watch.rs`'s own doc
 //! comment), and salsa's own cancellation firing on a `typecheck` demand
-//! exactly as it already does on `ipe watch`'s `compile_prepared`
+//! exactly as it already does on `ipe dev watch`'s `compile_prepared`
 //! (`crates/ipe/tests/watch_cancellation.rs`).
 //!
 //! Nothing in `ipe_db` needs to change for this: [`ipe_db::SourceFile`] /
@@ -67,7 +67,7 @@ const ENTRY_TYPE_ERROR: &str = "module Main exposing (main)\n\nimport A exposing
 
 /// The LSP's request loop must be able to hand a database clone to a
 /// worker thread per demand (exactly [`ipe_db::IpeDatabase`]'s existing
-/// `Clone` + `ipe watch`'s orchestrator/worker split). This is a
+/// `Clone` + `ipe dev watch`'s orchestrator/worker split). This is a
 /// compile-time assertion, not a runtime one: if a future change to
 /// `SharedInterner` or the `salsa::Storage<IpeDatabase>` field ever made the
 /// database `!Send`, this line fails to compile rather than the property
@@ -98,7 +98,7 @@ fn lsp_shaped_buffer_edit_drives_diagnostics_and_navigation_in_memory() {
     let root = root_of(&db, &[(&["A"], a), (&["Main"], entry)]);
 
     // Diagnostics: `typecheck` is the same coarse per-program seam `ipe
-    // watch` already consumes (§9 of the spec) — an LSP's
+    // dev watch` already consumes (§9 of the spec) — an LSP's
     // publishDiagnostics push would demand exactly this.
     let solved = ipe_db::typecheck(&db, root, entry)
         .clone()
@@ -129,7 +129,7 @@ fn lsp_shaped_buffer_edit_drives_diagnostics_and_navigation_in_memory() {
 
     // Keystroke: the editor edits the OPEN buffer in place, introducing a
     // real type error. This is the exact `set_text_if_changed` call
-    // `sync_source_root` makes for a disk-driven `ipe watch` edit — here fed
+    // `sync_source_root` makes for a disk-driven `ipe dev watch` edit — here fed
     // straight from the in-memory buffer text, no file write in between.
     assert!(
         ipe_db::set_text_if_changed(&mut db, entry, ENTRY_TYPE_ERROR),
@@ -157,14 +157,14 @@ fn lsp_shaped_buffer_edit_drives_diagnostics_and_navigation_in_memory() {
 // ---------------------------------------------------------------------------
 // (c) Cancellation on the next keystroke, using the LSP's own diagnostics
 // query directly (not `ipe::compile_prepared`) — proving the cancellation
-// mechanism already wired for `ipe watch` is genuinely query-agnostic.
+// mechanism already wired for `ipe dev watch` is genuinely query-agnostic.
 // ---------------------------------------------------------------------------
 
 /// Mirrors `crates/ipe/tests/watch_cancellation.rs`'s
 /// `compile_worker_is_cancelled_by_a_concurrent_input_edit`, but against
 /// [`ipe_db::typecheck`] directly (the LSP's own diagnostics demand) rather
 /// than `ipe::compile_prepared` — proving the cancellation mechanism is a
-/// property of the DATABASE, not of `ipe watch`'s particular call chain, so
+/// property of the DATABASE, not of `ipe dev watch`'s particular call chain, so
 /// the LSP inherits it for free.
 ///
 /// Deterministic, no wall-clock race (same technique as the watch proof):
@@ -205,14 +205,16 @@ fn lsp_diagnostics_query_is_cancelled_by_the_next_keystroke_and_converges_to_lat
 
     // The LSP demands diagnostics for the open buffer on a background
     // worker thread — never on the request-loop thread itself — holding a
-    // CLONED database handle, exactly `ipe watch`'s orchestrator/worker
+    // CLONED database handle, exactly `ipe dev watch`'s orchestrator/worker
     // split (see the doc comment in `crates/ipe/src/watch.rs`).
     let db_worker = db.clone();
-    let worker = thread::spawn(move || {
-        salsa::Cancelled::catch(AssertUnwindSafe(|| {
-            ipe_db::typecheck(&db_worker, root, entry).clone()
-        }))
-    });
+    let worker = thread::Builder::new()
+        .spawn(move || {
+            salsa::Cancelled::catch(AssertUnwindSafe(|| {
+                ipe_db::typecheck(&db_worker, root, entry).clone()
+            }))
+        })
+        .expect("spawn test thread");
 
     first_exec_rx
         .recv_timeout(Duration::from_secs(10))

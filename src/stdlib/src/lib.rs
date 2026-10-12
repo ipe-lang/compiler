@@ -445,11 +445,11 @@ const STD_LIVE_HEAD: &str = include_str!("../Ipe/Web/Head.ipe");
 /// compiled-source Layer-3.
 ///
 /// The single member `unsafeJsonLd` is a pure-Ipê definition over the `Html`
-/// kernel qualifier (`Html.script`/`Html.text`) — the same body it had on
-/// `Ipe.Web.Head`; only the surface home moved here so the raw-script sink no
-/// longer resolves off a plain `Ipe.Web.Head` import. Importing this dotted
-/// `Ipe.<M>.Unsafe` submodule discloses the `unsafe` capability. The emitted
-/// output and the render sink are unchanged. `Ipe.Web.Head.Unsafe` is NOT in
+/// kernel qualifier (`Html.script` over an `Ipe.Html.Unsafe.unsafeRaw` body, as
+/// the safe surface refuses a text-bodied `<script>`), homed here so the
+/// raw-script sink never resolves off a plain `Ipe.Web.Head` import. Importing
+/// this dotted `Ipe.<M>.Unsafe` submodule discloses the `unsafe` capability.
+/// `Ipe.Web.Head.Unsafe` is NOT in
 /// `STDLIB_MODULE_QUALIFIERS` (no kernel qualifier), so the disjointness
 /// invariant holds.
 const STD_LIVE_HEAD_UNSAFE: &str = include_str!("../Ipe/Web/Head/Unsafe.ipe");
@@ -1492,9 +1492,9 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
         source: STD_LIVE_HEAD,
     },
     // Ipe.Web.Head.Unsafe — Layer-3 source; the single `unsafeJsonLd` verbatim
-    // JSON-LD `<script>` hatch, relocated out of `Ipe.Web.Head`. Its body is pure
-    // Ipê over the `Html` kernel qualifier — no new kernel. Importing it discloses
-    // the `unsafe` capability.
+    // JSON-LD `<script>` hatch. Its body is pure Ipê over the `Html` kernel
+    // qualifier and `Ipe.Html.Unsafe.unsafeRaw` — no new kernel. Importing it
+    // discloses the `unsafe` capability.
     CompiledStdModule {
         dotted: "Ipe.Web.Head.Unsafe",
         source: STD_LIVE_HEAD_UNSAFE,
@@ -2196,6 +2196,17 @@ mod tests {
             .collect()
     }
 
+    /// The module `|=` / `|.` desugar into is an embedded module under exactly
+    /// the name the syntax crate declares.
+    #[test]
+    fn the_parser_operator_module_is_embedded_under_its_declared_name() {
+        let declared = ipe_syntax::fixity::PARSER_OPERATOR_MODULE.dotted();
+        assert!(
+            COMPILED_STD_MODULES.iter().any(|m| m.dotted == declared),
+            "no embedded module is named {declared}"
+        );
+    }
+
     /// Every embedded `Ipe` module must PARSE with the same front end that
     /// reads user code — the proof that the compiler can read its own embedded
     /// standard library (the foundation the import resolver builds on).
@@ -2389,9 +2400,11 @@ mod tests {
     /// body, which fails name-resolution at every call site. Catching it here makes
     /// a declared-but-homeless export a build-time (CI) failure, pre-cargo.
     ///
-    /// Scope: VALUES only. An exported TYPE may legitimately be a kernel-provided
-    /// opaque (e.g. `Ipe.Path`'s `Path`) with no source declaration — its home is
-    /// the kernel registry, which this parse-only check cannot see. The deeper
+    /// An uppercase item names a type: a local union or alias, an import's
+    /// re-export, or a reserved builtin (e.g. `Ipe.Path`'s `Path`, a
+    /// kernel-provided opaque with no source declaration). An uppercase item that
+    /// is none of these — a constructor or an uppercase value spelled bare —
+    /// exports nothing, so it is refused here. The deeper
     /// "every export — types included — resolves through the real pipeline" guard
     /// is `compiled_source_modules_resolve_all_exports` in the `ipe` crate, which
     /// canonicalises each module against the kernel env. `exposing (..)` (export
@@ -2430,17 +2443,33 @@ mod tests {
             };
 
             for item in exposed {
-                if let Exposed::Value(name) = &item.value {
-                    let local = parsed.values.iter().any(|v| v.value.name.value == *name);
-                    let rendered = interner.resolve(*name).unwrap_or("<?>");
-                    assert!(
-                        local || imported(*name),
-                        "{}: exports value `{rendered}` but the module neither \
-                         defines a top-level binding for it nor re-exports it \
-                         from an import — a declared-but-homeless export \
-                         (source-vs-kernel drift)",
-                        m.dotted,
-                    );
+                match &item.value {
+                    Exposed::Value(name) => {
+                        let local = parsed.values.iter().any(|v| v.value.name.value == *name);
+                        let rendered = interner.resolve(*name).unwrap_or("<?>");
+                        assert!(
+                            local || imported(*name),
+                            "{}: exports value `{rendered}` but the module neither \
+                             defines a top-level binding for it nor re-exports it \
+                             from an import — a declared-but-homeless export \
+                             (source-vs-kernel drift)",
+                            m.dotted,
+                        );
+                    }
+                    Exposed::Type(name, _) => {
+                        let rendered = interner.resolve(*name).unwrap_or("<?>");
+                        let local = parsed.unions.iter().any(|u| u.value.name.value == *name)
+                            || parsed.aliases.iter().any(|a| a.value.name.value == *name);
+                        assert!(
+                            local
+                                || imported(*name)
+                                || ipe_canon::is_reserved_builtin_type_name(rendered),
+                            "{}: exposes `{rendered}` but declares no type or alias \
+                             of that name, re-exports none, and it is no reserved \
+                             builtin — the item exports nothing",
+                            m.dotted,
+                        );
+                    }
                 }
             }
         }
@@ -2787,5 +2816,133 @@ mod tests {
             "no axis may fall back to `Decode.succeed Nothing` — it swallows a \
              wrong-type value into `Nothing`, the fail-open boundary of #2692",
         );
+    }
+
+    /// Canonicalise `src` as the project module `Main` over `catalog`.
+    fn canon_main(
+        src: &str,
+        catalog: &ipe_canon::ModuleCatalog,
+    ) -> Result<(), ipe_diagnostics::Diagnostic> {
+        let mut interner = Interner::new();
+        let parsed = ipe_parse::parse_module(src, &mut interner)?;
+        let expected = parsed.name.value.clone();
+        ipe_canon::canonicalise_module_in_project(
+            &parsed,
+            &expected,
+            &std::collections::BTreeMap::new(),
+            catalog,
+            ipe_canon::ModuleOrigin::User,
+            &mut interner,
+        )
+        .map(drop)
+    }
+
+    /// The candidate modules of an IPE-N0034, or `None` for any other outcome.
+    fn import_candidates(result: &Result<(), ipe_diagnostics::Diagnostic>) -> Option<Vec<&str>> {
+        match result {
+            Err(ipe_diagnostics::Diagnostic::Name {
+                msg: ipe_diagnostics::NameError::ImportRequired { candidates, .. },
+                ..
+            }) => Some(candidates.iter().map(|m| &**m).collect()),
+            _ => None,
+        }
+    }
+
+    /// Every qualifier a catalog module's bare import binds, used unimported,
+    /// is the must-import diagnostic listing EXACTLY the catalog modules whose
+    /// bare import binds it — over a catalog built the way the build driver
+    /// builds it (kernel paths + compiled-source modules + the project).
+    ///
+    /// Iterates the whole catalog, so a module added later that shares a
+    /// qualifier with another (the kernel `Ipe.Tea.Tui` and the compiled
+    /// `Ipe.Ui.Tui` both bind `Tui`) is checked by construction: a candidate
+    /// set built from one table, a first match, or a last-segment-keyed map
+    /// drops one and goes red here.
+    #[test]
+    fn compiled_std_modules_are_in_the_catalog() {
+        let catalog = ipe_canon::ModuleCatalog::new(
+            std::iter::once(Box::<str>::from("Main")).chain(
+                COMPILED_STD_MODULES
+                    .iter()
+                    .map(|module| Box::<str>::from(module.dotted)),
+            ),
+        );
+        let qualifiers: std::collections::BTreeSet<&str> = catalog
+            .paths()
+            .flat_map(|module| {
+                let segments: Vec<&str> = module.split('.').collect();
+                let canonical = ipe_canon::stdlib_canonical_qualifier(&segments);
+                module.rsplit('.').next().into_iter().chain(canonical)
+            })
+            .filter(|qualifier| *qualifier != "Main")
+            .collect();
+        let mut shared = 0usize;
+        for qualifier in qualifiers {
+            // `Cmd` / `Sub` belong to the shape modules: an unimported use names
+            // the four shapes to import, not every module whose bare import
+            // happens to end in `Cmd` / `Sub`.
+            let expected: Vec<&str> = if matches!(qualifier, "Cmd" | "Sub") {
+                vec![
+                    "Ipe.Tea.Cli",
+                    "Ipe.Tea.Tui",
+                    "Ipe.Tea.Web",
+                    "Ipe.Tea.Worker",
+                ]
+            } else {
+                catalog
+                    .paths()
+                    .filter(|module| *module != "Main")
+                    .filter(|module| ipe_canon::bare_import_binds(module, qualifier))
+                    .collect()
+            };
+            if expected.is_empty() {
+                continue;
+            }
+            let src = format!("module Main exposing (main)\n\nmain =\n    {qualifier}.x\n");
+            let result = canon_main(&src, &catalog);
+            // An ambient qualifier resolves with no import, so it never raises
+            // IPE-N0034 and builds no candidate list.
+            if matches!(
+                &result,
+                Ok(())
+                    | Err(ipe_diagnostics::Diagnostic::Name {
+                        msg: ipe_diagnostics::NameError::NoSuchMember { .. },
+                        ..
+                    })
+            ) {
+                continue;
+            }
+            if expected.len() > 1 {
+                shared += 1;
+            }
+            assert_eq!(
+                import_candidates(&result).as_deref(),
+                Some(&expected[..]),
+                "{qualifier}.x unimported must be IPE-N0034 naming every binding \
+                 module, sorted: {result:?}"
+            );
+        }
+        assert!(
+            shared > 0,
+            "the catalog has a qualifier two modules bind (`Tui`); the check above \
+             must exercise it"
+        );
+        let tui = canon_main(
+            "module Main exposing (main)\n\nmain =\n    Tui.x\n",
+            &catalog,
+        );
+        assert_eq!(
+            import_candidates(&tui).as_deref(),
+            Some(&["Ipe.Tea.Tui", "Ipe.Ui.Tui"][..]),
+            "{tui:?}"
+        );
+        for module in COMPILED_STD_MODULES {
+            let qualifier = module.dotted.rsplit('.').next().unwrap_or(module.dotted);
+            assert!(
+                ipe_canon::bare_import_binds(module.dotted, qualifier),
+                "a compiled-source module binds its last segment: {}",
+                module.dotted
+            );
+        }
     }
 }

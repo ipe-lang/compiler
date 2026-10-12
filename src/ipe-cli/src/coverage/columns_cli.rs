@@ -183,9 +183,16 @@ fn bare_flag_token(synopsis: &str) -> &str {
 /// a `"…"` token is counted. This is sufficient for the coverage probe: we are
 /// looking for the command/flag name as a literal string, not for a specific
 /// call site shape.
+///
+/// Two literals that follow each other as consecutive argv words (`"dev",
+/// "build"`, `.arg("dev").arg("build")`) are also recorded joined by a space,
+/// so a grouped verb named `dev build` counts as invoked by a test that passes
+/// it as two argv elements.
 fn collect_string_literals(src: &str, out: &mut BTreeSet<String>) {
     let mut rest = src;
+    let mut previous: Option<&str> = None;
     while let Some(pos) = rest.find('"') {
+        let gap = rest.get(..pos).unwrap_or("");
         // Step past the opening quote.
         let Some(after) = rest.get(pos + 1..) else {
             break;
@@ -194,14 +201,36 @@ fn collect_string_literals(src: &str, out: &mut BTreeSet<String>) {
         // Find the closing quote (naive: ignores backslash-escapes for our
         // purpose — we match whole words, not the exact literal value).
         let end = rest.find('"').unwrap_or(rest.len());
-        if let Some(content) = rest.get(..end) {
+        let content = rest.get(..end);
+        if let Some(content) = content
+            && content.len() <= 64
+        {
             // Only short tokens are plausible command/flag names.
-            if content.len() <= 64 {
-                out.insert(content.to_owned());
+            out.insert(content.to_owned());
+            if let Some(first) = previous
+                && is_argv_separator(gap)
+            {
+                out.insert(format!("{first} {content}"));
             }
         }
+        previous = content.filter(|c| c.len() <= 64);
         rest = rest.get(end + 1..).unwrap_or("");
     }
+}
+
+/// Whether the source text between two literals only separates argv words:
+/// commas, whitespace, `.to_owned()` / `.into()` conversions, and
+/// `.arg(` / `)` call punctuation.
+fn is_argv_separator(gap: &str) -> bool {
+    let stripped = gap
+        .replace(".to_owned()", "")
+        .replace(".to_string()", "")
+        .replace(".into()", "")
+        .replace(".arg(", "");
+    !stripped.is_empty()
+        && stripped
+            .chars()
+            .all(|c| c == ',' || c == ')' || c.is_whitespace())
 }
 
 /// Whether `path` is a coverage-module file (excluded from the test scan so
@@ -361,4 +390,32 @@ fn rs_files_under(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grouped verb passed as two consecutive argv words is recorded under its
+    /// joined name; two literals separated by other code are not joined.
+    #[test]
+    fn consecutive_argv_literals_are_joined() {
+        let mut found = BTreeSet::new();
+        collect_string_literals(
+            "run(&[\"dev\", \"build\"]); cmd.arg(\"release\")\n    .arg(\"run\"); \
+             vec![\"release\".to_owned(), \"eject\".to_owned()]; \
+             let a = \"dev\"; let b = \"watch\";",
+            &mut found,
+        );
+        for joined in ["dev build", "release run", "release eject"] {
+            assert!(
+                found.contains(joined),
+                "`{joined}` must be recorded: {found:?}"
+            );
+        }
+        assert!(
+            !found.contains("dev watch"),
+            "literals split by other code must not join: {found:?}"
+        );
+    }
 }

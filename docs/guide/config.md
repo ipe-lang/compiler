@@ -70,7 +70,7 @@ report label toml =
             label ++ ": rejected (typed decode error)"
 ```
 
-Running it (`ipe run`) over a valid and a broken document prints:
+Running it (`ipe dev run`) over a valid and a broken document prints:
 
 ```
 valid : OK 0.0.0.0:8080 debug=on tags=web,api

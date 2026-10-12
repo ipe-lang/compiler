@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ipe = { path = "../../src/ipe-cli" }
+ipe_docs = { path = "../../src/ipe-docs" }
 serde_json = "1"
 
 [lints]

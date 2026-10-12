@@ -39,7 +39,7 @@ fn db_store_rename_column_emits() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the rename program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the rename program, got: {built:?}"
     );
 }
 
@@ -62,7 +62,7 @@ fn db_store_rename_column_runs_and_matches() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the rename program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the rename program, got: {built:?}"
     );
 
     let outcome = crate::support::build_and_run_emitted(GOLDEN, &out);

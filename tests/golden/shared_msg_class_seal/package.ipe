@@ -1,0 +1,10 @@
+module Package exposing (package)
+
+import Ipe.Package exposing (..)
+
+
+package : Package
+package =
+    { name = "shared_msg_class_seal"
+    , version = "0.1.0"
+    }

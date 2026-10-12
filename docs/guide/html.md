@@ -44,7 +44,7 @@ commentCard author body =
         ]
 ```
 
-Rendering a card whose author is `<script>steal()</script>` (`ipe run`) produces:
+Rendering a card whose author is `<script>steal()</script>` (`ipe dev run`) produces:
 
 ```html
 <div class="comment"><p class="author">&lt;script&gt;steal()&lt;/script&gt;</p><p class="body">Nice article!</p></div>

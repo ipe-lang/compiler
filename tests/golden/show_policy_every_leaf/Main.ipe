@@ -1,0 +1,82 @@
+module Main exposing (main)
+
+import Ipe.Bytes as Bytes
+import Ipe.Char as Char
+import Ipe.Db.Dsn as Dsn exposing (Dsn)
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Regex as Regex
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+-- Every constructible leaf renders through its own show row: a `Value` leaf
+-- shows its value, a `Redacted` leaf a fixed marker, an `Internals` leaf its
+-- `<Module.Type>` marker. The DSN password sentinel never reaches the output.
+type alias Held =
+    { c : Char, s : Set Int, b : Bytes }
+
+
+type Holder
+    = HoldsBytes Bytes
+    | HoldsRegex Regex
+    | HoldsDsn Dsn
+    | HoldsChar Char
+
+
+bytes : Bytes
+bytes =
+    Bytes.fromString "hello"
+
+
+held : Held
+held =
+    { c = Char.fromCode 120, s = Set.fromList [ 1 ], b = bytes }
+
+
+task : Task Error Int
+task =
+    Task.succeed 1
+
+
+regexLines : List String
+regexLines =
+    case Regex.compile "a+b" of
+        Ok re ->
+            [ "regex: " ++ errorToString re
+            , "holds regex: " ++ errorToString (HoldsRegex re)
+            ]
+
+        Err _ ->
+            [ "regex: UNEXPECTED-ERR" ]
+
+
+dsnLines : List String
+dsnLines =
+    case Dsn.parse "postgres://reader:hunter2SENTINEL@db.example.com:5432/appdb" of
+        Ok dsn ->
+            [ "dsn: " ++ errorToString dsn
+            , "holds dsn: " ++ errorToString (HoldsDsn dsn)
+            ]
+
+        Err _ ->
+            [ "dsn: UNEXPECTED-ERR" ]
+
+
+main =
+    Io.println
+        (String.join "\n"
+            ([ "char: " ++ errorToString (Char.fromCode 120)
+             , "set: " ++ errorToString (Set.fromList [ 3, 1, 2 ])
+             , "bytes: " ++ errorToString bytes
+             , "task: " ++ errorToString task
+             , "record: " ++ errorToString held
+             , "holds bytes: " ++ errorToString (HoldsBytes bytes)
+             , "holds char: " ++ errorToString (HoldsChar (Char.fromCode 120))
+             ]
+                ++ regexLines
+                ++ dsnLines
+            )
+        )

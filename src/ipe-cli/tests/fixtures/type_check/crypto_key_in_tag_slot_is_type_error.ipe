@@ -1,0 +1,19 @@
+module Main exposing (main)
+
+import Ipe.Crypto as Crypto
+import Ipe.Io as Io
+
+-- SECURITY: the tag slot of `Crypto.verifyHmacSha256` takes a `Mac`. A `Key`
+-- in that slot must be a compile error.
+main : Task ()
+main =
+    case Crypto.keyFromString "s3cret-signing-key" of
+        Just key ->
+            if Crypto.verifyHmacSha256 key "message" key then
+                Io.println "valid"
+
+            else
+                Io.println "invalid"
+
+        Nothing ->
+            Io.println "empty key rejected at the boundary"

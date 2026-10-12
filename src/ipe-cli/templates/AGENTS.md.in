@@ -33,6 +33,8 @@ main =
 `|>` `<|` pipelines | `::` cons | `\x -> x + 1` lambdas | `let…in`
 | `case…of` (exhaustiveness checked) | `{ record | field = value }`
 update | `module M exposing (..)` | `import M as Alias exposing (func)`.
+An open import's (`exposing (..)`) clash with another name is reported only
+where the name is used bare, never at the import itself.
 
 **Multiline strings** — triple-quoted, `{{expr}}` interpolation:
 
@@ -77,7 +79,7 @@ Two tiers are ambient — in scope with no `import`; a third requires an explici
 `import`.
 
 - **Tier A — `Ipe.Basics`.** The grammar-level surface, unqualified in every
-  module: the arithmetic/comparison/function operators (`+ - * / // ^`,
+  module: the arithmetic/comparison/function operators (`+ - * / //`,
   `== /= < > <= >=`, `<| |> << >>`, `++`), the base types
   `Int`/`Float`/`Char`/`String`, `Bool` with `not`/`&&`/`||`/`xor`, `Order` with
   `LT`/`EQ`/`GT`, `Never`/`never`, `identity`/`always`, and the numeric helpers
@@ -128,8 +130,8 @@ Ask one focused question per ambiguity; no guess heroically.
 |------------------------------------------|--------------------|------------------------------------|-------|
 | Web app (forms, real-time, UI state)     | **Ipe.Tea.Web**        | `Web.tea cfg`                      | HTTP-first; SSE patches; sessions + cookies + routing built in. |
 | Multi-tenant SaaS / dashboard            | **Ipe.Tea.Web + auth-app gate** | `Web.tea { consoleAuth = … }` | Tenant scope enforced at SQL layer. |
-| Desktop app                              | **Ipe.Tea.Web** (host=desktop) | `Web.tea cfg` + `ipe build web desktop` | Same `web` shape; desktop is a delivery host. |
-| Mobile app (iOS / Android)               | **Ipe.Tea.Web** (solo runtime) | `Web.tea cfg` + `ipe release web solo ios\|android` | `wasm = On { mode = Solo }` in `package.ipe`. |
+| Desktop app                              | **Ipe.Tea.Web** (host=desktop) | `Web.tea cfg` + `ipe dev build web desktop` | Same `web` shape; desktop is a delivery host. |
+| Mobile app (iOS / Android)               | **Ipe.Tea.Web** (solo runtime) | `Web.tea cfg` + `ipe release build web solo ios\|android` | `wasm = On { mode = Solo }` in `package.ipe`. |
 | View-less background TEA worker          | **Ipe.Tea.Worker**     | `Worker.tea cfg`                   | Managed `init`/`update`/`subscriptions` loop, no view sink. |
 | Line-oriented interactive tool           | **Ipe.Tea.Cli**        | `Cli.tea cfg`                      | Managed stdin-driven TEA loop (init/update/view/subscriptions); lines via `Sub.onLine`. |
 | Terminal UI (TUI)                        | **Ipe.Tea.Tui**        | `Tui.tea cfg`                      | `Screen` view (`Ipe.Ui.Tui`), a terminal-only view type; keys via `Sub.onKey`. |
@@ -402,12 +404,12 @@ app code.
 | `Process` | `Ipe.Process` | run (subprocess) |
 | `Db` | `Ipe.Db` | open, connect, close, exec, unsafeExecRaw (verbatim-SQL escape hatch; only for DDL that cannot be parameterised — its name marks the raw-SQL injection surface), query, insertRow, getById, updateById, deleteById, findOneByField, findManyByField, findByConditions, unsafeFindWhere, queryDecode, withTransaction, migrate (versioned forward-only schema migrations + `_ipe_migrations` + checksum guard), getField, getString, getInt, getBool. **Typed param binding**: `SqlValue` ADT (`SqlString`/`SqlInt`/`SqlFloat`/`SqlBool`/`SqlBytes`/`SqlDecimal`/`SqlTime`/`SqlMoney`/`SqlNull SqlValue`) — mixed-type SQL params as homogeneous `List SqlValue` for `INSERT … VALUES (?, ?, ?)` mixing `String + Maybe Int + Bool`. 8 `fromMaybe*` helpers for nullable columns. `SqlField` (`SetField SqlValue`/`OmitField`) + `Db.updateFields conn table whereCols setFields` for PATCH w/ column-omit; `Db.insertFields conn table fields` = INSERT counterpart (`OmitField` cols drop from SQL so DB applies DEFAULT; all-omit → `INSERT … DEFAULT VALUES`); `Db.upsertFields conn table conflictCols fields` = insert-or-update-in-place (`INSERT … ON CONFLICT (conflictCols) DO UPDATE SET c = excluded.c`, same SQL + semantics on SQLite and Postgres; conflict cols must be `SetField`s and are never in the SET; `OmitField` cols never overwritten; nothing left to SET → `DO NOTHING`; returns rows affected); `Db.insertFieldsReturning conn table fields projection decoder` appends `RETURNING <projection>`, decodes via `Ipe.Db.Decode`. Money serialises lossless as `"ISO_CODE AMOUNT"` TEXT, paired w/ `Db.Decode.money`. `Maybe a` params bind directly (nil/unwrapped). `nullable : Decoder a -> Decoder (Maybe a)`. |
 | `Db.Store` | `Ipe.Db.Store` | Typed, injection-safe table over `Ipe.Db`, derived from ONE `Codec`. `fromCodec` → `Draft` (schema known, deny-by-default: NO read/write). Classify to query: `public` (world-open `Store`, uses `all`/`get`/`insert`/`upsert`/…; `upsert`'s conflict target is the declared key — primary key, else the one `unique` column — never an argument, and a store without one is a typed `Err`) or `secured policy` → `Secured` (read/written ONLY via the authenticated `allAs`/`getAs`/`insertAs`/`updateAs`/`deleteAs`, each taking an `Auth.Principal`). **`Policy` builders**: `ownerColumn .col` (scope all ops to `col = $subject` + force owner on insert; never rewritten), `readOnly p` (reads `p`, every write `never`), `publicRead`/`unrestricted`, `immutable .col` (drop from update SET), `mask .col pred` (project value only when `pred`, else NULL), `alsoInsert`/`alsoUpdate`/`alsoDelete` (open a write path; a secured write the policy refuses returns `0` and writes nothing), `andPolicy` (AND-compose). **Predicate leaves** (`Pred row`): `always`/`never`/`allOf`/`anyOf`/`notPred`/`matchWhere` (lift a `Cond`), the FAIL-CLOSED caller-side `role`/`memberOf`/`claimEquals` (absent role/group/claim DENIES), and `existsIn`/`correlate` (correlated-subquery sharing). `explain policy` → the per-op WHERE as text. Owner filter compiles to bound-param `Sql.column`/`Sql.param`, never interpolation. Guide: `docs/guide/db-store.md` + `db-store-rls-composition.md`. |
-| `Auth` | `Ipe.Auth` | register, login, setRole (Task) + hashPassword, hashPasswordCost, verifyPassword, passwordStrength, signToken, verifyToken (Result); signTokenWithClaims/verifyTokenWithAlgorithm — typed-builder aliases over `Ipe.Jwt` for fine-grained algorithm+claims control |
+| `Auth` | `Ipe.Auth` | register, login, setRole (Task); subject, claim, hasRole, memberOf (over `Principal`); hashPassword, hashPasswordCost, verifyPassword, passwordStrength, signToken (Result). `verifyToken : Secret -> String -> Result AuthError (Dict String String)` refuses with the closed `AuthError` — `Malformed`, `BadSignature`, `Expired`, `NotYetValid`, `MissingClaim`, `Revoked`, `RevocationUnavailable`, `TooManyCredentials`, `SecretTooShort` — written `Auth.Expired` in an expression; a `case` pattern takes the bare name, so `import Ipe.Auth exposing (AuthError(..))` first; match it with `case`, never parse text. `Expired`/`NotYetValid` are judged before the signature, so they do not prove the token authentic: never answer a client differently for them than for `BadSignature`. Under `Web.withRevocation Web.revocationStore` / `Server.withRevocation` / `IPE_AUTH_REVOCATION=store`, `verifyToken` refuses a token without `sub` or `jti` and binds each token it admits to the running `Web` session or `Server` request; the session ends once a bound token is revoked (`Auth.Revocation`) or past its deadline, and a restored session re-proves its persisted tokens or starts over. |
 | `Log` | `Ipe.Log` | debug, info, warn, error, debugWith, infoWith, warnWith, errorWith — observability only (levelled, timestamped, telemetry-mirrored). For a bare line use `Io.println` / `Io.eprintln`. |
-| `Debug` | `Ipe.Debug` | log : String -> a -> a — DEV-ONLY escape hatch (Elm-style). Prints `"label: value"` to stderr, returns the value unchanged. `ipe release` REJECTS any `Debug.*` use (IPE-L0140); use `ipe build` / `ipe run` during development. |
+| `Debug` | `Ipe.Debug` | log : String -> a -> a — DEV-ONLY escape hatch (Elm-style). Prints `"label: value"` to stderr, returns the value unchanged. `ipe release` REJECTS any `Debug.*` use (IPE-L0140); use `ipe dev build` / `ipe dev run` during development. |
 | `Trace` | `Ipe.Trace` | span, event, attr — opt-in app-level tracing spans. Tier-1 spans (HTTP/session/Msg/DB/Auth/Http/File) automatic. |
 | `Server` | `Ipe.Http.Server` | param, queryParam, header, getCookie, static (Layer 3 surface); higher-level `get/post/listen/text/json/html` are kernel-only |
-| `Stream` | `Ipe.Http.Server.Stream` | stream, emit, finish, withContentType — server-side streaming HTTP responses (SSE/LLM token forwarding/chunked downloads). Mirror of `Ipe.Core.Http.Stream`. Sync bridge: `Ipe.Core.Http.Stream.forEachChunk hdl body` drains an upstream stream from inside a plain Ipe.Http.Server handler (relay shape). |
+| `Stream` | `Ipe.Http.Server.Stream` | stream, emit, finish, withContentType — server-side streaming HTTP responses (SSE/LLM token forwarding/chunked downloads). Mirror of `Ipe.Core.Http.Stream`. Sync bridge: `Ipe.Core.Http.Stream.forEachChunk hdl body` drains an upstream stream from inside a plain Ipe.Http.Server handler (relay shape). A plain response body that begins with the reserved `__ipe_stream:` prefix is refused with a 500, never served as a stream. |
 | `Middleware` | `Ipe.Http.Middleware` | withCors, withLogging, withBasicAuth, withRateLimit |
 | `Head` | `Ipe.Web.Head` | Per-page `<head>` injection — `title`/`meta`/`metaProperty` (OG)/`link`/`canonical`/`themeColor`/`rss`. Opt in via optional `head : Model -> List (Html msg)` field on `Web.tea` cfg. The verbatim JSON-LD `<script>` hatch `unsafeJsonLd` lives in `Ipe.Web.Head.Unsafe` (discloses the `unsafe` capability). |
 | `Console` | `Ipe.Web.Console` | `Identity` type alias (`{ subject, email, claims : Dict String String }`) for optional row-poly `consoleAuth : Request -> Task Error (Maybe Identity)` field on `Web.tea` cfg. |
@@ -452,9 +454,9 @@ the view through the `Ui.html : Html msg -> Element msg` node.
 **`init` is per-session, not per-page-reload.** First request from browser
 w/ no `ipe_sid` cookie fires `init`. Browser reload while session alive
 RESTORES Model from session store — `init` does NOT run. Force fresh `init`
-(demo reset/e2e bootstrap): `Cmd.perform
-(Cookie.expire "ipe_sid")` then reload. If goal = "my other tab missed an
-update", use `Cmd.publish` instead.
+(demo reset/e2e bootstrap): run under `ipe dev watch --reset-state`, or
+clear the session cookie in the browser, then reload. If goal = "my other tab
+missed an update", use `Cmd.publish` instead.
 
 ### init's `req` shape
 
@@ -829,6 +831,25 @@ view model =
    fills parent, and `Background.color (Ui.rgb 240 240 240)` colours
    textarea itself.
 
+   The label names the control by structure. A visible label makes the
+   wrapper a `<label>` that contains the control, so clicking the label text
+   focuses or toggles it; `Input.labelHidden "Name"` puts `aria-label` on the
+   control itself (an empty text names nothing). A radio group is a
+   `<fieldset>` whose first child is the label as a `<legend>` (hidden label:
+   `aria-label` on the fieldset), and each radio sits inside its own `<label>`.
+   Form, ARIA and event attrs reach the `<input>` for every kind, checkbox
+   included; on a radio group they land on the `<fieldset>`. To tie an error
+   message to a field:
+
+   ```elm
+   Input.text [ Ui.ariaInvalid Ui.InvalidTrue, Ui.ariaDescribedby "email-err" ] ...
+   Ui.el [ Ui.id "email-err" ] (Ui.text "Not an email address")
+   ```
+
+   A checkbox `icon` is visual only: the whole `<label>` toggles the box, so
+   an icon must not carry its own click handler. In the terminal UI a radio
+   group's legend is always drawn first, even for `labelBelow` / `labelRight`.
+
 ### `Ui.fill` semantics
 
 `Ui.fill` lowers asymmetrically per parent's flex direction: main-axis fill
@@ -1046,7 +1067,7 @@ through the `Ui.html : Html msg -> Element msg` node.
 
 ## Browser-WASM target (`--target wasm`)
 
-`ipe build --target wasm` compiles single-page `Web.tea` program to
+`ipe dev build --target wasm` compiles single-page `Web.tea` program to
 browser bundle: emitted project = `cdylib` crate (wasm-bindgen glue, no
 tokio/axum/sqlx) plus static `www/` shell (CSP `script-src 'self'
 'wasm-unsafe-eval'` — no JS eval). Bundle w/
@@ -1101,14 +1122,14 @@ package =
             { mode = Solo                       -- Solo | Hydrate
             , entry = "src/Client.ipe"          -- client entry file (defaults to the build's own entry)
             , mount = "#app"                    -- solo mount selector
-            , publicEnv = [ "API_BASE_URL" ]    -- default-deny allowlist; rejects IPE_*/secret-pattern names
+            , publicEnv = [ "API_BASE_URL" ]    -- default-deny allowlist; rejects IPE_*/secret/temp-root/home names
             , optLevel = "z"
             }
     }
 ```
 
 When `wasm = On { mode = Solo }` (or `Hydrate`), the compiler infers the wasm
-target: `ipe build` is equivalent to `ipe build --target wasm` without an
+target: `ipe dev build` is equivalent to `ipe dev build --target wasm` without an
 explicit flag. Precedence (highest first): `--target wasm` CLI flag >
 `IPE_TARGET=wasm` env > the manifest's `wasm` mode > default native. An
 absent `wasm` field (or `wasm = Off`) keeps the native default.
@@ -1118,7 +1139,10 @@ absent `wasm` field (or `wasm = Off`) keeps the native default.
 `PASSWORD`/`PASSWD`/`CREDENTIAL`/`AUTH`/`APIKEY` — plus `DATABASE_URL` and the
 `IPE_*` namespace) enforced at manifest PARSE time — listing `SESSION_TOKEN`
 (or any denylisted pattern) in `publicEnv` is a build error, never a silently
-dropped entry and never a runtime-only refusal. `System.getenv` stays a
+dropped entry and never a runtime-only refusal. The temp-root and home
+variables (`TMPDIR`/`TMP`/`TEMP`/`HOME`/`USERPROFILE`/`HOMEDRIVE`/`HOMEPATH`,
+any case), a name outside ASCII letters/digits/`_` (or starting with a digit),
+and a repeated name are refused the same way. `System.getenv` stays a
 DOES-NOT-exist-for-wasm kernel regardless (Layer 1) — public build-time
 config is a distinct, narrower surface, not a `getenv` backdoor.
 
@@ -1158,7 +1182,10 @@ Not limitations — the language is meant to work this way.
   defect: an HTTP handler returns a 500 with a correlation ref and the server
   survives, a live session ends and the client reconnects, a CLI exits non-zero
   with a classified message — never a whole-process crash. Raise the ceiling
-  with the `IPE_RECURSION_LIMIT` environment variable. Self-tail-recursive
+  with the `IPE_RECURSION_LIMIT` environment variable, a positive decimal
+  integer; any other value (`0` included) refuses the program at startup. On
+  wasm32 the maximum is `10000`; a larger value is refused too.
+  Self-tail-recursive
   functions the compiler rewrites into a loop run in constant stack and are
   exempt, so the limit only bounds recursion that actually grows the stack.
 
@@ -1173,20 +1200,24 @@ Deliberate omissions, not gaps to close.
 
 ```bash
 ipe init [name]                    # new project
-# The dev inner loop lives under `ipe dev {build,run,watch}` (dev posture:
-# Debug.* on, unsigned, hot-reload). `build`/`run`/`watch` also work bare as
-# shortcuts for the same dev posture. `ipe release` is the distinct shipping
-# posture (optimised, Debug.* rejected, native code jailed) — there is no
-# `watch` under release, so hot-reloading a shipping build is not expressible.
-ipe dev build src/Main.ipe         # compile → out/app  (bare `ipe build` too)
+# The dev inner loop lives under `ipe dev {build,run,watch}`. `ipe dev` runs
+# your program with your full user permissions and checks no capabilities.
+# Run external packages only through `ipe release`, which infers
+# capabilities, asks for consent and runs native code jailed.
+# `ipe release build|run|eject` is the distinct shipping posture (optimised,
+# Debug.* rejected, native code jailed)
+# — there is no `watch` under release, so hot-reloading a shipping build is
+# not expressible. A `build` / `run` with no group in front is refused: the
+# group names the posture.
+ipe dev build src/Main.ipe         # compile → out/app
 ipe dev build src/Main.ipe --target wasm   # browser-WASM project (cdylib + www/ shell)
-ipe dev run src/Main.ipe           # build + run        (bare `ipe run` too)
-ipe release src/Main.ipe           # PRODUCTION build; rejects any Debug.* use
+ipe dev run src/Main.ipe           # build + run
+ipe release build src/Main.ipe     # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)
 ipe dev build|run … --static       # fully-static musl single binary (dlmalloc
                                    #  default; --target <triple> --allocator
                                    #  <auto|system|dlmalloc|talc|mimalloc>)
-ipe dev watch src/Main.ipe         # file-watch rebuild + restart (bare `ipe watch` too)
+ipe dev watch src/Main.ipe         # file-watch rebuild + restart
 ipe type-check src/Main.ipe        # type-check only — no build, no run, no emit
 ipe fmt src/Main.ipe               # opinionated formatter (run after editing .ipe/.ipei)
                                    # test runner: place tests/Main.ipe in the
@@ -1216,10 +1247,10 @@ directories it created (marked by an `.ipe-output` file) and refuses an `--out`
 that is the project, encloses it, sits inside `src/`, or already holds your files:
 
 ```bash
-cd my-app && ipe build            # → out/rust/, out/bin/my-app
+cd my-app && ipe dev build        # → out/rust/, out/bin/my-app
 ```
 
-`ipe type-check` runs the same pipeline as `ipe build` up through type-checking,
+`ipe type-check` runs the same pipeline as `ipe dev build` up through type-checking,
 then stops — it emits no Rust and runs no `cargo`, so it is the fastest way to
 ask "does this program type-check?". Run `ipe fmt` after editing
 `.ipe`/`.ipei` files (formatter idempotent).

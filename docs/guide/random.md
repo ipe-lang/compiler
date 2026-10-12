@@ -62,7 +62,7 @@ rollSheet seed0 =
     ...
 ```
 
-Running it (`ipe run`) rolls seed 42 twice — identical both times — and seed 99
+Running it (`ipe dev run`) rolls seed 42 twice — identical both times — and seed 99
 once, different, proving reproducibility:
 
 ```

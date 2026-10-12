@@ -275,7 +275,8 @@ const QUALIFIER_MODULE_OVERRIDES: &[(&str, &[&str])] = &[
     // `EmailAddress` newtype via `parseAddress` / `addressToString` aliases.
     ("EmailAddress", &["Ipe", "Email"]),
     // `Key` and `Mac` are the opaque-type kernel families declared and used in
-    // `Ipe.Crypto` (`keyFromString` / `keyFromBytes` / `macToHex` aliases).
+    // `Ipe.Crypto` (`keyFromString` / `keyFromBytes` / `macToHex` / `macFromHex`
+    // aliases).
     ("Key", &["Ipe", "Crypto"]),
     ("Mac", &["Ipe", "Crypto"]),
     // `UiCells` kernels (`cells`, `column`, `el`, `none`, `row`, `text`) are the

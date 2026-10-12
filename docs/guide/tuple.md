@@ -62,7 +62,7 @@ report range =
         ++ "°C"
 ```
 
-Running it (`ipe run`) prints:
+Running it (`ipe dev run`) prints:
 
 ```
 coldest 14.2°C, warmest 27.3°C

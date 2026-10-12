@@ -149,7 +149,7 @@ pub const FAMILIES: [FamilyRow; 8] = [
     FamilyRow {
         family: Family::Security,
         letter: 'S',
-        summary: "security consent — an effect or escape hatch that needs your explicit approval",
+        summary: "security consent — an effect, escape hatch, or control model that needs your explicit approval",
     },
     FamilyRow {
         family: Family::Environment,
@@ -315,6 +315,10 @@ code! {
     IPE_P0020 = "IPE-P0020", "malformed module header", "IPE-P0020";
     /// malformed exposing list
     IPE_P0021 = "IPE-P0021", "malformed exposing list", "IPE-P0021";
+    /// a mobile bundle wraps a `Web` app, and this app's shape is not `Web`
+    IPE_P0022 = "IPE-P0022", "a mobile bundle needs a Web app", "IPE-P0022";
+    /// a mobile bundle wraps the wasm client, and the project's `[wasm]` mode is off
+    IPE_P0023 = "IPE-P0023", "a mobile bundle needs the wasm client", "IPE-P0023";
     /// missing `=` in definition
     IPE_P0030 = "IPE-P0030", "missing '=' in definition", "IPE-P0030";
     /// malformed type declaration
@@ -401,8 +405,8 @@ code! {
     IPE_N0032 = "IPE-N0032", "type alias expansion too deep or too large", "IPE-N0032";
     /// a plain-`main` Program imports a managed-update-loop shape under `Ipe.Tea.*`
     IPE_N0033 = "IPE-N0033", "a Program may not import a managed-update-loop shape", "IPE-N0033";
-    /// a known standard-library module is used qualified without importing it
-    IPE_N0034 = "IPE-N0034", "standard-library module used without importing it", "IPE-N0034";
+    /// a known module (standard-library or project) is used qualified without importing it
+    IPE_N0034 = "IPE-N0034", "module used without importing it", "IPE-N0034";
     /// a TEA app imports another shape's `Cmd` / `Sub` re-export module
     IPE_N0035 = "IPE-N0035", "Cmd / Sub imported from a different shape than the app's", "IPE-N0035";
     /// a removed surface binding is used; `ipe fix` can migrate the call site
@@ -458,6 +462,9 @@ code! {
     IPE_N0051 = "IPE-N0051", "an app entry is built with a Model or Msg that is still a type variable", "IPE-N0051";
     /// terminal input passed as an app config field instead of a subscription
     IPE_N0052 = "IPE-N0052", "terminal input is a subscription, not an app config field", "IPE-N0052";
+    /// a row-parameter argument of a type alias is not a record, or repeats
+    /// one of the alias's own record labels
+    IPE_N0053 = "IPE-N0053", "a type alias row argument cannot extend its record", "IPE-N0053";
 
     // -----------------------------------------------------------------------
     // Type (IPE-T####)
@@ -722,9 +729,15 @@ code! {
     // -----------------------------------------------------------------------
 
     /// a program imports an `Ipe.<M>.Unsafe` escape hatch and the risk was not
-    /// acknowledged (non-interactive build without `--accept-risks` / manifest
+    /// acknowledged (non-interactive release build without manifest
     /// pre-acceptance, or an interactive "no")
     IPE_S0001 = "IPE-S0001", "unsafe escape hatch imported without acknowledgment", "IPE-S0001";
+    /// a program reaches a browser web capability the app has not granted
+    IPE_S0002 = "IPE-S0002", "a web capability is reached without the app's grant", "IPE-S0002";
+    /// a program crosses into native `Rust.` code the app has not granted
+    IPE_S0003 = "IPE-S0003", "native Rust code is crossed without the app's grant", "IPE-S0003";
+    /// the program's control model is not covered by the declared `acceptsControl` set
+    IPE_S0004 = "IPE-S0004", "the control model is not covered by acceptsControl", "IPE-S0004";
 
     // -----------------------------------------------------------------------
     // Environment (IPE-E####)

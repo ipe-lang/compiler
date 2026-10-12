@@ -65,6 +65,8 @@ pub enum LoadError {
     },
     /// The FFI artifact cache failed its trust check.
     FfiUntrusted(String),
+    /// The installed FFI catalog is inconsistent; no buffer edit fixes it.
+    FfiCatalogRefused(String),
     /// The discovered package manifest failed its trust check.
     ManifestUntrusted(String),
 }
@@ -113,6 +115,7 @@ impl LoadError {
                 ..
             }
             | Self::FfiUntrusted(_)
+            | Self::FfiCatalogRefused(_)
             | Self::ManifestUntrusted(_) => LoadDisposition::Refuse,
         }
     }
@@ -126,6 +129,7 @@ impl fmt::Display for LoadError {
             | Self::Refused(detail)
             | Self::Limit { detail, .. }
             | Self::FfiUntrusted(detail)
+            | Self::FfiCatalogRefused(detail)
             | Self::ManifestUntrusted(detail) => f.write_str(detail),
         }
     }

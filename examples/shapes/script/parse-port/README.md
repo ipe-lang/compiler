@@ -6,6 +6,6 @@ re-checks the range. The worked example for the
 [parse-don't-validate idiom](../../../../docs/idioms/parse-dont-validate.md).
 
 ```
-ipe build package.ipe
+ipe dev build package.ipe
 cargo run --manifest-path out/rust/Cargo.toml
 ```

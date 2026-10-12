@@ -51,6 +51,12 @@ package =
     }
 ```
 
+`basePath` is the URL path the client bundle is served at; the `web solo`
+host, static hosts, and mobile shells all serve the bundle under it. It is `"/"`
+(or `""`) for the root, or one or more `/segment` parts made only of
+`A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty, `.`, or `..` segment, and
+at most 1024 bytes in all; the manifest refuses any other value.
+
 Run `ipe doc Ipe.Package` for every field.
 
 ## Desktop: a webview-native bundle
@@ -62,7 +68,7 @@ the `main` head `Web.tea` is enough.
 Package it:
 
 ```
-ipe release web desktop
+ipe release build web desktop
 ```
 
 This compiles the app and lays out a bundle for the host OS:
@@ -108,7 +114,7 @@ Then package for a device OS. Because mobile is the `solo` runtime, the host is
 spelled `web solo <os>`:
 
 ```
-ipe release web solo android
+ipe release build web solo android
 ```
 
 This builds the wasm bundle and materialises a native shell:
@@ -126,7 +132,7 @@ The Android shell is a ready-to-build Gradle project; the client rides under
 there is no remote host and no `file://` access. Finish the APK with
 `./gradlew assembleDebug` where the Android SDK is present.
 
-`ipe release web solo ios` writes the equivalent Xcode project (`WKWebView` +
+`ipe release build web solo ios` writes the equivalent Xcode project (`WKWebView` +
 `WKURLSchemeHandler`). Its layout and derived-permission manifest are written for
 inspection, but a signed `.ipa` must be produced on a macOS runner with Xcode and
 a signing identity. As with desktop, `build web solo <os>` lays out the same shell
@@ -139,11 +145,11 @@ on a machine without a display (desktop) or without the device (mobile).
 
 ### Desktop
 
-`ipe run web desktop` compiles and opens the app in a native webview window. To
+`ipe dev run web desktop` compiles and opens the app in a native webview window. To
 run the packaged build instead, launch the emitted binary directly:
 
 ```
-ipe release web desktop
+ipe release build web desktop
 ./out/release/dist/linux/<name>/bin/<name>
 ```
 
@@ -203,7 +209,7 @@ See exactly what a consent set yields, without building, with a read-only
 dry-run:
 
 ```
-ipe build --emit-permissions android
+ipe release build --emit-permissions android
 ```
 
 For an app that accepts `JsPort Geolocation`, that prints:
@@ -226,6 +232,6 @@ path selects a project other than the current directory.
   model in full: the four TEA shapes plus the direct bucket, the two web runtimes,
   and why each is where it is.
 - `ipe doc Ipe.Package` — every `delivery`, `wasm`, and `capabilities` field.
-- `ipe build --help` / `ipe release --help` — the one delivery grammar (`ipe
+- `ipe dev build --help` / `ipe release --help` — the one delivery grammar (`ipe
   <verb> [shape] [runtime] [host]`): `build` compiles or bundles a single
   delivery for the inner loop, `release` produces the production distributable.

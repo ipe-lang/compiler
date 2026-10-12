@@ -59,7 +59,7 @@ fn i199_ipec_accepts_and_hoists() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for nested_capture_outer_arg: {:?}",
+        "ipe dev build must succeed for nested_capture_outer_arg: {:?}",
         built.err()
     );
 
@@ -103,7 +103,11 @@ fn i199_cargo_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     let outcome = crate::support::build_and_run_emitted("nested_capture_outer_arg", &out);
     assert_eq!(

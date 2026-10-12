@@ -6,6 +6,7 @@ pub(crate) enum IpeLengthUnit {
     Vh,
     Vw,
 }
+
 impl IpeStringify for IpeLengthUnit {
     fn ipe_show(&self) -> String {
         match self {
@@ -15,6 +16,13 @@ impl IpeStringify for IpeLengthUnit {
         }
     }
 }
+
+impl RetainedBytes for IpeLengthUnit {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()
+    }
+}
+
 pub(crate) fn user_ipe_length_to_css(n: i64, unit: IpeLengthUnit) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     match unit {

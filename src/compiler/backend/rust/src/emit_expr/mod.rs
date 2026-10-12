@@ -11,7 +11,7 @@ pub use crate::emit_ui_plan::{
     appearance_literal_record_fields, shape_appearance_literal_args, ui_call_shape,
 };
 pub use crate::naming::kernel_name;
-pub use crate::render::{RenderConfig, render_seeded};
+pub use crate::render::RenderConfig;
 pub use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
 pub use ipe_intern::Symbol;
 pub use ipe_ir::{
@@ -24,6 +24,7 @@ mod expr;
 mod ffi;
 mod func;
 mod kernel_calls;
+mod numeric;
 mod patterns;
 mod records;
 #[cfg(test)]
@@ -34,5 +35,6 @@ pub use expr::*;
 pub use ffi::*;
 pub use func::*;
 pub use kernel_calls::*;
+pub use numeric::*;
 pub use patterns::*;
 pub use records::*;

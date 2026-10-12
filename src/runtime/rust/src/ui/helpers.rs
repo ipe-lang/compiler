@@ -9,11 +9,12 @@
 //! and to avoid shadowing the runtime's own `element` type names.
 
 use super::element::{
-    Attribute, Description, Element, HAlign, Length, Location, Portion, PseudoClass, VAlign,
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, PseudoClass,
+    VAlign, WhiteSpace,
 };
 use crate::color::Color;
 use crate::core::IpeMaybe;
-use crate::html::Html;
+use crate::html::{DOCTYPE_WRAPPER_TAG, Html, admit_element};
 
 // ── Element builders ──────────────────────────────────────────────────────────
 
@@ -38,6 +39,11 @@ pub fn ui_node_<M>(
 /// the HTML tag, role `Description`, attributes, and children. The flow builders
 /// (`paragraph` / `textColumn` / `form` / `input`) are pure Ipê over this
 /// primitive with a fixed tag + marker.
+///
+/// SECURITY: the tag runs the shared `admit_element` gate. A refused element (an
+/// unsafe tag name, `<plaintext>`, or a `<script>`/`<style>` whose children are
+/// not all `Ui.html` over trusted raw markup) is built as `Element::Empty`, so
+/// the safe surface cannot make data an executable or raw-text body.
 #[must_use]
 pub fn ui_tagged_node_<M>(
     tag: String,
@@ -45,6 +51,9 @@ pub fn ui_tagged_node_<M>(
     attrs: Vec<Attribute<M>>,
     children: Vec<Element<M>>,
 ) -> Element<M> {
+    if admit_element(&tag, &children).is_err() {
+        return Element::Empty;
+    }
     Element::TaggedNode(tag, desc, attrs, children)
 }
 
@@ -607,18 +616,19 @@ pub fn html_raw_node_<M>(s: String) -> Html<M> {
 
 /// `Html.styleNode : List (Attribute msg) -> String -> Html msg`
 ///
-/// SECURITY (F7): `styleNode` is arity-2 `(attrs, css:String)` — NOT the arity-3
-/// `html_node_`. It bakes injection safety into construction (PARSE, DON'T
-/// VALIDATE): the CSS body is close-tag-neutralised
-/// exactly once, HERE, so the `HRaw` it produces is already safe. The `<style>`
-/// render sink (`html::render_into_ctx`) strips again — defence in depth — so a
-/// `</style><script>` breakout in a `Ipe.Css` value cannot reach the DOM.
+/// SECURITY: `styleNode` is arity-2 `(attrs, css:String)`, not the arity-3
+/// `html_node_`. It bakes injection safety into construction (parse, don't
+/// validate): `neutralise_style_body` removes every `</style` and every other
+/// markup opener exactly once, HERE, so the `HRaw` it produces can end neither
+/// the `<style>` nor an RCDATA, RAWTEXT or foreign-content ancestor. The
+/// `<style>` render sink (`html::render_into_ctx`) neutralises again (defence
+/// in depth), so a breakout in a `Ipe.Css` value cannot reach the DOM.
 #[must_use]
 pub fn html_style_node_<M>(attrs: Vec<crate::html::Attribute<M>>, css: String) -> Html<M> {
     Html::HElement(
         "style".to_owned(),
         attrs,
-        vec![Html::HRaw(crate::css_safety::strip_style_close(&css))],
+        vec![Html::HRaw(crate::css_safety::neutralise_style_body(&css))],
     )
 }
 
@@ -630,12 +640,13 @@ pub fn html_style_node_<M>(attrs: Vec<crate::html::Attribute<M>>, css: String) -
 /// named `unsafe*` — never on the safe `Ipe.Html` surface. There is no escaping a
 /// script body admits: HTML-escaping it would corrupt the JavaScript, and the
 /// body is executable code regardless of value-escaping, so the caller owns the
-/// invariant that the body is trusted, author-controlled code. The one structural
-/// breakout — a literal `</script` closing the element early — is neutralised
-/// here at construction (parse, don't validate) by splitting the ASCII-case-
-/// insensitive `</script` sequence with a backslash, exactly the belt-and-braces
-/// shape `html_style_node_` uses for `</style`; the `<script>` render sink emits
-/// the resulting `HRaw` child verbatim.
+/// invariant that the body is trusted, author-controlled code. The structural
+/// breakouts — a literal `</script` closing the element early, and a `<!--`
+/// that lets a later `<script` swallow the close tag — are neutralised here at
+/// construction (parse, don't validate) by `neutralise_script_close`, exactly
+/// the belt-and-braces shape `html_style_node_` uses for `</style`; the render
+/// sink neutralises the `HRaw` child again and admits the `<script>` only where
+/// its start tag enters script-data state.
 #[must_use]
 pub fn html_script_node_<M>(body: String) -> Html<M> {
     Html::HElement(
@@ -648,22 +659,31 @@ pub fn html_script_node_<M>(body: String) -> Html<M> {
 }
 
 /// `Html.node : String -> List (Attribute msg) -> List (Html msg) -> Html msg`
+///
+/// SECURITY: the tag runs the shared `admit_element` gate. A refused element (an
+/// unsafe tag name, `<plaintext>`, or a `<script>`/`<style>` whose children are
+/// not all trusted raw markup) is built as empty text, so `Html.script [] [
+/// Html.text s ]` renders nothing instead of executing `s`. A trusted body comes
+/// only from `Ipe.Html.Unsafe` or `Ipe.Html.styleNode`.
 #[must_use]
 pub fn html_node_<M>(
     tag: String,
     attrs: Vec<crate::html::Attribute<M>>,
     children: Vec<Html<M>>,
 ) -> Html<M> {
+    if admit_element(&tag, &children).is_err() {
+        return Html::HText(String::new());
+    }
     Html::HElement(tag, attrs, children)
 }
 
 /// `Html.doctype : List (Html msg) -> Html msg` — wraps children in the
-/// `!doctype-wrapper` pseudo-tag; `ipe_runtime::html::render_into_ctx`
-/// recognises that literal tag and emits `<!DOCTYPE html>` before the
-/// children directly.
+/// `!doctype-wrapper` pseudo-tag, which `ipe_runtime::html::admit_rendered_in`
+/// recognises for the render sink and the SSE diff alike: it renders as
+/// `<!DOCTYPE html>` and then the children directly.
 #[must_use]
 pub fn html_doctype_<M>(children: Vec<Html<M>>) -> Html<M> {
-    Html::HElement("!doctype-wrapper".to_owned(), Vec::new(), children)
+    Html::HElement(DOCTYPE_WRAPPER_TAG.to_owned(), Vec::new(), children)
 }
 
 /// `Html.titleNode : String -> Html msg` — wraps a raw string directly in
@@ -1151,7 +1171,7 @@ pub fn ui_region_aside_<M>() -> Attribute<M> {
 /// `Region.heading : Int -> Attribute msg`
 #[must_use]
 pub fn ui_region_heading_<M>(n: i64) -> Attribute<M> {
-    Attribute::AttrDescribe(Description::DescHeading(n))
+    Attribute::AttrDescribe(Description::DescHeading(HeadingLevel::from_requested(n)))
 }
 
 /// `Region.label : String -> Attribute msg`
@@ -1243,7 +1263,7 @@ pub fn ui_desc_live_assertive_() -> Description {
 /// `Ui.descHeading : Int -> Description`
 #[must_use]
 pub fn ui_desc_heading_(n: i64) -> Description {
-    Description::DescHeading(n)
+    Description::DescHeading(HeadingLevel::from_requested(n))
 }
 
 /// `Ui.descLabel : String -> Description`
@@ -1252,20 +1272,91 @@ pub fn ui_desc_label_(s: String) -> Description {
     Description::DescLabel(s)
 }
 
+/// The `DescSection` role — a document section.
+#[must_use]
+pub fn ui_desc_section_() -> Description {
+    Description::DescSection
+}
+
+/// The `DescSectionHeading` role — the heading of the enclosing section.
+#[must_use]
+pub fn ui_desc_section_heading_() -> Description {
+    Description::DescSectionHeading
+}
+
+/// The `DescCodeBlock` role — a preformatted block of code.
+#[must_use]
+pub fn ui_desc_code_block_() -> Description {
+    Description::DescCodeBlock
+}
+
+/// The `DescCode` role — an inline run of code.
+#[must_use]
+pub fn ui_desc_code_() -> Description {
+    Description::DescCode
+}
+
+/// The `DescKbd` role — an inline run of keyboard input.
+#[must_use]
+pub fn ui_desc_kbd_() -> Description {
+    Description::DescKbd
+}
+
+/// The `DescTextColumn` role — a column of text blocks.
+#[must_use]
+pub fn ui_desc_text_column_() -> Description {
+    Description::DescTextColumn
+}
+
+/// The `DescForm` role — a form that groups input controls.
+#[must_use]
+pub fn ui_desc_form_() -> Description {
+    Description::DescForm
+}
+
+/// `Font.whiteSpace Font.Normal`
+#[must_use]
+pub const fn ui_font_white_space_normal_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::Normal)
+}
+
+/// `Font.whiteSpace Font.NoWrap`
+#[must_use]
+pub const fn ui_font_white_space_no_wrap_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::NoWrap)
+}
+
+/// `Font.whiteSpace Font.Pre`
+#[must_use]
+pub const fn ui_font_white_space_pre_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::Pre)
+}
+
+/// `Font.whiteSpace Font.PreWrap`
+#[must_use]
+pub const fn ui_font_white_space_pre_wrap_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::PreWrap)
+}
+
+/// `Font.whiteSpace Font.PreLine`
+#[must_use]
+pub const fn ui_font_white_space_pre_line_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::PreLine)
+}
+
+/// `Font.whiteSpace Font.BreakSpaces`
+#[must_use]
+pub const fn ui_font_white_space_break_spaces_<M>() -> Attribute<M> {
+    Attribute::AttrFontWhiteSpace(WhiteSpace::BreakSpaces)
+}
+
 /// `Ui.paragraph : List (Attribute msg) -> List (Element msg) -> Element msg`
 ///
-/// Mirrors `paragraph` in `Ipe/Ui.ipe`: a `<p>`-tagged node carrying
-/// `DescParagraph` plus the `__paragraph` marker (matching `paragraphMarker`),
-/// so text children wrap as inline flow.
+/// Mirrors `paragraph` in `Ipe/Ui.ipe`: a `<p>`-tagged node whose
+/// `DescParagraph` role makes its children flow inline.
 #[must_use]
 pub fn ui_paragraph_<M: Clone>(attrs: Vec<Attribute<M>>, children: Vec<Element<M>>) -> Element<M> {
-    let mut full = Vec::with_capacity(attrs.len() + 1);
-    full.push(Attribute::AttrStyle(
-        "__paragraph".to_owned(),
-        "true".to_owned(),
-    ));
-    full.extend(attrs);
-    Element::TaggedNode("p".to_owned(), Description::DescParagraph, full, children)
+    Element::TaggedNode("p".to_owned(), Description::DescParagraph, attrs, children)
 }
 
 // ── Form ─────────────────────────────────────────────────────────────────────
@@ -1615,10 +1706,9 @@ mod script_node_tests {
             neutralise_script_close("a</script><img src=x onerror=alert(1)>"),
             "a<\\/script><img src=x onerror=alert(1)>"
         );
-        // Case-insensitive match; the neutralised run is emitted as the fixed
-        // lowercase literal (the exact casing of the code text is irrelevant —
-        // only that no `</script` byte run of ANY case survives).
-        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/script >");
+        // Case-insensitive match; the tag name keeps its original case so a
+        // data string value is unchanged — only the `</` pair is split.
+        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/SCRIPT >");
         // No surviving `</script` (any case) after neutralisation.
         let out = neutralise_script_close("x</script>y</ScRiPt>z");
         assert!(!out.to_ascii_lowercase().contains("</script"));
@@ -1636,6 +1726,206 @@ mod script_node_tests {
             "the breakout must not survive into the render: {html}"
         );
         assert!(html.starts_with("<script>") && html.ends_with("</script>"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tag_gate_tests {
+    use super::{
+        Description, Element, html_node_, html_raw_node_, html_script_node_, html_style_node_,
+        html_text_node_, ui_html_, ui_tagged_node_,
+    };
+    use crate::html::{Attribute as HtmlAttribute, Html, render_html};
+    use crate::ui::render::ui_layout;
+
+    /// Every tag the shared gate refuses, in more than one ASCII case.
+    const REFUSED_WITH_TEXT: [&str; 9] = [
+        "script",
+        "SCRIPT",
+        "Script",
+        "style",
+        "STYLE",
+        "sTyLe",
+        "plaintext",
+        "PLAINTEXT",
+        "div><script",
+    ];
+
+    fn ui_render(el: Element<()>) -> String {
+        render_html(&ui_layout(vec![], el))
+    }
+
+    /// SECURITY: `Html.node` (and so `Html.script`) refuses a raw-text or
+    /// executable element whose body is data: the result is empty text, never
+    /// an element.
+    #[test]
+    fn html_node_refuses_every_denied_tag() {
+        for tag in REFUSED_WITH_TEXT {
+            let node: Html<()> = html_node_(
+                tag.to_owned(),
+                vec![],
+                vec![html_text_node_("alert(document.cookie)".to_owned())],
+            );
+            assert!(
+                matches!(&node, Html::HText(t) if t.is_empty()),
+                "<{tag}>: {node:?}"
+            );
+            assert_eq!(render_html(&node), "", "<{tag}>");
+        }
+        // An empty `<script>` is not started, so a later patch or its `src`
+        // could run: refused too.
+        let empty: Html<()> = html_node_(
+            "script".to_owned(),
+            vec![HtmlAttribute::Attr("src".into(), "/x.js".into())],
+            vec![],
+        );
+        assert!(
+            matches!(&empty, Html::HText(t) if t.is_empty()),
+            "{empty:?}"
+        );
+        // A child element is not trusted raw markup either.
+        let nested: Html<()> = html_node_(
+            "style".to_owned(),
+            vec![],
+            vec![html_node_("b".to_owned(), vec![], vec![])],
+        );
+        assert!(
+            matches!(&nested, Html::HText(t) if t.is_empty()),
+            "{nested:?}"
+        );
+    }
+
+    /// Controls: trusted raw bodies, `styleNode`, `unsafeScript`, an empty
+    /// `<style>` and ordinary elements are still built and rendered.
+    #[test]
+    fn html_node_admits_trusted_bodies_and_ordinary_tags() {
+        let raw_script: Html<()> = html_node_(
+            "script".to_owned(),
+            vec![],
+            vec![html_raw_node_("x()".to_owned())],
+        );
+        assert_eq!(render_html(&raw_script), "<script>x()</script>");
+        let unsafe_script: Html<()> = html_script_node_("y()".to_owned());
+        assert_eq!(render_html(&unsafe_script), "<script>y()</script>");
+        let style: Html<()> = html_style_node_(vec![], ".a{color:red}".to_owned());
+        assert_eq!(render_html(&style), "<style>.a{color:red}</style>");
+        let empty_style: Html<()> = html_node_("style".to_owned(), vec![], vec![]);
+        assert_eq!(render_html(&empty_style), "<style></style>");
+        for tag in ["div", "p", "title", "textarea", "noscript", "template"] {
+            let node: Html<()> = html_node_(
+                tag.to_owned(),
+                vec![],
+                vec![html_text_node_("<b>".to_owned())],
+            );
+            let escaped = crate::escape::html_text("<b>");
+            assert_eq!(render_html(&node), format!("<{tag}>{escaped}</{tag}>"));
+        }
+    }
+
+    /// SECURITY: `Ui.taggedNode` refuses the same tags: a text, element or
+    /// `Ui.html (Html.text ..)` body builds `Element::Empty` and renders no
+    /// element.
+    #[test]
+    fn ui_tagged_node_refuses_every_denied_tag() {
+        let bodies: [fn() -> Vec<Element<()>>; 3] = [
+            || vec![Element::Text("alert(document.cookie)".into())],
+            || {
+                vec![ui_html_(html_text_node_(
+                    "alert(document.cookie)".to_owned(),
+                ))]
+            },
+            || vec![Element::Node(Description::NoDescription, vec![], vec![])],
+        ];
+        for tag in REFUSED_WITH_TEXT {
+            for body in &bodies {
+                let el =
+                    ui_tagged_node_(tag.to_owned(), Description::NoDescription, vec![], body());
+                assert!(matches!(el, Element::Empty), "<{tag}>: {el:?}");
+                let out = ui_render(el);
+                assert!(
+                    !out.to_ascii_lowercase().contains("<script"),
+                    "<{tag}>: {out}"
+                );
+                assert!(!out.contains("alert"), "<{tag}>: {out}");
+            }
+        }
+        let empty = ui_tagged_node_::<()>(
+            "script".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![],
+        );
+        assert!(matches!(empty, Element::Empty), "{empty:?}");
+    }
+
+    /// Control: a `Ui.html` child over trusted raw markup is admitted.
+    #[test]
+    fn ui_tagged_node_admits_a_trusted_raw_body() {
+        let el = ui_tagged_node_::<()>(
+            "script".to_owned(),
+            Description::NoDescription,
+            vec![],
+            vec![ui_html_(html_raw_node_("x()".to_owned()))],
+        );
+        assert!(
+            matches!(&el, Element::TaggedNode(t, ..) if t == "script"),
+            "{el:?}"
+        );
+        let out = ui_render(el);
+        assert!(
+            out.contains("<script") && out.contains(">x()</script>"),
+            "{out}"
+        );
+    }
+
+    /// SECURITY: an `Element::TaggedNode` that reached the tree without the
+    /// constructor is refused again when `Ipe.Ui` lowers it to `Html`.
+    #[test]
+    fn ui_render_refuses_a_hand_built_script_element() {
+        let el: Element<()> = Element::TaggedNode(
+            "script".into(),
+            Description::NoDescription,
+            vec![],
+            vec![Element::Text("alert(document.cookie)".into())],
+        );
+        // The lowered tree itself holds no script element and no script
+        // text: the render sink refuses the element again, so asserting on the
+        // rendered string alone would pass without the lowering gate.
+        let lowered = ui_layout(vec![], el.clone());
+        assert!(!has_element(&lowered, "script"), "{lowered:?}");
+        assert!(!has_text(&lowered, "alert"), "{lowered:?}");
+        assert!(has_text_exactly(&lowered, ""), "{lowered:?}");
+        let out = ui_render(el);
+        assert!(!out.contains("<script"), "{out}");
+        assert!(!out.contains("alert"), "{out}");
+    }
+
+    /// True when `node` or a descendant is an element named `tag` (any case).
+    fn has_element(node: &Html<()>, tag: &str) -> bool {
+        match node {
+            Html::HElement(t, _, kids) => {
+                t.eq_ignore_ascii_case(tag) || kids.iter().any(|k| has_element(k, tag))
+            }
+            Html::HText(_) | Html::HRaw(_) => false,
+        }
+    }
+
+    /// True when `node` or a descendant is a text or raw node holding `needle`.
+    fn has_text(node: &Html<()>, needle: &str) -> bool {
+        match node {
+            Html::HElement(_, _, kids) => kids.iter().any(|k| has_text(k, needle)),
+            Html::HText(t) | Html::HRaw(t) => t.contains(needle),
+        }
+    }
+
+    /// True when `node` or a descendant is a text node equal to `text`.
+    fn has_text_exactly(node: &Html<()>, text: &str) -> bool {
+        match node {
+            Html::HElement(_, _, kids) => kids.iter().any(|k| has_text_exactly(k, text)),
+            Html::HText(t) => t == text,
+            Html::HRaw(_) => false,
+        }
     }
 }
 
@@ -1709,5 +1999,38 @@ mod link_tests {
         let attrs = link_attrs(&el);
         assert_eq!(rel_count(attrs), 1);
         assert!(has_attr(attrs, "rel", "noopener"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod white_space_helper_tests {
+    use super::{
+        ui_font_white_space_break_spaces_, ui_font_white_space_no_wrap_,
+        ui_font_white_space_normal_, ui_font_white_space_pre_, ui_font_white_space_pre_line_,
+        ui_font_white_space_pre_wrap_,
+    };
+    use crate::ui::element::{Attribute, WhiteSpace};
+
+    /// Each `Font.whiteSpace` helper carries a distinct keyword and together
+    /// they cover `WhiteSpace::ALL` in order (CI job `test`).
+    #[test]
+    fn white_space_helpers_map_one_to_one_onto_all() {
+        let helpers: [Attribute<()>; 6] = [
+            ui_font_white_space_normal_(),
+            ui_font_white_space_no_wrap_(),
+            ui_font_white_space_pre_(),
+            ui_font_white_space_pre_wrap_(),
+            ui_font_white_space_pre_line_(),
+            ui_font_white_space_break_spaces_(),
+        ];
+        let carried: Vec<WhiteSpace> = helpers
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::AttrFontWhiteSpace(ws) => Some(*ws),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carried, WhiteSpace::ALL.to_vec());
     }
 }

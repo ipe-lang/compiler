@@ -36,7 +36,7 @@ fn unit_pattern_ipec_accepts_and_lowers() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must accept the unit pattern `()`: {:?}",
+        "ipe dev build must accept the unit pattern `()`: {:?}",
         built.err()
     );
 

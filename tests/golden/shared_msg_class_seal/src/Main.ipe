@@ -1,0 +1,22 @@
+module Main exposing (main)
+
+-- `Lib.nav` has no cross-module use; its message slot is the one `Lib.wrap`
+-- and `Lib.b` share with it, and `Main` pins both. ipe MUST exit 0 AND the
+-- emitted project MUST cargo-build (THE SEAL).
+
+import Ipe.Html as Html exposing (Html)
+import Ipe.Io as Io
+import Lib exposing (b, wrap)
+
+
+type Msg
+    = Click
+
+
+view : Html Msg
+view =
+    Html.div [] [ wrap, b Click ]
+
+
+main =
+    Io.println (Html.render view)

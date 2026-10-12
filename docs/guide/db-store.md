@@ -136,7 +136,7 @@ main =
         )
 ```
 
-Running it (`ipe run`) prints its name — the store is assembled and the route wired,
+Running it (`ipe dev run`) prints its name — the store is assembled and the route wired,
 but the never-served `listen` is caught by `Task.onError`, so no live database or
 network is needed to prove the model compiles and the security path type-checks:
 

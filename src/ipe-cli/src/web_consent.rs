@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ipe_diagnostics::ConsentError;
 use ipe_ir::{Capability, WebCapability};
 
 use crate::CliError;
@@ -93,9 +94,9 @@ fn browser_axes_imported_by(src: &str) -> BTreeSet<WebCapability> {
 /// - Every disclosed `js-port:<axis>` in `inferred` that is present in `granted`
 ///   proceeds silently.
 /// - A disclosed axis absent from `granted` is a fail-closed, typed refusal naming
-///   the disclosing module(s) and the remedy (add `accept = [ JsPort <Axis> ]` to
-///   the app's `package.ipe`, or drop the dependency). `granted` is ONLY the
-///   top-level app manifest's `accept` set — the grant does not compose.
+///   the disclosing module(s) and the remedy (add `JsPort <Axis>` to `accepts`
+///   in the app's `package.ipe`, or drop the dependency). `granted` is ONLY the
+///   top-level app manifest's `accepts` set — the grant does not compose.
 /// - An axis disclosed but attributed to NO scanned module (un-attributable) is
 ///   ALSO a refusal, stating the axis cannot be attributed — never a silent drop.
 ///
@@ -142,15 +143,15 @@ pub fn gate(
 /// The typed, fail-closed refusal naming each ungranted web axis, its disclosing
 /// module(s), and the remedy.
 fn refusal(ungranted: &[crate::text::Message]) -> CliError {
-    CliError::Usage(crate::text::Message::lines(
-        std::iter::once(crate::text::msg::web_consent_header())
-            .chain(
-                ungranted
-                    .iter()
-                    .map(|item| crate::text::msg::consent_item(item)),
-            )
+    let body = crate::text::Message::lines(
+        ungranted
+            .iter()
+            .map(|item| crate::text::msg::consent_item(item))
             .chain(std::iter::once(crate::text::msg::web_consent_remedy())),
-    ))
+    );
+    CliError::consent_refused(ConsentError::WebAxisUngranted {
+        body: body.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -182,6 +183,10 @@ mod tests {
         assert!(msg.contains("IPE-S0002"), "carries the code: {msg}");
         assert!(msg.contains("js-port:clipboard"), "names the axis: {msg}");
         assert!(msg.contains("Dep.Widget"), "names the discloser: {msg}");
+        assert!(
+            msg.contains("`JsPort <Axis>`, to `accepts = [ … ]` in the `capabilities` record"),
+            "the remedy names the manifest field the gate reads: {msg}"
+        );
     }
 
     #[test]

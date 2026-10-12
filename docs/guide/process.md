@@ -57,7 +57,7 @@ Io.println ("exit=" ++ String.fromInt result.exitCode)
 Io.println ("stdout -> " ++ String.trim result.stdout)
 ```
 
-Running it (`ipe run`) prints:
+Running it (`ipe dev run`) prints:
 
 ```
 run -> hello from a child

@@ -44,7 +44,7 @@ fn i224_destructure_ipec_accepts_and_clones_reused_component() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for destructure_move_ownership: {:?}",
+        "ipe dev build must succeed for destructure_move_ownership: {:?}",
         built.err()
     );
 
@@ -76,7 +76,11 @@ fn i224_destructure_cargo_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     let outcome = crate::support::build_and_run_emitted("destructure_move_ownership", &out);
     assert_eq!(

@@ -62,7 +62,7 @@ fn build_run_oninput_closure() -> (PathBuf, crate::support::RunOutcome) {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for stdui_oninput_closure: {:?}",
+        "ipe dev build must succeed for stdui_oninput_closure: {:?}",
         built.err()
     );
 

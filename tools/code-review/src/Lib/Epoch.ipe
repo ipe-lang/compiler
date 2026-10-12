@@ -1,0 +1,20 @@
+module Lib.Epoch exposing (Epoch, mint)
+
+-- One server process's identity, minted once at startup. A session slot
+-- holding a read or a decision in flight records the epoch whose process
+-- runs its completion, so a slot persisted by another process, whose
+-- completion died with it, is idle by type rather than taken forever.
+-- Opaque: built only by `mint`, so no other value can pass for an epoch.
+
+import Ipe.Crypto as Crypto
+import Ipe.Task as Task
+
+
+type Epoch
+    = Epoch String
+
+
+-- 16 bytes from the OS entropy source: two processes never share an epoch.
+mint : Task.Task Error Epoch
+mint =
+    Crypto.randomToken 16 |> Task.map Epoch

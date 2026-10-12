@@ -56,7 +56,6 @@ fn make_get_name_def(
     /* get_name */ Symbol,
     /* p */ Symbol,
     /* name_field */ Symbol,
-    /* any_sym */ Symbol,
     /* gn_sig_span */ Span,
     /* gn_param_span */ Span,
     /* gn_access_span */ Span,
@@ -64,7 +63,6 @@ fn make_get_name_def(
     let get_name = interner.intern("getName").unwrap();
     let p = interner.intern("p").unwrap();
     let name_field = interner.intern("name").unwrap();
-    let any_sym = interner.intern("any").unwrap();
 
     let gn_sig_span = Span::new(0, 1);
     let gn_param_span = Span::new(2, 3);
@@ -83,14 +81,14 @@ fn make_get_name_def(
     let gn_def = canon::Def::Typed {
         home: vec![],
         name: ipe_diagnostics::Located::new(gn_sig_span, get_name),
-        free_vars: vec![any_sym],
+        free_vars: Vec::new(),
         patterns: vec![ipe_diagnostics::Located::new(
             gn_param_span,
             canon::Pattern_::PVar(p),
         )],
         body: gn_body,
         ty: canon::Type::Lambda(
-            Box::new(canon::Type::Var(any_sym)),
+            Box::new(canon::Type::Wildcard),
             Box::new(ty_string(interner)),
         ),
     };
@@ -100,7 +98,6 @@ fn make_get_name_def(
         get_name,
         p,
         name_field,
-        any_sym,
         gn_sig_span,
         gn_param_span,
         gn_access_span,
@@ -119,7 +116,7 @@ fn lower_any_call(
     field_solved_ty: Ty,
     interner: &mut Interner,
 ) -> DResult<ipe_ir::Program> {
-    let (gn_def, get_name, _p, name_field, any_sym, _gn_sig_span, gn_param_span, gn_access_span) =
+    let (gn_def, get_name, _p, name_field, _gn_sig_span, gn_param_span, gn_access_span) =
         make_get_name_def(interner);
     let caller = interner.intern("caller").unwrap();
 
@@ -159,10 +156,7 @@ fn lower_any_call(
     let mut env: BTreeMap<(Vec<Symbol>, Symbol), Ty> = BTreeMap::new();
     env.insert(
         (vec![], get_name),
-        Ty::Fun(
-            Box::new(Ty::Var(any_sym.as_raw())),
-            Box::new(solved_string(interner)),
-        ),
+        Ty::Fun(Box::new(Ty::Wildcard), Box::new(solved_string(interner))),
     );
     env.insert((vec![], caller), solved_string(interner));
 
@@ -246,7 +240,7 @@ fn correct_field_type_at_any_call_site_is_accepted() {
 #[test]
 fn extra_field_beyond_required_is_accepted() {
     let mut i = Interner::new();
-    let (gn_def, get_name, _p, name_field, any_sym, _gn_sig, gn_param_span, gn_access_span) =
+    let (gn_def, get_name, _p, name_field, _gn_sig, gn_param_span, gn_access_span) =
         make_get_name_def(&mut i);
     let caller_sym = i.intern("caller").unwrap();
     let age_field = i.intern("age").unwrap();
@@ -291,10 +285,7 @@ fn extra_field_beyond_required_is_accepted() {
     let mut env: BTreeMap<(Vec<Symbol>, Symbol), Ty> = BTreeMap::new();
     env.insert(
         (vec![], get_name),
-        Ty::Fun(
-            Box::new(Ty::Var(any_sym.as_raw())),
-            Box::new(solved_string(&mut i)),
-        ),
+        Ty::Fun(Box::new(Ty::Wildcard), Box::new(solved_string(&mut i))),
     );
     env.insert((vec![], caller_sym), solved_string(&mut i));
 
@@ -353,7 +344,7 @@ fn extra_field_beyond_required_is_accepted() {
 #[test]
 fn relayed_any_param_at_row_callee_is_rejected() {
     let mut i = Interner::new();
-    let (gn_def, get_name, _p, name_field, any_sym, _gn_sig, gn_param_span, gn_access_span) =
+    let (gn_def, get_name, _p, name_field, _gn_sig, gn_param_span, gn_access_span) =
         make_get_name_def(&mut i);
 
     // `relay : any -> String; relay x = getName x`
@@ -398,10 +389,7 @@ fn relayed_any_param_at_row_callee_is_rejected() {
     let mut env: BTreeMap<(Vec<Symbol>, Symbol), Ty> = BTreeMap::new();
     env.insert(
         (vec![], get_name),
-        Ty::Fun(
-            Box::new(Ty::Var(any_sym.as_raw())),
-            Box::new(solved_string(&mut i)),
-        ),
+        Ty::Fun(Box::new(Ty::Wildcard), Box::new(solved_string(&mut i))),
     );
     env.insert(
         (vec![], relay_sym),
@@ -467,7 +455,7 @@ fn lower_any_call_bare_arg(
     arg_solved_ty: Ty,
     interner: &mut Interner,
 ) -> DResult<ipe_ir::Program> {
-    let (gn_def, get_name, _p, name_field, any_sym, _gn_sig_span, gn_param_span, gn_access_span) =
+    let (gn_def, get_name, _p, name_field, _gn_sig_span, gn_param_span, gn_access_span) =
         make_get_name_def(interner);
     let caller = interner.intern("caller").unwrap();
 
@@ -499,10 +487,7 @@ fn lower_any_call_bare_arg(
     let mut env: BTreeMap<(Vec<Symbol>, Symbol), Ty> = BTreeMap::new();
     env.insert(
         (vec![], get_name),
-        Ty::Fun(
-            Box::new(Ty::Var(any_sym.as_raw())),
-            Box::new(solved_string(interner)),
-        ),
+        Ty::Fun(Box::new(Ty::Wildcard), Box::new(solved_string(interner))),
     );
     env.insert((vec![], caller), solved_string(interner));
 

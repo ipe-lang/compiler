@@ -5,7 +5,7 @@
 //! Every handler here is a pure function from (database snapshot, position)
 //! to an LSP payload. This crate owns **no** parser, resolver, or solver of
 //! its own: diagnostics, types, and navigation targets are read from the same
-//! memoized `ipe_db` queries `ipe build` and `ipe watch` run, so an answer
+//! memoized `ipe_db` queries `ipe dev build` and `ipe dev watch` run, so an answer
 //! that disagrees with the compiler has no code path. No function here
 //! touches `std::fs`, `std::env`, or the clock — file text enters through
 //! the `SourceFile` inputs the driver (the LSP server crate) sets.

@@ -83,7 +83,7 @@ const UNSAFE_AND_SIBLING_NETWORK: &[(&str, &str)] = &[
 ];
 
 /// `Main` reaches the network and the clock; `Util` is pure; the UNIMPORTED
-/// `Broken` does not compile, so the package is refused exactly as `ipe build`
+/// `Broken` does not compile, so the package is refused exactly as `ipe dev build`
 /// refuses it, with the diagnostic framed against `Broken.ipe`.
 const NETWORK_CLOCK_WITH_BROKEN_SIBLING: &[(&str, &str)] = &[
     (

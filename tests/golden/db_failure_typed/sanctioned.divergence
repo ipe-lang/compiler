@@ -1,0 +1,1 @@
+sanctioned: this program reads the typed DbFailure an Ipe.Db failure carries in ErrorInfo.details, over an in-memory SQLite database via Db.open + Db.withTransaction. DbFailure is an Ipê-only addition with no reference-backend counterpart, so the divergence is structural. Ipê's own verified output is recorded as the reference.

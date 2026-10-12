@@ -42,7 +42,9 @@ fn kill_and_reap(mut child: Child) {
 
 #[test]
 fn a_child_outlives_the_thread_that_requested_it() {
-    let mut child = std::thread::spawn(|| spawn_hardened(sleep_30()))
+    let mut child = std::thread::Builder::new()
+        .spawn(|| spawn_hardened(sleep_30()))
+        .expect("spawn test thread")
         .join()
         .expect("requesting thread")
         .expect("hardened spawn");
@@ -115,15 +117,17 @@ fn a_hardened_child_dies_with_its_killed_parent() {
         // The reader ends at EOF: the probe is killed below, and the grandchild
         // holds no copy of the pipe.
         let (pid_tx, pid_rx) = std::sync::mpsc::channel::<u32>();
-        let reader = std::thread::spawn(move || {
-            let reported = std::io::BufReader::new(stdout)
-                .lines()
-                .map_while(Result::ok)
-                .find_map(|line| line.strip_prefix(PROBE_PID_PREFIX)?.trim().parse().ok());
-            if let Some(pid) = reported {
-                let _ = pid_tx.send(pid);
-            }
-        });
+        let reader = std::thread::Builder::new()
+            .spawn(move || {
+                let reported = std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                    .find_map(|line| line.strip_prefix(PROBE_PID_PREFIX)?.trim().parse().ok());
+                if let Some(pid) = reported {
+                    let _ = pid_tx.send(pid);
+                }
+            })
+            .expect("spawn test thread");
         let grandchild = pid_rx.recv_timeout(POLL_CEILING).ok();
         // Captured before the probe dies, while its pid names the grandchild.
         let identity = grandchild.and_then(ProcStat::read);
@@ -181,10 +185,13 @@ mod tokio_entry {
             .build()
             .expect("runtime");
         let running = rt.block_on(async {
-            let mut child = tokio::task::spawn_blocking(|| spawn_hardened_tokio(tokio_sleep_30()))
-                .await
-                .expect("blocking task")
-                .expect("hardened tokio spawn");
+            let mut child = ipe_runtime_rust::threads::offload_blocking("pdeath-probe", || {
+                spawn_hardened_tokio(tokio_sleep_30())
+            })
+            .expect("offload to the blocking pool")
+            .await
+            .expect("blocking task")
+            .expect("hardened tokio spawn");
             tokio::time::sleep(keep_alive + OUTLIVE).await;
             let running = child.try_wait().expect("poll child").is_none();
             let _ = child.start_kill();

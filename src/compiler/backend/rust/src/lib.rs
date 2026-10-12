@@ -18,6 +18,9 @@
 mod capabilities;
 mod const_fold;
 pub use const_fold::fold_program;
+pub use emit_expr::rust_str_lit;
+/// The typed mount base the emitted browser shell is served under.
+pub use ipe_runtime_rust::encoding::MountBase;
 mod crate_specs;
 mod doc;
 mod emit_console;
@@ -33,6 +36,8 @@ mod emit_ui_template;
 mod emit_web;
 mod emit_webview;
 mod emit_worker;
+mod items;
+mod layout_sweep;
 mod naming;
 mod preamble;
 mod project;
@@ -44,19 +49,19 @@ pub mod static_build;
 // The `update`-arm → transition-datum classifier: the compile-time half of the
 // dev-loop's logic hot-swap (the counterpart of `emit_template`'s static
 // partition). Public API — consumed by the `hot_appearance` update emitter and
-// the `ipe watch` transition classifier; its dev == prod conformance to the
+// the `ipe dev watch` transition classifier; its dev == prod conformance to the
 // runtime `apply_transition` is pinned in-module.
 pub mod transition_classify;
 // The `Msg`-enum → schema-tagged set-descriptor classifier: the compile-time
 // half of the additive-`Msg`-variant hot-swap. Public API — consumed by the
-// `ipe watch` loop to bake and diff the program's `Msg` variant surface; its
+// `ipe dev watch` loop to bake and diff the program's `Msg` variant surface; its
 // dev == prod conformance to the runtime `web::msg_set` proof is pinned
 // in-module.
 pub mod msg_set_classify;
 
 // The `subscriptions`-entry sub-description partition: reduces a data-describable
 // tick subscription (`Time.every 1000 Tick`) to an inert `CompileSubDescription`
-// consumed by the emit hook and mirrored by the `ipe watch` subs classifier; its
+// consumed by the emit hook and mirrored by the `ipe dev watch` subs classifier; its
 // dev == prod conformance to the runtime `sub_every_hot` is pinned in-module.
 pub mod sub_classify;
 
@@ -72,12 +77,13 @@ use ipe_ir::{
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
+pub use layout_sweep::{BodyLayoutBudget, LAYOUT_FUEL, body_layout_budgets};
 pub use preamble::{epilogue, preamble};
 
 /// Which `ipe` verb family an emit serves.
 ///
-/// The verb, never the cargo profile, decides it. `Development` (`ipe build`,
-/// `ipe run`, `ipe test`, `ipe watch`) turns on the runtime `dev-posture`
+/// The verb, never the cargo profile, decides it. `Development` (`ipe dev build`,
+/// `ipe dev run`, `ipe test`, `ipe dev watch`) turns on the runtime `dev-posture`
 /// feature, the one input that lets the operator console default open, and only
 /// on a loopback bind. `Release` is the default, so an emit whose caller states
 /// no intent is a release emit: the console stays closed until
@@ -86,7 +92,7 @@ pub use preamble::{epilogue, preamble};
 pub enum BuildIntent {
     /// A dev-loop verb: the runtime carries the `dev-posture` feature.
     Development,
-    /// A shipped artifact (`ipe release`, `ipe eject`, the desktop bundle).
+    /// A shipped artifact (`ipe release`, `ipe release eject`, the desktop bundle).
     #[default]
     Release,
 }
@@ -99,7 +105,7 @@ pub enum BuildIntent {
 /// the `ipe_runtime/config.rs` template and `Cargo.toml` sqlx feature
 /// [`crate::project::emit_program`] selects. `Sqlite` is the default: a
 /// program with no database setting, or one built via the single-file
-/// `ipe build` path (no manifest at all), emits byte-identical output to
+/// `ipe dev build` path (no manifest at all), emits byte-identical output to
 /// pre-driver-selection backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DbDriver {
@@ -235,9 +241,10 @@ pub struct RustBackend<'a> {
     ffi: Option<FfiEmit>,
     target: ipe_ir::Target,
     wasm_public_env: Vec<String>,
+    mount_base: MountBase,
     wasm_hydrate_mode: bool,
     runtime_dep: Option<RuntimeDep>,
-    /// `true` when `ipe build --debugger` / `ipe run --debugger` was passed. Adds
+    /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed. Adds
     /// the runtime `debugger` feature to the emitted project's dependency feature
     /// list so the TEA driver instantiates the recorder. Never set for
     /// `ipe release` (the release command does not expose the flag), so no
@@ -513,6 +520,7 @@ impl<'a> RustBackend<'a> {
             ffi: None,
             target: ipe_ir::Target::Native,
             wasm_public_env: Vec::new(),
+            mount_base: MountBase::root(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -605,7 +613,7 @@ impl<'a> RustBackend<'a> {
     }
 
     /// Select the compilation target the emitted project is built for
-    /// (`Native` by default; `WasmClient` under `ipe build --target wasm`).
+    /// (`Native` by default; `WasmClient` under `ipe dev build --target wasm`).
     #[must_use]
     pub const fn with_target(mut self, target: ipe_ir::Target) -> Self {
         self.target = target;
@@ -641,6 +649,17 @@ impl<'a> RustBackend<'a> {
         self
     }
 
+    /// Supply the mount base the emitted browser shell is served under.
+    ///
+    /// Parsed once from the manifest's `browser.basePath`; every shell URL
+    /// (`boot.js`, the wasm-bindgen glue and module) is built from it. The
+    /// default is [`MountBase::root`].
+    #[must_use]
+    pub fn with_mount_base(mut self, base: MountBase) -> Self {
+        self.mount_base = base;
+        self
+    }
+
     /// Enable the `[wasm] mode = "hydrate"` emission path (M7 SSR + hydration).
     /// When set, the emitted wasm crate exports a `#[wasm_bindgen] pub fn
     /// hydrate(model_json: &str)` in addition to the `#[wasm_bindgen(start)]`
@@ -672,6 +691,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -701,6 +721,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -730,6 +751,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -759,6 +781,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -803,6 +826,7 @@ impl<'a> RustBackend<'a> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -854,6 +878,7 @@ impl Backend for RustBackend<'_> {
             self.ffi.clone(),
             self.target,
             self.wasm_public_env.clone(),
+            self.mount_base.clone(),
             self.wasm_hydrate_mode,
             self.runtime_dep.clone(),
             self.debugger,
@@ -1461,6 +1486,9 @@ pub(crate) struct EmitCtx<'a> {
     /// secret-name denylist at manifest parse time. Meaningless / ignored
     /// when [`Self::uses_env_public`] is `false`.
     pub(crate) wasm_public_env: Vec<String>,
+    /// Where the emitted browser shell is served, threaded in via
+    /// [`RustBackend::with_mount_base`]; every shell URL is built from it.
+    pub(crate) mount_base: MountBase,
     /// `true` when `[wasm] mode = "hydrate"` was set in `package.ipe`. When set,
     /// the emitted wasm epilogue includes a `#[wasm_bindgen] pub fn hydrate(…)`
     /// export in addition to the `#[wasm_bindgen(start)] ipe_start` entry —
@@ -1473,7 +1501,7 @@ pub(crate) struct EmitCtx<'a> {
     /// source; `None` (the default) emits the byte-identical vendored project.
     /// Ignored on the wasm target (which keeps its closed vendoring template).
     pub(crate) runtime_dep: Option<RuntimeDep>,
-    /// `true` when `ipe build/run --debugger` selected the development-only
+    /// `true` when `ipe dev build/run --debugger` selected the development-only
     /// time-travelling debugger. When set, [`crate::runtime_features`] adds the
     /// `debugger` feature to the emitted runtime dependency's feature list on
     /// both targets, so the TEA driver records each `(msg, model)` step. Never
@@ -1767,19 +1795,40 @@ fn refuse_unclassified_enum(
 /// semantics under the emitted `impl<Tn: Clone> Clone`, which bounds every
 /// type parameter and so makes a bare type variable `Clone`.
 fn field_is_clone(ty: &IrType, enum_clone: &dyn Fn(&ModPath, Symbol) -> bool) -> bool {
+    clone_under(ty, enum_clone, &ipe_ir::payload_leaf_is_clone)
+}
+
+/// Is a value of type `ty` inside an emitted function body `Clone`?
+///
+/// The same walk as [`field_is_clone`], plus a row witness: an emitted
+/// function bounds every type parameter and every row witness by `Clone`, so
+/// both are `Clone` there at any depth.
+pub(crate) fn fn_value_is_clone(
+    ty: &IrType,
+    enum_clone: &dyn Fn(&ModPath, Symbol) -> bool,
+) -> bool {
+    clone_under(ty, enum_clone, &|t| {
+        matches!(t, IrType::RowGeneric(_)) || ipe_ir::payload_leaf_is_clone(t)
+    })
+}
+
+/// The `Clone` walk shared by [`field_is_clone`] and [`fn_value_is_clone`];
+/// `leaf` decides every type that is neither a named enum nor a carrier.
+fn clone_under(
+    ty: &IrType,
+    enum_clone: &dyn Fn(&ModPath, Symbol) -> bool,
+    leaf: &dyn Fn(&IrType) -> bool,
+) -> bool {
+    let go = |t: &IrType| clone_under(t, enum_clone, leaf);
     match ty {
-        IrType::Enum { home, name, args } => {
-            enum_clone(home, *name) && args.iter().all(|a| field_is_clone(a, enum_clone))
-        }
-        IrType::Maybe(e) | IrType::List(e) | IrType::Set(e) => field_is_clone(e, enum_clone),
-        IrType::Result(a, b) | IrType::Dict(a, b) => {
-            field_is_clone(a, enum_clone) && field_is_clone(b, enum_clone)
-        }
-        IrType::Tuple(es) => es.iter().all(|e| field_is_clone(e, enum_clone)),
-        IrType::Record(fields) => fields.values().all(|f| field_is_clone(f, enum_clone)),
-        IrType::Ui { msg, .. } => field_is_clone(msg, enum_clone),
-        IrType::WebRoute(page) => field_is_clone(page, enum_clone),
-        other => ipe_ir::payload_leaf_is_clone(other),
+        IrType::Enum { home, name, args } => enum_clone(home, *name) && args.iter().all(go),
+        IrType::Maybe(e) | IrType::List(e) | IrType::Set(e) => go(e),
+        IrType::Result(a, b) | IrType::Dict(a, b) => go(a) && go(b),
+        IrType::Tuple(es) => es.iter().all(go),
+        IrType::Record(fields) => fields.values().all(go),
+        IrType::Ui { msg, .. } => go(msg),
+        IrType::WebRoute(page) => go(page),
+        other => leaf(other),
     }
 }
 
@@ -1795,6 +1844,7 @@ impl<'a> EmitCtx<'a> {
         ffi: Option<FfiEmit>,
         target: ipe_ir::Target,
         wasm_public_env: Vec<String>,
+        mount_base: MountBase,
         wasm_hydrate_mode: bool,
         runtime_dep: Option<RuntimeDep>,
         debugger: bool,
@@ -2441,6 +2491,7 @@ impl<'a> EmitCtx<'a> {
             uses_env_public,
             uses_async_runtime,
             wasm_public_env,
+            mount_base,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -2474,7 +2525,7 @@ impl<'a> EmitCtx<'a> {
             // `IPE_DEBUGGER_RECORD` dump at loop exit, not the control socket. A
             // pure webview shape (`uses_webview && !uses_web`) is likewise gated
             // off: it ships `web-core` (so the table would build) but runs no
-            // control port to push to. With the flag off (`ipe build`/`ipe
+            // control port to push to. With the flag off (`ipe dev build`/`ipe
             // release`) the whole hoist is inert and the emit is byte-identical to
             // the direct-literal form — so a release artifact never references the
             // dev-loop table. `tui_shape_hoists`, `pure_webview_shape_does_not_hoist`,
@@ -2669,6 +2720,16 @@ impl<'a> EmitCtx<'a> {
     /// augmenter and the `mod.rs` append — they can never disagree.
     pub(crate) const fn reaches_jwt(&self) -> bool {
         self.uses_jwt || self.uses_auth
+    }
+
+    /// `true` when the emitted crate declares the `revocation` runtime module.
+    ///
+    /// `revocation.rs` publishes its generation channel on `tokio::sync::watch`
+    /// whenever the `tokio` feature is on, so the same predicate that declares
+    /// the module in `mod.rs` also extends the `tokio` dependency with `"sync"`
+    /// — the two can never disagree.
+    pub(crate) const fn declares_revocation(&self) -> bool {
+        self.uses_principal || self.reaches_jwt()
     }
 
     /// `true` when the emitted crate names the `Value` (`JsonVal`) or `Decoder<T>`
@@ -3013,7 +3074,7 @@ impl<'a> EmitCtx<'a> {
     /// Both browser shapes route seal types through serde (the Web session
     /// store, the `CustomElement` down/up seam), and a `--debugger` build encodes
     /// a cli/worker session's `Msg` (and, when legal, `Model`) into the typed
-    /// session log `ipe run --replay` reads. The derive only ever lands on a
+    /// session log `ipe dev run --replay` reads. The derive only ever lands on a
     /// type the serde fixpoint proved derivable, so widening this gate is
     /// cargo-buildable by construction. The ONE predicate every serde derive
     /// site and the app-crate `serde` dependency read, so they cannot drift.
@@ -3285,7 +3346,7 @@ impl<'a> EmitCtx<'a> {
     /// argument renders as that function's Rust generic (`RecValue<T1>`).
     ///
     /// The prepass collected every `IrType::Record` reachable from a signature,
-    /// so a miss here is an internal invariant violation (IPE-I0204).
+    /// so a miss here is an internal invariant violation (IPE-I0001).
     fn render_record_use(
         &self,
         fields: &BTreeMap<Symbol, IrType>,
@@ -3344,7 +3405,7 @@ impl<'a> EmitCtx<'a> {
     /// literal's solved [`IrType::Record`] shape threaded from the lowerer.
     ///
     /// A miss means the literal's shape never appeared in a signature — a
-    /// lowerer-contract violation (IPE-I0204), surfaced rather than mis-emitted.
+    /// lowerer-contract violation (IPE-I0001), surfaced rather than mis-emitted.
     fn record_name_for_literal(
         &self,
         field_names: &[String],
@@ -3437,7 +3498,7 @@ impl<'a> EmitCtx<'a> {
     ///   invariant violation, never a silent pick.
     ///
     /// A miss (no struct for the set) means the shape never appeared in a
-    /// signature — a lowerer-contract violation (IPE-I0204).
+    /// signature — a lowerer-contract violation (IPE-I0001).
     fn record_struct_by_key(
         &self,
         key: &[String],
@@ -3673,6 +3734,18 @@ impl<'a> EmitCtx<'a> {
         if home.0.is_empty() && matches!(self.interner.resolve(ty), Some("RedirectPolicy")) {
             return Ok("RedirectPolicy");
         }
+        // `DbFailure` is a Prelude-built-in enum backed by the runtime
+        // `ipe_runtime::error::IpeDbFailure`, with no `EnumDef`; routed here so
+        // a `Database f` payload binder resolves in type position.
+        if home.0.is_empty() && matches!(self.interner.resolve(ty), Some("DbFailure")) {
+            return Ok("IpeDbFailure");
+        }
+        // `AuthError` is a Prelude-built-in enum backed by the runtime
+        // `ipe_runtime::error::IpeAuthError`, with no `EnumDef`; routed here so
+        // an annotation or an `Err e` binder resolves in type position.
+        if home.0.is_empty() && matches!(self.interner.resolve(ty), Some("AuthError")) {
+            return Ok("IpeAuthError");
+        }
         self.enum_names
             .get(&(home.clone(), ty))
             .map(String::as_str)
@@ -3740,8 +3813,14 @@ impl<'a> EmitCtx<'a> {
             // `ErrorDetails` is backed by `IpeErrorDetails`. Constructor names
             // match Ipê source verbatim:
             // `FfiPanic` / `TypeMismatch` / `HttpStatus` / `JsonDecode` /
-            // `Custom`.
+            // `Custom` / `Database`.
             Some("ErrorDetails") => Some("IpeErrorDetails"),
+            // `DbFailure` is backed by `IpeDbFailure`; `Db.UniqueViolation`
+            // emits `IpeDbFailure::UniqueViolation`, variant names verbatim.
+            Some("DbFailure") => Some("IpeDbFailure"),
+            // `AuthError` is backed by `IpeAuthError`; `Auth.Expired` emits
+            // `IpeAuthError::Expired`, variant names verbatim.
+            Some("AuthError") => Some("IpeAuthError"),
             // `Ipe.Cache.Cache` is backed by the non-generic runtime enum
             // `IpeCacheHandle { Cache(i64) }`. Its `EnumDef` is suppressed in
             // `ipe_lower` (no `enum_names` entry, so the guard above lets this
@@ -4768,7 +4847,7 @@ fn skeleton_ty(ty: &IrType, idx: &mut BTreeMap<Symbol, usize>, out: &mut String)
 ///
 /// A mismatch means a use site that does not instantiate the struct template —
 /// an upstream-contract violation surfaced as a [`Diagnostic::CompilerBug`]
-/// (IPE-I0205), never a silent mis-emit.
+/// (IPE-I0001), never a silent mis-emit.
 #[allow(clippy::too_many_lines)]
 fn match_template(
     template: &IrType,
@@ -5373,6 +5452,7 @@ mod record_struct_namespace_tests {
             None,
             ipe_ir::Target::Native,
             Vec::new(),
+            crate::MountBase::root(),
             false,
             None,
             false,
@@ -5480,6 +5560,7 @@ mod record_struct_namespace_tests {
             None,
             ipe_ir::Target::Native,
             Vec::new(),
+            crate::MountBase::root(),
             false,
             None,
             false,
@@ -5571,6 +5652,7 @@ mod record_struct_namespace_tests {
             None,
             ipe_ir::Target::Native,
             Vec::new(),
+            crate::MountBase::root(),
             false,
             None,
             false,

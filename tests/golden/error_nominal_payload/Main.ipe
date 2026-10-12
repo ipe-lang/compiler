@@ -51,6 +51,9 @@ describe err =
                 Just (Custom msg) ->
                     "Custom " ++ msg
 
+                Just (Database _) ->
+                    "Database"
+
                 Nothing ->
                     "plain: " ++ describeInfo info
 

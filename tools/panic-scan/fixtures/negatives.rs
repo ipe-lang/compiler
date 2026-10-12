@@ -41,10 +41,6 @@ mod tests {
     fn t03() { assert_eq!(a, b); }
 }
 
-// A bare `#[test]` fn body is test code — ignored.
-#[test]
-fn direct_test_fn() { assert!(cond); }
-
 // `all(test, …)` gates the item to test-only compilation, so its body is test
 // code even when the attribute is not the bare `cfg(test)` form.
 #[cfg(all(test, unix))]

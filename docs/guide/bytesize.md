@@ -50,7 +50,7 @@ render cap =
         ++ " bytes"
 ```
 
-Running it (`ipe run`) expands each binary unit correctly and clamps the negative:
+Running it (`ipe dev run`) expands each binary unit correctly and clamps the negative:
 
 ```
 Resource caps:

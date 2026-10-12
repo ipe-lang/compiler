@@ -85,7 +85,7 @@ main =
         attempt "bad deploy" False
 ```
 
-Running it (`ipe run`) shows the green deploy running every step, and the bad
+Running it (`ipe dev run`) shows the green deploy running every step, and the bad
 deploy short-circuiting at the failed migration (the traffic-shift step never
 runs) then rolling back:
 

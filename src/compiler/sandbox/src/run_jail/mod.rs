@@ -34,7 +34,7 @@
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4413, SandboxError};
 use ipe_kernels::Capability;
@@ -87,6 +87,9 @@ macro_rules! on_jailed_target {
 
 pub(crate) mod profile;
 pub use profile::*;
+
+pub(crate) mod nproc_scope;
+pub use nproc_scope::{CanaryExit, NprocScope, SCOPE_SCRIPT, Scope, TEETH_SCRIPT, classify, prove};
 
 pub(crate) mod linux;
 #[cfg(all(
@@ -251,39 +254,106 @@ pub struct RunJailTools {
 /// The env is scrubbed with `--clearenv`; only the fixed minimal allowlist
 /// (`PATH`, `TMPDIR`, `LANG`) plus the profile's `env_allowlist` re-enter. There
 /// is NO shell token anywhere in the result.
-#[must_use]
+///
+/// `scope` is the proof that the tools it carries jail with a process cap
+/// counting only the jail's own tasks; the argv names those tools.
+///
+/// # Errors
+/// Any error of [`crate::WritableTree::parse`] when the profile grants the
+/// working tree: its version-control metadata cannot be carved, or the
+/// configuration that metadata holds names code inside a writable grant.
 pub fn run_jail_argv<'fd>(
-    tools: &RunJailTools,
+    scope: &NprocScope,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     seccomp_fd: Option<SealedFdNumber<'fd>>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
-) -> JailArgv<'fd> {
-    run_jail_argv_with_delivery(tools, profile, mounts, seccomp_fd, None, host_env, payload)
+) -> Result<JailArgv<'fd>, JailPathError> {
+    jail_argv_unproven(
+        scope.tools(),
+        profile,
+        mounts,
+        seccomp_fd,
+        None,
+        host_env,
+        payload,
+    )
 }
 
-/// [`run_jail_argv`] plus optional in-jail materialisation of the app binary
-/// from an inherited descriptor.
+/// The directory, under the scoped tempdir, the delivered app is materialised in.
 ///
-/// When `app_delivery` is `Some((fd, dest))`, a `--perms 0700 --file <fd>
-/// <dest>` pair is emitted AFTER every mount op (so `dest`'s parent tmpfs/bind
-/// already exists) and BEFORE the payload separator. bwrap reads the app bytes
-/// from the inherited (sealed, non-cloexec) `fd` and writes an owner-execute
-/// copy at `dest` inside the sandbox — the delivered bytes are exactly the
-/// sealed bytes the caller verified, with no host path lookup to race. The
-/// caller then runs `dest` as the payload.
+/// It is a mount point for a jail-private tmpfs, so the delivered copy lives
+/// only in the jail's memory: nothing of the app is ever written to the host
+/// directory `scoped_tmp` binds. The scoped tempdir is created fresh per run,
+/// so no other bind can lie beneath it and be shadowed by the tmpfs.
+const DELIVERY_DIR: &str = ".ipe-app";
+
+/// The delivered app's file name inside [`DELIVERY_DIR`].
+const DELIVERY_FILE: &str = "ipe-app";
+
+/// The in-jail path the delivered app is materialised at and run from.
 #[must_use]
+pub fn delivered_app_path(mounts: &JailMounts) -> PathBuf {
+    mounts
+        .scoped_tmp()
+        .as_path()
+        .join(DELIVERY_DIR)
+        .join(DELIVERY_FILE)
+}
+
+/// [`run_jail_argv`] for an app delivered from an inherited sealed descriptor.
+///
+/// The builder owns the destination: it mounts a jail-private tmpfs at
+/// `<scoped_tmp>/.ipe-app` AFTER every bind, copies the app from `app_fd`
+/// into it owner-executable (`--perms 0700 --file`), remounts the tmpfs
+/// read-only, and runs `[<delivered path>, app_args...]` as the payload. bwrap
+/// reads the bytes from the inherited (sealed, non-cloexec) descriptor, so
+/// the delivered file is exactly the bytes the caller verified, with no host
+/// path lookup to race and no copy left on the host when the jail exits.
+///
+/// # Errors
+/// As [`run_jail_argv`].
 pub fn run_jail_argv_with_delivery<'fd>(
+    scope: &NprocScope,
+    profile: &SandboxProfile,
+    mounts: &JailMounts,
+    seccomp_fd: Option<SealedFdNumber<'fd>>,
+    app_fd: SealedFdNumber<'fd>,
+    host_env: &dyn Fn(&str) -> Option<OsString>,
+    app_args: &[OsString],
+) -> Result<JailArgv<'fd>, JailPathError> {
+    let mut payload: Vec<OsString> = Vec::with_capacity(app_args.len().saturating_add(1));
+    payload.push(delivered_app_path(mounts).into_os_string());
+    payload.extend(app_args.iter().cloned());
+    jail_argv_unproven(
+        scope.tools(),
+        profile,
+        mounts,
+        seccomp_fd,
+        Some(app_fd),
+        host_env,
+        &payload,
+    )
+}
+
+/// The one run-jail argv builder behind [`run_jail_argv`] and
+/// [`run_jail_argv_with_delivery`].
+///
+/// It takes bare tools rather than an [`NprocScope`] because the canary that
+/// mints the proof runs through it; every other caller goes through the two
+/// builders above.
+fn jail_argv_unproven<'fd>(
     tools: &RunJailTools,
     profile: &SandboxProfile,
     mounts: &JailMounts,
     seccomp_fd: Option<SealedFdNumber<'fd>>,
-    app_delivery: Option<(SealedFdNumber<'fd>, &Path)>,
+    app_fd: Option<SealedFdNumber<'fd>>,
     host_env: &dyn Fn(&str) -> Option<OsString>,
     payload: &[OsString],
-) -> JailArgv<'fd> {
-    let (scoped_tmp, working_tree) = (mounts.scoped_tmp(), mounts.working_tree());
+) -> Result<JailArgv<'fd>, JailPathError> {
+    let tree = crate::mounts::TreeBind::granted_by(&profile.filesystem, mounts)?;
+    let scoped_tmp = mounts.scoped_tmp();
     let mut argv: Vec<OsString> = Vec::new();
 
     // Optional wall clock (only when the profile sets one AND `timeout` is
@@ -300,11 +370,14 @@ pub fn run_jail_argv_with_delivery<'fd>(
     // cgroup are unconditionally unshared (SysV shmem / abstract sockets are
     // covert channels that ride IPC independent of the network axis). PID is
     // unconditionally unshared (no host-PID visibility even when subprocess is
-    // granted).
+    // granted). The user namespace is requested explicitly: the `--nproc` cap
+    // counts per namespace only inside it, so a `bwrap` that cannot create one
+    // must fail the spawn rather than run under a user-wide count.
     if !profile.network {
         argv.push("--unshare-net".into());
     }
     for flag in [
+        "--unshare-user",
         "--unshare-pid",
         "--unshare-uts",
         "--unshare-ipc",
@@ -336,18 +409,10 @@ pub fn run_jail_argv_with_delivery<'fd>(
     // emitted app binary commonly lives under `$HOME` (e.g. a
     // `CARGO_TARGET_DIR` in `~/.cache`); the caller binds the app FILE itself,
     // never its parent directory.
-    let working = crate::mounts::WorkingTree::granted_by(&profile.filesystem);
-    let binds = crate::mounts::jail_binds(mounts, working);
-    crate::mounts::push_mounts(&mut argv, mounts.homes(), &binds);
+    let binds = crate::mounts::jail_binds(mounts, &tree);
+    crate::mounts::push_mounts(&mut argv, mounts.homes(), &binds)?;
     argv.push("--chdir".into());
-    argv.push(
-        match working {
-            crate::mounts::WorkingTree::ReadWrite => working_tree,
-            crate::mounts::WorkingTree::Unbound => scoped_tmp,
-        }
-        .as_path()
-        .into(),
-    );
+    argv.push(tree.chdir(mounts).as_path().into());
 
     // The seccomp filter (subprocess denial + baseline denials). Attached via a
     // pre-arranged fd. `no_new_privs` is set by bubblewrap by default (it always
@@ -381,17 +446,22 @@ pub fn run_jail_argv_with_delivery<'fd>(
     }
 
     // Materialise the app inside the jail from the inherited sealed descriptor,
-    // AFTER all mounts (so the destination's parent exists) and BEFORE the
-    // payload. `--perms 0700` applies to the `--file` copy that follows it,
-    // making the delivered binary owner-executable. bwrap reads the bytes from
-    // `fd` (inherited, non-cloexec, sealed) — the delivered file cannot differ
-    // from the verified bytes.
-    if let Some((fd, dest)) = app_delivery {
+    // AFTER all mounts and BEFORE the payload: a fresh tmpfs at the delivery
+    // dir (jail memory, never the host dir `scoped_tmp` binds), the
+    // owner-execute copy from `fd` into it, then the tmpfs remounted read-only
+    // so the app cannot rewrite its own image. `--perms 0700` applies to the
+    // `--file` that follows it.
+    if let Some(fd) = app_fd {
+        let dir = scoped_tmp.as_path().join(DELIVERY_DIR);
+        argv.push("--tmpfs".into());
+        argv.push(dir.clone().into());
         argv.push("--perms".into());
         argv.push("0700".into());
         argv.push("--file".into());
         argv.push(fd.render());
-        argv.push(dest.into());
+        argv.push(dir.join(DELIVERY_FILE).into());
+        argv.push("--remount-ro".into());
+        argv.push(dir.into());
     }
 
     // Resource caps via prlimit, then the payload with NO shell. The wall clock
@@ -405,10 +475,10 @@ pub fn run_jail_argv_with_delivery<'fd>(
     argv.push("--".into());
     argv.extend(payload.iter().cloned());
     // `'fd` is the borrow of every number rendered above.
-    JailArgv {
+    Ok(JailArgv {
         argv,
         fds: std::marker::PhantomData,
-    }
+    })
 }
 
 // ── refusal + the fail-closed platform decision ─────────────────────────────
@@ -459,6 +529,12 @@ pub enum RunJailDefect {
     /// A path the jail would mount or hand to the payload could not be
     /// resolved, or a home it must mask is unknown.
     Path(JailPathError),
+    /// The process cap was measured not to count only the jail's own tasks, so
+    /// it cannot bound a fork bomb inside the jail.
+    ProcCapUnscoped {
+        /// What the cap counts instead.
+        reason: Scope,
+    },
 }
 
 impl RunJailDefect {
@@ -467,39 +543,48 @@ impl RunJailDefect {
     pub const fn code(&self) -> Code {
         IPE_F4413
     }
-}
 
-impl From<RunJailDefect> for SandboxError {
-    fn from(d: RunJailDefect) -> Self {
-        let detail = match &d {
-            RunJailDefect::PrimitiveUnavailable { missing } => format!(
+    /// The refusal's rendered cause and remedy, without the code.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::PrimitiveUnavailable { missing } => format!(
                 "cannot establish a runtime jail around the app — missing {} — refusing to run \
                  a capability-bearing program unconfined; install bubblewrap (bwrap) and \
                  util-linux (prlimit)",
                 missing.join(", ")
             ),
-            RunJailDefect::UnsupportedPlatform { reason } => format!(
+            Self::UnsupportedPlatform { reason } => format!(
                 "no runtime jail can be built on this platform ({reason}); refusing to run a \
                  native-capability program unconfined"
             ),
-            RunJailDefect::Profile(e) => e.to_string(),
-            RunJailDefect::Spawn { detail } => {
+            Self::Profile(e) => e.to_string(),
+            Self::Spawn { detail } => {
                 format!("failed to spawn the jailed app: {detail}")
             }
-            RunJailDefect::MountFailed { target, detail } => format!(
+            Self::MountFailed { target, detail } => format!(
                 "could not establish the jail-root mount at {} ({detail}); refusing to run the \
                  untrusted payload against an incompletely-mounted root",
                 target.display()
             ),
-            RunJailDefect::ProfileWeakerThanFloor => {
+            Self::ProfileWeakerThanFloor => {
                 "the artifact's ipe.profile requests less isolation than the capability floor \
                  embedded in the binary — refusing to run under a weakened profile"
                     .to_owned()
             }
-            RunJailDefect::Path(e) => e.to_string(),
-        };
+            Self::Path(e) => e.to_string(),
+            Self::ProcCapUnscoped { reason } => format!(
+                "refusing to run without a process cap that counts only the jail: {}",
+                reason.remedy()
+            ),
+        }
+    }
+}
+
+impl From<RunJailDefect> for SandboxError {
+    fn from(d: RunJailDefect) -> Self {
         Self::RunJail {
-            detail: detail.into(),
+            detail: d.detail().into(),
         }
     }
 }
@@ -756,9 +841,9 @@ pub fn probe_run_jail_tools(_wants_wall_clock: bool) -> Result<RunJailTools, Run
 pub fn exec_in_run_jail(
     _tools: &RunJailTools,
     _profile: &SandboxProfile,
-    _scoped_tmp: &Path,
-    _working_tree: &Path,
-    _app: &Path,
+    _scoped_tmp: &std::path::Path,
+    _working_tree: &std::path::Path,
+    _app: &std::path::Path,
     _app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
     Err(RunJailDefect::UnsupportedPlatform {
@@ -834,8 +919,8 @@ pub fn write_sealed_app_memfd(bytes: &[u8]) -> Result<SealedApp, RunJailDefect> 
 pub fn exec_embedded_in_run_jail(
     _tools: &RunJailTools,
     _profile: &SandboxProfile,
-    _scoped_tmp: &Path,
-    _working_tree: &Path,
+    _scoped_tmp: &std::path::Path,
+    _working_tree: &std::path::Path,
     _app: &SealedApp,
     _app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
@@ -848,6 +933,7 @@ pub fn exec_embedded_in_run_jail(
 mod tests {
     use super::*;
     use crate::{CanonicalPath, HomeMasks};
+    use std::path::Path;
 
     /// An absent anchor token attaches nothing and leaves the argv byte-identical.
     #[cfg(unix)]
@@ -1101,12 +1187,12 @@ mod tests {
         assert!(subset.is_at_least_as_isolated_as(&floor));
     }
 
-    fn tools() -> RunJailTools {
-        RunJailTools {
+    fn scope() -> NprocScope {
+        NprocScope::for_test(RunJailTools {
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             prlimit: PathBuf::from("/usr/bin/prlimit"),
             timeout: Some(PathBuf::from("/usr/bin/timeout")),
-        }
+        })
     }
 
     /// Mounts over paths that need not exist, checked against a cargo home
@@ -1139,13 +1225,14 @@ mod tests {
     fn rendered(profile: &SandboxProfile, seccomp_fd: Option<SealedFdNumber<'_>>) -> Vec<String> {
         let no_env = |_: &str| None;
         run_jail_argv(
-            &tools(),
+            &scope(),
             profile,
             &work_mounts(),
             seccomp_fd,
             &no_env,
             &[OsString::from("/work/tree/target/debug/ipe-app")],
         )
+        .expect("the argv builds")
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -1173,16 +1260,17 @@ mod tests {
             tree_bind,
             // A bind of the whole home must not survive its mask.
             vec![home_bind],
-            HomeMasks::resolve(Some(&user_home), None).expect("homes"),
+            HomeMasks::resolve(Ok(&crate::home::test_home(&user_home)), None).expect("homes"),
         );
         let argv: Vec<String> = run_jail_argv(
-            &tools(),
+            &scope(),
             &profile,
             &mounts,
             None,
             &no_env,
             &[OsString::from("app")],
         )
+        .expect("the argv builds")
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -1241,13 +1329,14 @@ mod tests {
                 HomeMasks::unmasked(),
             );
             let argv: Vec<String> = run_jail_argv(
-                &tools(),
+                &scope(),
                 &profile,
                 &mounts,
                 None,
                 &no_env,
                 &[OsString::from("app")],
             )
+            .expect("the argv builds")
             .args()
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1270,6 +1359,47 @@ mod tests {
     #[allow(clippy::expect_used)] // a test host with no `/dev/null` cannot build the fixture
     fn stand_in_fd() -> std::fs::File {
         std::fs::File::open("/dev/null").expect("open /dev/null")
+    }
+
+    /// Both Linux argv builders request the user namespace the per-jail process count rests on.
+    #[test]
+    fn jail_argv_unshares_the_user_namespace() {
+        let unshares_user = |argv: &[String]| {
+            argv.iter()
+                .take_while(|a| a.as_str() != "--")
+                .any(|a| a == "--unshare-user")
+        };
+        let granted = SandboxProfile {
+            network: true,
+            subprocess: true,
+            ..SandboxProfile::maximally_isolated()
+        };
+        for profile in [SandboxProfile::maximally_isolated(), granted] {
+            let argv = rendered(&profile, None);
+            assert!(unshares_user(&argv), "run jail: {argv:?}");
+        }
+        let spec = crate::JailSpec {
+            network: crate::NetworkPolicy::Denied,
+            scoped_tmp: CanonicalPath::assumed("/work/tmp-1"),
+            registry_cache: None,
+            toolchain: None,
+            toolchain_ro_binds: Vec::new(),
+            path_prepend: Vec::new(),
+            rustup_home: None,
+            homes: HomeMasks::unmasked(),
+            limits: crate::ResourceLimits::default(),
+        };
+        let build: Vec<String> = crate::bwrap_argv(
+            &scope(),
+            Path::new("/usr/bin/timeout"),
+            &spec,
+            &[OsString::from("cargo")],
+        )
+        .expect("the build argv builds")
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        assert!(unshares_user(&build), "build jail: {build:?}");
     }
 
     #[cfg(unix)]
@@ -1314,52 +1444,90 @@ mod tests {
         assert!(!joined.contains("sh -c"), "{joined}");
     }
 
+    /// Every bwrap mount op before the payload separator, as `(op, target)` in argv order.
+    fn mount_targets(argv: &[String]) -> Vec<(String, String)> {
+        let mut ops = Vec::new();
+        let mut rest = argv.iter();
+        while let Some(token) = rest.next() {
+            let operands = match token.as_str() {
+                "--" => break,
+                "--bind" | "--ro-bind" | "--dev-bind" | "--bind-try" | "--ro-bind-try"
+                | "--file" => 2,
+                "--tmpfs" | "--proc" | "--dev" | "--dir" | "--remount-ro" => 1,
+                _ => continue,
+            };
+            let target = rest.by_ref().take(operands).last().cloned();
+            ops.push((token.clone(), target.expect("mount op operand")));
+        }
+        ops
+    }
+
     #[cfg(unix)]
     #[test]
-    fn app_delivery_emits_perms_file_after_mounts_before_payload() {
+    fn app_delivery_lands_on_a_jail_private_tmpfs_never_the_host_scratch_bind() {
         use std::os::fd::{AsFd as _, AsRawFd as _};
         let (filter, app) = (stand_in_fd(), stand_in_fd());
         let no_env = |_: &str| None;
-        let dest = Path::new("/work/tmp-1/ipe-app");
+        let mounts = work_mounts();
+        let dest = delivered_app_path(&mounts);
         let argv: Vec<String> = run_jail_argv_with_delivery(
-            &tools(),
+            &scope(),
             &SandboxProfile::maximally_isolated(),
-            &work_mounts(),
+            &mounts,
             Some(SealedFdNumber::for_test(filter.as_fd())),
-            Some((SealedFdNumber::for_test(app.as_fd()), dest)),
+            SealedFdNumber::for_test(app.as_fd()),
             &no_env,
-            &[OsString::from("/work/tmp-1/ipe-app")],
+            &[OsString::from("--port"), OsString::from("8080")],
         )
+        .expect("the argv builds")
         .args()
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
         let joined = argv.join(" ");
-        let file_op = format!("--file {}", app.as_raw_fd());
-        // The sealed-fd delivery pair: owner-execute perms then a copy from the
-        // inherited fd to the in-jail app path.
+        let dest_str = dest.to_string_lossy().into_owned();
+        let dir = dest.parent().expect("delivery dir");
         assert!(
-            joined.contains(&format!("--perms 0700 {file_op} /work/tmp-1/ipe-app")),
-            "delivery pair missing: {joined}"
+            dir.starts_with("/work/tmp-1") && dir != Path::new("/work/tmp-1"),
+            "the delivery dir must be its own mount point beneath the scratch dir: {joined}"
         );
-        // It must come AFTER the writable bind (so the dest parent exists) and
-        // BEFORE the `-- /usr/bin/prlimit` payload separator.
-        let bind = joined
-            .find("--bind /work/tmp-1 /work/tmp-1")
-            .expect("scratch bind");
-        let file = joined.find(&file_op).expect("delivery");
-        let payload = joined.find("-- /usr/bin/prlimit").expect("payload sep");
-        assert!(
-            file > bind,
-            "delivery must follow the scratch bind: {joined}"
+        let ops = mount_targets(&argv);
+        let file_at = ops
+            .iter()
+            .position(|(op, target)| op == "--file" && *target == dest_str)
+            .expect("delivery --file op");
+        // The mount the copy lands on is the LAST op before it whose target
+        // contains the destination: it must be a fresh tmpfs, never the
+        // host-bound scratch dir (whose writes reach the host and outlive the run).
+        let (landing_op, landing) = ops
+            .get(..file_at)
+            .expect("ops before the copy")
+            .iter()
+            .rev()
+            .find(|(op, target)| op != "--remount-ro" && dest.starts_with(target))
+            .expect("a mount covering the destination");
+        assert_eq!(
+            (landing_op.as_str(), Path::new(landing)),
+            ("--tmpfs", dir),
+            "the delivered app must land on a jail-private tmpfs: {joined}"
         );
         assert!(
-            file < payload,
-            "delivery must precede the payload: {joined}"
+            ops.iter()
+                .any(|(op, target)| op == "--bind" && target == "/work/tmp-1"),
+            "the scratch dir stays bound writable: {joined}"
         );
-        // The payload execs the delivered in-jail path, not any host path.
+        // Owner-execute perms on the copy, then the tmpfs remounted read-only.
         assert!(
-            joined.ends_with("-- /work/tmp-1/ipe-app"),
+            joined.contains(&format!(
+                "--perms 0700 --file {} {dest_str} --remount-ro {}",
+                app.as_raw_fd(),
+                dir.display()
+            )),
+            "delivery sequence missing: {joined}"
+        );
+        // The payload execs the delivered in-jail path with the app args.
+        assert!(
+            joined.ends_with(&format!("-- {dest_str} --port 8080")),
             "payload must exec the delivered path: {joined}"
         );
     }
@@ -1397,16 +1565,41 @@ mod tests {
 
     #[test]
     fn filesystem_granted_binds_the_working_tree_read_write() {
+        let base_dir = crate::test_dir::TestDir::new("run-jail-rw").expect("test dir");
+        let tree = base_dir.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("fixture dir");
+        let tree = CanonicalPath::resolve(&tree).expect("fixture path");
         let p = SandboxProfile {
             filesystem: FilesystemScope::WorkingTreeReadWrite,
             ..SandboxProfile::maximally_isolated()
         };
-        let joined = rendered(&p, None).join(" ");
+        let mounts = mounts_of(
+            CanonicalPath::assumed("/work/tmp-1"),
+            tree.clone(),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        let no_env = |_: &str| None;
+        let joined = run_jail_argv(
+            &scope(),
+            &p,
+            &mounts,
+            None,
+            &no_env,
+            &[OsString::from("app")],
+        )
+        .expect("the argv builds")
+        .args()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+        let at = tree.as_path().display();
         assert!(
-            joined.contains("--bind /work/tree /work/tree"),
+            joined.contains(&format!("--bind {at} {at}")),
             "working tree not bound rw: {joined}"
         );
-        assert!(joined.contains("--chdir /work/tree"), "{joined}");
+        assert!(joined.contains(&format!("--chdir {at}")), "{joined}");
     }
 
     #[test]
@@ -1423,17 +1616,10 @@ mod tests {
         }
         let canonical = |path: &Path| CanonicalPath::resolve(path).expect("fixture path");
         let no_env = |_: &str| None;
-        for (filesystem, working) in [
-            (
-                FilesystemScope::Isolated,
-                crate::mounts::WorkingTree::Unbound,
-            ),
-            (
-                FilesystemScope::WorkingTreeReadWrite,
-                crate::mounts::WorkingTree::ReadWrite,
-            ),
+        for filesystem in [
+            FilesystemScope::Isolated,
+            FilesystemScope::WorkingTreeReadWrite,
         ] {
-            assert_eq!(crate::mounts::WorkingTree::granted_by(&filesystem), working);
             let profile = SandboxProfile {
                 filesystem,
                 ..SandboxProfile::maximally_isolated()
@@ -1442,16 +1628,23 @@ mod tests {
                 CanonicalPath::assumed("/work/tmp-1"),
                 canonical(&tree),
                 vec![canonical(&bin)],
-                HomeMasks::resolve(Some(&user_home), None).expect("homes"),
+                HomeMasks::resolve(Ok(&crate::home::test_home(&user_home)), None).expect("homes"),
+            );
+            let bind = crate::mounts::TreeBind::granted_by(&profile.filesystem, &mounts)
+                .expect("a tree without metadata parses");
+            assert_eq!(
+                matches!(bind, crate::mounts::TreeBind::ReadWrite(_)),
+                profile.filesystem == FilesystemScope::WorkingTreeReadWrite
             );
             let argv: Vec<OsString> = run_jail_argv(
-                &tools(),
+                &scope(),
                 &profile,
                 &mounts,
                 None,
                 &no_env,
                 &[OsString::from("app")],
             )
+            .expect("the argv builds")
             .args()
             .to_vec();
             let mut expected: Vec<OsString> =
@@ -1462,17 +1655,11 @@ mod tests {
             crate::mounts::push_mounts(
                 &mut expected,
                 mounts.homes(),
-                &crate::mounts::jail_binds(&mounts, working),
-            );
+                &crate::mounts::jail_binds(&mounts, &bind),
+            )
+            .expect("the plan builds");
             expected.push("--chdir".into());
-            expected.push(
-                match working {
-                    crate::mounts::WorkingTree::ReadWrite => mounts.working_tree(),
-                    crate::mounts::WorkingTree::Unbound => mounts.scoped_tmp(),
-                }
-                .as_path()
-                .into(),
-            );
+            expected.push(bind.chdir(&mounts).as_path().into());
             let start = argv
                 .windows(3)
                 .position(|w| w == ["--ro-bind", "/", "/"])
@@ -1499,13 +1686,14 @@ mod tests {
             }
         };
         let argv = run_jail_argv(
-            &tools(),
+            &scope(),
             &p,
             &work_mounts(),
             None,
             &host,
             &[OsString::from("app")],
-        );
+        )
+        .expect("the argv builds");
         let joined: Vec<String> = argv
             .args()
             .iter()
@@ -1528,10 +1716,10 @@ mod tests {
         };
         // Simulate a binary: arbitrary bytes, the floor line in .rodata, more bytes.
         let mut buf: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
-        buf.extend_from_slice(p.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(p.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(0); // NUL-terminated as in .rodata
         buf.extend_from_slice(&[0x11, 0x22]);
-        let floor = scan_capfloor(&buf).expect("found");
+        let floor = scan_capfloor(&buf).expect("found").axes;
         assert!(floor.network);
         assert_eq!(floor.filesystem, FilesystemScope::WorkingTreeReadWrite);
         assert_eq!(floor.env_allowlist, vec!["A".to_owned(), "B".to_owned()]);
@@ -1551,11 +1739,11 @@ mod tests {
             ..SandboxProfile::maximally_isolated()
         };
         let mut buf = Vec::new();
-        buf.extend_from_slice(legit.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(legit.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(b'\n');
-        buf.extend_from_slice(forged.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(forged.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(0);
-        let floor = scan_capfloor(&buf).expect("found");
+        let floor = scan_capfloor(&buf).expect("found").axes;
         assert_eq!(floor.env_allowlist, vec!["B".to_owned()]);
         // A profile granting C is refused: C is not in the intersected floor.
         let wants_c = SandboxProfile {
@@ -1578,11 +1766,11 @@ mod tests {
             ..SandboxProfile::maximally_isolated()
         };
         let mut buf = Vec::new();
-        buf.extend_from_slice(strict.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(strict.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(b'\n');
-        buf.extend_from_slice(forged.to_capfloor_line().as_bytes());
+        buf.extend_from_slice(forged.to_capfloor_line(FloorIntent::Release).as_bytes());
         buf.push(0);
-        let floor = scan_capfloor(&buf).expect("found");
+        let floor = scan_capfloor(&buf).expect("found").axes;
         // The strict floor wins: no axis granted.
         assert!(!floor.network);
         assert!(!floor.subprocess);
@@ -1634,9 +1822,12 @@ mod tests {
             subprocess: false,
             limits: RunResourceLimits::default(),
         };
-        let line = p.to_capfloor_line();
-        assert_eq!(line, "ipe-capfloor 1 net=true fs=rw sub=false env=A,B");
-        let floor = parse_capfloor(&line).expect("round-trips");
+        let line = p.to_capfloor_line(FloorIntent::Release);
+        assert_eq!(
+            line,
+            "ipe-capfloor 1 net=true fs=rw sub=false env=A,B intent=release"
+        );
+        let floor = parse_capfloor(&line).expect("round-trips").axes;
         assert!(floor.network);
         assert_eq!(floor.filesystem, FilesystemScope::WorkingTreeReadWrite);
         assert!(!floor.subprocess);
@@ -1647,17 +1838,23 @@ mod tests {
     #[test]
     fn capfloor_line_empty_env_round_trips() {
         let p = SandboxProfile::maximally_isolated();
-        let line = p.to_capfloor_line();
-        assert_eq!(line, "ipe-capfloor 1 net=false fs=isolated sub=false env=");
-        let floor = parse_capfloor(&line).expect("round-trips");
+        let line = p.to_capfloor_line(FloorIntent::Release);
+        assert_eq!(
+            line,
+            "ipe-capfloor 1 net=false fs=isolated sub=false env= intent=release"
+        );
+        let floor = parse_capfloor(&line).expect("round-trips").axes;
         assert!(floor.env_allowlist.is_empty());
     }
 
     #[test]
     fn satisfies_capfloor_refuses_a_widened_profile() {
         // floor = maximally isolated; a profile granting network must be refused.
-        let floor = parse_capfloor(&SandboxProfile::maximally_isolated().to_capfloor_line())
-            .expect("floor");
+        let floor = parse_capfloor(
+            &SandboxProfile::maximally_isolated().to_capfloor_line(FloorIntent::Release),
+        )
+        .expect("floor")
+        .axes;
         let widened = SandboxProfile {
             network: true,
             ..SandboxProfile::maximally_isolated()
@@ -1673,7 +1870,9 @@ mod tests {
             env_allowlist: vec!["A".to_owned()],
             ..SandboxProfile::maximally_isolated()
         };
-        let floor = parse_capfloor(&floor_profile.to_capfloor_line()).expect("floor");
+        let floor = parse_capfloor(&floor_profile.to_capfloor_line(FloorIntent::Release))
+            .expect("floor")
+            .axes;
         let two_env = SandboxProfile {
             env_allowlist: vec!["A".to_owned(), "B".to_owned()],
             ..SandboxProfile::maximally_isolated()
@@ -1699,7 +1898,9 @@ mod tests {
             env_allowlist: vec!["PATH".to_owned(), "HOME".to_owned()],
             ..SandboxProfile::maximally_isolated()
         };
-        let floor = parse_capfloor(&floor_profile.to_capfloor_line()).expect("floor");
+        let floor = parse_capfloor(&floor_profile.to_capfloor_line(FloorIntent::Release))
+            .expect("floor")
+            .axes;
         let swapped = SandboxProfile {
             env_allowlist: vec![
                 "AWS_SECRET_ACCESS_KEY".to_owned(),
@@ -1737,6 +1938,104 @@ mod tests {
         assert!(parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=,A").is_err());
         assert!(parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=1BAD").is_err());
         assert!(parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=A-B").is_err());
+    }
+
+    #[test]
+    fn capfloor_intent_round_trips_and_absent_is_development() {
+        let p = SandboxProfile::maximally_isolated();
+        for intent in [FloorIntent::Release, FloorIntent::Development] {
+            let floor = parse_capfloor(&p.to_capfloor_line(intent)).expect("round-trips");
+            assert_eq!(floor.intent, intent);
+        }
+        // A floor naming no intent never counts as a release build's.
+        let bare =
+            parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=").expect("parses");
+        assert_eq!(bare.intent, FloorIntent::Development);
+        // An unknown or repeated intent is a malformed floor.
+        assert!(parse_capfloor("ipe-capfloor 1 env= intent=prod").is_err());
+        assert!(parse_capfloor("ipe-capfloor 1 env= intent=release intent=release").is_err());
+    }
+
+    #[test]
+    fn scan_capfloor_is_release_only_when_every_copy_is() {
+        let p = SandboxProfile::maximally_isolated();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(p.to_capfloor_line(FloorIntent::Development).as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(p.to_capfloor_line(FloorIntent::Release).as_bytes());
+        buf.push(0);
+        let floor = scan_capfloor(&buf).expect("found");
+        assert_eq!(
+            floor.intent,
+            FloorIntent::Development,
+            "a release line beside a development floor must not make it a release build"
+        );
+    }
+
+    #[test]
+    fn verify_release_floor_refuses_a_development_build() {
+        let p = SandboxProfile::maximally_isolated();
+        let dev = p.to_capfloor_line(FloorIntent::Development).into_bytes();
+        assert_eq!(
+            verify_release_floor(&p, &dev),
+            Err(FloorRefusal::NotRelease)
+        );
+        assert!(
+            FloorRefusal::NotRelease
+                .to_string()
+                .contains("rebuild it with `ipe release build`"),
+            "the refusal names the remedy"
+        );
+        let release = p.to_capfloor_line(FloorIntent::Release).into_bytes();
+        assert_eq!(verify_release_floor(&p, &release), Ok(()));
+        assert_eq!(
+            verify_release_floor(&p, b"no floor"),
+            Err(FloorRefusal::Unreadable)
+        );
+        let widened = SandboxProfile {
+            network: true,
+            ..SandboxProfile::maximally_isolated()
+        };
+        assert_eq!(
+            verify_release_floor(&widened, &release),
+            Err(FloorRefusal::ProfileWider)
+        );
+    }
+
+    /// A binary with no floor marker (a foreign or hand-built app) is refused
+    /// as unreadable, whatever profile it is offered, and the refusal names
+    /// the remedy.
+    #[test]
+    fn verify_release_floor_refuses_a_floorless_binary() {
+        let floorless: &[u8] = b"\x7fELF\x02\x01\x01\0fn main() {}\0";
+        for profile in [
+            SandboxProfile::maximally_isolated(),
+            SandboxProfile {
+                network: true,
+                ..SandboxProfile::maximally_isolated()
+            },
+        ] {
+            assert_eq!(
+                verify_release_floor(&profile, floorless),
+                Err(FloorRefusal::Unreadable)
+            );
+            assert_eq!(
+                verify_release_floor(&profile, b""),
+                Err(FloorRefusal::Unreadable)
+            );
+        }
+        assert!(
+            FloorRefusal::Unreadable
+                .to_string()
+                .contains("embeds no readable capability floor"),
+            "the refusal names why"
+        );
+        assert!(
+            FloorRefusal::Unreadable
+                .to_string()
+                .ends_with("rebuild it with `ipe release build`"),
+            "the refusal names the remedy"
+        );
     }
 
     #[test]
@@ -1852,5 +2151,301 @@ mod tests {
             joined.starts_with("/usr/bin/timeout --kill-after=5s 30 /usr/bin/bwrap"),
             "{joined}"
         );
+    }
+
+    #[test]
+    fn the_run_jail_binds_a_trees_git_dir_read_only_over_its_write_grant() {
+        let base_dir = crate::test_dir::TestDir::new("run-jail-vcs").expect("test dir");
+        let base = base_dir.path();
+        let tree = base.join("tree");
+        let tmp = base.join("tmp");
+        std::fs::create_dir_all(tree.join(".git").join("hooks")).expect("git dir");
+        std::fs::create_dir_all(&tmp).expect("scratch");
+        let mounts = mounts_of(
+            CanonicalPath::resolve(&tmp).expect("resolve scratch"),
+            CanonicalPath::resolve(&tree).expect("resolve tree"),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        let argv_for = |filesystem: FilesystemScope| -> Vec<String> {
+            let profile = SandboxProfile {
+                filesystem,
+                ..SandboxProfile::maximally_isolated()
+            };
+            let no_env = |_: &str| None;
+            run_jail_argv(
+                &scope(),
+                &profile,
+                &mounts,
+                None,
+                &no_env,
+                &[OsString::from("app")],
+            )
+            .expect("the argv builds")
+            .args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let tree = tree.to_string_lossy().into_owned();
+        let git = format!("{tree}/.git");
+        let granted = argv_for(FilesystemScope::WorkingTreeReadWrite);
+        let at = |argv: &[String], window: &[&str]| {
+            argv.windows(window.len())
+                .position(|w| w.iter().zip(window).all(|(a, b)| a == b))
+        };
+        let found = (
+            at(&granted, &["--bind", &tree, &tree]),
+            at(&granted, &["--ro-bind", &git, &git]),
+        );
+        assert!(
+            matches!(found, (Some(bind), Some(carve)) if bind < carve),
+            "the git dir is bound read-only after the tree's write bind: {granted:?}"
+        );
+        let isolated = argv_for(FilesystemScope::Isolated);
+        assert!(
+            !isolated.contains(&git),
+            "an ungranted tree renders no carve: {isolated:?}"
+        );
+    }
+
+    /// A tree and scratch under one test dir, with the jail mounts over them.
+    struct TreeFixture {
+        _base: crate::test_dir::TestDir,
+        tree: CanonicalPath,
+        mounts: JailMounts,
+    }
+
+    fn tree_fixture(label: &str) -> TreeFixture {
+        let base = crate::test_dir::TestDir::new(label).expect("test dir");
+        let tree = base.path().join("tree");
+        let tmp = base.path().join("tmp");
+        std::fs::create_dir_all(&tree).expect("tree");
+        std::fs::create_dir_all(&tmp).expect("scratch");
+        let tree = CanonicalPath::resolve(&tree).expect("resolve tree");
+        let mounts = mounts_of(
+            CanonicalPath::resolve(&tmp).expect("resolve scratch"),
+            tree.clone(),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        TreeFixture {
+            _base: base,
+            tree,
+            mounts,
+        }
+    }
+
+    /// The run-jail argv for `filesystem` over `mounts`, or why it refused.
+    fn tree_argv(
+        mounts: &JailMounts,
+        filesystem: FilesystemScope,
+    ) -> Result<Vec<String>, crate::JailPathError> {
+        let profile = SandboxProfile {
+            filesystem,
+            ..SandboxProfile::maximally_isolated()
+        };
+        let no_env = |_: &str| None;
+        run_jail_argv(
+            &scope(),
+            &profile,
+            mounts,
+            None,
+            &no_env,
+            &[OsString::from("app")],
+        )
+        .map(|argv| {
+            argv.args()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        })
+    }
+
+    fn write_git_config(tree: &CanonicalPath, text: &str) {
+        let git = tree.as_path().join(".git");
+        std::fs::create_dir_all(git.join("hooks")).expect("git dir");
+        std::fs::write(git.join("config"), text).expect("git config");
+    }
+
+    #[test]
+    fn a_hooks_path_into_the_tree_refuses_the_jail() {
+        let fixture = tree_fixture("run-jail-hookspath");
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        let husky = fixture.tree.as_path().join(".husky");
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &granted,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    kind: crate::VcsKind::Git,
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "a hooks path into the writable tree refuses: {granted:?}"
+        );
+        assert!(
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).is_ok(),
+            "an ungranted tree is never scanned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_symlink_into_the_tree_refuses_the_jail() {
+        let fixture = tree_fixture("run-jail-hooklink");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let target = fixture.tree.as_path().join("evil.sh");
+        std::fs::write(&target, "#!/bin/sh\n").expect("hook target");
+        let hook = fixture
+            .tree
+            .as_path()
+            .join(".git")
+            .join("hooks")
+            .join("pre-commit");
+        std::os::unix::fs::symlink(&target, &hook).expect("hook link");
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &granted,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::LinkNamesWritable {
+                    kind: crate::VcsKind::Git,
+                    link,
+                    named: crate::Named::InGrant(named),
+                })) if *link == hook && *named == target
+            ),
+            "a hook linking into the writable tree refuses: {granted:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unbound_tree_is_never_parsed() {
+        let fixture = tree_fixture("run-jail-unbound");
+        let entry = fixture.tree.as_path().join(".git");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &entry,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("mkfifo");
+        let isolated = tree_argv(&fixture.mounts, FilesystemScope::Isolated);
+        assert!(isolated.is_ok(), "an ungranted tree builds: {isolated:?}");
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &granted,
+                Err(crate::JailPathError::VcsEntryUnexpectedKind {
+                    kind: crate::VcsKind::Git,
+                    path,
+                }) if *path == entry
+            ),
+            "a granted tree is parsed: {granted:?}"
+        );
+    }
+
+    /// Whether `argv` binds `tree` read-write over itself.
+    fn binds_tree(argv: &[String], tree: &CanonicalPath) -> bool {
+        let tree = tree.as_path().to_string_lossy();
+        argv.windows(3).any(
+            |w| matches!(w, [flag, from, to] if flag == "--bind" && *from == tree && *to == tree),
+        )
+    }
+
+    #[test]
+    fn one_mount_set_serves_both_scopes() {
+        let fixture = tree_fixture("run-jail-both-scopes");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let isolated =
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).expect("isolated argv");
+        assert!(
+            !binds_tree(&isolated, &fixture.tree),
+            "an isolated profile binds no tree: {isolated:?}"
+        );
+        let granted = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite)
+            .expect("granted argv");
+        assert!(
+            binds_tree(&granted, &fixture.tree),
+            "a granted profile binds the tree: {granted:?}"
+        );
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        let husky = fixture.tree.as_path().join(".husky");
+        let refused = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "the same mounts scan the granted tree: {refused:?}"
+        );
+        assert!(
+            tree_argv(&fixture.mounts, FilesystemScope::Isolated).is_ok(),
+            "the same mounts still serve an isolated profile"
+        );
+    }
+
+    #[test]
+    fn the_jail_rescans_config_at_every_build() {
+        let fixture = tree_fixture("run-jail-rescan");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let first = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(first.is_ok(), "a clean config builds: {first:?}");
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        let second = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &second,
+                Err(crate::JailPathError::VcsConfig(
+                    crate::ConfigRefusal::NamesWritableCode { .. }
+                ))
+            ),
+            "the same mounts rescan an edited config: {second:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_edited_after_the_mount_recheck_refuses_at_argv_time() {
+        let fixture = tree_fixture("run-jail-recheck-then-argv");
+        write_git_config(&fixture.tree, "[core]\n\trepositoryformatversion = 0\n");
+        let first = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(first.is_ok(), "a clean config builds: {first:?}");
+        write_git_config(&fixture.tree, "[core]\n\thooksPath = .husky\n");
+        assert_eq!(
+            fixture.mounts.recheck(),
+            Ok(()),
+            "the mount recheck proves paths, never the tree's configuration"
+        );
+        let husky = fixture.tree.as_path().join(".husky");
+        let refused = tree_argv(&fixture.mounts, FilesystemScope::WorkingTreeReadWrite);
+        assert!(
+            matches!(
+                &refused,
+                Err(crate::JailPathError::VcsConfig(crate::ConfigRefusal::NamesWritableCode {
+                    kind: crate::VcsKind::Git,
+                    named: crate::Named::InGrant(path),
+                    ..
+                })) if *path == husky
+            ),
+            "the argv builder parses the tree after the mounts were rechecked: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn vcs_config_refusal_display_is_escaped() {
+        let path = std::path::PathBuf::from("/tree/a\nb");
+        let refusal = crate::ConfigRefusal::ConfigInGrant {
+            kind: crate::VcsKind::Git,
+            path: path.clone(),
+            named: crate::Named::InGrant(path),
+        };
+        let shown = crate::JailPathError::VcsConfig(refusal.clone()).to_string();
+        assert_eq!(shown, refusal.to_string());
+        assert!(!shown.contains("a\nb"), "{shown}");
     }
 }

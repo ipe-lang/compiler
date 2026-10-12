@@ -70,7 +70,7 @@ main =
         }
 ```
 
-Building it (`ipe build`) compiles the app; serving it renders the tags into
+Building it (`ipe dev build`) compiles the app; serving it renders the tags into
 `<head>` on each page load.
 
 ## The why

@@ -47,7 +47,7 @@ fn store_migrations_producer_runs_and_matches() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "{GOLDEN}: ipe build must accept the migrations producer program, got: {built:?}"
+        "{GOLDEN}: ipe dev build must accept the migrations producer program, got: {built:?}"
     );
 
     let outcome = crate::support::build_and_run_emitted(GOLDEN, &out);

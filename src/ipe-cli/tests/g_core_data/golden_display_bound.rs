@@ -1,6 +1,6 @@
 //! `{{x}}` interpolation of a wildcard `any` param.
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build`
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build`
 //! with E0277 at the `interpolate_to_string(x)` call inside a function whose
 //! only generic is the wildcard `any` PARAM (`render : any -> String; render x =
 //! """value={{x}}"""`).
@@ -55,7 +55,7 @@ fn i186_ipec_accepts_and_bounds_fn_display() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for display_bound: {:?}",
+        "ipe dev build must succeed for display_bound: {:?}",
         built.err()
     );
 
@@ -87,7 +87,7 @@ fn i186_ipec_accepts_and_bounds_fn_display() {
 
 /// cargo-0 ∧ run-0: the emitted project actually compiles with `rustc` and
 /// prints the rendered value. Gated on `IPE_E2E=1` — the only check that would
-/// have caught the original SEAL violation (E0277, `ipe build` clean).
+/// have caught the original SEAL violation (E0277, `ipe dev build` clean).
 #[test]
 fn i186_cargo_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -104,7 +104,7 @@ fn i186_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for display_bound: {:?}",
+        "ipe dev build must succeed for display_bound: {:?}",
         built.err()
     );
 

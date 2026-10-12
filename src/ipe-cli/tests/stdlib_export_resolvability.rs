@@ -61,6 +61,7 @@ fn native_config(db: &ipe_db::IpeDatabase) -> ipe_db::BuildConfig {
         None,
         ipe_ir::Target::Native,
         Vec::new(),
+        ipe_backend_rust::MountBase::root(),
         false,
         ipe_backend_rust::BuildIntent::Development,
         None,
@@ -806,7 +807,7 @@ fn run_probe(
     };
     let types = ipe_db::typecheck_module(&db, root, *entry, *module)
         .clone()
-        .map_err(|(d, _)| refused(&d))?;
+        .map_err(|err| refused(err.diagnostic()))?;
     let canon = ipe_db::canonicalize(&db, root, *module)
         .clone()
         .map_err(|d| refused(&d))?;

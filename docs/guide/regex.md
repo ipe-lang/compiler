@@ -76,7 +76,7 @@ leakedTokens tokenRule line =
     Regex.findAll tokenRule.pattern line
 ```
 
-Running it (`ipe run`) prints the scrubbed log and the collected tokens:
+Running it (`ipe dev run`) prints the scrubbed log and the collected tokens:
 
 ```
 Scrubbed log:

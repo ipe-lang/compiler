@@ -109,8 +109,11 @@ like : String -> String -> Cond row
 ```
 
 `like col pattern` — the rows where `col` matches the SQL `LIKE` `pattern`.
-The pattern is bound as a parameter, so its wildcards (`%`, `_`) are DATA the
-SQL engine interprets, never SQL text the caller injects.
+The pattern is bound as a parameter, never as SQL text. It is still a
+pattern: `%` and `_` in it, including any that come from user text, are
+wildcards. It is read under `ESCAPE '\'` on every engine, so `\%`, `\_` and
+`\\` match `%`, `_` and `\` literally; a pattern ending in an unpaired `\` is
+refused as a typed error.
 
 Example:
 

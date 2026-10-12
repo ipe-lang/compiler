@@ -128,7 +128,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Default gate: `ipe build` exits 0 and the emitted crate carries the whole
+/// Default gate: `ipe dev build` exits 0 and the emitted crate carries the whole
 /// asserted surface — the `Rust.Ffi` forwarder module and the `ipe_asserted`
 /// shim region with exact carriers, the panic boundary, and no coercion.
 #[test]
@@ -283,7 +283,7 @@ fn asserted_program_discloses_ffi_raw() {
         .expect("entry module present");
     let program = match ipe_db::lower_program(&db, root, entry_file) {
         Ok(p) => p,
-        Err((diag, _)) => panic!("fixture must lower: {diag:?}"),
+        Err(err) => panic!("fixture must lower: {err:?}"),
     };
     let caps = ipe_lower::program_capabilities(program);
     assert!(

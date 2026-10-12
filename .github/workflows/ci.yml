@@ -11,10 +11,11 @@ name: Build & test
 #     diagnostic-tone, build-tools, the docs-drift gates, the example gates, the
 #     first-party check-floor + shapes build gate, wasm-floor, editors-configure.
 #     A pull request runs only this phase.
-#   • TESTS (`tests`: merge queue, dispatch) — test (nextest), the 14-shard e2e
+#   • TESTS (`tests`: merge queue, dispatch) — test (nextest, with the `ipe`
+#     feature job wasi-run and the Windows job windows-test), the 14-shard e2e
 #     SEAL and seal-slice's coverage proof, seal-smoke, seal-modset (vendored),
 #     the runtime feature-combo / full-feature builds, registry-admission, the
-#     Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
+#     release-target checks, the Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
 #     the queue is about to land.
 #   • POST-MERGE (`post_merge`: push to main, dispatch) — the ASAN/TSAN
 #     sanitizers and the arm64 Tier-2 proof.
@@ -60,13 +61,18 @@ permissions:
 
 concurrency:
   # A pull request run cancels the previous run for the same ref, so devs get
-  # fast feedback without wasting runner minutes. A push run is keyed by its
+  # fast feedback without wasting runner minutes. A merge-group run cancels
+  # too: the queue re-creates a ref only when a PR re-enters it, so a running
+  # run on the same merge-group ref is always stale and would otherwise hold
+  # its runners while the new run waits. A failed merge-group entry is
+  # re-queued, never re-run: a re-run joins its ref's group and cancels the
+  # live run of a re-entered PR. A push run is keyed by its
   # commit: GitHub replaces a queued run in a group whenever a newer one joins
   # it (whatever cancel-in-progress says), so a per-ref push group lets a
   # newer main commit discard an older one's run before it starts, leaving
   # that commit's main-required contexts never reported.
   group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -148,15 +154,51 @@ jobs:
   # (a target/ directory, an .rlib/.rmeta/.o/.a/.so/.dylib/.wasm blob) or any file
   # over 5 MiB turns this red. Regenerable build output committed once bloats every
   # future clone and can only be purged from history by a human-run rewrite;
-  # this keeps the tree clean going forward. No toolchain needed — pure git +
-  # shell, so it stays on the
-  # fast required PR path.
+  # this keeps the tree clean going forward. The same required job runs the CI
+  # check-disposition gate (`verify-manifest.py` and the CI tooling's refusal
+  # tests), so no CI invariant rests on an advisory context. No Rust toolchain
+  # needed — git, shell and Python only, so it stays on the fast required PR path.
   artifact-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reject committed build artifacts
         run: .github/ci/artifact-guard.sh
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install PyYAML
+        run: 'PIP_CONFIG_FILE=/dev/null python3 -m pip install --isolated --require-hashes --only-binary :all: -r "$GITHUB_WORKSPACE/.github/ci/requirements.txt"'
+      - name: Every produced check has exactly one declared disposition
+        run: python3 .github/ci/verify-manifest.py
+      - name: Prove the workflow-step refusals (unit tests)
+        run: python3 .github/ci/test_verify_manifest.py -v
+      - name: Prove the strict-YAML loader refusals (unit tests)
+        run: python3 .github/ci/test_strict_yaml.py -v
+      - name: Prove the fail-closed change-classifier refusals (unit tests)
+        run: python3 .github/ci/test_change_class.py -v
+      - name: The e2e shards and their cover run exactly the SSOT plan
+        run: python3 .github/ci/e2e_shard.py --lint
+      - name: Prove the e2e shard-partition refusals (unit tests)
+        run: python3 .github/ci/test_e2e_shard.py -v
+      - name: Reruns fire only on infrastructure; no test retries
+        run: python3 .github/ci/rerun_policy.py --lint
+      - name: Prove the rerun-policy refusals (unit tests)
+        run: python3 .github/ci/test_rerun_policy.py -v
+      - name: A red nightly blocks the next merge (nightly-green wiring)
+        run: python3 .github/ci/nightly_green.py --lint
+      - name: Prove the nightly-green refusals (unit tests)
+        run: python3 .github/ci/test_nightly_green.py -v
+      - name: Prove the trust-root parser and merge-decision refusals (unit tests)
+        run: python3 .github/ci/test_trust_roots.py -v
+      - name: Prove the local-gate refusals (unit tests)
+        run: python3 .github/ci/test_local_gate.py -v
+      - name: Prove the cargo-invocation reader refusals (unit tests)
+        run: python3 .github/ci/test_cargo_invocation.py -v
+      - name: Prove the test-claims table refusals (unit tests)
+        run: python3 .github/ci/test_claims_table.py -v
+      - name: The derived required-set is in sync with the manifest
+        run: python3 .github/ci/check_required_set.py
 
   # Cargo.lock must agree with the version Cargo.toml declares. Fail-closed
   # backstop to the release-please sync-cargo-lock job: a version-desynced tree
@@ -235,6 +277,13 @@ jobs:
         if: steps.classify.outputs.panic_scan != 'false'
         run: cargo test --manifest-path tools/panic-scan/Cargo.toml
 
+      - name: Calibrate the parse stack against the depth ceiling
+        if: steps.classify.outputs.panic_scan != 'false'
+        # Optimised, every recursive shape at the depth ceiling must parse,
+        # visit and drop on a quarter of the parse stack: the release scanner's
+        # 4x stack margin.
+        run: cargo test --release --manifest-path tools/panic-scan/Cargo.toml --test depth_ceiling
+
       - name: Build the scanner
         if: steps.classify.outputs.panic_scan != 'false'
         run: cargo build --release --manifest-path tools/panic-scan/Cargo.toml
@@ -252,11 +301,12 @@ jobs:
         if: steps.classify.outputs.panic_scan == 'false'
         run: echo "No panic-scan-relevant paths changed; gate is a no-op for this PR."
 
-  # The Windows-only code of `ipe` and `ipe_fs_open` (held directory handles,
-  # reparse-point refusal) never compiles on a Linux runner, so a cfg(windows)
-  # break would otherwise surface only at release. Type-checks both crates and
-  # their tests for Windows on every code change; the Windows test suites do
-  # not run in CI.
+  # The Windows-only code of `ipe`, `ipe_fs_open` and `ipe_sandbox` (held
+  # directory handles, reparse-point refusal, the Windows jail and tool-name
+  # checks) never compiles on a Linux runner, so a cfg(windows)
+  # break would otherwise surface only at release. Type-checks the crates and
+  # their tests for Windows on every code change; `windows-test` runs the
+  # transfer-containment tests on Windows.
   windows-check:
     runs-on: windows-latest
     needs: changes
@@ -267,7 +317,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --locked -p ipe -p ipe_fs_open --all-targets
+      - run: cargo check --locked -p ipe -p ipe_fs_open -p ipe_sandbox --all-targets
+      - run: cargo check --locked -p ipe-runtime-rust --lib --tests --no-default-features
 
   # No compiler-internal jargon or raw Rust types leak into user-facing text
   # (rendered diagnostic goldens + `ipe explain` pages). Pure git + ripgrep, no
@@ -292,35 +343,37 @@ jobs:
           bash tools/scripts/tests/test-require-tool.sh
           bash tools/scripts/lint-diagnostic-tone.sh
 
-  # Doctest-style gate: every unmarked ```ipe block in src/compiler/diagnostics/explain/*.md
-  # must type-check. A page that teaches broken syntax is worse than no page (ADR 0059).
-  # Requires `ipe` binary (type-check only — no emit, no cargo, no IPE_E2E).
-  # Fence-marker convention:
-  #   ```ipe            default — MUST type-check
-  #   ```ipe ipe:error  intentional bad example — gate fails if it compiles
-  #   ```ipe ipe:skip   pseudocode / FFI / multi-file — skipped entirely
-  # Change-gated: explain pages live under src/** (already in the `code` filter),
-  # so a prose-only PR legitimately skips this gate.
+  # Doctest-style gate (ADR 0059): every fenced ```ipe block on every registry
+  # explain page and every docs/constructs and docs/topics page is judged
+  # in-process through the build front end (`ipe::front_check_entry`), short of
+  # cargo. The checker is `src/ipe-cli/tests/explain_examples.rs`.
+  # Fence info strings:
+  #   ```ipe                      MUST be accepted
+  #   ```ipe ipe:error            explain page: refused with the page's own code
+  #   ```ipe ipe:error IPE-XNNNN  docs page: refused with exactly that code
+  #   ```ipe ipe:skip <reason>    not compiled; the reason is required
+  # Any other `ipe…` info string is refused. A known failing block is listed in
+  # `tests/explain_examples/known_rot.txt`, which may only shrink.
+  # Change-gated: explain pages live under src/** (already in the `code` filter).
   explain-examples:
     name: explain-page example gate (ADR 0059)
     runs-on: ubuntu-latest
-    needs: [changes, quick-check, build-tools]
+    needs: [changes, quick-check]
     # Change-gated: runs on a change that touches src/**.
     if: needs.changes.outputs.cheap == 'true' && needs.changes.outputs.code == 'true'
     env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/mold
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          name: ci-ipe-release
-          path: ${{ runner.temp }}/ipe-release
-      - name: Mark the prebuilt ipe executable
-        run: chmod +x "$RUNNER_TEMP/ipe-release/ipe"
-      - name: Compile every explain-page example
-        env:
-          IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
-        run: bash tools/scripts/check-explain-examples.sh
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Judge every explain-page and docs-page example
+        run: cargo nextest run -p ipe --test explain_examples --profile ci
 
   # Every fenced ```ipe block in every {-| … -} doc-string in the standard
   # library must type-check. A doc-string edit that introduces a broken example
@@ -400,6 +453,84 @@ jobs:
           results: >-
             changes=${{ needs.changes.result }}
             registry-admission-run=${{ needs.registry-admission-run.result }}
+          phase: tests
+          tier: ${{ needs.changes.outputs.tests }}
+          scope: ${{ needs.changes.outputs.code }}
+
+  # The release workflow's targets, type-checked before a release is cut: each
+  # release leg's `cargo build` is a `cargo check` here, on the same runner, target
+  # and pinned toolchain, so a target that cannot compile surfaces in the merge
+  # queue, not on the release tag. `ring` needs a native C toolchain, so each leg
+  # runs natively. Both workflows run the checkout, the one shared
+  # .github/actions/release-target-toolchain step and the cargo command, in that
+  # order and nothing else before the cargo command; ci/verify-manifest.py
+  # check 23 pins all three.
+  # `cargo check` does not link.
+  release-targets-run:
+    needs: [changes, quick-check]
+    # Tests phase: five native runners, so merge queue and dispatch only.
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/release-target-toolchain
+        with:
+          target: ${{ matrix.target }}
+      - name: Check ipe + ipe-ffi-inspector
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+
+  # FreeBSD has no native GitHub runner, so its release leg runs in a VM; this is
+  # that leg's check: release.yml's VM step, its cargo line pinned by check 23.
+  release-targets-freebsd:
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check in FreeBSD VM
+        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        with:
+          usesh: true
+          prepare: pkg install -y rust
+          run: cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
+
+  # Required context for the release-target jobs: the phase verdict (see the header).
+  release-targets:
+    name: release-targets
+    runs-on: ubuntu-latest
+    needs: [changes, release-targets-run, release-targets-freebsd]
+    if: always()
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/phase-verdict
+      - name: Judge the aggregated jobs
+        uses: ./.github/actions/phase-verdict
+        with:
+          results: >-
+            changes=${{ needs.changes.result }}
+            release-targets-run=${{ needs.release-targets-run.result }}
+            release-targets-freebsd=${{ needs.release-targets-freebsd.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
@@ -671,13 +802,66 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Required aggregation gate for `test`: green only when every shard and the
-  # doctest job (in test-prep) passed. Branch protection lists this job, so a
+  # The `wasi_run` and `signing` Cargo features of `ipe` are off by default, so
+  # no other job compiles the embedded wasmtime engine, the sigstore verifier or
+  # the code and tests behind them. This job lints and tests `ipe` with both on,
+  # then runs the WASI seal and the wall-clock and memory ceiling tests of the
+  # embedded run. `ci/verify-manifest.py` check 22 holds every feature of a
+  # workspace member to a command that enables it.
+  wasi-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: ./.github/actions/mold
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Lint ipe with the optional features on
+        run: cargo clippy --locked -p ipe --features wasi_run,signing --all-targets -- -D warnings
+      - name: Test ipe with the optional features on
+        run: cargo nextest run --locked -p ipe --features wasi_run,signing --profile ci
+      - name: Run the WASI seal end to end
+        env:
+          IPE_E2E: "1"
+        run: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
+
+  # A Git or Curl transfer on Windows runs in its own kill-on-close job object
+  # inside the CLI's own job, and a transfer that cannot be contained is refused
+  # with its child killed and reaped. Those refusals and the job teardown of a
+  # lingering grandchild exist only on Windows, so this job runs the
+  # `remote_ingest` tests of `ipe` there.
+  windows-test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - name: Test the transfer containment on Windows
+        shell: bash
+        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::)'
+
+  # Required aggregation gate for `test`: green only when every shard, the
+  # doctest job (in test-prep), the feature job `wasi-run` and the Windows job
+  # `windows-test` passed. Branch protection lists this job, so a
   # matrix expansion never silently drops a required check. The `always()` guard
   # makes a skipped/failed dependency a FAILURE here, never a false green.
   test:
     runs-on: ubuntu-latest
-    needs: [changes, test-prep, test-run]
+    needs: [changes, test-prep, test-run, wasi-run, windows-test]
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -691,12 +875,14 @@ jobs:
             changes=${{ needs.changes.result }}
             test-prep=${{ needs.test-prep.result }}
             test-run=${{ needs.test-run.result }}
+            wasi-run=${{ needs.wasi-run.result }}
+            windows-test=${{ needs.windows-test.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
 
   # SEAL smoke — the fast required proxy for THE SEAL. Build the compiler, then
-  # take ONE small `cli` example end to end: `ipe build` → `cargo build` the
+  # take ONE small `cli` example end to end: `ipe dev build` → `cargo build` the
   # emitted crate → run it → assert its expected stdout. This proves the
   # emit→build→run floor holds in ~a couple of minutes, apart from the full
   # 14-shard `e2e` below. A break here means
@@ -741,7 +927,7 @@ jobs:
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           WARM="$(mktemp -d)"
           cd "$WARM"
-          "$IPE" build "$GITHUB_WORKSPACE/examples/shapes/non-tea/hello-world/package.ipe" --out out
+          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/non-tea/hello-world/package.ipe" --out out
           cd out/rust
           cargo build --release   # compiles the runtime dep tree into the shared target
       - name: Emit + build + run (examples/shapes/non-tea/hello-world)
@@ -751,7 +937,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           cd examples/shapes/non-tea/hello-world
-          "$IPE" build package.ipe --out out
+          "$IPE" dev build package.ipe --out out
           cd out/rust
           cargo build --release   # incremental: deps already in the shared target
           OUT="$(cargo run --release --quiet)"
@@ -780,7 +966,7 @@ jobs:
 
   # First-party shape examples — the representative user-facing gate. Every
   # committed example under examples/shapes/ (one per shape: script, terminal,
-  # web) must `ipe type-check`, `ipe build`, and cargo-build its emitted crate on
+  # web) must `ipe type-check`, `ipe dev build`, and cargo-build its emitted crate on
   # every code change. This is the fast, non-flaky core of the examples proof: it catches
   # a compiler change that makes a shipped example stop type-checking or emit a
   # crate that no longer compiles — the two ways a user first feels a regression.
@@ -820,7 +1006,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           WARM="$(mktemp -d)"; cd "$WARM"
-          "$IPE" build "$GITHUB_WORKSPACE/examples/shapes/script/release-preflight/package.ipe" --out out
+          "$IPE" dev build "$GITHUB_WORKSPACE/examples/shapes/script/release-preflight/package.ipe" --out out
           cd out/rust && cargo build
       - name: Check + emit + build every first-party shape
         env:
@@ -836,8 +1022,8 @@ jobs:
             if ! "$IPE" type-check "$entry"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
-            if ! "$IPE" build "$toml" --out "$dir/out"; then
-              echo "::error::ipe build regressed: $dir"; fail=1; echo "::endgroup::"; continue
+            if ! "$IPE" dev build "$toml" --out "$dir/out"; then
+              echo "::error::ipe dev build regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
             # A debug build proves the emitted crate compiles and links — the two
             # ways a user first feels an emit regression. Release optimisation adds
@@ -918,9 +1104,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
-      # `debugger` is a build-mode opt-in outside `full`; named here so its
-      # overlay and recorder tests run.
-      - run: cargo nextest run -p ipe-runtime-rust --features full,debugger --profile ci
+      # `dev-posture` is the dev-intent build outside `full`; its pins prove a
+      # dev build on a loopback listener opens each dev-only surface.
+      - run: cargo nextest run -p ipe-runtime-rust --features full,dev-posture --profile ci -E 'test(dev_posture_pin_)'
+      # `debugger` and `locale` are opt-ins outside `full`; named here so the
+      # overlay and recorder tests and the ICU case-fold oracle run.
+      - run: cargo nextest run -p ipe-runtime-rust --features full,debugger,locale --profile ci
       - name: Upload JUnit results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -1187,7 +1376,7 @@ jobs:
           # `.github/ci/e2e_shard.py`: shards 1-5 spread the heavy cold-build
           # goldens, shards 6-14 the heavy-free complement, all from the
           # prebuilt archive (no recompile). `seal-slice` proves the plan
-          # partitions the archive's test set exactly, and manifest-guard
+          # partitions the archive's test set exactly, and artifact-guard
           # (`e2e_shard.py --lint`) pins this matrix and this wiring.
           SHARD_FILTER: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].filter }}
           SHARD_PARTITION: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].partition }}
@@ -1717,7 +1906,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Regenerate the Markdown parity snapshot via an ipe run
+      - name: Regenerate the Markdown parity snapshot via an ipe dev run
         run: tools/scripts/regen-markdown-parity.sh
       - name: Fail if the regenerated snapshot differs from the committed one
         run: tools/scripts/generated-unchanged.sh src/ipe-docs/src/markdown/parity/snapshot.txt
@@ -1752,8 +1941,8 @@ jobs:
   # fork PR rather than attempted and denied.
   #
   # `.github/ci/deterministic-checks.json` is the SSOT of (job, check step)
-  # pairs; `ci/verify-manifest.py` (run in
-  # `manifest-guard.yml`) fails the build if this job's `needs:` differs from
+  # pairs; `ci/verify-manifest.py` (run in the
+  # required `artifact-guard` job) fails the build if this job's `needs:` differs from
   # that file's job set or a listed step name is not in the job's steps.
   cancel-on-cheap-red:
     runs-on: ubuntu-latest
@@ -1845,6 +2034,7 @@ jobs:
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
       IPE_GEO_CLIPBOARD_PORT: "18080"
       IPE_LAYOUT_FILL_PORT: "18081"
+      IPE_FOCUS_ACROSS_PATCH_PORT: "18082"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
@@ -1876,7 +2066,7 @@ jobs:
           set -euo pipefail
           IPE="$RUNNER_TEMP/ipe-release/ipe"
           OUT="$RUNNER_TEMP/geo-clipboard-emitted"
-          "$IPE" build examples/shapes/web/geo-clipboard/package.ipe --out "$OUT"
+          "$IPE" dev build examples/shapes/web/geo-clipboard/package.ipe --out "$OUT"
           bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_GEO_CLIPBOARD_EMITTED "$OUT/rust"
       - name: Cargo-build emitted project
         env:
@@ -1926,7 +2116,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/layout-fill-emitted"
-          "$RUNNER_TEMP/ipe-release/ipe" build examples/shapes/web/layout-fill/package.ipe --out "$OUT"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/layout-fill/package.ipe --out "$OUT"
           cd "$OUT/rust"
           cargo build --release
           NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"
@@ -1957,12 +2147,49 @@ jobs:
             echo "layout-fill server never became ready on port $IPE_LAYOUT_FILL_PORT" >&2
             exit 1
           fi
-      - name: Run Playwright specs (geo + clipboard, layout fill)
+      - name: Compile + cargo-build focus-across-patch example
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/browser-e2e-target/focus-across-patch
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/focus-across-patch-emitted"
+          "$RUNNER_TEMP/ipe-release/ipe" dev build examples/shapes/web/focus-across-patch/package.ipe --out "$OUT"
+          cd "$OUT/rust"
+          cargo build --release
+          NAME="$(sed -n 's/^name = "\(.*\)"$/\1/p;T;q' Cargo.toml)"
+          BIN="$CARGO_TARGET_DIR/release/$NAME"
+          # Fail closed: no executable named after the emitted package means the
+          # spawn below would run nothing.
+          if [ -z "$NAME" ] || [ ! -x "$BIN" ]; then
+            echo "focus-across-patch binary not found at '$BIN'" >&2
+            exit 1
+          fi
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_FOCUS_ACROSS_PATCH_BIN "$BIN"
+      - name: Spawn focus-across-patch server
+        run: |
+          set -euo pipefail
+          IPE_WEB_PORT="$IPE_FOCUS_ACROSS_PATCH_PORT" \
+          IPE_CSRF=off \
+          IPE_CONSOLE_EMBED=off \
+          "$CI_JOB_FOCUS_ACROSS_PATCH_BIN" &
+          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_FOCUS_SERVER_PID "$!"
+          ready=""
+          for i in $(seq 1 40); do
+            if curl -sf --max-time 2 "http://127.0.0.1:$IPE_FOCUS_ACROSS_PATCH_PORT/" >/dev/null 2>&1; then
+              echo "server ready (attempt $i)"; ready=1; break
+            fi
+            sleep 0.5
+          done
+          if [ -z "$ready" ]; then
+            echo "focus-across-patch server never became ready on port $IPE_FOCUS_ACROSS_PATCH_PORT" >&2
+            exit 1
+          fi
+      - name: Run Playwright specs (geo + clipboard, layout fill, focus across patch)
         working-directory: tools/scripts/browser-e2e
         run: npx playwright test --config playwright.config.mjs
       - name: Kill server
         if: always()
-        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" 2>/dev/null || true
+        run: kill "$CI_JOB_GEO_SERVER_PID" "$CI_JOB_LAYOUT_SERVER_PID" "$CI_JOB_FOCUS_SERVER_PID" 2>/dev/null || true
       # The wasm test runner, pinned to the Cargo.lock wasm-bindgen version
       # (a runner of another version refuses the test binary).
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2

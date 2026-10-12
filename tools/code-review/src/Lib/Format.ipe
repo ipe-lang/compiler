@@ -1,6 +1,5 @@
-module Lib.Format exposing (byteSize, formatReviewedAt, numberedLines, percent)
+module Lib.Format exposing (byteSize, formatReviewedAt, percent)
 
-import Ipe.List as List
 import Ipe.String
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
 
@@ -87,16 +86,6 @@ formatReviewedAt t =
 pad2 : Int -> String
 pad2 n =
     String.padLeft 2 '0' (String.fromInt n)
-
-
--- Splits source text into (absolute line number, line text) pairs, numbering
--- from the unit's line_start so reviewers can cite the exact lines shown in
--- the index (ipe:src/Lib.rs:14 style citations stay consistent with the gutter).
-numberedLines : Int -> String -> List ( Int, String )
-numberedLines start text =
-    text
-        |> String.lines
-        |> List.indexedMap (\i line -> ( start + i, line ))
 
 
 -- Floor percentage of k decided out of n queued; 0% when nothing is queued

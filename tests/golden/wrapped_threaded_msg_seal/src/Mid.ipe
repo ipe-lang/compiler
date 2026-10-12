@@ -1,0 +1,8 @@
+module Mid exposing (w)
+
+import Lib exposing (Wrap(..), nav)
+
+
+-- Unannotated: its message slot is `Lib.nav`'s, under a user constructor.
+w =
+    Wrap nav

@@ -56,7 +56,7 @@ main =
                 ++ boolText (Bytes.length restored == Bytes.length original))
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 original 800 bytes -> gzip 59 bytes

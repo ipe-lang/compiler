@@ -73,7 +73,7 @@ dispatch rawPath =
             rawPath ++ "  ->  (invalid url)"
 ```
 
-Running it (`ipe run`) matches each path to its typed page, with the unmatched one
+Running it (`ipe dev run`) matches each path to its typed page, with the unmatched one
 falling through to `NotFound`:
 
 ```

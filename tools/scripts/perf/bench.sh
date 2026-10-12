@@ -2,22 +2,22 @@
 # Ipê dev-loop performance harness — WALL-CLOCK (not CPU) benchmarks.
 #
 # Drives the reference served `Ipe.Tea.Web` app in `fixture/` with the SAME
-# commands a user runs (`ipe build`, `ipe run`, `ipe watch`) and reports the
+# commands a user runs (`ipe dev build`, `ipe dev run`, `ipe dev watch`) and reports the
 # numbers surfaced in README.md:
 #
-#   * Cold build          — a clean, from-scratch `ipe build` (full `rustc`).
-#   * Warm build          — the incremental rebuild `ipe watch` falls back to only
+#   * Cold build          — a clean, from-scratch `ipe dev build` (full `rustc`).
+#   * Warm build          — the incremental rebuild `ipe dev watch` falls back to only
 #     (= App recompilation)  for a TYPE change (a `Model` field, a signature). Every
 #                            other edit — text, `init`, `update`, subscriptions,
 #                            styles — hot-swaps instead (below), so a recompile is
 #                            the rare case.
 #   * Dev watch hot reload — a non-type Ui edit (a style value) pushed by
-#                            `ipe watch` with no `cargo` at all; measured
+#                            `ipe dev watch` with no `cargo` at all; measured
 #                            end-to-end (edit → served HTML reflects it), in ms.
 #   * Release binary size — the running app binary's size on disk.
 #   * Peak RAM            — RSS high-water of the running served app.
 #
-# Both `ipe run` and `ipe watch` default to port 8000; the harness pins each to
+# Both `ipe dev run` and `ipe dev watch` default to port 8000; the harness pins each to
 # a free port instead (`IPE_WEB_PORT` for run, `--port` for watch) so a stray
 # server can never collide. Nothing is built in-tree: the fixture is copied to a
 # scratch dir.
@@ -41,7 +41,7 @@ now_s() { date +%s.%N; }
 now_ms() { date +%s%3N; }
 secs() { awk "BEGIN{printf \"%.2f\", $2 - $1}"; }
 note() { [ "$JSON" = 0 ] && printf '%s\n' "perf: $*" >&2 || true; }
-build() { ( cd "$WORK" && $IPE build -q ) >"$1" 2>&1; }
+build() { ( cd "$WORK" && $IPE dev build -q ) >"$1" 2>&1; }
 # A free TCP port on loopback (python3, else a fixed high port).
 free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null || echo 8731; }
 # Poll (≤ N*0.1s) until GET / on $1 answers; 0 on success.
@@ -68,18 +68,18 @@ if [ "$COLD" != n/a ]; then
   note "  warm build = ${WARM}s"
 fi
 
-# 3+4. Peak RAM + binary size — off the running server (real `ipe run`).
+# 3+4. Peak RAM + binary size — off the running server (real `ipe dev run`).
 if [ "$COLD" != n/a ]; then
-  note "[3/4] peak RAM + binary size (ipe run) …"
+  note "[3/4] peak RAM + binary size (ipe dev run) …"
   RPORT=$(free_port)
-  ( cd "$WORK" && IPE_WEB_PORT="$RPORT" $IPE run -q >/tmp/ipe-perf-run.log 2>&1 ) & PIDS+=($!)
+  ( cd "$WORK" && IPE_WEB_PORT="$RPORT" $IPE dev run -q >/tmp/ipe-perf-run.log 2>&1 ) & PIDS+=($!)
   if wait_http "$RPORT" 900; then
     SRV=$(ss -ltnHp "sport = :$RPORT" 2>/dev/null | rg -o 'pid=[0-9]+' | rg -o '[0-9]+' | head -1)
     if [ -n "${SRV:-}" ]; then
       RK=$(awk '/VmHWM/{print $2}' "/proc/$SRV/status" 2>/dev/null); [ -n "${RK:-}" ] && RAM=$(awk "BEGIN{printf \"%.1f\", $RK/1024}")
       EXE=$(readlink -f "/proc/$SRV/exe" 2>/dev/null); [ -n "${EXE:-}" ] && [ -f "$EXE" ] && BIN=$(awk "BEGIN{printf \"%.1f\", $(stat -c%s "$EXE")/1048576}")
     fi
-  else note "  ipe run never served on :$RPORT:"; tail -6 /tmp/ipe-perf-run.log >&2; fi
+  else note "  ipe dev run never served on :$RPORT:"; tail -6 /tmp/ipe-perf-run.log >&2; fi
   pkill -f "$WORK" 2>/dev/null || true; wait_port_free "$RPORT" || true
   note "  peak RAM = ${RAM} MB · binary = ${BIN} MB"
 fi
@@ -87,7 +87,7 @@ fi
 # Y. Dev watch hot reload — appearance edit, end-to-end, no cargo.
 note "[4/4] dev watch hot reload …"
 WPORT=$(free_port)
-( cd "$WORK" && $IPE watch -q --port "$WPORT" >/tmp/ipe-perf-watch.log 2>&1 ) & PIDS+=($!)
+( cd "$WORK" && $IPE dev watch -q --port "$WPORT" >/tmp/ipe-perf-watch.log 2>&1 ) & PIDS+=($!)
 if wait_http "$WPORT" 1500; then
   up=0; for _ in $(seq 1 300); do curl -fsS "http://127.0.0.1:$WPORT/" 2>/dev/null | rg -q '#ffffff' && { up=1; break; }; sleep 0.2; done
   if [ "$up" = 1 ]; then

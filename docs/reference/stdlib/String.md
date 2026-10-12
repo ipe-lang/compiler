@@ -11,14 +11,15 @@ rather than changing its argument. The functions cluster into families:
 construction (`fromInt`, `fromFloat`, `fromBool`, `fromChar`, `repeat`), shape (`length`, `isEmpty`),
 combining (`join`, `append`, `concat`), splitting (`split`, `words`, `lines`),
 slicing (`slice`, `left`, `right`, `dropLeft`, `padLeft`), case
-(`toUpper`, `toLower`, and the locale-aware `*In` / `casefold` variants),
-searching (`contains`, `startsWith`, `indexes`), parsing (`toInt`, `toFloat`,
+(`toUpper`, `toLower`, the locale-aware `toUpperIn` / `toLowerIn`, and the
+locale-independent `casefold` / `equalFold`), searching (`contains`,
+`startsWith`, `indexes`), parsing (`toInt`, `toFloat`,
 `isEmail`, `isUrl`), and character-wise transforms (`map`, `filter`, `foldl`).
 
 Parsers return an `Ipe.Maybe`: `toInt "12"` is `Just 12`, `toInt "x"` is
 `Nothing` — so a caller handles the un-parsable case in the type. The String
-guide walks the mental model and a worked example; this module is the
-per-symbol reference.
+guide (`ipe doc guide:string`) walks the mental model and a worked example;
+this module is the per-symbol reference.
 
 ## `fromInt`
 
@@ -372,13 +373,12 @@ endsWith "" "hello" --> True
 containsIn : String -> String -> Bool
 ```
 
-`containsIn needle haystack` — `True` when `needle` appears in `haystack`.
-Haystack-first for pipeline use.
+`containsIn haystack needle` — `True` when `needle` appears in `haystack`: `contains` with the arguments swapped.
 
 ```ipe
-containsIn "world" "hello world" --> True
-containsIn "xyz" "hello" --> False
-"hello world" |> containsIn "world" --> True
+containsIn "hello world" "world" --> True
+containsIn "hello" "xyz" --> False
+"world" |> containsIn "hello world" --> True
 ```
 
 ## `startsWithIn`
@@ -387,12 +387,12 @@ containsIn "xyz" "hello" --> False
 startsWithIn : String -> String -> Bool
 ```
 
-`startsWithIn prefix haystack` — `True` when `haystack` starts with `prefix`.
+`startsWithIn haystack prefix` — `True` when `haystack` starts with `prefix`: `startsWith` with the arguments swapped.
 
 ```ipe
-startsWithIn "/api" "/api/users" --> True
-startsWithIn "/v2" "/api/users" --> False
-"/api/users" |> startsWithIn "/api" --> True
+startsWithIn "/api/users" "/api" --> True
+startsWithIn "/api/users" "/v2" --> False
+"/api" |> startsWithIn "/api/users" --> True
 ```
 
 ## `endsWithIn`
@@ -401,12 +401,12 @@ startsWithIn "/v2" "/api/users" --> False
 endsWithIn : String -> String -> Bool
 ```
 
-`endsWithIn suffix haystack` — `True` when `haystack` ends with `suffix`.
+`endsWithIn haystack suffix` — `True` when `haystack` ends with `suffix`: `endsWith` with the arguments swapped.
 
 ```ipe
-endsWithIn ".png" "image.png" --> True
-endsWithIn ".jpg" "image.png" --> False
-"image.png" |> endsWithIn ".png" --> True
+endsWithIn "image.png" ".png" --> True
+endsWithIn "image.png" ".jpg" --> False
+".png" |> endsWithIn "image.png" --> True
 ```
 
 ## `casefold`
@@ -415,11 +415,17 @@ endsWithIn ".jpg" "image.png" --> False
 casefold : String -> String
 ```
 
-`casefold s` — case-fold `s` for case-insensitive comparison.
+`casefold s` — Unicode default full case folding, for case-insensitive comparison and keys.
+
+Locale-independent (no Turkish dotless-i rule). The result is for comparing,
+not for display: it can be longer than `s` (`ß` folds to `ss`) and is not
+always lowercase. No Unicode normalization is applied: `é` and `e` followed by
+a combining acute fold differently.
 
 ```ipe
 casefold "HELLO" --> "hello"
 casefold "Straße" --> "strasse"
+casefold "ΟΔΟΣ" --> "οδοσ"
 ```
 
 ## `equalFold`
@@ -428,12 +434,17 @@ casefold "Straße" --> "strasse"
 equalFold : String -> String -> Bool
 ```
 
-`equalFold s1 s2` — case-insensitive equality comparison.
+`equalFold a b` — case-insensitive equality: `casefold a == casefold b`.
+
+No Unicode normalization is applied: `é` and `e` followed by a combining acute
+fold differently. It is not an identifier, security or uniqueness comparison.
 
 ```ipe
 equalFold "Hello" "hello" --> True
 equalFold "Hello" "world" --> False
 equalFold "ABC" "abc" --> True
+equalFold "STRASSE" "straße" --> True
+equalFold "i" "İ" --> False
 ```
 
 ## `isEmail`

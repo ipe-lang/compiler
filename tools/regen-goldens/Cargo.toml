@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ipe = { path = "../../src/ipe-cli" }
+ipe_docs = { path = "../../src/ipe-docs" }
 e2e-support = { path = "../e2e-support" }
 
 [lints]

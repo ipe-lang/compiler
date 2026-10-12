@@ -18,7 +18,8 @@ Three knots.
   or `GT`. Sorting (`List.sortWith`), `min`, and `max` are all phrased in terms of
   it — when you need a custom order, you return an `Order` from `compare`, you
   don't invent a `<`-and-`>` pair. `compare` carries an implicit `Comparable`
-  bound, so it works on any comparable value but rejects a function or record.
+  bound, so it works on `Int`, `Float`, `String`, `Char`, and `Bool` but rejects a
+  list, tuple, record, or function.
 - **Rendering to text is explicit and lives in `Ipe.String`.** The prelude has
   no generic stringifier: `String.fromInt`, `String.fromFloat`, and
   `String.fromBool` each name the type they render, so the call site shows what
@@ -63,7 +64,7 @@ render reading =
     String.padRight 8 ' ' reading.sensor ++ String.fromInt reading.celsius ++ " C"
 ```
 
-Running it (`ipe run`) clamps the two impossible readings to the band edges,
+Running it (`ipe dev run`) clamps the two impossible readings to the band edges,
 orders the rest, and prints the range:
 
 ```

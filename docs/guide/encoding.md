@@ -70,7 +70,7 @@ badDecode =
             "rejected malformed base64 (Err, not a crash)"
 ```
 
-Running it (`ipe run`) over a payload with non-ASCII text (`café ☕`) shows all
+Running it (`ipe dev run`) over a payload with non-ASCII text (`café ☕`) shows all
 three encodings round-trip, and the malformed decode is rejected cleanly:
 
 ```

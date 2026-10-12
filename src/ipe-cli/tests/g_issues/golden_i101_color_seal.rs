@@ -81,7 +81,7 @@ fn user_color_via_hof_resolves_to_own_enum() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for user_color_hof: {:?}",
+        "ipe dev build must succeed for user_color_hof: {:?}",
         built.err()
     );
 
@@ -147,7 +147,7 @@ fn user_color_in_record_field_agrees_across_paths() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for user_color_record: {:?}",
+        "ipe dev build must succeed for user_color_record: {:?}",
         built.err()
     );
 

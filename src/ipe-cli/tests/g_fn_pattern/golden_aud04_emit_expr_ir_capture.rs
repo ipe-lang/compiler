@@ -54,7 +54,7 @@ fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for fixture {fixture}: {:?}",
+        "ipe dev build must succeed for fixture {fixture}: {:?}",
         built.err()
     );
 }
@@ -80,7 +80,7 @@ fn assert_e2e_output(fixture: &str, expect_contains: &str) {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {fixture}: {:?}",
+        "ipe dev build must succeed for {fixture}: {:?}",
         built.err()
     );
 

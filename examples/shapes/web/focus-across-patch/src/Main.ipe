@@ -1,0 +1,391 @@
+module Main exposing (main)
+
+-- | focus-across-patch — a patch never moves keyboard focus.
+--
+-- The root column takes focus when the page loads and handles every key, so a
+-- key works wherever focus sits below it. `add` appends a row and `drop`
+-- removes itself, each changing the panel's children (the client swaps the
+-- panel); `Escape` toggles the row from the keyboard. The note field sits
+-- ahead of the row so its position survives either change. `swap` replaces
+-- itself with another focusable control at the same position, which is not the
+-- node that held focus. `press` replaces its keyed item with one whose key
+-- spells the button's own identity, one level up. The form holds a control
+-- named after each DOM member the client reads on a node that may be a form,
+-- which shadows that member on the form, and a field to type in. The form
+-- gains a row on `Escape`, so the client swaps a form's children; `fdrop`
+-- removes itself from it, so focus falls back to the form. `fgrow` (inside the
+-- form) and `nfocus` (after it) each add a row beside the form, so the client
+-- swaps the form's parent with focus inside or after the form. `escname` is a
+-- field whose `name` holds a backslash and a newline; `Escape` puts a row ahead
+-- of it, so the swap finds it again by name. `m` puts a row beside the
+-- focusable MathML element `mfocus`.
+-- Clicking `xdeep` replaces its keyed chain with one whose keys absorb the
+-- next id segment, so a node at the same depth carries the same id under a
+-- different chain. `tbutton` (a `button` named `x`) is replaced by an element
+-- whose tag is `button:x`, which carries the same id under another tag.
+--
+-- Co-located, no capabilities, no JS ports.
+
+import Ipe.Html as Html
+import Ipe.Html.Attributes as Attr
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+import Ipe.Ui.Input as Input
+import Ipe.Ui.Keyed as Keyed
+
+
+type alias Model =
+    { keys : String
+    , row : Bool
+    , drop : Bool
+    , note : String
+    , swapped : Bool
+    , pressed : Bool
+    , deep : Bool
+    , tagSwapped : Bool
+    , hostRow : Bool
+    , formDrop : Bool
+    , mathRow : Bool
+    }
+
+
+type Msg
+    = KeyDown String
+    | AddRow
+    | DropButton
+    | Note String
+    | Swap
+    | Press
+    | Deep
+    | TagSwap
+    | Grow
+    | FormDrop
+    | NoOp
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        KeyDown key ->
+            if key == "Escape" then
+                ( { model | keys = key, row = not model.row }, Cmd.none )
+
+            else if key == "m" then
+                ( { model | keys = key, mathRow = not model.mathRow }, Cmd.none )
+
+            else
+                ( { model | keys = key }, Cmd.none )
+
+        AddRow ->
+            ( { model | row = True }, Cmd.none )
+
+        DropButton ->
+            ( { model | drop = False }, Cmd.none )
+
+        Note text ->
+            ( { model | note = text }, Cmd.none )
+
+        Swap ->
+            ( { model | swapped = True }, Cmd.none )
+
+        Press ->
+            ( { model | pressed = True }, Cmd.none )
+
+        Deep ->
+            ( { model | deep = True }, Cmd.none )
+
+        TagSwap ->
+            ( { model | tagSwapped = True }, Cmd.none )
+
+        Grow ->
+            ( { model | hostRow = True }, Cmd.none )
+
+        FormDrop ->
+            ( { model | formDrop = False }, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+panelRow : Model -> List (Ui.Element Msg)
+panelRow model =
+    if model.row then
+        [ Ui.el [ Ui.id "row" ] (Ui.text "row") ]
+
+    else
+        []
+
+
+panelDrop : Model -> List (Ui.Element Msg)
+panelDrop model =
+    if model.drop then
+        [ Ui.button [ Ui.id "drop" ] { onPress = Just DropButton, label = Ui.text "drop" } ]
+
+    else
+        []
+
+
+swapSlot : Model -> Ui.Element Msg
+swapSlot model =
+    if model.swapped then
+        Ui.el [ Ui.id "swapped", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "swapped")
+
+    else
+        Ui.button [ Ui.id "swap" ] { onPress = Just Swap, label = Ui.text "swap" }
+
+
+-- The pressed item's key `k_0_button` makes its server identity the one the
+-- `press` button held, `<column>_0_div:k_0_button`, one level higher.
+keyedItems : Model -> List ( String, Ui.Element Msg )
+keyedItems model =
+    if model.pressed then
+        [ ( "k_0_button", Ui.el [ Ui.id "kspoof", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "spoof") )
+        , ( "tail", Ui.el [ Ui.id "ktail" ] (Ui.text "tail") )
+        ]
+
+    else
+        [ ( "k", Ui.el [ Ui.id "kitem" ] (Ui.button [ Ui.id "kbutton" ] { onPress = Just Press, label = Ui.text "press" }) ) ]
+
+
+-- Before: item `a` > unkeyed column > `xdeep` keyed `b_0_div`. After: item
+-- `a_0_div` > div keyed `b` > unkeyed `ydeep`. Both deepest nodes are divs
+-- with id `<column>_0_div:a_0_div_0_div:b_0_div`; their parents' ids differ.
+deepItems : Model -> List ( String, Ui.Element Msg )
+deepItems model =
+    if model.deep then
+        [ ( "a_0_div"
+        , Keyed.column
+            []
+            [ ( "b", Ui.el [] (Ui.el [ Ui.id "ydeep", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "y")) ) ]
+        )
+        , ( "deeptail", Ui.el [ Ui.id "deeptail" ] (Ui.text "tail") )
+        ]
+
+    else
+        [ ( "a"
+        , Ui.el []
+            (Keyed.column []
+                [ ( "b_0_div"
+                , Ui.el
+                    [ Ui.id "xdeep", Ui.htmlAttribute "tabindex" "0", Ui.onClick Deep ]
+                    (Ui.text "x")
+                )
+                ]
+            )
+        )
+        ]
+
+
+-- A `button` named `x` and a `button:x` element both get id `<column>_0_button:x`.
+tagSlot : Model -> Ui.Element Msg
+tagSlot model =
+    if model.tagSwapped then
+        Ui.html
+            (Html.node
+                "button:x"
+                [ Attr.id "tspoof", Attr.attribute "tabindex" "0" ]
+                [ Html.text "spoof" ]
+            )
+
+    else
+        Ui.button
+            [ Ui.id "tbutton", Ui.htmlAttribute "name" "x" ]
+            { onPress = Just TagSwap, label = Ui.text "tag" }
+
+
+formRow : Model -> List (Ui.Element Msg)
+formRow model =
+    if model.row then
+        [ Ui.el [ Ui.id "formrow" ] (Ui.text "form row") ]
+
+    else
+        []
+
+
+hostRow : Model -> List (Ui.Element Msg)
+hostRow model =
+    if model.hostRow then
+        [ Ui.el [ Ui.id "hostrow" ] (Ui.text "host row") ]
+
+    else
+        []
+
+
+formDrop : Model -> List (Ui.Element Msg)
+formDrop model =
+    if model.formDrop then
+        [ Ui.button
+            [ Ui.id "fdrop", Ui.htmlAttribute "type" "button" ]
+            { onPress = Just FormDrop, label = Ui.text "form drop" }
+        ]
+
+    else
+        []
+
+
+-- A disabled button named `member`: the form's `member` property answers with it.
+shadow : String -> Ui.Element Msg
+shadow member =
+    Ui.button
+        [ Ui.htmlAttribute "name" member ]
+        { onPress = Nothing, label = Ui.text member }
+
+
+-- `mark` while `on`, else empty: the empty value removes the attribute when
+-- the form is patched.
+dropMark : Bool -> String -> String
+dropMark on mark =
+    if on then
+        mark
+
+    else
+        ""
+
+
+-- The form's first child holds the `appendChild` control, so the commit's
+-- second append reads it; `firstChild` and `firstElementChild` sit one level
+-- down, so a lookup through the form answers with a node that is not its
+-- child.
+shadowingForm : Model -> Ui.Element Msg
+shadowingForm model =
+    Ui.form
+        [ Ui.id "form"
+        , Ui.htmlAttribute "tabindex" "0"
+        , Ui.htmlAttribute "data-drop" (dropMark model.formDrop "kept")
+        , Ui.htmlAttribute "data-dropped" (dropMark (not model.formDrop) "yes")
+        ]
+        ([ shadow "appendChild"
+        , Ui.button
+            [ Ui.id "rc", Ui.htmlAttribute "name" "removeChild" ]
+            { onPress = Nothing, label = Ui.text "named control" }
+        , Ui.button
+            [ Ui.id "pe", Ui.htmlAttribute "name" "parentElement" ]
+            { onPress = Nothing, label = Ui.text "named walk" }
+        , Ui.el [] (shadow "firstChild")
+        , Ui.el [] (shadow "firstElementChild")
+        , shadow "querySelectorAll"
+        , shadow "contains"
+        , shadow "getAttribute"
+        , shadow "tagName"
+        , shadow "previousElementSibling"
+        , shadow "nextElementSibling"
+        , shadow "namespaceURI"
+        , shadow "replaceChild"
+        , shadow "focus"
+        , shadow "setAttribute"
+        , shadow "removeAttribute"
+        , shadow "closest"
+        , Ui.el [ Ui.id "formlabel" ] (Ui.text "form label")
+        , Ui.el
+            [ Ui.id "fgrow", Ui.htmlAttribute "tabindex" "0", Ui.onClick Grow ]
+            (Ui.text "grow")
+        ]
+            ++ formDrop model
+            ++ [ Ui.input
+                [ Ui.id "typed"
+                , Ui.htmlAttribute "name" "typed"
+                , Ui.htmlAttribute "aria-label" "Form field"
+                ]
+            ]
+            ++ formRow model
+        )
+
+
+escRow : Model -> List (Ui.Element Msg)
+escRow model =
+    if model.row then
+        [ Ui.el [ Ui.id "escrow" ] (Ui.text "esc row") ]
+
+    else
+        []
+
+
+mathRow : Model -> List (Ui.Element Msg)
+mathRow model =
+    if model.mathRow then
+        [ Ui.el [ Ui.id "mathrow" ] (Ui.text "math row") ]
+
+    else
+        []
+
+
+view : Model -> Ui.Element Msg
+view model =
+    Ui.column
+        [ Ui.id "root"
+        , Ui.onKeyDown KeyDown
+        , Ui.htmlAttribute "tabindex" "0"
+        , Ui.htmlAttribute "autofocus" ""
+        ]
+        [ Ui.el [ Ui.id "keys" ] (Ui.text ("keys: " ++ model.keys))
+        , Ui.column
+            [ Ui.id "panel" ]
+            ([ Ui.button [ Ui.id "add" ] { onPress = Just AddRow, label = Ui.text "add" }
+            , Input.text
+                [ Ui.id "note" ]
+                { label = Input.labelHidden "Note"
+                , text = model.note
+                , onChange = Note
+                , placeholder = Nothing
+                }
+            ]
+                ++ panelRow model
+                ++ panelDrop model
+            )
+        , Ui.column [ Ui.id "swapper" ] [ swapSlot model ]
+        , Keyed.column [ Ui.id "keyed" ] (keyedItems model)
+        , Keyed.column [ Ui.id "deep" ] (deepItems model)
+        , Ui.column [ Ui.id "tagswap" ] [ tagSlot model ]
+        , Ui.column
+            [ Ui.id "formhost" ]
+            ([ shadowingForm model
+            , Ui.el
+                [ Ui.id "nfocus", Ui.htmlAttribute "tabindex" "0", Ui.onClick Grow ]
+                (Ui.text "after form")
+            ]
+                ++ hostRow model
+            )
+        , Ui.column
+            [ Ui.id "eschost" ]
+            (escRow model
+                ++ [ Ui.input
+                    [ Ui.id "escname"
+                    , Ui.htmlAttribute "name" "a\\b\nc"
+                    , Ui.htmlAttribute "aria-label" "Escaped name"
+                    ]
+                ]
+            )
+        , Ui.column
+            [ Ui.id "mathhost" ]
+            (Ui.html
+                (Html.node
+                    "math"
+                    [ Attr.id "mfocus", Attr.attribute "tabindex" "0" ]
+                    [ Html.node "mi" [] [ Html.text "x" ] ]
+                )
+                :: mathRow model
+            )
+        ]
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = NoOp
+        }

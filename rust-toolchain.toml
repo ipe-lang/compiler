@@ -11,7 +11,7 @@ components = ["clippy", "rustfmt"]
 #     so this target must be present or the SEAL is decorative (the `wasm-floor`
 #     CI job builds it; see `.github/workflows/ci.yml`).
 #   - `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`: the
-#     fully-static deploy targets `ipe build --static` / `ipe run --static`
+#     fully-static deploy targets `ipe dev build --static` / `ipe dev run --static`
 #     link (see `static.yml`, `release.yml`); the pinned toolchain must have
 #     them or the static preflight fails with `TargetNotInstalled`.
 targets = [

@@ -11,14 +11,22 @@
 //! hands the backend its [`ipe_backend_rust::FfiEmit`] inputs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use ipe_ffi::driver::{CargoDep, CrateName, CrateSpec, FfiCache, InstalledCrate, VersionPin};
 use ipe_ffi::pkginfo::FeatureName;
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal};
 
 use crate::CliError;
+use crate::io_bounded::{FFI_CACHE_CAP, MANIFEST_CAP, SMALL_FILE_CAP, refusal_error};
 use crate::owner_trust::{self, TrustedCache};
+use crate::remote_ingest::{
+    CHILD_STDERR_MAX_BYTES, ChildStderr, FFI_INSPECT_LIMITS, LocalCeiling, LocalRefusal,
+    LocalSource, RunError, run_local,
+};
 use crate::text;
 
 /// The project-relative FFI cache directory.
@@ -31,6 +39,260 @@ const PROJECT_MANIFEST: &str = "package.ipe";
 /// for `[rust.dependencies]` / `[rust.wrapper]`, pending the ergonomic Rust-FFI
 /// work that lifts those bindings out of a `package.ipe`.
 const PROJECT_MANIFEST_TOML: &str = "ipe.toml";
+
+/// The most entries one source-tree read lists, across every level, before it is refused.
+const TREE_ENTRY_CAP: EntryCap = EntryCap::from_nonzero(NonZeroU32::MIN.saturating_add(65_535));
+
+/// `result` with absence as `None`; every other refusal is the error for `path`.
+fn absent_as_none<T>(result: Result<T, OpenRefusal>, path: &Path) -> Result<Option<T>, CliError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(OpenRefusal::Absent) => Ok(None),
+        Err(refusal) => Err(refusal_error(path, refusal)),
+    }
+}
+
+/// `dir` joined with each of `below`.
+fn joined(dir: &Path, below: &[&str]) -> PathBuf {
+    below
+        .iter()
+        .fold(dir.to_path_buf(), |path, name| path.join(name))
+}
+
+/// Hold the directory `below` spells under `dir`; `None` when a level is absent.
+///
+/// `dir` itself is opened as named (an empty `dir` is the working directory);
+/// every level of `below` is opened without following a link.
+///
+/// # Errors
+/// The [`refusal_error`] of a level that is a link, not a directory, or not
+/// openable.
+pub fn open_project_dir(dir: &Path, below: &[&str]) -> Result<Option<HeldDir>, CliError> {
+    absent_as_none(open_levels(dir, below), &joined(dir, below))
+}
+
+/// `dir` opened as named, then each of `below` from its parent's handle without following a link.
+fn open_levels(dir: &Path, below: &[&str]) -> Result<HeldDir, OpenRefusal> {
+    let mut level = HeldDir::open_root(dir)?;
+    for name in below {
+        level = level.child_dir(&EntryName::parse(OsStr::new(name))?)?;
+    }
+    Ok(level)
+}
+
+/// Read the regular file `name` in the held `dir` (at `dir_path`) as UTF-8 within `cap`.
+///
+/// The open never follows a link and never blocks on a FIFO, and the type is
+/// checked on the opened handle; `None` when the entry is absent.
+///
+/// # Errors
+/// The [`refusal_error`] of a link, a non-regular entry, a denied open, a
+/// read past `cap`, or a read failure.
+pub fn read_held_file(
+    dir: &HeldDir,
+    dir_path: &Path,
+    name: &str,
+    cap: ByteCap,
+) -> Result<Option<String>, CliError> {
+    let read = EntryName::parse(OsStr::new(name))
+        .and_then(|entry| dir.open_regular(&entry))
+        .and_then(|file| file.read_utf8(cap));
+    absent_as_none(read, &dir_path.join(name))
+}
+
+/// Read the regular file `name` in the directory `below` spells under `dir`.
+///
+/// `None` when any level, or the file, is absent.
+///
+/// # Errors
+/// As [`open_project_dir`] and [`read_held_file`].
+pub fn read_project_file(
+    dir: &Path,
+    below: &[&str],
+    name: &str,
+    cap: ByteCap,
+) -> Result<Option<String>, CliError> {
+    open_project_dir(dir, below)?.map_or(Ok(None), |held| {
+        read_held_file(&held, &joined(dir, below), name, cap)
+    })
+}
+
+/// What the entry `name` in the held `dir` (at `dir_path`) is, read without following a link.
+///
+/// `None` when the entry is absent.
+///
+/// # Errors
+/// The [`refusal_error`] of a failure other than absence.
+pub fn held_entry_kind(
+    dir: &HeldDir,
+    dir_path: &Path,
+    name: &str,
+) -> Result<Option<FileKind>, CliError> {
+    EntryName::parse(OsStr::new(name))
+        .and_then(|entry| dir.kind_of(&entry))
+        .map_err(|refusal| refusal_error(&dir_path.join(name), refusal))
+}
+
+/// Which entries a [`read_source_tree`] takes.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeSelect {
+    /// Whether a regular file of this name is read.
+    pub keep: fn(&OsStr) -> bool,
+    /// Whether a directory of this name is walked.
+    pub descend: fn(&OsStr) -> bool,
+}
+
+/// How a [`read_source_tree`] treats an entry it cannot read as source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreadable {
+    /// Refuse the whole read: a selected link, special file, or unreadable
+    /// file or directory is an error, so no source goes unscanned.
+    Refuse,
+    /// Leave the entry out: the read is advisory and the compiler reports the
+    /// entry itself.
+    Skip,
+}
+
+/// One directory a [`read_source_tree`] still has to list.
+enum Level {
+    /// The held top of the tree.
+    Top(HeldDir),
+    /// The subdirectory `name` of an already-listed directory.
+    Below(Rc<HeldDir>, EntryName),
+}
+
+/// Read every regular file `select` keeps under the held `top` (at `top_path`), sorted by path.
+///
+/// Every level is opened from its parent's handle without following a link,
+/// every file without following a link and without blocking, each read within
+/// `cap`, and the listing of the whole tree within one entry budget. Only the
+/// directories still being walked stay open. Under [`Unreadable::Refuse`] a
+/// link where `select` would read or walk is refused, so a linked directory
+/// can never hide source from the read.
+///
+/// # Errors
+/// [`CliError::Io`] when the tree lists more entries than its budget; under
+/// [`Unreadable::Refuse`], the [`refusal_error`] of the first selected entry
+/// that is a link, not regular, or unreadable.
+pub fn read_source_tree(
+    top: HeldDir,
+    top_path: &Path,
+    select: TreeSelect,
+    cap: ByteCap,
+    unreadable: Unreadable,
+) -> Result<Vec<(PathBuf, String)>, CliError> {
+    let refused = |path: &Path, refusal: OpenRefusal| -> Result<(), CliError> {
+        match unreadable {
+            Unreadable::Refuse => Err(refusal_error(path, refusal)),
+            Unreadable::Skip => Ok(()),
+        }
+    };
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    let mut listed: u32 = 0;
+    let mut pending: Vec<(Level, PathBuf)> = vec![(Level::Top(top), top_path.to_path_buf())];
+    while let Some((level, dir_path)) = pending.pop() {
+        let opened = match level {
+            Level::Top(dir) => Ok(dir),
+            Level::Below(parent, name) => parent.child_dir(&name),
+        };
+        let dir = match opened {
+            Ok(dir) => Rc::new(dir),
+            Err(refusal) => {
+                refused(&dir_path, refusal)?;
+                continue;
+            }
+        };
+        let over_budget = || refusal_error(&dir_path, OpenRefusal::TooManyEntries(TREE_ENTRY_CAP));
+        let listing_cap =
+            EntryCap::new(TREE_ENTRY_CAP.get().saturating_sub(listed)).ok_or_else(over_budget)?;
+        let entries = match dir.entries(listing_cap) {
+            Ok(entries) => entries,
+            Err(OpenRefusal::TooManyEntries(_)) => return Err(over_budget()),
+            Err(refusal) => {
+                refused(&dir_path, refusal)?;
+                continue;
+            }
+        };
+        listed = listed.saturating_add(u32::try_from(entries.len()).unwrap_or(u32::MAX));
+        for (name, kind) in entries {
+            let walked = (select.descend)(name.as_os_str());
+            let kept = (select.keep)(name.as_os_str());
+            let path = dir_path.join(name.as_os_str());
+            match kind {
+                FileKind::Dir if walked => {
+                    pending.push((Level::Below(Rc::clone(&dir), name), path));
+                }
+                FileKind::Regular if kept => {
+                    match dir.open_regular(&name).and_then(|file| file.read_utf8(cap)) {
+                        Ok(text) => files.push((path, text)),
+                        Err(refusal) => refused(&path, refusal)?,
+                    }
+                }
+                FileKind::Symlink if walked || kept => refused(&path, OpenRefusal::Link)?,
+                FileKind::Fifo | FileKind::Socket | FileKind::Device | FileKind::Other if kept => {
+                    refused(&path, OpenRefusal::NotRegular(kind))?;
+                }
+                FileKind::Dir
+                | FileKind::Regular
+                | FileKind::Symlink
+                | FileKind::Fifo
+                | FileKind::Socket
+                | FileKind::Device
+                | FileKind::Other => {}
+            }
+        }
+    }
+    files.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(files)
+}
+
+/// Whether `name` is a Rust source file name.
+fn is_rust_source(name: &OsStr) -> bool {
+    Path::new(name).extension() == Some(OsStr::new("rs"))
+}
+
+/// Whether `name` is not a Cargo build-output directory.
+///
+/// A built wrapper's `target/` holds its dependencies' source, not the
+/// author's Rust, and would swamp the scan (the manifest already refuses
+/// those dependencies). The author surface is `src/`, `build.rs`, and any
+/// sibling module files.
+fn is_not_build_output(name: &OsStr) -> bool {
+    name != OsStr::new("target")
+}
+
+/// Whether `name` is an Ipê source file name.
+fn is_ipe_source(name: &OsStr) -> bool {
+    Path::new(name).extension() == Some(OsStr::new("ipe"))
+}
+
+/// Whether `name` is an FFI binding file name.
+fn is_binding_source(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.ends_with("_bindings.rs"))
+}
+
+/// Every directory is walked.
+const fn every_dir(_name: &OsStr) -> bool {
+    true
+}
+
+/// The Rust a wrapper crate's author wrote: every `.rs`, `target/` not walked.
+const WRAPPER_SOURCES: TreeSelect = TreeSelect {
+    keep: is_rust_source,
+    descend: is_not_build_output,
+};
+
+/// Every `.ipe` source under a project's `src`.
+const IPE_SOURCES: TreeSelect = TreeSelect {
+    keep: is_ipe_source,
+    descend: every_dir,
+};
+
+/// Every `_bindings.rs` under an FFI cache.
+pub const BINDING_SOURCES: TreeSelect = TreeSelect {
+    keep: is_binding_source,
+    descend: every_dir,
+};
 
 /// Walk up from `start` looking for an FFI artifact cache, bounded at the
 /// nearest `package.ipe` project root.
@@ -76,6 +338,28 @@ pub fn load_catalog_for(blame_path: &Path) -> Result<Vec<InstalledCrate>, CliErr
     load_located_catalog(blame_path).map(|(catalog, _)| catalog)
 }
 
+/// Whether a build can link Rust FFI: an installed crate catalog makes its
+/// `Rust.*` interfaces reachable from the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiPresence {
+    /// No crate is installed; the program links no foreign code.
+    Absent,
+    /// At least one crate is installed for the build.
+    Present,
+}
+
+/// The [`FfiPresence`] of the build rooted at (or blamed on) `blame_path`.
+///
+/// # Errors
+/// As [`load_catalog_for`].
+pub fn project_ffi_presence(blame_path: &Path) -> Result<FfiPresence, CliError> {
+    Ok(if load_catalog_for(blame_path)?.is_empty() {
+        FfiPresence::Absent
+    } else {
+        FfiPresence::Present
+    })
+}
+
 /// The catalog for `blame_path` with the path of the cache it was read from
 /// (empty when no cache exists), from one discovery walk.
 ///
@@ -94,21 +378,21 @@ fn load_located_catalog(blame_path: &Path) -> Result<(Vec<InstalledCrate>, PathB
 /// [`ipe_canon::ModuleOrigin::FfiInterface`] at input creation).
 ///
 /// # Errors
-/// [`CliError::Usage`] when a project module already claims an
+/// [`FfiPrepError::ModuleClaimed`] when a project module already claims an
 /// installed crate's `Rust.*` module path.
 pub fn inject_interfaces(
     sources: &mut BTreeMap<Vec<String>, (PathBuf, String)>,
     catalog: &[InstalledCrate],
     cache_root_hint: &Path,
-) -> Result<BTreeSet<Vec<String>>, CliError> {
+) -> Result<BTreeSet<Vec<String>>, FfiPrepError> {
     let mut injected = BTreeSet::new();
     for c in catalog {
         let mod_path: Vec<String> = c.module_name.split('.').map(str::to_owned).collect();
         if sources.contains_key(&mod_path) {
-            return Err(CliError::Usage(text::msg::ffi_module_clash(
-                &c.module_name,
-                &c.slug,
-            )));
+            return Err(FfiPrepError::ModuleClaimed {
+                module: c.module_name.clone(),
+                slug: c.slug.clone(),
+            });
         }
         let pseudo_path = cache_root_hint.join(format!("{}.ipe", c.slug));
         sources.insert(mod_path.clone(), (pseudo_path, c.interface_source.clone()));
@@ -117,20 +401,32 @@ pub fn inject_interfaces(
     Ok(injected)
 }
 
+/// The backend emission inputs with the one dependency table they were sealed against.
+///
+/// Later growth of the wrapper module (the asserted shims) re-seals against
+/// this same table, so one catalog is merged exactly once.
+pub struct AssembledEmit {
+    /// The backend emission inputs.
+    pub emit: ipe_backend_rust::FfiEmit,
+    /// The merged `[dependencies]` table the emit renders and was sealed against.
+    merged: MergedDeps,
+}
+
 /// Assemble the backend emission inputs from the catalog: the merged
 /// module-qualified opaque-type map, the de-duplicated pinned dep lines, and
 /// the combined `src/ffi.rs` (one `pub mod <slug>` per crate).
 ///
 /// # Errors
-/// [`CliError::Usage`] when two installed crates pin the SAME
-/// dependency name to versions that cannot share one line, bind one
-/// dependency name to two different sources (a registry pin and a wrapper
-/// path, or two wrapper paths), or when emitted code names the path root of a
+/// [`FfiPrepError::DefineOpaqueCollision`] when a define type and an opaque
+/// type of one crate share a name; [`FfiPrepError::DependencyMerge`] when two
+/// installed crates pin the SAME dependency name to versions that cannot share
+/// one line, or bind one dependency name to two different sources (a registry
+/// pin and a wrapper path, or two wrapper paths);
+/// [`FfiPrepError::CatalogSeal`] when emitted code names the path root of a
 /// dependency left out of `[dependencies]` — an unbuildable crate refused here
-/// rather than discovered by `cargo`.
-pub fn assemble_emit(
-    catalog: &[InstalledCrate],
-) -> Result<Option<ipe_backend_rust::FfiEmit>, CliError> {
+/// rather than discovered by `cargo`; [`FfiPrepError::TransparentWithoutShape`]
+/// when a binding names a transparent shape the catalog does not carry.
+pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>, FfiPrepError> {
     use std::fmt::Write as _;
     if catalog.is_empty() {
         return Ok(None);
@@ -160,9 +456,10 @@ pub fn assemble_emit(
             // the SEAL would then compile against). Fail closed — the author must
             // rename one; the two nominals are genuinely different Rust types.
             if foreign_types.contains_key(&key) {
-                return Err(CliError::Usage(text::msg::ffi_define_opaque_collision(
-                    &c.slug, &name,
-                )));
+                return Err(FfiPrepError::DefineOpaqueCollision {
+                    slug: c.slug.clone(),
+                    name: name.clone(),
+                });
             }
             foreign_types.insert(key, format!("crate::ffi::{}::{name}", c.slug));
         }
@@ -174,7 +471,7 @@ pub fn assemble_emit(
             body = c.bindings_source
         );
     }
-    let merged = merge_catalog_deps(catalog)?;
+    let merged = merge_catalog_deps(catalog).map_err(FfiPrepError::DependencyMerge)?;
     let dep_lines: Vec<String> = merged
         .declared
         .values()
@@ -187,13 +484,44 @@ pub fn assemble_emit(
         interface_modules: catalog.iter().map(|c| c.module_name.clone()).collect(),
         wrapper_glue,
     };
-    seal_dependency_references(catalog, &merged, &emit)?;
-    Ok(Some(emit))
+    seal_dependency_references(catalog, &merged, &emit).map_err(FfiPrepError::CatalogSeal)?;
+    Ok(Some(AssembledEmit { emit, merged }))
 }
 
-/// Why the catalog's dependency table cannot back the emitted crate.
+/// Every refusal FFI prep returns, one variant per cause.
+///
+/// It reaches [`CliError`] only as [`CliError::FfiPrep`], so a consumer (the
+/// LSP's load classifier) decides each cause's handling from its type, never
+/// from message text.
 #[derive(Debug, PartialEq, Eq)]
-enum DependencyRefusal {
+pub enum FfiPrepError {
+    /// A project module already claims an installed crate's interface module path.
+    ModuleClaimed { module: String, slug: String },
+    /// A project module already occupies the reserved asserted module path.
+    ReservedModuleExists,
+    /// An asserted call or constant failed validation or deduplication.
+    AssertedRefused(Box<ipe_ffi::diag::Diagnostic>),
+    /// The shims appended for asserted calls name a crate the table leaves out.
+    AssertedShimSeal(SealRefusal),
+    /// A define type and an opaque type share one name in one crate.
+    DefineOpaqueCollision { slug: String, name: String },
+    /// The merged `[dependencies]` table cannot be built.
+    DependencyMerge(MergeRefusal),
+    /// Emitted catalog code names a dependency the table leaves out.
+    CatalogSeal(SealRefusal),
+    /// A binding references a transparent shape the catalog does not carry.
+    TransparentWithoutShape {
+        slug: String,
+        name: String,
+        binding: String,
+    },
+    /// Asserted calls validated, yet the assembled emit is empty (an internal invariant).
+    AssertedWithoutCatalog,
+}
+
+/// Why the catalog's dependencies cannot merge into one `[dependencies]` table.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeRefusal {
     /// Two members pin one package to versions no single line satisfies, and
     /// the package is not provably a transitive dependency Cargo may resolve.
     PinConflict {
@@ -208,6 +536,11 @@ enum DependencyRefusal {
         first: String,
         second: String,
     },
+}
+
+/// Why an emitted text cannot be sealed against the merged dependency table.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SealRefusal {
     /// Emitted code names the path root of a package left out of
     /// `[dependencies]`, so `cargo` could not resolve it.
     DroppedTransitive {
@@ -219,26 +552,71 @@ enum DependencyRefusal {
     Unlexable { site: String },
 }
 
-impl From<DependencyRefusal> for CliError {
-    fn from(refusal: DependencyRefusal) -> Self {
-        Self::Usage(match refusal {
-            DependencyRefusal::PinConflict {
+impl FfiPrepError {
+    /// The catalog message this refusal renders as.
+    fn message(&self) -> text::Message {
+        match self {
+            Self::ModuleClaimed { module, slug } => text::msg::ffi_module_clash(module, slug),
+            Self::ReservedModuleExists => {
+                text::msg::ffi_reserved_module_exists(&ipe_canon::asserted::ASSERTED_MODULE)
+            }
+            Self::AssertedRefused(diag) => text::Message::relay(&**diag),
+            Self::AssertedShimSeal(refusal) | Self::CatalogSeal(refusal) => refusal.message(),
+            Self::DefineOpaqueCollision { slug, name } => {
+                text::msg::ffi_define_opaque_collision(slug, name)
+            }
+            Self::DependencyMerge(refusal) => refusal.message(),
+            Self::TransparentWithoutShape {
+                slug,
+                name,
+                binding,
+            } => text::msg::ffi_transparent_without_shape(slug, name, binding),
+            Self::AssertedWithoutCatalog => text::msg::ffi_asserted_empty_catalog(),
+        }
+    }
+}
+
+impl std::fmt::Display for FfiPrepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl MergeRefusal {
+    /// The catalog message naming the conflicting dependency and its two sources.
+    fn message(&self) -> text::Message {
+        match self {
+            Self::PinConflict {
                 name,
                 first,
                 second,
-            } => text::msg::ffi_dependency_pin_conflict(&name, &first, &second),
-            DependencyRefusal::SourceConflict {
+            } => text::msg::ffi_dependency_pin_conflict(name, first, second),
+            Self::SourceConflict {
                 name,
                 first,
                 second,
-            } => text::msg::ffi_dependency_source_conflict(&name, &first, &second),
-            DependencyRefusal::DroppedTransitive {
+            } => text::msg::ffi_dependency_source_conflict(name, first, second),
+        }
+    }
+}
+
+impl SealRefusal {
+    /// The catalog message naming the offending site.
+    fn message(&self) -> text::Message {
+        match self {
+            Self::DroppedTransitive {
                 package,
                 ident,
                 site,
-            } => text::msg::ffi_dropped_transitive(&package, &ident, &site),
-            DependencyRefusal::Unlexable { site } => text::msg::ffi_emit_unlexable(&site),
-        })
+            } => text::msg::ffi_dropped_transitive(package, ident, site),
+            Self::Unlexable { site } => text::msg::ffi_emit_unlexable(site),
+        }
+    }
+}
+
+impl From<FfiPrepError> for CliError {
+    fn from(refusal: FfiPrepError) -> Self {
+        Self::FfiPrep(Box::new(refusal))
     }
 }
 
@@ -293,14 +671,13 @@ impl<'a> DeferrableDeps<'a> {
 ///
 /// # Errors
 ///
-/// [`DependencyRefusal::DroppedTransitive`] naming the first offending site,
-/// [`DependencyRefusal::Unlexable`] for a text whose references are unknown,
-/// or the merge's own refusal when the table cannot be built.
+/// [`SealRefusal::DroppedTransitive`] naming the first offending site, or
+/// [`SealRefusal::Unlexable`] for a text whose references are unknown.
 fn seal_dependency_references(
     catalog: &[InstalledCrate],
     merged: &MergedDeps,
     emit: &ipe_backend_rust::FfiEmit,
-) -> Result<(), DependencyRefusal> {
+) -> Result<(), SealRefusal> {
     let all_idents = || catalog.iter().flat_map(|c| &c.dep_idents);
     let declared_idents: BTreeSet<&str> = all_idents()
         .filter(|(name, _)| merged.declared.contains_key(*name))
@@ -331,13 +708,12 @@ fn seal_dependency_references(
         )
         .chain(glue_sites);
     for (site, text) in sites {
-        let refs = ipe_ffi::crate_refs::crate_references(text).map_err(|_| {
-            DependencyRefusal::Unlexable {
+        let refs =
+            ipe_ffi::crate_refs::crate_references(text).map_err(|_| SealRefusal::Unlexable {
                 site: site.to_owned(),
-            }
-        })?;
+            })?;
         if let Some((ident, package)) = dropped.iter().find(|(ident, _)| refs.contains(**ident)) {
-            return Err(DependencyRefusal::DroppedTransitive {
+            return Err(SealRefusal::DroppedTransitive {
                 package: (*package).to_owned(),
                 ident: (*ident).to_owned(),
                 site: site.to_owned(),
@@ -363,22 +739,23 @@ fn glue_rust_path(ty: &ipe_backend_rust::FfiGlueType) -> &str {
 /// seam whose two sides disagree.
 ///
 /// # Errors
-/// [`CliError::Usage`] naming the crate, binding, and missing shape.
+/// [`FfiPrepError::TransparentWithoutShape`] naming the crate, binding, and
+/// missing shape.
 fn assemble_wrapper_glue(
     c: &InstalledCrate,
     wrapper_glue: &mut BTreeMap<String, ipe_backend_rust::FfiWrapperGlue>,
-) -> Result<(), CliError> {
+) -> Result<(), FfiPrepError> {
     for b in &c.bindings {
         if b.transparent_params.is_none() && b.transparent_result.is_none() {
             continue;
         }
-        let glue_ty = |name: &str| -> Result<ipe_backend_rust::FfiGlueType, CliError> {
+        let glue_ty = |name: &str| -> Result<ipe_backend_rust::FfiGlueType, FfiPrepError> {
             let t = c.transparent_types.get(name).ok_or_else(|| {
-                CliError::Usage(text::msg::ffi_transparent_without_shape(
-                    &c.slug,
-                    &name,
-                    &b.ref_name,
-                ))
+                FfiPrepError::TransparentWithoutShape {
+                    slug: c.slug.clone(),
+                    name: name.to_owned(),
+                    binding: b.ref_name.clone(),
+                }
             })?;
             Ok(glue_type_of(&c.module_name, &c.slug, t))
         };
@@ -530,8 +907,8 @@ struct MergedDeps {
 /// Merge every member's typed dependencies into one manifest-wide table.
 ///
 /// # Errors
-/// The first [`DependencyRefusal`] of [`merge_cargo_dep`].
-fn merge_catalog_deps(catalog: &[InstalledCrate]) -> Result<MergedDeps, DependencyRefusal> {
+/// The first [`MergeRefusal`] of [`merge_cargo_dep`].
+fn merge_catalog_deps(catalog: &[InstalledCrate]) -> Result<MergedDeps, MergeRefusal> {
     let deferrable = DeferrableDeps::of(catalog);
     let mut merged = MergedDeps {
         declared: BTreeMap::new(),
@@ -557,18 +934,18 @@ fn merge_catalog_deps(catalog: &[InstalledCrate]) -> Result<MergedDeps, Dependen
 /// one source can back a dependency key.
 ///
 /// # Errors
-/// [`DependencyRefusal::PinConflict`] or [`DependencyRefusal::SourceConflict`].
+/// [`MergeRefusal::PinConflict`] or [`MergeRefusal::SourceConflict`].
 fn merge_cargo_dep(
     dep: &CargoDep,
     deferrable: &DeferrableDeps<'_>,
     merged: &mut MergedDeps,
-) -> Result<(), DependencyRefusal> {
+) -> Result<(), MergeRefusal> {
     let incoming = MergedDep::of(dep);
     let key = incoming.name.as_str().to_owned();
     if merged.unpinned.contains(&key) {
         return match incoming.source {
             MergedSource::Registry(_) => Ok(()),
-            MergedSource::Wrapper(_) => Err(DependencyRefusal::SourceConflict {
+            MergedSource::Wrapper(_) => Err(MergeRefusal::SourceConflict {
                 first: "an unpinned registry dependency".to_owned(),
                 second: incoming.source.describe(),
                 name: key,
@@ -586,7 +963,7 @@ fn merge_cargo_dep(
     match (&prev.source, &incoming.source) {
         (MergedSource::Registry(a), MergedSource::Registry(b)) => {
             if !deferrable.admits(&key) {
-                return Err(DependencyRefusal::PinConflict {
+                return Err(MergeRefusal::PinConflict {
                     first: a.as_str().to_owned(),
                     second: b.as_str().to_owned(),
                     name: key,
@@ -598,7 +975,7 @@ fn merge_cargo_dep(
         }
         (MergedSource::Wrapper(_), MergedSource::Wrapper(_) | MergedSource::Registry(_))
         | (MergedSource::Registry(_), MergedSource::Wrapper(_)) => {
-            Err(DependencyRefusal::SourceConflict {
+            Err(MergeRefusal::SourceConflict {
                 first: prev.source.describe(),
                 second: incoming.source.describe(),
                 name: key,
@@ -609,7 +986,7 @@ fn merge_cargo_dep(
 
 /// All FFI seam outputs produced from a single project-scoped catalog load.
 ///
-/// Returned by [`prepare_ffi`]; consumed by the build pipeline, `ipe watch`,
+/// Returned by [`prepare_ffi`]; consumed by the build pipeline, `ipe dev watch`,
 /// and `ipe lsp` so all three go through exactly the same injection steps.
 pub struct FfiPrep {
     /// The parsed per-crate entries — used to assemble [`ipe_backend_rust::FfiEmit`].
@@ -627,7 +1004,7 @@ pub struct FfiPrep {
 
 /// Load, inject, and assemble the FFI catalog for a project in one step.
 ///
-/// This is the shared seam used by `run_build`, `ipe watch`, and `ipe lsp` so
+/// This is the shared seam used by `run_build`, `ipe dev watch`, and `ipe lsp` so
 /// all three compilation paths go through the SAME catalog-load → interface-
 /// inject → emit-assemble sequence. Each caller was previously duplicating
 /// these steps independently, or (in `watch`/`lsp`) skipping them entirely —
@@ -680,34 +1057,33 @@ pub fn prepare_ffi(
     // holds only project (and stdlib) modules.
     let ScannedFfi { asserted, consts } = scan_asserted(sources, &catalog)?;
     let mut injected = inject_interfaces(sources, &catalog, &cache_hint)?;
-    let mut emit = assemble_emit(&catalog)?;
+    let mut assembled = assemble_emit(&catalog)?;
     if !asserted.is_empty() || !consts.is_empty() {
         let mod_path: Vec<String> = ipe_canon::asserted::ASSERTED_MODULE
             .split('.')
             .map(str::to_owned)
             .collect();
         if sources.contains_key(&mod_path) {
-            return Err(CliError::Usage(text::msg::ffi_reserved_module_exists(
-                &ipe_canon::asserted::ASSERTED_MODULE,
-            )));
+            return Err(FfiPrepError::ReservedModuleExists.into());
         }
         let iface = ipe_ffi::asserted::render_asserted_interface(&asserted, &consts);
         sources.insert(mod_path.clone(), (cache_hint.join("Rust.Ffi.ipe"), iface));
         injected.insert(mod_path);
         // `validate` proved every target crate is installed, so the catalog —
         // and therefore the assembled emit — is non-empty here.
-        let Some(e) = emit.as_mut() else {
-            return Err(CliError::Usage(text::msg::ffi_asserted_empty_catalog()));
+        let Some(a) = assembled.as_mut() else {
+            return Err(FfiPrepError::AssertedWithoutCatalog.into());
         };
-        e.interface_modules
+        a.emit
+            .interface_modules
             .push(ipe_canon::asserted::ASSERTED_MODULE.to_owned());
-        append_asserted_shims(&catalog, e, &asserted, &consts)?;
+        append_asserted_shims(&catalog, a, &asserted, &consts)?;
     }
     Ok(FfiPrep {
         catalog,
         unify,
         injected,
-        emit,
+        emit: assembled.map(|a| a.emit),
     })
 }
 
@@ -716,15 +1092,20 @@ pub fn prepare_ffi(
 /// The shims name crates too, so the grown module is re-checked against the
 /// dependency table before it can reach the backend.
 ///
+/// The re-check reads the table the emit was assembled and sealed against,
+/// never a second merge of the catalog.
+///
 /// # Errors
 ///
-/// A [`DependencyRefusal`] when a shim names a crate the table leaves out.
+/// [`FfiPrepError::AssertedShimSeal`] when a shim names a crate the table
+/// leaves out.
 fn append_asserted_shims(
     catalog: &[InstalledCrate],
-    emit: &mut ipe_backend_rust::FfiEmit,
+    assembled: &mut AssembledEmit,
     asserted: &[ipe_ffi::asserted::AssertedSpec],
     consts: &[ipe_ffi::asserted::ConstSpec],
-) -> Result<(), DependencyRefusal> {
+) -> Result<(), FfiPrepError> {
+    let AssembledEmit { emit, merged } = assembled;
     if !asserted.is_empty() {
         emit.bindings_source.push('\n');
         emit.bindings_source
@@ -735,7 +1116,16 @@ fn append_asserted_shims(
         emit.bindings_source
             .push_str(&ipe_ffi::asserted::emit_const_shims(consts));
     }
-    seal_dependency_references(catalog, &merge_catalog_deps(catalog)?, emit)
+    seal_dependency_references(catalog, merged, emit).map_err(FfiPrepError::AssertedShimSeal)
+}
+
+/// The two native-binding surfaces one scan pass produces: forwarder calls
+/// (`Rust.fn` / `Rust.Ffi.call`) and bare-scalar constant reads (`Rust.const`).
+/// A single pass over the modules yields both — splitting the scan would
+/// re-parse every module.
+struct ScannedFfi {
+    asserted: Vec<ipe_ffi::asserted::AssertedSpec>,
+    consts: Vec<ipe_ffi::asserted::ConstSpec>,
 }
 
 /// Scan every project source module for asserted-call sites
@@ -748,16 +1138,7 @@ fn append_asserted_shims(
 ///
 /// # Errors
 /// [`CliError::Pipeline`] (IPE-N0038, span-attributed) for a malformed site;
-/// [`CliError::Usage`] (IPE-F4414) for a refused assertion.
-/// The two native-binding surfaces one scan pass produces: forwarder calls
-/// (`Rust.fn` / `Rust.Ffi.call`) and bare-scalar constant reads (`Rust.const`).
-/// A single pass over the modules yields both — splitting the scan would
-/// re-parse every module.
-struct ScannedFfi {
-    asserted: Vec<ipe_ffi::asserted::AssertedSpec>,
-    consts: Vec<ipe_ffi::asserted::ConstSpec>,
-}
-
+/// [`FfiPrepError::AssertedRefused`] (IPE-F4414) for a refused assertion.
 fn scan_asserted(
     sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
     catalog: &[InstalledCrate],
@@ -791,20 +1172,23 @@ fn scan_asserted(
             if matches!(u.callee, ipe_canon::asserted::AssertedCallee::RustConst) {
                 let spec =
                     ipe_ffi::asserted::validate_const(u.path, &u.annotation, &interner, catalog)
-                        .map_err(|d| CliError::Usage(crate::text::Message::relay(&d)))?;
+                        .map_err(asserted_refused)?;
                 const_specs.push(spec);
             } else {
                 let spec = ipe_ffi::asserted::validate(u.path, &u.annotation, &interner, catalog)
-                    .map_err(|d| CliError::Usage(crate::text::Message::relay(&d)))?;
+                    .map_err(asserted_refused)?;
                 specs.push(spec);
             }
         }
     }
-    let asserted = ipe_ffi::asserted::dedupe(specs)
-        .map_err(|d| CliError::Usage(crate::text::Message::relay(&d)))?;
-    let consts = ipe_ffi::asserted::dedupe_consts(const_specs)
-        .map_err(|d| CliError::Usage(crate::text::Message::relay(&d)))?;
+    let asserted = ipe_ffi::asserted::dedupe(specs).map_err(asserted_refused)?;
+    let consts = ipe_ffi::asserted::dedupe_consts(const_specs).map_err(asserted_refused)?;
     Ok(ScannedFfi { asserted, consts })
+}
+
+/// Lift a refused asserted call or constant into its typed FFI prep refusal.
+fn asserted_refused(diag: ipe_ffi::diag::Diagnostic) -> CliError {
+    FfiPrepError::AssertedRefused(Box::new(diag)).into()
 }
 
 /// Locate the `ipe-ffi-inspector` binary: beside the running `ipe`
@@ -837,8 +1221,8 @@ fn inspector_binary() -> Result<PathBuf, CliError> {
 /// path; absent that the function fails closed rather than falling back to a
 /// world-writable or working-directory-relative path.
 fn make_scratch_dir(krate: &str) -> Result<PathBuf, CliError> {
-    let home =
-        crate::env_dir::home().ok_or(CliError::Usage(text::msg::ffi_add_home_not_absolute()))?;
+    let home = crate::env_dir::home()
+        .map_err(|_refusal| CliError::Usage(text::msg::ffi_add_home_not_absolute()))?;
     let base = home.join(".cache/ipe/ffi-scratch");
     crate::scratch::ScratchDir::new_under(&base, &format!("add-{krate}"))
         .map(crate::scratch::ScratchDir::into_path)
@@ -885,13 +1269,14 @@ fn jail_path_refused(e: &ipe_sandbox::JailPathError) -> CliError {
 ///   it, a jail path does not resolve, or the user's home is unknown (see
 ///   [`toolchain_binds_from`]).
 fn toolchain_binds(inspector: &Path) -> Result<ToolchainBinds, CliError> {
-    let cargo_home = crate::env_dir::tool_home("CARGO_HOME", ".cargo")?;
-    let rustup_home = crate::env_dir::tool_home("RUSTUP_HOME", ".rustup")?;
+    let user_home = crate::env_dir::home();
+    let cargo_home = crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref().ok(), ".cargo")?;
+    let rustup_home = crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref().ok(), ".rustup")?;
     toolchain_binds_from(
         inspector,
-        cargo_home.as_deref(),
+        cargo_home.as_ref(),
         rustup_home,
-        crate::env_dir::home().as_deref(),
+        user_home.as_ref().map_err(|refusal| *refusal),
     )
 }
 
@@ -909,12 +1294,12 @@ fn toolchain_binds(inspector: &Path) -> Result<ToolchainBinds, CliError> {
 /// - any read-only bind equals or contains the cargo home (a rustup home at or
 ///   above it, or an inspector directory above it): binding it would expose
 ///   `credentials.toml` inside the jail;
-/// - the user's home is unset or relative, so it cannot be masked.
+/// - the user's home is refused, so it cannot be masked.
 fn toolchain_binds_from(
     inspector: &Path,
-    cargo_home: Option<&Path>,
-    rustup_home: Option<PathBuf>,
-    user_home: Option<&Path>,
+    cargo_home: Option<&crate::env_dir::ToolHome>,
+    rustup_home: Option<crate::env_dir::ToolHome>,
+    user_home: Result<&crate::env_dir::HomeDir, crate::env_dir::HomeRefusal>,
 ) -> Result<ToolchainBinds, CliError> {
     let cargo_home =
         cargo_home.ok_or_else(|| CliError::Usage(text::msg::ffi_cargo_home_unresolved()))?;
@@ -936,18 +1321,18 @@ fn toolchain_binds_from(
         // credentials.toml stays outside the jail.
         toolchain_ro_binds.push(cargo_bin);
     }
-    let rustup_home = match rustup_home.filter(|rustup| rustup.is_dir()) {
-        Some(rustup) => Some(canonical(&rustup)?),
+    let rustup_home = match rustup_home.filter(|rustup| rustup.as_path().is_dir()) {
+        Some(rustup) => Some(canonical(rustup.as_path())?),
         None => None,
     };
     if let Some(rustup) = &rustup_home {
         toolchain_ro_binds.push(rustup.clone());
     }
-    if let Some(bind) = ipe_sandbox::bind_exposing(&toolchain_ro_binds, cargo_home) {
+    if let Some(bind) = ipe_sandbox::bind_exposing(&toolchain_ro_binds, cargo_home.as_path()) {
         return Err(CliError::Usage(
             text::msg::ffi_toolchain_bind_exposes_cargo_home(
                 &bind.as_path().display(),
-                &cargo_home.display(),
+                &cargo_home.as_path().display(),
             ),
         ));
     }
@@ -962,11 +1347,31 @@ fn toolchain_binds_from(
     })
 }
 
+/// The operator's `IPE_FFI_PROC_CAP` override, parsed into the typed cap.
+///
+/// Unset is `Ok(None)` (the default cap stands). A set value that is not
+/// UTF-8, not digits, zero or above `ProcCap::MAX` refuses: it is never
+/// clamped into range and never ignored in favor of the default.
+fn proc_cap_override(
+    raw: Option<&std::ffi::OsStr>,
+) -> Result<Option<ipe_sandbox::run_jail::ProcCap>, ipe_sandbox::run_jail::ProcCapError> {
+    raw.map(|raw| {
+        raw.to_str()
+            .ok_or(ipe_sandbox::run_jail::ProcCapError::NotANumber)
+            .and_then(str::parse)
+    })
+    .transpose()
+}
+
 /// The jail resource caps: the fail-closed defaults, each raisable through an
 /// explicit env override that prints a warning (an SDK-scale dependency
 /// closure — hundreds of crates under one `cargo check`/rustdoc — legitimately
 /// needs more CPU/wall/output than the small-crate defaults).
-fn jail_limits() -> ipe_sandbox::ResourceLimits {
+///
+/// # Errors
+///
+/// A refused `IPE_FFI_PROC_CAP` (see [`proc_cap_override`]) refuses the run.
+fn jail_limits() -> Result<ipe_sandbox::ResourceLimits, CliError> {
     let mut limits = ipe_sandbox::ResourceLimits::default();
     let with_override = |var: &str, slot: &mut u64, scale: u64| {
         if let Ok(raw) = ipe_env::var(var) {
@@ -992,9 +1397,26 @@ fn jail_limits() -> ipe_sandbox::ResourceLimits {
     with_override("IPE_FFI_CPU_SECS", &mut limits.cpu_secs, 1);
     with_override("IPE_FFI_WALL_SECS", &mut limits.wall_secs, 1);
     with_override("IPE_FFI_FD_CAP", &mut limits.fd_cap, 1);
-    with_override("IPE_FFI_PROC_CAP", &mut limits.proc_cap, 1);
     with_override("IPE_FFI_OUT_CAP_MB", &mut limits.out_cap_bytes, 1024 * 1024);
-    limits
+    let proc_cap = ipe_env::var_os("IPE_FFI_PROC_CAP");
+    match proc_cap_override(proc_cap.as_deref()) {
+        Ok(None) => {}
+        Ok(Some(cap)) => {
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &format!("WARNING: jail cap override IPE_FFI_PROC_CAP={cap}"),
+            );
+            limits.proc_cap = cap;
+        }
+        Err(refused) => {
+            return Err(CliError::Usage(text::msg::command_refusal(
+                &"add",
+                &crate::style::TerminalSafe::sanitize(&format!("IPE_FFI_PROC_CAP: {refused}")),
+            )));
+        }
+    }
+    Ok(limits)
 }
 
 /// Run one jailed inspector phase over the shared `scoped_tmp`, returning its
@@ -1021,7 +1443,7 @@ fn run_phase(
         homes: binds.homes.clone(),
         path_prepend: binds.path_prepend.clone(),
         rustup_home: binds.rustup_home.clone(),
-        limits: jail_limits(),
+        limits: jail_limits()?,
     };
     ipe_sandbox::run_in_bwrap_jail(caps, &spec, payload)
         .map_err(|d| io_err(format!("sandboxed inspection failed: {d}")))
@@ -1282,12 +1704,6 @@ fn run_single_bwrap(
     binds: &ToolchainBinds,
     allow_build_scripts: bool,
 ) -> Result<String, CliError> {
-    let io_err = |detail: String| {
-        CliError::Usage(text::msg::command_refusal(
-            &"add",
-            &crate::style::TerminalSafe::sanitize(&detail),
-        ))
-    };
     let with_payload =
         |fetch_only: bool| inspector_payload(inspector, job, None, allow_build_scripts, fetch_only);
     run_phase(
@@ -1304,15 +1720,7 @@ fn run_single_bwrap(
         binds,
         &with_payload(false),
     )?;
-    if out.status != Some(0) {
-        return Err(io_err(format!(
-            "inspector exited with {:?}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    String::from_utf8(out.stdout)
-        .map_err(|_| io_err("inspector produced non-UTF-8 output".to_owned()))
+    InspectorFailure::from_jailed(out).map_err(|failure| failure.into_cli_error(inspector))
 }
 
 /// The inspector argv for one chunk of the manifest flow: a single-crate
@@ -1355,12 +1763,6 @@ fn run_introspect_chunk(
     binds: &ToolchainBinds,
     payload: &[OsString],
 ) -> Result<String, CliError> {
-    let io_err = |detail: String| {
-        CliError::Usage(text::msg::command_refusal(
-            &"add",
-            &crate::style::TerminalSafe::sanitize(&detail),
-        ))
-    };
     let out = run_phase(
         caps,
         ipe_sandbox::NetworkPolicy::Denied,
@@ -1368,15 +1770,8 @@ fn run_introspect_chunk(
         binds,
         payload,
     )?;
-    if out.status != Some(0) {
-        return Err(io_err(format!(
-            "inspector exited with {:?}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    String::from_utf8(out.stdout)
-        .map_err(|_| io_err("inspector produced non-UTF-8 output".to_owned()))
+    InspectorFailure::from_jailed(out)
+        .map_err(|failure| failure.into_cli_error(binds.inspector.as_path()))
 }
 
 /// Chunk a multi-crate manifest into per-crate jailed runs so no single run
@@ -1510,19 +1905,13 @@ fn write_inspector_manifest_chunk(
 }
 
 /// The explicit `IPE_FFI_ALLOW_UNSANDBOXED=1` escape hatch: one direct argv
-/// spawn, loudly labelled.
+/// spawn, loudly labelled, held to [`FFI_INSPECT_LIMITS`].
 fn run_inspector_job_unsandboxed(
     inspector: &Path,
     job: &InspectorJob,
     scratch_hint: &str,
     allow_build_scripts: bool,
 ) -> Result<String, CliError> {
-    let io_err = |detail: String| {
-        CliError::Usage(text::msg::command_refusal(
-            &"add",
-            &crate::style::TerminalSafe::sanitize(&detail),
-        ))
-    };
     crate::screen::chatter(
         crate::screen::Stream::Stderr,
         crate::screen::Tone::UserError,
@@ -1543,21 +1932,104 @@ fn run_inspector_job_unsandboxed(
     let (program, rest) = payload
         .split_first()
         .ok_or(CliError::Usage(text::msg::ffi_add_no_payload()))?;
-    let out = std::process::Command::new(program)
-        .args(rest)
-        .output()
-        .map_err(|e| io_err(e.to_string()));
+    let inspected = inspect_unsandboxed(program, rest, FFI_INSPECT_LIMITS);
     let _ = std::fs::remove_dir_all(&scoped_tmp);
-    let out = out?;
-    if !out.status.success() {
-        return Err(io_err(format!(
-            "inspector exited with {:?}\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
+    inspected.map_err(|failure| failure.into_cli_error(inspector))
+}
+
+/// Why the unsandboxed inspector produced no inspection report.
+#[derive(Debug)]
+enum InspectorFailure {
+    /// The run left no captured result: the inspector did not start, crossed
+    /// its ceiling and was killed, or left an output pipe held or unread.
+    Run(RunError<LocalRefusal>),
+    /// The inspector exited unsuccessfully.
+    Exit {
+        /// The exit code, absent when a signal ended the inspector.
+        code: Option<i32>,
+        /// The inspector's stderr as kept, marked when cut at its ceiling.
+        stderr: ChildStderr,
+    },
+    /// The inspection report is not UTF-8.
+    NotUtf8,
+}
+
+impl InspectorFailure {
+    /// The failure of a jailed inspector run, or its stdout as text.
+    ///
+    /// A wall kill leaves no status, which renders as a signal ending the run.
+    fn from_jailed(out: ipe_sandbox::JailedOutput) -> Result<String, Self> {
+        if out.status != Some(0) {
+            return Err(Self::Exit {
+                code: out.status,
+                stderr: kept_stderr(out.stderr),
+            });
+        }
+        String::from_utf8(out.stdout).map_err(|_| Self::NotUtf8)
     }
-    String::from_utf8(out.stdout)
-        .map_err(|_| io_err("inspector produced non-UTF-8 output".to_owned()))
+
+    /// The CLI error of this failure; `inspector` names the binary on a start or wait failure.
+    fn into_cli_error(self, inspector: &Path) -> CliError {
+        match self {
+            Self::Run(RunError::Exceeded(refusal)) => CliError::LocalLimitExceeded(refusal),
+            Self::Run(RunError::Spawn(source) | RunError::Wait(source)) => CliError::Io {
+                path: inspector.to_path_buf(),
+                source,
+            },
+            Self::Run(RunError::Measure(path, source)) => CliError::Io { path, source },
+            Self::Run(RunError::PipeDrainTimeout(stream)) => CliError::ChildPipeHeld(stream),
+            Self::Run(RunError::PipeRead(stream, kind)) => CliError::ChildPipeUnread(stream, kind),
+            Self::Exit {
+                code: Some(code),
+                stderr,
+            } => CliError::Usage(text::msg::ffi_inspector_exited(
+                &code,
+                &stderr.to_terminal(),
+            )),
+            Self::Exit { code: None, stderr } => {
+                CliError::Usage(text::msg::ffi_inspector_signalled(&stderr.to_terminal()))
+            }
+            Self::NotUtf8 => CliError::Usage(text::msg::ffi_inspector_not_utf8()),
+        }
+    }
+}
+
+/// A jailed inspector's stderr held to the child-stderr ceiling, marked when cut.
+fn kept_stderr(mut bytes: Vec<u8>) -> ChildStderr {
+    let ceiling = usize::try_from(CHILD_STDERR_MAX_BYTES.get()).unwrap_or(usize::MAX);
+    if bytes.len() > ceiling {
+        bytes.truncate(ceiling);
+        ChildStderr::Truncated(bytes)
+    } else {
+        ChildStderr::Whole(bytes)
+    }
+}
+
+/// Run the inspector `program` with `args` outside the jail, held to `ceiling`.
+///
+/// On unix a crossed ceiling kills the inspector's process group; elsewhere
+/// only the inspector itself.
+///
+/// # Errors
+/// [`InspectorFailure::Run`] when the run left no result,
+/// [`InspectorFailure::Exit`] on an unsuccessful exit, and
+/// [`InspectorFailure::NotUtf8`] on a report that is not UTF-8.
+fn inspect_unsandboxed(
+    program: &std::ffi::OsStr,
+    args: &[OsString],
+    ceiling: LocalCeiling,
+) -> Result<String, InspectorFailure> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let captured =
+        run_local(command, ceiling, LocalSource::FfiInspect).map_err(InspectorFailure::Run)?;
+    if !captured.status.success() {
+        return Err(InspectorFailure::Exit {
+            code: captured.status.code(),
+            stderr: captured.stderr,
+        });
+    }
+    String::from_utf8(captured.stdout).map_err(|_| InspectorFailure::NotUtf8)
 }
 
 /// Inspect + install a `[rust.wrapper]` local wrapper crate.
@@ -1691,7 +2163,7 @@ fn install_wrapper(
 /// The refuse-until-jail → admit-and-isolate hand-off is per-target: a
 /// runtime-enforced axis is admitted only where the jail actually holds. The
 /// deploy target is unknown at install, so the honest proxy is this host's jail
-/// capability — `ipe add` and `ipe run` typically run on the same machine. It is
+/// capability — `ipe add` and `ipe dev run` typically run on the same machine. It is
 /// built from [`ipe_sandbox::run_jail::platform_confined_axes`] — the SET of
 /// runtime-enforced axes the compiled-in `exec_in_run_jail` arm actually confines
 /// on this host, single-sourced to that arm by the `on_jailed_target!` macro. So
@@ -1747,26 +2219,31 @@ fn enforce_wrapper_capabilities(
     wrapper_dir: &Path,
     declared: &BTreeSet<ipe_ffi::capability_scan::Capability>,
 ) -> Result<(), CliError> {
-    // Collect every `.rs` under the wrapper crate (incl. `build.rs`, `bin/`,
+    // Read every `.rs` under the wrapper crate (incl. `build.rs`, `bin/`,
     // nested modules). A single unscanned file is a hole, so the walk is
-    // recursive and unfiltered.
-    let mut rs_files: Vec<PathBuf> = Vec::new();
-    collect_wrapper_rust_files(wrapper_dir, &mut rs_files)?;
-    rs_files.sort();
-
-    let mut sources: Vec<(String, String)> = Vec::with_capacity(rs_files.len());
-    for file in &rs_files {
-        let src =
-            crate::io_bounded::read_to_string_capped(file, crate::io_bounded::FFI_CACHE_READ_CAP)?;
-        sources.push((file.display().to_string(), src));
-    }
-    let scan = ipe_ffi::capability_scan::scan_sources(
-        sources.iter().map(|(f, s)| (f.as_str(), s.as_str())),
-    );
+    // recursive and unfiltered. The crate is held once: its manifest and every
+    // source are opened from that handle, no link followed, and a link where a
+    // source or directory could be is refused, so nothing hides from the scan.
+    let wrapper = open_project_dir(wrapper_dir, &[])?
+        .ok_or_else(|| refusal_error(wrapper_dir, OpenRefusal::Absent))?;
 
     // A wrapper with any non-`std` Cargo dependency is opaque: a dependency's
     // capabilities live in source the scan never opens.
-    let non_std_deps = wrapper_non_std_dependencies(wrapper_dir)?;
+    let non_std_deps = wrapper_non_std_dependencies(&wrapper, wrapper_dir)?;
+
+    let sources: Vec<(String, String)> = read_source_tree(
+        wrapper,
+        wrapper_dir,
+        WRAPPER_SOURCES,
+        FFI_CACHE_CAP,
+        Unreadable::Refuse,
+    )?
+    .into_iter()
+    .map(|(file, src)| (file.display().to_string(), src))
+    .collect();
+    let scan = ipe_ffi::capability_scan::scan_sources(
+        sources.iter().map(|(f, s)| (f.as_str(), s.as_str())),
+    );
 
     let jail = jail_for_host();
 
@@ -1832,41 +2309,6 @@ fn enforce_wrapper_capabilities(
     }
 }
 
-/// Recursively collect every `.rs` file under a wrapper crate directory.
-///
-/// # Errors
-/// [`CliError::Io`] on a directory-read failure.
-fn collect_wrapper_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| CliError::Io {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| CliError::Io {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| CliError::Io {
-            path: path.clone(),
-            source: e,
-        })?;
-        if file_type.is_dir() {
-            // Never descend into `target/`: a built wrapper's dependency source is
-            // not the author's Rust and would swamp the scan (and re-flag deps we
-            // already refuse via the manifest). The author surface is `src/`,
-            // `build.rs`, and any sibling module files.
-            if path.file_name().and_then(|n| n.to_str()) == Some("target") {
-                continue;
-            }
-            collect_wrapper_rust_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// The wrapper crate's non-`std` Cargo dependency names, read from its
 /// `Cargo.toml`. A wrapper with any external dependency is opaque to the source
 /// scan (a dependency's capabilities live in source the scan never opens), so
@@ -1881,20 +2323,20 @@ fn collect_wrapper_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
 /// build-only, never shipped).
 ///
 /// # Errors
-/// [`CliError::Io`] on a read failure (an unreadable manifest is refused, not
-/// silently treated as dependency-free).
-fn wrapper_non_std_dependencies(wrapper_dir: &Path) -> Result<Vec<String>, CliError> {
-    let manifest = wrapper_dir.join("Cargo.toml");
-    if !manifest.is_file() {
-        // No manifest means no crate to inspect; the inspector will fail loudly
-        // later. Treat as no declared deps here (the source scan still runs).
-        return Ok(Vec::new());
-    }
-    let text = crate::io_bounded::read_to_string_capped(
-        &manifest,
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    )?;
-    Ok(parse_cargo_dependency_names(&text))
+/// The [`refusal_error`] of a manifest that is a link, not a regular file,
+/// past its cap, or unreadable (refused, not silently treated as
+/// dependency-free).
+fn wrapper_non_std_dependencies(
+    wrapper: &HeldDir,
+    wrapper_dir: &Path,
+) -> Result<Vec<String>, CliError> {
+    // No manifest means no crate to inspect; the inspector will fail loudly
+    // later. Treat as no declared deps here (the source scan still runs).
+    Ok(
+        read_held_file(wrapper, wrapper_dir, "Cargo.toml", SMALL_FILE_CAP)?
+            .as_deref()
+            .map_or_else(Vec::new, parse_cargo_dependency_names),
+    )
 }
 
 /// Extract every dependency name from a `Cargo.toml`'s text — the pure,
@@ -2100,11 +2542,8 @@ fn add_one(
     // into the inspection document before the driver decodes it, so each
     // author-declared adapter/struct/enum flows through the same `PkgInfo` gate
     // and the unforgeable `FfiInterface` module as an inspected binding.
-    let doc_text = match crate::io_bounded::read_to_string_capped(
-        std::path::Path::new(PROJECT_MANIFEST),
-        crate::io_bounded::MANIFEST_READ_CAP,
-    ) {
-        Ok(text) => {
+    let doc_text = match read_project_file(Path::new(""), &[], PROJECT_MANIFEST, MANIFEST_CAP)? {
+        Some(text) => {
             reject_legacy_define_tables(&text)?;
             let src_root = Path::new("src");
             let (closures, structs, enums, opaques) = scan_foreign_defines(src_root)?;
@@ -2120,7 +2559,7 @@ fn add_one(
             )?
         }
         // No manifest (a bare `ipe add` outside a project) ⇒ nothing to merge.
-        Err(_) => doc_text,
+        None => doc_text,
     };
     let build_stage = Stage::with_mode(std::io::stderr(), mode, format!("building {crate_label}…"));
     let install_result = ipe_ffi::driver::install_from_inspection(cache, &doc_text);
@@ -2161,16 +2600,29 @@ fn add_one(
 /// a sibling `ipe.toml` sidecar, which is read here. A path that is already an
 /// `ipe.toml` (or any non-`package.ipe`) is read as-is, and a `package.ipe`
 /// with no sidecar falls back to itself so a pure-Ipê manifest stays a no-op.
-fn ffi_vocabulary_source(manifest_path: &Path) -> PathBuf {
-    if manifest_path.file_name().and_then(|n| n.to_str()) == Some(PROJECT_MANIFEST)
-        && let Some(dir) = manifest_path.parent()
+/// Both are read from one held handle on the manifest's directory, never
+/// following a link and never blocking on a FIFO.
+///
+/// # Errors
+/// [`CliError::Io`] when the manifest is absent; the [`refusal_error`] of a
+/// manifest path that does not end in one plain UTF-8 entry name, or of a
+/// sidecar or manifest that is a link, not a regular file, past
+/// [`MANIFEST_CAP`], or unreadable.
+fn read_ffi_vocabulary(manifest_path: &Path) -> Result<String, CliError> {
+    let (Some(dir), Some(name)) = (
+        manifest_path.parent(),
+        manifest_path.file_name().and_then(OsStr::to_str),
+    ) else {
+        return Err(refusal_error(manifest_path, OpenRefusal::BadName));
+    };
+    let absent = || refusal_error(manifest_path, OpenRefusal::Absent);
+    let held = open_project_dir(dir, &[])?.ok_or_else(absent)?;
+    if name == PROJECT_MANIFEST
+        && let Some(sidecar) = read_held_file(&held, dir, PROJECT_MANIFEST_TOML, MANIFEST_CAP)?
     {
-        let sidecar = dir.join(PROJECT_MANIFEST_TOML);
-        if sidecar.is_file() {
-            return sidecar;
-        }
+        return Ok(sidecar);
     }
-    manifest_path.to_path_buf()
+    read_held_file(&held, dir, name, MANIFEST_CAP)?.ok_or_else(absent)
 }
 
 /// Returns an error if `text` contains a legacy `[[rust.define.*]]` TOML table.
@@ -2214,13 +2666,9 @@ pub fn install_registry_deps_for_project(
 ) -> Result<(), CliError> {
     let project_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     // The `[rust.dependencies]` FFI vocabulary lives in the `ipe.toml` sidecar
-    // for a native `package.ipe`, so resolve the source that actually carries it
+    // for a native `package.ipe`, so read the source that actually carries it
     // before scanning for dependencies.
-    let ffi_source = ffi_vocabulary_source(manifest_path);
-    let text = crate::io_bounded::read_to_string_capped(
-        &ffi_source,
-        crate::io_bounded::MANIFEST_READ_CAP,
-    )?;
+    let text = read_ffi_vocabulary(manifest_path)?;
     let deps = rust_dependencies_from_manifest(&text);
     if deps.is_empty() {
         return Ok(());
@@ -2426,13 +2874,11 @@ pub fn run_install(rest: &[String]) -> Result<(), CliError> {
             text::msg::rust_install_package_ipe_unsupported(),
         ));
     }
-    let manifest = Path::new(PROJECT_MANIFEST_TOML);
-    if !manifest.is_file() {
-        return Err(CliError::Usage(text::msg::rust_install_no_manifest()));
-    }
-    let text =
-        crate::io_bounded::read_to_string_capped(manifest, crate::io_bounded::MANIFEST_READ_CAP)
-            .map_err(|e| CliError::Usage(text::msg::command_refusal(&"install", &e)))?;
+    let text = match read_project_file(Path::new(""), &[], PROJECT_MANIFEST_TOML, MANIFEST_CAP) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Err(CliError::Usage(text::msg::rust_install_no_manifest())),
+        Err(e) => return Err(CliError::Usage(text::msg::command_refusal(&"install", &e))),
+    };
     let deps = rust_dependencies_from_manifest(&text);
     let wrapper = rust_wrapper_from_manifest(&text);
     if deps.is_empty() && wrapper.is_none() {
@@ -3194,22 +3640,20 @@ pub(crate) fn scan_foreign_defines(src_root: &Path) -> Result<ForeignDefines, Cl
     let mut enums = Vec::new();
     let mut opaques = Vec::new();
 
-    let mut ipe_files = Vec::new();
-    collect_ipe_files(src_root, &mut ipe_files)?;
-    ipe_files.sort();
+    // A missing or unreadable source dir, and any file in it that cannot be
+    // read as source, is left to the compiler to report.
+    let Ok(Some(src)) = open_project_dir(src_root, &[]) else {
+        return Ok((closures, structs, enums, opaques));
+    };
+    let ipe_files = read_source_tree(src, src_root, IPE_SOURCES, MANIFEST_CAP, Unreadable::Skip)?;
 
-    for file in &ipe_files {
-        let Ok(text) =
-            crate::io_bounded::read_to_string_capped(file, crate::io_bounded::MANIFEST_READ_CAP)
-        else {
-            continue;
-        };
+    for (file, text) in &ipe_files {
         // Fast reject: skip files with no `foreign` keyword.
         if !text.contains("foreign") {
             continue;
         }
         let mut interner = ipe_intern::Interner::new();
-        let Ok(module) = ipe_parse::parse_module(&text, &mut interner) else {
+        let Ok(module) = ipe_parse::parse_module(text, &mut interner) else {
             continue; // compile pipeline surfaces parse errors
         };
         if module.foreigns.is_empty() {
@@ -3217,7 +3661,7 @@ pub(crate) fn scan_foreign_defines(src_root: &Path) -> Result<ForeignDefines, Cl
         }
         let reader = ForeignReader {
             interner: &interner,
-            src: &text,
+            src: text,
             file,
         };
         for foreign in &module.foreigns {
@@ -3230,24 +3674,6 @@ pub(crate) fn scan_foreign_defines(src_root: &Path) -> Result<ForeignDefines, Cl
         }
     }
     Ok((closures, structs, enums, opaques))
-}
-
-/// Recursively collect every `.ipe` file under `dir`.
-fn collect_ipe_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CliError> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(()); // missing or unreadable source dir — compiler reports it
-    };
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            collect_ipe_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("ipe") {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Borrowed context for lifting one `ForeignDecl` into a `ForeignDefine`.
@@ -3809,12 +4235,64 @@ pub(crate) fn rust_wrapper_header_accepted_by_ffi_reader(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ffi_proc_cap_override_refuses_zero_and_overflow() {
+        use ipe_sandbox::run_jail::{ProcCap, ProcCapError};
+        use std::ffi::OsStr;
+        let of = |raw: &str| proc_cap_override(Some(OsStr::new(raw)));
+        assert_eq!(of("0"), Err(ProcCapError::Zero));
+        assert_eq!(of("4097"), Err(ProcCapError::PastCeiling));
+        assert_eq!(of("18446744073709551615"), Err(ProcCapError::PastCeiling));
+        assert_eq!(of("18446744073709551616"), Err(ProcCapError::PastCeiling));
+        for not_digits in ["", "+64", "-1", "64k", " 64", "0x10", "\u{663}"] {
+            assert_eq!(
+                of(not_digits),
+                Err(ProcCapError::NotANumber),
+                "{not_digits:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                proc_cap_override(Some(OsStr::from_bytes(b"6\xff4"))),
+                Err(ProcCapError::NotANumber)
+            );
+        }
+        // Controls: unset keeps the default; an in-range value is taken as is.
+        assert_eq!(proc_cap_override(None), Ok(None));
+        assert_eq!(of("64").map(|c| c.map(ProcCap::get)), Ok(Some(64)));
+        assert_eq!(of("4096"), Ok(Some(ProcCap::MAX)));
+    }
+
+    #[test]
+    fn the_proc_cap_env_doc_states_the_typed_range() {
+        let doc = ipe_docs::env_vars::ENV_VARS
+            .iter()
+            .find(|v| v.name == "IPE_FFI_PROC_CAP")
+            .map(|v| v.purpose);
+        let range = format!("1 to {}", ipe_sandbox::run_jail::ProcCap::MAX);
+        assert!(
+            doc.is_some_and(|purpose| purpose.contains(&range)),
+            "IPE_FFI_PROC_CAP must document the range {range}: {doc:?}"
+        );
+    }
+
     /// Seal `emit` against the table `catalog` merges to.
+    #[allow(clippy::expect_used)] // every catalog sealed here merges; a refusal is a red test
     fn seal(
         catalog: &[InstalledCrate],
         emit: &ipe_backend_rust::FfiEmit,
-    ) -> Result<(), DependencyRefusal> {
-        seal_dependency_references(catalog, &merge_catalog_deps(catalog)?, emit)
+    ) -> Result<(), SealRefusal> {
+        let merged = merge_catalog_deps(catalog).expect("the sealed catalog merges");
+        seal_dependency_references(catalog, &merged, emit)
+    }
+
+    /// The backend emission inputs [`assemble_emit`] produces, without the table.
+    fn emit_of(
+        catalog: &[InstalledCrate],
+    ) -> Result<Option<ipe_backend_rust::FfiEmit>, FfiPrepError> {
+        assemble_emit(catalog).map(|a| a.map(|a| a.emit))
     }
 
     #[test]
@@ -4298,7 +4776,7 @@ version = \"1\"
         // HOME must be set for the sanctioned path; the test crate always has
         // one. The scratch dir lives under ~/.cache/ipe/ffi-scratch/, never
         // /tmp.
-        let Some(home) = crate::env_dir::home() else {
+        let Ok(home) = crate::env_dir::home() else {
             return;
         };
         let scratch = make_scratch_dir("semver").expect("first create succeeds");
@@ -4342,10 +4820,18 @@ version = \"1\"
     }
 
     /// A user home planted under `tmp`.
-    fn plant_user_home(tmp: &Path) -> PathBuf {
+    fn plant_user_home(tmp: &Path) -> crate::env_dir::HomeDir {
         let user_home = tmp.join("user");
         std::fs::create_dir_all(&user_home).expect("mk user home");
-        user_home
+        crate::env_dir::HomeDir::try_parse(Some(user_home.into_os_string()))
+            .expect("an absolute test home")
+    }
+
+    /// A tool home over the absolute test path `path`, spelled as given.
+    fn tool(path: &Path) -> crate::env_dir::ToolHome {
+        ipe_sandbox::home::tool_home_from("CARGO_HOME", Some(path.into()), None, ".cargo")
+            .expect("an absolute test tool home")
+            .expect("a set tool home")
     }
 
     fn canonical(path: &Path) -> ipe_sandbox::CanonicalPath {
@@ -4363,11 +4849,11 @@ version = \"1\"
         let user_home = plant_user_home(&tmp);
         let got = toolchain_binds_from(
             &inspector,
-            Some(&cargo_home),
-            Some(rustup_home.clone()),
-            Some(&user_home),
+            Some(&tool(&cargo_home)),
+            Some(tool(&rustup_home)),
+            Ok(&user_home),
         );
-        let want_homes = ipe_sandbox::HomeMasks::resolve(Some(&user_home), Some(&cargo_home))
+        let want_homes = ipe_sandbox::HomeMasks::resolve(Ok(&user_home), Some(&tool(&cargo_home)))
             .expect("homes resolve");
         let want_inspector = canonical(&inspector);
         let cargo_bin = canonical(&cargo_home.join("bin"));
@@ -4403,9 +4889,9 @@ version = \"1\"
     fn assert_toolchain_refused(cargo_home: &Path, rustup_home: &Path, inspector: &Path) {
         let got = toolchain_binds_from(
             inspector,
-            Some(cargo_home),
-            Some(rustup_home.to_path_buf()),
-            None,
+            Some(&tool(cargo_home)),
+            Some(tool(rustup_home)),
+            Err(crate::env_dir::HomeRefusal::Unset),
         );
         assert!(
             matches!(&got, Err(CliError::Usage(m)) if m.contains("credentials.toml")),
@@ -4489,9 +4975,9 @@ version = \"1\"
         let user_home = plant_user_home(&tmp);
         let got = toolchain_binds_from(
             &inspector,
-            Some(&cargo_home),
-            Some(rustup_home),
-            Some(&user_home),
+            Some(&tool(&cargo_home)),
+            Some(tool(&rustup_home)),
+            Ok(&user_home),
         );
         let cargo_home = canonical(&cargo_home);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4507,7 +4993,7 @@ version = \"1\"
             Path::new("/opt/ipe/bin/ipe-ffi-inspector"),
             None,
             None,
-            None,
+            Err(crate::env_dir::HomeRefusal::Unset),
         );
         assert!(
             matches!(&got, Err(CliError::Usage(m)) if m.contains("cannot locate the cargo home")),
@@ -4522,8 +5008,8 @@ version = \"1\"
         let cargo_home = tmp.join("elsewhere").join(".cargo");
         plant_cargo_home(&cargo_home);
         let inspector = plant_inspector(&tmp.join("tools"));
-        let got = toolchain_binds_from(&inspector, Some(&cargo_home), None, Some(&user_home));
-        let want = ipe_sandbox::HomeMasks::resolve(Some(&user_home), Some(&cargo_home))
+        let got = toolchain_binds_from(&inspector, Some(&tool(&cargo_home)), None, Ok(&user_home));
+        let want = ipe_sandbox::HomeMasks::resolve(Ok(&user_home), Some(&tool(&cargo_home)))
             .expect("homes resolve");
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(
@@ -4533,43 +5019,37 @@ version = \"1\"
     }
 
     #[test]
-    fn toolchain_binds_refuse_an_unset_or_relative_user_home() {
+    fn toolchain_binds_refuse_an_unset_user_home() {
+        use crate::env_dir::HomeRefusal;
         let tmp = toolbinds_root("no-user-home");
         let cargo_home = tmp.join(".cargo");
         plant_cargo_home(&cargo_home);
         let inspector = plant_inspector(&tmp.join("tools"));
-        let unset = toolchain_binds_from(&inspector, Some(&cargo_home), None, None);
-        let relative = toolchain_binds_from(
-            &inspector,
-            Some(&cargo_home),
-            None,
-            Some(Path::new("relative/home")),
-        );
+        let refusals = [
+            HomeRefusal::Unset,
+            HomeRefusal::NotUtf8,
+            HomeRefusal::ContainsNul,
+            HomeRefusal::NotAbsolute,
+            HomeRefusal::ParentComponent,
+            HomeRefusal::WindowsDeviceOrVerbatim,
+            HomeRefusal::WindowsUnc,
+        ];
+        let walks: Vec<_> = refusals
+            .iter()
+            .map(|refusal| {
+                let got =
+                    toolchain_binds_from(&inspector, Some(&tool(&cargo_home)), None, Err(*refusal));
+                (*refusal, got)
+            })
+            .collect();
         let _ = std::fs::remove_dir_all(&tmp);
-        for got in [unset, relative] {
+        for (refusal, got) in walks {
             assert!(
-                matches!(&got, Err(CliError::Usage(m)) if m.contains("cannot be masked")),
-                "an unknown user home cannot be masked, so the jail must be refused: {got:?}"
+                matches!(&got, Err(CliError::Usage(m))
+                    if m.contains("cannot be masked") && m.contains(&refusal.to_string())),
+                "a refused user home cannot be masked, so the jail must be refused: {got:?}"
             );
         }
-    }
-
-    #[test]
-    fn toolchain_binds_refuse_a_relative_cargo_home() {
-        let tmp = toolbinds_root("relative-cargo");
-        let inspector = plant_inspector(&tmp.join("tools"));
-        let user_home = plant_user_home(&tmp);
-        let got = toolchain_binds_from(
-            &inspector,
-            Some(Path::new("relative/.cargo")),
-            None,
-            Some(&user_home),
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert!(
-            matches!(&got, Err(CliError::Usage(m)) if m.contains("CARGO_HOME")),
-            "a relative cargo home names no fixed directory to mask: {got:?}"
-        );
     }
 
     #[test]
@@ -4580,9 +5060,9 @@ version = \"1\"
         let user_home = plant_user_home(&tmp);
         let got = toolchain_binds_from(
             &tmp.join("missing").join("ipe-ffi-inspector"),
-            Some(&cargo_home),
+            Some(&tool(&cargo_home)),
             None,
-            Some(&user_home),
+            Ok(&user_home),
         );
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(
@@ -4603,9 +5083,9 @@ version = \"1\"
         std::os::unix::fs::symlink(tmp.join("real"), &link_dir).expect("symlink");
         let got = toolchain_binds_from(
             &link_dir.join("ipe-ffi-inspector"),
-            Some(&cargo_home),
+            Some(&tool(&cargo_home)),
             None,
-            Some(&user_home),
+            Ok(&user_home),
         );
         let real_dir = canonical(&tmp.join("real"));
         let real = canonical(&real);
@@ -4641,17 +5121,27 @@ version = \"1\"
             dep_idents: BTreeMap::new(),
         };
         // Two crates agreeing on a shared dep line dedupe to one.
-        let ok = assemble_emit(&[mk("a", "serde = \"=1.0.1\""), mk("b", "serde = \"=1.0.1\"")]);
+        let ok = emit_of(&[mk("a", "serde = \"=1.0.1\""), mk("b", "serde = \"=1.0.1\"")]);
         assert!(ok.is_ok_and(|e| e.is_some_and(|e| e.dep_lines == vec!["serde = \"=1.0.1\""])));
         // A VERSION disagreement between legacy members (no typed package name, so
         // no proof the dep is transitive) is refused fail-closed. (A typed
         // transitive-dep conflict instead defers to Cargo — see
         // `transitive_version_conflict_defers_to_cargo`.)
-        let clash = assemble_emit(&[
+        let clash = emit_of(&[
             mk("serde", "serde = \"=1.0.1\""),
             mk("other", "serde = \"=1.0.2\""),
         ]);
-        assert!(clash.is_err());
+        assert!(
+            refused_as(
+                &clash,
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                    name: "serde".to_owned(),
+                    first: "1.0.1".to_owned(),
+                    second: "1.0.2".to_owned(),
+                })
+            ),
+            "{clash:?}"
+        );
     }
 
     #[test]
@@ -4678,7 +5168,7 @@ version = \"1\"
             package_name: None,
             dep_idents: BTreeMap::new(),
         };
-        let e = assemble_emit(&[
+        let e = emit_of(&[
             mk("a", "async-stripe-shared = \"=1.0.0-rc.6\""),
             mk(
                 "b",
@@ -4704,7 +5194,7 @@ version = \"1\"
         // NOT be exact-pinned to one arbitrary version. It is dropped so Cargo resolves
         // the transitive graph of the direct pins itself.
         let mk = |slug: &str, lines: Vec<&str>| typed_crate(slug, slug, &lines);
-        let e = assemble_emit(&[
+        let e = emit_of(&[
             mk("a", vec!["a = \"=1.0.0\"", "syn = \"=2.0.119\""]),
             mk("b", vec!["b = \"=1.0.0\"", "syn = \"=3.0.0\""]),
         ])
@@ -4722,51 +5212,52 @@ version = \"1\"
             e.dep_lines
         );
         // A DIRECT crate version conflict is still a hard error.
-        let clash = assemble_emit(&[
+        let clash = emit_of(&[
             mk("stripe", vec!["stripe = \"=1.0.0\""]),
             mk("other", vec!["stripe = \"=2.0.0\""]),
         ]);
         assert!(
             refused_as(
                 &clash,
-                DependencyRefusal::PinConflict {
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
                     name: "stripe".to_owned(),
                     first: "1.0.0".to_owned(),
                     second: "2.0.0".to_owned(),
-                }
+                })
             ),
             "a direct-crate version conflict still refuses: {clash:?}"
         );
     }
 
-    /// Whether `result` is exactly the usage error `want` renders to.
+    /// Whether `result` is exactly the refusal `want`.
     fn refused_as(
-        result: &Result<Option<ipe_backend_rust::FfiEmit>, CliError>,
-        want: DependencyRefusal,
+        result: &Result<Option<ipe_backend_rust::FfiEmit>, FfiPrepError>,
+        want: &FfiPrepError,
     ) -> bool {
-        let want = format!("{:?}", CliError::from(want));
-        result
-            .as_ref()
-            .err()
-            .is_some_and(|e| format!("{e:?}") == want)
+        result.as_ref().err() == Some(want)
     }
 
     /// The `syn` 2.x / 3.x pin conflict between the two [`syn_split`] members.
-    fn syn_pin_conflict() -> DependencyRefusal {
-        DependencyRefusal::PinConflict {
+    fn syn_pin_conflict() -> FfiPrepError {
+        FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
             name: "syn".to_owned(),
             first: "2.0.119".to_owned(),
             second: "3.0.0".to_owned(),
-        }
+        })
     }
 
-    /// The refusal for a `syn` reference at `site` once `syn` is dropped.
-    fn syn_dropped_at(site: &str) -> DependencyRefusal {
-        DependencyRefusal::DroppedTransitive {
+    /// The seal refusal for a `syn` reference at `site` once `syn` is dropped.
+    fn syn_dropped_at(site: &str) -> SealRefusal {
+        SealRefusal::DroppedTransitive {
             package: "syn".to_owned(),
             ident: "syn".to_owned(),
             site: site.to_owned(),
         }
+    }
+
+    /// The catalog seal refusal for a `syn` reference at `site`.
+    fn catalog_dropped_at(site: &str) -> FfiPrepError {
+        FfiPrepError::CatalogSeal(syn_dropped_at(site))
     }
 
     /// A typed (inspection-built) member: package `package`, lib slug `slug`,
@@ -4803,9 +5294,9 @@ version = \"1\"
     fn a_dropped_transitive_named_by_the_bindings_is_refused() {
         let [a, mut b] = syn_split();
         b.bindings_source = "pub fn span() -> ::syn::Ident { ::syn::parse_str(\"x\") }".to_owned();
-        let refused = assemble_emit(&[a, b]);
+        let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_dropped_at("src/ffi.rs")),
+            refused_as(&refused, &catalog_dropped_at("src/ffi.rs")),
             "a `::syn::` path with `syn` undeclared must refuse: {refused:?}"
         );
     }
@@ -4815,9 +5306,9 @@ version = \"1\"
         let [mut a, b] = syn_split();
         a.opaque_types
             .insert("Ident".to_owned(), "::syn::Ident".to_owned());
-        let refused = assemble_emit(&[a, b]);
+        let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_dropped_at("Rust.a.Ident")),
+            refused_as(&refused, &catalog_dropped_at("Rust.a.Ident")),
             "an opaque path rooted at undeclared `syn` must refuse: {refused:?}"
         );
     }
@@ -4827,7 +5318,7 @@ version = \"1\"
         let [a, b] = syn_split();
         let catalog = [a, b];
         let mut emit =
-            assemble_emit(&catalog)
+            emit_of(&catalog)
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| ipe_backend_rust::FfiEmit {
@@ -4847,7 +5338,7 @@ version = \"1\"
             .push_str("\npub fn h() -> syn::Ident { todo() }");
         assert_eq!(
             seal(&catalog, &emit),
-            Err(DependencyRefusal::DroppedTransitive {
+            Err(SealRefusal::DroppedTransitive {
                 package: "syn".to_owned(),
                 ident: "syn".to_owned(),
                 site: "src/ffi.rs".to_owned(),
@@ -4859,7 +5350,7 @@ version = \"1\"
     fn a_renamed_lib_direct_crate_conflict_is_refused() {
         // Package `async-stripe` exposes lib `stripe`: the direct set is built from
         // the typed package name, so the `async-stripe` clash is caught as direct.
-        let refused = assemble_emit(&[
+        let refused = emit_of(&[
             typed_crate("stripe", "async-stripe", &["async-stripe = \"=1.0.0\""]),
             typed_crate(
                 "other",
@@ -4870,13 +5361,38 @@ version = \"1\"
         assert!(
             refused_as(
                 &refused,
-                DependencyRefusal::PinConflict {
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
                     name: "async-stripe".to_owned(),
                     first: "1.0.0".to_owned(),
                     second: "2.0.0".to_owned(),
-                }
+                })
             ),
             "a direct-crate conflict must refuse even when its lib ident differs: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn an_underscore_named_direct_crate_conflict_is_refused() {
+        // The direct set and the dependency keys compare one typed package-name
+        // spelling, so `foo_bar` is direct on both sides and never deferred.
+        let refused = emit_of(&[
+            typed_crate("foo_bar", "foo_bar", &["foo_bar = \"=1.0.0\""]),
+            typed_crate(
+                "other",
+                "other",
+                &["other = \"=1.0.0\"", "foo_bar = \"=2.0.0\""],
+            ),
+        ]);
+        assert!(
+            refused_as(
+                &refused,
+                &FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                    name: "foo_bar".to_owned(),
+                    first: "1.0.0".to_owned(),
+                    second: "2.0.0".to_owned(),
+                })
+            ),
+            "a direct crate named with `_` must refuse its conflict: {refused:?}"
         );
     }
 
@@ -4886,9 +5402,9 @@ version = \"1\"
         let [a, mut b] = syn_split();
         b.package_name = None;
         b.dep_idents = BTreeMap::new();
-        let refused = assemble_emit(&[a, b]);
+        let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_pin_conflict()),
+            refused_as(&refused, &syn_pin_conflict()),
             "a conflict involving a legacy member must fail closed: {refused:?}"
         );
     }
@@ -4900,9 +5416,9 @@ version = \"1\"
         let [mut a, mut b] = syn_split();
         a.dep_idents.remove("syn");
         b.dep_idents.remove("syn");
-        let refused = assemble_emit(&[a, b]);
+        let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_pin_conflict()),
+            refused_as(&refused, &syn_pin_conflict()),
             "an unidentifiable dropped dep must fail closed: {refused:?}"
         );
     }
@@ -4912,7 +5428,7 @@ version = \"1\"
         // No single pin is provably acceptable to every intermediate crate's
         // requirement, so even a same-major disagreement leaves the choice to
         // Cargo and the seal guards every emitted reference.
-        let e = assemble_emit(&[
+        let e = emit_of(&[
             typed_crate("a", "a", &["a = \"=1.0.0\"", "syn = \"=2.0.1\""]),
             typed_crate(
                 "b",
@@ -4934,9 +5450,9 @@ version = \"1\"
             typed_crate("b", "b", &["b = \"=1.0.0\"", "syn = \"=2.0.119\""]),
         ];
         a.bindings_source = "pub fn f() -> ::syn::Ident { g() }".to_owned();
-        let refused = assemble_emit(&[a, b]);
+        let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_dropped_at("src/ffi.rs")),
+            refused_as(&refused, &catalog_dropped_at("src/ffi.rs")),
             "a reference to the dropped same-major dep is refused: {refused:?}"
         );
     }
@@ -4945,7 +5461,7 @@ version = \"1\"
     fn a_dropped_transitive_named_by_a_glue_path_is_refused() {
         let [a, b] = syn_split();
         let catalog = [a, b];
-        let mut emit = assemble_emit(&catalog)
+        let mut emit = emit_of(&catalog)
             .expect("no emitted text names `syn` yet")
             .expect("emit present");
         emit.wrapper_glue.insert(
@@ -4965,9 +5481,12 @@ version = \"1\"
     fn an_asserted_shim_naming_a_dropped_transitive_is_refused() {
         let [a, b] = syn_split();
         let catalog = [a, b];
-        let mut emit = assemble_emit(&catalog)
-            .expect("no emitted text names `syn` yet")
-            .expect("emit present");
+        let assembled = || {
+            assemble_emit(&catalog)
+                .ok()
+                .flatten()
+                .ok_or("no emitted text names `syn` yet")
+        };
         let spec = |path: &str| ipe_ffi::asserted::ConstSpec {
             path: ipe_canon::asserted::AssertedPath::parse(path).expect("valid path"),
             scalar: ipe_ffi::carrier::ScalarCarrier::Int,
@@ -4975,14 +5494,18 @@ version = \"1\"
             wrapper_ident: "ipe_asserted_const_limit".to_owned(),
         };
         // A shim rooted at a declared crate passes the second seal.
-        let mut sound = emit.clone();
+        let sound = assembled().and_then(|mut a| {
+            append_asserted_shims(&catalog, &mut a, &[], &[spec("a::LIMIT")])
+                .map_err(|_| "a declared root refused")
+        });
+        assert_eq!(sound, Ok(()));
+        let dropped = assembled()
+            .map(|mut a| append_asserted_shims(&catalog, &mut a, &[], &[spec("syn::LIMIT")]));
         assert_eq!(
-            append_asserted_shims(&catalog, &mut sound, &[], &[spec("a::LIMIT")]),
-            Ok(())
-        );
-        assert_eq!(
-            append_asserted_shims(&catalog, &mut emit, &[], &[spec("syn::LIMIT")]),
-            Err(syn_dropped_at("src/ffi.rs"))
+            dropped,
+            Ok(Err(FfiPrepError::AssertedShimSeal(syn_dropped_at(
+                "src/ffi.rs"
+            ))))
         );
     }
 
@@ -4997,7 +5520,7 @@ version = \"1\"
             ipe_ffi::naming::RustIdent::parse("syn").expect("valid ident"),
         );
         b.bindings_source = "pub fn span() -> ::syn::Ident { g() }".to_owned();
-        let e = assemble_emit(&[a, b, c]);
+        let e = emit_of(&[a, b, c]);
         assert!(
             e.as_ref().is_ok_and(|e| e
                 .as_ref()
@@ -5023,9 +5546,9 @@ version = \"1\"
         ] {
             let [a, mut b] = syn_split();
             b.bindings_source = body.to_owned();
-            let refused = assemble_emit(&[a, b]);
+            let refused = emit_of(&[a, b]);
             assert!(
-                refused_as(&refused, syn_dropped_at("src/ffi.rs")),
+                refused_as(&refused, &catalog_dropped_at("src/ffi.rs")),
                 "{body}: {refused:?}"
             );
         }
@@ -5035,13 +5558,13 @@ version = \"1\"
     fn unlexable_emitted_text_is_refused() {
         let [a, mut b] = syn_split();
         b.bindings_source = "pub fn f() { \"unterminated }".to_owned();
-        let refused = assemble_emit(&[a, b]);
+        let refused = emit_of(&[a, b]);
         assert!(
             refused_as(
                 &refused,
-                DependencyRefusal::Unlexable {
+                &FfiPrepError::CatalogSeal(SealRefusal::Unlexable {
                     site: "src/ffi.rs".to_owned()
-                }
+                })
             ),
             "{refused:?}"
         );
@@ -5082,9 +5605,9 @@ version = \"1\"
             Some("::syn::Ident"),
             "the declared opaque surfaces"
         );
-        let refused = assemble_emit(&[a, b]);
+        let refused = emit_of(&[a, b]);
         assert!(
-            refused_as(&refused, syn_dropped_at("Rust.A.Ident")),
+            refused_as(&refused, &catalog_dropped_at("Rust.A.Ident")),
             "{refused:?}"
         );
     }
@@ -5177,11 +5700,11 @@ version = \"1\"
     /// renders the one canonical `path` line; two members naming the same
     /// wrapper directory dedupe to it.
     #[test]
-    fn a_wrapper_crate_renders_its_path_line_through_assemble_emit() {
+    fn a_wrapper_crate_renders_its_path_line_through_emit_of() {
         let (project, deps) = jailed_wrappers("ok", &["engine"]);
         let canonical = std::fs::canonicalize(project.join("wrappers/engine"))
             .expect("wrapper dir canonicalizes");
-        let r = assemble_emit(&[
+        let r = emit_of(&[
             crate_with_deps("engine_wrap", deps.clone()),
             crate_with_deps("other", deps),
         ]);
@@ -5204,11 +5727,11 @@ version = \"1\"
         let path = wrapper_source(&wrapper, 0);
         let registry =
             vec![CargoDep::parse_registry_line("engine_wrap = \"=1.0.0\"").expect("registry line")];
-        let forward = assemble_emit(&[
+        let forward = emit_of(&[
             crate_with_deps("a", registry.clone()),
             crate_with_deps("b", wrapper.clone()),
         ]);
-        let backward = assemble_emit(&[
+        let backward = emit_of(&[
             crate_with_deps("a", wrapper),
             crate_with_deps("b", registry),
         ]);
@@ -5218,7 +5741,8 @@ version = \"1\"
             (backward, source_conflict(&path, "version =1.0.0")),
         ] {
             assert!(
-                matches!(&r, Err(CliError::Usage(m)) if *m == expected),
+                matches!(&r, Err(e @ FfiPrepError::DependencyMerge(MergeRefusal::SourceConflict { .. }))
+                    if e.to_string() == expected),
                 "{r:?}"
             );
         }
@@ -5228,14 +5752,15 @@ version = \"1\"
     #[test]
     fn two_wrapper_paths_for_one_dependency_are_refused() {
         let (project, deps) = jailed_wrappers("two", &["engine", "engine2"]);
-        let r = assemble_emit(&[
+        let r = emit_of(&[
             crate_with_deps("a", deps.iter().take(1).cloned().collect()),
             crate_with_deps("b", deps.iter().skip(1).cloned().collect()),
         ]);
         let _ = std::fs::remove_dir_all(&project);
         let expected = source_conflict(&wrapper_source(&deps, 0), &wrapper_source(&deps, 1));
         assert!(
-            matches!(&r, Err(CliError::Usage(m)) if *m == expected),
+            matches!(&r, Err(e @ FfiPrepError::DependencyMerge(MergeRefusal::SourceConflict { .. }))
+                    if e.to_string() == expected),
             "{r:?}"
         );
     }
@@ -5249,7 +5774,7 @@ version = \"1\"
             CargoDep::parse_registry_line(&format!("engine_wrap = \"={v}\""))
                 .expect("registry line")
         };
-        let r = assemble_emit(&[
+        let r = emit_of(&[
             crate_with_deps("a", vec![pin("1.0.0")]),
             crate_with_deps("b", vec![pin("2.0.0")]),
             crate_with_deps("c", wrapper.clone()),
@@ -5260,7 +5785,8 @@ version = \"1\"
             &wrapper_source(&wrapper, 0),
         );
         assert!(
-            matches!(&r, Err(CliError::Usage(m)) if *m == expected),
+            matches!(&r, Err(e @ FfiPrepError::DependencyMerge(MergeRefusal::SourceConflict { .. }))
+                    if e.to_string() == expected),
             "{r:?}"
         );
     }
@@ -5546,7 +6072,7 @@ version = \"1\"
     fn a_define_type_renders_a_crate_absolute_ffi_path() {
         // A define-defined type lives in `crate::ffi::<slug>::<Name>` (the app
         // crate's own module tree), NOT at an external `::crate::Path`.
-        let emit = assemble_emit(&[crate_with_types("iced", &[], &["Counter", "Message"])])
+        let emit = emit_of(&[crate_with_types("iced", &[], &["Counter", "Message"])])
             .expect("emit ok")
             .expect("emit present");
         assert_eq!(
@@ -5587,7 +6113,7 @@ version = \"1\"
                 in_result: false,
             }),
         });
-        let emit = assemble_emit(&[c]).expect("emit ok").expect("emit present");
+        let emit = emit_of(&[c]).expect("emit ok").expect("emit present");
         let glue = emit
             .wrapper_glue
             .get("Rust_demo_counter_new")
@@ -5610,12 +6136,398 @@ version = \"1\"
         // A define type sharing a name with an inspected opaque of the SAME
         // crate would silently overwrite one path — the two are different Rust
         // types. Fail closed rather than emit a wrong-type binding.
-        let clash = assemble_emit(&[crate_with_types(
+        let clash = emit_of(&[crate_with_types(
             "iced",
             &[("Element", "::iced::Element")],
             &["Element"],
         )]);
-        assert!(clash.is_err(), "a define-vs-opaque name clash must refuse");
+        assert!(
+            refused_as(
+                &clash,
+                &FfiPrepError::DefineOpaqueCollision {
+                    slug: "iced".to_owned(),
+                    name: "Element".to_owned(),
+                }
+            ),
+            "a define-vs-opaque name clash must refuse: {clash:?}"
+        );
+    }
+
+    #[test]
+    fn inject_interfaces_two_crates_one_module_is_module_claimed() {
+        let mut sources = BTreeMap::new();
+        let claimed = (
+            PathBuf::from("src/Rust/b.ipe"),
+            "module Rust.b exposing (..)\n".to_owned(),
+        );
+        sources.insert(vec!["Rust".to_owned(), "b".to_owned()], claimed);
+        let catalog = [
+            crate_with_types("a", &[], &[]),
+            crate_with_types("b", &[], &[]),
+        ];
+        let got = inject_interfaces(&mut sources, &catalog, Path::new("/cache"));
+        assert_eq!(
+            got,
+            Err(FfiPrepError::ModuleClaimed {
+                module: "Rust.b".to_owned(),
+                slug: "b".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn assemble_wrapper_glue_missing_shape_is_transparent_without_shape() {
+        let mut c = crate_with_types("demo", &[], &[]);
+        c.bindings.push(ipe_ffi::interface::InterfaceBinding {
+            ref_name: "counter_new".to_owned(),
+            wrapper_ident: "Rust_demo_counter_new".to_owned(),
+            arity: 1,
+            sig: "Int -> Counter".to_owned(),
+            transparent_params: ipe_ffi::interface::TransparentParams::None,
+            transparent_result: Some(ipe_ffi::interface::TransparentResult {
+                type_name: "Counter".to_owned(),
+                in_result: false,
+            }),
+        });
+        let mut glue = BTreeMap::new();
+        assert_eq!(
+            assemble_wrapper_glue(&c, &mut glue),
+            Err(FfiPrepError::TransparentWithoutShape {
+                slug: "demo".to_owned(),
+                name: "Counter".to_owned(),
+                binding: "counter_new".to_owned(),
+            })
+        );
+        assert!(
+            glue.is_empty(),
+            "no glue is assembled for a refused binding"
+        );
+    }
+
+    /// One source module whose body is `body`, keyed as `Main`.
+    fn main_module(body: &str) -> BTreeMap<Vec<String>, (PathBuf, String)> {
+        let text = format!("module Main exposing (main)\nimport Rust.Ffi\n\n{body}");
+        BTreeMap::from([(
+            vec!["Main".to_owned()],
+            (PathBuf::from("src/Main.ipe"), text),
+        )])
+    }
+
+    #[test]
+    fn scan_asserted_refused_assertion_is_asserted_refused() {
+        let sources = main_module(
+            "shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n",
+        );
+        let got = scan_asserted(&sources, &[]);
+        assert!(
+            matches!(&got, Err(CliError::FfiPrep(refusal))
+                if matches!(refusal.as_ref(), FfiPrepError::AssertedRefused(diag)
+                    if matches!(diag.as_ref(), ipe_ffi::diag::Diagnostic::AssertedRefused { path, .. }
+                        if path == "tm::shift"))),
+            "an asserted call into an uninstalled crate is a typed refusal"
+        );
+    }
+
+    #[test]
+    fn scan_asserted_malformed_site_stays_pipeline() {
+        let sources = main_module(
+            "main =\n    case (Rust.Ffi.call \"tm::shift\") 1 of\n        Ok _ -> 1\n        Err _ -> 0\n",
+        );
+        let got = scan_asserted(&sources, &[]);
+        assert!(
+            matches!(&got, Err(CliError::Pipeline { .. })),
+            "a misplaced asserted call stays a span-attributed pipeline error"
+        );
+    }
+
+    #[test]
+    fn display_is_byte_identical_per_variant() {
+        let dropped = || SealRefusal::DroppedTransitive {
+            package: "syn".to_owned(),
+            ident: "syn".to_owned(),
+            site: "src/ffi.rs".to_owned(),
+        };
+        let diag = ipe_ffi::diag::Diagnostic::ArtifactIo {
+            path: "/p/x.consumer.json".to_owned(),
+            detail: "refused".to_owned(),
+        };
+        let cases: [(FfiPrepError, text::Message); 10] = [
+            (
+                FfiPrepError::ModuleClaimed {
+                    module: "Rust.a".to_owned(),
+                    slug: "a".to_owned(),
+                },
+                text::msg::ffi_module_clash(&"Rust.a", &"a"),
+            ),
+            (
+                FfiPrepError::ReservedModuleExists,
+                text::msg::ffi_reserved_module_exists(&ipe_canon::asserted::ASSERTED_MODULE),
+            ),
+            (
+                FfiPrepError::AssertedRefused(Box::new(diag.clone())),
+                text::Message::relay(&diag),
+            ),
+            (
+                FfiPrepError::AssertedShimSeal(dropped()),
+                text::msg::ffi_dropped_transitive(&"syn", &"syn", &"src/ffi.rs"),
+            ),
+            (
+                FfiPrepError::DefineOpaqueCollision {
+                    slug: "a".to_owned(),
+                    name: "T".to_owned(),
+                },
+                text::msg::ffi_define_opaque_collision(&"a", &"T"),
+            ),
+            (
+                FfiPrepError::DependencyMerge(MergeRefusal::PinConflict {
+                    name: "serde".to_owned(),
+                    first: "1.0.1".to_owned(),
+                    second: "1.0.2".to_owned(),
+                }),
+                text::msg::ffi_dependency_pin_conflict(&"serde", &"1.0.1", &"1.0.2"),
+            ),
+            (
+                FfiPrepError::DependencyMerge(MergeRefusal::SourceConflict {
+                    name: "engine_wrap".to_owned(),
+                    first: "version =1.0.0".to_owned(),
+                    second: "path /p/engine".to_owned(),
+                }),
+                text::msg::ffi_dependency_source_conflict(
+                    &"engine_wrap",
+                    &"version =1.0.0",
+                    &"path /p/engine",
+                ),
+            ),
+            (
+                FfiPrepError::CatalogSeal(SealRefusal::Unlexable {
+                    site: "src/ffi.rs".to_owned(),
+                }),
+                text::msg::ffi_emit_unlexable(&"src/ffi.rs"),
+            ),
+            (
+                FfiPrepError::TransparentWithoutShape {
+                    slug: "a".to_owned(),
+                    name: "Shape".to_owned(),
+                    binding: "make".to_owned(),
+                },
+                text::msg::ffi_transparent_without_shape(&"a", &"Shape", &"make"),
+            ),
+            (
+                FfiPrepError::AssertedWithoutCatalog,
+                text::msg::ffi_asserted_empty_catalog(),
+            ),
+        ];
+        for (refusal, message) in cases {
+            let want = message.to_string();
+            assert_eq!(refusal.to_string(), want);
+            assert_eq!(CliError::from(refusal).to_string(), want);
+        }
+    }
+
+    /// The FFI prep entry point every prep refusal leaves through.
+    const FFI_PREP_ENTRY: &str = "prepare_ffi";
+
+    /// Prep functions the reach walk must find from [`FFI_PREP_ENTRY`]: a walk
+    /// that loses one (a rename, a parse that stopped early) goes red instead
+    /// of passing over less code.
+    const FFI_PREP_REACHED: [&str; 11] = [
+        "prepare_ffi",
+        "load_located_catalog",
+        "scan_asserted",
+        "asserted_refused",
+        "inject_interfaces",
+        "assemble_emit",
+        "assemble_wrapper_glue",
+        "append_asserted_shims",
+        "seal_dependency_references",
+        "merge_catalog_deps",
+        "merge_cargo_dep",
+    ];
+
+    /// Whether `attrs` carry `#[cfg(test)]`.
+    fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            matches!(&attr.meta, syn::Meta::List(list)
+                if list.path.is_ident("cfg") && list.tokens.to_string() == "test")
+        })
+    }
+
+    /// Every production function body under `items`, keyed by its name.
+    ///
+    /// A `#[cfg(test)]` item and everything inside it is left out. Methods and
+    /// trait defaults are keyed by their bare name, so same-named functions
+    /// are all walked.
+    fn production_fn_bodies<'f>(
+        items: &'f [syn::Item],
+        bodies: &mut BTreeMap<String, Vec<&'f syn::Block>>,
+    ) {
+        for item in items {
+            match item {
+                syn::Item::Fn(f) if !is_cfg_test(&f.attrs) => {
+                    bodies
+                        .entry(f.sig.ident.to_string())
+                        .or_default()
+                        .push(&f.block);
+                }
+                syn::Item::Impl(imp) if !is_cfg_test(&imp.attrs) => {
+                    for member in &imp.items {
+                        if let syn::ImplItem::Fn(f) = member
+                            && !is_cfg_test(&f.attrs)
+                        {
+                            bodies
+                                .entry(f.sig.ident.to_string())
+                                .or_default()
+                                .push(&f.block);
+                        }
+                    }
+                }
+                syn::Item::Trait(tr) if !is_cfg_test(&tr.attrs) => {
+                    for member in &tr.items {
+                        if let syn::TraitItem::Fn(f) = member
+                            && let Some(block) = &f.default
+                            && !is_cfg_test(&f.attrs)
+                        {
+                            bodies
+                                .entry(f.sig.ident.to_string())
+                                .or_default()
+                                .push(block);
+                        }
+                    }
+                }
+                syn::Item::Mod(m) if !is_cfg_test(&m.attrs) => {
+                    if let Some((_, inner)) = &m.content {
+                        production_fn_bodies(inner, bodies);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The names one function body mentions, and how many of them are `Usage`.
+    #[derive(Default)]
+    struct Mentions {
+        names: BTreeSet<String>,
+        usage: usize,
+    }
+
+    impl Mentions {
+        fn word(&mut self, word: String) {
+            if word == "Usage" {
+                self.usage += 1;
+            }
+            self.names.insert(word);
+        }
+
+        /// Every identifier of a macro's unparsed tokens; a literal never matches.
+        fn tokens(&mut self, stream: proc_macro2::TokenStream) {
+            for tree in stream {
+                match tree {
+                    proc_macro2::TokenTree::Ident(ident) => self.word(ident.to_string()),
+                    proc_macro2::TokenTree::Group(group) => self.tokens(group.stream()),
+                    proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => {}
+                }
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Mentions {
+        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+            self.word(segment.ident.to_string());
+            syn::visit::visit_path_segment(self, segment);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            self.word(call.method.to_string());
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_use_path(&mut self, path: &'ast syn::UsePath) {
+            self.word(path.ident.to_string());
+            syn::visit::visit_use_path(self, path);
+        }
+
+        fn visit_use_name(&mut self, name: &'ast syn::UseName) {
+            self.word(name.ident.to_string());
+        }
+
+        fn visit_use_rename(&mut self, rename: &'ast syn::UseRename) {
+            self.word(rename.ident.to_string());
+            self.word(rename.rename.to_string());
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            self.tokens(mac.tokens.clone());
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    /// The production functions `src` reaches from [`FFI_PREP_ENTRY`], with
+    /// the count of `Usage` mentions in their bodies; `None` when `src` does
+    /// not parse.
+    ///
+    /// Reach over-approximates: every name a body mentions (a call, a method,
+    /// a function value, a macro token) that names a production function is
+    /// walked, so a refusal built one helper deep is still seen.
+    fn ffi_prep_reach(src: &str) -> Option<(BTreeSet<String>, usize)> {
+        use syn::visit::Visit as _;
+        let file = syn::parse_file(src).ok()?;
+        let mut bodies = BTreeMap::new();
+        production_fn_bodies(&file.items, &mut bodies);
+        let mut reached = BTreeSet::new();
+        let mut usage = 0;
+        let mut pending = vec![FFI_PREP_ENTRY.to_owned()];
+        while let Some(name) = pending.pop() {
+            let Some(blocks) = bodies.get(&name) else {
+                continue;
+            };
+            if !reached.insert(name) {
+                continue;
+            }
+            for block in blocks {
+                let mut mentions = Mentions::default();
+                mentions.visit_block(block);
+                usage += mentions.usage;
+                pending.extend(
+                    mentions
+                        .names
+                        .into_iter()
+                        .filter(|n| bodies.contains_key(n) && !reached.contains(n)),
+                );
+            }
+        }
+        Some((reached, usage))
+    }
+
+    #[test]
+    fn ffi_prep_reach_sees_a_usage_build_one_helper_deep() {
+        let src = "fn prepare_ffi() { helper(); x.map_err(lift); }\n\
+                   fn helper() -> Result<(), CliError> { Err(CliError::Usage(m())) }\n\
+                   fn lift(m: M) -> CliError { wrap!(Usage, \"Usage\") }\n\
+                   fn unrelated() -> CliError { CliError::Usage(x()) }\n\
+                   #[cfg(test)]\n\
+                   fn prepare_ffi() -> CliError { CliError::Usage(t()) }\n";
+        let want = BTreeSet::from(["helper", "lift", "prepare_ffi"].map(str::to_owned));
+        assert_eq!(ffi_prep_reach(src), Some((want, 2)));
+    }
+
+    /// No function FFI prep reaches builds `CliError::Usage`: each prep
+    /// refusal is a typed [`FfiPrepError`] the LSP classifies by variant.
+    #[test]
+    fn ffi_prep_builds_no_usage() {
+        let reach = ffi_prep_reach(include_str!("ffi.rs"));
+        assert!(reach.is_some(), "ffi.rs parses");
+        let (reached, usage) = reach.unwrap_or_default();
+        let lost: Vec<&str> = FFI_PREP_REACHED
+            .into_iter()
+            .filter(|f| !reached.contains(*f))
+            .collect();
+        assert!(lost.is_empty(), "the prep walk lost {lost:?}");
+        assert_eq!(
+            usage, 0,
+            "an FFI prep function builds `CliError::Usage`; type the refusal as an \
+             `FfiPrepError` variant (walked: {reached:?})"
+        );
     }
 
     #[test]
@@ -5761,6 +6673,118 @@ version = \"1\"
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             closures.is_empty() && structs.is_empty() && enums.is_empty() && opaques.is_empty()
+        );
+    }
+
+    /// A `_bindings.rs` that is a symlink is refused, never followed: the
+    /// read of the FFI cache is the scan's whole input, so a link that could
+    /// point it elsewhere fails the read with the link refusal itself.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write or symlink IS the failure
+    fn a_symlinked_ffi_cache_binding_is_refused() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-held-binding-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = root.join(ipe_ffi::driver::FFI_CACHE_REL);
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let outside = root.join("outside.rs");
+        std::fs::write(&outside, "pub fn elsewhere() {}\n").expect("write link target");
+        std::fs::write(cache.join("real_bindings.rs"), "pub fn f() {}\n").expect("write binding");
+        let cache_rel: Vec<&str> = ipe_ffi::driver::FFI_CACHE_REL.split('/').collect();
+        let held = || {
+            open_project_dir(&root, &cache_rel)
+                .expect("open cache")
+                .expect("cache present")
+        };
+        let read = read_source_tree(
+            held(),
+            &cache,
+            BINDING_SOURCES,
+            FFI_CACHE_CAP,
+            Unreadable::Refuse,
+        )
+        .expect("a cache of regular bindings reads");
+        assert_eq!(read.len(), 1, "the one regular binding is read: {read:?}");
+
+        std::os::unix::fs::symlink(&outside, cache.join("linked_bindings.rs"))
+            .expect("plant symlink");
+        let refused = read_source_tree(
+            held(),
+            &cache,
+            BINDING_SOURCES,
+            FFI_CACHE_CAP,
+            Unreadable::Refuse,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    ref path,
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                }) if path.ends_with("linked_bindings.rs")
+            ),
+            "a symlinked binding is refused as a symlink, got: {refused:?}"
+        );
+    }
+
+    /// A manifest path with no entry name is refused as not a regular file, the one mapping every held read shares.
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_path_without_an_entry_name_is_refused_as_not_a_regular_file() {
+        let refused = read_ffi_vocabulary(Path::new("/"));
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                })
+            ),
+            "a nameless manifest path is refused as not a regular file, got: {refused:?}"
+        );
+    }
+
+    /// The wrapper capability scan refuses a linked source directory instead
+    /// of passing over it: a `.rs` reached only through a link is still code
+    /// the wrapper's build compiles, so leaving it out would let it reach a
+    /// capability the declaration never names.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: a failed write or symlink IS the failure
+    fn the_wrapper_scan_refuses_a_linked_source_directory() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-wrapper-linked-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let wrapper = root.join("wrapper");
+        std::fs::create_dir_all(wrapper.join("src")).expect("wrapper src");
+        std::fs::write(
+            wrapper.join("Cargo.toml"),
+            "[package]\nname = \"w\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(wrapper.join("src").join("lib.rs"), "pub fn f() {}\n").expect("write lib");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(
+            outside.join("hidden.rs"),
+            "pub fn h() { let _ = std::net::TcpStream::connect(\"a:1\"); }\n",
+        )
+        .expect("write hidden source");
+        std::os::unix::fs::symlink(&outside, wrapper.join("src").join("linked"))
+            .expect("plant dir link");
+        let refused = enforce_wrapper_capabilities(&wrapper, &BTreeSet::new());
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::SourceRefused {
+                    ref path,
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                }) if path.ends_with("linked")
+            ),
+            "a linked wrapper source directory is refused as a symlink, got: {refused:?}"
         );
     }
 
@@ -6016,5 +7040,191 @@ iced = "=0.12.1"
             "{relayed:?}"
         );
         assert!(!relayed.contains("evil"), "{relayed:?}");
+    }
+
+    /// Run a `sh -c` stub inspector through the unsandboxed path under `ceiling`.
+    #[cfg(unix)]
+    fn stub_inspector(script: &str, ceiling: LocalCeiling) -> Result<String, InspectorFailure> {
+        inspect_unsandboxed(
+            std::ffi::OsStr::new("sh"),
+            &[OsString::from("-c"), OsString::from(script)],
+            ceiling,
+        )
+    }
+
+    /// An unsandboxed inspector still running at its wall is killed and refused on time.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsandboxed_inspector_past_its_wall_is_refused() {
+        let started = std::time::Instant::now();
+        let run = stub_inspector(
+            "exec sleep 30",
+            FFI_INSPECT_LIMITS.with_wall(crate::remote_ingest::LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            matches!(
+                run,
+                Err(InspectorFailure::Run(RunError::Exceeded(LocalRefusal {
+                    source: LocalSource::FfiInspect,
+                    limit: crate::remote_ingest::IngestLimit::Time(_),
+                    ..
+                })))
+            ),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// An unsandboxed inspector writing past its stdout ceiling is killed before its wall.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // 16 is inside the byte budget's range; a refusal is a red test
+    fn an_unsandboxed_inspector_flooding_stdout_is_refused() {
+        let cap = crate::remote_ingest::ByteBudget::for_test(16).expect("in-range byte budget");
+        let started = std::time::Instant::now();
+        let run = stub_inspector(
+            "head -c 4096 /dev/zero; exec sleep 30",
+            FFI_INSPECT_LIMITS.with_stdout(cap),
+        );
+        assert!(
+            matches!(
+                run,
+                Err(InspectorFailure::Run(RunError::Exceeded(LocalRefusal {
+                    source: LocalSource::FfiInspect,
+                    limit: crate::remote_ingest::IngestLimit::Bytes(16),
+                    ..
+                })))
+            ),
+            "{run:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// An inspection report that is not UTF-8 is a typed failure, never lossily decoded.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_inspector_output_is_a_typed_failure() {
+        let run = stub_inspector("printf '\\377'", FFI_INSPECT_LIMITS);
+        assert!(matches!(run, Err(InspectorFailure::NotUtf8)), "{run:?}");
+    }
+
+    /// An inspector exiting unsuccessfully keeps its code and its stderr as kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_unsandboxed_inspector_keeps_its_code_and_stderr() {
+        let run = stub_inspector("echo boom >&2; exit 3", FFI_INSPECT_LIMITS);
+        assert!(
+            matches!(run, Err(InspectorFailure::Exit { code: Some(3), .. })),
+            "{run:?}"
+        );
+        let Err(InspectorFailure::Exit { stderr, .. }) = run else {
+            return;
+        };
+        assert_eq!(stderr.to_terminal().as_str(), "boom");
+    }
+
+    /// A signal ending the inspector is a typed failure without a code, stderr kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_unsandboxed_inspector_keeps_its_stderr() {
+        let run = stub_inspector("echo dying >&2; kill -KILL $$", FFI_INSPECT_LIMITS);
+        assert!(
+            matches!(run, Err(InspectorFailure::Exit { code: None, .. })),
+            "{run:?}"
+        );
+        let Err(InspectorFailure::Exit { stderr, .. }) = run else {
+            return;
+        };
+        assert_eq!(stderr.to_terminal().as_str(), "dying");
+    }
+
+    /// The build-scripts banner still leads when the refusal arrives through the catalog phrase.
+    #[test]
+    #[allow(clippy::panic)]
+    fn the_build_scripts_banner_survives_the_inspector_phrase() {
+        let failure = InspectorFailure::Exit {
+            code: Some(1),
+            stderr: ChildStderr::Whole(
+                b"refusing to inspect:\n  - x (build script)\nPass --allow-build-scripts to proceed anyway"
+                    .to_vec(),
+            ),
+        };
+        let CliError::Usage(message) = failure.into_cli_error(Path::new("ipe-ffi-inspector"))
+        else {
+            panic!("an inspector exit is a usage refusal");
+        };
+        match map_inspector_error(message) {
+            CliError::Resolve(text) => assert!(
+                text.starts_with(
+                    "warning: some crates in the dependency graph have build scripts."
+                ),
+                "{text:?}"
+            ),
+            other => panic!("expected Resolve, got {other:?}"),
+        }
+    }
+
+    /// An escape sequence in the inspector's stderr never reaches the refusal text.
+    #[test]
+    #[allow(clippy::panic)]
+    fn an_escape_in_inspector_stderr_is_stripped_from_the_refusal() {
+        let failure = InspectorFailure::Exit {
+            code: Some(2),
+            stderr: ChildStderr::Whole(b"\x1b[31mred\x1b[0m".to_vec()),
+        };
+        let CliError::Usage(message) = failure.into_cli_error(Path::new("ipe-ffi-inspector"))
+        else {
+            panic!("an inspector exit is a usage refusal");
+        };
+        assert!(!message.as_str().contains('\u{1b}'), "{message:?}");
+        assert!(message.as_str().contains("red"), "{message:?}");
+    }
+
+    /// A jailed inspector's stderr is held to the child-stderr ceiling and marked when cut.
+    #[test]
+    fn a_jailed_inspector_failure_keeps_a_bounded_stderr() {
+        let flood = ipe_sandbox::JailedOutput {
+            status: Some(2),
+            stdout: Vec::new(),
+            stderr: vec![b'e'; 70 * 1024],
+        };
+        let Err(InspectorFailure::Exit { code, stderr }) = InspectorFailure::from_jailed(flood)
+        else {
+            return;
+        };
+        assert_eq!(code, Some(2));
+        assert!(matches!(stderr, ChildStderr::Truncated(_)));
+        assert_eq!(
+            u64::try_from(stderr.bytes().len()).ok(),
+            Some(CHILD_STDERR_MAX_BYTES.get())
+        );
+    }
+
+    /// A jailed run killed by the wall has no status and is a failure without a code.
+    #[test]
+    fn a_jailed_inspector_killed_by_the_wall_has_no_code() {
+        let killed = ipe_sandbox::JailedOutput {
+            status: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(matches!(
+            InspectorFailure::from_jailed(killed),
+            Err(InspectorFailure::Exit { code: None, .. })
+        ));
+    }
+
+    /// A jailed inspection report that is not UTF-8 is a typed failure.
+    #[test]
+    fn a_non_utf8_jailed_inspector_report_is_a_typed_failure() {
+        let bad = ipe_sandbox::JailedOutput {
+            status: Some(0),
+            stdout: vec![0xff],
+            stderr: Vec::new(),
+        };
+        assert!(matches!(
+            InspectorFailure::from_jailed(bad),
+            Err(InspectorFailure::NotUtf8)
+        ));
     }
 }

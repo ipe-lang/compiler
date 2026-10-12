@@ -190,7 +190,9 @@ fn module_file_name(module_name: &str) -> String {
 /// directory that contains a `Cargo.toml` with a `[workspace]` table).
 fn find_repo_root() -> Result<PathBuf, String> {
     // Allow an explicit override from the CLI: `-- --repo-root <path>`.
-    let mut args = std::env::args().skip(1);
+    let mut args = ipe_docs::argv::host_args()
+        .map_err(|e| e.to_string())?
+        .into_iter();
     while let Some(arg) = args.next() {
         if arg == "--repo-root" {
             let path = args

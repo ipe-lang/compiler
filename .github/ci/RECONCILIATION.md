@@ -18,8 +18,8 @@ the pair, not the name, is what every comparison below checks.
 
 | Boundary | Compares | Runs |
 |----------|----------|------|
-| `verify-manifest.py` check 4 | manifest ⇄ `required-set.json` | `manifest-guard`, the local gate |
-| `check_required_set.py` | manifest ⇄ `required-set.json` | `manifest-guard` |
+| `verify-manifest.py` check 4 | manifest ⇄ `required-set.json` | `artifact-guard`, the local gate |
+| `check_required_set.py` | manifest ⇄ `required-set.json` | `artifact-guard` |
 | `check_required_set.py --fetch` | manifest ⇄ the live ruleset | `ruleset-drift` job in `ci.yml` |
 | `check_required_set.py --fetch-admin` | manifest ⇄ the live ruleset, `bypass_actors` included | `ruleset-admin-read` job in `ruleset-admin-read.yml`, nightly |
 

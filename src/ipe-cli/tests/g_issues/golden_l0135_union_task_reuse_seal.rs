@@ -4,12 +4,12 @@
 //! `Task`/`Cmd`/`Sub` (an opaque boxed future — never `Clone`) makes that bound
 //! unsatisfiable, so reusing such a binding twice in a value-consuming position
 //! cannot be lowered as a `.clone()`: the emitted crate fails `cargo build`
-//! (E0382 use-after-move / E0277 missing-`Clone`) AFTER `ipe build` already
+//! (E0382 use-after-move / E0277 missing-`Clone`) AFTER `ipe dev build` already
 //! reported exit 0. That exit-0-then-cargo-fail hole is the exact SEAL break
 //! `PRINCIPLES.md` forbids.
 //!
 //! The lowerer now fails closed on the non-linear reuse of an effect-carrier
-//! value with IPE-L0135, so `ipe build` can never exit 0 with uncompilable Rust
+//! value with IPE-L0135, so `ipe dev build` can never exit 0 with uncompilable Rust
 //! for this shape.
 //!
 //! The gate is PARAM-scoped: a param's value arrives from the caller and cannot

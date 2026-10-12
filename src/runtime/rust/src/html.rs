@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::css_safety;
+use crate::retained::{Bytes, RetainedBytes};
 
 /// Form data delivered to an `OnForm` handler (lower-cased keys; see dispatch).
 pub type FormData = HashMap<String, String>;
@@ -107,11 +108,14 @@ impl<M: PartialEq> PartialEq for Attribute<M> {
     }
 }
 
+// The attribute name only: a value (a token, a prefilled field) never reaches
+// a `{:?}` rendering.
 impl<M> std::fmt::Debug for Attribute<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let hidden = crate::redact::REDACTED;
         match self {
-            Attribute::Attr(k, v) => write!(f, "Attr({k:?},{v:?})"),
-            Attribute::BoolAttr(k, v) => write!(f, "BoolAttr({k:?},{v})"),
+            Attribute::Attr(k, _) => write!(f, "Attr({k:?},{hidden})"),
+            Attribute::BoolAttr(k, _) => write!(f, "BoolAttr({k:?},{hidden})"),
             Attribute::EventAttr(e) => write!(f, "{e:?}"),
             Attribute::NoAttr => write!(f, "NoAttr"),
         }
@@ -174,16 +178,12 @@ const VOID: &[&str] = &[
     "track", "wbr",
 ];
 
-/// True for HTML void elements (no children, self-closing). Exposed for the
-/// style-injection pass, which must hoist a `<style>` to a sibling slot after a
-/// void element because `render_into` emits no children for void tags.
-/// Its sole consumer is the render-core `style_inject` pass, so it is gated on
-/// the `web-core` render floor (every render host — served web, browser-WASM,
-/// native webview — selects it); a build with no render core that gained a
-/// caller would fail loud.
-#[cfg(feature = "web-core")]
+/// True for HTML void elements (no children, self-closing), matched without
+/// regard to ASCII case as the HTML tokenizer lowercases tag names. The render
+/// sink self-closes these and the style-injection pass hoists a `<style>` to a
+/// sibling slot after them, so both read the one predicate.
 pub(crate) fn is_void(tag: &str) -> bool {
-    VOID.contains(&tag)
+    VOID.iter().any(|v| tag.eq_ignore_ascii_case(v))
 }
 
 /// Render an `Html` tree to an HTML string. Text is HTML-escaped; Raw is
@@ -196,6 +196,13 @@ pub fn render_html<M>(node: &Html<M>) -> String {
     render_into(node, &mut s);
     s
 }
+
+/// Marker attribute on a radio group's `<fieldset>`.
+///
+/// The ipe-id stamping pass reads it to give the group's unnamed radios one
+/// shared `name`, then removes it. Forging it only names the forger's own
+/// unnamed radios.
+pub(crate) const RADIO_GROUP_MARKER: &str = "data-ipe-radio-group";
 
 /// Maximum Html nesting depth the renderer and the ipe-id stamper descend.
 /// The Html tree is produced by the Ipê `view` from Model, and Model commonly
@@ -217,30 +224,74 @@ pub(crate) const MAX_HTML_DEPTH: usize = 1024;
 /// write every child into one shared String instead of allocating a
 /// throwaway String per child (efficiency-audit §6 medium).
 pub(crate) fn render_into<M>(node: &Html<M>, s: &mut String) {
-    render_into_ctx(node, s, None, false, 0);
+    render_into_ctx(node, s, ParseContext::Data, None, 0);
 }
 
-/// Render `node` into `s` as raw text — `HText` verbatim (no HTML-escaping),
-/// `HRaw` verbatim. Used by the SSE diff when rendering the body of a
-/// `<script>` or `<style>` child list before the caller applies
-/// `neutralise_script_close` / `strip_style_close`.
+/// Render the children of an element admitted as `body` into `s`.
 ///
-/// Element nodes are rendered via the normal path (they carry their own open/close
-/// tags and their OWN children handle `<script>`/`<style>` internally).
-pub(crate) fn render_into_raw_text<M>(node: &Html<M>, s: &mut String) {
-    render_into_ctx(node, s, None, true, 0);
+/// The SSE diff's whole-subtree replace writes an element's new children
+/// through this, so a patched `<script>`/`<style>` body gets the same
+/// neutralisation the first paint applies. `child_ctx` is the context the
+/// element puts its children in (`ParseContext::enter` of its own context),
+/// so a patched subtree is admitted exactly as the first paint admitted it.
+pub(crate) fn render_children_into<M>(
+    body: ElementBody,
+    child_ctx: ParseContext,
+    kids: &[Html<M>],
+    s: &mut String,
+) {
+    render_body_into(body, child_ctx, kids, s, None, 0);
+}
+
+/// Render `kids`, the children of an element admitted as `body`, into `s`.
+///
+/// A `<script>` or `<style>` body is admitted only when every child is a
+/// trusted `HRaw` node, so it is gathered verbatim into a scratch buffer and
+/// neutralised as a whole: `neutralise_script_close` splits a `</script`
+/// breakout, `neutralise_style_body` removes `</style` and every other markup
+/// opener. `select_value` reaches only a `Markup` body's direct children, and
+/// `child_ctx` is the parse context every child is written in.
+fn render_body_into<M>(
+    body: ElementBody,
+    child_ctx: ParseContext,
+    kids: &[Html<M>],
+    s: &mut String,
+    select_value: Option<&str>,
+    depth: usize,
+) {
+    let child_depth = depth.saturating_add(1);
+    match body {
+        ElementBody::Markup => {
+            for c in kids {
+                render_into_ctx(c, s, child_ctx, select_value, child_depth);
+            }
+        }
+        ElementBody::Script => {
+            let mut raw = String::new();
+            for c in kids {
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
+            }
+            s.push_str(&css_safety::neutralise_script_close(&raw));
+        }
+        ElementBody::Style => {
+            let mut raw = String::new();
+            for c in kids {
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
+            }
+            s.push_str(&css_safety::neutralise_style_body(&raw));
+        }
+    }
 }
 
 // `select_value`: when this node renders as a direct child of a `<select>` that
 // carries a value, the chosen value is threaded here so the matching `<option>`
-// flips `selected`. `raw_text`: set when the parent is `<script>`/`<style>` so
-// HText children emit verbatim — see SECURITY.
+// flips `selected`. `ctx` is the parse context `node` is written in.
 #[allow(clippy::too_many_lines)]
 fn render_into_ctx<M>(
     node: &Html<M>,
     s: &mut String,
+    ctx: ParseContext,
     select_value: Option<&str>,
-    raw_text: bool,
     depth: usize,
 ) {
     // Bounded descent: a tree deeper than the cap is dropped here rather than
@@ -250,45 +301,32 @@ fn render_into_ctx<M>(
         return;
     }
     match node {
-        // SECURITY: verbatim (un-escaped) text is reachable here only with
-        // raw_text=true, which is set ONLY when the parent tag is the literal
-        // "script"/"style" (see the child loop below). Ipe.Ui never produces a
-        // script/style ELEMENT — its styling flows through data-ipe-* markers
-        // consumed server-side — so the "Ipe.Ui HTML-escapes everything" contract
-        // is NOT weakened. A `<script>`/`<style>` body is NOT the last line of
-        // defence: the child loop renders it into a scratch buffer and runs
-        // `neutralise_script_close`/`strip_style_close` over the whole body, so a
-        // `</script`/`</style` breakout in verbatim text cannot terminate the
-        // element early. The only verbatim-into-`<script>` value that is trusted
-        // as code is the capability-disclosing `Ipe.Html.Unsafe.unsafeScript`.
-        Html::HText(t) => {
-            if raw_text {
-                s.push_str(t);
-            } else {
-                crate::escape::html_text_into(t, s);
-            }
-        }
+        // SECURITY: text is always entity-escaped. No element body renders a
+        // text node verbatim: a `<script>`/`<style>` whose children are not all
+        // `HRaw` is refused by `admit_element` before any byte of it is written.
+        Html::HText(t) => crate::escape::html_text_into(t, s),
         Html::HRaw(r) => s.push_str(r),
         Html::HElement(tag, attrs, kids) => {
-            // Html.doctype wraps children in a pseudo-element; emit a literal
-            // `<!DOCTYPE html>` then the children directly.
-            // Handled BEFORE the name gate because `!doctype-wrapper` contains a
-            // `!`. The doctype string is a fixed literal and the wrapper's own
-            // tag/attrs are never interpolated → not an injection vector; the
-            // children keep full name/attr/text gating via render_into_ctx.
-            if tag == "!doctype-wrapper" {
-                s.push_str("<!DOCTYPE html>");
-                for c in kids {
-                    render_into_ctx(c, s, None, false, depth.saturating_add(1));
+            // SECURITY: the shared tag gate, re-checked at the sink. A refused
+            // element (an unsafe tag name, an unclosable `<plaintext>`, or a
+            // `<script>`/`<style>` whose body is not trusted raw markup, or a
+            // `<script>` outside an HTML data-state context) is dropped with
+            // its whole subtree, so no value built on the safe surface reaches
+            // a raw-text or executable element body.
+            let Ok(rendered) = admit_rendered_in(ctx, tag, kids) else {
+                return;
+            };
+            let body = match rendered {
+                // The doctype string is a fixed literal and the wrapper's own
+                // tag/attrs are never written; its children render as markup
+                // with full name/attr/text gating.
+                RenderedElement::Doctype => {
+                    s.push_str("<!DOCTYPE html>");
+                    render_body_into(ElementBody::Markup, ctx, kids, s, None, depth);
+                    return;
                 }
-                return;
-            }
-            // Injection guard: an unsafe tag name (spaces / `>` / `<` …) would
-            // break out of the start tag. Drop the whole element — including its
-            // subtree — rather than emit an attacker-controlled tag.
-            if !is_safe_html_name(tag) {
-                return;
-            }
+                RenderedElement::Element(body) => body,
+            };
             s.push('<');
             s.push_str(tag);
             // Collect regular + bool attrs into (key, value) pairs, then sort
@@ -315,7 +353,7 @@ fn render_into_ctx<M>(
                 match a {
                     Attribute::Attr(k, v) => {
                         let k = k.as_str();
-                        if k == "ipe-id" {
+                        if k == STAMPED_ID_ATTR {
                             ipe_id = Some(v);
                         }
                         match pairs.iter_mut().find(|(pk, _)| *pk == k) {
@@ -390,11 +428,18 @@ fn render_into_ctx<M>(
                 // injects a new attribute, and a script-bearing key (`onerror`,
                 // `srcdoc`) executes regardless of value-escaping. `SafeAttrName`
                 // enforces both policies in one place; a key that fails is dropped.
-                let Some(safe_key) = SafeAttrName::parse(k) else {
-                    continue;
+                // The stamped identity is the one reserved name the sink writes
+                // itself; every other `ipe-*` name fails `SafeAttrName`.
+                let name = if *k == STAMPED_ID_ATTR {
+                    STAMPED_ID_ATTR
+                } else {
+                    let Some(safe_key) = SafeAttrName::parse(k) else {
+                        continue;
+                    };
+                    safe_key.as_str()
                 };
                 s.push(' ');
-                s.push_str(safe_key.as_str());
+                s.push_str(name);
                 s.push_str("=\"");
                 crate::escape::html_attr_into(sanitise_url_attr(k, v), s);
                 s.push('"');
@@ -415,7 +460,9 @@ fn render_into_ctx<M>(
                 s.push_str(&events.join(" "));
                 s.push('"');
                 if let Some(id) = ipe_id {
-                    s.push_str(" data-ipe-hid=\"");
+                    s.push(' ');
+                    s.push_str(HANDLER_ID_ATTR);
+                    s.push_str("=\"");
                     crate::escape::html_attr_into(id, s);
                     s.push('"');
                 }
@@ -439,7 +486,7 @@ fn render_into_ctx<M>(
                     s.push('"');
                 }
             }
-            if VOID.contains(&tag.as_str()) {
+            if is_void(tag) {
                 s.push_str(" />");
                 return;
             }
@@ -455,53 +502,14 @@ fn render_into_ctx<M>(
             {
                 crate::escape::html_text_into(v, s);
             }
-            // <script>/<style> emit text children verbatim (rawBody); a
-            // <select> threads its value to option children for the `selected`
-            // flip. Both reset for deeper descendants .
-            let raw_body = tag == "script" || tag == "style";
+            // A <select> threads its value to its option children for the
+            // `selected` flip; deeper descendants reset it.
             let child_select_value = if tag == "select" {
                 textarea_value.as_deref().filter(|v| !v.is_empty())
             } else {
                 None
             };
-            if tag == "style" {
-                // SECURITY: every `<style>` body — from `Ipe.Html.styleNode`, a
-                // hand-built `Html.node "style" [] [Html.raw css]`, or a `Ipe.Css`
-                // stylesheet string — is close-tag-neutralised at THIS sink before
-                // it reaches the DOM. `styleNode` also pre-strips at construction
-                // (`html_style_node_`), so the body is gated twice (belt and
-                // braces). Rendered into a scratch buffer with raw_text=true (CSS
-                // is not HTML-decoded), then `strip_style_close` removes any
-                // `</style` breakout.
-                let mut body = String::new();
-                for c in kids {
-                    render_into_ctx(c, &mut body, None, true, depth.saturating_add(1));
-                }
-                s.push_str(&css_safety::strip_style_close(&body));
-            } else if raw_body {
-                // SECURITY: a `<script>` body reaches the browser as executable
-                // code with no HTML decoding, so verbatim text here is a breakout
-                // sink symmetric to `<style>`. The body is rendered into a scratch
-                // buffer with raw_text=true (script source is not entity-escaped)
-                // and close-tag-neutralised so no `</script` byte run survives to
-                // terminate the element early. `Ipe.Html.Unsafe.unsafeScript`
-                // already neutralises at construction, and the split is a fixpoint
-                // (`<\/script` no longer matches `</script`), so that
-                // capability-gated path is unchanged; the safe-surface
-                // `Html.script [] [ Html.text … ]` path is now closed too — the
-                // ONLY difference between the two is that `unsafeScript` discloses
-                // the `unsafe` capability, never that one can break out and the
-                // other cannot.
-                let mut body = String::new();
-                for c in kids {
-                    render_into_ctx(c, &mut body, None, true, depth.saturating_add(1));
-                }
-                s.push_str(&css_safety::neutralise_script_close(&body));
-            } else {
-                for c in kids {
-                    render_into_ctx(c, s, child_select_value, raw_body, depth.saturating_add(1));
-                }
-            }
+            render_body_into(body, ctx.enter(tag), kids, s, child_select_value, depth);
             s.push_str("</");
             s.push_str(tag);
             s.push('>');
@@ -526,6 +534,225 @@ fn is_safe_html_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
 }
 
+/// A child node that can say whether it is trusted raw markup.
+///
+/// Only a capability-disclosing constructor (`Ipe.Html.Unsafe.unsafeRaw`,
+/// `unsafeScript`, `Ipe.Html.styleNode`) or a runtime-internal producer builds
+/// an `HRaw` node, so "every child is trusted raw" is the proof that an element
+/// body was not built from data on the safe surface. Implemented for `Html` here
+/// and for `Ipe.Ui`'s `Element` beside its definition, so both constructors run
+/// the one `admit_element` gate.
+pub(crate) trait TrustedRawChild {
+    /// True when this child is trusted raw markup.
+    fn is_trusted_raw(&self) -> bool;
+}
+
+impl<M> TrustedRawChild for Html<M> {
+    fn is_trusted_raw(&self) -> bool {
+        matches!(self, Html::HRaw(_))
+    }
+}
+
+/// How an admitted element's body is rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElementBody {
+    /// Ordinary markup: children render with full escaping and gating.
+    Markup,
+    /// A `<script>` whose body is trusted raw source, close-tag-neutralised.
+    Script,
+    /// A `<style>` whose body is trusted raw CSS, markup-opener-neutralised.
+    Style,
+}
+
+/// Why `admit_element` refused an element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElementRefusal {
+    /// The tag name carries a byte that would break out of the start tag.
+    UnsafeName,
+    /// A `<plaintext>` element: nothing can ever close it, so every later byte
+    /// of the page would render as its text.
+    Unclosable,
+    /// A `<script>` whose body is empty or holds a child that is not trusted
+    /// raw markup: its text would execute, or an empty not-yet-started script
+    /// could run a later patch's body or its `src`.
+    UntrustedScript,
+    /// A `<style>` holding a child that is not trusted raw markup: its text
+    /// would be read as CSS, a raw-text body the safe surface never builds.
+    UntrustedStyle,
+    /// A trusted `<script>` under an RCDATA, RAWTEXT or foreign-content
+    /// ancestor: its body would be read as text that can end that ancestor,
+    /// or as live markup, instead of as script data.
+    ScriptOutsideData,
+}
+
+/// Elements whose children the HTML tokenizer reads as RCDATA or RAWTEXT.
+///
+/// `noscript` is RAWTEXT when scripting is enabled, which is how a browser
+/// renders the page.
+const RAW_OR_RCDATA_TAGS: [&str; 7] = [
+    "textarea", "title", "xmp", "noscript", "iframe", "noembed", "noframes",
+];
+
+/// The tokenizer state an element's children are written in.
+///
+/// The render sink and the SSE diff thread it from the root down, so both
+/// walkers judge a raw body against the same ancestors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParseContext {
+    /// HTML namespace, no raw-text ancestor: a `<script>` start tag puts the
+    /// tokenizer in script-data state.
+    Data,
+    /// Below an RCDATA or RAWTEXT element: every byte is that element's text
+    /// until its own close tag.
+    RawOrRcdata,
+    /// Below an `<svg>` or `<math>` element: a `<script>` body is tokenized as
+    /// markup.
+    Foreign,
+}
+
+impl ParseContext {
+    /// The context of the children of an element `tag` written in `self`.
+    ///
+    /// `svg` and `math` open foreign content, and foreign content stays sticky
+    /// for the whole subtree, `foreignObject` and the HTML elements that would
+    /// break out of it included. That is stricter than the HTML parser, which
+    /// returns to the HTML namespace there: the divergence only refuses more
+    /// scripts, so it fails closed. An RCDATA or RAWTEXT element makes its
+    /// whole subtree text. Tags are matched without regard to ASCII case.
+    pub(crate) fn enter(self, tag: &str) -> Self {
+        match self {
+            Self::Foreign => Self::Foreign,
+            Self::RawOrRcdata => Self::RawOrRcdata,
+            Self::Data => {
+                if tag.eq_ignore_ascii_case("svg") || tag.eq_ignore_ascii_case("math") {
+                    Self::Foreign
+                } else if RAW_OR_RCDATA_TAGS
+                    .iter()
+                    .any(|t| tag.eq_ignore_ascii_case(t))
+                {
+                    Self::RawOrRcdata
+                } else {
+                    Self::Data
+                }
+            }
+        }
+    }
+
+    /// True when a `<script>` start tag written here enters script-data state.
+    const fn admits_script(self) -> bool {
+        match self {
+            Self::Data => true,
+            Self::RawOrRcdata | Self::Foreign => false,
+        }
+    }
+}
+
+/// Decide whether an element `tag` with children `kids` may be rendered.
+///
+/// This is the one tag gate of the safe surface: every element constructor
+/// (`Html.node`, `Ui.taggedNode`, both template materialisers, `Ipe.Ui`'s
+/// lowering) and the render sink and SSE diff all call it, so no path builds a
+/// raw-text or executable element from data. Tag names are matched without
+/// regard to ASCII case, as the HTML tokenizer lowercases them. A `<script>` or
+/// `<style>` is admitted only when its body is trusted raw markup, which only a
+/// capability-disclosing constructor produces. The other raw-text and RCDATA
+/// elements (`title`, `textarea`, `noscript`, `iframe`, `xmp`, `noembed`,
+/// `noframes`) are admitted as markup: their text children are entity-escaped
+/// and any trusted `<style>` inside them is markup-neutralised, so no child can
+/// end them early.
+pub(crate) fn admit_element<K: TrustedRawChild>(
+    tag: &str,
+    kids: &[K],
+) -> Result<ElementBody, ElementRefusal> {
+    if !is_safe_html_name(tag) {
+        return Err(ElementRefusal::UnsafeName);
+    }
+    if tag.eq_ignore_ascii_case("plaintext") {
+        return Err(ElementRefusal::Unclosable);
+    }
+    let all_trusted = kids.iter().all(TrustedRawChild::is_trusted_raw);
+    if tag.eq_ignore_ascii_case("script") {
+        return if !kids.is_empty() && all_trusted {
+            Ok(ElementBody::Script)
+        } else {
+            Err(ElementRefusal::UntrustedScript)
+        };
+    }
+    if tag.eq_ignore_ascii_case("style") {
+        return if all_trusted {
+            Ok(ElementBody::Style)
+        } else {
+            Err(ElementRefusal::UntrustedStyle)
+        };
+    }
+    Ok(ElementBody::Markup)
+}
+
+/// Decide whether an element `tag` with children `kids`, written in `ctx`, may
+/// be rendered.
+///
+/// It runs `admit_element`, then refuses a `<script>` whose start tag would not
+/// put the tokenizer in script-data state. `<style>` is admitted in every
+/// context, as `neutralise_style_body` removes every markup opener from its
+/// body.
+pub(crate) fn admit_in_context<K: TrustedRawChild>(
+    ctx: ParseContext,
+    tag: &str,
+    kids: &[K],
+) -> Result<ElementBody, ElementRefusal> {
+    let body = admit_element(tag, kids)?;
+    match body {
+        ElementBody::Script if !ctx.admits_script() => Err(ElementRefusal::ScriptOutsideData),
+        ElementBody::Script | ElementBody::Markup | ElementBody::Style => Ok(body),
+    }
+}
+
+/// The `Html.doctype` pseudo-tag.
+///
+/// It renders as `<!DOCTYPE html>` and then its children, with no element of
+/// its own.
+pub(crate) const DOCTYPE_WRAPPER_TAG: &str = "!doctype-wrapper";
+
+/// How a rendered `Html` element node reaches the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenderedElement {
+    /// The `Html.doctype` wrapper: a literal `<!DOCTYPE html>`, then the
+    /// children as markup.
+    Doctype,
+    /// An element admitted by `admit_element`, rendered with this body class.
+    Element(ElementBody),
+}
+
+impl RenderedElement {
+    /// The body class the node's children render with.
+    pub(crate) const fn body(self) -> ElementBody {
+        match self {
+            Self::Doctype => ElementBody::Markup,
+            Self::Element(body) => body,
+        }
+    }
+}
+
+/// Decide how an `Html` element node `tag` with children `kids`, written in
+/// `ctx`, is rendered.
+///
+/// This is the one admission rule of every rendered-tree walker (the render
+/// sink and the SSE diff), so the two cannot disagree on which nodes are on
+/// the page: the `Html.doctype` wrapper is recognised by its exact pseudo-tag,
+/// before the name gate its `!` fails, and every other tag runs
+/// `admit_in_context`. The context is a required argument, so no walker can
+/// judge a raw body without its ancestors.
+pub(crate) fn admit_rendered_in<M>(
+    ctx: ParseContext,
+    tag: &str,
+    kids: &[Html<M>],
+) -> Result<RenderedElement, ElementRefusal> {
+    if tag == DOCTYPE_WRAPPER_TAG {
+        return Ok(RenderedElement::Doctype);
+    }
+    admit_in_context(ctx, tag, kids).map(RenderedElement::Element)
+}
+
 /// Attribute NAMES that execute script (or embed a scripting context) regardless
 /// of how the VALUE is escaped — entity-escaping the value is useless when the
 /// value IS script (event handlers like `onerror`/`onclick`) or markup
@@ -538,26 +765,59 @@ fn is_dangerous_attr_name(name: &str) -> bool {
     lower.starts_with("on") || lower == "srcdoc"
 }
 
+/// The attribute-name prefix the runtime reserves for its own wire markers.
+///
+/// The browser client binds a listener on every `[ipe-<event>]` element and
+/// addresses patches by `ipe-id`, so a program-built `ipe-*` attribute would
+/// forge a handler binding or an element identity. Matched ASCII-case-insensitively.
+const RESERVED_ATTR_PREFIX: &[u8] = b"ipe-";
+
+/// The attribute carrying the identity the ipe-id stamper assigns.
+const STAMPED_ID_ATTR: &str = "ipe-id";
+
+/// The attribute `Html.keyed` sets; the stamper reads it as the key segment.
+const KEY_ATTR: &str = "ipe-key";
+
+/// The attribute carrying an event element's handler identity.
+///
+/// The client posts it as the handler id of every gesture on the element, and
+/// the HTML parser keeps the first of two same-named attributes, so a
+/// program-built one would route the gesture to another element's handler.
+pub(crate) const HANDLER_ID_ATTR: &str = "data-ipe-hid";
+
+/// True for a runtime wire-marker name, compared ASCII-case-insensitively.
+///
+/// That is a name starting with [`RESERVED_ATTR_PREFIX`], or [`HANDLER_ID_ATTR`].
+fn is_reserved_attr_name(name: &str) -> bool {
+    name.as_bytes()
+        .get(..RESERVED_ATTR_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTR_PREFIX))
+        || name.eq_ignore_ascii_case(HANDLER_ID_ATTR)
+}
+
 /// A validated HTML **attribute** name (parse-don't-validate). The ONLY way to
 /// build one runs the full attribute-name policy — `is_safe_html_name` (charset:
-/// no structural-breakout bytes) AND `!is_dangerous_attr_name` (no script-bearing
-/// names) — exactly once. Every emit sink consumes a `SafeAttrName` instead of a
-/// raw `&str`, so a sink CANNOT forget a check: an unchecked sink leaving
-/// `htmlAttrToString` exposed is unrepresentable.
+/// no structural-breakout bytes), `!is_dangerous_attr_name` (no script-bearing
+/// names) and `!is_reserved_attr_name` (no runtime wire marker) — exactly once.
+/// Every emit sink consumes a `SafeAttrName` instead of a raw `&str`, so a sink
+/// CANNOT forget a check: an unchecked sink leaving `htmlAttrToString` exposed
+/// is unrepresentable. The stamped `ipe-id` is written by the render sink
+/// itself, never through this type.
 /// NB: element tag names and event-marker names are NOT attribute names — they
 /// keep the plain `is_safe_html_name` gate.
 struct SafeAttrName<'a>(&'a str);
 
 impl<'a> SafeAttrName<'a> {
     fn parse(name: &'a str) -> Option<Self> {
-        if is_safe_html_name(name) && !is_dangerous_attr_name(name) {
+        if is_safe_html_name(name) && !is_dangerous_attr_name(name) && !is_reserved_attr_name(name)
+        {
             Some(SafeAttrName(name))
         } else {
             None
         }
     }
 
-    fn as_str(&self) -> &str {
+    const fn as_str(&self) -> &'a str {
         self.0
     }
 }
@@ -692,72 +952,161 @@ fn sanitise_url_attr<'a>(name: &str, value: &'a str) -> &'a str {
 /// fails policy is dropped, which also covers the removal sentinel (an empty
 /// value on a dangerous name must never reach `setAttribute`).
 ///
+/// Every reserved name fails [`SafeAttrName`], so a program-built wire marker
+/// never reaches `setAttribute`; the builder's own markers go through
+/// [`patch_marker_attr`].
+///
 /// Consumed by `dom/diff.rs` (the shared patch builder) — always compiled.
 pub(crate) fn safe_patch_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'a str, &'a str)> {
     let SafeAttrName(safe_name) = SafeAttrName::parse(name)?;
     Some((safe_name, sanitise_url_attr(name, value)))
 }
 
-/// Stamp every `HElement` (not HText/HRaw) with a stable `ipe-id` attribute derived
-/// from its path. Idempotent: an existing ipe-id is overwritten with the same
-/// value. HText/HRaw nodes are unaddressable .
+/// Gate a listener marker the patch builder writes for an event delta.
 ///
-/// Each non-root segment is `{path}_{idx}_{tag}[:{key}]` — the embedded tag means
-/// two structurally different subtrees never share an id at the same positional
+/// Admits a name in the HTML-name charset that carries no script and is
+/// neither the stamped `ipe-id` nor `ipe-key` in any case: the `ipe-<event>`
+/// and `data-ipe-ev-<event>` markers and [`HANDLER_ID_ATTR`]. Only the
+/// builder's event delta calls it, never with a program-built attribute.
+pub(crate) fn patch_marker_attr<'a>(name: &'a str, value: &'a str) -> Option<(&'a str, &'a str)> {
+    (is_safe_html_name(name)
+        && !is_dangerous_attr_name(name)
+        && !name.eq_ignore_ascii_case(STAMPED_ID_ATTR)
+        && !name.eq_ignore_ascii_case(KEY_ATTR))
+    .then_some((name, value))
+}
+
+/// Stamp every `HElement` (not HText/HRaw) with a stable `ipe-id` attribute derived
+/// from its path. Idempotent: restamping yields the same ids. HText/HRaw nodes
+/// are unaddressable.
+///
+/// The id grammar is `{root}(_{idx}_{tag}[:{key}])*`: the embedded tag means two
+/// structurally different subtrees never share an id at the same positional
 /// depth, and the optional `:{key}` disambiguator (from an explicit `ipe-key`
 /// attribute, or implicit from `name` on form-bearing tags) lets keyed list items
 /// and named form fields keep identity across reorder.
 ///
-/// The id holds only `[A-Za-z0-9_.:-]`: a tag that fails `is_safe_html_name`
-/// contributes [`UNSAFE_TAG_ID_SEGMENT`] instead of its own text, and a key is
-/// sanitised, so `style_inject` can quote the id inside a CSS selector.
+/// The id is injective over (path, tag, key): the root, every tag and every key
+/// pass through [`push_id_segment`], whose output never holds `_` or `:`, so the
+/// separators split an id back into exactly the segments that built it. The id
+/// holds only `[A-Za-z0-9_.:-]`, so `style_inject` can quote it inside a CSS
+/// selector.
+///
+/// Every program-built `ipe-*` attribute (any ASCII case) on a stamped element is
+/// removed, except the `ipe-key` the key segment is read from, so the stamped
+/// `ipe-id` is the element's only reserved attribute. The render sink drops the
+/// remaining `ipe-key`.
+///
+/// The same descent names radio groups: a `<fieldset>` carrying
+/// [`RADIO_GROUP_MARKER`] loses it, and every unnamed `<input type="radio">`
+/// below it (up to a nested marked fieldset) gets `name="ipe-rg-{fieldset ipe-id}"`.
+/// The name is a pure function of the fieldset's path, so it is stable across
+/// renders and distinct per group within one document. A radio that already
+/// has a non-empty `name` keeps it. A serialiser that does not stamp
+/// (`Html.toString`) leaves the marker and the radios unnamed.
 pub fn assign_ipe_ids<M>(node: &mut Html<M>, path: &str) {
-    assign_ipe_ids_depth(node, path, 0);
+    let mut root = String::with_capacity(path.len());
+    push_id_segment(path, &mut root);
+    assign_ipe_ids_depth(node, &root, 0, None);
 }
 
-/// The `ipe-id` tag segment of an element whose tag fails `is_safe_html_name`.
-///
-/// Such an element never renders, but its id still reaches `style_inject`.
-const UNSAFE_TAG_ID_SEGMENT: &str = "x";
+/// Separator between an id's root, index and tag segments.
+const ID_STEP_SEP: char = '_';
 
-// Same bounded-descent rationale as render_into_ctx (see MAX_HTML_DEPTH): the
-// stamper recurses once per nesting level, so an attacker-influenced deep tree
-// would overflow the stack. Stop descending at the cap. Kept in step with the
-// renderer's cap so a node the renderer drops is also left unstamped.
-fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize) {
-    if depth >= MAX_HTML_DEPTH {
-        return;
-    }
-    if let Html::HElement(_tag, attrs, kids) = node {
-        set_attr(attrs, "ipe-id", path);
-        let mut idx = 0usize;
-        for child in kids.iter_mut() {
-            if let Html::HElement(ctag, cattrs, _) = child {
-                let tag_seg = if is_safe_html_name(ctag) {
-                    ctag.as_str()
-                } else {
-                    UNSAFE_TAG_ID_SEGMENT
-                };
-                let mut seg = format!("{path}_{idx}_{tag_seg}");
-                if let Some(key) = ipe_id_key(ctag, cattrs) {
-                    seg.push(':');
-                    seg.push_str(&key);
+/// Separator between an id's tag segment and its key segment.
+const ID_KEY_SEP: char = ':';
+
+/// Lead byte of a hex escape inside an id segment.
+const ID_ESCAPE: char = '.';
+
+/// Append `segment` to `out` in the injective id-segment encoding.
+///
+/// ASCII letters, digits and `-` pass through; every other byte, the escape
+/// lead `.` included, becomes `.` followed by its two lowercase hex digits. The
+/// output therefore never holds [`ID_STEP_SEP`] or [`ID_KEY_SEP`], and a decoder
+/// that reads `.hh` as one byte recovers `segment` exactly.
+fn push_id_segment(segment: &str, out: &mut String) {
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' {
+            out.push(char::from(byte));
+        } else {
+            out.push(ID_ESCAPE);
+            for nibble in [byte >> 4, byte & 0x0f] {
+                if let Some(digit) = char::from_digit(u32::from(nibble), 16) {
+                    out.push(digit);
                 }
-                idx += 1;
-                assign_ipe_ids_depth(child, &seg, depth.saturating_add(1));
             }
         }
     }
 }
 
-/// Stable disambiguator for an element, or `None`. Priority: an explicit
-/// `ipe-key` attribute (set by `Html.keyed`), then `name` on form-bearing tags.
-/// Any matched value is sanitised so it can't corrupt the ipe-id grammar.
-fn ipe_id_key<M>(tag: &str, attrs: &[Attribute<M>]) -> Option<String> {
-    if let Some(k) = attr_value(attrs, "ipe-key")
+/// True for a program-built attribute the stamper removes.
+///
+/// That is every reserved name except the `ipe-key` the key segment is read from.
+fn is_unstamped_reserved_attr<M>(attr: &Attribute<M>) -> bool {
+    match attr {
+        Attribute::Attr(k, _) => k != KEY_ATTR && is_reserved_attr_name(k),
+        Attribute::BoolAttr(k, _) => is_reserved_attr_name(k),
+        Attribute::EventAttr(_) | Attribute::NoAttr => false,
+    }
+}
+
+// Same bounded-descent rationale as render_into_ctx (see MAX_HTML_DEPTH): the
+// stamper recurses once per nesting level, so an attacker-influenced deep tree
+// would overflow the stack. Stop descending at the cap. Kept in step with the
+// renderer's cap so a node the renderer drops is also left unstamped.
+fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: Option<&str>) {
+    if depth >= MAX_HTML_DEPTH {
+        return;
+    }
+    if let Html::HElement(tag, attrs, kids) = node {
+        attrs.retain(|a| !is_unstamped_reserved_attr(a));
+        attrs.push(Attribute::Attr(STAMPED_ID_ATTR.to_owned(), path.to_owned()));
+        let own_group = (tag.as_str() == "fieldset" && take_radio_group_marker(attrs))
+            .then(|| format!("ipe-rg-{path}"));
+        let group = own_group.as_deref().or(group);
+        let mut idx = 0usize;
+        for child in kids.iter_mut() {
+            if let Html::HElement(ctag, cattrs, _) = child {
+                if let Some(name) = group
+                    && ctag.as_str() == "input"
+                    && attr_value(cattrs, "type") == Some("radio")
+                    && attr_value(cattrs, "name").is_none_or(str::is_empty)
+                {
+                    set_attr(cattrs, "name", name);
+                }
+                let mut seg = String::from(path);
+                seg.push(ID_STEP_SEP);
+                seg.push_str(&idx.to_string());
+                seg.push(ID_STEP_SEP);
+                push_id_segment(ctag, &mut seg);
+                if let Some(key) = ipe_id_key(ctag, cattrs) {
+                    seg.push(ID_KEY_SEP);
+                    push_id_segment(key, &mut seg);
+                }
+                idx = idx.saturating_add(1);
+                assign_ipe_ids_depth(child, &seg, depth.saturating_add(1), group);
+            }
+        }
+    }
+}
+
+/// Remove [`RADIO_GROUP_MARKER`] from `attrs`; true when it was present.
+fn take_radio_group_marker<M>(attrs: &mut Vec<Attribute<M>>) -> bool {
+    let before = attrs.len();
+    attrs.retain(|a| !matches!(a, Attribute::Attr(k, _) if k == RADIO_GROUP_MARKER));
+    attrs.len() != before
+}
+
+/// Stable disambiguator for an element, or `None`.
+///
+/// Priority: an explicit `ipe-key` attribute (set by `Html.keyed`), then `name`
+/// on form-bearing tags. The caller encodes the value with [`push_id_segment`].
+fn ipe_id_key<'a, M>(tag: &str, attrs: &'a [Attribute<M>]) -> Option<&'a str> {
+    if let Some(k) = attr_value(attrs, KEY_ATTR)
         && !k.is_empty()
     {
-        return Some(sanitise_ipe_id_key(k));
+        return Some(k);
     }
     if matches!(
         tag,
@@ -765,7 +1114,7 @@ fn ipe_id_key<M>(tag: &str, attrs: &[Attribute<M>]) -> Option<String> {
     ) && let Some(k) = attr_value(attrs, "name")
         && !k.is_empty()
     {
-        return Some(sanitise_ipe_id_key(k));
+        return Some(k);
     }
     None
 }
@@ -775,20 +1124,6 @@ fn attr_value<'a, M>(attrs: &'a [Attribute<M>], key: &str) -> Option<&'a str> {
         Attribute::Attr(k, v) if k == key => Some(v.as_str()),
         _ => None,
     })
-}
-
-/// Replace anything outside `[A-Za-z0-9_-]` with `_`. Prevents the key from
-/// breaking ipe-id parsing, CSS selector escaping, or HTML attribute quoting.
-fn sanitise_ipe_id_key(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn set_attr<M>(attrs: &mut Vec<Attribute<M>>, key: &str, val: &str) {
@@ -974,8 +1309,11 @@ pub fn html_on_raw_fixed_<M>(_name: String, _msg: M) -> Attribute<M> {
 
 /// `Ffi.callPure "htmlEscapeText"` — HTML-escape a string for text content.
 ///
-/// Routes through the same escaper as render, so the set (`& ' < >`; `"` stays
-/// raw, it carries no meaning in text content) can never drift.
+/// Escapes exactly `&` `<` `>` `'`, each to the entity the `crate::escape`
+/// text form names, and leaves `"` raw, so the output is safe only as element
+/// text content. A
+/// double-quoted attribute value needs [`html_escape_attr_`], which also
+/// escapes `"`. Routes through render's escaper, so the set cannot drift.
 #[must_use]
 pub fn html_escape_text_(s: String) -> String {
     crate::escape::html_text(&s)
@@ -1015,24 +1353,62 @@ pub fn html_attr_to_string_<M>(attr: Attribute<M>) -> String {
     }
 }
 
-// ─── IpeStringify for the Html runtime types ────────────────────────────────
-// Same rationale as the Ipe.Ui impls in ui/element.rs: a codegen-emitted
-// `ipe_show` recurses into every field, so an Html/Attribute/Event a generated
-// type can hold must impl the trait (else E0599). A stable type-tag placeholder
-// is total and never recurses into `M`.
-impl<M> crate::stringify::IpeStringify for Html<M> {
-    fn ipe_show(&self) -> String {
-        "<html>".to_string()
+// ─── Show rows for the Html runtime types ───────────────────────────────────
+// `Internals` leaves: the `<Module.Type>` marker, never the tree, an attribute
+// value, or the `M` payload.
+crate::stringify::show_row!("Html", Internals, [M] Html<M>, |_| "<Ipe.Html.Html>".to_owned());
+crate::stringify::show_row!("HtmlAttribute", Internals, [M] Attribute<M>, |_| "<Ipe.Html.Attribute>".to_owned());
+crate::stringify::show_row!("HtmlEvent", Internals, [M] Event<M>, |_| "<Ipe.Html.Events.Event>".to_owned());
+
+// ─── Retained measures for the Html runtime types ───────────────────────────
+
+impl<M: RetainedBytes> RetainedBytes for Html<M> {
+    // Walked with an explicit worklist, as `Drop` is, so a deep tree is measured
+    // without recursion. Each node counts its inline size once; an element adds
+    // its tag, its attributes and its children list's spare slots.
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let node = Bytes::inline::<Self>()?;
+        let mut total = Bytes::ZERO;
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(html) = pending.pop() {
+            total = total.checked_add(node)?;
+            match html {
+                Self::HElement(tag, attrs, children) => {
+                    let spare = children.capacity().checked_sub(children.len())?;
+                    total = total
+                        .plus(tag)?
+                        .plus(attrs)?
+                        .checked_add(Bytes::slots::<Self>(spare)?)?;
+                    pending.extend(children);
+                }
+                Self::HText(text) | Self::HRaw(text) => total = total.plus(text)?,
+            }
+        }
+        Some(total)
     }
 }
-impl<M> crate::stringify::IpeStringify for Attribute<M> {
-    fn ipe_show(&self) -> String {
-        "<html-attribute>".to_string()
+
+impl<M: RetainedBytes> RetainedBytes for Attribute<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            Self::Attr(key, value) => inline.plus(key)?.plus(value),
+            Self::BoolAttr(key, on) => inline.plus(key)?.plus(on),
+            Self::EventAttr(event) => inline.plus(event),
+            Self::NoAttr => Some(inline),
+        }
     }
 }
-impl<M> crate::stringify::IpeStringify for Event<M> {
-    fn ipe_show(&self) -> String {
-        "<event>".to_string()
+
+impl<M: RetainedBytes> RetainedBytes for Event<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
+            // A handler's captured heap is not reachable through `dyn Fn`, so
+            // its measure is unknown rather than an undercount.
+            Self::OnString(..) | Self::OnBool(..) | Self::OnForm(..) | Self::OnWidget(..) => None,
+        }
     }
 }
 
@@ -1043,6 +1419,50 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
+    }
+
+    // A tree far deeper than any recursion could walk is measured on the heap,
+    // and the measure covers every text byte it holds.
+    #[test]
+    fn a_deep_tree_is_measured_without_recursion() {
+        let depth = 200_000_usize;
+        let mut tree: Html<()> = Html::HText("x".repeat(64));
+        for _ in 0..depth {
+            tree = Html::HElement("div".into(), Vec::new(), vec![tree]);
+        }
+        let measured = tree.retained_bytes().map(Bytes::get);
+        let floor = u64::try_from(64 + 3 * depth).unwrap();
+        assert!(measured.is_some_and(|n| n >= floor), "{measured:?}");
+    }
+
+    // A handler's captured heap is unreachable, so a handler event is unmeasurable.
+    #[test]
+    fn a_handler_event_is_unmeasurable() {
+        let attr: Attribute<String> = html_on_string_("input".into(), std::sync::Arc::new(|s| s));
+        assert_eq!(attr.retained_bytes(), None);
+    }
+
+    // A message an event carries counts toward the attribute holding it.
+    #[test]
+    fn an_event_counts_its_message() {
+        let msg = "m".repeat(4096);
+        let attr: Attribute<String> = Attribute::EventAttr(Event::OnMsg("click".into(), msg));
+        assert!(attr.retained_bytes().is_some_and(|n| n.get() >= 4096));
+    }
+
+    // An attribute's `{:?}` names the attribute and hides its value.
+    #[test]
+    fn attribute_debug_hides_the_value() {
+        let shown = format!(
+            "{:?} {:?}",
+            Attribute::<()>::Attr("value".into(), "S3CR3T".into()),
+            Attribute::<()>::BoolAttr("checked".into(), true),
+        );
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert_eq!(
+            shown,
+            "Attr(\"value\",<redacted>) BoolAttr(\"checked\",<redacted>)"
+        );
     }
 
     #[test]
@@ -1260,6 +1680,30 @@ mod tests {
         );
     }
 
+    /// The text kernel escapes exactly `& < > '` and leaves `"` raw; the attr
+    /// kernel adds `"`, the one byte that separates the two contexts. Each
+    /// writes the owner's bytes; `crate::escape` pins the entities themselves.
+    #[test]
+    fn escape_kernels_pin_their_escaped_sets() {
+        for c in (0x20u8..=0x7E).map(char::from) {
+            let raw = c.to_string();
+            let text = html_escape_text_(raw.clone());
+            let attr = html_escape_attr_(raw.clone());
+            assert_eq!(text, crate::escape::html_text(&raw), "{c:?}");
+            assert_eq!(attr, crate::escape::html_attr(&raw), "{c:?}");
+            assert_eq!(
+                text != raw,
+                matches!(c, '&' | '<' | '>' | '\''),
+                "text kernel on {c:?}"
+            );
+            assert_eq!(
+                attr != raw,
+                matches!(c, '&' | '<' | '>' | '\'' | '"'),
+                "attr kernel on {c:?}"
+            );
+        }
+    }
+
     #[test]
     fn single_quote_is_escaped_everywhere() {
         // A `'` in attr/text/kernel output must become `&#39;` so a value placed
@@ -1335,6 +1779,185 @@ mod tests {
         out
     }
 
+    fn radio_input(name: Option<&str>) -> Html<()> {
+        let mut attrs = vec![Attribute::Attr("type".into(), "radio".into())];
+        if let Some(n) = name {
+            attrs.push(Attribute::Attr("name".into(), n.into()));
+        }
+        Html::HElement("input".into(), attrs, vec![])
+    }
+
+    /// A radio group the way `ui::input` builds it: a fieldset (marked or not)
+    /// around a container of labelled radios.
+    fn radio_fieldset(marked: bool, extra: Vec<Attribute<()>>, radios: Vec<Html<()>>) -> Html<()> {
+        let mut attrs = extra;
+        if marked {
+            attrs.push(Attribute::Attr(RADIO_GROUP_MARKER.into(), String::new()));
+        }
+        let labels = radios
+            .into_iter()
+            .map(|r| Html::HElement("label".into(), vec![], vec![r]))
+            .collect();
+        Html::HElement(
+            "fieldset".into(),
+            attrs,
+            vec![Html::HElement("div".into(), vec![], labels)],
+        )
+    }
+
+    fn radio_names_go(n: &Html<()>, out: &mut Vec<Option<String>>) {
+        if let Html::HElement(tag, attrs, kids) = n {
+            if tag == "input" && attr_value(attrs, "type") == Some("radio") {
+                out.push(attr_value(attrs, "name").map(str::to_owned));
+            }
+            for c in kids {
+                radio_names_go(c, out);
+            }
+        }
+    }
+
+    fn radio_names(n: &Html<()>) -> Vec<Option<String>> {
+        let mut out = vec![];
+        radio_names_go(n, &mut out);
+        out
+    }
+
+    fn named(name: &str) -> Option<String> {
+        Some(name.to_owned())
+    }
+
+    /// Every unnamed radio of a marked fieldset gets the group name derived from
+    /// the fieldset's path, and the marker is consumed. Red if the stamper stops
+    /// naming radios or leaves the marker in the output.
+    #[test]
+    fn radio_group_gets_path_name() {
+        let mut t = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![radio_fieldset(
+                true,
+                vec![],
+                vec![radio_input(None), radio_input(None)],
+            )],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let group = named("ipe-rg-r_0_fieldset");
+        assert_eq!(radio_names(&t), vec![group.clone(), group]);
+        assert!(!render_html(&t).contains(RADIO_GROUP_MARKER));
+    }
+
+    /// Two groups in one document never share a name, or the browser would merge
+    /// them into one selection. Red if the name stops being a function of the
+    /// fieldset's own path.
+    #[test]
+    fn two_groups_in_one_document_get_distinct_names() {
+        let group = || radio_fieldset(true, vec![], vec![radio_input(None), radio_input(None)]);
+        let mut t = Html::HElement("div".into(), vec![], vec![group(), group()]);
+        assign_ipe_ids(&mut t, "r");
+        let (first, second) = (named("ipe-rg-r_0_fieldset"), named("ipe-rg-r_1_fieldset"));
+        assert_eq!(
+            radio_names(&t),
+            vec![first.clone(), first, second.clone(), second]
+        );
+    }
+
+    /// A radio that already has a non-empty `name` keeps it; an empty `name` is
+    /// as good as none. Red if the stamper overwrites an author's name.
+    #[test]
+    fn user_radio_name_is_not_overwritten() {
+        let mut t = radio_fieldset(
+            true,
+            vec![],
+            vec![
+                radio_input(Some("mine")),
+                radio_input(None),
+                radio_input(Some("")),
+            ],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let group = named("ipe-rg-r");
+        assert_eq!(radio_names(&t), vec![named("mine"), group.clone(), group]);
+    }
+
+    /// A fieldset without the marker is an ordinary fieldset: its radios stay
+    /// unnamed. Red if naming keys off the tag instead of the marker.
+    #[test]
+    fn unmarked_fieldset_radios_untouched() {
+        let mut t = radio_fieldset(false, vec![], vec![radio_input(None), radio_input(None)]);
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(radio_names(&t), vec![None, None]);
+    }
+
+    /// A marked fieldset inside a marked fieldset names its own radios, and the
+    /// outer group's radios keep the outer name. Red if the group name is not
+    /// replaced on entering the inner fieldset.
+    #[test]
+    fn nested_group_uses_innermost_fieldset() {
+        let inner = radio_fieldset(true, vec![], vec![radio_input(None)]);
+        let mut t = Html::HElement(
+            "fieldset".into(),
+            vec![Attribute::Attr(RADIO_GROUP_MARKER.into(), String::new())],
+            vec![radio_input(None), inner],
+        );
+        assign_ipe_ids(&mut t, "r");
+        assert_eq!(
+            radio_names(&t),
+            vec![named("ipe-rg-r"), named("ipe-rg-r_1_fieldset")]
+        );
+    }
+
+    /// Stamping again, or stamping a fresh build of the same view, yields the
+    /// same names, so a diff sees no spurious `name` change. Red if the name
+    /// depends on anything but the fieldset's path.
+    #[test]
+    fn radio_names_survive_diff_restamp() {
+        let build = || {
+            Html::HElement(
+                "div".into(),
+                vec![],
+                vec![radio_fieldset(
+                    true,
+                    vec![],
+                    vec![radio_input(None), radio_input(None)],
+                )],
+            )
+        };
+        let mut first = build();
+        assign_ipe_ids(&mut first, "r");
+        let names = radio_names(&first);
+        assign_ipe_ids(&mut first, "r");
+        assert_eq!(radio_names(&first), names);
+        let mut second = build();
+        assign_ipe_ids(&mut second, "r");
+        assert_eq!(radio_names(&second), names);
+        assert_eq!(render_html(&first), render_html(&second));
+    }
+
+    /// A group name built from a path that carries a hostile `ipe-key` stays in
+    /// the id alphabet and cannot break out of the attribute. Red if the name
+    /// uses an unsanitised key.
+    #[test]
+    fn radio_group_name_is_escaped_and_in_alphabet() {
+        let hostile = Attribute::Attr("ipe-key".into(), "a\"<b>&'".into());
+        let mut t = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![radio_fieldset(true, vec![hostile], vec![radio_input(None)])],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let names = radio_names(&t);
+        assert_eq!(names.len(), 1);
+        let name = names.into_iter().next().flatten().unwrap_or_default();
+        assert!(name.starts_with("ipe-rg-r_0_fieldset"), "{name}");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_.:-".contains(c)),
+            "{name}"
+        );
+        let html = render_html(&t);
+        assert!(!html.contains("<b>"), "{html}");
+    }
+
     #[test]
     fn unsafe_child_tag_never_reaches_the_ipe_id() {
         let mut t: Html<()> = Html::HElement(
@@ -1351,7 +1974,16 @@ mod tests {
         );
         assign_ipe_ids(&mut t, "r");
         let ids = collect_ids(&t);
-        assert_eq!(ids, vec!["r", "r_0_x", "r_0_x_0_b", "r_1_span"]);
+        let unsafe_tag = "r_0_x.22.5d.7b.7d.3c.2fstyle.3e";
+        assert_eq!(
+            ids,
+            vec![
+                "r".to_owned(),
+                unsafe_tag.to_owned(),
+                format!("{unsafe_tag}_0_b"),
+                "r_1_span".to_owned()
+            ]
+        );
         for id in &ids {
             assert!(
                 !id.contains(['"', ']', '{', '<']),
@@ -1361,9 +1993,10 @@ mod tests {
     }
 
     #[test]
-    fn keyed_items_keep_id_across_reorder() {
-        // Two keyed <li> swapped: each keeps its `:{key}` id so the diff can
-        // target the moved element instead of replacing the whole list.
+    fn keyed_item_id_carries_position_and_key() {
+        // Two keyed <li> swapped: the stamped id carries both the position and
+        // the key, so a moved item's id changes and the diff replaces the list
+        // rather than patching one item in place under the other's id.
         let li = |k: &str| -> Html<()> {
             Html::HElement(
                 "li".into(),
@@ -1377,7 +2010,7 @@ mod tests {
         assign_ipe_ids(&mut b, "r");
         let ids_a = collect_ids(&a);
         let ids_b = collect_ids(&b);
-        // alpha keeps the same id in both renders even though its position moved.
+        // alpha's id changes with its position; the key stays in it.
         assert!(ids_a.contains(&"r_0_li:alpha".to_string()), "{ids_a:?}");
         assert!(ids_b.contains(&"r_1_li:alpha".to_string()), "{ids_b:?}");
         // The key disambiguator is present, sanitised.
@@ -1403,10 +2036,256 @@ mod tests {
         assert!(collect_ids(&t).contains(&"r_0_input:email".to_string()));
     }
 
+    /// Inverse of `push_id_segment`: `None` for a byte outside the encoding.
+    fn decode_id_segment(encoded: &str) -> Option<String> {
+        let mut out = Vec::new();
+        let mut bytes = encoded.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'.' {
+                let hi = char::from(bytes.next()?).to_digit(16)?;
+                let lo = char::from(bytes.next()?).to_digit(16)?;
+                out.push(u8::try_from(hi * 16 + lo).ok()?);
+            } else if byte.is_ascii_alphanumeric() || byte == b'-' {
+                out.push(byte);
+            } else {
+                return None;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// One decoded id step: index, tag, optional key.
+    type IdStep = (usize, String, Option<String>);
+
+    /// Split a stamped id back into its root and steps.
+    fn decode_id(id: &str) -> Option<(String, Vec<IdStep>)> {
+        let mut parts = id.split('_');
+        let root = decode_id_segment(parts.next()?)?;
+        let mut steps = Vec::new();
+        while let Some(idx) = parts.next() {
+            let idx = idx.parse().ok()?;
+            let mut halves = parts.next()?.split(':');
+            let tag = decode_id_segment(halves.next()?)?;
+            let key = halves.next().map(decode_id_segment);
+            if matches!(key, Some(None)) || halves.next().is_some() {
+                return None;
+            }
+            steps.push((idx, tag, key.flatten()));
+        }
+        Some((root, steps))
+    }
+
+    /// The id stamped on the only child of a `div` root.
+    fn only_child_id(tag: &str, key: Option<&str>) -> String {
+        let attrs = key.map_or_else(Vec::new, |k| {
+            vec![Attribute::Attr(KEY_ATTR.into(), k.into())]
+        });
+        let mut t: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![Html::HElement(tag.into(), attrs, vec![])],
+        );
+        assign_ipe_ids(&mut t, "r");
+        collect_ids(&t).into_iter().nth(1).unwrap_or_default()
+    }
+
     #[test]
-    fn ipe_key_value_is_sanitised() {
-        assert_eq!(sanitise_ipe_id_key("a/b c.d"), "a_b_c_d");
-        assert_eq!(sanitise_ipe_id_key("keep-_OK9"), "keep-_OK9");
+    fn keys_differing_only_in_punctuation_get_distinct_ids() {
+        assert_ne!(
+            only_child_id("li", Some("a.b")),
+            only_child_id("li", Some("a_b"))
+        );
+        assert_ne!(
+            only_child_id("li", Some("a b")),
+            only_child_id("li", Some("a/b"))
+        );
+    }
+
+    #[test]
+    fn colon_in_tag_never_spells_a_key() {
+        assert_ne!(only_child_id("li:a", None), only_child_id("li", Some("a")));
+        assert_ne!(only_child_id("x\"]", None), only_child_id("x", None));
+    }
+
+    #[test]
+    fn id_segment_round_trips_over_a_small_alphabet() {
+        let alphabet = ["a", "Z", "0", "-", "_", ".", ":", " ", "\u{e9}"];
+        let mut inputs = vec![String::new()];
+        for _ in 0..3 {
+            let longer: Vec<String> = inputs
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            inputs.extend(longer);
+        }
+        inputs.sort();
+        inputs.dedup();
+        for input in &inputs {
+            let mut encoded = String::new();
+            push_id_segment(input, &mut encoded);
+            assert!(!encoded.contains(['_', ':']), "{input:?} -> {encoded:?}");
+            assert_eq!(decode_id_segment(&encoded).as_deref(), Some(input.as_str()));
+        }
+    }
+
+    #[test]
+    fn stamped_ids_decode_to_the_shape_that_built_them() {
+        let tags = [
+            "li", "li:a", "li_a", "li.a", "li_0_li", "x", "x\"]", "\u{e9}",
+        ];
+        let keys = [
+            None,
+            Some("a"),
+            Some("a.b"),
+            Some("a_b"),
+            Some("b_0_li"),
+            Some("a:b"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in tags {
+            for key in keys {
+                let id = only_child_id(tag, key);
+                let expected = (
+                    "r".to_owned(),
+                    vec![(0, tag.to_owned(), key.map(str::to_owned))],
+                );
+                assert_eq!(decode_id(&id), Some(expected), "{id}");
+                assert!(seen.insert(id.clone()), "two shapes share the id {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn safe_attr_name_refuses_the_reserved_prefix() {
+        for name in ["ipe-x", "IPE-x", "Ipe-id", "ipe-key", "ipe-click"] {
+            assert!(SafeAttrName::parse(name).is_none(), "{name}");
+            assert_eq!(
+                html_attr_to_string_::<()>(Attribute::Attr(name.into(), "v".into())),
+                ""
+            );
+        }
+        for name in [
+            "ipe-id",
+            "IPE-ID",
+            "ipe-key",
+            "ipe-click",
+            "data-ipe-hid",
+            "DATA-IPE-HID",
+        ] {
+            assert!(safe_patch_attr(name, "v").is_none(), "{name}");
+        }
+        for name in [
+            "ipe-id", "IPE-ID", "ipe-key", "Ipe-Key", "ipe-x y", "onclick",
+        ] {
+            assert!(patch_marker_attr(name, "v").is_none(), "{name}");
+        }
+        for name in ["ipe-click", "data-ipe-ev-ipe-file", HANDLER_ID_ATTR] {
+            assert!(patch_marker_attr(name, "v").is_some(), "{name}");
+        }
+        assert!(SafeAttrName::parse("ipe").is_some());
+        assert!(SafeAttrName::parse("data-ipe-x").is_some());
+    }
+
+    /// An unstamped tree still drops every program-built reserved name other
+    /// than the exact stamped-id spelling.
+    #[test]
+    fn render_sink_drops_program_built_reserved_attrs() {
+        let t: Html<()> = Html::HElement(
+            "button".into(),
+            vec![
+                Attribute::Attr("IPE-ID".into(), "x".into()),
+                Attribute::Attr("ipe-click".into(), "y".into()),
+                Attribute::Attr(KEY_ATTR.into(), "k".into()),
+                Attribute::BoolAttr("Ipe-Flag".into(), true),
+            ],
+            vec![],
+        );
+        let low = render_html(&t).to_ascii_lowercase();
+        assert!(!low.contains("ipe-"), "{low}");
+    }
+
+    #[test]
+    fn stamper_leaves_the_stamped_id_as_the_only_reserved_attr() {
+        let mut t: Html<()> = Html::HElement(
+            "div".into(),
+            vec![
+                Attribute::Attr("ipe-id".into(), "forged".into()),
+                Attribute::Attr("IPE-ID".into(), "forged".into()),
+                Attribute::BoolAttr("ipe-click".into(), true),
+            ],
+            vec![],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let Html::HElement(_, attrs, _) = &t else {
+            return;
+        };
+        let reserved: Vec<(&str, &str)> = attrs
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::Attr(k, v) if is_reserved_attr_name(k) => Some((k.as_str(), v.as_str())),
+                Attribute::BoolAttr(k, _) if is_reserved_attr_name(k) => Some((k.as_str(), "")),
+                Attribute::Attr(..)
+                | Attribute::BoolAttr(..)
+                | Attribute::EventAttr(_)
+                | Attribute::NoAttr => None,
+            })
+            .collect();
+        assert_eq!(reserved, vec![(STAMPED_ID_ATTR, "r")]);
+    }
+
+    /// The HTML parser keeps the first of two same-named attributes, so a
+    /// program-built handler id rendered ahead of the stamped one would route
+    /// this button's click to another element's handler.
+    #[test]
+    fn program_built_handler_id_never_reaches_the_page() {
+        let mut t: Html<()> = Html::HElement(
+            "button".into(),
+            vec![
+                Attribute::Attr("data-ipe-hid".into(), "r_9_button".into()),
+                Attribute::Attr("Data-Ipe-Hid".into(), "r_9_button".into()),
+                Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+            ],
+            vec![],
+        );
+        assign_ipe_ids(&mut t, "r");
+        let out = render_html(&t);
+        let low = out.to_ascii_lowercase();
+        assert_eq!(low.matches("data-ipe-hid=").count(), 1, "{out}");
+        assert!(out.contains(r#"data-ipe-hid="r""#), "{out}");
+        assert!(!out.contains("r_9_button"), "{out}");
+        let unstamped: Html<()> = Html::HElement(
+            "b".into(),
+            vec![Attribute::Attr("data-ipe-hid".into(), "r_9_button".into())],
+            vec![],
+        );
+        assert!(!render_html(&unstamped).contains("r_9_button"));
+    }
+
+    #[test]
+    fn ui_html_attribute_cannot_forge_the_stamped_id() {
+        use crate::ui::helpers::{ui_el_, ui_html_attribute_, ui_text_};
+        let elem = ui_el_::<()>(
+            vec![
+                ui_html_attribute_("IPE-ID".into(), "x".into()),
+                ui_html_attribute_("ipe-id".into(), "y".into()),
+            ],
+            ui_text_("t".into()),
+        );
+        let mut html = crate::ui::render::ui_layout(vec![], elem);
+        assign_ipe_ids(&mut html, "r");
+        let stamped = collect_ids(&html);
+        let out = render_html(&html);
+        let rendered: Vec<&str> = out
+            .split(" ipe-id=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert_eq!(rendered, stamped, "{out}");
+        assert_eq!(
+            out.to_ascii_lowercase().matches("ipe-id=").count(),
+            stamped.len(),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1509,21 +2388,192 @@ mod tests {
         out.to_ascii_lowercase().matches("</script").count()
     }
 
+    /// SECURITY: a `<script>` or `<style>` built on the safe surface (a text
+    /// child, a child element, a mixed body, or for `<script>` an empty body)
+    /// is refused at the render sink in every tag-name case: nothing of it
+    /// renders, so data never becomes executable code or a raw-text body.
     #[test]
-    fn safe_surface_script_text_breakout_is_neutralised() {
-        // SECURITY: the safe-surface `Html.script [] [ Html.text … ]` path (HText
-        // child, raw_text=true at the `<script>` sink) must NOT let an
-        // attacker-influenced `</script>` in the text break out of the element.
-        let node: Html<()> = Html::HElement(
-            "script".into(),
-            vec![],
-            vec![Html::HText("</script><img src=x onerror=alert(1)>".into())],
+    fn safe_surface_raw_text_element_is_refused_at_sink() {
+        let bodies: [fn() -> Vec<Html<()>>; 4] = [
+            || vec![Html::HText("alert(document.cookie)".into())],
+            || {
+                vec![Html::HElement(
+                    "b".into(),
+                    vec![],
+                    vec![Html::HText("alert(1)".into())],
+                )]
+            },
+            || vec![Html::HRaw("x()".into()), Html::HText("alert(1)".into())],
+            Vec::new,
+        ];
+        for tag in ["script", "SCRIPT", "Script", "style", "STYLE", "sTyLe"] {
+            for (n, body) in bodies.iter().enumerate() {
+                let kids = body();
+                // An empty `<style>` is admitted: it holds no body to execute.
+                if kids.is_empty() && tag.eq_ignore_ascii_case("style") {
+                    continue;
+                }
+                let node: Html<()> = Html::HElement(
+                    "div".into(),
+                    vec![],
+                    vec![Html::HElement(
+                        tag.into(),
+                        vec![Attribute::Attr("src".into(), "/x.js".into())],
+                        kids,
+                    )],
+                );
+                let out = render_html(&node);
+                assert_eq!(
+                    out, "<div></div>",
+                    "<{tag}> body {n} must be refused: {out}"
+                );
+            }
+        }
+    }
+
+    /// A `<plaintext>` element can never be closed, so it is refused in any
+    /// case; an unsafe tag name keeps being refused through the same gate.
+    #[test]
+    fn unclosable_and_unsafe_name_elements_are_refused_at_sink() {
+        for tag in [
+            "plaintext",
+            "PLAINTEXT",
+            "PlainText",
+            "div><script",
+            "a b",
+            "",
+        ] {
+            let node: Html<()> = Html::HElement(
+                "div".into(),
+                vec![],
+                vec![Html::HElement(
+                    tag.into(),
+                    vec![],
+                    vec![Html::HText("x".into())],
+                )],
+            );
+            assert_eq!(render_html(&node), "<div></div>", "<{tag}> must be refused");
+        }
+    }
+
+    /// The shared gate's verdict for each denied tag and for the admitted
+    /// controls, tag names matched without regard to ASCII case.
+    #[test]
+    fn admit_element_decides_every_tag_class() {
+        let text = || vec![Html::<()>::HText("t".into())];
+        let raw = || vec![Html::<()>::HRaw("r".into())];
+        let none: Vec<Html<()>> = Vec::new();
+        assert_eq!(
+            admit_element("script", &text()),
+            Err(ElementRefusal::UntrustedScript)
         );
-        let out = render_html(&node);
-        // Exactly one `</script` survives: the element's own closing tag.
-        assert_eq!(script_close_count(&out), 1, "{out}");
-        // The would-be breakout is inert code text, not a live tag sequence.
-        assert!(out.contains("<\\/script>"), "{out}");
+        assert_eq!(
+            admit_element("ScRiPt", &text()),
+            Err(ElementRefusal::UntrustedScript)
+        );
+        assert_eq!(
+            admit_element("script", &none),
+            Err(ElementRefusal::UntrustedScript)
+        );
+        assert_eq!(
+            admit_element("style", &text()),
+            Err(ElementRefusal::UntrustedStyle)
+        );
+        assert_eq!(
+            admit_element("STYLE", &text()),
+            Err(ElementRefusal::UntrustedStyle)
+        );
+        assert_eq!(
+            admit_element("plaintext", &none),
+            Err(ElementRefusal::Unclosable)
+        );
+        assert_eq!(admit_element("x y", &none), Err(ElementRefusal::UnsafeName));
+        assert_eq!(admit_element("script", &raw()), Ok(ElementBody::Script));
+        assert_eq!(admit_element("SCRIPT", &raw()), Ok(ElementBody::Script));
+        assert_eq!(admit_element("style", &raw()), Ok(ElementBody::Style));
+        assert_eq!(admit_element("style", &none), Ok(ElementBody::Style));
+        for tag in [
+            "div", "p", "title", "textarea", "noscript", "iframe", "template", "svg",
+        ] {
+            assert_eq!(
+                admit_element(tag, &text()),
+                Ok(ElementBody::Markup),
+                "<{tag}>"
+            );
+        }
+    }
+
+    /// Controls: a trusted raw `<script>`/`<style>` body still renders, in any
+    /// tag-name case, with its own close tag neutralised.
+    #[test]
+    fn trusted_raw_script_and_style_bodies_render() {
+        let script: Html<()> = Html::HElement(
+            "SCRIPT".into(),
+            vec![],
+            vec![Html::HRaw("x();</script>y".into())],
+        );
+        let out = render_html(&script);
+        assert!(
+            out.starts_with("<SCRIPT>x();<\\/script>y</SCRIPT>"),
+            "{out}"
+        );
+        let style: Html<()> = Html::HElement(
+            "style".into(),
+            vec![],
+            vec![Html::HRaw(".a{color:red}".into())],
+        );
+        assert_eq!(render_html(&style), "<style>.a{color:red}</style>");
+    }
+
+    /// A trusted `<style>` body inside an RCDATA, RAWTEXT or foreign-content
+    /// ancestor cannot end that ancestor or open a live tag.
+    #[test]
+    fn style_body_cannot_break_out_of_an_ancestor() {
+        for ancestor in [
+            "textarea", "title", "noscript", "iframe", "xmp", "svg", "math",
+        ] {
+            let css = format!("x{{}}</{ancestor}><img src=x onerror=alert(1)>");
+            let node: Html<()> = Html::HElement(
+                ancestor.into(),
+                vec![],
+                vec![html_style_node_::<()>(vec![], css)],
+            );
+            let out = render_html(&node);
+            let closes = format!("</{ancestor}");
+            assert_eq!(out.matches(closes.as_str()).count(), 1, "{out}");
+            assert!(!out.contains("<img"), "{out}");
+        }
+    }
+
+    /// A void tag in any ASCII case self-closes with no children, as the
+    /// browser's tokenizer treats it.
+    #[test]
+    fn void_tags_match_without_regard_to_ascii_case() {
+        for tag in ["br", "BR", "Img", "INPUT"] {
+            assert!(is_void(tag), "{tag}");
+            let node: Html<()> = Html::HElement(tag.into(), vec![], vec![Html::HText("x".into())]);
+            assert_eq!(render_html(&node), format!("<{tag} />"));
+        }
+        assert!(!is_void("div"));
+        assert!(!is_void("brx"));
+    }
+
+    /// A hand-built `<style>` over an untouched trusted raw body (not built by
+    /// `styleNode`, which neutralises at construction) is neutralised by the
+    /// render sink itself, so it cannot end a `<textarea>` or open a tag inside
+    /// `<svg>`.
+    #[test]
+    fn hand_built_style_body_is_neutralised_at_the_sink() {
+        for ancestor in ["textarea", "svg"] {
+            let css = format!("x{{}}</{ancestor}><img src=x onerror=alert(1)>");
+            let style: Html<()> = Html::HElement("style".into(), vec![], vec![Html::HRaw(css)]);
+            let node: Html<()> = Html::HElement(ancestor.into(), vec![], vec![style]);
+            let out = render_html(&node);
+            let closes = format!("</{ancestor}");
+            assert_eq!(out.matches(closes.as_str()).count(), 1, "{out}");
+            assert!(!out.contains("<img"), "{out}");
+            assert!(out.contains("< /"), "close tag must be split: {out}");
+        }
     }
 
     #[test]
@@ -1567,7 +2617,7 @@ mod tests {
     #[test]
     fn fixture69_render_parity() {
         // <select value="b"> flips `selected` onto the matching <option>, NOT the
-        // first; <script> text child emits verbatim; ordinary text stays
+        // first; a trusted raw <script> body emits verbatim; ordinary text stays
         // entity-escaped; Html.doctype → literal <!DOCTYPE html>.
         let tree: Html<()> = Html::HElement(
             "!doctype-wrapper".into(),
@@ -1595,7 +2645,7 @@ mod tests {
                     Html::HElement(
                         "script".into(),
                         vec![],
-                        vec![Html::HText("if (1 < 2) { x = '&'; }".into())],
+                        vec![Html::HRaw("if (1 < 2) { x = '&'; }".into())],
                     ),
                     Html::HElement("div".into(), vec![], vec![Html::HText("<b>raw</b>".into())]),
                 ],
@@ -1793,5 +2843,124 @@ mod tests {
             vec![Html::HText("hi".into())],
         );
         assert_eq!(html_render_(t.clone()), render_html(&t));
+    }
+
+    fn element(tag: &str, kids: Vec<Html<()>>) -> Html<()> {
+        Html::HElement(tag.into(), vec![], kids)
+    }
+
+    fn trusted_script(body: &str) -> Html<()> {
+        element("script", vec![Html::HRaw(body.into())])
+    }
+
+    /// Each element's tag puts its children in the context the HTML tokenizer
+    /// reads them in, and foreign content and raw text stay sticky below it.
+    #[test]
+    fn parse_context_follows_the_tokenizer_state() {
+        assert_eq!(ParseContext::Data.enter("div"), ParseContext::Data);
+        assert_eq!(ParseContext::Data.enter("svg"), ParseContext::Foreign);
+        assert_eq!(ParseContext::Data.enter("MATH"), ParseContext::Foreign);
+        for tag in RAW_OR_RCDATA_TAGS {
+            assert_eq!(ParseContext::Data.enter(tag), ParseContext::RawOrRcdata);
+            let upper = tag.to_ascii_uppercase();
+            assert_eq!(ParseContext::Data.enter(&upper), ParseContext::RawOrRcdata);
+        }
+        for tag in ["foreignObject", "div", "textarea"] {
+            assert_eq!(ParseContext::Foreign.enter(tag), ParseContext::Foreign);
+        }
+        for tag in ["div", "svg"] {
+            assert_eq!(
+                ParseContext::RawOrRcdata.enter(tag),
+                ParseContext::RawOrRcdata
+            );
+        }
+    }
+
+    /// A trusted `<script>` is admitted only in the HTML data state; `<style>`
+    /// and markup are admitted in every context.
+    #[test]
+    fn admit_in_context_refuses_a_script_outside_data_state() {
+        let raw = vec![Html::<()>::HRaw("r".into())];
+        assert_eq!(
+            admit_in_context(ParseContext::Data, "script", &raw),
+            Ok(ElementBody::Script)
+        );
+        for ctx in [ParseContext::RawOrRcdata, ParseContext::Foreign] {
+            assert_eq!(
+                admit_in_context(ctx, "script", &raw),
+                Err(ElementRefusal::ScriptOutsideData)
+            );
+            assert_eq!(
+                admit_in_context(ctx, "SCRIPT", &raw),
+                Err(ElementRefusal::ScriptOutsideData)
+            );
+            assert_eq!(admit_in_context(ctx, "style", &raw), Ok(ElementBody::Style));
+            assert_eq!(admit_in_context(ctx, "div", &raw), Ok(ElementBody::Markup));
+        }
+    }
+
+    /// A trusted script under `svg`, `math` or `svg > foreignObject` would be
+    /// tokenized as markup, so it renders no script and none of its body.
+    #[test]
+    fn script_under_foreign_ancestor_refused() {
+        let body = "<img src=x onerror=alert(1)>";
+        for node in [
+            element("svg", vec![trusted_script(body)]),
+            element("math", vec![trusted_script(body)]),
+            element(
+                "svg",
+                vec![element("foreignObject", vec![trusted_script(body)])],
+            ),
+            element("SVG", vec![element("g", vec![trusted_script(body)])]),
+        ] {
+            let out = render_html(&node);
+            assert!(!out.contains("<img"), "{out}");
+            assert!(!out.to_ascii_lowercase().contains("<script"), "{out}");
+        }
+    }
+
+    /// A trusted script under an RCDATA or RAWTEXT ancestor would be that
+    /// ancestor's text, so a body naming the ancestor's close tag cannot end it.
+    #[test]
+    fn script_under_rcdata_ancestor_refused() {
+        for tag in RAW_OR_RCDATA_TAGS {
+            let body = format!("</{tag}><img src=x onerror=alert(1)>");
+            let out = render_html(&element(tag, vec![trusted_script(&body)]));
+            let close = format!("</{tag}");
+            assert_eq!(out.matches(close.as_str()).count(), 1, "{out}");
+            assert!(!out.contains("<img"), "{out}");
+            assert!(!out.contains("<script"), "{out}");
+        }
+    }
+
+    /// A `<!--` in a script body is split, so a later `<script` cannot enter
+    /// the double-escaped state and the renderer's `</script>` is the only
+    /// close.
+    #[test]
+    fn script_body_comment_open_neutralised() {
+        let out = render_html(&trusted_script("x = '<!--<script>'; y();"));
+        assert!(!out.contains("<!--"), "{out}");
+        assert_eq!(
+            out.to_ascii_lowercase().matches("</script").count(),
+            1,
+            "{out}"
+        );
+        assert!(out.ends_with("</script>"), "{out}");
+        let body = crate::css_safety::neutralise_script_close("<!--<script>");
+        assert_eq!(crate::css_safety::neutralise_script_close(&body), body);
+    }
+
+    /// The control: a trusted script at the top level and under ordinary
+    /// markup still renders its body verbatim.
+    #[test]
+    fn script_in_data_state_renders_verbatim() {
+        assert_eq!(
+            render_html(&trusted_script("init();")),
+            "<script>init();</script>"
+        );
+        assert_eq!(
+            render_html(&element("div", vec![trusted_script("init();")])),
+            "<div><script>init();</script></div>"
+        );
     }
 }

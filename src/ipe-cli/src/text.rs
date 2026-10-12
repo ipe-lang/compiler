@@ -127,8 +127,10 @@ relayable!(
     crate::ffi::WrapperRefusal,
     crate::ffi::BuildScriptsBanner,
     ipe_watch::ScopeError,
+    ipe_docs::argv::NonUtf8Argument,
     ipe_lint::ConfigError,
     ipe_sandbox::run_jail::RunJailDefect,
+    ipe_sandbox::run_jail::FloorRefusal,
     ipe_ffi::diag::Diagnostic,
     ipe_ffi::diag::WireDefect,
 );
@@ -637,15 +639,15 @@ messages! {
     emit_ir_with_allocator = "emit-ir-with-allocator";
     /// `--emit-ir` with `--cfree`.
     emit_ir_with_cfree = "emit-ir-with-cfree";
-    /// `ipe run --target wasm`, which has no native artifact.
+    /// `ipe dev run --target wasm`, which has no native artifact.
     run_wasm_target = "run-wasm-target";
-    /// `ipe run --target wasi` with a native-only flag.
+    /// `ipe dev run --target wasi` with a native-only flag.
     run_wasi_native_flags = "run-wasi-native-flags";
-    /// `ipe eject` without `--out`.
+    /// `ipe release eject` without `--out`.
     eject_out_required = "eject-out-required";
-    /// `ipe release --target wasi`.
+    /// `ipe release build --target wasi`.
     release_no_wasi = "release-no-wasi";
-    /// `ipe release --embed --bundle`.
+    /// `ipe release build --embed --bundle`.
     release_embed_bundle_exclusive = "release-embed-bundle-exclusive";
     /// `--port 0`.
     port_zero(command) = "port-zero";
@@ -703,7 +705,7 @@ messages! {
     pkg_no_manifest = "pkg-no-manifest";
     /// `ipe package publish` given more than one path.
     publish_single_path = "publish-single-path";
-    /// `ipe watch`/`ipe build` given a directory with no manifest inside it.
+    /// `ipe dev watch`/`ipe dev build` given a directory with no manifest inside it.
     watch_dir_no_manifest = "watch-dir-no-manifest";
     /// `ipe diff` misuse.
     diff_usage = "diff-usage";
@@ -725,6 +727,8 @@ messages! {
     internal_module_not_in_source_map = "internal-module-not-in-source-map";
     /// A library package (only `exposedModules`) has no runnable entry.
     library_package_no_entry = "library-package-no-entry";
+    /// A `--debugger` build under the vendored emit model.
+    debugger_needs_runtime_dep = "debugger-needs-runtime-dep";
     /// A packager could not find a `package.ipe` from the given root.
     pkg_not_found_in_dir = "pkg-not-found-in-dir";
     /// Bare `ipe package`.
@@ -877,8 +881,12 @@ messages! {
     cli_doc_not_found(query) = "cli-doc-not-found";
     /// The header over a doc-not-found suggestion list.
     cli_doc_suggestions_header = "cli-doc-suggestions-header";
-    /// One suggested documentation entry.
-    cli_doc_suggestion_line(key, title, kind) = "cli-doc-suggestion-line";
+    /// One numbered documentation entry of a doc-not-found list.
+    cli_doc_suggestion_line(index, term, summary, kind) = "cli-doc-suggestion-line";
+    /// The header over a doc-not-found list when nothing matched closely.
+    cli_doc_nearest_header = "cli-doc-nearest-header";
+    /// The note under a doc-not-found list the result ceiling cut.
+    cli_doc_more_matches = "cli-doc-more-matches";
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     cli_unknown_code(input) = "cli-unknown-code";
     /// The first suggested code for an unknown-code error.
@@ -893,6 +901,12 @@ messages! {
     cli_unknown_group_verb(group, attempted) = "cli-unknown-group-verb";
     /// The near-miss suggestion offered for an unknown group verb.
     cli_unknown_group_suggestion(group, sugg) = "cli-unknown-group-suggestion";
+    /// A legacy verb name typed without the group it now lives under.
+    cli_group_required(attempted) = "cli-group-required";
+    /// A command group typed with no subcommand.
+    cli_subcommand_required(group) = "cli-subcommand-required";
+    /// One grouped form offered for a group-required refusal.
+    cli_group_required_form(form) = "cli-group-required-form";
     /// A stage of `ipe verify` failed.
     cli_verify_failed(stage) = "cli-verify-failed";
     /// The project's test runner exited non-zero.
@@ -901,7 +915,7 @@ messages! {
     cli_upgrade_no_prebuilt(glyph, version, platform) = "cli-upgrade-no-prebuilt";
     /// `ipe health` found a critical prerequisite missing.
     cli_health_critical = "cli-health-critical";
-    /// `ipe eject` was asked to eject a program it cannot make self-contained.
+    /// `ipe release eject` was asked to eject a program it cannot make self-contained.
     cli_eject_unsupported(reason) = "cli-eject-unsupported";
     /// `ipe lint` found one or more findings at or above the gate severity.
     cli_lint_gate_failed = "cli-lint-gate-failed";
@@ -921,15 +935,27 @@ messages! {
     cli_local_limit_exceeded(source, limit) = "cli-local-limit-exceeded";
     /// A local git query ran past its wall-time ceiling.
     cli_local_timed_out(source, limit) = "cli-local-timed-out";
+    /// A `cargo build` ran past its wall and was stopped.
+    cli_cargo_build_timed_out(wall) = "cli-cargo-build-timed-out";
     /// A local walk met an entry it refuses by its shape.
     cli_local_tree_refused(source, shape) = "cli-local-tree-refused";
     /// A finished child's output pipe stayed open past the grace.
     cli_child_pipe_held(stream) = "cli-child-pipe-held";
+    /// Reading a child's output pipe failed, so its output is incomplete.
+    cli_child_pipe_unread(stream, kind) = "cli-child-pipe-unread";
+    /// A child's stderr was cut at its ceiling; the line closes the kept text.
+    cli_child_stderr_truncated(limit) = "cli-child-stderr-truncated";
+    /// The unsandboxed FFI inspector exited unsuccessfully with a code.
+    ffi_inspector_exited(code, stderr: &crate::style::TerminalSafe) = "ffi-inspector-exited";
+    /// A signal ended the unsandboxed FFI inspector.
+    ffi_inspector_signalled(stderr: &crate::style::TerminalSafe) = "ffi-inspector-signalled";
+    /// The unsandboxed FFI inspector's report is not UTF-8.
+    ffi_inspector_not_utf8 = "ffi-inspector-not-utf8";
     /// A source path named a FIFO, device, socket or other non-regular file.
     cli_source_not_regular_file(path) = "cli-source-not-regular-file";
     /// A source file or directory could not be opened for lack of permission.
     cli_source_access_denied(path) = "cli-source-access-denied";
-    /// A module path was reached through a symlink the no-follow walk refuses.
+    /// A convention file or walked module path is a symlink the no-follow open refuses.
     cli_source_symlink(path) = "cli-source-symlink";
     /// A manifest path escaped the project directory.
     cli_path_escape(raw, reason) = "cli-path-escape";
@@ -948,7 +974,7 @@ messages! {
     cli_advisory_db_unreachable(detail) = "cli-advisory-db-unreachable";
     /// An advisory DB file was present but malformed.
     cli_advisory_db_malformed(path, detail) = "cli-advisory-db-malformed";
-    /// `ipe run --target wasi` on a binary built without the `wasi_run` feature.
+    /// `ipe dev run --target wasi` on a binary built without the `wasi_run` feature.
     cli_wasi_run_feature_disabled = "cli-wasi-run-feature-disabled";
     /// The embedded wasmtime engine could not run the emitted WASI module.
     cli_wasi_run_failed(detail) = "cli-wasi-run-failed";
@@ -964,6 +990,26 @@ messages! {
     cli_io_other(path, kind) = "cli-io-other";
     /// No private scratch directory could be created under the OS temp root.
     cli_scratch_unavailable(kind) = "cli-scratch-unavailable";
+    /// The OS refused to start a thread the command needs.
+    cli_thread_refused(role, kind) = "cli-thread-refused";
+    /// The thread that runs an `ipe dev watch` session.
+    thread_role_watch_session = "thread-role-watch-session";
+    /// The thread that coalesces `ipe dev watch` file events.
+    thread_role_watch_coalesce = "thread-role-watch-coalesce";
+    /// The thread that relays filesystem events to `ipe dev watch`.
+    thread_role_watch_fs_relay = "thread-role-watch-fs-relay";
+    /// The thread that relays a stop request to `ipe dev watch`.
+    thread_role_watch_stop_relay = "thread-role-watch-stop-relay";
+    /// The thread that retries an `ipe dev watch` dependency resolve.
+    thread_role_watch_resolve_retry = "thread-role-watch-resolve-retry";
+    /// The thread that runs an `ipe dev watch` compile.
+    thread_role_watch_compile = "thread-role-watch-compile";
+    /// The thread that waits on an `ipe dev watch` cargo build.
+    thread_role_watch_cargo_waiter = "thread-role-watch-cargo-waiter";
+    /// The thread that enforces a WASI run's wall-clock ceiling.
+    thread_role_wasi_wall_clock = "thread-role-wasi-wall-clock";
+    /// `ipe dev watch` could not start its dependency-resolve retry thread.
+    watch_thread_refused(detail) = "watch-thread-refused";
     /// Publish from a dirty working tree.
     publish_dirty_tree(source_root) = "publish-dirty-tree";
     /// Publish of an unpushed HEAD.
@@ -976,6 +1022,8 @@ messages! {
     publish_unsigned_commit = "publish-unsigned-commit";
     /// Publish without a resolvable GitHub identity.
     publish_unresolvable_identity = "publish-unresolvable-identity";
+    /// Publish refusing a link or wrong-kind entry in the index-fork checkout.
+    publish_fork_entry_not_plain(path) = "publish-fork-entry-not-plain";
     /// An `ipe.lock` `[[package]]` table lacks a required field.
     lock_missing_field(field) = "lock-missing-field";
     /// An `ipe.lock` package carries an unrecognised `kind`.
@@ -1058,20 +1106,20 @@ messages! {
     upgrade_confirm = "upgrade-confirm";
     /// `ipe release` wrote a single self-jailing binary.
     release_embedded(path) = "release-embedded";
-    /// `ipe release --bundle` wrote a wrapper and app pair.
+    /// `ipe release build --bundle` wrote a wrapper and app pair.
     release_bundled(path) = "release-bundled";
+    /// The note under a written Android shell project: unsigned, and how to sign it.
+    mobile_android_note = "mobile-android-note";
+    /// The note under a written iOS shell project.
+    mobile_ios_note = "mobile-ios-note";
     /// One disclosure line under a consent refusal.
     consent_item(item) = "consent-item";
-    /// The headline of the ungranted web-capability refusal.
-    web_consent_header = "web-consent-header";
     /// An ungranted web axis and the modules that disclose it.
     web_consent_disclosure(wire, via) = "web-consent-disclosure";
     /// An ungranted web axis no scanned module could be attributed to.
     web_consent_disclosure_unattributed(wire) = "web-consent-disclosure-unattributed";
     /// The remedy closing the ungranted web-capability refusal.
     web_consent_remedy = "web-consent-remedy";
-    /// The headline of the ungranted native-crossing refusal.
-    native_ffi_consent_header = "native-ffi-consent-header";
     /// An ungranted native crossing and the modules that cross it.
     native_ffi_crossing(krate, via) = "native-ffi-crossing";
     /// An ungranted native crossing no scanned crate could be attributed to.
@@ -1113,6 +1161,8 @@ messages! {
     fmt_stdin_unformatted = "fmt-stdin-unformatted";
     /// `ipe fmt` was given a missing path.
     fmt_no_such_path(root) = "fmt-no-such-path";
+    /// `ipe fmt` refused a file whose formatted output would pass its cap.
+    fmt_output_too_large(file, cap) = "fmt-output-too-large";
     /// `ipe health` could not locate the home directory.
     health_home_unknown = "health-home-unknown";
     /// An `ipe health` install command was empty (an internal invariant).
@@ -1129,11 +1179,11 @@ messages! {
     lint_fix_with_format = "lint-fix-with-format";
     /// The language server failed.
     lsp_failed(detail) = "lsp-failed";
-    /// `ipe watch` could not start its filesystem watcher.
+    /// `ipe dev watch` could not start its filesystem watcher.
     watch_start_failed(detail) = "watch-start-failed";
-    /// `ipe watch` could not watch a path.
+    /// `ipe dev watch` could not watch a path.
     watch_path_failed(path, detail) = "watch-path-failed";
-    /// `ipe watch` could not bind its blue-green proxy's port.
+    /// `ipe dev watch` could not bind its blue-green proxy's port.
     watch_proxy_bind_failed(port, detail) = "watch-proxy-bind-failed";
     /// A `ships` delivery is listed twice.
     ships_repeated(delivery) = "ships-repeated";
@@ -1155,10 +1205,40 @@ messages! {
     manifest_entry_segment_invalid(entry, segment) = "manifest-entry-segment-invalid";
     /// A `package.ipe` program entry names no module.
     manifest_entry_no_module(entry) = "manifest-entry-no-module";
+    /// `delivery.browser.basePath` is longer than the mount base limit.
+    manifest_base_path_too_long(len, max) = "manifest-base-path-too-long";
+    /// `delivery.browser.basePath` does not start with `/`.
+    manifest_base_path_no_leading_slash(base) = "manifest-base-path-no-leading-slash";
+    /// `delivery.browser.basePath` other than the root ends with `/`.
+    manifest_base_path_trailing_slash(base) = "manifest-base-path-trailing-slash";
+    /// `delivery.browser.basePath` has an empty segment.
+    manifest_base_path_empty_segment(base) = "manifest-base-path-empty-segment";
+    /// `delivery.browser.basePath` has a `.` or `..` segment.
+    manifest_base_path_dot_segment(base) = "manifest-base-path-dot-segment";
+    /// `delivery.browser.basePath` holds a byte outside the unreserved set.
+    manifest_base_path_reserved_byte(base, byte) = "manifest-base-path-reserved-byte";
     /// A manifest path is not a `package.ipe`.
     manifest_not_package_ipe(path, hint) = "manifest-not-package-ipe";
     /// A package name is not a single path component for a bundle.
     bundle_name_not_a_component(name) = "bundle-name-not-a-component";
+    /// The emitted wasm bundle has no top-level `index.html`.
+    mobile_bundle_no_index(dir) = "mobile-bundle-no-index";
+    /// An entry of the emitted wasm bundle a mobile shell cannot place.
+    mobile_bundle_unplaceable(path, reason) = "mobile-bundle-unplaceable";
+    /// The emitted wasm bundle nests directories past the walk's depth ceiling.
+    mobile_bundle_too_deep(limit, path) = "mobile-bundle-too-deep";
+    /// The emitted wasm bundle holds more entries than the walk's ceiling.
+    mobile_bundle_too_many(limit) = "mobile-bundle-too-many";
+    /// The emitted wasm bundle was replaced between its collection and its copy.
+    mobile_bundle_replaced(path) = "mobile-bundle-replaced";
+    /// A filesystem failure while walking the emitted wasm bundle.
+    mobile_bundle_io(path, detail) = "mobile-bundle-io";
+    /// A bundle entry's name is not UTF-8.
+    mobile_asset_not_utf8 = "mobile-asset-not-utf8";
+    /// A bundle entry's name is not one plain entry name.
+    mobile_asset_bad_name = "mobile-asset-bad-name";
+    /// A bundle entry is neither a regular file nor a directory.
+    mobile_asset_kind(kind) = "mobile-asset-kind";
     /// A generate-only flag was given to an `ipe doc` subcommand.
     doc_generate_only_flag(sub, flag) = "doc-generate-only-flag";
     /// `--port` was given to an `ipe doc` subcommand other than `serve`.
@@ -1173,8 +1253,18 @@ messages! {
     doc_bundle_build_error(detail) = "doc-bundle-build-error";
     /// An `ipe doc <kind>:<key>` query named an unknown kind.
     doc_unknown_kind(prefix) = "doc-unknown-kind";
-    /// An `ipe doc <kind>:<key>` query named no entry of that kind.
-    doc_no_entry_for_key(kind, key, nearby: &crate::text::TerminalBlock) = "doc-no-entry-for-key";
+    /// An `ipe doc` term was empty or only whitespace.
+    doc_query_empty = "doc-query-empty";
+    /// An `ipe doc` term was longer than the query ceiling.
+    doc_query_too_long(max) = "doc-query-too-long";
+    /// An `ipe doc` term carried a control character or escape sequence.
+    doc_query_control = "doc-query-control";
+    /// The prompt asking which listed `ipe doc` entry to open.
+    doc_pick_prompt(count) = "doc-pick-prompt";
+    /// The answer to the `ipe doc` prompt named no listed entry.
+    doc_pick_retry = "doc-pick-retry";
+    /// The `ipe doc` prompt ended without opening an entry.
+    doc_pick_none = "doc-pick-none";
     /// An `ipe doc <query>` short name matched more than one stdlib module.
     doc_ambiguous_module(query, candidates: &crate::text::TerminalBlock) = "doc-ambiguous-module";
     /// `ipe doc --type` matched no symbol.
@@ -1426,46 +1516,70 @@ messages! {
     publish_fresh_refused(name) = "publish-fresh-refused";
     /// The emitted `fn main` anchor is absent from the build.
     run_main_anchor_absent = "run-main-anchor-absent";
+    /// The emitted source holds more than one `fn main` anchor line.
+    run_main_anchor_ambiguous = "run-main-anchor-ambiguous";
+    /// An emitted source's prior floor block is not one ipe wrote.
+    run_floor_block_malformed = "run-floor-block-malformed";
     /// A jail profile does not parse.
     run_profile_unparsable(code, detail) = "run-profile-unparsable";
-    /// A binary carries no readable capability floor.
-    run_floor_unreadable(code) = "run-floor-unreadable";
     /// A declared program entry outside `Main` is not yet buildable.
     build_entry_not_main(module) = "build-entry-not-main";
     /// `ipe pack` is retired.
     pack_retired = "pack-retired";
-    /// `ipe build` found no binary after a successful `cargo build`.
+    /// `ipe dev build` found no binary after a successful `cargo build`.
     build_binary_missing(path) = "build-binary-missing";
     /// `ipe release` found no binary after a successful `cargo build`.
     release_binary_missing(path) = "release-binary-missing";
     /// `ipe release` found no app binary after a successful `cargo build`.
     release_app_binary_missing(path) = "release-app-binary-missing";
-    /// `ipe release` could not locate the workspace root.
-    release_workspace_root_unknown = "release-workspace-root-unknown";
+    /// An emitted crate's `Cargo.toml` names no plain `[package] name`.
+    emitted_crate_name_unreadable(path) = "emitted-crate-name-unreadable";
+    /// A native-bearing release refused the `ipe_wrapper` source it builds.
+    cli_wrapper_source_refused(root, reason) = "cli-wrapper-source-refused";
+    /// The wrapper source's build-time crate path has no workspace root.
+    wrapper_source_no_build_root = "wrapper-source-no-build-root";
+    /// The host cannot prove the wrapper source's ownership.
+    wrapper_source_unsupported = "wrapper-source-unsupported";
+    /// A wrapper source path is absent or not owner-trusted.
+    wrapper_source_unproven(path) = "wrapper-source-unproven";
+    /// A wrapper source manifest could not be read within the cap.
+    wrapper_source_unreadable(path) = "wrapper-source-unreadable";
+    /// A wrapper source manifest is not valid TOML.
+    wrapper_source_unparsable(path) = "wrapper-source-unparsable";
+    /// The wrapper source's root manifest has no `[workspace]` table.
+    wrapper_source_not_workspace = "wrapper-source-not-workspace";
+    /// The wrapper source's workspace does not list the wrapper member.
+    wrapper_source_member_undeclared(member) = "wrapper-source-member-undeclared";
+    /// The wrapper source's member manifest names another package.
+    wrapper_source_package_mismatch(package) = "wrapper-source-package-mismatch";
+    /// `ipe release run` was given a target with no run form.
+    cli_no_run_form(target) = "cli-no-run-form";
+    /// The `ipe release build` form a no-run-form target builds with.
+    cli_no_run_form_hint(form) = "cli-no-run-form-hint";
+    /// `ipe release run <dir>` given a directory and build arguments together.
+    release_run_artifact_flags(dir) = "release-run-artifact-flags";
+    /// `ipe release run <dir>` found a bundle missing one of its three files.
+    release_run_bundle_incomplete(dir, missing) = "release-run-bundle-incomplete";
+    /// `ipe release run <dir>` found a lone wrapper with no app and profile to verify.
+    release_run_wrapper_unverifiable(dir) = "release-run-wrapper-unverifiable";
     /// `wasm-bindgen` failed while bundling a `--target wasm` build.
     wasm_bindgen_failed(code, version) = "wasm-bindgen-failed";
     /// The `wasm32-wasip1` build reported no `.wasm` artifact.
     wasi_artifact_missing(dir) = "wasi-artifact-missing";
-    /// `ipe run --record`/`--replay` on a program with no recordable session.
+    /// `ipe dev run --record`/`--replay` on a program with no recordable session.
     session_no_recordable(flag, name) = "session-no-recordable";
-    /// `ipe run --record`/`--replay` with `--target wasi`.
+    /// `ipe dev run --record`/`--replay` with `--target wasi`.
     session_native_only(flag) = "session-native-only";
-    /// `ipe run --record`/`--replay` on a native-bearing program.
-    session_jailed(flag) = "session-jailed";
-    /// `ipe run --record` with `--replay`.
+    /// `ipe dev run --record`/`--replay` on a program that can link Rust FFI.
+    session_ffi_unproven(flag) = "session-ffi-unproven";
+    /// `ipe dev run --record` with `--replay`.
     session_flags_exclusive(first, second) = "session-flags-exclusive";
-    /// `ipe run --replay` with no recorded log or trace in the output root.
+    /// `ipe dev run --replay` with no recorded log or trace in the output root.
     replay_no_default_log(typed, trace) = "replay-no-default-log";
-    /// `ipe run --replay <log>` naming no regular file.
+    /// `ipe dev run --replay <log>` naming no regular file.
     replay_log_missing(path) = "replay-log-missing";
     /// A run program exited non-zero.
     program_exited(program, code) = "program-exited";
-    /// `ipe exec` found no artifact directory.
-    exec_no_artifact_dir(dir) = "exec-no-artifact-dir";
-    /// `ipe exec` found no built binary.
-    exec_no_binary(path) = "exec-no-binary";
-    /// `ipe exec` found a floor-carrying binary without its jail profile.
-    exec_profile_missing(path) = "exec-profile-missing";
     /// `cargo metadata` failed.
     cargo_metadata_failed(dir, detail) = "cargo-metadata-failed";
     /// `cargo metadata` emitted malformed JSON.
@@ -1494,6 +1608,8 @@ messages! {
     upgrade_installer_download_failed(detail) = "upgrade-installer-download-failed";
     /// `ipe upgrade`'s installer could not be waited on.
     upgrade_installer_wait_failed(detail) = "upgrade-installer-wait-failed";
+    /// `ipe upgrade`'s installer exited before reading its whole script.
+    upgrade_installer_short_feed(detail) = "upgrade-installer-short-feed";
     /// `ipe upgrade`'s installer exited non-zero.
     upgrade_installer_failed = "upgrade-installer-failed";
     /// An output path that is a symbolic link.
@@ -1512,6 +1628,8 @@ messages! {
     output_unresolved_sources(path) = "output-unresolved-sources";
     /// A user-bound output inside a tree ipe owns.
     output_inside_ipe_owned(out, owner) = "output-inside-ipe-owned";
+    /// A user-bound output inside a directory an ipe claim is turning into ipe's.
+    output_inside_claim(out, owner, claim) = "output-inside-claim";
     /// An output inside a `.git` directory.
     output_inside_vcs(out) = "output-inside-vcs";
     /// An output inside an ipe cache namespace.
@@ -1534,6 +1652,16 @@ messages! {
     output_reparse_point(path) = "output-reparse-point";
     /// An entry another program holds open, so ipe cannot remove or replace it.
     output_in_use(path) = "output-in-use";
+    /// An output directory another ipe process is still claiming past the wait bound.
+    output_claim_busy(path, waited, claim) = "output-claim-busy";
+    /// An output directory on a filesystem that refused the claim's file lock.
+    output_claim_lock_unavailable(path, kind) = "output-claim-lock-unavailable";
+    /// An unfinished claim with foreign entries beside its marker.
+    output_claim_interrupted(path, marker, claim) = "output-claim-interrupted";
+    /// A crashed claim that left a marker ipe cannot read as genuine.
+    output_claim_marker_unfinished(path, marker) = "output-claim-marker-unfinished";
+    /// An output directory a claim is running on, or a crashed claim left.
+    output_claim_in_flight(path) = "output-claim-in-flight";
     /// A GitHub login with nothing before its optional `[bot]` suffix.
     login_empty = "login-empty";
     /// A GitHub login past the length ceiling.
@@ -1904,8 +2032,8 @@ mod tests {
     #[test]
     fn an_inline_value_cannot_open_an_output_line() {
         let forged = "x\nerror: forged\u{1b}[2K";
-        let filled = command_refusal(&"build", &forged);
-        assert_eq!(filled, "ipe build: x\n    error: forged");
+        let filled = command_refusal(&"dev build", &forged);
+        assert_eq!(filled, "ipe dev build: x\n    error: forged");
         assert!(
             !filled.lines().any(|l| l.starts_with("error:")),
             "{filled:?}"
@@ -1939,9 +2067,9 @@ mod tests {
         );
         assert!(!filled.contains('\u{1b}'), "{filled:?}");
         let near = TerminalBlock::lines(["  fn:map", "  fn:x\rerror: forged"]);
-        let filled = doc_no_entry_for_key(&"fn", &"mapp", &near);
+        let filled = doc_ambiguous_module(&"fn", &near);
         assert!(
-            filled.ends_with("Nearby keys:\n  fn:map\n  fn:xerror: forged"),
+            filled.ends_with("stdlib module\n  fn:map\n  fn:xerror: forged"),
             "{filled:?}"
         );
     }
@@ -1968,8 +2096,8 @@ mod tests {
         let args: [(&str, &dyn Placeholder); 2] = [("x", &one), ("y", &two)];
         assert_eq!(fill("a {x} b {y} {z} {", &args), "a 1 b two {z} {");
         assert_eq!(
-            unknown_flag(&"build", &"--nope"),
-            "ipe build: unknown flag `--nope`"
+            unknown_flag(&"dev build", &"--nope"),
+            "ipe dev build: unknown flag `--nope`"
         );
     }
 

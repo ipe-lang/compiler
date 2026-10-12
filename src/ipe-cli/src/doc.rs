@@ -2,7 +2,7 @@
 //!
 //! Generates reference documentation for an Ipê package from its own source: the
 //! public API a consumer sees, each entry carrying its checker-inferred type
-//! signature, its `-- |` doc-comment, and a stable source location.
+//! signature, its doc-comment, and a stable source location.
 //!
 //! ## Output layout
 //!
@@ -79,9 +79,10 @@
 //! Type signatures come from the type checker — this module reuses
 //! [`crate::api_surface::extract_tree`], the same projection `ipe diff` uses, so
 //! a documented type is exactly the checked type and is never re-parsed. Ipê's
-//! lexer discards every `--` comment before the AST exists, so the `-- |`
-//! doc-comments are recovered here at the driver boundary by a source scan
-//! ([`scan_doc_comments`]) that is joined to the checked surface by binding name.
+//! lexer discards every comment before the AST exists, so the `{-| … -}` and
+//! `-- |` doc-comments are recovered at the driver boundary by the shared
+//! extractor ([`scan_doc_comments`] over [`ipe_docs::stdlib_docs`]) and joined to
+//! the checked surface by binding name.
 //! Neither pass runs the emit tier — `ipe doc` needs types, not code.
 //!
 //! ## Stdlib coverage
@@ -116,7 +117,9 @@ use ipe_types::{VarNamer, kernel_type_table, ty_to_doc};
 use crate::CliError;
 use crate::api_surface::{ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree};
 use crate::cli_args::OutputFormat;
-use crate::doc_bundle::{BundleSource, DocBundle, fuzzy_rank, is_qualified};
+use crate::doc_bundle::{BundleSource, DocBundle, DocEntry, DocKind, is_qualified};
+use crate::doc_pick::Pick;
+use crate::doc_search::{DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
 use crate::text;
 
 /// The `docs.json` schema version. Bumped only on an incompatible shape change,
@@ -194,8 +197,8 @@ pub enum DocMode {
     },
     /// Print one module's exposed types and values with their type signatures.
     Query {
-        /// The dotted module name to look up (e.g. `Ipe.List`).
-        module: String,
+        /// The dotted module name to look up (e.g. `Ipe.List`), parsed once.
+        module: DocQuery,
         /// How to render the result.
         format: OutputFormat,
     },
@@ -209,8 +212,8 @@ pub enum DocMode {
     /// Accepts symbols (`List.map`), modules (`List`), diagnostic codes
     /// (`IPE-L0107`), language constructs (`case`), and CLI commands (`version`).
     Lookup {
-        /// The documentation key to resolve.
-        key: String,
+        /// The documentation key to resolve, parsed once.
+        key: LookupTerm,
         /// How to render the result.
         format: OutputFormat,
     },
@@ -223,6 +226,20 @@ pub enum DocMode {
         query: String,
         /// How to render the results.
         format: OutputFormat,
+    },
+}
+
+/// An `ipe doc` lookup term, parsed once at the argument boundary.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LookupTerm {
+    /// A bare term, tried against the index, project members, and every kind.
+    Bare(DocQuery),
+    /// A `kind:key` term, resolved within that kind alone.
+    Qualified {
+        /// The whole term, as a miss names it.
+        term: DocQuery,
+        /// The key part, proven a query too.
+        key: DocQuery,
     },
 }
 
@@ -239,9 +256,9 @@ enum Sub {
     Serve,
     Check,
     List,
-    Query(String),
+    Query(DocQuery),
     CheckExamples,
-    Lookup(String),
+    Lookup(LookupTerm),
 }
 
 /// Accumulated flag values while parsing `ipe doc`'s argument tail.
@@ -371,56 +388,20 @@ fn parse_doc_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<DocMo
                 it.next();
                 Sub::List
             }
-            // A diagnostic code (`IPE-X0000`) or a symbol key (`List.map`) routes
-            // to the content index. A diagnostic code always starts uppercase and
-            // contains a `-`; a symbol key starts uppercase and contains a `.`
-            // followed by a lowercase letter.
-            Some(first)
-                if !first.starts_with('-')
-                    && first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                    && (first.contains('-') || is_symbol_key(first)) =>
-            {
-                let key = (*first).to_owned();
-                it.next();
-                Sub::Lookup(key)
+            // A blank positional names nothing; refused rather than read as a
+            // project path or a match-everything term.
+            Some(first) if first.trim().is_empty() => {
+                return Err(query_refused(QueryRefusal::Empty));
             }
-            // A module-path positional is a module API query only when every
-            // dot-separated segment satisfies the module-name grammar. A host
-            // path never does: `/`, `\` and `:` are not grammar characters, so
-            // a Windows drive path (`D:\pkg`) or a separator path can never be
-            // read as a module on any platform.
-            Some(first) if !first.starts_with('-') && is_module_name(first) => {
-                let name = (*first).to_owned();
-                it.next();
-                Sub::Query(name)
-            }
-            // An uppercase-leading positional that fails the module grammar is
-            // a host path, never a module query. Leave it unconsumed so the
-            // flag scan below (`parse_doc_flags`) picks it up as the `generate`
-            // project path.
-            Some(first)
-                if !first.starts_with('-')
-                    && first.chars().next().is_some_and(|c| c.is_ascii_uppercase()) =>
-            {
-                Sub::Generate
-            }
-            // A lowercase bare word is a content-index lookup key only when no
-            // generate-specific flags (`--out`, `--write-format`) appear in the
-            // remaining arguments — those flags are unambiguous signals that the
-            // word is a project path for the `generate` subcommand.
-            //
-            // A positional carrying host-path syntax (`/`, `\`, `:`) is never a
-            // lookup key regardless of case — `src/x` and `d:\pkg` fall through
-            // to the generate arm below exactly like their uppercase cousins.
-            Some(first)
-                if !first.starts_with('-')
-                    && !first.is_empty()
-                    && !has_host_path_syntax(first)
-                    && !rest.iter().any(|a| a == "--out" || a == "--write-format") =>
-            {
-                let key = (*first).to_owned();
-                it.next();
-                Sub::Lookup(key)
+            // Any other positional is a term, routed on its trimmed text; a
+            // project path is left unconsumed for `parse_doc_flags`.
+            Some(first) if !first.starts_with('-') => {
+                let generate_flags = rest.iter().any(|a| a == "--out" || a == "--write-format");
+                let sub = route_term(first, generate_flags)?;
+                if !matches!(sub, Sub::Generate) {
+                    it.next();
+                }
+                sub
             }
             _ => Sub::Generate,
         }
@@ -446,6 +427,70 @@ fn parse_doc_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<DocMo
         Sub::Query(module) => DocMode::Query { module, format },
         Sub::CheckExamples => DocMode::CheckExamples,
         Sub::Lookup(key) => DocMode::Lookup { key, format },
+    })
+}
+
+/// The subcommand a positional term names, routed on its trimmed text.
+///
+/// A lookup or module term is parsed here, once, so edge whitespace can never
+/// route a term one way and look it up another. `generate_flags` is whether
+/// `--out` or `--write-format` appears, which marks the positional a project
+/// path. A [`Sub::Generate`] leaves the raw positional for the flag scan.
+///
+/// # Errors
+/// [`CliError::Usage`] naming the [`QueryRefusal`] of a lookup or module term.
+fn route_term(raw: &str, generate_flags: bool) -> Result<Sub, CliError> {
+    let term = raw.trim();
+    let uppercase = term.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    // A `kind:key` term whose prefix is a known kind is a bundle lookup,
+    // whatever its key holds (an operator symbol may carry `/`).
+    if is_qualified(term) && !generate_flags {
+        return parsed_term(raw).map(Sub::Lookup);
+    }
+    // A diagnostic code (`IPE-X0000`) or a symbol key (`List.map`) routes to
+    // the content index: both start uppercase, a code contains a `-`, and a
+    // symbol key a `.` followed by a lowercase letter.
+    if uppercase && (term.contains('-') || is_symbol_key(term)) {
+        return parsed_term(raw).map(Sub::Lookup);
+    }
+    // A module path is a module API query only when every dot-separated
+    // segment satisfies the module-name grammar. A host path never does: `/`,
+    // `\` and `:` are not grammar characters, so a Windows drive path
+    // (`D:\pkg`) or a separator path is never read as a module.
+    if is_module_name(term) {
+        return DocQuery::parse(raw).map(Sub::Query).map_err(query_refused);
+    }
+    // An uppercase-led term that fails the module grammar is a host path. A
+    // lowercase word is a lookup key unless it carries host-path syntax (`/`,
+    // `\`, `:`) or a generate-only flag marks it a project path.
+    if uppercase || has_host_path_syntax(term) || generate_flags {
+        return Ok(Sub::Generate);
+    }
+    parsed_term(raw).map(Sub::Lookup)
+}
+
+/// A lookup term parsed into its [`LookupTerm`], the key part of a `kind:key`
+/// term proven a [`DocQuery`] too.
+///
+/// # Errors
+/// [`CliError::Usage`] naming the [`QueryRefusal`].
+fn parsed_term(raw: &str) -> Result<LookupTerm, CliError> {
+    let term = DocQuery::parse(raw).map_err(query_refused)?;
+    match crate::doc_bundle::split_qualified(term.text()) {
+        Some((_, key)) if is_qualified(term.text()) => {
+            let key = DocQuery::parse(key).map_err(query_refused)?;
+            Ok(LookupTerm::Qualified { term, key })
+        }
+        Some(_) | None => Ok(LookupTerm::Bare(term)),
+    }
+}
+
+/// The usage error for a refused `ipe doc` term.
+fn query_refused(refusal: QueryRefusal) -> CliError {
+    CliError::Usage(match refusal {
+        QueryRefusal::Empty => text::msg::doc_query_empty(),
+        QueryRefusal::TooLong => text::msg::doc_query_too_long(&MAX_QUERY_CHARS),
+        QueryRefusal::ControlChar => text::msg::doc_query_control(),
     })
 }
 
@@ -697,7 +742,7 @@ fn build_index() -> Result<Index, CliError> {
     }
 
     // Commands: sourced from the COMMANDS registry so the index never drifts.
-    let commands: Vec<CommandInfo> = crate::help::command_names()
+    let commands: Vec<CommandInfo> = crate::help::documented_command_keys()
         .into_iter()
         .filter_map(|name| {
             crate::help::command_doc_markdown(name).map(|help| CommandInfo { name, help })
@@ -732,26 +777,36 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
         .collect();
 
     // Symbols: sourced from the ipe_docs index (already built from parsed
-    // stdlib source).
-    let mut symbol_sources: Vec<BundleSource> = Vec::new();
-    {
-        use ipe_docs::IndexBuilder;
-        let mut builder = IndexBuilder::new();
-        let _ = builder.add_stdlib();
-        let _ = builder.add_compiled_stdlib();
-        let idx = builder.finish();
+    // stdlib source). The index files each symbol under several spellings; the
+    // bundle carries ONE entry per symbol, keyed by the index's canonical
+    // `source_key` (the key a lookup of any spelling reports), with the other
+    // spellings as aliases that open it but are never listed.
+    // The index is the one `build_index` lookups resolve against, so a listed
+    // key and a resolved key come from the same producer.
+    let symbol_sources: Vec<BundleSource> = {
+        let idx = build_index()?;
+        let mut by_canonical: std::collections::BTreeMap<&str, (&str, Vec<String>)> =
+            std::collections::BTreeMap::new();
         for key in idx.keys() {
             if let Some(entry) = idx.resolve(key)
                 && matches!(entry.kind, ipe_docs::EntryKind::Symbol)
             {
-                symbol_sources.push(BundleSource::with_body(
-                    key.to_owned(),
-                    key.to_owned(),
-                    entry.text.clone(),
-                ));
+                let slot = by_canonical
+                    .entry(entry.source_key.as_str())
+                    .or_insert_with(|| (entry.text.as_str(), Vec::new()));
+                if key != entry.source_key {
+                    slot.1.push(key.to_owned());
+                }
             }
         }
-    }
+        by_canonical
+            .into_iter()
+            .map(|(canonical, (body, mut aliases))| {
+                aliases.sort_unstable();
+                BundleSource::with_body(canonical, canonical, body).with_aliases(aliases)
+            })
+            .collect()
+    };
 
     // Diagnostics: from the embedded explain pages. The title is the page's
     // human heading (never the code repeated), so a list reads
@@ -771,7 +826,7 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
     // list reads `<command>  <summary>` in an aligned table); the body is the
     // command's full help rendered as Markdown from the same registry, so the
     // HTML command page mirrors `ipe <command> --help`.
-    let cli_sources: Vec<BundleSource> = crate::help::command_names()
+    let cli_sources: Vec<BundleSource> = crate::help::documented_command_keys()
         .into_iter()
         .filter_map(|name| {
             let summary = crate::help::command_summary(name)?;
@@ -797,15 +852,19 @@ fn build_doc_bundle(docs_root: &std::path::Path) -> Result<DocBundle, CliError> 
 /// `ipe doc kind:key` -- exact scoped bundle lookup.
 ///
 /// Resolves a `kind:key` qualified reference against the unified bundle and
-/// renders the matched entry. On a miss, reports which keys are available in
-/// that kind.
-fn run_bundle_lookup(key: &str, format: OutputFormat) -> Result<(), CliError> {
+/// renders the matched entry. On a miss, lists the entries of that kind that
+/// rank closest to the key, each as the exact term that opens it.
+fn run_bundle_lookup(
+    term: &DocQuery,
+    key: &DocQuery,
+    format: OutputFormat,
+) -> Result<(), CliError> {
     // Locate the docs root relative to the repo, falling back gracefully when
     // running outside the repo tree (e.g. a user's home directory).
     let docs_root = locate_docs_root();
     let bundle = build_doc_bundle(&docs_root)?;
 
-    match bundle.resolve_qualified(key) {
+    match bundle.resolve_qualified(term.text()) {
         Ok(entry) => {
             render_bundle_entry(entry, format);
             Ok(())
@@ -813,31 +872,26 @@ fn run_bundle_lookup(key: &str, format: OutputFormat) -> Result<(), CliError> {
         Err(crate::doc_bundle::BundleError::UnknownKind(prefix)) => {
             Err(CliError::Usage(text::msg::doc_unknown_kind(&prefix)))
         }
-        Err(crate::doc_bundle::BundleError::UnknownKey { kind, key: k }) => {
-            let near: Vec<String> = bundle
-                .entries_for_kind(kind)
-                .take(5)
-                .map(|e| format!("  {}:{}", kind, e.key))
-                .collect();
-            let hint = if near.is_empty() {
-                text::TerminalBlock::lines(["  (no entries in this kind)"])
-            } else {
-                text::TerminalBlock::lines(near)
-            };
-            Err(CliError::Usage(text::msg::doc_no_entry_for_key(
-                &kind, &k, &hint,
-            )))
+        Err(crate::doc_bundle::BundleError::UnknownKey { kind, .. }) => {
+            let ranked = crate::doc_search::rank(
+                bundle.entries_for_kind(kind),
+                bundle.aliases_for_kind(kind),
+                key,
+            );
+            Err(miss_error(term.text(), &ranked, format))
         }
         Err(e) => Err(CliError::Usage(text::msg::command_refusal(&"doc", &e))),
     }
 }
 
-/// `ipe doc <bare>` -- fuzzy search across all kinds.
+/// `ipe doc <bare>` -- exact lookup, then a ranked miss list across all kinds.
 ///
-/// First tries the existing `ipe_docs` index for exact matches (preserving
-/// backward-compatible behaviour for diagnostic codes, symbol keys, and module
-/// names). When the exact lookup misses, falls back to the bundle fuzzy ranker.
-fn run_doc_lookup_with_fuzzy(key: &str, format: OutputFormat) -> Result<(), CliError> {
+/// First tries the existing `ipe_docs` index for exact matches (diagnostic
+/// codes, symbol keys, module names), then a project module member, then a
+/// unique exact bundle key. Only when all of those miss does the bundle
+/// ranking run, so a precise hit never has a list put in front of it.
+fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
+    let key = query.text();
     // Try the legacy exact index first.
     let index = build_index()?;
     if let Some(entry) = index.resolve(key) {
@@ -871,25 +925,33 @@ fn run_doc_lookup_with_fuzzy(key: &str, format: OutputFormat) -> Result<(), CliE
     // lists the closest entries of every kind.
     let docs_root = locate_docs_root();
     let bundle = build_doc_bundle(&docs_root)?;
-    let exact: Vec<_> = fuzzy_rank(&bundle, key)
-        .into_iter()
-        .filter(|r| r.score >= crate::doc_bundle::EXACT_SCORE)
-        .collect();
-    if let [only] = exact.as_slice() {
-        render_bundle_entry(only.entry, format);
+    if let Some(only) = crate::doc_search::unique_exact(bundle.all_entries(), query) {
+        render_bundle_entry(only, format);
         return Ok(());
     }
-    Err(doc_miss(key, &bundle, format))
+    Err(doc_miss(query, &bundle, format))
 }
 
-/// The error for a query that named no entry: [`CliError::DocNotFound`] with the closest entries of
-/// any kind.
+/// The error for a query that named no entry: [`CliError::DocNotFound`] with the entries of any
+/// kind that rank closest to it.
 ///
 /// Under a machine format it is written as the machine error envelope instead of the human frame.
-fn doc_miss(query: &str, bundle: &DocBundle, format: OutputFormat) -> CliError {
+fn doc_miss(query: &DocQuery, bundle: &DocBundle, format: OutputFormat) -> CliError {
+    miss_error(
+        query.text(),
+        &crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), query),
+        format,
+    )
+}
+
+/// The [`CliError::DocNotFound`] for `shown`, listing `ranked`, each entry as its
+/// [`rerun_term`].
+///
+/// Under a machine format it is written as the machine error envelope instead of the human frame.
+fn miss_error(shown: &str, ranked: &Ranked<'_>, format: OutputFormat) -> CliError {
+    let modules = stdlib_module_names();
     let err = CliError::DocNotFound {
-        query: query.to_owned(),
-        suggestions: crate::doc_bundle::suggestions_for(bundle, query),
+        miss: DocMiss::new(shown, ranked, |entry| rerun_term(entry, &modules)),
     };
     match format {
         OutputFormat::Human => err,
@@ -897,6 +959,53 @@ fn doc_miss(query: &str, bundle: &DocBundle, format: OutputFormat) -> CliError {
             crate::driver::emit_machine_error(format, "doc", &err)
         }
     }
+}
+
+/// The `ipe doc` argument that opens `entry` exactly.
+///
+/// A stdlib module in a reserved namespace, named by a key that resolves to it
+/// alone, and a symbol whose key the bare-word router sends to the symbol
+/// index, are listed bare (`Ipe.List`, `Ipe.List.map`); every other entry is
+/// listed `kind:key`, which the bundle resolves exactly whatever the key holds.
+/// No project module sits in a reserved namespace, so no project module can
+/// take a bare module term over from the entry it was listed for.
+fn rerun_term(entry: &DocEntry, stdlib_modules: &[String]) -> String {
+    let bare = match entry.kind {
+        DocKind::Module => {
+            is_module_name(&entry.key)
+                && in_reserved_namespace(&entry.key)
+                && matches!(
+                    resolve_stdlib_candidate(&entry.key, stdlib_modules),
+                    StdlibCandidate::One(only) if only == entry.key
+                )
+        }
+        DocKind::Symbol => {
+            entry
+                .key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+                && is_symbol_key(&entry.key)
+                && !has_host_path_syntax(&entry.key)
+        }
+        DocKind::Diagnostic
+        | DocKind::Construct
+        | DocKind::Idiom
+        | DocKind::Topic
+        | DocKind::Guide
+        | DocKind::Cli => false,
+    };
+    if bare {
+        entry.key.clone()
+    } else {
+        format!("{}:{}", entry.kind.prefix(), entry.key)
+    }
+}
+
+/// Whether a dotted module name lives in a namespace only the stdlib may
+/// claim, so no project module can carry it.
+fn in_reserved_namespace(module_name: &str) -> bool {
+    ipe_kernels::is_reserved_module_path(&module_name.split('.').collect::<Vec<_>>())
 }
 
 /// One `Module.member` resolution's outcome.
@@ -1188,7 +1297,61 @@ fn render_doc_entry_human(entry: &ipe_docs::Entry, p: &crate::style::Palette) ->
 /// [`CliError::Io`] on a write failure, and [`CliError::Usage`] carrying the
 /// coverage report when `check` finds an undocumented binding.
 pub fn run_doc(rest: &[String]) -> Result<(), CliError> {
-    match parse_doc(rest)? {
+    let mode = parse_doc(rest)?;
+    let human = matches!(
+        mode,
+        DocMode::Lookup {
+            format: OutputFormat::Human,
+            ..
+        } | DocMode::Query {
+            format: OutputFormat::Human,
+            ..
+        }
+    );
+    match dispatch(mode) {
+        Err(CliError::DocNotFound { miss })
+            if human && !miss.hits.is_empty() && crate::unsafe_ack::is_interactive() =>
+        {
+            open_picked(miss)
+        }
+        outcome => outcome,
+    }
+}
+
+/// Show a human miss list on a terminal and open the entry the person picks.
+///
+/// The list and the prompt go to stderr, the answer is read from stdin
+/// through [`crate::doc_pick::pick`]; the picked term is dispatched once, never
+/// re-prompted, so a pick cannot loop.
+///
+/// # Errors
+/// [`CliError::Usage`] when the prompt ends without a pick, else whatever the
+/// picked entry's lookup returns.
+fn open_picked(miss: DocMiss) -> Result<(), CliError> {
+    let terms: Vec<String> = miss
+        .hits
+        .iter()
+        .map(|hit| hit.term.as_str().to_owned())
+        .collect();
+    crate::screen::report_error(&CliError::DocNotFound { miss });
+    let picked = crate::doc_pick::pick(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+        terms.len(),
+    );
+    let chosen = match picked {
+        Pick::Chosen(at) => terms.get(at),
+        Pick::Cancelled | Pick::Exhausted => None,
+    };
+    match chosen {
+        Some(term) => dispatch(parse_doc(std::slice::from_ref(term))?),
+        None => Err(CliError::Usage(text::msg::doc_pick_none())),
+    }
+}
+
+/// Run one parsed [`DocMode`].
+fn dispatch(mode: DocMode) -> Result<(), CliError> {
+    match mode {
         DocMode::Generate {
             path,
             out,
@@ -1202,13 +1365,14 @@ pub fn run_doc(rest: &[String]) -> Result<(), CliError> {
         }
         DocMode::Query { module, format } => query_module(&module, format),
         DocMode::CheckExamples => check_examples(),
-        DocMode::Lookup { key, format } => {
-            if is_qualified(&key) {
-                run_bundle_lookup(&key, format)
-            } else {
-                run_doc_lookup_with_fuzzy(&key, format)
-            }
-        }
+        DocMode::Lookup {
+            key: LookupTerm::Qualified { term, key },
+            format,
+        } => run_bundle_lookup(&term, &key, format),
+        DocMode::Lookup {
+            key: LookupTerm::Bare(query),
+            format,
+        } => run_doc_lookup_with_fuzzy(&query, format),
         DocMode::TypeSearch { query, format } => run_type_search(&query, format),
     }
 }
@@ -1272,7 +1436,7 @@ pub struct ModuleDoc {
     pub name: String,
     /// Whether this is a project module or a bundled stdlib module.
     pub kind: ModuleKind,
-    /// The module's own `-- |` header doc-comment, empty when it has none.
+    /// The module's own header doc-comment, empty when it has none.
     pub comment: String,
     /// Exposed union types, in name order.
     pub unions: Vec<UnionDoc>,
@@ -1292,7 +1456,7 @@ pub struct ValueDoc {
     /// are computed from this — never from the flat string — so a link is a real
     /// resolved identity, not a text match.
     pub signature_ty: TyDoc,
-    /// Its `-- |` doc-comment, empty when it has none.
+    /// Its doc-comment, empty when it has none.
     pub comment: String,
 }
 
@@ -1305,7 +1469,7 @@ pub struct UnionDoc {
     pub params: usize,
     /// Constructor name → argument signatures, in declaration order.
     pub ctors: Vec<CtorDoc>,
-    /// The union's `-- |` doc-comment, empty when it has none.
+    /// The union's doc-comment, empty when it has none.
     pub comment: String,
 }
 
@@ -1920,13 +2084,20 @@ fn render_module_human(module: &ModuleDoc, index: &AnchorIndex) {
 
 /// Query one module's API and render it per `format`.
 ///
-/// Resolves `module_name` against stdlib + project (project overrides stdlib on
+/// Resolves `term` against stdlib + project (project overrides stdlib on
 /// a name collision). Errors with a typed message on an unknown module.
-fn query_module(module_name: &str, format: OutputFormat) -> Result<(), CliError> {
+fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
+    let module_name = term.text();
     // Project wins over stdlib on name collision. Project modules are already a
     // single resolved pass; the stdlib side is resolved lazily so a single-name
     // query type-checks one module, not all ~130 compiled-source modules.
-    let project = query_project_modules();
+    // A reserved-namespace name is never a project module's, so it skips the
+    // project side and always opens the stdlib module it names.
+    let project = if in_reserved_namespace(module_name) {
+        Vec::new()
+    } else {
+        query_project_modules()
+    };
     if let Some(module) = project.into_iter().find(|m| m.name == module_name) {
         render_query_module(&module, format);
         return Ok(());
@@ -1952,7 +2123,7 @@ fn query_module(module_name: &str, format: OutputFormat) -> Result<(), CliError>
             }
             MemberResolution::Miss => {
                 let bundle = build_doc_bundle(&locate_docs_root())?;
-                Err(doc_miss(module_name, &bundle, format))
+                Err(doc_miss(term, &bundle, format))
             }
         },
     }
@@ -2048,11 +2219,10 @@ fn union_doc(name: &str, union: &UnionApi, comments: &DocComments) -> UnionDoc {
 /// comment and a per-binding-name map.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DocComments {
-    /// The `-- |` block immediately above the `module` header, empty when absent.
+    /// The doc-comment directly above the `module` header, empty when absent.
     module: String,
-    /// Binding name → its `-- |` block. A binding is a top-level value or a union
-    /// type; a doc-comment attaches to the name on the first non-comment line
-    /// below it.
+    /// Exported name → its doc-comment (`{-| … -}` or `-- |`). A name is a
+    /// top-level value or a type; its comment sits directly above it.
     bindings: BTreeMap<String, String>,
 }
 
@@ -2063,138 +2233,22 @@ impl DocComments {
     }
 }
 
-/// Scan one module's source for `-- |` doc-comments and attach each to the
-/// binding it precedes.
+/// Read one module's doc-comments through the shared extractor
+/// ([`ipe_docs::stdlib_docs::extract_module_doc`]), the one reader of both the
+/// `{-| … -}` and the `-- |` forms, so `ipe doc` and the generated reference
+/// show the same prose for the same declaration.
 ///
-/// A doc-comment is a `-- |` line optionally followed by plain `--` continuation
-/// lines; it attaches to the identifier that opens the next non-comment,
-/// non-blank line. This is the driver-boundary recovery of a convention the lexer
-/// erases — a value binding is recognised by `name :` or `name … =`, a union by
-/// `type Name`, and the module header by `module`.
+/// A doc-comment attaches to the declaration directly below it (no blank line
+/// between); the module header's comment sits directly above `module`.
 fn scan_doc_comments(src: &str) -> DocComments {
-    let mut result = DocComments::default();
-    let mut pending: Option<String> = None;
-
-    for line in src.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = doc_comment_text(trimmed) {
-            // Start of, or continuation of, a doc block.
-            match &mut pending {
-                Some(block) => {
-                    block.push('\n');
-                    block.push_str(rest);
-                }
-                None => pending = Some(rest.to_owned()),
-            }
-            continue;
-        }
-        if is_plain_comment(trimmed) {
-            // A plain `--` line continues an open doc block (the stdlib writes
-            // multi-line comments with only the first line marked `-- |`), and is
-            // otherwise ignored.
-            if let Some(block) = &mut pending {
-                block.push('\n');
-                block.push_str(plain_comment_text(trimmed));
-            }
-            continue;
-        }
-        if trimmed.is_empty() {
-            // A blank line does not break an open block; a doc-comment separated
-            // from its binding by blank lines still attaches to it.
-            continue;
-        }
-
-        // A code line: the pending block, if any, attaches to the binding it
-        // opens. A line with no recognised binding drops the block.
-        if let Some(block) = pending.take() {
-            let block = block.trim().to_owned();
-            if let Some(target) = binding_target(trimmed) {
-                match target {
-                    BindingTarget::Module => result.module = block,
-                    BindingTarget::Named(name) => {
-                        result.bindings.entry(name).or_insert(block);
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
-/// The text of a `-- |` doc-comment line (the marker stripped), or `None` when
-/// `line` is not a doc-comment opener.
-fn doc_comment_text(line: &str) -> Option<&str> {
-    line.strip_prefix("-- |")
-        .map(str::trim_start)
-        .or_else(|| line.strip_prefix("--|").map(str::trim_start))
-}
-
-/// Whether `line` is any `--` line comment (doc or plain).
-fn is_plain_comment(line: &str) -> bool {
-    line.starts_with("--")
-}
-
-/// The text of a plain `--` comment line, marker stripped.
-///
-/// Strips the `-- ` prefix (with a single space) so that any indentation
-/// following the space is preserved in the returned text — allowing indented
-/// code examples embedded in doc-comments to carry their leading spaces into
-/// the accumulated block and, from there, into the HTML code-block renderer.
-/// A bare `--` with no following space (a blank continuation line) strips only
-/// the `--`, returning an empty string.
-fn plain_comment_text(line: &str) -> &str {
-    line.strip_prefix("-- ")
-        .or_else(|| line.strip_prefix("--"))
-        .unwrap_or(line)
-}
-
-/// What binding a code line opens, for attaching a preceding doc-comment.
-enum BindingTarget {
-    /// The `module` header.
-    Module,
-    /// A named top-level value or union type.
-    Named(String),
-}
-
-/// Recognise the binding a code line opens: the `module` header, a `type Name`
-/// union, or a top-level `name` value (`name :` signature or `name … =`
-/// definition). Returns `None` for any other line (an `import`, an expression
-/// continuation, a `)` closing an exposing list), so a doc block above such a
-/// line is dropped rather than misattached.
-fn binding_target(line: &str) -> Option<BindingTarget> {
-    let mut words = line.split_whitespace();
-    let first = words.next()?;
-    if first == "module" {
-        return Some(BindingTarget::Module);
-    }
-    if first == "type" {
-        // `type Name …` or `type alias Name …`.
-        let name = match words.next() {
-            Some("alias") => words.next()?,
-            Some(other) => other,
-            None => return None,
-        };
-        return Some(BindingTarget::Named(name.to_owned()));
-    }
-    // A top-level value: an identifier that begins a signature (`name :`) or a
-    // definition (`name arg… =`). A binding name starts with a lowercase letter;
-    // this excludes keywords like `import`, `exposing`, and closing punctuation.
-    let name = first.trim_end_matches(':');
-    if is_value_name(name) {
-        return Some(BindingTarget::Named(name.to_owned()));
-    }
-    None
-}
-
-/// Whether `word` is a lowercase-initial identifier — a top-level value name, as
-/// distinct from a `Type`, a keyword, or punctuation.
-fn is_value_name(word: &str) -> bool {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() => {
-            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
-        }
-        _ => false,
+    let doc = ipe_docs::stdlib_docs::extract_module_doc("", src);
+    DocComments {
+        module: doc.module_doc.unwrap_or_default(),
+        bindings: doc
+            .exports
+            .into_iter()
+            .filter_map(|export| export.doc.map(|text| (export.name, text)))
+            .collect(),
     }
 }
 
@@ -2865,7 +2919,7 @@ fn build_stdlib_only_docs() -> DocsJson {
 /// Verify every exposed binding in the package at `path` carries a doc-comment.
 ///
 /// Writes nothing; exits non-zero (a [`CliError::DocCoverage`] carrying the
-/// report) when any exposed value or union type lacks a `-- |` comment.
+/// report) when any exposed value or union type lacks a doc-comment.
 /// Stdlib modules are exempt — their signatures are the contract, doc-comments
 /// are optional.
 ///
@@ -2916,9 +2970,8 @@ fn check(path: &Path) -> Result<(), CliError> {
     for gap in &gaps {
         let _ = writeln!(report, "  {}.{}", gap.module, gap.name);
     }
-    let _ = write!(
-        report,
-        "add a `-- |` comment above each, or hide it from the module's exposing list"
+    report.push_str(
+        "add a `{-| … -}` doc-comment above each, or hide it from the module's exposing list",
     );
     Err(CliError::DocCoverage(crate::style::TerminalSafe::sanitize(
         &report,
@@ -3195,7 +3248,7 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
     out
 }
 
-/// The `CARGO_TARGET_DIR` an `ipe run` child spawned by the doc-example gate
+/// The `CARGO_TARGET_DIR` an `ipe dev run` child spawned by the doc-example gate
 /// should inherit so its build links against the warm shared dependency target.
 ///
 /// Resolution mirrors the E2E harness's fail-safe: an absolute
@@ -3204,7 +3257,7 @@ fn synthesize_module(body: &str, source_module: &str, module_imports: &[String])
 /// so a bare local run stays hermetic). A non-absolute shared value fails safe
 /// to the ambient value rather than pinning a relative target.
 ///
-/// This translation lives in the doc-gate test path only — production `ipe run`
+/// This translation lives in the doc-gate test path only — production `ipe dev run`
 /// never reads `IPE_ORACLE_SHARED_TARGET`; it honours an inherited
 /// `CARGO_TARGET_DIR`, which is exactly what this sets on the child.
 fn child_shared_target_dir() -> Option<std::ffi::OsString> {
@@ -3228,8 +3281,9 @@ fn child_shared_target_dir() -> Option<std::ffi::OsString> {
 /// Run the compiled example at `snippet_path` and assert its output matches the
 /// `-->` annotated results (one per line, in order).
 ///
-/// Spawns the current binary as `ipe run <snippet_path>` and compares stdout
-/// against the expected output. Returns `Err(description)` on a mismatch or
+/// Runs the current binary as `ipe dev run <snippet_path>`, held to
+/// [`crate::remote_ingest::SELF_RUN_LIMITS`], and compares stdout against the
+/// expected output. Returns `Err(description)` on a mismatch or
 /// subprocess failure; `Ok(())` when the output matches.
 fn run_example_and_check(
     snippet_path: &Path,
@@ -3238,15 +3292,16 @@ fn run_example_and_check(
 ) -> Result<(), String> {
     use std::process::Command;
 
-    // Locate this binary (we re-invoke ourselves as `ipe run`).
+    // Locate this binary (we re-invoke ourselves as `ipe dev run`).
     let ipe_bin = std::env::current_exe()
         .map_err(|e| format!("{label}: could not locate ipe binary: {e}"))?;
 
     let mut cmd = Command::new(&ipe_bin);
-    cmd.arg("run").arg(snippet_path);
-    // Forward the warm shared target into the `ipe run` child's CARGO_TARGET_DIR.
+    cmd.args(crate::verb::Verb::DEV_RUN.argv())
+        .arg(snippet_path);
+    // Forward the warm shared target into the `ipe dev run` child's CARGO_TARGET_DIR.
     // CI's e2e/seal jobs export ONLY IPE_ORACLE_SHARED_TARGET, which production
-    // `ipe run` never reads; without this translation the child cold-builds the
+    // `ipe dev run` never reads; without this translation the child cold-builds the
     // whole runtime tree per example. Absent it (a bare local run) the child
     // inherits the ambient env unchanged.
     if let Some(target) = child_shared_target_dir() {
@@ -3260,13 +3315,18 @@ fn run_example_and_check(
         // ordinary local run keeps the plain `ipe-app` default.
         cmd.env("IPE_EMIT_PACKAGE_NAME", format!("ipe-doc-example-{label}"));
     }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("{label}: ipe run failed to spawn: {e}"))?;
+    let out = crate::remote_ingest::run_local(
+        cmd,
+        crate::remote_ingest::SELF_RUN_LIMITS,
+        crate::remote_ingest::LocalSource::SelfRun,
+    )
+    .map_err(|e| format!("{label}: ipe dev run failed: {e}"))?;
 
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("{label}: ipe run exited non-zero\n       {stderr}"));
+        let stderr = out.stderr.to_terminal();
+        return Err(format!(
+            "{label}: ipe dev run exited non-zero\n       {stderr}"
+        ));
     }
 
     let actual = String::from_utf8_lossy(&out.stdout);
@@ -5165,8 +5225,11 @@ fn serve(path: &Path, port: Option<u16>) -> Result<(), CliError> {
     // A headless caller (CI, a test, a remote shell) opts out of the browser pop
     // with `IPE_DOC_NO_OPEN`; the URL is already printed, so the preview stays
     // reachable.
-    if ipe_env::var_os("IPE_DOC_NO_OPEN").is_none() {
-        open_in_browser(&url);
+    if ipe_env::var_os("IPE_DOC_NO_OPEN").is_none()
+        && let Ok(url) =
+            crate::browser::BrowserUrl::parse(&url, crate::browser::BrowserOrigin::Loopback)
+    {
+        let _ = crate::browser::open_url(&url);
     }
 
     // A single dropped connection must not take the server down; `flatten` skips
@@ -5273,22 +5336,364 @@ fn http_response(status: &str, content_type: &str, body: &str) -> String {
     )
 }
 
-/// Best-effort open of `url` in the default browser. A failure is silent — the
-/// URL is already printed, so the preview is reachable regardless.
-fn open_in_browser(url: &str) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(opener).arg(url).spawn();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refusal_text(rest: &[&str]) -> String {
+        let parsed = parse_doc(&s(rest));
+        assert!(
+            matches!(parsed, Err(CliError::Usage(_))),
+            "{rest:?} must be a usage refusal, got {parsed:?}"
+        );
+        parsed.err().map(|err| err.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_blank_term_is_refused_not_read_as_a_path() {
+        let empty = query_refused(QueryRefusal::Empty).to_string();
+        for blank in ["", " ", "\u{a0}\u{a0}"] {
+            assert_eq!(refusal_text(&[blank]), empty, "{blank:?}");
+            assert_eq!(refusal_text(&[blank, "--json"]), empty, "{blank:?}");
+        }
+        assert_eq!(refusal_text(&["topic:"]), empty, "an empty key part");
+        assert_eq!(refusal_text(&["topic:   "]), empty, "a blank key part");
+    }
+
+    #[test]
+    fn a_hazardous_or_over_long_term_is_refused_by_its_kind() {
+        let control = query_refused(QueryRefusal::ControlChar).to_string();
+        for raw in [
+            "map\u{1b}[2J",
+            "Ipe.List.map\u{7}",
+            "topic:x\u{202e}",
+            "map\tx",
+        ] {
+            assert_eq!(refusal_text(&[raw]), control, "{raw:?}");
+        }
+        let too_long = query_refused(QueryRefusal::TooLong).to_string();
+        let over = "a".repeat(MAX_QUERY_CHARS.saturating_add(1));
+        assert_eq!(refusal_text(&[over.as_str()]), too_long);
+        let longest = "a".repeat(MAX_QUERY_CHARS);
+        assert!(matches!(
+            parse_doc(&s(&[longest.as_str()])),
+            Ok(DocMode::Lookup { .. })
+        ));
+    }
+
+    fn doc_query(raw: &str) -> DocQuery {
+        let parsed = DocQuery::parse(raw);
+        assert!(parsed.is_ok(), "{raw:?} must parse: {parsed:?}");
+        parsed.unwrap_or_else(|_| doc_query("x"))
+    }
+
+    fn bare(raw: &str, format: OutputFormat) -> DocMode {
+        DocMode::Lookup {
+            key: LookupTerm::Bare(doc_query(raw)),
+            format,
+        }
+    }
+
+    fn qualified(term: &str, key: &str, format: OutputFormat) -> DocMode {
+        DocMode::Lookup {
+            key: LookupTerm::Qualified {
+                term: doc_query(term),
+                key: doc_query(key),
+            },
+            format,
+        }
+    }
+
+    #[test]
+    fn a_term_is_trimmed_before_lookup() {
+        assert_eq!(
+            parse_doc(&s(&["  select "])).ok(),
+            Some(bare("select", OutputFormat::Human))
+        );
+    }
+
+    /// A term routes on its trimmed text, so edge whitespace never turns a
+    /// module, a code, a symbol, or a `kind:key` term into a project path.
+    #[test]
+    fn edge_whitespace_never_changes_the_route() {
+        let module = |name: &str| DocMode::Query {
+            module: doc_query(name),
+            format: OutputFormat::Human,
+        };
+        let cases = [
+            ("Ipe.List ", module("Ipe.List")),
+            (" Ipe.List", module("Ipe.List")),
+            ("\u{a0}Ipe.List\u{a0}", module("Ipe.List")),
+            (" topic:x", qualified("topic:x", "x", OutputFormat::Human)),
+            ("topic:x ", qualified("topic:x", "x", OutputFormat::Human)),
+            (" IPE-E0001", bare("IPE-E0001", OutputFormat::Human)),
+            ("Ipe.List.map ", bare("Ipe.List.map", OutputFormat::Human)),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(parse_doc(&s(&[raw])).ok(), Some(want), "{raw:?}");
+        }
+        for path in [" d:\\pkg", "src/x ", " nokind:x", "Foo/bar "] {
+            assert!(
+                matches!(parse_doc(&s(&[path])), Ok(DocMode::Generate { .. })),
+                "{path:?} stays a project path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_term_is_a_lookup_whatever_its_key_holds() {
+        for (term, key) in [
+            ("topic:pipelines", "pipelines"),
+            ("symbol:Ipe.Basics.//", "Ipe.Basics.//"),
+            ("cli:build", "build"),
+        ] {
+            assert_eq!(
+                parse_doc(&s(&[term, "--plain"])).ok(),
+                Some(qualified(term, key, OutputFormat::Plain)),
+                "{term:?}"
+            );
+        }
+        for flags in [["--out", "site"], ["--write-format", "json"]] {
+            let mut rest = vec!["topic:x"];
+            rest.extend(flags);
+            assert!(
+                matches!(parse_doc(&s(&rest)), Ok(DocMode::Generate { .. })),
+                "{flags:?} keeps the positional a project path"
+            );
+        }
+        for path in ["d:\\pkg", "D:\\pkg", "src/x", "nokind:x"] {
+            assert!(
+                matches!(parse_doc(&s(&[path])), Ok(DocMode::Generate { .. })),
+                "{path:?} stays a project path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rerun_term_is_bare_only_where_the_bare_router_finds_the_entry() {
+        let entry = |kind, key: &str| DocEntry {
+            kind,
+            key: key.to_owned(),
+            title: key.to_owned(),
+            body: String::new(),
+            order: None,
+        };
+        let modules = [
+            "Ipe.List".to_owned(),
+            "Ipe.Http.Json".to_owned(),
+            "Ipe.Json".to_owned(),
+        ];
+        let cases = [
+            (entry(DocKind::Module, "Ipe.List"), "Ipe.List"),
+            (entry(DocKind::Module, "Ipe.Json"), "Ipe.Json"),
+            (entry(DocKind::Module, "Ipe.Http.Json"), "Ipe.Http.Json"),
+            (entry(DocKind::Symbol, "Ipe.List.map"), "Ipe.List.map"),
+            (
+                entry(DocKind::Symbol, "Ipe.Maybe.Maybe"),
+                "symbol:Ipe.Maybe.Maybe",
+            ),
+            (
+                entry(DocKind::Symbol, "Ipe.Basics.//"),
+                "symbol:Ipe.Basics.//",
+            ),
+            (entry(DocKind::Topic, "pipelines"), "topic:pipelines"),
+            (
+                entry(DocKind::Diagnostic, "IPE-E0001"),
+                "diagnostic:IPE-E0001",
+            ),
+            (entry(DocKind::Cli, "build"), "cli:build"),
+        ];
+        for (e, want) in &cases {
+            assert_eq!(rerun_term(e, &modules), *want, "{}", e.key);
+        }
+        // A module outside every reserved namespace could be a project
+        // module's name too, so it is listed by kind even when it resolves.
+        let open = ["List".to_owned()];
+        assert_eq!(
+            rerun_term(&entry(DocKind::Module, "List"), &open),
+            "module:List"
+        );
+    }
+
+    /// Every entry of the real bundle, listed as its rerun term, parses back
+    /// to a lookup that opens that same entry — the machine re-run contract.
+    #[test]
+    fn every_listed_term_opens_its_entry_when_passed_back() {
+        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let index = build_index().expect("the doc index builds");
+        let modules = stdlib_module_names();
+        let mut checked = 0_usize;
+        let mut listed = std::collections::BTreeSet::new();
+        for entry in bundle.all_entries() {
+            let term = rerun_term(entry, &modules);
+            assert!(
+                listed.insert(term.clone()),
+                "{term:?} is listed for two entries; a term opens exactly one"
+            );
+            let parsed = parse_doc(&s(&[term.as_str(), "--json"]));
+            assert!(parsed.is_ok(), "{term:?} parsed to {parsed:?}");
+            let Ok(mode) = parsed else {
+                return;
+            };
+            match mode {
+                DocMode::Lookup {
+                    key: LookupTerm::Qualified { term: got, .. },
+                    ..
+                } => {
+                    assert_eq!(got.text(), term, "a listed term carries no edge whitespace");
+                    let resolved = bundle.resolve_qualified(got.text()).ok();
+                    assert_eq!(resolved, Some(entry), "{term:?}");
+                }
+                DocMode::Lookup {
+                    key: LookupTerm::Bare(got),
+                    ..
+                } => {
+                    assert_eq!(got.text(), term, "a listed term carries no edge whitespace");
+                    assert_eq!(entry.kind, DocKind::Symbol, "{term:?}");
+                    let resolved = index.resolve(got.text());
+                    assert!(
+                        resolved.is_some_and(|e| matches!(e.kind, ipe_docs::EntryKind::Symbol)),
+                        "{term:?} must open the symbol through the index"
+                    );
+                    assert_eq!(
+                        resolved.map(|e| e.source_key.as_str()),
+                        Some(entry.key.as_str()),
+                        "{term:?} must open the very entry it was listed for"
+                    );
+                }
+                DocMode::Query { module, .. } => {
+                    assert_eq!(
+                        module.text(),
+                        term,
+                        "a listed term carries no edge whitespace"
+                    );
+                    assert_eq!(entry.kind, DocKind::Module, "{term:?}");
+                    assert!(
+                        in_reserved_namespace(module.text()),
+                        "{term:?} is bare only where no project module can shadow it"
+                    );
+                    assert!(
+                        matches!(
+                            resolve_stdlib_candidate(module.text(), &modules),
+                            StdlibCandidate::One(only) if only == entry.key
+                        ),
+                        "{term:?} must name exactly its module"
+                    );
+                }
+                other => assert!(
+                    matches!(other, DocMode::Lookup { .. }),
+                    "{term:?} parsed to {other:?}, not a lookup"
+                ),
+            }
+            checked = checked.saturating_add(1);
+        }
+        assert!(checked > 0, "the bundle holds entries to walk");
+        assert_eq!(
+            checked,
+            bundle.all_entries().count(),
+            "every entry is walked; none skipped"
+        );
+    }
+
+    /// Every spelling the index files a stdlib symbol under opens, as
+    /// `symbol:<spelling>`, the one bundle entry keyed by the index's canonical
+    /// `source_key`, never a second entry for the same symbol.
+    #[test]
+    fn every_symbol_spelling_opens_its_one_canonical_entry() {
+        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let index = build_index().expect("the doc index builds");
+        let mut spellings = 0_usize;
+        for key in index.keys() {
+            let Some(found) = index.resolve(key) else {
+                continue;
+            };
+            if !matches!(found.kind, ipe_docs::EntryKind::Symbol) {
+                continue;
+            }
+            let opened = bundle.resolve_qualified(&format!("symbol:{key}")).ok();
+            assert_eq!(
+                opened.map(|e| e.key.as_str()),
+                Some(found.source_key.as_str()),
+                "`symbol:{key}` opens the canonical entry"
+            );
+            spellings = spellings.saturating_add(1);
+        }
+        let entries = bundle.entries_for_kind(DocKind::Symbol).count();
+        assert!(entries > 0, "the bundle holds symbols");
+        assert!(
+            spellings > entries,
+            "aliases fold into fewer entries: {spellings} spellings, {entries} entries"
+        );
+        assert!(
+            bundle
+                .entries_for_kind(DocKind::Symbol)
+                .all(|e| index.resolve(&e.key).is_some_and(|i| i.source_key == e.key)),
+            "every symbol entry is keyed by its own canonical key"
+        );
+    }
+
+    #[test]
+    fn a_miss_lists_only_rerun_terms_under_every_format() {
+        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let query = DocQuery::parse("pipelin").expect("a valid query");
+        let ranked = crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query);
+        let err = miss_error("pipelin", &ranked, OutputFormat::Human);
+        assert!(
+            matches!(err, CliError::DocNotFound { .. }),
+            "a human miss stays the typed error: {err:?}"
+        );
+        let CliError::DocNotFound { miss } = err else {
+            return;
+        };
+        assert!(!miss.hits.is_empty());
+        let modules = stdlib_module_names();
+        for (hit, entry) in miss.hits.iter().zip(&ranked.entries) {
+            assert_eq!(hit.term.as_str(), rerun_term(entry, &modules));
+        }
+        assert!(matches!(
+            miss_error("pipelin", &ranked, OutputFormat::Plain),
+            CliError::DiagnosticJsonEmitted
+        ));
+    }
+
+    /// A typo in a member or a qualifier ranks the intended stdlib symbol among
+    /// the closest entries of the real bundle, ahead of any entry that only
+    /// holds the query's characters scattered in order.
+    #[test]
+    fn a_member_or_qualifier_typo_ranks_the_intended_symbol() {
+        let bundle = build_doc_bundle(&locate_docs_root()).expect("the doc bundle builds");
+        let ranked = |raw: &str| {
+            let query = DocQuery::parse(raw).expect("a valid query");
+            crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query)
+        };
+        let keys =
+            |r: &Ranked<'_>| -> Vec<String> { r.entries.iter().map(|e| e.key.clone()).collect() };
+
+        for raw in ["List.mapp", "Ipe.Lsit.map"] {
+            let r = ranked(raw);
+            assert_eq!(r.closeness, crate::doc_search::Closeness::Match, "{raw:?}");
+            assert_eq!(
+                keys(&r).first().map(String::as_str),
+                Some("Ipe.List.map"),
+                "{raw:?} ranks `Ipe.List.map` first: {:?}",
+                keys(&r)
+            );
+        }
+
+        let r = ranked("mapp");
+        assert!(
+            keys(&r).iter().any(|k| k == "Ipe.List.map"),
+            "a member typo lists `Ipe.List.map`: {:?}",
+            keys(&r)
+        );
+
+        let r = ranked("lsit");
+        let listed = keys(&r);
+        assert!(
+            listed.iter().take(2).any(|k| k == "Ipe.List"),
+            "a transposed module name lists `Ipe.List` among the first two: {listed:?}"
+        );
+    }
 
     /// A search entry holding `</script>`, `<!--`, `&` or U+2028 reaches the
     /// embedded index escaped, and the index still decodes to the entry.
@@ -5510,7 +5915,7 @@ mod tests {
         assert_eq!(
             m,
             DocMode::Query {
-                module: "Ipe.List".to_owned(),
+                module: doc_query("Ipe.List"),
                 format: OutputFormat::Human,
             }
         );
@@ -5522,7 +5927,7 @@ mod tests {
         assert_eq!(
             m,
             DocMode::Query {
-                module: "Ipe.String".to_owned(),
+                module: doc_query("Ipe.String"),
                 format: OutputFormat::Plain,
             }
         );
@@ -5534,7 +5939,7 @@ mod tests {
         assert_eq!(
             m,
             DocMode::Query {
-                module: "Ipe.Http".to_owned(),
+                module: doc_query("Ipe.Http"),
                 format: OutputFormat::Json,
             }
         );
@@ -5547,7 +5952,7 @@ mod tests {
         assert_eq!(
             m,
             DocMode::Query {
-                module: "Ipe.List".to_owned(),
+                module: doc_query("Ipe.List"),
                 format: OutputFormat::Human,
             }
         );
@@ -5728,6 +6133,52 @@ mod tests {
     #[test]
     fn rejects_second_positional() {
         assert!(parse_doc(&s(&["a", "b"])).is_err());
+    }
+
+    /// Every value a compiled-source stdlib module exposes reaches the `ipe doc`
+    /// surface with its checker signature and the doc-comment the shared
+    /// extractor reads — a kernel alias included, and either comment form.
+    #[test]
+    fn compiled_stdlib_values_carry_signature_and_shared_comment() {
+        let mut gaps = Vec::new();
+        for module in ipe_stdlib::COMPILED_STD_MODULES {
+            let segments: Vec<String> = module.dotted.split('.').map(str::to_owned).collect();
+            let doc = build_compiled_std_module_doc(&segments, module.source);
+            let shared = ipe_docs::stdlib_docs::extract_module_doc(module.dotted, module.source);
+            for export in &shared.exports {
+                if !export.name.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    continue;
+                }
+                let Some(value) = doc.values.iter().find(|v| v.name == export.name) else {
+                    gaps.push(format!("{}.{}: missing", module.dotted, export.name));
+                    continue;
+                };
+                if value.signature.is_empty() {
+                    gaps.push(format!("{}.{}: no signature", module.dotted, export.name));
+                }
+                if value.comment != export.doc.as_deref().unwrap_or_default() {
+                    gaps.push(format!(
+                        "{}.{}: comment differs",
+                        module.dotted, export.name
+                    ));
+                }
+            }
+        }
+        assert!(
+            gaps.is_empty(),
+            "stdlib values off the doc surface:\n{}",
+            gaps.join("\n")
+        );
+    }
+
+    #[test]
+    fn scans_block_doc_comments() {
+        let src = "module M exposing (foo)\n\n{-| The foo value.\n\n```ipe\nfoo --> 1\n```\n-}\nfoo : Int\nfoo = 1\n";
+        let comments = scan_doc_comments(src);
+        assert_eq!(
+            comments.get("foo").as_deref(),
+            Some("The foo value.\n\n```ipe\nfoo --> 1\n```")
+        );
     }
 
     #[test]
@@ -6264,8 +6715,9 @@ mod tests {
     /// terminal help omits.
     #[test]
     fn html_command_page_mirrors_command_help_ssot() {
-        let command = "build";
-        let markdown = crate::help::command_doc_markdown(command).expect("build has help");
+        let verb = crate::verb::Verb::DEV_BUILD;
+        let command = verb.help_key();
+        let markdown = crate::help::command_doc_markdown(command).expect("dev build has help");
         let entry = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Cli,
             key: command.to_owned(),
@@ -6276,10 +6728,12 @@ mod tests {
         let html = render_entry_page(crate::doc_bundle::DocKind::Cli, &entry, "");
 
         // Every option flag and its description from the SSOT appears on the page.
+        let mut seen = false;
         for spec in crate::help::all_command_specs() {
-            if spec.name != command {
+            if spec.name != verb.name() {
                 continue;
             }
+            seen = true;
             for opt in &spec.options {
                 assert!(
                     html.contains(&html::escape(opt.flag)),
@@ -6288,8 +6742,9 @@ mod tests {
                 );
             }
         }
+        assert!(seen, "no command spec is named {verb}");
         // The synopsis and the Arguments/Options headings are present.
-        assert!(html.contains("ipe build"), "synopsis present: {html}");
+        assert!(html.contains("ipe dev build"), "synopsis present: {html}");
         assert!(html.contains("Arguments"), "arguments section present");
         assert!(html.contains("Options"), "options section present");
         // No raw Markdown leaks through the renderer.
@@ -7260,12 +7715,14 @@ withBaseMs = something
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
 
-        let handle = std::thread::spawn(move || {
-            let mut site: BTreeMap<String, String> = BTreeMap::new();
-            site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
-            let (mut conn, _) = listener.accept().expect("accept");
-            serve_one(&mut conn, &site);
-        });
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                let mut site: BTreeMap<String, String> = BTreeMap::new();
+                site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
+                let (mut conn, _) = listener.accept().expect("accept");
+                serve_one(&mut conn, &site);
+            })
+            .expect("spawn test thread");
 
         let mut client = TcpStream::connect(addr).expect("connect");
         client
@@ -7292,13 +7749,15 @@ withBaseMs = something
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
 
-        let handle = std::thread::spawn(move || {
-            let site: BTreeMap<String, String> = BTreeMap::new();
-            let (mut conn, _) = listener.accept().expect("accept");
-            let started = Instant::now();
-            serve_one(&mut conn, &site);
-            started.elapsed()
-        });
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                let site: BTreeMap<String, String> = BTreeMap::new();
+                let (mut conn, _) = listener.accept().expect("accept");
+                let started = Instant::now();
+                serve_one(&mut conn, &site);
+                started.elapsed()
+            })
+            .expect("spawn test thread");
 
         let mut client = TcpStream::connect(addr).expect("connect");
         // Send well past the request-line cap with no newline. Ignore write
@@ -7333,12 +7792,14 @@ withBaseMs = something
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
 
-        let handle = std::thread::spawn(move || {
-            let mut site: BTreeMap<String, String> = BTreeMap::new();
-            site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
-            let (mut conn, _) = listener.accept().expect("accept");
-            serve_one(&mut conn, &site);
-        });
+        let handle = std::thread::Builder::new()
+            .spawn(move || {
+                let mut site: BTreeMap<String, String> = BTreeMap::new();
+                site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
+                let (mut conn, _) = listener.accept().expect("accept");
+                serve_one(&mut conn, &site);
+            })
+            .expect("spawn test thread");
 
         let mut client = TcpStream::connect(addr).expect("connect");
         // Exactly the cap in bytes, no newline: the server's capped read consumes
@@ -7378,7 +7839,7 @@ withBaseMs = something
         let bundle = build_doc_bundle(&docs_root).expect("bundle");
         let site = render_site_for_serve(&docs, &bundle);
 
-        for name in crate::help::command_names() {
+        for name in crate::help::documented_command_keys() {
             let Some(md) = crate::help::command_doc_markdown(name) else {
                 continue;
             };

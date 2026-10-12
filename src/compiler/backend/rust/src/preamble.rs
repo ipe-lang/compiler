@@ -2,8 +2,8 @@
 //!
 //! The Ipê → Rust codegen wraps the user's emitted types and functions in a
 //! fixed prologue (header, imports, basic type aliases, runtime re-exports) and
-//! a fixed epilogue (list helpers, FFI-placeholder banner, entry point). Those
-//! two fixed regions are produced here.
+//! a fixed epilogue (list helpers, entry point). Those two fixed regions are
+//! produced here.
 //!
 //! The byte source of truth is the hand-maintained template at
 //! `templates/main.rs` — a canonical whole-program rendering that owns the fixed
@@ -92,8 +92,8 @@ pub fn preamble(keep_json: bool) -> DResult<String> {
 
 /// The fixed epilogue emitted after the user's function definitions.
 ///
-/// Spans the list helpers, the FFI-placeholder banner, and the entry point
-/// (`fn main`) — the tail of the golden program. `Ffi.kernel` calls are routed
+/// Spans the list helpers and the entry point (`fn main`) — the tail of the
+/// golden program. `Ffi.kernel` calls are routed
 /// directly by codegen, so no runtime polyfill is emitted; a construction path
 /// that could not be routed is rejected at ipe-time, never left to a runtime
 /// panic in emitted pure-Ipê Rust.
@@ -177,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn epilogue_ends_the_process_only_through_the_runtime_exit_funnel() -> DResult<()> {
+        // Both `fn main` outcomes reach `exit_process`, which runs the exit hook
+        // and the exporter flush; a raw `std::process::exit` skips both.
+        let tail = epilogue()?;
+        assert!(
+            !tail.contains("process::exit"),
+            "the epilogue ends the process outside the runtime funnel: {tail}"
+        );
+        assert!(tail.contains("IpeResult::Ok(_) => ipe_runtime::system::exit_process(0)"));
+        assert!(tail.contains("ipe_runtime::system::exit_process(1)"));
+        Ok(())
+    }
+
+    #[test]
     fn preamble_is_a_prefix_of_golden() -> DResult<()> {
         assert!(GOLDEN.starts_with(&preamble(true)?));
         Ok(())
@@ -194,6 +208,35 @@ mod tests {
             preamble(true)?
                 .ends_with("// USER TYPES\n// ===========================================\n\n")
         );
+        Ok(())
+    }
+
+    /// The emitted `main` runs the runtime's startup checks before the entry.
+    ///
+    /// `install_panic_classifier` refuses a malformed `IPE_RECURSION_LIMIT` (and
+    /// `IPE_LOG_LEVEL`) before the program's first line, so it must precede the
+    /// entry under both the `block_on` form and the `run_blocking` form a shaped
+    /// application substitutes at the same site.
+    #[test]
+    fn epilogue_installs_classifier_before_entry() -> DResult<()> {
+        const INSTALL: &str = "install_panic_classifier();";
+        let tail = epilogue()?;
+        let shaped = tail.replace("block_on(ipe_main())", "ipe_main().run_blocking()");
+        for (text, entry) in [(&tail, "block_on("), (&shaped, "run_blocking(")] {
+            let install = text.find(INSTALL);
+            let call = text.find(entry);
+            assert!(
+                install.is_some() && call.is_some(),
+                "the epilogue carries `{INSTALL}` and `{entry}`: {text}"
+            );
+            let (Some(install), Some(call)) = (install, call) else {
+                return Ok(());
+            };
+            assert!(
+                install < call,
+                "`{INSTALL}` must run before `{entry}`: {text}"
+            );
+        }
         Ok(())
     }
 

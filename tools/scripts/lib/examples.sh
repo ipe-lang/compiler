@@ -195,7 +195,7 @@ is_wasm_example() {
 # per-commit sweep does not run that install (it compiles third-party SDKs with
 # build scripts — heavy, network, RCE-sandbox territory), so without a
 # pre-populated cache the `import Rust.<Crate>` modules are absent and `ipe
-# build` fails IPE-N0020. That is an install prerequisite, not a compiler defect:
+# dev build` fails IPE-N0020. That is an install prerequisite, not a compiler defect:
 # such an example is SKIPPED (not RED) unless its bindings cache already exists.
 needs_ffi_install() {
   local d="$1" m; m="$(example_manifest "$d")"

@@ -95,6 +95,32 @@ fn type_error_is_attributed_to_the_entry_module() {
     assert!(lsp.message.contains("type mismatch"), "{}", lsp.message);
 }
 
+/// A dependency whose field access disagrees with its annotation: the failing
+/// `rec.present` sits at a byte offset `Main`'s longer body also covers.
+const DEP_FIELD_MISMATCH: &str = "module Dep exposing (bad)\n\nbad : Int\nbad =\n    let\n        pad0 = 0\n        pad1 = 0\n        pad2 = 0\n        pad3 = 0\n        pad4 = 0\n        pad5 = 0\n        rec = { present = \"a\" }\n    in\n    rec.present\n";
+const ENTRY_OVER_DEP: &str = "module Main exposing (main)\n\nimport Dep exposing (bad)\n\nmain : Int\nmain =\n    bad + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0\n";
+
+/// A field-type mismatch is attributed to the module owning the access, never
+/// to the module whose def happens to enclose the same byte offsets.
+#[test]
+fn field_mismatch_attributes_to_owning_module() {
+    let db = IpeDatabase::new();
+    let dep = file(&db, &["Dep"], DEP_FIELD_MISMATCH);
+    let entry = file(&db, &["Main"], ENTRY_OVER_DEP);
+    let root = root_of(&db, &[(&["Dep"], dep), (&["Main"], entry)]);
+
+    let all = collect(&db, root, entry);
+    let dep_diags = &diags_for(&all, &["Dep"]).diagnostics;
+    assert!(
+        dep_diags.iter().any(|d| d.code().as_str() == "IPE-T0001"),
+        "the T0001 must be attributed to Dep, got {all:?}"
+    );
+    assert!(
+        diags_for(&all, &["Main"]).diagnostics.is_empty(),
+        "Main must not carry Dep's mismatch, got {all:?}"
+    );
+}
+
 #[test]
 fn dep_parse_error_is_blamed_on_the_dep_not_the_importer() {
     let db = IpeDatabase::new();
@@ -315,6 +341,58 @@ fn add_import_quick_fix_sorts_among_existing_imports() {
         diags_for(&all, &["Main"]).diagnostics.is_empty(),
         "sorted insert compiles, got {:?}",
         diags_for(&all, &["Main"]).diagnostics
+    );
+}
+
+/// A module already imported under an alias gets no "Add import" action: the
+/// diagnostic names the alias to write instead.
+#[test]
+fn aliased_import_offers_no_add_import_action() {
+    let src = "module Main exposing (main)\n\n\
+        import Ipe.Crypto as C\n\
+        import Ipe.System as System\n\n\
+        main = System.setenv \"KEY\" (Crypto.sha256 \"hello\")\n";
+    let db = IpeDatabase::new();
+    let entry = file(&db, &["Main"], src);
+    let root = root_of(&db, &[(&["Main"], entry)]);
+    let all = collect(&db, root, entry);
+    let diag = diags_for(&all, &["Main"])
+        .diagnostics
+        .iter()
+        .find(|d| d.code().as_str() == "IPE-N0034")
+        .expect("an IPE-N0034 diagnostic");
+    let lsp_diag = to_lsp(diag, src, PositionEncoding::Utf16);
+    assert!(
+        lsp_diag.data.is_none(),
+        "no import candidates: {lsp_diag:?}"
+    );
+    let uri = Url::from_file_path("/fake/Main.ipe").expect("uri");
+    let range = Range {
+        start: lsp_diag.range.start,
+        end: lsp_diag.range.end,
+    };
+    let actions = code_actions(
+        DbView {
+            db: &db,
+            root,
+            entry,
+        },
+        &["Main".to_owned()],
+        Document {
+            uri: &uri,
+            text: src,
+            version: None,
+        },
+        range,
+        std::slice::from_ref(&lsp_diag),
+        PositionEncoding::Utf16,
+    );
+    assert!(
+        actions.iter().all(|a| match a {
+            CodeActionOrCommand::CodeAction(action) => !action.title.starts_with("Add import"),
+            CodeActionOrCommand::Command(_) => true,
+        }),
+        "no Add import action: {actions:?}"
     );
 }
 

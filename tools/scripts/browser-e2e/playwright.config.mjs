@@ -1,6 +1,9 @@
 /**
- * Playwright configuration for the browser E2E suite (geo-clipboard and
- * layout-fill).
+ * Playwright configuration for the browser E2E suite (geo-clipboard,
+ * layout-fill, the stale-event, boot-data and form-controls refusals and the
+ * select-hold and live-property specs on the geo-clipboard app, and the
+ * focus-across-patch refusals on their own app, and the host-rebind refusal
+ * on the layout-fill app).
  *
  * A single Chromium project — the only browser target for these tests.
  * The geo/clipboard browser APIs (navigator.geolocation,
@@ -13,7 +16,17 @@
 
 /** @type {import('@playwright/test').PlaywrightTestConfig} */
 export default {
-  testMatch: ["geo-clipboard.spec.mjs", "layout-fill.spec.mjs"],
+  testMatch: [
+    "geo-clipboard.spec.mjs",
+    "layout-fill.spec.mjs",
+    "stale-event.spec.mjs",
+    "boot-data.spec.mjs",
+    "select-hold.spec.mjs",
+    "live-property.spec.mjs",
+    "form-controls.spec.mjs",
+    "focus-across-patch.spec.mjs",
+    "host-rebind.spec.mjs",
+  ],
   timeout: 30_000,
   retries: 0,
   reporter: "list",

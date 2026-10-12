@@ -9,45 +9,6 @@ use ipe_types::Ty;
 
 use super::ty_contains_var;
 
-/// The security-tier and SEAL-critical opaque builtin names whose lowerer arm
-/// sits ABOVE the `enum_variants` guard AND whose reservation in
-/// `ipe_canon::RESERVED_BUILTIN_TYPES` is the structural guarantee preventing
-/// a user `type <Name>` from being silently mis-lowered.
-///
-/// Invariant (tested by `reserved_opaque_names_above_guard_are_reserved_in_canon`):
-/// every name here MUST be present in `ipe_canon::RESERVED_BUILTIN_TYPES`.
-/// When adding a new opaque builtin with an above-guard fixed-IrType arm,
-/// add its name to BOTH `RESERVED_BUILTIN_TYPES` (resolve.rs) AND this list —
-/// the test then prevents future drift between the two.
-///
-/// Names with above-guard arms that are intentionally NOT reserved (e.g.
-/// `Order`, `Decimal`, `ErrorKind` — whose arms are user-shadowable via the
-/// program-enum path) are deliberately excluded; fixing those is a separate
-/// concern from the four issues this change addresses.
-#[cfg(test)]
-pub const OPAQUE_NAMES_ABOVE_GUARD: &[&str] = &[
-    // Security-tier sealed handles added to RESERVED_BUILTIN_TYPES by
-    // canon-1 / canon-2 fixes (issues #1047 and #1048).
-    "SqlFragment",
-    "Secret",
-    "Algorithm",
-    "Path",
-    "Regex",
-    "Url",
-    "Dsn",
-    "Key",
-    "Mac",
-    "EmailAddress",
-    "Locale",
-    "Connection",
-    "ReadOnly",
-    "ReadWrite",
-    "Topic",
-    "StreamId",
-    "ChunkEvent",
-    "HttpMethod",
-];
-
 /// The expected TYPE shape of one field of the canonical `HttpRequest`
 /// record — `String` / `Bool` / `Int` / `List (String, String)` (the
 /// header-pair list). Ground truth mirrors

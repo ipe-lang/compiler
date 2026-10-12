@@ -54,7 +54,7 @@ fn assert_ipec_accepts(name: &str) -> PathBuf {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {name} (contract converged to reference): {:?}",
+        "ipe dev build must succeed for {name} (contract converged to reference): {:?}",
         built.err()
     );
     out
@@ -73,7 +73,7 @@ fn e2e_build_and_run(name: &str, expect_stdout_contains: &str) {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {name}: {:?}",
+        "ipe dev build must succeed for {name}: {:?}",
         built.err()
     );
 

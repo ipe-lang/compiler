@@ -18,7 +18,9 @@
 //! exactly as it does a compiled literal. There is no code path, including
 //! deserialization, by which a `UiTemplate` yields a handler or unescaped HTML.
 
-use super::element::{Attribute, Description, Element, HAlign, Length, PseudoClass, VAlign};
+use super::element::{
+    Attribute, Description, Element, HAlign, HeadingLevel, Length, PseudoClass, VAlign, WhiteSpace,
+};
 use crate::color::Color;
 use crate::html::{Attribute as HtmlAttribute, Event};
 
@@ -221,6 +223,13 @@ pub enum UiDescription {
     DescLiveAssertive,
     DescButton,
     DescParagraph,
+    DescSection,
+    DescSectionHeading,
+    DescCodeBlock,
+    DescCode,
+    DescKbd,
+    DescTextColumn,
+    DescForm,
 }
 
 impl UiDescription {
@@ -231,12 +240,19 @@ impl UiDescription {
             Description::DescNavigation => Self::DescNavigation,
             Description::DescContentInfo => Self::DescContentInfo,
             Description::DescComplementary => Self::DescComplementary,
-            Description::DescHeading(n) => Self::DescHeading(*n),
+            Description::DescHeading(l) => Self::DescHeading(l.get()),
             Description::DescLabel(s) => Self::DescLabel(s.clone()),
             Description::DescLivePolite => Self::DescLivePolite,
             Description::DescLiveAssertive => Self::DescLiveAssertive,
             Description::DescButton => Self::DescButton,
             Description::DescParagraph => Self::DescParagraph,
+            Description::DescSection => Self::DescSection,
+            Description::DescSectionHeading => Self::DescSectionHeading,
+            Description::DescCodeBlock => Self::DescCodeBlock,
+            Description::DescCode => Self::DescCode,
+            Description::DescKbd => Self::DescKbd,
+            Description::DescTextColumn => Self::DescTextColumn,
+            Description::DescForm => Self::DescForm,
         }
     }
 
@@ -247,12 +263,19 @@ impl UiDescription {
             Self::DescNavigation => Description::DescNavigation,
             Self::DescContentInfo => Description::DescContentInfo,
             Self::DescComplementary => Description::DescComplementary,
-            Self::DescHeading(n) => Description::DescHeading(*n),
+            Self::DescHeading(n) => Description::DescHeading(HeadingLevel::from_requested(*n)),
             Self::DescLabel(s) => Description::DescLabel(s.clone()),
             Self::DescLivePolite => Description::DescLivePolite,
             Self::DescLiveAssertive => Description::DescLiveAssertive,
             Self::DescButton => Description::DescButton,
             Self::DescParagraph => Description::DescParagraph,
+            Self::DescSection => Description::DescSection,
+            Self::DescSectionHeading => Description::DescSectionHeading,
+            Self::DescCodeBlock => Description::DescCodeBlock,
+            Self::DescCode => Description::DescCode,
+            Self::DescKbd => Description::DescKbd,
+            Self::DescTextColumn => Description::DescTextColumn,
+            Self::DescForm => Description::DescForm,
         }
     }
 }
@@ -307,6 +330,7 @@ pub enum UiTemplateAttr {
     Transition(String, bool),
     GridTracks(String, String),
     Animation(String, String, String, bool),
+    FontWhiteSpace(WhiteSpace),
     /// A model-dependent event handler reduced to an opaque HOLE (issue #1668):
     /// only the DOM event name and a compile-time-stable hole id, NEVER the
     /// `Msg` or a closure. The concrete `Msg` is resolved per render from a
@@ -396,12 +420,15 @@ impl UiTemplateAttr {
             Attribute::AttrAnimation(n, tail, body, respect) => {
                 Self::Animation(n.clone(), tail.clone(), body.clone(), *respect)
             }
+            Attribute::AttrFontWhiteSpace(ws) => Self::FontWhiteSpace(*ws),
             // Logic (a handler), a nested sub-view overlay, or the debug-only
             // outline toggle — not inert static attribute data. Refuse: keep the
             // subtree compiled.
             Attribute::AttrEvent(_) | Attribute::AttrNearby(..) | Attribute::AttrExplain => {
                 return None;
             }
+            // Checkedness follows the model per render; it has no static wire form.
+            Attribute::AttrChecked(_) => return None,
         })
     }
 
@@ -534,6 +561,7 @@ impl UiTemplateAttr {
             Self::Animation(n, tail, body, respect) => {
                 Attribute::AttrAnimation(n.clone(), tail.clone(), body.clone(), *respect)
             }
+            Self::FontWhiteSpace(ws) => Attribute::AttrFontWhiteSpace(*ws),
             // A handler hole with NO resolution map cannot reconstruct a live
             // handler (it carries no `Msg`), so it drops to `NoAttribute` —
             // fail-closed by construction. [`Self::to_attr_resolved`] is the path
@@ -1023,7 +1051,8 @@ fn materialize_at<M: Clone>(
             children,
         } => {
             let resolved_attrs = resolve_attrs(attrs, fills);
-            Element::TaggedNode(
+            // The shared tag gate runs inside `ui_tagged_node_`.
+            super::helpers::ui_tagged_node_(
                 tag.clone(),
                 desc.to_desc(),
                 resolved_attrs,
@@ -1066,7 +1095,7 @@ fn materialize_wrapper_hole<M: Clone>(
     match &wrapper {
         Some(UiTemplate::TaggedNode {
             tag, desc, attrs, ..
-        }) => Element::TaggedNode(
+        }) => super::helpers::ui_tagged_node_(
             tag.clone(),
             desc.to_desc(),
             resolve_attrs(attrs, fills),
@@ -1488,6 +1517,25 @@ mod tests {
         assert_eq!(ui_template_of(&subtree), None);
     }
 
+    /// SECURITY: a `TaggedNode` template naming a `<script>`/`<style>` with a
+    /// text body (a baked or a patched slot) materializes through
+    /// `ui_tagged_node_`, so the shared tag gate builds `Element::Empty`.
+    #[test]
+    fn tagged_script_or_style_template_materializes_empty() {
+        for tag in ["script", "STYLE", "plaintext"] {
+            let template = UiTemplate::TaggedNode {
+                tag: tag.to_string(),
+                desc: super::UiDescription::NoDescription,
+                attrs: vec![],
+                children: vec![UiTemplate::Text("alert(document.cookie)".to_string())],
+            };
+            let elem: Element<()> = materialize(&template, TemplateFills::default());
+            assert!(matches!(elem, Element::Empty), "<{tag}>: {elem:?}");
+            let rendered = render(elem);
+            assert!(!rendered.contains("alert"), "<{tag}>: {rendered}");
+        }
+    }
+
     #[test]
     fn cells_grid_is_refused() {
         let subtree: Element<()> = Element::Cells(vec![vec!['a', 'b']]);
@@ -1528,6 +1576,21 @@ mod tests {
             vec![],
         );
         assert_eq!(ui_template_of(&subtree), None);
+    }
+
+    /// Checkedness follows the model per render and has no static wire form, so a
+    /// subtree carrying it stays compiled. Red without the `AttrChecked` refusal
+    /// arm in `from_attr`.
+    #[test]
+    fn checked_attribute_is_not_templatable() {
+        for checked in [true, false] {
+            let subtree: Element<()> = Element::Node(
+                Description::NoDescription,
+                vec![Attribute::AttrChecked(checked)],
+                vec![],
+            );
+            assert_eq!(ui_template_of(&subtree), None);
+        }
     }
 
     #[test]
@@ -2981,5 +3044,108 @@ mod tests {
                 "float_attr_fills=[] must not perturb a template with no AttrHoleFloat"
             );
         }
+    }
+
+    /// A heading level crosses the template wire as a plain `i64`; a level
+    /// below 1 comes back as level 1 and a high level is kept as written.
+    #[test]
+    fn desc_heading_round_trips_through_template() {
+        use super::UiDescription;
+        use crate::ui::element::HeadingLevel;
+        let low = UiDescription::DescHeading(0).to_desc();
+        assert_eq!(
+            low,
+            Description::DescHeading(HeadingLevel::from_requested(1))
+        );
+        let high = Description::DescHeading(HeadingLevel::from_requested(7));
+        assert_eq!(
+            UiDescription::from_desc(&high),
+            UiDescription::DescHeading(7)
+        );
+        assert_eq!(UiDescription::DescHeading(7).to_desc(), high);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn desc_heading_wire_stays_an_integer() {
+        use super::UiDescription;
+        use crate::ui::element::HeadingLevel;
+        let decoded: UiDescription =
+            serde_json::from_str(r#"{"DescHeading":0}"#).expect("integer level decodes");
+        assert_eq!(
+            decoded.to_desc(),
+            Description::DescHeading(HeadingLevel::from_requested(1))
+        );
+        assert!(serde_json::from_str::<UiDescription>(r#"{"DescHeading":"2"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod text_role_tests {
+    use super::{UiDescription, UiTemplateAttr};
+    use crate::ui::element::{Attribute, Description, HeadingLevel, WhiteSpace};
+
+    /// Every `Description` survives the inert template form unchanged.
+    ///
+    /// The text roles included (CI job `test`).
+    #[test]
+    fn every_description_round_trips_through_the_template_form() {
+        let all = [
+            Description::NoDescription,
+            Description::DescMain,
+            Description::DescNavigation,
+            Description::DescContentInfo,
+            Description::DescComplementary,
+            Description::DescHeading(HeadingLevel::from_requested(3)),
+            Description::DescLabel("l".to_owned()),
+            Description::DescLivePolite,
+            Description::DescLiveAssertive,
+            Description::DescButton,
+            Description::DescParagraph,
+            Description::DescSection,
+            Description::DescSectionHeading,
+            Description::DescCodeBlock,
+            Description::DescCode,
+            Description::DescKbd,
+            Description::DescTextColumn,
+            Description::DescForm,
+        ];
+        for desc in all {
+            assert_eq!(UiDescription::from_desc(&desc).to_desc(), desc);
+        }
+    }
+
+    /// Every white-space keyword survives the inert template form unchanged.
+    ///
+    /// CI job `test`.
+    #[test]
+    fn every_white_space_round_trips_through_the_template_form() {
+        for ws in WhiteSpace::ALL {
+            let attr: Attribute<()> = Attribute::AttrFontWhiteSpace(ws);
+            let inert = UiTemplateAttr::from_attr(&attr);
+            assert_eq!(inert, Some(UiTemplateAttr::FontWhiteSpace(ws)));
+            let back: Option<Attribute<()>> = inert.map(|a| a.to_attr());
+            assert!(matches!(back, Some(Attribute::AttrFontWhiteSpace(w)) if w == ws));
+        }
+    }
+
+    /// A text role decodes from the unit-variant JSON the template carries.
+    ///
+    /// A keyword outside the closed set is refused (CI job `test`).
+    #[cfg(feature = "json")]
+    #[test]
+    fn text_roles_decode_from_unit_json_and_unknown_keywords_refuse() {
+        let desc: Result<UiDescription, _> = serde_json::from_str(r#""DescCodeBlock""#);
+        assert!(matches!(desc, Ok(UiDescription::DescCodeBlock)));
+        let attr: Result<UiTemplateAttr, _> =
+            serde_json::from_str(r#"{"FontWhiteSpace":"PreWrap"}"#);
+        assert!(matches!(
+            attr,
+            Ok(UiTemplateAttr::FontWhiteSpace(WhiteSpace::PreWrap))
+        ));
+        let refused: Result<UiTemplateAttr, _> =
+            serde_json::from_str(r#"{"FontWhiteSpace":"pre;color:red"}"#);
+        assert!(refused.is_err());
     }
 }

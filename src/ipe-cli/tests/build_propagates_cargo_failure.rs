@@ -1,4 +1,4 @@
-//! Regression: `ipe build` must propagate a failed emitted-crate `cargo build`
+//! Regression: `ipe dev build` must propagate a failed emitted-crate `cargo build`
 //! as a non-zero `ipe` exit — never report success while its cargo step failed.
 //!
 //! The cheap-gate SEAL depends on this: an exit-0-then-cargo-fail miscompile is
@@ -65,22 +65,22 @@ fn build_propagates_a_failed_emitted_cargo_build() {
     // and no real cargo can be reached. `sh` is invoked by the fake cargo via
     // its shebang, which the kernel resolves without consulting PATH.
     let out = std::process::Command::new(ipe_bin)
-        .args(["build", &entry.to_string_lossy(), "--out"])
+        .args(["dev", "build", &entry.to_string_lossy(), "--out"])
         .arg(&out_dir)
         .env("PATH", &bin_dir)
         .env("IPE_RUNTIME_DIR", &runtime_dir)
         .env("NO_COLOR", "1")
         .output();
     let Ok(out) = out else {
-        panic!("failed to spawn ipe build: {out:?}")
+        panic!("failed to spawn ipe dev build: {out:?}")
     };
 
     // The core assertion: a failed emitted-crate cargo build must NOT be a
-    // success. Before the fix, `ipe build` emitted the crate and returned 0
+    // success. Before the fix, `ipe dev build` emitted the crate and returned 0
     // without ever compiling it, so this exited 0 and masked the failure.
     assert!(
         !out.status.success(),
-        "ipe build must exit non-zero when the emitted crate fails to compile; \
+        "ipe dev build must exit non-zero when the emitted crate fails to compile; \
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),

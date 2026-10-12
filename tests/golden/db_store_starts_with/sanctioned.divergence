@@ -1,0 +1,1 @@
+sanctioned: `Store.startsWith` is an Ipê-only query leaf with no reference counterpart, so there is no other backend to diverge from. Ipê's output is recorded as the correct reference.

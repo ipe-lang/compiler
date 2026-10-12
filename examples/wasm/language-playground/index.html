@@ -368,8 +368,8 @@ main = greeting
     function showRunResult(data) {
       // Wire shape: { ok, unsandboxed, output } — the only states the server
       // emits (build failure = ok:false with a Build transcript; success =
-      // ok:true with the Run transcript; unsandboxed only when the operator
-      // explicitly opted out with IPE_ALLOW_UNSANDBOXED).
+      // ok:true with the Run transcript; unsandboxed only when the server
+      // operator explicitly set the jail runner's unsandboxed override).
       if (data.ok) {
         runOutput.className = data.unsandboxed ? 'warn' : '';
         runTitle.textContent = 'Program output';

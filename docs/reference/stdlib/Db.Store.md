@@ -21,8 +21,9 @@ construction. A caller who wants raw SQL, or a non-codec dynamic table, reaches
 for the capability-gated `Ipe.Db.Store.Unsafe`.
 
 The mental model, the secured row-security grammar, and a runnable end-to-end
-example live in the Store guide; the composable owner/tenant/RBAC/sharing
-policy algebra lives in its sibling composition guide. This doc-comment is the
+example live in the Store guide (`ipe doc guide:db-store`); the composable
+owner/tenant/RBAC/sharing policy algebra lives in its sibling composition guide
+(`ipe doc guide:db-store-rls-composition`). This doc-comment is the
 per-symbol reference — see the guides for the narrative and the worked example.
 
 ## `Draft`
@@ -1434,13 +1435,39 @@ like : (row -> String) -> String -> Cond row
 
 `like accessor pattern` — the rows where the `String` column named by
 `accessor` matches the SQL `LIKE` `pattern`. The pattern binds as a
-parameter (wildcards `%` / `_` are DATA the SQL engine interprets, never
-SQL text the caller injects). The accessor must name a `String` field.
+parameter, never as SQL text. It is still a pattern: `%` and `_` in it,
+including any that come from user text, are wildcards. It is read under
+`ESCAPE '\'` on every engine, so `\%`, `\_` and `\\` match `%`, `_` and `\`
+literally; a pattern ending in an unpaired `\` is refused as a typed error.
+For a literal prefix, use `Store.startsWith`. The accessor must name a
+`String` field.
 
 Example:
 
     Store.query store
         |> Store.where (Store.like .name "al%")
+
+## `startsWith`
+
+```ipe
+startsWith : (row -> String) -> String -> Cond row
+```
+
+`startsWith accessor prefix` — the rows where the `String` column named by
+`accessor` begins with `prefix`, read literally: `%`, `_` and `\` in it,
+including any that come from user text, match only themselves. The prefix
+binds as a parameter, never as SQL text, and the match is case-sensitive on
+every engine under a deterministic collation; a Postgres column declared
+with a nondeterministic collation (a case-insensitive ICU one) compares by
+that collation instead. It renders through `Sql.startsWith`, so an empty
+prefix, one holding a NUL character, or one longer than 16384 bytes is
+refused as a typed error before any SQL is sent. The accessor must name a
+`String` field.
+
+Example:
+
+    Store.query store
+        |> Store.where (Store.startsWith .name searchText)
 
 ## `isNull`
 
@@ -2005,12 +2032,14 @@ coalesce : a -> a -> a
 
 `coalesce left right` — inside a `Store.select` projection lambda, emits
 `COALESCE(a, b) AS pN` in the SELECT list, returning the first non-null
-value. Both operands must share the same scalar type `a` (the type variable
-is unified by the constraint scheme). Each operand is either a bare
-`side.field` column reference or a `Store.literal` value; a computed
-expression is a fail-closed build error (IPE-L0149). The operand types must
-agree; a mismatch is a compile-time type error. Every column identifier is
-validated at compile time and re-checked by the runtime.
+value. Both operands share one scalar type `a` — `String`, `Int`, `Float`
+or `Bool` — unified by the constraint scheme; `ipe` rejects a mismatched
+pair at type-check, before any Rust is emitted. A `Maybe` or other
+non-scalar operand is rejected at lowering instead (IPE-L0149). Each
+operand is either a bare `side.field` column reference or a
+`Store.literal` value; a computed expression is the same lowering refusal.
+Every column identifier is validated at compile time and re-checked by the
+runtime.
 
 Example:
 
@@ -2027,11 +2056,13 @@ add : a -> a -> a
 
 `add left right` — inside a `Store.select` projection lambda, emits
 `(a + b) AS pN` in the SELECT list over two numeric operands. Both operands
-share one numeric type (`Int` or `Float`); a non-numeric operand is a
-compile-time type error. Each operand is either a bare `side.field` column
-reference or a `Store.literal` value; a computed expression is a fail-closed
-build error (IPE-L0149). Every column identifier is validated at compile time
-and re-checked by the runtime.
+share one numeric type `a`, which must be `Int` or `Float`; `ipe` rejects
+any other operand type — including an `Int`/`Float` mismatch between the
+two operands — at type-check, before any Rust is emitted. Each operand is
+either a bare `side.field` column reference or a `Store.literal` value; a
+computed expression is rejected at lowering instead (IPE-L0149). Every
+column identifier is validated at compile time and re-checked by the
+runtime.
 
 Example:
 
@@ -2047,7 +2078,8 @@ sub : a -> a -> a
 ```
 
 `sub left right` — subtraction counterpart to `add`: emits `(a - b) AS pN`.
-The same operand and numeric-type restrictions apply.
+The same shared numeric type (`Int` or `Float`), type-check-time rejection,
+and lowering-time computed-operand rejection (IPE-L0149) apply.
 
 ## `mul`
 
@@ -2056,7 +2088,9 @@ mul : a -> a -> a
 ```
 
 `mul left right` — multiplication counterpart to `add`: emits
-`(a * b) AS pN`. The same operand and numeric-type restrictions apply.
+`(a * b) AS pN`. The same shared numeric type (`Int` or `Float`),
+type-check-time rejection, and lowering-time computed-operand rejection
+(IPE-L0149) apply.
 
 ## `selectToList`
 

@@ -1,10 +1,18 @@
--- | Ipe.Error — the structured `Error` type (Layer-3 Ipe source).
+-- | Ipe.Error — the structured `Error` type.
 --
 -- `Error` is the implicit error channel of every `Task` and the payload of
 -- `Result Error a`.  Its constructors classify the kind of failure at
 -- construction time (the `ErrorKind` tag) and carry a human-readable
 -- message; optional `ErrorDetails` attach structured context for logging or
 -- round-tripping without widening the public interface.
+--
+-- `ErrorDetails` is `FfiPanic`, `TypeMismatch`, `HttpStatus`, `JsonDecode`,
+-- `Custom` or `Database`. A failed `Ipe.Db` operation carries
+-- `Database f`, where `f` is the closed `DbFailure` cause
+-- (`Db.UniqueViolation`, `Db.TriggerRaised`, `Db.ReadOnlyDatabase`, ...,
+-- `Db.OtherFailure`): match on it, never on the message text, which names no
+-- driver code. Bring the causes into bare pattern scope with
+-- `import Ipe.Db as Db exposing (DbFailure(..))`.
 --
 -- Constructors fall into two groups:
 --

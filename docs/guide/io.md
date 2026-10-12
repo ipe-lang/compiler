@@ -40,14 +40,14 @@ main =
         Io.println (greeting ++ ", " ++ firstName argv ++ "!")
 ```
 
-Running it (`ipe run`) with the streams shown separately:
+Running it (`ipe dev run`) with the streams shown separately:
 
 ```
 user args: 0          # stderr
 Hello, world!         # stdout
 ```
 
-Because the count went to stderr, `ipe run … | cat` would show only
+Because the count went to stderr, `ipe dev run … | cat` would show only
 `Hello, world!` — the result — while the diagnostic still reaches the terminal.
 Printing a whole *list* of lines is the `List.map Io.println` then `Task.sequence`
 idiom shown in the [List guide](list.md).

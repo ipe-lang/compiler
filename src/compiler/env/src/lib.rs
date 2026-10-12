@@ -7,14 +7,14 @@
 //! pins as audited). The two readers mirror their `std` namesakes except that a
 //! home or temp-root variable is never returned. The invoking user's home is
 //! attacker-reachable input that decides where caches and scratch roots live,
-//! and its one validated reader is `ipe_sandbox::home::home_dir` (absolute or
-//! nothing). The temp root (`TMPDIR`, `TMP`, `TEMP`) names a base other users
-//! can write, and its one reader is the scratch primitive, which verifies the
-//! base and creates entries exclusively under it. A refused read through this
-//! crate — by literal, by a constant, or by a key computed at runtime — answers
-//! as unset, so no spelling of the key reaches the raw value. There is no
-//! whole-environment iterator: an iteration would hand a refused value out
-//! under its own name.
+//! and its one validated reader is `ipe_sandbox::home::home_dir` (a parsed
+//! `HomeDir` or a typed refusal). The temp root (`TMPDIR`, `TMP`, `TEMP`) names
+//! a base other users can write, and its one reader is the scratch primitive,
+//! which verifies the base and creates entries exclusively under it. A refused
+//! read through this crate — by literal, by a constant, or by a key computed at
+//! runtime — answers as unset, so no spelling of the key reaches the raw value.
+//! There is no whole-environment iterator: an iteration would hand a refused
+//! value out under its own name.
 
 pub mod artifact;
 

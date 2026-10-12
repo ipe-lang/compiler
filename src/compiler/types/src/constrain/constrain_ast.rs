@@ -1,16 +1,20 @@
+use ipe_diagnostics::{Candidates, NameError};
+
 use super::{
-    BTreeMap, Builder, DResult, Diagnostic, Feature, FlatType, LowerError, PendingInstantiation,
-    RouteWitnessCheck, RoutedWebCheck, STAGE, SchemeApp, SchemeKey, Span, StdlibKernel, Symbol, Ty,
-    TyBounds, TypeError, VarId, WildcardEntry, canon, canon_type_to_doc, from_canon,
+    BTreeMap, Builder, CtorKey, DResult, Diagnostic, Feature, FlatType, LowerError, ModuleHome,
+    PendingInstantiation, RouteWitnessCheck, RoutedWebCheck, STAGE, SchemeApp, SchemeKey, Span,
+    StdlibKernel, Symbol, Ty, TyBounds, TypeError, VarId, WildcardAnyUse, WildcardEntry, canon,
+    canon_type_to_doc, from_canon,
 };
 
 /// The role a pinned kernel-obligation slot plays in its kernel's scheme.
 ///
 /// Each variant identifies WHICH scheme variable a `constrain_var_kernel` tie
 /// site must bound; the concrete raw index lives in [`OBLIGATION_SLOTS`] (the
-/// `SqlParam` index differs across the `Db` family — var 0 for `exec`/`query`,
-/// var 1 for the `queryDecode` shapes that carry a decoder var ahead of the
-/// params list — so the index cannot live on the kind alone).
+/// `SqlParam` index differs across the `Db` family — var 0 for
+/// `exec`/`query`/`findProjection`/`findProjectionOrdered`, var 1 for the
+/// `queryDecode` shapes that carry a decoder var ahead of the bind list — so
+/// the index cannot live on the kind alone).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationKind {
     /// Dict/Set element-key or `Ipe.Cache` key (`comparable` / `PartialEq`).
@@ -35,6 +39,38 @@ pub enum ObligationKind {
     WebPage,
     /// `Web.route` page-builder var (per-route page witness).
     WebBuilder,
+    /// A scheme var the kernel's runtime function bounds by `PartialOrd`.
+    Ordered,
+    /// A scheme var the kernel's runtime function bounds by `PartialEq`.
+    Equatable,
+}
+
+impl ObligationKind {
+    /// The super-type bound the shared table-driven tie attaches to a slot of this kind.
+    ///
+    /// `Some` for a kind that mirrors a trait bound of the kernel's runtime
+    /// Rust function: `Builder::tie_bound_obligations` ties every such row
+    /// after any instantiation, so adding a row is all it takes to enforce it.
+    /// `None` for a kind whose own `constrain_var_kernel` arm reads its slot
+    /// (a module-selected key, a SQL bind, a stringify, a Web witness).
+    #[must_use]
+    pub const fn generic_bound(self) -> Option<TyBounds> {
+        match self {
+            Self::Ordered => Some(TyBounds::ord()),
+            Self::Equatable => Some(TyBounds::eq()),
+            Self::Key
+            | Self::SetMapResult
+            | Self::SqlParam
+            | Self::Show
+            | Self::Interpolable
+            | Self::WebModel
+            | Self::WebNotFound
+            | Self::WebMsg
+            | Self::WebCfgTail
+            | Self::WebPage
+            | Self::WebBuilder => None,
+        }
+    }
 }
 
 /// Single source of truth for every pinned kernel-obligation slot: the
@@ -64,11 +100,15 @@ pub const OBLIGATION_SLOTS: &[(StdlibKernel, u32, ObligationKind)] = {
         (K::CacheRemove, 0, O::Key),
         // `Set.map` result element — raw scheme-var 1.
         (K::SetMap, 1, O::SetMapResult),
-        // `Db.*` params-list element — var 0 (exec/query), var 1 (queryDecode).
+        // `Db.*` bind-list element — var 0 (exec/query/findProjection/
+        // findProjectionOrdered), var 1 (queryDecode, whose var 0 is the
+        // decoder's result type).
         (K::DbExec, 0, O::SqlParam),
         (K::DbQuery, 0, O::SqlParam),
         (K::DbQueryDecode, 1, O::SqlParam),
         (K::DbConnQueryDecode, 1, O::SqlParam),
+        (K::DbFindProjection, 0, O::SqlParam),
+        (K::DbFindProjectionOrdered, 0, O::SqlParam),
         // `Log.*With` list element / `Debug.log` value — Show, raw var 0.
         (K::LogInfoWith, 0, O::Interpolable),
         (K::LogDebugWith, 0, O::Interpolable),
@@ -92,23 +132,75 @@ pub const OBLIGATION_SLOTS: &[(StdlibKernel, u32, ObligationKind)] = {
         // `Web.route` — page var 0, builder var 1.
         (K::WebRoute, 0, O::WebPage),
         (K::WebRoute, 1, O::WebBuilder),
+        // `List.sortBy : (a -> b) -> List a -> List a` — the key `b` (raw var
+        // 1) is the runtime `list_sort_by`'s `B: PartialOrd`.
+        (K::ListSortBy, 1, O::Ordered),
+        // `List.member` / `List.unique` — the element (raw var 0) is the
+        // runtime `list_member`'s `T0: PartialEq` / `list_unique`'s
+        // `T: PartialEq`.
+        (K::ListMember, 0, O::Equatable),
+        (K::ListUnique, 0, O::Equatable),
     ]
 };
+
+/// Whether every bound-carrying [`OBLIGATION_SLOTS`] row names a var its kernel's scheme shape carries.
+///
+/// One pass over the rows: a row whose kind has an
+/// [`ObligationKind::generic_bound`] needs a [`StdlibKernel::scheme_shape`] in
+/// which [`ipe_kernels::shape_aligns_var`] finds the row's slot, otherwise the
+/// tie would miss the variable the runtime bound sits on.
+const fn bound_rows_are_aligned(rows: &[(StdlibKernel, u32, ObligationKind)]) -> bool {
+    let mut rest = rows;
+    while let Some((&(kernel, slot, kind), tail)) = rest.split_first() {
+        if kind.generic_bound().is_some() {
+            let Some(shape) = kernel.scheme_shape() else {
+                return false;
+            };
+            if slot > 0xFF {
+                return false;
+            }
+            #[allow(clippy::cast_possible_truncation)] // bounded by the check above
+            let var = slot as u8;
+            if !ipe_kernels::shape_aligns_var(shape, var) {
+                return false;
+            }
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a bound-carrying obligation row names a scheme var its kernel's scheme shape does not carry, the kernel-obligation SEAL invariant
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    bound_rows_are_aligned(OBLIGATION_SLOTS),
+    "an OBLIGATION_SLOTS row with a generic bound names a scheme var its kernel's scheme_shape does not carry at an aligned position",
+);
 
 /// The frozen size of [`OBLIGATION_SLOTS`], pinned by
 /// `obligation_slots_match_scheme_shapes` so adding/removing a pinned slot must
 /// update this count — a silently dropped entry (obligation removed → hazard
 /// reopened) fails the build.
 #[cfg(test)]
-pub const EXPECTED_OBLIGATION_SLOT_COUNT: usize = 32;
+pub const EXPECTED_OBLIGATION_SLOT_COUNT: usize = 37;
 
 impl Builder<'_> {
-    #[allow(clippy::too_many_lines)] // Handler expansion block (E-12) pushes it over 100
+    /// Constrain one def's body with `current_home` set to the def's module
+    /// for exactly the walk: every record minted inside it names that module,
+    /// and once it returns a mint names no module, so it fails closed instead
+    /// of inheriting the last def's home.
     pub fn constrain_def(&mut self, def: &canon::Def) -> DResult<()> {
         // Track which source module this def belongs to so every `regions.insert`
         // in the sub-expression walk uses `(home, span)` as the key, preventing
         // cross-module span collisions after `link::link` merges dep modules.
-        self.current_home = def.home().to_vec();
+        self.current_home = ModuleHome::new(def.home().to_vec());
+        let walked = self.constrain_def_body(def);
+        self.current_home = None;
+        walked
+    }
+
+    #[allow(clippy::too_many_lines)] // the Handler expansion block pushes it over 100
+    fn constrain_def_body(&mut self, def: &canon::Def) -> DResult<()> {
         match def {
             canon::Def::Typed {
                 name,
@@ -205,14 +297,14 @@ impl Builder<'_> {
                         &mut wildcards,
                     )?;
                     param_counts.push(wildcards.len().saturating_sub(before));
-                    bare_params.push(self.is_wildcard_any_ty(&arg));
+                    bare_params.push(Self::is_wildcard_any_ty(&arg));
                     self.constrain_pattern(&mut local, pat, arg_var)?;
                     // Record the param pattern's region so the lowerer can read the
                     // solved param type (record-param field-set completion, IPE-T0015
                     // path). Keyed by `(current_home, pat.span)` to prevent collisions
                     // across dep modules (see `Builder::regions` doc comment).
                     self.regions
-                        .insert((self.current_home.clone(), pat.span), arg_var);
+                        .insert((self.home()?.into_path(), pat.span), arg_var);
                     cursor = rest;
                 }
                 let ret_ty = self.normalize_annotation_ty(from_canon(cursor), name.span)?;
@@ -226,8 +318,8 @@ impl Builder<'_> {
                 // A typed binding's body expects its annotation return type —
                 // the strongest completion signal: `f : Color; f = ⟨|⟩` offers
                 // `Color`'s constructors first.
-                self.record_expected(body.span, ret_var);
-                self.eq(body.span, body_var, ret_var);
+                self.record_expected(body.span, ret_var)?;
+                self.eq(body.span, body_var, ret_var)?;
                 // A binding whose RETURN annotation is the bare wildcard `any`
                 // severs its body's settled type from every use site (each `any`
                 // occurrence instantiates its own fresh flex). Record the body
@@ -240,9 +332,9 @@ impl Builder<'_> {
                 // (`alias : Model -> any; alias = view`, zero written patterns)
                 // leaves `ret_ty` as the whole `Model -> any` arrow, which the
                 // tie peels along with the use — so both def forms are recorded.
-                if self.annotation_returns_wildcard_any(&ret_ty) {
+                if Self::annotation_returns_wildcard_any(&ret_ty) {
                     self.wildcard_any_return_bodies
-                        .insert((self.current_home.clone(), name.value), body_var);
+                        .insert((self.home()?.into_path(), name.value), body_var);
                 }
                 // Record the skolem each annotation variable instantiated to, so
                 // its body-imposed super-type obligations can be read back for
@@ -255,10 +347,10 @@ impl Builder<'_> {
                     }
                 }
                 self.typed_rigids
-                    .push(((self.current_home.clone(), name.value), var_rigids));
+                    .push(((self.home()?.into_path(), name.value), var_rigids));
                 if !wildcards.is_empty() {
                     self.typed_wildcards.push(WildcardEntry {
-                        key: (self.current_home.clone(), name.value),
+                        key: (self.home()?.into_path(), name.value),
                         wildcards,
                         param_counts,
                         bare_params,
@@ -278,8 +370,7 @@ impl Builder<'_> {
                 for pat in patterns {
                     let v = self.flex()?;
                     self.constrain_pattern(&mut local, pat, v)?;
-                    self.regions
-                        .insert((self.current_home.clone(), pat.span), v);
+                    self.regions.insert((self.home()?.into_path(), pat.span), v);
                     param_vars.push(v);
                 }
                 let body_var = self.constrain_expr(&local, body)?;
@@ -304,7 +395,7 @@ impl Builder<'_> {
                         ),
                     });
                 };
-                self.eq(name.span, arrow, shared);
+                self.eq(name.span, arrow, shared)?;
                 Ok(())
             }
         }
@@ -361,8 +452,10 @@ impl Builder<'_> {
         let key = (module.to_vec(), name);
         if let Some(ty) = self.top_level.get(&key).cloned() {
             let (var, vars, wildcards) = self.instantiate_tracked(&ty)?;
+            let use_home = self.home()?;
             self.scheme_apps.push(SchemeApp {
                 home: module.to_vec(),
+                use_home: use_home.clone(),
                 name,
                 vars,
                 wildcards,
@@ -374,11 +467,20 @@ impl Builder<'_> {
             // body — undoing the wildcard severance so the body's real type
             // reaches this use site.
             if self.wildcard_any_return_bindings.contains(&key) {
-                self.wildcard_any_use_results.push((var, key));
+                self.wildcard_any_use_results.push(WildcardAnyUse {
+                    arrow: var,
+                    binding: key,
+                    span,
+                    use_home,
+                });
             }
             Ok(var)
         } else if let Some(v) = self.untyped.get(&key).copied() {
-            if key.0 == self.current_home {
+            if self
+                .current_home
+                .as_ref()
+                .is_some_and(|home| home.path() == key.0.as_slice())
+            {
                 // Same-module: still the one shared monomorphic var — an
                 // untyped binding is monomorphic *within its home module*
                 // (matches the reference's `CLocal` semantics exactly; see
@@ -394,7 +496,7 @@ impl Builder<'_> {
                 self.pending_instantiations.push(PendingInstantiation {
                     source: key,
                     placeholder,
-                    use_home: self.current_home.clone(),
+                    use_home: self.home()?,
                     span,
                 });
                 Ok(placeholder)
@@ -438,8 +540,10 @@ impl Builder<'_> {
     /// [`OBLIGATION_SLOTS`] SSOT rather than an inline literal at the tie site —
     /// so a scheme-var reorder cannot leave the tie index and the scheme shape
     /// disagreeing. `None` iff the `(k, kind)` pair is not a pinned obligation —
-    /// a fail-closed miss for the exact-domain selectors (SQL-param, Web), and
-    /// the benign no-obligation case for the broad `Key` module selector.
+    /// a fail-closed miss for the exact-domain Web selectors, and the benign
+    /// no-obligation case for the broad `Key` module selector and for every
+    /// kernel without a SQL bind list (a `Db` kernel taking one cannot lack its
+    /// row: `every_db_list_var_argument_has_a_sql_param_slot` walks them all).
     fn obligation_slot(k: StdlibKernel, kind: ObligationKind) -> Option<u32> {
         OBLIGATION_SLOTS
             .iter()
@@ -472,9 +576,56 @@ impl Builder<'_> {
                 msg: LowerError::Unsupported(Feature::Kernels),
             })?;
             let s = self.super_var(TyBounds::hof_kernel_result(), span)?;
-            self.eq(span, result_var, s);
+            self.eq(span, result_var, s)?;
         }
         Ok(())
+    }
+
+    /// Tie every bound-carrying [`OBLIGATION_SLOTS`] row of kernel `k` to a super-typed variable.
+    ///
+    /// A row whose kind has an [`ObligationKind::generic_bound`] names the raw
+    /// scheme variable its kernel's runtime Rust function bounds by a trait
+    /// (`list_sort_by`'s `B: PartialOrd`, `list_member`'s `T0: PartialEq`).
+    /// Tying it here, on the union-find variable minted for this reference,
+    /// makes a concrete pin that Rust cannot satisfy fail closed at type-check
+    /// and lifts the bound onto an enclosing generic's annotation skolem. A row
+    /// whose variable is absent from the instantiated scheme is a registry
+    /// drift and fails closed.
+    fn tie_bound_obligations(
+        &mut self,
+        k: StdlibKernel,
+        vars: &BTreeMap<u32, VarId>,
+        span: Span,
+    ) -> DResult<()> {
+        for &(kernel, slot, kind) in OBLIGATION_SLOTS {
+            if kernel != k {
+                continue;
+            }
+            let Some(bound) = kind.generic_bound() else {
+                continue;
+            };
+            let slot_var = *vars.get(&slot).ok_or(Diagnostic::Lower {
+                span,
+                msg: LowerError::Unsupported(Feature::Kernels),
+            })?;
+            let s = self.super_var(bound, span)?;
+            self.eq(span, slot_var, s)?;
+        }
+        Ok(())
+    }
+
+    /// Tie every scheme-declared obligation of an instantiated kernel `k`.
+    ///
+    /// The one call each instantiation site makes, so no site can tie the
+    /// callback-result restriction yet skip a table-declared bound.
+    fn tie_scheme_obligations(
+        &mut self,
+        k: StdlibKernel,
+        vars: &BTreeMap<u32, VarId>,
+        span: Span,
+    ) -> DResult<()> {
+        self.tie_hof_results(k, vars, span)?;
+        self.tie_bound_obligations(k, vars, span)
     }
 
     /// The type of a kernel reference (`Math.min`, `Set.insert`, …).
@@ -500,6 +651,12 @@ impl Builder<'_> {
     ///   `Hash + Eq + Ord` (Dict) onto its annotation skolem (see `bounds_for`).
     ///   This is also more conservative than Ipê's runtime, which keys a Set /
     ///   Dict on a stringified value.
+    /// * Every instantiated kernel — each [`OBLIGATION_SLOTS`] row with an
+    ///   [`ObligationKind::generic_bound`] (the `List.sortBy` key, the
+    ///   `List.member` / `List.unique` element) is tied by
+    ///   `Self::tie_bound_obligations`, so a record, custom-type, tuple or
+    ///   function key and a function-bearing element fail closed instead of
+    ///   reaching `cargo` as an unmet `PartialOrd` / `PartialEq`.
     #[allow(clippy::too_many_lines)]
     pub fn constrain_var_kernel(
         &mut self,
@@ -663,7 +820,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 // The key qualifier (`Set`/`Dict`/`Cache` in `key_obligation_for`)
                 // selects the WHOLE module. The key/element is raw scheme-var 0 by
                 // construction across every kernel in it — the convention the
@@ -684,7 +841,7 @@ impl Builder<'_> {
                 // hole this closes; slot 0 cannot drift out of coverage.
                 if let Some(&key_var) = vars.get(&0) {
                     let s = self.super_var(bound, span)?;
-                    self.eq(span, key_var, s);
+                    self.eq(span, key_var, s)?;
                 }
                 // `Set.map : (a -> b) -> Set a -> Set b` — the RESULT element
                 // `b` (raw scheme-var 1) also backs a `BTreeSet<b>`, so it
@@ -703,18 +860,16 @@ impl Builder<'_> {
                         msg: LowerError::Unsupported(Feature::Kernels),
                     })?;
                     let s = self.super_var(bound, span)?;
-                    self.eq(span, res_var, s);
+                    self.eq(span, res_var, s)?;
                 }
                 return Ok(var);
             }
-            // `Db.exec` / `Db.query` / `Db.queryDecode`: the params-LIST
-            // ELEMENT (raw scheme-var 0 for `exec`/`query`; var 1 for
-            // `queryDecode`, whose var 0 is the decoder's result type — see
-            // the scheme comments above) carries the SQL-bind-parameter
-            // obligation. Same `stdlib_scheme` + tie shape as the Set/Dict
-            // key obligation directly above: only the params-element
-            // position is bounded, so a generic wrapper around `Db.exec` /
-            // `Db.query` (`Database.exec label queryStr args` in
+            // Every kernel with a SQL bind list: the list ELEMENT (the raw
+            // scheme var `OBLIGATION_SLOTS` names for it) carries the
+            // SQL-bind-parameter obligation. Same `stdlib_scheme` + tie shape
+            // as the Set/Dict key obligation directly above: only the
+            // bind-element position is bounded, so a generic wrapper around a
+            // Db kernel (`Database.exec label queryStr args` in
             // `examples/17-ipemon`) lifts `Into<SqlParam>` onto its own
             // emitted Rust generic (closing the E0277 half), and an
             // empty-list call site whose element type is otherwise
@@ -722,35 +877,21 @@ impl Builder<'_> {
             // instead of the wildcard-`any` fallback (closing the E0283
             // half — see the `sql_param` arm of the numeric-defaulting loop
             // in `crate::lib`), rather than emitting a bare `Vec::new()`
-            // `cargo` cannot infer.
-            if matches!(
-                k,
-                StdlibKernel::DbExec
-                    | StdlibKernel::DbQuery
-                    | StdlibKernel::DbQueryDecode
-                    | StdlibKernel::DbConnQueryDecode
-            ) {
-                // The params-list element var is index 1 for both `queryDecode`
-                // shapes (they carry a decoder var 0 ahead of it), index 0 for the
-                // bare `exec`/`query` — read from `OBLIGATION_SLOTS`, not inlined.
-                let raw_idx = Self::obligation_slot(k, ObligationKind::SqlParam).ok_or(
-                    Diagnostic::Lower {
-                        span,
-                        msg: LowerError::Unsupported(Feature::Kernels),
-                    },
-                )?;
+            // `cargo` cannot infer. The kernel set is the table's rows, so a
+            // Db kernel cannot take a bind list without the bound.
+            if let Some(raw_idx) = Self::obligation_slot(k, ObligationKind::SqlParam) {
                 let ty = self.resolve_scheme(SchemeKey(k)).ok_or(Diagnostic::Lower {
                     span,
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let params_var = *vars.get(&raw_idx).ok_or(Diagnostic::Lower {
                     span,
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let s = self.super_var(TyBounds::sql_param(), span)?;
-                self.eq(span, params_var, s);
+                self.eq(span, params_var, s)?;
                 return Ok(var);
             }
             // `Log.*With : String -> List a -> Task Error ()` — the attr-list
@@ -772,7 +913,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let slot = Self::obligation_slot(k, ObligationKind::Interpolable).ok_or(
                     Diagnostic::Lower {
                         span,
@@ -784,7 +925,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let s = self.super_var(TyBounds::interpolable(), span)?;
-                self.eq(span, elem_var, s);
+                self.eq(span, elem_var, s)?;
                 return Ok(var);
             }
             // `Debug.log : String -> a -> a` — the value `a` (shared by the
@@ -800,7 +941,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let slot =
                     Self::obligation_slot(k, ObligationKind::Show).ok_or(Diagnostic::Lower {
                         span,
@@ -811,7 +952,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let s = self.super_var(TyBounds::show(), span)?;
-                self.eq(span, value_var, s);
+                self.eq(span, value_var, s)?;
                 return Ok(var);
             }
             // `Web.tea` / `Web.embed` / `Web.appWith` — post-solve routed-Web check.
@@ -836,7 +977,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let model_slot = Self::obligation_slot(k, ObligationKind::WebModel).ok_or(
                     Diagnostic::Lower {
                         span,
@@ -873,7 +1014,7 @@ impl Builder<'_> {
                     not_found_var,
                     cfg_tail_var,
                     span,
-                    home: self.current_home.clone(),
+                    home: self.home()?,
                 });
                 return Ok(var);
             }
@@ -895,7 +1036,7 @@ impl Builder<'_> {
                     msg: LowerError::Unsupported(Feature::Kernels),
                 })?;
                 let (var, vars, _) = self.instantiate_tracked(&ty)?;
-                self.tie_hof_results(k, &vars, span)?;
+                self.tie_scheme_obligations(k, &vars, span)?;
                 let page_slot =
                     Self::obligation_slot(k, ObligationKind::WebPage).ok_or(Diagnostic::Lower {
                         span,
@@ -919,6 +1060,7 @@ impl Builder<'_> {
                     builder_var,
                     page_var,
                     span,
+                    home: self.home()?,
                 });
                 return Ok(var);
             }
@@ -942,7 +1084,7 @@ impl Builder<'_> {
         let ty = Self::kernel_scheme_or_unsupported(registry, None, span)?;
         let (var, vars, _) = self.instantiate_tracked(&ty)?;
         if let Some(k) = id {
-            self.tie_hof_results(k, &vars, span)?;
+            self.tie_scheme_obligations(k, &vars, span)?;
         }
         Ok(var)
     }
@@ -976,8 +1118,8 @@ impl Builder<'_> {
     /// reference walk.
     pub fn tie_wildcard_any_uses_to_bodies(&mut self) -> DResult<()> {
         let ties = std::mem::take(&mut self.wildcard_any_use_results);
-        for (use_arrow, binding) in ties {
-            let Some(&body_var) = self.wildcard_any_return_bodies.get(&binding) else {
+        for tie in ties {
+            let Some(&body_var) = self.wildcard_any_return_bodies.get(&tie.binding) else {
                 continue;
             };
             // Peel BOTH the use's instantiated arrow and the recorded body to
@@ -986,21 +1128,24 @@ impl Builder<'_> {
             // (a def written with parameters) OR the same arrow shape (a
             // point-free def, `alias = view`), so peeling both reaches the
             // matching `any`/`Html` slot regardless of the def form or arity.
-            let use_result = self.peel_arrow_result(use_arrow)?;
+            let use_result = self.peel_arrow_result(tie.arrow)?;
             let body_result = self.peel_arrow_result(body_var)?;
-            self.eq(Span::DUMMY, use_result, body_result);
+            self.eq_at(tie.use_home, tie.span, use_result, body_result);
         }
         Ok(())
     }
-    /// Constrain a constructor referenced as a value: its scheme instantiated
-    /// fresh. A nullary constructor's value type is the enum itself; a payload
+    /// Constrain a constructor referenced as a value: its scheme instantiated fresh.
+    ///
+    /// A nullary constructor's value type is the enum itself; a payload
     /// constructor's is the curried arrow `field0 -> … -> T vars`. Each reference
     /// instantiates independently, so the same generic constructor used at `Int`
-    /// and at `Bool` in one module yields two separately-satisfiable types. A
-    /// constructor with no registered scheme (imported, outside the single-module
-    /// subset) falls back to the bare enum type, sound for the nullary case.
+    /// and at `Bool` in one module yields two separately-satisfiable types.
+    ///
+    /// # Errors
+    /// See [`Self::ctor_scheme_miss`] for a constructor with no scheme.
     pub fn constrain_var_ctor(
         &mut self,
+        span: Span,
         home: &[Symbol],
         type_name: Symbol,
         name: Symbol,
@@ -1009,15 +1154,42 @@ impl Builder<'_> {
         // referenced as a value resolves against its own declaring module's
         // scheme, never a same-named constructor from another module.
         let key = (home.to_vec(), type_name, name);
-        if let Some(scheme) = self.ctors.get(&key).cloned() {
-            let (arg_vars, result_var) = self.instantiate_ctor(&scheme)?;
-            let mut t = result_var;
-            for av in arg_vars.into_iter().rev() {
-                t = self.structure(FlatType::Fun(av, t))?;
-            }
-            Ok(t)
-        } else {
-            self.con_var(home.to_vec(), type_name, Vec::new())
+        let Some(scheme) = self.ctors.get(&key).cloned() else {
+            return Err(self.ctor_scheme_miss(span, &key));
+        };
+        let (arg_vars, result_var) = self.instantiate_ctor(&scheme)?;
+        let mut t = result_var;
+        for av in arg_vars.into_iter().rev() {
+            t = self.structure(FlatType::Fun(av, t))?;
+        }
+        Ok(t)
+    }
+
+    /// The refusal for a constructor `key` that has no registered scheme.
+    ///
+    /// A sealed builtin capability handle (`StreamId`) is a user error,
+    /// `ConstructorNotFound` with no suggestions. Any other miss means canon
+    /// resolved a constructor the table does not carry: a `CompilerBug`, never
+    /// an unconstrained fallback type.
+    pub fn ctor_scheme_miss(&self, span: Span, key: &CtorKey) -> Diagnostic {
+        let (_, type_name, name) = key;
+        let resolved = self.interner.resolve(*name);
+        match resolved {
+            Some(s) if self.sealed_ctors.contains(key) => Diagnostic::Name {
+                span,
+                msg: NameError::ConstructorNotFound {
+                    name: Box::from(s),
+                    suggestions: Candidates::at(None, Box::new([])),
+                },
+            },
+            _ => Diagnostic::CompilerBug {
+                where_: "constrain.ctor_scheme",
+                detail: format!(
+                    "constructor `{}` of type `{}` has no registered scheme",
+                    resolved.unwrap_or("<unresolved>"),
+                    self.interner.resolve(*type_name).unwrap_or("<unresolved>"),
+                ),
+            },
         }
     }
 }

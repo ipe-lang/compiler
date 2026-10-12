@@ -19,6 +19,7 @@ pub mod module_classify;
 pub mod ref_index;
 pub mod rename;
 mod resolve;
+mod scope;
 pub mod shape_runtime;
 pub mod shape_source;
 pub mod sig_delta;
@@ -29,11 +30,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use ipe_diagnostics::DResult;
 use ipe_intern::{Interner, Symbol};
 
-pub use env::{CtorHome, Env, STDLIB_MODULE_QUALIFIERS, VarHome, stdlib_canonical_qualifier};
+pub use env::{
+    CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, VarHome, bare_import_binds,
+    kernel_import_binds_last_segment, stdlib_canonical_qualifier,
+};
 pub use resolve::{
-    ModuleOrigin, QualifierForm, RESERVED_BUILTIN_TYPES, builtin_empty_home_arity,
-    import_qualifier_forms, import_qualifiers, is_reserved_builtin_type_name,
-    is_stdlib_shared_carrier_type, is_user_type_declaration_forbidden, to_snake_case,
+    ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
+    import_qualifiers, is_reserved_builtin_type_name, is_stdlib_shared_carrier_type,
+    is_user_type_declaration_forbidden, to_snake_case,
 };
 
 /// A type alias exported by a module, resolved in the defining module's scope.
@@ -171,10 +175,10 @@ pub fn canonicalise_module_with_origin(
 ///
 /// Like [`canonicalise_module_with_origin`] but takes the dep interfaces by
 /// reference (the `module_interface` query memos — no per-importer deep clone)
-/// and an explicit `known_modules` universe (dot-joined module paths) used
-/// ONLY for the IPE-N0020 did-you-mean list. `deps` must contain exactly this
-/// module's resolved imports; `known_modules` should list every module in the
-/// project. Strings only on the suggestion path — it never interns.
+/// and the importable-module `catalog`, read only on diagnostic paths: the
+/// IPE-N0020 did-you-mean list and the IPE-N0034 verdict for an unbound
+/// qualifier. `deps` must contain exactly this module's resolved imports; the
+/// catalog should list every project module and compiled-source stdlib module.
 ///
 /// # Errors
 /// Same set as [`canonicalise_module_with_origin`].
@@ -182,18 +186,18 @@ pub fn canonicalise_module_in_project(
     m: &ipe_syntax::Module,
     expected_path: &[Symbol],
     deps: &BTreeMap<Vec<Symbol>, &ModuleExports>,
-    known_modules: &BTreeSet<Box<str>>,
+    catalog: &ModuleCatalog,
     origin: ModuleOrigin,
     interner: &mut Interner,
 ) -> DResult<(ast::Module, ModuleExports)> {
-    resolve::canonicalise_module_in_project(m, expected_path, deps, known_modules, origin, interner)
+    resolve::canonicalise_module_in_project(m, expected_path, deps, catalog, origin, interner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ast::{Def, Expr, Expr_, Pattern_};
-    use ipe_diagnostics::{Diagnostic, NameError};
+    use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
     use ipe_intern::Symbol;
 
     const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
@@ -666,7 +670,7 @@ mod tests {
         };
         assert_eq!(&*member, "getcw");
         assert!(
-            suggestions.iter().any(|s| &**s == "getcwd"),
+            suggestions.names.iter().any(|s| &**s == "getcwd"),
             "suggestions should include `getcwd`, got {suggestions:?}"
         );
     }
@@ -684,7 +688,7 @@ mod tests {
             return;
         };
         assert!(
-            suggestions.is_empty(),
+            suggestions.names.is_empty(),
             "no suggestion within edit-distance 2, got {suggestions:?}"
         );
     }
@@ -705,6 +709,7 @@ mod tests {
             return;
         };
         let keys: Vec<(usize, String)> = suggestions
+            .names
             .iter()
             .map(|s| (test_levenshtein("sha", s), s.to_string()))
             .collect();
@@ -715,8 +720,9 @@ mod tests {
 
     #[test]
     fn unknown_qualifier_is_unknown_module() {
-        // `Crpyto` is one transposition from the `Crypto` kernel qualifier.
-        let err = canon_err("module Main exposing (main)\n\nmain = Crpyto.sha256\n");
+        // `Crpyto` is one transposition from the imported `Crypto` qualifier.
+        let err =
+            canon_err("module Main exposing (main)\nimport Ipe.Crypto\n\nmain = Crpyto.sha256\n");
         let Some(Diagnostic::Name {
             msg:
                 NameError::UnknownModule {
@@ -731,7 +737,7 @@ mod tests {
         };
         assert_eq!(&*qualifier, "Crpyto");
         assert!(
-            suggestions.iter().any(|s| &**s == "Crypto"),
+            suggestions.names.iter().any(|s| &**s == "Crypto"),
             "should suggest `Crypto`, got {suggestions:?}"
         );
     }
@@ -837,7 +843,7 @@ mod tests {
         assert_eq!(&*module, "Crypto");
         assert_eq!(&*member, "sha25");
         assert!(
-            suggestions.iter().any(|s| &**s == "sha256"),
+            suggestions.names.iter().any(|s| &**s == "sha256"),
             "should suggest `sha256`, got {suggestions:?}"
         );
     }
@@ -865,7 +871,7 @@ mod tests {
         };
         assert_eq!(&*name, "Ipe.Crpyto");
         assert!(
-            suggestions.iter().any(|s| &**s == "Ipe.Crypto"),
+            suggestions.names.iter().any(|s| &**s == "Ipe.Crypto"),
             "should suggest `Ipe.Crypto`, got {suggestions:?}"
         );
     }
@@ -892,7 +898,7 @@ mod tests {
         };
         assert_eq!(&*name, "Ipe.Crpyto");
         assert!(
-            suggestions.iter().any(|s| &**s == "Ipe.Crypto"),
+            suggestions.names.iter().any(|s| &**s == "Ipe.Crypto"),
             "should suggest `Ipe.Crypto`, got {suggestions:?}"
         );
     }
@@ -967,18 +973,19 @@ mod tests {
         let err = canon_err("module Main exposing (main)\n\nmain = Crypto.sha256 \"x\"\n");
         let Some(Diagnostic::Name {
             msg:
-                NameError::StdlibImportRequired {
-                    qualifier,
-                    import_path,
+                NameError::ImportRequired {
+                    reached: StdlibReach::Qualifier(qualifier),
+                    candidates,
+                    imported_as: None,
                 },
             ..
         }) = err
         else {
-            assert!(false_marker(), "expected StdlibImportRequired (IPE-N0034)");
+            assert!(false_marker(), "expected ImportRequired (IPE-N0034)");
             return;
         };
         assert_eq!(&*qualifier, "Crypto");
-        assert_eq!(&*import_path, "Ipe.Crypto");
+        assert_eq!(&*candidates, &[Box::<str>::from("Ipe.Crypto")]);
     }
 
     /// The counterpart to the gate: WITH `import Ipe.Crypto`, the same qualified
@@ -1012,7 +1019,7 @@ mod tests {
         };
         assert_eq!(&*name, "Incremen");
         assert!(
-            suggestions.iter().any(|s| &**s == "Increment"),
+            suggestions.names.iter().any(|s| &**s == "Increment"),
             "should suggest `Increment`, got {suggestions:?}"
         );
     }
@@ -1199,6 +1206,53 @@ mod tests {
             assert!(
                 is_reserved_builtin_type_name(name),
                 "`{name}` must still be a known builtin name"
+            );
+        }
+
+        // Names both reserved and lowered by a fixed arm: forbidden and builtin.
+        for name in &[
+            "Html",
+            "CustomElement",
+            "Description",
+            "HAlign",
+            "LayoutContext",
+            "Length",
+            "Location",
+            "PseudoClass",
+            "VAlign",
+            "WebReq",
+        ] {
+            assert!(
+                is_user_type_declaration_forbidden(name),
+                "`{name}` must be user-declaration-forbidden"
+            );
+            assert!(
+                is_reserved_builtin_type_name(name),
+                "`{name}` must be a known builtin"
+            );
+        }
+
+        // Below-guard and kernel-implicit names: builtin, user-shadowable.
+        for name in &["Order", "Color", "Decimal", "Value"] {
+            assert!(
+                !is_user_type_declaration_forbidden(name),
+                "`{name}` must NOT be user-declaration-forbidden (user-shadowable)"
+            );
+            assert!(
+                is_reserved_builtin_type_name(name),
+                "`{name}` must still be a known builtin name"
+            );
+        }
+
+        // Heads that live only at a module home are never bare builtins.
+        for name in &["Claims", "Draft", "Cond", "RadioOption"] {
+            assert!(
+                !is_reserved_builtin_type_name(name),
+                "`{name}` lives only at a module home"
+            );
+            assert!(
+                !is_user_type_declaration_forbidden(name),
+                "`{name}` lives only at a module home"
             );
         }
     }
@@ -1453,8 +1507,8 @@ mod tests {
             );
             let sym = i.intern(canonical).expect("intern canonical");
             assert!(
-                env.qual_members(sym).is_some(),
-                "canonical `{canonical}` for path {path:?} is not a registered qualifier"
+                env.kernel_module_of(sym).is_some(),
+                "canonical `{canonical}` for path {path:?} is not a registered kernel module"
             );
         }
     }
@@ -1466,7 +1520,7 @@ mod tests {
         // module cannot ship without an `import … as Alias` route.
         //
         // Primary qualifiers are the bare short-names (no `.`) plus the sole
-        // dotted canonical `Db.Decode`; the other dotted `qual_vars` keys are the
+        // dotted canonical `Db.Decode`; the other dotted kernel-pool keys are the
         // inline-qualifier convenience aliases (`Ipe.Html`, …), not import targets.
         //
         // The canonical `Cmd` / `Sub` kernel qualifiers are internal-only: they
@@ -1481,7 +1535,7 @@ mod tests {
             .iter()
             .map(|(_, c)| *c)
             .collect();
-        for &key in env.qual_vars.keys() {
+        for key in env.kernel_members.keys().map(|module| module.symbol()) {
             let Some(name) = i.resolve(key) else { continue };
             if INTERNAL_ONLY_QUALIFIERS.contains(&name) {
                 continue;
@@ -2470,14 +2524,14 @@ mod tests {
     ///
     /// Forward direction (registry → canon): for every
     /// [`ipe_kernels::StdlibKernel`] variant in `ALL`, if the variant's
-    /// declared qualifier IS present in `Env.qual_vars`, then the variant's
+    /// declared qualifier IS present in `Env.kernel_members`, then the variant's
     /// declared name must ALSO be present in that qualifier's member map.  A
     /// failure here means `QUALIFIERS` in `env.rs` diverged from
     /// `StdlibKernel::ALL + decl()` — the anti-drift invariant is broken.
     ///
     /// The forward check is intentionally one-directional: names present in
     /// `QUALIFIERS` but absent from the registry (e.g. `Basics.*` helper
-    /// aliases) are NOT an error.  Qualifiers absent from `qual_vars` entirely
+    /// aliases) are NOT an error.  Qualifiers absent from the pool entirely
     /// (e.g. `"Log"`, `"PubSub"`) are skipped automatically.
     ///
     /// Reverse direction (canon → registry, "G1"): every
@@ -2517,7 +2571,7 @@ mod tests {
         // `Ipe.<M>.Unsafe` escape-hatch submodule. The canonical qualifier stays
         // (so `Kernel.kernel "Db_unsafeExecRaw"` still splits to `("Db", …)` and
         // resolves the same kernel), but the member is intentionally ABSENT from
-        // `qual_vars[qualifier]` so it no longer resolves off a plain import of
+        // `kernel_members[qualifier]` so it no longer resolves off a plain import of
         // the native module. Verified positively by the `Ipe.Db.Unsafe`
         // disclosure + resolution tests; this set exempts them from the
         // surface-parity tripwire below.
@@ -2565,7 +2619,7 @@ mod tests {
 
             // Intern qualifier + name.  If they were already interned by
             // install_prelude_qualifiers we get the same symbol; if not, the
-            // fresh symbol will simply not appear in qual_vars (correct skip).
+            // fresh symbol will simply not appear in the pool (correct skip).
             // `Interner::intern` is infallible in practice (OOM only).
             let qual_sym = interner
                 .intern(decl.qualifier)
@@ -2574,9 +2628,9 @@ mod tests {
                 .intern(decl.name)
                 .expect("tripwire: intern name OOM");
 
-            // If the qualifier is not in qual_vars at all (e.g. "Log" is only
-            // in `vars`, not `qual_vars`; "PubSub" is not yet wired), skip.
-            let Some(members) = env.qual_vars.get(&qual_sym) else {
+            // If the qualifier is not in the kernel pool at all (e.g. "Log" is
+            // only in `vars`; "PubSub" is not yet wired), skip.
+            let Some(members) = env.kernel_members.get(&qual_sym) else {
                 continue;
             };
 
@@ -2584,7 +2638,7 @@ mod tests {
             assert!(
                 members.contains_key(&name_sym),
                 "StdlibKernel::{sk:?} declares ({:?}, {:?}) but {:?} is missing \
-                 from env.qual_vars[{:?}]; update QUALIFIERS in env.rs to match \
+                 from env.kernel_members[{:?}]; update QUALIFIERS in env.rs to match \
                  StdlibKernel::decl()",
                 decl.qualifier,
                 decl.name,
@@ -2595,7 +2649,7 @@ mod tests {
             // Also verify the stdlib_index was populated for this entry.
             assert!(
                 env.stdlib_index.contains_key(&(qual_sym, name_sym)),
-                "StdlibKernel::{sk:?} is in qual_vars but missing from stdlib_index; \
+                "StdlibKernel::{sk:?} is in kernel_members but missing from stdlib_index; \
                  the Phase-A registry-population loop in install_prelude_qualifiers \
                  must have skipped it",
             );
@@ -2619,13 +2673,13 @@ mod tests {
         // decl() (covered by ipe_kernels::tests::no_colliding_qualifier_name_pairs)
         // nor decl-equiv-legacy equivalence (covered by
         // ipe_lower::tests::decl_equiv_legacy_match).
-        for (qual_sym, members) in env.qual_vars.iter() {
-            let qual_str = interner.resolve(*qual_sym).unwrap_or("<unknown>");
+        for (module, members) in env.kernel_members.iter() {
+            let qual_str = interner.resolve(module.symbol()).unwrap_or("<unknown>");
             for (name_sym, home) in members {
                 if let VarHome::Kernel(actual_sk, m, f) = home {
                     // The carried kernel is verified against stdlib_index using
                     // the CANONICAL (module, name) stored in VarHome, not the
-                    // qual_vars KEY.
+                    // pool KEY.
                     //
                     // For plain entries: m == qual_sym, f == name_sym.
                     // For FUNC_ALIASES: name_sym is the ALIAS (e.g.
@@ -2644,7 +2698,7 @@ mod tests {
                     assert_eq!(
                         Some(actual_sk),
                         expected,
-                        "G1 reverse: VarHome::Kernel in qual_vars[{qual_str:?}][{name_str:?}] \
+                        "G1 reverse: VarHome::Kernel in kernel_members[{qual_str:?}][{name_str:?}] \
                          (canonical fn={canon_str:?}) carries kernel {actual_sk:?} but \
                          stdlib_index has {expected:?}; \
                          install_prelude_qualifiers propagation is incorrect",
@@ -2661,13 +2715,13 @@ mod tests {
         // reserved variant instead of a `None` inside `Kernel`.
         //
         // The allowlist is intentionally empty: `("String", "toChar")` which was
-        // previously the sole entry is no longer registered in `qual_vars` because
+        // previously the sole entry is no longer registered in the pool because
         // `Ipe.String` is now a compiled-source module (not a kernel qualifier).
         // Any future reserved entry must be added here with a comment explaining
         // why it deliberately lacks a `StdlibKernel` variant.
         let reserved_allowlist: std::collections::BTreeSet<(&str, &str)> =
             std::collections::BTreeSet::new();
-        let reserved_actual = reserved_kernel_members(&env.qual_vars, &interner);
+        let reserved_actual = reserved_kernel_members(&env.kernel_members, &interner);
         assert_eq!(
             reserved_actual, reserved_allowlist,
             "reserved-category gate: VarHome::ReservedKernel members must be \
@@ -2682,11 +2736,12 @@ mod tests {
 
     /// Collect the `(qualifier, name)` pairs of every reachable-but-unbacked
     /// member — the [`crate::env::VarHome::ReservedKernel`] entries — in
-    /// `qual_vars`. `canon_equals_registry` asserts the result equals the fixed
-    /// reserved allowlist, so the reserved set cannot drift.
-    fn reserved_kernel_members<'a>(
+    /// a qualifier-keyed member table. `canon_equals_registry` asserts the
+    /// result equals the fixed reserved allowlist, so the reserved set cannot
+    /// drift.
+    fn reserved_kernel_members<'a, K>(
         qual_vars: &std::collections::BTreeMap<
-            ipe_intern::Symbol,
+            K,
             std::collections::BTreeMap<ipe_intern::Symbol, crate::env::VarHome>,
         >,
         interner: &'a ipe_intern::Interner,
@@ -2758,11 +2813,11 @@ mod tests {
 
     /// `Ipe.PubSub` (the top-level, Task-shaped publish surface) is a
     /// COMPILED-SOURCE stdlib module (`src/stdlib/Ipe/PubSub.ipe`), so the bare
-    /// `"PubSub"` KERNEL qualifier must NOT be registered in `env.qual_vars`
+    /// `"PubSub"` KERNEL qualifier must NOT be registered in `env.kernel_members`
     /// (kernel qualifier OR compiled-source — never both). `Ipe.PubSub.publish`
     /// resolves through the compiled module's `Kernel.kernel "PubSub_publish"` alias,
     /// whose fast-path mints a `VarKernel` with a concrete kernel id — so the
-    /// `stdlib_scheme` totality flip stays sound without a `qual_vars` entry.
+    /// `stdlib_scheme` totality flip stays sound without a kernel-pool entry.
     #[test]
     fn pubsub_kernel_qualifier_absent_compiled_source() {
         use ipe_intern::Interner;
@@ -2775,8 +2830,8 @@ mod tests {
             .expect("Env::initial must not fail in the tripwire test");
 
         assert!(
-            !env.qual_vars.contains_key(&pubsub),
-            "The `PubSub` kernel qualifier must stay OUT of env.qual_vars — \
+            env.kernel_module_of(pubsub).is_none(),
+            "The `PubSub` kernel qualifier must stay OUT of env.kernel_members — \
              `Ipe.PubSub` is a compiled-source module resolved via the \
              `Kernel.kernel \"PubSub_publish\"` alias, not a kernel qualifier.",
         );
@@ -3323,7 +3378,7 @@ mod tests {
         use ipe_intern::Interner;
 
         // `Ipe.Html` is a COMPILED-SOURCE module (`COMPILED_STD_MODULES`), so the
-        // `Html` kernel qualifier must be ABSENT from `env.qual_vars`: its element
+        // `Html` kernel qualifier must be ABSENT from `env.kernel_members`: its element
         // builders and the re-exposed serialiser (`render` / `renderStatic` / …)
         // resolve through the `Kernel.kernel "Html_*"` aliases in `Ipe/Html.ipe`, not
         // a kernel-qualifier prelude (mirrors the `PubSub` precedent).
@@ -3332,8 +3387,8 @@ mod tests {
         let env = Env::initial(vec![], &mut interner)
             .expect("Env::initial must not fail in the tripwire test");
         assert!(
-            !env.qual_vars.contains_key(&html),
-            "The `Html` kernel qualifier must stay OUT of env.qual_vars — \
+            env.kernel_module_of(html).is_none(),
+            "The `Html` kernel qualifier must stay OUT of env.kernel_members — \
              `Ipe.Html` is a compiled-source module resolved via the \
              `Kernel.kernel \"Html_*\"` alias, not a kernel qualifier.",
         );
@@ -3365,10 +3420,10 @@ mod tests {
     }
 
     #[test]
-    fn main_branching_between_shapes_is_rejected_n0045() {
+    fn main_branching_between_shapes_is_rejected_n0035() {
         // A `main` whose head is an `if` choosing between two app entries selects
-        // its shape at run time — refused (static pinning). This precise gate
-        // fires ahead of the coarser IPE-N0033 import contradiction.
+        // its shape at run time. The second shape import is already refused at
+        // the import (IPE-N0035), ahead of the `main` gate.
         let src = "module Main exposing (main)\n\
                    import Ipe.Tea.Web as Web\n\
                    import Ipe.Tea.Tui as Tui\n\n\
@@ -3379,11 +3434,11 @@ mod tests {
             matches!(
                 canon_module_err(src),
                 Some(Diagnostic::Name {
-                    msg: NameError::RuntimeBranchedMain,
+                    msg: NameError::TwoShapeImports { .. },
                     ..
                 })
             ),
-            "a `main` that picks its shape from an `if` must be rejected IPE-N0045"
+            "a module importing two shapes must be rejected IPE-N0035 at the second import"
         );
     }
 
@@ -3577,11 +3632,19 @@ mod tests {
             "Ipe.Tea.Cli.Sub",
             "onKey"
         ));
-        assert!(!resolves(
+        // The shared terminal `Sub` adds nothing to the shape's own `Sub`: the
+        // spelling holds the shape's members and never another shape's.
+        assert!(resolves(
             "Ipe.Tea.Tui as Tui",
             "Tui.tea",
             "Ipe.Tea.Terminal.Sub",
             "onKey"
+        ));
+        assert!(!resolves(
+            "Ipe.Tea.Tui as Tui",
+            "Tui.tea",
+            "Ipe.Tea.Terminal.Sub",
+            "onLine"
         ));
         assert!(!resolves(
             "Ipe.Tea.Web as Web",
@@ -4054,8 +4117,32 @@ mod tests {
     }
 
     #[test]
+    fn a_local_value_shadows_the_prelude_without_a_duplicate() {
+        let src = "module Main exposing (main)\n\
+                   max : Int -> Int -> Int\n\
+                   max a _b = a\n\
+                   main = max\n";
+        let Some((m, i)) = canon_src(src) else {
+            assert!(
+                false_marker(),
+                "a local `max` is no duplicate of the prelude's"
+            );
+            return;
+        };
+        let Some(Def::Untyped { body, .. }) = find_def(&m, &i, "main") else {
+            assert!(false_marker(), "main should be an untyped def");
+            return;
+        };
+        assert!(
+            matches!(body.value, Expr_::VarTopLevel { name, .. } if i.resolve(name) == Some("max")),
+            "a bare `max` names the local definition, got {:?}",
+            body.value
+        );
+    }
+
+    #[test]
     fn stdlib_wildcard_shadowed_by_explicit_exposing() {
-        // An explicit `exposing (color)` (higher priority, in `env.vars`) wins over
+        // An explicit `exposing (color)` (the explicit tier) wins over
         // a wildcard `color`; the pair is NOT ambiguous. Resolves to Font.color.
         let src = "module Main exposing (main)\n\
                    import Ipe.Ui.Background exposing (..)\n\
@@ -4454,11 +4541,10 @@ mod tests {
     //
     // Ipe.Money imports `Ipe.String as String` and uses `String.*` in its body.
     // The Tier-C import gate (ADR 0001) must see that import as satisfied —
-    // `register_stdlib_import_aliases` marks the qualifier imported BEFORE
-    // `resolve_qual_var` consults `stdlib_import_required`. If that ordering
-    // were broken (e.g. the gate were checked before alias registration),
-    // every compiled-source stdlib module that imports a kernel module would
-    // fail with IPE-N0034 on its own import.
+    // `register_stdlib_import_aliases` installs the qualifier BEFORE any body
+    // reference reaches `resolve_qual_var`. If that ordering were broken, every
+    // compiled-source stdlib module that imports a kernel module would fail
+    // with IPE-N0034 on its own import.
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -4492,12 +4578,69 @@ mod tests {
             matches!(
                 err.as_ref().err(),
                 Some(Diagnostic::Name {
-                    msg: NameError::StdlibImportRequired { .. },
+                    msg: NameError::ImportRequired { .. },
                     ..
                 })
             ),
             "user module without import must still be IPE-N0034, got {err:?}"
         );
+    }
+
+    /// The IPE-N0034 candidate rule (`bare_import_binds`) agrees with what a
+    /// bare import of every kernel module actually binds.
+    ///
+    /// For each kernel path and each spelling a use site may try (canonical,
+    /// last segment, dotted path) that the gate refuses with no import, `import
+    /// P` then `Q.member` resolves the qualifier exactly when the rule says the
+    /// import binds it. A candidate the import would not bind (an applied fix
+    /// that still fails), or a binding import left out of the list, goes red
+    /// here. A spelling that resolves with no import never raises IPE-N0034, so
+    /// no candidate list is built for it.
+    #[test]
+    fn candidate_rule_matches_kernel_import_binding() {
+        let mut checked = 0usize;
+        for (path, canonical) in STDLIB_MODULE_QUALIFIERS {
+            let module = path.join(".");
+            let last = path.last().copied().unwrap_or(&module);
+            for qualifier in [*canonical, last, &module] {
+                if qualifier_bound("", qualifier).0 != Some(false) {
+                    continue;
+                }
+                checked += 1;
+                let (bound, result) = qualifier_bound(&format!("import {module}\n"), qualifier);
+                assert_eq!(
+                    bound,
+                    Some(bare_import_binds(&module, qualifier)),
+                    "import {module}; {qualifier}.member: {result:?}"
+                );
+            }
+        }
+        assert!(checked > 0, "no gated kernel spelling was exercised");
+    }
+
+    /// Whether `qualifier.zzAbsentMember` reaches the qualifier's member table
+    /// after `imports`: `Some(true)` resolved (or missed only the member),
+    /// `Some(false)` the qualifier is gated or unknown, `None` anything else.
+    fn qualifier_bound(
+        imports: &str,
+        qualifier: &str,
+    ) -> (Option<bool>, DResult<(ast::Module, ModuleExports)>) {
+        let src =
+            format!("module Main exposing (main)\n{imports}main = {qualifier}.zzAbsentMember\n");
+        let result = canon_with_origin(&src, ModuleOrigin::User);
+        let bound = match &result {
+            Ok(_)
+            | Err(Diagnostic::Name {
+                msg: NameError::NoSuchMember { .. },
+                ..
+            }) => Some(true),
+            Err(Diagnostic::Name {
+                msg: NameError::ImportRequired { .. } | NameError::UnknownModule { .. },
+                ..
+            }) => Some(false),
+            Err(_) => None,
+        };
+        (bound, result)
     }
 
     #[test]

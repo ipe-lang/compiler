@@ -1,0 +1,1189 @@
+module IndexTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.Db as Db
+import Ipe.Db.Decode
+import Ipe.Db.Sql as Sql
+import Ipe.Dict as Dict
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Path as Path
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Set as Set
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import Ipe.Time.Timestamp as Timestamp
+import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Format as Format
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Index as Index exposing (Body(..), Oversize(..), SourceRow(..), SourceView(..), StaleReason(..))
+import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Links as Links exposing (Link(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.ReviewKey as ReviewKey
+import Lib.SafeText as SafeText
+import Lib.Uid as Uid exposing (Uid)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid)
+
+
+-- ── ipe-index bridge ───────────────────────────────────────────────────
+--
+-- Seeds a scratch ipe-index database (units + change_queue) plus two source
+-- files, then loads the first queue page and checks the loaded
+-- units' metadata and source slices.
+indexBridge : Task.Task Error Bool
+indexBridge =
+    freshDir "ipe-index-b3-test" |> Task.andThen indexBridgeIn
+
+
+indexBridgeIn : String -> Task.Task Error Bool
+indexBridgeIn base =
+    let
+        repo =
+            base ++ "/repo"
+
+        indexDb =
+            base ++ "/index.db"
+    in
+    Task.fromResult (Path.fromString indexDb)
+        |> Task.andThen File.remove
+        |> Task.onError (\_ -> Task.succeed ())
+        |> Task.andThen (\_ -> seedIndex indexDb repo)
+        |> Task.andThen (\_ -> loadFirstPage |> Task.map (\r -> checkUnits r.total r.units))
+        |> Task.andThen (\ok -> cleanupIndex indexDb repo |> Task.map (\_ -> ok))
+
+
+-- Seeds the bridge fixture at `name`, runs `mutate`, loads the first page and
+-- returns the view tag of each queued unit as `uid=tag`.
+viewTagsAfter : String -> (Scratch -> Task.Task Error ()) -> Task.Task Error (List String)
+viewTagsAfter name mutate =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        mutate at
+        r <- loadFirstPage
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (List.map (\u -> fixtureLabel u.uid ++ "=" ++ viewTag u.view) r.units)
+
+
+-- The fixture label of a seeded unit id, or the id itself for any other.
+fixtureLabel : Uid -> String
+fixtureLabel unit =
+    if unit == uid "u-a" then
+        "u-a"
+
+    else if unit == uid "u-b" then
+        "u-b"
+
+    else
+        Uid.toString unit
+
+
+-- True for an `Unreadable` view tag whose rendered error contains `needle`.
+unreadableNaming : String -> String -> Bool
+unreadableNaming needle tag =
+    String.startsWith "unreadable: " tag && String.contains needle tag
+
+
+-- R1: one line inserted above the unit moves its bytes; the stored hash no
+-- longer matches. Red if the hash comparison is removed (the view is shown).
+driftedSourceNotShown : Task.Task Error Bool
+driftedSourceNotShown =
+    viewTagsAfter
+        "ipe-index-attest-drift"
+        (\at -> writeFileText (at.repo ++ "/src/Lib.rs") ("// inserted above\n" ++ fixtureLibRs))
+        |> Task.map (\tags -> List.member "u-a=drifted" tags && List.member "u-b=shown" tags)
+
+
+-- R2: a span one line past the 10-line file, stored with the hash of the
+-- clamped slice so only the range check can refuse it. Red if the range check
+-- is removed or clamping comes back.
+rangePastFileIsStale : Task.Task Error Bool
+rangePastFileIsStale =
+    viewTagsAfter "ipe-index-attest-range"
+        (\at ->
+            execIndex at.indexDb
+                "UPDATE units SET line_start = ?, line_end = ?, body_hash = ? WHERE uid = ?"
+                [ SqlInt 9, SqlInt 11, SqlString (Index.attest "    7\n}"), Uid.toSql (uid "u-a") ]
+        )
+        |> Task.map (\tags -> List.member "u-a=range 10" tags)
+
+
+-- R3: a stored value with no exact `sha256:` prefix is never re-proved, even
+-- when it is the right digest. Red if the scheme parse is removed (each
+-- value would read as drifted).
+legacyHashUnverifiable : Task.Task Error Bool
+legacyHashUnverifiable =
+    [ Crypto.sha256 viewA
+    , "SHA256:" ++ Crypto.sha256 viewA
+    , "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    ]
+        |> List.map
+            (\stored ->
+                viewTagsAfter
+                    "ipe-index-attest-legacy"
+                    (\at -> execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString stored, Uid.toSql (uid "u-a") ])
+                    |> Task.map (\tags -> List.member "u-a=unverifiable" tags)
+            )
+        |> Task.sequence
+        |> Task.map (List.all identity)
+
+
+-- R8: one queued unit's file is gone; that unit alone is unreadable, naming
+-- its stored path, and the page still loads. Red if the per-unit error
+-- capture is removed (the whole page fails).
+oneMissingFileIsolated : Task.Task Error Bool
+oneMissingFileIsolated =
+    viewTagsAfter
+        "ipe-index-attest-missing"
+        (\at -> removeFileIfAny (at.repo ++ "/src/Main.ipe"))
+        |> Task.map
+            (\tags ->
+                List.member "u-a=shown" tags
+                    && List.any (\t -> String.startsWith "u-b=unreadable: " t && String.contains "ipe:src/Main.ipe" t) tags
+            )
+
+
+-- A unit whose file is gone reads as naming no file; one whose path now
+-- holds a directory reads as present but not read as text. Neither carries
+-- the read error's own wording, its kind or an OS error number. Red if a
+-- read error's message reaches the view again.
+unreadableReasonsTyped : Task.Task Error Bool
+unreadableReasonsTyped =
+    do
+        gone <- viewTagsAfter "ipe-index-unreadable-gone" (\at -> removeFileIfAny (at.repo ++ "/src/Main.ipe"))
+        dir <- viewTagsAfter "ipe-index-unreadable-dir" mainIpeAsDirectory
+        Task.succeed (typedUnreadable "names no file" gone && typedUnreadable "did not read as text" dir)
+
+
+-- `src/Main.ipe` replaced by a directory of that name.
+mainIpeAsDirectory : Scratch -> Task.Task Error ()
+mainIpeAsDirectory at =
+    removeFileIfAny (at.repo ++ "/src/Main.ipe")
+        |> Task.andThen (\_ -> Task.fromResult (Path.fromString (at.repo ++ "/src/Main.ipe")))
+        |> Task.andThen File.mkdirAll
+
+
+-- `u-b` is unreadable naming its stored path and `reason`, with no OS
+-- wording or error kind in the text.
+typedUnreadable : String -> List String -> Bool
+typedUnreadable reason tags =
+    List.any
+        (\t ->
+            String.startsWith "u-b=unreadable: " t
+                && String.contains reason t
+                && String.contains "ipe:src/Main.ipe" t
+                && not (String.contains "os error" t)
+                && not (String.contains "Unexpected" t)
+        )
+        tags
+
+
+-- A queued unit whose source file is one byte past the 16 MiB read ceiling
+-- is unreadable for that reason, rather than read whole; the page still
+-- loads.
+oversizedSourceRefused : Task.Task Error Bool
+oversizedSourceRefused =
+    freshDir "ipe-index-oversized-source" |> Task.andThen oversizedSourceRefusedIn
+
+
+oversizedSourceRefusedIn : String -> Task.Task Error Bool
+oversizedSourceRefusedIn base =
+    let
+        repo =
+            base ++ "/repo"
+
+        indexDb =
+            base ++ "/index.db"
+    in
+    do
+        removeFileIfAny indexDb
+        seedIndex indexDb repo
+        writeFileText (repo ++ "/src/Lib.rs") (String.repeat (16 * 1024 * 1024 + 1) "x")
+        r <- loadFirstPage
+        cleanupIndex indexDb repo
+        Task.succeed (unreadableNaming "16777216-byte limit" (unitViewTag (uid "u-a") r.units))
+
+
+-- ── view ceilings ──────────────────────────────────────────────────────
+--
+-- A view past `viewLineCeiling` lines or `viewByteCeiling` bytes is
+-- `TooLarge`: never shown, never hashed, never decidable. Each fixture sits
+-- on a ceiling or one step past it, built from the constants.
+--
+-- Unit `u-a` re-pointed at lines `start..end` under `hash`.
+setUnitA : Scratch -> Int -> Int -> String -> Task.Task Error ()
+setUnitA at start end hash =
+    execIndex at.indexDb
+        "UPDATE units SET line_start = ?, line_end = ?, body_hash = ? WHERE uid = ?"
+        [ SqlInt start, SqlInt end, SqlString hash, Uid.toSql (uid "u-a") ]
+
+
+-- `n` lines of `x` joined by `\n`: a view of exactly `n` lines.
+xLines : Int -> String
+xLines n =
+    String.join "\n" (List.repeat n "x")
+
+
+-- `u-a`'s view tag after its file becomes `file` and its row spans
+-- `start..end` under `hash`; with `remove`, the file is then deleted.
+oversizeTag : Bool -> String -> Int -> Int -> String -> Task.Task Error String
+oversizeTag remove file start end hash =
+    viewTagsAfter "ipe-index-view-ceiling"
+        (\at ->
+            do
+                writeFileText (at.repo ++ "/src/Lib.rs") file
+                setUnitA at start end hash
+                if remove then
+                    removeFileIfAny (at.repo ++ "/src/Lib.rs")
+
+                else
+                    Task.succeed ()
+        )
+        |> Task.map
+            (\tags ->
+                Maybe.withDefault "absent"
+                    (List.head
+                        (List.filterMap
+                            (\t ->
+                                if String.startsWith "u-a=" t then
+                                    Just (String.dropLeft 4 t)
+
+                                else
+                                    Nothing
+                            )
+                            tags
+                        )
+                    )
+            )
+
+
+-- A span of exactly `viewLineCeiling` lines is shown. Red if the line
+-- check refuses at the ceiling itself.
+spanAtLineCeilingShown : Task.Task Error Bool
+spanAtLineCeilingShown =
+    oversizeTag False (xLines Index.viewLineCeiling ++ "\n") 1 Index.viewLineCeiling (Index.attest (xLines Index.viewLineCeiling))
+        |> Task.map (\tag -> tag == "shown")
+
+
+-- A span one line past the ceiling is withheld before any read: with its
+-- file removed it is still too large, not unreadable. The control, a span
+-- of exactly the ceiling with its file removed, is unreadable, so the read
+-- is what the pre-check skips. Red if the pre-check moves after the read or
+-- is removed.
+spanPastLineCeilingWithheldUnread : Task.Task Error Bool
+spanPastLineCeilingWithheldUnread =
+    let
+        past =
+            Index.viewLineCeiling + 1
+
+        tooLarge =
+            "too large lines " ++ String.fromInt past
+    in
+    do
+        read <- oversizeTag False (xLines past ++ "\n") 1 past (Index.attest (xLines past))
+        unread <- oversizeTag True (xLines past ++ "\n") 1 past (Index.attest (xLines past))
+        control <- oversizeTag True (xLines Index.viewLineCeiling ++ "\n") 1 Index.viewLineCeiling (Index.attest (xLines Index.viewLineCeiling))
+        Task.succeed (read == tooLarge && unread == tooLarge && String.startsWith "unreadable: " control)
+
+
+-- Half the byte ceiling in two-byte characters: a view of exactly
+-- `viewByteCeiling` UTF-8 bytes.
+twoByteView : String
+twoByteView =
+    String.repeat (ByteSize.toBytes Index.viewByteCeiling // 2) (codeText 233)
+
+
+-- A one-line view of exactly the byte ceiling is shown. Red if the byte
+-- measure is off by one.
+viewAtByteCeilingShown : Task.Task Error Bool
+viewAtByteCeilingShown =
+    oversizeTag False (twoByteView ++ "\n") 1 1 (Index.attest twoByteView)
+        |> Task.map (\tag -> tag == "shown")
+
+
+-- One byte past the ceiling is withheld, while its character count is about
+-- half the ceiling, so the measure is bytes. Red if `String.length` is the
+-- measure, or the byte check is removed.
+viewPastByteCeilingWithheld : Task.Task Error Bool
+viewPastByteCeilingWithheld =
+    let
+        view =
+            twoByteView ++ "a"
+
+        past =
+            ByteSize.toBytes Index.viewByteCeiling + 1
+    in
+    oversizeTag False (view ++ "\n") 1 1 (Index.attest view)
+        |> Task.map (\tag -> tag == "too large bytes " ++ String.fromInt past && String.length view < ByteSize.toBytes Index.viewByteCeiling)
+
+
+-- Each ceiling binds where the other does not: one line past the byte
+-- ceiling is `ViewBytes`, and one empty line past the line ceiling, a few
+-- KiB, is `SpanLines`. Red if either check is removed.
+byteCeilingVsLineCeiling : Task.Task Error Bool
+byteCeilingVsLineCeiling =
+    let
+        bytesPast =
+            ByteSize.toBytes Index.viewByteCeiling + 1
+
+        longLine =
+            String.repeat bytesPast "a"
+
+        linesPast =
+            Index.viewLineCeiling + 1
+
+        emptyLines =
+            String.repeat (linesPast - 1) "\n"
+    in
+    do
+        wide <- oversizeTag False (longLine ++ "\n") 1 1 (Index.attest longLine)
+        tall <- oversizeTag False (emptyLines ++ "\n") 1 linesPast (Index.attest emptyLines)
+        Task.succeed (wide == "too large bytes " ++ String.fromInt bytesPast && tall == "too large lines " ++ String.fromInt linesPast)
+
+
+-- An oversized view under a wrong hash is too large, not drifted: it is
+-- withheld before it is hashed. Red if the attestation compare runs first.
+oversizeRanksBeforeDrift : Task.Task Error Bool
+oversizeRanksBeforeDrift =
+    let
+        view =
+            twoByteView ++ "a"
+    in
+    oversizeTag False (view ++ "\n") 1 1 (Index.attest "another view")
+        |> Task.map (\tag -> String.startsWith "too large bytes " tag)
+
+
+-- The span pre-check is guarded on hostile stored integers. Ipê `Int`
+-- subtraction wraps, so the guard is proven by ranges the wrapped difference
+-- would misjudge: `1..MAX` is too large with its exact line count, `-MAX..MAX`
+-- is an invalid range refused by the range check, a start below 1 is not
+-- judged (unguarded it reads as an oversize span), and a start past the end
+-- is not judged (unguarded its difference wraps to a huge span). Red if the
+-- validity guard is dropped or the pre-check judges an invalid range.
+spanPreCheckNoOverflow : Task.Task Error Bool
+spanPreCheckNoOverflow =
+    do
+        huge <- oversizeTag False fixtureLibRs 1 9223372036854775807 (Index.attest viewA)
+        invalid <- oversizeTag False fixtureLibRs (0 - 9223372036854775807) 9223372036854775807 (Index.attest viewA)
+        Task.succeed
+            (huge
+                == "too large lines 9223372036854775807"
+                && invalid
+                == "range 10"
+                && notJudged 0 Index.viewLineCeiling
+                && notJudged 2 (0 - 9223372036854775807)
+            )
+
+
+-- Whether the span pre-check leaves `start..end` for the range check.
+notJudged : Int -> Int -> Bool
+notJudged start end =
+    case Index.spanOversize start end of
+        Nothing ->
+            True
+
+        Just _ ->
+            False
+
+
+-- `classifyView` itself refuses a span past the line ceiling, not only the
+-- pre-check before the read does. Red if its own span check is dropped.
+classifyRefusesPastLineCeiling : Bool
+classifyRefusesPastLineCeiling =
+    let
+        past =
+            Index.viewLineCeiling + 1
+
+        text =
+            xLines past
+    in
+    case Index.classifyView (uid "u-a") (Index.attest text) (LineRange 1 past) text of
+        TooLarge (SpanLines o) ->
+            o.lines == past
+
+        TooLarge (ViewBytes _) ->
+            False
+
+        TooLarge (ChildSpans _) ->
+            False
+
+        Shown _ ->
+            False
+
+        Stale _ ->
+            False
+
+        Unreadable _ ->
+            False
+
+
+-- Both ceilings are positive, and the byte ceiling is within the read
+-- ceiling, so it can bind. Red on a zero sentinel or a byte ceiling above
+-- the read ceiling.
+viewCeilingsWellFormed : Bool
+viewCeilingsWellFormed =
+    0
+        < Index.viewLineCeiling
+        && 0
+        < ByteSize.toBytes Index.viewByteCeiling
+        && ByteSize.toBytes Index.viewByteCeiling
+        <= ByteSize.toBytes Index.sourceCeiling
+
+
+-- The drawn lines are the attested lines: a `\r` is kept, and a trailing
+-- empty line of the span is drawn, numbered from the unit's first line. Red
+-- if the draw splits with `String.lines` (strips `\r`, drops the trailing
+-- empty line) or re-applies the file rule to the view (drops it too).
+shownLinesAreAttestedLines : Bool
+shownLinesAreAttestedLines =
+    let
+        file =
+            "a\r\nb\n\n\n"
+
+        span =
+            List.take 4 (Index.viewLines file)
+
+        crView =
+            String.join "\n" span
+
+        drawn text first last =
+            Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-x") (Index.attest text) (LineRange first last) file))
+    in
+    span
+        == [ "a\r", "b", "", "" ]
+        && drawn crView 1 4
+        == Just [ Numbered 1 "a\r", Numbered 2 "b", Numbered 3 "", Numbered 4 "" ]
+        && drawn "b\n" 2 3
+        == Just [ Numbered 2 "b", Numbered 3 "" ]
+        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") (Index.attest viewB) (LineRange 1 2) fixtureMainIpe))
+        == Just [ Numbered 1 "module Main exposing (main)", Numbered 2 "" ]
+
+
+-- The unit page's data path: a uid that exists loads with its source and
+-- qualified name, and links nothing its source does not name; a bogus uid
+-- loads Nothing.
+unitPageLoad : Task.Task Error Bool
+unitPageLoad =
+    freshDir "ipe-index-b9-unit" |> Task.andThen unitPageLoadIn
+
+
+unitPageLoadIn : String -> Task.Task Error Bool
+unitPageLoadIn base =
+    let
+        repo =
+            base ++ "/repo"
+
+        indexDb =
+            base ++ "/index.db"
+    in
+    Task.fromResult (Path.fromString indexDb)
+        |> Task.andThen File.remove
+        |> Task.onError (\_ -> Task.succeed ())
+        |> Task.andThen (\_ -> Task.fromResult (Path.fromString base) |> Task.andThen File.mkdirAll)
+        |> Task.andThen (\_ -> Task.fromResult (Path.fromString (repo ++ "/src")) |> Task.andThen File.mkdirAll)
+        |> Task.andThen (\_ -> writeFileText (repo ++ "/src/Lib.rs") fixtureLibRs)
+        |> Task.andThen (\_ -> writeFileText (repo ++ "/src/Main.ipe") fixtureMainIpe)
+        |> Task.andThen (\_ -> seedIndexDb indexDb)
+        |> Task.andThen (\_ -> setIndexEnv indexDb repo)
+        |> Task.andThen
+            (\_ ->
+                loadUnitNow (uid "u-a")
+                    |> Task.andThen
+                        (\mb ->
+                            case mb of
+                                Just loaded ->
+                                    Task.succeed
+                                        (SafeText.toString loaded.unit.qualified
+                                            == "Lib.answer"
+                                            && shownTextOf loaded.view
+                                            == Just viewA
+                                            && List.isEmpty loaded.links.links
+                                            && loaded.links.hidden
+                                            == Links.NoneHidden
+                                        )
+
+                                Nothing ->
+                                    Task.succeed False
+                        )
+            )
+        |> Task.andThen
+            (\ok ->
+                if not ok then
+                    Task.succeed False
+
+                else
+                    loadUnitNow (uid "u-zz")
+                        |> Task.map
+                            (\mb ->
+                                case mb of
+                                    Nothing ->
+                                        True
+
+                                    Just _ ->
+                                        False
+                            )
+            )
+        |> Task.andThen
+            (\ok ->
+                Task.sequence
+                    [ removeFileIfAny indexDb
+                    , removeFileIfAny (indexDb ++ "-wal")
+                    , removeFileIfAny (indexDb ++ "-shm")
+                    , removeFileIfAny (repo ++ "/src/Lib.rs")
+                    , removeFileIfAny (repo ++ "/src/Main.ipe")
+                    ]
+                    |> Task.map (\_ -> ok)
+            )
+
+
+-- ── shared view/hash vectors ──────────────────────────────────────────────
+--
+-- The Ipê view rule and attestation agree with ipe-index's on every row of
+-- the shared vectors file, and a row ipe-index refuses is refused here too.
+-- Red if the trailing-newline drop or the `\r` keep rule changes, or if a
+-- range past the file is clamped instead of refused.
+type alias HashVector =
+    { name : String
+    , src : String
+    , startLine : Int
+    , endLine : Int
+    , view : Maybe String
+    , hash : Maybe String
+    }
+
+
+viewHashVectors : Task.Task Error Bool
+viewHashVectors =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (vectorsPath cwd))
+        text <- File.readFileLimit path (ByteSize.kib 64)
+        vectors <- Task.fromResult (Decode.decodeString (Decode.list vectorDecoder) text)
+        Task.succeed (List.length vectors >= 13 && List.all vectorHolds vectors)
+
+
+vectorDecoder : Decode.Decoder HashVector
+vectorDecoder =
+    Decode.map3
+        (\name src rest ->
+            { name = name
+            , src = src
+            , startLine = rest.startLine
+            , endLine = rest.endLine
+            , view = rest.view
+            , hash = rest.hash
+            }
+        )
+        (Decode.field "name" Decode.string)
+        (Decode.field "src" Decode.string)
+        (Decode.map4
+            (\startLine endLine view hash -> { startLine = startLine, endLine = endLine, view = view, hash = hash })
+            (Decode.field "start" Decode.int)
+            (Decode.field "end" Decode.int)
+            (Decode.field "view" (Decode.nullable Decode.string))
+            (Decode.field "hash" (Decode.nullable Decode.string))
+        )
+
+
+vectorHolds : HashVector -> Bool
+vectorHolds v =
+    case Index.viewText v.startLine v.endLine v.src of
+        Ok text ->
+            case ( v.view, v.hash ) of
+                ( Just view, Just hash ) ->
+                    text == view && Index.attest text == hash
+
+                _ ->
+                    False
+
+        Err (RangeOutOfFile _) ->
+            v.view == Nothing && v.hash == Nothing
+
+        Err _ ->
+            False
+
+
+-- One row of ipe-index's `tests/residual_vectors.json`: a source, the spans
+-- of its child units, and the residual a file unit attests with its hash.
+type alias ResidualVector =
+    { name : String
+    , src : String
+    , spans : List (List Int)
+    , residual : String
+    , hash : String
+    }
+
+
+-- Every residual vector holds on this side: `residualText` gives the shared
+-- residual and hash, a non-empty residual starts with its first row's `\n`,
+-- and `classifyView` shows a file unit stored under that hash with exactly
+-- that text. Red if the residual rule drifts from ipe-index's, a source line
+-- reads as a covered row, or a file unit is judged by its line range.
+residualVectors : Task.Task Error Bool
+residualVectors =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (ipeIndexTestFile cwd "residual_vectors.json"))
+        text <- File.readFileLimit path (ByteSize.kib 64)
+        vectors <- Task.fromResult (Decode.decodeString (Decode.list residualVectorDecoder) text)
+        Task.succeed (List.length vectors >= 27 && List.all residualVectorHolds vectors)
+
+
+residualVectorDecoder : Decode.Decoder ResidualVector
+residualVectorDecoder =
+    Decode.map3
+        (\name src rest ->
+            { name = name
+            , src = src
+            , spans = rest.spans
+            , residual = rest.residual
+            , hash = rest.hash
+            }
+        )
+        (Decode.field "name" Decode.string)
+        (Decode.field "src" Decode.string)
+        (Decode.map3
+            (\spans residual hash -> { spans = spans, residual = residual, hash = hash })
+            (Decode.field "spans" (Decode.list (Decode.list Decode.int)))
+            (Decode.field "residual" Decode.string)
+            (Decode.field "hash" Decode.string)
+        )
+
+
+residualVectorHolds : ResidualVector -> Bool
+residualVectorHolds v =
+    let
+        spans =
+            List.filterMap spanPair v.spans
+    in
+    List.length spans
+        == List.length v.spans
+        && Index.residualText spans v.src
+        == v.residual
+        && (String.isEmpty v.residual || String.startsWith "\n" v.residual)
+        && Index.attestResidual v.residual
+        == v.hash
+        && shownTextOf (Index.classifyView (uid "u-file") v.hash (Residual spans) v.src)
+        == Just v.residual
+
+
+spanPair : List Int -> Maybe ( Int, Int )
+spanPair pair =
+    case pair of
+        [ first, last ] ->
+            Just ( first, last )
+
+        _ ->
+            Nothing
+
+
+-- The residual of `fixtureLibRs` beside unit `u-a` (lines 3..6), written out
+-- by hand: line 1, the covered run's empty row, lines 8..10, each row after
+-- a `\n`; blank lines 2 and 7 dropped.
+libResidual : String
+libResidual =
+    "\n// fixture library\n\npub fn other() -> i32 {\n    7\n}"
+
+
+-- A file unit `u-file` over `fixtureLibRs`, stored under `hash`.
+withFileUnit : String -> Scratch -> Task.Task Error ()
+withFileUnit hash at =
+    execIndex at.indexDb
+        "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        [ Uid.toSql (uid "u-file"), SqlString "ipe:src/Lib.rs", SqlString "file", SqlString "Lib.rs", SqlString "Lib::FILE", SqlInt 1, SqlInt 10, SqlString "internal", SqlNull (SqlString ""), SqlString hash, SqlString "shaF" ]
+
+
+-- The view a file unit stored under `hash` loads with, after `mutate`.
+fileUnitView : String -> String -> (Scratch -> Task.Task Error ()) -> Task.Task Error (Maybe Index.SourceView)
+fileUnitView name hash mutate =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        withFileUnit hash at
+        mutate at
+        loaded <- loadUnitNow (uid "u-file")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (Maybe.map (\l -> l.view) loaded)
+
+
+-- A file unit loads its residual through the app's one source read: the
+-- lines no other unit of its file covers, the covered run drawn as one
+-- marker row, the uncovered lines numbered from the file. A file unit stored
+-- under its whole file's hash, or under the line-range scheme's hash of its
+-- own residual text, is drifted, never shown. Red if a file unit is judged by
+-- its line range, its rows and its hashed text part, or its residual is
+-- attested under the line-range scheme.
+fileUnitShowsResidual : Task.Task Error Bool
+fileUnitShowsResidual =
+    do
+        residual <- fileUnitView "ipe-index-file-residual" (Index.attestResidual libResidual) (\_ -> Task.succeed ())
+        whole <- fileUnitView "ipe-index-file-whole" (Index.attest (String.dropRight 1 fixtureLibRs)) (\_ -> Task.succeed ())
+        viewScheme <- fileUnitView "ipe-index-file-view-scheme" (Index.attest libResidual) (\_ -> Task.succeed ())
+        let
+            rows =
+                Maybe.map Index.shownRows (Maybe.andThen shownOf residual)
+        in
+        Task.succeed
+            (rows
+                == Just [ Numbered 1 "// fixture library", Covered, Numbered 8 "pub fn other() -> i32 {", Numbered 9 "    7", Numbered 10 "}" ]
+                && Maybe.andThen shownTextOf residual
+                == Just libResidual
+                && Maybe.map viewTag whole
+                == Just "drifted"
+                && Maybe.map viewTag viewScheme
+                == Just "drifted"
+            )
+
+
+-- A file unit whose file holds more than `childSpanCeiling` other units is
+-- withheld, never judged on a truncated span list; exactly the ceiling is
+-- judged. Red if the span read loses its ceiling or the ceiling check.
+fileUnitPastChildSpanCeiling : Task.Task Error Bool
+fileUnitPastChildSpanCeiling =
+    do
+        past <- fileUnitView "ipe-index-file-spans-past" (Index.attestResidual libResidual) (childUnits Index.childSpanCeiling)
+        at <- fileUnitView "ipe-index-file-spans-at" (Index.attestResidual libResidual) (childUnits (Index.childSpanCeiling - 1))
+        Task.succeed
+            (Maybe.map viewTag past
+                == Just ("too large spans " ++ String.fromInt (Index.childSpanCeiling + 1))
+                && Maybe.map viewTag at
+                == Just "shown"
+            )
+
+
+-- `count` more one-line units of `ipe:src/Lib.rs`, each on line 3, inside
+-- `u-a`'s span, so the residual is unchanged; one statement.
+childUnits : Int -> Scratch -> Task.Task Error ()
+childUnits count at =
+    execIndex at.indexDb
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) SELECT 'c-' || i, 'ipe:src/Lib.rs', 'fn', 'c' || i, 'Lib.c' || i, 3, 3, 'internal', NULL, 'sha256:0', 'shaC' FROM n"
+        [ SqlInt count ]
+
+
+-- Every `.json` file in `tools/ipe-index/tests` is read by name through
+-- `ipeIndexTestFile` in this suite's code (comment lines aside), so a shared
+-- vectors file cannot sit beside the suite unread. Red if a vectors file is
+-- added with no consumer, or a consumer stops naming it.
+everySharedVectorsFileRead : Task.Task Error Bool
+everySharedVectorsFileRead =
+    do
+        cwd <- System.cwd ()
+        names <- Task.fromResult (Path.fromString (String.dropRight 1 (ipeIndexTestFile cwd ""))) |> Task.andThen File.readDir
+        suiteNames <- Task.fromResult (Path.fromString (cwd ++ "/tests")) |> Task.andThen File.readDir
+        sources <- Task.sequence
+            (List.map
+                (\file -> Task.fromResult (Path.fromString (cwd ++ "/tests/" ++ file)) |> Task.andThen (\p -> File.readFileLimit p (ByteSize.kib 256)))
+                (List.filter (String.endsWith ".ipe") suiteNames)
+            )
+        let
+            code =
+                String.join "\n" (List.map codeLines sources)
+
+            vectors =
+                List.filter (String.endsWith ".json") names
+        in
+        Task.succeed
+            (List.member "residual_vectors.json" vectors
+                && List.member "view_hash_vectors.json" vectors
+                && allReadByName vectors code
+                && not (allReadByName (vectors ++ [ "unread_vectors.json" ]) code)
+            )
+
+
+-- True when `code` names each of `files` in an `ipeIndexTestFile` read.
+allReadByName : List String -> String -> Bool
+allReadByName files code =
+    List.all (\file -> String.contains ("ipeIndexTestFile cwd \"" ++ file ++ "\"") code) files
+
+
+-- `source` without its comment lines.
+codeLines : String -> String
+codeLines source =
+    String.lines source
+        |> List.filter (\line -> not (String.startsWith "--" (String.trim line)))
+        |> String.join "\n"
+
+
+-- ── metadata-only queue page ───────────────────────────────────────────
+--
+-- A queue page carries no source (`Index.Unit` has no view to hold one):
+-- with both queued units' files gone the page still loads both units, and a
+-- unit's own view load is where its unreadable file is reported. Red if a
+-- page load fails or drops a unit over a missing file.
+pageReadsNoSource : Task.Task Error Bool
+pageReadsNoSource =
+    do
+        at <- freshScratch "ipe-index-page-no-source"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        removeFileIfAny (at.repo ++ "/src/Lib.rs")
+        removeFileIfAny (at.repo ++ "/src/Main.ipe")
+        conn <- indexConn
+        rows <- pendingRows conn
+        settings <- envSettings
+        found <- Index.loadView conn settings.roots (uid "u-b")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (List.map (\r -> r.unit.uid) rows
+                == [ uid "u-a", uid "u-b" ]
+                && String.startsWith "unreadable: " (loadedViewTag found)
+            )
+
+
+loadedViewTag : Maybe Index.UnitView -> String
+loadedViewTag found =
+    case found of
+        Just loaded ->
+            viewTag loaded.view
+
+        Nothing ->
+            "absent"
+
+
+-- A unit's highlighting language is its file's language as ipe-index
+-- indexed it in `files.lang`; a unit whose file has no `files` row is
+-- `Unknown`. Red if the language is taken from anywhere but `files.lang`.
+langFromFilesTable : Task.Task Error Bool
+langFromFilesTable =
+    do
+        at <- freshScratch "ipe-index-files-lang"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "INSERT INTO files (path, lang) VALUES (?, ?)" [ SqlString "ipe:src/Lib.rs", SqlString "rs" ]
+        conn <- indexConn
+        rows <- pendingRows conn
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (List.map (\r -> fixtureLabel r.unit.uid ++ "=" ++ langName r.unit.lang) rows == [ "u-a=Rust", "u-b=Unknown" ])
+
+
+-- An index with no `files` table stops startup naming `IPE_INDEX_DB`. Red if
+-- the probe stops reading the language join a queue page reads.
+probeRefusesIndexWithoutFiles : Task.Task Error Bool
+probeRefusesIndexWithoutFiles =
+    do
+        at <- freshScratch "ipe-index-probe-files"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "DROP TABLE files" []
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
+
+
+-- An index without the `change_queue` table a queue page joins, or without
+-- the `reviewed_stamp` table, stops startup naming `IPE_INDEX_DB`. Red if
+-- the probe stops selecting either.
+probeRefusesIndexWithoutQueueOrStamp : Task.Task Error Bool
+probeRefusesIndexWithoutQueueOrStamp =
+    do
+        noQueue <- probeAfter "ipe-index-probe-queue" "DROP TABLE change_queue"
+        noStamp <- probeAfter "ipe-index-probe-stamp" "DROP TABLE reviewed_stamp"
+        Task.succeed (noQueue && noStamp)
+
+
+-- The probe of a seeded index after `sql` ran on it: True when it refuses,
+-- naming the variable and the file.
+probeAfter : String -> String -> Task.Task Error Bool
+probeAfter name sql =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb sql []
+        message <- probeMessage (envSettings |> Task.andThen Index.probe)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
+
+
+-- A unit with no change_queue row for its current body is still open: it
+-- is listed and counted, its change `Unrecorded`. Membership is the current
+-- pair against the decided set, never the event log. Red while the page
+-- reads `change_queue` as its membership.
+unrecordedUnitListed : Task.Task Error Bool
+unrecordedUnitListed =
+    do
+        at <- freshScratch "ipe-index-unrecorded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "DELETE FROM change_queue WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        r <- loadFirstPage
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (r.total
+                == 2
+                && List.map (\e -> e.uid) r.units
+                == [ uid "u-a", uid "u-b" ]
+                && List.all (\e -> e.uid /= uid "u-a" || isUnrecorded e.change) r.units
+                && List.all (\e -> e.uid /= uid "u-b" || modifiedFrom e.change == Just "oldB") r.units
+            )
+
+
+-- A `modified` row that does not say which hash it replaced fails the page
+-- read rather than show a change with no old side. Red if the decoder fills
+-- in a missing `old_hash`.
+changeDecodeRefusesModifiedWithoutOld : Task.Task Error Bool
+changeDecodeRefusesModifiedWithoutOld =
+    pageReadFailsAfter "ipe-index-modified-no-old" ("UPDATE change_queue SET old_hash = NULL WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'")
+
+
+-- An index whose queue row reports a change kind this reviewer does not
+-- know, or an old hash with no change, fails the page read rather than show
+-- the unit as some other change. The `change_queue` table is replaced
+-- without its CHECK and NOT NULL, as a foreign or tampered index could. Red
+-- if the decoder has a catch-all arm, or if the page drops a queue row of a
+-- kind it does not know, listing the unit as unrecorded.
+changeDecodeRefusesUnknown : Task.Task Error Bool
+changeDecodeRefusesUnknown =
+    do
+        unknown <- pageReadFailsAfter "ipe-index-change-unknown" (foreignQueue "'renamed'" "NULL")
+        orphanOld <- pageReadFailsAfter "ipe-index-change-orphan-old" (foreignQueue "NULL" "'h-old'")
+        Task.succeed (unknown && orphanOld)
+
+
+-- A replacement `change_queue` with one row per unit for its current body,
+-- holding a fixed change and old hash.
+foreignQueue : String -> String -> String
+foreignQueue change oldHash =
+    String.concat
+        [ "DROP TABLE change_queue; CREATE TABLE change_queue (uid TEXT, change TEXT, old_hash TEXT, new_hash TEXT, enqueued_sha TEXT, enqueued_at INTEGER); INSERT INTO change_queue SELECT uid, "
+        , change
+        , ", "
+        , oldHash
+        , ", body_hash, 'sha', 0 FROM units"
+        ]
+
+
+-- An `open_units` view redefined in the index to leave a unit out does not
+-- hide it: the queue's membership is the app's own query over the index's
+-- tables, so both units are listed and counted. Red while any page or count
+-- reads the view.
+redefinedViewHidesNoUnit : Task.Task Error Bool
+redefinedViewHidesNoUnit =
+    do
+        at <- freshScratch "ipe-index-redefined-view"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb ("DROP VIEW open_units; CREATE VIEW open_units AS SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, NULL AS lang, NULL AS change, NULL AS old_hash, 0 AS enqueued_at FROM units WHERE uid <> '" ++ Uid.toString (uid "u-b") ++ "'")
+        r <- loadFirstPage
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (r.total == 2 && List.map (\e -> e.uid) r.units == [ uid "u-a", uid "u-b" ])
+
+
+-- The `reviewed` copy is digested only while each pair is in it once: a
+-- copy recreated without its primary key and holding one pair twice reads
+-- no digest, while the same keyless table holding the pair once still does,
+-- so the refusal is the repeat's. Red if the copy is digested without
+-- proving its pairs distinct, where a repeated pair cancels out of the
+-- digest.
+repeatedCopyPairReadsNoDigest : Task.Task Error Bool
+repeatedCopyPairReadsNoDigest =
+    let
+        keyless =
+            "DROP TABLE reviewed; CREATE TABLE reviewed (uid TEXT NOT NULL, body_hash TEXT NOT NULL); INSERT INTO reviewed VALUES ('x', 'hx')"
+    in
+    do
+        once <- copyReadAfter "ipe-index-copy-once" keyless
+        twice <- copyReadAfter "ipe-index-copy-twice" (keyless ++ "; INSERT INTO reviewed VALUES ('x', 'hx')")
+        Task.succeed (once && not twice)
+
+
+-- A `reviewed` copy replaced by a view over another table reads no digest:
+-- a view can show the digest read and the membership read different rows.
+-- Red if the copy is digested without proving it a plain table.
+viewCopyReadsNoDigest : Task.Task Error Bool
+viewCopyReadsNoDigest =
+    do
+        plain <- copyReadAfter "ipe-index-copy-plain" "DELETE FROM reviewed"
+        viewed <- copyReadAfter "ipe-index-copy-view" "DROP TABLE reviewed; CREATE TABLE reviewed_rows (uid TEXT NOT NULL, body_hash TEXT NOT NULL); CREATE VIEW reviewed AS SELECT uid, body_hash FROM reviewed_rows"
+        Task.succeed (plain && not viewed)
+
+
+-- True when a snapshot of a seeded index, after `sql` ran on it, carries a
+-- digest of its `reviewed` copy.
+copyReadAfter : String -> String -> Task.Task Error Bool
+copyReadAfter name sql =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb sql
+        conn <- indexConn
+        snap <- Index.readSnapshot ReviewKey.ReadOnly conn Index.Start
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (Maybe.withDefault False (Maybe.map (\_ -> True) snap.copy))
+
+
+-- True when the first page read fails on a seeded index after `sql` ran.
+pageReadFailsAfter : String -> String -> Task.Task Error Bool
+pageReadFailsAfter name sql =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb sql
+        conn <- indexConn
+        failed <- pendingRows conn
+            |> Task.map (\_ -> False)
+            |> Task.onError (\_ -> Task.succeed True)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed failed
+
+
+-- Each `;`-separated statement of `sql` run in order on the index.
+execIndexScript : String -> String -> Task.Task Error ()
+execIndexScript indexDb sql =
+    String.split "; " sql
+        |> List.map (\stmt -> execIndex indexDb stmt [])
+        |> Task.sequence
+        |> Task.map (\_ -> ())
+
+
+-- The first page's rows on `conn`, read through `Index.readSnapshot`, the
+-- one reader of a page `Lib.Index` exposes.
+pendingRows : Db -> Task.Task Error (List Index.PendingRow)
+pendingRows conn =
+    Index.readSnapshot ReviewKey.ReadOnly conn Index.Start |> Task.map (\snap -> snap.rows)
+
+
+-- ── one reader of a page ───────────────────────────────────────────────
+--
+-- A page's rows, its open and unit counts and the index size are read only
+-- through `Index.readSnapshot`, in one transaction. `Lib.Index` exposes
+-- exactly `indexExposes`, name for name, and no reader in `snapshotReaders`
+-- is among them, so a reader of one of them alone, or a wrapper around one
+-- under a new name, cannot be exposed without turning this red.
+indexExposesOnlySnapshotReader : Task.Task Error Bool
+indexExposesOnlySnapshotReader =
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
+        source <- File.readFileLimit path (ByteSize.kib 256)
+        Task.succeed
+            (exposesAdmitted source
+                && List.all (\reader -> not (List.member reader indexExposes)) snapshotReaders
+                && List.member "readSnapshot" indexExposes
+            )
+
+
+-- The scan refuses each way around it: one of the readers re-exposed,
+-- a wrapper exposed under a new name, an `exposing (..)` header, and a
+-- reader on a continuation line of a multi-line header. The same header
+-- written over several lines without a reader is admitted, so the
+-- multi-line refusal is the reader's. Red while the scan reads only the
+-- header's first line or matches a fixed spelling.
+indexExposingScanRefusesEvasions : Task.Task Error Bool
+indexExposingScanRefusesEvasions =
+    let
+        multiLine names =
+            "module Lib.Index exposing\n    ( " ++ String.join "\n    , " names ++ "\n    )\n\nimport Ipe.Db\n"
+    in
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (cwd ++ "/src/Lib/Index.ipe"))
+        source <- File.readFileLimit path (ByteSize.kib 256)
+        Task.succeed
+            (exposesAdmitted source
+                && List.all (\reader -> not (exposesAdmitted (String.replace "readSnapshot," ("readSnapshot, " ++ reader ++ ",") source))) snapshotReaders
+                && not (exposesAdmitted (String.replace "readSnapshot," "readSnapshot, pendingPage," source))
+                && not (exposesAdmitted "module Lib.Index exposing (..)\n\nimport Ipe.Db\n")
+                && exposesAdmitted (multiLine indexExposes)
+                && not (exposesAdmitted (multiLine (indexExposes ++ [ "dbBytes" ])))
+            )
+
+
+-- Every name `Lib.Index` exposes, a type's constructors written bare.
+indexExposes : List String
+indexExposes =
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+
+
+-- The readers `Index.readSnapshot` runs in its transaction.
+snapshotReaders : List String
+snapshotReaders =
+    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "dbBytes" ]
+
+
+-- True when the module header of `source` exposes exactly `indexExposes`.
+exposesAdmitted : String -> Bool
+exposesAdmitted source =
+    case exposedNames source of
+        Just names ->
+            List.all (\name -> List.member name indexExposes) names
+                && List.all (\name -> List.member name names) indexExposes
+
+        Nothing ->
+            False
+
+
+-- The names a module header exposes, each constructor list `(..)` dropped.
+-- The header is the source up to its first blank line, its lines joined, so
+-- a list written over several lines is read whole. Nothing when the source
+-- does not open with an `exposing (` header.
+exposedNames : String -> Maybe (List String)
+exposedNames source =
+    let
+        header =
+            String.join " " (List.map String.trim (String.lines (Maybe.withDefault "" (List.head (String.split "\n\n" source)))))
+    in
+    case String.split " exposing ( " (String.replace "exposing (" "exposing ( " header) of
+        [ start, list ] ->
+            if String.startsWith "module " start then
+                Just (List.map String.trim (String.split "," (String.replace ")" "" (String.replace "(..)" "" list))))
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ check "index bridge loads queued units" indexBridge
+        , check "a drifted unit's source is withheld" driftedSourceNotShown
+        , check "a span past the file is refused, not clamped" rangePastFileIsStale
+        , check "an unprefixed or foreign-scheme hash is unverifiable" legacyHashUnverifiable
+        , check "one missing file fails only its unit" oneMissingFileIsolated
+        , check "source file past the read ceiling refused" oversizedSourceRefused
+        , check "an unreadable file renders a typed reason, never the OS error" unreadableReasonsTyped
+        , check "view and attestation match the shared ipe-index vectors" viewHashVectors
+        , check "a file unit's residual matches the shared ipe-index vectors" residualVectors
+        , check "a file unit shows and attests its residual, never its whole range" fileUnitShowsResidual
+        , check "a file unit past the child span ceiling is withheld" fileUnitPastChildSpanCeiling
+        , check "every shared ipe-index vectors file is read by name" everySharedVectorsFileRead
+        , check "unit page loads by uid, names resolve" unitPageLoad
+        , check "a queue page reads no source file; only a unit's view load does" pageReadsNoSource
+        , check "a unit's language comes from its file's indexed language" langFromFilesTable
+        , check "an index without a files table fails the probe" probeRefusesIndexWithoutFiles
+        , check "an index without the change queue or the stamp fails the probe" probeRefusesIndexWithoutQueueOrStamp
+        , check "a unit with no change row is still listed" unrecordedUnitListed
+        , check "a modified row without its old hash fails the page" changeDecodeRefusesModifiedWithoutOld
+        , check "an unknown change kind fails the page" changeDecodeRefusesUnknown
+        , check "a redefined open_units view hides no unit" redefinedViewHidesNoUnit
+        , check "a copy holding a pair twice reads no digest" repeatedCopyPairReadsNoDigest
+        , check "a copy that is a view reads no digest" viewCopyReadsNoDigest
+        , check "the page snapshot is the only reader of a page, its counts and size Lib.Index exposes" indexExposesOnlySnapshotReader
+        , check "the exposing scan refuses a re-exposed reader, a wrapper, an open list and a multi-line header" indexExposingScanRefusesEvasions
+        , check "a span of exactly the line ceiling is shown" spanAtLineCeilingShown
+        , check "a span past the line ceiling is withheld before its file is read" spanPastLineCeilingWithheldUnread
+        , check "a view of exactly the byte ceiling is shown" viewAtByteCeilingShown
+        , check "a view one byte past the byte ceiling is withheld, measured in bytes" viewPastByteCeilingWithheld
+        , check "each view ceiling binds where the other does not" byteCeilingVsLineCeiling
+        , check "an oversized view is too large, never drifted" oversizeRanksBeforeDrift
+        , check "the span pre-check cannot overflow on hostile line numbers" spanPreCheckNoOverflow
+        , Task.succeed ( "classifying a span past the line ceiling withholds it", classifyRefusesPastLineCeiling )
+        , Task.succeed ( "the view ceilings are positive and within the read ceiling", viewCeilingsWellFormed )
+        , Task.succeed ( "the drawn lines are the attested lines", shownLinesAreAttestedLines )
+        ]

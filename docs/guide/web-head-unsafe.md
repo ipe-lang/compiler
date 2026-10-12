@@ -33,7 +33,7 @@ head =
     HeadU.unsafeJsonLd productJsonLd
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 Rendered JSON-LD (script body emitted verbatim, not escaped):

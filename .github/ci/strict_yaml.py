@@ -26,6 +26,8 @@ also run it, not rely on this loader alone.
 
 from __future__ import annotations
 
+import re
+
 import yaml
 
 import gha_expr
@@ -51,6 +53,39 @@ import gha_expr
 # refused.
 _ASSEMBLY_CALLS = frozenset({"format", "join", "tojson"})
 _FROMJSON = "fromjson"
+
+
+# The plain scalar spellings YAML 1.2's core schema (GitHub Actions' reading)
+# and PyYAML's YAML 1.1 resolver read alike. A plain value outside them is
+# refused: `yes`/`on`/`off` are booleans to PyYAML and strings to GitHub;
+# `0x2`, `0o7`, `010`, `1_000` and `1:30` are numbers to one reader and text
+# or another number to the other; `2026-01-01` is a date to PyYAML only; `1e3`
+# is text to PyYAML and a float to YAML 1.2. Either way the parsed value is
+# not the value GitHub runs, so a compare or a scan on it certifies nothing.
+_CORE_BOOL = frozenset({"true", "True", "TRUE", "false", "False", "FALSE"})
+_CORE_NULL = frozenset({"", "~", "null", "Null", "NULL"})
+_CORE_INT = re.compile(r"[-+]?(?:0|[1-9][0-9]*)")
+_CORE_FLOAT = re.compile(r"[-+]?(?:\.[0-9]+|[0-9]+\.[0-9]*)(?:[eE][-+]?[0-9]+)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)")
+# Spellings YAML 1.2 reads as a number but PyYAML leaves as text.
+_CORE_ONLY_NUMBER = re.compile(r"0o[0-7]+|0x[0-9a-fA-F]+|[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)[eE][-+]?[0-9]+")
+_YAML_TAG = "tag:yaml.org,2002:"
+
+
+def _version_split_refusal(node: yaml.ScalarNode) -> str | None:
+    """Why the plain value `node` reads differently under YAML 1.1 and 1.2,
+    or None."""
+    if node.style is not None:
+        return None
+    text, tag = node.value, node.tag
+    kind = tag[len(_YAML_TAG) :] if tag.startswith(_YAML_TAG) else tag
+    agreed = (
+        (kind == "bool" and text in _CORE_BOOL)
+        or (kind == "null" and text in _CORE_NULL)
+        or (kind == "int" and _CORE_INT.fullmatch(text) is not None)
+        or (kind == "float" and _CORE_FLOAT.fullmatch(text) is not None)
+        or (kind == "str" and _CORE_ONLY_NUMBER.fullmatch(text) is None)
+    )
+    return None if agreed else f"plain value {text!r} reads as {kind} under YAML 1.1 but not alike under YAML 1.2"
 
 
 class StrictYAMLError(yaml.YAMLError):
@@ -88,7 +123,17 @@ class StrictSafeLoader(yaml.SafeLoader):
                 f"explicit tag {tag!r} at line {event.start_mark.line + 1}: "
                 "tags are refused; write the plain value"
             )
-        return super().compose_node(parent, index)
+        node = super().compose_node(parent, index)
+        # A mapping key is composed with `index` None; every other scalar is
+        # a value. Keys keep PyYAML's reading (`on:` is the trigger key).
+        is_key = isinstance(parent, yaml.MappingNode) and index is None
+        if isinstance(node, yaml.ScalarNode) and not is_key:
+            why = _version_split_refusal(node)
+            if why is not None:
+                raise StrictYAMLError(
+                    f"{why} at line {node.start_mark.line + 1}: quote it, or spell it as YAML 1.2 does"
+                )
+        return node
 
     def flatten_mapping(self, node):
         for key_node, _value_node in node.value:

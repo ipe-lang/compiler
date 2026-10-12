@@ -60,7 +60,7 @@ fn store_ident_parity_resolves_and_builds() {
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
-        "store_ident_parity: `ipe build` must exit 0 (Store.validSqlIdent + \
+        "store_ident_parity: `ipe dev build` must exit 0 (Store.validSqlIdent + \
          Store.validSqlIdentPlain must resolve and build): {:?}",
         built.err()
     );
@@ -83,7 +83,7 @@ fn store_ident_parity_end_to_end() {
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
-        "store_ident_parity: `ipe build` must exit 0: {:?}",
+        "store_ident_parity: `ipe dev build` must exit 0: {:?}",
         built.err()
     );
 

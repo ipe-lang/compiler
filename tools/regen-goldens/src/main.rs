@@ -32,7 +32,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let filter: BTreeSet<String> = std::env::args().skip(1).collect();
+    let filter: BTreeSet<String> = match ipe_docs::argv::host_args() {
+        Ok(args) => args.into_iter().collect(),
+        Err(refused) => {
+            eprintln!("regen-goldens: {refused}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let repo_root = repo_root();
     let golden_root = repo_root.join("tests").join("golden");

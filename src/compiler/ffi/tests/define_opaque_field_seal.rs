@@ -12,7 +12,7 @@
 //!    region) resolves to the bare in-module name and round-trips;
 //!  * a lifetime/generic-parameterised inspected opaque (`Element<'a, Message>`)
 //!    is unsound to emit as a stripped bare-arg path (an E0107), so the whole
-//!    definition OVER-DROPS (no wrapper) rather than breach the `ipe build ⇒
+//!    definition OVER-DROPS (no wrapper) rather than breach the `ipe dev build ⇒
 //!    cargo build` keystone — and the interface, keyed off the same survivor
 //!    gate, never surfaces a forwarder onto the absent wrapper fn.
 //!

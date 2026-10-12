@@ -6,6 +6,6 @@ helpers (`isLeapYear`, `daysInMonth`). It pins a fixed instant so the output is
 reproducible. The worked example for the [Time guide](../../../../docs/guide/time.md).
 
 ```
-ipe build package.ipe
+ipe dev build package.ipe
 cargo run --manifest-path out/rust/Cargo.toml
 ```

@@ -69,7 +69,7 @@
 //!   match → `[]`). Output:
 //!   `"apple:fruit:5\nmissing\napple:fruit:5,banana:fruit:3\nempty"`.
 //!   Golden-E2E coverage for `DbFindOneByField`/`DbFindManyByField` through a
-//!   real `ipe build` + `cargo build` + run, not just direct runtime source
+//!   real `ipe dev build` + `cargo build` + run, not just direct runtime source
 //!   inspection.
 //! * `db_decode_money` — `Db.Decode.money "amount"` inside a
 //!   `Db.queryDecode` pipeline decodes the `"CODE AMOUNT"` TEXT column
@@ -411,7 +411,7 @@ fn db_store_local_derived_forwarder() {
 /// SEAL regression: a generic HOF (`Result.map`) applied to a callee whose
 /// return type is a CROSS-MODULE concrete stdlib type (`Ipe.Db.Store.Store`).
 /// Before the fix the `Result.map` type variable erased to `JsonVal` in emitted
-/// Rust — `ipe build` accepted, then the emitted crate failed `cargo build`
+/// Rust — `ipe dev build` accepted, then the emitted crate failed `cargo build`
 /// with `E0308` (expected `IpeResult<_, IpeDbStoreStore>`, found
 /// `IpeResult<_, serde_json::Value>`). The concrete `Store` now threads through
 /// the HOF's instantiated slot for BOTH the point-free
@@ -494,6 +494,36 @@ fn db_store_where_mutations() {
 #[test]
 fn db_sql_combinators() {
     assert_runs_and_matches_oracle("db_sql_combinators");
+}
+
+/// `Sql.startsWith` matches a literal prefix only.
+///
+/// Through `Db.findWhere`: `%`, `_` and `\` in the prefix match themselves,
+/// the match is case-sensitive, `NULL` never matches, the bind order survives
+/// `Sql.and` on either side, and an empty or one-past-the-ceiling prefix
+/// surfaces as a typed error while the longest legal prefix is admitted.
+///
+/// Sanctioned divergence: `Sql.startsWith` has no reference counterpart;
+/// oracle is Ipê's own output.
+#[test]
+fn db_sql_starts_with() {
+    assert_runs_and_matches_oracle("db_sql_starts_with");
+}
+
+/// `Store.startsWith` matches a literal prefix only, on a typed record store.
+///
+/// `%`, `_` and `\` in the prefix match themselves where `Store.like` with the
+/// same text matches wildcards, the match is case-sensitive, the bind order
+/// survives `Store.and` on either side, an empty or one-past-the-ceiling
+/// prefix poisons the query (and a `deleteWhere`) with a typed error while the
+/// longest legal prefix is admitted, and a `deleteWhere` over the leaf removes
+/// only the matching row.
+///
+/// Sanctioned divergence: `Store.startsWith` has no reference counterpart;
+/// oracle is Ipê's own output.
+#[test]
+fn db_store_starts_with() {
+    assert_runs_and_matches_oracle("db_store_starts_with");
 }
 
 /// `Ipe.Db.Dsn` parse-don't-validate surface, end-to-end and PURE (no connect,
@@ -643,7 +673,7 @@ fn db_poly_params_e2e() {
 /// `"apple:fruit:5\nmissing\napple:fruit:5,banana:fruit:3\nempty"`.
 ///
 /// Golden-E2E coverage for `DbFindOneByField`/`DbFindManyByField` through a
-/// real `ipe build` + `cargo build` + run, not just direct runtime source
+/// real `ipe dev build` + `cargo build` + run, not just direct runtime source
 /// inspection + the internal exhaustiveness test.
 ///
 /// Sanctioned divergence: Ipê emits Rust+sqlx; oracle is Ipê's own output.

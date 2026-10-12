@@ -4,7 +4,12 @@ use std::collections::{BTreeSet, HashMap};
 use ipe_diagnostics::{DResult, Diagnostic};
 
 mod rust_keywords;
+mod rust_literal;
 pub use rust_keywords::{RUST_KEYWORDS, is_rust_keyword};
+pub use rust_literal::{
+    EMIT_LEXABLE, LexerHazard, LexerHazardKind, find_lexer_hazard, rust_char_lit,
+    rust_comment_text, rust_fmt_str_lit, rust_str_lit,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Symbol(u32);
@@ -44,6 +49,8 @@ pub struct Interner {
     /// [`Self::set_fresh_avoid`]; `None` uses the
     /// whole-table behaviour for callers that own a per-build interner.
     fresh_avoid: Option<BTreeSet<String>>,
+    /// Running sum of the byte lengths of every distinct interned string.
+    held_bytes: u64,
 }
 
 impl Interner {
@@ -69,10 +76,38 @@ impl Interner {
             detail: "symbol table exhausted (u32::MAX identifiers)".to_owned(),
         })?;
         let sym = Symbol(id);
+        let held_bytes = u64::try_from(s.len())
+            .ok()
+            .and_then(|len| self.held_bytes.checked_add(len))
+            .ok_or_else(|| Diagnostic::CompilerBug {
+                where_: "intern",
+                detail: "interned byte count exceeds u64::MAX".to_owned(),
+            })?;
+        self.held_bytes = held_bytes;
         let shared: std::sync::Arc<str> = std::sync::Arc::from(s);
         self.strings.push(std::sync::Arc::clone(&shared));
         self.map.insert(shared, sym);
         Ok(sym)
+    }
+
+    /// Count of distinct strings this interner holds.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    /// Whether this interner holds no string.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.strings.is_empty()
+    }
+
+    /// Sum of the byte lengths of every distinct string this interner holds.
+    ///
+    /// Each distinct string counts once, however often it is interned.
+    #[must_use]
+    pub const fn held_bytes(&self) -> u64 {
+        self.held_bytes
     }
 
     /// Mint `count` fresh symbols whose resolved strings are guaranteed to be
@@ -442,6 +477,20 @@ mod tests {
         assert_ne!(a, c);
         assert_eq!(i.resolve(a), Some("Increment"));
         assert_eq!(i.resolve(c), Some("Decrement"));
+        Ok(())
+    }
+    #[test]
+    fn interner_held_bytes_counts_once() -> ipe_diagnostics::DResult<()> {
+        let mut i = Interner::new();
+        assert!(i.is_empty());
+        assert_eq!(i.held_bytes(), 0);
+        i.intern("Increment")?;
+        i.intern("Increment")?;
+        assert_eq!(i.len(), 1, "a repeat intern adds no string");
+        assert_eq!(i.held_bytes(), 9, "a repeat intern adds no bytes");
+        i.intern("Up")?;
+        assert_eq!(i.len(), 2);
+        assert_eq!(i.held_bytes(), 11, "a fresh string adds its own bytes");
         Ok(())
     }
     #[test]

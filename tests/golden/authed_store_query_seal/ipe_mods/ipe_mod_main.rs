@@ -78,10 +78,12 @@ pub(crate) fn main_doc_codec() -> IpeCodecCodec<RecAuthorBody> {
         )]),
     })
 }
+
 pub(crate) fn main_doc_policy() -> IpeDbStorePolicy {
     let _ipe_recursion_guard = crate::recursion_guard();
     crate::user_ipe_db_store_owner_column_named("author".to_string())
 }
+
 pub(crate) fn main_secured_docs() -> IpeResult<
     ipe_runtime::error::IpeError, IpeDbStoreSecured<RecAuthorBody>,
 > {
@@ -91,6 +93,7 @@ pub(crate) fn main_secured_docs() -> IpeResult<
         IpeResult::Ok(store) => crate::user_ipe_db_store_secured(crate::main_doc_policy(), store),
     }
 }
+
 pub(crate) fn main_share_codec() -> IpeCodecCodec<RecDocRefMember> {
     let _ipe_recursion_guard = crate::recursion_guard();
     IpeCodecCodec::Codec(RecEncMkDecShp {
@@ -169,10 +172,12 @@ pub(crate) fn main_share_codec() -> IpeCodecCodec<RecDocRefMember> {
         )]),
     })
 }
+
 pub(crate) fn main_share_policy() -> IpeDbStorePolicy {
     let _ipe_recursion_guard = crate::recursion_guard();
     crate::user_ipe_db_store_owner_column_named("member".to_string())
 }
+
 pub(crate) fn main_secured_shares() -> IpeResult<
     ipe_runtime::error::IpeError, IpeDbStoreSecured<RecDocRefMember>,
 > {
@@ -182,6 +187,7 @@ pub(crate) fn main_secured_shares() -> IpeResult<
         IpeResult::Ok(store) => crate::user_ipe_db_store_secured(crate::main_share_policy(), store),
     }
 }
+
 pub(crate) fn main_shared_docs_policy(
     securedShare: IpeDbStoreSecured<RecDocRefMember>,
 ) -> IpeDbStorePolicy {
@@ -194,6 +200,7 @@ pub(crate) fn main_shared_docs_policy(
         ),
     )
 }
+
 pub(crate) fn main_secured_shared_docs() -> IpeResult<
     ipe_runtime::error::IpeError, IpeDbStoreSecured<RecAuthorBody>,
 > {
@@ -207,6 +214,7 @@ pub(crate) fn main_secured_shared_docs() -> IpeResult<
         (_, IpeResult::Err(e)) => IpeResult::Err(e),
     }
 }
+
 pub(crate) fn main_handle_shared_docs(
     req: ServerRequest,
     principal: ipe_runtime::principal::Principal,
@@ -255,6 +263,7 @@ pub(crate) fn main_handle_shared_docs(
         ),
     )
 }
+
 pub(crate) fn main_handle_my_docs(
     req: ServerRequest,
     principal: ipe_runtime::principal::Principal,
@@ -303,6 +312,7 @@ pub(crate) fn main_handle_my_docs(
         ),
     )
 }
+
 pub(crate) fn main_mask_codec() -> IpeCodecCodec<RecOwnerSsn> {
     let _ipe_recursion_guard = crate::recursion_guard();
     IpeCodecCodec::Codec(RecEncMkDecShp {
@@ -351,6 +361,7 @@ pub(crate) fn main_mask_codec() -> IpeCodecCodec<RecOwnerSsn> {
         )]),
     })
 }
+
 pub(crate) fn main_encode_maybe_string(m: IpeMaybe<String>) -> JsonVal {
     let _ipe_recursion_guard = crate::recursion_guard();
     match m {
@@ -358,6 +369,7 @@ pub(crate) fn main_encode_maybe_string(m: IpeMaybe<String>) -> JsonVal {
         IpeMaybe::Nothing => json_enc_null(),
     }
 }
+
 pub(crate) fn main_mask_policy() -> IpeDbStorePolicy {
     let _ipe_recursion_guard = crate::recursion_guard();
     ({
@@ -382,6 +394,7 @@ pub(crate) fn main_mask_policy() -> IpeDbStorePolicy {
         }
     })(crate::user_ipe_db_store_owner_column_named("owner".to_string()))
 }
+
 pub(crate) fn main_secured_mask_docs() -> IpeResult<
     ipe_runtime::error::IpeError, IpeDbStoreSecured<RecOwnerSsn>,
 > {
@@ -391,6 +404,7 @@ pub(crate) fn main_secured_mask_docs() -> IpeResult<
         IpeResult::Ok(store) => crate::user_ipe_db_store_secured(crate::main_mask_policy(), store),
     }
 }
+
 pub(crate) fn main_handle_mask_docs(
     req: ServerRequest,
     principal: ipe_runtime::principal::Principal,
@@ -437,6 +451,7 @@ pub(crate) fn main_handle_mask_docs(
         ),
     )
 }
+
 pub(crate) fn main_auth_cfg() -> ipe_runtime::server::AuthConfig {
     let _ipe_recursion_guard = crate::recursion_guard();
     server_auth_config(
@@ -447,6 +462,7 @@ pub(crate) fn main_auth_cfg() -> ipe_runtime::server::AuthConfig {
         server_token_bearer(),
     )
 }
+
 pub(crate) fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     task_on_error(

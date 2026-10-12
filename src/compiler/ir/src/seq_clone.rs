@@ -175,9 +175,10 @@ fn rewrite(expr: Expr, target: Symbol, eager: bool, payloads: &EnumPayloadTable)
             head: Box::new(rewrite(*head, target, eager, payloads)),
             tail: Box::new(rewrite(*tail, target, eager, payloads)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(borrow_base(*list, target, eager, payloads)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(borrow_base(*list, target, eager, payloads)),
@@ -556,12 +557,13 @@ mod tests {
             Expr::ListIndexClone {
                 list: Box::new(Expr::Var(w)),
                 index: 0,
+                elem: IrType::Int,
             },
             w,
             &EnumPayloadTable::new(),
         );
         assert!(
-            matches!(rewritten, Expr::ListIndexClone { ref list, index: 0 } if matches!(**list, Expr::Var(s) if s == w)),
+            matches!(rewritten, Expr::ListIndexClone { ref list, index: 0, .. } if matches!(**list, Expr::Var(s) if s == w)),
             "an index read borrows the list: {rewritten:?}"
         );
     }

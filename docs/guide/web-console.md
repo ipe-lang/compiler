@@ -63,7 +63,7 @@ main =
         }
 ```
 
-Building it (`ipe build`) compiles the app; when the console is gated in app-mode,
+Building it (`ipe dev build`) compiles the app; when the console is gated in app-mode,
 the callback runs per request and only an authorised identity reaches it.
 
 ## The why
@@ -89,7 +89,7 @@ Two credential roles guard the surface. The **admin** token opens
 only, so a Prometheus scrape credential can never read logs or spans. Either is
 presented as `Authorization: Bearer <token>` or as the password of HTTP Basic auth.
 
-`ipe build`, `ipe run`, `ipe test` and `ipe watch` produce development binaries:
+`ipe dev build`, `ipe dev run`, `ipe test` and `ipe dev watch` produce development binaries:
 with `IPE_CONSOLE_AUTH` unset, their console is open only while the server is
 bound to loopback, and on an exposed bind it requires a credential. `ipe release`
 artifacts keep the console closed until `IPE_CONSOLE_AUTH` (with its admin token)

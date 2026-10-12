@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use ipe::{BuildOptions, CliError};
+use ipe_runtime_rust::encoding::MountBase;
 
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -54,14 +55,8 @@ fn build_wasm(entry: &Path, out: &Path) -> Result<(), CliError> {
     ipe::build_with_options(entry, out, &runtime, wasm_options())
 }
 
-/// A pure `Ipe.Ui` TEA app compiles under the wasm target, and the emitted
-/// project is the browser cdylib shape (Layer 3: dependency floor).
-#[test]
-fn pure_ui_app_emits_wasm_project() {
-    let dir = scratch("wasm_gate_green");
-    let entry = write_entry(
-        &dir.join("srcdir"),
-        "module Main exposing (main)\n\
+/// A pure `Ipe.Ui` TEA app: the smallest program the wasm target accepts.
+const PURE_UI_APP: &str = "module Main exposing (main)\n\
          import Ipe.String as String\n\
          import Ipe.Tea.Web exposing (tea)\n\
          import Ipe.Tea.Web.Cmd as Cmd\n\
@@ -95,8 +90,69 @@ fn pure_ui_app_emits_wasm_project() {
          \x20       , subscriptions = subscriptions\n\
          \x20       , routes = []\n\
          \x20       , notFound = CounterPage\n\
-         \x20       }\n",
+         \x20       }\n";
+
+/// Under a `/app` mount base the shell loads `boot.js`, the glue and the
+/// module from absolute URLs under the base, so a deep-link reload still boots;
+/// no page-relative `./` URL remains.
+#[test]
+fn wasm_shell_urls_derive_from_base() -> Result<(), Box<dyn std::error::Error>> {
+    let out = build_shell("wasm_shell_app_base", "/app")?;
+    let index = std::fs::read_to_string(out.join("www/index.html"))?;
+    let boot = std::fs::read_to_string(out.join("www/boot.js"))?;
+    assert!(index.contains("src=\"/app/boot.js\""), "{index}");
+    assert!(
+        boot.contains("import init from \"/app/pkg/ipe_app.js\";"),
+        "{boot}"
     );
+    assert!(
+        boot.contains("module_or_path: \"/app/pkg/ipe_app_bg.wasm\""),
+        "{boot}"
+    );
+    assert!(!index.contains("./"), "{index}");
+    assert!(!boot.contains("./"), "{boot}");
+    Ok(())
+}
+
+/// The root mount base keeps the shell URLs at `/`.
+#[test]
+fn wasm_shell_urls_sit_at_the_root() -> Result<(), Box<dyn std::error::Error>> {
+    let out = build_shell("wasm_shell_root_base", "")?;
+    let index = std::fs::read_to_string(out.join("www/index.html"))?;
+    let boot = std::fs::read_to_string(out.join("www/boot.js"))?;
+    assert!(index.contains("src=\"/boot.js\""), "{index}");
+    assert!(
+        boot.contains("import init from \"/pkg/ipe_app.js\";"),
+        "{boot}"
+    );
+    Ok(())
+}
+
+/// Build [`PURE_UI_APP`] for the wasm target under the mount base `base`
+/// (`""` is the root) and return the output directory.
+fn build_shell(name: &str, base: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = scratch(name);
+    let src = dir.join("srcdir");
+    std::fs::create_dir_all(&src)?;
+    let entry = src.join("Main.ipe");
+    std::fs::write(&entry, PURE_UI_APP)?;
+    let out = dir.join("out");
+    let mount_base = MountBase::parse(base).map_err(|r| r.to_string())?;
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let options = BuildOptions {
+        mount_base,
+        ..wasm_options()
+    };
+    ipe::build_with_options(&entry, &out, &runtime, options).map_err(|e| format!("{e:?}"))?;
+    Ok(out)
+}
+
+/// A pure `Ipe.Ui` TEA app compiles under the wasm target, and the emitted
+/// project is the browser cdylib shape (Layer 3: dependency floor).
+#[test]
+fn pure_ui_app_emits_wasm_project() {
+    let dir = scratch("wasm_gate_green");
+    let entry = write_entry(&dir.join("srcdir"), PURE_UI_APP);
     let out = dir.join("out");
     build_wasm(&entry, &out).expect("pure Ipe.Ui app must build under --target wasm");
 
@@ -282,6 +338,63 @@ fn routed_web_app_emits_wasm_app_routed() {
     assert!(
         mod_rs.contains("pub mod route"),
         "wasm runtime mod.rs must expose `route` for `Route::new`:\n{mod_rs}"
+    );
+}
+
+/// A routed wasm app with `onNavigate` evaluates `update` once and shares it
+/// between the runtime entry and the generated `set_page`.
+#[test]
+fn routed_web_app_with_on_navigate_emits_update_once() {
+    let dir = scratch("wasm_gate_routed_on_navigate");
+    let entry = write_entry(
+        &dir.join("srcdir"),
+        "module Main exposing (main)\n\
+         import Ipe.String as String\n\
+         import Ipe.Tea.Web exposing (tea, route)\n\
+         import Ipe.Tea.Web.Cmd as Cmd\n\
+         import Ipe.Tea.Web.Sub as Sub\n\
+         import Ipe.Ui as Ui\n\
+         \n\
+         type Page = Home | About\n\
+         type Msg = Navigate Page\n\
+         type alias Model = { page : Page, count : Int }\n\
+         \n\
+         init : WebReq -> ( Model, Cmd Msg )\n\
+         init _req = ( { page = Home, count = 0 }, Cmd.none )\n\
+         \n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update msg model =\n\
+         \x20   case msg of\n\
+         \x20       Navigate page -> ( { model | page = page }, Cmd.none )\n\
+         \n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model = Sub.none\n\
+         \n\
+         view : Model -> Element Msg\n\
+         view _model = Ui.text \"hello\"\n\
+         \n\
+         main =\n\
+         \x20   tea\n\
+         \x20       { init = init\n\
+         \x20       , update = update\n\
+         \x20       , view = view\n\
+         \x20       , subscriptions = subscriptions\n\
+         \x20       , routes = [ route \"/\" Home, route \"/about\" About ]\n\
+         \x20       , notFound = Home\n\
+         \x20       , onNavigate = Navigate\n\
+         \x20       }\n",
+    );
+    let out = dir.join("out");
+    build_wasm(&entry, &out)
+        .expect("routed Web.tea with onNavigate must build under --target wasm");
+
+    let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("emitted main.rs");
+    assert_eq!(
+        main_rs
+            .matches("let __update_shared = ::std::sync::Arc::new(")
+            .count(),
+        1,
+        "onNavigate present ⇒ `update` is emitted once and shared, got:\n{main_rs}"
     );
 }
 

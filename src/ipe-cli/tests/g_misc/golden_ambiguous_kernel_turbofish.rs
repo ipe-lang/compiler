@@ -3,7 +3,7 @@
 //! When the HM solver leaves a polymorphic kernel's result type parameter
 //! GENUINELY UNCONSTRAINED — a discarded / empty / phantom position — the
 //! emitted Rust must carry a default turbofish so `cargo build` succeeds. Before
-//! the fix these shapes `ipe build`-accepted (exit 0) but the emitted
+//! the fix these shapes `ipe dev build`-accepted (exit 0) but the emitted
 //! `ipe_mod_main.rs` failed `cargo build` with `E0282`/`E0283` "type annotations
 //! needed" — the exit-0-then-cargo-fail SEAL violation.
 //!
@@ -16,7 +16,7 @@
 //!   * `Decimal.fromString "abc"`        — free (discarded) error channel.
 //!   * `Task.run (Task.fail …)`          — free (phantom) success type.
 //!
-//! The compile check is a PURE ipe build (no cargo) — the ipe-exit-0 half of
+//! The compile check is a PURE ipe dev build (no cargo) — the ipe-exit-0 half of
 //! the SEAL. The run check is `IPE_E2E`-gated: it builds the emitted project
 //! (the cargo-exit-0 half) and runs it, asserting the RUNTIME behaviour is still
 //! correct (every discarded/empty shape yields its expected value, not just that

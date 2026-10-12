@@ -93,11 +93,9 @@ const WORKSPACE_VERSION_LINE: &str = "version.workspace = true";
 /// manifest declares the runtime package. `None` means "not a runtime crate
 /// root" — the caller treats that as a hard refusal, never a walk-on.
 fn runtime_version_at(root: &Path) -> Option<String> {
-    let text = crate::io_bounded::read_to_string_capped(
-        &root.join(MANIFEST),
-        crate::io_bounded::SMALL_FILE_READ_CAP,
-    )
-    .ok()?;
+    let text =
+        crate::io_bounded::read_named_in(root, &[MANIFEST], crate::io_bounded::SMALL_FILE_CAP)
+            .ok()?;
     let declares_package = text
         .lines()
         .any(|l| l.trim() == format!("name = \"{RUNTIME_PACKAGE}\""));
@@ -146,7 +144,7 @@ pub fn ipe_home() -> Result<PathBuf, CliError> {
     ipe_home_from(
         ipe_env::var_os("IPE_HOME"),
         ipe_env::var_os("XDG_DATA_HOME"),
-        crate::env_dir::home(),
+        crate::env_dir::home().ok().as_ref(),
     )
 }
 
@@ -154,7 +152,7 @@ pub fn ipe_home() -> Result<PathBuf, CliError> {
 fn ipe_home_from(
     ipe_home: Option<std::ffi::OsString>,
     xdg_data_home: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
+    home: Option<&crate::env_dir::HomeDir>,
 ) -> Result<PathBuf, CliError> {
     if let Some(dir) = crate::env_dir::explicit_override("IPE_HOME", ipe_home)? {
         return Ok(dir);
@@ -639,20 +637,28 @@ mod tests {
         );
     }
 
+    /// A parsed home over the absolute test path `path`.
+    #[cfg(not(windows))]
+    fn parsed_home(path: &str) -> crate::env_dir::HomeDir {
+        crate::env_dir::HomeDir::try_parse(Some(path.into())).expect("an absolute test home")
+    }
+
     #[test]
+    #[cfg(not(windows))]
     fn ipe_home_uses_an_absolute_override() {
         let got = ipe_home_from(
             Some("/opt/ipe".into()),
             Some("/xdg".into()),
-            Some("/home/u".into()),
+            Some(&parsed_home("/home/u")),
         );
         assert!(matches!(got, Ok(p) if p == std::path::Path::new("/opt/ipe")));
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn ipe_home_refuses_a_relative_or_empty_override() {
         for raw in ["", "ipe", "./ipe"] {
-            let got = ipe_home_from(Some(raw.into()), None, Some("/home/u".into()));
+            let got = ipe_home_from(Some(raw.into()), None, Some(&parsed_home("/home/u")));
             assert!(
                 matches!(got, Err(CliError::EnvDirNotAbsolute { var: "IPE_HOME" })),
                 "IPE_HOME={raw:?} must be refused: {got:?}"
@@ -661,10 +667,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn ipe_home_skips_a_relative_xdg_data_home() {
-        let got = ipe_home_from(None, Some("rel".into()), Some("/home/u".into()));
+        let home = parsed_home("/home/u");
+        let got = ipe_home_from(None, Some("rel".into()), Some(&home));
         assert!(matches!(got, Ok(p) if p == std::path::Path::new("/home/u/.ipe")));
-        let got = ipe_home_from(None, Some("/xdg".into()), Some("/home/u".into()));
+        let got = ipe_home_from(None, Some("/xdg".into()), Some(&home));
         assert!(matches!(got, Ok(p) if p == std::path::Path::new("/xdg/ipe")));
     }
 

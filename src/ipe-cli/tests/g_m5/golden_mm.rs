@@ -249,3 +249,103 @@ fn mm_neg_sametype_is_ipe_n0012() {
 fn mm_neg_qualref_sig_is_ipe_t0001() {
     expect_error_code("mm_neg_qualref_sig", ipe_diagnostics::IPE_T0001);
 }
+
+// ---------------------------------------------------------------------------
+// Open-import clash is reported at the use, not the import.
+//
+// `ModA` and `ModB` both declare `type Shape = Circle | …`, each exposed with
+// `exposing (..)` — the open/wildcard tier, which defers a name clash to the
+// first bare use rather than flagging it eagerly at import time the way an
+// explicit `exposing (name)` import does.
+// ---------------------------------------------------------------------------
+
+/// Like [`expect_error_code`], but also asserts the diagnostic's file and
+/// line, so a clash that fires at the wrong site (e.g. the import line
+/// instead of the bare use) is caught even though the `Code` matches.
+///
+/// `CliError::Pipeline { file, src, diag }` carries the exact source file and
+/// text the failing module compiled from (`attribute_canon_errors` blames the
+/// module whose `canonicalize` failed), so the diagnostic's byte-offset span
+/// is counted against that same `src` to get a 1-based line number.
+#[allow(clippy::expect_used)]
+fn expect_error_at_line(
+    fixture_name: &str,
+    expected: ipe_diagnostics::Code,
+    expected_file_suffix: &str,
+    expected_line: usize,
+) {
+    let fixture = golden_dir(fixture_name);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture_name);
+    let _ = std::fs::remove_dir_all(&out);
+
+    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    assert!(
+        res.is_err(),
+        "fixture `{fixture_name}` must fail but succeeded"
+    );
+    let err = res.expect_err("`res` must be rejected");
+    let (code, line, file_ok) = match &err {
+        ipe::CliError::Pipeline { file, src, diag } => {
+            let lo = usize::try_from(diag.primary_span().lo).unwrap_or(usize::MAX);
+            let line = src.get(..lo).unwrap_or_default().matches('\n').count() + 1;
+            (
+                Some(diag.code()),
+                line,
+                file.to_string_lossy().ends_with(expected_file_suffix),
+            )
+        }
+        _ => (None, 0, false),
+    };
+    assert_eq!(
+        code,
+        Some(expected),
+        "fixture `{fixture_name}`: expected error code {expected:?}, got {code:?}\nerr = {err}"
+    );
+    assert!(
+        file_ok,
+        "fixture `{fixture_name}`: expected the diagnostic's file to end with `{expected_file_suffix}`\nerr = {err}"
+    );
+    assert_eq!(
+        line, expected_line,
+        "fixture `{fixture_name}`: an open-import clash must be reported at the bare use \
+         (line {expected_line} of {expected_file_suffix}), not merely carry code {expected:?}; \
+         got line {line}\nerr = {err}"
+    );
+}
+
+/// Both `ModA`/`ModB` opened with `exposing (..)`, `Circle`/`Shape` never
+/// used bare. An open import's clash is deferred to the use, and there is no
+/// use here, so the program must compile.
+#[test]
+fn mm_open_user_unused_compiles() {
+    let fixture = golden_dir("mm_open_user_unused");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_open_user_unused");
+    let _ = std::fs::remove_dir_all(&out);
+    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    assert!(res.is_ok(), "build_project failed: {:?}", res.err());
+}
+
+/// The same two open imports, but `Circle` is used bare on line 6 of
+/// `Main.ipe`. The clash must fire there — at the use — not at either import
+/// line (2-3) or at either module's own declaration.
+#[test]
+fn mm_open_user_used_is_ipe_n0024_at_the_use() {
+    expect_error_at_line(
+        "mm_open_user_used",
+        ipe_diagnostics::IPE_N0024,
+        "Main.ipe",
+        6,
+    );
+}
+
+/// `ModA` exposes `Shape(..)` explicitly, `ModB` opens `exposing (..)`.
+/// Explicit beats open on the binding ladder, so the bare `Circle` resolves
+/// to `ModA`'s without ambiguity and the program must compile.
+#[test]
+fn mm_open_user_explicit_wins_compiles() {
+    let fixture = golden_dir("mm_open_user_explicit_wins");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_open_user_explicit_wins");
+    let _ = std::fs::remove_dir_all(&out);
+    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    assert!(res.is_ok(), "build_project failed: {:?}", res.err());
+}

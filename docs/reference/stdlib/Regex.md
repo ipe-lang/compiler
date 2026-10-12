@@ -20,6 +20,8 @@ overridable via `IPE_REGEX_MAX_INPUT_BYTES`): a subject past the bound is
 turned back at the boundary — `match` yields `False`, `find` `Nothing`,
 `findAll` `[]`, `replace` the subject unchanged, `split` the subject as a
 single element — so an untrusted subject can never drive unbounded work.
+The ceiling is fixed when `compile` builds the `Regex`; a value that is not a
+positive decimal byte count (`0` included) makes `compile` return `Err`.
 
 ## `compile`
 

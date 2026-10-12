@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BTreeSet, Budget, Builder, Builtins, Content, DResult, Diagnostic, FlatType,
-    Generated, Interner, RefCell, RowTail, STAGE, SchemeKey, StdlibKernel, Symbol, Ty, UnionFind,
-    VarId, ZONK_NODE_LIMIT, tag_solver_var, unify,
+    Generated, InferError, Interner, RefCell, RowTail, STAGE, SchemeKey, StdlibKernel, Symbol, Ty,
+    UnionFind, VarId, ZONK_NODE_LIMIT, tag_solver_var, unify_at,
 };
 
 // ===========================================================================
@@ -22,7 +22,7 @@ use super::{
 /// home module's boundary-discharge step.
 ///
 /// `quantified` maps each generalized `Flex` root to its synthesized name
-/// (`"a"`, `"b"`, …, never `"any"`). Only plain, obligation-free `Flex` roots
+/// (`"a"`, `"b"`, …). Only plain, obligation-free `Flex` roots
 /// are quantified in phase 1 — `Super`-bounded and `Rigid`-contaminated roots
 /// stay shared program-wide (Divergences D2/D3 in the spec); a residual root
 /// still reachable from a pending field-access / record-update / route
@@ -279,8 +279,7 @@ pub fn reachable_flex_roots(
 }
 
 /// Mint a fresh, source-collision-free type-variable name (`"a"`, `"b"`, …,
-/// `"z"`, `"a1"`, …) for a generalized untyped-def scheme — never `"any"`
-/// (AUD-13's wildcard sentinel is reserved). `next` is the caller's shared
+/// `"z"`, `"a1"`, …) for a generalized untyped-def scheme. `next` is the caller's shared
 /// naming cursor, threaded across every quantified var of every scheme in one
 /// `promote_untyped_boundaries` run so names stay distinct program-wide (not
 /// required for soundness — each scheme's names only need to be distinct
@@ -316,16 +315,16 @@ pub fn mint_synth_symbol(interner: &mut Interner, next: &mut u32) -> DResult<Sym
 /// A cross-module reference's instantiated scheme failing to unify against
 /// local call-site structure is a genuine `IPE-T0001`, blamed on the
 /// referencing (`use_home`) module. A union-find invariant violation is a
-/// `Diagnostic::CompilerBug` with an empty home.
+/// whole-program [`InferError::Program`] carrying a `Diagnostic::CompilerBug`.
 pub fn promote_untyped_boundaries(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
     interner: &mut Interner,
     generated: &Generated,
-) -> Result<UntypedSchemes, (Diagnostic, Vec<Symbol>)> {
+) -> Result<UntypedSchemes, InferError> {
     macro_rules! lift {
         ($e:expr) => {
-            $e.map_err(|d: Diagnostic| (d, Vec::<Symbol>::new()))?
+            $e.map_err(InferError::unsited)?
         };
     }
 
@@ -388,7 +387,7 @@ pub fn promote_untyped_boundaries(
         for pi in generated
             .pending_instantiations
             .iter()
-            .filter(|pi| &pi.use_home == home)
+            .filter(|pi| pi.use_home.path() == home.as_slice())
         {
             let Some(scheme) = schemes.get(&pi.source) else {
                 // module_order is dependency-first, and a `PendingInstantiation`
@@ -396,30 +395,34 @@ pub fn promote_untyped_boundaries(
                 // source module always precedes `use_home` and always has a
                 // scheme by now. Unreachable except via a link-order invariant
                 // break; fail closed rather than panic.
-                return Err((
-                    Diagnostic::CompilerBug {
-                        where_: "ipe_types::promote_untyped_boundaries",
-                        detail: "cross-module untyped reference discharged before its source \
-                                 module was generalized"
-                            .to_owned(),
-                    },
-                    pi.use_home.clone(),
-                ));
+                return Err(InferError::unsited(Diagnostic::CompilerBug {
+                    where_: "ipe_types::promote_untyped_boundaries",
+                    detail: "cross-module untyped reference discharged before its source \
+                             module was generalized"
+                        .to_owned(),
+                }));
             };
             let root = scheme.root;
             let quantified = scheme.quantified.clone();
             let mut fresh_map = BTreeMap::new();
             let inst = copy_var(uf, budget, root, &quantified, &mut fresh_map)
-                .map_err(|d| (d, pi.use_home.clone()))?;
-            unify(uf, budget, interner, pi.span, inst, pi.placeholder)
-                .map_err(|d| (d, pi.use_home.clone()))?;
+                .map_err(|d| InferError::sited(d, &pi.use_home))?;
+            unify_at(
+                uf,
+                budget,
+                interner,
+                &pi.use_home,
+                pi.span,
+                inst,
+                pi.placeholder,
+            )?;
         }
 
         // (b) Generalize this module's own untyped defs.
         for (key, &shared) in generated.untyped.iter().filter(|(k, _)| &k.0 == home) {
             let root = lift!(uf.find(shared));
-            let candidates =
-                reachable_flex_roots(uf, budget, root).map_err(|d| (d, key.0.clone()))?;
+            let candidates = reachable_flex_roots(uf, budget, root)
+                .map_err(|d| InferError::sited_at_path(d, &key.0))?;
             let mut quantified = BTreeMap::new();
             for r in candidates {
                 if obligation_roots.contains(&r) {
@@ -683,9 +686,9 @@ fn zonk_visit(
         // super-typed variable is still a variable; its obligations are read
         // separately when generalising — see [`crate::SolvedTypes::bounds`].)
         Content::Flex | Content::Rigid | Content::Super { .. } => {
-            // AUD-13: tag so this solver-representative id can never be mistaken
-            // for an annotation-symbol raw by `instantiate_in`'s wildcard-`"any"`
-            // check if this zonked `Ty` is ever fed back through it.
+            // Tag so this solver-representative id can never be mistaken for an
+            // annotation-symbol raw if this zonked `Ty` is ever fed back
+            // through instantiation.
             let ty = Ty::Var(tag_solver_var(root));
             memo.insert(root, ty.clone());
             results.push(ty);
@@ -888,7 +891,7 @@ impl<'a> Builder<'a> {
             builtins,
             regions: BTreeMap::new(),
             expected: BTreeMap::new(),
-            current_home: Vec::new(),
+            current_home: None,
             constraints: Vec::new(),
             top_level: BTreeMap::new(),
             untyped: BTreeMap::new(),
@@ -900,6 +903,7 @@ impl<'a> Builder<'a> {
             wildcard_any_return_bindings: BTreeSet::new(),
             wildcard_any_use_results: Vec::new(),
             ctors: BTreeMap::new(),
+            sealed_ctors: BTreeSet::new(),
             typed_rigids: Vec::new(),
             scheme_apps: Vec::new(),
             super_vars: Vec::new(),

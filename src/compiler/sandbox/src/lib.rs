@@ -28,8 +28,22 @@ use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4410, SandboxError};
 
 pub use covers::{JailMounts, bind_exposing, path_covers};
 pub use mounts::{CanonicalPath, HomeMasks, JailPathError, MaskedDir};
+pub use vcs_config::{
+    ConfigFault, ConfigLimits, ConfigRefusal, ConfigRoots, ConfigSetting, Grants, Home, MAX_LINKS,
+    MAX_MODULE_DEPTH, MAX_PATH_BYTES, MAX_PATH_COMPONENTS, MAX_WORDS, Named, Unprovable,
+    scan as scan_vcs_config,
+};
+pub use vcs_metadata::{
+    CarvePath, JailArm, MAX_CARVE_ENTRIES, MAX_DEPTH, MAX_HELD_NAME_BYTES, MAX_PIN_MOUNTS,
+    MAX_WALK_ENTRIES, POINTER_CAP, PointerFault, VcsCarve, VcsKind, WalkCeiling, WalkLimits,
+    WritableTree,
+};
 
 pub mod build_jail;
+// Names every path the root `clippy.toml` denies, so a stale path breaks the
+// test build instead of silently disabling its lint.
+#[cfg(test)]
+mod clippy_paths_resolve;
 mod covers;
 pub mod home;
 pub mod host_env;
@@ -39,6 +53,9 @@ pub mod scratch;
 pub mod seccomp;
 #[cfg(test)]
 mod test_dir;
+mod vcs_config;
+mod vcs_keys;
+mod vcs_metadata;
 
 /// Why a jail could not be established or a jailed run failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +88,13 @@ pub enum SandboxDefect {
     /// A path the jail would mount or hand to the payload could not be
     /// resolved, or a home it must mask is unknown.
     Path(JailPathError),
+    /// The OS refused to start an output-drain thread. The child is killed
+    /// and reaped before this is returned, so the jail is never left
+    /// running.
+    DrainThread(std::io::ErrorKind),
+    /// The jail's process cap could not be proven to count only the jail's own
+    /// tasks (see [`run_jail::prove`]).
+    ProcCapUnproven(run_jail::RunJailDefect),
 }
 
 impl SandboxDefect {
@@ -107,6 +131,11 @@ impl From<SandboxDefect> for SandboxError {
                     .to_owned()
             }
             SandboxDefect::Path(e) => e.to_string(),
+            SandboxDefect::DrainThread(kind) => format!(
+                "the OS refused to start an output-drain thread ({kind}); the jailed process \
+                 was killed and reaped"
+            ),
+            SandboxDefect::ProcCapUnproven(defect) => defect.detail(),
         };
         Self::BuildJail {
             detail: detail.into(),
@@ -224,7 +253,7 @@ pub struct ResourceLimits {
     /// Open-file-descriptor cap.
     pub fd_cap: u64,
     /// Process-count cap.
-    pub proc_cap: u64,
+    pub proc_cap: run_jail::ProcCap,
     /// Maximum bytes read from the jailed process's stdout.
     pub out_cap_bytes: u64,
 }
@@ -250,7 +279,7 @@ impl Default for ResourceLimits {
             cpu_secs: 900,
             wall_secs: 900,
             fd_cap: 256,
-            proc_cap: 512,
+            proc_cap: run_jail::ProcCap::DEFAULT,
             out_cap_bytes: 256 * 1024 * 1024,
         }
     }
@@ -296,26 +325,33 @@ pub struct JailSpec {
 /// `prlimit` and `timeout` are non-optional: an argv that omits the wall
 /// clock or the rlimits is unrepresentable, so untrusted code can never run
 /// uncapped. A host missing either helper is refused upstream
-/// ([`missing_caps`]) before this is reached.
-#[must_use]
+/// ([`missing_caps`]) before this is reached. `scope` carries the `bwrap` and
+/// `prlimit` the argv names, proven to jail with a process cap that counts
+/// only the jail's own tasks.
+///
+/// # Errors
+/// Any error of [`mounts::push_mounts`].
 pub fn bwrap_argv(
-    bwrap: &Path,
-    prlimit: &Path,
+    scope: &run_jail::NprocScope,
     timeout: &Path,
     spec: &JailSpec,
     payload: &[OsString],
-) -> Vec<OsString> {
+) -> Result<Vec<OsString>, JailPathError> {
+    let tools = scope.tools();
     // The wall clock wraps everything: `timeout --kill-after=5s <wall> bwrap …`.
     let mut argv: Vec<OsString> = vec![
         timeout.into(),
         "--kill-after=5s".into(),
         spec.limits.wall_secs.to_string().into(),
-        bwrap.into(),
+        tools.bwrap.clone().into(),
     ];
     if spec.network == NetworkPolicy::Denied {
         argv.push("--unshare-net".into());
     }
+    // The user namespace is requested explicitly: the `--nproc` cap counts per
+    // namespace only inside it.
     for flag in [
+        "--unshare-user",
         "--unshare-pid",
         "--unshare-uts",
         "--unshare-ipc",
@@ -351,7 +387,7 @@ pub fn bwrap_argv(
     binds.extend(spec.path_prepend.iter().map(mounts::Bind::ReadOnly));
     binds.extend(spec.rustup_home.iter().map(mounts::Bind::ReadOnly));
     binds.push(mounts::Bind::ReadWrite(&spec.scoped_tmp));
-    mounts::push_mounts(&mut argv, &spec.homes, &binds);
+    mounts::push_mounts(&mut argv, &spec.homes, &binds)?;
     let scoped_tmp = spec.scoped_tmp.as_path();
     argv.push("--chdir".into());
     argv.push(scoped_tmp.into());
@@ -387,7 +423,7 @@ pub fn bwrap_argv(
         argv.push(rustup_home.as_path().into());
     }
     argv.push("--".into());
-    argv.push(prlimit.into());
+    argv.push(tools.prlimit.clone().into());
     argv.push(format!("--as={}", spec.limits.rss_bytes).into());
     argv.push(format!("--cpu={}", spec.limits.cpu_secs).into());
     argv.push(format!("--nofile={}", spec.limits.fd_cap).into());
@@ -395,7 +431,7 @@ pub fn bwrap_argv(
     argv.push(format!("--fsize={}", spec.limits.out_cap_bytes).into());
     argv.push("--".into());
     argv.extend(payload.iter().cloned());
-    argv
+    Ok(argv)
 }
 
 // ── jailed execution ────────────────────────────────────────────────────────
@@ -418,6 +454,9 @@ pub struct JailedOutput {
 ///
 /// # Errors
 ///
+/// [`SandboxDefect::NoIsolationMechanism`] or [`SandboxDefect::CapsUnavailable`]
+/// when a jail tool is absent; [`SandboxDefect::ProcCapUnproven`] when the
+/// process cap cannot be proven to count only the jail;
 /// [`SandboxDefect::Spawn`] when the jail cannot start;
 /// [`SandboxDefect::OutputCapExceeded`] when the payload out-talks the cap.
 pub fn run_in_bwrap_jail(
@@ -425,7 +464,36 @@ pub fn run_in_bwrap_jail(
     spec: &JailSpec,
     payload: &[OsString],
 ) -> Result<JailedOutput, SandboxDefect> {
-    run_bwrap(caps, spec, payload, None)
+    let (scope, timeout) = proven_scope(caps)?;
+    run_bwrap(&scope, timeout, spec, payload, None)
+}
+
+/// The jail tools `caps` names, proven to jail with a process cap that counts
+/// only the jail's own tasks, and the `timeout` that wraps every jail.
+///
+/// # Errors
+/// [`SandboxDefect::NoIsolationMechanism`] without `bwrap`;
+/// [`SandboxDefect::CapsUnavailable`] without `prlimit` or `timeout`;
+/// [`SandboxDefect::ProcCapUnproven`] when the proof is refused.
+fn proven_scope(caps: &Capabilities) -> Result<(run_jail::NprocScope, &Path), SandboxDefect> {
+    let Some(bwrap) = &caps.bwrap else {
+        return Err(SandboxDefect::NoIsolationMechanism);
+    };
+    // Mandatory caps: refuse before building an argv rather than run an
+    // uncapped jail. `bwrap_argv`'s non-optional params make this the only
+    // way to reach it, so an uncapped jail is unrepresentable.
+    let (Some(prlimit), Some(timeout)) = (&caps.prlimit, &caps.timeout) else {
+        return Err(SandboxDefect::CapsUnavailable {
+            missing: missing_caps(caps),
+        });
+    };
+    let tools = run_jail::RunJailTools {
+        bwrap: bwrap.clone(),
+        prlimit: prlimit.clone(),
+        timeout: Some(timeout.clone()),
+    };
+    let scope = run_jail::prove(&tools).map_err(SandboxDefect::ProcCapUnproven)?;
+    Ok((scope, timeout.as_path()))
 }
 
 /// Run `payload` in the bubblewrap jail under a subprocess-deny seccomp filter.
@@ -442,8 +510,10 @@ pub fn run_in_bwrap_jail(
 /// creation routes through it and seccomp cannot inspect its pointer-borne flags.
 /// The security boundary a spawned child cannot cross is the bubblewrap namespace
 /// itself — the caller relies on `--unshare-net`, the read-only root, and the
-/// `prlimit` caps to confine any child to the parent's capability set, and on
-/// `--nproc` + the wall clock to bound a fork bomb.
+/// `prlimit` caps to confine any child to the parent's capability set. A fork
+/// bomb is bounded by the `--nproc` cap, which [`run_jail::NprocScope`] proves
+/// counts only the jail's own user namespace, by the pid namespace that keeps
+/// every task the jail starts inside the jail, and by the wall clock.
 ///
 /// Fail-closed: on any architecture with no compilable filter (neither `x86_64`
 /// nor `aarch64`) this REFUSES rather than running the payload unfiltered.
@@ -461,6 +531,9 @@ pub fn run_in_bwrap_jail_deny_subprocess(
     spec: &JailSpec,
     payload: &[OsString],
 ) -> Result<JailedOutput, SandboxDefect> {
+    // The proof's canary jails run before the seccomp fd below turns
+    // inheritable, so none of them can inherit it.
+    let (scope, timeout) = proven_scope(caps)?;
     // `allow_subprocess = false` ⇒ the fork/process-clone family is denied.
     let Some(program) = seccomp::subprocess_deny_program(false) else {
         // No filter can be compiled here — refuse rather than run unfiltered.
@@ -488,7 +561,7 @@ pub fn run_in_bwrap_jail_deny_subprocess(
         program: "seccomp".to_owned(),
         detail: format!("clearing close-on-exec on the seccomp memfd failed: {e}"),
     })?;
-    let out = run_bwrap(caps, spec, payload, Some(seccomp_fd));
+    let out = run_bwrap(&scope, timeout, spec, payload, Some(seccomp_fd));
     drop(owned);
     out
 }
@@ -499,23 +572,13 @@ pub fn run_in_bwrap_jail_deny_subprocess(
 /// the caller owns that sealed fd and has already made it inheritable, so bwrap
 /// reads the filter from it across the exec.
 fn run_bwrap(
-    caps: &Capabilities,
+    scope: &run_jail::NprocScope,
+    timeout: &Path,
     spec: &JailSpec,
     payload: &[OsString],
     seccomp_fd: Option<run_jail::SealedFdNumber<'_>>,
 ) -> Result<JailedOutput, SandboxDefect> {
-    let Some(bwrap) = &caps.bwrap else {
-        return Err(SandboxDefect::NoIsolationMechanism);
-    };
-    // Mandatory caps: refuse before building an argv rather than run an
-    // uncapped jail. `bwrap_argv`'s non-optional params make this the only
-    // way to reach it, so an uncapped jail is unrepresentable.
-    let (Some(prlimit), Some(timeout)) = (&caps.prlimit, &caps.timeout) else {
-        return Err(SandboxDefect::CapsUnavailable {
-            missing: missing_caps(caps),
-        });
-    };
-    let argv = bwrap_argv_with_seccomp(bwrap, prlimit, timeout, spec, payload, seccomp_fd)?;
+    let argv = bwrap_argv_with_seccomp(scope, timeout, spec, payload, seccomp_fd)?;
     let (program, rest) = argv
         .args()
         .split_first()
@@ -567,18 +630,41 @@ fn drain_and_reap(
     let err_handle = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel::<DrainOutcome>();
     let out_tx = tx.clone();
-    let out_thread = std::thread::spawn(move || {
-        let _ = out_tx.send(DrainOutcome {
-            stream: Stream::Stdout,
-            result: read_bounded(out_handle, cap),
-        });
-    });
-    let err_thread = std::thread::spawn(move || {
-        let _ = tx.send(DrainOutcome {
-            stream: Stream::Stderr,
-            result: read_bounded(err_handle, cap),
-        });
-    });
+    // A refused drain thread must not leave the jailed child running
+    // unwatched: kill and reap it before returning the typed refusal.
+    let out_thread = match std::thread::Builder::new()
+        .name("ipe-jail-drain-stdout".to_owned())
+        .spawn(move || {
+            let _ = out_tx.send(DrainOutcome {
+                stream: Stream::Stdout,
+                result: read_bounded(out_handle, cap),
+            });
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            let kind = e.kind();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SandboxDefect::DrainThread(kind));
+        }
+    };
+    let err_thread = match std::thread::Builder::new()
+        .name("ipe-jail-drain-stderr".to_owned())
+        .spawn(move || {
+            let _ = tx.send(DrainOutcome {
+                stream: Stream::Stderr,
+                result: read_bounded(err_handle, cap),
+            });
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            let kind = e.kind();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_thread.join();
+            return Err(SandboxDefect::DrainThread(kind));
+        }
+    };
     let join_err = || SandboxDefect::Spawn {
         program: program.to_string_lossy().into_owned(),
         detail: "output-drain thread panicked".to_owned(),
@@ -647,20 +733,21 @@ fn drain_and_reap(
 /// would run the payload without its syscall filter (fail-open). The refusal
 /// here keeps the seccomp guarantee: no filter, no run.
 fn bwrap_argv_with_seccomp<'fd>(
-    bwrap: &Path,
-    prlimit: &Path,
+    scope: &run_jail::NprocScope,
     timeout: &Path,
     spec: &JailSpec,
     payload: &[OsString],
     seccomp_fd: Option<run_jail::SealedFdNumber<'fd>>,
 ) -> Result<run_jail::JailArgv<'fd>, SandboxDefect> {
-    let mut argv = run_jail::JailArgv::fd_free(bwrap_argv(bwrap, prlimit, timeout, spec, payload));
+    let mut argv = run_jail::JailArgv::fd_free(
+        bwrap_argv(scope, timeout, spec, payload).map_err(SandboxDefect::Path)?,
+    );
     let Some(fd) = seccomp_fd else {
         return Ok(argv);
     };
     // The argv is `timeout … <wall> bwrap …`; insert `--seccomp <fd>` right after
     // the `bwrap` token so it is a bwrap option, not a timeout one.
-    if !argv.attach_fd_after(bwrap.as_os_str(), "--seccomp", &fd) {
+    if !argv.attach_fd_after(scope.tools().bwrap.as_os_str(), "--seccomp", &fd) {
         return Err(SandboxDefect::SeccompNotAttached);
     }
     Ok(argv)
@@ -702,15 +789,24 @@ mod tests {
         }
     }
 
+    /// A proof over `bwrap` and the system `prlimit`, for argv-rendering tests.
+    fn scope_of(bwrap: &str) -> run_jail::NprocScope {
+        run_jail::NprocScope::for_test(run_jail::RunJailTools {
+            bwrap: bwrap.into(),
+            prlimit: "/usr/bin/prlimit".into(),
+            timeout: None,
+        })
+    }
+
     fn rendered_argv(spec: &JailSpec) -> Vec<String> {
         let payload: Vec<OsString> = vec!["ipe-ffi-inspector".into(), "semver".into()];
         bwrap_argv(
-            Path::new("/usr/bin/bwrap"),
-            Path::new("/usr/bin/prlimit"),
+            &scope_of("/usr/bin/bwrap"),
             Path::new("/usr/bin/timeout"),
             spec,
             &payload,
         )
+        .expect("the argv builds")
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect()
@@ -786,7 +882,11 @@ mod tests {
                 CanonicalPath::resolve(&bin).expect("canonical bin"),
                 CanonicalPath::resolve(&cargo_home).expect("canonical cargo home"),
             ],
-            homes: HomeMasks::resolve(Some(&user_home), Some(&cargo_home)).expect("homes"),
+            homes: HomeMasks::resolve(
+                Ok(&crate::home::test_home(&user_home)),
+                Some(&crate::home::test_tool_home(&cargo_home)),
+            )
+            .expect("homes"),
             ..spec()
         };
         let argv = rendered_argv(&jail);
@@ -989,8 +1089,12 @@ mod tests {
         let out = b"stdout".to_vec();
         let err = vec![b'e'; 4096];
         let cap = 1024_u64;
-        let ot = std::thread::spawn(move || read_bounded(Some(&out[..]), cap));
-        let et = std::thread::spawn(move || read_bounded(Some(&err[..]), cap));
+        let ot = std::thread::Builder::new()
+            .spawn(move || read_bounded(Some(&out[..]), cap))
+            .expect("spawn test thread");
+        let et = std::thread::Builder::new()
+            .spawn(move || read_bounded(Some(&err[..]), cap))
+            .expect("spawn test thread");
         let out_r = ot.join().expect("join").expect("read");
         let err_r = et.join().expect("join").expect("read");
         assert_eq!(out_r.as_deref(), Some(&b"stdout"[..]));
@@ -1059,6 +1163,54 @@ mod tests {
         assert_eq!(out.status, Some(0));
     }
 
+    // RLIMIT_NPROC is a per-process soft limit: lowering THIS test process's
+    // own limit refuses only its own future thread/process creation, never
+    // another process's (each process carries its own limit value, checked
+    // against the real user ID's live thread count at `clone`/`fork` time).
+    // No bwrap is needed: the fake child only needs to exist long enough to
+    // be killed and reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_drain_thread_kills_and_reaps_the_child() {
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let Ok(child) = cmd.spawn() else {
+            return;
+        };
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("pid fits i32"))
+            .expect("positive pid");
+
+        let original = rustix::process::getrlimit(rustix::process::Resource::Nproc);
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nproc,
+            rustix::process::Rlimit {
+                current: Some(1),
+                maximum: original.maximum,
+            },
+        )
+        .expect("lower this process's own thread budget");
+
+        let outcome = drain_and_reap(child, 1024, std::ffi::OsStr::new("sleep"));
+        // Lift the starved budget before any assertion, so a test runner that
+        // shares this process keeps its own threads.
+        let restored = rustix::process::setrlimit(rustix::process::Resource::Nproc, original);
+        assert!(restored.is_ok(), "restore the thread budget: {restored:?}");
+        assert!(
+            matches!(outcome, Err(SandboxDefect::DrainThread(_))),
+            "a starved thread budget must surface as DrainThread: {outcome:?}"
+        );
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH),
+            "the child must be killed and reaped, not left running"
+        );
+    }
+
     #[test]
     fn default_limits_match_the_spec_table() {
         let l = ResourceLimits::default();
@@ -1068,7 +1220,8 @@ mod tests {
         assert_eq!(l.cpu_secs, 900);
         assert_eq!(l.wall_secs, 900);
         assert_eq!(l.fd_cap, 256);
-        assert_eq!(l.proc_cap, 512);
+        assert_eq!(l.proc_cap, crate::run_jail::ProcCap::DEFAULT);
+        assert_eq!(l.proc_cap.get(), 512);
         assert_eq!(l.out_cap_bytes, 256 * 1024 * 1024);
     }
 
@@ -1125,8 +1278,7 @@ mod tests {
         use std::os::fd::{AsFd as _, AsRawFd as _};
         let filter = stand_in_fd();
         let argv = bwrap_argv_with_seccomp(
-            Path::new("/usr/bin/bwrap"),
-            Path::new("/usr/bin/prlimit"),
+            &scope_of("/usr/bin/bwrap"),
             Path::new("/usr/bin/timeout"),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
@@ -1164,8 +1316,7 @@ mod tests {
         // for the impossible case where the token the builder itself inserted
         // cannot be found again; it turns a silent drop into a hard refusal.
         let argv = bwrap_argv_with_seccomp(
-            Path::new("/nonexistent/bwrap-alias"),
-            Path::new("/usr/bin/prlimit"),
+            &scope_of("/nonexistent/bwrap-alias"),
             Path::new("/usr/bin/timeout"),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],
@@ -1196,8 +1347,7 @@ mod tests {
     #[test]
     fn no_seccomp_request_is_unchanged() {
         let argv = bwrap_argv_with_seccomp(
-            Path::new("/nonexistent/bwrap-alias"),
-            Path::new("/usr/bin/prlimit"),
+            &scope_of("/nonexistent/bwrap-alias"),
             Path::new("/usr/bin/timeout"),
             &spec(),
             &[OsString::from("ipe-ffi-inspector")],

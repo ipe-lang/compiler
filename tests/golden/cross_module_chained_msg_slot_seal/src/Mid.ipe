@@ -1,0 +1,16 @@
+module Mid exposing (frame, wrap)
+
+import Ipe.Html as Html exposing (Html)
+import Lib exposing (badge, menu, nav)
+
+
+-- Unannotated: its message slot is shared with `Lib.nav`'s and `Lib.badge`'s,
+-- and is pinned only by `Main.view`, one module further out.
+wrap =
+    Html.div [] [ nav, badge ]
+
+
+-- Annotated generic: its `msg` is shared with `Lib.menu`'s.
+frame : Html msg
+frame =
+    Html.div [] [ menu ]

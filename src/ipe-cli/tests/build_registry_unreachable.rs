@@ -60,14 +60,14 @@ fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
     let out = std::process::Command::new(ipe_bin)
-        .args(["build", &entry.to_string_lossy(), "--out"])
+        .args(["dev", "build", &entry.to_string_lossy(), "--out"])
         .arg(&out_dir)
         .env("PATH", &bin_dir)
         .env("IPE_RUNTIME_DIR", &runtime_dir)
         .env("NO_COLOR", "1")
         .output();
     let Ok(out) = out else {
-        panic!("failed to spawn ipe build: {out:?}")
+        panic!("failed to spawn ipe dev build: {out:?}")
     };
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -75,7 +75,7 @@ fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
     // Must exit non-zero.
     assert!(
         !out.status.success(),
-        "ipe build must exit non-zero on a registry failure; stderr:\n{stderr}"
+        "ipe dev build must exit non-zero on a registry failure; stderr:\n{stderr}"
     );
 
     // Must surface IPE-E0001, not the ICE IPE-I0001.

@@ -19,17 +19,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
-    DResult, Diagnostic, Feature, GenericAppEntryReach, Located, LowerError, MainRetName,
-    NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
+    DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
+    MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
-use ipe_ir::once_closure::MovedCapture;
+use ipe_ir::once_closure::{CaptureScope, ClosureKind, MovedCapture};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
+    RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
     ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde, is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
@@ -47,9 +47,10 @@ mod ty_templates;
 use capture_rewrite::force_shared_capture_clones;
 use clone_class::CaptureWalk;
 use clone_class::{
-    CloneClass, CloneEnv, HandlerCapture, classify_capture_clone, classify_handler_capture,
-    clone_class, enum_is_opaque_ffi_handle, param_is_multiuse_clonable,
+    CloneClass, CloneEnv, HandlerCapture, alias_rebuild_refusal, classify_capture_clone,
+    classify_handler_capture, clone_class, enum_is_opaque_ffi_handle, param_is_multiuse_clonable,
     reject_nonclone_value_reuse, rewrite_captured_clones, rewrite_multiuse_clones,
+    slice_element_alias_refusal, slice_ownership,
 };
 use generic_syms::{collect_ir_generic_syms, default_generics_to_unit};
 #[cfg(test)]
@@ -62,8 +63,6 @@ use ir_type_mentions::{
     ir_type_mentions_server, ir_type_mentions_sqlvalue, ir_type_mentions_url,
     program_type_mentions,
 };
-#[cfg(test)]
-use record_shapes::OPAQUE_NAMES_ABOVE_GUARD;
 use record_shapes::{
     CACHE_CFG_FIELDS, CACHE_STATS_FIELDS, is_all_int_canon_record_shape, is_all_int_record_shape,
     is_backoff_strategy_ty, is_csv_doc_canon_shape, is_csv_doc_shape,
@@ -311,7 +310,7 @@ const fn mapper_param_binds_fn_element(
 /// The walk is bounded by the solved type's own depth.
 fn ty_has_type_var(t: &Ty) -> bool {
     match t {
-        Ty::Var(_) => true,
+        Ty::Var(_) | Ty::Wildcard => true,
         Ty::Fun(a, b) => ty_has_type_var(a) || ty_has_type_var(b),
         Ty::Con { args, .. } | Ty::Tuple(args) => args.iter().any(ty_has_type_var),
         Ty::Record(fields, tail) => {
@@ -582,9 +581,10 @@ fn clear_let_bound_task_fail_pins(expr: Expr) -> Expr {
             effect: Box::new(recur(*effect)),
             rest: Box::new(recur(*rest)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(recur(*list)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(recur(*list)),
@@ -874,7 +874,7 @@ fn retry_policy_concrete_ir(interner: &Interner, ty: &Ty) -> Option<IrType> {
 
 fn embeds_nonderivable_function(interner: &Interner, ty: &Ty) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Unit => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
         Ty::Fun(a, b) => {
             embeds_nonderivable_function(interner, a) || embeds_nonderivable_function(interner, b)
         }
@@ -967,7 +967,9 @@ fn collect_type_vars(t: &canon::Type, out: &mut BTreeSet<Symbol>) {
         canon::Type::Var(s) => {
             out.insert(*s);
         }
-        canon::Type::Unit => {}
+        // The wildcard is no type variable: a union field `any` is the pub/sub
+        // carrier, never a parameter the union must declare.
+        canon::Type::Wildcard | canon::Type::Unit => {}
         canon::Type::Lambda(a, b) => {
             collect_type_vars(a, out);
             collect_type_vars(b, out);
@@ -1009,7 +1011,7 @@ fn collect_type_vars(t: &canon::Type, out: &mut BTreeSet<Symbol>) {
 fn canon_type_has_open_row(t: &canon::Type) -> bool {
     match t {
         canon::Type::RecordOpen(_, _) => true,
-        canon::Type::Var(_) | canon::Type::Unit => false,
+        canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => false,
         canon::Type::Lambda(a, b) => canon_type_has_open_row(a) || canon_type_has_open_row(b),
         canon::Type::Tuple(elems) => elems.iter().any(canon_type_has_open_row),
         canon::Type::Con { args, .. } => args.iter().any(canon_type_has_open_row),
@@ -1113,7 +1115,7 @@ fn canon_sig_unsupported_inner(sig: &canon::Type, arg_row_vars: &BTreeSet<Symbol
 /// Complements [`escapes`], which answers the same question at the
 /// IR-expression level for function bodies.
 const fn ty_can_satisfy_row_witness(ty: &Ty) -> bool {
-    !matches!(ty, Ty::Var(_))
+    !matches!(ty, Ty::Var(_) | Ty::Wildcard)
 }
 
 /// A short plain-English name for a solved [`Ty`], used in error messages when
@@ -1131,7 +1133,7 @@ fn ty_short_name(ty: &Ty, interner: &Interner) -> Box<str> {
         Ty::Tuple(_) => "tuple".into(),
         Ty::Unit => "unit".into(),
         Ty::Record(_, _) => "record".into(),
-        Ty::Var(_) => "unknown".into(),
+        Ty::Var(_) | Ty::Wildcard => "unknown".into(),
     }
 }
 
@@ -1661,7 +1663,7 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 
 // ── Shared (Arc) capture rewrite, E0507 fix ──────────────────────────────────
 //
-// `rewrite_captured_clones`'s depth==0 bare-callee exemption for a NonClone
+// `rewrite_captured_clones`'s bare-callee exemption for a NonClone
 // (function-typed) capture is sound only when the capturing lambda is not
 // ITSELF nested inside another lambda that also captures the same symbol.
 // Each `lower_lambda` call classifies its OWN captures independently, with
@@ -1677,51 +1679,59 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 //
 // Fix: after a `let`-bound function-typed value's WHOLE remaining scope has
 // been lowered (`lower_let`'s `PVar` arm, once every later sibling binding
-// has already folded around it), check whether the symbol is referenced at
-// lambda-nesting depth >= 2, or at depth >= 1 in 2+ distinct places
-// (`needs_shared_capture`). If so:
-//   * every read of the symbol at lambda-nesting depth >= 1 is rewritten to
-//     `CloneVar` (`force_shared_capture_clones`) -- a depth-0 (non-nested)
-//     read stays bare, since calling through an `Arc<dyn Fn>` auto-derefs
-//     exactly like `Box<dyn Fn>` and needs no clone;
+// has already folded around it), check whether the symbol is referenced
+// past a `Recallable` closure, or inside `Recallable` closures in 2+ distinct
+// places (`needs_shared_capture`; scopes per `ipe_ir::once_closure`, the
+// `move |_|` around a `TaskSeq` continuation counted as a `Once` closure).
+// If so:
+//   * every read of the symbol inside a closure is rewritten to
+//     `CloneVar` (`force_shared_capture_clones`) -- a non-nested read stays
+//     bare, since calling through an `Arc<dyn Fn>` auto-derefs exactly like
+//     `Box<dyn Fn>` and needs no clone;
 //   * the let-bound closure LITERAL itself is wrapped in `Expr::SharedLambda`
 //     so the backend boxes it with `Arc::new` (`+ Send + Sync` trait-object
 //     bound) instead of `Box::new` -- `Arc<T>: Clone`, so the inserted
-//     `.clone()` calls above compile. A single depth-1 occurrence (the
-//     common, already-sound case -- e.g. `Task.andThen (\\ts -> insertRow db
+//     `.clone()` calls above compile. A single occurrence directly inside
+//     one `Recallable` closure (the common, already-sound case -- e.g. `Task.andThen (\\ts -> insertRow db
 //     ts)`) stays untouched: byte-identical `Box<dyn Fn>`, zero behaviour
 //     change for the steady-state pattern this fix must not regress.
 
-/// Record, into `depths`, the LAMBDA-NESTING DEPTH (relative to `expr`'s own
-/// scope) of every live (non-shadowed) `Var(sym)` / `CloneVar(sym)` occurrence
-/// in `expr`. `cur_depth` is the number of `Lambda` / `SharedLambda`
-/// boundaries already crossed to reach `expr`. Mirrors
-/// [`lambda_body_refs_sym`]'s shadowing discipline exactly, generalised from
-/// a boolean "does it occur" to "at what depth does it occur, possibly more
-/// than once". `Expr::Update.record` is walked too (unlike
-/// `lambda_body_refs_sym`, which treats it as borrow-only for a DIFFERENT
-/// question) -- a false positive here only costs an unneeded (but harmless)
-/// `Arc`/`.clone()`, whereas a false negative would leave a real E0507/E0382
-/// unfixed, so this walker is deliberately the more conservative of the two.
+/// Record, into `out`, the [`CaptureScope`] of every live `Var(sym)` / `CloneVar(sym)` in `expr`.
+///
+/// `scope` is where `expr` itself sits; every closure the backend emits steps
+/// it through [`CaptureScope::enter_boundary`], the `move |_|` around a
+/// `TaskSeq` continuation included. Mirrors [`lambda_body_refs_sym`]'s
+/// shadowing discipline exactly, generalised from a boolean "does it occur" to
+/// "where does it occur, possibly more than once". `Expr::Update.record` is
+/// walked too (unlike `lambda_body_refs_sym`, which treats it as borrow-only
+/// for a DIFFERENT question) -- a false positive here only costs an unneeded
+/// (but harmless) `Arc`/`.clone()`, whereas a false negative would leave a
+/// real E0507/E0382 unfixed, so this walker is deliberately the more
+/// conservative of the two.
 #[allow(clippy::too_many_lines)] // exhaustive IR match; every arm is structurally required
-fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depths: &mut Vec<u32>) {
+fn collect_capture_scopes(
+    sym: Symbol,
+    expr: &Expr,
+    scope: CaptureScope,
+    out: &mut Vec<CaptureScope>,
+) {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => {
             if *s == sym {
-                depths.push(cur_depth);
+                out.push(scope);
             }
         }
         Expr::Lambda { params, body, .. }
         | Expr::SharedLambda { params, body, .. }
         | Expr::OnceLambda { params, body, .. } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth + 1, depths);
+                collect_capture_scopes(sym, body, scope.enter_boundary(expr), out);
             }
         }
         Expr::Let { name, value, body } => {
-            collect_lambda_capture_depths(sym, value, cur_depth, depths);
+            collect_capture_scopes(sym, value, scope, out);
             if *name != sym {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::Destructure {
@@ -1729,75 +1739,75 @@ fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depth
             value,
             body,
         } => {
-            collect_lambda_capture_depths(sym, value, cur_depth, depths);
+            collect_capture_scopes(sym, value, scope, out);
             if !pat_binds_symbol(binder, sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::Match(m) => {
-            collect_lambda_capture_depths(sym, m.scrutinee(), cur_depth, depths);
+            collect_capture_scopes(sym, m.scrutinee(), scope, out);
             for arm in m.arms() {
                 if !pat_binds_symbol(&arm.pat, sym) {
                     for e in arm.guard.iter().chain([&arm.body]) {
-                        collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                        collect_capture_scopes(sym, e, scope, out);
                     }
                 }
             }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                collect_lambda_capture_depths(sym, body, cur_depth, depths);
+                collect_capture_scopes(sym, body, scope, out);
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            collect_lambda_capture_depths(sym, lhs, cur_depth, depths);
-            collect_lambda_capture_depths(sym, rhs, cur_depth, depths);
+            collect_capture_scopes(sym, lhs, scope, out);
+            collect_capture_scopes(sym, rhs, scope, out);
         }
         Expr::If { cond, then_, else_ } => {
-            collect_lambda_capture_depths(sym, cond, cur_depth, depths);
-            collect_lambda_capture_depths(sym, then_, cur_depth, depths);
-            collect_lambda_capture_depths(sym, else_, cur_depth, depths);
+            collect_capture_scopes(sym, cond, scope, out);
+            collect_capture_scopes(sym, then_, scope, out);
+            collect_capture_scopes(sym, else_, scope, out);
         }
         Expr::Call { args, .. } | Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
-                collect_lambda_capture_depths(sym, a, cur_depth, depths);
+                collect_capture_scopes(sym, a, scope, out);
             }
         }
         Expr::Apply { func, args } => {
-            collect_lambda_capture_depths(sym, func, cur_depth, depths);
+            collect_capture_scopes(sym, func, scope, out);
             for a in args {
-                collect_lambda_capture_depths(sym, a, cur_depth, depths);
+                collect_capture_scopes(sym, a, scope, out);
             }
         }
         Expr::Tuple(items) | Expr::List { items, .. } => {
             for e in items {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::Cons { head, tail } => {
-            collect_lambda_capture_depths(sym, head, cur_depth, depths);
-            collect_lambda_capture_depths(sym, tail, cur_depth, depths);
+            collect_capture_scopes(sym, head, scope, out);
+            collect_capture_scopes(sym, tail, scope, out);
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            collect_lambda_capture_depths(sym, list, cur_depth, depths);
+            collect_capture_scopes(sym, list, scope, out);
         }
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::Update { record, fields } => {
-            collect_lambda_capture_depths(sym, record, cur_depth, depths);
+            collect_capture_scopes(sym, record, scope, out);
             for (_, e) in fields {
-                collect_lambda_capture_depths(sym, e, cur_depth, depths);
+                collect_capture_scopes(sym, e, scope, out);
             }
         }
         Expr::TaskSeq { effect, rest } => {
-            collect_lambda_capture_depths(sym, effect, cur_depth, depths);
-            collect_lambda_capture_depths(sym, rest, cur_depth, depths);
+            collect_capture_scopes(sym, effect, scope, out);
+            collect_capture_scopes(sym, rest, scope.enter_boundary(expr), out);
         }
         Expr::Access { record, .. } => {
-            collect_lambda_capture_depths(sym, record, cur_depth, depths);
+            collect_capture_scopes(sym, record, scope, out);
         }
         Expr::Int(_)
         | Expr::Bool(_)
@@ -1810,26 +1820,29 @@ fn collect_lambda_capture_depths(sym: Symbol, expr: &Expr, cur_depth: u32, depth
     }
 }
 
-/// Does `sym` (a `let`-bound, function-typed local) need `Arc`-based shared
-/// capture treatment? True when some occurrence is nested at least 2 lambda
-/// levels deep (the outer closure must move-capture it to hand off to the
-/// inner closure, which ALSO move-captures it) OR there are at least 2
-/// distinct depth-at-least-1 occurrences (two independent closures each
-/// move-capturing the same symbol -- the sibling-closure analogue of the
-/// same E0507/E0382 class). A single depth-1 occurrence (the common,
-/// already-sound case) returns `false`, so ordinary single-capture closures
-/// stay byte-identical `Box<dyn Fn>`.
+/// Does `sym` (a `let`-bound, function-typed local) need `Arc`-based shared capture?
+///
+/// True when some occurrence sits past a `Recallable` closure (the outer
+/// closure must move-capture it to hand off to the inner closure, which ALSO
+/// move-captures it, on every call) OR at least 2 occurrences sit inside
+/// `Recallable` closures (two independent closures each move-capturing the
+/// same symbol -- the sibling-closure analogue of the same E0507/E0382
+/// class). A single occurrence directly inside one `Recallable` closure (the
+/// common, already-sound case) returns `false`, so ordinary single-capture
+/// closures stay byte-identical `Box<dyn Fn>`; so do reads inside only `Once`
+/// closures, such as a top-level run-statement chain.
 fn needs_shared_capture(sym: Symbol, expr: &Expr) -> bool {
-    let mut depths = Vec::new();
-    collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-    depths.iter().any(|&d| d >= 2) || depths.iter().filter(|&&d| d >= 1).count() >= 2
+    let mut scopes = Vec::new();
+    collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+    scopes.iter().any(|s| s.borrow_is_hazard())
+        || scopes.iter().filter(|s| s.move_is_hazard()).count() >= 2
 }
 
 // ── Usage-site (not nesting-site) shared-capture trigger ──────────────────
 //
 // `needs_shared_capture` (above) closes the class: a `let`-bound closure
 // moved into 2+ competing closure environments. It does NOT cover a narrower,
-// DIFFERENT class — a single, non-nested (depth-0) reference to a `let`-bound
+// DIFFERENT class — a single, non-nested reference to a `let`-bound
 // closure passed straight into a kernel call whose runtime consumer itself
 // requires `Send + Sync` (`KernelFn::requires_sync_capture`, e.g.
 // `Ui.onSubmit` / `Ui.onInput` / `Ipe.Html.Events.on*` / `Stream.stream`).
@@ -1845,14 +1858,14 @@ fn needs_shared_capture(sym: Symbol, expr: &Expr) -> bool {
 // ORs this predicate into the same `Expr::SharedLambda` promotion path.
 
 /// Does `sym` occur ANYWHERE inside `expr` as a live `Var`/`CloneVar` leaf
-/// (any lambda-nesting depth, no boundary exemptions)? Used only to test
+/// (inside any closures, no boundary exemptions)? Used only to test
 /// whether a specific kernel-call ARGUMENT subtree mentions `sym` —
 /// deliberately over-inclusive (a false positive costs one harmless
 /// `Arc`/`.clone()`; a false negative would leave a real E0277 unfixed).
 fn expr_mentions_sym(sym: Symbol, expr: &Expr) -> bool {
-    let mut depths = Vec::new();
-    collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-    !depths.is_empty()
+    let mut scopes = Vec::new();
+    collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+    !scopes.is_empty()
 }
 
 /// Does `sym` (a `let`-bound, function-typed local) flow — anywhere in
@@ -1862,7 +1875,7 @@ fn expr_mentions_sym(sym: Symbol, expr: &Expr) -> bool {
 /// (`KernelFn::requires_sync_capture`)? See the module comment above for the
 /// bug class this closes.
 ///
-/// Traversal mirrors [`collect_lambda_capture_depths`] (recurse into every
+/// Traversal mirrors [`collect_capture_scopes`] (recurse into every
 /// `Expr` variant, lambda bodies included — a sync-requiring call reachable
 /// only through a nested closure still needs the same promotion), but asks a
 /// structurally different question at each node, so it is its own walker.
@@ -2509,9 +2522,10 @@ fn promote_unification_sibling_lambdas(
             head: Box::new(recur(*head)?),
             tail: Box::new(recur(*tail)?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(recur(*list)?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(recur(*list)?),
@@ -4003,6 +4017,10 @@ fn binder_captured_in_move_closure(binder: Symbol, expr: &Expr) -> bool {
         Expr::Record { fields, .. } | Expr::Update { fields, .. } => fields
             .iter()
             .any(|(_, e)| binder_captured_in_move_closure(binder, e)),
+        // The `move |_|` around the continuation is a `Once` boundary
+        // (`ipe_ir::once_closure::boundary_kind`) whose slot asks only `Send`,
+        // so it adds no `Sync` obligation of its own; a `Fn` closure around
+        // the node already sees the continuation's reads through it.
         Expr::TaskSeq { effect, rest } => {
             binder_captured_in_move_closure(binder, effect)
                 || binder_captured_in_move_closure(binder, rest)
@@ -4192,7 +4210,7 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(p, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for h in prefix {
                 collect_ir_pat_syms(h, out);
             }
@@ -4791,7 +4809,7 @@ fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
                 pat_binder_syms(p, out);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 pat_binder_syms(p, out);
             }
@@ -5773,8 +5791,13 @@ fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
                     .sum::<usize>()
         }
         Expr::Ctor { args, .. } => args.iter().map(|a| count_fn_value_uses(sym, a)).sum(),
+        // The continuation is the body of the `move |_|` closure the backend
+        // hands to `task_and_then` (`ipe_ir::once_closure::boundary_kind`): a
+        // read there, a borrowing call included, moves `sym` into that closure
+        // once, and the moves inside it count on their own.
         Expr::TaskSeq { effect, rest } => {
-            count_fn_value_uses(sym, effect) + count_fn_value_uses(sym, rest)
+            count_fn_value_uses(sym, effect)
+                + count_fn_value_uses(sym, rest).max(usize::from(lambda_body_refs_sym(sym, rest)))
         }
         Expr::TailLoop { params, body } => {
             if params.iter().any(|(s, _)| *s == sym) {
@@ -5969,9 +5992,18 @@ fn fn_value_move_walk(
                 fn_value_move_walk(sym, e, state, payloads);
             }
         }
+        // The continuation is the body of the `move |_|` closure the backend
+        // hands to `task_and_then` (`ipe_ir::once_closure::boundary_kind`):
+        // building it is one consuming read of `sym`, after the effect. Inside
+        // it the closure owns `sym`, so its own reads start unmoved.
         Expr::TaskSeq { effect, rest } => {
             fn_value_move_walk(sym, effect, state, payloads);
-            fn_value_move_walk(sym, rest, state, payloads);
+            if lambda_body_refs_sym(sym, rest) {
+                state.read(true);
+                let mut inner = FnValueMoveState::default();
+                fn_value_move_walk(sym, rest, &mut inner, payloads);
+                state.hazard |= inner.hazard;
+            }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
@@ -7040,13 +7072,17 @@ fn ir_type_has_ffi_foreign_handle(env: CloneEnv<'_>, ty: &IrType) -> bool {
 // `wrap`'s 2 flattened args, so a residual `\eta_0 -> wrap(<partial>, eta_0)`
 // capturing `wrap` exists only post-lowering).
 //
-// Read soundness for a `Box`-carried fn binding, by position:
-//   * depth-0 direct callee — borrows via `Fn::call(&self, ..)`, sound.
-//   * depth-0 non-callee, single use — a plain final move, sound.
-//   * NON-CALLEE read at closure depth ≥ 1 — the closure body moves the
-//     captured `Box` out of a `&self` env per call → E0507.
-//   * ANY read at closure depth ≥ 2 — an inner closure's construction moves
-//     the value out of the outer closure's env per call → E0507/E0525.
+// Read soundness for a `Box`-carried fn binding, by its `CaptureScope`
+// (`ipe_ir::once_closure`; the `move |_|` around a `TaskSeq` continuation is
+// a `Once` closure like any other):
+//   * direct callee short of past-`Recallable` — borrows via
+//     `Fn::call(&self, ..)`, sound.
+//   * non-callee outside every `Recallable` closure, single use — a plain
+//     final move, sound.
+//   * NON-CALLEE read inside a `Recallable` closure — the closure body moves
+//     the captured `Box` out of a `&self` env per call → E0507.
+//   * ANY read past a `Recallable` closure — an inner closure's construction
+//     moves the value out of the outer closure's env per call → E0507/E0525.
 //   * > 1 consuming use — the second move of a non-`Clone` value → E0382.
 // The last three demand the `Arc` carrier; [`fn_value_read_flags`] +
 // [`count_fn_value_uses`] detect them.
@@ -7069,12 +7105,15 @@ fn ir_type_has_ffi_foreign_handle(env: CloneEnv<'_>, ty: &IrType) -> bool {
 /// whose output is byte-pinned.
 #[derive(Clone, Copy, Default)]
 struct FnValueReadFlags {
-    /// A non-callee `Var`/`CloneVar` read at closure depth ≥ 1 exists — a bare
-    /// `Box` capture would be moved out of a `Fn` env per call (E0507).
-    non_callee_ge1: bool,
-    /// Any read at closure depth ≥ 2 exists — an intermediate closure's
-    /// construction would move the `Box` out of its enclosing env (E0525).
-    any_ge2: bool,
+    /// A non-callee `Var`/`CloneVar` read inside a `Recallable` closure exists.
+    ///
+    /// A bare `Box` capture would be moved out of a `Fn` env per call (E0507).
+    move_in_recallable: bool,
+    /// Any read past a `Recallable` closure exists.
+    ///
+    /// An intermediate closure's construction would move the `Box` out of its
+    /// enclosing env per call (E0507/E0525).
+    any_past: bool,
 }
 
 /// Threaded per-symbol summary maintained across the reverse fold in
@@ -7089,12 +7128,13 @@ struct FnValueReadFlags {
 /// - `var_uses`             ← `count_var_uses(sym, acc)`
 /// - `fn_value_uses`        ← `count_fn_value_uses(sym, acc)`
 /// - `fn_flags`             ← `fn_value_read_flags(sym, acc)`
-/// - `depth1_capture_count` ← count of depth-≥1 entries in
-///   `collect_lambda_capture_depths(sym, acc, 0, ..)`
-/// - `any_depth2_capture`   ← any depth-≥2 entry in the same collection
+/// - `recallable_capture_count` ← count of entries inside a `Recallable`
+///   closure in `collect_capture_scopes(sym, acc, CaptureScope::Top, ..)`
+/// - `any_past_capture` ← any entry past a `Recallable` closure in the same
+///   collection
 ///
 /// From those last two: `needs_shared_capture(sym, acc)` =
-/// `any_depth2_capture || depth1_capture_count >= 2`.
+/// `any_past_capture || recallable_capture_count >= 2`.
 ///
 /// `flows_into_sync_kernel_call` is intentionally NOT threaded: its
 /// alias-chain resolution (`let g = f in Ui.onSubmit g` propagating `f`'s
@@ -7106,8 +7146,8 @@ struct LetAccum {
     var_uses: usize,
     fn_value_uses: usize,
     fn_flags: FnValueReadFlags,
-    depth1_capture_count: usize,
-    any_depth2_capture: bool,
+    recallable_capture_count: usize,
+    any_past_capture: bool,
 }
 
 impl LetAccum {
@@ -7120,47 +7160,47 @@ impl LetAccum {
         let fn_value_uses = count_fn_value_uses(sym, expr);
         let fn_flags = {
             let mut f = FnValueReadFlags::default();
-            fn_value_read_flags_walk(sym, expr, 0, &mut f);
+            fn_value_read_flags_walk(sym, expr, CaptureScope::Top, &mut f);
             f
         };
-        let mut depths: Vec<u32> = Vec::new();
-        collect_lambda_capture_depths(sym, expr, 0, &mut depths);
-        let depth1_capture_count = depths.iter().filter(|&&d| d >= 1).count();
-        let any_depth2_capture = depths.iter().any(|&d| d >= 2);
+        let mut scopes = Vec::new();
+        collect_capture_scopes(sym, expr, CaptureScope::Top, &mut scopes);
+        let recallable_capture_count = scopes.iter().filter(|s| s.move_is_hazard()).count();
+        let any_past_capture = scopes.iter().any(|s| s.borrow_is_hazard());
         Self {
             var_uses,
             fn_value_uses,
             fn_flags,
-            depth1_capture_count,
-            any_depth2_capture,
+            recallable_capture_count,
+            any_past_capture,
         }
     }
 
     /// Fold `other` (computed over a fresh sub-expression) into `self`
     /// (accumulated over all previously folded sub-expressions).  Correct
-    /// because the sub-expressions are at the SAME lambda-nesting depth —
-    /// they are sibling Let-value sub-trees separated by Let nodes, and a
-    /// `Let` node does not increment depth.  Counts add; boolean flags OR.
+    /// because the sub-expressions sit at the SAME capture scope — they are
+    /// sibling Let-value sub-trees separated by Let nodes, and a `Let` node
+    /// is no closure boundary.  Counts add; boolean flags OR.
     const fn merge(&mut self, other: Self) {
         // `count_var_uses` is additive across Let-separated sub-expressions
-        // at the same depth.  The MAX semantics within If/Match are already
+        // at the same scope.  The MAX semantics within If/Match are already
         // captured by `count_var_uses` when called on each individual
         // sub-expression; merging across disjoint sub-trees is always SUM.
         self.var_uses += other.var_uses;
         self.fn_value_uses += other.fn_value_uses;
-        self.fn_flags.non_callee_ge1 |= other.fn_flags.non_callee_ge1;
-        self.fn_flags.any_ge2 |= other.fn_flags.any_ge2;
-        // Depth-counts add: two distinct depth-1 captures in different
-        // sub-expressions each contribute one slot; their SUM determines
-        // whether `needs_shared_capture` fires (>= 2 depth-1 captures).
-        self.depth1_capture_count += other.depth1_capture_count;
-        self.any_depth2_capture |= other.any_depth2_capture;
+        self.fn_flags.move_in_recallable |= other.fn_flags.move_in_recallable;
+        self.fn_flags.any_past |= other.fn_flags.any_past;
+        // Capture counts add: two distinct captures inside `Recallable`
+        // closures in different sub-expressions each contribute one slot;
+        // their SUM determines whether `needs_shared_capture` fires (>= 2).
+        self.recallable_capture_count += other.recallable_capture_count;
+        self.any_past_capture |= other.any_past_capture;
     }
 
     /// Reconstruct the `needs_shared_capture` boolean from the threaded
-    /// depth-count summary.  Mirrors `needs_shared_capture`'s own condition.
+    /// capture-scope summary.  Mirrors `needs_shared_capture`'s own condition.
     const fn needs_shared(&self) -> bool {
-        self.any_depth2_capture || self.depth1_capture_count >= 2
+        self.any_past_capture || self.recallable_capture_count >= 2
     }
 }
 
@@ -7286,44 +7326,50 @@ fn batch_accum_update(accum: &mut BTreeMap<Symbol, LetAccum>, expr: &Expr) {
 }
 
 /// Gather [`FnValueReadFlags`] for `sym` over `expr`. Shadow discipline and
-/// callee-position handling mirror [`count_fn_value_uses`]; depth counting
-/// mirrors [`collect_lambda_capture_depths`]. Enumerated exhaustively (no `_`
+/// callee-position handling mirror [`count_fn_value_uses`]; scope tracking
+/// mirrors [`collect_capture_scopes`]. Enumerated exhaustively (no `_`
 /// catch-all) so a future `Expr` variant is a compile error here, not a
 /// silently-missed read.
 fn fn_value_read_flags(sym: Symbol, expr: &Expr) -> FnValueReadFlags {
     let mut flags = FnValueReadFlags::default();
-    fn_value_read_flags_walk(sym, expr, 0, &mut flags);
+    fn_value_read_flags_walk(sym, expr, CaptureScope::Top, &mut flags);
     flags
 }
 
 #[allow(clippy::too_many_lines)]
-fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut FnValueReadFlags) {
+fn fn_value_read_flags_walk(
+    sym: Symbol,
+    expr: &Expr,
+    scope: CaptureScope,
+    flags: &mut FnValueReadFlags,
+) {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => {
             if *s == sym {
-                flags.non_callee_ge1 |= depth >= 1;
-                flags.any_ge2 |= depth >= 2;
+                flags.move_in_recallable |= scope.move_is_hazard();
+                flags.any_past |= scope.borrow_is_hazard();
             }
         }
         Expr::Lambda { params, body, .. }
         | Expr::SharedLambda { params, body, .. }
         | Expr::OnceLambda { params, body, .. } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                fn_value_read_flags_walk(sym, body, depth + 1, flags);
+                fn_value_read_flags_walk(sym, body, scope.enter_boundary(expr), flags);
             }
         }
         Expr::Apply { func, args } => {
             match func.as_ref() {
                 // Direct-callee read: borrows (`Fn::call`), so it is not a
-                // non-callee hazard — but at depth ≥ 2 its capture chain still
-                // moves the value through an intermediate closure env.
+                // non-callee hazard — but past a `Recallable` closure its
+                // capture chain still moves the value through an intermediate
+                // closure env.
                 Expr::Var(s) | Expr::CloneVar(s) if *s == sym => {
-                    flags.any_ge2 |= depth >= 2;
+                    flags.any_past |= scope.borrow_is_hazard();
                 }
-                other => fn_value_read_flags_walk(sym, other, depth, flags),
+                other => fn_value_read_flags_walk(sym, other, scope, flags),
             }
             for a in args {
-                fn_value_read_flags_walk(sym, a, depth, flags);
+                fn_value_read_flags_walk(sym, a, scope, flags);
             }
         }
         // A sync-capture kernel argument is the sync-promotion path's slot —
@@ -7331,14 +7377,14 @@ fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut Fn
         Expr::Call { callee, args, .. } => {
             if !matches!(callee, Callee::Kernel(k) if k.requires_sync_capture()) {
                 for a in args {
-                    fn_value_read_flags_walk(sym, a, depth, flags);
+                    fn_value_read_flags_walk(sym, a, scope, flags);
                 }
             }
         }
         Expr::Let { name, value, body } => {
-            fn_value_read_flags_walk(sym, value, depth, flags);
+            fn_value_read_flags_walk(sym, value, scope, flags);
             if *name != sym {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::Destructure {
@@ -7346,67 +7392,67 @@ fn fn_value_read_flags_walk(sym: Symbol, expr: &Expr, depth: u32, flags: &mut Fn
             value,
             body,
         } => {
-            fn_value_read_flags_walk(sym, value, depth, flags);
+            fn_value_read_flags_walk(sym, value, scope, flags);
             if !pat_binds_symbol(binder, sym) {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::Match(m) => {
-            fn_value_read_flags_walk(sym, m.scrutinee(), depth, flags);
+            fn_value_read_flags_walk(sym, m.scrutinee(), scope, flags);
             for arm in m.arms() {
                 if !pat_binds_symbol(&arm.pat, sym) {
-                    fn_value_read_flags_walk(sym, &arm.body, depth, flags);
+                    fn_value_read_flags_walk(sym, &arm.body, scope, flags);
                 }
             }
         }
         Expr::TailLoop { params, body } => {
             if !params.iter().any(|(s, _)| *s == sym) {
-                fn_value_read_flags_walk(sym, body, depth, flags);
+                fn_value_read_flags_walk(sym, body, scope, flags);
             }
         }
         Expr::BinOp { lhs, rhs, .. } => {
-            fn_value_read_flags_walk(sym, lhs, depth, flags);
-            fn_value_read_flags_walk(sym, rhs, depth, flags);
+            fn_value_read_flags_walk(sym, lhs, scope, flags);
+            fn_value_read_flags_walk(sym, rhs, scope, flags);
         }
         Expr::If { cond, then_, else_ } => {
-            fn_value_read_flags_walk(sym, cond, depth, flags);
-            fn_value_read_flags_walk(sym, then_, depth, flags);
-            fn_value_read_flags_walk(sym, else_, depth, flags);
+            fn_value_read_flags_walk(sym, cond, scope, flags);
+            fn_value_read_flags_walk(sym, then_, scope, flags);
+            fn_value_read_flags_walk(sym, else_, scope, flags);
         }
         Expr::Ctor { args, .. } | Expr::TailRecur { args } => {
             for a in args {
-                fn_value_read_flags_walk(sym, a, depth, flags);
+                fn_value_read_flags_walk(sym, a, scope, flags);
             }
         }
         Expr::Tuple(items) | Expr::List { items, .. } => {
             for e in items {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::Cons { head, tail } => {
-            fn_value_read_flags_walk(sym, head, depth, flags);
-            fn_value_read_flags_walk(sym, tail, depth, flags);
+            fn_value_read_flags_walk(sym, head, scope, flags);
+            fn_value_read_flags_walk(sym, tail, scope, flags);
         }
         Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            fn_value_read_flags_walk(sym, list, depth, flags);
+            fn_value_read_flags_walk(sym, list, scope, flags);
         }
         Expr::Record { fields, .. } => {
             for (_, e) in fields {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::Update { record, fields } => {
-            fn_value_read_flags_walk(sym, record, depth, flags);
+            fn_value_read_flags_walk(sym, record, scope, flags);
             for (_, e) in fields {
-                fn_value_read_flags_walk(sym, e, depth, flags);
+                fn_value_read_flags_walk(sym, e, scope, flags);
             }
         }
         Expr::TaskSeq { effect, rest } => {
-            fn_value_read_flags_walk(sym, effect, depth, flags);
-            fn_value_read_flags_walk(sym, rest, depth, flags);
+            fn_value_read_flags_walk(sym, effect, scope, flags);
+            fn_value_read_flags_walk(sym, rest, scope.enter_boundary(expr), flags);
         }
         Expr::Access { record, .. } => {
-            fn_value_read_flags_walk(sym, record, depth, flags);
+            fn_value_read_flags_walk(sym, record, scope, flags);
         }
         Expr::Int(_)
         | Expr::Bool(_)
@@ -7589,6 +7635,245 @@ fn is_direct_closure(expr: &Expr) -> bool {
         Expr::Lambda { .. } | Expr::OnceLambda { .. } => true,
         Expr::Let { body, .. } => matches!(**body, Expr::Lambda { .. }),
         _ => false,
+    }
+}
+
+/// Whether `expr` is a leaf read the shared-carrier demotion moves into its wrapper.
+///
+/// A local, a field read, or a closure built on the `Arc` carrier; any other
+/// value is bound once outside the wrapper instead.
+const fn is_shared_fn_leaf(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Var(_) | Expr::CloneVar(_) | Expr::Access { .. } | Expr::SharedLambda { .. }
+    )
+}
+
+/// What a `case` scrutinee says about the stored functions its arms' binders read.
+struct StoredScrutinee {
+    /// The scrutinee's own arrow when it is a stored function read.
+    value: Option<(Vec<IrType>, IrType)>,
+    /// Whether a built-in constructor's payload under the scrutinee is a storage position.
+    builtin_payload: bool,
+}
+
+/// The carrier a function value is emitted on.
+enum FnCarrier {
+    /// A `Box`/`impl Fn` closure, which a direct function slot accepts as is.
+    Direct,
+    /// An `Arc<dyn Fn>` value with its parameter and return types, which a
+    /// direct function slot refuses.
+    Shared(Vec<IrType>, IrType),
+}
+
+impl FnCarrier {
+    /// The carrier of a value of lowered type `ty`; `None` when `ty` is no function.
+    fn of_type(ty: IrType) -> Option<Self> {
+        match ty {
+            IrType::SharedFun(params, ret) => Some(Self::Shared(params, *ret)),
+            IrType::Fun(..) | IrType::FnOnceChain(..) => Some(Self::Direct),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the solved type `ty` holds a function anywhere a carrier can sit.
+fn ty_holds_fun(ty: &Ty) -> bool {
+    match ty {
+        Ty::Fun(..) => true,
+        Ty::Con { args, .. } | Ty::Tuple(args) => args.iter().any(ty_holds_fun),
+        Ty::Record(fields, _) => fields.values().any(ty_holds_fun),
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
+    }
+}
+
+/// Whether the lowered type `ty` holds an `Arc` function anywhere.
+///
+/// Walks every type-carrying position through the exhaustive
+/// [`ir_type_mentions`], so a container variant added to [`IrType`] is
+/// descended here the day it exists rather than read as holding no function.
+fn ir_holds_shared(ty: &IrType) -> bool {
+    ir_type_mentions(ty, &|t| matches!(t, IrType::SharedFun(..)))
+}
+
+/// Whether the lowered type `ty` is an `Arc` function, or one directly under a `Maybe`/`Result` payload.
+///
+/// These are the positions a branch's own carrier decides; a storage
+/// position is on `Arc` in every branch alike.
+fn holds_shared_direct(ty: &IrType) -> bool {
+    match ty {
+        IrType::SharedFun(..) => true,
+        IrType::Maybe(item) => holds_shared_direct(item),
+        IrType::Result(err, ok) => holds_shared_direct(err) || holds_shared_direct(ok),
+        _ => false,
+    }
+}
+
+/// The carrier type of a branching expression over its branches' carrier types.
+///
+/// A branch on `Arc` at a direct position decides it: every branch of one
+/// expression is emitted on one carrier, and a branch already on the direct
+/// carrier is still a callable a conversion can wrap. Otherwise the first
+/// known branch type.
+fn join_carrier_types(branches: impl Iterator<Item = Option<IrType>>) -> Option<IrType> {
+    let mut first = None;
+    for ty in branches.flatten() {
+        if holds_shared_direct(&ty) {
+            return Some(ty);
+        }
+        if first.is_none() {
+            first = Some(ty);
+        }
+    }
+    first
+}
+
+/// Whether the curried spine of `kernel` whose outer `outer_len` arguments start at slot `offset` lowers as one saturated call.
+///
+/// True when the kernel is an accessor-intercept placeholder or a
+/// capture-cloned handler kernel, whose saturated-call gate must observe every
+/// argument, or when an outer argument `j` that is a stored function read
+/// (`stored(j)`) lands in a [`FnSlotCarrier::Direct`] slot, which only the
+/// saturated call converts.
+fn spine_saturates(
+    kernel: KernelFn,
+    offset: usize,
+    outer_len: usize,
+    stored: impl Fn(usize) -> bool,
+) -> bool {
+    kernel.is_accessor_intercept_placeholder()
+        || kernel.capture_cloned_handler_arg().is_some()
+        || (0..outer_len).any(|j| {
+            matches!(
+                kernel.fn_slot_carrier(offset.saturating_add(j)),
+                Some(FnSlotCarrier::Direct)
+            ) && stored(j)
+        })
+}
+
+/// The curried arrow `shape` past its first `count` arguments, or `None` past its spine.
+const fn spine_after(shape: &ipe_kernels::TyShape, count: usize) -> Option<&ipe_kernels::TyShape> {
+    let mut cur = shape;
+    let mut left = count;
+    while left > 0 {
+        let ipe_kernels::TyShape::Fun(_, rest) = cur else {
+            return None;
+        };
+        cur = rest;
+        left -= 1;
+    }
+    Some(cur)
+}
+
+/// The scheme variables a saturated call of `kernel` binds to its result's carriers.
+///
+/// Each scheme variable bound, through an argument's carrier type
+/// (`arg_types`), to a type holding an `Arc` function takes that type at every
+/// direct position of the result (a bare result variable, a `Maybe`/`Result`
+/// payload); every other position keeps `base`, the solved result type
+/// lowered, whose storage positions are already on `Arc`. A kernel with no
+/// scheme is `base`.
+fn kernel_result_carrier_type(
+    kernel: KernelFn,
+    arg_types: &[Option<IrType>],
+    base: Option<IrType>,
+) -> Option<IrType> {
+    let Some(shape) = kernel.scheme_shape() else {
+        return base;
+    };
+    let mut bound: Vec<(u8, IrType)> = Vec::new();
+    for (index, ty) in arg_types.iter().enumerate() {
+        if let (Some(arg_shape), Some(ty)) = (ipe_kernels::spine_arg(shape, index), ty) {
+            bind_shape_carriers(arg_shape, ty, &mut bound);
+        }
+    }
+    let Some(result_shape) = spine_after(shape, arg_types.len()) else {
+        return base;
+    };
+    base.map_or_else(
+        || match result_shape {
+            ipe_kernels::TyShape::Var(var) => bound_carrier(&bound, *var),
+            _ => None,
+        },
+        |base| Some(overlay_shape_carriers(result_shape, base, &bound)),
+    )
+}
+
+/// The carrier type scheme variable `var` is bound to, if any.
+fn bound_carrier(bound: &[(u8, IrType)], var: u8) -> Option<IrType> {
+    bound
+        .iter()
+        .find(|(bound_var, _)| *bound_var == var)
+        .map(|(_, ty)| ty.clone())
+}
+
+/// The lowered type argument `slot` of the built-in constructor `tag`, read off `ty`.
+fn builtin_child(tag: ipe_kernels::BuiltinTag, ty: &IrType, slot: usize) -> Option<&IrType> {
+    use ipe_kernels::BuiltinTag;
+    match (tag, ty, slot) {
+        (BuiltinTag::Maybe, IrType::Maybe(item), 0)
+        | (BuiltinTag::List, IrType::List(item), 0)
+        | (BuiltinTag::Set, IrType::Set(item), 0)
+        | (BuiltinTag::Result, IrType::Result(item, _), 0)
+        | (BuiltinTag::Dict, IrType::Dict(item, _), 0)
+        | (BuiltinTag::Result, IrType::Result(_, item), 1)
+        | (BuiltinTag::Dict, IrType::Dict(_, item), 1) => Some(item),
+        _ => None,
+    }
+}
+
+/// Bind every scheme variable of `shape` that `ty` instantiates with a type holding an `Arc` function.
+///
+/// Walks a constructor argument and a tuple component in step with `ty`; an
+/// arrow and a record are not walked, so a variable seen only there stays
+/// unbound. The first binding of a variable is kept.
+fn bind_shape_carriers(shape: &ipe_kernels::TyShape, ty: &IrType, bound: &mut Vec<(u8, IrType)>) {
+    use ipe_kernels::TyShape;
+    match shape {
+        TyShape::Var(var) => {
+            if ir_holds_shared(ty) && bound_carrier(bound, *var).is_none() {
+                bound.push((*var, ty.clone()));
+            }
+        }
+        TyShape::Con(tag, items) => {
+            for (slot, item) in items.iter().enumerate() {
+                if let Some(child) = builtin_child(*tag, ty, slot) {
+                    bind_shape_carriers(item, child, bound);
+                }
+            }
+        }
+        TyShape::Tuple(items) => {
+            if let IrType::Tuple(children) = ty
+                && items.len() == children.len()
+            {
+                for (item, child) in items.iter().zip(children) {
+                    bind_shape_carriers(item, child, bound);
+                }
+            }
+        }
+        TyShape::Fun(..) | TyShape::Record { .. } | TyShape::Unit => {}
+    }
+}
+
+/// `base` with every direct position `shape` names a bound scheme variable at replaced by its binding.
+fn overlay_shape_carriers(
+    shape: &ipe_kernels::TyShape,
+    base: IrType,
+    bound: &[(u8, IrType)],
+) -> IrType {
+    use ipe_kernels::{BuiltinTag, TyShape};
+    match (shape, base) {
+        (TyShape::Var(var), base) => bound_carrier(bound, *var).unwrap_or(base),
+        (TyShape::Con(BuiltinTag::Maybe, [item]), IrType::Maybe(base_item)) => {
+            IrType::Maybe(Box::new(overlay_shape_carriers(item, *base_item, bound)))
+        }
+        (TyShape::Con(BuiltinTag::Result, [err, ok]), IrType::Result(base_err, base_ok)) => {
+            IrType::Result(
+                Box::new(overlay_shape_carriers(err, *base_err, bound)),
+                Box::new(overlay_shape_carriers(ok, *base_ok, bound)),
+            )
+        }
+        (_, base) => base,
     }
 }
 
@@ -7840,9 +8125,10 @@ fn shim_fn_value_reads_at(site: &ShimSite<'_>, expr: Expr, in_storage: bool) -> 
             head: Box::new(recurse_storage(*head)?),
             tail: Box::new(recurse_storage(*tail)?),
         }),
-        Expr::ListIndexClone { list, index } => Ok(Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Ok(Expr::ListIndexClone {
             list: Box::new(recurse(*list)?),
             index,
+            elem,
         }),
         Expr::ListLenCheck { list, len, exact } => Ok(Expr::ListLenCheck {
             list: Box::new(recurse(*list)?),
@@ -7924,6 +8210,77 @@ impl FlatNestedList {
     /// open one to `.len() >= N`.
     const fn closed(&self) -> bool {
         matches!(self.tail, NestedTail::Closed)
+    }
+
+    /// Does any head element or the open tail bind a name?
+    fn binds_any(&self) -> bool {
+        self.prefix
+            .iter()
+            .any(|b| matches!(b, NestedBinder::Named(_)))
+            || matches!(self.tail, NestedTail::Rest(NestedBinder::Named(_)))
+    }
+}
+
+/// The internal error of a nested list head binder whose element type was never resolved.
+fn unresolved_nested_cons_elem() -> Diagnostic {
+    bug(
+        "ipe_lower::desugar_ctor_nested_special_args",
+        "a nested list binds a head element but its element type was not resolved",
+    )
+}
+
+/// Refuse (IPE-L0116) a binding nested list in a constructor payload over a non-`Clone` element.
+///
+/// The nested-list desugaring copies each head out by index and takes the tail
+/// by `List.drop` of the copied binder; neither exists for an
+/// [`SliceOwnership::OwnedMove`] element.
+const fn nested_cons_ownership_refusal(own: SliceOwnership, span: Span) -> DResult<()> {
+    match own {
+        SliceOwnership::BorrowClone => Ok(()),
+        SliceOwnership::OwnedMove => Err(unsupported(span, Feature::NestedCtorDiscrimination)),
+    }
+}
+
+/// The ownership gates of one list arm head at `span` over `prefix`.
+///
+/// Under [`SliceOwnership::OwnedMove`] each element moves out of the owned view,
+/// so an element alias whose inner binds a name would own its part twice and is
+/// refused (IPE-L0135).
+fn owned_slice_refusal(own: SliceOwnership, prefix: &[Pat], span: Span) -> DResult<()> {
+    match own {
+        SliceOwnership::BorrowClone => Ok(()),
+        SliceOwnership::OwnedMove => slice_element_alias_refusal(prefix, span),
+    }
+}
+
+/// Refuse (IPE-L0116) a binding or-pattern over an owned list view.
+///
+/// An owned list view moves each binder out of one view shape, so every
+/// alternative would have to bind each name at the same position of the view;
+/// the owned rendering supports alternatives that bind nothing.
+fn owned_or_refusal(alts: &[Pat], span: Span) -> DResult<()> {
+    let owned = alts.iter().any(holds_owned_slice_head);
+    if owned && alts.iter().any(clone_class::pat_binds_any_name) {
+        return Err(unsupported(span, Feature::NestedCtorDiscrimination));
+    }
+    Ok(())
+}
+
+/// Is `pat` an owned-move slice head, directly or under an alias or or-pattern?
+fn holds_owned_slice_head(pat: &Pat) -> bool {
+    match pat {
+        Pat::Slice { own, .. } => *own == SliceOwnership::OwnedMove,
+        Pat::Alias(inner, _) => holds_owned_slice_head(inner),
+        Pat::Or(alts) => alts.iter().any(holds_owned_slice_head),
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Ctor { .. }
+        | Pat::Tuple(_)
+        | Pat::Record(_) => false,
     }
 }
 
@@ -9126,7 +9483,7 @@ fn collect_pat_ir_type_refs(pat: &Pat, enums: &mut BTreeSet<(ModPath, Symbol)>) 
                 collect_pat_ir_type_refs(p, enums);
             }
         }
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             for p in prefix {
                 collect_pat_ir_type_refs(p, enums);
             }
@@ -9448,7 +9805,7 @@ fn pat_matches_sqlvalue(pat: &Pat, enums: &[Symbol]) -> bool {
         }
         Pat::Tuple(ps) | Pat::Or(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_matches_sqlvalue(p, enums)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_matches_sqlvalue(p, enums))
                 || rest
                     .as_ref()
@@ -9738,7 +10095,7 @@ fn projection_ty_label(ty: &Ty, interner: &Interner) -> Box<str> {
         Ty::Record(_, _) => "record".into(),
         Ty::Fun(_, _) => "function".into(),
         Ty::Unit => "()".into(),
-        Ty::Var(_) => "type variable".into(),
+        Ty::Var(_) | Ty::Wildcard => "type variable".into(),
     }
 }
 
@@ -9876,6 +10233,54 @@ fn reject_point_free_store_kernel(callee: &Callee, span: Span) -> DResult<()> {
         return Err(Diagnostic::Lower {
             span,
             msg: LowerError::PointFreeAccessorKernel { kernel },
+        });
+    }
+    Ok(())
+}
+
+/// The one context in which an intercept-only `Store.*` kernel's rewrite runs.
+///
+/// The projection elements are read structurally by `lower_store_select`'s
+/// projection walk; every other placeholder is rewritten by its saturated
+/// direct-call arm in `intercept_web_kernel_call`.
+const fn intercept_context(k: KernelFn) -> InterceptContext {
+    if matches!(
+        k,
+        KernelFn::StoreLiteral
+            | KernelFn::StoreUpper
+            | KernelFn::StoreLower
+            | KernelFn::StoreCoalesce
+            | KernelFn::StoreAdd
+            | KernelFn::StoreSub
+            | KernelFn::StoreMul
+    ) {
+        InterceptContext::SelectProjection
+    } else {
+        InterceptContext::SaturatedCall
+    }
+}
+
+/// Fail-closed SEAL gate for an intercept-only `Store.*` kernel applied off its intercept.
+///
+/// A saturated or over-applied placeholder reaching the uniform call path is
+/// one whose rewrite did not run: a projection element (`Store.add`,
+/// `Store.literal`, …) called outside a `Store.select` body, or any placeholder
+/// over-applied past its arity. Emitting it would name the never-defined
+/// placeholder symbol (`store_add`, …), so `ipe` would accept a program `cargo`
+/// rejects with E0425. Refused with IPE-L0146; the unsaturated shapes keep their
+/// own [`reject_point_free_store_kernel`] refusal. A no-op for every other callee.
+fn reject_off_intercept_store_kernel(callee: &Callee, span: Span) -> DResult<()> {
+    if let Callee::Kernel(k) = callee
+        && k.is_accessor_intercept_placeholder()
+    {
+        let d = k.decl();
+        let kernel = format!("{}.{}", d.qualifier, d.name).into_boxed_str();
+        return Err(Diagnostic::Lower {
+            span,
+            msg: LowerError::AccessorKernelOffIntercept {
+                kernel,
+                context: intercept_context(*k),
+            },
         });
     }
     Ok(())
@@ -10125,7 +10530,7 @@ fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_symbol(p, target)),
-        Pat::Slice { prefix, rest } => {
+        Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_binds_symbol(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_symbol(p, target))
         }
@@ -10266,9 +10671,10 @@ fn rewrite_var_free_occurrences(
             head: Box::new(rewrite_var_free_occurrences(target, *head, on_hit)),
             tail: Box::new(rewrite_var_free_occurrences(target, *tail, on_hit)),
         },
-        Expr::ListIndexClone { list, index } => Expr::ListIndexClone {
+        Expr::ListIndexClone { list, index, elem } => Expr::ListIndexClone {
             list: Box::new(rewrite_var_free_occurrences(target, *list, on_hit)),
             index,
+            elem,
         },
         Expr::ListLenCheck { list, len, exact } => Expr::ListLenCheck {
             list: Box::new(rewrite_var_free_occurrences(target, *list, on_hit)),
@@ -10598,16 +11004,19 @@ pub struct Lowerer<'a> {
     /// advances; overrun fails closed as a [`bug`] (never an index panic). Interior
     /// mutability so the lowering walk stays over a shared `&self`.
     param_cursor: Cell<usize>,
-    /// Fresh symbols for the per-occurrence `any`-in-param-position seal fix
-    /// (AUD-01). Sized by [`count_any_param_sites`], pre-interned through the
+    /// Fresh symbols for the per-occurrence `any`-in-param-position
+    /// substitution. Sized by [`count_any_param_sites`], pre-interned through the
     /// owned `&mut Interner` before this immutably-borrowed `Lowerer` is
     /// constructed (the interner is frozen by lowering time — a symbol cannot
     /// be minted from inside `&self`). Each bare param-position `any`
     /// occurrence in `split_typed_sig` gets ONE of these instead of sharing the
-    /// single interned `"any"` Symbol, so two `any` params pinned by the body
+    /// one wildcard marker, so two `any` params pinned by the body
     /// to two DIFFERENT concrete types emit as two DISTINCT Rust generics
     /// (`fn f<T1, T2>(a:T1, b:T2)`) rather than colliding onto one shared `T1`.
     any_param_binders: Vec<Symbol>,
+    /// The symbol of this lowering's [`WildcardMarker`]: every wildcard `any`
+    /// lowers to `IrType::Generic(wildcard_marker)` until freshened or pinned.
+    wildcard_marker: Symbol,
     /// Monotonic cursor into [`Self::any_param_binders`], mirroring
     /// [`Self::param_cursor`]'s shape exactly.
     any_param_cursor: Cell<usize>,
@@ -10685,8 +11094,8 @@ pub struct Lowerer<'a> {
     /// builder recorded.  Interior mutability so `lower_def` can update it through
     /// the shared `&self` reference that the lowering walk uses.
     current_home: std::cell::RefCell<Vec<Symbol>>,
-    /// Reverse map from union-find representative id to annotation variable
-    /// symbol for the typed def currently being lowered.  Populated by
+    /// Reverse map from solver-tagged union-find representative to annotation
+    /// variable symbol for the def currently being lowered.  Populated by
     /// [`Self::lower_def`] from [`SolvedTypes::poly_var_map`] before recursing
     /// into the body; cleared (restored to empty) afterward.
     ///
@@ -10699,7 +11108,7 @@ pub struct Lowerer<'a> {
     /// to `IrType::Unit`, causing E0308 (`Attribute<()>` vs `Attribute<T1>`) in
     /// the Rust emitted for polymorphic functions such as
     /// `view : (Msg -> parentMsg) -> Counter -> Html parentMsg`.
-    current_poly_tvars: std::cell::RefCell<BTreeMap<u32, Symbol>>,
+    current_poly_tvars: std::cell::RefCell<BTreeMap<ipe_types::SolverVar, Symbol>>,
     /// Whether the function (def or lambda) currently being lowered has a Task
     /// return type. Set to `true` when `lower_def` / `lower_lambda` detects that
     /// the inferred return type is `IrType::Task(_)`; reset to `false` on entry to
@@ -10788,6 +11197,9 @@ pub struct Lowerer<'a> {
     /// its record's type, so it needs no entry. Saved and restored per scope;
     /// interior mutability so the lowering walk stays over a shared `&self`.
     shared_fn_reads: std::cell::RefCell<BTreeMap<Symbol, (Vec<IrType>, IrType)>>,
+    /// The number of expressions [`Self::value_carrier_type`] has classified.
+    #[cfg(test)]
+    carrier_walks: std::cell::Cell<usize>,
     /// Per-def record of the erased row params a function accumulates during its
     /// own lowering, keyed by `(home_path, name)`. Each entry is a list of
     /// `(param_position, RowParam)` pairs — the zero-based index of the
@@ -11001,6 +11413,47 @@ fn promote_fn_field_value_carrier(value: Expr) -> Expr {
     }
 }
 
+/// The `DbFailure` constructor symbols, in the shared builtin table's order.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if the shared table has no `DbFailure` row, or
+/// the interner is exhausted.
+pub fn intern_db_failure_ctors(interner: &mut Interner) -> DResult<Vec<Symbol>> {
+    intern_builtin_union_ctors(interner, "DbFailure", "ipe_lower::intern_db_failure_ctors")
+}
+
+/// The `AuthError` constructor symbols, in the shared builtin table's order.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] if the shared table has no `AuthError` row, or
+/// the interner is exhausted.
+pub fn intern_auth_error_ctors(interner: &mut Interner) -> DResult<Vec<Symbol>> {
+    intern_builtin_union_ctors(interner, "AuthError", "ipe_lower::intern_auth_error_ctors")
+}
+
+/// The constructor symbols of the shared builtin union `type_name`, in table
+/// order; `where_` names the caller in the refusal.
+fn intern_builtin_union_ctors(
+    interner: &mut Interner,
+    type_name: &str,
+    where_: &'static str,
+) -> DResult<Vec<Symbol>> {
+    let union = ipe_canon::builtins::BUILTIN_UNIONS
+        .iter()
+        .find(|u| u.type_name == type_name)
+        .ok_or_else(|| {
+            bug(
+                where_,
+                format!("the shared builtin table has no `{type_name}` row"),
+            )
+        })?;
+    union
+        .ctors
+        .iter()
+        .map(|&(name, _, _)| interner.intern(name))
+        .collect()
+}
+
 /// The interned symbols of the built-in `Maybe` / `Result` types and their
 /// constructors, minted by [`crate::lower`] through its owned `&mut Interner`.
 ///
@@ -11075,13 +11528,24 @@ pub struct BuiltinCtors {
     pub ek_unavailable: Symbol,
     pub ek_unexpected: Symbol,
     // ── ErrorDetails ADT ──────────────────────────────
-    // `ErrorDetails` has 5 constructors, each arity 1.
+    // `ErrorDetails` has 6 constructors, each arity 1.
     pub errordetails: Symbol,
     pub ed_ffi_panic: Symbol,
     pub ed_type_mismatch: Symbol,
     pub ed_http_status: Symbol,
     pub ed_json_decode: Symbol,
     pub ed_custom: Symbol,
+    pub ed_database: Symbol,
+    // ── DbFailure ADT ─────────────────────────────────
+    // The closed database-failure-cause union carried by `ErrorDetails.Database`;
+    // its nullary constructors in the shared builtin table's order.
+    pub db_failure: Symbol,
+    pub db_failure_ctors: Vec<Symbol>,
+    // ── AuthError ADT ─────────────────────────────────
+    // The closed `Auth.verifyToken` refusal union; its nullary constructors in
+    // the shared builtin table's order.
+    pub auth_error: Symbol,
+    pub auth_error_ctors: Vec<Symbol>,
     // ── HttpMethod ADT ──────────────────────────────────
     // `HttpMethod` has 7 nullary verb constructors.
     pub http_method: Symbol,
@@ -11458,9 +11922,11 @@ pub fn count_projection_decode_sites(m: &canon::Module, interner: &Interner) -> 
 /// Each `any` occurrence — whether a bare `any` param or an `any` nested
 /// inside `List any`, `Maybe any`, `Result e any`, a tuple/record/fn field,
 /// etc. — needs its OWN fresh symbol so independent occurrences lower to
-/// distinct generics (see AUD-01 and [`Lowerer::split_typed_sig`]).
+/// distinct generics (see [`Lowerer::split_typed_sig`]).
 ///
-/// Only `any` gets a fresh UV per occurrence in the checker; genuine named
+/// Only the wildcard [`canon::Type::Wildcard`] gets a fresh unknown per
+/// occurrence in the checker; a declared parameter spelled `any` and every
+/// other genuine named
 /// type variables share one symbol and are fine. Bare or `Ui`-wrapped `any`
 /// in return position is handled by the region-based substitution in
 /// `lower_def` (which replaces the whole return with the body's solved type).
@@ -11471,26 +11937,17 @@ pub fn count_projection_decode_sites(m: &canon::Module, interner: &Interner) -> 
 /// Over-counting is harmless (a few unused interned symbols); under-counting
 /// would let [`Lowerer::fresh_any_param_symbol`]'s cursor overrun, which
 /// fails closed as a [`bug`] — never an index panic, never a silent reuse.
-pub fn count_any_param_sites(m: &canon::Module, interner: &Interner) -> usize {
-    fn count_any_in_type(t: &canon::Type, interner: &Interner) -> usize {
+pub fn count_any_param_sites(m: &canon::Module) -> usize {
+    fn count_any_in_type(t: &canon::Type) -> usize {
         match t {
-            canon::Type::Var(v) => usize::from(interner.resolve(*v) == Some("any")),
-            canon::Type::Con { args, .. } => {
-                args.iter().map(|a| count_any_in_type(a, interner)).sum()
+            canon::Type::Wildcard => 1,
+            canon::Type::Var(_) | canon::Type::Unit => 0,
+            canon::Type::Con { args, .. } => args.iter().map(count_any_in_type).sum(),
+            canon::Type::Lambda(arg, rest) => count_any_in_type(arg) + count_any_in_type(rest),
+            canon::Type::Tuple(elems) => elems.iter().map(count_any_in_type).sum(),
+            canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => {
+                fields.iter().map(|(_, f)| count_any_in_type(f)).sum()
             }
-            canon::Type::Lambda(arg, rest) => {
-                count_any_in_type(arg, interner) + count_any_in_type(rest, interner)
-            }
-            canon::Type::Tuple(elems) => elems.iter().map(|e| count_any_in_type(e, interner)).sum(),
-            canon::Type::Record(fields) => fields
-                .iter()
-                .map(|(_, f)| count_any_in_type(f, interner))
-                .sum(),
-            canon::Type::RecordOpen(_, fields) => fields
-                .iter()
-                .map(|(_, f)| count_any_in_type(f, interner))
-                .sum(),
-            canon::Type::Unit => 0,
         }
     }
     m.defs
@@ -11507,11 +11964,11 @@ pub fn count_any_param_sites(m: &canon::Module, interner: &Interner) -> usize {
             let mut cur = ty;
             let mut n = 0;
             while let canon::Type::Lambda(arg, rest) = cur {
-                n += count_any_in_type(arg, interner);
+                n += count_any_in_type(arg);
                 cur = rest.as_ref();
             }
             // `cur` is now the trailing return type; count its `any`s.
-            n += count_any_in_type(cur, interner);
+            n += count_any_in_type(cur);
             n
         })
         .sum()
@@ -12366,6 +12823,36 @@ fn mapper_wrap_eta_demand(body: &canon::Expr, home: &[Symbol], types: &SolvedTyp
     total
 }
 
+/// The one symbol that stands for the wildcard `any` in lowered types.
+///
+/// Minted fresh per lowering through [`Interner::fresh_symbols`], so no
+/// source identifier can spell it: a declared type parameter named `any` is a
+/// separate symbol and never reaches a wildcard-only path. The field is
+/// private, so a marker comes only from [`Self::mint`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WildcardMarker(Symbol);
+
+impl WildcardMarker {
+    /// Mint the marker for one lowering.
+    ///
+    /// # Errors
+    ///
+    /// An interner diagnostic when the fresh symbol cannot be interned.
+    pub fn mint(interner: &mut Interner) -> DResult<Self> {
+        interner
+            .fresh_symbols("anyw_", 1)?
+            .first()
+            .copied()
+            .map(Self)
+            .ok_or_else(|| bug("ipe_lower::WildcardMarker::mint", "no fresh symbol minted"))
+    }
+
+    /// The marker's symbol, as it appears in an [`IrType::Generic`].
+    pub const fn symbol(self) -> Symbol {
+        self.0
+    }
+}
+
 /// Every pre-minted, collision-free synthetic-symbol pool [`Lowerer::new`]
 /// needs — bundled into one argument so the constructor stays under
 /// clippy's arg-count ceiling. Each field is documented at its matching
@@ -12384,11 +12871,13 @@ pub struct SymbolPools {
     /// scrutinee — sized by [`module_symbol_pool_counts`] and consumed via
     /// [`Lowerer::tuple_elem_binders`].
     pub tuple_elem_binders: Vec<Symbol>,
+    /// The symbol every wildcard `any` lowers to before it is freshened.
+    pub wildcard_marker: WildcardMarker,
 }
 
 /// `(params, prologue, ret, any_syms_minted, row_params, wildcard_bounds)` —
 /// [`Lowerer::split_typed_sig`]'s return shape, named so the signature stays
-/// under clippy's type-complexity ceiling. `any_syms_minted` (AUD-01 seal fix)
+/// under clippy's type-complexity ceiling. `any_syms_minted`
 /// lists every fresh symbol handed out by [`Lowerer::fresh_any_param_symbol`]
 /// for THIS call — the caller must union these into whatever set gates
 /// `type_params` (they are NOT in [`canon::Def::Typed::free_vars`], since they
@@ -12469,6 +12958,7 @@ impl<'a> Lowerer<'a> {
             nested_cons_binders,
             nested_strlit_binders,
             tuple_elem_binders,
+            wildcard_marker,
         } = pools;
         let mut func_ids = BTreeMap::new();
         for (idx, def) in m.defs.iter().enumerate() {
@@ -12494,20 +12984,16 @@ impl<'a> Lowerer<'a> {
                 ctor_arity.insert((uhome.clone(), ctor.name), ctor.arity);
             }
             // A `Rust.*`-home union that is NOT the opaque-handle placeholder
-            // (one nullary ctor spelling the type name) is a transparent FFI
-            // import: it lowers to a real app enum, and its constructors are
-            // constructible/matchable like any user enum's.
-            let rust_home = union
-                .home
-                .first()
-                .and_then(|s| interner.resolve(*s))
-                .is_some_and(|s| s == "Rust");
-            let placeholder = union.ctors.len() == 1
-                && union
-                    .ctors
-                    .first()
-                    .is_some_and(|c| c.name == union.name && c.arity == 0);
-            if rust_home && !placeholder {
+            // is a transparent FFI import: it lowers to a real app enum, and
+            // its constructors are constructible/matchable like any user
+            // enum's. The type checker's show gate reads the same
+            // classification.
+            if ipe_ir::home_is_ffi_interface(interner, &union.home)
+                && ipe_ir::FfiUnion::classify(
+                    union.name,
+                    union.ctors.iter().map(|c| (c.name, c.arity)),
+                ) == ipe_ir::FfiUnion::Transparent
+            {
                 transparent_ffi_unions.insert((uhome.clone(), union.name));
                 for ctor in &union.ctors {
                     transparent_ffi_ctors.insert((uhome.clone(), ctor.name));
@@ -12587,7 +13073,7 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.ek_unavailable), 0);
         ctor_arity.insert((prelude_home.clone(), builtins.ek_unexpected), 0);
         // ── ErrorDetails ADT ─────────────────────────────
-        // 5-variant enrichment union carried on `ErrorInfo.details`. Same
+        // 6-variant enrichment union carried on `ErrorInfo.details`. Same
         // registration recipe as `ErrorKind` above — seeding here lets
         // `case d of FfiPanic info -> …` / `HttpStatus code -> …` validate and
         // lower past the `Match::new` enum-cover check.
@@ -12599,6 +13085,7 @@ impl<'a> Lowerer<'a> {
                 builtins.ed_http_status,
                 builtins.ed_json_decode,
                 builtins.ed_custom,
+                builtins.ed_database,
             ],
         );
         ctor_arity.insert((prelude_home.clone(), builtins.ed_ffi_panic), 1); // FfiPanic(PanicInfo)
@@ -12606,6 +13093,27 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.ed_http_status), 1); // HttpStatus(Int)
         ctor_arity.insert((prelude_home.clone(), builtins.ed_json_decode), 1); // JsonDecode(String)
         ctor_arity.insert((prelude_home.clone(), builtins.ed_custom), 1); // Custom(String)
+        ctor_arity.insert((prelude_home.clone(), builtins.ed_database), 1); // Database(DbFailure)
+        // ── DbFailure ADT ──────────────────────────────────
+        // Nullary `Db.`-qualified constructors; seeding here lets
+        // `case f of Db.UniqueViolation -> …` validate and lower past the
+        // enum-cover check.
+        enum_variants.insert(
+            (prelude_home.clone(), builtins.db_failure),
+            builtins.db_failure_ctors.clone(),
+        );
+        for &ctor in &builtins.db_failure_ctors {
+            ctor_arity.insert((prelude_home.clone(), ctor), 0);
+        }
+        // ── AuthError ADT ──────────────────────────────────
+        // Nullary `Auth.`-qualified constructors, seeded like `DbFailure`.
+        enum_variants.insert(
+            (prelude_home.clone(), builtins.auth_error),
+            builtins.auth_error_ctors.clone(),
+        );
+        for &ctor in &builtins.auth_error_ctors {
+            ctor_arity.insert((prelude_home.clone(), ctor), 0);
+        }
         // ── HttpMethod ADT ─────────────────────────────────
         // 7 nullary HTTP-verb constructors. Prelude built-in (no user `type`),
         // reachable through `Ipe.Http`; seeding here lets `case m of Get -> …`
@@ -12678,6 +13186,7 @@ impl<'a> Lowerer<'a> {
             param_cursor: Cell::new(0),
             any_param_binders,
             any_param_cursor: Cell::new(0),
+            wildcard_marker: wildcard_marker.symbol(),
             projection_decode_binders,
             projection_decode_cursor: Cell::new(0),
             destructure_thunk_binders,
@@ -12698,6 +13207,8 @@ impl<'a> Lowerer<'a> {
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
             shared_fn_reads: std::cell::RefCell::new(BTreeMap::new()),
+            #[cfg(test)]
+            carrier_walks: std::cell::Cell::new(0),
             fn_row_params: std::cell::RefCell::new(BTreeMap::new()),
             source_path: source_path.to_owned(),
             source_text: source_text.to_owned(),
@@ -12811,7 +13322,7 @@ impl<'a> Lowerer<'a> {
 
     /// Hand out the next globally-unique fresh symbol from
     /// [`Self::any_param_binders`] for the per-occurrence `any`-in-param-
-    /// position seal fix (AUD-01). Mirrors [`Self::fresh_param_binder`]
+    /// position substitution. Mirrors [`Self::fresh_param_binder`]
     /// exactly; sized by [`count_any_param_sites`], so an overrun is an
     /// internal invariant violation, never an index panic.
     fn fresh_any_param_symbol(&self) -> DResult<Symbol> {
@@ -12826,20 +13337,18 @@ impl<'a> Lowerer<'a> {
         Ok(sym)
     }
 
-    /// Walk `ty` and replace every `IrType::Generic(s)` where `s` resolves to
-    /// `"any"` with a fresh, distinct symbol from the `any_param_binders` pool.
-    /// Push each minted symbol into `minted` so the caller can extend
-    /// `any_syms_minted` and surface the new generics in the function's
-    /// `type_params`.
+    /// Replace every wildcard `IrType::Generic(wildcard_marker)` in `ty` with a fresh symbol.
     ///
-    /// This closes the AUD-01 class for NESTED `any` occurrences (e.g.
-    /// `List any`, `Maybe any`, `Result e any`, a tuple/record/fn with `any`).
-    /// The top-level bare-`any` case is the same structural form, so the walk
-    /// handles both uniformly — `split_typed_sig` no longer needs a separate
-    /// outer-only check.
+    /// Each occurrence draws a distinct symbol from the `any_param_binders`
+    /// pool and pushes it into `minted`, so the caller can extend
+    /// `any_syms_minted` and surface the new generics in the function's
+    /// `type_params`. A declared parameter spelled `any` is a different symbol
+    /// and is left alone. Bare and nested occurrences (`List any`,
+    /// `Maybe any`, `Result e any`, a tuple/record/fn with `any`) share this
+    /// one walk.
     fn freshen_any_generics(&self, ty: IrType, minted: &mut Vec<Symbol>) -> DResult<IrType> {
         Self::map_ir_generics(ty, &mut |sym| {
-            if self.interner.resolve(sym) != Some("any") {
+            if sym != self.wildcard_marker {
                 return Ok(None);
             }
             let fresh = self.fresh_any_param_symbol()?;
@@ -12913,8 +13422,8 @@ impl<'a> Lowerer<'a> {
             // A UI carrier's message slot can embed a nested `any`
             // (`Html (List any)`), so it must freshen like any other container
             // — otherwise two independent Ui-nested `any`s in return position
-            // collapse onto the shared interned `"any"` symbol and emit one
-            // generic where two are required (SEAL break, E0308).
+            // collapse onto the one wildcard marker and emit one generic where
+            // two are required (SEAL break, E0308).
             IrType::Ui { ctor, msg } => Ok(IrType::Ui {
                 ctor,
                 msg: Box::new(Self::map_ir_generics(*msg, f)?),
@@ -13119,6 +13628,34 @@ impl<'a> Lowerer<'a> {
     fn region_ty(&self, span: Span) -> Option<&Ty> {
         let home = self.current_home.borrow().clone();
         self.types.regions.get(&(home, span))
+    }
+
+    /// Refuse (IPE-L0135) an alias at `span` whose binding `inner` would share a non-`Clone` part.
+    ///
+    /// The part's type is the solved region type at `ty_span`, on its storage
+    /// carriers. A binding alias at a span with no recorded region type has no
+    /// part to classify, so it is refused as a compiler bug, never accepted.
+    fn refuse_nonclone_alias_part(&self, inner: &Pat, ty_span: Span, span: Span) -> DResult<()> {
+        if !clone_class::pat_binds_any_name(inner) {
+            return Ok(());
+        }
+        let ty = self.region_ty(ty_span).ok_or_else(|| {
+            bug(
+                "ipe_lower::refuse_nonclone_alias_part",
+                "no inferred type for an alias part",
+            )
+        })?;
+        let part = normalize_record_fun_carriers(self.ir_type_from_ty_json(ty, ty_span)?);
+        alias_rebuild_refusal(self.clone_env(), inner, &part, span)
+    }
+
+    /// The element type of the list at `span` on its storage carriers.
+    ///
+    /// A function directly in the element, or in a record field or tuple
+    /// component of it, is carried on the `Clone` `Arc` carrier, exactly as the
+    /// emitted `Vec` stores it, so the element's clone class is the stored one.
+    fn list_storage_elem_ir(&self, span: Span) -> DResult<IrType> {
+        Ok(normalize_record_fun_carriers(self.list_elem_ir(span)?))
     }
 
     /// The `Ipe.Db.Store` module home, or `None` when the program does not link
@@ -13518,27 +14055,33 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Lower `Store.like .field pattern` to `Like col pattern_string`. The
-    /// accessor must name a `String` field (pinned by the type scheme); the
-    /// pattern string is lowered as-is and binds as a parameter at SQL time.
-    fn lower_store_like(&self, args: &[canon::Expr]) -> DResult<Expr> {
-        let (Some(acc), Some(pattern)) = (args.first(), args.get(1)) else {
-            return Err(bug("ipe_lower::lower_store_like", "Store.like arity < 2"));
+    /// Lower a text leaf `Store.like .field pattern` / `Store.startsWith .field
+    /// prefix` to the named `Cond` constructor (`Like` / `StartsWith`) over the
+    /// validated column and the lowered text.
+    ///
+    /// The accessor must name a `String` field (pinned by the type scheme); the
+    /// text is lowered as-is and binds as a parameter at SQL time.
+    fn lower_store_text_leaf(&self, ctor: &'static str, args: &[canon::Expr]) -> DResult<Expr> {
+        let (Some(acc), Some(text)) = (args.first(), args.get(1)) else {
+            return Err(bug(
+                "ipe_lower::lower_store_text_leaf",
+                format!("Store text leaf `{ctor}` arity < 2"),
+            ));
         };
         let (column, _field_ty) = self.accessor_column(acc)?;
-        let lowered_pattern = self.lower_expr(pattern)?;
+        let lowered_text = self.lower_expr(text)?;
         let ids = self.store_cond_ids()?;
-        let like_variant = self.interner.lookup("Like").ok_or_else(|| {
+        let variant = self.interner.lookup(ctor).ok_or_else(|| {
             bug(
-                "ipe_lower::lower_store_like",
-                "Ipe.Db.Store `Like` constructor not interned",
+                "ipe_lower::lower_store_text_leaf",
+                format!("Ipe.Db.Store `{ctor}` constructor not interned"),
             )
         })?;
         Ok(Expr::Ctor {
             home: ids.home,
             ty: ids.cond_ty,
-            variant: like_variant,
-            args: vec![Expr::Str(column), lowered_pattern],
+            variant,
+            args: vec![Expr::Str(column), lowered_text],
         })
     }
 
@@ -14152,8 +14695,8 @@ impl<'a> Lowerer<'a> {
                 ));
             };
             // Determine the result kind from the left operand's type (both
-            // operands must have the same type — enforced by the type constraint
-            // `coalesce : Projection a -> Projection a -> Projection a`).
+            // operands share one type — the kernel scheme `coalesce : a -> a -> a`
+            // unifies them).
             let result_ty = self.region_ty(left_expr.span);
             let Some(kind) = result_ty.and_then(|ty| ProjColKind::of_ty(ty, self.interner)) else {
                 let ty_label = result_ty.map_or_else(
@@ -15865,7 +16408,7 @@ impl<'a> Lowerer<'a> {
             canon::Type::Record(fields) | canon::Type::RecordOpen(_, fields) => fields
                 .iter()
                 .find_map(|(_, ty)| self.task_arity_in_canon(ty)),
-            canon::Type::Var(_) | canon::Type::Unit => None,
+            canon::Type::Var(_) | canon::Type::Wildcard | canon::Type::Unit => None,
         }
     }
 
@@ -15922,98 +16465,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// is `(module, name)` the `Ipe.Db.Store.Cond` typed-query predicate —
-    /// module `["Ipe", "Db", "Store"]`, name `Cond`? Its `row` argument is a
-    /// PHANTOM: no `Cond` constructor carries a `row` value (the parameter ties
-    /// the predicate to the store's row type at the type-checker only). It is
-    /// dropped at lowering so the emitted enum is the non-generic
-    /// `IpeDbStoreCond`; otherwise every leaf construction (`Compare …`) leaves
-    /// the enum's type argument unconstrained at the point of construction — an
-    /// uninferrable `T` (E0283), exactly as for `Ipe.Cache.Cache`.
-    fn is_cond_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Cond")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.Policy` row-security policy —
-    /// module `["Ipe", "Db", "Store"]`, name `Policy`? Its `row` argument is a
-    /// PHANTOM: no `Policy` constructor carries a `row` value (the parameter
-    /// ties the policy's accessor columns to the store's row type at the
-    /// type-checker only, via `secured : Policy a -> Store a -> …`). It is
-    /// dropped at lowering so the emitted enum is the non-generic
-    /// `IpeDbStorePolicy`; otherwise every construction (`ownerColumnNamed …`)
-    /// leaves the enum's type argument unconstrained at the point of
-    /// construction — an uninferrable `T` (E0283/E0392), exactly as for `Cond`.
-    fn is_policy_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Policy")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.Pred` row-security predicate ADT —
-    /// module `["Ipe", "Db", "Store"]`, name `Pred`? Its `row` argument is a
-    /// PHANTOM: no `Pred` constructor carries a `row` value (`PMatch` holds a
-    /// `Cond`, itself phantom-dropped; `POwner` a `String`; the boolean nodes only
-    /// nested `Pred`s). It is dropped at lowering so the emitted enum is the
-    /// non-generic `IpeDbStorePred`; otherwise every construction (`PMatch …`,
-    /// `PAll …`) leaves the enum's type argument unconstrained — an uninferrable
-    /// `T` (E0283/E0392), exactly as for `Cond` / `Policy` / `Select`.
-    fn is_pred_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Pred")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.ExistsRef` correlated-subquery leaf —
-    /// module `["Ipe", "Db", "Store"]`, name `ExistsRef`? Its `row` argument is a
-    /// PHANTOM: the `ExistsRef` constructor holds only transparent data (column
-    /// strings and a `shareRead : Pred row`, itself phantom-dropped) — never a
-    /// `row` value. It is dropped at lowering so the emitted struct is the
-    /// non-generic `IpeDbStoreExistsRef`; otherwise the `PExists (ExistsRef row)`
-    /// field reintroduces the phantom `row` as a live generic that the enclosing
-    /// (phantom-dropped, non-generic) `Pred` no longer quantifies — an
-    /// unquantified type variable at emit (`GenericScope::rust_name`), the twin of
-    /// the `Cond` / `Pred` / `Select` erasure.
-    fn is_exists_ref_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("ExistsRef")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
-    }
-
-    /// is `(module, name)` the `Ipe.Db.Store.Select` column-projection ADT —
-    /// module `["Ipe", "Db", "Store"]`, name `Select`? Its `row` argument is a
-    /// PHANTOM: no `Select` constructor carries a `row` value (the parameter
-    /// records the projected shape so `selectToList` / `selectToMaybe` return the
-    /// typed `row`, while the runtime value holds only query data). It is dropped
-    /// at lowering so the emitted enum is the non-generic `IpeDbStoreSelect`;
-    /// otherwise every `selectNamed` construction leaves the enum's type argument
-    /// unconstrained at the point of construction — an uninferrable `T`
-    /// (E0283/E0392), exactly as for `Cond` / `Policy`.
-    fn is_select_con(&self, module: &[Symbol], name: Symbol) -> bool {
-        self.interner.resolve(name) == Some("Select")
-            && matches!(
-                module,
-                [a, b, c] if self.interner.resolve(*a) == Some("Ipe")
-                    && self.interner.resolve(*b) == Some("Db")
-                    && self.interner.resolve(*c) == Some("Store")
-            )
+    /// is `(module, name)` an `Ipe.Db.Store` union whose `row` argument is phantom?
+    ///
+    /// The set is [`ipe_ir::STORE_ROW_PHANTOM_UNIONS`] (`Cond`, `Policy`,
+    /// `Pred`, `ExistsRef`, `Select`): no constructor carries a `row` value, so
+    /// the argument is dropped at lowering and the emitted enum is non-generic
+    /// (`IpeDbStoreCond`, `IpeDbStorePred`, …). Kept, every leaf construction
+    /// (`Compare …`, `PMatch …`, `selectNamed …`) would leave the enum's type
+    /// argument unconstrained — an uninferrable `T` (E0283/E0392), exactly as
+    /// for `Ipe.Cache.Cache` — and `PExists (ExistsRef row)` would reintroduce
+    /// `row` as a live generic the non-generic `Pred` no longer quantifies.
+    fn is_store_row_phantom_con(&self, module: &[Symbol], name: Symbol) -> bool {
+        ipe_ir::is_store_row_phantom_union(self.interner, module, name)
     }
 
     /// is `(module, name)` the `Ipe.Cache.Cache` opaque handle type?
@@ -16038,7 +16501,7 @@ impl<'a> Lowerer<'a> {
     /// A user union of the same name (`type Route = …`) is keyed in
     /// `enum_variants` under its own module home; guarding on the empty home lets
     /// it fall through to the program-enum path and win by its own identity —
-    /// the second, independent gate behind `RESERVED_BUILTIN_TYPES` (IPE-N0026),
+    /// the second, independent gate behind the reserved builtin rows (IPE-N0026),
     /// so no single missed check can silently map a user type to the opaque.
     fn is_server_opaque_con(&self, home: &[Symbol], name: Symbol) -> bool {
         home.is_empty()
@@ -16071,8 +16534,9 @@ impl<'a> Lowerer<'a> {
     /// Each is minted only by an `Ipe.Http.Server.Stream` / `…WebSocket` kernel
     /// with the empty home (`ipe_types::constrain` builds `sw()` / `wsh()` /
     /// `wscfg()` with `module: Vec::new()`), so the runtime-`IrType` mapping keys
-    /// on that empty home alone. These names are NOT reserved (they sit in
-    /// `EXTRA_BUILTIN_TYPE_NAMES`), so a user `type StreamWriter = …` is legal and
+    /// on that empty home alone. These names are NOT reserved (their
+    /// `ipe_kernels::BUILTIN_TYPES` rows are `LoweredBelowGuard`), so a user
+    /// `type StreamWriter = …` is legal and
     /// is keyed in `enum_variants` under its own home; the empty-home guard lets
     /// that user union fall through to the program-enum guard and win by its own
     /// identity, instead of being hijacked to the opaque runtime handle (an
@@ -16090,14 +16554,10 @@ impl<'a> Lowerer<'a> {
         // `Ipe.Db.Store.Cond row` carries a PHANTOM `row` (no constructor holds a
         // `row` value — it ties the predicate to the store's row at the
         // type-checker only). Emit the enum non-generic so its construction is
-        // type-determinate; the `is_cond_con` arms in `ir_type_from_ty` /
+        // type-determinate; the `is_store_row_phantom_con` arms in `ir_type_from_ty` /
         // `ir_type_from_canon` drop the matching type argument at every use site,
         // so the decl and the references agree.
-        let cond_phantom = self.is_cond_con(&u.home, u.name)
-            || self.is_policy_con(&u.home, u.name)
-            || self.is_pred_con(&u.home, u.name)
-            || self.is_exists_ref_con(&u.home, u.name)
-            || self.is_select_con(&u.home, u.name);
+        let cond_phantom = self.is_store_row_phantom_con(&u.home, u.name);
         let type_params = if cond_phantom {
             Vec::new()
         } else {
@@ -16128,16 +16588,13 @@ impl<'a> Lowerer<'a> {
                 }
                 // Gate 1: every field type variable must be one the union
                 // quantifies, so it resolves to a Rust generic by position.
-                // Exception: `any` wildcard is the pub/sub wire-carrier pin
-                // (Dict String String) — excluded from the bound check,
-                // mirroring the reference's `(/= "any") freeVars` filter
-                // (DeclaredArityHelperSpec.hs:43). `ir_type_from_canon` maps
-                // it to the concrete IrType::Dict(Str, Str) below.
+                // The wildcard `any` is the pub/sub wire-carrier pin
+                // (Dict String String): it is no type variable, so
+                // `collect_type_vars` never yields it, and `ir_type_from_canon`
+                // maps it to the concrete IrType::Dict(Str, Str) below.
                 let mut vars = BTreeSet::new();
                 collect_type_vars(arg, &mut vars);
-                if !vars.iter().all(|v| {
-                    gate_params.contains(v) || self.interner.resolve(*v).is_some_and(|n| n == "any")
-                }) {
+                if !vars.iter().all(|v| gate_params.contains(v)) {
                     return Err(unsupported(ctor.span, Feature::Polymorphism));
                 }
                 let ir = self.ir_type_from_canon(arg, &gate_params)?;
@@ -16156,7 +16613,7 @@ impl<'a> Lowerer<'a> {
                 // `ipe_backend_rust::emit_types`) drops the enum's
                 // `#[derive(Clone, Debug, PartialEq)]` whenever a field embeds a
                 // function, and the hand-written `IpeStringify` impl renders such
-                // a field as the `<fn>` placeholder.
+                // a field as the `<function>` placeholder.
                 let ir = normalize_enum_payload_fun_carrier(ir);
                 fields.push(ir);
             }
@@ -16278,7 +16735,7 @@ impl<'a> Lowerer<'a> {
                     self.collect_records_in_ty(a, out, seen)?;
                 }
             }
-            Ty::Var(_) | Ty::Unit => {}
+            Ty::Var(_) | Ty::Wildcard | Ty::Unit => {}
         }
         Ok(())
     }
@@ -16441,7 +16898,15 @@ impl<'a> Lowerer<'a> {
                                 sig,
                                 bounds: self.types.bounds.get(&key),
                             });
-                    self.split_typed_sig(ty, patterns, free_vars, sig_span, solved)?
+                    // The wildcard marker is a generic of every typed signature:
+                    // `split_typed_sig` freshens each param-position occurrence and
+                    // the return-position substitution below resolves the rest.
+                    let sig_generics: Vec<Symbol> = free_vars
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(self.wildcard_marker))
+                        .collect();
+                    self.split_typed_sig(ty, patterns, &sig_generics, sig_span, solved)?
                 };
                 // Unconstrained UI-msg defaulting: the type checker records
                 // (`msg_defaulted_vars`) each annotation variable whose only role
@@ -16474,7 +16939,7 @@ impl<'a> Lowerer<'a> {
                 // `FView: Fn(Model) -> Html<Msg>` bound (E0271).
                 //
                 // Detection: if the annotation return is `IrType::Generic(sym)`
-                // where `sym` resolves to "any" AND the body region is a
+                // where `sym` is the wildcard marker AND the body region is a
                 // `Ty::Con` with exactly one arg that is a bare `Ty::Var`,
                 // record `(uv_rep, any_sym)` for injection in the poly_tvars
                 // installation block below.
@@ -16483,27 +16948,27 @@ impl<'a> Lowerer<'a> {
                 // block (next) so that the `ir_type_from_ty(body_ty)` call in
                 // the any-ret fix (after the installation) already runs with the
                 // correct current_poly_tvars.
-                let any_ui_msg_injection: Option<(u32, Symbol)> = if let IrType::Generic(sym) = &ret
-                {
-                    if self.interner.resolve(*sym) == Some("any") {
-                        self.types
-                            .regions
-                            .get(&(def.home().to_vec(), body.span))
-                            .and_then(|body_ty| {
-                                let Ty::Con { args, .. } = body_ty else {
-                                    return None;
-                                };
-                                let Some(Ty::Var(uv)) = args.first() else {
-                                    return None;
-                                };
-                                Some((*uv, *sym))
-                            })
+                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> =
+                    if let IrType::Generic(sym) = &ret {
+                        if *sym == self.wildcard_marker {
+                            self.types
+                                .regions
+                                .get(&(def.home().to_vec(), body.span))
+                                .and_then(|body_ty| {
+                                    let Ty::Con { args, .. } = body_ty else {
+                                        return None;
+                                    };
+                                    let Some(Ty::Var(uv)) = args.first() else {
+                                        return None;
+                                    };
+                                    ipe_types::SolverVar::from_raw(*uv).map(|uv| (uv, *sym))
+                                })
+                        } else {
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
                 // Install the binding's generic type-variable map so
                 // `ir_type_from_ty_ui_msg` can distinguish a `Ty::Var` that is an
                 // enclosing generic (→ `IrType::Generic`) from one that is a
@@ -16533,12 +16998,12 @@ impl<'a> Lowerer<'a> {
                 if !default_to_unit.is_empty() {
                     poly.retain(|_, sym| !default_to_unit.contains(sym));
                 }
-                // Wildcard-`any` return-type fix: `view : Model -> any` makes
-                // `any` appear in `free_vars` (the canon free-var collector treats
-                // it uniformly alongside genuine type parameters).  But `any` is NOT
-                // a real type parameter — it is a return-type wildcard whose concrete
-                // type is resolved by the HM solver from the body.  When
-                // `split_typed_sig` returns `IrType::Generic(any_sym)` for the
+                // Wildcard-`any` return type: `view : Model -> any` lowers its
+                // return to the wildcard marker, which `split_typed_sig` admits as
+                // a generic.  But `any` is NOT a real type parameter — it is a
+                // return-type wildcard whose concrete type is resolved by the HM
+                // solver from the body.  When `split_typed_sig` returns
+                // `IrType::Generic(wildcard_marker)` for the
                 // return position, substitute the body's solved concrete type from
                 // `self.types.regions` instead.  Without this substitution the
                 // emitted Rust function gains a spurious `<T1: Clone>` generic
@@ -16553,29 +17018,27 @@ impl<'a> Lowerer<'a> {
                 //
                 // Why regions, not env? `SolvedTypes::env` for TYPED bindings
                 // stores the annotation type verbatim (`generated.top_level`), which
-                // still has `Ty::Var(any_sym)` in the return position — the any UV
+                // still has `Ty::Wildcard` in the return position — the any UV
                 // was never zonked back there.  `self.types.regions[(home, body.span)]`
                 // is the body expression's solved type, which IS the concrete return
                 // type after solving.
                 //
-                // The analogous gate in the reference compiler: `Instantiate.fromAnnotation`
-                // filters `"any"` out before treating free vars as polymorphic;
-                // `buildEnv` gives each `any` occurrence a fresh flex UV that the body
-                // constrains to a concrete type.  The Rust port must do the same.
+                // The checker gives each wildcard occurrence a fresh flex UV that
+                // the body constrains to a concrete type.
                 // A return whose type is (or wraps) the `any` wildcard is resolved
                 // from the body's SOLVED type, never emitted as a spurious generic.
-                //  * `view : Model -> any` → `ret` is `IrType::Generic(any)`.
+                //  * `view : Model -> any` → `ret` is `IrType::Generic(marker)`.
                 //  * `view : Model -> Html` → canon arity-fills to `Html any`, so
-                //    `ret` is `IrType::Ui { msg: Generic(any) }` (the msg slot
+                //    `ret` is `IrType::Ui { msg: Generic(marker) }` (the msg slot
                 //    carries the wildcard, produced by `ir_ui_msg_from_canon`).
                 // Both cases substitute the whole return with the body's region
                 // type: `Html<Msg>` concrete, not `Html<()>`, `Html<T1>`, or the
                 // pub/sub `Html<HashMap<String,String>>` carrier.
                 let ret_is_any_wildcard = match &ret {
-                    IrType::Generic(sym) => self.interner.resolve(*sym) == Some("any"),
+                    IrType::Generic(sym) => *sym == self.wildcard_marker,
                     IrType::Ui { msg, .. } => {
                         matches!(msg.as_ref(), IrType::Generic(sym)
-                            if self.interner.resolve(*sym) == Some("any"))
+                            if *sym == self.wildcard_marker)
                     }
                     _ => false,
                 };
@@ -16599,7 +17062,7 @@ impl<'a> Lowerer<'a> {
                     } else {
                         // A nested `any` in return position (e.g. `foo : X -> List any`)
                         // is not covered by the bare-wildcard region substitution above.
-                        // Freshen every `Generic("any")` node in the return type so each
+                        // Freshen every wildcard-marker generic in the return type so each
                         // occurrence becomes a distinct fresh symbol — the same treatment
                         // `split_typed_sig` applies to param-position `any`s.
                         //
@@ -16873,21 +17336,13 @@ impl<'a> Lowerer<'a> {
                 // body-imposed super-type obligations require (empty for a
                 // structurally-parametric variable — a bare `T{n}`).
                 //
-                // Bug-28 fix (`init : any -> (Model, Cmd Msg)`): `any` in PARAM
-                // position is a legitimate type parameter — `IrType::Generic(any_sym)`
-                // appears in `params` and must be in `type_params` so the backend
-                // can map it to a Rust generic `T{n}`.  The old filter
-                // (`resolve(v) != "any"`) was correct for RETURN-position `any`
-                // (resolved away above) but over-removed `any_sym` when `any` is
-                // structurally used in `params`.
-                //
-                // Principled rule: include `v` in `type_params` iff
-                // `IrType::Generic(v)` structurally appears in the RESOLVED
-                // `params` or `ret`.  This naturally:
-                //   - INCLUDES `any_sym` when `any` is in param position (Generic stays).
-                //   - EXCLUDES `any_sym` when `any` is in return position (resolved away).
-                //   - INCLUDES `any_sym` when `any` is the injected UI msg generic
-                //     (`view : Model -> any`, Bug-29) because `ret = Html<Generic(any_sym)>`.
+                // Include `v` in `type_params` iff `IrType::Generic(v)`
+                // structurally appears in the RESOLVED `params` or `ret`. For the
+                // wildcard marker this:
+                //   - EXCLUDES it when `any` is in return position (resolved away).
+                //   - INCLUDES it when `any` is the injected UI msg generic
+                //     (`view : Model -> any`) because `ret = Html<Generic(marker)>`.
+                // A param-position `any` was already freshened to a minted symbol.
                 let used_generics: BTreeSet<Symbol> = {
                     let mut s = BTreeSet::new();
                     for (_, ty) in &params {
@@ -16899,7 +17354,7 @@ impl<'a> Lowerer<'a> {
                 // (AUD-05) keyed by (home, name) — see the `bounds` field doc
                 // on `SolvedTypes` for why a bare-name lookup is unsound here.
                 let var_bounds = self.types.bounds.get(&(def.home().to_vec(), name));
-                // AUD-01 seal fix: `any_syms_minted` holds every fresh symbol
+                // `any_syms_minted` holds every fresh symbol
                 // `split_typed_sig` handed out for a per-occurrence `any`
                 // param-position substitution — these are, by construction,
                 // NOT in `free_vars` (canon never saw them; they're minted at
@@ -16916,6 +17371,7 @@ impl<'a> Lowerer<'a> {
                 let type_params: Vec<(Symbol, BoundSet)> = free_vars
                     .iter()
                     .copied()
+                    .chain(std::iter::once(self.wildcard_marker))
                     .filter(|v| used_generics.contains(v))
                     .chain(any_syms_minted.iter().copied())
                     .map(|v| {
@@ -17381,20 +17837,20 @@ impl<'a> Lowerer<'a> {
             } else {
                 self.ir_type_from_canon(arg, generics)?
             };
-            // Per-occurrence `any` seal fix (AUD-01 — structural fix): every
-            // `any` occurrence — bare (`any`) OR nested inside a container
-            // (`List any`, `Maybe any`, `Result e any`, a tuple/record/fn
-            // argument with `any`) — lowers to `IrType::Generic(any_sym)` with
-            // the SAME interned Symbol for every occurrence.  Two independent
+            // Per-occurrence `any`: every wildcard occurrence — bare (`any`)
+            // OR nested inside a container (`List any`, `Maybe any`,
+            // `Result e any`, a tuple/record/fn argument with `any`) — lowers
+            // to `IrType::Generic(wildcard_marker)`, the SAME symbol for every
+            // occurrence.  Two independent
             // `any` occurrences collapsing to one generic means
             // `f : List any -> Maybe any` emits `fn f<T>(a:Vec<T>) -> Option<T>`
             // instead of `fn f<T0,T1>(a:Vec<T0>) -> Option<T1>`, making a
             // well-typed call fail cargo E0308 (SEAL break).
             //
             // Fix (structural — closes the whole class): walk the full `IrType`
-            // tree and replace every `Generic("any")` node with a fresh, distinct
+            // tree and replace every wildcard-marker generic with a fresh, distinct
             // symbol from the `any_param_binders` pool.  `count_any_param_sites`
-            // now recursively counts ALL `any` occurrences (bare and nested), so
+            // recursively counts ALL `any` occurrences (bare and nested), so
             // the pool is always large enough.  The backend positions each
             // `Generic` by its index in `Func::type_params`, not by spelling, so
             // a distinctly-named symbol per occurrence gives the correct
@@ -17615,10 +18071,11 @@ impl<'a> Lowerer<'a> {
                 })?;
                 self.lower_record_pat(fields, ty, pat.span)
             }
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_param_binder_pat(inner, param_span)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_param_binder_pat(inner, param_span)?;
+                self.refuse_nonclone_alias_part(&inner_pat, param_span, pat.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             _ => self.lower_destructure_pat(pat),
         }
     }
@@ -17651,22 +18108,18 @@ impl<'a> Lowerer<'a> {
     /// Lower the message-type argument of a UI constructor (`Html msg`,
     /// `Element msg`, `Attribute msg`, `Event msg`) from a canon annotation.
     ///
-    /// Identical to [`Self::ir_type_from_canon`] except for the arity-fill
-    /// wildcard: canon fills a bare `Html` / `Element` / `Attribute` annotation
-    /// to `Html any` using the `any` wildcard variable, and that variable is
-    /// deliberately NOT in the binding's `free_vars`. The plain
-    /// `ir_type_from_canon` `Var` arm maps an out-of-scope `any` to the pub/sub
+    /// Identical to [`Self::ir_type_from_canon`] except for the wildcard:
+    /// canon fills a bare `Html` / `Element` / `Attribute` annotation to
+    /// `Html any` with [`canon::Type::Wildcard`]. Outside a typed signature the
+    /// plain `ir_type_from_canon` maps the wildcard to the pub/sub
     /// `Dict String String` carrier — correct for a union-ctor wire field, wrong
-    /// for a UI message slot. Here the `any` wildcard instead lowers to
-    /// `IrType::Generic(any)`, preserving the marker that the return-type
+    /// for a UI message slot. Here the wildcard always lowers to
+    /// `IrType::Generic(wildcard_marker)`, the marker the return-type
     /// substitution in `lower_def` keys on to swap in the body's SOLVED concrete
     /// message type (`Html<Msg>`), never `Html<()>` or `Html<HashMap<..>>`.
     fn ir_ui_msg_from_canon(&self, t: &canon::Type, generics: &[Symbol]) -> DResult<IrType> {
-        if let canon::Type::Var(v) = t
-            && self.interner.resolve(*v).is_some_and(|n| n == "any")
-            && !generics.contains(v)
-        {
-            return Ok(IrType::Generic(*v));
+        if matches!(t, canon::Type::Wildcard) {
+            return Ok(IrType::Generic(self.wildcard_marker));
         }
         self.ir_type_from_canon(t, generics)
     }
@@ -17705,34 +18158,29 @@ impl<'a> Lowerer<'a> {
         // `row` of `Ipe.Db.Store.Cond row` (untyped runtime data) —
         // twin of the solved-Ty arm; see its comment for the E0283
         // rationale.
-        let ir_args = if self.is_cache_handle_con(home, name)
-            || self.is_cond_con(home, name)
-            || self.is_policy_con(home, name)
-            || self.is_pred_con(home, name)
-            || self.is_exists_ref_con(home, name)
-            || self.is_select_con(home, name)
-        {
-            Vec::new()
-        } else {
-            let mut v = Vec::with_capacity(args.len());
-            for a in args {
-                // A type argument filling a generic payload slot that
-                // instantiates to a function takes the same `Arc<dyn Fn>`
-                // carrier the decl-side flip
-                // ([`normalize_enum_payload_fun_carrier`]) stamps on a
-                // direct-function payload and the value-side flip
-                // ([`promote_stored_fn_carrier`]) constructs with
-                // `Arc::new`. Without it the type application spells the
-                // slot `Box<dyn Fn>` while the construction fills it with
-                // an `Arc`, an `Arc`-vs-`Box` E0308 (and the composite's
-                // derived `Clone` fails on the non-`Clone` `Box`). The
-                // flip is a no-op for every non-function argument.
-                v.push(normalize_enum_payload_fun_carrier(
-                    self.ir_type_from_canon(a, generics)?,
-                ));
-            }
-            v
-        };
+        let ir_args =
+            if self.is_cache_handle_con(home, name) || self.is_store_row_phantom_con(home, name) {
+                Vec::new()
+            } else {
+                let mut v = Vec::with_capacity(args.len());
+                for a in args {
+                    // A type argument filling a generic payload slot that
+                    // instantiates to a function takes the same `Arc<dyn Fn>`
+                    // carrier the decl-side flip
+                    // ([`normalize_enum_payload_fun_carrier`]) stamps on a
+                    // direct-function payload and the value-side flip
+                    // ([`promote_stored_fn_carrier`]) constructs with
+                    // `Arc::new`. Without it the type application spells the
+                    // slot `Box<dyn Fn>` while the construction fills it with
+                    // an `Arc`, an `Arc`-vs-`Box` E0308 (and the composite's
+                    // derived `Clone` fails on the non-`Clone` `Box`). The
+                    // flip is a no-op for every non-function argument.
+                    v.push(normalize_enum_payload_fun_carrier(
+                        self.ir_type_from_canon(a, generics)?,
+                    ));
+                }
+                v
+            };
         Ok(IrType::Enum {
             home: ModPath(home.to_vec()),
             name,
@@ -17761,11 +18209,7 @@ impl<'a> Lowerer<'a> {
         // (Cache k v)` whose result no longer mentions them), an
         // uninferrable `T` at the call site (E0283).
         let ir_args = if self.is_cache_handle_con(module, name)
-            || self.is_cond_con(module, name)
-            || self.is_policy_con(module, name)
-            || self.is_pred_con(module, name)
-            || self.is_exists_ref_con(module, name)
-            || self.is_select_con(module, name)
+            || self.is_store_row_phantom_con(module, name)
         {
             Vec::new()
         } else {
@@ -17896,12 +18340,12 @@ impl<'a> Lowerer<'a> {
                 // longer merged with `String`. `ErrorKind` mirrors `Order`.
                 "Error" => Ok(IrType::Error),
                 "ErrorKind" => Ok(IrType::ErrorKind),
-                // `ErrorDetails` — the 5-variant enrichment union carried on
+                // `ErrorDetails` — the 6-variant enrichment union carried on
                 // `ErrorInfo.details : Maybe ErrorDetails`. Backed by
                 // `ipe_runtime::error::IpeErrorDetails`.
                 "ErrorDetails" => Ok(IrType::ErrorDetails),
                 // The NOMINAL error-payload types (SEAL fix) —
-                // annotatable via canon's `EXTRA_BUILTIN_TYPE_NAMES`. Backed
+                // annotatable via their `LoweredBelowGuard` builtin rows. Backed
                 // by `ipe_runtime::error::{IpeErrorInfo, IpePanicInfo,
                 // IpeTypeInfo}`.
                 "ErrorInfo" => Ok(IrType::ErrorInfo),
@@ -18007,7 +18451,7 @@ impl<'a> Lowerer<'a> {
                 // Home-guarded on the empty kernel home so a user `type Route = …`
                 // (keyed under its own home) falls through to the program-enum
                 // guard below and wins by its own identity — defence-in-depth
-                // behind the `RESERVED_BUILTIN_TYPES` canon gate.
+                // behind the reserved-builtin canon gate (IPE-N0026).
                 "Request" if self.is_server_opaque_con(home, *name) => Ok(IrType::ServerRequest),
                 "Response" if self.is_server_opaque_con(home, *name) => Ok(IrType::ServerResponse),
                 "Route" if self.is_server_opaque_con(home, *name) => Ok(IrType::ServerRoute),
@@ -18259,7 +18703,7 @@ impl<'a> Lowerer<'a> {
                     },
                     // A shape-generic annotation (`Program shape msg`) names no
                     // single app leaf to emit; this arm carries no span.
-                    Some(canon::Type::Var(_)) => {
+                    Some(canon::Type::Var(_) | canon::Type::Wildcard) => {
                         Err(unsupported(Span::DUMMY, Feature::Polymorphism))
                     }
                     _ => Err(bug(
@@ -18427,8 +18871,8 @@ impl<'a> Lowerer<'a> {
                 // on user functions (kernel-implicit Prelude type).
                 // `Claims` maps to the same opaque JSON accumulator.
                 // ── Kernel-implicit opaque server / Ipe.Web types ────────
-                // These names are registered in `KERNEL_IMPLICIT_BUILTIN_TYPE_NAMES`
-                // in ipe_canon so they pass N0002 without an explicit import.
+                // These names are `KernelImplicit` rows of `ipe_kernels::BUILTIN_TYPES`,
+                // so they pass N0002 without an explicit import.
                 // They all carry zero type arguments at the annotation level.
                 // `Handler` / `Middleware` — Ipe.Http.Server function aliases.
                 // `Session` / `Store` — Ipe.Web session-management opaques.
@@ -18496,17 +18940,7 @@ impl<'a> Lowerer<'a> {
             // construction, so a variable absent from `generics` here means canon
             // failed to collect the binding's complete free-variable set — a
             // violated invariant, not a user-reachable feature gap.
-            //
-            // Exception: `any` wildcard in a union-ctor field (e.g.
-            // `| CartTopicReceived any`) is the pub/sub wire carrier, pinned to
-            // `Dict String String` by the solver (constrain.rs `pin_any_in_ty`).
-            // The gate-1 check in `lower_enum` already skips these vars; here we
-            // emit the matching concrete IR type so the emitted Rust is a
-            // `HashMap<String, String>` field — no free generic, no `dyn Any`.
             canon::Type::Var(v) => {
-                if self.interner.resolve(*v).is_some_and(|n| n == "any") && !generics.contains(v) {
-                    return Ok(IrType::Dict(Box::new(IrType::Str), Box::new(IrType::Str)));
-                }
                 if generics.contains(v) {
                     Ok(IrType::Generic(*v))
                 } else {
@@ -18514,6 +18948,20 @@ impl<'a> Lowerer<'a> {
                         "ipe_lower::ir_type_from_canon",
                         "annotation type variable not in the binding's free-variable set",
                     ))
+                }
+            }
+            // The wildcard `any`. Inside a typed signature (whose generics carry
+            // the marker) it is the marker generic, freshened per occurrence by
+            // `split_typed_sig`. In a union-ctor field (e.g.
+            // `| CartTopicReceived any`) it is the pub/sub wire carrier, pinned
+            // to `Dict String String` by the solver (`pin_any_in_ty`); emit the
+            // matching concrete IR type so the emitted Rust is a
+            // `HashMap<String, String>` field — no free generic, no `dyn Any`.
+            canon::Type::Wildcard => {
+                if generics.contains(&self.wildcard_marker) {
+                    Ok(IrType::Generic(self.wildcard_marker))
+                } else {
+                    Ok(IrType::Dict(Box::new(IrType::Str), Box::new(IrType::Str)))
                 }
             }
             // The unit type `()` in an annotation (`f : () -> Int`).
@@ -18698,14 +19146,14 @@ impl<'a> Lowerer<'a> {
         pinned: &mut bool,
     ) -> Option<Ty> {
         match ty {
-            Ty::Var(v) if self.poly_tvar_symbol(*v).is_none() => {
+            Ty::Var(_) | Ty::Wildcard if self.ty_is_unbound_free(ty) => {
                 if no_default {
                     return None;
                 }
                 *pinned = true;
                 Some(carrier.clone())
             }
-            Ty::Var(_) | Ty::Unit => Some(ty.clone()),
+            Ty::Var(_) | Ty::Wildcard | Ty::Unit => Some(ty.clone()),
             Ty::Fun(arg, res) => Some(Ty::Fun(
                 Box::new(self.pin_phantom_vars(arg, carrier, true, pinned)?),
                 Box::new(self.pin_phantom_vars(res, carrier, true, pinned)?),
@@ -18797,7 +19245,9 @@ impl<'a> Lowerer<'a> {
     /// T3 capture-clone rewrite for a closure body: classify the free locals
     /// captured by the closure (from its CANON body) and rewrite the LOWERED
     /// `body` — `CloneOk` reads become `CloneVar` (`.clone()`), `NonClone` captures
-    /// outside the depth-0 callee position fail-close IPE-L0125/L0126.
+    /// outside a borrowing callee position fail-close IPE-L0126. A callee read
+    /// past the closure, such as one in a run-statement continuation inside
+    /// it, refuses at the capture's own use.
     ///
     /// A captured pure-`Fun` symbol whose binder can carry the `Arc<dyn Fn>`
     /// promotion (a plain `let` name or a def/lambda param — see
@@ -18815,10 +19265,11 @@ impl<'a> Lowerer<'a> {
         span: Span,
         body: Expr,
     ) -> DResult<Expr> {
-        let captures = self.captured_locals(all_param_pats, cur_body)?;
+        let captures = self.captured_locals_at(all_param_pats, cur_body)?;
         let mut clone_set: BTreeSet<Symbol> = BTreeSet::new();
         let mut noncl_set: BTreeSet<Symbol> = BTreeSet::new();
-        for (sym, binder_ty) in captures {
+        let mut capture_spans: BTreeMap<Symbol, Span> = BTreeMap::new();
+        for (sym, capture_span, binder_ty) in captures {
             let ir_ty = binder_ty.classified();
             if fun_value_arc_promotable(ir_ty) && self.promotable_fn_binders.borrow().contains(&sym)
             {
@@ -18831,6 +19282,7 @@ impl<'a> Lowerer<'a> {
                 }
                 Some(false) => {
                     noncl_set.insert(sym);
+                    capture_spans.insert(sym, capture_span);
                 }
                 None => {}
             }
@@ -18838,9 +19290,9 @@ impl<'a> Lowerer<'a> {
         rewrite_captured_clones(
             &clone_set,
             &noncl_set,
-            &CaptureWalk::refusing(span),
+            &CaptureWalk::refusing_at(span, capture_spans),
             body,
-            0,
+            CaptureScope::Top.enter(ClosureKind::Recallable),
         )
     }
 
@@ -18859,7 +19311,7 @@ impl<'a> Lowerer<'a> {
     ///   `Clone` `Arc` carrier when a read here would move it;
     /// * a `CloneOk` read clones, exactly as in a source lambda, or the closure
     ///   would move it out of its `Fn` environment (E0507);
-    /// * a `NonClone` read the body moves (anything but a depth-0 callee) is
+    /// * a `NonClone` read the body moves (anything but a borrowing callee) is
     ///   recorded: the closure is then `FnOnce` only and is built as an
     ///   [`Expr::OnceLambda`], which the once check admits only where its
     ///   position calls it at most once;
@@ -18898,7 +19350,11 @@ impl<'a> Lowerer<'a> {
         }
         let walk = CaptureWalk::recording(span);
         let body = Box::new(rewrite_captured_clones(
-            &clone_set, &noncl_set, &walk, body, 0,
+            &clone_set,
+            &noncl_set,
+            &walk,
+            body,
+            CaptureScope::Top.enter(ClosureKind::Recallable),
         )?);
         Ok(match walk.first_moved() {
             None => Expr::Lambda { params, ret, body },
@@ -18923,7 +19379,11 @@ impl<'a> Lowerer<'a> {
     /// The previous map is restored once `f` returns, whatever path `f` exits
     /// by, so a definition's generics can never stay in scope for the next
     /// definition. `None` leaves the current map untouched.
-    fn with_poly_tvars<T>(&self, poly: Option<BTreeMap<u32, Symbol>>, f: impl FnOnce() -> T) -> T {
+    fn with_poly_tvars<T>(
+        &self,
+        poly: Option<BTreeMap<ipe_types::SolverVar, Symbol>>,
+        f: impl FnOnce() -> T,
+    ) -> T {
         let Some(poly) = poly else {
             return f();
         };
@@ -19050,9 +19510,10 @@ impl<'a> Lowerer<'a> {
             // per call (E0507) unless it rides the `Clone` `Arc` carrier —
             // the flags walk deliberately excludes those slots, so the flow
             // check is the param-side trigger for them.
-            if flags.non_callee_ge1
-                || flags.any_ge2
+            if flags.move_in_recallable
+                || flags.any_past
                 || count_fn_value_uses(sym, &body) > 1
+                || fn_value_use_after_consume(sym, &body, &self.enum_payloads)
                 || flows_into_sync_kernel_call(sym, &body)
             {
                 let shimmed = shim_fn_value_reads(
@@ -19443,36 +19904,17 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Look up a `Ty::Var` raw union-find representative against
-    /// [`Self::current_poly_tvars`], tolerating either tagged or untagged
-    /// input.
+    /// The enclosing definition's generic named by a `Ty::Var` raw.
     ///
-    /// SEAL fix: `SolvedTypes::poly_var_map` populates
-    /// `current_poly_tvars` two different ways depending on the enclosing
-    /// binding's shape — see the doc comment on
-    /// [`ipe_types::untag_solver_var`] for the full rationale. In short: a
-    /// **typed** binding's own quantified vars are keyed by the BARE
-    /// union-find representative (its `params`/`ret` are read straight from
-    /// the annotation, never zonked), while a **boundary-scheme-promoted
-    /// untyped** binding's are keyed by the TAGGED representative (their
-    /// region/env types always come back through `zonk`, which tags). A
-    /// `Ty::Var` raw arriving HERE may be either form too — a nested lambda's
-    /// return-type slot (`region_ty`, always zonked/tagged) inside a
-    /// *typed* enclosing function needs to match against that function's
-    /// BARE keys, so a single fixed-representation lookup silently misses.
-    /// Probing both the raw and its tag-toggled form closes that gap
-    /// regardless of which side is tagged.
+    /// Every [`Self::current_poly_tvars`] key is an [`ipe_types::SolverVar`],
+    /// the tagged form `zonk` writes into every solved `Ty::Var`, so a tagged
+    /// raw is answered by exact lookup. An untagged raw is an annotation
+    /// symbol, never a solver variable, and has no key: it returns `None`, so
+    /// a symbol id equal to a variable's bare id cannot pick up that
+    /// variable's generic.
     fn poly_tvar_symbol(&self, raw: u32) -> Option<Symbol> {
-        let map = self.current_poly_tvars.borrow();
-        if let Some(&sym) = map.get(&raw) {
-            return Some(sym);
-        }
-        let toggled = if ipe_types::is_solver_var(raw) {
-            ipe_types::untag_solver_var(raw)
-        } else {
-            ipe_types::tag_solver_var(raw)
-        };
-        map.get(&toggled).copied()
+        let key = ipe_types::SolverVar::from_raw(raw)?;
+        self.current_poly_tvars.borrow().get(&key).copied()
     }
 
     // The match has one arm per Ipê builtin type — each arm adds ~5-10 lines;
@@ -19483,8 +19925,8 @@ impl<'a> Lowerer<'a> {
         match t {
             Ty::Unit => Ok(IrType::Unit),
             // Reserved builtin names are matched first. This precedence is sound
-            // because `ipe_canon`'s `RESERVED_BUILTIN_TYPES` gate (resolve.rs,
-            // IPE-N0026) rejects any user `type` / `type alias` whose name is one
+            // because `ipe_canon`'s reserved-builtin gate (the `Reserved` rows of
+            // `ipe_kernels::BUILTIN_TYPES`, IPE-N0026) rejects any user `type` / `type alias` whose name is one
             // of these builtin constructors, so those arms can never silently
             // override a user `type Int = …` / `type Html = …`.
             //
@@ -19496,7 +19938,7 @@ impl<'a> Lowerer<'a> {
             // wins by its `(home, name)` identity, and only a genuine opaque
             // builtin (no union entry) falls through to the `UiPlain` arm. This
             // matches `ir_type_from_canon`, so the inferred and annotated paths
-            // agree. See RESERVED_BUILTIN_TYPES for the per-name cite list.
+            // agree. See `ipe_kernels::BUILTIN_TYPES` for the per-name roles.
             Ty::Con { name, args, module } => match self.resolve(*name)? {
                 // Twin of the `ir_type_from_canon` arm: a program union that is not
                 // the builtin of its name lowers by its own identity first.
@@ -20115,7 +20557,9 @@ impl<'a> Lowerer<'a> {
                             format!("Program carrier with unknown shape tag `{other}`"),
                         )),
                     },
-                    Some(Ty::Var(_)) => Err(unsupported(span, Feature::Polymorphism)),
+                    Some(Ty::Var(_) | Ty::Wildcard) => {
+                        Err(unsupported(span, Feature::Polymorphism))
+                    }
                     _ => Err(bug(
                         "ipe_lower::ir_type_from_ty",
                         "Program carrier without a settled shape tag",
@@ -20195,7 +20639,7 @@ impl<'a> Lowerer<'a> {
                 // user-declared `type Value` still resolves as its own enum here.
                 // The parametric reserved builtins (`Decoder` / `Cmd` / `Html` /
                 // …) stay ABOVE the guard — they are name-reserved
-                // (`RESERVED_BUILTIN_TYPES`, IPE-N0026) and so can never collide
+                // (`Reserved` builtin rows, IPE-N0026) and so can never collide
                 // with a program union.
                 "Value" => Ok(IrType::Json),
                 // Name resolution guarantees every type constructor resolves to
@@ -20374,6 +20818,8 @@ impl<'a> Lowerer<'a> {
                 || Err(unsupported(span, Feature::Polymorphism)),
                 |sym| Ok(IrType::Generic(sym)),
             ),
+            // An unpinned wildcard names no generic of the enclosing def.
+            Ty::Wildcard => Err(unsupported(span, Feature::Polymorphism)),
         }
     }
 
@@ -20400,8 +20846,9 @@ impl<'a> Lowerer<'a> {
             //   (a) an enclosing annotated function's generic type parameter —
             //       e.g. `parentMsg` in `view : (Msg -> parentMsg) -> Counter ->
             //       Html parentMsg`.  Region types inside the body carry this as
-            //       `Ty::Var(uf_rep)` where `uf_rep` is the union-find
-            //       representative of the rigid (skolem) created for `parentMsg`.
+            //       `Ty::Var(tag_solver_var(uf_rep))` where `uf_rep` is the
+            //       union-find representative of the rigid (skolem) created for
+            //       `parentMsg`.
             //       → emit `IrType::Generic(sym)` so the backend produces
             //       `Attribute<T1>` rather than `Attribute<()>`, avoiding E0308.
             //
@@ -20412,12 +20859,15 @@ impl<'a> Lowerer<'a> {
             //
             // `current_poly_tvars` (populated by `lower_def` for each `Def::Typed`
             // before it recurses into the body, and restored afterward) maps
-            // uf_rep → annotation var symbol for the current enclosing function.
+            // tagged uf_rep → annotation var symbol for the current enclosing
+            // function.
             // An empty map (unannotated or non-polymorphic context) always falls
             // through to `IrType::Unit`.
             Ty::Var(v) => self
                 .poly_tvar_symbol(*v)
                 .map_or(Ok(IrType::Unit), |sym| Ok(IrType::Generic(sym))),
+            // A wildcard names no enclosing generic: a message-free subtree.
+            Ty::Wildcard => Ok(IrType::Unit),
             // All other forms delegate to the strict helper — a concrete `Msg`
             // type becomes `IrType::Enum(Msg)`, `()` becomes `IrType::Unit`, etc.
             _ => self.ir_type_from_ty(t, span),
@@ -20465,6 +20915,7 @@ impl<'a> Lowerer<'a> {
             Ty::Var(v) => self
                 .poly_tvar_symbol(*v)
                 .map_or(Ok(IrType::Json), |sym| Ok(IrType::Generic(sym))),
+            Ty::Wildcard => Ok(IrType::Json),
             // Recursively handle compound types so embedded `Ty::Var`s also
             // map to `IrType::Json`.
             Ty::Tuple(elems) => {
@@ -20518,7 +20969,7 @@ impl<'a> Lowerer<'a> {
                         // `result_and_map_fn_payload` positive-path
                         // fixture). One defaulting policy, both sides.
                         let err_ty = args.first().ok_or_else(result_arg_bug)?;
-                        let err = if matches!(err_ty, Ty::Var(_)) {
+                        let err = if matches!(err_ty, Ty::Var(_) | Ty::Wildcard) {
                             IrType::Error
                         } else {
                             self.ir_type_from_ty_json(err_ty, span)?
@@ -22207,14 +22658,11 @@ impl<'a> Lowerer<'a> {
         let Ok(Callee::Kernel(k)) = self.lower_callee(head) else {
             return false;
         };
-        k.is_accessor_intercept_placeholder()
-            || k.capture_cloned_handler_arg().is_some()
-            || outer.iter().enumerate().any(|(j, arg)| {
-                matches!(
-                    k.fn_slot_carrier(offset.saturating_add(j)),
-                    Some(FnSlotCarrier::Direct)
-                ) && self.canon_stored_fn_carrier(arg).is_some()
-            })
+        spine_saturates(k, offset, outer.len(), |j| {
+            outer
+                .get(j)
+                .is_some_and(|arg| self.canon_stored_fn_carrier(arg).is_some())
+        })
     }
 
     /// Kernel-call intercepts that must run BEFORE the uniform arg lowering
@@ -22540,7 +22988,12 @@ impl<'a> Lowerer<'a> {
                     return Ok(Intercepted::Done(self.lower_store_compare(&peek, args)?));
                 }
                 Callee::Kernel(KernelFn::StoreLike) if args.len() == 2 => {
-                    return Ok(Intercepted::Done(self.lower_store_like(args)?));
+                    return Ok(Intercepted::Done(self.lower_store_text_leaf("Like", args)?));
+                }
+                Callee::Kernel(KernelFn::StoreStartsWith) if args.len() == 2 => {
+                    return Ok(Intercepted::Done(
+                        self.lower_store_text_leaf("StartsWith", args)?,
+                    ));
                 }
                 Callee::Kernel(KernelFn::StoreIsNull) if args.len() == 1 => {
                     return Ok(Intercepted::Done(self.lower_store_isnull(args)?));
@@ -22791,7 +23244,11 @@ impl<'a> Lowerer<'a> {
     /// A free var bound by the enclosing signature returns `false`: rustc binds
     /// it through the function's own generic, so no pin is needed OR wanted.
     fn ty_is_unbound_free(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Var(raw) if self.poly_tvar_symbol(*raw).is_none())
+        match ty {
+            Ty::Var(raw) => self.poly_tvar_symbol(*raw).is_none(),
+            Ty::Wildcard => true,
+            Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
+        }
     }
 
     /// The turbofish pin for a polymorphic kernel whose free result type
@@ -23567,6 +24024,13 @@ impl<'a> Lowerer<'a> {
                 self.reject_fn_element_for_capability_kernel(&resolved, callee.span, args)?;
                 self.reject_nonclone_handler_capture(&resolved, args)?;
                 let arity = self.callee_arity(&resolved)?;
+                // An intercept-only placeholder that is saturated or over-applied
+                // here escaped its rewrite; refuse it before any arity shape can
+                // emit its placeholder symbol. The partial shape is refused by
+                // `eta_expand_partial` (IPE-L0146, point-free).
+                if args.len() >= arity {
+                    reject_off_intercept_store_kernel(&resolved, call_span)?;
+                }
                 // Close the `Arc`-vs-`Box` frontier at a higher-order kernel's
                 // mapper over stored functions, once, ahead of the arity split,
                 // so the saturated, partial, and over-applied shapes share one
@@ -23900,9 +24364,9 @@ impl<'a> Lowerer<'a> {
     /// carrier. A parameter is a direct fn position when the def's DECLARED
     /// signature has an arrow (`Ty::Fun`) there — an ordinary `Box<dyn Fn>` param —
     /// or a bare type variable (`Ty::Var`) there — a monomorphized `FN: Fn(..)`
-    /// generic slot; both reject an `Arc<dyn Fn>` (`E0277`). An argument whose
-    /// lowered carrier is `SharedFun` ([`Self::shared_fn_read_carrier`]) is
-    /// eta-demoted; every other argument is untouched, so a call with no
+    /// generic slot; both reject an `Arc<dyn Fn>` (`E0277`). An argument on the
+    /// shared carrier ([`Self::fn_carrier_of`]) is eta-demoted; every other
+    /// argument is untouched, so a call with no
     /// stored-function read is byte-identical. A missing declared template fails
     /// open exactly as the sibling generic-slot gate does.
     ///
@@ -23933,20 +24397,28 @@ impl<'a> Lowerer<'a> {
             // A declared arrow OR a bare type variable is a DIRECT fn position; a
             // concrete non-arrow, non-var param (a record/enum that STORES the fn)
             // is a fill slot the promoters own — never demoted.
-            let direct_fn_slot = matches!(param_tpl.as_ref(), Ty::Fun(_, _) | Ty::Var(_));
+            let direct_fn_slot = matches!(
+                param_tpl.as_ref(),
+                Ty::Fun(_, _) | Ty::Var(_) | Ty::Wildcard
+            );
             if direct_fn_slot
-                && !is_direct_closure(slot)
-                && let Some((params, ret)) = self.shared_fn_read_carrier(slot).or_else(|| {
-                    canon_args
-                        .get(offset)
-                        .and_then(|a| self.canon_record_read_carrier(a))
-                })
+                && let Some(canon_arg) = canon_args.get(offset)
+                && let Some(FnCarrier::Shared(params, ret)) = self.fn_carrier_of(canon_arg, slot)
             {
-                site = site
-                    .charge(params.len())
-                    .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
                 let read = std::mem::replace(slot, Expr::Unit);
-                *slot = self.demote_shared_fn_read(read, &params, &ret)?;
+                // A leaf read is moved into the wrapper; any other value (a
+                // call result, a branching expression) is bound once outside it.
+                *slot = if is_shared_fn_leaf(&read) {
+                    site = site
+                        .charge(params.len())
+                        .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
+                    self.demote_shared_fn_read(read, &params, &ret)?
+                } else {
+                    site = site
+                        .charge(params.len().saturating_add(1))
+                        .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
+                    self.hoist_stored_fn_read(read, &params, &ret)?
+                };
             }
             cur = rest.as_ref();
         }
@@ -23960,8 +24432,8 @@ impl<'a> Lowerer<'a> {
     /// which implements no `Fn` trait, so a kernel parameter typed `impl Fn`,
     /// `F: Fn`, or `Box<dyn Fn>` refuses it (E0277). Which argument is such a
     /// slot is [`KernelFn::fn_slot_carrier`], derived from the kernel scheme:
-    /// every [`FnSlotCarrier::Direct`] slot holding a detected stored read
-    /// ([`Self::stored_fn_read_carrier`]) is rebuilt as a direct closure
+    /// every [`FnSlotCarrier::Direct`] slot holding a value on the shared
+    /// carrier ([`Self::fn_carrier_of`]) is rebuilt as a direct closure
     /// ([`Self::hoist_stored_fn_read`]). An [`FnSlotCarrier::AcceptsShared`]
     /// slot is re-wrapped by the backend and left as is.
     ///
@@ -23987,14 +24459,10 @@ impl<'a> Lowerer<'a> {
             if !matches!(kernel.fn_slot_carrier(arg), Some(FnSlotCarrier::Direct)) {
                 continue;
             }
-            // A fresh direct closure (an inline lambda, or a mapper the
-            // element-carrier pass already wrapped) is on the direct carrier.
-            if is_direct_closure(slot) {
-                continue;
-            }
-            let Some((params, ret)) = self.stored_fn_read_carrier(canon_arg, slot) else {
+            let Some(FnCarrier::Shared(params, ret)) = self.fn_carrier_of(canon_arg, slot) else {
                 continue;
             };
+            let (params, ret) = self.use_site_arrow(canon_arg).unwrap_or((params, ret));
             site = site
                 .charge(params.len().saturating_add(1))
                 .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
@@ -24038,81 +24506,188 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// The arrow of a stored function read passed as `canon_arg`, lowered to `lowered`.
+    /// The carrier the function value `canon_arg`, lowered to `lowered`, reaches a slot on.
     ///
-    /// `None` when the argument is not read out of storage. The parameter and
-    /// return types are the use site's solved arrow when it lowers to one, so
-    /// the closure matches the slot it fills; otherwise the stored carrier's.
-    fn stored_fn_read_carrier(
-        &self,
-        canon_arg: &canon::Expr,
-        lowered: &Expr,
-    ) -> Option<(Vec<IrType>, IrType)> {
-        let carrier = self
-            .shared_fn_read_carrier(lowered)
-            .or_else(|| self.canon_stored_fn_carrier(canon_arg))?;
-        let use_site = self
+    /// A fresh direct closure is on the direct carrier; a lowered storage read
+    /// ([`Self::shared_fn_read_carrier`]) is on the shared one; every other
+    /// shape takes the carrier of its value type
+    /// ([`Self::value_carrier_type`]), so a call result is classified by the
+    /// type it lowers to, never by its syntax. `None` when the value is no
+    /// function.
+    fn fn_carrier_of(&self, canon_arg: &canon::Expr, lowered: &Expr) -> Option<FnCarrier> {
+        if is_direct_closure(lowered) {
+            return Some(FnCarrier::Direct);
+        }
+        if let Some((params, ret)) = self.shared_fn_read_carrier(lowered) {
+            return Some(FnCarrier::Shared(params, ret));
+        }
+        FnCarrier::of_type(self.value_carrier_type(canon_arg)?)
+    }
+
+    /// The use site's solved arrow of `canon_arg`, lowered, when it is one.
+    ///
+    /// A converted stored read takes these parameter and return types so the
+    /// closure matches the slot it fills.
+    fn use_site_arrow(&self, canon_arg: &canon::Expr) -> Option<(Vec<IrType>, IrType)> {
+        let ty = self
             .region_ty(canon_arg.span)
-            .filter(|ty| matches!(ty, Ty::Fun(..)))
-            .and_then(|ty| self.ir_type_from_ty(ty, canon_arg.span).ok());
-        Some(match use_site {
-            Some(IrType::Fun(params, ret) | IrType::SharedFun(params, ret)) => (params, *ret),
-            _ => carrier,
-        })
+            .filter(|ty| matches!(ty, Ty::Fun(..)))?;
+        match self.ir_type_from_ty(ty, canon_arg.span).ok()? {
+            IrType::Fun(params, ret) | IrType::SharedFun(params, ret) => Some((params, *ret)),
+            _ => None,
+        }
     }
 
     /// The stored carrier of a source expression whose value is a function read out of storage.
     ///
-    /// Covers a record field read ([`Self::canon_record_read_carrier`]), a
-    /// local bound to a stored function ([`Self::shared_fn_reads`]), and an
-    /// `if`, `let`, or `case` with such a result in any branch: every branch
-    /// of one expression shares one carrier, and a branch already on the
-    /// direct carrier is still a callable the conversion can wrap. Every other
-    /// shape is `None`.
+    /// The projection of [`Self::value_carrier_type`] onto a `SharedFun`
+    /// value: a record field read, a local bound to a stored function, a
+    /// kernel call whose result carries a stored argument, and an `if`,
+    /// `let`, or `case` with such a result in any branch. Every other value is
+    /// `None`.
     fn canon_stored_fn_carrier(&self, expr: &canon::Expr) -> Option<(Vec<IrType>, IrType)> {
-        match &expr.value {
-            canon::Expr_::Access(..) => self.canon_record_read_carrier(expr),
-            canon::Expr_::VarLocal(sym) => self.shared_fn_reads.borrow().get(sym).cloned(),
-            canon::Expr_::If(branches, otherwise) => branches
-                .iter()
-                .find_map(|(_, then)| self.canon_stored_fn_carrier(then))
-                .or_else(|| self.canon_stored_fn_carrier(otherwise)),
-            canon::Expr_::Let(bindings, body) => {
-                self.with_stored_fn_let_binders(bindings, || self.canon_stored_fn_carrier(body))
-            }
-            canon::Expr_::Case(scrutinee, branches) => branches.iter().find_map(|br| {
-                let saved = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrutinee, None, &br.pat);
-                let found = self.canon_stored_fn_carrier(&br.body);
-                *self.shared_fn_reads.borrow_mut() = saved;
-                found
-            }),
+        match self.value_carrier_type(expr)? {
+            IrType::SharedFun(params, ret) => Some((params, *ret)),
             _ => None,
         }
     }
 
-    /// The `SharedFun` carrier of a RECORD-FIELD read argument, recovered from the
-    /// record's OWN type rather than the lowered access's `field_ty`. A field read
-    /// (`runner.run`) lowers to an [`Expr::Access`] whose `field_ty` is the
-    /// access's direct region type (`Fun`) — the record-field storage flip
-    /// ([`normalize_record_fun_carriers`]) lives on the STRUCT field, not on the
-    /// access — so the read emits `Arc<dyn Fn>` even though its `field_ty` is the
-    /// direct carrier. Consult the record's solved type, lower it (which applies
-    /// the flip), and read the field's carrier: a `SharedFun` field is an
-    /// `Arc`-carried read. A non-record-access argument, a non-`SharedFun` field,
-    /// or an unresolvable record type is `None` — never demoted.
-    fn canon_record_read_carrier(&self, arg: &canon::Expr) -> Option<(Vec<IrType>, IrType)> {
-        let canon::Expr_::Access(record, field) = &arg.value else {
+    /// The lowered type of `expr` with every function on the carrier it is emitted on.
+    ///
+    /// The solved type lowered ([`Self::ir_type_from_ty`]) already places a
+    /// function in storage (a record field, a tuple component, a collection
+    /// element) on the `Arc` carrier; this adds what the solved type alone
+    /// cannot say: a field read keeps its field's carrier, a local bound to a
+    /// stored read is on `Arc`, a branching expression takes the carrier of a
+    /// branch that is on `Arc`, and a saturated kernel call passes its
+    /// arguments' carriers through to the scheme variables of its result
+    /// ([`Self::call_carrier_type`]). `None` when the type holds no function
+    /// or cannot be lowered.
+    fn value_carrier_type(&self, expr: &canon::Expr) -> Option<IrType> {
+        #[cfg(test)]
+        self.carrier_walks
+            .set(self.carrier_walks.get().saturating_add(1));
+        let region = self.region_ty(expr.span);
+        if region.is_some_and(|ty| !ty_holds_fun(ty)) {
             return None;
+        }
+        let lowered = || region.and_then(|ty| self.ir_type_from_ty(ty, expr.span).ok());
+        match &expr.value {
+            canon::Expr_::Access(record, field) => {
+                self.access_field_type(record, *field).or_else(lowered)
+            }
+            canon::Expr_::VarLocal(sym) => {
+                let stored = self.shared_fn_reads.borrow().get(sym).cloned();
+                stored
+                    .map(|(params, ret)| IrType::SharedFun(params, Box::new(ret)))
+                    .or_else(lowered)
+            }
+            canon::Expr_::If(branches, otherwise) => join_carrier_types(
+                branches
+                    .iter()
+                    .map(|(_, then)| then)
+                    .chain(std::iter::once(otherwise.as_ref()))
+                    .map(|branch| self.value_carrier_type(branch)),
+            )
+            .or_else(lowered),
+            canon::Expr_::Let(bindings, body) => self
+                .with_stored_fn_let_binders(bindings, || self.value_carrier_type(body))
+                .or_else(lowered),
+            canon::Expr_::Case(scrutinee, branches) => {
+                let stored = self.stored_fn_scrutinee(scrutinee, None);
+                join_carrier_types(branches.iter().map(|br| {
+                    let saved = self.shared_fn_reads.borrow().clone();
+                    self.register_stored_fn_arm_binders(&stored, &br.pat);
+                    let found = self.value_carrier_type(&br.body);
+                    *self.shared_fn_reads.borrow_mut() = saved;
+                    found
+                }))
+                .or_else(lowered)
+            }
+            canon::Expr_::Call(callee, args) => self.call_carrier_type(callee, args, lowered()),
+            canon::Expr_::VarTopLevel { .. }
+            | canon::Expr_::VarKernel { .. }
+            | canon::Expr_::VarCtor { .. }
+            | canon::Expr_::Int(_)
+            | canon::Expr_::Float(_)
+            | canon::Expr_::Str(_)
+            | canon::Expr_::Char(_)
+            | canon::Expr_::CustomElementCtor(_)
+            | canon::Expr_::Unit
+            | canon::Expr_::ForeignCall { .. }
+            | canon::Expr_::Lambda(..)
+            | canon::Expr_::Binop { .. }
+            | canon::Expr_::Tuple(_)
+            | canon::Expr_::List(_)
+            | canon::Expr_::Cons(..)
+            | canon::Expr_::Record(_)
+            | canon::Expr_::Update(..) => lowered(),
+        }
+    }
+
+    /// The lowered type of the call `callee args`, with its result carrying its arguments' carriers.
+    ///
+    /// Only a kernel call that lowers saturated passes a carrier through: its
+    /// spine holds exactly the kernel's arity, and every curried level
+    /// collapses into the one direct call ([`spine_saturates`], the rule
+    /// [`Self::lower_call`] applies). A partial, over-applied, or
+    /// non-collapsing spine, and a call to anything but a kernel, emits a
+    /// closure or a call whose result is on the solved type's own carriers,
+    /// so it is `base`. A top-level user def's result is its declared return
+    /// type lowered: a declared variable an argument binds to a function is
+    /// refused before lowering ([`Self::reject_fn_through_generic_slot`]),
+    /// so no argument's function carrier reaches the result outside an opaque
+    /// wrapper (`Task`, `Decoder`, `Cmd`, `Sub`) no function slot reads.
+    fn call_carrier_type(
+        &self,
+        callee: &canon::Expr,
+        args: &[canon::Expr],
+        base: Option<IrType>,
+    ) -> Option<IrType> {
+        let mut levels: Vec<&[canon::Expr]> = vec![args];
+        let mut head = callee;
+        while let canon::Expr_::Call(inner, inner_args) = &head.value {
+            levels.push(inner_args);
+            head = inner;
+        }
+        let Ok(Callee::Kernel(kernel)) = self.lower_callee_resolve(head) else {
+            return base;
         };
+        let spine: Vec<&canon::Expr> = levels.iter().rev().flat_map(|level| level.iter()).collect();
+        if spine.len() != usize::from(kernel.decl().arity) {
+            return base;
+        }
+        let arg_types: Vec<Option<IrType>> = spine
+            .iter()
+            .map(|arg| self.value_carrier_type(arg))
+            .collect();
+        let stored = |slot: usize| matches!(arg_types.get(slot), Some(Some(IrType::SharedFun(..))));
+        let mut offset = spine.len();
+        for level in levels.iter().take(levels.len().saturating_sub(1)) {
+            offset = offset.saturating_sub(level.len());
+            let outer_len = spine.len().saturating_sub(offset);
+            if !spine_saturates(kernel, offset, outer_len, |j| {
+                stored(offset.saturating_add(j))
+            }) {
+                return base;
+            }
+        }
+        kernel_result_carrier_type(kernel, &arg_types, base)
+    }
+
+    /// The lowered type of field `field` of the record `record`, on its storage carrier.
+    ///
+    /// A field read lowers to an [`Expr::Access`] whose `field_ty` is the
+    /// access's direct region type; the record-field storage flip
+    /// ([`normalize_record_fun_carriers`]) lives on the struct field, so the
+    /// record's own solved type, lowered, is what says the field is read on
+    /// `Arc`. `None` when the record type does not resolve to a record.
+    fn access_field_type(&self, record: &canon::Expr, field: Symbol) -> Option<IrType> {
         let record_ty = self.region_ty(record.span)?;
         let IrType::Record(fields) = self.ir_type_from_ty(record_ty, record.span).ok()? else {
             return None;
         };
-        match fields.get(field)? {
-            IrType::SharedFun(params, ret) => Some((params.clone(), (**ret).clone())),
-            _ => None,
-        }
+        fields.get(&field).cloned()
     }
 
     /// Does the scrutinee PROJECT a function element out of a stored collection —
@@ -24165,7 +24740,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Register every binder of a match arm's pattern that reads a stored function.
+    /// The stored-function facts of a `case` scrutinee its arms' binders register against.
     ///
     /// A constructor payload is stored when the constructor is a USER enum
     /// (its payload arrow is flipped to `SharedFun`,
@@ -24176,19 +24751,32 @@ impl<'a> Lowerer<'a> {
     /// a directly-built `Maybe (Int -> Int)` payload stays on `Box`. A
     /// root-level binder aliases the scrutinee and reads a stored function
     /// exactly when the scrutinee does. `scrutinee` is the lowered scrutinee
-    /// when one exists. The caller saves and restores [`Self::shared_fn_reads`]
-    /// around the arm so a binder never outlives its pattern scope.
-    fn register_stored_fn_arm_binders(
+    /// when one exists. Computed once per `case`, before its arms: the facts
+    /// depend on the scrutinee alone, and walking the scrutinee per arm makes
+    /// a scrutinee nested `d` cases deep cost `arms^d`.
+    fn stored_fn_scrutinee(
         &self,
         canon_scrutinee: &canon::Expr,
         scrutinee: Option<&Expr>,
-        pat: &canon::Pattern,
-    ) {
+    ) -> StoredScrutinee {
         let lowered = scrutinee.and_then(|s| self.shared_fn_read_carrier(s));
         let builtin_payload =
             lowered.is_some() || self.scrutinee_projects_collection_fn(canon_scrutinee);
         let value = lowered.or_else(|| self.canon_stored_fn_carrier(canon_scrutinee));
-        self.register_stored_fn_root(pat, value, builtin_payload);
+        StoredScrutinee {
+            value,
+            builtin_payload,
+        }
+    }
+
+    /// Register every binder of a match arm's pattern that reads a stored function.
+    ///
+    /// `scrutinee` is the arm's `case` scrutinee, classified once
+    /// ([`Self::stored_fn_scrutinee`]). The caller saves and restores
+    /// [`Self::shared_fn_reads`] around the arm so a binder never outlives
+    /// its pattern scope.
+    fn register_stored_fn_arm_binders(&self, scrutinee: &StoredScrutinee, pat: &canon::Pattern) {
+        self.register_stored_fn_root(pat, scrutinee.value.clone(), scrutinee.builtin_payload);
     }
 
     /// Register the binders of a root pattern bound to a value whose stored carrier is `value`.
@@ -25374,12 +25962,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::WebRevocationStore
                 // ── Server: bearer token source — arity 0 ────────────────
                 // `Server.bearerToken : TokenSource`
-                | KernelFn::ServerTokenBearer
-                // ── BackoffStrategy constructors — arity 0 ────────────────
-                | KernelFn::BackoffLinear
-                | KernelFn::BackoffLinearWithJitter
-                | KernelFn::BackoffExponential
-                | KernelFn::BackoffExponentialWithJitter,
+                | KernelFn::ServerTokenBearer,
             ) => Ok(0),
             Callee::Kernel(
                 KernelFn::StringFromInt
@@ -25732,7 +26315,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::StoreUpper
                 | KernelFn::StoreLower
                 // ── Server: cookie token source — arity 1 ────────────────
-                // `Server.cookieToken : String -> TokenSource`
+                // `Server.cookieToken : String -> Result Error TokenSource`
                 | KernelFn::ServerCookieToken
                 // ── Ipe.Ffi.Js port — outbound. `Js.send : a -> Cmd msg`. Arity 1;
                 //    the port intercept rejects it before emission, this is the
@@ -25762,9 +26345,10 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::StringAny
                 | KernelFn::StringAll
                 // `Store.eq` / `Store.neq` / `Store.gt` / `Store.gte` / `Store.lt`
-                // / `Store.lte` / `Store.like` / `Store.inList` — arity 2, all
-                // intercepted at lowering. These arities are only defensive fallback
-                // counts; the intercept fires before the generic arity dispatch.
+                // / `Store.lte` / `Store.like` / `Store.startsWith` / `Store.inList`
+                // — arity 2, all intercepted at lowering. These arities are only
+                // defensive fallback counts; the intercept fires before the generic
+                // arity dispatch.
                 // `Store.coalesce` / `Store.add` / `Store.sub` / `Store.mul` —
                 // arity 2 (left projection + right projection). Intercepted inside
                 // the `Store.select` projection body.
@@ -25779,6 +26363,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::StoreLtCol
                 | KernelFn::StoreLteCol
                 | KernelFn::StoreLike
+                | KernelFn::StoreStartsWith
                 | KernelFn::StoreInListCol
                 // Correlated-subquery row-security (arity 2). `correlate` (two
                 // accessors) and `existsIn` (Secured + a two-binder lambda) are
@@ -26024,7 +26609,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::ServerQueryParam
                 | KernelFn::ServerHeader
                 | KernelFn::ServerGetCookie
-                // `Server.cookie : String -> String -> Cookie`
+                // `Server.cookie : String -> String -> Result Error Cookie`
                 | KernelFn::ServerCookieNew
                 // `Server.withCookie : Cookie -> Response -> Response`
                 | KernelFn::ServerWithCookie
@@ -26111,7 +26696,7 @@ impl<'a> Lowerer<'a> {
                 // `required : String -> Decoder a -> Decoder (a -> b) -> Decoder b`
                 | KernelFn::DbDecRequired
                 // ── Server arity-3 ───────────────────────────────────────
-                // `Server.withHeader : String -> String -> Response -> Response`
+                // `Server.withHeader : String -> String -> Response -> Result Error Response`
                 | KernelFn::ServerWithHeader
                 // `Server.getAuthed/postAuthed/putAuthed/deleteAuthed :
                 //     String -> AuthConfig
@@ -26917,7 +27502,7 @@ impl<'a> Lowerer<'a> {
             // ── Ipe.Db.Sql — SqlFragment builder, arity 2 ─────────────────────
             // `eq`/`ne`/`gt`/`lt`/`gte`/`lte`/`and`/`or : SqlFragment -> SqlFragment -> SqlFragment`,
             // `inList : SqlFragment -> List SqlValue -> SqlFragment`,
-            // `like : SqlFragment -> String -> SqlFragment`.
+            // `like`/`startsWith : SqlFragment -> String -> SqlFragment`.
             Callee::Kernel(
                 KernelFn::SqlEq
                 | KernelFn::SqlNe
@@ -26929,6 +27514,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::SqlOr
                 | KernelFn::SqlInList
                 | KernelFn::SqlLike
+                | KernelFn::SqlStartsWith
                 // `exists : String -> SqlFragment -> SqlFragment`.
                 | KernelFn::SqlExists
                 // `maskedColumn : SqlFragment -> String -> SqlFragment`.
@@ -27066,6 +27652,7 @@ impl<'a> Lowerer<'a> {
                 KernelFn::CryptoKeyFromString
                 | KernelFn::CryptoKeyFromBytes
                 | KernelFn::CryptoMacToHex
+                | KernelFn::CryptoMacFromHex
                 | KernelFn::EmailAddressParse
                 | KernelFn::EmailAddressToString
                 // `Locale.fromTag`/`Locale.toTag` are arity-1.
@@ -27077,6 +27664,8 @@ impl<'a> Lowerer<'a> {
             Callee::Kernel(
                 KernelFn::CryptoHmacSha256WithKey | KernelFn::CryptoHmacSha512WithKey,
             ) => Ok(2),
+            // `Crypto.verifyHmacSha256 : Key -> String -> Mac -> Bool`.
+            Callee::Kernel(KernelFn::CryptoVerifyHmacSha256) => Ok(3),
             // ── Ipe.Color constructor kernels ──
             Callee::Kernel(
                 KernelFn::ColorWhite
@@ -27163,7 +27752,7 @@ impl<'a> Lowerer<'a> {
         match self.region_ty(span) {
             Some(Ty::Con { name, args, .. }) => {
                 self.resolve(*name).is_ok_and(|n| n == "Result")
-                    && matches!(args.first(), Some(Ty::Var(_)))
+                    && matches!(args.first(), Some(Ty::Var(_) | Ty::Wildcard))
             }
             _ => false,
         }
@@ -27476,6 +28065,7 @@ impl<'a> Lowerer<'a> {
     fn first_poly_tvar(&self, t: &Ty) -> Option<Symbol> {
         match t {
             Ty::Var(v) => self.poly_tvar_symbol(*v),
+            Ty::Wildcard | Ty::Unit => None,
             Ty::Fun(a, b) => self.first_poly_tvar(a).or_else(|| self.first_poly_tvar(b)),
             Ty::Con { args, .. } | Ty::Tuple(args) => {
                 args.iter().find_map(|a| self.first_poly_tvar(a))
@@ -27484,7 +28074,6 @@ impl<'a> Lowerer<'a> {
                 .values()
                 .find_map(|f| self.first_poly_tvar(f))
                 .or_else(|| self.row_tail_poly_tvar(tail)),
-            Ty::Unit => None,
         }
     }
 
@@ -27574,6 +28163,7 @@ impl<'a> Lowerer<'a> {
     fn ty_mentions_poly_tvar(&self, t: &Ty, tv: Symbol) -> bool {
         match t {
             Ty::Var(v) => self.poly_tvar_symbol(*v) == Some(tv),
+            Ty::Wildcard | Ty::Unit => false,
             Ty::Fun(a, b) => self.ty_mentions_poly_tvar(a, tv) || self.ty_mentions_poly_tvar(b, tv),
             Ty::Con { args, .. } | Ty::Tuple(args) => {
                 args.iter().any(|a| self.ty_mentions_poly_tvar(a, tv))
@@ -27582,7 +28172,6 @@ impl<'a> Lowerer<'a> {
                 self.row_tail_poly_tvar(tail) == Some(tv)
                     || fields.values().any(|f| self.ty_mentions_poly_tvar(f, tv))
             }
-            Ty::Unit => false,
         }
     }
 
@@ -28192,14 +28781,6 @@ impl<'a> Lowerer<'a> {
                         Ok(Callee::Kernel(KernelFn::TaskWithMaxAttempts))
                     }
                     ("Task", "withBaseMs") => Ok(Callee::Kernel(KernelFn::TaskWithBaseMs)),
-                    ("Task", "Linear") => Ok(Callee::Kernel(KernelFn::BackoffLinear)),
-                    ("Task", "LinearWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffLinearWithJitter))
-                    }
-                    ("Task", "Exponential") => Ok(Callee::Kernel(KernelFn::BackoffExponential)),
-                    ("Task", "ExponentialWithJitter") => {
-                        Ok(Callee::Kernel(KernelFn::BackoffExponentialWithJitter))
-                    }
                     // ── Io kernels ──────────────────────────────────────
                     ("Io", "readLine") => Ok(Callee::Kernel(KernelFn::IoReadLine)),
                     ("Io", "readSecret") => Ok(Callee::Kernel(KernelFn::IoReadSecret)),
@@ -28305,6 +28886,7 @@ impl<'a> Lowerer<'a> {
                     ("Sql", "isNotNull") => Ok(Callee::Kernel(KernelFn::SqlIsNotNull)),
                     ("Sql", "inList") => Ok(Callee::Kernel(KernelFn::SqlInList)),
                     ("Sql", "like") => Ok(Callee::Kernel(KernelFn::SqlLike)),
+                    ("Sql", "startsWith") => Ok(Callee::Kernel(KernelFn::SqlStartsWith)),
                     ("Sql", "exists") => Ok(Callee::Kernel(KernelFn::SqlExists)),
                     ("Sql", "maskedColumn") => Ok(Callee::Kernel(KernelFn::SqlMaskedColumn)),
                     ("Db", "findWhere") => Ok(Callee::Kernel(KernelFn::DbFindWhere)),
@@ -28334,6 +28916,7 @@ impl<'a> Lowerer<'a> {
                     ("Store", "lte") => Ok(Callee::Kernel(KernelFn::StoreLteCol)),
                     ("Store", "lteBy") => Ok(Callee::Kernel(KernelFn::StoreLteBy)),
                     ("Store", "like") => Ok(Callee::Kernel(KernelFn::StoreLike)),
+                    ("Store", "startsWith") => Ok(Callee::Kernel(KernelFn::StoreStartsWith)),
                     ("Store", "isNull") => Ok(Callee::Kernel(KernelFn::StoreIsNull)),
                     ("Store", "notNull") => Ok(Callee::Kernel(KernelFn::StoreNotNull)),
                     ("Store", "inList") => Ok(Callee::Kernel(KernelFn::StoreInListCol)),
@@ -29209,10 +29792,11 @@ impl<'a> Lowerer<'a> {
             // PList / PCons gate below. Class 4 item C2.
             canon::Pattern_::PStr(_) => Err(unsupported(p.span, Feature::NestedCtorDiscrimination)),
             // An alias `inner as name` lowers to the IR binding-with-subpattern.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_payload_pat(inner)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_payload_pat(inner)?;
+                self.refuse_nonclone_alias_part(&inner_pat, p.span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             canon::Pattern_::PTuple(elems) => {
                 let subs = elems
                     .iter()
@@ -29319,10 +29903,11 @@ impl<'a> Lowerer<'a> {
             | canon::Pattern_::POr(_) => Err(unsupported(p.span, Feature::TuplePatternMatch)),
             // An alias `inner as name` is irrefutable exactly when `inner` is, so
             // it recurses: a refutable inner surfaces the same IPE-L0115 gap.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_destructure_pat(inner)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_destructure_pat(inner)?;
+                self.refuse_nonclone_alias_part(&inner_pat, p.span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             // A record pattern nested inside a tuple destructure (`(Ok {name}, y)`
             // single-arm form, `({ x }, y) = e`). The element's complete record
             // type is recovered from the per-sub-pattern region the constraint
@@ -29370,10 +29955,11 @@ impl<'a> Lowerer<'a> {
             // scrutinee's type — so a nested record still recovers its full
             // field set. Lowers to Rust's binding-with-subpattern
             // `name @ <inner>`.
-            canon::Pattern_::PAlias(inner, name) => Ok(Pat::Alias(
-                Box::new(self.lower_binder_pat(inner, value)?),
-                name.value,
-            )),
+            canon::Pattern_::PAlias(inner, name) => {
+                let inner_pat = self.lower_binder_pat(inner, value)?;
+                self.refuse_nonclone_alias_part(&inner_pat, value.span, pat.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
+            }
             _ => self.lower_destructure_pat(pat),
         }
     }
@@ -29836,7 +30422,7 @@ impl<'a> Lowerer<'a> {
                 &noncl_set,
                 &CaptureWalk::refusing(value_span),
                 value,
-                0,
+                CaptureScope::Top.enter(ClosureKind::Recallable),
             )?
         };
         let thunk_name = self.fresh_destructure_thunk_symbol()?;
@@ -29940,11 +30526,11 @@ impl<'a> Lowerer<'a> {
         }
         // NOTE the deferred-capture signal is NOT a trigger: a deferral
         // also fires for the lean, sound capture shapes (a single
-        // depth-0-callee read inside one closure), which must keep the bare
+        // borrowing-callee read inside one closure), which must keep the bare
         // `Box` carrier byte-identically. The walkers below detect exactly
         // the read patterns a `Box` cannot serve; `needs_shared_capture`
-        // (depth ≥ 2 / 2+ closure captures) joins in the carrier-flip
-        // condition further down.
+        // (a read past a `Recallable` closure / 2+ closure captures) joins in
+        // the carrier-flip condition further down.
         // Use threaded counts from the accumulator when available (O(1)),
         // falling back to fresh walks of `acc` (O(|acc|)) only when called
         // without a precomputed summary.
@@ -29954,7 +30540,8 @@ impl<'a> Lowerer<'a> {
         // in evaluation order by ANY further read, including a borrowing
         // direct-callee call — is the third unsound shape. It is invisible to
         // `count_fn_value_uses` (which exempts the callee position) and to
-        // `non_callee_ge1` (the reuse can be two depth-0 reads), so it is
+        // `move_in_recallable` (the reuse can be two reads outside every
+        // closure), so it is
         // detected order-aware here. Like `flows_into_sync_kernel_call` it is
         // not additively threadable across `Let` siblings (a move in one
         // binding and a use in the next cross the boundary), so it is a full
@@ -29962,10 +30549,10 @@ impl<'a> Lowerer<'a> {
         let new_trigger = fun_shape.is_some()
             && (precomputed.map_or_else(
                 || {
-                    fn_value_read_flags(name, &acc).non_callee_ge1
+                    fn_value_read_flags(name, &acc).move_in_recallable
                         || count_fn_value_uses(name, &acc) > 1
                 },
-                |a| a.fn_flags.non_callee_ge1 || a.fn_value_uses > 1,
+                |a| a.fn_flags.move_in_recallable || a.fn_value_uses > 1,
             ) || fn_value_use_after_consume(name, &acc, &self.enum_payloads));
         let mut acc = match (&fun_shape, new_trigger) {
             (Some((ps, r)), true) => {
@@ -30045,20 +30632,21 @@ impl<'a> Lowerer<'a> {
         // is built INLINE at the call site, never when it is a `Var` read
         // of an already-built `Box<dyn Fn + Send>` local (capturing an
         // already-non-Sync value cannot make the capturing wrapper `Sync`).
-        // `flows_into_sync_kernel_call` detects this at depth 0 — where
+        // `flows_into_sync_kernel_call` detects this outside every closure — where
         // `needs_shared_capture` intentionally stays silent, a single
         // non-nested capture being the common sound case for THAT trigger —
         // and ORs into the same promotion path.
         let mut value = value;
-        // A NEW-trigger promotion (deferred capture / non-callee depth ≥ 1
-        // read / value reuse — decided on the LOWERED scope above) MUST flip
+        // A NEW-trigger promotion (deferred capture / non-callee read inside
+        // a `Recallable` closure / value reuse — decided on the LOWERED scope
+        // above) MUST flip
         // the carrier here or the inserted `.clone()`s hit E0599 on a `Box`.
         // OR it into the promotion alongside the existing nesting /
         // sync-kernel heuristics.
-        // `needs_shared_capture` is derived from the threaded depth-count
+        // `needs_shared_capture` is derived from the threaded capture-scope
         // summary when available.  `apply_move_ownership_precomputed` (the
         // non-new-trigger path) converts Var→CloneVar but preserves capture
-        // depths, so the threaded value remains correct post-rewrite.
+        // scopes, so the threaded value remains correct post-rewrite.
         //
         // `flows_into_sync_kernel_call` is always a full walk: its
         // alias-chain resolution cannot be accumulated incrementally across
@@ -30102,13 +30690,18 @@ impl<'a> Lowerer<'a> {
                 // alias `Var`, a top-level `FuncValue`, a fn-typed record
                 // field access, …): mint the `Arc` carrier by eta-expanding
                 // the value into a `SharedLambda` that moves the underlying
-                // value in once and forwards per call. A LEGACY-only trigger
-                // keeps the value untouched — an alias binding propagates the
-                // promoted root's `Arc` type through Rust inference (see
-                // `flows_into_sync_kernel_call`'s alias-chain doc), and that
-                // behaviour is byte-pinned.
+                // value in once and forwards per call. A nesting trigger
+                // (`needs_shared_capture`) mints it the same way, an alias
+                // `Var` included: its reads inside closures become
+                // `.clone()`s, and nothing promotes the alias root for them, so
+                // a `Box` root would leave them without `Clone`. An alias under
+                // the sync-kernel trigger alone keeps the value untouched — it
+                // propagates the promoted root's `Arc` type through Rust
+                // inference (see `flows_into_sync_kernel_call`'s alias-chain
+                // doc, which promotes the root too), and that behaviour is
+                // byte-pinned.
                 other => {
-                    value = if new_trigger {
+                    value = if new_trigger || needs_shared_val {
                         eta_shared_rebind(other, &ps, &r, self.eta_slice())?
                     } else {
                         other
@@ -30527,6 +31120,7 @@ impl<'a> Lowerer<'a> {
     #[allow(clippy::too_many_lines)]
     fn lower_case(&self, scrut: &canon::Expr, branches: &[canon::CaseBranch]) -> DResult<Expr> {
         let scrutinee = self.lower_expr(scrut)?;
+        let stored_scrutinee = self.stored_fn_scrutinee(scrut, Some(&scrutinee));
 
         // The parser rejects a zero-branch `case` (CaseDefect::NoBranches), so
         // an empty branch list here is a violated invariant.
@@ -30548,7 +31142,7 @@ impl<'a> Lowerer<'a> {
                 // any outer promotable name over the arm body. A component read
                 // out of storage is registered for the arm body like any arm's.
                 let shared_before = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &first.pat);
+                self.register_stored_fn_arm_binders(&stored_scrutinee, &first.pat);
                 let body = self.with_binders(&shadowing_binder_scope(&first.pat), || {
                     self.lower_expr(&first.body)
                 });
@@ -30613,10 +31207,10 @@ impl<'a> Lowerer<'a> {
                     let arms_s = branches_s
                         .iter()
                         .map(|br| {
-                            let arm_pat = self.lower_arm_pat(&br.pat)?;
+                            let arm_pat = self.lower_arm_pat(&br.pat, scrut.span)?;
                             let arm_syms = collect_arm_pat_pvars(&br.pat.value);
                             let shared_before = self.shared_fn_reads.borrow().clone();
-                            self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
+                            self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                             let mut arm_body = self
                                 .with_binders(&arm_binder_scope(&arm_syms), || {
                                     self.lower_expr(&br.body)
@@ -30703,7 +31297,7 @@ impl<'a> Lowerer<'a> {
                 let (arm_pat, arm_guard, nested_bindings) =
                     match self.desugar_ctor_nested_special_args(&br.pat)? {
                         Some((pat, guard, bindings)) => (pat, guard, bindings),
-                        None => (self.lower_arm_pat(&br.pat)?, None, Vec::new()),
+                        None => (self.lower_arm_pat(&br.pat, scrut.span)?, None, Vec::new()),
                     };
                 // A pattern binder that binds a fn-typed value (the `varN`
                 // projection `Codec f -> …` case) is a promotable fn binder for
@@ -30721,7 +31315,7 @@ impl<'a> Lowerer<'a> {
                 // read into a direct higher-order parameter demotes to `Box`
                 // ([`Self::demote_shared_fn_read`]). Scoped to this arm.
                 let shared_before = self.shared_fn_reads.borrow().clone();
-                self.register_stored_fn_arm_binders(scrut, Some(&scrutinee), &br.pat);
+                self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                 let mut arm_body =
                     self.with_binders(&arm_binder_scope(&arm_syms), || self.lower_expr(&br.body))?;
                 *self.shared_fn_reads.borrow_mut() = shared_before;
@@ -30869,7 +31463,7 @@ impl<'a> Lowerer<'a> {
                 .iter()
                 .any(|(_, p)| Self::arm_has_dispatch_needing_alias(p)),
             Pat::Ctor { args, .. } => args.iter().any(Self::arm_has_dispatch_needing_alias),
-            Pat::Slice { prefix, rest } => {
+            Pat::Slice { prefix, rest, .. } => {
                 prefix.iter().any(Self::arm_has_dispatch_needing_alias)
                     || rest
                         .as_deref()
@@ -30959,7 +31553,11 @@ impl<'a> Lowerer<'a> {
     /// [`Self::lower_payload_pat`]). A tuple / record head is the destructure
     /// path (handled by the single-arm branch of [`Self::lower_case`]); reaching
     /// it here is a multi-arm product `case`, the tuple-pattern gap (IPE-L0115).
-    fn lower_arm_pat(&self, p: &canon::Pattern) -> DResult<Pat> {
+    ///
+    /// `ty_span` is the span whose solved region type is `p`'s scrutinee type:
+    /// the `case` scrutinee for a root head, the element sub-pattern for a tuple
+    /// column. An alias or or-pattern keeps it, since neither changes the type.
+    fn lower_arm_pat(&self, p: &canon::Pattern, ty_span: Span) -> DResult<Pat> {
         match &p.value {
             canon::Pattern_::PVar(s) => Ok(Pat::Var(*s)),
             // `()` is irrefutable and its scrutinee is unit-typed; a wildcard arm
@@ -30974,7 +31572,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PChar(c) => Ok(Pat::Char(c.clone())),
             canon::Pattern_::PStr(s) => Ok(Pat::Str(s.clone())),
             canon::Pattern_::PAlias(inner, name) => {
-                Ok(Pat::Alias(Box::new(self.lower_arm_pat(inner)?), name.value))
+                let inner_pat = self.lower_arm_pat(inner, ty_span)?;
+                self.refuse_nonclone_alias_part(&inner_pat, ty_span, p.span)?;
+                Ok(Pat::Alias(Box::new(inner_pat), name.value))
             }
             canon::Pattern_::PCtor {
                 home,
@@ -31004,7 +31604,7 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PTuple(elems) => {
                 let subs = elems
                     .iter()
-                    .map(|e| self.lower_arm_pat(e))
+                    .map(|e| self.lower_arm_pat(e, e.span))
                     .collect::<DResult<Vec<_>>>()?;
                 Ok(Pat::Tuple(subs))
             }
@@ -31014,7 +31614,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PRecord(_) => Err(unsupported(p.span, Feature::TuplePatternMatch)),
             // A list (`[a, b]`) or cons (`x :: xs`) case-arm head flattens to the
             // slice-shaped IR [`Pat::Slice`].
-            canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => self.lower_list_arm_pat(p),
+            canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
+                self.lower_list_arm_pat(p, ty_span)
+            }
             // An or-pattern `p1 | p2 | …` lowers each alternative through this
             // same arm lowerer into a single [`Pat::Or`]. The backend renders it
             // as the native Rust or-pattern `p1 | p2 | …` with the arm body
@@ -31024,8 +31626,9 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::POr(alts) => {
                 let lowered = alts
                     .iter()
-                    .map(|a| self.lower_arm_pat(a))
+                    .map(|a| self.lower_arm_pat(a, ty_span))
                     .collect::<DResult<Vec<_>>>()?;
+                owned_or_refusal(&lowered, p.span)?;
                 Ok(Pat::Or(lowered))
             }
         }
@@ -31139,6 +31742,10 @@ impl<'a> Lowerer<'a> {
                 // is the root-cause fix — `flat` itself still supplies the
                 // prefix/tail shape used below, so it stays in scope.
                 //
+                // The prelude copies each head out by `ListIndexClone` and takes
+                // the tail by `List.drop`, so a binding shape over a non-`Clone`
+                // element has no sound rendering here. [IPE-L0116]
+                let elem = self.nested_cons_elem(&flat, a.span)?;
                 // Replace this ctor arg with a fresh `Vec` binder and record the
                 // guard + per-element prelude bindings against it.
                 let fresh = self.fresh_nested_cons_binder()?;
@@ -31151,13 +31758,15 @@ impl<'a> Lowerer<'a> {
                 });
                 // Head-element binders BORROW `fresh` (index + clone), so they
                 // precede the tail binder that MOVES it.
-                for (idx, elem) in flat.prefix.iter().enumerate() {
-                    if let NestedBinder::Named(sym) = elem {
+                for (idx, binder) in flat.prefix.iter().enumerate() {
+                    if let NestedBinder::Named(sym) = binder {
+                        let elem = elem.clone().ok_or_else(unresolved_nested_cons_elem)?;
                         bindings.push((
                             *sym,
                             Expr::ListIndexClone {
                                 list: Box::new(Expr::Var(fresh)),
                                 index: idx,
+                                elem,
                             },
                         ));
                     }
@@ -31197,6 +31806,20 @@ impl<'a> Lowerer<'a> {
             rhs: Box::new(g),
         });
         Ok(Some((ir_pat, guard, bindings)))
+    }
+
+    /// The element type of the nested list `flat` at `span`, when it binds a part.
+    ///
+    /// A binding shape copies each head out by `ListIndexClone` and takes the
+    /// tail by `List.drop`, so its element must be `Clone`; any other element
+    /// is refused (IPE-L0116). A shape that binds nothing reads no element.
+    fn nested_cons_elem(&self, flat: &FlatNestedList, span: Span) -> DResult<Option<IrType>> {
+        if !flat.binds_any() {
+            return Ok(None);
+        }
+        let elem = self.list_storage_elem_ir(span)?;
+        nested_cons_ownership_refusal(slice_ownership(self.clone_env(), &elem), span)?;
+        Ok(Some(elem))
     }
 
     /// Classify a constructor-arg sub-pattern as a SUPPORTABLE nested list for
@@ -31257,7 +31880,24 @@ impl<'a> Lowerer<'a> {
     /// sub-pattern lowers through [`Self::lower_payload_pat`] (variable /
     /// wildcard / literal / alias / nested tuple / constructor); the open tail
     /// binds a variable / wildcard / alias via [`Self::lower_rest_pat`].
-    fn lower_list_arm_pat(&self, p: &canon::Pattern) -> DResult<Pat> {
+    ///
+    /// The slice's [`SliceOwnership`] is decided here, once, from the element
+    /// type of the list at `ty_span` (see [`slice_ownership`]).
+    fn lower_list_arm_pat(&self, p: &canon::Pattern, ty_span: Span) -> DResult<Pat> {
+        let elem = self.list_storage_elem_ir(ty_span)?;
+        let own = slice_ownership(self.clone_env(), &elem);
+        let (prefix, rest) = self.lower_list_arm_shape(p)?;
+        owned_slice_refusal(own, &prefix, p.span)?;
+        Ok(Pat::Slice {
+            prefix,
+            rest,
+            own,
+            elem,
+        })
+    }
+
+    /// Flatten a list / cons arm head into its element prefix and its open tail binder.
+    fn lower_list_arm_shape(&self, p: &canon::Pattern) -> DResult<(Vec<Pat>, Option<Box<Pat>>)> {
         let mut prefix = Vec::new();
         let mut cur = p;
         loop {
@@ -31267,7 +31907,7 @@ impl<'a> Lowerer<'a> {
                     for e in elems {
                         prefix.push(self.lower_payload_pat(e)?);
                     }
-                    return Ok(Pat::Slice { prefix, rest: None });
+                    return Ok((prefix, None));
                 }
                 canon::Pattern_::PCons(head, tail) => {
                     prefix.push(self.lower_payload_pat(head)?);
@@ -31281,10 +31921,7 @@ impl<'a> Lowerer<'a> {
                         // the remaining list.
                         canon::Pattern_::PVar(_) | canon::Pattern_::PAnything => {
                             let rest = Self::lower_rest_pat(tail)?;
-                            return Ok(Pat::Slice {
-                                prefix,
-                                rest: Some(Box::new(rest)),
-                            });
+                            return Ok((prefix, Some(Box::new(rest))));
                         }
                         // Any other tail shape (an alias / literal / constructor /
                         // tuple / record in tail position) is not a list pattern
@@ -31502,6 +32139,13 @@ mod tests {
         let redirect_policy = interner.intern("RedirectPolicy").unwrap();
         let no_redirects = interner.intern("NoRedirects").unwrap();
         let follow_redirects = interner.intern("FollowRedirects").unwrap();
+        // ── DbFailure ADT ──────────────────────────────
+        let ed_database = interner.intern("Database").unwrap();
+        let db_failure = interner.intern("DbFailure").unwrap();
+        let db_failure_ctors = super::intern_db_failure_ctors(interner).unwrap();
+        // ── AuthError ADT ──────────────────────────────
+        let auth_error = interner.intern("AuthError").unwrap();
+        let auth_error_ctors = super::intern_auth_error_ctors(interner).unwrap();
 
         BuiltinCtors {
             maybe,
@@ -31583,6 +32227,13 @@ mod tests {
             redirect_policy,
             no_redirects,
             follow_redirects,
+            // ── DbFailure ─────────────────────────
+            ed_database,
+            db_failure,
+            db_failure_ctors,
+            // ── AuthError ─────────────────────────
+            auth_error,
+            auth_error_ctors,
             kernel_types: ipe_types::Builtins::new(interner).unwrap(),
         }
     }
@@ -31837,6 +32488,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -31861,6 +32513,36 @@ mod tests {
                 lowerer.binder_ir_type(Some(UNIT_SPAN)),
                 Ok(Some(super::BinderType::Resolved(super::IrType::Unit)))
             ));
+        });
+    }
+
+    /// An untagged raw equal to a generic's bare variable id is a symbol and names no generic.
+    ///
+    /// The generic map is keyed by the tagged variable; probing the raw's
+    /// tag-flipped form would read the symbol as that variable and lower it to
+    /// the enclosing generic.
+    #[test]
+    fn poly_tvar_lookup_never_reads_a_symbol_raw_as_a_variable_key() {
+        const BARE_VAR: u32 = 7;
+        with_binder_type_lowerer(|lowerer, generic| {
+            let poly = BTreeMap::from([(ipe_types::SolverVar::from_var(BARE_VAR), generic)]);
+            lowerer.with_poly_tvars(Some(poly), || {
+                assert_eq!(
+                    lowerer.poly_tvar_symbol(ipe_types::tag_solver_var(BARE_VAR)),
+                    Some(generic),
+                    "the tagged variable names its generic"
+                );
+                assert_eq!(
+                    lowerer.poly_tvar_symbol(BARE_VAR),
+                    None,
+                    "an untagged raw is an annotation symbol, never a variable key"
+                );
+                let msg_slot = lowerer.ir_type_from_ty_ui_msg(&Ty::Var(BARE_VAR), UNIT_SPAN);
+                assert!(
+                    matches!(msg_slot, Ok(super::IrType::Unit)),
+                    "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
+                );
+            });
         });
     }
 
@@ -32038,6 +32720,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -32217,8 +32900,10 @@ mod tests {
         KernelFn::CryptoKeyFromString,
         KernelFn::CryptoKeyFromBytes,
         KernelFn::CryptoMacToHex,
+        KernelFn::CryptoMacFromHex,
         KernelFn::CryptoHmacSha256WithKey,
         KernelFn::CryptoHmacSha512WithKey,
+        KernelFn::CryptoVerifyHmacSha256,
         // Ipe.Email.EmailAddress — compiled-source Layer-3 module.
         KernelFn::EmailAddressParse,
         KernelFn::EmailAddressToString,
@@ -32375,6 +33060,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -32511,6 +33197,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             &builtins,
             "",
@@ -32544,11 +33231,15 @@ mod tests {
     /// prevent (a `.clone()` on a non-`Clone` carrier is cargo E0599 after
     /// ipe exit 0).
     #[test]
+    #[allow(clippy::too_many_lines)] // one fixture table drives every agreement assertion
     fn carrier_clone_authority_agrees_with_clone_class() {
         use ipe_intern::Symbol;
-        use ipe_ir::{EnumPayloadTable, IrType, ModPath, carrier_is_clone};
+        use ipe_ir::{
+            EnumPayloadTable, IrType, ModPath, SliceOwnership, carrier_is_clone,
+            carrier_is_clone_bounded,
+        };
 
-        use super::{CloneClass, CloneEnv, clone_class};
+        use super::{CloneClass, CloneEnv, clone_class, slice_ownership};
 
         // The shared authority agreement is checked on non-FFI types (an FFI
         // foreign-interface `Enum` is intentionally NonClone in `clone_class`
@@ -32625,7 +33316,76 @@ mod tests {
         assert!(carrier_is_clone(&named(shared_fn, Vec::new()), &payloads));
         assert!(carrier_is_clone(&named(wrap, vec![IrType::Int]), &payloads));
         assert!(!carrier_is_clone(&named(boxed_fn, Vec::new()), &payloads));
-        assert!(!carrier_is_clone(&named(wrap, vec![fun]), &payloads));
+        assert!(!carrier_is_clone(
+            &named(wrap, vec![fun.clone()]),
+            &payloads
+        ));
+
+        // The list-`case` ownership decision and the emitter's generic-aware
+        // authority agree exactly on every non-FFI type: a slice element moves
+        // out of an owned view exactly when its carrier is not `Clone` under
+        // the emitted bound. A generic or row-generic leaf at any depth carries
+        // that bound, so a composite over one copies out of the borrow.
+        let generic = IrType::Generic(Symbol::from_raw(8));
+        let row = IrType::RowGeneric(Symbol::from_raw(9));
+        let bounded_samples = [
+            generic.clone(),
+            row.clone(),
+            IrType::Tuple(vec![generic.clone(), IrType::Int]),
+            IrType::Tuple(vec![row.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(row)),
+            IrType::List(Box::new(generic)),
+        ];
+        for ty in &bounded_samples {
+            assert_eq!(
+                slice_ownership(env, ty),
+                SliceOwnership::BorrowClone,
+                "a generic-bounded element must copy out: {ty:?}"
+            );
+        }
+        for ty in samples.iter().chain(&bounded_samples) {
+            assert_eq!(
+                slice_ownership(env, ty) == SliceOwnership::OwnedMove,
+                !carrier_is_clone_bounded(ty, &payloads),
+                "slice_ownership / carrier_is_clone_bounded drift on {ty:?}"
+            );
+        }
+        assert_eq!(slice_ownership(env, &fun), SliceOwnership::OwnedMove);
+        assert_eq!(
+            slice_ownership(env, &IrType::Task(Box::new(IrType::Int))),
+            SliceOwnership::OwnedMove
+        );
+
+        // `carrier_is_clone_bounded` is not FFI-aware: it calls an opaque
+        // `Rust.*` handle `Clone`. The list-`case` decision gives such a handle
+        // no `Clone` fact, bare or nested, so its elements move.
+        let mut ffi_interner = Interner::new();
+        let ffi_home = ModPath(vec![
+            ffi_interner.intern("Rust").expect("intern"),
+            ffi_interner.intern("Bevy_ecs").expect("intern"),
+        ]);
+        let handle = IrType::Enum {
+            home: ffi_home,
+            name: ffi_interner.intern("World").expect("intern"),
+            args: Vec::new(),
+        };
+        let ffi_env = CloneEnv {
+            interner: &ffi_interner,
+            transparent_ffi: &transparent,
+            payloads: &payloads,
+        };
+        for ty in [
+            handle.clone(),
+            IrType::Tuple(vec![handle.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(handle)),
+        ] {
+            assert!(carrier_is_clone_bounded(&ty, &payloads));
+            assert_eq!(
+                slice_ownership(ffi_env, &ty),
+                SliceOwnership::OwnedMove,
+                "an opaque FFI handle element must move out: {ty:?}"
+            );
+        }
     }
 
     /// SEAL: an FFI foreign opaque handle (`Rust.*`-homed `Enum`) is a real
@@ -33205,6 +33965,59 @@ mod tests {
             vec![user_call(vec![Expr::Var(w)]), user_call(vec![read_tag()])],
         );
         assert!(nonclone_read_after_move(env, w, &wrap_task, &unordered));
+    }
+
+    /// A run-statement continuation is the body of the `move |_|` closure
+    /// `task_and_then` receives, so any read of a function value there,
+    /// a borrowing direct call included, moves the value into it.
+    #[test]
+    fn taskseq_continuation_read_moves_the_fn_value() {
+        use ipe_ir::{CallPin, Callee, Expr, FuncId, OnFormKind};
+
+        use super::{count_fn_value_uses, fn_value_use_after_consume};
+
+        let mut interner = Interner::new();
+        let f = interner.intern("f").expect("intern");
+        let payloads = ipe_ir::EnumPayloadTable::new();
+        let pass = || Expr::Call {
+            callee: Callee::Func(FuncId::from_raw(0)),
+            args: vec![Expr::Var(f)],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+        let call_f = || Expr::Apply {
+            func: Box::new(Expr::Var(f)),
+            args: vec![Expr::Int(1)],
+        };
+        let seq = |effect: Expr, rest: Expr| Expr::TaskSeq {
+            effect: Box::new(effect),
+            rest: Box::new(rest),
+        };
+
+        // `do { use f ; f 1 }`: the effect moves `f`, the continuation closure
+        // captures it again.
+        let moved_then_called = seq(pass(), call_f());
+        assert_eq!(count_fn_value_uses(f, &moved_then_called), 2);
+        assert!(fn_value_use_after_consume(f, &moved_then_called, &payloads));
+
+        // `do { f 1 ; f 1 }`: the effect borrows; the one capture is sound.
+        let called_twice = seq(call_f(), call_f());
+        assert_eq!(count_fn_value_uses(f, &called_twice), 1);
+        assert!(!fn_value_use_after_consume(f, &called_twice, &payloads));
+
+        // `do { f 1 ; use f }`: inside the continuation the closure owns `f`.
+        let called_then_moved = seq(call_f(), pass());
+        assert_eq!(count_fn_value_uses(f, &called_then_moved), 1);
+        assert!(!fn_value_use_after_consume(
+            f,
+            &called_then_moved,
+            &payloads
+        ));
+
+        // A continuation that never reads `f` captures nothing.
+        let unrelated = seq(pass(), Expr::Unit);
+        assert_eq!(count_fn_value_uses(f, &unrelated), 1);
+        assert!(!fn_value_use_after_consume(f, &unrelated, &payloads));
     }
 
     /// A sequenced task whose capture-clone rewrite would clone a non-Clone
@@ -35177,33 +35990,15 @@ mod tests {
         );
     }
 
-    /// Structural invariant (canon-1 / canon-2): every name in
-    /// `OPAQUE_NAMES_ABOVE_GUARD` must also appear in canon's
-    /// `RESERVED_BUILTIN_TYPES`.  An above-guard arm with a fixed `IrType`
-    /// mapping that is NOT reserved means a user `type <Name>` is silently
-    /// mis-lowered — a direct SEAL break.  Adding an above-guard arm without
-    /// also adding the name to `RESERVED_BUILTIN_TYPES` now fails this test.
-    #[test]
-    fn reserved_opaque_names_above_guard_are_reserved_in_canon() {
-        for &name in super::OPAQUE_NAMES_ABOVE_GUARD {
-            assert!(
-                ipe_canon::RESERVED_BUILTIN_TYPES.contains(&name),
-                "OPAQUE_NAMES_ABOVE_GUARD contains `{name}` but \
-                 ipe_canon::RESERVED_BUILTIN_TYPES does not — \
-                 a user `type {name}` would be silently mis-lowered (SEAL break); \
-                 add `{name}` to RESERVED_BUILTIN_TYPES in resolve.rs",
-            );
-        }
-    }
-
-    /// Per-occurrence `any` freshening covers NESTED occurrences (lower-1):
-    /// `freshen_any_generics` must replace EVERY `Generic("any")` in a tree
-    /// with a distinct fresh symbol, not just the outermost one.
+    /// Per-occurrence `any` freshening covers NESTED occurrences.
     ///
-    /// Two independent `List any` / `Maybe any` param types share the same
-    /// interned `any_sym` before freshening — after freshening each must
-    /// carry a distinct generic, or the emitted Rust would collapse them to
-    /// one type parameter (SEAL break: E0308).
+    /// `freshen_any_generics` must replace EVERY wildcard-marker generic in a
+    /// tree with a distinct fresh symbol, not just the outermost one. Two
+    /// independent `List any` / `Maybe any` param types share the one marker
+    /// before freshening — after freshening each must carry a distinct
+    /// generic, or the emitted Rust would collapse them to one type parameter
+    /// (SEAL break: E0308). A generic whose symbol merely spells `any` (a
+    /// declared parameter) is left alone.
     #[test]
     #[allow(clippy::panic)] // let-else in test code; panic on unexpected shape is intentional
     fn nested_any_produces_distinct_generics() {
@@ -35214,9 +36009,11 @@ mod tests {
         let fresh0 = interner.intern("__any_test0").unwrap();
         let fresh1 = interner.intern("__any_test1").unwrap();
 
-        // `any_sym` is the shared interned symbol that both `List any` and
-        // `Maybe any` carry before freshening.
-        let any_sym = interner.intern("any").unwrap();
+        // The wildcard marker both `List any` and `Maybe any` carry before
+        // freshening, and a declared parameter that merely spells `any`.
+        let marker = super::WildcardMarker::mint(&mut interner).unwrap();
+        let any_sym = marker.symbol();
+        let declared_any = interner.intern("any").unwrap();
 
         let shared = ipe_canon::builtins::intern_builtins(&mut interner)
             .expect("intern shared built-in table");
@@ -35245,16 +36042,32 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: marker,
             },
             &builtins,
             "",
             "",
         );
 
+        // A declared parameter spelled `any` is not the wildcard: no mint.
+        let mut minted_declared: Vec<ipe_intern::Symbol> = Vec::new();
+        let declared_ir = ipe_ir::IrType::List(Box::new(ipe_ir::IrType::Generic(declared_any)));
+        let kept = lowerer
+            .freshen_any_generics(declared_ir.clone(), &mut minted_declared)
+            .expect("freshen a declared `any` generic");
+        assert_eq!(
+            kept, declared_ir,
+            "a declared `any` generic must stay unchanged"
+        );
+        assert!(
+            minted_declared.is_empty(),
+            "a declared `any` generic must mint nothing"
+        );
+
         // Build the two IR types that would come from lowering:
-        //   `List any` → List(Generic(any_sym))
-        //   `Maybe any` → Maybe(Generic(any_sym))
-        // Both carry the SAME any_sym before freshening.
+        //   `List any` → List(Generic(marker))
+        //   `Maybe any` → Maybe(Generic(marker))
+        // Both carry the SAME marker before freshening.
         let list_ir = ipe_ir::IrType::List(Box::new(ipe_ir::IrType::Generic(any_sym)));
         let maybe_ir = ipe_ir::IrType::Maybe(Box::new(ipe_ir::IrType::Generic(any_sym)));
 
@@ -35314,16 +36127,15 @@ mod tests {
     #[test]
     fn count_any_param_sites_includes_return_position() {
         let mut interner = Interner::new();
-        let any_sym = interner.intern("any").unwrap();
         let list_sym = interner.intern("List").unwrap();
         let int_sym = interner.intern("Int").unwrap();
 
         // Canonical type for `foo : Int -> List any`:
-        //   Lambda(Con { name: Int, args: [] }, Con { name: List, args: [Var(any)] })
+        //   Lambda(Con { name: Int, args: [] }, Con { name: List, args: [Wildcard] })
         let list_any = ipe_canon::ast::Type::Con {
             home: vec![],
             name: list_sym,
-            args: vec![ipe_canon::ast::Type::Var(any_sym)],
+            args: vec![ipe_canon::ast::Type::Wildcard],
         };
         let ty = ipe_canon::ast::Type::Lambda(
             Box::new(ipe_canon::ast::Type::Con {
@@ -35346,12 +36158,12 @@ mod tests {
                     ipe_diagnostics::Span::DUMMY,
                     ipe_canon::ast::Expr_::Unit,
                 ),
-                free_vars: vec![any_sym],
+                free_vars: vec![],
                 home: vec![],
             }],
         };
 
-        let count = super::count_any_param_sites(&module, &interner);
+        let count = super::count_any_param_sites(&module);
         assert_eq!(
             count, 1,
             "return-position `any` in `Int -> List any` must be counted \
@@ -35464,7 +36276,7 @@ mod tests {
     /// generic (SEAL break, E0308).
     ///
     /// This test constructs, for each container variant, the shallowest tree
-    /// that holds exactly one `Generic("any")` under that variant, runs
+    /// that holds exactly one wildcard-marker generic under that variant, runs
     /// `freshen_any_generics`, and asserts it mints exactly one fresh symbol.
     ///
     /// The exhaustive `match` below has NO wildcard arm, so adding a new
@@ -35478,9 +36290,10 @@ mod tests {
         let mut interner = Interner::new();
         let builtins = build_test_builtin_ctors(&mut interner);
 
-        // Pre-intern the "any" symbol and one fresh pool symbol per container
+        // Mint the wildcard marker and one fresh pool symbol per container
         // variant under test — each freshen call consumes exactly one slot.
-        let any_sym = interner.intern("any").unwrap();
+        let marker = super::WildcardMarker::mint(&mut interner).unwrap();
+        let any_sym = marker.symbol();
         // 17 container variants: List, Dict, Set, Maybe, Result, Task,
         // Tuple, Record, Fun, SharedFun, FnOnceChain, Decoder, Cmd, Sub,
         // Enum, Ui, WebRoute.
@@ -35519,6 +36332,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: marker,
             },
             &builtins,
             "",
@@ -35622,7 +36436,7 @@ mod tests {
         }
 
         // One representative per container variant: the shallowest tree
-        // embedding exactly one `Generic("any")`.
+        // embedding exactly one wildcard-marker generic.
         let containers: Vec<ipe_ir::IrType> = vec![
             ipe_ir::IrType::List(Box::new(any())),
             ipe_ir::IrType::Dict(Box::new(any()), Box::new(ipe_ir::IrType::Int)),
@@ -36436,6 +37250,7 @@ mod tests {
                 nested_cons_binders: vec![],
                 nested_strlit_binders: vec![],
                 tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
             },
             builtins,
             "",
@@ -36870,5 +37685,616 @@ mod tests {
             super::instance_tvars(&[], &IrType::Int, msg, &instance(vec![], vec![]), &caller)
                 .is_empty()
         );
+    }
+
+    /// The shared fixture of the list-`case` ownership tests: an interner and empty FFI and payload tables.
+    struct OwnFixture {
+        interner: Interner,
+        transparent: BTreeSet<(ipe_ir::ModPath, ipe_intern::Symbol)>,
+        payloads: ipe_ir::EnumPayloadTable,
+    }
+
+    impl OwnFixture {
+        fn new() -> Self {
+            Self {
+                interner: Interner::new(),
+                transparent: BTreeSet::new(),
+                payloads: ipe_ir::EnumPayloadTable::new(),
+            }
+        }
+
+        fn sym(&mut self, name: &str) -> ipe_intern::Symbol {
+            self.interner.intern(name).expect("intern")
+        }
+
+        const fn env(&self) -> super::CloneEnv<'_> {
+            super::CloneEnv {
+                interner: &self.interner,
+                transparent_ffi: &self.transparent,
+                payloads: &self.payloads,
+            }
+        }
+    }
+
+    /// `case ts of x :: r -> 1 ; _ -> 0` over the list binding `ts`, with the given ownership.
+    fn cons_case(
+        ts: ipe_intern::Symbol,
+        x: ipe_intern::Symbol,
+        r: ipe_intern::Symbol,
+        own: ipe_ir::SliceOwnership,
+    ) -> ipe_ir::Expr {
+        use ipe_ir::{Arm, Expr, Match, Pat};
+        let slice = Pat::Slice {
+            prefix: vec![Pat::Var(x)],
+            rest: Some(Box::new(Pat::Var(r))),
+            own,
+            elem: ipe_ir::IrType::Int,
+        };
+        Expr::Match(
+            Match::new_flat(
+                Expr::Var(ts),
+                vec![
+                    Arm::new(slice, Expr::Int(1)),
+                    Arm::new(Pat::Wildcard, Expr::Int(0)),
+                ],
+            )
+            .expect("flat match"),
+        )
+    }
+
+    /// A list `case` moves its binders out of an owned view exactly when the element is non-`Clone`.
+    #[test]
+    fn slice_ownership_follows_the_element_clone_class() {
+        use ipe_ir::{IrType, ModPath, SliceOwnership};
+
+        use super::{flip_fun_in_storage_element, slice_ownership};
+
+        let mut fx = OwnFixture::new();
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let a = fx.sym("a");
+        let env = fx.env();
+        let task = IrType::Task(Box::new(IrType::Int));
+        let ffi_handle = IrType::Enum {
+            home: ModPath(vec![rust, bevy]),
+            name: entity,
+            args: vec![],
+        };
+        let fun = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
+        let owned = [
+            task.clone(),
+            IrType::Maybe(Box::new(task)),
+            ffi_handle,
+            IrType::Tuple(vec![IrType::Int, IrType::Cmd(Box::new(IrType::Unit))]),
+        ];
+        for elem in &owned {
+            assert_eq!(
+                slice_ownership(env, elem),
+                SliceOwnership::OwnedMove,
+                "{elem:?}"
+            );
+        }
+        // A function element sits on the `Arc` storage carrier, as `list_elem_ir` stores it.
+        let borrowed = [
+            IrType::Int,
+            IrType::Str,
+            flip_fun_in_storage_element(fun),
+            IrType::Generic(a),
+        ];
+        for elem in &borrowed {
+            assert_eq!(
+                slice_ownership(env, elem),
+                SliceOwnership::BorrowClone,
+                "{elem:?}"
+            );
+        }
+    }
+
+    /// A composite over a row witness carries the emitted `Clone` bound, so its elements copy out.
+    #[test]
+    fn row_generic_composite_elements_copy_out() {
+        use ipe_ir::{IrType, SliceOwnership};
+
+        use super::slice_ownership;
+
+        let mut fx = OwnFixture::new();
+        let r = fx.sym("r");
+        let env = fx.env();
+        let row = IrType::RowGeneric(r);
+        for elem in [
+            row.clone(),
+            IrType::Tuple(vec![row.clone(), IrType::Int]),
+            IrType::Maybe(Box::new(row)),
+        ] {
+            assert_eq!(
+                slice_ownership(env, &elem),
+                SliceOwnership::BorrowClone,
+                "{elem:?}"
+            );
+        }
+    }
+
+    /// A second use of a `List (Task ..)` moved by a list `case` is refused with IPE-L0135.
+    #[test]
+    fn owned_list_case_reuse_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Expr, IrType, SliceOwnership};
+
+        use super::{reject_nonclone_value_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let ts = fx.sym("ts");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
+        let case = cons_case(ts, x, r, SliceOwnership::OwnedMove);
+        let reused = Expr::Tuple(vec![case.clone(), Expr::Var(ts)]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, ts, &list_task, &reused, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // The case alone is one consume and is accepted.
+        assert_eq!(
+            reject_nonclone_value_reuse(env, ts, &list_task, &case, span),
+            Ok(())
+        );
+    }
+
+    /// A field-path read of a `List (Task ..)` after a list `case` moved it is refused with IPE-L0135.
+    #[test]
+    fn owned_list_case_field_read_after_move_fails_closed() {
+        use std::collections::BTreeMap;
+
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Arm, Expr, IrType, Match, Pat, SliceOwnership};
+
+        use super::{reject_nonclone_value_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let model = fx.sym("model");
+        let tasks = fx.sym("tasks");
+        let x = fx.sym("x");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let list_task = IrType::List(Box::new(IrType::Task(Box::new(IrType::Int))));
+        let record = IrType::Record(BTreeMap::from([(tasks, list_task.clone())]));
+        let field = || Expr::Access {
+            record: Box::new(Expr::Var(model)),
+            field: tasks,
+            field_ty: list_task.clone(),
+        };
+        let slice = Pat::Slice {
+            prefix: vec![Pat::Var(x)],
+            rest: None,
+            own: SliceOwnership::OwnedMove,
+            elem: IrType::Task(Box::new(IrType::Int)),
+        };
+        let case = Expr::Match(
+            Match::new_flat(
+                field(),
+                vec![
+                    Arm::new(slice, Expr::Int(1)),
+                    Arm::new(Pat::Wildcard, Expr::Int(0)),
+                ],
+            )
+            .expect("flat match"),
+        );
+        let read_after = Expr::Tuple(vec![case, field()]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, model, &record, &read_after, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+    }
+
+    /// A second use of an FFI-handle list moved by a list `case` is refused by the foreign-handle gate.
+    #[test]
+    fn owned_ffi_handle_list_case_reuse_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Expr, IrType, ModPath, SliceOwnership};
+
+        use super::{reject_foreign_handle_reuse, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let hs = fx.sym("hs");
+        let h = fx.sym("h");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let handles = IrType::List(Box::new(IrType::Enum {
+            home: ModPath(vec![rust, bevy]),
+            name: entity,
+            args: vec![],
+        }));
+        let reused = Expr::Tuple(vec![
+            cons_case(hs, h, r, SliceOwnership::OwnedMove),
+            Expr::Var(hs),
+        ]);
+        assert_eq!(
+            reject_foreign_handle_reuse(env, hs, &handles, &reused, span),
+            Err(unsupported(span, Feature::ForeignHandleReuse))
+        );
+    }
+
+    /// A list `case` over a non-`Clone` capture inside a re-callable closure is refused with IPE-L0126.
+    #[test]
+    fn owned_list_case_in_recallable_closure_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::SliceOwnership;
+        use ipe_ir::once_closure::CaptureScope;
+
+        use super::{CaptureWalk, rewrite_captured_clones, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let ts = fx.sym("ts");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let span = Span::new(17, 23);
+        let noncl = BTreeSet::from([ts]);
+        let refused = rewrite_captured_clones(
+            &BTreeSet::new(),
+            &noncl,
+            &CaptureWalk::refusing(span),
+            cons_case(ts, x, r, SliceOwnership::OwnedMove),
+            CaptureScope::InRecallable,
+        );
+        assert_eq!(
+            refused.map(|_| ()),
+            Err(unsupported(span, Feature::NonCloneCapture))
+        );
+    }
+
+    /// An owned-move list element alias whose inner binds is refused with IPE-L0135.
+    #[test]
+    fn owned_slice_element_alias_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{ModPath, Pat, SliceOwnership};
+
+        use super::{owned_slice_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let maybe = fx.sym("Maybe");
+        let just = fx.sym("Just");
+        let t = fx.sym("t");
+        let m = fx.sym("m");
+        let span = Span::new(17, 23);
+        let just_t = Pat::Ctor {
+            home: ModPath(vec![maybe]),
+            ty: maybe,
+            variant: just,
+            args: vec![Pat::Var(t)],
+        };
+        let aliased = [Pat::Alias(Box::new(just_t), m)];
+        assert_eq!(
+            owned_slice_refusal(SliceOwnership::OwnedMove, &aliased, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // A borrowed slice copies each element, so the alias stays accepted.
+        assert_eq!(
+            owned_slice_refusal(SliceOwnership::BorrowClone, &aliased, span),
+            Ok(())
+        );
+    }
+
+    /// A binding or-pattern over an owned list view is refused with IPE-L0116; one binding nothing is accepted.
+    #[test]
+    fn owned_or_pattern_binding_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{Pat, SliceOwnership};
+
+        use super::{owned_or_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let x = fx.sym("x");
+        let span = Span::new(17, 23);
+        let slice = |own, prefix: Vec<Pat>| Pat::Slice {
+            prefix,
+            rest: None,
+            own,
+            elem: ipe_ir::IrType::Task(Box::new(ipe_ir::IrType::Int)),
+        };
+        let binding = [
+            slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),
+            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard, Pat::Var(x)]),
+        ];
+        assert_eq!(
+            owned_or_refusal(&binding, span),
+            Err(unsupported(span, Feature::NestedCtorDiscrimination))
+        );
+        let unbound = [
+            slice(SliceOwnership::OwnedMove, vec![]),
+            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard]),
+        ];
+        assert_eq!(owned_or_refusal(&unbound, span), Ok(()));
+        // A borrowed view copies each binder out, so a binding or-pattern stays accepted.
+        let borrowed = [
+            slice(SliceOwnership::BorrowClone, vec![Pat::Var(x)]),
+            slice(
+                SliceOwnership::BorrowClone,
+                vec![Pat::Wildcard, Pat::Var(x)],
+            ),
+        ];
+        assert_eq!(owned_or_refusal(&borrowed, span), Ok(()));
+    }
+
+    /// A binding nested list in a constructor payload over a non-`Clone` element is refused with IPE-L0116.
+    #[test]
+    fn nested_owned_cons_in_ctor_payload_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{IrType, SliceOwnership};
+
+        use super::{nested_cons_ownership_refusal, slice_ownership, unsupported};
+
+        let fx = OwnFixture::new();
+        let span = Span::new(17, 23);
+        let own = slice_ownership(fx.env(), &IrType::Task(Box::new(IrType::Int)));
+        assert_eq!(
+            nested_cons_ownership_refusal(own, span),
+            Err(unsupported(span, Feature::NestedCtorDiscrimination))
+        );
+        assert_eq!(
+            nested_cons_ownership_refusal(SliceOwnership::BorrowClone, span),
+            Ok(())
+        );
+    }
+
+    /// An alias whose inner binds over a non-`Clone` part is refused with IPE-L0135.
+    #[test]
+    fn alias_rebuild_over_nonclone_part_fails_closed() {
+        use ipe_diagnostics::Feature;
+        use ipe_ir::{IrType, Pat};
+
+        use super::{alias_rebuild_refusal, unsupported};
+
+        let mut fx = OwnFixture::new();
+        let a = fx.sym("a");
+        let b = fx.sym("b");
+        let g = fx.sym("g");
+        let rust = fx.sym("Rust");
+        let bevy = fx.sym("Bevy_ecs");
+        let entity = fx.sym("Entity");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let task = IrType::Task(Box::new(IrType::Int));
+        let pair = Pat::Tuple(vec![Pat::Var(a), Pat::Var(b)]);
+        let nonclone = IrType::Tuple(vec![task, IrType::Int]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &pair, &nonclone, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+        // An inner that binds nothing takes no part.
+        let unbound = Pat::Tuple(vec![Pat::Wildcard, Pat::Wildcard]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &unbound, &nonclone, span),
+            Ok(())
+        );
+        // A `Clone` part and a generic part copy.
+        let clone_part = IrType::Tuple(vec![IrType::Str, IrType::Int]);
+        assert_eq!(alias_rebuild_refusal(env, &pair, &clone_part, span), Ok(()));
+        assert_eq!(
+            alias_rebuild_refusal(env, &Pat::Var(a), &IrType::Generic(g), span),
+            Ok(())
+        );
+        // A composite over a row witness carries the emitted `Clone` bound.
+        let row_part = IrType::Tuple(vec![IrType::RowGeneric(g), IrType::Int]);
+        assert_eq!(alias_rebuild_refusal(env, &pair, &row_part, span), Ok(()));
+        // An opaque FFI handle nested in the part has no `Clone` fact.
+        let handle = IrType::Enum {
+            home: ipe_ir::ModPath(vec![rust, bevy]),
+            name: entity,
+            args: Vec::new(),
+        };
+        let ffi_part = IrType::Tuple(vec![handle, IrType::Int]);
+        assert_eq!(
+            alias_rebuild_refusal(env, &pair, &ffi_part, span),
+            Err(unsupported(span, Feature::NonCloneValueReuse))
+        );
+    }
+
+    /// A binding alias whose part has no recorded region type is refused as a compiler bug.
+    #[test]
+    fn alias_part_without_region_type_is_a_compiler_bug() {
+        use ipe_diagnostics::Diagnostic;
+        use ipe_ir::Pat;
+
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let main = interner.intern("Main").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![main],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = covers_fixture_lowerer(&module, &types, &interner, &builtins);
+        let unrecorded = Span::new(17, 23);
+        let refused = lowerer.refuse_nonclone_alias_part(&Pat::Var(x), unrecorded, unrecorded);
+        assert!(
+            matches!(
+                refused,
+                Err(Diagnostic::CompilerBug {
+                    where_: "ipe_lower::refuse_nonclone_alias_part",
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // An inner that binds nothing takes no part and needs no type.
+        assert_eq!(
+            lowerer.refuse_nonclone_alias_part(&Pat::Wildcard, unrecorded, unrecorded),
+            Ok(())
+        );
+    }
+
+    /// A borrowed list `case` over `List Int` leaves the list owned, so a later reuse stays accepted.
+    #[test]
+    fn borrowed_list_case_reuse_is_accepted() {
+        use ipe_ir::{Expr, IrType, SliceOwnership};
+
+        use super::{owned_slice_refusal, reject_nonclone_value_reuse, slice_ownership};
+
+        let mut fx = OwnFixture::new();
+        let xs = fx.sym("xs");
+        let x = fx.sym("x");
+        let r = fx.sym("r");
+        let env = fx.env();
+        let span = Span::new(17, 23);
+        let list_int = IrType::List(Box::new(IrType::Int));
+        let own = slice_ownership(env, &IrType::Int);
+        assert_eq!(own, SliceOwnership::BorrowClone);
+        assert_eq!(owned_slice_refusal(own, &[], span), Ok(()));
+        let reused = Expr::Tuple(vec![cons_case(xs, x, r, own), Expr::Var(xs)]);
+        assert_eq!(
+            reject_nonclone_value_reuse(env, xs, &list_int, &reused, span),
+            Ok(())
+        );
+    }
+
+    /// A `case` whose scrutinee is the same two-arm `case`, `depth` levels deep.
+    fn nested_scrutinee_case(depth: usize) -> canon::Expr {
+        let unit = || Located::new(Span::DUMMY, canon::Expr_::Unit);
+        let arm = || canon::CaseBranch {
+            pat: Located::new(Span::DUMMY, canon::Pattern_::PAnything),
+            body: unit(),
+        };
+        (0..depth).fold(unit(), |scrutinee, _| {
+            Located::new(
+                Span::DUMMY,
+                canon::Expr_::Case(Box::new(scrutinee), vec![arm(), arm()]),
+            )
+        })
+    }
+
+    /// A `case` scrutinee is classified once for all of its arms.
+    ///
+    /// Each of the 24 levels walks its scrutinee once and its two arm bodies
+    /// once: `3 * depth + 1` walks. Classifying the scrutinee per arm doubles
+    /// the walk at every level, `2^depth` walks.
+    #[test]
+    fn nested_case_scrutinee_carrier_walk_is_linear() {
+        const DEPTH: usize = 24;
+        let expr = nested_scrutinee_case(DEPTH);
+        with_binder_type_lowerer(|lowerer, _| {
+            lowerer.carrier_walks.set(0);
+            assert_eq!(lowerer.value_carrier_type(&expr), None);
+            let walks = lowerer.carrier_walks.get();
+            assert!(
+                walks <= 3 * DEPTH + 1,
+                "{walks} carrier walks over a {DEPTH}-deep case scrutinee"
+            );
+        });
+    }
+
+    /// An `Arc` function, the payload every container case below wraps.
+    fn shared_fn() -> IrType {
+        IrType::SharedFun(vec![IrType::Int], Box::new(IrType::Bool))
+    }
+
+    /// A `Box` function, the payload no container case below may report.
+    fn direct_fn() -> IrType {
+        IrType::Fun(vec![IrType::Int], Box::new(IrType::Bool))
+    }
+
+    /// Every container shape over `item`, one per type-carrying [`IrType`] position.
+    fn every_container(item: &IrType) -> Vec<(&'static str, IrType)> {
+        let boxed = || Box::new(item.clone());
+        vec![
+            ("Task", IrType::Task(boxed())),
+            ("Cmd", IrType::Cmd(boxed())),
+            ("Sub", IrType::Sub(boxed())),
+            ("Decoder", IrType::Decoder(boxed())),
+            ("Maybe", IrType::Maybe(boxed())),
+            ("List", IrType::List(boxed())),
+            ("Set", IrType::Set(boxed())),
+            ("WebRoute", IrType::WebRoute(boxed())),
+            (
+                "Ui",
+                IrType::Ui {
+                    ctor: ipe_ir::UiCtor::Html,
+                    msg: boxed(),
+                },
+            ),
+            ("Result err", IrType::Result(boxed(), Box::new(IrType::Int))),
+            ("Result ok", IrType::Result(Box::new(IrType::Int), boxed())),
+            ("Dict key", IrType::Dict(boxed(), Box::new(IrType::Int))),
+            ("Dict value", IrType::Dict(Box::new(IrType::Int), boxed())),
+            (
+                "CustomElement down",
+                IrType::CustomElement {
+                    down: boxed(),
+                    up: Box::new(IrType::Unit),
+                },
+            ),
+            (
+                "CustomElement up",
+                IrType::CustomElement {
+                    down: Box::new(IrType::Unit),
+                    up: boxed(),
+                },
+            ),
+            (
+                "Fun param",
+                IrType::Fun(vec![item.clone()], Box::new(IrType::Unit)),
+            ),
+            ("Fun return", IrType::Fun(vec![IrType::Unit], boxed())),
+            (
+                "FnOnceChain param",
+                IrType::FnOnceChain(vec![item.clone()], Box::new(IrType::Unit)),
+            ),
+            (
+                "FnOnceChain return",
+                IrType::FnOnceChain(vec![IrType::Unit], boxed()),
+            ),
+            ("Tuple", IrType::Tuple(vec![IrType::Int, item.clone()])),
+            (
+                "Record",
+                IrType::Record(BTreeMap::from([(
+                    ipe_intern::Symbol::from_raw(1),
+                    item.clone(),
+                )])),
+            ),
+            (
+                "Enum",
+                IrType::Enum {
+                    home: ipe_ir::ModPath(Vec::new()),
+                    name: ipe_intern::Symbol::from_raw(2),
+                    args: vec![item.clone()],
+                },
+            ),
+        ]
+    }
+
+    /// An `Arc` function under every container shape is seen.
+    #[test]
+    fn ir_holds_shared_sees_an_arc_fn_under_every_container() {
+        assert!(super::ir_holds_shared(&shared_fn()));
+        for (shape, ty) in every_container(&shared_fn()) {
+            assert!(
+                super::ir_holds_shared(&ty),
+                "an Arc function under `{shape}` is missed"
+            );
+        }
+    }
+
+    /// A `Box` function or a plain value under every container shape is not reported as `Arc`.
+    #[test]
+    fn ir_holds_shared_refuses_a_direct_fn_under_every_container() {
+        for item in [direct_fn(), IrType::Int] {
+            assert!(!super::ir_holds_shared(&item));
+            for (shape, ty) in every_container(&item) {
+                assert!(
+                    !super::ir_holds_shared(&ty),
+                    "`{shape}` over {item:?} is reported as holding an Arc function"
+                );
+            }
+        }
     }
 }

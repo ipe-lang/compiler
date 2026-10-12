@@ -98,7 +98,7 @@ fn runtime_crate_root() -> PathBuf {
         .expect("runtime crate root canonicalizes")
 }
 
-/// The dependency-model native manifest — the DEFAULT `ipe build` shape: the app
+/// The dependency-model native manifest — the DEFAULT `ipe dev build` shape: the app
 /// crate declares the runtime as a path dependency selected by the SSOT feature
 /// list, so the security-forbidden crates are absent from the app manifest and
 /// only the server-free subset is pulled transitively by the `webview` feature.

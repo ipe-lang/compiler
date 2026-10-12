@@ -42,6 +42,8 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+use crate::web::route::MountRefusal;
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Attribute written on the overlay root so nothing in the app's ipe-id
@@ -138,54 +140,67 @@ pub(super) fn mount_overlay() -> Option<Rc<OverlayState>> {
     let result = try_mount_overlay();
     match result {
         Ok(state) => Some(Rc::new(state)),
-        Err(msg) => {
-            super::console_warn(&format!("debugger-overlay mount failed: {msg}"));
+        Err(refusal) => {
+            super::console_warn(&format!("debugger-overlay mount failed: {refusal}"));
             None
         }
     }
 }
 
-fn try_mount_overlay() -> Result<OverlayState, String> {
-    let window = web_sys::window().ok_or("no window")?;
-    let document = window.document().ok_or("no document")?;
-    let body: web_sys::HtmlElement = document.body().ok_or("no body")?;
+/// The refusal for a DOM `step` the platform rejected with `error`.
+fn dom_refusal(step: &'static str, error: &JsValue) -> MountRefusal {
+    MountRefusal::Dom {
+        step,
+        detail: Some(format!("{error:?}")),
+    }
+}
+
+/// The refusal for a DOM `step` that failed without a platform report.
+const fn dom_step(step: &'static str) -> MountRefusal {
+    MountRefusal::Dom { step, detail: None }
+}
+
+fn try_mount_overlay() -> Result<OverlayState, MountRefusal> {
+    let window = web_sys::window().ok_or(MountRefusal::NoWindow)?;
+    let document = window.document().ok_or(MountRefusal::NoDocument)?;
+    let body: web_sys::HtmlElement = document.body().ok_or(MountRefusal::NoBody)?;
 
     // ── Root container ────────────────────────────────────────────────────
     let root: web_sys::HtmlElement = document
         .create_element("div")
-        .map_err(|e| format!("createElement(div): {e:?}"))?
+        .map_err(|e| dom_refusal("createElement(div)", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "root cast to HtmlElement failed")?;
+        .map_err(|_| dom_step("root cast to HtmlElement"))?;
 
     root.set_attribute(OVERLAY_ATTR, "1")
-        .map_err(|e| format!("setAttribute: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute", &e))?;
     root.set_attribute("style", OVERLAY_STYLE)
-        .map_err(|e| format!("setAttribute style: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute style", &e))?;
 
     // ── Header row (drag handle + tip) ────────────────────────────────────
     let header: web_sys::HtmlElement = document
         .create_element("div")
-        .map_err(|e| format!("createElement header: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement header", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "header cast failed")?;
+        .map_err(|_| dom_step("header cast"))?;
     header
         .set_attribute("style", HEADER_STYLE)
-        .map_err(|e| format!("setAttribute header style: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute header style", &e))?;
     header.set_attribute(OVERLAY_ATTR, "1").ok();
 
     let title: web_sys::HtmlElement = document
         .create_element("span")
-        .map_err(|e| format!("createElement title: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement title", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "title cast failed")?;
+        .map_err(|_| dom_step("title cast"))?;
     title.set_text_content(Some("⏱ Debugger"));
     title.set_attribute("style", "font-weight:bold;").ok();
 
     let tip: web_sys::HtmlElement = document
         .create_element("span")
-        .map_err(|e| format!("createElement tip: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement tip", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "tip cast failed")?;
+        .map_err(|_| dom_step("tip cast"))?;
     // Static tip text; set via text_content (never innerHTML) — no interpolation
     // of untrusted data, so no injection surface.
     tip.set_text_content(Some(&format!("drag to move · {TOGGLE_HINT} to close")));
@@ -194,85 +209,85 @@ fn try_mount_overlay() -> Result<OverlayState, String> {
 
     header
         .append_child(&title)
-        .map_err(|e| format!("appendTitle: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendTitle", &e))?;
     header
         .append_child(&tip)
-        .map_err(|e| format!("appendTip: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendTip", &e))?;
     root.append_child(&header)
-        .map_err(|e| format!("appendHeader: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendHeader", &e))?;
 
     // ── Collapsed launcher tab ────────────────────────────────────────────
     let tab: web_sys::HtmlElement = document
         .create_element("div")
-        .map_err(|e| format!("createElement tab: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement tab", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "tab cast failed")?;
+        .map_err(|_| dom_step("tab cast"))?;
     tab.set_attribute(OVERLAY_ATTR, "1").ok();
     tab.set_attribute("style", TAB_STYLE)
-        .map_err(|e| format!("setAttribute tab style: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute tab style", &e))?;
     tab.set_text_content(Some(&format!("⏱ Debugger ({TOGGLE_HINT})")));
 
     // ── Scrubber row ──────────────────────────────────────────────────────
     let scrubber_row: web_sys::HtmlElement = document
         .create_element("div")
-        .map_err(|e| format!("createElement scrubber-row: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement scrubber-row", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "scrubber-row cast failed")?;
+        .map_err(|_| dom_step("scrubber-row cast"))?;
     scrubber_row
         .set_attribute("style", SCRUBBER_STYLE)
-        .map_err(|e| format!("setAttribute scrubber-row style: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute scrubber-row style", &e))?;
 
     // Label
     let label: web_sys::HtmlElement = document
         .create_element("span")
-        .map_err(|e| format!("createElement span: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement span", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "label cast failed")?;
+        .map_err(|_| dom_step("label cast"))?;
     label.set_text_content(Some("▶ Debugger"));
     label
         .set_attribute("style", "flex-shrink:0;opacity:.7;")
-        .map_err(|e| format!("setAttribute label style: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute label style", &e))?;
 
     // Range input
     let scrubber: web_sys::HtmlInputElement = document
         .create_element("input")
-        .map_err(|e| format!("createElement input: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement input", &e))?
         .dyn_into::<web_sys::HtmlInputElement>()
-        .map_err(|_| "input cast to HtmlInputElement failed")?;
+        .map_err(|_| dom_step("input cast to HtmlInputElement"))?;
     scrubber.set_type("range");
     scrubber.set_min("0");
     scrubber.set_max("0");
     scrubber.set_value("0");
     scrubber
         .set_attribute("style", "flex:1;min-width:0;")
-        .map_err(|e| format!("setAttribute scrubber style: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute scrubber style", &e))?;
 
     scrubber_row
         .append_child(&label)
-        .map_err(|e| format!("appendLabel: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendLabel", &e))?;
     scrubber_row
         .append_child(&scrubber)
-        .map_err(|e| format!("appendScrubber: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendScrubber", &e))?;
 
     // ── Message list ──────────────────────────────────────────────────────
     let list_el: web_sys::HtmlElement = document
         .create_element("div")
-        .map_err(|e| format!("createElement list: {e:?}"))?
+        .map_err(|e| dom_refusal("createElement list", &e))?
         .dyn_into::<web_sys::HtmlElement>()
-        .map_err(|_| "list cast failed")?;
+        .map_err(|_| dom_step("list cast"))?;
     list_el
         .set_attribute("style", LIST_STYLE)
-        .map_err(|e| format!("setAttribute list style: {e:?}"))?;
+        .map_err(|e| dom_refusal("setAttribute list style", &e))?;
 
     root.append_child(&scrubber_row)
-        .map_err(|e| format!("appendScrubberRow: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendScrubberRow", &e))?;
     root.append_child(&list_el)
-        .map_err(|e| format!("appendList: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendList", &e))?;
 
     body.append_child(&root)
-        .map_err(|e| format!("appendRoot: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendRoot", &e))?;
     body.append_child(&tab)
-        .map_err(|e| format!("appendTab: {e:?}"))?;
+        .map_err(|e| dom_refusal("appendTab", &e))?;
 
     Ok(OverlayState {
         root,

@@ -413,9 +413,12 @@ impl PackageName {
 /// (`[dependencies.evil]`, a path override) into the generated file. Gating
 /// here at the decode boundary — the same surface [`PackageName`] and
 /// [`PkgPath`] are gated on — makes an injection-bearing version
-/// unrepresentable past decode; the charset mirrors the driver's `VersionPin`
-/// (the CLI-supplied version pin), so both halves of a `name@version` spec and
-/// every resolved dependency share one semver-value gate.
+/// unrepresentable past decode.
+///
+/// The value is parsed as a `SemVer` version, `MAJOR.MINOR.PATCH[-PRE][+BUILD]`,
+/// never as requirement text: the emitter prefixes `=`, and `=` followed by a
+/// `SemVer` version is always a requirement Cargo accepts, while requirement
+/// text (`*`, `=1`, `>=1, <2`) after that `=` is one Cargo refuses.
 ///
 /// An EMPTY version is legal here — the inspector reports an empty version on a
 /// probe failure, and the manifest emitter's own downstream check refuses to
@@ -427,13 +430,12 @@ pub struct CrateVersion(String);
 
 /// Whether `c` may appear in a crate-version requirement value.
 ///
-/// The single semver-value charset `[0-9A-Za-z.*=<>~^,+ -]`, shared by both
-/// version newtypes: [`CrateVersion`] (the wire-decode boundary) and
-/// [`crate::driver::VersionPin`] (the CLI `name@version` boundary). A version
-/// is spliced into a TOML value position in the emitted manifest; every
-/// character outside this set (quote, bracket, brace, backslash, control, …)
-/// is excluded so a value can never close its string and inject manifest
-/// content.
+/// The requirement charset `[0-9A-Za-z.*=<>~^,+ -]` of
+/// [`crate::driver::VersionPin`] (the CLI `name@version` boundary). A
+/// requirement is spliced into a TOML value position of the inspector's probe
+/// manifest; every character outside this set (quote, bracket, brace,
+/// backslash, control, …) is excluded so a value can never close its string
+/// and inject manifest content.
 pub(crate) const fn version_char_is_legal(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -443,15 +445,14 @@ pub(crate) const fn version_char_is_legal(c: char) -> bool {
 }
 
 impl CrateVersion {
-    /// Validate and wrap a crate version (possibly empty).
+    /// Parse a crate version: a `SemVer` version, or empty.
     ///
     /// # Errors
     ///
-    /// [`crate::diag::WireDefect::InvalidVersion`] when the text carries a
-    /// character outside the semver-value charset.
+    /// [`crate::diag::WireDefect::InvalidVersion`] when non-empty text is not a
+    /// `SemVer` version `MAJOR.MINOR.PATCH[-PRE][+BUILD]`.
     pub fn parse(s: &str) -> Result<Self, crate::diag::WireDefect> {
-        let legal = s.chars().all(version_char_is_legal);
-        if legal {
+        if s.is_empty() || is_semver_version(s) {
             Ok(Self(s.to_owned()))
         } else {
             Err(crate::diag::WireDefect::InvalidVersion { got: s.to_owned() })
@@ -469,6 +470,51 @@ impl CrateVersion {
     pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// Whether `s` is a `SemVer` version `MAJOR.MINOR.PATCH[-PRE][+BUILD]`.
+///
+/// The grammar is the one Cargo's `semver` crate reads after `=`: three
+/// `u64` numeric identifiers without leading zeros, then optional dot-separated
+/// pre-release and build identifiers over `[0-9A-Za-z-]`, where a numeric
+/// pre-release identifier carries no leading zero.
+fn is_semver_version(s: &str) -> bool {
+    let (rest, build) = s.split_once('+').map_or((s, None), |(r, b)| (r, Some(b)));
+    let (core, pre) = rest
+        .split_once('-')
+        .map_or((rest, None), |(c, p)| (c, Some(p)));
+    let mut parts = core.split('.');
+    let core_legal = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if [major, minor, patch].into_iter().all(is_numeric_identifier)
+    );
+    core_legal
+        && pre.is_none_or(|p| p.split('.').all(is_prerelease_identifier))
+        && build.is_none_or(|b| b.split('.').all(is_build_identifier))
+}
+
+/// Whether `s` is a `SemVer` numeric identifier: a `u64` with no leading zero.
+fn is_numeric_identifier(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
+        && (s == "0" || !s.starts_with('0'))
+        && s.parse::<u64>().is_ok()
+}
+
+/// Whether `s` is a `SemVer` pre-release identifier.
+///
+/// A non-empty `[0-9A-Za-z-]` run; an all-digit one is a numeric identifier.
+fn is_prerelease_identifier(s: &str) -> bool {
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        is_numeric_identifier(s)
+    } else {
+        is_build_identifier(s)
+    }
+}
+
+/// Whether `s` is a `SemVer` build identifier: a non-empty `[0-9A-Za-z-]` run.
+fn is_build_identifier(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// A validated inspector-reported package path.
@@ -519,8 +565,15 @@ impl PkgPath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrapperCratePath(String);
 
-/// The read ceiling for a wrapper crate's `Cargo.toml`, in bytes.
-pub const WRAPPER_MANIFEST_LIMIT: u64 = 1024 * 1024;
+/// The read ceiling for a wrapper crate's `Cargo.toml`.
+pub const WRAPPER_MANIFEST_CAP: ipe_fs_open::ByteCap =
+    ipe_fs_open::ByteCap::from_nonzero(std::num::NonZeroU64::MIN.saturating_add(1024 * 1024 - 1));
+
+/// [`WRAPPER_MANIFEST_CAP`] in bytes, as an oversized-manifest refusal reports it.
+pub const WRAPPER_MANIFEST_LIMIT: u64 = WRAPPER_MANIFEST_CAP.get();
+
+/// The file name of a wrapper crate's manifest inside its directory.
+const WRAPPER_MANIFEST_FILE: &str = "Cargo.toml";
 
 impl WrapperCratePath {
     /// Validate and wrap a wrapper-crate path.
@@ -651,38 +704,19 @@ struct WrapperCargoPackage {
 
 /// Read and parse the `[package] name` of the `Cargo.toml` in `dir`.
 ///
-/// The manifest is opened without following a symlink at its final
-/// component, must be a regular file, and is read up to
-/// [`WRAPPER_MANIFEST_LIMIT`] bytes; one byte more is refused as oversized.
+/// The manifest is opened through `ipe_fs_open` relative to the held `dir`:
+/// never through a link at its name, never blocking, proven a regular file
+/// from the opened handle, and read up to [`WRAPPER_MANIFEST_CAP`]; one byte
+/// more is refused as oversized.
 fn read_wrapper_package(
     dir: &std::path::Path,
 ) -> Result<PackageName, crate::diag::WrapperManifestDefect> {
     use crate::diag::WrapperManifestDefect as Defect;
-    use std::io::Read as _;
-    let unreadable = |e: std::io::Error| Defect::Unreadable {
-        detail: e.to_string(),
-    };
-    let file = open_manifest_no_follow(&dir.join("Cargo.toml"))?;
-    let metadata = file.metadata().map_err(unreadable)?;
-    if !metadata.is_file() {
-        return Err(Defect::NotRegularFile);
-    }
-    let oversized = Defect::Oversized {
-        limit: WRAPPER_MANIFEST_LIMIT,
-    };
-    if metadata.len() > WRAPPER_MANIFEST_LIMIT {
-        return Err(oversized);
-    }
-    let mut bytes = Vec::new();
-    file.take(WRAPPER_MANIFEST_LIMIT.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(unreadable)?;
-    if !u64::try_from(bytes.len()).is_ok_and(|n| n <= WRAPPER_MANIFEST_LIMIT) {
-        return Err(oversized);
-    }
-    let text = String::from_utf8(bytes).map_err(|e| Defect::Invalid {
-        detail: e.to_string(),
-    })?;
+    use ipe_fs_open::{EntryName, HeldDir};
+    let text = EntryName::parse(std::ffi::OsStr::new(WRAPPER_MANIFEST_FILE))
+        .and_then(|name| HeldDir::open_root(dir)?.open_regular(&name))
+        .and_then(|file| file.read_utf8(WRAPPER_MANIFEST_CAP))
+        .map_err(manifest_refusal)?;
     let manifest: WrapperCargoManifest = toml::from_str(&text).map_err(|e| Defect::Invalid {
         detail: e.message().to_owned(),
     })?;
@@ -690,66 +724,25 @@ fn read_wrapper_package(
     PackageName::parse(&found).map_err(|_| Defect::PackageNameIllegal { found })
 }
 
-/// Open `path` read-only without following a symlink at its final component.
-///
-/// `O_NONBLOCK` keeps a FIFO planted in place of the manifest from blocking
-/// the open; the caller's regular-file check then refuses it.
-#[cfg(unix)]
-fn open_manifest_no_follow(
-    path: &std::path::Path,
-) -> Result<std::fs::File, crate::diag::WrapperManifestDefect> {
+/// The manifest defect a refused open or read of the wrapper `Cargo.toml` reports.
+fn manifest_refusal(refusal: ipe_fs_open::OpenRefusal) -> crate::diag::WrapperManifestDefect {
     use crate::diag::WrapperManifestDefect as Defect;
-    use rustix::fs::{Mode, OFlags};
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    rustix::fs::open(path, flags, Mode::empty())
-        .map(std::fs::File::from)
-        .map_err(|errno| {
-            let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-            if is_link {
-                Defect::NotRegularFile
-            } else {
-                Defect::Unreadable {
-                    detail: std::io::Error::from(errno).to_string(),
-                }
-            }
-        })
-}
-
-/// Open `path` read-only, refusing a reparse point at its final component.
-#[cfg(windows)]
-fn open_manifest_no_follow(
-    path: &std::path::Path,
-) -> Result<std::fs::File, crate::diag::WrapperManifestDefect> {
-    use crate::diag::WrapperManifestDefect as Defect;
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    /// `FILE_FLAG_OPEN_REPARSE_POINT`: opens a reparse point itself, never its target.
-    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
-    const ATTR_REPARSE_POINT: u32 = 0x400;
-    let unreadable = |e: std::io::Error| Defect::Unreadable {
-        detail: e.to_string(),
-    };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(unreadable)?;
-    let attributes = file.metadata().map_err(unreadable)?.file_attributes();
-    if attributes & ATTR_REPARSE_POINT == 0 {
-        Ok(file)
-    } else {
-        Err(Defect::NotRegularFile)
+    use ipe_fs_open::OpenRefusal;
+    match refusal {
+        OpenRefusal::Link | OpenRefusal::NotRegular(_) => Defect::NotRegularFile,
+        OpenRefusal::TooLarge(cap) => Defect::Oversized { limit: cap.get() },
+        OpenRefusal::NotUtf8 => Defect::Invalid {
+            detail: refusal.to_string(),
+        },
+        OpenRefusal::Absent
+        | OpenRefusal::Denied
+        | OpenRefusal::InUse
+        | OpenRefusal::BadName
+        | OpenRefusal::TooManyEntries(_)
+        | OpenRefusal::Io(_) => Defect::Unreadable {
+            detail: refusal.to_string(),
+        },
     }
-}
-
-/// Refuse: this platform has no symlink-refusing open.
-#[cfg(not(any(unix, windows)))]
-fn open_manifest_no_follow(
-    _path: &std::path::Path,
-) -> Result<std::fs::File, crate::diag::WrapperManifestDefect> {
-    Err(crate::diag::WrapperManifestDefect::Unreadable {
-        detail: "this platform has no symlink-refusing open".to_owned(),
-    })
 }
 
 /// A wrapper-crate directory proven, at load, to be the crate cargo builds.
@@ -2501,12 +2494,20 @@ mod tests {
         ));
     }
 
-    // Legal semver requirement text (exact pins, ranges, prereleases, the
-    // empty unresolved-probe version) must still decode — the gate rejects
-    // only the TOML-breaking charset, never ordinary version syntax.
+    // Every `SemVer` version (pre-release and build metadata included) and the
+    // empty unresolved-probe version decode.
     #[test]
     fn legal_versions_decode() {
-        for ok in ["1.0.26", "=1.0.0-rc.6", ">=1, <2", "1.2.3+build.5", "*", ""] {
+        for ok in [
+            "1.0.26",
+            "0.0.0",
+            "1.0.0-rc.6",
+            "1.0.0-alpha-1.0.x",
+            "1.2.3+build.5",
+            "1.2.3+001",
+            "1.0.0-rc.1+exp.sha.5114f85",
+            "",
+        ] {
             let v = json!({
                 "pkg": "semver",
                 "name": "semver",
@@ -2515,6 +2516,61 @@ mod tests {
                 "errors": []
             });
             assert!(decode(&v).is_ok(), "{ok:?} must decode");
+        }
+    }
+
+    // Requirement text and malformed versions are refused at decode: the
+    // emitter renders `"=<version>"`, and each of these after `=` is a
+    // requirement Cargo rejects.
+    #[test]
+    fn requirement_text_and_malformed_versions_are_refused() {
+        for bad in [
+            "==1",
+            "=*",
+            "*",
+            "=1.0.0",
+            ">=1, <2",
+            "^1.2.3",
+            "1",
+            "1.0",
+            "1.0.0.0",
+            "01.0.0",
+            "1.00.0",
+            "1..0",
+            " 1.0.0",
+            "1.0.0 ",
+            "1.0.0-",
+            "1.0.0+",
+            "1.0.0-rc..1",
+            "1.0.0-01",
+            "1.0.0+a+b",
+            "18446744073709551616.0.0",
+        ] {
+            assert!(
+                matches!(
+                    CrateVersion::parse(bad),
+                    Err(WireDefect::InvalidVersion { .. })
+                ),
+                "{bad:?} must be refused"
+            );
+            let transitive = json!({
+                "pkg": "semver",
+                "name": "semver",
+                "version": "1.0.26",
+                "functions": [],
+                "errors": [],
+                "transitiveDeps": [{"ident": "serde", "name": "serde", "version": bad}]
+            });
+            assert!(
+                matches!(
+                    decode(&transitive),
+                    Err(Diagnostic::WireMalformed {
+                        defect: WireDefect::InvalidVersion { .. },
+                        ..
+                    })
+                ),
+                "{bad:?} as a transitive version must fail the whole package"
+            );
         }
     }
 
@@ -2717,5 +2773,95 @@ mod tests {
             "serde-json"
         );
         assert_eq!(pkg.modules(), ["semver".to_owned()]);
+    }
+
+    /// A wrapper manifest declaring the package `engine`.
+    const ENGINE_WRAPPER_MANIFEST: &str = "[package]\nname = \"engine\"\n";
+
+    /// A fresh, empty wrapper directory for one manifest-read test.
+    fn wrapper_scratch(name: &str) -> std::path::PathBuf {
+        let dir = ipe_test_temp::temp_root().join(format!(
+            "ipe-ffi-wrapper-read-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create wrapper scratch");
+        dir
+    }
+
+    /// `ENGINE_WRAPPER_MANIFEST` padded with a trailing comment to exactly `len` bytes.
+    fn padded_manifest(len: usize) -> Vec<u8> {
+        let mut bytes = ENGINE_WRAPPER_MANIFEST.as_bytes().to_vec();
+        bytes.push(b'#');
+        bytes.resize(len, b'x');
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_wrapper_cargo_toml_is_not_regular() {
+        let dir = wrapper_scratch("link");
+        let real = dir.join("real.toml");
+        let manifest = dir.join(WRAPPER_MANIFEST_FILE);
+        std::fs::write(&real, ENGINE_WRAPPER_MANIFEST).expect("write link target");
+        std::os::unix::fs::symlink(&real, &manifest).expect("symlink manifest");
+        let linked = read_wrapper_package(&dir);
+        std::fs::remove_file(&manifest).expect("remove link");
+        std::fs::rename(&real, &manifest).expect("make the manifest a plain file");
+        let plain = read_wrapper_package(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            linked,
+            Err(crate::diag::WrapperManifestDefect::NotRegularFile)
+        );
+        assert!(
+            matches!(&plain, Ok(name) if name.as_str() == "engine"),
+            "{plain:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_wrapper_cargo_toml_is_refused_not_hung() {
+        let dir = wrapper_scratch("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join(WRAPPER_MANIFEST_FILE))
+            .status();
+        assert!(matches!(made, Ok(s) if s.success()), "mkfifo: {made:?}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_dir = dir.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = tx.send(read_wrapper_package(&reader_dir));
+            })
+            .expect("spawn reader thread");
+        let read = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            read,
+            Ok(Err(crate::diag::WrapperManifestDefect::NotRegularFile))
+        );
+    }
+
+    #[test]
+    fn a_wrapper_manifest_one_past_the_limit_is_oversized() {
+        let limit = usize::try_from(WRAPPER_MANIFEST_LIMIT).expect("limit fits usize");
+        let dir = wrapper_scratch("oversized");
+        let manifest = dir.join(WRAPPER_MANIFEST_FILE);
+        std::fs::write(&manifest, padded_manifest(limit + 1)).expect("write oversized manifest");
+        let over = read_wrapper_package(&dir);
+        std::fs::write(&manifest, padded_manifest(limit)).expect("write manifest at the limit");
+        let at = read_wrapper_package(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            over,
+            Err(crate::diag::WrapperManifestDefect::Oversized {
+                limit: WRAPPER_MANIFEST_LIMIT
+            })
+        );
+        assert!(
+            matches!(&at, Ok(name) if name.as_str() == "engine"),
+            "{at:?}"
+        );
     }
 }

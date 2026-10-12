@@ -49,7 +49,7 @@ showProp name value =
     name ++ " -> " ++ Encode.encode 0 (Analytics.encodePropValue value)
 ```
 
-Running it (`ipe run`) redacts the PII, keeps the plain and numeric props, and
+Running it (`ipe dev run`) redacts the PII, keeps the plain and numeric props, and
 gates the event on consent — the `Granted` event reaches the stderr sink; the
 `Pending` and `Denied` events are dropped, and their Tasks still succeed:
 

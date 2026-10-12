@@ -148,8 +148,8 @@ or `keyFromBytes`; never forge from a plain string.
 ## `Mac`
 
 An opaque message authentication code (HMAC output).  Inspect via
-`macToHex`; never compare with `==` (use `constantTimeEqual` on the
-hex representation instead, or use a typed constant-time check).
+`macToHex`; check a tag against a message with `verifyHmacSha256`, which
+recomputes it and compares in constant time.
 
 ## `keyFromString`
 
@@ -157,9 +157,10 @@ hex representation instead, or use a typed constant-time check).
 keyFromString : String -> Maybe Key
 ```
 
-Parse a hex-encoded or raw string into a `Key`.  Returns `Nothing`
-for an empty key; a wrong-length key for a given algorithm fails closed
-at that algorithm's boundary (e.g. AEAD requires a 32-byte key).
+Wrap a string as a `Key`: the string's bytes are the key material as
+given, with no hex or other decoding.  Returns `Nothing` for an empty
+key; a wrong-length key for a given algorithm fails closed at that
+algorithm's boundary (e.g. AEAD requires a 32-byte key).
 
 ## `keyFromBytes`
 
@@ -177,6 +178,18 @@ macToHex : Mac -> String
 
 Render a `Mac` as a lowercase hex string for storage or display.
 
+## `macFromHex`
+
+```ipe
+macFromHex : String -> Maybe Mac
+```
+
+Parse a stored hex tag back into a `Mac`: exactly 64 hex digits (an
+HMAC-SHA-256 tag) or 128 (HMAC-SHA-512), in upper or lower case.
+Returns `Nothing` for anything else — empty, odd length, another length,
+a non-hex digit, whitespace, or a `0x` prefix.  `macToHex` renders the
+result in lowercase.
+
 ## `hmacSha256`
 
 ```ipe
@@ -192,4 +205,16 @@ hmacSha512 : Key -> String -> Mac
 ```
 
 `hmacSha512 key message` — HMAC-SHA-512.  Returns a typed `Mac`.
+
+## `verifyHmacSha256`
+
+```ipe
+verifyHmacSha256 : Key -> String -> Mac -> Bool
+```
+
+`verifyHmacSha256 key message mac` — `True` exactly when `mac` is the
+HMAC-SHA-256 tag of `message` under `key`.  The tag is recomputed and
+compared in constant time on the raw bytes, so a stored tag (parsed with
+`macFromHex`) is never trusted on its own.  An HMAC-SHA-512 `Mac` is
+always `False`.
 

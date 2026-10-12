@@ -67,7 +67,7 @@ decodeText buffer =
             "(not valid UTF-8)"
 ```
 
-Running it (`ipe run`) shows the full buffer round-trips but the truncated window
+Running it (`ipe dev run`) shows the full buffer round-trips but the truncated window
 does not:
 
 ```

@@ -38,7 +38,8 @@ use std::path::Path;
 use std::process::Command;
 
 use ipe_sandbox::run_jail::{
-    FilesystemScope, RunJailTools, RunResourceLimits, SandboxProfile, run_jail_argv,
+    CanaryExit, FilesystemScope, ProcCap, RunJailDefect, RunJailTools, RunResourceLimits,
+    SCOPE_SCRIPT, SandboxProfile, Scope, TEETH_SCRIPT, classify, prove, run_jail_argv,
 };
 use ipe_sandbox::{CanonicalPath, JailMounts};
 
@@ -68,6 +69,24 @@ fn e2e_tools() -> Option<RunJailTools> {
         prlimit,
         timeout: caps.timeout,
     };
+    // The proof's canaries spawn children, so they run under the lock that
+    // keeps every inheritable memfd to its one jail.
+    let proven = {
+        let _guard = JAIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        prove(&tools)
+    };
+    // A host whose jail can boot but whose cap counts the whole user (or no
+    // one) is exactly the host production refuses: a real failure here.
+    assert!(
+        !matches!(proven, Err(RunJailDefect::ProcCapUnscoped { .. })),
+        "the jail's process cap is not scoped to the jail on this host: {proven:?}"
+    );
+    if let Err(defect) = proven {
+        eprintln!(
+            "run_jail_e2e: skipping — the process-cap canary jail cannot run here: {defect:?}"
+        );
+        return None;
+    }
     if !jail_can_establish(&tools) {
         return None;
     }
@@ -91,7 +110,7 @@ fn e2e_tools() -> Option<RunJailTools> {
 /// Only an establishment failure gates skipping; a *successful* canary lets the
 /// real assertions run and catch a genuine jail bug. This is inert on the
 /// production path — it lives in the test harness and never touches how
-/// `ipe run` / `ipe exec` decide to refuse.
+/// `ipe dev run` / `ipe release run` decide to refuse.
 fn jail_can_establish(tools: &RunJailTools) -> bool {
     static CANARY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CANARY.get_or_init(|| {
@@ -135,7 +154,18 @@ struct Outcome {
 fn run_jailed(tools: &RunJailTools, profile: &SandboxProfile, payload: &[OsString]) -> Option<i32> {
     // The assertions inherit stderr (a diagnostic when one fails); only the
     // canary captures it.
-    run_jailed_inner(tools, profile, payload, false).code
+    run_jailed_inner(tools, profile, None, payload, false, |_| {}).code
+}
+
+/// Like [`run_jailed`], with `tree` bound as the working tree instead of the
+/// scratch.
+fn run_jailed_in_tree(
+    tools: &RunJailTools,
+    profile: &SandboxProfile,
+    tree: &Path,
+    payload: &[OsString],
+) -> Option<i32> {
+    run_jailed_inner(tools, profile, Some(tree), payload, false, |_| {}).code
 }
 
 /// Like [`run_jailed`], but captures `bwrap`'s stderr so an establishment
@@ -145,17 +175,21 @@ fn run_jailed_capturing(
     profile: &SandboxProfile,
     payload: &[OsString],
 ) -> Outcome {
-    run_jailed_inner(tools, profile, payload, true)
+    run_jailed_inner(tools, profile, None, payload, true, |_| {})
 }
 
 /// Shared spawn core. `capture_stderr` selects whether `bwrap`'s stderr is piped
-/// (canary) or inherited (assertions). Panics (fails the test) if the spawn
-/// itself could not be launched.
+/// (canary) or inherited (assertions). The working tree is `tree`, else the
+/// scratch. `after` inspects the host side of the scoped scratch once the jail
+/// has exited, before it is removed. Panics (fails the test) if the spawn itself
+/// could not be launched.
 fn run_jailed_inner(
     tools: &RunJailTools,
     profile: &SandboxProfile,
+    tree: Option<&Path>,
     payload: &[OsString],
     capture_stderr: bool,
+    after: impl FnOnce(&Path),
 ) -> Outcome {
     // Hold the global lock across the whole spawn — the memfd + cloexec-clear is
     // a process-wide fd-table mutation.
@@ -174,12 +208,18 @@ fn run_jailed_inner(
     let scoped = CanonicalPath::resolve(&scoped).expect("scoped tmp resolves");
     let system_bins = [Path::new("/usr/bin"), Path::new("/bin")]
         .map(|dir| CanonicalPath::resolve(dir).expect("system bin dir resolves"));
-    let mounts = JailMounts::of_invoker(scoped.clone(), scoped.clone(), system_bins.to_vec())
+    let working_tree = tree.map_or_else(
+        || scoped.clone(),
+        |tree| CanonicalPath::resolve(tree).expect("working tree resolves"),
+    );
+    let mounts = JailMounts::of_invoker(scoped.clone(), working_tree, system_bins.to_vec())
         .expect("checked jail mounts");
     // `ipe_env` matches the launcher's crate-private passthrough for every name
     // but a home variable, and no profile in this file grants one.
     let host_env = |k: &str| ipe_env::var_os(k);
-    let argv = run_jail_argv(tools, profile, &mounts, Some(fd), &host_env, payload);
+    let scope = prove(tools).expect("the process cap is proven scoped to the jail");
+    let argv = run_jail_argv(&scope, profile, &mounts, Some(fd), &host_env, payload)
+        .expect("the argv builds");
     let (prog, rest) = argv.args().split_first().expect("non-empty argv");
     let mut cmd = Command::new(prog);
     cmd.args(rest);
@@ -189,11 +229,154 @@ fn run_jailed_inner(
     let out = cmd.output().expect("spawn jailed process");
     // Reap the memfd.
     drop(seccomp);
+    after(scoped.as_path());
     let _ = std::fs::remove_dir_all(&scoped);
     Outcome {
         code: out.status.code(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
+}
+
+/// A working tree holding a `.git` dir with a `HEAD` and a `hooks` dir, under
+/// the test temp root; removed by the caller.
+fn git_tree(label: &str) -> std::path::PathBuf {
+    let base = ipe_test_temp::temp_root().join(format!("ipe-e2e-{label}-{}", std::process::id()));
+    let hooks = base.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).expect("git hooks dir");
+    std::fs::write(base.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    base
+}
+
+fn tree_granted() -> SandboxProfile {
+    SandboxProfile {
+        filesystem: FilesystemScope::WorkingTreeReadWrite,
+        ..SandboxProfile::maximally_isolated()
+    }
+}
+
+#[test]
+fn a_jailed_write_to_git_hooks_is_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    let tree = git_tree("vcs-hooks");
+    let hook = tree.join(".git").join("hooks").join("pre-commit");
+    let source = tree.join("main.rs");
+    // A builtin `echo` with a redirect: the shell writes without forking.
+    let write = |path: &Path| -> Vec<OsString> {
+        vec![
+            OsString::from("/bin/bash"),
+            OsString::from("-c"),
+            OsString::from(format!("echo pwned > '{}'", path.display())),
+        ]
+    };
+    let hook_code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &write(&hook));
+    let source_code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &write(&source));
+    let hook_written = hook.exists();
+    let source_written = source.exists();
+    let _ = std::fs::remove_dir_all(&tree);
+    assert_eq!(
+        source_code,
+        Some(0),
+        "the rest of a granted tree stays writable (no false-deny)"
+    );
+    assert!(source_written, "the control write landed on the host");
+    assert_ne!(
+        hook_code,
+        Some(0),
+        "a jailed write into .git/hooks must fail (read-only carve)"
+    );
+    assert!(!hook_written, "no hook reached the host");
+}
+
+#[test]
+fn a_jailed_git_status_still_reads_the_repo() {
+    let Some(tools) = e2e_tools() else { return };
+    let tree = git_tree("vcs-read");
+    let payload = vec![
+        OsString::from("/bin/cat"),
+        tree.join(".git").join("HEAD").into_os_string(),
+    ];
+    let code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &payload);
+    let _ = std::fs::remove_dir_all(&tree);
+    assert_eq!(
+        code,
+        Some(0),
+        "the carve is read-only, never hidden: the repo stays readable"
+    );
+}
+
+#[test]
+fn nested_carve_ancestor_rename_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    let tree = std::fs::canonicalize(git_tree("vcs-pins")).expect("tree resolves");
+    let store = tree.join("store");
+    let repo = store.join("repo");
+    std::fs::create_dir_all(repo.join(".git").join("hooks")).expect("nested git dir");
+    let moved = tree.join("store2");
+    let rename = vec![
+        OsString::from("/bin/mv"),
+        store.clone().into_os_string(),
+        moved.clone().into_os_string(),
+    ];
+    let rename_code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &rename);
+    let mounted = |dir: &Path| -> Vec<OsString> {
+        vec![
+            OsString::from("/bin/grep"),
+            OsString::from("-qF"),
+            OsString::from(format!(" {} ", dir.display())),
+            OsString::from("/proc/self/mountinfo"),
+        ]
+    };
+    let pinned: Vec<(std::path::PathBuf, Option<i32>)> = [store.clone(), repo]
+        .into_iter()
+        .map(|dir| {
+            let code = run_jailed_in_tree(&tools, &tree_granted(), &tree, &mounted(&dir));
+            (dir, code)
+        })
+        .collect();
+    let store_kept = store.is_dir();
+    let moved_exists = moved.exists();
+    let _ = std::fs::remove_dir_all(&tree);
+    assert_ne!(
+        rename_code,
+        Some(0),
+        "an ancestor of a nested carve cannot be renamed inside the jail"
+    );
+    assert!(store_kept && !moved_exists, "the host tree kept its layout");
+    for (dir, code) in pinned {
+        assert_eq!(
+            code,
+            Some(0),
+            "{} is a mount point inside the jail",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn an_in_scratch_write_succeeds_under_the_run_jail() {
+    let Some(tools) = e2e_tools() else { return };
+    // A builtin `printf` with a redirect into the jail's `TMPDIR` (the scoped
+    // scratch): the shell writes without forking, so the isolated profile's
+    // subprocess denial is not in play.
+    let payload: Vec<OsString> = ["/bin/sh", "-c", "printf ok > \"$TMPDIR/ipe-e2e-write\""]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let mut written = None;
+    let code = run_jailed_inner(&tools, &isolated(), None, &payload, false, |scoped| {
+        written = std::fs::read_to_string(scoped.join("ipe-e2e-write")).ok();
+    })
+    .code;
+    assert_eq!(
+        code,
+        Some(0),
+        "a write into the scoped scratch succeeds under the isolated jail (no false-deny)"
+    );
+    assert_eq!(
+        written.as_deref(),
+        Some("ok"),
+        "the in-scratch write reached the host's scoped scratch"
+    );
 }
 
 fn isolated() -> SandboxProfile {
@@ -347,4 +530,144 @@ fn canary_gates_skip_on_any_establishment_failure() {
         "a non-zero bwrap setup exit is a skip"
     );
     assert!(!established(None), "a signalled process is a skip");
+}
+
+#[test]
+fn nproc_scope_is_proven_on_this_host() {
+    let Some(tools) = e2e_tools() else { return };
+    let proven = prove(&tools);
+    assert!(
+        proven.as_ref().is_ok_and(|scope| scope.tools() == &tools),
+        "the proof must succeed and carry the tools it measured: {proven:?}"
+    );
+}
+
+/// A `/bin/sh -c script` jail with `prlimit` OUTSIDE `bwrap`, so `cap` is set
+/// in the invoker's namespace and counts every task the user owns.
+fn user_wide_canary(tools: &RunJailTools, cap: ProcCap, script: &str) -> CanaryExit {
+    let status = Command::new(&tools.prlimit)
+        .arg(format!("--nproc={}", cap.get()))
+        .arg("--")
+        .arg(&tools.bwrap)
+        .args([
+            "--unshare-user",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn the user-wide canary");
+    if status.success() {
+        CanaryExit::Succeeded
+    } else {
+        CanaryExit::Failed
+    }
+}
+
+#[test]
+fn a_canary_with_prlimit_outside_the_namespace_is_refused() {
+    let Some(tools) = e2e_tools() else { return };
+    // The discriminator must tell the two scopes apart on a real kernel: the
+    // same scripts under a user-wide count classify as a refusal.
+    let teeth_control = user_wide_canary(&tools, ProcCap::MAX, TEETH_SCRIPT);
+    let scope_run = user_wide_canary(&tools, ProcCap::CANARY, SCOPE_SCRIPT);
+    let teeth_run = user_wide_canary(&tools, ProcCap::CANARY, TEETH_SCRIPT);
+    assert_eq!(
+        classify(teeth_control, scope_run, teeth_run),
+        Err(Scope::UserWide),
+        "a cap counting the whole user must be refused (control {teeth_control:?}, \
+         scope {scope_run:?}, teeth {teeth_run:?})"
+    );
+}
+
+/// Host children that are killed and reaped when the guard drops.
+struct HostSleepers(Vec<std::process::Child>);
+
+impl Drop for HostSleepers {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn a_busy_user_does_not_starve_a_granted_jail() {
+    let Some(tools) = e2e_tools() else { return };
+    // The invoker already owns more tasks than the jail's cap; a cap counting
+    // only the jail still admits the jail's own fork.
+    let sleepers = HostSleepers(
+        (0..ProcCap::CANARY.get() + 8)
+            .map(|_| {
+                Command::new("sleep")
+                    .arg("5")
+                    .spawn()
+                    .expect("spawn a host sleeper")
+            })
+            .collect(),
+    );
+    let mut profile = subprocess_granted();
+    profile.limits.proc_cap = ProcCap::of::<8>();
+    let payload: Vec<OsString> = ["/bin/sh", "-c", SCOPE_SCRIPT]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let code = run_jailed(&tools, &profile, &payload);
+    drop(sleepers);
+    assert_eq!(
+        code,
+        Some(0),
+        "the invoker's other tasks must not count against the jail's cap"
+    );
+}
+
+#[test]
+fn a_fork_bomb_is_bounded_in_a_granted_jail() {
+    let Some(tools) = e2e_tools() else { return };
+    let payload: Vec<OsString> = [
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 32 ]; do sleep 1 & i=$((i+1)); done; wait",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    // Control: under a cap above the payload's peak the same jail succeeds, so
+    // a refusal below is the cap's and not the jail's or the payload's.
+    let mut roomy = subprocess_granted();
+    roomy.limits.proc_cap = ProcCap::of::<64>();
+    let control = run_jailed_capturing(&tools, &roomy, &payload);
+    assert_eq!(
+        control.code,
+        Some(0),
+        "the payload must run under a cap above its peak: {}",
+        control.stderr
+    );
+    let mut profile = subprocess_granted();
+    profile.limits.proc_cap = ProcCap::of::<8>();
+    let bounded = run_jailed_capturing(&tools, &profile, &payload);
+    assert_ne!(
+        bounded.code,
+        Some(0),
+        "a jail forking past its cap must be refused the excess forks"
+    );
+    // dash says "Cannot fork", bash "fork: ...", busybox "can't fork".
+    assert!(
+        bounded.stderr.to_lowercase().contains("fork"),
+        "the jail must fail on a refused fork, not on another error: {}",
+        bounded.stderr
+    );
 }

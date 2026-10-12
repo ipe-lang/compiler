@@ -50,7 +50,7 @@ fn i193_update_base_ipec_accepts_and_clones_consuming_use() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for update_base_after_move: {:?}",
+        "ipe dev build must succeed for update_base_after_move: {:?}",
         built.err()
     );
 
@@ -124,7 +124,11 @@ fn i193_update_base_cargo_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let built = ipe::build_loose_file(&entry, &out, &runtime);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(
+        built.is_ok(),
+        "ipe dev build must succeed: {:?}",
+        built.err()
+    );
 
     let outcome = crate::support::build_and_run_emitted("update_base_after_move", &out);
     assert_eq!(

@@ -29,7 +29,7 @@ the real program output back.
 
 ```sh
 cd examples/wasm/language-playground/setup
-ipe run
+ipe dev run
 ```
 
 `setup/src/Main.ipe` runs the full setup in one step:
@@ -43,7 +43,7 @@ Styled install hints and a non-zero exit on any missing tool.
 
 ```sh
 cd examples/wasm/language-playground/server
-ipe run
+ipe dev run
 ```
 
 This starts the Ipê server (`Ipe.Http.Server`, port 8000), which serves the
@@ -57,7 +57,7 @@ jail-runner rebuild and prewarm):
 
 ```sh
 cd examples/wasm/language-playground/build
-ipe run
+ipe dev run
 ```
 
 ## Manual steps (reference)
@@ -66,7 +66,7 @@ The one-command setup above runs these steps in sequence:
 
 ```sh
 # 1. Build the wasm bundle
-cd examples/wasm/language-playground/build && ipe run
+cd examples/wasm/language-playground/build && ipe dev run
 
 # 2. Build the jail-runner and warm the offline cache
 cargo build -p playground-jail-runner

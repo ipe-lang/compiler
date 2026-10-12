@@ -8,7 +8,7 @@
 #
 # Commands (run `ipe-index` with no args for the full list):
 #   index               rebuild the index (the review queue is reconciled, never reset)
-#   update              incremental: git-diff last_sha..HEAD, re-extract changed files
+#   update              incremental: re-extract the files whose content stamp changed
 #   locate <name>       every def site of a symbol (file:line:col)
 #   roles | pipeline | wakeup | deps <m> | rdeps <m> | covers <m>
 #

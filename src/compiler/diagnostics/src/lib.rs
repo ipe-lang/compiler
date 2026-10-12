@@ -9,6 +9,7 @@ pub mod json;
 pub mod path_check;
 mod render;
 mod span;
+pub mod suggest;
 pub mod terminal;
 
 // Re-export the whole taxonomy with a glob so no downstream-nameable code can be
@@ -19,12 +20,13 @@ pub mod terminal;
 // reachable through this re-export.
 pub use code::*;
 pub use diagnostic::{
-    AliasExpansionKind, AppShape, Applicability, CaseDefect, CmdSubShapeMismatch,
-    CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic, Expected, ExpectedSet,
-    ExposingDefect, Feature, FfiError, GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HeaderDefect,
-    HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect, LetDefect, LowerError,
-    MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection, NameError, ParseError,
-    RoutePatternDefect, RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole,
+    AliasExpansionKind, AliasRowFault, AppShape, Applicability, Candidates, CaseDefect,
+    CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic,
+    EditTarget, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
+    HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES,
+    IfDefect, ImportedAs, InterceptContext, LetDefect, LowerError, MainRetName, ModelLeaf,
+    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, RoutePatternDefect,
+    RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach,
     StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
     TypeDeclDefect, TypeError, WildcardDependence,
 };
@@ -164,6 +166,21 @@ mod tests {
             IPE_S0001 => Diagnostic::Consent {
                 msg: ConsentError::NonInteractive {
                     body: "this program imports Ipe.Html.Unsafe\n".into(),
+                },
+            },
+            IPE_S0002 => Diagnostic::Consent {
+                msg: ConsentError::WebAxisUngranted {
+                    body: "`js-port:clipboard` disclosed by Dep.Widget".into(),
+                },
+            },
+            IPE_S0003 => Diagnostic::Consent {
+                msg: ConsentError::NativeCrossingUngranted {
+                    body: "`Rust.Csum` crossed by Dep.Widget".into(),
+                },
+            },
+            IPE_S0004 => Diagnostic::Consent {
+                msg: ConsentError::ControlModelUncovered {
+                    body: "`Main` runs the `direct` control model".into(),
                 },
             },
             // Compiler bug / internal — where_ strings must match code.rs mapping
@@ -374,7 +391,7 @@ mod tests {
             span: Span::DUMMY,
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Box::new(["length".into(), "list".into()]),
+                suggestions: Candidates::hints(Box::new(["length".into(), "list".into()])),
             },
         };
         assert_eq!(
@@ -392,17 +409,99 @@ mod tests {
             span: Span::new(0, 6),
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Box::new(["length".into()]),
+                suggestions: Candidates::at(
+                    EditTarget::whole(Span::new(0, 6), "lenght"),
+                    Box::new(["length".into()]),
+                ),
             },
         };
         assert_eq!(
             d.help(),
             vec![HelpLine::Suggest(Suggestion {
                 span: Span::new(0, 6),
+                replaces: "lenght".into(),
                 replacement: "length".into(),
                 applicability: Applicability::MachineApplicable,
             })]
         );
+    }
+
+    /// `Lsit.map` at `10..18`: the applicable edit overwrites only `Lsit`.
+    #[test]
+    fn unknown_module_suggestion_region_is_the_qualifier() {
+        let token = Span::new(10, 18);
+        let d = Diagnostic::Name {
+            span: token,
+            msg: NameError::UnknownModule {
+                qualifier: "Lsit".into(),
+                suggestions: Candidates::at(
+                    EditTarget::prefix(token, "Lsit"),
+                    Box::new(["List".into()]),
+                ),
+            },
+        };
+        assert_eq!(
+            d.help(),
+            vec![HelpLine::Suggest(Suggestion {
+                span: Span::new(10, 14),
+                replaces: "Lsit".into(),
+                replacement: "List".into(),
+                applicability: Applicability::MachineApplicable,
+            })]
+        );
+    }
+
+    /// `List.mpa` at `10..18`: the applicable edit overwrites only `mpa`.
+    #[test]
+    fn no_such_member_region_is_the_member() {
+        let token = Span::new(10, 18);
+        let d = Diagnostic::Name {
+            span: token,
+            msg: NameError::NoSuchMember {
+                module: "List".into(),
+                member: "mpa".into(),
+                suggestions: Candidates::at(
+                    EditTarget::suffix(token, "mpa"),
+                    Box::new(["map".into()]),
+                ),
+            },
+        };
+        assert_eq!(
+            d.help(),
+            vec![HelpLine::Suggest(Suggestion {
+                span: Span::new(15, 18),
+                replaces: "mpa".into(),
+                replacement: "map".into(),
+                applicability: Applicability::MachineApplicable,
+            })]
+        );
+    }
+
+    /// A type-annotation site has no provable sub-span: a sole candidate stays a hint.
+    #[test]
+    fn type_position_candidates_are_not_applicable() {
+        let d = Diagnostic::Name {
+            span: Span::new(0, 30),
+            msg: NameError::TypeNotFound {
+                name: "Strng".into(),
+                suggestions: Candidates::hints(Box::new(["String".into()])),
+            },
+        };
+        assert_eq!(d.help(), vec![HelpLine::DidYouMean("String".into())]);
+    }
+
+    /// A region wider, narrower, or outside its token is refused, never clamped.
+    #[test]
+    fn edit_target_refuses_a_region_that_leaves_its_token() {
+        let token = Span::new(10, 14);
+        assert!(EditTarget::whole(token, "Lsit").is_some());
+        assert!(EditTarget::whole(token, "Lsi").is_none());
+        assert!(EditTarget::whole(token, "Lsit.map").is_none());
+        assert!(EditTarget::prefix(token, "Lsit.map").is_none());
+        assert!(EditTarget::suffix(token, "Lsit.map").is_none());
+        assert!(EditTarget::prefix(token, "").is_none());
+        assert!(EditTarget::suffix(Span::new(0, 2), "abc").is_none());
+        assert!(EditTarget::prefix(Span::new(u32::MAX - 1, u32::MAX), "abc").is_none());
     }
 
     #[test]
@@ -653,7 +752,7 @@ mod tests {
     fn every_code_renders_through_the_pipeline() {
         let representatives: &[Code] = &[
             IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410, IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414,
-            IPE_F4415, IPE_S0001, IPE_I0001,
+            IPE_F4415, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_I0001,
         ];
 
         for &code in representatives {

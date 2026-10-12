@@ -102,7 +102,8 @@ fn every_command_help_page_matches_its_golden() {
         if spec.hidden {
             continue; // hidden commands are not part of the advertised surface
         }
-        let (code, stdout) = run(&[spec.name, "--help"]);
+        let argv: Vec<&str> = spec.name.split(' ').chain(["--help"]).collect();
+        let (code, stdout) = run(&argv);
         assert_matches_golden(&cli_transcript::help_golden_name(spec.name), code, &stdout);
     }
 }

@@ -3,7 +3,7 @@
 //! (`evenLen`/`oddLen : List a -> Bool`), used by an importer at TWO different
 //! element types (`List Int` and `List String`).
 //!
-//! Without the fix, `ipe build` FAILED with IPE-L0102 ("polymorphic value's type could
+//! Without the fix, `ipe dev build` FAILED with IPE-L0102 ("polymorphic value's type could
 //! not be determined") at the `[] ->` arm inside `Lib.ipe`. The type-checker
 //! (`ipe_types`) correctly generalized the boundary scheme — its
 //! `untyped_type_params` entry listed the element var — but `ipe_lower`'s
@@ -60,7 +60,7 @@ fn i201_ipec_accepts_and_emits_clone_bounded_generic() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for cross_module_poly_recursion (no IPE-L0102): {:?}",
+        "ipe dev build must succeed for cross_module_poly_recursion (no IPE-L0102): {:?}",
         built.err()
     );
 
@@ -98,7 +98,7 @@ fn i201_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for cross_module_poly_recursion: {:?}",
+        "ipe dev build must succeed for cross_module_poly_recursion: {:?}",
         built.err()
     );
 

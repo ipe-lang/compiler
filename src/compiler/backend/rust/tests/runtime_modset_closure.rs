@@ -270,7 +270,8 @@ fn duplicate_declarations(mod_rs: &str) -> BTreeSet<String> {
 /// `<name>/mod.rs`) and return the set of top-level modules it references via an
 /// UNCONDITIONAL `use crate::<dep>` (dep = first path segment after `crate::`).
 /// cfg-/test-gated `use`s are excluded (their target is pulled in by the same
-/// cfg, not the base append).
+/// cfg, not the base append), and so is every file of a child module whose
+/// `mod` declaration is cfg-gated.
 fn unconditional_crate_deps(runtime_root: &Path, name: &str) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
     let flat = runtime_root.join(format!("{name}.rs"));
@@ -283,21 +284,94 @@ fn unconditional_crate_deps(runtime_root: &Path, name: &str) -> BTreeSet<String>
     if dir.is_dir() {
         // Files under `<name>/`: `<name>/mod.rs` is `crate::<name>` (1 super to
         // root); `<name>/foo.rs` is `crate::<name>::foo` (2); each nested dir +1.
-        collect_dir_deps(&dir, 1, &mut deps);
+        collect_dir_deps(&dir, &flat, 1, &mut deps);
     }
     deps
 }
 
+/// The child modules whose `mod <child>;` declaration in `decl_src` carries a
+/// `#[cfg(...)]` attribute.
+///
+/// A cfg on a `mod` declaration gates the child's whole file, so the child's
+/// references are pulled in by that cfg, never by the parent's base append.
+/// `#[cfg_attr(..)]` gates nothing and a top-level `#[cfg(not(..))]` holds in
+/// the base build, so neither makes a child gated.
+fn cfg_gated_child_modules(decl_src: &str) -> BTreeSet<String> {
+    let mut gated = BTreeSet::new();
+    let mut cfg_pending = false;
+    for line in decl_src.lines() {
+        let t = line.trim();
+        if t.starts_with("#[cfg(") && !t.starts_with("#[cfg(not(") {
+            cfg_pending = true;
+            continue;
+        }
+        if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
+            continue;
+        }
+        if cfg_pending && let Some(child) = mod_declaration_name(t) {
+            gated.insert(child.to_owned());
+        }
+        cfg_pending = false;
+    }
+    gated
+}
+
+/// The module name of a file-backed `mod <name>;` declaration line.
+fn mod_declaration_name(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("pub").map_or(line, |after_pub| {
+        // `pub(crate) mod`, `pub(super) mod`, or plain `pub mod`.
+        after_pub
+            .split_once(')')
+            .filter(|_| after_pub.starts_with('('))
+            .map_or(after_pub, |(_, tail)| tail)
+    });
+    let name = rest
+        .trim_start()
+        .strip_prefix("mod ")?
+        .strip_suffix(';')?
+        .trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(name)
+}
+
+/// The child-module declarations of the module whose files live in `dir`.
+///
+/// They are in `<dir>/mod.rs`, or else in the sibling `<dir>.rs` (`outer_file`).
+fn dir_child_declarations(dir: &Path, outer_file: &Path) -> BTreeSet<String> {
+    let mod_rs = dir.join("mod.rs");
+    let decl = if mod_rs.is_file() {
+        mod_rs.as_path()
+    } else {
+        outer_file
+    };
+    std::fs::read_to_string(decl)
+        .map(|src| cfg_gated_child_modules(&src))
+        .unwrap_or_default()
+}
+
 /// Recurse a module's directory, scanning each `.rs` file for crate-root deps.
-/// `mod_depth` is the module-path depth of `<dir>/mod.rs` (= supers to root).
-fn collect_dir_deps(dir: &Path, mod_depth: usize, deps: &mut BTreeSet<String>) {
+/// `mod_depth` is the module-path depth of `<dir>/mod.rs` (= supers to root);
+/// `outer_file` is the `<dir>.rs` that declares the children when there is no
+/// `<dir>/mod.rs`. A child whose `mod` declaration is cfg-gated is skipped
+/// whole, file and directory alike.
+fn collect_dir_deps(dir: &Path, outer_file: &Path, mod_depth: usize, deps: &mut BTreeSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let gated = dir_child_declarations(dir, outer_file);
     for entry in entries.flatten() {
         let path = entry.path();
+        let stem = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if gated.contains(&stem) {
+            continue;
+        }
         if path.is_dir() {
-            collect_dir_deps(&path, mod_depth + 1, deps);
+            let child_outer = dir.join(format!("{stem}.rs"));
+            collect_dir_deps(&path, &child_outer, mod_depth + 1, deps);
         } else if path.extension().is_some_and(|e| e == "rs") {
             // `mod.rs` sits at `mod_depth`; any other `<file>.rs` is one module
             // level deeper (`crate::…::<dir>::<file>`).
@@ -313,7 +387,7 @@ fn collect_dir_deps(dir: &Path, mod_depth: usize, deps: &mut BTreeSet<String>) {
 /// `use crate::<dep>` / `crate::<dep>::path()` and a matching-length
 /// `super`-chain name a top-level module. cfg-/test-gated lines are excluded.
 fn scan_file_deps(path: &Path, supers_to_root: usize, deps: &mut BTreeSet<String>) {
-    let src = std::fs::read_to_string(path).unwrap_or_default();
+    let src = blank_literals(&std::fs::read_to_string(path).unwrap_or_default());
 
     // Three skip-regions, checked in priority order:
     // 1. `in_cfg_test_mod` — `#[cfg(test)] mod tests { … }`: skip entire block.
@@ -427,61 +501,144 @@ fn scan_file_deps(path: &Path, supers_to_root: usize, deps: &mut BTreeSet<String
     }
 }
 
-/// Count the net unquoted brace depth change for one source line: `{` outside a
-/// string literal or character literal adds +1; `}` subtracts 1. String literals
-/// (including raw strings `r#"…"#` and `r"…"`) and char literals are skipped so
-/// that format-string braces (`"{value:?}"`) or pattern-match bodies with literal
-/// `'}'` do not skew the depth.
+/// Blank the block comment whose `/` was just emitted, `at` being the `*`;
+/// returns the index past its closing `*/`. Block comments nest.
+fn blank_block_comment(chars: &[char], at: usize, out: &mut String) -> usize {
+    out.push(' ');
+    let mut i = at + 1;
+    let mut depth = 1_usize;
+    while depth > 0 {
+        let Some(&x) = chars.get(i) else { break };
+        let next = chars.get(i + 1).copied();
+        if x == '/' && next == Some('*') {
+            depth += 1;
+            out.push_str("  ");
+            i += 2;
+        } else if x == '*' && next == Some('/') {
+            depth -= 1;
+            out.push_str("  ");
+            i += 2;
+        } else {
+            out.push(if x == '\n' { '\n' } else { ' ' });
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Blank the raw string whose `r` was just emitted, `at` being the index after
+/// it; returns the index past its closing quote and hashes. Not a raw string
+/// (`r#ident`) when no `"` follows the hashes: nothing more is consumed.
+fn blank_raw_string(chars: &[char], at: usize, out: &mut String) -> usize {
+    let mut open = at;
+    while chars.get(open) == Some(&'#') {
+        open += 1;
+    }
+    if chars.get(open) != Some(&'"') {
+        return at;
+    }
+    let hashes = open - at;
+    out.extend(std::iter::repeat_n('#', hashes));
+    out.push('"');
+    let mut i = open + 1;
+    while let Some(&x) = chars.get(i) {
+        if x == '"' && (1..=hashes).all(|h| chars.get(i + h) == Some(&'#')) {
+            out.push('"');
+            out.extend(std::iter::repeat_n('#', hashes));
+            return i + 1 + hashes;
+        }
+        out.push(if x == '\n' { '\n' } else { ' ' });
+        i += 1;
+    }
+    i
+}
+
+/// `src` with the inside of every string, raw string, char literal and block
+/// comment blanked to spaces, newlines kept.
 ///
-/// This is deliberately conservative and single-line: multi-line string literals
-/// are vanishingly rare in the runtime source, and any mismatch on a single line
-/// still averages out across the file because both `{` and `}` in strings are
-/// equally likely to appear.  The one case that matters — format strings like
-/// `"expected {val:?}"` — perfectly balance (one `{`, one `}`) and net to 0.
-fn unquoted_brace_delta(line: &str) -> i32 {
-    let mut delta: i32 = 0;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
+/// A literal may span lines (a raw string holding a fixture, a string with a
+/// backslash continuation), so no per-line reader can tell code from literal
+/// text: the whole file is blanked once, and every line scan reads code only.
+/// Quotes are a char literal when they hold one character or an escape (`'r'`,
+/// `'{'`, `'\n'`); `'a` is a lifetime. `r`, `br` and `cr` open a raw string
+/// only at the start of an identifier. A `//` comment is left as written.
+fn blank_literals(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let at = |k: usize| chars.get(k).copied();
+    let is_ident = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0_usize;
+    while let Some(c) = at(i) {
+        let before = i.checked_sub(1).and_then(at);
+        let before2 = i.checked_sub(2).and_then(at);
+        let raw_prefix =
+            !is_ident(before) || (matches!(before, Some('b' | 'c')) && !is_ident(before2));
+        out.push(c);
+        i += 1;
         match c {
-            // Regular string literal: skip to closing `"` (handle `\"` escapes).
+            '/' if at(i) == Some('/') => {
+                while let Some(x) = at(i).filter(|x| *x != '\n') {
+                    out.push(x);
+                    i += 1;
+                }
+            }
+            '/' if at(i) == Some('*') => i = blank_block_comment(&chars, i, &mut out),
+            'r' if raw_prefix && matches!(at(i), Some('#' | '"')) => {
+                i = blank_raw_string(&chars, i, &mut out);
+            }
             '"' => {
-                while let Some(sc) = chars.next() {
-                    if sc == '\\' {
-                        chars.next(); // consume escaped character
-                    } else if sc == '"' {
-                        break;
-                    }
-                }
-            }
-            // Char literal: skip to closing `'` (handle `\'` escapes).
-            '\'' => {
-                // Disambiguate lifetime from char: lifetimes are `'name` with an
-                // identifier character following. We do a simple lookahead:
-                // if the character after `'` is alphanumeric or `_`, treat as
-                // lifetime and don't try to consume a closing `'`.
-                if let Some(&nc) = chars.peek() {
-                    if nc.is_ascii_alphanumeric() || nc == '_' {
-                        // lifetime annotation — skip
-                    } else {
-                        // char literal
-                        while let Some(sc) = chars.next() {
-                            if sc == '\\' {
-                                chars.next();
-                            } else if sc == '\'' {
-                                break;
-                            }
+                while let Some(x) = at(i) {
+                    i += 1;
+                    if x == '\\' {
+                        out.push(' ');
+                        if let Some(escaped) = at(i) {
+                            out.push(blank(escaped));
+                            i += 1;
                         }
+                    } else if x == '"' {
+                        out.push('"');
+                        break;
+                    } else {
+                        out.push(blank(x));
                     }
                 }
             }
-            // Line comment: stop counting — everything after `//` is comment.
-            '/' if chars.peek() == Some(&'/') => break,
-            '{' => delta += 1,
-            '}' => delta -= 1,
+            '\'' => match (at(i), at(i + 1)) {
+                (Some('\\'), _) => {
+                    out.push_str("  ");
+                    i += 2;
+                    while let Some(x) = at(i) {
+                        i += 1;
+                        if x == '\'' {
+                            out.push('\'');
+                            break;
+                        }
+                        out.push(blank(x));
+                    }
+                }
+                (Some(x), Some('\'')) => {
+                    out.push(blank(x));
+                    out.push('\'');
+                    i += 2;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
-    delta
+    out
+}
+
+/// The net brace depth change of one line of [`blank_literals`] output: `{`
+/// adds one, `}` subtracts one, and a `//` comment ends the count.
+fn unquoted_brace_delta(line: &str) -> i32 {
+    let code = line.split_once("//").map_or(line, |(code, _)| code);
+    code.chars().fold(0, |depth, c| match c {
+        '{' => depth + 1,
+        '}' => depth - 1,
+        _ => depth,
+    })
 }
 
 /// Scan one source line for ALL occurrences of crate-root module references —
@@ -692,6 +849,54 @@ fn composed_full_modset_is_closed() {
 
     let mut dep_cache: HashMap<String, BTreeSet<String>> = HashMap::new();
     assert_mask_closed(&runtime_root, &interner, main, all, &mut dep_cache);
+}
+
+/// A vendored `revocation` module publishes on `tokio::sync::watch` whenever the
+/// `tokio` feature is on, so every emitted manifest that declares the module and
+/// enables `tokio` must extend the `tokio` dependency with `"sync"`. Checked on
+/// the featureless base, every singleton, and the all-on mask.
+#[test]
+fn declared_revocation_module_implies_tokio_sync() {
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    let all: u32 = (1u32 << FLAG_COUNT) - 1;
+    let masks = std::iter::once(0u32)
+        .chain((0..FLAG_COUNT).map(|bit| 1u32 << bit))
+        .chain(std::iter::once(all));
+    let mut revocation_cases = 0usize;
+    for mask in masks {
+        let prog = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+            modules: vec![module_for_mask(main, mask)],
+        };
+        let emitted = RustBackend::new(&interner)
+            .emit(&prog)
+            .expect("emit must succeed for a body-free program");
+        let mod_rs = emitted.files.get("src/ipe_runtime/mod.rs").expect("mod.rs");
+        let cargo = &emitted.cargo_toml;
+        let tokio_on = cargo
+            .lines()
+            .any(|l| l.starts_with("default = [") && l.contains("\"tokio\""));
+        if !declared_modules(mod_rs).contains("revocation") || !tokio_on {
+            continue;
+        }
+        revocation_cases += 1;
+        let tokio_dep = cargo
+            .lines()
+            .find(|l| l.starts_with("tokio = {"))
+            .expect("a manifest with the tokio feature on must declare the tokio dependency");
+        assert!(
+            tokio_dep.contains("\"sync\""),
+            "SEAL breach: `revocation` is declared with the tokio feature on, but the \
+             tokio dependency lacks `sync` (`tokio::sync::watch` would not compile) \
+             - flag mask {mask:#019b}: {tokio_dep}"
+        );
+    }
+    assert!(
+        revocation_cases > 0,
+        "no sampled mask declared `revocation` on a tokio runtime - the check proved nothing"
+    );
 }
 
 // ── the sampled full-mask backstop (redundancy, not the proof) ──────────────
@@ -950,7 +1155,7 @@ fn wasm_unconditional_crate_deps(
             scan_file_deps(&flat, 1, &mut deps);
         }
         if dir.is_dir() {
-            collect_dir_deps(&dir, 1, &mut deps);
+            collect_dir_deps(&dir, &flat, 1, &mut deps);
         }
     }
     deps
@@ -1245,6 +1450,117 @@ mod tests {
     assert!(
         deps.is_empty(),
         "no production crate-root deps in this fixture; got {deps:?}"
+    );
+}
+
+/// Blanking empties every literal and block comment, whatever its shape or the
+/// lines it spans, and leaves the code and the lifetimes around it.
+#[test]
+fn blank_literals_empties_every_literal_and_keeps_code() {
+    let depth = |src: &str| unquoted_brace_delta(&blank_literals(src));
+    assert_eq!(depth("('r', Some('#' | '\"')) if x => {"), 1);
+    assert_eq!(depth("fn f() { let b = br#\"x\"y\"#; g(async {}); }"), 0);
+    assert_eq!(depth("fn f() { let c = cr#\"x\"y\"#; }"), 0);
+    assert_eq!(depth("let s = r\"{\"; let t = r##\"}\"#\"##; {"), 1);
+    assert_eq!(depth("let c = '\\u{7b}'; let d = '\\''; {"), 1);
+    assert_eq!(depth("'a: loop { f::<'a>(); }"), 0);
+    assert_eq!(depth("let xr = 1; { let s = \"}\"; }"), 0);
+    assert_eq!(depth("let s = \"a{ \\\n }\"; {"), 1);
+    assert_eq!(depth("let s = r##\"{\n}\n{\"##; /* { /* } */ { */ }"), -1);
+    assert_eq!(depth("fn f() { // {{"), 1);
+    assert_eq!(
+        blank_literals("let a = 'x'; // 'q \" z"),
+        "let a = ' '; // 'q \" z"
+    );
+}
+
+/// A test module whose fixtures hold letter char literals, raw byte strings and
+/// multi-line strings with unbalanced braces keeps its `crate::` references out
+/// of the production deps, and a production reference after it is still found.
+#[test]
+fn scanner_excludes_a_test_mod_with_literal_fixtures() {
+    let src = r###"
+pub fn prod() -> i32 { 42 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fixtures {
+    fn code_only(c: char) -> bool {
+        match (c, Some('x')) {
+            ('r', Some('#' | '"')) if c == 'r' => {
+                let b = br#"x"y"#;
+                true
+            }
+            _ => false,
+        }
+    }
+    fn multi() {
+        let bare = "pub fn sub_fake() { IpeSub::Source(Box::new(move |emit| { \
+                    tokio::spawn(async move {}); SourceTask::Idle })) }";
+        let quoted = r##"pub fn sub_quoted() {
+    let s = "tokio::spawn(";
+}
+#[cfg(test)]
+mod tests {
+    fn t() { tokio::spawn(async {}); }
+"##;
+    }
+    const GUARD: fn() = crate::root_item::run;
+}
+
+pub fn after() { crate::real_dep::run(); }
+"###;
+    let dir = ipe_test_temp::temp_root();
+    let path = dir.join("ipe_modset_closure_literal_fixture_regression.rs");
+    std::fs::write(&path, src).expect("write temp file");
+    let mut deps = BTreeSet::new();
+    scan_file_deps(&path, 1, &mut deps);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        deps,
+        BTreeSet::from(["real_dep".to_owned()]),
+        "only the production reference counts, and the one after a fixture-laden test module is found"
+    );
+}
+
+/// A child module whose `mod` declaration is cfg-gated is gated whole: its
+/// file's `crate::` references are not unconditional deps of the parent, even
+/// on lines carrying no cfg of their own. An ungated sibling's still are.
+#[test]
+fn scanner_scopes_a_cfg_gated_mod_declaration_to_the_child_file() {
+    let root = ipe_test_temp::temp_root().join(format!(
+        "ipe_modset_closure_gated_child_{}",
+        std::process::id()
+    ));
+    let web = root.join("web");
+    let nested = web.join("hub");
+    std::fs::create_dir_all(&nested).expect("create fixture dirs");
+    let files = [
+        (
+            web.join("mod.rs"),
+            "/// Server-only.\n#[cfg(feature = \"server\")]\n#[allow(dead_code)]\npub mod csrf;\n\
+             #[cfg(feature = \"db\")]\npub(crate) mod hub;\npub mod plain;\n\
+             #[cfg_attr(test, allow(dead_code))]\npub mod attr;\n\
+             #[cfg(not(feature = \"db\"))]\nmod fallback;\n\
+             #[cfg(feature = \"server\")]\nfn gated() {\n    crate::session::x();\n}\n",
+        ),
+        (
+            web.join("csrf.rs"),
+            "pub fn set() -> crate::server::SetCookie {\n    use crate::server::{CookieName};\n}\n",
+        ),
+        (web.join("plain.rs"), "use crate::tea::Model;\n"),
+        (web.join("attr.rs"), "use crate::alpha::A;\n"),
+        (web.join("fallback.rs"), "use crate::beta::B;\n"),
+        (nested.join("mod.rs"), "use crate::db::Pool;\n"),
+    ];
+    for (path, src) in &files {
+        std::fs::write(path, src).expect("write fixture file");
+    }
+    let deps = unconditional_crate_deps(&root, "web");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        deps,
+        BTreeSet::from(["alpha".to_owned(), "beta".to_owned(), "tea".to_owned()]),
+        "only the children whose `mod` declaration is not cfg-gated are dep sources"
     );
 }
 

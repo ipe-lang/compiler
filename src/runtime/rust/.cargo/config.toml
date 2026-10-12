@@ -6,7 +6,7 @@
 # breaks every wasm32 build/test on a machine that has one configured, with no
 # code-level fix possible (the flag never applies to wasm32 code at all).
 # Mirrors the SAME shield the emitted-project manifest template
-# (`crate_specs.rs`'s `WASM_CARGO_CONFIG`) already ships for `ipe build
+# (`crate_specs.rs`'s `WASM_CARGO_CONFIG`) already ships for `ipe dev build
 # --target wasm`'s generated projects — this file is the source crate's own
 # copy of that guard, since this crate is ALSO built directly for wasm32 (the
 # `wasm-floor` CI job, `wasm_floor_scope.rs`, and this test file), not only

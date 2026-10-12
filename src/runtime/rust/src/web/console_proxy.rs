@@ -62,11 +62,12 @@ pub fn console_bin_path() -> Option<std::path::PathBuf> {
         return if pb.is_file() { Some(pb) } else { None };
     }
     // Key on the IPE compiler version (same source as `/_ipe/buildinfo`), NOT
-    // the generated crate's CARGO_PKG_VERSION (always "0.1.0"). The ipe build
+    // the generated crate's CARGO_PKG_VERSION (always "0.1.0"). The ipe dev build
     // sets IPE_VERSION when compiling this app, so a console binary placed for
     // one ipe version is never exec'd by an app built with another.
     let ver = option_env!("IPE_VERSION").unwrap_or("dev");
-    let pb = crate::system::home_dir()?
+    let pb = crate::system::home_dir()
+        .ok()?
         .join(".cache/ipe/rust-console")
         .join(ver)
         .join("ipe-console");
@@ -723,7 +724,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(echo));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
 
         // The parent receives POST /_ipe/console/_ipe/event?x=1 with body "hi".
@@ -773,7 +774,7 @@ mod tests {
             .fallback(any(leak))
             .with_state(leak_hits.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(leak_listener, leak_app).await;
+            let _ = crate::server::serve_fixture(leak_listener, leak_app).await;
         });
 
         let leak_base = format!("http://127.0.0.1:{leak_port}");
@@ -793,7 +794,7 @@ mod tests {
             .fallback(any(redirect))
             .with_state(leak_base.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(up_listener, up_app).await;
+            let _ = crate::server::serve_fixture(up_listener, up_app).await;
         });
 
         // The same redirect-disabled client `ensure_console_proxy` constructs.
@@ -834,7 +835,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(echo_path));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
 
         let req = axum::http::Request::builder()

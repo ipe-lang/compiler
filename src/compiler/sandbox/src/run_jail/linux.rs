@@ -12,7 +12,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use super::{
-    JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber, run_jail_argv,
+    JailArgv, RunJailDefect, RunJailTools, SandboxProfile, SealedFdNumber, prove, run_jail_argv,
     run_jail_argv_with_delivery,
 };
 use crate::seccomp;
@@ -116,7 +116,9 @@ fn app_ro_binds(app: &CanonicalPath) -> Vec<CanonicalPath> {
 ///
 /// Any [`RunJailDefect`]; [`RunJailDefect::Path`] when `scoped_tmp`,
 /// `working_tree`, or `app` does not resolve, the invoker's homes are unknown,
-/// or a path would expose the cargo home. On success (Linux) it does not return.
+/// a path would expose the cargo home, or a granted working tree's
+/// version-control metadata cannot be kept read-only or its configuration names
+/// code inside a writable grant. On success (Linux) it does not return.
 pub fn exec_in_run_jail(
     tools: &RunJailTools,
     profile: &SandboxProfile,
@@ -125,6 +127,9 @@ pub fn exec_in_run_jail(
     app: &Path,
     app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
+    // The process cap must count only the jail's tasks; its canary jails run
+    // before any descriptor below turns inheritable.
+    let scope = prove(tools)?;
     // Resolve every path once: the app the payload execs and the dirs it is
     // handed are exactly the paths the jail binds.
     let scoped_tmp = CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?;
@@ -158,13 +163,14 @@ pub fn exec_in_run_jail(
 
     let host_env = crate::host_env::granted;
     let argv = run_jail_argv(
-        tools,
+        &scope,
         profile,
         &mounts,
         Some(seccomp_fd),
         &host_env,
         &payload,
-    );
+    )
+    .map_err(RunJailDefect::Path)?;
 
     Err(exec_jail_argv(&argv))
 }
@@ -178,16 +184,16 @@ pub fn exec_in_run_jail(
 /// ([`write_sealed_app_memfd`]), verifies the capability floor by reading the
 /// SEALED fd, then calls this, which makes the sealed fd inheritable. bwrap
 /// inherits it across the process replacement and materialises the app inside
-/// the jail via `--file` at a fixed sandbox path — so the bytes executed are provably the
-/// sealed bytes that were verified; a same-uid attacker has no host path to
-/// pre-seed or swap.
+/// a jail-private tmpfs via `--file` — so the bytes executed are provably the
+/// sealed bytes that were verified, a same-uid attacker has no host path to
+/// pre-seed or swap, and no copy of the app is left on the host.
 ///
 /// # Errors
 ///
 /// Any [`RunJailDefect`]; [`RunJailDefect::Path`] when `scoped_tmp` or
-/// `working_tree` does not resolve, the invoker's homes are unknown, or a path
-/// would expose the cargo home. On
-/// success (Linux) it does not return.
+/// `working_tree` does not resolve, the invoker's homes are unknown, a path
+/// would expose the cargo home, or a granted working tree is refused as in
+/// [`exec_in_run_jail`]. On success (Linux) it does not return.
 pub fn exec_embedded_in_run_jail(
     tools: &RunJailTools,
     profile: &SandboxProfile,
@@ -196,6 +202,8 @@ pub fn exec_embedded_in_run_jail(
     app: &SealedApp,
     app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
+    // As in `exec_in_run_jail`: proven before any descriptor turns inheritable.
+    let scope = prove(tools)?;
     let scoped_tmp = CanonicalPath::resolve(scoped_tmp).map_err(RunJailDefect::Path)?;
     let working_tree = CanonicalPath::resolve(working_tree).map_err(RunJailDefect::Path)?;
     let mounts = JailMounts::of_invoker(scoped_tmp, working_tree, Vec::new())
@@ -223,24 +231,19 @@ pub fn exec_embedded_in_run_jail(
         .make_inheritable()
         .map_err(|e| cloexec_err("sealed app memfd", e))?;
 
-    // The in-jail path the app is materialised at. It sits under `scoped_tmp`,
-    // the one always-writable bind, so bwrap can create it after the mounts.
-    let dest = mounts.scoped_tmp().as_path().join("ipe-app");
-
-    let mut payload: Vec<OsString> = Vec::with_capacity(app_args.len() + 1);
-    payload.push(dest.as_os_str().to_owned());
-    payload.extend(app_args.iter().cloned());
-
+    // The builder owns the in-jail destination: a jail-private tmpfs under
+    // `scoped_tmp`, so no copy of the app reaches the host directory.
     let host_env = crate::host_env::granted;
     let argv = run_jail_argv_with_delivery(
-        tools,
+        &scope,
         profile,
         &mounts,
         Some(seccomp_fd),
-        Some((app_fd, &dest)),
+        app_fd,
         &host_env,
-        &payload,
-    );
+        app_args,
+    )
+    .map_err(RunJailDefect::Path)?;
 
     Err(exec_jail_argv(&argv))
 }
@@ -363,22 +366,26 @@ fn write_frozen_memfd(
 /// ```compile_fail,E0505
 /// # use std::ffi::OsString;
 /// # use std::path::Path;
-/// # use ipe_sandbox::run_jail::{RunJailTools, SandboxProfile, run_jail_argv, write_seccomp_memfd};
+/// # use ipe_sandbox::run_jail::{
+/// #     RunJailTools, SandboxProfile, prove, run_jail_argv, write_seccomp_memfd,
+/// # };
 /// # use ipe_sandbox::{CanonicalPath, JailMounts};
 /// # fn stale() -> Option<usize> {
 /// # let tools = RunJailTools { bwrap: "bwrap".into(), prlimit: "prlimit".into(), timeout: None };
+/// # let scope = prove(&tools).ok()?;
 /// # let root = CanonicalPath::resolve(Path::new("/")).ok()?;
 /// # let mounts = JailMounts::of_invoker(root.clone(), root, Vec::new()).ok()?;
 /// # let no_env = |_: &str| None;
 /// let sealed = write_seccomp_memfd(b"filter").ok()?;
 /// let argv = run_jail_argv(
-///     &tools,
+///     &scope,
 ///     &SandboxProfile::maximally_isolated(),
 ///     &mounts,
 ///     Some(sealed.make_inheritable().ok()?),
 ///     &no_env,
 ///     &[OsString::from("app")],
-/// );
+/// )
+/// .ok()?;
 /// drop(sealed);
 /// Some(argv.args().len())
 /// # }

@@ -51,7 +51,7 @@ render stage =
         ++ " ms"
 ```
 
-Running it (`ipe run`) converts each unit correctly and clamps the negative span:
+Running it (`ipe dev run`) converts each unit correctly and clamps the negative span:
 
 ```
 Timeout schedule:

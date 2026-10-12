@@ -7,7 +7,7 @@
 //! There are exactly two typed decode boundaries (`pkginfo`, `call`), so
 //! every downstream emitter is a total function over already-validated data.
 //!
-//! Governing invariant: `ipe build` ⇒ `cargo build`. The only sound error
+//! Governing invariant: `ipe dev build` ⇒ `cargo build`. The only sound error
 //! direction is over-drop at introspection (a bindable symbol omitted) plus
 //! reject-at-decode with `IPE-F4400` (an unrenderable foreign call refused
 //! before emission). Under-bind — emitting a binding cargo then rejects — is

@@ -1,0 +1,32 @@
+module Main exposing (main)
+
+-- `byKey` forwards to `List.sortBy` over a generic key `b`. An ordering generic
+-- is emitted with a `Copy` bound, which `String` does not meet, so a `String`
+-- key through the wrapper is rejected at type-check (IPE-T0014). The direct
+-- `List.sortBy` call with a `String` key is accepted.
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+type alias Person =
+    { age : Int, name : String }
+
+
+byKey : (a -> b) -> List a -> List a
+byKey f xs =
+    List.sortBy f xs
+
+
+people : List Person
+people =
+    [ { age = 30, name = "b" }, { age = 25, name = "a" } ]
+
+
+main =
+    let
+        _unused =
+            byKey (\p -> p.name) people
+    in
+    Io.println (String.fromInt 0)

@@ -9,7 +9,7 @@
 //! `Main.ipe` to stdout `51\n`, exit 0 — verified by running it in a temp dir:
 //!
 //! ```text
-//! $ ipe run tests/golden/firstclass/Main.ipe
+//! $ ipe dev run tests/golden/firstclass/Main.ipe
 //! 51
 //! ```
 //!

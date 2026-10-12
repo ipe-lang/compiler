@@ -16,7 +16,7 @@
 //! `Main.ipe` to stdout `42\n`, exit 0:
 //!
 //! ```text
-//! $ cd "$(mktemp -d)" && ipe run Main.ipe
+//! $ cd "$(mktemp -d)" && ipe dev run Main.ipe
 //! 42
 //! ```
 

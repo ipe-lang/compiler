@@ -9,7 +9,7 @@
 //! inside the [`ipe_sandbox`] bubblewrap jail; the server never `cargo`-builds or
 //! execs user-derived code outside it.
 //!
-//! The compile step (`ipe build`) is distinct: it runs the project's own trusted
+//! The compile step (`ipe dev build`) is distinct: it runs the project's own trusted
 //! compiler over the source text — deterministic codegen, not execution of the
 //! user's program — so it stays a plain, timeout-bounded subprocess. Only the
 //! two steps that run attacker-controlled code (build, run) are jailed.
@@ -34,9 +34,11 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use ipe_sandbox::home::ToolHome;
 use ipe_sandbox::{
     CanonicalPath, Capabilities, HomeMasks, JailPathError, JailSpec, NetworkPolicy, ResourceLimits,
     SandboxDefect, missing_caps, probe, run_in_bwrap_jail, run_in_bwrap_jail_deny_subprocess,
+    run_jail::ProcCap,
 };
 
 /// Resource caps for one playground build+run.
@@ -55,7 +57,7 @@ pub struct RunCaps {
     /// Open-file-descriptor cap (`prlimit --nofile`).
     pub fd_cap: u64,
     /// Process-count cap (`prlimit --nproc`) — a fork bomb is killed here.
-    pub proc_cap: u64,
+    pub proc_cap: ProcCap,
     /// Maximum captured stdout/stderr bytes.
     pub out_cap_bytes: u64,
 }
@@ -78,7 +80,7 @@ impl RunCaps {
             cpu_secs: 900,
             wall_secs: 900,
             fd_cap: 512,
-            proc_cap: 256,
+            proc_cap: ProcCap::of::<256>(),
             out_cap_bytes: 512 * 1024 * 1024,
         }
     }
@@ -99,7 +101,7 @@ impl RunCaps {
             fd_cap: 64,
             // >1 so the tokio runtime's worker threads (same process, but nproc
             // counts threads) start; low enough that a fork bomb is killed.
-            proc_cap: 32,
+            proc_cap: ProcCap::of::<32>(),
             out_cap_bytes: 8 * 1024 * 1024,
         }
     }
@@ -129,12 +131,13 @@ impl RunCaps {
 /// [`SandboxDefect::Path`] when `CARGO_HOME` or `RUSTUP_HOME` is relative, a
 /// bind does not resolve, or a bind would expose the cargo home.
 fn toolchain_binds() -> Result<ToolchainBinds, SandboxDefect> {
-    let tool_home = |var: &'static str, fallback: &str| {
-        ipe_sandbox::home::tool_home(var, fallback)
+    let user_home = ipe_sandbox::home::home_dir().ok();
+    let tool_home = |var: &'static str, fallback: &'static str| {
+        ipe_sandbox::home::tool_home(var, user_home.as_ref(), fallback)
             .map_err(|e| SandboxDefect::Path(JailPathError::ToolHomeRelative(e)))
     };
     toolchain_binds_from(
-        tool_home("CARGO_HOME", ".cargo")?.as_deref(),
+        tool_home("CARGO_HOME", ".cargo")?.as_ref(),
         tool_home("RUSTUP_HOME", ".rustup")?,
     )
 }
@@ -147,9 +150,10 @@ fn toolchain_binds() -> Result<ToolchainBinds, SandboxDefect> {
 /// sits at or above the cargo home, so binding it would expose
 /// `credentials.toml`.
 fn toolchain_binds_from(
-    cargo_home: Option<&Path>,
-    rustup_home: Option<PathBuf>,
+    cargo_home: Option<&ToolHome>,
+    rustup_home: Option<ToolHome>,
 ) -> Result<ToolchainBinds, SandboxDefect> {
+    let cargo_home = cargo_home.map(ToolHome::as_path);
     let canonical = |path: &Path| CanonicalPath::resolve(path).map_err(SandboxDefect::Path);
     let mut binds = ToolchainBinds::default();
     if let Some(cargo_home) = cargo_home {
@@ -161,9 +165,9 @@ fn toolchain_binds_from(
         }
     }
     if let Some(rustup) = rustup_home
-        && rustup.is_dir()
+        && rustup.as_path().is_dir()
     {
-        let rustup = canonical(&rustup)?;
+        let rustup = canonical(rustup.as_path())?;
         binds.ro_binds.push(rustup.clone());
         binds.rustup_home = Some(rustup);
     }
@@ -537,7 +541,7 @@ mod tests {
         let l = RunCaps::run_defaults().to_limits();
         assert_eq!(l.cpu_secs, 5);
         assert_eq!(l.wall_secs, 10);
-        assert_eq!(l.proc_cap, 32);
+        assert_eq!(l.proc_cap, ProcCap::of::<32>());
         // The build phase is more generous but still bounded.
         let b = RunCaps::build_defaults().to_limits();
         assert!(b.wall_secs > l.wall_secs);
@@ -567,6 +571,13 @@ mod tests {
         assert!(!is_wall_clock_kill(Some(1)));
     }
 
+    /// A tool home over the absolute test path `path`.
+    fn tool(path: &Path) -> ToolHome {
+        ipe_sandbox::home::tool_home_from("CARGO_HOME", Some(path.into()), None, ".cargo")
+            .expect("an absolute test tool home")
+            .expect("a set tool home")
+    }
+
     /// A host layout with `cargo/bin` and a disjoint `rustup`, canonicalized.
     fn toolchain_tree() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir_in(ipe_test_temp::temp_root()).expect("tempdir");
@@ -581,7 +592,7 @@ mod tests {
         let (_dir, root) = toolchain_tree();
         let cargo_home = root.join("cargo");
         for rustup in [cargo_home.clone(), root] {
-            let refused = toolchain_binds_from(Some(&cargo_home), Some(rustup));
+            let refused = toolchain_binds_from(Some(&tool(&cargo_home)), Some(tool(&rustup)));
             assert!(matches!(
                 refused,
                 Err(SandboxDefect::Path(JailPathError::ExposesCargoHome { .. }))
@@ -593,7 +604,8 @@ mod tests {
     fn a_disjoint_rustup_home_binds_bin_and_rustup_only() {
         let (_dir, root) = toolchain_tree();
         let cargo_home = root.join("cargo");
-        let result = toolchain_binds_from(Some(&cargo_home), Some(root.join("rustup")));
+        let result =
+            toolchain_binds_from(Some(&tool(&cargo_home)), Some(tool(&root.join("rustup"))));
         assert!(result.is_ok(), "a disjoint layout must bind");
         let Ok(binds) = result else { return };
         let bound: Vec<&Path> = binds.ro_binds.iter().map(CanonicalPath::as_path).collect();

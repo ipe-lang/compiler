@@ -82,7 +82,7 @@ fn transition_module_resolves_and_emits_kernel() {
     let (emit, res) = build_transition_project("emit");
     assert!(
         res.is_ok(),
-        "ipe build with `import Ipe.Ui.Transition` must succeed \
+        "ipe dev build with `import Ipe.Ui.Transition` must succeed \
          (native transition + compiled module): {:?}",
         res.err()
     );

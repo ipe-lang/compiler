@@ -30,7 +30,7 @@ multi-repo setup without a schema change:
 
 ```
 ipe-index index                 # rebuild → .ipe-index/index.db
-ipe-index update                # incremental: git-diff last_sha..HEAD
+ipe-index update                # incremental: re-extract files whose content stamp changed
 ipe-index locate <name>         # every def site (file:line:col + qualified + uid)
 ipe-index roles|pipeline|wakeup
 ipe-index deps <m> | rdeps <m> | covers <m>
@@ -55,9 +55,11 @@ Hooks are local (`.git/hooks`, not committed). Re-install after a fresh clone.
 
 ## Notes
 
-- **Incremental `update`** — per-repo `last_sha:<tag>..HEAD` git diff, re-extract
-  only changed files. Falls back to a full `index` when the DB is absent or a
-  repo has no recorded sha. Zero drift vs a fresh full index.
+- **Incremental `update`** — walks the same files `index` walks and re-extracts
+  each one whose content stamp (`blake3:` digest in `files.sha`) changed; a
+  path no longer listed or readable leaves the index. Falls back to a full
+  `index` when the DB is absent, of another schema or root set, or holds a path
+  with no stamp. Open units match a fresh full index.
 - **Rust `impl`-target capture** — `impl Foo` / `impl Trait for Foo` (incl.
   `impl Vec<T>`) stored as kind `impl` so `locate Foo` surfaces impl sites.
 

@@ -103,7 +103,7 @@ showSet s =
         |> String.join ", "
 ```
 
-Running it (`ipe run`) prints:
+Running it (`ipe dev run`) prints:
 
 ```
 alice reads: GRANTED

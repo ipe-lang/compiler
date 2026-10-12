@@ -72,7 +72,7 @@ fn entry_path() -> Vec<String> {
 type CompileOutcome = Result<ipe_backend::EmittedProject, String>;
 
 /// The cold side: a fresh database built from the final source state — the
-/// exact shape `compile_modules` produces on a one-shot `ipe build`.
+/// exact shape `compile_modules` produces on a one-shot `ipe dev build`.
 fn cold_compile(user: &UserSources) -> CompileOutcome {
     let (sources, injected) = prepared(user);
     let db = ipe_db::IpeDatabase::new();
@@ -84,6 +84,7 @@ fn cold_compile(user: &UserSources) -> CompileOutcome {
         None,
         ipe_ir::Target::Native,
         Vec::new(),
+        ipe_backend_rust::MountBase::root(),
         false,
         ipe_backend_rust::BuildIntent::Development,
         None,
@@ -158,6 +159,7 @@ impl WarmSession {
                 None,
                 ipe_ir::Target::Native,
                 Vec::new(),
+                ipe_backend_rust::MountBase::root(),
                 false,
                 ipe_backend_rust::BuildIntent::Development,
                 None,
@@ -535,7 +537,7 @@ fn parity_multimodule_adversarial_edits() {
 }
 
 // ---------------------------------------------------------------------------
-// Watch-mode shape: the exact incremental pattern `ipe watch`'s orchestrator
+// Watch-mode shape: the exact incremental pattern `ipe dev watch`'s orchestrator
 // runs (one `SourceRoot` reused across `FsBatch` cycles via
 // `sync_source_root`, feeding the same `compile_prepared` call every cycle —
 // see `src/ipe-cli/src/watch.rs`'s `OrchestratorEvent::FsBatch` arm).
@@ -556,7 +558,7 @@ const WATCH_PROBE_V0: &str = "module Main exposing (main)\n\n\
      compose f =\n    \\x -> applyTwice f x\n\n\
      main =\n    Io.println (String.fromInt (compose (\\n -> n + 1) 3))\n";
 
-/// One save-cycle in `ipe watch` that adds a brand-new top-level identifier
+/// One save-cycle in `ipe dev watch` that adds a brand-new top-level identifier
 /// — the sharpest symbol-numbering probe (a warm db interns it at a tail id;
 /// a cold db interns it mid-parse) — must still emit byte-identical Rust to
 /// a cold build of the post-edit source, on a program whose lowering mints

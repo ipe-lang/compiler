@@ -52,6 +52,11 @@ argument is not valid UTF-8.
 getenv : String -> Task Error String
 ```
 
+`getenv key` -- the value of the environment variable `key`.
+Fails with `NotFound` when the variable is not set (a temp-root name
+is never set), and with `InvalidInput` when it is set to a value that
+is not valid Unicode.  A message names the variable, never its value.
+
 ## `getenvOr`
 
 ```ipe
@@ -62,17 +67,35 @@ getenvOr : String -> String -> String
 otherwise the supplied default.  Sync (no Task) because the
 default handles the missing case.
 
+A variable set to a value that is not valid Unicode answers the
+default too, as an unset one does: the bare `String` return has no
+failure to report it through.  Do not use `getenvOr` for a security
+setting whose default is the permissive branch; read it with `getenv`
+and refuse on `InvalidInput`.
+
 ## `getenvInt`
 
 ```ipe
 getenvInt : String -> Task Error Int
 ```
 
+`getenvInt key` -- the environment variable `key` as an integer.
+Fails with `NotFound` when the variable is not set, and with
+`InvalidInput` when it is not valid Unicode or does not parse as an
+integer.  A message names the variable, never its value.
+
 ## `getenvBool`
 
 ```ipe
 getenvBool : String -> Task Error Bool
 ```
+
+`getenvBool key` -- the environment variable `key` as a boolean.
+Case and surrounding whitespace are ignored: `true`, `yes`, `1`, `on`, `y` and `t` read as `True`; `false`, `no`,
+`0`, `off`, `n`, `f` and the empty value read as `False`.  Fails
+with `NotFound` when the variable is not set, and with `InvalidInput`
+when it is not valid Unicode or is any other value.  A message names
+the variable, never its value.
 
 ## `setenv`
 

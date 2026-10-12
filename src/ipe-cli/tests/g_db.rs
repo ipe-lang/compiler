@@ -8,6 +8,8 @@ mod support;
 mod golden_app_settings_front_door;
 #[path = "g_db/golden_authed_store_query_seal.rs"]
 mod golden_authed_store_query_seal;
+#[path = "g_db/golden_db_failure_typed.rs"]
+mod golden_db_failure_typed;
 #[path = "g_db/golden_db_get_alias_row.rs"]
 mod golden_db_get_alias_row;
 #[path = "g_db/golden_db_get_iperow_bound.rs"]
@@ -34,6 +36,8 @@ mod golden_db_store_order_builtin_order_rejected;
 mod golden_db_store_order_by_seal;
 #[path = "g_db/golden_db_store_order_value.rs"]
 mod golden_db_store_order_value;
+#[path = "g_db/golden_db_store_placeholder_off_intercept.rs"]
+mod golden_db_store_placeholder_off_intercept;
 #[path = "g_db/golden_db_store_policy_algebra.rs"]
 mod golden_db_store_policy_algebra;
 #[path = "g_db/golden_db_store_projection_arith_seal.rs"]

@@ -335,7 +335,7 @@ main =
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// The `ipe build` dev-loop intent: these fixtures exercise the dev posture
+/// The `ipe dev build` dev-loop intent: these fixtures exercise the dev posture
 /// (plain cookie names, loopback upstreams), which a release binary refuses.
 fn dev_loop_options() -> ipe::BuildOptions {
     ipe::BuildOptions {
@@ -369,7 +369,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     ipe::build_with_options(&entry, &out_dir, &runtime, dev_loop_options())
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
@@ -407,6 +407,35 @@ impl Drop for ProcessGuard {
     }
 }
 
+/// How a spawned app binary learns its port and announces readiness.
+struct Launch<'a> {
+    /// The env var the binary reads its port from.
+    port_var: &'a str,
+    /// The stderr text the binary prints once its listener is bound.
+    ready_marker: &'a str,
+    /// Env vars set on the child after the defaults.
+    extra_env: &'a [(&'a str, &'a str)],
+}
+
+/// A standalone `Web.tea` app: `IPE_WEB_PORT` and the `[ipe.web]` banner.
+const WEB_LAUNCH: Launch<'static> = Launch {
+    port_var: "IPE_WEB_PORT",
+    ready_marker: "[ipe.web] listening on",
+    extra_env: &[],
+};
+
+/// Env vars that set a revocation or session-store posture.
+///
+/// The spawner clears them so a test's posture comes only from its own
+/// `extra_env`, never from the environment the test runner inherited.
+const POSTURE_ENV: [&str; 5] = [
+    "IPE_AUTH_REVOCATION",
+    "IPE_AUTH_MAX_LIFETIME",
+    "IPE_AUTH_SLIDE_WINDOW",
+    "IPE_WEB_STORE",
+    "IPE_WEB_STORE_PATH",
+];
+
 /// Spawn the Ipê Live binary and wait until it signals readiness via
 /// `[ipe.web] listening on` on stderr.
 ///
@@ -419,9 +448,27 @@ fn spawn_and_wait_ready(
     exe: &std::path::Path,
     port: u16,
 ) -> Result<ProcessGuard, BoxError> {
-    let mut child = Command::new(exe)
-        // Ipe.Web reads its port from IPE_WEB_PORT (default 8000).
-        .env("IPE_WEB_PORT", port.to_string())
+    spawn_ready_with(test_name, exe, port, &WEB_LAUNCH)
+}
+
+/// Spawn an app binary under `launch` and wait for its ready banner.
+///
+/// # Errors
+///
+/// Returns an error if the binary cannot be spawned or the ready signal does
+/// not appear within 10 s.
+fn spawn_ready_with(
+    test_name: &str,
+    exe: &std::path::Path,
+    port: u16,
+    launch: &Launch<'_>,
+) -> Result<ProcessGuard, BoxError> {
+    let mut command = Command::new(exe);
+    for var in POSTURE_ENV {
+        command.env_remove(var);
+    }
+    command
+        .env(launch.port_var, port.to_string())
         // Disable the double-submit CSRF check so raw TcpStream GETs work.
         .env("IPE_CSRF", "off")
         // Disable the dev console proxy. The console child binary is pre-built
@@ -434,7 +481,11 @@ fn spawn_and_wait_ready(
         // makes gate_allows() return false so no child is spawned and the
         // only `[ipe.web] listening on` line in the stderr pipe is the
         // parent's own (emitted AFTER the TCP listener is bound).
-        .env("IPE_CONSOLE_EMBED", "off")
+        .env("IPE_CONSOLE_EMBED", "off");
+    for (key, value) in launch.extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -466,8 +517,8 @@ fn spawn_and_wait_ready(
                 );
             }
             Ok(_) => {
-                // The web runtime emits: `[ipe.web] listening on http://0.0.0.0:<port>`
-                if line.contains("[ipe.web] listening on") {
+                // e.g. `[ipe.web] listening on http://127.0.0.1:<port>`
+                if line.contains(launch.ready_marker) {
                     return Ok(ProcessGuard(child));
                 }
             }
@@ -614,6 +665,19 @@ fn extract_hid_for_open_tag(html: &str, tag: &str) -> Option<String> {
     let after = &tag_slice[hid_pos + attr_prefix.len()..];
     let end = after.find('"')?;
     Some(after[..end].to_string())
+}
+
+/// A well-formed tab id, as a browser tab mints once per page load.
+const TAB: &str = "00112233445566778899aabbccddeeff";
+
+/// The render epoch the page's boot data block carries.
+///
+/// An event carries it so the server resolves the handler id against the
+/// render that produced it.
+fn extract_epoch(test_name: &str, html: &str) -> Result<String, BoxError> {
+    e2e_support::live_page::boot_string(html, "epoch").ok_or_else(|| -> BoxError {
+        format!("{test_name}: no boot-block epoch in the page").into()
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -812,7 +876,10 @@ fn live_onclick_increments_counter() -> Result<(), BoxError> {
     // `msg` carries the event name (the runtime prefers `event`, then `msg`,
     // then defaults to "click").  `sessionId` is retained in the body for
     // wire-compat but ignored by the server; auth is via the Cookie header.
-    let event_body = format!(r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":""}}"#);
+    let epoch = extract_epoch(test_name, &body)?;
+    let event_body = format!(
+        r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
+    );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
         test_name,
@@ -853,6 +920,47 @@ fn live_onclick_increments_counter() -> Result<(), BoxError> {
         "{test_name}: counter not incremented to 1 after Increment click\n\
          --- first 2000 bytes of second GET / ---\n{}",
         &body2[..body2.len().min(2000)]
+    );
+
+    // ── Step 5: an event from another render history is refused ─────────────
+    //
+    // The same handler id under an epoch this server never minted must not
+    // resolve against the current render: 409 with the current render, and
+    // the counter stays at 1.
+    let foreign = format!("{:032x}.1", 0xdead_u128);
+    let stale_body = format!(
+        r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":"","epoch":"{foreign}","tab":"{TAB}","seq":2}}"#
+    );
+    let (stale_headers, stale_reply) = http_send(
+        test_name,
+        &addr,
+        "POST",
+        "/_ipe/event",
+        &[
+            ("Content-Type", "application/json"),
+            ("Cookie", &cookie_header),
+        ],
+        Some(stale_body.as_bytes()),
+    )?;
+    assert!(
+        stale_headers.starts_with("HTTP/1.1 409") && stale_reply.contains("stale-render"),
+        "{test_name}: a foreign-epoch event must be refused with 409 stale-render\n\
+         --- headers ---\n{stale_headers}\n--- body ---\n{stale_reply}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let (_, body3) = http_send(
+        test_name,
+        &addr,
+        "GET",
+        "/",
+        &[("Cookie", &cookie_header)],
+        None,
+    )?;
+    assert!(
+        body3.contains(">1<") && !body3.contains(">2<"),
+        "{test_name}: a refused event must not dispatch\n\
+         --- first 2000 bytes of third GET / ---\n{}",
+        &body3[..body3.len().min(2000)]
     );
 
     Ok(())
@@ -1347,8 +1455,9 @@ fn live_onsubmit_typed_record_dispatches_decoded_payload() -> Result<(), BoxErro
     })?;
 
     // ── Step 2: POST /_ipe/event — submit with the typed-record form data ──
+    let epoch = extract_epoch(test_name, &body)?;
     let event_body = format!(
-        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":""}}"#
+        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
     );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
@@ -1401,7 +1510,7 @@ fn live_onsubmit_typed_record_dispatches_decoded_payload() -> Result<(), BoxErro
 /// are already synced into `Model` via `onInput`/`onChange`; `onSubmit`
 /// just triggers the action, ignoring the posted `FormData` entirely.
 ///
-/// `ipe build` exits 0 here (`HtmlOnSubmit`'s Ipê-level scheme
+/// `ipe dev build` exits 0 here (`HtmlOnSubmit`'s Ipê-level scheme
 /// deliberately leaves the argument type unconstrained — decoupled from
 /// `msg`, see `constrain.rs`'s `HtmlEventShape::Raw` arm — so a Msg-typed
 /// value type-checks fine there). Emitting the argument unconditionally as a
@@ -1558,8 +1667,10 @@ fn live_onsubmit_bare_msg_dispatches_fixed_msg() -> Result<(), BoxError> {
     })?;
 
     // ── Step 2: POST /_ipe/event — submit with REAL (but ignored) form data ─
-    let event_body =
-        format!(r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":""}}"#);
+    let epoch = extract_epoch(test_name, &body)?;
+    let event_body = format!(
+        r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
+    );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
         test_name,
@@ -2006,8 +2117,10 @@ fn live_onsubmit_var_bound_msg_dispatches_fixed_msg() -> Result<(), BoxError> {
     })?;
 
     // ── Step 2: POST /_ipe/event — submit with REAL (but ignored) form data ─
-    let event_body =
-        format!(r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":""}}"#);
+    let epoch = extract_epoch(test_name, &body)?;
+    let event_body = format!(
+        r#"{{"id":"{hid}","event":"submit","args":[{{"name":"alice"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
+    );
     let cookie_header = format!("ipe_sid={sid}");
     let (_, post_body) = http_send(
         test_name,
@@ -2384,8 +2497,9 @@ fn live_unrouted_get_does_not_wipe_form_handlers() -> Result<(), BoxError> {
     );
 
     // ── Step 3: POST /_ipe/event — submit the typed-record form ────────────
+    let epoch = extract_epoch(test_name, &body)?;
     let event_body = format!(
-        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":""}}"#
+        r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":"","epoch":"{epoch}","tab":"{TAB}","seq":1}}"#
     );
     let (_, post_body) = http_send(
         test_name,
@@ -2880,5 +2994,671 @@ fn web_authn_browser_build_only() -> Result<(), BoxError> {
     }
 
     let _exe = compile_and_build_web_authn()?;
+    Ok(())
+}
+
+// ── Credential revocation and the credential cap ─────────────────────────────
+
+/// The first `max` characters of `text`, for a failure message.
+fn head(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// The status code on the status line of raw response headers.
+fn status_code(raw_headers: &str) -> Option<u16> {
+    raw_headers
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Whether raw response headers carry `name: value`, both case-insensitive.
+fn has_header(raw_headers: &str, name: &str, value: &str) -> bool {
+    raw_headers.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case(name) && v.trim().eq_ignore_ascii_case(value)
+        })
+    })
+}
+
+/// The `(name, value)` of the session cookie a response sets.
+///
+/// A mounted app suffixes the `ipe_sid` name with its base path, so the name
+/// is matched by prefix.
+fn extract_session_cookie(raw_headers: &str) -> Option<(String, String)> {
+    for line in raw_headers.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        let pair = value.trim().split(';').next().unwrap_or_default();
+        let Some((name, sid)) = pair.split_once('=') else {
+            continue;
+        };
+        if name.trim().starts_with("ipe_sid") {
+            return Some((name.trim().to_owned(), sid.trim().to_owned()));
+        }
+    }
+    None
+}
+
+/// Whether a response is the Web runtime's session-lost answer.
+///
+/// That is a `404` with the `x-ipe-web: 1` marker and the `session not found`
+/// body, which the client turns into a fresh page load.
+fn is_session_lost(raw_headers: &str, body: &str) -> bool {
+    status_code(raw_headers) == Some(404)
+        && has_header(raw_headers, "x-ipe-web", "1")
+        && body.contains("session not found")
+}
+
+/// One rendered page: the session it joined and the `+` handler it shows.
+struct Page {
+    /// The `Cookie` header value naming the page's session.
+    cookie: String,
+    /// The session id the page set.
+    sid: String,
+    /// The handler id of the `+` element.
+    hid: String,
+    /// The render epoch the page's handlers resolve against.
+    epoch: String,
+    /// The page body.
+    body: String,
+}
+
+/// `GET path` with `cookie`, read as a page that sets a session cookie.
+///
+/// # Errors
+///
+/// Returns an error when the request fails, or the response sets no session
+/// cookie, shows no `+` handler or carries no render epoch.
+fn get_page(
+    test_name: &str,
+    addr: &str,
+    path: &str,
+    cookie: Option<&str>,
+) -> Result<Page, BoxError> {
+    let headers: Vec<(&str, &str)> = cookie.map(|c| ("Cookie", c)).into_iter().collect();
+    let (raw_headers, body) = http_send(test_name, addr, "GET", path, &headers, None)?;
+    let (name, sid) = extract_session_cookie(&raw_headers).ok_or_else(|| -> BoxError {
+        format!(
+            "{test_name}: GET {path} set no session cookie\n--- raw headers ---\n{raw_headers}\n--- body ---\n{}",
+            head(&body, 2000)
+        )
+        .into()
+    })?;
+    let hid = extract_hid_near_text(&body, "+").ok_or_else(|| -> BoxError {
+        format!(
+            "{test_name}: GET {path} shows no '+' handler\n--- body ---\n{}",
+            head(&body, 2000)
+        )
+        .into()
+    })?;
+    let epoch = extract_epoch(test_name, &body)?;
+    Ok(Page {
+        cookie: format!("{name}={sid}"),
+        sid,
+        hid,
+        epoch,
+        body,
+    })
+}
+
+/// POST one `+` click against `page` and return `(raw_headers, body)`.
+///
+/// # Errors
+///
+/// Returns an error when the request fails.
+fn post_click(
+    test_name: &str,
+    addr: &str,
+    event_path: &str,
+    page: &Page,
+    seq: u64,
+) -> Result<(String, String), BoxError> {
+    let event_body = format!(
+        r#"{{"id":"{}","msg":"click","args":[],"sessionId":"","epoch":"{}","tab":"{TAB}","seq":{seq}}}"#,
+        page.hid, page.epoch
+    );
+    http_send(
+        test_name,
+        addr,
+        "POST",
+        event_path,
+        &[
+            ("Content-Type", "application/json"),
+            ("Cookie", &page.cookie),
+        ],
+        Some(event_body.as_bytes()),
+    )
+}
+
+/// A `Server` that issues a token for `alice`, revokes its bearer's subject,
+/// and mounts a single-page `Web.embed` app whose `init` verifies the `auth`
+/// cookie and shows who it admitted.
+///
+/// The program never calls `Server.withRevocation`: the revocation gate is
+/// armed only by the operator env floor, so one binary runs armed and unarmed.
+const IPE_SERVER_REVOCATION_MOUNT: &str = r#"module Main exposing (main)
+
+import Ipe.Auth as Auth
+import Ipe.Auth.Revocation as Revocation
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Http.Server as Server
+import Ipe.Http.Server exposing (Request, Response)
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Secret as Secret
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+import Ipe.Ui as Ui
+
+
+signingKey : Secret.Secret
+signingKey =
+    Secret.fromString (System.getenvOr "LIVE_E2E_SIGNING_KEY" "live-e2e-revocation-signing-key-of-32-bytes-or-more")
+
+
+type Msg
+    = Increment
+
+
+type alias Model =
+    { user : String
+    , count : Int
+    }
+
+
+userOf : String -> String
+userOf token =
+    case Auth.verifyToken signingKey token of
+        Ok claims ->
+            Maybe.withDefault "anon" (Dict.get "sub" claims)
+
+        Err _ ->
+            "anon"
+
+
+init : WebReq -> ( Model, Cmd Msg )
+init req =
+    ( { user = userOf (Maybe.withDefault "" (Dict.get "auth" req.cookies)), count = 0 }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+
+htmlView : Model -> Html Msg
+htmlView model =
+    Ui.layout []
+        (Ui.column []
+            [ Ui.text (String.concat [ "user:", model.user ])
+            , Ui.el [ Ui.onClick Increment ] (Ui.text "+")
+            , Ui.text (String.fromInt model.count)
+            ])
+
+
+view : Model -> Element Msg
+view model =
+    Ui.html (htmlView model)
+
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+issueToken : Request -> Task Error Response
+issueToken _req =
+    case Auth.signToken signingKey (Dict.fromList [ ( "sub", "alice" ) ]) 3600 of
+        Ok token ->
+            Task.succeed (Server.text token)
+
+        Err e ->
+            Task.succeed (Server.text (String.concat [ "token-error:", Error.message e ]))
+
+
+revoke : Request -> Auth.Principal -> Task Error Response
+revoke _req principal =
+    Task.onError
+        (\_ -> Task.succeed (Server.text "revoke-error"))
+        (Task.andThen
+            (\_ -> Task.succeed (Server.text "revoked"))
+            (Revocation.revokeUser principal (Auth.subject principal))
+        )
+
+
+main : Task Error ()
+main =
+    let port = Maybe.withDefault 8080 (String.toInt (System.getenvOr "IPE_SERVER_PORT" "8080"))
+    in
+    Server.listen port
+        [ Server.get "/token" issueToken
+        , Server.postAuthed "/revoke" (Server.authConfig signingKey Server.bearerToken) revoke
+        , Server.mountApp "/app"
+            (Web.embed
+                { init = init
+                , update = update
+                , view = view
+                , subscriptions = subscriptions
+                , routes = []
+                , notFound = Increment
+                }
+            )
+        ]
+"#;
+
+/// A `Server` program: `IPE_SERVER_PORT` and the `[ipe.http.server]` banner.
+const fn server_launch<'a>(extra_env: &'a [(&'a str, &'a str)]) -> Launch<'a> {
+    Launch {
+        port_var: "IPE_SERVER_PORT",
+        ready_marker: "[ipe.http.server] listening on",
+        extra_env,
+    }
+}
+
+/// The mounted app's page path: `/app/`, else `/app`, whichever serves it.
+///
+/// # Errors
+///
+/// Returns an error when neither path serves the page.
+fn first_mounted_page(
+    test_name: &str,
+    addr: &str,
+    cookie: &str,
+) -> Result<(String, Page), BoxError> {
+    let mut misses = Vec::new();
+    for path in ["/app/", "/app"] {
+        match get_page(test_name, addr, path, Some(cookie)) {
+            Ok(page) => return Ok((path.to_owned(), page)),
+            Err(e) => misses.push(e.to_string()),
+        }
+    }
+    Err(format!(
+        "{test_name}: the mounted app served no page\n{}",
+        misses.join("\n")
+    )
+    .into())
+}
+
+/// Revoke alice through the mounted server's `/revoke` route and require the
+/// `revoked` answer.
+///
+/// # Errors
+///
+/// Returns an error when the request fails or the route does not answer
+/// `revoked`.
+fn revoke_alice(test_name: &str, addr: &str, token: &str) -> Result<(), BoxError> {
+    let bearer = format!("Bearer {token}");
+    let (raw_headers, body) = http_send(
+        test_name,
+        addr,
+        "POST",
+        "/revoke",
+        &[("Authorization", &bearer)],
+        Some(b"".as_slice()),
+    )?;
+    if body.trim() == "revoked" {
+        Ok(())
+    } else {
+        Err(format!(
+            "{test_name}: POST /revoke did not answer `revoked`\n--- raw headers ---\n{raw_headers}\n--- body ---\n{}",
+            head(&body, 2000)
+        )
+        .into())
+    }
+}
+
+/// What one run of the mounted program observed after revoking alice.
+struct RevokedRun {
+    /// The page path the mounted app answered on.
+    path: String,
+    /// The page alice's session rendered.
+    page: Page,
+    /// The auth cookie carrying alice's token.
+    auth_cookie: String,
+    /// The raw headers of the event sent after the revocation.
+    after_headers: String,
+    /// The body of the event sent after the revocation.
+    after_body: String,
+}
+
+/// Issue a token, open alice's mounted session, click once, revoke alice and
+/// click again.
+///
+/// # Errors
+///
+/// Returns an error on any request failure, a page that did not admit alice,
+/// a first click that was not acknowledged, or a refused revocation.
+fn revoke_during_session(test_name: &str, addr: &str) -> Result<RevokedRun, BoxError> {
+    let token = http_get(test_name, addr, "/token")?.trim().to_owned();
+    if token.is_empty() || token.starts_with("token-error") {
+        return Err(format!("{test_name}: GET /token issued no token: {token}").into());
+    }
+    let auth_cookie = format!("auth={token}");
+
+    let (path, page) = first_mounted_page(test_name, addr, &auth_cookie)?;
+    if !page.body.contains(">user:alice<") {
+        return Err(format!(
+            "{test_name}: the mounted page did not admit alice's verified token\n--- body ---\n{}",
+            head(&page.body, 2000)
+        )
+        .into());
+    }
+
+    let event_path = "/app/_ipe/event";
+    let (first_headers, first_body) = post_click(test_name, addr, event_path, &page, 1)?;
+    if !first_body.contains("patches") {
+        return Err(format!(
+            "{test_name}: the click before the revocation was not acknowledged\n--- raw headers ---\n{first_headers}\n--- body ---\n{first_body}"
+        )
+        .into());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    revoke_alice(test_name, addr, &token)?;
+
+    let (after_headers, after_body) = post_click(test_name, addr, event_path, &page, 2)?;
+    Ok(RevokedRun {
+        path,
+        page,
+        auth_cookie,
+        after_headers,
+        after_body,
+    })
+}
+
+/// A user revoked through a mounted server loses its live Web session.
+///
+/// The gate is armed by `IPE_AUTH_REVOCATION=store` alone. After the server's
+/// `/revoke` route revokes alice, the session's next event answers
+/// session-lost and a page reload re-runs `init`, which no longer admits the
+/// revoked token. The same binary run unarmed keeps the session, so the
+/// session-lost answer is the gate's, not the route's.
+///
+/// # Errors
+///
+/// Propagates any pipeline, build, spawn, HTTP, or assertion error.
+#[test]
+fn web_session_revoked_through_mounted_server_is_session_lost() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "web_session_revoked_through_mounted_server";
+    let exe = compile_and_build(test_name, IPE_SERVER_REVOCATION_MOUNT)?;
+
+    // ── Armed: the env floor alone arms the gate ─────────────────────────────
+    {
+        let port = pick_ephemeral_port()?;
+        let armed_env = [
+            ("IPE_HTTP_BIND", "127.0.0.1"),
+            ("IPE_AUTH_REVOCATION", "store"),
+        ];
+        let _guard = spawn_ready_with(test_name, &exe, port, &server_launch(&armed_env))?;
+        let addr = format!("127.0.0.1:{port}");
+
+        let run = revoke_during_session(test_name, &addr)?;
+        assert!(
+            is_session_lost(&run.after_headers, &run.after_body),
+            "{test_name}: an event after the revocation must answer session-lost\n--- raw headers ---\n{}\n--- body ---\n{}",
+            run.after_headers,
+            run.after_body
+        );
+
+        // The reload carries the closed sid and the revoked token: the closed
+        // session is gone, so `init` runs under a fresh sid and refuses the
+        // revoked token.
+        let reload_cookie = format!("{}; {}", run.page.cookie, run.auth_cookie);
+        let reload = get_page(test_name, &addr, &run.path, Some(&reload_cookie))?;
+        assert_ne!(
+            reload.sid, run.page.sid,
+            "{test_name}: the reload must not rejoin the revoked session"
+        );
+        assert!(
+            reload.body.contains(">user:anon<") && !reload.body.contains(">user:alice<"),
+            "{test_name}: the reload must not admit the revoked token\n--- body ---\n{}",
+            head(&reload.body, 2000)
+        );
+    }
+
+    // ── Unarmed control: the same binary keeps the session ───────────────────
+    {
+        let port = pick_ephemeral_port()?;
+        let off_env = [("IPE_HTTP_BIND", "127.0.0.1")];
+        let _guard = spawn_ready_with(test_name, &exe, port, &server_launch(&off_env))?;
+        let addr = format!("127.0.0.1:{port}");
+
+        let run = revoke_during_session(test_name, &addr)?;
+        assert!(
+            run.after_body.contains("patches"),
+            "{test_name}: unarmed, the event after the revocation must still be acknowledged\n--- raw headers ---\n{}\n--- body ---\n{}",
+            run.after_headers,
+            run.after_body
+        );
+    }
+
+    Ok(())
+}
+
+/// A standalone `Web.appWith` app armed by `Web.withRevocation` whose `init`
+/// signs and verifies its own token, so every session carries a credential
+/// whose cap the operator sets.
+const IPE_WEB_CAPPED_SESSION: &str = r#"module Main exposing (main)
+
+import Ipe.Auth as Auth
+import Ipe.Dict as Dict
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Secret as Secret
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+import Ipe.Ui as Ui
+
+
+signingKey : Secret.Secret
+signingKey =
+    Secret.fromString (System.getenvOr "LIVE_E2E_SIGNING_KEY" "live-e2e-capped-session-signing-key-of-32-bytes-or-more")
+
+
+type Msg
+    = Increment
+
+
+type alias Model =
+    { user : String
+    , count : Int
+    }
+
+
+userOf : String -> String
+userOf token =
+    case Auth.verifyToken signingKey token of
+        Ok claims ->
+            Maybe.withDefault "anon" (Dict.get "sub" claims)
+
+        Err _ ->
+            "anon"
+
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    case Auth.signToken signingKey (Dict.fromList [ ( "sub", "alice" ) ]) 3600 of
+        Ok token ->
+            ( { user = userOf token, count = 0 }, Cmd.none )
+
+        Err _ ->
+            ( { user = "unsigned", count = 0 }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+
+htmlView : Model -> Html Msg
+htmlView model =
+    Ui.layout []
+        (Ui.column []
+            [ Ui.text (String.concat [ "user:", model.user ])
+            , Ui.el [ Ui.onClick Increment ] (Ui.text "+")
+            , Ui.text (String.fromInt model.count)
+            ])
+
+
+view : Model -> Element Msg
+view model =
+    Ui.html (htmlView model)
+
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+main =
+    Web.appWith
+        [ Web.withRevocation Web.revocationStore
+        ]
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Increment
+        }
+"#;
+
+/// The credential cap, in seconds, the capped-session test runs under.
+///
+/// Long enough that a restart lands well inside it, short enough that the
+/// session ends within the poll ceiling.
+const CAP_SECONDS: &str = "10";
+
+/// How long the capped-session test waits for the session to end.
+const CAP_POLL_CEILING: Duration = Duration::from_secs(30);
+
+/// A standalone Web session ends at its credential cap, across a restart.
+///
+/// The session is persisted to a file store with its verified credential,
+/// the server is killed and restarted, and the restored session rejoins with
+/// its model. Its credential is re-proved on restore, so once the cap passes
+/// its next event answers session-lost.
+///
+/// # Errors
+///
+/// Propagates any pipeline, build, spawn, HTTP, or assertion error.
+#[test]
+fn standalone_web_tea_session_ends_at_cap() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "standalone_web_tea_session_ends_at_cap";
+    let exe = compile_and_build(test_name, IPE_WEB_CAPPED_SESSION)?;
+
+    let store_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("live_e2e_{test_name}_sessions.json"));
+    let _ = std::fs::remove_file(&store_path);
+    let store_path = store_path.to_str().ok_or_else(|| -> BoxError {
+        format!("{test_name}: the session-store path is not UTF-8").into()
+    })?;
+    let env = [
+        ("IPE_AUTH_MAX_LIFETIME", CAP_SECONDS),
+        ("IPE_AUTH_SLIDE_WINDOW", "1"),
+        ("IPE_WEB_STORE", "file"),
+        ("IPE_WEB_STORE_PATH", store_path),
+    ];
+    let launch = Launch {
+        extra_env: &env,
+        ..WEB_LAUNCH
+    };
+
+    // ── First run: open the session and commit one click ─────────────────────
+    let sid = {
+        let port = pick_ephemeral_port()?;
+        let _guard = spawn_ready_with(test_name, &exe, port, &launch)?;
+        let addr = format!("127.0.0.1:{port}");
+
+        let page = get_page(test_name, &addr, "/", None)?;
+        assert!(
+            page.body.contains(">user:alice<") && page.body.contains(">0<"),
+            "{test_name}: `init` did not admit its own token\n--- body ---\n{}",
+            head(&page.body, 2000)
+        );
+        let (raw_headers, body) = post_click(test_name, &addr, "/_ipe/event", &page, 1)?;
+        assert!(
+            body.contains("patches"),
+            "{test_name}: the first click was not acknowledged\n--- raw headers ---\n{raw_headers}\n--- body ---\n{body}"
+        );
+        // The driver commits and checkpoints after `update`.
+        std::thread::sleep(Duration::from_millis(300));
+        page.sid
+    };
+
+    // ── Second run: the persisted session restores, then ends at its cap ─────
+    let port = pick_ephemeral_port()?;
+    let _guard = spawn_ready_with(test_name, &exe, port, &launch)?;
+    let addr = format!("127.0.0.1:{port}");
+
+    let cookie = format!("ipe_sid={sid}");
+    let restored = get_page(test_name, &addr, "/", Some(&cookie))?;
+    assert_eq!(
+        restored.sid, sid,
+        "{test_name}: the restart must rejoin the persisted session, not mint a new one"
+    );
+    assert!(
+        restored.body.contains(">1<") && restored.body.contains(">user:alice<"),
+        "{test_name}: the persisted session did not restore with its model\n--- body ---\n{}",
+        head(&restored.body, 2000)
+    );
+    let (raw_headers, body) = post_click(test_name, &addr, "/_ipe/event", &restored, 2)?;
+    assert!(
+        body.contains("patches"),
+        "{test_name}: the restored session's first click was not acknowledged\n--- raw headers ---\n{raw_headers}\n--- body ---\n{body}"
+    );
+
+    let deadline = Instant::now() + CAP_POLL_CEILING;
+    let mut seq = 3;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let (raw_headers, body) = post_click(test_name, &addr, "/_ipe/event", &restored, seq)?;
+        if is_session_lost(&raw_headers, &body) {
+            break;
+        }
+        // Before the cap an event is acknowledged, or refused as stale once
+        // its render leaves the retained history; anything else is a fault.
+        let status = status_code(&raw_headers);
+        if status != Some(200) && status != Some(409) {
+            return Err(format!(
+                "{test_name}: an event before the session ended answered {status:?}\n--- raw headers ---\n{raw_headers}\n--- body ---\n{body}"
+            )
+            .into());
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "{test_name}: the restored session outlived its {CAP_SECONDS} s credential cap by the {} s poll ceiling",
+                CAP_POLL_CEILING.as_secs()
+            )
+            .into());
+        }
+        seq += 1;
+    }
     Ok(())
 }

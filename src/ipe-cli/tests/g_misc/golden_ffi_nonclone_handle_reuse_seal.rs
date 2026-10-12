@@ -4,11 +4,11 @@
 //! type. When that type is not `Clone` (e.g. `bevy_ecs::World`), reusing the
 //! same handle binding twice in a value-consuming position cannot be lowered as
 //! `handle.clone()` — the emitted crate would fail `cargo build` (E0599) AFTER
-//! `ipe build` already reported exit 0. That exit-0-then-cargo-fail hole is the
+//! `ipe dev build` already reported exit 0. That exit-0-then-cargo-fail hole is the
 //! exact SEAL break `PRINCIPLES.md` forbids.
 //!
 //! The lowerer now classifies a `Rust.*`-homed opaque `Enum` as non-`Clone` and
-//! fails closed on its non-linear reuse with IPE-L0130, so `ipe build` can never
+//! fails closed on its non-linear reuse with IPE-L0130, so `ipe dev build` can never
 //! exit 0 with uncompilable Rust for this shape.
 //!
 //! ```text
@@ -128,7 +128,7 @@ fn nonclone_handle_reused_fails_closed_before_cargo() {
     let Err(err) = built else {
         panic!(
             "expected IPE-L0130 rejection for reusing a non-`Clone` FFI handle, \
-             but ipe build SUCCEEDED — an exit-0-then-cargo-fail SEAL hole"
+             but ipe dev build SUCCEEDED — an exit-0-then-cargo-fail SEAL hole"
         )
     };
     let ipe::CliError::Pipeline { diag, .. } = &err else {

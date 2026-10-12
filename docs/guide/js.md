@@ -84,7 +84,7 @@ subscriptions _model =
     Js.subscribe Decode.int Ticked
 ```
 
-Building it (`ipe build`) compiles the app — reaching a built binary means both
+Building it (`ipe dev build`) compiles the app — reaching a built binary means both
 `ipe` accepted the program and the emitted Rust compiled, which is the seal for a
 port program: a seal-legal payload lowers to the shared transport with no
 per-port adapter.

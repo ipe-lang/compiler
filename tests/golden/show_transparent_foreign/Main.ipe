@@ -1,0 +1,21 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Rust.Tm as Tm exposing (Shade(..))
+
+
+-- A transparent `Rust.*` union lowers to an app enum with its own show row, so
+-- showing it, directly or as a user union's payload, is accepted and renders
+-- its constructors. The harness seeds the `tm` FFI interface this module
+-- imports.
+type Holder
+    = Holder Tm.Shade
+
+
+main =
+    case Tm.brightness (Level 3) of
+        Ok n ->
+            Io.println ("shade: " ++ errorToString (Level n) ++ "\nholder: " ++ errorToString (Holder (Mix 2 "mix")))
+
+        Err _ ->
+            Io.println "err brightness"

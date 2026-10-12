@@ -1,6 +1,6 @@
 //! A generic union's inner record-of-function has no `Clone` impl (SEAL).
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build`:
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build`:
 //! a generic union `Box a` whose inner record stores a first-class function keyed
 //! on `a` (`read : String -> Result Error a`) ALONGSIDE a bare generic field
 //! (`seed : a`) synthesised a `Rec…<T1>` struct with NEITHER a `#[derive(Clone)]`
@@ -65,7 +65,7 @@ fn fncarrier_record_generic_clone_ipec_accepts_and_impls_clone() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for fncarrier_record_generic_clone: {:?}",
+        "ipe dev build must succeed for fncarrier_record_generic_clone: {:?}",
         built.err()
     );
 
@@ -111,7 +111,7 @@ fn fncarrier_record_generic_clone_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for fncarrier_record_generic_clone: {:?}",
+        "ipe dev build must succeed for fncarrier_record_generic_clone: {:?}",
         built.err()
     );
 

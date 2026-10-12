@@ -1,0 +1,24 @@
+module Main exposing (main)
+import Ipe.Io as Io
+import Ipe.String
+
+-- A union parameter may be spelled `any`. Declared, it is the union's own
+-- type variable, never the wildcard: `Box Int` holds an `Int` and
+-- `Box String` holds a `String`, each read back at its own type.
+type Box any
+    = Box any
+
+unboxInt : Box Int -> Int
+unboxInt box =
+    case box of
+        Box n ->
+            n
+
+unboxString : Box String -> String
+unboxString box =
+    case box of
+        Box s ->
+            s
+
+main =
+    Io.println (unboxString (Box "boxed") ++ ":" ++ String.fromInt (unboxInt (Box 41) + 1))

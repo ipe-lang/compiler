@@ -1,7 +1,7 @@
 //! A promoted Arc-root handler and a non-promoted
 //! function-value sibling unified at ONE Rust type position.
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails `cargo build` with
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails `cargo build` with
 //! E0308. A function-typed `let handler = \form -> …` flows into the
 //! `Ui.onSubmit` kernel (a `requires_sync_capture` consumer), so the lowerer
 //! promotes it to an `Expr::SharedLambda` — its reads render
@@ -76,7 +76,7 @@ fn assert_ipec_unifies_to_arc(fixture: &str) {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {fixture}: {:?}",
+        "ipe dev build must succeed for {fixture}: {:?}",
         built.err()
     );
 
@@ -110,7 +110,7 @@ fn assert_ipec_unifies_to_arc(fixture: &str) {
 
 /// cargo-0 ∧ run-0: the emitted project actually compiles with `rustc` (no
 /// E0308/E0507) and renders the form. Gated on `IPE_E2E=1` — the only check that
-/// would have caught the original SEAL violation (E0308, `ipe build` clean).
+/// would have caught the original SEAL violation (E0308, `ipe dev build` clean).
 fn assert_cargo_builds_and_runs(fixture: &str) {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
@@ -126,7 +126,7 @@ fn assert_cargo_builds_and_runs(fixture: &str) {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for {fixture}: {:?}",
+        "ipe dev build must succeed for {fixture}: {:?}",
         built.err()
     );
 

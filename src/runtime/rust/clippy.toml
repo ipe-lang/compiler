@@ -22,12 +22,23 @@ allow-expect-in-tests = true
 # allow. `percent-encoding`, `url`, `serde_urlencoded` and `axum` are optional
 # dependencies, so their entries tolerate a build without them (`allow-invalid`);
 # `src/clippy_paths_resolve.rs` names each one so a stale path breaks the build.
+#
+# A thread start the OS refuses must reach the caller as an error, never a
+# panic: OS threads start through `threads::spawn_named` (`Builder::spawn`), and
+# blocking-pool work through `threads::offload_blocking`, the one site allowed to
+# call tokio's `spawn_blocking` (whose thread-start panic it catches). `tokio` is
+# an optional dependency, so its entries tolerate a build without it.
+#
+# The process ends only through `system::exit_process`, which runs the pre-exit
+# stages Drop would have run (terminal restore, telemetry exporter flush) before
+# its one `std::process::exit`.
 disallowed-methods = [
     # The abrupt-failure constructs the root `clippy.toml` bans, mirrored here
     # because this crate reads its own config.
     { path = "core::option::Option::unwrap_unchecked", reason = "UB on None; return a Result or model the invariant in a type" },
     { path = "core::result::Result::unwrap_unchecked", reason = "UB on Err; return a Result or model the invariant in a type" },
     { path = "std::process::abort", reason = "abrupt termination that skips Drop; return a Result" },
+    { path = "std::process::exit", reason = "skips the pre-exit stages (terminal restore, exporter flush); end the process through `system::exit_process`" },
     { path = "std::panic::panic_any", reason = "a panic; return a Result" },
     { path = "core::hint::unreachable_unchecked", reason = "UB; model the invariant in a type instead" },
     { path = "std::env::home_dir", reason = "an unvalidated home; read it through `system::home_dir`" },
@@ -36,6 +47,10 @@ disallowed-methods = [
     { path = "std::env::vars", reason = "a whole-environment iterator bypasses the overlay and hands out the temp root; read named keys through `system::read_env_var`" },
     { path = "std::env::vars_os", reason = "a whole-environment iterator bypasses the overlay and hands out the temp root; read named keys through `system::read_env_var`" },
     { path = "std::env::temp_dir", reason = "a base other users can write; create temporary entries through `scratch_core` (tests: `scratch_core::test_temp_root`)" },
+    { path = "std::thread::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn` and route the `io::Error`" },
+    { path = "std::thread::Scope::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn_scoped` and route the `io::Error`" },
+    { path = "tokio::task::spawn_blocking", reason = "panics when the blocking pool cannot start a thread; use `threads::offload_blocking`", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "panics when the blocking pool cannot start a thread; use `threads::offload_blocking`", allow-invalid = true },
     { path = "percent_encoding::percent_decode_str", reason = "lenient; decode a URL component through `encoding::decode_component`", allow-invalid = true },
     { path = "percent_encoding::percent_decode", reason = "lenient; decode a URL component through `encoding::decode_component`", allow-invalid = true },
     { path = "percent_encoding::PercentDecode::decode_utf8_lossy", reason = "lossy; decode a URL component through `encoding::decode_component`", allow-invalid = true },
@@ -45,6 +60,7 @@ disallowed-methods = [
     { path = "serde_urlencoded::from_bytes", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
     { path = "serde_urlencoded::from_reader", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
     { path = "url::Url::query_pairs", reason = "lenient; decode a query through `encoding::decode_form_query` (a driver-parity read goes through `ssrf::DriverParityQuery`)", allow-invalid = true },
+    { path = "axum::serve::serve", reason = "serve an app listener through server::serve_app (Host admission)", allow-invalid = true },
 ]
 
 disallowed-types = [

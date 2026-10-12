@@ -73,7 +73,7 @@ Binding a `Task` to `_` discards its effect outside the effect discipline and
 is rejected (IPE-L0141). Thread effects sequentially with `Task.andThen` or use
 a `do` block instead:
 
-```ipe ipe:error
+```ipe ipe:error IPE-L0141
 main : Task Error ()
 main =
     let

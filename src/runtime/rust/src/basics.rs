@@ -34,6 +34,12 @@ pub enum IpeOrder {
     GT = 2,
 }
 
+crate::stringify::show_row!("Order", Value, [] IpeOrder, |o| match o {
+    IpeOrder::LT => "LT".to_owned(),
+    IpeOrder::EQ => "EQ".to_owned(),
+    IpeOrder::GT => "GT".to_owned(),
+});
+
 /// Ipê `compare : comparable -> comparable -> Order`.
 ///
 /// `LT` when `a < b`, `GT` when `a > b`, `EQ` otherwise. The `PartialOrd`

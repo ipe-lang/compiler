@@ -82,7 +82,7 @@ type alias Package =
 -- | Per-host delivery configuration.
 --
 -- All three sections are present and live — the active target is the CLI's
--- resolved shape+runtime+host, not a field here. `ipe build` reads only the
+-- resolved shape+runtime+host, not a field here. `ipe dev build` reads only the
 -- section matching the resolved target; the others are inert at that run.
 type alias Delivery =
     { ships : List Ship
@@ -190,10 +190,15 @@ type Orientation
     | Any
 
 
--- | Configuration for the `web solo` browser host.
+-- | Configuration for the browser host.
 --
--- `basePath` is the URL base path the client is served from. Use `"/"` for the
--- root and `"/app"` when the client lives at a sub-path behind a reverse proxy.
+-- `basePath` is the URL path the client bundle is served at: the `web solo`
+-- host, static hosts, and mobile shells all serve the bundle under it. Use
+-- `"/"` (or `""`) for the root and `"/app"` when the client lives at a sub-path
+-- behind a reverse proxy. Any other value is one or more `/segment` parts, each
+-- made only of the bytes `A-Z a-z 0-9 - . _ ~`, with no trailing `/`, no empty,
+-- `.`, or `..` segment, and at most 1024 bytes in all. The manifest refuses any
+-- other value.
 type alias BrowserConfig =
     { basePath : String
     }
@@ -295,7 +300,8 @@ type WasmMode
 
 -- | The options of an active wasm client bundle. `publicEnv` is a default-deny
 -- allowlist of environment-variable names the bundle may read at build time;
--- listing a secret-pattern name is a read-time build error.
+-- listing a secret-pattern name, a temp-root or home variable (`TMPDIR`,
+-- `HOME`, …), a malformed name, or one name twice is a read-time build error.
 type alias WasmOptions =
     { mode : WasmMode
     , entry : String

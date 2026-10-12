@@ -240,8 +240,8 @@ fn synthesises_struct_literal_access_and_update() -> DResult<()> {
     );
     assert!(
         out.contains("\"{{{} {}}}\",")
-            && out.contains("(&ipe_runtime::stringify::Wrap(&self.x)).dispatch(),")
-            && out.contains("(&ipe_runtime::stringify::Wrap(&self.y)).dispatch()"),
+            && out.contains("IpeStringify::ipe_show(&self.x),")
+            && out.contains("IpeStringify::ipe_show(&self.y)"),
         "IpeStringify format! body wrong:\n{out}"
     );
     // Literal → struct literal.

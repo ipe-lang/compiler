@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! T4 (prove the refusal): `ipe build` copies the freshly built native binary
+//! T4 (prove the refusal): `ipe dev build` copies the freshly built native binary
 //! into `<project>/out/bin/<name>` so it is findable under the project even when
 //! `CARGO_TARGET_DIR` points at a shared cache OUTSIDE the project. And the
 //! clobber regression: two different projects that share the emitted crate name
@@ -21,7 +21,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 const SRC_A: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"AAA\"\n";
 const SRC_B: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"BBB\"\n";
 
-/// Run `ipe build <entry> --out <project>/out` against a shared target.
+/// Run `ipe dev build <entry> --out <project>/out` against a shared target.
 ///
 /// `CARGO_TARGET_DIR` is forced to a SHARED directory OUTSIDE the project, and
 /// the emitted crate name pinned so both projects collide on the same
@@ -43,7 +43,7 @@ fn build_into_shared_target(
     let out_dir = project.join("out");
 
     let status = std::process::Command::new(ipe_bin)
-        .args(["build", &entry.to_string_lossy(), "--out"])
+        .args(["dev", "build", &entry.to_string_lossy(), "--out"])
         .arg(&out_dir)
         // The shared cache lives OUTSIDE the project — the exact Ipê-recommended
         // setup that leaves the binary unfindable without the out/bin copy.
@@ -54,9 +54,9 @@ fn build_into_shared_target(
         .env("IPE_EMIT_PACKAGE_NAME", "app")
         .env("NO_COLOR", "1")
         .status()
-        .map_err(|e| -> BoxError { format!("spawn ipe build: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("spawn ipe dev build: {e}").into() })?;
     if !status.success() {
-        return Err(format!("[{tag}] ipe build must succeed, got {status:?}").into());
+        return Err(format!("[{tag}] ipe dev build must succeed, got {status:?}").into());
     }
 
     // The artifact lands at `<project>/out/bin/<friendly>` (sibling of

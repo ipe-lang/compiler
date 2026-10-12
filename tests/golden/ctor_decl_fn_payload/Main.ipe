@@ -4,7 +4,7 @@ import Ipe.Io as Io
 -- #90 Stage 1: a DECLARED function-typed constructor payload used to trip
 -- IPE-L0114 at the union declaration (`lower_enum`'s decl-site gate). #87's
 -- derive-demotion fixpoint already keeps the emitted enum sound (no derive,
--- `<fn>` IpeStringify placeholder), so the declaration site needs no gate.
+-- `<function>` IpeStringify placeholder), so the declaration site needs no gate.
 type Retryish e = RetryAlways | RetryWhen (e -> Bool)
 
 shouldRetry : Retryish Int -> Int -> Bool

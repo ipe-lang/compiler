@@ -52,7 +52,7 @@ fn analytics_store_gate_resolves_and_builds() {
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
-        "analytics_store_gate: `ipe build` must exit 0 (Ipe.Analytics store \
+        "analytics_store_gate: `ipe dev build` must exit 0 (Ipe.Analytics store \
          surface — eventsStore/persist/erase/totals/uniqueUsers/eventCounts/recent \
          — must all resolve and build): {:?}",
         built.err()
@@ -76,7 +76,7 @@ fn analytics_store_gate_end_to_end() {
     let built = ipe::build(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
-        "analytics_store_gate: `ipe build` must exit 0: {:?}",
+        "analytics_store_gate: `ipe dev build` must exit 0: {:?}",
         built.err()
     );
 

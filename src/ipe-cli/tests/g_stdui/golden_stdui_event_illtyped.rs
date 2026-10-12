@@ -71,7 +71,7 @@ fn event_oninput_illtyped_bool_handler_is_ipe_t0001() {
 }
 
 /// POSITIVE sentinel: `Event.onInput` with a correct
-/// `String -> msg` handler must compile (ipe build returns `Ok`).
+/// `String -> msg` handler must compile (ipe dev build returns `Ok`).
 ///
 /// This confirms the widened qualifier arm in `constrain.rs` does not
 /// break well-typed `Event.onInput` usage.

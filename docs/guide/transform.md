@@ -34,7 +34,7 @@ lift =
     ]
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 The transform declaration (propsToCss emits the property name and value):

@@ -52,7 +52,7 @@ describe block =
         -- … one arm per remaining variant …
 ```
 
-Parsing the note and describing each block (`ipe run`):
+Parsing the note and describing each block (`ipe dev run`):
 
 ```
 Parsed markdown blocks:

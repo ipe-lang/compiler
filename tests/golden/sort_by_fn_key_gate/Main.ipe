@@ -1,0 +1,21 @@
+module Main exposing (main)
+
+-- A function key cannot be ordered, so `List.sortBy` keyed on `Int -> Int` is
+-- rejected at type-check (IPE-T0001).
+
+import Ipe.Io as Io
+import Ipe.List
+import Ipe.String
+
+
+offsets : List Int
+offsets =
+    [ 2, 1 ]
+
+
+main =
+    let
+        _unused =
+            List.sortBy (\n -> \m -> n + m) offsets
+    in
+    Io.println (String.fromInt 0)

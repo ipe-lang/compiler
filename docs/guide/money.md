@@ -66,7 +66,7 @@ crossCurrency =
     Money.add bill (Money.fromMajor EUR 50)
 ```
 
-Running it (`ipe run`):
+Running it (`ipe dev run`):
 
 ```
 Bill + 18% tip: $118.00

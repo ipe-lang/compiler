@@ -10,42 +10,184 @@
 
 use super::*;
 use std::collections::HashMap;
+#[cfg(feature = "db")]
 use std::sync::OnceLock;
 
-/// A fixed, valid cost-12 bcrypt hash used ONLY to make the unknown-email login
-/// path do the same KDF work as the known-email path (anti-enumeration timing
-/// defence). Computed once; the verify result is always discarded. Cost 12
-/// matches the register default so both paths cost the same. Only the db
-/// `auth_login` flow consumes it, so it is `db`-gated alongside its sole caller
-/// — a `jwt`-without-`db` auth build (hash/verify/sign kernels only) needs
-/// neither.
+/// The bcrypt cost registration hashes at, and the login decoy hashes at.
+///
+/// One cost for both makes the unknown-email login path do the same KDF work
+/// as the known-email path, so login timing names no account.
+const REGISTER_COST: BcryptCost = BcryptCost(12);
+
+/// A valid bcrypt hash at [`REGISTER_COST`], the decoy when hashing fails.
+///
+/// Its cost field is tied to [`REGISTER_COST`] by a test that parses it.
+#[cfg(feature = "db")]
+const DECOY_FALLBACK_HASH: &str = "$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW";
+
+/// The bcrypt hash at [`REGISTER_COST`] an unknown-email login verifies against.
+///
+/// It makes the unknown-email path do the known-email path's KDF work
+/// (anti-enumeration timing defence). Computed once; the verify result is
+/// always discarded. Only the db `auth_login` flow consumes it, so it is
+/// `db`-gated alongside its sole caller: a `jwt`-without-`db` auth build
+/// (hash/verify/sign kernels only) needs neither.
 #[cfg(feature = "db")]
 fn dummy_bcrypt_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
     HASH.get_or_init(|| {
         // bcrypt::hash is infallible for a fixed valid input + cost; on the
-        // structurally-unreachable Err, fall back to a static valid cost-12
-        // hash literal so the verify still runs the KDF.
-        bcrypt::hash("ipe-login-timing-defence", 12).unwrap_or_else(|_| {
-            "$2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW".to_string()
-        })
+        // structurally-unreachable Err, the fallback literal at the same cost
+        // keeps the verify running the KDF.
+        bcrypt::hash("ipe-login-timing-defence", REGISTER_COST.get())
+            .unwrap_or_else(|_| DECOY_FALLBACK_HASH.to_owned())
     })
 }
 
 // ─── Pure crypto kernels ──────────────────────────────────────────────
 
-/// Ipê `hashPassword : String -> Result Error String`. Bcrypt with default
-/// cost 12.
+/// Ipê `hashPassword : String -> Result Error String`. Bcrypt at
+/// [`REGISTER_COST`], the login decoy's cost.
 pub fn auth_hash_password<E: From<String>>(pw: String) -> IpeResult<E, String> {
-    auth_hash_password_cost(pw, 12)
+    auth_hash_password_cost(pw, i64::from(REGISTER_COST.get()))
+}
+
+/// The lowest bcrypt cost the library accepts.
+const BCRYPT_COST_MIN: u32 = 4;
+
+/// The highest bcrypt cost hashed or verified: each +1 doubles the work, so a
+/// cost past this ceiling (~1–2 s/hash) is a CPU-exhaustion vector.
+const BCRYPT_COST_MAX: u32 = 15;
+
+/// A bcrypt work factor inside `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BcryptCost(u32);
+
+/// Why a stored hash was refused before bcrypt ran on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredHashRefusal {
+    /// The hash is not a `$2[abxy]$NN$<salt><digest>` hash bcrypt verifies.
+    NotBcrypt,
+    /// The hash's cost field is above [`BCRYPT_COST_MAX`].
+    CostOverCeiling,
+}
+
+impl StoredHashRefusal {
+    /// The fixed message an `Auth.verifyPassword` refusal carries; it never
+    /// names the hash.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::NotBcrypt => "auth.verifyPassword: stored hash is not a bcrypt hash",
+            Self::CostOverCeiling => "auth.verifyPassword: stored hash cost exceeds the ceiling",
+        }
+    }
+}
+
+impl BcryptCost {
+    /// The `requested` cost clamped into the accepted range.
+    fn clamped(requested: i64) -> Self {
+        let clamped = requested.clamp(i64::from(BCRYPT_COST_MIN), i64::from(BCRYPT_COST_MAX));
+        Self(u32::try_from(clamped).unwrap_or(BCRYPT_COST_MAX))
+    }
+
+    /// The cost field of the bcrypt `hash`, read from its `$2[abxy]$NN$`
+    /// prefix.
+    fn of_hash(hash: &str) -> Result<Self, StoredHashRefusal> {
+        let [b'$', b'2', variant, b'$', tens, ones, b'$', ..] = hash.as_bytes() else {
+            return Err(StoredHashRefusal::NotBcrypt);
+        };
+        if !matches!(variant, b'a' | b'b' | b'x' | b'y') {
+            return Err(StoredHashRefusal::NotBcrypt);
+        }
+        let (Some(tens), Some(ones)) = (
+            char::from(*tens).to_digit(10),
+            char::from(*ones).to_digit(10),
+        ) else {
+            return Err(StoredHashRefusal::NotBcrypt);
+        };
+        let cost = tens.saturating_mul(10).saturating_add(ones);
+        if cost < BCRYPT_COST_MIN {
+            Err(StoredHashRefusal::NotBcrypt)
+        } else if cost > BCRYPT_COST_MAX {
+            Err(StoredHashRefusal::CostOverCeiling)
+        } else {
+            Ok(Self(cost))
+        }
+    }
+
+    /// The work factor bcrypt runs at.
+    const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The byte length of a bcrypt hash's `$2[abxy]$NN$` prefix.
+const BCRYPT_PREFIX_LEN: usize = 7;
+
+/// The salt's length in bcrypt base64 characters.
+const BCRYPT_SALT_CHARS: usize = 22;
+
+/// The salt and digest's length in bcrypt base64 characters.
+const BCRYPT_BODY_CHARS: usize = 53;
+
+/// The salt's length in bytes.
+const BCRYPT_SALT_BYTES: usize = 16;
+
+/// The stored digest's length in bytes.
+const BCRYPT_DIGEST_BYTES: usize = 23;
+
+/// The base64 engine bcrypt encodes its salt and digest with: its own
+/// alphabet, no padding, canonical trailing bits.
+const BCRYPT_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::BCRYPT,
+    base64::engine::general_purpose::NO_PAD,
+);
+
+/// A stored hash bcrypt verifies without refusing it: the exact
+/// `$2[abxy]$NN$<salt><digest>` shape, its cost inside
+/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]`, salt and digest each decoding to its
+/// full length. Verifying one always runs the KDF, at a bounded cost.
+#[derive(Clone, Copy)]
+struct StoredHash<'a> {
+    /// The hash text, proven to have that shape.
+    text: &'a str,
+}
+
+impl<'a> StoredHash<'a> {
+    /// The stored hash `text`, admitted only in the shape bcrypt verifies.
+    fn parse(text: &'a str) -> Result<Self, StoredHashRefusal> {
+        use base64::Engine as _;
+        BcryptCost::of_hash(text)?;
+        let decodes_to = |part: &str, len: usize| {
+            BCRYPT_BASE64
+                .decode(part)
+                .is_ok_and(|bytes| bytes.len() == len)
+        };
+        let body = text.get(BCRYPT_PREFIX_LEN..).unwrap_or_default();
+        match body.split_at_checked(BCRYPT_SALT_CHARS) {
+            Some((salt, digest))
+                if body.len() == BCRYPT_BODY_CHARS
+                    && decodes_to(salt, BCRYPT_SALT_BYTES)
+                    && decodes_to(digest, BCRYPT_DIGEST_BYTES) =>
+            {
+                Ok(Self { text })
+            }
+            _ => Err(StoredHashRefusal::NotBcrypt),
+        }
+    }
+
+    /// Whether `password` hashes to this hash.
+    fn verifies(self, password: &str) -> Result<bool, StoredHashRefusal> {
+        bcrypt::verify(password, self.text).map_err(|_| StoredHashRefusal::NotBcrypt)
+    }
 }
 
 /// Ipê `hashPasswordCost : String -> Int -> Result Error String`. Clamps cost to
-/// [4, 15] (4 = fast for tests, 12 = production default, 14–15 = high security).
-/// The bcrypt VALID range is [4, 31], but cost is caller-controlled: each +1
-/// DOUBLES the work, so cost 31 is a single-call CPU-exhaustion DoS (~years per
-/// hash). 15 (~1–2 s/hash) is a generous operational ceiling; higher is always a
-/// self-DoS, so it is clamped down rather than honoured.
+/// `[BCRYPT_COST_MIN, BCRYPT_COST_MAX]` = [4, 15] (4 = fast for tests, 12 =
+/// production default, 14–15 = high security). The bcrypt VALID range is
+/// [4, 31], but cost is caller-controlled: each +1 DOUBLES the work, so cost 31
+/// is a single-call CPU-exhaustion DoS (~years per hash). Higher than the
+/// ceiling is always a self-DoS, so it is clamped down rather than honoured.
 pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeResult<E, String> {
     if pw.chars().count() < 8 {
         return IpeResult::Err("password must be at least 8 characters".to_string().into());
@@ -57,8 +199,7 @@ pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeRes
                 .into(),
         );
     }
-    let clamped = cost.clamp(4, 15) as u32;
-    match bcrypt::hash(&pw, clamped) {
+    match bcrypt::hash(&pw, BcryptCost::clamped(cost).get()) {
         Ok(h) => IpeResult::Ok(h),
         Err(e) => IpeResult::Err(format!("bcrypt: {}", e).into()),
     }
@@ -66,11 +207,17 @@ pub fn auth_hash_password_cost<E: From<String>>(pw: String, cost: i64) -> IpeRes
 
 /// Ipê `verifyPassword : String -> String -> Result Error Bool`.
 /// `verifyPassword candidate hash` — true if candidate hashes to the same hash.
-pub fn auth_verify_password<E: From<String>>(pw: String, hash: String) -> IpeResult<E, bool> {
-    match bcrypt::verify(&pw, &hash) {
-        Ok(b) => IpeResult::Ok(b),
-        Err(e) => IpeResult::Err(format!("bcrypt verify: {}", e).into()),
-    }
+///
+/// A hash that is not a [`StoredHash`] (not a bcrypt hash, or its cost above
+/// [`BCRYPT_COST_MAX`]) is refused before the KDF runs, with a fixed
+/// `InvalidInput` message that never names the hash.
+pub fn auth_verify_password(pw: String, hash: String) -> IpeResult<IpeError, bool> {
+    StoredHash::parse(&hash)
+        .and_then(|stored| stored.verifies(&pw))
+        .map_or_else(
+            |refusal| IpeResult::Err(IpeError::invalid_input(refusal.message().to_owned())),
+            IpeResult::Ok,
+        )
 }
 
 /// Ipê `passwordStrength : String -> Result Error String`. Validates length
@@ -162,18 +309,30 @@ pub fn auth_sign_token<E: From<String>>(
     let exp = now.checked_add(expiry_seconds).unwrap_or(i64::MAX);
     let iat = now;
     // The absolute lifetime cap: iat + max_lifetime. A caller that already
-    // carries a `cap` claim (re-issue scenario) keeps its original value —
-    // only a fresh token (no `cap` in the supplied claims) gets the cap stamped.
-    // This guarantees cap is immutable across re-issues: the re-issuer supplies
-    // the original cap back in the claims map and this block leaves it alone.
-    let max_lifetime_secs = crate::app_config::resolve_auth_max_lifetime();
-    let cap_from_claims = claims.get("cap").and_then(|s| s.parse::<i64>().ok());
-    let cap: i64 = match cap_from_claims {
-        Some(existing) => existing,
-        None => {
-            // Fresh token: stamp the cap at iat + max_lifetime.
-            let ml = i64::try_from(max_lifetime_secs).unwrap_or(i64::MAX);
-            iat.checked_add(ml).unwrap_or(i64::MAX)
+    // carries a `cap` claim (re-issue scenario) keeps its original value, which
+    // is never past the fresh cap — only a fresh token (no `cap` in the supplied
+    // claims) gets the cap stamped. A re-issue therefore never extends the
+    // absolute lifetime.
+    let max_lifetime_secs = match crate::app_config::resolve_auth_max_lifetime() {
+        Ok(secs) => secs,
+        // A malformed lifetime mints no token: the cap would be an unknown bound.
+        Err(refusal) => return IpeResult::Err(format!("auth.signToken: {refusal}").into()),
+    };
+    // A fresh token's cap is iat + max_lifetime. A carried cap was stamped at an
+    // earlier iat, so it never exceeds that; a larger carried value (a claims
+    // map built from untrusted input) is clamped, never honoured.
+    let fresh_cap = iat.saturating_add(i64::try_from(max_lifetime_secs).unwrap_or(i64::MAX));
+    // A carried `cap` the clamp cannot read mints no token: a fresh cap in its
+    // place would extend the session past the bound it carried.
+    let cap: i64 = match claims.get("cap").map(|raw| raw.parse::<i64>()) {
+        None => fresh_cap,
+        Some(Ok(carried)) => carried.min(fresh_cap),
+        Some(Err(_)) => {
+            return IpeResult::Err(
+                "auth.signToken: `cap` must be whole Unix seconds"
+                    .to_string()
+                    .into(),
+            );
         }
     };
     // Per-session id for session-scoped revocation. A re-issue that already
@@ -190,6 +349,19 @@ pub fn auth_sign_token<E: From<String>>(
             uuid::Uuid::new_v4().to_string()
         }
     };
+    // A caller-supplied `nbf` is signed as a NumericDate, the only form the
+    // verifier reads; any other value mints no token.
+    let nbf = match claims.get("nbf").map(|raw| raw.parse::<i64>()) {
+        None => None,
+        Some(Ok(nbf)) => Some(nbf),
+        Some(Err(_)) => {
+            return IpeResult::Err(
+                "auth.signToken: `nbf` must be whole Unix seconds"
+                    .to_string()
+                    .into(),
+            );
+        }
+    };
     // Build the claims object with keys in ascending order so the signed bytes are
     // deterministic across runs. A `BTreeMap` fixes the key order explicitly,
     // independent of both the source `HashMap` iteration order and the ambient
@@ -199,9 +371,13 @@ pub fn auth_sign_token<E: From<String>>(
         // Strip any caller-supplied `cap`, `exp`, `iat`, and `jti` — these are
         // runtime-controlled claims; a caller must not be able to override them
         // via the claims map (the computed values below are authoritative).
-        .filter(|(k, _)| k != "cap" && k != "exp" && k != "iat" && k != "jti")
+        // `nbf` is re-inserted as a number below.
+        .filter(|(k, _)| k != "cap" && k != "exp" && k != "iat" && k != "jti" && k != "nbf")
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
+    if let Some(nbf) = nbf {
+        sorted.insert("nbf".to_string(), serde_json::Value::Number(nbf.into()));
+    }
     sorted.insert("cap".to_string(), serde_json::Value::Number(cap.into()));
     sorted.insert("exp".to_string(), serde_json::Value::Number(exp.into()));
     sorted.insert("iat".to_string(), serde_json::Value::Number(iat.into()));
@@ -216,10 +392,236 @@ pub fn auth_sign_token<E: From<String>>(
     }
 }
 
-/// Ipê `verifyToken : String -> String -> Result Error a`. Verifies signature,
-/// `exp`, and (when present) the absolute lifetime `cap`. Returns the claims as a
-/// `HashMap<String, String>` (Ipê-side resolves polymorphic `a` to this shape at
-/// the FFI boundary).
+/// Why `verify_claims` refused a token.
+///
+/// No variant carries the token, the secret or the verifier's error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenRefusal {
+    /// The HS256 secret is shorter than the floor.
+    ShortSecret,
+    /// The token is at or past its `exp`.
+    Expired,
+    /// The token is before its `nbf`.
+    NotYetValid,
+    /// The token is at or past its absolute lifetime `cap`.
+    PastCap,
+    /// A time claim (`exp`, `nbf`, `iat`, `cap`) is present but not a number
+    /// the checks can read: not a JSON number, or an `exp` past the decoder's
+    /// `u64` range.
+    NonNumericDate,
+    /// The signature does not verify under the secret, or the header names
+    /// another algorithm or key family.
+    BadSignature,
+    /// The token is not a well-formed HS256 JWT.
+    Malformed,
+    /// A claim the verifier requires (`exp`) is absent.
+    MissingClaim,
+}
+
+impl TokenRefusal {
+    /// Every variant, in declaration order.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::ShortSecret,
+        Self::Expired,
+        Self::NotYetValid,
+        Self::PastCap,
+        Self::NonNumericDate,
+        Self::BadSignature,
+        Self::Malformed,
+        Self::MissingClaim,
+    ];
+
+    /// The `Auth.verifyToken` refusal this surfaces as.
+    #[must_use]
+    pub const fn auth_error(self) -> IpeAuthError {
+        match self {
+            Self::ShortSecret => IpeAuthError::SecretTooShort,
+            Self::Expired | Self::PastCap => IpeAuthError::Expired,
+            Self::NotYetValid => IpeAuthError::NotYetValid,
+            Self::NonNumericDate | Self::Malformed => IpeAuthError::Malformed,
+            Self::BadSignature => IpeAuthError::BadSignature,
+            Self::MissingClaim => IpeAuthError::MissingClaim,
+        }
+    }
+}
+
+/// The refusal a `jsonwebtoken` decode failure of `kind` stands for.
+fn classify_jwt(kind: &jsonwebtoken::errors::ErrorKind) -> TokenRefusal {
+    use jsonwebtoken::errors::ErrorKind as K;
+    match kind {
+        K::InvalidSignature
+        | K::InvalidAlgorithm
+        | K::InvalidAlgorithmName
+        | K::InvalidKeyFormat => TokenRefusal::BadSignature,
+        K::ExpiredSignature => TokenRefusal::Expired,
+        K::ImmatureSignature => TokenRefusal::NotYetValid,
+        // `verify_claims` refuses an absent `exp` before the decode, so the
+        // decoder's "missing" `exp` is one it could not read as a `u64`.
+        K::MissingRequiredClaim(_) => TokenRefusal::NonNumericDate,
+        K::InvalidToken
+        | K::Base64(_)
+        | K::Json(_)
+        | K::Utf8(_)
+        | K::InvalidIssuer
+        | K::InvalidAudience
+        | K::InvalidSubject
+        | K::InvalidEcdsaKey
+        | K::InvalidRsaKey(_)
+        | K::RsaFailedSigning
+        | K::MissingAlgorithm
+        | K::Crypto(_) => TokenRefusal::Malformed,
+        // foreign non_exhaustive: unknown kinds refuse as Malformed
+        _ => TokenRefusal::Malformed,
+    }
+}
+
+/// The claims of a token whose signature, `exp`, `nbf` and `cap` verified, each
+/// value coerced to a string.
+///
+/// Only `verify_claims` builds one, so a value of this type is proof the claims
+/// came from a verified token.
+pub struct VerifiedClaims {
+    /// Every claim, its value coerced to a string.
+    claims: HashMap<String, String>,
+    /// The names of the claims whose value was not a JSON string.
+    coerced: std::collections::HashSet<String>,
+    /// The time claims, as the one reading `verify_claims` judged them by.
+    times: TimeClaims,
+}
+
+/// The NumericDate claims of a verified token, as whole Unix seconds.
+///
+/// Only `verify_claims` builds one, from the same `jwt::read_numeric_date`
+/// reading its clock checks used, so no later reader re-parses a date from the
+/// claim's string form. `exp` is required; for the others `None` means the
+/// claim is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeClaims {
+    /// `exp`: the token is refused at or after it.
+    exp: i64,
+    /// `nbf`: the token is refused before it.
+    nbf: Option<i64>,
+    /// `iat`: when the session was first minted.
+    iat: Option<i64>,
+    /// `cap`: the absolute lifetime bound.
+    cap: Option<i64>,
+}
+
+impl TimeClaims {
+    /// The `exp` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn exp(self) -> i64 {
+        self.exp
+    }
+
+    /// The `nbf` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn nbf(self) -> Option<i64> {
+        self.nbf
+    }
+
+    /// The `iat` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn iat(self) -> Option<i64> {
+        self.iat
+    }
+
+    /// The `cap` claim, floored to whole seconds.
+    #[must_use]
+    pub const fn cap(self) -> Option<i64> {
+        self.cap
+    }
+}
+
+impl VerifiedClaims {
+    /// The time claims the verification judged the token by.
+    #[must_use]
+    pub const fn times(&self) -> TimeClaims {
+        self.times
+    }
+
+    /// The value of claim `name`, coerced to a string.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.claims.get(name).map(String::as_str)
+    }
+
+    /// The value of claim `name` only when the token wrote it as a JSON
+    /// string: a `null`, number, boolean, array or object is absent here, never
+    /// its JSON text.
+    #[must_use]
+    pub fn text(&self, name: &str) -> Option<&str> {
+        if self.coerced.contains(name) {
+            return None;
+        }
+        self.get(name)
+    }
+
+    /// Every claim as a `(name, value)` pair.
+    pub fn iter(&self) -> ClaimPairs<'_> {
+        self.claims
+            .iter()
+            .map(claim_pair as for<'x> fn((&'x String, &'x String)) -> (&'x str, &'x str))
+    }
+
+    /// The claims as the map the `Auth.verifyToken` kernel returns.
+    #[must_use]
+    pub fn into_map(self) -> HashMap<String, String> {
+        self.claims
+    }
+}
+
+/// The `(name, value)` pairs of [`VerifiedClaims`].
+pub type ClaimPairs<'a> = std::iter::Map<
+    std::collections::hash_map::Iter<'a, String, String>,
+    fn((&'a String, &'a String)) -> (&'a str, &'a str),
+>;
+
+/// A claim entry as borrowed strings.
+fn claim_pair<'a>((name, value): (&'a String, &'a String)) -> (&'a str, &'a str) {
+    (name.as_str(), value.as_str())
+}
+
+impl<'a> IntoIterator for &'a VerifiedClaims {
+    type Item = (&'a str, &'a str);
+    type IntoIter = ClaimPairs<'a>;
+
+    fn into_iter(self) -> ClaimPairs<'a> {
+        self.iter()
+    }
+}
+
+// A claim value can name the caller or the session, so `Debug` shows the claim
+// names only.
+impl std::fmt::Debug for VerifiedClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.claims.keys()).finish()
+    }
+}
+
+/// The time claim `claim` of the claims set `payload`, read as `verify_claims`
+/// judges it.
+///
+/// # Errors
+///
+/// [`TokenRefusal::Malformed`] when `payload` is not a JSON object;
+/// [`TokenRefusal::NonNumericDate`] when the claim is present but not a number.
+fn time_claim(
+    payload: &serde_json::Value,
+    claim: &'static str,
+) -> Result<Option<i64>, TokenRefusal> {
+    crate::jwt::read_numeric_date(payload, claim).map_err(|refusal| match refusal {
+        crate::jwt::ClaimsRefusal::NonNumericDate { .. } => TokenRefusal::NonNumericDate,
+        crate::jwt::ClaimsRefusal::NotAnObject => TokenRefusal::Malformed,
+        crate::jwt::ClaimsRefusal::Expired => TokenRefusal::Expired,
+        crate::jwt::ClaimsRefusal::NotYetValid => TokenRefusal::NotYetValid,
+    })
+}
+
+/// Verify an HS256 `token` under `secret`: signature, `exp`, `nbf`, and (when
+/// present) the absolute lifetime `cap`. `exp` is required; a present `exp`,
+/// `nbf`, `iat` or `cap` must be a JSON number.
 ///
 /// # Absolute lifetime cap (`cap` claim)
 ///
@@ -228,50 +630,36 @@ pub fn auth_sign_token<E: From<String>>(
 /// A token without a `cap` claim is a legacy token (minted before this feature);
 /// it is accepted only against its `exp` and is never granted an unlimited
 /// lifetime — the `exp` bound is the sole gate in that case.
-pub fn auth_verify_token<E: From<String>>(
-    secret: String,
-    token: String,
-) -> IpeResult<E, HashMap<String, String>> {
+///
+/// # Errors
+///
+/// A [`TokenRefusal`] naming the check the token failed.
+pub(crate) fn verify_claims(secret: &str, token: &str) -> Result<VerifiedClaims, TokenRefusal> {
     if secret.len() < crate::jwt::HS256_MIN_SECRET_BYTES {
-        return IpeResult::Err(
-            crate::jwt::hs256_short_secret_msg("auth.verifyToken", secret.len()).into(),
-        );
+        return Err(TokenRefusal::ShortSecret);
     }
-    // Pre-reject on the full RFC 7519 NumericDate domain (negative, fractional,
-    // integer) before jsonwebtoken's `exp - 1` u64 subtraction can underflow.
-    // Mirrors jwt.rs's `jwt_decode_hs256` pre-reject; see that function's
-    // comment for the detailed rationale.
-    if let Some(payload) = crate::jwt::decode_payload(&token) {
-        let now = crate::jwt::now_unix_seconds();
-        if let Some(exp) = crate::jwt::numeric_date(&payload, "exp")
-            && now >= exp
-        {
-            return IpeResult::Err("auth.verifyToken: token has expired".to_string().into());
-        }
-        if let Some(nbf) = crate::jwt::numeric_date(&payload, "nbf")
-            && now < nbf
-        {
-            return IpeResult::Err(
-                "auth.verifyToken: token is not yet valid"
-                    .to_string()
-                    .into(),
-            );
-        }
-        // Absolute cap gate — checked on the unverified payload first for a fast
-        // pre-reject path, then confirmed on the verified claims after signature
-        // check below. A cap in the past denies immediately (the signature check
-        // below is still required, but there is no point decoding claims we will
-        // discard). Legacy tokens without a `cap` are not pre-rejected here — the
-        // `exp` gate above is their sole bound.
-        if let Some(cap) = crate::jwt::numeric_date(&payload, "cap")
-            && now >= cap
-        {
-            return IpeResult::Err(
-                "auth.verifyToken: token has exceeded its absolute lifetime cap"
-                    .to_string()
-                    .into(),
-            );
-        }
+    // The time claims are read once, here, on the full RFC 7519 NumericDate
+    // domain (negative, fractional, integer), before jsonwebtoken's `exp - 1`
+    // u64 subtraction can underflow; see `jwt_decode_hs256` for that mechanism.
+    // A present claim that is not a number is refused, never skipped, and the
+    // typed values read here are the ones every later reader uses.
+    let payload = crate::jwt::decode_payload(token).ok_or(TokenRefusal::Malformed)?;
+    let times = TimeClaims {
+        exp: time_claim(&payload, "exp")?.ok_or(TokenRefusal::MissingClaim)?,
+        nbf: time_claim(&payload, "nbf")?,
+        iat: time_claim(&payload, "iat")?,
+        cap: time_claim(&payload, "cap")?,
+    };
+    let now = crate::jwt::now_unix_seconds();
+    if now >= times.exp {
+        return Err(TokenRefusal::Expired);
+    }
+    if times.nbf.is_some_and(|nbf| now < nbf) {
+        return Err(TokenRefusal::NotYetValid);
+    }
+    // A token without a `cap` is bounded by its `exp` alone.
+    if times.cap.is_some_and(|cap| now >= cap) {
+        return Err(TokenRefusal::PastCap);
     }
     let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -298,39 +686,157 @@ pub fn auth_verify_token<E: From<String>>(
     // sign-then-verify roundtrip of aud-bearing claims. Mirrors jwt.rs's
     // identical rationale.
     validation.validate_aud = false;
-    let parsed = match jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation) {
-        Ok(d) => d,
-        Err(e) => return IpeResult::Err(format!("jwt verify: {}", e).into()),
-    };
-    // Re-check the absolute cap on the signature-verified claims. The pre-reject
-    // above already denies past-cap tokens before the signature decode, but this
-    // second check on the verified payload closes any edge where the pre-reject
-    // payload and the verified payload diverge (they cannot in practice — the
-    // signature covers both — but defence-in-depth here costs nothing).
-    if let Some(cap) = crate::jwt::numeric_date(&parsed.claims, "cap") {
-        let now = crate::jwt::now_unix_seconds();
-        if now >= cap {
-            return IpeResult::Err(
-                "auth.verifyToken: token has exceeded its absolute lifetime cap"
-                    .to_string()
-                    .into(),
-            );
-        }
+    let parsed = jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
+        .map_err(|e| classify_jwt(e.kind()))?;
+    // The time claims were judged on the payload read above; the verified
+    // claims set must be that same payload, or the judgement is of another one.
+    if parsed.claims != payload {
+        return Err(TokenRefusal::Malformed);
     }
-    let mut out = HashMap::new();
+    let mut claims = HashMap::new();
+    let mut coerced = std::collections::HashSet::new();
     if let serde_json::Value::Object(m) = parsed.claims {
         for (k, v) in m {
             // Coerce each claim value to a string. Numbers/booleans get
             // their JSON-text representation; nested objects/arrays get their
-            // JSON serialisation (Sprintf behaviour).
+            // JSON serialisation (Sprintf behaviour). A coerced claim's name is
+            // kept, so `text` never reads `null` as the string "null".
             let s = match v {
                 serde_json::Value::String(s) => s,
-                other => other.to_string(),
+                other => {
+                    coerced.insert(k.clone());
+                    other.to_string()
+                }
             };
-            out.insert(k, s);
+            claims.insert(k, s);
         }
     }
-    IpeResult::Ok(out)
+    Ok(VerifiedClaims {
+        claims,
+        coerced,
+        times,
+    })
+}
+
+/// Ipê `verifyToken : Secret -> String -> Result AuthError (Dict String String)`.
+/// Verifies the token (`verify_claims`) and returns its claims as a
+/// `HashMap<String, String>`.
+///
+/// When the process revocation mode is `Store`
+/// ([`process_mode`](crate::revocation::process_mode)), the token must also
+/// pass the revocation gate: a revoked token, a token the store cannot judge,
+/// and a token with no `sub` or no `jti` are refused. Inside
+/// a `Web` session the admitted credential is bound to that session, inside a
+/// `Server` request to that request; while a `Web` app serves, a call neither
+/// owns is refused.
+///
+/// Every refusal is a payload-free [`IpeAuthError`].
+pub fn auth_verify_token(
+    secret: String,
+    token: String,
+) -> IpeResult<IpeAuthError, HashMap<String, String>> {
+    let gate = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode());
+    match verify_token_under(gate, &secret, &token) {
+        Ok(claims) => IpeResult::Ok(claims),
+        Err(refusal) => IpeResult::Err(refusal),
+    }
+}
+
+/// Where an armed `Auth.verifyToken` binds the credential it admits.
+enum BindTarget {
+    /// The credential set of the `Web` session user code runs on behalf of.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    Session(std::sync::Arc<std::sync::Mutex<crate::revocation::SessionBindings>>),
+    /// The binding set of the `Server` request being handled.
+    #[cfg(feature = "server")]
+    ServerRequest(std::sync::Arc<std::sync::Mutex<crate::revocation::SessionBindings>>),
+    /// No channel owner while a `Web` app serves in this process: a task the
+    /// runtime spawned without its session's scope. Refused, never admitted
+    /// unbound, because the session it acts for could not be closed on revoke.
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    Unscoped,
+    /// No channel owner: a script, a CLI program or a background task.
+    Outside,
+}
+
+/// The channel owner the current task runs on behalf of, in this process.
+fn bind_target() -> BindTarget {
+    bind_target_in(web_serving())
+}
+
+/// Whether a `Web` app serves in this process.
+#[cfg(all(feature = "web-core", feature = "server"))]
+fn web_serving() -> bool {
+    crate::web::web_serving()
+}
+
+/// Without the `Web` server no `Web` app can serve.
+#[cfg(not(all(feature = "web-core", feature = "server")))]
+const fn web_serving() -> bool {
+    false
+}
+
+/// The channel owner the current task runs on behalf of, given whether a `Web` app serves.
+///
+/// The `Web` session scope wins over the `Server` request: a `Web` router
+/// mounted in a `Server` sees both, and the session is the long-lived owner.
+fn bind_target_in(web_serving: bool) -> BindTarget {
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    if let Some(bindings) = crate::web::pubsub::session_bindings() {
+        return BindTarget::Session(bindings);
+    }
+    #[cfg(feature = "server")]
+    if let Some(bindings) = crate::server::request_bindings() {
+        return BindTarget::ServerRequest(bindings);
+    }
+    #[cfg(all(feature = "web-core", feature = "server"))]
+    if web_serving {
+        return BindTarget::Unscoped;
+    }
+    #[cfg(not(all(feature = "web-core", feature = "server")))]
+    let _ = web_serving;
+    BindTarget::Outside
+}
+
+/// The `Auth.verifyToken` kernel under `gate`: verify, then (when armed) admit
+/// and bind.
+fn verify_token_under(
+    gate: Option<crate::revocation::ArmedGate>,
+    secret: &str,
+    token: &str,
+) -> Result<HashMap<String, String>, IpeAuthError> {
+    verify_token_bound(gate, bind_target, secret, token)
+}
+
+/// [`verify_token_under`] with the channel owner read from `target`, only once armed.
+fn verify_token_bound(
+    gate: Option<crate::revocation::ArmedGate>,
+    target: impl FnOnce() -> BindTarget,
+    secret: &str,
+    token: &str,
+) -> Result<HashMap<String, String>, IpeAuthError> {
+    let claims = verify_claims(secret, token).map_err(TokenRefusal::auth_error)?;
+    if let Some(gate) = gate {
+        let refuse = crate::revocation::Denial::auth_error;
+        let credential = gate.admit(&claims, "sub").map_err(refuse)?;
+        match target() {
+            #[cfg(all(feature = "web-core", feature = "server"))]
+            BindTarget::Session(bindings) => {
+                crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
+            }
+            #[cfg(feature = "server")]
+            BindTarget::ServerRequest(bindings) => {
+                crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
+            }
+            #[cfg(all(feature = "web-core", feature = "server"))]
+            BindTarget::Unscoped => {
+                return Err(refuse(crate::revocation::Denial::Unscoped));
+            }
+            // Admitted; no channel exists to bind.
+            BindTarget::Outside => drop(credential),
+        }
+    }
+    Ok(claims.into_map())
 }
 
 // ─── Sliding re-issue ────────────────────────────────────────────────
@@ -345,7 +851,7 @@ pub fn auth_verify_token<E: From<String>>(
 /// token) the re-issue path structurally cannot accept a forged or caller-inflated
 /// cap, nor a replaced session id.
 #[cfg(feature = "jwt")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReissueContext {
     /// Original issue timestamp (immutable across all re-issues).
     pub iat: i64,
@@ -357,9 +863,17 @@ pub struct ReissueContext {
     pub jti: String,
 }
 
-/// Parse a `ReissueContext` from a signature-verified claims map (the output of
-/// `auth_verify_token`). Returns `None` when any required field is missing or
-/// malformed — the caller must deny in that case.
+// The subject identifies the caller and the jti names the session, so `Debug`
+// masks both, as it masks a `Principal`'s identity.
+#[cfg(feature = "jwt")]
+crate::redact::redacting_debug!(ReissueContext {
+    shown: [iat, cap],
+    masked: [subject, jti],
+});
+
+/// Parse a `ReissueContext` from signature-verified claims. Returns `None` when
+/// any required field is missing or malformed — the caller must deny in that
+/// case.
 ///
 /// Tokens minted before `jti` was introduced carry no `jti` claim. For backward
 /// compatibility, a missing `jti` is treated as an empty string — such a token
@@ -368,14 +882,13 @@ pub struct ReissueContext {
 /// `auth_sign_token` path (the empty string is filtered out in that path).
 #[cfg(feature = "jwt")]
 #[must_use]
-pub fn reissue_context_from_claims(
-    claims: &std::collections::HashMap<String, String>,
-) -> Option<ReissueContext> {
-    let iat = claims.get("iat")?.parse::<i64>().ok()?;
-    let cap = claims.get("cap")?.parse::<i64>().ok()?;
-    let subject = claims.get("sub").filter(|s| !s.is_empty())?.clone();
+pub fn reissue_context_from_claims(claims: &VerifiedClaims) -> Option<ReissueContext> {
+    let times = claims.times();
+    let iat = times.iat()?;
+    let cap = times.cap()?;
+    let subject = claims.get("sub").filter(|s| !s.is_empty())?.to_owned();
     // `jti` absent on legacy tokens — treat as empty (cannot be session-revoked by id).
-    let jti = claims.get("jti").cloned().unwrap_or_default();
+    let jti = claims.get("jti").unwrap_or_default().to_owned();
     Some(ReissueContext {
         iat,
         cap,
@@ -415,9 +928,13 @@ pub fn auth_reissue_token<E: From<String>>(
         .min(ctx.cap);
     // Build deterministic sorted payload. `iat`, `cap`, `jti`, and `sub` come
     // verbatim from `ctx` (verified-origin); caller-supplied duplicates are stripped.
+    // `nbf` is dropped: the verified token was already past it, and its text
+    // form would not be a NumericDate.
     let mut sorted: std::collections::BTreeMap<String, serde_json::Value> = extra_claims
         .into_iter()
-        .filter(|(k, _)| k != "cap" && k != "exp" && k != "iat" && k != "jti" && k != "sub")
+        .filter(|(k, _)| {
+            k != "cap" && k != "exp" && k != "iat" && k != "jti" && k != "sub" && k != "nbf"
+        })
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
     sorted.insert("cap".to_string(), serde_json::Value::Number(ctx.cap.into()));
@@ -454,13 +971,21 @@ pub fn auth_reissue_token<E: From<String>>(
 // kernel calls, which implies `uses_db = true` and `db` in default features.
 
 #[cfg(feature = "db")]
+/// The Ipê `Error` for a failed `users` statement: classified like every other
+/// statement failure, so the driver's message (which can name a column or
+/// embed a bound value) never reaches the caller.
+fn auth_db_error<E: crate::FromIpeError>(context: &str, e: &sqlx::Error) -> E {
+    crate::db::driver_error(context, crate::db::KERNEL_ENGINE, e)
+}
+
+#[cfg(feature = "db")]
 /// Idempotent `CREATE TABLE IF NOT EXISTS users (...)`. Runs at the start of
 /// register/login/setRole so the schema is always available without users
 /// having to call a separate migration. The id-column DDL is per-driver
 /// — `db_auto_id_column()` returns the right fragment for sqlite
 /// (`INTEGER PRIMARY KEY AUTOINCREMENT`), mysql (`BIGINT NOT NULL
 /// AUTO_INCREMENT PRIMARY KEY`), or postgres (`BIGSERIAL PRIMARY KEY`).
-async fn ensure_users_schema<E: From<String> + Send>(conn: &Db) -> IpeResult<E, ()> {
+async fn ensure_users_schema<E: crate::FromIpeError + Send>(conn: &Db) -> IpeResult<E, ()> {
     let schema = format!(
         "CREATE TABLE IF NOT EXISTS users (
             {},
@@ -473,14 +998,16 @@ async fn ensure_users_schema<E: From<String> + Send>(conn: &Db) -> IpeResult<E, 
     );
     match sqlx::query(&schema).execute(conn).await {
         Ok(_) => IpeResult::Ok(()),
-        Err(e) => IpeResult::Err(format!("auth.users schema: {}", e).into()),
+        Err(e) => IpeResult::Err(auth_db_error("auth.users schema: db: ", &e)),
     }
 }
 
 #[cfg(feature = "db")]
 /// Ipê `register : Db -> String -> String -> Task Error Int`.
 /// Creates a new user. Returns the new user id.
-pub fn auth_register<E: Send + From<String> + 'static>(
+pub fn auth_register<
+    E: Send + From<String> + crate::FromUnavailable + crate::FromIpeError + 'static,
+>(
     conn: Db,
     email: String,
     password: String,
@@ -500,18 +1027,19 @@ pub fn auth_register<E: Send + From<String> + 'static>(
         // bcrypt is CPU-bound and BLOCKING (~250 ms at cost 12). Running it on a
         // tokio worker thread starves the async runtime (every concurrent register
         // ties up a core worker). Offload to the blocking pool.
-        let hash =
-            match tokio::task::spawn_blocking(move || auth_hash_password::<E>(password)).await {
-                Ok(IpeResult::Ok(h)) => h,
-                Ok(IpeResult::Err(e)) => return IpeResult::Err(e),
-                Err(_) => {
-                    return IpeResult::Err(
-                        "auth.register: password-hash task failed"
-                            .to_string()
-                            .into(),
-                    );
-                }
-            };
+        let hashed = crate::threads::join_blocking("auth.register", move || {
+            auth_hash_password::<E>(password)
+        })
+        .await;
+        let hash = match hashed {
+            Ok(IpeResult::Ok(h)) => h,
+            Ok(IpeResult::Err(e)) => return IpeResult::Err(e),
+            Err(failure) => {
+                return IpeResult::Err(
+                    failure.into_error("auth.register: password-hash task failed"),
+                );
+            }
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -529,12 +1057,34 @@ pub fn auth_register<E: Send + From<String> + 'static>(
             .await;
         match result {
             Ok(res) => IpeResult::Ok(db_last_insert_id(&res)),
-            Err(sqlx::Error::Database(de)) if de.is_unique_violation() => {
-                IpeResult::Err("auth.register: email already registered".to_string().into())
+            Err(e) => {
+                let failure = crate::db::classify_failure(crate::db::KERNEL_ENGINE, &e);
+                if failure == IpeDbFailure::UniqueViolation {
+                    IpeResult::Err(E::from_ipe_error(IpeError::database(
+                        failure,
+                        "auth.register: email already registered".to_owned(),
+                    )))
+                } else {
+                    IpeResult::Err(auth_db_error("auth.register: db: ", &e))
+                }
             }
-            Err(e) => IpeResult::Err(format!("auth.register: {}", e).into()),
         }
     })
+}
+
+#[cfg(feature = "db")]
+/// Whether `password` verifies against the `stored` hash a login read.
+///
+/// A stored hash that is not a [`StoredHash`] never verifies, and bcrypt runs
+/// on `decoy` instead: a cost above the ceiling never reaches the KDF, and a
+/// hash bcrypt would refuse before hashing costs what a wrong password costs.
+fn login_hash_verifies(password: &str, stored: &str, decoy: &str) -> bool {
+    let parsed = StoredHash::parse(stored);
+    let verified = parsed.map_or_else(
+        |_| bcrypt::verify(password, decoy).unwrap_or(false),
+        |hash| hash.verifies(password).unwrap_or(false),
+    );
+    parsed.is_ok() && verified
 }
 
 #[cfg(feature = "db")]
@@ -542,7 +1092,9 @@ pub fn auth_register<E: Send + From<String> + 'static>(
 /// Authenticates the user. Returns user id on success. Does NOT leak whether
 /// the email exists vs. password was wrong — both paths return the same
 /// generic "invalid credentials" error.
-pub fn auth_login<E: Send + From<String> + 'static>(
+pub fn auth_login<
+    E: Send + From<String> + crate::FromUnavailable + crate::FromIpeError + 'static,
+>(
     conn: Db,
     email: String,
     password: String,
@@ -570,29 +1122,42 @@ pub fn auth_login<E: Send + From<String> + 'static>(
                 };
                 let hash: String = row.try_get(1).unwrap_or_default();
                 // bcrypt::verify is CPU-bound + blocking → blocking pool (see register).
-                let ok = tokio::task::spawn_blocking(move || {
-                    bcrypt::verify(&password, &hash).unwrap_or(false)
+                // A refused thread is `Unavailable` on both email paths alike; a
+                // panicked verify fails closed as invalid credentials.
+                let verified = crate::threads::join_blocking("auth.login", move || {
+                    login_hash_verifies(&password, &hash, dummy_bcrypt_hash())
                 })
-                .await
-                .unwrap_or(false);
-                if ok {
-                    IpeResult::Ok(id)
-                } else {
-                    IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                .await;
+                match verified {
+                    Ok(true) => IpeResult::Ok(id),
+                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
+                        IpeResult::Err(refused.into_error())
+                    }
+                    Ok(false) | Err(crate::threads::BlockingFailure::Panicked) => {
+                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                    }
                 }
             }
             Ok(None) => {
                 // TIMING: perform an equal-cost bcrypt verify against a fixed
-                // cost-12 hash so the unknown-email path does the same hashing
+                // `REGISTER_COST` hash so the unknown-email path does the same hashing
                 // work as the known-email path — removing the email-enumeration
-                // timing oracle. The result is discarded.
-                let _ = tokio::task::spawn_blocking(move || {
+                // timing oracle. The verify result is discarded; a refused
+                // thread is `Unavailable`, as on the known-email path.
+                let verified = crate::threads::join_blocking("auth.login", move || {
                     bcrypt::verify(&password, dummy_bcrypt_hash())
                 })
                 .await;
-                IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                match verified {
+                    Err(crate::threads::BlockingFailure::Refused(refused)) => {
+                        IpeResult::Err(refused.into_error())
+                    }
+                    Ok(_) | Err(crate::threads::BlockingFailure::Panicked) => {
+                        IpeResult::Err("auth.login: invalid credentials".to_string().into())
+                    }
+                }
             }
-            Err(e) => IpeResult::Err(format!("auth.login: {}", e).into()),
+            Err(e) => IpeResult::Err(auth_db_error("auth.login: db: ", &e)),
         }
     })
 }
@@ -600,7 +1165,7 @@ pub fn auth_login<E: Send + From<String> + 'static>(
 #[cfg(feature = "db")]
 /// Ipê `setRole : Db -> Int -> String -> Task Error ()`.
 /// Sets the user's role. No-op if the user doesn't exist (returns Ok).
-pub fn auth_set_role<E: Send + From<String> + 'static>(
+pub fn auth_set_role<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     user_id: i64,
     role: String,
@@ -617,7 +1182,7 @@ pub fn auth_set_role<E: Send + From<String> + 'static>(
             .await
         {
             Ok(_) => IpeResult::Ok(()),
-            Err(e) => IpeResult::Err(format!("auth.setRole: {}", e).into()),
+            Err(e) => IpeResult::Err(auth_db_error("auth.setRole: db: ", &e)),
         }
     })
 }
@@ -637,9 +1202,9 @@ mod tests {
             IpeResult::Ok(h) => h,
             _ => panic!("hash"),
         };
-        let ok: IpeResult<String, bool> = auth_verify_password("password123".into(), h.clone());
+        let ok: IpeResult<IpeError, bool> = auth_verify_password("password123".into(), h.clone());
         assert!(matches!(ok, IpeResult::Ok(true)));
-        let bad: IpeResult<String, bool> = auth_verify_password("wrongpass".into(), h);
+        let bad: IpeResult<IpeError, bool> = auth_verify_password("wrongpass".into(), h);
         assert!(matches!(bad, IpeResult::Ok(false)));
     }
 
@@ -683,7 +1248,8 @@ mod tests {
             IpeResult::Ok(t) => t,
             _ => panic!("sign"),
         };
-        let verified: IpeResult<String, HashMap<String, String>> = auth_verify_token(secret, t);
+        let verified: IpeResult<IpeAuthError, HashMap<String, String>> =
+            auth_verify_token(secret, t);
         match verified {
             IpeResult::Ok(m) => {
                 assert_eq!(m.get("sub").unwrap(), "user-123");
@@ -791,9 +1357,10 @@ mod tests {
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
         let key = jsonwebtoken::EncodingKey::from_secret(secret.as_bytes());
         let token = jsonwebtoken::encode(&header, &claims, &key).expect("encode");
-        let verified: IpeResult<String, HashMap<String, String>> = auth_verify_token(secret, token);
+        let verified: IpeResult<IpeAuthError, HashMap<String, String>> =
+            auth_verify_token(secret, token);
         assert!(
-            matches!(verified, IpeResult::Err(_)),
+            matches!(verified, IpeResult::Err(IpeAuthError::Expired)),
             "an Auth token expired 30s ago must be rejected (no clock-skew leeway)"
         );
     }
@@ -814,15 +1381,17 @@ mod tests {
             IpeResult::Ok(t) => t,
             IpeResult::Err(e) => panic!("sign: {e}"),
         };
-        let verified: IpeResult<String, HashMap<String, String>> = auth_verify_token(secret, t);
+        let verified: IpeResult<IpeAuthError, HashMap<String, String>> =
+            auth_verify_token(secret, t);
         match verified {
             IpeResult::Ok(m) => {
                 assert_eq!(m.get("aud").map(String::as_str), Some("my-service"));
             }
-            IpeResult::Err(e) => panic!("verify must accept aud-bearing claims: {e}"),
+            IpeResult::Err(e) => panic!("verify must accept aud-bearing claims: {e:?}"),
         }
     }
 
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_email_normalized_case_insensitive() {
         let pool = match DbPool::connect("sqlite::memory:").await {
@@ -857,6 +1426,120 @@ mod tests {
         );
     }
 
+    /// A pool over a fresh in-memory database whose `users` object is built by
+    /// `setup` before any kernel runs.
+    #[cfg(feature = "db")]
+    async fn pool_with(setup: &str) -> DbPool {
+        let pool = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory connect");
+        sqlx::query(setup).execute(&pool).await.expect("setup");
+        pool
+    }
+
+    /// The database failure an auth kernel's error carries, with its message.
+    #[cfg(feature = "db")]
+    fn database_failure<T: std::fmt::Debug>(r: IpeResult<IpeError, T>) -> (IpeDbFailure, String) {
+        match r {
+            IpeResult::Err(IpeError::Error(_, info)) => match info.details {
+                IpeMaybe::Just(IpeErrorDetails::Database(f)) => (f, info.message),
+                other => panic!("no Database details ({other:?}): {}", info.message),
+            },
+            IpeResult::Ok(v) => panic!("accepted: {v:?}"),
+        }
+    }
+
+    /// A duplicate registration is `Database UniqueViolation` with the fixed
+    /// message, never the driver's text.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn register_duplicate_is_classified_unique_violation() {
+        let pool = DbPool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory connect");
+        let first: IpeResult<IpeError, i64> =
+            auth_register(pool.clone(), "dup@example.com".into(), "hunter2!".into()).await;
+        assert!(
+            matches!(first, IpeResult::Ok(_)),
+            "first register: {first:?}"
+        );
+        let (failure, message) = database_failure(
+            auth_register::<IpeError>(pool, "dup@example.com".into(), "hunter2!".into()).await,
+        );
+        assert_eq!(failure, IpeDbFailure::UniqueViolation);
+        assert_eq!(message, "auth.register: email already registered");
+    }
+
+    /// Any other failed register insert is classified, and its message names
+    /// neither the table nor the column the driver's message names.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn register_driver_failure_is_classified_without_driver_text() {
+        let pool = pool_with(
+            "CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at BIGINT NOT NULL,
+                nickname TEXT NOT NULL
+            )",
+        )
+        .await;
+        let (failure, message) = database_failure(
+            auth_register::<IpeError>(pool, "n@example.com".into(), "hunter2!".into()).await,
+        );
+        assert_eq!(failure, IpeDbFailure::NotNullViolation);
+        assert!(message.starts_with("auth.register: db: "), "{message}");
+        assert!(!message.contains("nickname"), "{message}");
+        assert!(!message.contains("users"), "{message}");
+    }
+
+    /// A failed login query is classified without the driver's text.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn login_driver_failure_is_classified_without_driver_text() {
+        let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
+        let (failure, message) = database_failure(
+            auth_login::<IpeError>(pool, "x@example.com".into(), "hunter2!".into()).await,
+        );
+        assert_eq!(failure, IpeDbFailure::InvalidStatement);
+        assert!(message.starts_with("auth.login: db: "), "{message}");
+        assert!(!message.contains("password_hash"), "{message}");
+        assert!(!message.contains("no such column"), "{message}");
+    }
+
+    /// A failed role update is classified without the driver's text.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn set_role_driver_failure_is_classified_without_driver_text() {
+        let pool = pool_with("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)").await;
+        let (failure, message) =
+            database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
+        assert_eq!(failure, IpeDbFailure::InvalidStatement);
+        assert!(message.starts_with("auth.setRole: db: "), "{message}");
+        assert!(!message.contains("role"), "{message}");
+        assert!(!message.contains("no such column"), "{message}");
+    }
+
+    /// A failed `users` schema statement is classified without the driver's
+    /// text: an index already named `users` refuses the table.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn users_schema_failure_is_classified_without_driver_text() {
+        let pool = pool_with("CREATE TABLE t (x INTEGER)").await;
+        sqlx::query("CREATE INDEX users ON t (x)")
+            .execute(&pool)
+            .await
+            .expect("index");
+        let (failure, message) =
+            database_failure(auth_set_role::<IpeError>(pool, 1, "admin".into()).await);
+        assert_eq!(failure, IpeDbFailure::InvalidStatement);
+        assert!(message.starts_with("auth.users schema: db: "), "{message}");
+        assert!(!message.contains("index"), "{message}");
+    }
+
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_register_login_flow() {
         let pool = DbPool::connect("sqlite::memory:").await.expect("connect");
@@ -905,6 +1588,7 @@ mod tests {
         assert!(matches!(token2, IpeResult::Err(_)));
     }
 
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn test_login_id_decode_failure_yields_err_not_user_zero() {
         let pool = match DbPool::connect("sqlite::memory:").await {
@@ -943,6 +1627,95 @@ mod tests {
         );
     }
 
+    /// A login against a stored hash whose cost is above the ceiling, or that
+    /// is not a bcrypt hash at all, is refused as invalid credentials without
+    /// running the KDF at that cost.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn login_refuses_a_stored_hash_above_the_cost_ceiling() {
+        let pool = match DbPool::connect("sqlite::memory:").await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let IpeResult::Ok(()) = ensure_users_schema::<IpeError>(&pool).await else {
+            panic!("users schema");
+        };
+        let at_floor = bcrypt::hash("hunter2!", BCRYPT_COST_MIN).expect("hash");
+        let over_ceiling = at_floor.replacen("$04$", "$31$", 1);
+        assert_ne!(over_ceiling, at_floor, "the fixture raised the cost field");
+        // A cost-12 prefix whose digest is one character short: bcrypt refuses
+        // it before hashing.
+        let at_default = at_floor.replacen("$04$", "$12$", 1);
+        let (malformed, _) = at_default
+            .split_at_checked(at_default.len() - 1)
+            .expect("a full hash");
+        assert!(bcrypt::verify("hunter2!", malformed).is_err());
+        for (email, stored) in [
+            ("floor@example.com", at_floor.as_str()),
+            ("over@example.com", over_ceiling.as_str()),
+            ("malformed@example.com", malformed),
+            ("plain@example.com", "hunter2!"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (email, password_hash, role, created_at) \
+                 VALUES (?, ?, 'user', 0)",
+            )
+            .bind(email)
+            .bind(stored)
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+        let login = |email: &str| {
+            auth_login::<IpeError>(pool.clone(), email.to_owned(), "hunter2!".to_owned())
+        };
+        assert!(
+            matches!(login("floor@example.com").await, IpeResult::Ok(_)),
+            "the control: a hash inside the ceiling still logs in"
+        );
+        let started = std::time::Instant::now();
+        let over = login("over@example.com").await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                &over,
+                IpeResult::Err(IpeError::Error(_, info))
+                    if info.message == "auth.login: invalid credentials"
+            ),
+            "{over:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(120),
+            "no cost-31 KDF ran: {elapsed:?}"
+        );
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            bcrypt::verify("hunter2!", dummy_bcrypt_hash()),
+            Ok(false)
+        ));
+        let decoy_kdf = started.elapsed();
+        let started = std::time::Instant::now();
+        let malformed = login("malformed@example.com").await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                &malformed,
+                IpeResult::Err(IpeError::Error(_, info))
+                    if info.message == "auth.login: invalid credentials"
+            ),
+            "{malformed:?}"
+        );
+        assert!(
+            elapsed >= decoy_kdf / 10,
+            "a stored hash bcrypt refuses before hashing costs a decoy KDF: \
+             {elapsed:?} vs {decoy_kdf:?}"
+        );
+        assert!(
+            matches!(login("plain@example.com").await, IpeResult::Err(_)),
+            "a plaintext stored password never logs in"
+        );
+    }
+
     // ── Absolute lifetime cap (P1) ────────────────────────────────────────────
 
     const SECRET: &str = "a-test-secret-of-32-bytes-padding";
@@ -965,10 +1738,10 @@ mod tests {
             "exp": now + 3600,
             "cap": now - 1,
         }));
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), token);
         assert!(
-            matches!(result, IpeResult::Err(_)),
+            matches!(result, IpeResult::Err(IpeAuthError::Expired)),
             "a session past its absolute cap must be rejected even if exp is still future"
         );
     }
@@ -988,12 +1761,14 @@ mod tests {
             };
         // Extract the cap from the first token.
         let payload = crate::jwt::decode_payload(&first_token).expect("first payload");
-        let original_cap = crate::jwt::numeric_date(&payload, "cap").expect("cap in first token");
+        let original_cap = crate::jwt::read_numeric_date(&payload, "cap")
+            .expect("a numeric date")
+            .expect("cap in first token");
         // Simulate a re-issue: extract all claims and pass them (including cap) back.
         let verified: HashMap<String, String> =
-            match auth_verify_token::<String>(SECRET.to_string(), first_token) {
+            match auth_verify_token(SECRET.to_string(), first_token) {
                 IpeResult::Ok(m) => m,
-                IpeResult::Err(e) => panic!("first verify: {e}"),
+                IpeResult::Err(e) => panic!("first verify: {e:?}"),
             };
         // Re-issue by signing with the original claims (including cap).
         let reissued_token: String =
@@ -1003,11 +1778,37 @@ mod tests {
             };
         let reissued_payload =
             crate::jwt::decode_payload(&reissued_token).expect("reissued payload");
-        let reissued_cap =
-            crate::jwt::numeric_date(&reissued_payload, "cap").expect("cap in reissued token");
+        let reissued_cap = crate::jwt::read_numeric_date(&reissued_payload, "cap")
+            .expect("a numeric date")
+            .expect("cap in reissued token");
         assert_eq!(
             original_cap, reissued_cap,
             "cap must be identical on the re-issued token — it is immutable"
+        );
+    }
+
+    #[test]
+    fn a_carried_cap_past_the_max_lifetime_is_clamped() {
+        let before = now_unix();
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), "u-cap".to_string());
+        claims.insert("cap".to_string(), i64::MAX.to_string());
+        let token: String = match auth_sign_token::<String>(SECRET.to_string(), claims, 3600) {
+            IpeResult::Ok(t) => t,
+            IpeResult::Err(e) => panic!("mint: {e}"),
+        };
+        let after = now_unix();
+        let payload = crate::jwt::decode_payload(&token).expect("payload");
+        let cap = crate::jwt::read_numeric_date(&payload, "cap")
+            .expect("a numeric date")
+            .expect("cap");
+        let lifetime = i64::try_from(
+            crate::app_config::resolve_auth_max_lifetime().expect("the default lifetime resolves"),
+        )
+        .expect("the default lifetime fits i64");
+        assert!(
+            (before + lifetime..=after + lifetime).contains(&cap),
+            "a carried cap never extends past iat + max lifetime, got {cap}"
         );
     }
 
@@ -1040,10 +1841,10 @@ mod tests {
         let tampered_payload_json = serde_json::to_string(&payload).expect("serialise");
         let tampered_payload_seg = URL_SAFE_NO_PAD.encode(tampered_payload_json.as_bytes());
         let forged_token = format!("{header_seg}.{tampered_payload_seg}.{sig_seg}");
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), forged_token);
         assert!(
-            matches!(result, IpeResult::Err(_)),
+            matches!(result, IpeResult::Err(IpeAuthError::BadSignature)),
             "a token with a client-mutated cap must fail signature verification"
         );
     }
@@ -1060,7 +1861,7 @@ mod tests {
             "exp": now + 3600,
             // deliberately no `cap` claim
         }));
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), token);
         assert!(
             matches!(result, IpeResult::Ok(_)),
@@ -1079,10 +1880,10 @@ mod tests {
             "exp": now - 1,
             // no `cap` claim
         }));
-        let result: IpeResult<String, HashMap<String, String>> =
+        let result: IpeResult<IpeAuthError, HashMap<String, String>> =
             auth_verify_token(SECRET.to_string(), token);
         assert!(
-            matches!(result, IpeResult::Err(_)),
+            matches!(result, IpeResult::Err(IpeAuthError::Expired)),
             "a legacy token without cap must be rejected when exp is past"
         );
     }
@@ -1097,20 +1898,32 @@ mod tests {
         };
         let payload = crate::jwt::decode_payload(&token).expect("payload");
         assert!(
-            crate::jwt::numeric_date(&payload, "cap").is_some(),
+            crate::jwt::read_numeric_date(&payload, "cap")
+                .expect("a numeric date")
+                .is_some(),
             "a freshly minted token must carry a signed `cap` claim"
         );
     }
 
     // ── Sliding re-issue (P2) ─────────────────────────────────────────────────
 
+    #[test]
+    fn reissue_context_debug_prints_neither_subject_nor_jti() {
+        let ctx = crate::auth::ReissueContext {
+            iat: 1,
+            cap: 2,
+            subject: "user-S3CR3T".to_owned(),
+            jti: "J71T0K3N".to_owned(),
+        };
+        let shown = format!("{ctx:?}");
+        assert!(!shown.contains("S3CR3T"), "{shown}");
+        assert!(!shown.contains("J71T0K3N"), "{shown}");
+        assert!(shown.contains("cap: 2"), "{shown}");
+    }
+
     /// Build a ReissueContext directly from a signed+verified token.
     fn reissue_ctx_from_token(token: &str) -> crate::auth::ReissueContext {
-        let claims: HashMap<String, String> =
-            match auth_verify_token::<String>(SECRET.to_string(), token.to_string()) {
-                IpeResult::Ok(c) => c,
-                IpeResult::Err(e) => panic!("verify: {e}"),
-            };
+        let claims = verify_claims(SECRET, token).expect("verify");
         crate::auth::reissue_context_from_claims(&claims)
             .expect("reissue context from verified claims")
     }
@@ -1133,14 +1946,20 @@ mod tests {
                 None => panic!("reissue returned None unexpectedly"),
             };
         let new_payload = crate::jwt::decode_payload(&new_token).expect("payload");
-        let new_exp = crate::jwt::numeric_date(&new_payload, "exp").expect("exp");
+        let new_exp = crate::jwt::read_numeric_date(&new_payload, "exp")
+            .expect("a numeric date")
+            .expect("exp");
         let now = now_unix();
         // new_exp must be in (now, now + slide + 2s fuzz] and <= cap.
         assert!(new_exp > now, "reissued exp must be in the future");
         assert!(new_exp <= ctx.cap, "reissued exp must not exceed cap");
         // iat and cap must be carried verbatim.
-        let new_iat = crate::jwt::numeric_date(&new_payload, "iat").expect("iat");
-        let new_cap = crate::jwt::numeric_date(&new_payload, "cap").expect("cap");
+        let new_iat = crate::jwt::read_numeric_date(&new_payload, "iat")
+            .expect("a numeric date")
+            .expect("iat");
+        let new_cap = crate::jwt::read_numeric_date(&new_payload, "cap")
+            .expect("a numeric date")
+            .expect("cap");
         assert_eq!(new_iat, ctx.iat, "iat must be unchanged on re-issue");
         assert_eq!(new_cap, ctx.cap, "cap must be unchanged on re-issue");
     }
@@ -1158,11 +1977,7 @@ mod tests {
             "exp": now + 30,
             "cap": cap,
         }));
-        let claims: HashMap<String, String> =
-            match auth_verify_token::<String>(SECRET.to_string(), token) {
-                IpeResult::Ok(c) => c,
-                IpeResult::Err(e) => panic!("verify near-cap token: {e}"),
-            };
+        let claims = verify_claims(SECRET, &token).expect("verify near-cap token");
         let ctx =
             crate::auth::reissue_context_from_claims(&claims).expect("context from near-cap token");
         let new_token =
@@ -1172,7 +1987,9 @@ mod tests {
                 None => panic!("reissue returned None unexpectedly"),
             };
         let new_payload = crate::jwt::decode_payload(&new_token).expect("payload");
-        let new_exp = crate::jwt::numeric_date(&new_payload, "exp").expect("exp");
+        let new_exp = crate::jwt::read_numeric_date(&new_payload, "exp")
+            .expect("a numeric date")
+            .expect("exp");
         assert_eq!(
             new_exp, cap,
             "exp must be clamped to cap when slide > remaining"
@@ -1241,7 +2058,9 @@ mod tests {
             None => panic!("reissue returned None (forged cap is future, expected Some)"),
         };
         let payload = crate::jwt::decode_payload(&token).expect("payload");
-        let emitted_cap = crate::jwt::numeric_date(&payload, "cap").expect("cap");
+        let emitted_cap = crate::jwt::read_numeric_date(&payload, "cap")
+            .expect("a numeric date")
+            .expect("cap");
         // The emitted cap equals whatever is in ctx — structural proof that the
         // reissue function does NOT override ctx.cap with something larger. The
         // defence against a forged ctx is that verified-origin is the ONLY path
@@ -1250,7 +2069,9 @@ mod tests {
             emitted_cap, forged_ctx.cap,
             "auth_reissue_token must copy ctx.cap verbatim — it never inflates it further"
         );
-        let emitted_exp = crate::jwt::numeric_date(&payload, "exp").expect("exp");
+        let emitted_exp = crate::jwt::read_numeric_date(&payload, "exp")
+            .expect("a numeric date")
+            .expect("exp");
         assert!(
             emitted_exp <= forged_ctx.cap,
             "exp must always be <= ctx.cap regardless of slide_window"
@@ -1259,36 +2080,1407 @@ mod tests {
 
     #[test]
     fn reissue_context_from_verified_claims_requires_iat_cap_sub() {
-        // Missing `cap` → None.
-        let mut claims = HashMap::new();
-        claims.insert("sub".to_string(), "u".to_string());
-        claims.insert("iat".to_string(), "1000".to_string());
+        let now = now_unix();
+        let context_of = |claims: &serde_json::Value| {
+            let verified = verify_claims(SECRET, &raw_hs256(claims)).expect("verify");
+            crate::auth::reissue_context_from_claims(&verified)
+        };
+        let (iat, exp, cap) = (now - 60, now + 3600, now + 7200);
         assert!(
-            crate::auth::reissue_context_from_claims(&claims).is_none(),
+            context_of(&serde_json::json!({ "sub": "u", "iat": iat, "exp": exp })).is_none(),
             "missing cap must yield None"
         );
-        // Missing `iat` → None.
-        let mut claims2 = HashMap::new();
-        claims2.insert("sub".to_string(), "u".to_string());
-        claims2.insert("cap".to_string(), "9000".to_string());
         assert!(
-            crate::auth::reissue_context_from_claims(&claims2).is_none(),
+            context_of(&serde_json::json!({ "sub": "u", "cap": cap, "exp": exp })).is_none(),
             "missing iat must yield None"
         );
-        // Missing `sub` → None.
-        let mut claims3 = HashMap::new();
-        claims3.insert("iat".to_string(), "1000".to_string());
-        claims3.insert("cap".to_string(), "9000".to_string());
         assert!(
-            crate::auth::reissue_context_from_claims(&claims3).is_none(),
+            context_of(&serde_json::json!({ "iat": iat, "cap": cap, "exp": exp })).is_none(),
             "missing sub must yield None"
         );
-        // All present → Some.
-        let mut claims4 = HashMap::new();
-        claims4.insert("sub".to_string(), "user".to_string());
-        claims4.insert("iat".to_string(), "1000".to_string());
-        claims4.insert("cap".to_string(), "9000".to_string());
-        let ctx = crate::auth::reissue_context_from_claims(&claims4);
-        assert!(ctx.is_some(), "all fields present must yield Some");
+        assert!(
+            context_of(&serde_json::json!({ "sub": "user", "iat": iat, "cap": cap, "exp": exp }))
+                .is_some(),
+            "all fields present must yield Some"
+        );
+    }
+
+    // ── Time claims must be numbers ───────────────────────────────────────────
+
+    #[test]
+    fn verify_claims_refuses_non_numeric_time_claims() {
+        let now = now_unix();
+        let refused = |claims: serde_json::Value| {
+            matches!(
+                verify_claims(SECRET, &raw_hs256(&claims)),
+                Err(TokenRefusal::NonNumericDate)
+            )
+        };
+        assert!(
+            refused(
+                serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": (now - 10).to_string() })
+            ),
+            "a past `cap` written as text is refused, not skipped"
+        );
+        assert!(
+            refused(
+                serde_json::json!({ "sub": "u", "exp": now + 3600, "nbf": (now + 3600).to_string() })
+            ),
+            "a future `nbf` written as text is refused, not skipped"
+        );
+        assert!(refused(
+            serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": null })
+        ));
+        assert!(
+            refused(serde_json::json!({ "sub": "u", "exp": (now + 3600).to_string() })),
+            "an `exp` written as text is refused as unreadable, not as absent"
+        );
+        assert!(
+            refused(serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": "1" })),
+            "a `cap` written as text is refused even when it reads as past"
+        );
+        assert!(
+            refused(serde_json::json!({ "sub": "u", "exp": true })),
+            "a boolean `exp` is refused as unreadable, not as absent"
+        );
+        assert!(matches!(
+            verify_claims(
+                SECRET,
+                &raw_hs256(&serde_json::json!({ "sub": "u", "exp": now + 3600, "cap": now - 10 }))
+            ),
+            Err(TokenRefusal::PastCap)
+        ));
+        assert!(
+            verify_claims(
+                SECRET,
+                &raw_hs256(&serde_json::json!({
+                    "sub": "u",
+                    "exp": now + 3600,
+                    "cap": now + 7200,
+                    "nbf": now - 10,
+                }))
+            )
+            .is_ok(),
+            "numeric time claims inside their window verify"
+        );
+    }
+
+    #[test]
+    fn string_iat_is_refused() {
+        let now = now_unix();
+        assert!(matches!(
+            verify_claims(
+                SECRET,
+                &raw_hs256(&serde_json::json!({ "sub": "u", "exp": now + 3600, "iat": "x" }))
+            ),
+            Err(TokenRefusal::NonNumericDate)
+        ));
+        let numeric = verify_claims(
+            SECRET,
+            &raw_hs256(&serde_json::json!({ "sub": "u", "exp": now + 3600, "iat": now - 60 })),
+        );
+        assert!(
+            matches!(&numeric, Ok(claims) if claims.times().iat() == Some(now - 60)),
+            "a numeric `iat` verifies and is carried typed"
+        );
+    }
+
+    #[test]
+    fn non_object_payload_is_malformed() {
+        for payload in [
+            serde_json::json!([{ "sub": "u", "exp": now_unix() + 3600 }]),
+            serde_json::json!("claims"),
+            serde_json::json!(7),
+        ] {
+            let token = signed_under(SECRET, jsonwebtoken::Algorithm::HS256, &payload);
+            assert!(
+                matches!(verify_claims(SECRET, &token), Err(TokenRefusal::Malformed)),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_time_claims_are_the_numbers_the_checks_read() {
+        let now = now_unix();
+        let token = signed_under(
+            SECRET,
+            jsonwebtoken::Algorithm::HS256,
+            &serde_json::from_str::<serde_json::Value>(&format!(
+                r#"{{"sub":"u","exp":{}.5,"nbf":{}.5,"iat":{}.5,"cap":{}.5}}"#,
+                now + 3600,
+                now - 60,
+                now - 60,
+                now + 7200
+            ))
+            .expect("fractional claims parse"),
+        );
+        let verified = verify_claims(SECRET, &token);
+        assert!(verified.is_ok(), "fractional dates verify");
+        let Ok(claims) = verified else { return };
+        let times = claims.times();
+        assert_eq!(times.exp(), now + 3600);
+        assert_eq!(times.nbf(), Some(now - 60));
+        assert_eq!(times.iat(), Some(now - 60));
+        assert_eq!(times.cap(), Some(now + 7200));
+        assert_eq!(
+            claims.get("cap").map(str::to_owned),
+            Some(format!("{}.5", now + 7200)),
+            "the display form keeps the token's own text"
+        );
+        let context = reissue_context_from_claims(&claims);
+        assert!(
+            matches!(&context, Some(ctx) if ctx.iat == now - 60 && ctx.cap == now + 7200),
+            "a fractional `iat` and `cap` still yield a re-issue context"
+        );
+    }
+
+    #[test]
+    fn sign_token_writes_nbf_as_a_numeric_date() {
+        let now = now_unix();
+        let sign = |nbf: String| {
+            let mut claims = HashMap::new();
+            claims.insert("sub".to_string(), "u".to_string());
+            claims.insert("nbf".to_string(), nbf);
+            auth_sign_token::<String>(SECRET.to_string(), claims, 3600)
+        };
+        let IpeResult::Ok(future) = sign((now + 3600).to_string()) else {
+            panic!("an integer `nbf` signs");
+        };
+        assert!(
+            matches!(
+                verify_claims(SECRET, &future),
+                Err(TokenRefusal::NotYetValid)
+            ),
+            "a future `nbf` from `signToken` is enforced"
+        );
+        let IpeResult::Ok(past) = sign((now - 10).to_string()) else {
+            panic!("an integer `nbf` signs");
+        };
+        assert!(
+            verify_claims(SECRET, &past).is_ok(),
+            "a past `nbf` verifies"
+        );
+        assert!(
+            matches!(sign("soon".to_string()), IpeResult::Err(_)),
+            "a non-integer `nbf` mints no token"
+        );
+    }
+
+    #[test]
+    fn sign_token_refuses_an_unreadable_carried_cap() {
+        let now = now_unix();
+        let sign = |cap: String| {
+            let mut claims = HashMap::new();
+            claims.insert("sub".to_string(), "u".to_string());
+            claims.insert("cap".to_string(), cap);
+            auth_sign_token::<String>(SECRET.to_string(), claims, 3600)
+        };
+        assert!(
+            matches!(sign(format!("{}.5", now + 120)), IpeResult::Err(_)),
+            "a fractional carried `cap` mints no token, never a fresh cap"
+        );
+        assert!(
+            matches!(sign("soon".to_string()), IpeResult::Err(_)),
+            "a text carried `cap` mints no token, never a fresh cap"
+        );
+        let IpeResult::Ok(carried) = sign((now + 120).to_string()) else {
+            panic!("an integer carried `cap` signs");
+        };
+        let payload = crate::jwt::decode_payload(&carried).expect("payload");
+        assert_eq!(
+            crate::jwt::read_numeric_date(&payload, "cap").expect("a numeric date"),
+            Some(now + 120),
+            "an integer carried `cap` is kept"
+        );
+    }
+
+    #[test]
+    fn verify_claims_requires_exp_before_the_signature() {
+        let now = now_unix();
+        let forged = format!(
+            "{}x",
+            raw_hs256(&serde_json::json!({ "sub": "u", "cap": now + 3600 }))
+        );
+        assert!(
+            matches!(
+                verify_claims(SECRET, &forged),
+                Err(TokenRefusal::MissingClaim)
+            ),
+            "an absent `exp` is refused by the one date read, not left to the decoder"
+        );
+    }
+
+    #[test]
+    fn exp_past_the_decoders_range_is_non_numeric_not_missing() {
+        let token = raw_hs256(
+            &serde_json::from_str::<serde_json::Value>(r#"{"sub":"u","exp":1e20}"#)
+                .expect("an out-of-range `exp` parses"),
+        );
+        assert!(
+            matches!(
+                verify_claims(SECRET, &token),
+                Err(TokenRefusal::NonNumericDate)
+            ),
+            "a present `exp` the decoder cannot read is never reported absent"
+        );
+    }
+
+    #[test]
+    fn reissued_token_drops_nbf_and_verifies() {
+        let now = now_unix();
+        let original = raw_hs256(&serde_json::json!({
+            "sub": "u",
+            "jti": "nbf-jti",
+            "iat": now - 60,
+            "nbf": now - 60,
+            "exp": now + 60,
+            "cap": now + 7200,
+        }));
+        let claims = verify_claims(SECRET, &original).expect("verify original");
+        let ctx = reissue_context_from_claims(&claims).expect("context");
+        let extra: HashMap<String, String> = claims
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let Some(IpeResult::Ok(reissued)) = auth_reissue_token::<String>(SECRET, &ctx, extra, 600)
+        else {
+            panic!("a live session re-issues");
+        };
+        assert!(
+            verify_claims(SECRET, &reissued).is_ok(),
+            "a re-issued token never carries a text `nbf`"
+        );
+    }
+
+    // ── Typed verifyToken refusals ────────────────────────────────────────────
+
+    /// The base64url segment of `json`.
+    fn segment(json: &str) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD.encode(json.as_bytes())
+    }
+
+    /// A token for `claims` with an `alg` header, signed under `key`.
+    fn signed_under(key: &str, alg: jsonwebtoken::Algorithm, claims: &serde_json::Value) -> String {
+        let header = jsonwebtoken::Header::new(alg);
+        let key = jsonwebtoken::EncodingKey::from_secret(key.as_bytes());
+        jsonwebtoken::encode(&header, claims, &key).expect("encode")
+    }
+
+    /// `token` with the first byte of its signature segment changed.
+    fn flip_signature(token: &str) -> String {
+        let Some((message, signature)) = token.rsplit_once('.') else {
+            return String::new();
+        };
+        let mut chars = signature.chars();
+        let flipped = match chars.next() {
+            Some('A') => 'B',
+            _ => 'A',
+        };
+        format!("{message}.{flipped}{}", chars.as_str())
+    }
+
+    #[test]
+    fn verify_token_refusals_are_their_exact_auth_error() {
+        let now = now_unix();
+        let live = serde_json::json!({ "sub": "t-sub", "exp": now + 3600 });
+        let refused = |secret: &str, token: &str| verify_token_under(None, secret, token).err();
+        let cases: [(&str, String, String, IpeAuthError); 12] = [
+            (
+                "short key",
+                "short".to_owned(),
+                raw_hs256(&live),
+                IpeAuthError::SecretTooShort,
+            ),
+            (
+                "expired",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": now - 30 })),
+                IpeAuthError::Expired,
+            ),
+            (
+                "nbf in the future",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": now + 7200, "nbf": now + 3600 })),
+                IpeAuthError::NotYetValid,
+            ),
+            (
+                "past cap",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": now + 3600, "cap": now - 1 })),
+                IpeAuthError::Expired,
+            ),
+            (
+                "non-numeric exp",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t", "exp": "tomorrow" })),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "flipped signature byte",
+                SECRET.to_owned(),
+                flip_signature(&raw_hs256(&live)),
+                IpeAuthError::BadSignature,
+            ),
+            (
+                "wrong key",
+                SECRET.to_owned(),
+                signed_under(
+                    "another-test-secret-of-32-bytes-pad",
+                    jsonwebtoken::Algorithm::HS256,
+                    &live,
+                ),
+                IpeAuthError::BadSignature,
+            ),
+            (
+                "HS512 header",
+                SECRET.to_owned(),
+                signed_under(SECRET, jsonwebtoken::Algorithm::HS512, &live),
+                IpeAuthError::BadSignature,
+            ),
+            (
+                "alg none",
+                SECRET.to_owned(),
+                format!(
+                    "{}.{}.",
+                    segment(r#"{"alg":"none","typ":"JWT"}"#),
+                    segment(&live.to_string())
+                ),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "truncated token",
+                SECRET.to_owned(),
+                raw_hs256(&live)
+                    .rsplit_once('.')
+                    .map(|(message, _)| message.to_owned())
+                    .unwrap_or_default(),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "base64 garbage",
+                SECRET.to_owned(),
+                "!!!.###.$$$".to_owned(),
+                IpeAuthError::Malformed,
+            ),
+            (
+                "missing exp",
+                SECRET.to_owned(),
+                raw_hs256(&serde_json::json!({ "sub": "t" })),
+                IpeAuthError::MissingClaim,
+            ),
+        ];
+        for (label, secret, token, expected) in cases {
+            assert!(!token.is_empty(), "{label}: the fixture built a token");
+            assert_eq!(refused(&secret, &token), Some(expected), "{label}");
+        }
+        assert_eq!(
+            refused(SECRET, &raw_hs256(&live)),
+            None,
+            "the unaltered token verifies"
+        );
+    }
+
+    #[test]
+    fn verify_token_refusal_carries_no_token_text() {
+        const MARKER: &str = "LEAKMARKER-7f3a";
+        let now = now_unix();
+        let alg_header = format!(r#"{{"alg":"\u001b[31m{MARKER}","typ":"JWT"}}"#);
+        let alg_token = format!(
+            "{}.{}.c2ln",
+            segment(&alg_header),
+            segment(&serde_json::json!({ "exp": now + 3600 }).to_string())
+        );
+        let cases = [
+            (
+                alg_header.clone(),
+                alg_token.clone(),
+                IpeAuthError::Malformed,
+            ),
+            (
+                serde_json::json!({ "exp": MARKER }).to_string(),
+                raw_hs256(&serde_json::json!({ "exp": MARKER })),
+                IpeAuthError::Malformed,
+            ),
+            (
+                serde_json::json!({ "x": format!("\u{1b}[31m{MARKER}"), "exp": now + 3600 })
+                    .to_string(),
+                signed_under(
+                    "another-test-secret-of-32-bytes-pad",
+                    jsonwebtoken::Algorithm::HS256,
+                    &serde_json::json!({ "x": format!("\u{1b}[31m{MARKER}"), "exp": now + 3600 }),
+                ),
+                IpeAuthError::BadSignature,
+            ),
+        ];
+        for (segment_json, token, expected) in cases {
+            let carried = token.split('.').any(|part| {
+                use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+                URL_SAFE_NO_PAD.decode(part).is_ok_and(|bytes| {
+                    std::str::from_utf8(&bytes).is_ok_and(|text| text.contains(MARKER))
+                })
+            });
+            assert!(carried, "the marker is in the token: {segment_json}");
+            let refusal = verify_token_under(None, SECRET, &token).err();
+            assert_eq!(refusal, Some(expected), "{segment_json}");
+            let Some(refusal) = refusal else { return };
+            assert!(!refusal.phrase().contains(MARKER));
+            assert!(!format!("{refusal:?}").contains(MARKER));
+        }
+    }
+
+    #[test]
+    fn every_token_refusal_maps_to_its_auth_error() {
+        let expected = [
+            (TokenRefusal::ShortSecret, IpeAuthError::SecretTooShort),
+            (TokenRefusal::Expired, IpeAuthError::Expired),
+            (TokenRefusal::NotYetValid, IpeAuthError::NotYetValid),
+            (TokenRefusal::PastCap, IpeAuthError::Expired),
+            (TokenRefusal::NonNumericDate, IpeAuthError::Malformed),
+            (TokenRefusal::BadSignature, IpeAuthError::BadSignature),
+            (TokenRefusal::Malformed, IpeAuthError::Malformed),
+            (TokenRefusal::MissingClaim, IpeAuthError::MissingClaim),
+        ];
+        assert_eq!(expected.len(), TokenRefusal::ALL.len());
+        for ((refusal, error), listed) in expected.into_iter().zip(TokenRefusal::ALL) {
+            assert_eq!(refusal, listed, "{refusal:?} out of order in ALL");
+            assert_eq!(refusal.auth_error(), error, "{refusal:?}");
+        }
+    }
+
+    // ── verifyPassword stored-hash refusals ───────────────────────────────────
+
+    /// A cost-15 bcrypt hash of `password123`.
+    const COST_15_HASH: &str = "$2b$15$v81ksFestWCfPXD9cGDMfeV2hI.YAhbV1wPHNRmEiDgXR9O6lROsq";
+
+    /// The kind and message of a refused `verifyPassword`.
+    fn password_refusal(result: IpeResult<IpeError, bool>) -> Option<(IpeErrorKind, String)> {
+        match result {
+            IpeResult::Err(IpeError::Error(kind, info)) => Some((kind, info.message)),
+            IpeResult::Ok(_) => None,
+        }
+    }
+
+    #[test]
+    fn verify_password_refuses_a_cost_above_the_ceiling_without_hashing() {
+        let started = std::time::Instant::now();
+        let at_ceiling = auth_verify_password("password123".into(), COST_15_HASH.to_owned());
+        let one_hash = started.elapsed();
+        assert!(
+            matches!(at_ceiling, IpeResult::Ok(true)),
+            "a cost-15 hash still verifies"
+        );
+        let over = COST_15_HASH.replacen("$15$", "$31$", 1);
+        let started = std::time::Instant::now();
+        let refused = password_refusal(auth_verify_password("password123".into(), over));
+        let refusal_time = started.elapsed();
+        assert_eq!(
+            refused,
+            Some((
+                IpeErrorKind::InvalidInput,
+                "auth.verifyPassword: stored hash cost exceeds the ceiling".to_owned()
+            ))
+        );
+        assert!(
+            refusal_time < one_hash / 100,
+            "the refusal ran no KDF: {refusal_time:?} vs {one_hash:?}"
+        );
+    }
+
+    #[test]
+    fn verify_password_refuses_a_non_bcrypt_hash_without_echoing_it() {
+        for stored in [
+            "plain-stored-LEAKMARKER-7f3a".to_owned(),
+            "$2b$12$LEAKMARKER-7f3a-not-a-valid-salt-or-digest".to_owned(),
+        ] {
+            let refused =
+                password_refusal(auth_verify_password("password123".into(), stored.clone()));
+            assert_eq!(
+                refused,
+                Some((
+                    IpeErrorKind::InvalidInput,
+                    "auth.verifyPassword: stored hash is not a bcrypt hash".to_owned()
+                )),
+                "{stored}"
+            );
+            let Some((_, message)) = refused else { return };
+            assert!(stored.contains("LEAKMARKER"));
+            assert!(!message.contains("LEAKMARKER"), "{message}");
+        }
+    }
+
+    /// A stored hash bcrypt would turn back before hashing, or read in another
+    /// shape than it writes, is refused by the parse, so every admitted hash
+    /// runs the KDF; a hash bcrypt wrote is admitted and verifies.
+    #[test]
+    fn stored_hash_admits_only_the_shape_bcrypt_writes() {
+        let valid = bcrypt::hash("password123", BCRYPT_COST_MIN).expect("hash");
+        assert_eq!(
+            StoredHash::parse(&valid).map(|stored| stored.verifies("password123")),
+            Ok(Ok(true)),
+            "the control: a hash bcrypt wrote verifies"
+        );
+        let (head, _) = valid
+            .split_at_checked(valid.len() - 1)
+            .expect("a full hash");
+        let (prefix, body) = valid.split_at_checked(BCRYPT_PREFIX_LEN).expect("a prefix");
+        let (salt, digest) = body.split_at_checked(BCRYPT_SALT_CHARS).expect("a salt");
+        let (salt_head, _) = salt
+            .split_at_checked(BCRYPT_SALT_CHARS - 1)
+            .expect("a salt");
+        let refused = [
+            (head.to_owned(), "a digest one character short"),
+            (format!("{valid}."), "a digest one character long"),
+            (format!("{valid}$"), "a trailing `$` bcrypt's split skips"),
+            (format!("{prefix}${body}"), "an empty `$` segment"),
+            (format!("{head}/"), "digest trailing bits set"),
+            (
+                format!("{prefix}{salt_head}/{digest}"),
+                "salt trailing bits set",
+            ),
+            (format!("{head}+"), "a character outside bcrypt's alphabet"),
+            (format!("{head}\u{e9}"), "a multibyte character"),
+            (format!("{prefix}{salt}"), "a salt without a digest"),
+            (prefix.to_owned(), "a prefix alone"),
+        ];
+        for (stored, why) in refused {
+            assert_eq!(
+                StoredHash::parse(&stored).err(),
+                Some(StoredHashRefusal::NotBcrypt),
+                "{why}: {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn bcrypt_cost_parses_only_a_bcrypt_prefix_within_range() {
+        assert_eq!(BcryptCost::of_hash("$2b$04$"), Ok(BcryptCost(4)));
+        assert_eq!(BcryptCost::of_hash("$2y$15$"), Ok(BcryptCost(15)));
+        assert_eq!(BcryptCost::of_hash(COST_15_HASH), Ok(BcryptCost(15)));
+        assert_eq!(
+            BcryptCost::of_hash("$2b$16$"),
+            Err(StoredHashRefusal::CostOverCeiling)
+        );
+        for refused in ["$2b$3$", "$2b$03$", "$2c$10$", "$2b$1x$", "", "$2b"] {
+            assert_eq!(
+                BcryptCost::of_hash(refused),
+                Err(StoredHashRefusal::NotBcrypt),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(BcryptCost::clamped(-5), BcryptCost(BCRYPT_COST_MIN));
+        assert_eq!(BcryptCost::clamped(12), BcryptCost(12));
+        assert_eq!(BcryptCost::clamped(i64::MAX), BcryptCost(BCRYPT_COST_MAX));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_login_decoy_hashes_at_the_registration_cost() {
+        assert_eq!(BcryptCost::of_hash(dummy_bcrypt_hash()), Ok(REGISTER_COST));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_decoy_fallback_hash_is_at_the_registration_cost() {
+        assert_eq!(BcryptCost::of_hash(DECOY_FALLBACK_HASH), Ok(REGISTER_COST));
+        assert!(StoredHash::parse(DECOY_FALLBACK_HASH).is_ok());
+    }
+
+    #[test]
+    fn a_registered_hash_is_at_the_registration_cost() {
+        let hash: IpeResult<String, String> = auth_hash_password("password123".into());
+        assert!(matches!(
+            &hash,
+            IpeResult::Ok(h) if BcryptCost::of_hash(h) == Ok(REGISTER_COST)
+        ));
+    }
+
+    // ── Armed revocation gate ─────────────────────────────────────────────────
+
+    /// The armed gate.
+    fn armed() -> Option<crate::revocation::ArmedGate> {
+        crate::revocation::ArmedGate::resolve(crate::app_config::RevocationMode::Store)
+    }
+
+    /// A token for `sub` with session id `jti`, live for an hour.
+    fn session_token(sub: &str, jti: &str) -> String {
+        let now = now_unix();
+        raw_hs256(&serde_json::json!({
+            "sub": sub,
+            "jti": jti,
+            "iat": now,
+            "exp": now + 3600,
+            "cap": now + 7200,
+        }))
+    }
+
+    #[test]
+    fn verify_token_armed_refuses_revoked_token() {
+        crate::revocation::revoke_subject("k1-revoked-subject".to_owned()).expect("revoke subject");
+        crate::revocation::revoke_session("k1-revoked-jti".to_owned(), now_unix() + 7200)
+            .expect("revoke session");
+        let by_subject = verify_token_under(
+            armed(),
+            SECRET,
+            &session_token("k1-revoked-subject", "k1-live-jti"),
+        )
+        .expect_err("a revoked subject is refused");
+        let by_session = verify_token_under(
+            armed(),
+            SECRET,
+            &session_token("k1-live-subject", "k1-revoked-jti"),
+        )
+        .expect_err("a revoked session is refused");
+        assert_eq!(by_subject, IpeAuthError::Revoked);
+        assert_eq!(by_session, IpeAuthError::Revoked);
+    }
+
+    #[test]
+    fn verify_token_off_is_unchanged() {
+        crate::revocation::revoke_subject("k2-revoked-subject".to_owned()).expect("revoke subject");
+        let claims =
+            verify_token_under(None, SECRET, &session_token("k2-revoked-subject", "k2-jti"))
+                .expect("an unarmed gate never consults the store");
+        assert_eq!(
+            claims.get("sub").map(String::as_str),
+            Some("k2-revoked-subject")
+        );
+        let legacy = raw_hs256(&serde_json::json!({ "sub": "k2-legacy", "exp": now_unix() + 60 }));
+        assert!(
+            verify_token_under(None, SECRET, &legacy).is_ok(),
+            "an unarmed gate admits a token with no `jti`"
+        );
+    }
+
+    #[test]
+    fn verify_token_armed_in_script_process_admits_without_binding() {
+        #[cfg(feature = "server")]
+        assert!(
+            crate::server::request_bindings().is_none(),
+            "a script runs outside any request scope"
+        );
+        // A script process serves no `Web` app.
+        let claims = verify_token_bound(
+            armed(),
+            || bind_target_in(false),
+            SECRET,
+            &session_token("k4-subject", "k4-jti"),
+        )
+        .expect("an armed gate admits a live token outside a request");
+        assert_eq!(claims.get("jti").map(String::as_str), Some("k4-jti"));
+    }
+
+    #[test]
+    fn verify_token_armed_refuses_jti_less_and_sub_less() {
+        let now = now_unix();
+        let refused = |claims: &serde_json::Value| {
+            verify_token_under(armed(), SECRET, &raw_hs256(claims))
+                .expect_err("an incomplete token is refused when armed")
+        };
+        assert_eq!(
+            refused(&serde_json::json!({ "sub": "k8-subject", "exp": now + 60 })),
+            IpeAuthError::MissingClaim
+        );
+        assert_eq!(
+            refused(&serde_json::json!({ "sub": "k8-subject", "jti": "", "exp": now + 60 })),
+            IpeAuthError::MissingClaim
+        );
+        assert_eq!(
+            refused(&serde_json::json!({ "jti": "k8-jti", "exp": now + 60 })),
+            IpeAuthError::MissingClaim
+        );
+        assert_eq!(
+            refused(&serde_json::json!({ "sub": "", "jti": "k8-jti", "exp": now + 60 })),
+            IpeAuthError::MissingClaim
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn verify_token_in_server_handler_binds_request_set() {
+        let bindings = crate::server::in_request_scope(async {
+            let admitted =
+                verify_token_under(armed(), SECRET, &session_token("k7-subject", "k7-jti"));
+            assert!(admitted.is_ok(), "{admitted:?}");
+            crate::server::request_bindings()
+        })
+        .await
+        .expect("a request scope carries a binding set");
+        let held = bindings.lock().expect("bindings lock");
+        assert_eq!(held.len(), 1);
+        assert!(held.binds_session("k7-jti"));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn verify_token_armed_full_bindings_refuses() {
+        let bound = crate::revocation::MAX_SESSION_CREDENTIALS;
+        let (ninth, bindings) = crate::server::in_request_scope(async move {
+            for n in 0..bound {
+                verify_token_under(
+                    armed(),
+                    SECRET,
+                    &session_token("k5-subject", &format!("k5-jti-{n}")),
+                )
+                .expect("within the bound");
+            }
+            let ninth = verify_token_under(
+                armed(),
+                SECRET,
+                &session_token("k5-subject", "k5-jti-ninth"),
+            );
+            (ninth, crate::server::request_bindings())
+        })
+        .await;
+        assert_eq!(
+            ninth.expect_err("a full set refuses the next session"),
+            IpeAuthError::TooManyCredentials
+        );
+        let bindings = bindings.expect("a request scope carries a binding set");
+        let held = bindings.lock().expect("bindings lock");
+        assert_eq!(held.len(), bound);
+        assert!((0..bound).all(|n| held.binds_session(&format!("k5-jti-{n}"))));
+        assert!(!held.binds_session("k5-jti-ninth"));
+    }
+
+    /// While a `Web` app serves, an armed `verifyToken` no session or request
+    /// owns is refused; unarmed, the same call is admitted.
+    #[cfg(feature = "web")]
+    #[test]
+    fn verify_token_armed_outside_scope_on_web_process_refuses() {
+        let token = session_token("k3-subject", "k3-jti");
+        assert_eq!(
+            verify_token_bound(armed(), || bind_target_in(true), SECRET, &token),
+            Err(IpeAuthError::RevocationUnavailable),
+            "an unscoped call while a Web app serves is refused"
+        );
+        assert!(
+            verify_token_bound(None, || bind_target_in(true), SECRET, &token).is_ok(),
+            "an unarmed gate never asks for an owner"
+        );
+        assert!(
+            verify_token_bound(armed(), || bind_target_in(false), SECRET, &token).is_ok(),
+            "with no Web app serving, an unscoped call is a script and is admitted"
+        );
+    }
+
+    /// Inside a `Web` session scope an armed `verifyToken` binds to that
+    /// session, even while a `Web` app serves.
+    #[cfg(feature = "web")]
+    #[test]
+    fn verify_token_armed_in_web_session_binds_session_set() {
+        let scope = crate::web::pubsub::SessionScope::new("k3-session".to_owned());
+        let admitted = crate::web::pubsub::with_session(&scope, || {
+            verify_token_bound(
+                armed(),
+                || bind_target_in(true),
+                SECRET,
+                &session_token("k3-subject", "k3-bound-jti"),
+            )
+        });
+        assert!(admitted.is_ok(), "{admitted:?}");
+        let held = scope.bindings().lock().expect("bindings lock");
+        assert_eq!(held.len(), 1);
+        assert!(held.binds_session("k3-bound-jti"));
+    }
+
+    // ── Construction scan ─────────────────────────────────────────────────────
+    //
+    // `VerifiedClaims` and `SessionCredential` keep private fields, so no other
+    // module can build one; the scan covers the two defining files.
+
+    /// The blank a masked source character becomes; newlines stay, so line
+    /// numbers survive.
+    const fn blank(c: char) -> char {
+        if c == '\n' { '\n' } else { ' ' }
+    }
+
+    /// Whether `chars[at]` continues an identifier.
+    fn is_ident(chars: &[char], at: usize) -> bool {
+        chars
+            .get(at)
+            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+    }
+
+    /// The end of a `//` comment starting at `at`.
+    fn line_comment_end(chars: &[char], at: usize) -> Option<usize> {
+        if !matches!(chars.get(at..at + 2), Some(['/', '/'])) {
+            return None;
+        }
+        let rest = chars.get(at..).unwrap_or_default();
+        Some(at + rest.iter().position(|c| *c == '\n').unwrap_or(rest.len()))
+    }
+
+    /// The end of a (nested) `/* */` comment starting at `at`.
+    fn block_comment_end(chars: &[char], at: usize) -> Option<usize> {
+        if !matches!(chars.get(at..at + 2), Some(['/', '*'])) {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut k = at;
+        while k < chars.len() {
+            match chars.get(k..k + 2) {
+                Some(['/', '*']) => {
+                    depth += 1;
+                    k += 2;
+                }
+                Some(['*', '/']) => {
+                    depth -= 1;
+                    k += 2;
+                    if depth == 0 {
+                        return Some(k);
+                    }
+                }
+                _ => k += 1,
+            }
+        }
+        Some(chars.len())
+    }
+
+    /// The end of a raw string (`r"…"`, `r#"…"#`, `br#"…"#`) starting at `at`.
+    fn raw_string_end(chars: &[char], at: usize) -> Option<usize> {
+        if at > 0 && is_ident(chars, at - 1) {
+            return None;
+        }
+        let open = match (chars.get(at), chars.get(at + 1)) {
+            (Some('r'), _) => at + 1,
+            (Some('b'), Some('r')) => at + 2,
+            _ => return None,
+        };
+        let hashes = chars
+            .get(open..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|c| **c == '#')
+            .count();
+        if chars.get(open + hashes) != Some(&'"') {
+            return None;
+        }
+        let mut k = open + hashes + 1;
+        while k < chars.len() {
+            if chars.get(k) == Some(&'"') && (1..=hashes).all(|h| chars.get(k + h) == Some(&'#')) {
+                return Some(k + 1 + hashes);
+            }
+            k += 1;
+        }
+        Some(chars.len())
+    }
+
+    /// The end of a `"…"` or `b"…"` string starting at `at`.
+    fn string_end(chars: &[char], at: usize) -> Option<usize> {
+        let open = match (chars.get(at), chars.get(at + 1)) {
+            (Some('"'), _) => at,
+            (Some('b'), Some('"')) if at == 0 || !is_ident(chars, at - 1) => at + 1,
+            _ => return None,
+        };
+        let mut k = open + 1;
+        while k < chars.len() {
+            match chars.get(k) {
+                Some('\\') => k += 2,
+                Some('"') => return Some(k + 1),
+                _ => k += 1,
+            }
+        }
+        Some(chars.len())
+    }
+
+    /// The end of a char literal starting at `at`; a lifetime is none.
+    fn char_literal_end(chars: &[char], at: usize) -> Option<usize> {
+        if chars.get(at) != Some(&'\'') {
+            return None;
+        }
+        match chars.get(at + 1) {
+            Some('\\') => {
+                let rest = chars.get(at + 3..)?;
+                Some(at + 4 + rest.iter().position(|c| *c == '\'')?)
+            }
+            Some(_) if chars.get(at + 2) == Some(&'\'') => Some(at + 3),
+            _ => None,
+        }
+    }
+
+    /// `source` with comments, strings and char literals blanked, so a scan sees
+    /// code only.
+    fn code_only(source: &str) -> Vec<char> {
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = Vec::with_capacity(chars.len());
+        let mut at = 0;
+        while let Some(&c) = chars.get(at) {
+            let masked = line_comment_end(&chars, at)
+                .or_else(|| block_comment_end(&chars, at))
+                .or_else(|| raw_string_end(&chars, at))
+                .or_else(|| string_end(&chars, at))
+                .or_else(|| char_literal_end(&chars, at));
+            if let Some(end) = masked {
+                let end = end.min(chars.len());
+                out.extend(
+                    chars
+                        .get(at..end)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|c| blank(*c)),
+                );
+                at = end;
+            } else {
+                out.push(c);
+                at += 1;
+            }
+        }
+        out
+    }
+
+    /// Whether the code before `at`, past whitespace, ends with `pattern`.
+    fn preceded_by(code: &[char], at: usize, pattern: &str) -> bool {
+        let before: Vec<char> = code
+            .get(..at)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .skip_while(|c| c.is_whitespace())
+            .take(pattern.chars().count())
+            .copied()
+            .collect();
+        before.into_iter().rev().eq(pattern.chars())
+    }
+
+    /// The first non-whitespace character at or after `at`.
+    fn next_significant(code: &[char], at: usize) -> Option<char> {
+        code.get(at..)?.iter().copied().find(|c| !c.is_whitespace())
+    }
+
+    /// A brace scope: the `fn` it belongs to and the type an enclosing `impl`
+    /// names.
+    #[derive(Clone, Default)]
+    struct Scope {
+        func: Option<String>,
+        impl_target: Option<String>,
+    }
+
+    /// An `impl` header being read up to its `{`.
+    #[derive(Default)]
+    struct ImplHeader {
+        angle_depth: usize,
+        target: Option<String>,
+        in_where: bool,
+    }
+
+    /// The 1-based lines of `source` that construct `ty` (`ty(`, `ty {`, or
+    /// `Self(`/`Self {` inside an `impl` of `ty`) outside the functions
+    /// `allowed` names.
+    fn constructions(source: &str, ty: &str, allowed: &[&str]) -> Vec<usize> {
+        let code = code_only(source);
+        let mut scopes: Vec<Scope> = Vec::new();
+        let mut pending_fn: Option<String> = None;
+        let mut expect_fn_name = false;
+        let mut header: Option<ImplHeader> = None;
+        let mut found = Vec::new();
+        let mut line = 1;
+        let mut at = 0;
+        while let Some(&c) = code.get(at) {
+            if c.is_alphabetic() || c == '_' {
+                let start = at;
+                while is_ident(&code, at) {
+                    at += 1;
+                }
+                let word: String = code.get(start..at).unwrap_or_default().iter().collect();
+                if expect_fn_name {
+                    expect_fn_name = false;
+                    pending_fn = Some(word);
+                    continue;
+                }
+                if let Some(h) = header.as_mut() {
+                    if word == "where" {
+                        h.in_where = true;
+                    } else if h.angle_depth == 0 && !h.in_where && word != "for" && word != "dyn" {
+                        h.target = Some(word);
+                    }
+                    continue;
+                }
+                match word.as_str() {
+                    "fn" => {
+                        expect_fn_name = next_significant(&code, at)
+                            .is_some_and(|n| n.is_alphabetic() || n == '_');
+                    }
+                    "impl" if pending_fn.is_none() => header = Some(ImplHeader::default()),
+                    _ => {}
+                }
+                let scope = scopes.last().cloned().unwrap_or_default();
+                let names_ty =
+                    word == ty || (word == "Self" && scope.impl_target.as_deref() == Some(ty));
+                let builds = matches!(next_significant(&code, at), Some('(' | '{'));
+                let declares = ["struct", "enum", "type", "->", "redacting_debug!("]
+                    .iter()
+                    .any(|p| preceded_by(&code, start, p));
+                let sanctioned = scope.func.as_deref().is_some_and(|f| allowed.contains(&f));
+                if names_ty && builds && !declares && !sanctioned {
+                    found.push(line);
+                }
+                continue;
+            }
+            match c {
+                '\n' => line += 1,
+                ';' => pending_fn = None,
+                '<' => {
+                    if let Some(h) = header.as_mut() {
+                        h.angle_depth += 1;
+                    }
+                }
+                '>' if !preceded_by(&code, at, "-") => {
+                    if let Some(h) = header.as_mut() {
+                        h.angle_depth = h.angle_depth.saturating_sub(1);
+                    }
+                }
+                '{' => {
+                    let parent = scopes.last().cloned().unwrap_or_default();
+                    let scope = match header.take() {
+                        Some(h) => Scope {
+                            func: parent.func,
+                            impl_target: h.target,
+                        },
+                        None => Scope {
+                            func: pending_fn.take().or(parent.func),
+                            impl_target: parent.impl_target,
+                        },
+                    };
+                    scopes.push(scope);
+                }
+                '}' => {
+                    scopes.pop();
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        found
+    }
+
+    /// Source exercising every masking and scoping rule of the scan.
+    const SYNTHETIC: &str = r##"
+struct VerifiedClaims(Map);
+impl VerifiedClaims {
+    fn get(&self) -> &str { "VerifiedClaims(x)" }
+    fn forge() -> Self { Self(Map::new()) }
+}
+// VerifiedClaims(in a comment)
+/* VerifiedClaims { nested /* VerifiedClaims( */ } */
+fn verify_claims() -> VerifiedClaims {
+    let brace = '{';
+    let raw = r#"VerifiedClaims("#;
+    VerifiedClaims(Map::new())
+}
+fn rogue<'a>(x: &'a str) {
+    let _ = VerifiedClaims { 0: x };
+}
+"##;
+
+    #[test]
+    fn construction_scan_masks_literals_and_tracks_scopes() {
+        assert_eq!(
+            constructions(SYNTHETIC, "VerifiedClaims", &["verify_claims"]),
+            vec![5, 15]
+        );
+        assert_eq!(
+            constructions(SYNTHETIC, "VerifiedClaims", &[]),
+            vec![5, 12, 15]
+        );
+    }
+
+    #[test]
+    fn verified_claims_only_from_verify_claims() {
+        let auth = include_str!("auth.rs");
+        let revocation = include_str!("revocation.rs");
+        let none: Vec<usize> = Vec::new();
+        assert_eq!(
+            constructions(auth, "VerifiedClaims", &["verify_claims"]),
+            none,
+            "`VerifiedClaims` is built only inside `verify_claims`"
+        );
+        assert_eq!(constructions(revocation, "VerifiedClaims", &[]), none);
+        assert_eq!(
+            constructions(revocation, "SessionCredential", &["admit_in", "try_from"]),
+            none,
+            "`SessionCredential` is built only by the gate and its wire decode"
+        );
+        assert_eq!(constructions(auth, "SessionCredential", &[]), none);
+        assert_eq!(
+            constructions(auth, "VerifiedClaims", &[]).len(),
+            1,
+            "the scan sees the sanctioned construction"
+        );
+        assert_eq!(
+            constructions(revocation, "SessionCredential", &[]).len(),
+            2,
+            "the scan sees both sanctioned constructions"
+        );
+        assert_eq!(
+            constructions(auth, "TimeClaims", &["verify_claims"]),
+            none,
+            "`TimeClaims` is built only inside `verify_claims`"
+        );
+        assert_eq!(constructions(auth, "TimeClaims", &[]).len(), 1);
+        assert_eq!(constructions(revocation, "TimeClaims", &[]), none);
+        for ty in ["VerifiedClaims", "TimeClaims", "SessionCredential"] {
+            for source in [auth, revocation] {
+                assert_eq!(
+                    aliases(source, ty),
+                    Vec::<String>::new(),
+                    "`{ty}` has no alias the construction scan cannot see"
+                );
+            }
+        }
+    }
+
+    /// The enclosing `fn` of every alias of `ty` in `source` (`use … ty as N`,
+    /// or `type N = … ty` naming `ty` itself), a name under which the
+    /// construction scan would not see `ty` built. A `type` that only holds
+    /// `ty` inside another type (`Vec<ty>`) builds no `ty`.
+    fn aliases(source: &str, ty: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        let mut sites = Vec::new();
+        for (at, token) in tokens.iter().enumerate() {
+            if token.text != "use" && token.text != "type" {
+                continue;
+            }
+            let item: Vec<&str> = tokens
+                .iter()
+                .skip(at + 1)
+                .map(|t| t.text.as_str())
+                .take_while(|t| *t != ";")
+                .collect();
+            let renames = item.windows(2).any(|pair| pair == [ty, "as"]);
+            let names = item.contains(&"=") && item.last() == Some(&ty);
+            if (token.text == "use" && renames) || (token.text == "type" && names) {
+                sites.push(token.func.clone().unwrap_or_default());
+            }
+        }
+        sites
+    }
+
+    /// Source exercising the alias scan.
+    const SYNTHETIC_ALIASES: &str = r#"
+use crate::auth::TimeClaims;
+use crate::auth::{TimeClaims as Times, VerifiedClaims};
+type T = TimeClaims;
+fn forge() -> Option<i64> {
+    type Inner = crate::auth::TimeClaims;
+    type Many = Vec<TimeClaims>;
+    let t: Option<TimeClaims> = None;
+    None
+}
+// type C = TimeClaims;
+type Other = VerifiedClaims;
+"#;
+
+    #[test]
+    fn alias_scan_refuses_every_rename() {
+        assert_eq!(aliases(SYNTHETIC_ALIASES, "TimeClaims"), ["", "", "forge"]);
+    }
+
+    /// A code token and the `fn` whose body holds it.
+    struct Token {
+        text: String,
+        func: Option<String>,
+    }
+
+    /// The code tokens of `source` (comments and literals masked), each with
+    /// its enclosing `fn`.
+    fn tokens(source: &str) -> Vec<Token> {
+        let code = code_only(source);
+        let mut out: Vec<Token> = Vec::new();
+        let mut scopes: Vec<Option<String>> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut at = 0;
+        while let Some(&c) = code.get(at) {
+            let func = scopes.last().cloned().flatten();
+            if c.is_alphabetic() || c == '_' {
+                let start = at;
+                while is_ident(&code, at) {
+                    at += 1;
+                }
+                let text: String = code.get(start..at).unwrap_or_default().iter().collect();
+                if out.last().is_some_and(|t| t.text == "fn") {
+                    pending = Some(text.clone());
+                }
+                out.push(Token { text, func });
+                continue;
+            }
+            match c {
+                ';' => pending = None,
+                '{' => {
+                    let parent = scopes.last().cloned().flatten();
+                    scopes.push(pending.take().or(parent));
+                }
+                '}' => {
+                    scopes.pop();
+                }
+                _ => {}
+            }
+            if !c.is_whitespace() {
+                out.push(Token {
+                    text: c.to_string(),
+                    func,
+                });
+            }
+            at += 1;
+        }
+        out
+    }
+
+    /// The text-to-value readers a date could be re-read through.
+    const TEXT_READERS: [&str; 5] = [
+        "parse",
+        "from_str",
+        "from_str_radix",
+        "from_slice",
+        "from_reader",
+    ];
+
+    /// `from_str` qualifiers that read header bytes, never a number.
+    const HEADER_READERS: [&str; 1] = ["HeaderValue"];
+
+    /// The enclosing `fn` of every text read in `source`, whatever type it
+    /// reads into: `.parse()`, `str::parse`, any `from_str*`, `from_slice` or
+    /// `from_reader`. A `fn` of that name being declared, a `Type::parse`
+    /// smart constructor (an upper-case qualifier), and a `HeaderValue` read
+    /// are not reads of a number.
+    fn text_reads(source: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        let text = |at: Option<usize>| {
+            at.and_then(|at| tokens.get(at))
+                .map_or("", |t| t.text.as_str())
+        };
+        let mut sites = Vec::new();
+        for (at, token) in tokens.iter().enumerate() {
+            let word = token.text.as_str();
+            if !TEXT_READERS.contains(&word) || text(at.checked_sub(1)) == "fn" {
+                continue;
+            }
+            let qualifier = ([":", ":"] == [text(at.checked_sub(2)), text(at.checked_sub(1))])
+                .then(|| text(at.checked_sub(3)));
+            let constructor = word == "parse"
+                && qualifier.is_some_and(|q| q.starts_with(|c: char| c.is_uppercase()));
+            let header =
+                word == "from_str" && qualifier.is_some_and(|q| HEADER_READERS.contains(&q));
+            if !constructor && !header {
+                sites.push(token.func.clone().unwrap_or_default());
+            }
+        }
+        sites
+    }
+
+    /// Source exercising the text-read scan: one evasion per `fn`, plus the
+    /// masked and exempt forms.
+    const SYNTHETIC_PARSES: &str = r#"
+fn turbofish(claims: &Claims) -> Option<i64> {
+    // claims.get("exp").and_then(|s| s.parse::<i64>().ok())
+    let _ = "s.parse::<i64>()";
+    claims.get("exp").and_then(|s| s.parse :: < i64 > ().ok())
+}
+fn inferred(s: &str) -> Option<i64> { let e: i64 = s.parse().ok()?; Some(e) }
+fn pathed(s: &str) -> Option<i64> { s.parse::<core::primitive::i64>().ok() }
+fn aliased(s: &str) -> Option<i64> { type S = i64; s.parse::<S>().ok() }
+fn serde(s: &str) -> Option<i64> { serde_json::from_str::<i64>(s).ok() }
+fn bytes(s: &str) -> Option<i64> { serde_json::from_slice(s.as_bytes()).ok() }
+fn radix(raw: &str) -> Option<u64> { u64::from_str_radix(raw, 10).ok() }
+fn trait_path(raw: &str) -> Option<i64> { <i64 as FromStr>::from_str(raw).ok() }
+fn point_free(raw: Option<&str>) -> Option<i64> { raw.map(str::parse::<i64>)?.ok() }
+fn width(raw: &str) -> Option<usize> { raw.parse::<usize>().ok() }
+fn parse(raw: &str) -> Option<Name> { Name::parse(raw) }
+fn header(raw: &str) -> bool { HeaderValue::from_str(raw).is_ok() }
+"#;
+
+    #[test]
+    fn text_read_scan_refuses_every_evasion() {
+        assert_eq!(
+            text_reads(SYNTHETIC_PARSES),
+            [
+                "turbofish",
+                "inferred",
+                "pathed",
+                "aliased",
+                "serde",
+                "bytes",
+                "radix",
+                "trait_path",
+                "point_free",
+                "width",
+            ]
+        );
+    }
+
+    /// No reader after `verify_claims` re-parses a date from a claim's string
+    /// form, and the lenient reader that passed over a mistyped date is gone.
+    #[test]
+    fn date_claims_read_once() {
+        // The two parses read the caller's `signToken` dict, never a verified
+        // token.
+        // Production: the two reads are `signToken`'s caller dict, never a
+        // verified token. Tests: JSON fixtures decoded whole.
+        assert_eq!(
+            text_reads(include_str!("auth.rs")),
+            [
+                "auth_sign_token",
+                "auth_sign_token",
+                "test_auth_sign_token_payload_keys_sorted",
+                "tampered_cap_fails_signature_verification",
+                "verified_time_claims_are_the_numbers_the_checks_read",
+                "exp_past_the_decoders_range_is_non_numeric_not_missing",
+            ],
+            "a new text read in `auth.rs` must not re-read a verified date"
+        );
+        // Production: the bindings wire decode. Tests: wire fixtures.
+        let fixture = "session_credential_deserialize_refuses_empty_fields";
+        assert_eq!(
+            text_reads(include_str!("revocation.rs")),
+            [
+                "decode_bindings",
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                fixture,
+                "decode_bindings_refuses_nine_and_empty_fields",
+            ],
+            "a new text read in `revocation.rs` must not re-read a verified date"
+        );
+        // Production: the `Content-Length` header. Tests: a response status
+        // line, a port variable parsed through the registry, an address and a
+        // JSON payload fixture.
+        assert_eq!(
+            text_reads(include_str!("server.rs")),
+            [
+                "build_request",
+                "raw_status",
+                "ipe_server_port_resolves_operator_over_source_under_relocation",
+                "ipe_server_port_resolves_operator_over_source_under_relocation",
+                "an_env_exposure_warns_with_the_parsed_address",
+                "fractional_exp_still_slides",
+            ],
+            "a new text read in `server.rs` must not re-read a verified date"
+        );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root];
+        let mut scanned = 0;
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).expect("read a source dir");
+            for entry in entries {
+                let path = entry.expect("read a source dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let source = std::fs::read_to_string(&path).expect("read a source file");
+                    scanned += 1;
+                    assert!(
+                        tokens(&source).iter().all(|t| t.text != "numeric_date"),
+                        "`numeric_date` is gone; read a date through `read_numeric_date`: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(scanned > 3, "the scan walked the runtime sources");
     }
 }

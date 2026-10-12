@@ -93,7 +93,7 @@ fn c01_enum_capture_fix1() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for enum_capture: {:?}",
+        "ipe dev build must succeed for enum_capture: {:?}",
         built.err()
     );
 
@@ -138,7 +138,7 @@ fn c02_record_capture_fix1() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for record_capture: {:?}",
+        "ipe dev build must succeed for record_capture: {:?}",
         built.err()
     );
 
@@ -184,7 +184,7 @@ fn c13_complex_arg_hoist_t4() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for complex_arg_hoist: {:?}",
+        "ipe dev build must succeed for complex_arg_hoist: {:?}",
         built.err()
     );
 

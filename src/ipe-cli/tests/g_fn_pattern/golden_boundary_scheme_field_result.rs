@@ -1,6 +1,6 @@
 //! Class-1 "Boundary Scheme Promotion" — regression for a SEAL violation.
 //!
-//! Without the fix, `ipe build` exits 0, but the emitted Rust fails
+//! Without the fix, `ipe dev build` exits 0, but the emitted Rust fails
 //! `cargo build` with:
 //!
 //! ```text
@@ -91,7 +91,7 @@ fn class1_field_result_ipec_accepts_and_emits_concrete_getter() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for boundary_scheme_field_result: {:?}",
+        "ipe dev build must succeed for boundary_scheme_field_result: {:?}",
         built.err()
     );
 
@@ -148,7 +148,7 @@ fn class1_field_result_cargo_builds_and_runs() {
     let built = ipe::build_loose_file(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for boundary_scheme_field_result: {:?}",
+        "ipe dev build must succeed for boundary_scheme_field_result: {:?}",
         built.err()
     );
 

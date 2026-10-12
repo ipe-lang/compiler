@@ -524,7 +524,7 @@ fn unbacked_permission_refusal(platform: Platform, unbacked: &[&String]) -> CliE
 /// A structured, per-axis view of a derivation for the CLI surface — which web
 /// axes were granted and, for each, the OS entries it contributed on the target.
 ///
-/// Consumed by the `ipe build --emit-permissions` dry-run to print a legible,
+/// Consumed by the `ipe release build --emit-permissions` dry-run to print a legible,
 /// deterministic report without the CLI reaching into the private table.
 #[must_use]
 pub fn per_axis_breakdown(

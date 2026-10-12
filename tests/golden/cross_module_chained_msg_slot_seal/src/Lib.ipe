@@ -1,0 +1,18 @@
+module Lib exposing (badge, menu, nav)
+
+import Ipe.Html as Html exposing (Html)
+
+
+-- Message-free view helpers. Each is used only inside a helper of `Mid` whose
+-- own message slot is still open there.
+nav =
+    Html.div [] [ Html.text "nav" ]
+
+
+menu =
+    Html.div [] [ Html.text "menu" ]
+
+
+badge : Html msg
+badge =
+    Html.div [] [ Html.text "badge" ]

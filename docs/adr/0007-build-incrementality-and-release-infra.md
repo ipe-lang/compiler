@@ -50,13 +50,26 @@ a non-type-checking program still yields kind-only completion rather than an
 invented type. Feature `match`es carry no wildcard, so a new language variant is a
 compile error in the server until every handler covers it.
 
-> **NEEDS UPDATE AFTER IMPLEMENTATION** — `typecheck` is still a coarse
-> whole-program solve (`src/compiler/db/src/lib.rs` "the COARSE spine";
-> `metadata.rs` "coarse, LOCKED whole-program"), so a settled edit on a large
-> project re-solves the whole program; per-module `typecheck(ModuleId)`
-> granularity is designed but not landed (untracked). Once landed, restate this as
-> per-module and drop the coarse-latency caveat. (The `expected_type_at`
-> type-directed-completion follow-on *has* landed — `src/lsp/features/src/expected_type.rs` — and is current, not pending.)
+Type checking has two tiers over the one database. `infer_module_scoped`
+solves a single module against its dependencies' `typed_interface` schemes, so a
+scheme-preserving edit to a dependency does not re-solve its dependents; the
+editor features read it through `typecheck_module`. A module is served
+per-module only when every solved fact it carries is independent of its
+importers. An importer-pinnable scheme (an unannotated numeric export) marks
+its interface open, and it and its importers fall back to the joint `typecheck`
+projection, as do import cycles and red dependencies. An exported
+UI-message-defaulting slot (whose default reads every use site, importers'
+included) leaves the exported scheme closed (the annotation, or the scheme
+reified before defaulting), so its importers still solve per-module against
+the interface while the module's own types come from the joint projection. The build commands (`build`, `run`, `watch`, `check`, `test`,
+`pkg`) lower from the joint `typecheck` solve: the lowerer also consumes
+whole-program solver facts (warnings, the polymorphic-variable map keyed by
+solver ids, untyped type parameters, signature wildcards, message-defaulted
+variables) that the per-module result does not yet carry or gate, so routing
+lowering through the scoped tier requires those facts per module and a
+lowered-IR differential proving the assembled program identical to the joint
+one. The `expected_type_at` type-directed completion
+(`src/lsp/features/src/expected_type.rs`) reads the same per-module tier.
 
 ### Stdlib modules with internal structure are compiled from source
 

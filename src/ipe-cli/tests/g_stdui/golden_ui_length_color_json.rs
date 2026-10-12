@@ -55,7 +55,7 @@ fn ui_length_color_and_json_value_render_end_to_end() {
     let built = ipe::build(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
-        "ipe build must succeed for ui_length_color_json: {:?}",
+        "ipe dev build must succeed for ui_length_color_json: {:?}",
         built.err()
     );
 

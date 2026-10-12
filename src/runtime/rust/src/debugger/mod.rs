@@ -1,6 +1,6 @@
 //! Shape-agnostic TEA debugger core — recorder, re-fold, export, and import.
 //!
-//! Enabled only when the `debugger` feature is active (`ipe build/run --debugger`).
+//! Enabled only when the `debugger` feature is active (`ipe dev build/run --debugger`).
 //! A non-`--debugger` build carries zero code from this module.
 //!
 //! ## Data model
@@ -35,6 +35,7 @@
 
 use std::collections::VecDeque;
 
+use crate::retained::{Bytes, RetainedBytes};
 use crate::tea::IpeCmd;
 
 // Server-driven TEA debugger: session-scoped history and overlay HTML.
@@ -52,7 +53,7 @@ pub mod tui;
 pub mod record_sink;
 
 // Typed session log: the replayable form of a recorded cli/worker session
-// (`ipe run --record` writes it, `ipe run --replay` re-folds it).
+// (`ipe dev run --record` writes it, `ipe dev run --replay` re-folds it).
 // Gated on `feature = "debugger"` via the inner `#![cfg(...)]`.
 pub mod session_log;
 
@@ -90,6 +91,21 @@ pub struct RecordBuffer<Msg, Model> {
     cap: usize,
     /// `true` once a step has been evicted, so `base` is no longer the initial model.
     overflowed: bool,
+}
+
+impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for Step<Msg, Model> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?
+            .plus(&self.msg)?
+            .plus(&self.model_after)
+    }
+}
+
+impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for RecordBuffer<Msg, Model> {
+    // The base model plus every retained step, spare log slots included.
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.base)?.plus(&self.log)
+    }
 }
 
 impl<Msg: Clone, Model: Clone> RecordBuffer<Msg, Model> {
@@ -297,6 +313,12 @@ impl<Msg: Clone, Model: Clone> RecordBuffer<Msg, Model> {
 pub struct History<Msg, Model> {
     inner: RecordBuffer<Msg, Model>,
     update: fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+}
+
+impl<Msg: RetainedBytes, Model: RetainedBytes> RetainedBytes for History<Msg, Model> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        Bytes::inline::<Self>()?.plus(&self.inner)
+    }
 }
 
 impl<Msg: Clone, Model: Clone> History<Msg, Model> {

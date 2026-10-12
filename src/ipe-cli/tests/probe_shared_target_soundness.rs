@@ -14,7 +14,7 @@
 //! could reuse a prior probe's compiled crate and green a broken emit, defeating
 //! the seal the coverage sweep exists to hold.
 //!
-//! This test drives the real single-file emit path (`ipe build` with
+//! This test drives the real single-file emit path (`ipe dev build` with
 //! `IPE_EMIT_PACKAGE_NAME` set, as a subprocess) into ONE shared cargo target: a
 //! well-typed crate warms the target and builds; a second crate — emitted under
 //! its own unique package name, then corrupted with an injected Rust type error —
@@ -33,9 +33,9 @@ fn ipe_bin() -> std::path::PathBuf {
     e2e_support::cargo_bin!("ipe").into_path_buf()
 }
 
-/// Emit `SRC` at `dir/Main.ipe` into `dir/out` via a subprocess `ipe build`,
+/// Emit `SRC` at `dir/Main.ipe` into `dir/out` via a subprocess `ipe dev build`,
 /// naming the emitted crate `package_name` and building into `shared_target`.
-/// Returns the emitted-project dir and whether `ipe build` succeeded.
+/// Returns the emitted-project dir and whether `ipe dev build` succeeded.
 fn ipe_build_into_shared(
     ipe: &Path,
     dir: &Path,
@@ -49,6 +49,7 @@ fn ipe_build_into_shared(
     let out_dir = dir.join("out");
 
     let status = Command::new(ipe)
+        .arg("dev")
         .arg("build")
         .arg(&entry)
         .arg("--out")
@@ -59,7 +60,7 @@ fn ipe_build_into_shared(
         .env("RUSTC_WRAPPER", "")
         .env("NO_COLOR", "1")
         .status()
-        .expect("ipe build must spawn");
+        .expect("ipe dev build must spawn");
     // `--out` names the output root; the emitted crate is its `rust/` area.
     (out_dir.join("rust"), status.success())
 }
@@ -91,7 +92,7 @@ fn probe_shared_target_never_masks_a_broken_emit() {
         return;
     }
     let ipe = ipe_bin();
-    // `ipe build` resolves the runtime itself; prove this host has one.
+    // `ipe dev build` resolves the runtime itself; prove this host has one.
     let _runtime = e2e_support::require_runtime();
 
     let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

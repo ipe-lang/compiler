@@ -12,6 +12,7 @@ use syn::token::{Brace, Semi};
 use syn::visit::{self, Visit};
 use syn::{Attribute, Fields, ForeignItem, ImplItem, Item, MacroDelimiter, TraitItem};
 
+use crate::bounded::{ScanError, with_parsed};
 use crate::{
     attrs_test_only, foreign_item_test_only, impl_item_test_only, item_test_only,
     trait_item_test_only,
@@ -20,7 +21,7 @@ use crate::{
 /// 1-based inclusive line spans of the test-only items in `src`.
 ///
 /// An item is test-only as [`crate::scan_str`] judges one: a test-only
-/// `#[cfg(…)]` or, on a function, `#[test]`. Each span runs from the item's
+/// `#[cfg(…)]`; a bare `#[test]` is production. Each span runs from the item's
 /// first attribute to its closing brace or semicolon. The first line is left
 /// out when anything but whitespace precedes the attribute, and the last when
 /// anything but whitespace follows the close, so a production token sharing a
@@ -31,19 +32,20 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`syn::Error`] when `src` does not parse as a Rust file.
-pub fn test_only_item_lines(src: &str) -> Result<Vec<RangeInclusive<usize>>, syn::Error> {
-    let file = syn::parse_file(src)?;
-    if attrs_test_only(&file.attrs, false) {
-        let whole_file = 1..=src.lines().count().max(1);
-        return Ok(vec![whole_file]);
-    }
-    let mut spans = TestSpans {
-        lines: src.lines().collect(),
-        spans: Vec::new(),
-    };
-    spans.visit_file(&file);
-    Ok(spans.spans)
+/// [`ScanError`] when `src` is over a ceiling or does not parse as a Rust file.
+pub fn test_only_item_lines(src: &str) -> Result<Vec<RangeInclusive<usize>>, ScanError> {
+    with_parsed(src, |file| {
+        if attrs_test_only(&file.attrs) {
+            let whole_file = 1..=src.lines().count().max(1);
+            return vec![whole_file];
+        }
+        let mut spans = TestSpans {
+            lines: src.lines().collect(),
+            spans: Vec::new(),
+        };
+        spans.visit_file(file);
+        spans.spans
+    })
 }
 
 /// The source lines and the spans collected so far.
@@ -267,10 +269,7 @@ mod tests {
                    fn bare() {}\n\
                    #[cfg(any(test, feature = \"x\"))]\n\
                    fn maybe_prod() {}\n";
-        assert_eq!(
-            test_only_item_lines(src).ok(),
-            Some(vec![2..=6, 8..=9, 10..=11])
-        );
+        assert_eq!(test_only_item_lines(src).ok(), Some(vec![2..=6, 8..=9]));
     }
 
     /// Test-only impl items are spanned inside a production impl.

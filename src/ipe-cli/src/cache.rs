@@ -3,7 +3,7 @@
 //! Decision record: `docs/adr/0007-build-incrementality-and-release-infra.md`.
 //!
 //! Everything in-process is memoized, but nothing survives ACROSS process
-//! invocations — every `ipe build` starts a cold [`ipe_db::IpeDatabase`].
+//! invocations — every `ipe dev build` starts a cold [`ipe_db::IpeDatabase`].
 //! This module closes that gap for the coarse, whole-project granularity
 //! that genuinely exists (`ipe_db::emit_project`'s output — see this
 //! module's own doc section below for why that is a deliberate, documented
@@ -37,7 +37,7 @@
 //! `files` maps `RelPath -> String`, `cargo_toml` is a `String`), so it
 //! serializes and deserializes losslessly with zero cross-process identity
 //! risk. The practical win is AT LEAST as large as literal IR caching would
-//! give for `ipe build`'s actual use case (a cold-start cache hit skips
+//! give for `ipe dev build`'s actual use case (a cold-start cache hit skips
 //! parse -> canon -> link -> infer -> lower -> emit ENTIRELY, not just
 //! infer -> lower -> emit), at the cost of not serving a hypothetical
 //! future interpreter tier that wants to consume `ipe_ir` directly (design
@@ -59,7 +59,8 @@
 //!   completeness note calls out: an add/delete/rename of a module MUST
 //!   yield a different key, never a stale hit), and full source text,
 //! - every emit-shape build flag (target, production, `--debugger`,
-//!   hot-appearance, the webview host and window).
+//!   hot-appearance, the webview host and window),
+//! - the mount base every emitted browser shell URL is built from.
 //!
 //! `blame_path` (diagnostic-only) and the vendored runtime tree are
 //! deliberately NOT part of the key: neither affects [`EmittedProject`]'s
@@ -88,8 +89,8 @@
 //! guess, never a build failure: a compile just runs uncached, exactly as
 //! every build did before this module existed.
 //!
-//! **Not yet ported**: `ipe watch`'s specific mid-session UX (hard-refuse a
-//! REBUILD with `toolchain changed (was A, now B) — restart 'ipe watch'`
+//! **Not yet ported**: `ipe dev watch`'s specific mid-session UX (hard-refuse a
+//! REBUILD with `toolchain changed (was A, now B) — restart 'ipe dev watch'`
 //! while keeping the last-good binary alive) needs a live watch session to
 //! refuse INTO. The sound foundation that UX builds on is the version-epoch
 //! gate itself.
@@ -111,13 +112,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ipe_backend::EmittedProject;
 use ipe_backend_rust::DbDriver;
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal, RegularFile};
 use ipe_intern::{Interner, SerdeInternerGuard};
 use ipe_ir::Program;
+use ipe_runtime_rust::encoding::MountBase;
 
 use crate::output_dir::OwnedDir;
-use crate::proven_dir::EntryName;
 use crate::remote_ingest::{IngestLimit, LocalRefusal, LocalSource, PACKAGE_SOURCE, TreeCeiling};
 use crate::secret_file::OwnerDir;
+use crate::toolchain::RustcVersion;
 use sha2::{Digest, Sha256};
 
 /// Domain-separation tag for the content-address hash — bumped whenever the
@@ -196,24 +199,15 @@ impl TreePath {
         Self(String::new())
     }
 
-    /// `name`, the entry at `path` inside the directory this path names.
+    /// `name`, the entry inside the directory this path names.
     ///
-    /// A name that is not UTF-8 is refused as [`IngestLimit::NonUtf8Name`]; a
-    /// name no directory listing yields (empty, `.`, `..`, or holding a `/`) is
-    /// refused as an `InvalidInput` I/O error.
-    fn child(&self, name: &std::ffi::OsStr, path: &Path) -> Result<Self, TreeHashError> {
-        let Some(name) = name.to_str() else {
+    /// A name that is not UTF-8 is refused as [`IngestLimit::NonUtf8Name`].
+    /// [`EntryName`] already holds the single-component rule (never empty,
+    /// `.` or `..`, never holding a separator or NUL).
+    fn child(&self, name: &EntryName) -> Result<Self, TreeHashError> {
+        let Some(name) = name.as_os_str().to_str() else {
             return Err(tree_exceeded(IngestLimit::NonUtf8Name));
         };
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-            return Err(tree_io(
-                path,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "a directory listing named an entry that is not a single path component",
-                ),
-            ));
-        }
         if self.0.is_empty() {
             return Ok(Self(name.to_owned()));
         }
@@ -327,20 +321,163 @@ impl TreeDigest {
 /// # Errors
 /// As [`hash_tree`].
 fn tree_hasher_within(root: &Path, ceiling: &TreeCeiling) -> Result<Sha256, TreeHashError> {
-    let mut files: Vec<(TreePath, PathBuf)> = Vec::new();
-    let mut entries: u64 = 0;
-    collect_files(
+    walk_within(root, ceiling, |_| None).map(|walked| walked.hasher)
+}
+
+/// What one budgeted walk produced: the un-finalized hasher and what it kept.
+struct Walked {
+    hasher: Sha256,
+    kept: BTreeMap<String, KeptFile>,
+    dirs: BTreeSet<String>,
+}
+
+/// The one budgeted walk: hash every file into the [`hash_tree`] stream and keep
+/// the bytes of each file `keep` names.
+///
+/// The root is held once; every entry below it is reached from that handle,
+/// one entry name per level, each level opened without following a link, so
+/// no lookup leaves the tree or passes through a link.
+///
+/// `keep` maps a tree-relative path to the byte cap its file is kept under, or
+/// `None` when the file is only hashed. A kept file's bytes are the very bytes
+/// fed to the hasher, so the digest is a function of the kept value.
+///
+/// # Errors
+/// As [`hash_tree`].
+fn walk_within(
+    root: &Path,
+    ceiling: &TreeCeiling,
+    keep: impl Fn(&str) -> Option<u64>,
+) -> Result<Walked, TreeHashError> {
+    let held = HeldDir::open_root(root).map_err(|refusal| tree_io(root, refusal.into_io()))?;
+    let (files, dirs) = walk_tree(&held, root, ceiling)?;
+    let (hasher, kept) = hash_walked(&held, root, &files, ceiling, keep)?;
+    Ok(Walked {
+        hasher,
+        kept,
+        dirs: dirs.into_iter().map(|dir| dir.0).collect(),
+    })
+}
+
+/// What a walk keeps of one file whose bytes the caller asked for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeptFile {
+    /// The file's bytes, exactly those hashed into the tree digest.
+    Bytes(Vec<u8>),
+    /// The file is larger than the cap it was to be kept under; it is hashed, not kept.
+    Oversize {
+        /// The byte cap the file exceeded.
+        cap: u64,
+    },
+}
+
+/// One budgeted walk of a source tree: its digest and the bytes it kept.
+///
+/// The digest is computed over the same bytes the kept files hold, so a verdict
+/// over the kept bytes and the digest that pins them can never describe two
+/// reads.
+pub struct TreeCapture {
+    digest: TreeDigest,
+    kept: BTreeMap<String, KeptFile>,
+    dirs: BTreeSet<String>,
+}
+
+impl TreeCapture {
+    /// Whether the walk met a visible directory at this tree-relative path.
+    #[must_use]
+    pub fn has_dir(&self, rel: &str) -> bool {
+        self.dirs.contains(rel)
+    }
+
+    /// Take what the walk kept of the file at this tree-relative path.
+    pub fn take(&mut self, rel: &str) -> Option<KeptFile> {
+        self.kept.remove(rel)
+    }
+
+    /// The [`hash_tree`] digest of the walked tree and the kept files.
+    ///
+    /// The files are keyed by forward-slash path relative to the tree root.
+    #[must_use]
+    pub fn into_parts(self) -> (TreeDigest, BTreeMap<String, KeptFile>) {
+        (self.digest, self.kept)
+    }
+}
+
+/// Walk the tree at `root` once, hashing it and keeping the files `keep` names.
+///
+/// `keep` maps a tree-relative path to the byte cap its file is kept under
+/// (`None`: hashed only). A file past its cap is recorded as
+/// [`KeptFile::Oversize`] and still hashed.
+///
+/// # Errors
+/// As [`hash_tree`].
+pub fn capture_tree_within(
+    root: &Path,
+    ceiling: &TreeCeiling,
+    keep: impl Fn(&str) -> Option<u64>,
+) -> Result<TreeCapture, TreeHashError> {
+    let Walked { hasher, kept, dirs } = walk_within(root, ceiling, keep)?;
+    Ok(TreeCapture {
+        digest: TreeDigest(hasher),
+        kept,
+        dirs,
+    })
+}
+
+/// A regular file the walk listed: its tree path and the entry names that reach it from the root.
+#[derive(Debug)]
+struct WalkedFile {
+    rel: TreePath,
+    names: Vec<EntryName>,
+}
+
+/// List every regular file below the held `dir`, sorted by tree path, and every visible directory.
+///
+/// `root` is the path `dir` was opened from, used only to name a failing
+/// entry in an error; nothing is opened through it.
+///
+/// # Errors
+/// As [`hash_tree`].
+fn walk_tree(
+    dir: &HeldDir,
+    root: &Path,
+    ceiling: &TreeCeiling,
+) -> Result<(Vec<WalkedFile>, BTreeSet<TreePath>), TreeHashError> {
+    let mut files = Vec::new();
+    let mut dirs = BTreeSet::new();
+    let mut seen: u64 = 0;
+    let mut walk = Walk {
         root,
-        &TreePath::root(),
-        &mut files,
-        &mut entries,
         ceiling,
-        0,
-    )?;
+        out: &mut files,
+        dirs: &mut dirs,
+        seen: &mut seen,
+    };
+    walk.collect(dir, &TreePath::root(), &[], 0)?;
     // Sort by the relative path so the hash is independent of directory-read
     // order (which the OS does not guarantee).
-    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok((files, dirs))
+}
 
+/// Hash the listed `files`, each opened afresh from the held `dir` and read from that one handle.
+///
+/// Each file is reached by [`HeldDir::open_rel`], which opens every level
+/// without following a link and proves the final entry a regular file from
+/// its own handle, so an entry swapped for a link, a FIFO or a device after
+/// the walk is refused, never followed or blocked on: the bytes hashed (and
+/// kept, for each file `keep` names) are the bytes of the handle that was
+/// checked.
+///
+/// # Errors
+/// As [`hash_tree`].
+fn hash_walked(
+    dir: &HeldDir,
+    root: &Path,
+    files: &[WalkedFile],
+    ceiling: &TreeCeiling,
+    keep: impl Fn(&str) -> Option<u64>,
+) -> Result<(Sha256, BTreeMap<String, KeptFile>), TreeHashError> {
     let mut hasher = Sha256::new();
     update_len_prefixed(&mut hasher, TREE_TAG);
     let count = u64::try_from(files.len()).unwrap_or(u64::MAX);
@@ -350,47 +487,88 @@ fn tree_hasher_within(root: &Path, ceiling: &TreeCeiling) -> Result<Sha256, Tree
     // same fixed-size window.
     let mut buf = vec![0u8; TREE_HASH_CHUNK_BYTES];
     let mut total_bytes: u64 = 0;
-    for (rel, abs) in &files {
-        update_str(&mut hasher, rel.as_str());
-        let len = hash_one_file(
+    let mut kept = BTreeMap::new();
+    for walked in files {
+        let rel = walked.rel.as_str();
+        let shown = root.join(rel);
+        update_str(&mut hasher, rel);
+        let file = dir
+            .open_rel(&walked.names)
+            .map_err(|refusal| tree_refusal(&shown, refusal, ceiling))?;
+        let (len, file_kept) = hash_one_file(
             &mut hasher,
-            rel.as_str(),
-            abs,
+            file,
+            &FileAt { rel, shown: &shown },
             &mut buf,
             total_bytes,
             ceiling,
+            keep(rel),
         )?;
+        if let Some(file_kept) = file_kept {
+            kept.insert(rel.to_owned(), file_kept);
+        }
         total_bytes = total_bytes.saturating_add(len);
     }
-    Ok(hasher)
+    Ok((hasher, kept))
 }
 
-/// Stream one file's bytes into `hasher` with an explicit little-endian
+/// The file one hash step reads: its tree path and the path that names it in an error.
+struct FileAt<'a> {
+    rel: &'a str,
+    shown: &'a Path,
+}
+
+/// The tree-hash refusal an [`OpenRefusal`] of the entry at `shown` stands for.
+fn tree_refusal(shown: &Path, refusal: OpenRefusal, ceiling: &TreeCeiling) -> TreeHashError {
+    match refusal {
+        OpenRefusal::Link => tree_exceeded(IngestLimit::Symlink),
+        OpenRefusal::NotRegular(_) => tree_exceeded(IngestLimit::SpecialFile),
+        OpenRefusal::NotUtf8 => tree_exceeded(IngestLimit::NonUtf8Name),
+        OpenRefusal::TooLarge(cap) => tree_exceeded(IngestLimit::Bytes(cap.get())),
+        OpenRefusal::TooManyEntries(_) => tree_exceeded(IngestLimit::Entries(ceiling.entries())),
+        OpenRefusal::BadName => tree_io(
+            shown,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a directory listing named an entry that is not a single path component",
+            ),
+        ),
+        OpenRefusal::Absent | OpenRefusal::Denied | OpenRefusal::InUse | OpenRefusal::Io(_) => {
+            tree_io(shown, refusal.into_io())
+        }
+    }
+}
+
+/// Stream one opened file's bytes into `hasher` with an explicit little-endian
 /// length prefix (matching [`update_len_prefixed`]'s framing), refusing a file
 /// past `ceiling.per_file()` before the read can exhaust memory.
 ///
-/// The length prefix is derived from the file's metadata size and re-checked
-/// against the bytes actually read, so a file that grows between `stat` and the
-/// final read (a race an attacker controls) is refused rather than framed with a
-/// stale, mismatched length that would corrupt the integrity hash.
+/// The length prefix is the length the handle's own proof saw, re-checked
+/// against the bytes actually read: the read stops just past it, so a
+/// file that grows or shrinks after the proof (a race an attacker controls)
+/// is refused rather than framed with a stale, mismatched length that would
+/// corrupt the integrity hash.
 ///
 /// `buf` is a caller-owned scratch chunk reused across every file in a tree; its
 /// length is the streaming window and its contents on entry are irrelevant.
 /// `hashed_so_far` is the byte total of the tree's earlier files: a file that
 /// would carry the tree past `ceiling.bytes()` is refused before it is read.
-/// Returns the file's length.
+/// `at.shown` names the file in an error only. `keep_cap` asks for the file's
+/// bytes to be kept as they are hashed: `None` keeps nothing, and a file larger
+/// than the cap is reported as oversize. Returns the file's length and what
+/// was kept.
 fn hash_one_file(
     hasher: &mut Sha256,
-    rel: &str,
-    abs: &Path,
+    file: RegularFile,
+    at: &FileAt<'_>,
     buf: &mut [u8],
     hashed_so_far: u64,
     ceiling: &TreeCeiling,
-) -> Result<u64, TreeHashError> {
+    keep_cap: Option<u64>,
+) -> Result<(u64, Option<KeptFile>), TreeHashError> {
     use std::io::Read as _;
 
-    let file = fs::File::open(abs).map_err(|e| tree_io(abs, e))?;
-    let declared_len = file.metadata().map_err(|e| tree_io(abs, e))?.len();
+    let declared_len = file.len();
     if declared_len > ceiling.per_file() {
         return Err(tree_exceeded(IngestLimit::Bytes(ceiling.per_file())));
     }
@@ -400,40 +578,66 @@ fn hash_one_file(
 
     hasher.update(declared_len.to_le_bytes());
 
-    let mut reader = file.take(declared_len);
+    // Reserved only for a file within its cap, so the reservation is bounded by
+    // that cap and by the per-file ceiling checked above; the read below stops
+    // one byte past `declared_len`, so the buffer never grows past it.
+    let mut kept: Option<Vec<u8>> = keep_cap
+        .filter(|cap| declared_len <= *cap)
+        .map(|_| Vec::with_capacity(usize::try_from(declared_len).unwrap_or(0)));
+
+    let one_past = ByteCap::from_nonzero(std::num::NonZeroU64::MIN.saturating_add(declared_len));
+    let mut reader = file.into_reader(one_past);
     let mut total: u64 = 0;
     loop {
-        let n = reader.read(buf).map_err(|e| tree_io(abs, e))?;
+        let n = match reader.read(buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+                return Err(size_changed(at.shown, at.rel, declared_len));
+            }
+            Err(e) => return Err(tree_io(at.shown, e)),
+        };
         if n == 0 {
             break;
         }
         total = total.saturating_add(n as u64);
+        if total > declared_len {
+            break;
+        }
         let chunk = buf.get(..n).ok_or_else(|| {
             tree_io(
-                abs,
+                at.shown,
                 std::io::Error::other("short read reported more bytes than the buffer holds"),
             )
         })?;
         hasher.update(chunk);
+        if let Some(kept) = kept.as_mut() {
+            kept.extend_from_slice(chunk);
+        }
     }
 
     if total != declared_len {
-        return Err(tree_io(
-            abs,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "file `{rel}` changed size during hashing (declared {declared_len} bytes, \
-                     read {total})"
-                ),
-            ),
-        ));
+        return Err(size_changed(at.shown, at.rel, declared_len));
     }
-    Ok(declared_len)
+    let outcome = match (keep_cap, kept) {
+        (Some(_), Some(bytes)) => Some(KeptFile::Bytes(bytes)),
+        (Some(cap), None) => Some(KeptFile::Oversize { cap }),
+        (None, _) => None,
+    };
+    Ok((declared_len, outcome))
 }
 
-/// Depth-first collect every regular file under the directory `rel` names
-/// inside `root`, as `(relative_path, absolute_path)`.
+/// The refusal of the file `rel` at `shown`, whose content stopped matching the `declared` length its proof saw.
+fn size_changed(shown: &Path, rel: &str, declared: u64) -> TreeHashError {
+    tree_io(
+        shown,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("file `{rel}` changed size during hashing (declared {declared} bytes)"),
+        ),
+    )
+}
+
+/// One depth-first walk of a held tree, collecting every regular file it lists.
 ///
 /// Hidden (dot-prefixed) directories are skipped. These hold VCS and local
 /// tooling metadata — `.git`, a code indexer's `.tokensave`, an editor's
@@ -449,50 +653,83 @@ fn hash_one_file(
 /// block the read, and a name that is not UTF-8 cannot be hashed without two
 /// distinct trees colliding.
 ///
-/// `seen` counts every entry visited across the whole walk; one past
+/// `out` collects every regular file and `dirs` every visible directory met.
+/// `seen` counts every entry listed across the whole walk; one past
 /// `ceiling.entries()` refuses the tree. A directory below `ceiling.depth()`
-/// levels is refused before it is listed, bounding the recursion.
-fn collect_files(
-    root: &Path,
-    rel: &TreePath,
-    out: &mut Vec<(TreePath, PathBuf)>,
-    seen: &mut u64,
-    ceiling: &TreeCeiling,
-    depth: u32,
-) -> Result<(), TreeHashError> {
-    if depth > ceiling.depth() {
-        return Err(tree_exceeded(IngestLimit::Depth(ceiling.depth())));
-    }
-    let dir = if rel.as_str().is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel.as_str())
-    };
-    let entries = fs::read_dir(&dir).map_err(|e| tree_io(&dir, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| tree_io(&dir, e))?;
-        *seen = seen.saturating_add(1);
-        if *seen > ceiling.entries() {
-            return Err(tree_exceeded(IngestLimit::Entries(ceiling.entries())));
+/// levels is refused before it is listed, bounding the recursion; only the
+/// chain of directories above the one being listed is held open.
+struct Walk<'a> {
+    root: &'a Path,
+    ceiling: &'a TreeCeiling,
+    out: &'a mut Vec<WalkedFile>,
+    dirs: &'a mut BTreeSet<TreePath>,
+    seen: &'a mut u64,
+}
+
+impl Walk<'_> {
+    /// Collect the regular files below the held `dir`, which `rel` and `names` reach from the root.
+    fn collect(
+        &mut self,
+        dir: &HeldDir,
+        rel: &TreePath,
+        names: &[EntryName],
+        depth: u32,
+    ) -> Result<(), TreeHashError> {
+        if depth > self.ceiling.depth() {
+            return Err(tree_exceeded(IngestLimit::Depth(self.ceiling.depth())));
         }
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| tree_io(&path, e))?;
-        if file_type.is_symlink() {
-            return Err(tree_exceeded(IngestLimit::Symlink));
+        // One past the entries the tree may still hold: the listing itself is
+        // bounded, and a directory that alone crosses the ceiling is refused.
+        let remaining = self.ceiling.entries().saturating_sub(*self.seen);
+        let listing_cap = EntryCap::from_nonzero(
+            std::num::NonZeroU32::MIN.saturating_add(u32::try_from(remaining).unwrap_or(u32::MAX)),
+        );
+        let entries = dir.entries(listing_cap).map_err(|refusal| {
+            tree_refusal(&self.root.join(rel.as_str()), refusal, self.ceiling)
+        })?;
+        *self.seen = self
+            .seen
+            .saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+        if *self.seen > self.ceiling.entries() {
+            return Err(tree_exceeded(IngestLimit::Entries(self.ceiling.entries())));
         }
-        let child = rel.child(&entry.file_name(), &path)?;
-        if file_type.is_dir() {
-            if child.is_hidden() {
-                continue;
+        for (name, kind) in entries {
+            match kind {
+                FileKind::Symlink => return Err(tree_exceeded(IngestLimit::Symlink)),
+                FileKind::Fifo | FileKind::Socket | FileKind::Device | FileKind::Other => {
+                    return Err(tree_exceeded(IngestLimit::SpecialFile));
+                }
+                FileKind::Dir => {
+                    let child = rel.child(&name)?;
+                    if child.is_hidden() {
+                        continue;
+                    }
+                    let held = dir.child_dir(&name).map_err(|refusal| {
+                        tree_refusal(&self.root.join(child.as_str()), refusal, self.ceiling)
+                    })?;
+                    let child_names = extended(names, name);
+                    self.collect(&held, &child, &child_names, depth.saturating_add(1))?;
+                    self.dirs.insert(child);
+                }
+                FileKind::Regular => {
+                    let child = rel.child(&name)?;
+                    self.out.push(WalkedFile {
+                        rel: child,
+                        names: extended(names, name),
+                    });
+                }
             }
-            collect_files(root, &child, out, seen, ceiling, depth.saturating_add(1))?;
-        } else if file_type.is_file() {
-            out.push((child, path));
-        } else {
-            return Err(tree_exceeded(IngestLimit::SpecialFile));
         }
+        Ok(())
     }
-    Ok(())
+}
+
+/// `names` followed by `name`.
+fn extended(names: &[EntryName], name: EntryName) -> Vec<EntryName> {
+    let mut joined = Vec::with_capacity(names.len().saturating_add(1));
+    joined.extend_from_slice(names);
+    joined.push(name);
+    joined
 }
 
 /// Compute the content-address key for one build: a pure function of every
@@ -513,6 +750,7 @@ pub fn compute_project_key(
     db_driver: DbDriver,
     target: ipe_ir::Target,
     wasm_public_env: &[String],
+    mount_base: &MountBase,
     intent: ipe_backend_rust::BuildIntent,
     debugger: bool,
     hot_appearance: bool,
@@ -588,6 +826,11 @@ pub fn compute_project_key(
     for name in wasm_public_env {
         update_str(&mut hasher, name);
     }
+
+    // The mount base reaches only the emitted shell (`www/index.html`,
+    // `www/boot.js`), the same final-emit class as `[wasm] publicEnv`: an entry
+    // built for `/app` must never serve a root build, or vice versa.
+    update_str(&mut hasher, mount_base.prefix());
 
     // `BTreeMap` iteration is already sorted by key — deterministic across
     // runs and independent of insertion order.
@@ -686,19 +929,17 @@ fn compiler_revision_hash() -> Option<String> {
 }
 
 /// The active `rustc`'s `-vV` output, hashed — the design doc's
-/// `toolchain_fingerprint()`. `None` when `rustc` is not on `PATH` or exits
-/// non-zero.
+/// `toolchain_fingerprint()`.
+///
+/// `None` when the query is refused: `rustc` is missing, crosses its ceiling,
+/// exits non-zero, or prints a report [`RustcVersion::parse`] refuses.
 fn toolchain_fingerprint_hash() -> Option<String> {
-    let output = std::process::Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(&output.stdout);
-    Some(hex::encode(hasher.finalize()))
+    RustcVersion::active().ok().map(toolchain_fingerprint_of)
+}
+
+/// The fingerprint of `version`'s exact report bytes.
+fn toolchain_fingerprint_of(version: &RustcVersion) -> String {
+    hex::encode(Sha256::digest(version.verbatim()))
 }
 
 /// Derive the version-epoch directory name for this process, or `None` when
@@ -782,20 +1023,17 @@ impl CacheSite {
 
     /// The bytes of entry `file_name` under `epoch`, read through no symlink.
     ///
-    /// An in-output entry is read only from a marked, non-symlink output dir;
-    /// every level below it (and below an explicit root) is lstat'd, and a
-    /// symlink anywhere is a miss.
+    /// An in-output entry is read only from an output dir ipe owns now (a
+    /// genuine marker and no claim in flight, read through one held handle);
+    /// every level below it (and below an explicit root) is opened from the
+    /// held level above without following a link, and a symlink anywhere is a
+    /// miss.
     fn read(&self, epoch: &str, file_name: &str) -> Option<Vec<u8>> {
         match self {
             Self::InOutput { out_dir, salt } => {
-                let meta = fs::symlink_metadata(out_dir).ok()?;
-                let owned =
-                    meta.is_dir() && crate::output_dir::has_marker(out_dir).unwrap_or(false);
-                if !owned {
-                    return None;
-                }
-                read_without_links(
-                    out_dir,
+                let out = crate::output_dir::held::HeldDir::open(out_dir).ok()??;
+                read_in_owned(
+                    &out,
                     &[CACHE_DIR_NAME, salt.as_str(), epoch, file_name],
                     crate::io_bounded::BUILD_CACHE_ENTRY_CAP,
                 )
@@ -817,7 +1055,10 @@ impl CacheRoot {
     /// An entry past [`crate::io_bounded::BUILD_CACHE_ENTRY_CAP`] is skipped, since a read
     /// of it would be a miss anyway.
     fn write(&self, epoch: &str, file_name: &str, bytes: &[u8]) {
-        if !within_cap(bytes, crate::io_bounded::BUILD_CACHE_ENTRY_CAP) {
+        if !within_cap(bytes, crate::io_bounded::BUILD_CACHE_ENTRY_CAP)
+            || !ipe_fs_open::is_one_spelled_name(std::ffi::OsStr::new(epoch))
+            || !ipe_fs_open::is_one_spelled_name(std::ffi::OsStr::new(file_name))
+        {
             return;
         }
         match self {
@@ -840,54 +1081,56 @@ fn within_cap(bytes: &[u8], cap: u64) -> bool {
     u64::try_from(bytes.len()).is_ok_and(|len| len <= cap)
 }
 
-/// Read `base/<parts...>` when each part is one plain name and no level is a symlink.
+/// Read `base/<parts...>` when each part is one spelled name and no level is a symlink.
 ///
-/// The opened file must be the regular file the lstat saw, so a link swapped
-/// in after the check is a miss too. At most `cap + 1` bytes are read, and a
-/// file past `cap` is a miss.
+/// Every level below `base` is opened relative to the held level above it,
+/// never following a link, and the file is proven regular and read from that
+/// one handle, so a link swapped in at any level is a miss. At most `cap + 1`
+/// bytes are read, and a file past `cap` is a miss.
 fn read_without_links(base: &Path, parts: &[&str], cap: u64) -> Option<Vec<u8>> {
-    use std::io::Read as _;
-    let mut path = base.to_path_buf();
-    let mut seen = None;
-    for part in parts {
-        let mut components = Path::new(part).components();
-        if !matches!(
-            (components.next(), components.next()),
-            (Some(std::path::Component::Normal(_)), None)
-        ) {
-            return None;
-        }
-        path.push(part);
-        let meta = fs::symlink_metadata(&path).ok()?;
-        if meta.file_type().is_symlink() {
-            return None;
-        }
-        seen = Some(meta);
-    }
-    let seen = seen.filter(fs::Metadata::is_file)?;
-    let file = crate::io_bounded::open_regular(&path, crate::io_bounded::FinalLink::Refuse).ok()?;
-    let opened = file.metadata().ok()?;
-    if !same_file(&seen, &opened) {
+    read_below(&HeldDir::open_root(base).ok()?, parts, cap)
+}
+
+/// Read `<parts...>` below the output dir `out` holds, when ipe owns that held dir now.
+///
+/// Ownership is decided by [`crate::output_dir::held::HeldDir::owned_now`]
+/// on `out`'s own handle (a genuine marker and no claim in flight), and the
+/// levels below are opened from a handle proven to be the same directory
+/// object as `out` (equal identity while both are open), so an output dir
+/// swapped for a link or for another directory after it was held is a miss:
+/// the entry read sits in the directory whose ownership was checked.
+fn read_in_owned(
+    out: &crate::output_dir::held::HeldDir,
+    parts: &[&str],
+    cap: u64,
+) -> Option<Vec<u8>> {
+    if out.owned_now().ok()? != crate::output_dir::held::OwnedNow::Owned {
         return None;
     }
-    let mut bytes = Vec::new();
-    file.take(cap.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    within_cap(&bytes, cap).then_some(bytes)
+    let dir = HeldDir::open_root(out.path()).ok()?;
+    if dir.id().ok()? != out.id().ok()? {
+        return None;
+    }
+    read_below(&dir, parts, cap)
 }
 
-/// Whether two metadata records name the same file.
-#[cfg(unix)]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-/// No stable file identity in a metadata record here, so never the same file: the cache runs cold.
-#[cfg(windows)]
-const fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
-    false
+/// Read `<parts...>` below the held `dir`, at most `cap` bytes, no level a link.
+///
+/// Each part must pass [`ipe_fs_open::is_one_spelled_name`], the rule
+/// [`write_entry`] and [`CacheRoot::write`] apply, so a read never names an
+/// entry the cache could not have written.
+fn read_below(dir: &HeldDir, parts: &[&str], cap: u64) -> Option<Vec<u8>> {
+    let names = parts
+        .iter()
+        .map(|part| {
+            let name = std::ffi::OsStr::new(part);
+            ipe_fs_open::is_one_spelled_name(name)
+                .then(|| EntryName::new(name))
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let cap = ByteCap::new(cap)?;
+    dir.open_rel(&names).ok()?.read_bytes(cap).ok()
 }
 
 /// The cache site for a build writing to `out_dir`.
@@ -1038,15 +1281,6 @@ fn create_salt(dir: &OwnerDir, name: &EntryName) -> Option<String> {
     }
 }
 
-/// Whether `part` is one plain path component, never a separator, `..` or `.`.
-fn is_plain_name(part: &str) -> bool {
-    let mut components = Path::new(part).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(std::path::Component::Normal(name)), None) if name == std::ffi::OsStr::new(part)
-    )
-}
-
 /// Write `bytes` to `<cache_root>/<epoch>/<file_name>` through held directory handles.
 ///
 /// Best-effort: every failure is swallowed. `cache_root` is opened without
@@ -1056,8 +1290,12 @@ fn is_plain_name(part: &str) -> bool {
 /// an exclusively created, process-unique temp file renamed over the name.
 fn write_entry(cache_root: &Path, epoch: &str, file_name: &str, bytes: &[u8]) {
     use crate::output_dir::held::{HeldDir, level_held};
+    use ipe_fs_open::is_one_spelled_name;
+    use std::ffi::OsStr;
     use std::io::Write as _;
-    if !is_plain_name(epoch) || !is_plain_name(file_name) || fs::create_dir_all(cache_root).is_err()
+    if !is_one_spelled_name(OsStr::new(epoch))
+        || !is_one_spelled_name(OsStr::new(file_name))
+        || fs::create_dir_all(cache_root).is_err()
     {
         return;
     }
@@ -1093,13 +1331,13 @@ pub fn try_load(site: &CacheSite, epoch: &str, key: &str) -> Option<EmittedProje
 /// `key`/`epoch`. Every failure (directory creation, serialize, write,
 /// rename) is silently swallowed — a cache-write failure must never turn a
 /// successful build into a reported failure. Writes atomically (tmp file +
-/// rename) so a concurrent reader (a second `ipe build` racing this one)
+/// rename) so a concurrent reader (a second `ipe dev build` racing this one)
 /// never observes a partially-written entry; a torn read is impossible, a
 /// missing-then-appearing file is the only visible race, which `try_load`
 /// already treats as an ordinary miss.
 ///
 /// The tmp file name is unique to this process, so two concurrent
-/// `ipe build` invocations computing the same key never write to the same
+/// `ipe dev build` invocations computing the same key never write to the same
 /// tmp path and so never interleave into one entry a third reader could load.
 ///
 /// An in-output root writes through [`OwnedDir::path_to`]: a symlink planted
@@ -1202,6 +1440,58 @@ pub fn store_ir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_epoch_hash_input_is_the_verbatim_output() {
+        let report: &[u8] = b"rustc 1.80.0 (abcdef 2024-01-01)\n\
+            binary: rustc\n\
+            host: x86_64-unknown-linux-gnu\n\
+            release: 1.80.0\n\
+            LLVM version: 18.1.7\n\n";
+        let version = RustcVersion::parse(report);
+        assert!(version.is_ok(), "{version:?}");
+        let mut hasher = Sha256::new();
+        hasher.update(report);
+        assert_eq!(
+            version.as_ref().ok().map(toolchain_fingerprint_of),
+            Some(hex::encode(hasher.finalize()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // the test temp root is writable and its path holds no `PATH` separator
+    fn a_rustc_query_past_its_wall_disables_the_cache() {
+        use crate::remote_ingest::{LocalWall, RUSTC_QUERY_LIMITS};
+        use crate::toolchain::{RustcQueryRefusal, RustcRunFailure, StubRustc};
+        let stub = StubRustc::new(
+            "slow",
+            "sleep 30\nprintf 'rustc 1.0 (x)\\nhost: a-b-c\\nrelease: 1.0\\n'",
+        )
+        .expect("write the stub rustc");
+        let mut rustc = std::process::Command::new("rustc");
+        rustc.env("PATH", stub.path().expect("join the stub PATH"));
+        let started = std::time::Instant::now();
+        let query = RustcVersion::query(
+            rustc,
+            RUSTC_QUERY_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+        );
+        assert!(
+            matches!(
+                query,
+                Err(RustcQueryRefusal::Run(RustcRunFailure::Exceeded(
+                    LocalRefusal {
+                        source: LocalSource::RustcQuery,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }
+                )))
+            ),
+            "{query:?}"
+        );
+        assert_eq!(query.as_ref().ok().map(toolchain_fingerprint_of), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
 
     /// A fresh, empty scratch directory for one salt test, held as a secret dir.
     #[cfg(unix)]
@@ -1390,6 +1680,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1403,6 +1694,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1422,6 +1714,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1438,6 +1731,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1457,6 +1751,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1470,6 +1765,7 @@ mod tests {
             DbDriver::Postgres,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1492,6 +1788,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1505,6 +1802,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Release,
             false,
             false,
@@ -1527,6 +1825,7 @@ mod tests {
                 DbDriver::Sqlite,
                 ipe_ir::Target::Native,
                 &[],
+                &MountBase::root(),
                 ipe_backend_rust::BuildIntent::Development,
                 debugger,
                 false,
@@ -1554,6 +1853,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1567,6 +1867,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             true,
@@ -1596,6 +1897,7 @@ mod tests {
                 DbDriver::Sqlite,
                 ipe_ir::Target::Native,
                 &[],
+                &MountBase::root(),
                 ipe_backend_rust::BuildIntent::Development,
                 false,
                 false,
@@ -1630,6 +1932,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1643,6 +1946,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &["API_BASE_URL".to_owned()],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1655,6 +1959,42 @@ mod tests {
         );
     }
 
+    /// The mount base is part of the key: `/app` and the root never share an
+    /// entry, while the same base twice yields the same key.
+    #[test]
+    fn cache_key_changes_with_mount_base() {
+        let (sources, injected) = sample_sources();
+        let key = |base: &MountBase| {
+            compute_project_key(
+                &sources,
+                &injected,
+                &entry(),
+                DbDriver::Sqlite,
+                ipe_ir::Target::WasmClient,
+                &[],
+                base,
+                ipe_backend_rust::BuildIntent::Development,
+                false,
+                false,
+                false,
+                None,
+            )
+        };
+        let Ok(app) = MountBase::parse("/app") else {
+            return;
+        };
+        let Ok(app_again) = MountBase::parse("/app") else {
+            return;
+        };
+        let Ok(nested) = MountBase::parse("/app/v2") else {
+            return;
+        };
+        let root = MountBase::root();
+        assert_ne!(key(&root), key(&app), "the mount base is part of the key");
+        assert_ne!(key(&app), key(&nested), "each base keys its own entry");
+        assert_eq!(key(&app), key(&app_again), "an equal base reuses the entry");
+    }
+
     #[test]
     fn key_changes_with_entry_path() {
         let (sources, injected) = sample_sources();
@@ -1665,6 +2005,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1678,6 +2019,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1697,6 +2039,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1719,6 +2062,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1738,6 +2082,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1768,6 +2113,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1781,6 +2127,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1812,6 +2159,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -1825,6 +2173,7 @@ mod tests {
             DbDriver::Sqlite,
             ipe_ir::Target::Native,
             &[],
+            &MountBase::root(),
             ipe_backend_rust::BuildIntent::Development,
             false,
             false,
@@ -2079,6 +2428,34 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// An in-output epoch or key that is not one spelled name stores nothing.
+    #[test]
+    fn in_output_store_refuses_a_name_that_is_not_one_spelled_name() {
+        let (base, owned, _) = claimed_out_and_elsewhere("spelled-store");
+        let site = in_output_site(&owned);
+        let root = site.root(&owned).expect("root from the claimed dir");
+        store(&root, "ep/och", "key", &sample_project());
+        store(&root, "epoch", "k/ey", &sample_project());
+        assert!(
+            tree(owned.path())
+                .iter()
+                .all(|p| !p.ends_with("key.json") && !p.ends_with("ey.json")),
+            "a multi-level epoch or key writes no entry"
+        );
+        store(&root, "epoch", "key", &sample_project());
+        assert!(
+            owned
+                .path()
+                .join(CACHE_DIR_NAME)
+                .join("salt")
+                .join("epoch")
+                .join("key.json")
+                .is_file(),
+            "one plain epoch and key are stored"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// An in-output site yields a writable root only from its own claimed dir.
     #[test]
     fn in_output_site_yields_no_root_from_another_claimed_dir() {
@@ -2110,6 +2487,48 @@ mod tests {
         };
         assert!(try_load(&site, "epoch", "key").is_none());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An in-output read misses while a claim is in flight and when the marker is a hard link.
+    #[test]
+    fn cache_read_misses_on_a_linked_marker_and_on_a_claim_in_flight() {
+        let root =
+            ipe_test_temp::temp_root().join(format!("ipe-cache-claiming-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("make root");
+        let base = fs::canonicalize(&root).expect("canonicalize root");
+        let out = base.join("out");
+        crate::output_dir::OwnedDir::claim(&out).expect("claim out");
+        let entry = out
+            .join(CACHE_DIR_NAME)
+            .join("salt")
+            .join("epoch")
+            .join("raw.txt");
+        fs::create_dir_all(entry.parent().expect("entry dir")).expect("make entry dir");
+        fs::write(&entry, "hit").expect("plant entry");
+        let site = CacheSite::InOutput {
+            out_dir: out.clone(),
+            salt: "salt".to_owned(),
+        };
+        assert_eq!(site.read("epoch", "raw.txt").as_deref(), Some(&b"hit"[..]));
+
+        let claim = out.join(crate::output_dir::CLAIM_FILE);
+        fs::write(&claim, b"").expect("claim in flight");
+        assert!(
+            site.read("epoch", "raw.txt").is_none(),
+            "a claim in flight is a miss"
+        );
+        fs::remove_file(&claim).expect("drop the claim");
+
+        let marker = out.join(crate::output_dir::OWNERSHIP_MARKER);
+        let aside = base.join("marker-aside");
+        fs::rename(&marker, &aside).expect("move the marker aside");
+        fs::hard_link(&aside, &marker).expect("link the marker back");
+        assert!(
+            site.read("epoch", "raw.txt").is_none(),
+            "a hard-linked marker is a miss"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     // -----------------------------------------------------------------
@@ -2304,7 +2723,7 @@ mod tests {
     /// **Cross-process id-drift proof, at the on-disk cache boundary.**
     /// Stores a `Program` written through one interner, then loads it
     /// through a COMPLETELY DIFFERENT, differently-polluted interner (the
-    /// scenario a real `ipe build` -> `ipe build` sequence produces: a
+    /// scenario a real `ipe dev build` -> `ipe dev build` sequence produces: a
     /// fresh `Interner::new()` per invocation). Asserts the relocated
     /// `Program`'s structural content (via `ipe_ir::pretty::pretty`,
     /// resolved-name comparison — not raw `Symbol` equality, which is not
@@ -2675,6 +3094,15 @@ mod tests {
     }
 
     /// A FIFO is refused by its shape rather than opened (which would block).
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo must create the FIFO");
+    }
+
     #[test]
     #[cfg(unix)]
     fn hash_tree_refuses_a_fifo() {
@@ -2685,11 +3113,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create base");
-        let made = std::process::Command::new("mkfifo")
-            .arg(base.join("pipe.ipe"))
-            .status()
-            .expect("run mkfifo");
-        assert!(made.success(), "mkfifo must create the FIFO");
+        make_fifo(&base.join("pipe.ipe"));
 
         let result = hash_tree(&base);
         let _ = std::fs::remove_dir_all(&base);
@@ -2782,6 +3206,462 @@ mod tests {
         );
     }
 
+    /// A fresh test root holding `Main.ipe` and `sub/Helper.ipe`.
+    fn two_file_tree(tag: &str) -> PathBuf {
+        let base = ipe_test_temp::temp_root().join(format!(
+            "ipe-cache-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).expect("create tree");
+        std::fs::write(base.join("Main.ipe"), b"module Main exposing (main)\n")
+            .expect("write file");
+        std::fs::write(base.join("sub").join("Helper.ipe"), b"module Helper\n")
+            .expect("write nested file");
+        base
+    }
+
+    /// The held root of `base` and the files a walk of it lists.
+    #[cfg(unix)]
+    fn walked(base: &Path) -> (HeldDir, Vec<WalkedFile>) {
+        let held = HeldDir::open_root(base).expect("hold the tree root");
+        let (files, _) = walk_tree(&held, base, PACKAGE_SOURCE.tree()).expect("walk the tree");
+        (held, files)
+    }
+
+    /// The digest of a fixed tree is a literal: hashing through held handles
+    /// keeps the byte stream, so no pinned package hash moves.
+    #[test]
+    fn the_digest_of_a_fixed_tree_is_pinned() {
+        let base = two_file_tree("pinned-digest");
+        let digest = hash_tree(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            digest.expect("a plain tree hashes"),
+            "167b37abffdcb99712c3a6b27bc51955e3aed6248c244f2059772190bb62d466"
+        );
+    }
+
+    /// A file the walk listed, swapped for a symlink before it is opened, is
+    /// refused as a link and yields no digest: the hash never reads a link's target.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_swapped_for_a_symlink_between_listing_and_open_is_refused() {
+        let base = two_file_tree("swap-file-link");
+        let outside = base.with_extension("outside");
+        std::fs::write(&outside, b"a secret outside the tree").expect("write outside file");
+        let (held, files) = walked(&base);
+        std::fs::remove_file(base.join("Main.ipe")).expect("remove listed file");
+        std::os::unix::fs::symlink(&outside, base.join("Main.ipe")).expect("plant link");
+
+        let result = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree(), |_| None);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&outside);
+        assert!(
+            matches!(&result, Err(TreeHashError::Exceeded(refusal)) if *refusal == refused(IngestLimit::Symlink)),
+            "a file swapped for a link after the walk must be refused as a link, got: {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    /// A file the walk listed, swapped for a FIFO before it is opened, is
+    /// refused as a special file without the open blocking on the FIFO.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_swapped_for_a_fifo_after_listing_is_refused_not_hung() {
+        let base = two_file_tree("swap-file-fifo");
+        let (held, files) = walked(&base);
+        std::fs::remove_file(base.join("Main.ipe")).expect("remove listed file");
+        make_fifo(&base.join("Main.ipe"));
+
+        let (send, receive) = std::sync::mpsc::channel();
+        let hashed_base = base.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let result =
+                    hash_walked(&held, &hashed_base, &files, PACKAGE_SOURCE.tree(), |_| None);
+                let _ = send.send(result.map(|_| ()));
+            })
+            .expect("spawn hashing thread");
+        let answer = receive.recv_timeout(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(&answer, Ok(Err(TreeHashError::Exceeded(refusal))) if *refusal == refused(IngestLimit::SpecialFile)),
+            "a FIFO swapped in after the walk must be refused within five seconds, got: {answer:?}"
+        );
+    }
+
+    /// A directory the walk listed, swapped for a symlink before its files are
+    /// opened, is refused as a link rather than followed.
+    #[test]
+    #[cfg(unix)]
+    fn a_dir_swapped_for_a_link_mid_walk_is_refused() {
+        let base = two_file_tree("swap-dir-link");
+        let aside = base.with_extension("aside");
+        let _ = std::fs::remove_dir_all(&aside);
+        let (held, files) = walked(&base);
+        std::fs::rename(base.join("sub"), &aside).expect("move listed dir aside");
+        std::os::unix::fs::symlink(&aside, base.join("sub")).expect("plant link");
+
+        let result = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree(), |_| None);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&aside);
+        assert!(
+            matches!(&result, Err(TreeHashError::Exceeded(refusal)) if *refusal == refused(IngestLimit::Symlink)),
+            "a directory swapped for a link after the walk must be refused as a link, got: {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    /// The capture's digest is the `hash_tree` value, and the bytes it keeps are the file bytes.
+    #[test]
+    fn capture_digest_equals_hash_tree_and_keeps_the_hashed_bytes() {
+        let base = capped_tree("capture-eq");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |rel| {
+            (rel == "sub/b").then_some(1024)
+        });
+        let expected = hash_tree(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        let (digest, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(
+            digest.to_hex(),
+            expected.expect("hash_tree ok"),
+            "the capture digest must equal hash_tree over the same tree"
+        );
+        assert_eq!(kept.get("sub/b"), Some(&KeptFile::Bytes(vec![b'b'; 6])));
+        assert_eq!(
+            kept.len(),
+            1,
+            "only the named file is kept, never the whole tree"
+        );
+    }
+
+    /// A capture keeps the pinned digest of a fixed tree: keeping bytes never moves the stream.
+    #[test]
+    fn a_capture_keeping_every_file_has_the_pinned_digest() {
+        let base = two_file_tree("capture-pinned");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&base);
+        let (digest, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(
+            digest.to_hex(),
+            "167b37abffdcb99712c3a6b27bc51955e3aed6248c244f2059772190bb62d466"
+        );
+        assert_eq!(
+            kept.get("Main.ipe"),
+            Some(&KeptFile::Bytes(b"module Main exposing (main)\n".to_vec()))
+        );
+        assert_eq!(
+            kept.get("sub/Helper.ipe"),
+            Some(&KeptFile::Bytes(b"module Helper\n".to_vec()))
+        );
+    }
+
+    /// A file past its keep cap is hashed but never held: it is reported oversize, with the same digest.
+    #[test]
+    fn capture_marks_a_file_past_its_keep_cap_oversize_and_still_hashes_it() {
+        let base = capped_tree("capture-oversize");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |rel| {
+            (rel == "a").then_some(9)
+        });
+        let expected = hash_tree(&base);
+        let _ = std::fs::remove_dir_all(&base);
+        let (digest, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(kept.get("a"), Some(&KeptFile::Oversize { cap: 9 }));
+        assert_eq!(
+            digest.to_hex(),
+            expected.expect("hash_tree ok"),
+            "an oversize file still contributes its bytes to the digest"
+        );
+    }
+
+    /// A file exactly at its keep cap is kept; one byte past is oversize.
+    #[test]
+    fn capture_keeps_a_file_at_its_keep_cap() {
+        let base = capped_tree("capture-at-cap");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |rel| {
+            (rel == "a").then_some(10)
+        });
+        let _ = std::fs::remove_dir_all(&base);
+        let (_, kept) = capture.expect("capture ok").into_parts();
+        assert_eq!(kept.get("a"), Some(&KeptFile::Bytes(vec![b'a'; 10])));
+    }
+
+    /// The capture lists visible directories and never a hidden one.
+    #[test]
+    fn capture_lists_visible_directories_and_skips_hidden_ones() {
+        let base = capped_tree("capture-dirs");
+        std::fs::create_dir_all(base.join(".hidden")).expect("create hidden dir");
+        std::fs::write(base.join(".hidden").join("x"), b"x").expect("write hidden file");
+        let capture = capture_tree_within(&base, PACKAGE_SOURCE.tree(), |_| None);
+        let _ = std::fs::remove_dir_all(&base);
+        let capture = capture.expect("capture ok");
+        assert!(capture.has_dir("sub"));
+        assert!(!capture.has_dir(".hidden"));
+        assert!(!capture.has_dir("a"), "a file is not a directory");
+    }
+
+    /// A capture is refused wherever `hash_tree` is: the ceilings bind the one shared walk.
+    #[test]
+    fn capture_refuses_a_tree_past_each_ceiling() {
+        let base = capped_tree("capture-ceilings");
+        let entries = capture_tree_within(&base, &ceiling(16, 2, 10, 8), |_| Some(1024));
+        let bytes = capture_tree_within(&base, &ceiling(15, 3, 10, 8), |_| Some(1024));
+        let per_file = capture_tree_within(&base, &ceiling(16, 3, 9, 8), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(entries, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Entries(2)))
+        );
+        assert!(
+            matches!(bytes, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Bytes(15)))
+        );
+        assert!(
+            matches!(per_file, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Bytes(9)))
+        );
+    }
+
+    /// A symlink or a FIFO in the tree is refused by the capture, so a kept file is never a followed link.
+    #[cfg(unix)]
+    #[test]
+    fn capture_refuses_a_symlink_and_a_fifo() {
+        let linked = capped_tree("capture-symlink");
+        std::os::unix::fs::symlink(linked.join("a"), linked.join("link")).expect("create symlink");
+        let link = capture_tree_within(&linked, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&linked);
+        let piped = capped_tree("capture-fifo");
+        make_fifo(&piped.join("pipe.ipe"));
+        let fifo = capture_tree_within(&piped, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&piped);
+        assert!(
+            matches!(link, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::Symlink))
+        );
+        assert!(
+            matches!(fifo, Err(TreeHashError::Exceeded(refusal)) if refusal == refused(IngestLimit::SpecialFile))
+        );
+    }
+
+    /// A kept file the walk listed, swapped for a link or for different bytes
+    /// before it is read, is refused: nothing is kept from a handle the walk
+    /// did not check, and kept bytes never disagree with the length proven.
+    #[test]
+    #[cfg(unix)]
+    fn a_kept_file_swapped_after_listing_is_refused_never_kept() {
+        let base = two_file_tree("capture-swap-link");
+        let outside = base.with_extension("outside");
+        std::fs::write(&outside, b"a secret outside the tree").expect("write outside file");
+        let (held, files) = walked(&base);
+        std::fs::remove_file(base.join("Main.ipe")).expect("remove listed file");
+        std::os::unix::fs::symlink(&outside, base.join("Main.ipe")).expect("plant link");
+        let link = hash_walked(&held, &base, &files, PACKAGE_SOURCE.tree(), |_| Some(1024));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&outside);
+        assert!(
+            matches!(&link, Err(TreeHashError::Exceeded(refusal)) if *refusal == refused(IngestLimit::Symlink)),
+            "a kept file swapped for a link must be refused, got: {:?}",
+            link.map(|_| ())
+        );
+
+        let base = two_file_tree("capture-swap-grow");
+        let file = proven_file(&base, "Main.ipe");
+        std::fs::write(
+            base.join("Main.ipe"),
+            b"module Main exposing (main, more)\n",
+        )
+        .expect("rewrite listed file");
+        let mut buf = vec![0u8; TREE_HASH_CHUNK_BYTES];
+        let grown = hash_one_file(
+            &mut Sha256::new(),
+            file,
+            &FileAt {
+                rel: "Main.ipe",
+                shown: &base.join("Main.ipe"),
+            },
+            &mut buf,
+            0,
+            PACKAGE_SOURCE.tree(),
+            Some(1024),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(
+                &grown,
+                Err(TreeHashError::Io { source, .. })
+                    if source.to_string().contains("changed size during hashing")
+            ),
+            "a kept file that changed size after its proof must be refused, got: {:?}",
+            grown.map(|_| ())
+        );
+    }
+
+    /// A plain cache entry below plain levels is read back.
+    #[test]
+    fn read_without_links_reads_a_plain_entry() {
+        let base = ipe_test_temp::temp_root().join(format!(
+            "ipe-cache-test-plain-entry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a").join("b")).expect("create levels");
+        std::fs::write(base.join("a").join("b").join("entry"), b"cached").expect("write entry");
+        let read = read_without_links(&base, &["a", "b", "entry"], 64);
+        let past_cap = read_without_links(&base, &["a", "b", "entry"], 5);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(read.as_deref(), Some(&b"cached"[..]));
+        assert_eq!(past_cap, None, "an entry one byte past its cap is a miss");
+    }
+
+    /// The file `name` of the held `base`, proven regular, with the length its proof saw.
+    fn proven_file(base: &Path, name: &str) -> RegularFile {
+        HeldDir::open_root(base)
+            .expect("hold the base")
+            .open_regular(&EntryName::new(std::ffi::OsStr::new(name)).expect("plain name"))
+            .expect("open the regular file")
+    }
+
+    /// A file whose content stops matching the length its proof saw, by one
+    /// byte more, by more than the read window holds, or by one byte less, is
+    /// refused with the one size-change refusal, never hashed.
+    #[test]
+    fn a_file_that_changes_size_after_its_proof_is_refused() {
+        use std::io::Write as _;
+        let base = ipe_test_temp::temp_root().join(format!(
+            "ipe-cache-test-size-change-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create base");
+        let path = base.join("File.ipe");
+        let grow_by = |extra: usize| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(&vec![b'b'; extra]))
+                .expect("grow the file");
+        };
+        let mut outcomes = Vec::new();
+        for change in ["grow by one", "grow past the window", "shrink by one"] {
+            std::fs::write(&path, b"module A\n").expect("write the file");
+            let file = proven_file(&base, "File.ipe");
+            match change {
+                "grow by one" => grow_by(1),
+                "grow past the window" => grow_by(TREE_HASH_CHUNK_BYTES.saturating_mul(2)),
+                _ => std::fs::write(&path, b"module \n").expect("shrink the file"),
+            }
+            let mut buf = vec![0u8; TREE_HASH_CHUNK_BYTES];
+            let result = hash_one_file(
+                &mut Sha256::new(),
+                file,
+                &FileAt {
+                    rel: "File.ipe",
+                    shown: &path,
+                },
+                &mut buf,
+                0,
+                PACKAGE_SOURCE.tree(),
+                None,
+            );
+            outcomes.push((change, result));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        for (change, result) in outcomes {
+            let size_change = matches!(
+                &result,
+                Err(TreeHashError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::InvalidInput
+                        && source.to_string().contains("changed size during hashing")
+            );
+            assert!(
+                size_change,
+                "{change}: must be refused as a size change, got: {:?}",
+                result.map(|_| ())
+            );
+        }
+    }
+
+    /// The in-output cache reads only below the directory whose marker it
+    /// checked: an output dir swapped, after it was held, for a link to (or
+    /// a rename of) another marked dir holding the same entry is a miss.
+    #[test]
+    #[cfg(unix)]
+    fn an_in_output_read_misses_when_the_held_output_dir_is_swapped() {
+        let (base, owned, _elsewhere) = claimed_out_and_elsewhere("marked-swap");
+        let other = OwnedDir::claim(&base.join("other")).expect("claim the other dir");
+        let parts = [CACHE_DIR_NAME, "salt", "epoch", "entry"];
+        let plant = |dir: &Path, bytes: &[u8]| {
+            let level = dir.join(CACHE_DIR_NAME).join("salt").join("epoch");
+            fs::create_dir_all(&level).expect("create entry levels");
+            fs::write(level.join("entry"), bytes).expect("write entry");
+        };
+        plant(owned.path(), b"own");
+        plant(other.path(), b"other");
+        let out = owned.path().to_path_buf();
+        let aside = base.join("aside");
+
+        let marked = crate::output_dir::held::HeldDir::open(&out)
+            .expect("hold out")
+            .expect("out exists");
+        let unswapped = read_in_owned(&marked, &parts, 64);
+        fs::rename(&out, &aside).expect("move the held out dir aside");
+        std::os::unix::fs::symlink(other.path(), &out).expect("plant a link at out");
+        let through_link = read_in_owned(&marked, &parts, 64);
+        fs::remove_file(&out).expect("remove the link");
+        fs::rename(other.path(), &out).expect("rename the other dir onto out");
+        let through_rename = read_in_owned(&marked, &parts, 64);
+        let _ = fs::remove_dir_all(&base);
+
+        assert_eq!(unswapped.as_deref(), Some(&b"own"[..]));
+        assert_eq!(
+            through_link, None,
+            "an output dir swapped for a link after it was held must be a miss"
+        );
+        assert_eq!(
+            through_rename, None,
+            "an output dir replaced by another marked dir after it was held must be a miss"
+        );
+    }
+
+    /// A symlink standing at any level below the base, the entry included, is a miss.
+    #[test]
+    #[cfg(unix)]
+    fn read_without_links_misses_on_a_link_at_every_level() {
+        let base = ipe_test_temp::temp_root().join(format!(
+            "ipe-cache-test-link-levels-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let parts = ["a", "b", "entry"];
+        for (depth, link_name) in parts.iter().enumerate() {
+            let _ = std::fs::remove_dir_all(&base);
+            let real = base.join("real");
+            std::fs::create_dir_all(real.join("a").join("b")).expect("create real levels");
+            std::fs::write(real.join("a").join("b").join("entry"), b"cached")
+                .expect("write real entry");
+            let linked = base.join("linked");
+            let mut level = linked.clone();
+            for part in parts.iter().take(depth) {
+                level.push(part);
+            }
+            std::fs::create_dir_all(&level).expect("create linked levels");
+            let mut target = real.clone();
+            for part in parts.iter().take(depth + 1) {
+                target.push(part);
+            }
+            std::os::unix::fs::symlink(&target, level.join(link_name)).expect("plant link");
+
+            let through_real = read_without_links(&real, &parts, 64);
+            let through_link = read_without_links(&linked, &parts, 64);
+            let _ = std::fs::remove_dir_all(&base);
+            assert_eq!(through_real.as_deref(), Some(&b"cached"[..]));
+            assert_eq!(
+                through_link, None,
+                "a link at level {depth} must make the read a miss"
+            );
+        }
+    }
+
     /// An epoch level swapped for a link after the write held it never writes through the link.
     #[cfg(unix)]
     #[test]
@@ -2871,6 +3751,22 @@ mod tests {
         write_entry(&root, "../escape", "k.json", b"x");
         write_entry(&root, "e1", "../k.json", b"x");
         write_entry(&root, ".", "k.json", b"x");
+        write_entry(&root, "", "k.json", b"x");
+        write_entry(&root, "e1", "", b"x");
+        write_entry(&root, "e\0", "k.json", b"x");
+        write_entry(&root, "e1", "k\0.json", b"x");
+        #[cfg(windows)]
+        for (epoch, file_name) in [
+            ("e1.", "k.json"),
+            ("e1 ", "k.json"),
+            ("NUL", "k.json"),
+            ("e1", "k.json."),
+            ("e1", "k.json "),
+            ("e1", "con.json"),
+            ("e1", "k.json:stream"),
+        ] {
+            write_entry(&root, epoch, file_name, b"x");
+        }
         assert!(
             !base.join("escape").exists(),
             "a traversing epoch writes nothing"
@@ -2880,6 +3776,50 @@ mod tests {
             "a traversing file name writes nothing"
         );
         assert!(!root.exists(), "a refused write creates nothing");
+        write_entry(&root, "e1", "k.json", b"x");
+        assert_eq!(
+            fs::read(root.join("e1").join("k.json")).ok().as_deref(),
+            Some(b"x".as_slice()),
+            "one plain epoch and file name are written"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A read part that is not one spelled name misses, even where an entry of that name exists.
+    #[test]
+    fn a_read_part_that_is_not_one_spelled_name_misses() {
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe_cache_spelled_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("cache");
+        fs::create_dir_all(root.join("e1")).unwrap();
+        fs::write(root.join("e1").join("k.json"), b"in").unwrap();
+        fs::write(base.join("k.json"), b"out").unwrap();
+        let refused: [&[&str]; 5] = [
+            &["..", "k.json"],
+            &["e1/k.json"],
+            &[".", "e1", "k.json"],
+            &["", "k.json"],
+            &["e1", "k\0.json"],
+        ];
+        for parts in refused {
+            assert_eq!(read_without_links(&root, parts, 64), None, "{parts:?}");
+        }
+        #[cfg(windows)]
+        {
+            let real = fs::canonicalize(&root).unwrap();
+            fs::create_dir(real.join("e1.")).unwrap();
+            fs::write(real.join("e1.").join("k.json"), b"dot").unwrap();
+            fs::write(real.join("e1").join("k.json "), b"space").unwrap();
+            for parts in [["e1.", "k.json"], ["e1", "k.json "]] {
+                assert_eq!(read_without_links(&root, &parts, 64), None, "{parts:?}");
+            }
+        }
+        assert_eq!(
+            read_without_links(&root, &["e1", "k.json"], 64).as_deref(),
+            Some(b"in".as_slice()),
+            "one spelled epoch and file name are read"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 

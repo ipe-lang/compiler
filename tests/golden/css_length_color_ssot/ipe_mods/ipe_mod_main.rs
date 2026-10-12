@@ -372,6 +372,7 @@ pub(crate) fn main_lengths() -> String {
     })
     .clone()
 }
+
 pub(crate) fn main_colors() -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -469,6 +470,7 @@ pub(crate) fn main_colors() -> String {
     })
     .clone()
 }
+
 pub(crate) fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     io_println(format!(

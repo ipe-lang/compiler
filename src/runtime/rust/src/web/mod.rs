@@ -30,6 +30,9 @@ pub use route::*;
 pub mod console;
 #[cfg(feature = "server")]
 pub mod csrf;
+// A cookieless page request proves its Fetch Metadata before a session is minted.
+#[cfg(feature = "server")]
+mod mint_proof;
 pub mod style_inject;
 // Custom-element (`CustomElement.node`) registration glue + SRI-pinned author-JS serving.
 // The generator lives at the crate top level (`crate::widget_assets`) so the
@@ -44,9 +47,11 @@ pub mod style_inject;
 pub use crate::widget_assets;
 // Pre-built console child + reverse-proxy — spawns the bundled console
 // binary and proxies /_ipe/console/*; falls back to in-process `console` when the
-// binary is absent. Uses reqwest for the reverse-proxy path; gated so a web
-// app that makes no outbound HTTP calls (no `http_client` feature) stays reqwest-free.
-#[cfg(feature = "http_client")]
+// binary is absent. Uses reqwest for the reverse-proxy path and the `web`
+// surface (tokio process, the hardened child spawner); gated on both so a web
+// app that makes no outbound HTTP calls (no `http_client` feature) stays
+// reqwest-free and a server-only or webview build never compiles it.
+#[cfg(all(feature = "web", feature = "http_client"))]
 pub mod console_proxy;
 // Observability middleware + noise ingest — axum request/response types, server-only.
 #[cfg(feature = "server")]
@@ -55,9 +60,9 @@ pub mod observability;
 // and remote-hub OTLP push. Both env-gated + inert by default.
 // Use reqwest for outbound push; gated so a web app with no outbound HTTP
 // kernel (`http_client` absent) stays reqwest-free.
-#[cfg(feature = "http_client")]
+#[cfg(all(feature = "web", feature = "http_client"))]
 pub mod hub_exporter;
-#[cfg(feature = "http_client")]
+#[cfg(all(feature = "web", feature = "http_client"))]
 pub mod push_exporter;
 // Hub read-side kernels (the bundled console's data plane). Gated on `db` —
 // they read the SQLite telemetry spill via sqlx, so a `live`-only program with
@@ -238,26 +243,24 @@ pub fn render_page(body: &str) -> String {
     page_shell("", &format!("<div id=\"ipe-root\">{body}</div>"), "")
 }
 
-/// Escape a serde-serialised JSON string for safe embedding inside a
-/// `<script>` element (HTML script-data context, not attribute context).
+/// Escape a serde-serialised JSON string for embedding inside a `<script>`
+/// element.
 ///
-/// JSON alone is not sufficient: a string field containing `</script>` would
-/// end the `<script>` element, breaking out of the data island into executable
-/// script context and defeating the no-eval / no-`'unsafe-eval'` posture.
-/// The five characters below are the only ones that matter in script-data
-/// context; `serde_json`'s own output already encodes control characters, so
-/// no other escaping is required.
+/// The one JSON-in-HTML escaper: every JSON value a page carries in a
+/// `<script type="application/json">` block passes through it. JSON alone is not
+/// sufficient in HTML script-data context: a string field containing
+/// `</script>` would end the element and break out into markup, and `<!--`
+/// would switch the tokenizer into its escaped state. `serde_json`'s own output
+/// already encodes control characters, so the five characters below are the
+/// only ones left to escape.
 ///
-/// Escapes applied (JSON numeric escapes — losslessly round-trippable by any
-/// JSON parser, including `serde_json`):
-/// - U+003C `<`    → `<`  (forecloses `</script`)
-/// - U+003E `>`    → `>`  (defence-in-depth against `>` injection)
-/// - U+0026 `&`    → `&`  (forecloses HTML entity injection)
-/// - U+2028 LINE SEPARATOR   → ` `  (JSON-legal but HTML-hostile)
-/// - U+2029 PARAGRAPH SEPARATOR → ` `
-///
-/// Identical escape class as the telemetry `json_escape` U+2028/2029 gap —
-/// the island serialiser applies it here for consistency.
+/// Each becomes its JSON `\uXXXX` escape, which every JSON parser (including
+/// `serde_json` and `JSON.parse`) decodes back to the same character:
+/// - U+003C `<` (forecloses `</script` and `<!--`)
+/// - U+003E `>` (forecloses `]]>` and `-->`)
+/// - U+0026 `&` (forecloses HTML character references)
+/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR (JSON-legal but
+///   line terminators to older JavaScript parsers)
 #[cfg(feature = "server")]
 pub fn island_escape(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
@@ -272,42 +275,6 @@ pub fn island_escape(json: &str) -> String {
         }
     }
     out
-}
-
-/// Page wrap for isomorphic SSR + WASM hydration (M7 mode 2).
-///
-/// Emits a standard HTML page with:
-/// - The SSR body in `<div id="ipe-root">`.
-/// - The WASM bundle boot scripts (external JS + `hydrate(island_json)` call).
-/// - A **typed public-payload island** `<script type="application/ipe-model+json">`
-///   carrying the XSS-escaped, serde-serialised `HydrationState` JSON.
-///
-/// The island body is read by the WASM client via
-/// `document.querySelector('script[type="application/ipe-model+json"]').textContent`
-/// and passed to the emitted `hydrate(model_json)` entry — parsed with `serde_json`,
-/// never evaluated. The `island_escape` call forecloses all script-injection paths.
-///
-/// `body`        — SSR-rendered HTML (from `render_html` with ipe-ids assigned).
-/// `island_json` — serde-serialised `HydrationState` (BEFORE island_escape;
-///                 this function applies the escape internally).
-/// `pkg_base`    — URL prefix for the WASM bundle assets, e.g. `/pkg` or `./pkg`.
-#[cfg(feature = "server")]
-pub fn render_page_hydrate(body: &str, island_json: &str, pkg_base: &str) -> String {
-    let escaped = island_escape(island_json);
-    let body_inner = format!("<div id=\"ipe-root\">{body}</div>");
-    let tail_scripts = format!(
-        "<script type=\"application/ipe-model+json\">{escaped}</script>\
-<script type=\"module\">\
-import init, {{ hydrate }} from '{pkg_base}/ipe_app.js';\
-async function boot() {{\
-  await init('{pkg_base}/ipe_app_bg.wasm');\
-  const island = document.querySelector('script[type=\"application/ipe-model+json\"]');\
-  hydrate(island ? island.textContent : '');\
-}}\
-boot();\
-</script>"
-    );
-    page_shell("", &body_inner, &tail_scripts)
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -351,32 +318,9 @@ mod island_escape_tests {
     }
 }
 
-/// Full page wrap with the live client loaded as a cacheable external asset.
-/// Implements live page render
+/// The client's numeric tuning ceilings, keyed by their boot-block name.
 ///
-/// `sid`  — session id (injected into the JS via `window.__IPE_SID`).
-/// `base` — sub-app base path, e.g. "" for root-mounted apps.
-/// `body` — pre-rendered HTML body (from `render_html`).
-///
-/// Two scripts are emitted in document order (no defer/async — execution order
-/// is left-to-right by the HTML spec):
-///   1. A tiny inline `<script>` setting the three per-session window globals
-///      (`__IPE_SID`, `__IPE_BASE`, `__IPE_CSRF_TOKEN`). These MUST stay inline
-///      because they are per-session values and must never be cached.
-///   2. An external `<script src="…/_ipe/client.<hash>.js" integrity="sha256-…"
-///      crossorigin="anonymous">` loading the invariant client body. The URL is
-///      content-addressed (hash of the file) so it is safe to cache with
-///      `immutable`. The SRI `integrity` attribute lets the browser verify the
-///      file has not been tampered with before execution.
-///
-/// CSP note: the inline window-vars script still requires `script-src
-/// 'unsafe-inline'` (unchanged from the fully-inlined baseline). The external
-/// script requires no additional CSP directive beyond `script-src 'self'`
-/// (already needed for same-origin resource loading). Adding a nonce to the
-/// inline script to tighten CSP is deferred; it requires threading the nonce
-/// through the response pipeline and is outside the scope of this change.
-/// The client's numeric tuning ceilings, each with the `window.__IPE_*` global
-/// it sets. `0` passes through to the client unchanged.
+/// The client reads each under `cfg.tuning`; `0` passes through unchanged.
 #[cfg(feature = "server")]
 const CLIENT_TUNING_CEILINGS: [(&str, crate::system::EnvCeiling); 8] = {
     const fn tuning(name: &'static str, default: u64) -> crate::system::EnvCeiling {
@@ -408,77 +352,34 @@ const CLIENT_TUNING_CEILINGS: [(&str, crate::system::EnvCeiling); 8] = {
     ]
 };
 
-/// The `window.__IPE_*` numeric tuning assignments, resolved once per process.
+/// The client's numeric tuning values, keyed by their [`CLIENT_TUNING_CEILINGS`]
+/// name.
+#[cfg(feature = "server")]
+type ClientTuning = std::collections::BTreeMap<&'static str, u64>;
+
+/// The client's numeric tuning values, resolved once per process.
 ///
 /// [`build_web_router`] refuses to start on a refusal here, so every page a
-/// served app renders reads the resolved `Ok`.
+/// served app renders reads the resolved `Ok`; a render that still meets a
+/// refusal refuses the page ([`BootRefusal::TuningRefused`]).
 #[cfg(feature = "server")]
-fn client_tuning_js() -> &'static Result<String, crate::system::EnvCeilingRefusal> {
-    static TUNING: std::sync::OnceLock<Result<String, crate::system::EnvCeilingRefusal>> =
+fn client_tuning() -> &'static Result<ClientTuning, crate::system::EnvCeilingRefusal> {
+    static TUNING: std::sync::OnceLock<Result<ClientTuning, crate::system::EnvCeilingRefusal>> =
         std::sync::OnceLock::new();
     TUNING.get_or_init(|| {
-        use std::fmt::Write as _;
-        let mut out = String::new();
-        for (global, ceiling) in CLIENT_TUNING_CEILINGS {
-            let value: u64 = ceiling.read()?;
-            let _ = write!(out, "window.__IPE_{global}={value};");
-        }
-        Ok(out)
+        CLIENT_TUNING_CEILINGS
+            .into_iter()
+            .map(|(key, ceiling)| ceiling.read::<u64>().map(|value| (key, value)))
+            .collect()
     })
 }
 
-/// Server-side client-config templating: emit the `window.__IPE_*` assignments
-/// the client (`client.js`) reads, each with a hardcoded client fallback.
-#[cfg(feature = "server")]
-fn web_client_config_js() -> String {
-    // IPE_WEB_BANNER: off/0/false → disabled; anything else → on.
-    let banner = !matches!(
-        crate::system::read_env_var("IPE_WEB_BANNER")
-            .ok()
-            .map(|s| s.trim().to_ascii_lowercase()),
-        Some(ref v) if v == "off" || v == "0" || v == "false"
-    );
-    // IPE_WEB_SWAP_TOAST: set (non-empty ≠ "0") ⇒ this process runs behind the
-    // dev-watch blue-green proxy, so a reconnect is an expected rebuild cutover,
-    // not an outage. The client then greets a reconnect with a brief positive
-    // "updated ✓" toast instead of the amber "Reconnecting…" banner. Only the
-    // `ipe watch` blue-green path sets this; a release/`ipe run` server never
-    // does, so the flag defaults off there.
-    let swap_toast = matches!(
-        crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
-            .ok()
-            .map(|s| s.trim().to_string()),
-        Some(ref v) if !v.is_empty() && v != "0"
-    );
-    // A refused tuning value never reaches a served page (the router refused
-    // to start on it); an unserved render omits the numbers, so the client
-    // keeps its own fallbacks rather than an invented value.
-    let tuning = client_tuning_js().as_deref().unwrap_or_default();
-    format!(
-        "window.__IPE_BANNER_ENABLED={banner};\
-         window.__IPE_SWAP_TOAST={swap_toast};\
-         {tuning}\
-         window.__IPE_MSG_RECONNECTING=\"Reconnecting…\";\
-         window.__IPE_MSG_UPDATED=\"updated ✓\";\
-         window.__IPE_MSG_OFFLINE=\"Connection lost — refresh to retry\";"
-    )
-}
-
-/// Whether the dev watch/status banner endpoint should be mounted.
+/// Whether the client's connection banner is on.
 ///
-/// True when the banner is enabled (not explicitly disabled via `IPE_WEB_BANNER`
-/// off/0/false), the app is NOT in production, and the app is root-mounted
-/// (not a sub-app). Mirrors the three conditions the banner injection already
-/// uses so no new env var is needed.
+/// `IPE_WEB_BANNER` set to `off`, `0` or `false` turns it off; anything else,
+/// or no value, leaves it on.
 #[cfg(feature = "server")]
-fn watch_banner_active(base: &str) -> bool {
-    if crate::telemetry::production_from_env() {
-        return false;
-    }
-    if !base.is_empty() {
-        return false;
-    }
-    // Banner explicitly disabled → no endpoint either.
+fn web_banner_enabled() -> bool {
     !matches!(
         crate::system::read_env_var("IPE_WEB_BANNER")
             .ok()
@@ -487,36 +388,208 @@ fn watch_banner_active(base: &str) -> bool {
     )
 }
 
+/// Whether this process runs behind the dev-watch blue-green proxy.
+///
+/// `IPE_WEB_SWAP_TOAST` set to a non-empty value other than `0` means a
+/// reconnect is an expected rebuild cutover, not an outage: the client then
+/// greets a reconnect with a brief "updated ✓" toast instead of the amber
+/// "Reconnecting…" banner. Only the `ipe dev watch` blue-green path sets it; a
+/// release or `ipe dev run` server never does, so it defaults off there.
 #[cfg(feature = "server")]
-pub fn render_page_full(sid: &str, base: &str, body: &str, csrf_token: &str) -> String {
-    // sid_js / base_js / csrf_js: Rust Debug ("{:?}") of a &str yields a
-    // double-quoted, properly-escaped JS string literal for plain ASCII
-    // session ids, base paths, and the hex CSRF token.
-    let sid_js = format!("{sid:?}");
-    let base_js = format!("{base:?}");
-    let csrf_js = format!("{csrf_token:?}");
-    let dev_banner = dev_console_banner(base);
+fn web_swap_toast() -> bool {
+    matches!(
+        crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
+            .ok()
+            .map(|s| s.trim().to_string()),
+        Some(ref v) if !v.is_empty() && v != "0"
+    )
+}
+
+/// The client configuration a live page boots with.
+///
+/// Every field is required by the client: it refuses to boot on a missing or
+/// mistyped one, so there is no client-side default to drift from these.
+#[cfg(feature = "server")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientConfig<'a> {
+    banner_enabled: bool,
+    swap_toast: bool,
+    tuning: &'a ClientTuning,
+    msg_reconnecting: &'a str,
+    msg_updated: &'a str,
+    msg_offline: &'a str,
+}
+
+#[cfg(feature = "server")]
+impl<'a> ClientConfig<'a> {
+    /// The configuration of this process, over its resolved `tuning`.
+    fn from_env(tuning: &'a ClientTuning) -> Self {
+        Self {
+            banner_enabled: web_banner_enabled(),
+            swap_toast: web_swap_toast(),
+            tuning,
+            msg_reconnecting: "Reconnecting…",
+            msg_updated: "updated ✓",
+            msg_offline: "Connection lost — refresh to retry",
+        }
+    }
+}
+
+/// The boot data a live page hands its client, serialized as one JSON object.
+#[cfg(feature = "server")]
+#[derive(serde::Serialize)]
+struct BootConfig<'a> {
+    sid: &'a str,
+    epoch: String,
+    base: &'a str,
+    csrf: &'a str,
+    cfg: ClientConfig<'a>,
+}
+
+/// The `id` of the boot data block; `client.js` reads the element by it.
+#[cfg(feature = "server")]
+const BOOT_BLOCK_ID: &str = "ipe-boot";
+
+/// Why a live page could not be built; the page is refused with a 500.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootRefusal {
+    /// A client tuning value was refused by its ceiling.
+    TuningRefused,
+    /// The boot data did not serialize to JSON.
+    EncodeFailed,
+}
+
+/// The boot data block: `boot` as escaped JSON inside an inert data element.
+///
+/// `serde_json` writes the JSON and [`island_escape`] escapes it for script-data
+/// context, so no field value can end the element, open a comment, or change
+/// how the page parses. A `type="application/json"` script is never executed.
+#[cfg(feature = "server")]
+fn boot_block(boot: &BootConfig<'_>) -> Result<String, BootRefusal> {
+    let json = serde_json::to_string(boot).map_err(|_| BootRefusal::EncodeFailed)?;
+    let escaped = island_escape(&json);
+    Ok(format!(
+        "<script type=\"application/json\" id=\"{BOOT_BLOCK_ID}\">{escaped}</script>"
+    ))
+}
+
+/// A rendered page's boot data block, parsed as JSON.
+#[cfg(all(test, feature = "server"))]
+fn boot_json_of(html: &str) -> Option<serde_json::Value> {
+    let open = format!("<script type=\"application/json\" id=\"{BOOT_BLOCK_ID}\">");
+    let rest = html.get(html.find(&open)? + open.len()..)?;
+    serde_json::from_str(rest.get(..rest.find("</script>")?)?).ok()
+}
+
+/// Whether the dev watch/status banner endpoint should be mounted.
+///
+/// [`watch_banner_active_with`] over the process dev intent.
+#[cfg(feature = "server")]
+fn watch_banner_active(base: &str) -> bool {
+    watch_banner_active_with(base, crate::telemetry::dev_intent_from_env().as_ref())
+}
+
+/// Whether the banner endpoint mounts under an explicit dev-intent proof.
+///
+/// True when `dev` holds, the banner is enabled (not explicitly disabled via
+/// `IPE_WEB_BANNER` off/0/false), and the app is root-mounted (not a sub-app).
+/// Mirrors the conditions the banner injection already uses so no new env var
+/// is needed.
+#[cfg(feature = "server")]
+fn watch_banner_active_with(base: &str, dev: Option<&crate::telemetry::DevIntent>) -> bool {
+    if dev.is_none() {
+        return false;
+    }
+    if !base.is_empty() {
+        return false;
+    }
+    // Banner explicitly disabled → no endpoint either.
+    web_banner_enabled()
+}
+
+/// Full live page: the SSR body, the boot data block and the external client.
+///
+/// See [`render_live_page`]; this is the shell without a debugger overlay.
+///
+/// # Errors
+///
+/// [`BootRefusal`] when the boot data cannot be built; the page is refused.
+#[cfg(feature = "server")]
+pub fn render_page_full(
+    sid: &str,
+    base: &crate::encoding::MountBase,
+    body: &str,
+    epoch: &RenderEpoch,
+    csrf_token: &str,
+) -> Result<String, BootRefusal> {
+    render_live_page(
+        client_tuning().as_ref(),
+        sid,
+        base,
+        body,
+        epoch,
+        csrf_token,
+        "",
+    )
+}
+
+/// The one live-page builder every shell renders through.
+///
+/// The page carries no inline executable script. In document order its tail is:
+///   1. The boot data block ([`boot_block`]): the per-session values and the
+///      client config as inert, escaped JSON. It is never executed, so
+///      `script-src` needs no `'unsafe-inline'` and no nonce for it, and it is
+///      per-session, so it lives in the page, never in the cached client file.
+///   2. The external client, `…/_ipe/client.<hash>.js` with an SRI `integrity`.
+///      The URL is content-addressed, so it is cacheable as `immutable`; the
+///      client reads the boot block before any other of its code runs.
+///   3. The widget glue and the `Ipe.Ffi.Js` port glue, each external and
+///      SRI-pinned.
+///
+/// `tuning` is the process's resolved client tuning; a refused one refuses the
+/// page. `overlay` is raw HTML placed after `#ipe-root` (empty for none).
+#[cfg(feature = "server")]
+fn render_live_page(
+    tuning: Result<&ClientTuning, &crate::system::EnvCeilingRefusal>,
+    sid: &str,
+    base: &crate::encoding::MountBase,
+    body: &str,
+    epoch: &RenderEpoch,
+    csrf_token: &str,
+    overlay: &str,
+) -> Result<String, BootRefusal> {
+    let prefix = base.prefix();
+    let tuning = tuning.map_err(|_| BootRefusal::TuningRefused)?;
+    let boot = boot_block(&BootConfig {
+        sid,
+        epoch: epoch.to_token(),
+        base: prefix,
+        csrf: csrf_token,
+        cfg: ClientConfig::from_env(tuning),
+    })?;
+    let dev_banner = dev_console_banner(prefix);
     // Content-addressed client asset URL and SRI hash — computed once at first call.
     let (hex16, b64) = client_js_hashes();
     // Honour the sub-app base prefix so the external script request goes through
     // the parent proxy (same as /_ipe/sse, /_ipe/event, /_ipe/console).
-    let client_src = format!("{base}/_ipe/client.{hex16}.js");
+    let client_src = format!("{prefix}/_ipe/client.{hex16}.js");
     let integrity = format!("sha256-{b64}");
-    let config_js = web_client_config_js();
-    let head_extra = format!("<meta name=\"ipe-base\" content=\"{base}\">");
-    let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}");
+    let head_extra = format!("<meta name=\"ipe-base\" content=\"{prefix}\">");
+    let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}{overlay}");
     // Custom-element glue: an EXTERNAL, SRI-pinned `<script type="module">` plus a
     // `modulepreload` SRI pin per author asset. Empty when the program registers
     // no widget, so a widget-free page is byte-identical and its CSP is unchanged.
     // It loads AFTER the client core so `__ipeEmitWidgetUp` can reuse `__ipeSend`.
     let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
-    let port_glue = port_glue_script(base);
+    let port_glue = port_glue_script(prefix);
     let tail_scripts = format!(
-        "<script>window.__IPE_SID={sid_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
+        "{boot}\
          <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
          {widget_scripts}{port_glue}"
     );
-    page_shell(&head_extra, &body_inner, &tail_scripts)
+    Ok(page_shell(&head_extra, &body_inner, &tail_scripts))
 }
 
 /// The SRI-pinned `<script>` tag that loads the `Ipe.Ffi.Js` browser port surface,
@@ -543,35 +616,29 @@ fn port_glue_script(_base: &str) -> String {
     String::new()
 }
 
-/// Same as [`render_page_full`] but appends `overlay` (raw HTML) after the
-/// `#ipe-root` div. The overlay must carry `data-ipe-debugger` so the
-/// diff/patch engine ignores it.
+/// [`render_page_full`] with `overlay` (raw HTML) appended after `#ipe-root`.
+///
+/// The overlay must carry `data-ipe-debugger` so the diff/patch engine ignores
+/// it. The shell, boot block and scripts are the ones [`render_live_page`]
+/// builds for every live page.
 #[cfg(all(feature = "server", feature = "debugger"))]
 fn render_page_full_with_overlay(
     sid: &str,
-    base: &str,
+    base: &crate::encoding::MountBase,
     body: &str,
+    epoch: &RenderEpoch,
     csrf_token: &str,
     overlay: &str,
-) -> String {
-    let sid_js = format!("{sid:?}");
-    let base_js = format!("{base:?}");
-    let csrf_js = format!("{csrf_token:?}");
-    let dev_banner = dev_console_banner(base);
-    let (hex16, b64) = client_js_hashes();
-    let client_src = format!("{base}/_ipe/client.{hex16}.js");
-    let integrity = format!("sha256-{b64}");
-    let config_js = web_client_config_js();
-    let head_extra = format!("<meta name=\"ipe-base\" content=\"{base}\">");
-    let body_inner = format!("<div id=\"ipe-root\">{body}</div>{dev_banner}{overlay}");
-    let widget_scripts = widget_assets::page_scripts(base, widget_assets::WidgetTransport::Server);
-    let port_glue = port_glue_script(base);
-    let tail_scripts = format!(
-        "<script>window.__IPE_SID={sid_js};window.__IPE_BASE={base_js};window.__IPE_CSRF_TOKEN={csrf_js};{config_js}</script>\
-         <script src=\"{client_src}\" integrity=\"{integrity}\" crossorigin=\"anonymous\"></script>\
-         {widget_scripts}{port_glue}"
-    );
-    page_shell(&head_extra, &body_inner, &tail_scripts)
+) -> Result<String, BootRefusal> {
+    render_live_page(
+        client_tuning().as_ref(),
+        sid,
+        base,
+        body,
+        epoch,
+        csrf_token,
+        overlay,
+    )
 }
 
 /// Floating "🔍 Console" link injected into every dev-mode page. The
@@ -594,14 +661,18 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "server")]
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-/// Per-session live state behind an `Arc<Mutex<…>>`. `index` / `last_view` are
-/// re-derived on every commit; `sse_tx` is filled when the browser attaches the
-/// SSE channel; `msg_tx` feeds the per-session driver loop.
+/// Per-session live state behind an `Arc<Mutex<…>>`. `rendered` is advanced by
+/// every commit; `sse_tx` is filled when the browser attaches the SSE channel;
+/// `msg_tx` feeds the per-session driver loop.
 #[cfg(feature = "server")]
 pub struct SessionEntry<Model, Msg> {
     pub model: Model,
-    pub last_view: Html<Msg>,
-    pub index: HandlerIndex<Msg>,
+    /// The last committed view and the handler indexes of the retained
+    /// renders, each under its epoch; an event resolves only at its own epoch.
+    pub rendered: Rendered<Msg>,
+    /// The last event seq each recent tab posted, so a duplicate is acked
+    /// without a second dispatch.
+    pub tabs: TabSeqs,
     pub seq: u64,
     pub sse_tx: Option<SseTx>,
     pub msg_tx: Sender<Msg>,
@@ -621,6 +692,544 @@ pub struct SessionEntry<Model, Msg> {
     /// committed by `step_to`/`back`/`forward`. Reset to `None` on `reset`.
     #[cfg(feature = "debugger")]
     pub debug_cursor: Option<usize>,
+    /// The session's credential scope and the switch that ends its channels.
+    pub liveness: SessionLiveness,
+}
+
+#[cfg(feature = "server")]
+impl<Model, Msg> SessionEntry<Model, Msg> {
+    /// The credential section a checkpoint of this session carries.
+    ///
+    /// Armed, the session's bound set encoded by
+    /// [`crate::revocation::encode_bindings`], the empty set included, so an
+    /// armed anonymous session stays apart from a row written unarmed.
+    /// Unarmed, `None`. A poisoned credential lock is `None` too: the row is
+    /// then sectionless, which an armed reader refuses.
+    #[cfg(feature = "jwt")]
+    #[must_use]
+    pub fn checkpoint_section(&self) -> Option<Vec<u8>> {
+        crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())?;
+        self.liveness
+            .scope
+            .bindings()
+            .lock()
+            .ok()
+            .map(|held| crate::revocation::encode_bindings(&held))
+    }
+
+    /// Without `jwt` no credential is ever bound, so no section is written.
+    #[cfg(not(feature = "jwt"))]
+    #[must_use]
+    pub const fn checkpoint_section(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// A live session's credential scope and the switch that ends its channels.
+#[cfg(feature = "server")]
+pub struct SessionLiveness {
+    /// The scope every call into user code on behalf of the session runs in;
+    /// it carries the session's bound credentials.
+    pub scope: pubsub::SessionScope,
+    /// Set to `true` by [`close_session`]; the SSE stream and its heartbeat end
+    /// on it even while other senders on the channel are still held.
+    pub closer: tokio::sync::watch::Sender<bool>,
+    /// Revocation rechecks the driver ran, read by the coalescing test.
+    #[cfg(test)]
+    pub rechecks: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "server")]
+impl SessionLiveness {
+    /// The liveness of an open session running under `scope`.
+    #[must_use]
+    pub fn new(scope: pubsub::SessionScope) -> Self {
+        Self {
+            scope,
+            closer: tokio::sync::watch::Sender::new(false),
+            #[cfg(test)]
+            rechecks: Arc::default(),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+impl Default for SessionLiveness {
+    fn default() -> Self {
+        Self::new(pubsub::SessionScope::new(String::new()))
+    }
+}
+
+/// Whether a session's bound credentials still stand.
+// Without `jwt` no gate exists, so nothing ever constructs `Revoked`.
+#[cfg_attr(not(feature = "jwt"), allow(dead_code))]
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+enum Standing {
+    /// Every bound credential re-proved, or no gate is armed.
+    Live,
+    /// A credential is revoked, past its deadline, or cannot be proved.
+    Revoked,
+}
+
+/// Re-prove the credentials bound in `scope` now, and never earlier than `at_least`.
+///
+/// The gate is resolved at the check and never cached, so the kernel that
+/// binds and every point that enforces read one source. Unarmed, it costs one
+/// branch. A poisoned credential lock proves nothing, so it is `Revoked`.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn recheck_scope(scope: &pubsub::SessionScope, at_least: Option<i64>) -> Standing {
+    let Some(gate) = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
+    else {
+        return Standing::Live;
+    };
+    let now = crate::jwt::now_unix_seconds();
+    let now = at_least.map_or(now, |floor| now.max(floor));
+    let proved = scope
+        .bindings()
+        .lock()
+        .is_ok_and(|held| held.recheck_all(gate, now).is_ok());
+    if proved {
+        Standing::Live
+    } else {
+        Standing::Revoked
+    }
+}
+
+/// Without `jwt` no credential is ever bound, so every session stands.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+const fn recheck_scope(_scope: &pubsub::SessionScope, _at_least: Option<i64>) -> Standing {
+    Standing::Live
+}
+
+/// Prove a cold row's persisted credential `section` into `scope`, then re-prove the union.
+///
+/// Unarmed, the section is skipped unread and the row stands. Armed, a row
+/// without a section, one whose section does not decode, a union past
+/// [`crate::revocation::MAX_SESSION_CREDENTIALS`], a poisoned credential lock,
+/// or any credential that no longer re-proves is `Revoked`: the row is never
+/// restored unbound. `scope` holds what the lazy `init` bound, so a rebuilt
+/// row is proved over the persisted set and the new one together.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn prove_persisted(section: &store::CredSection, scope: &pubsub::SessionScope) -> Standing {
+    let Some(gate) = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
+    else {
+        return Standing::Live;
+    };
+    let store::CredSection::Present(bytes) = section else {
+        return Standing::Revoked;
+    };
+    let Ok(persisted) = crate::revocation::decode_bindings(bytes) else {
+        return Standing::Revoked;
+    };
+    let now = crate::jwt::now_unix_seconds();
+    let proved = scope.bindings().lock().is_ok_and(|mut held| {
+        held.absorb(persisted).is_ok() && held.recheck_all(gate, now).is_ok()
+    });
+    if proved {
+        Standing::Live
+    } else {
+        Standing::Revoked
+    }
+}
+
+/// Without `jwt` no gate exists, so every cold row stands.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+const fn prove_persisted(_section: &store::CredSection, _scope: &pubsub::SessionScope) -> Standing {
+    Standing::Live
+}
+
+/// A cold `rejoin` of `sid` whose credentials re-prove into `scope`, else a miss.
+///
+/// A refused row is deleted before its claim is released, so no later request
+/// restores it; the caller's miss path then mints a new sid and runs `init`.
+/// A live hit and a miss pass through unchanged.
+#[cfg(feature = "server")]
+async fn prove_rejoin<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    rejoin: store::Rejoin<Model, Msg>,
+    scope: &pubsub::SessionScope,
+) -> store::Rejoin<Model, Msg>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let standing = match &rejoin {
+        store::Rejoin::Restored { section, .. } | store::Rejoin::Rebuilt { section, .. } => {
+            prove_persisted(section, scope)
+        }
+        store::Rejoin::Live(_) | store::Rejoin::Miss => Standing::Live,
+    };
+    if standing == Standing::Live {
+        return rejoin;
+    }
+    store.delete(sid).await;
+    drop(rejoin);
+    store::Rejoin::Miss
+}
+
+/// End session `sid`: flip its closer, detach its SSE sender, drop it from the store.
+///
+/// The closer ends the SSE stream and its heartbeat although they still hold
+/// sender clones. The store delete removes the live entry and the persisted
+/// row on every backend, so the next request for the sid takes the
+/// session-lost path. The closer flips before the delete, so a
+/// [`checkpoint`] racing this close either sees it and undoes its write, or
+/// writes before the delete runs. Idempotent: a second close finds nothing
+/// left to end.
+#[cfg(feature = "server")]
+async fn close_session<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    entry: Option<&store::SessionHandle<Model, Msg>>,
+) where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    if let Some(entry) = entry {
+        let mut e = entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        e.liveness.closer.send_replace(true);
+        e.sse_tx = None;
+    }
+    store.delete(sid).await;
+}
+
+/// Whether a [`checkpoint`] left the session in the store.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Checkpoint {
+    /// The session is stored and open.
+    Stored,
+    /// The session was closed; the write is undone.
+    Closed,
+}
+
+/// Write session `sid` through to the store, unless it was closed meanwhile.
+///
+/// The closer is read after the write: a [`close_session`] that flipped it
+/// before this read has its delete repeated here, and one that flips it after
+/// deletes this write itself. A closed session is never stored again.
+#[cfg(feature = "server")]
+async fn checkpoint<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    entry: &store::SessionHandle<Model, Msg>,
+) -> Checkpoint
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    store.set(sid, Arc::clone(entry)).await;
+    let closed = *entry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .liveness
+        .closer
+        .borrow();
+    if closed {
+        store.delete(sid).await;
+        Checkpoint::Closed
+    } else {
+        Checkpoint::Stored
+    }
+}
+
+/// A session a request resolved whose credentials re-proved.
+#[cfg(feature = "server")]
+struct LiveSession<Model, Msg> {
+    /// The sid the session is stored under.
+    sid: String,
+    handle: store::SessionHandle<Model, Msg>,
+    scope: pubsub::SessionScope,
+}
+
+/// What a sid resolves to in this process.
+#[cfg(feature = "server")]
+enum SessionLookup<Model, Msg> {
+    /// The session is live and its credentials re-proved.
+    Live(LiveSession<Model, Msg>),
+    /// No live session holds the sid.
+    Absent,
+    /// The session's credentials no longer stand; the lookup closed it.
+    Closed,
+}
+
+/// The session-lost answer: 404, `X-Ipê-Web: 1` and [`SESSION_LOST_BODY`].
+///
+/// The client reloads on exactly this shape.
+#[cfg(feature = "server")]
+struct SessionLost;
+
+#[cfg(feature = "server")]
+impl axum::response::IntoResponse for SessionLost {
+    fn into_response(self) -> axum::response::Response {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
+            SESSION_LOST_BODY,
+        )
+            .into_response()
+    }
+}
+
+/// Re-prove the credentials of a live `handle` stored under `sid`.
+///
+/// `None` when they no longer stand: the session is closed here and never
+/// handed to the caller.
+#[cfg(feature = "server")]
+async fn admit_live<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    handle: store::SessionHandle<Model, Msg>,
+) -> Option<LiveSession<Model, Msg>>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let scope = handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .liveness
+        .scope
+        .clone();
+    match recheck_scope(&scope, None) {
+        Standing::Live => Some(LiveSession {
+            sid: sid.to_owned(),
+            handle,
+            scope,
+        }),
+        Standing::Revoked => {
+            close_session(store, sid, Some(&handle)).await;
+            None
+        }
+    }
+}
+
+/// Resolve `sid` to its live session; the one place a sid becomes a live entry.
+#[cfg(feature = "server")]
+async fn lookup_session<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+) -> SessionLookup<Model, Msg>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let Some(handle) = store.get(sid).await else {
+        return SessionLookup::Absent;
+    };
+    admit_live(store, sid, handle)
+        .await
+        .map_or(SessionLookup::Closed, SessionLookup::Live)
+}
+
+/// Resolve `sid` to a live session, or the session-lost answer.
+#[cfg(feature = "server")]
+async fn live_session_for<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+) -> Result<LiveSession<Model, Msg>, SessionLost>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    match lookup_session(store, sid).await {
+        SessionLookup::Live(live) => Ok(live),
+        SessionLookup::Absent | SessionLookup::Closed => Err(SessionLost),
+    }
+}
+
+/// Resolve the request's session cookie to a live session, or the session-lost answer.
+#[cfg(feature = "server")]
+async fn live_session<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    headers: &axum::http::HeaderMap,
+) -> Result<LiveSession<Model, Msg>, SessionLost>
+where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    let sid = sid_from_cookie(headers).ok_or(SessionLost)?;
+    live_session_for(store, &sid).await
+}
+
+/// Resolve once the session's closer reads `true`.
+///
+/// A dropped closer counts as closed: its session entry is gone.
+#[cfg(feature = "server")]
+async fn session_closed(closer: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = closer.wait_for(|closed| *closed).await;
+}
+
+/// How long a session waits after a revocation before it re-proves its credentials.
+///
+/// A burst of revocations inside one interval costs each open session at most
+/// one recheck beyond the first, whatever the burst size, so a party that can
+/// trigger revocations cannot amplify the recheck rate.
+#[cfg(all(feature = "server", feature = "jwt"))]
+const RECHECK_COALESCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Why a session driver woke to re-prove its credentials.
+// Without `jwt` the watch never wakes, so nothing constructs a variant.
+#[cfg_attr(not(feature = "jwt"), allow(dead_code))]
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wake {
+    /// A revocation landed; recheck at the current time.
+    Revocation,
+    /// The earliest bound deadline (Unix seconds) passed; recheck no earlier than it.
+    Deadline(i64),
+    /// The revocation generation can no longer be observed.
+    Lost,
+}
+
+/// A session driver's view of the revocation generation and its credential deadline.
+///
+/// Subscribed before the session's first credential is admitted, so a
+/// revocation landing between that admission and the driver's start still
+/// wakes the driver.
+#[cfg(all(feature = "server", feature = "jwt"))]
+struct RevocationWatch {
+    generation: tokio::sync::watch::Receiver<u64>,
+    /// When the last coalesced revocation recheck ran.
+    last_recheck: Option<tokio::time::Instant>,
+    /// When the pending coalesced recheck runs; the generation is not polled meanwhile.
+    recheck_due: Option<tokio::time::Instant>,
+    /// The earliest bound deadline, as a timer instant and as Unix seconds.
+    deadline: Option<(tokio::time::Instant, i64)>,
+    /// The generation sender is gone; no further revocation can be observed.
+    lost: bool,
+}
+
+#[cfg(all(feature = "server", feature = "jwt"))]
+impl RevocationWatch {
+    /// Subscribe to the revocation generation.
+    fn subscribe() -> Self {
+        Self {
+            generation: crate::revocation::subscribe(),
+            last_recheck: None,
+            recheck_due: None,
+            deadline: None,
+            lost: false,
+        }
+    }
+
+    /// Wait for the next reason to recheck.
+    ///
+    /// A generation change schedules one recheck at most [`RECHECK_COALESCE`]
+    /// after the previous one; every change before it fires folds into it. Each
+    /// branch updates state synchronously, so dropping the future mid-wait (the
+    /// driver's `select!`) loses nothing.
+    async fn wait(&mut self) -> Wake {
+        loop {
+            let now = tokio::time::Instant::now();
+            let recheck_due = self.recheck_due;
+            let deadline = self.deadline;
+            tokio::select! {
+                changed = self.generation.changed(), if recheck_due.is_none() && !self.lost => {
+                    if changed.is_err() {
+                        self.lost = true;
+                        return Wake::Lost;
+                    }
+                    self.recheck_due = Some(
+                        self.last_recheck
+                            .and_then(|last| last.checked_add(RECHECK_COALESCE))
+                            .map_or(now, |due| due.max(now)),
+                    );
+                }
+                () = sleep_until_opt(recheck_due) => {
+                    // Seen before the recheck reads the store: a revocation
+                    // written after this point bumps the generation again.
+                    self.generation.mark_unchanged();
+                    self.recheck_due = None;
+                    self.last_recheck = Some(tokio::time::Instant::now());
+                    return Wake::Revocation;
+                }
+                () = sleep_until_opt(deadline.map(|(at, _)| at)) => {
+                    return Wake::Deadline(deadline.map_or(i64::MIN, |(_, unix)| unix));
+                }
+            }
+        }
+    }
+
+    /// Re-arm the deadline timer from the credentials bound in `scope`.
+    ///
+    /// Run after every action, because the action may have bound a credential.
+    /// Unarmed, no timer runs. A poisoned credential lock arms an immediate
+    /// timer, whose recheck then refuses.
+    fn rearm(&mut self, scope: &pubsub::SessionScope) {
+        self.deadline = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
+            .and_then(|_| {
+                scope.bindings().lock().map_or(Some(i64::MIN), |held| {
+                    held.earliest_deadline()
+                        .map(crate::revocation::UnixSecs::get)
+                })
+            })
+            .and_then(|unix| deadline_instant(unix).map(|at| (at, unix)));
+    }
+}
+
+/// The timer instant at Unix second `unix`; `None` past the representable range.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn deadline_instant(unix: i64) -> Option<tokio::time::Instant> {
+    let wait = u64::try_from(unix.saturating_sub(crate::jwt::now_unix_seconds())).unwrap_or(0);
+    tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(wait))
+}
+
+/// Sleep until `at`, or forever when it is `None`.
+#[cfg(all(feature = "server", feature = "jwt"))]
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The standing a [`Wake`] leaves `scope` in.
+#[cfg(all(feature = "server", feature = "jwt"))]
+fn standing_after(scope: &pubsub::SessionScope, wake: Wake) -> Standing {
+    match wake {
+        Wake::Revocation => recheck_scope(scope, None),
+        Wake::Deadline(unix) => recheck_scope(scope, Some(unix)),
+        // Revocations can no longer be observed: an armed session cannot stay open.
+        Wake::Lost => {
+            if crate::revocation::ArmedGate::resolve(crate::revocation::process_mode()).is_some() {
+                Standing::Revoked
+            } else {
+                Standing::Live
+            }
+        }
+    }
+}
+
+/// Without `jwt` there is no revocation generation; the watch never wakes.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+struct RevocationWatch;
+
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+impl RevocationWatch {
+    /// A watch that never wakes.
+    const fn subscribe() -> Self {
+        Self
+    }
+
+    /// Pend forever.
+    async fn wait(&mut self) -> Wake {
+        std::future::pending().await
+    }
+
+    /// No deadline exists to arm.
+    const fn rearm(&mut self, _scope: &pubsub::SessionScope) {}
+}
+
+/// Without `jwt` every session stands.
+#[cfg(all(feature = "server", not(feature = "jwt")))]
+const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing {
+    Standing::Live
 }
 
 /// SSE patches envelope. The browser client (`live/client.js`) consumes the
@@ -628,17 +1237,171 @@ pub struct SessionEntry<Model, Msg> {
 /// `__ipeHandleResponse(undefined, _, _, globalSeq)` → `__ipeApplyPatches`.
 /// We use `globalSeq` (the server-owned broadcast counter) rather than the
 /// local `seq` so it never collides with the client's own POST-local seq gate.
+///
+/// `from` / `to` are the epochs the commit moved between: the client applies
+/// the patches only onto the DOM of `from`, then adopts `to`.
 #[derive(serde::Serialize)]
 #[cfg(feature = "server")]
 struct PatchEnvelope<'a> {
     #[serde(rename = "globalSeq")]
     global_seq: u64,
+    from: String,
+    to: String,
     patches: &'a [crate::web::diff::Patch],
+}
+
+/// Push one commit's `patches` frame, empty patches included, so the client's
+/// epoch always follows the server's.
+#[cfg(feature = "server")]
+async fn send_patches_frame(
+    sse: Option<SseTx>,
+    global_seq: u64,
+    step: EpochStep,
+    patches: &[crate::web::diff::Patch],
+) {
+    let Some(sse) = sse else {
+        return;
+    };
+    let env = PatchEnvelope {
+        global_seq,
+        from: step.from.to_token(),
+        to: step.to.to_token(),
+        patches,
+    };
+    if let Ok(json) = serde_json::to_string(&env) {
+        let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
+    }
+}
+
+/// A fresh render-history incarnation from the OS CSPRNG.
+#[cfg(feature = "server")]
+pub(crate) fn new_incarnation() -> Incarnation {
+    Incarnation::from_random_bits(uuid::Uuid::new_v4().as_u128())
+}
+
+/// The number of tabs whose last event seq a session remembers.
+#[cfg(feature = "server")]
+pub const TAB_SEQ_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(15);
+
+/// The random id a browser tab mints once per page load and echoes with its events.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TabId(u128);
+
+#[cfg(feature = "server")]
+impl TabId {
+    /// Parse exactly 32 lowercase hex characters; anything else is `None`.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        let well_formed = token.len() == 32
+            && token
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !well_formed {
+            return None;
+        }
+        u128::from_str_radix(token, 16).ok().map(Self)
+    }
+}
+
+/// How many seqs at and below a tab's highest dispatched seq its window
+/// remembers one by one.
+#[cfg(feature = "server")]
+pub const TAB_SEQ_WINDOW: u32 = u128::BITS;
+
+/// The seqs one tab has had dispatched: its highest seq, and for each of the
+/// [`TAB_SEQ_WINDOW`] seqs at and below it whether it was dispatched.
+///
+/// A tab's events can reach the server out of order: two posts in flight race
+/// for the session lock, and a retried event lands after a later one. So an
+/// earlier seq is a duplicate only when that exact seq was dispatched, never
+/// merely because a later one was.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SeqWindow {
+    top: u64,
+    /// Bit `k` is set when seq `top - k` was dispatched.
+    seen: u128,
+}
+
+#[cfg(feature = "server")]
+impl SeqWindow {
+    const fn first(seq: u64) -> Self {
+        Self { top: seq, seen: 1 }
+    }
+
+    /// The bit of `seq`, when `seq` is at most `top` and inside the window.
+    fn bit(self, seq: u64) -> Option<u128> {
+        let back = u32::try_from(self.top.checked_sub(seq)?).ok()?;
+        1_u128.checked_shl(back)
+    }
+
+    /// Whether `seq` was dispatched. A seq above `top` is new; one older than
+    /// the window can no longer be told apart and counts as dispatched.
+    fn has(self, seq: u64) -> bool {
+        if seq > self.top {
+            return false;
+        }
+        self.bit(seq).is_none_or(|bit| (self.seen & bit) != 0)
+    }
+
+    fn mark(&mut self, seq: u64) {
+        if let Some(ahead) = seq.checked_sub(self.top).filter(|&ahead| ahead > 0) {
+            let kept = u32::try_from(ahead)
+                .ok()
+                .and_then(|ahead| self.seen.checked_shl(ahead))
+                .unwrap_or(0);
+            self.top = seq;
+            self.seen = kept | 1;
+        } else if let Some(bit) = self.bit(seq) {
+            self.seen |= bit;
+        }
+    }
+}
+
+/// The dispatched event seqs of the most recently active tabs, at most
+/// [`TAB_SEQ_CAP`] tabs.
+///
+/// An event whose seq its tab already had dispatched is a duplicate and is
+/// acked without a dispatch. An unknown or evicted tab is accepted; the render
+/// epoch, not this map, is what keeps a replay from retargeting.
+#[cfg(feature = "server")]
+#[derive(Default)]
+pub struct TabSeqs {
+    recent: std::collections::VecDeque<(TabId, SeqWindow)>,
+}
+
+#[cfg(feature = "server")]
+impl TabSeqs {
+    /// Whether `tab` already had an event at `seq` dispatched.
+    #[must_use]
+    pub fn is_duplicate(&self, tab: TabId, seq: u64) -> bool {
+        self.recent
+            .iter()
+            .any(|&(t, window)| t == tab && window.has(seq))
+    }
+
+    /// Record `seq` as dispatched for `tab`, making `tab` the most recent.
+    pub fn record(&mut self, tab: TabId, seq: u64) {
+        let window = self
+            .recent
+            .iter()
+            .position(|&(t, _)| t == tab)
+            .and_then(|pos| self.recent.remove(pos))
+            .map_or(SeqWindow::first(seq), |(_, mut window)| {
+                window.mark(seq);
+                window
+            });
+        self.recent.push_back((tab, window));
+        while self.recent.len() > TAB_SEQ_CAP.get() {
+            self.recent.pop_front();
+        }
+    }
 }
 
 /// Body for the dev-only `POST /_ipe/watch/status` endpoint.
 ///
-/// Sent by `ipe watch` to push build state to connected browsers.
+/// Sent by `ipe dev watch` to push build state to connected browsers.
 /// Only mounted when the dev banner is active (non-production, root-mounted,
 /// and `IPE_WEB_BANNER` not explicitly disabled).
 #[derive(serde::Deserialize)]
@@ -654,7 +1417,7 @@ struct WatchStatusBody {
     phase: Option<String>,
 }
 
-/// Latest build status from `ipe watch`, held in the server's shared state.
+/// Latest build status from `ipe dev watch`, held in the server's shared state.
 ///
 /// `None` = no status yet (initial state or production). Set by the
 /// `/_ipe/watch/status` endpoint and replayed to new SSE connections so a
@@ -713,6 +1476,109 @@ struct EventBody {
     /// values so both shapes decode.
     #[serde(default)]
     args: Vec<serde_json::Value>,
+    /// The render epoch whose DOM the event came from; resolved only against
+    /// that render's handler index. Absent refuses.
+    #[serde(default)]
+    epoch: Option<String>,
+    /// The posting tab's id and its per-tab event seq: a repeat of a recorded
+    /// seq is acked without a second dispatch. Either absent skips that check.
+    #[serde(default)]
+    tab: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
+}
+
+/// Why `POST /_ipe/event` refuses to resolve an event.
+#[cfg(feature = "server")]
+enum EventRefusal {
+    /// The body names no render epoch.
+    Missing,
+    /// The epoch token is not well formed; an honest client never sends one.
+    Malformed(EpochParseError),
+    /// The tab id is not well formed; an honest client never sends one.
+    MalformedTab,
+    /// The epoch names no retained render of this session.
+    Stale(StaleEpoch),
+}
+
+/// The `409` stale-render refusal: the current epoch and full render, so the
+/// client replaces its DOM and never re-sends the refused event.
+#[cfg(feature = "server")]
+fn stale_render_response<Model, Msg: Clone>(
+    e: &SessionEntry<Model, Msg>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body = serde_json::json!({
+        "refused": "stale-render",
+        "epoch": e.rendered.epoch().to_token(),
+        "seq": e.seq,
+        "body": render_html(e.rendered.last_view()),
+    })
+    .to_string();
+    (
+        axum::http::StatusCode::CONFLICT,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// The HTTP answer to an [`EventRefusal`], one arm per variant.
+///
+/// A missing or stale epoch answers `409` with the current render; a
+/// malformed epoch or tab id answers `400`, like any other malformed body.
+#[cfg(feature = "server")]
+fn event_refusal_response<Model, Msg: Clone>(
+    refusal: EventRefusal,
+    e: &SessionEntry<Model, Msg>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let bad_body = || (axum::http::StatusCode::BAD_REQUEST, "bad body").into_response();
+    match refusal {
+        EventRefusal::Missing => stale_render_response(e),
+        EventRefusal::Stale(why) => {
+            crate::system::emit_runtime_log(
+                "live",
+                &format!("event_handler: render epoch refused ({why:?}); resyncing the page"),
+            );
+            stale_render_response(e)
+        }
+        EventRefusal::Malformed(why) => {
+            crate::system::emit_runtime_log(
+                "live",
+                &format!("event_handler: malformed render epoch ({why:?})"),
+            );
+            bad_body()
+        }
+        EventRefusal::MalformedTab => bad_body(),
+    }
+}
+
+/// The `200` ack of an accepted event; real patches flow over SSE.
+///
+/// `X-Ipe-Web: 1` marks a genuine Ipe.Web response: the client treats a `200`
+/// without it as a wedged-proxy signal. A duplicate is acked as such and was
+/// not dispatched a second time.
+#[cfg(feature = "server")]
+fn event_ack(seq: u64, duplicate: bool) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body = if duplicate {
+        format!("{{\"seq\":{seq},\"patches\":[],\"duplicate\":true}}")
+    } else {
+        format!("{{\"seq\":{seq},\"patches\":[]}}")
+    };
+    (
+        axum::http::StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Coerce a wire arg `Value` to the string the click/input/keydown path expects.
@@ -731,6 +1597,25 @@ fn value_to_string(v: &serde_json::Value) -> String {
 #[cfg(feature = "server")]
 type RouteEntry<Model, Msg> =
     Arc<dyn Fn(Model, &route::DecodedPath) -> route::Entered<Model, IpeCmd<Msg>> + Send + Sync>;
+
+/// Enters `path` for a new driver of the session `scope` names, running `seed_cmd` before the entry Cmd.
+///
+/// Every page-handler arm that builds a driver (miss, restored, rebuilt) goes
+/// through here, so the order `[seed, entry]` and the session scope live in
+/// one place. Relies on one invariant: constructing an `IpeCmd` performs no
+/// effect, only `run_cmd` does, so a seed built for a session that is then
+/// discarded never fires.
+#[cfg(feature = "server")]
+fn enter_session<Model, Msg>(
+    route_entry: &RouteEntry<Model, Msg>,
+    scope: &pubsub::SessionScope,
+    model: Model,
+    seed_cmd: IpeCmd<Msg>,
+    path: &route::DecodedPath,
+) -> (Model, IpeCmd<Msg>) {
+    let entered = pubsub::with_session(scope, || route_entry(model, path));
+    (entered.model, IpeCmd::Batch(vec![seed_cmd, entered.cmd]))
+}
 
 /// Pending URL entries a session driver holds before a new one is refused with 503.
 #[cfg(feature = "server")]
@@ -763,13 +1648,14 @@ pub struct EnterRequest {
     reply: tokio::sync::oneshot::Sender<EnterReply>,
 }
 
-/// The driver's answer to an [`EnterRequest`]: the committed page's rendered body.
+/// The driver's answer to an [`EnterRequest`]: the committed page's rendered body and its epoch.
 ///
-/// Only the body crosses back; the entry Cmd stays with the driver, so a
+/// Only the render crosses back; the entry Cmd stays with the driver, so a
 /// requester that stops waiting loses nothing.
 #[cfg(feature = "server")]
 pub struct EnterReply {
     body: String,
+    epoch: RenderEpoch,
 }
 
 /// Queue an entry of `path` in `mode` on the session driver behind `enter_tx`.
@@ -854,6 +1740,31 @@ fn entry_unavailable() -> axum::response::Response {
     )
         .into_response()
 }
+
+/// The 503 a request gets when the process holds as many sessions as it admits.
+#[cfg(feature = "server")]
+fn at_capacity() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "2")],
+        "server at session capacity",
+    )
+        .into_response()
+}
+
+// A claim waiter is a request queued on its session, so it waits no longer and
+// in no larger numbers than an entry queued on a live driver.
+#[cfg(feature = "server")]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's claim waiters outnumber its enter queue [ledger #boundary]
+const _: () = assert!(store::MAX_CLAIM_WAITERS.get() <= ENTER_QUEUE_CAP.get());
+#[cfg(feature = "server")]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the claim wait drifts from the enter reply timeout [ledger #boundary]
+const _: () = assert!(store::CLAIM_WAIT.as_millis() == ENTER_REPLY_TIMEOUT.as_millis());
+// Every minted sid parses back as a `SessionKey`.
+#[cfg(feature = "server")]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a minted sid's length drifts from the session key's [ledger #boundary]
+const _: () = assert!(uuid::fmt::Simple::LENGTH == store::SESSION_ID_LEN);
 
 /// Build the routed entry from the route table, the `notFound` page, the
 /// app's emitted `set_page`, and its page renderer.
@@ -997,7 +1908,7 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     /// an unbounded number of sessions. Decremented ONLY via `SessionSlot::drop`,
     /// so the leak fix (mortal driver) and this cap share one mechanism.
     session_count: Arc<AtomicUsize>,
-    /// Latest build status from `ipe watch`. `None` until the first status
+    /// Latest build status from `ipe dev watch`. `None` until the first status
     /// POST arrives. Replayed to new SSE connections so a browser refresh
     /// during a failed build immediately shows the sticky error banner.
     /// Populated only when the dev watch/status endpoint is mounted;
@@ -1057,20 +1968,63 @@ impl Drop for SessionSlot {
     }
 }
 
+/// Who a page GET's new driver belongs to: a claimed returning sid, or a freshly minted one.
+///
+/// A rejoined session's sid is its claim's key, so the published sid and the
+/// claim it is published under cannot differ.
+#[cfg(feature = "server")]
+enum SessionOwner {
+    /// A returning session rebuilt or restored under its claim; the claim is released once the session is live.
+    Rejoined(store::SidClaim),
+    /// A new session under a sid no other request knows.
+    Minted(String),
+}
+
+#[cfg(feature = "server")]
+impl SessionOwner {
+    /// The sid the session is published under.
+    fn sid(&self) -> &str {
+        match self {
+            Self::Rejoined(claim) => claim.key().as_str(),
+            Self::Minted(sid) => sid,
+        }
+    }
+}
+
 /// Fire a `Cmd`: None/Batch recurse; Perform spawns the composed task→Msg thunk
 /// and pushes the result back into the per-session loop.
+///
+/// The spawned task runs inside `scope` across every poll, so a credential the
+/// task admits binds to the session that dispatched it.
+///
+/// The session's credentials are re-proved at dispatch, with no await between
+/// the check and the effects: a revocation that returned while the caller
+/// awaited its SSE send or checkpoint write drops the whole Cmd.
 #[cfg(feature = "server")]
-fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, sid: &str) {
+fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, scope: &pubsub::SessionScope) {
+    if recheck_scope(scope, None) == Standing::Revoked {
+        return;
+    }
+    dispatch_cmd(cmd, tx, scope);
+}
+
+/// Fire a `Cmd` whose session [`run_cmd`] just re-proved.
+#[cfg(feature = "server")]
+fn dispatch_cmd<Msg: Send + 'static>(
+    cmd: IpeCmd<Msg>,
+    tx: &Sender<Msg>,
+    scope: &pubsub::SessionScope,
+) {
     match cmd {
         IpeCmd::None => {}
         IpeCmd::Batch(items) => {
             for c in items {
-                run_cmd(c, tx, sid);
+                dispatch_cmd(c, tx, scope);
             }
         }
         IpeCmd::Perform(thunk) => {
             let tx = tx.clone();
-            tokio::spawn(async move {
+            tokio::spawn(scope.clone().scoped(async move {
                 let m = thunk().await;
                 // Bounded send: drop the Msg and warn if the session queue is
                 // full (a stalled driver or a burst of fast Perform tasks).
@@ -1080,12 +2034,12 @@ fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, sid: &str) {
                         "run_cmd: session msg channel closed; dropping Perform result",
                     );
                 }
-            });
+            }));
         }
         IpeCmd::Publish(thunk) => {
             // Inject this session's sid as the broadcast origin (
             // liveApp.Publish sets Origin = session.sid). Fire-and-forget.
-            let _ = thunk(sid);
+            let _ = thunk(scope.sid());
         }
     }
 }
@@ -1123,7 +2077,7 @@ enum EntryCommit<Model, Msg> {
 /// A [`EnterMode::Reconcile`] request whose path equals the session's
 /// `entered_path` is dropped unanswered here, on the driver, so the check and
 /// the commit that follows cannot interleave with another entry. Otherwise
-/// enters `request.path` under the session's sid, renders, commits model, view,
+/// enters `request.path` under the session's scope, renders, commits model, view,
 /// index and `entered_path`, then replies with the rendered body. A requester
 /// that stopped waiting gets the committed page as a full resync frame over
 /// the attached SSE channel instead, so the browser never keeps a DOM the
@@ -1135,11 +2089,11 @@ async fn commit_entry<Model, Msg, FView>(
     route_entry: &RouteEntry<Model, Msg>,
     view: &FView,
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
-    sid: &str,
+    scope: &pubsub::SessionScope,
 ) -> EntryCommit<Model, Msg>
 where
-    Model: Clone,
-    Msg: Clone,
+    Model: Clone + Send + 'static,
+    Msg: Clone + Send + 'static,
     FView: Fn(Model) -> Html<Msg> + ?Sized,
 {
     let Some(strong) = entry.upgrade() else {
@@ -1157,24 +2111,42 @@ where
         }
         g.model.clone()
     };
-    let entered = pubsub::with_session_sid(sid.to_owned(), || route_entry(model, &path));
-    let mut tree = view(entered.model.clone());
+    let sid = scope.sid();
+    let entered = pubsub::with_session(scope, || route_entry(model, &path));
+    let mut tree = pubsub::with_session(scope, || view(entered.model.clone()));
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
     let body = render_html(&tree);
-    {
-        let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
-        e.index = build_index(&tree);
-        e.last_view = tree;
-        e.model = entered.model.clone();
-        e.entered_path = Some(path);
+    // Re-prove after user code ran: a revocation that landed meanwhile drops
+    // the entry, its reply and its Cmd.
+    if recheck_scope(scope, None) == Standing::Revoked {
+        close_session(store, sid, Some(&strong)).await;
+        return EntryCommit::SessionGone;
     }
-    if let Err(EnterReply { body }) = reply.send(EnterReply { body }) {
+    let committed = {
+        let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
+        match e.rendered.commit(tree) {
+            Ok(step) => {
+                e.model = entered.model.clone();
+                e.entered_path = Some(path);
+                Some(step.to)
+            }
+            Err(EpochExhausted) => None,
+        }
+    };
+    let Some(epoch) = committed else {
+        // The render history cannot mint another epoch: drop the session so
+        // the next request takes the session-lost path.
+        store.delete(sid).await;
+        return EntryCommit::SessionGone;
+    };
+    if let Err(EnterReply { body, epoch }) = reply.send(EnterReply { body, epoch }) {
         let (frame, sse_tx) = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
             e.seq += 1;
             (
-                serde_json::json!({ "seq": e.seq, "body": body }).to_string(),
+                serde_json::json!({ "seq": e.seq, "epoch": epoch.to_token(), "body": body })
+                    .to_string(),
                 e.sse_tx.clone(),
             )
         };
@@ -1182,8 +2154,10 @@ where
             let _ = sse_tx.send(SsePatch(sse::frame("patch", &frame))).await;
         }
     }
-    store.set(sid, strong).await;
-    EntryCommit::Entered(entered.model, entered.cmd)
+    match checkpoint(store, sid, &strong).await {
+        Checkpoint::Stored => EntryCommit::Entered(entered.model, entered.cmd),
+        Checkpoint::Closed => EntryCommit::SessionGone,
+    }
 }
 
 /// The per-session driver: folds each Msg through `update`, diffs the new view
@@ -1192,9 +2166,9 @@ where
 ///
 /// URL entries arrive on `enter_rx` and are committed by the same loop, so an
 /// entry and an in-flight `update` never overwrite each other's model.
-// Ten distinct per-session runtime handles (entry, both Msg channel ends, the
+// Eleven distinct per-session runtime handles (entry, both Msg channel ends, the
 // entry queue, the three Arc'd TEA callbacks, the route entry, the store, the
-// sid) — bundling them into a struct purely to satisfy the 7-arg heuristic
+// session scope, the revocation watch) — bundling them into a struct purely to satisfy the 7-arg heuristic
 // would add indirection without clarifying anything.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "server")]
@@ -1213,7 +2187,10 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     subs: Arc<FSubs>,
     route_entry: RouteEntry<Model, Msg>,
     store: Arc<dyn store::SessionStore<Model, Msg>>,
-    sid: String,
+    scope: pubsub::SessionScope,
+    // Subscribed by the page handler before the session's first credential was
+    // admitted, so no revocation between that admission and this start is missed.
+    mut revocation: RevocationWatch,
     // Admission-control slot: decrements WebState::session_count on driver exit.
     _slot: SessionSlot,
 ) where
@@ -1228,6 +2205,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
 {
+    let sid = scope.sid().to_owned();
     // One keyed subscription runtime per session: a re-evaluation keeps a
     // still-requested `Sub.every` timer and its phase.
     let mut sub_runtime = SubRuntime::new(msg_tx.clone());
@@ -1261,7 +2239,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // Register initial subscriptions at session creation, before the first
     // event. Without this a watch-only session never subscribes until it
     // dispatches its own Msg, so a pub/sub broadcast (or a Sub.every ticker)
-    // would never reach a freshly loaded session. Wrapped in the session-sid
+    // would never reach a freshly loaded session. Wrapped in the session
     // scope so SkipOrigin filtering binds the right owner.
     {
         // Upgrade transiently; if the session is already gone there is nothing to drive.
@@ -1275,10 +2253,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                 .model
                 .clone()
         };
-        pubsub::with_session_sid(sid.clone(), || {
+        pubsub::with_session(&scope, || {
             sub_runtime.reconcile(subs(model0));
         });
     }
+    revocation.rearm(&scope);
     // Periodic liveness check: the driver holds only a Weak ref, but it also holds
     // its own `msg_tx` clone, so `recv()` alone never returns None. The tick
     // upgrades the Weak — once the store has evicted the session AND no SSE
@@ -1297,16 +2276,44 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                 let Some(request) = maybe else {
                     break;
                 };
+                // Re-prove the credentials before the entry runs; a refused
+                // entry's request is dropped, so its requester answers 503.
+                if recheck_scope(&scope, None) == Standing::Revoked {
+                    close_session(&store, &sid, entry.upgrade().as_ref()).await;
+                    break;
+                }
                 let (next, cmd) =
-                    match commit_entry(&entry, request, &route_entry, &*view, &store, &sid).await {
+                    match commit_entry(&entry, request, &route_entry, &*view, &store, &scope).await {
                         EntryCommit::Entered(next, cmd) => (next, cmd),
                         EntryCommit::AlreadyEntered => continue,
                         EntryCommit::SessionGone => break,
                     };
-                pubsub::with_session_sid(sid.clone(), || run_cmd(cmd, &msg_tx, &sid));
-                pubsub::with_session_sid(sid.clone(), || {
+                pubsub::with_session(&scope, || {
+                    run_cmd(cmd, &msg_tx, &scope);
                     sub_runtime.reconcile(subs(next));
                 });
+                revocation.rearm(&scope);
+                continue;
+            }
+            wake = revocation.wait() => {
+                #[cfg(test)]
+                if wake == Wake::Revocation
+                    && let Some(strong) = entry.upgrade()
+                {
+                    let rechecks = Arc::clone(
+                        &strong
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .liveness
+                            .rechecks,
+                    );
+                    rechecks.fetch_add(1, Ordering::Relaxed);
+                }
+                if standing_after(&scope, wake) == Standing::Revoked {
+                    close_session(&store, &sid, entry.upgrade().as_ref()).await;
+                    break;
+                }
+                revocation.rearm(&scope);
                 continue;
             }
             _ = liveness.tick() => {
@@ -1322,6 +2329,12 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         let Some(strong) = entry.upgrade() else {
             break;
         };
+        // Re-prove the credentials before the Msg runs: a revoked session
+        // applies no further action.
+        if recheck_scope(&scope, None) == Standing::Revoked {
+            close_session(&store, &sid, Some(&strong)).await;
+            break;
+        }
         // Clone the model under a short lock, release before update.
         let model = {
             strong
@@ -1338,13 +2351,13 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         #[cfg(feature = "debugger")]
         let msg_for_history = msg.clone();
         let msg_started = std::time::Instant::now();
-        // Run `update` inside the session-sid scope: a `Task` it returns (e.g.
+        // Run `update` inside the session scope: a `Task` it returns (e.g.
         // `Geo.current`, `Clipboard.read`) captures the owning session's sid at
         // construction time via `scope_sid()`, so its outbound `Ipe.Ffi.Js` port
         // frame addresses THIS session's SSE sink. Without the scope the sid is
         // unset and a port-using Task's outbound frame reaches no sink — the
         // request never leaves the server and the awaited reply never arrives.
-        let (next, cmd) = pubsub::with_session_sid(sid.clone(), || update(msg, model));
+        let (next, cmd) = pubsub::with_session(&scope, || update(msg, model));
         crate::telemetry::metric_observe(
             "ipe_web_msg_seconds",
             &[("name", &msg_name)],
@@ -1354,13 +2367,20 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // run_cmd later. Part of the `noop` signal below.
         let cmd_is_none = matches!(cmd, IpeCmd::None);
 
-        let mut tree = view(next.clone());
+        let mut tree = pubsub::with_session(&scope, || view(next.clone()));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
 
-        let (patches, seq, sse, noop) = {
+        // Re-prove after user code ran: a revocation that landed meanwhile
+        // drops this Msg's commit and its Cmd.
+        if recheck_scope(&scope, None) == Standing::Revoked {
+            close_session(&store, &sid, Some(&strong)).await;
+            break;
+        }
+
+        let committed = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(&e.last_view, &tree);
+            let patches = diff(e.rendered.last_view(), &tree);
             // noop. Here
             // `e.model` STILL holds the OLD model (top-of-loop cloned it OUT; the
             // store isn't updated until the assignment below), so `e.model ==
@@ -1369,16 +2389,27 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             // dispatch has no error channel, so the `err==nil` conjunct is always
             // true and is dropped.
             let noop = cmd_is_none && e.model == next;
-            // Build the handler index from the tree, then move the tree into
-            // last_view (its only remaining use), avoiding a deep VDOM clone.
-            e.index = build_index(&tree);
-            e.last_view = tree;
-            e.model = next.clone();
-            e.seq += 1;
-            #[cfg(feature = "debugger")]
-            e.history
-                .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
-            (patches, e.seq, e.sse_tx.clone(), noop)
+            // The commit builds the handler index and mints the epoch, then
+            // moves the tree into the last view, avoiding a deep VDOM clone.
+            match e.rendered.commit(tree) {
+                Ok(step) => {
+                    e.model = next.clone();
+                    e.seq += 1;
+                    #[cfg(feature = "debugger")]
+                    pubsub::with_session(&scope, || {
+                        e.history
+                            .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
+                    });
+                    Some((patches, step, e.seq, e.sse_tx.clone(), noop))
+                }
+                Err(EpochExhausted) => None,
+            }
+        };
+        let Some((patches, step, seq, sse, noop)) = committed else {
+            // The render history cannot mint another epoch: drop the session so
+            // the next request takes the session-lost path.
+            store.delete(&sid).await;
+            break;
         };
         // Msg counter. All
         // labels bounded: name = finite variant set, outcome = "ok" (this path
@@ -1394,17 +2425,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             1,
         );
 
-        if !patches.is_empty()
-            && let Some(sse) = sse
-        {
-            let env = PatchEnvelope {
-                global_seq: seq,
-                patches: &patches,
-            };
-            if let Ok(json) = serde_json::to_string(&env) {
-                let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
-            }
-        }
+        send_patches_frame(sse, seq, step, &patches).await;
 
         // Write-through: checkpoint the committed model to the store (a touch
         // for memory; a re-serialize for persistent backends) on every commit.
@@ -1412,12 +2433,17 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // intended: a session that processes a Msg is
         // alive. `strong` is dropped at the end of this iteration (block scope),
         // before the next select! park — never held across the await loop.
-        store.set(&sid, strong.clone()).await;
+        // A session a request closed meanwhile is not stored again, and its
+        // Cmd never runs.
+        if checkpoint(&store, &sid, &strong).await == Checkpoint::Closed {
+            break;
+        }
 
-        pubsub::with_session_sid(sid.clone(), || run_cmd(cmd, &msg_tx, &sid));
-        pubsub::with_session_sid(sid.clone(), || {
+        pubsub::with_session(&scope, || {
+            run_cmd(cmd, &msg_tx, &scope);
             sub_runtime.reconcile(subs(next.clone()));
         });
+        revocation.rearm(&scope);
     }
     drop(sub_runtime);
 }
@@ -1437,6 +2463,12 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
 #[cfg(feature = "server")]
 fn new_sid() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// A fresh sid for a request whose mint was proved first-party.
+#[cfg(feature = "server")]
+fn minted_sid(_proof: mint_proof::MintProof) -> String {
+    new_sid()
 }
 
 /// Normalise a raw `IPE_WEB_BASE_PATH` value: trim, drop a trailing slash,
@@ -1472,19 +2504,27 @@ fn normalise_base_path(raw: &str) -> String {
 /// (`__Host-` requires Secure, which a browser drops over `http://`). A sub-app
 /// (Path != `/`) can never use `__Host-`, so it keeps the base-scoped name.
 #[cfg(feature = "server")]
-fn cookie_name_for(base: &str) -> String {
+fn cookie_name_for(base: &str) -> crate::server::CookieName {
+    cookie_name_with(base, csrf::cookies_secure())
+}
+
+/// [`cookie_name_for`] under an explicit `Secure` decision.
+#[cfg(feature = "server")]
+fn cookie_name_with(base: &str, secure: bool) -> crate::server::CookieName {
+    use crate::server::{CookieName, RuntimeCookie};
     if base.is_empty() {
-        if csrf::cookies_secure() {
-            "__Host-ipe_sid".to_string()
+        let root = if secure {
+            RuntimeCookie::HostSession
         } else {
-            "ipe_sid".to_string()
-        }
+            RuntimeCookie::Session
+        };
+        CookieName::runtime(root, "")
     } else {
         let suffix: String = base
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        format!("ipe_sid{suffix}")
+        CookieName::runtime(RuntimeCookie::Session, &suffix)
     }
 }
 
@@ -1515,7 +2555,7 @@ pub(super) fn web_base_path() -> String {
 /// The active session cookie name (read AND write must agree, so both
 /// `page_response` and `sid_from_cookie` route through this).
 #[cfg(feature = "server")]
-fn session_cookie_name() -> String {
+fn session_cookie_name() -> crate::server::CookieName {
     cookie_name_for(&web_base_path())
 }
 
@@ -1523,6 +2563,34 @@ fn session_cookie_name() -> String {
 #[cfg(feature = "server")]
 fn cookie_path() -> String {
     cookie_path_for(&web_base_path())
+}
+
+/// The session cookie line: `Path` is the app's base, `HttpOnly`, `Max-Age` is
+/// the store `ttl`. `Secure` when cookies are secure or this request arrived over
+/// TLS at a trusted proxy; `SameSite=None` (always `Secure`) when the app may be
+/// framed cross-origin, else `Lax`.
+#[cfg(feature = "server")]
+fn session_set_cookie(
+    sid: &str,
+    headers: &axum::http::HeaderMap,
+    ttl: std::time::Duration,
+) -> crate::server::SetCookie {
+    use crate::server::{CookieAttributes, CookiePath, CookieValue, SameSite, SetCookie};
+    SetCookie::new(
+        &session_cookie_name(),
+        &CookieValue::encode(sid),
+        CookieAttributes {
+            path: CookiePath::encode(&cookie_path()),
+            http_only: true,
+            same_site: if csrf::frame_ancestors().is_some() {
+                SameSite::None
+            } else {
+                SameSite::Lax
+            },
+            secure: csrf::cookies_secure() || request_is_https(headers),
+            max_age_secs: Some(ttl.as_secs()),
+        },
+    )
 }
 
 /// Whether to trust `X-Forwarded-Proto` for TLS-termination detection. Mirrors
@@ -1577,20 +2645,26 @@ fn request_is_https(headers: &axum::http::HeaderMap) -> bool {
 fn page_response(
     sid: &str,
     body: &str,
+    epoch: &RenderEpoch,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let html = render_page_full(sid, &web_base_path(), body, csrf_token);
-    // Session cookie carries `Secure` in production / frame-ancestors mode, OR
+    let Ok(base) = web_mount_base() else {
+        return ttl_unavailable_response();
+    };
+    let Ok(html) = render_page_full(sid, &base, body, epoch, csrf_token) else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
     // when this specific request arrived over TLS at a trusted proxy
     // (`request_is_https`, opt-in via `IPE_TRUSTED_PROXY` — closes the gap where
-    // `csrf::cookies_secure()` snapshots `production_from_env() ||
-    // frame_ancestors().is_some()` ONCE at process start and never inspects this
+    // `csrf::cookies_secure()` snapshots the dev intent and
+    // `frame_ancestors().is_some()` ONCE at process start and never inspects this
     // request's TLS / `X-Forwarded-Proto`, so a dev process fronted by a TLS
     // proxy would otherwise emit a non-Secure session cookie even though the
     // browser connection was HTTPS). The untrusted-proxy case (operator hasn't
-    // set `IPE_TRUSTED_PROXY`) keeps ENV-only behaviour — still SOUND, just not
+    // set `IPE_TRUSTED_PROXY`) keeps the process-wide behaviour — still SOUND, just not
     // maximally precise, because it never marks a cookie Secure incorrectly,
     // only potentially fails to mark one Secure that could safely have been.
     //
@@ -1602,55 +2676,28 @@ fn page_response(
     // request-scoped.
     //
     // SameSite=Lax stays so top-level navigations keep the session.
-    let secure = if csrf::cookies_secure() || request_is_https(headers) {
-        "; Secure"
-    } else {
-        ""
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
     };
-    // SameSite: a deploy opted into cross-origin embedding via
-    // IPE_WEB_FRAME_ANCESTORS needs `SameSite=None; Secure` so the
-    // session cookie survives inside a third-party iframe; otherwise `Lax`
-    // (top-level navigations keep the session). `cookies_secure()` is already true
-    // in frame-ancestors mode, so `None` always pairs with `Secure`.
-    let same_site = if csrf::frame_ancestors().is_some() {
-        "None"
-    } else {
-        "Lax"
-    };
-    // Max-Age: persist the cookie for the store TTL so a
-    // tab-close doesn't drop a still-live server session. Without it the cookie is
-    // session-scoped and the user loses state on tab close.
-    let max_age = web_ttl().as_secs();
-    let session_cookie = format!(
-        "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
-        session_cookie_name(),
-        cookie_path()
-    );
+    let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
-    let mut resp = (
+    let resp = (
         axum::http::StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/html; charset=utf-8".to_string(),
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".to_string(),
+            ),
+            // The epoch of the served render, read by client navigation.
+            (
+                axum::http::HeaderName::from_static("x-ipe-epoch"),
+                epoch.to_token(),
+            ),
+        ],
         html,
     )
         .into_response();
-    let h = resp.headers_mut();
-    // Two Set-Cookie headers — `append`, not `insert`, so both land.
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    if let Ok(v) = axum::http::HeaderValue::from_str(&csrf_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    // Security response headers — page GET only.
-    for (name, val) in csrf::security_headers() {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&val) {
-            h.insert(axum::http::HeaderName::from_static(name), v);
-        }
-    }
-    resp
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
 }
 
 /// Same as [`page_response`] but injects `overlay` (raw HTML) after `#ipe-root`
@@ -1659,51 +2706,166 @@ fn page_response(
 fn page_response_with_overlay(
     sid: &str,
     body: &str,
+    epoch: &RenderEpoch,
     overlay: &str,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let html = render_page_full_with_overlay(sid, &web_base_path(), body, csrf_token, overlay);
-    let secure = if csrf::cookies_secure() || request_is_https(headers) {
-        "; Secure"
-    } else {
-        ""
+    let Ok(base) = web_mount_base() else {
+        return ttl_unavailable_response();
     };
-    let same_site = if csrf::frame_ancestors().is_some() {
-        "None"
-    } else {
-        "Lax"
+    let Ok(html) = render_page_full_with_overlay(sid, &base, body, epoch, csrf_token, overlay)
+    else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let max_age = web_ttl().as_secs();
-    let session_cookie = format!(
-        "{}={sid}; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={max_age}",
-        session_cookie_name(),
-        cookie_path()
-    );
+    let Ok(ttl) = web_ttl() else {
+        return ttl_unavailable_response();
+    };
+    let session_cookie = session_set_cookie(sid, headers, ttl);
     let csrf_cookie = csrf::csrf_set_cookie(csrf_token, &web_base_path());
-    let mut resp = (
+    let resp = (
         axum::http::StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/html; charset=utf-8".to_string(),
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::HeaderName::from_static("x-ipe-epoch"),
+                epoch.to_token(),
+            ),
+        ],
         html,
     )
         .into_response();
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
+}
+
+/// `resp` with one `Set-Cookie` header per line of `cookies`, then the page
+/// security headers.
+///
+/// A cookie line or a security header with no header representation answers
+/// `500`: a page never ships without the session or CSRF cookie it was built
+/// with, nor without its framing policy.
+#[cfg(feature = "server")]
+fn with_page_headers(
+    resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+) -> axum::response::Response {
+    with_page_headers_checked(resp, cookies, csrf::security_headers())
+}
+
+/// [`with_page_headers`] over the outcome of reading the security headers: a
+/// refused framing policy answers `500` with no cookie and no header set.
+#[cfg(feature = "server")]
+fn with_page_headers_checked(
+    resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+    security: Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(security) = security else {
+        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    with_page_headers_from(resp, cookies, security)
+}
+
+/// [`with_page_headers`] over an explicit security-header set.
+#[cfg(feature = "server")]
+fn with_page_headers_from(
+    mut resp: axum::response::Response,
+    cookies: &[&crate::server::SetCookie],
+    security: Vec<(&'static str, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let h = resp.headers_mut();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&session_cookie) {
+    // One header per cookie — `append`, not `insert`, so every line lands.
+    for cookie in cookies {
+        let Some(v) = cookie.header_value() else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
         h.append(axum::http::header::SET_COOKIE, v);
     }
-    if let Ok(v) = axum::http::HeaderValue::from_str(&csrf_cookie) {
-        h.append(axum::http::header::SET_COOKIE, v);
-    }
-    for (name, val) in csrf::security_headers() {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&val) {
-            h.insert(axum::http::HeaderName::from_static(name), v);
-        }
+    for (name, val) in security {
+        let Ok(v) = axum::http::HeaderValue::from_str(&val) else {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        h.insert(axum::http::HeaderName::from_static(name), v);
     }
     resp
+}
+
+#[cfg(test)]
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+mod page_headers_tests {
+    use super::{with_page_headers_checked, with_page_headers_from};
+    use crate::server::SetCookie;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    fn ok() -> axum::response::Response {
+        StatusCode::OK.into_response()
+    }
+
+    fn framing() -> Vec<(&'static str, String)> {
+        vec![("x-frame-options", "SAMEORIGIN".to_owned())]
+    }
+
+    /// Every cookie line lands as its own header, next to the security headers.
+    #[test]
+    fn page_headers_append_every_cookie_line() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let csrf = SetCookie::unchecked_for_test("__ipe_csrf=b; Path=/");
+        let resp = with_page_headers_from(ok(), &[&session, &csrf], framing());
+        assert_eq!(resp.status(), StatusCode::OK);
+        let lines: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(lines, ["ipe_sid=a; Path=/", "__ipe_csrf=b; Path=/"]);
+        assert!(resp.headers().get("x-frame-options").is_some());
+    }
+
+    /// A cookie line with no header representation answers 500: the page is
+    /// never sent without its session cookie.
+    #[test]
+    fn page_headers_refuse_an_unrepresentable_cookie_line() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a\r\nX-Injected: 1");
+        let csrf = SetCookie::unchecked_for_test("__ipe_csrf=b; Path=/");
+        let resp = with_page_headers_from(ok(), &[&session, &csrf], framing());
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-injected").is_none());
+    }
+
+    /// A security header with no header representation answers 500: the page
+    /// is never sent without its framing policy.
+    #[test]
+    fn page_headers_refuse_an_unrepresentable_security_header() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let csp = vec![(
+            "content-security-policy",
+            "frame-ancestors https://a.example\r\nX-Injected: 1".to_owned(),
+        )];
+        let resp = with_page_headers_from(ok(), &[&session], csp);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get("content-security-policy").is_none());
+    }
+
+    /// A refused `IPE_WEB_FRAME_ANCESTORS` answers 500: the page ships neither
+    /// its cookies nor a header set missing the framing policy.
+    #[test]
+    fn page_headers_refuse_a_refused_framing_policy() {
+        let session = SetCookie::unchecked_for_test("ipe_sid=a; Path=/");
+        let resp = with_page_headers_checked(
+            ok(),
+            &[&session],
+            Err(crate::telemetry::FrameAncestorsRefusal::Blank),
+        );
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        assert!(resp.headers().get("x-frame-options").is_none());
+        let framed = with_page_headers_checked(ok(), &[&session], Ok(framing()));
+        assert_eq!(framed.status(), StatusCode::OK);
+    }
 }
 
 /// Maximum request body bytes for `/_ipe/event`: `IPE_WEB_MAX_BODY_BYTES`,
@@ -1741,62 +2903,46 @@ mod web_max_body_bytes_tests {
     }
 }
 
+/// The session idle-TTL the environment may set: `IPE_WEB_TTL`, whole seconds
+/// or `h` / `m` / `s` segments (`30m`, `1h30m`), at most 400 days.
+#[cfg(feature = "server")]
+const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
+    "IPE_WEB_TTL",
+    1800,
+    "duration (whole seconds, or h/m/s segments such as 30m or 1h30m)",
+)
+.at_most(400 * 24 * 60 * 60);
+
 /// Session idle-TTL under the one config precedence `env > setting-in-code >
 /// fallback`: `IPE_WEB_TTL` wins, else an installed `Web.sessionTtl` setting,
 /// else the default 1800 (30 min).
+///
+/// # Errors
+///
+/// A refusal naming `IPE_WEB_TTL` when it is present but not a positive
+/// duration within the bound, or naming `Web.sessionTtl` when that setting is
+/// not; a present value is never replaced by a default.
 #[cfg(feature = "server")]
-fn web_ttl() -> std::time::Duration {
-    let secs = crate::system::read_env_var("IPE_WEB_TTL")
-        .ok()
-        .and_then(|s| parse_duration_secs(&s))
-        .or_else(crate::app_config::resolve_session_ttl_override)
-        .unwrap_or(1800u64);
-    std::time::Duration::from_secs(secs)
+fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
+    let raw = WEB_TTL.lookup();
+    if matches!(raw, Err(std::env::VarError::NotPresent))
+        && let Some(secs) = crate::app_config::resolve_session_ttl_override(WEB_TTL)?
+    {
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    WEB_TTL.parse(raw).map(std::time::Duration::from_secs)
 }
 
-/// Parse a duration string: a bare integer is seconds (legacy), otherwise one
-/// or more `<number><unit>` segments with units `h` / `m` / `s`
-/// (e.g. `30m`, `1h`, `24h`, `90s`, `1h30m`). Total: any malformed input
-/// returns `None` (caller falls back to the default) — never panics.
+/// The `503` a request answers when the session TTL or the mount base cannot
+/// be resolved.
 #[cfg(feature = "server")]
-fn parse_duration_secs(raw: &str) -> Option<u64> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // Bare integer → seconds (legacy form).
-    if let Ok(n) = s.parse::<u64>() {
-        return Some(n);
-    }
-    let mut total: u64 = 0;
-    let mut num: u64 = 0;
-    let mut saw_unit = false;
-    let mut saw_digit = false;
-    for ch in s.chars() {
-        if let Some(d) = ch.to_digit(10) {
-            num = num.checked_mul(10)?.checked_add(d as u64)?;
-            saw_digit = true;
-        } else {
-            let unit_secs = match ch {
-                'h' => 3600,
-                'm' => 60,
-                's' => 1,
-                _ => return None, // unknown unit / stray char → malformed
-            };
-            if !saw_digit {
-                return None; // a unit with no preceding number
-            }
-            total = total.checked_add(num.checked_mul(unit_secs)?)?;
-            num = 0;
-            saw_digit = false;
-            saw_unit = true;
-        }
-    }
-    // A trailing number with no unit (e.g. `1h30`) is malformed.
-    if saw_digit || !saw_unit {
-        return None;
-    }
-    Some(total)
+fn ttl_unavailable_response() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        FAIL_CLOSED_BODY,
+    )
+        .into_response()
 }
 
 /// Graceful-drain grace window: how long the pure axum graceful drain is allowed
@@ -1809,7 +2955,7 @@ fn parse_duration_secs(raw: &str) -> Option<u64> {
 /// When `true`, the web request handler skips the session-checkpoint lookup
 /// (`get_reconstructing`) and forces every returning session to a fresh `init`,
 /// bypassing the additive-splice algorithm entirely. This is the escape hatch
-/// for `ipe watch --reset-state`: the watch process sets the flag in the child's
+/// for `ipe dev watch --reset-state`: the watch process sets the flag in the child's
 /// env for the lifetime of that binary. Dev-only; a release binary is never
 /// launched with this flag by the CLI.
 ///
@@ -1844,25 +2990,61 @@ fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefu
 }
 
 /// Best-effort bounded flush of all active telemetry exporters (push + hub).
-/// Waits at most 500 ms in total. Never panics, never blocks shutdown beyond
-/// the cap. This MUST be called before every `process::exit` because
-/// `process::exit` skips Drop, so the mpsc Sender never drops and the
-/// batchers' channel-close drain path never runs without this explicit flush.
 ///
-/// No-op when `http_client` is absent: the push/hub exporters make outbound
-/// HTTP calls and are gated behind that feature; a web app with no outbound
-/// HTTP kernel has no exporters to flush.
-#[cfg(all(feature = "server", feature = "http_client"))]
+/// The two flushes run concurrently, each bounded by its exporter's flush
+/// deadline (its connect timeout plus one send budget), so shutdown waits at
+/// most the larger deadline, never their sum, and never past
+/// `push_exporter::FLUSH_DEADLINE_CEILING_MS`. Never panics. `process::exit`
+/// skips Drop, so the mpsc Sender never drops and the batchers'
+/// channel-close drain path never runs without this explicit flush; every
+/// process exit reaches it through `system::exit_process`
+/// (`flush_exporters_before_exit`).
+///
+/// No-op unless both `web` and `http_client` are on: the push/hub exporters
+/// make outbound HTTP calls and are gated behind both features; a server with
+/// no outbound HTTP kernel has no exporters to flush.
+#[cfg(all(feature = "web", feature = "http_client"))]
 async fn flush_exporters() {
-    // 500 ms total cap (split across two exporters in sequence — each is capped
-    // independently so a slow/unavailable first target doesn't eat all of the
-    // second exporter's budget).
-    const CAP_MS: u64 = 250;
-    push_exporter::flush_now(CAP_MS).await;
-    hub_exporter::flush_now(CAP_MS).await;
+    tokio::join!(push_exporter::flush_now(), hub_exporter::flush_now());
 }
-#[cfg(all(feature = "server", not(feature = "http_client")))]
+#[cfg(all(feature = "server", not(all(feature = "web", feature = "http_client"))))]
 async fn flush_exporters() {}
+
+/// Runs `flush_exporters` to completion from synchronous code, bounded by `push_exporter::EXIT_FLUSH_BOUND`.
+///
+/// The pre-exit stage of `system::exit_process`, callable from any thread: a
+/// runtime worker, the entry's `block_on` thread, or a thread outside any
+/// runtime. The flush runs on a fresh thread through the exporters' own
+/// runtime handle (`Handle::block_on` from a thread with no runtime context, so
+/// no runtime is nested inside another), and the caller waits for it at most
+/// the bound. On a multi-thread runtime worker the wait goes through
+/// `block_in_place`, which hands the worker's queued tasks, the batchers among
+/// them, to another thread first. No-op when no exporter was enabled or the
+/// flush thread cannot start. Never panics.
+#[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
+pub(crate) fn flush_exporters_before_exit() {
+    let Some(handle) = push_exporter::exporter_runtime() else {
+        return;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let flush = crate::threads::spawn_named("ipe-exit-flush", move || {
+        handle.block_on(flush_exporters());
+        let _ = done_tx.send(());
+    });
+    if flush.is_err() {
+        return;
+    }
+    let wait = || {
+        let _ = done_rx.recv_timeout(push_exporter::EXIT_FLUSH_BOUND);
+    };
+    let on_multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if on_multi_thread {
+        tokio::task::block_in_place(wait);
+    } else {
+        wait();
+    }
+}
 
 /// Push a bounded `event: reload` frame to every session THIS PROCESS is
 /// currently serving over SSE, so a connected browser skips its own
@@ -1934,51 +3116,49 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         // A hot-swap NEVER runs `update`, so the Model is carried through
         // unchanged — this feeds the render its current input, it does not
         // advance the app's state.
-        let model = {
-            handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .model
-                .clone()
+        let (model, scope) = {
+            let e = handle.lock().unwrap_or_else(|e| e.into_inner());
+            (e.model.clone(), e.liveness.scope.clone())
         };
-        let mut tree = view(model);
+        // A session whose credentials no longer stand renders nothing more.
+        if recheck_scope(&scope, None) == Standing::Revoked {
+            close_session(store, scope.sid(), Some(&handle)).await;
+            continue;
+        }
+        let mut tree = pubsub::with_session(&scope, || view(model));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
 
         // Commit + diff under the entry lock, mirroring the driver's commit
-        // block: diff against last_view, then advance last_view/index/seq so the
-        // client's monotonic seq gate accepts the frame and the next real Msg
-        // diffs against this rendered view. The Model is deliberately left as-is.
-        let (patches, seq, sse) = {
+        // block: diff against the last view, then commit it under a new epoch
+        // and advance seq so the client's monotonic seq gate accepts the frame
+        // and the next real Msg diffs against this rendered view. The Model is
+        // deliberately left as-is.
+        let committed = {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(&e.last_view, &tree);
-            // Index first (borrow), then move the tree into last_view — its
-            // only remaining use — instead of a deep VDOM clone.
-            e.index = build_index(&tree);
-            e.last_view = tree;
-            e.seq += 1;
-            (patches, e.seq, e.sse_tx.clone())
-        };
-        if !patches.is_empty()
-            && let Some(sse) = sse
-        {
-            let env = PatchEnvelope {
-                global_seq: seq,
-                patches: &patches,
-            };
-            if let Ok(json) = serde_json::to_string(&env) {
-                let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
+            let patches = diff(e.rendered.last_view(), &tree);
+            match e.rendered.commit(tree) {
+                Ok(step) => {
+                    e.seq += 1;
+                    Some((patches, step, e.seq, e.sse_tx.clone()))
+                }
+                // The view and its epoch stay as they were; the session's
+                // driver drops the session on its own next commit.
+                Err(EpochExhausted) => None,
             }
+        };
+        if let Some((patches, step, seq, sse)) = committed {
+            send_patches_frame(sse, seq, step, &patches).await;
         }
     }
 }
 
-/// The H23 production gate over [`push_reload_to_web_sessions`]: in
-/// production (`ENV`/`IPE_ENV` set to a non-dev marker) the push path is
-/// UNREACHABLE — same one-`if` shape every other production gate in this
-/// module uses (dev-console mount, metrics auth). Split from
-/// `web_shutdown_signal` so the gate itself is unit-testable without
-/// delivering a real signal.
+/// The dev-only gate over [`push_reload_to_web_sessions`], over the process dev intent.
+///
+/// Without a [`DevIntent`](crate::telemetry::DevIntent) (a release build, or a
+/// production posture) the push path is unreachable. Split from
+/// `web_shutdown_signal` so the gate is unit-testable without delivering a
+/// real signal.
 #[cfg(feature = "server")]
 async fn maybe_push_reload_to_web_sessions<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
@@ -1986,7 +3166,20 @@ async fn maybe_push_reload_to_web_sessions<Model, Msg>(
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    if !crate::telemetry::production_from_env() {
+    let dev = crate::telemetry::dev_intent_from_env();
+    maybe_push_reload_with(store, dev.as_ref()).await;
+}
+
+/// [`maybe_push_reload_to_web_sessions`] under an explicit dev-intent proof.
+#[cfg(feature = "server")]
+async fn maybe_push_reload_with<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    dev: Option<&crate::telemetry::DevIntent>,
+) where
+    Model: Send + 'static,
+    Msg: Send + 'static,
+{
+    if dev.is_some() {
         push_reload_to_web_sessions(store).await;
     }
 }
@@ -2034,17 +3227,16 @@ async fn web_shutdown_signal<Model, Msg>(
     // (`kill_on_drop`) never runs on `process::exit`, so this explicit
     // `start_kill` is what prevents an orphan console child after a clean exit.
     // Absent when `http_client` is not active: the console proxy uses reqwest.
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     console_proxy::shutdown_console();
 
     // Telemetry export pipelines (push/hub exporters) flush every ~2 s on a
     // tick. The channel-close drain ONLY runs when the mpsc Sender is dropped,
-    // which requires Drop — and `process::exit` skips Drop entirely. Without an
-    // explicit pre-exit flush the grace-timer and watchdog paths below would
-    // silently lose ≤1 batch-interval (~2 s default) of buffered telemetry.
-    // `flush_exporters` sends a Flush sentinel to each active exporter and waits
-    // a bounded 500 ms; it is best-effort (telemetry only, never user data) and
-    // never hangs shutdown.
+    // which requires Drop — and `process::exit` skips Drop entirely. The
+    // grace-timer and watchdog paths below end through `system::exit_process`,
+    // whose pre-exit stage sends a Flush sentinel to each active exporter and
+    // waits at most the larger exporter flush deadline; it is best-effort
+    // (telemetry only, never user data) and never hangs shutdown.
 
     // Grace timer: force a CLEAN exit-0 after the window so a never-idle SSE
     // connection can't hang the drain. Spawned (not awaited) so we still return
@@ -2055,11 +3247,10 @@ async fn web_shutdown_signal<Model, Msg>(
         tokio::time::sleep(grace).await;
         // Defense-in-depth: kill the console child again in case it was spawned
         // after the first teardown call (shutdown_console is idempotent).
-        #[cfg(feature = "http_client")]
+        #[cfg(all(feature = "web", feature = "http_client"))]
         console_proxy::shutdown_console();
-        flush_exporters().await;
-        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — Ipe.Web server shutdown boundary: the grace timer won the drain race, exit zero [ledger #boundary]
-        std::process::exit(0);
+        // The exit funnel flushes the exporters before the process ends.
+        crate::system::exit_process(0);
     });
 
     // Second press: a watchdog that force-exits 130 if the user hits Ctrl-C
@@ -2067,11 +3258,10 @@ async fn web_shutdown_signal<Model, Msg>(
     tokio::spawn(async {
         wait_for_term_or_int().await;
         crate::system::write_stderr_line("Ipe.Web: forcing exit (second signal)");
-        #[cfg(feature = "http_client")]
+        #[cfg(all(feature = "web", feature = "http_client"))]
         console_proxy::shutdown_console();
-        flush_exporters().await;
-        // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — Ipe.Web server shutdown boundary: a second interrupt forces exit 130 (128 + SIGINT) [ledger #boundary]
-        std::process::exit(130); // 128 + SIGINT(2)
+        // 128 + SIGINT(2); the exit funnel flushes the exporters first.
+        crate::system::exit_process(130);
     });
     // Return → axum drains in-flight connections → serve future resolves Ok
     // (fast path when nothing long-lived is open; otherwise the grace timer
@@ -2129,7 +3319,7 @@ pub fn web_app<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -2162,16 +3352,24 @@ where
         // A fail-closed store config (e.g. prod `IPE_WEB_STORE=sqlite` in a
         // build with no `db` feature) surfaces as a task error → stderr + exit
         // 1, never a silent downgrade to a different backend.
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
         {
             Ok(s) => s,
-            Err(e) => return IpeResult::Err(e.to_string().into()),
+            Err(e) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::SessionStore(e).into()));
+            }
         };
         let state = WebState {
             store,
@@ -2260,17 +3458,17 @@ where
             // router that answers every path with the fixed 503 body (the
             // operator detail goes to the runtime log) — never a silent downgrade to a different backend and never a mount
             // that quietly serves real sessions on the wrong store.
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2363,17 +3561,17 @@ where
                 routed_resolvers(routes, not_found, set_page, render);
             // A mount has no task-error channel, so an unhonourable store config
             // fails closed as a 503-everywhere router (see `web_embed_router`).
-            let store = match store::choose_store::<Model, Msg>(
-                &store_kind,
-                &store_path,
-                web_ttl(),
-                schema_tag,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+            let ttl = match web_ttl() {
+                Ok(ttl) => ttl,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let store =
+                match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => return fail_closed_router(&StartupRefusal::SessionStore(e)),
+                };
             let state = WebState {
                 store,
                 init: Arc::new(init),
@@ -2570,8 +3768,19 @@ pub(crate) enum StartupRefusal {
         base: String,
         refusal: crate::encoding::DecodeRefusal,
     },
+    /// The base path is outside the mount-base grammar every shell URL uses.
+    MountBase {
+        base: String,
+        refusal: crate::encoding::MountBaseRefusal,
+    },
     /// An environment ceiling the app applies is present but malformed.
     Ceiling(crate::system::EnvCeilingRefusal),
+    /// `IPE_WEB_FRAME_ANCESTORS` has no `frame-ancestors` representation.
+    FrameAncestors(crate::telemetry::FrameAncestorsRefusal),
+    /// `IPE_HTTP_BIND` is present but not an IP address.
+    Bind(crate::system::EnvValueRefusal),
+    /// The auth configuration asks for a session gate the app cannot enforce.
+    Auth(crate::app_config::AuthStartupRefusal),
 }
 
 #[cfg(feature = "server")]
@@ -2579,12 +3788,35 @@ impl std::fmt::Display for StartupRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RouteTable(refusal) => write!(f, "{refusal}"),
-            Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
-            Self::BasePath { base, refusal } => {
-                write!(f, "web base path `{base}` is malformed: {refusal}")
-            }
+            Self::SessionStore(e) => write!(
+                f,
+                "session store misconfigured: {}",
+                crate::system::scrub_log_controls(&e.to_string())
+            ),
+            Self::BasePath { base, refusal } => write!(
+                f,
+                "web base path `{}` is malformed: {refusal}",
+                crate::system::scrub_log_controls(base)
+            ),
+            Self::MountBase { base, refusal } => write!(
+                f,
+                "web base path `{}` is not a mount base: {refusal}",
+                crate::system::scrub_log_controls(base)
+            ),
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
+            Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
+            Self::Bind(refusal) => write!(f, "{refusal}"),
+            Self::Auth(refusal) => write!(f, "{refusal}"),
         }
+    }
+}
+
+/// Every startup refusal is a fault in the app's or the operator's
+/// configuration: typed `InvalidInput`, never the `Unexpected` catch-all.
+#[cfg(feature = "server")]
+impl From<StartupRefusal> for crate::error::IpeError {
+    fn from(cause: StartupRefusal) -> Self {
+        Self::invalid_input(cause.to_string())
     }
 }
 
@@ -2606,6 +3838,31 @@ fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
         base: base.to_string(),
         refusal,
     })
+}
+
+/// Parse the normalised base path into the [`crate::encoding::MountBase`]
+/// every page and widget URL is built from. The empty base is the root.
+///
+/// # Errors
+///
+/// [`StartupRefusal::MountBase`] for a base outside the mount-base grammar.
+#[cfg(feature = "server")]
+fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRefusal> {
+    crate::encoding::MountBase::parse(base).map_err(|refusal| StartupRefusal::MountBase {
+        base: base.to_string(),
+        refusal,
+    })
+}
+
+/// The process's [`crate::encoding::MountBase`], read from `IPE_WEB_BASE_PATH`.
+///
+/// # Errors
+///
+/// [`StartupRefusal::MountBase`] for a base outside the mount-base grammar;
+/// [`build_web_router`] refuses such a base before any request is served.
+#[cfg(feature = "server")]
+fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
+    parse_mount_base(&web_base_path())
 }
 
 /// A router that answers EVERY path with `503 Service Unavailable` and the
@@ -2648,7 +3905,7 @@ pub fn web_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPag
     schema_tag: [u8; 32],
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
     Model: serde::Serialize
@@ -2682,22 +3939,32 @@ where
 {
     Box::pin(async move {
         // A malformed route pattern refuses to start, never a dead route.
-        if let Err(message) = route::refuse_route_table(&routes) {
-            return IpeResult::Err(message.into());
+        if let Err(refusal) = route::check_route_table(&routes) {
+            return IpeResult::Err(E::from_ipe_error(
+                StartupRefusal::RouteTable(refusal).into(),
+            ));
         }
         let (route_entry, param_resolver, route_matched) =
             routed_resolvers(routes, not_found, set_page, render);
         // Fail-closed on an unhonourable store config (see `web_app`).
+        let ttl = match web_ttl() {
+            Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
-            web_ttl(),
+            ttl,
             schema_tag,
         )
         .await
         {
             Ok(s) => s,
-            Err(e) => return IpeResult::Err(e.to_string().into()),
+            Err(e) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::SessionStore(e).into()));
+            }
         };
         let state = WebState {
             store,
@@ -2850,12 +4117,15 @@ fn client_route_path(
     raw: &str,
     base: &route::DecodedPath,
 ) -> Result<Option<route::DecodedPath>, crate::server::RequestRejection> {
-    let path =
-        route::DecodedPath::parse(raw).map_err(|_| crate::server::RequestRejection::BadRequest)?;
-    if !raw.starts_with('/') || raw.contains('?') || raw.contains('#') {
-        return Ok(None);
+    match route::app_path(raw, base) {
+        Ok(path) => Ok(Some(path)),
+        Err(route::PathMiss::Malformed(_)) => Err(crate::server::RequestRejection::BadRequest),
+        Err(
+            route::PathMiss::Unreadable
+            | route::PathMiss::NotBarePath
+            | route::PathMiss::OutsideBase,
+        ) => Ok(None),
     }
-    Ok(path.strip_base(base))
 }
 
 #[cfg(feature = "server")]
@@ -2866,7 +4136,27 @@ mod handlers {
     use axum::response::{IntoResponse, Response};
 
     // ── GET page (root + any path) ────────────────────────────────────
+    /// Serve a page, every response varying on the headers a mint is judged by.
     pub(super) async fn page<Model, Msg, FInit, FUpdate, FView, FSubs>(
+        state: State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+    ) -> Response
+    where
+        Model: Clone + PartialEq + Send + 'static,
+        Msg: Clone + Send + std::fmt::Debug + crate::stringify::IpeStringify + 'static,
+        FInit: Fn(req::WebReq) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+        FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+        FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
+        FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
+    {
+        let mut resp = serve_page(state, method, uri, headers).await;
+        mint_proof::vary_on_mint_inputs(resp.headers_mut());
+        resp
+    }
+
+    async fn serve_page<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
@@ -2889,7 +4179,7 @@ mod handlers {
         // this is the second, independent boundary before any session work.
         // The path is parsed here once; every route resolver below reads it.
         let path = match crate::server::strict_url(&uri) {
-            Ok(url) => url.path,
+            Ok(path) => path,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         let lookup = (st.route_matched)(&path);
@@ -2924,8 +4214,10 @@ mod handlers {
         // Cookie-based session lifecycle:
         //   * Web hit  → reuse the in-process session; its driver enters this
         //                 GET's path and runs the entry Cmd (no new driver).
-        //   * Cold hit  → a persisted model (post-restart / different replica);
+        //   * Restored  → a persisted model (post-restart / different replica);
         //                 hydrate a fresh driver seeded with it (no init).
+        //   * Rebuilt   → a persisted model spliced onto a fresh `init` across an
+        //                 additive Model change; init's Cmd runs, then the entry's.
         //   * miss      → init a new session.
         let cookie_sid = sid_from_cookie(&headers);
         // CSRF double-submit token: reuse the browser's existing well-formed
@@ -2956,35 +4248,94 @@ mod handlers {
         // value from THIS incoming GET request — the exact same `init(req)` the
         // clean-reinit miss path runs — so a reconstructed session's new fields
         // hold precisely what a fresh visit would have produced, with no
-        // synthetic request and no surprising default. It is invoked LAZILY:
+        // synthetic request and no surprising default. It runs under the
+        // cookie's sid (the sid a rebuilt session keeps) and returns init's
+        // whole `(Model, Cmd)` pair: the store hands the Cmd back beside the
+        // rebuilt model, and `enter_session` runs it. It is invoked LAZILY:
         // only on a schema-mismatched cold row, never on a live hit or a
-        // matched-schema restore, so `init` (and any side effect it carries)
-        // never fires on the hot paths. Any non-additive change (removed /
-        // retyped field), corrupt / oversized body, or pre-`v2` row falls back
-        // to the clean re-init the store's flat miss always produced.
-        let make_init = || {
-            let params = (st.param_resolver)(&path);
-            let req = req::web_req(&method, &uri, &headers, params);
-            let (m, _cmd) = (st.init)(req);
-            m
-        };
-        // `IPE_WEB_RESET_STATE=1` (set by `ipe watch --reset-state` in the child
+        // matched-schema restore. Any non-additive change (removed / retyped
+        // field), corrupt / oversized body, or pre-`v2` row falls back to the
+        // clean re-init the store's flat miss always produced.
+        // `IPE_WEB_RESET_STATE=1` (set by `ipe dev watch --reset-state` in the child
         // env) bypasses the checkpoint lookup entirely: every returning session
         // is treated as a miss and falls through to a fresh `init`. The flag is
         // evaluated once per request (cheap env read, cached by the OS) and is
         // fail-closed — any value other than a recognised truthy string leaves
         // the additive algorithm in place.
-        let hit = if reset_state_from_env() {
-            None
-        } else {
-            match cookie_sid.as_ref() {
-                Some(s) => st
-                    .store
-                    .get_reconstructing(s, &make_init)
-                    .await
-                    .map(|h| (s.clone(), h)),
-                None => None,
+        // A cookie that is not a well-formed sid is a miss: it reaches neither
+        // the claim table nor the store. A well-formed one is claimed first,
+        // so at most one request per sid turns a persisted checkpoint into a
+        // live driver; a request behind the claim waits for the holder to
+        // publish the session and then joins it live. A refused claim is the
+        // 503 a busy session or a full process already answers with.
+        let cookie_key = cookie_sid.as_deref().and_then(store::SessionKey::parse);
+        // Subscribed before any credential this request admits (in `init`,
+        // the route entry or the first view), so a revocation landing between
+        // that admission and the driver's start still wakes the driver.
+        let revocation = RevocationWatch::subscribe();
+        // The scope a claimed rejoin's lazy `init` ran in: the credentials it
+        // admitted stay bound to the session the claim publishes. A restored or
+        // rebuilt row always has one once proved; absent, the entry is refused
+        // rather than entered with its bindings dropped.
+        let mut claim_scope = None;
+        let hit = match cookie_key {
+            Some(key) if !reset_state_from_env() => 'rejoin: {
+                // A live session never contends for the claim table: the
+                // claim serialises only the cold-to-live transition.
+                if let Some(handle) = st.store.get(key.as_str()).await {
+                    break 'rejoin Some((key.as_str().to_owned(), store::Rejoin::Live(handle)));
+                }
+                // Once claimed, `get_reconstructing` checks live again first:
+                // the previous holder's publish may have landed while this waited.
+                let claim = match st.store.claim(key).await {
+                    Ok(claim) => claim,
+                    Err(store::ClaimRefusal::InFlight | store::ClaimRefusal::Crowded) => {
+                        return entry_unavailable();
+                    }
+                    Err(store::ClaimRefusal::Saturated) => return at_capacity(),
+                };
+                let sid = claim.key().as_str().to_owned();
+                let scope = pubsub::SessionScope::new(sid.clone());
+                let make_init = || {
+                    pubsub::with_session(&scope, || {
+                        let params = (st.param_resolver)(&path);
+                        let req = req::web_req(&method, &uri, &headers, params);
+                        (st.init)(req)
+                    })
+                };
+                let rejoin = st.store.get_reconstructing(claim, &make_init).await;
+                claim_scope = Some(scope);
+                Some((sid, rejoin))
             }
+            Some(_) | None => None,
+        };
+        // A live session joins only while its credentials re-prove; one whose
+        // credentials no longer stand is closed here and this GET takes the
+        // miss path, minting a fresh sid.
+        let hit = match hit {
+            Some((sid, store::Rejoin::Live(handle))) => {
+                Some(match admit_live(&st.store, &sid, handle).await {
+                    Some(live) => (live.sid, store::Rejoin::Live(live.handle)),
+                    None => (sid, store::Rejoin::Miss),
+                })
+            }
+            other => other,
+        };
+        // A cold row restores only once its persisted credentials re-prove
+        // under the armed gate, together with any `init` bound while
+        // rebuilding it; a refused row is deleted and this GET takes the miss
+        // path, minting a fresh sid.
+        let hit = match hit {
+            Some((
+                sid,
+                rejoin @ (store::Rejoin::Restored { .. } | store::Rejoin::Rebuilt { .. }),
+            )) => {
+                let scope =
+                    claim_scope.get_or_insert_with(|| pubsub::SessionScope::new(sid.clone()));
+                let rejoin = prove_rejoin(&st.store, &sid, rejoin, scope).await;
+                Some((sid, rejoin))
+            }
+            other => other,
         };
 
         //
@@ -2993,12 +4344,21 @@ mod handlers {
         // the handler index from that view, orphaning every handler on the
         // page the browser is still showing — the next event POST (form
         // submit, click, input) would silently resolve to nothing.
-        if !routed && hit.is_some() {
+        let known = match &hit {
+            Some((
+                _,
+                store::Rejoin::Live(_)
+                | store::Rejoin::Restored { .. }
+                | store::Rejoin::Rebuilt { .. },
+            )) => true,
+            Some((_, store::Rejoin::Miss)) | None => false,
+        };
+        if !routed && known {
             return (StatusCode::NOT_FOUND, "404 page not found").into_response();
         }
 
-        let (sid, model, cmd0) = match hit {
-            Some((sid, store::StoreHit::Web(handle))) => {
+        let (owner, scope, slot, model, cmd0) = match hit {
+            Some((sid, store::Rejoin::Live(handle))) => {
                 // sid is carried from the cookie lookup; the "hit but no sid"
                 // state is unrepresentable. The live driver enters the path,
                 // serialised with its `update`s, commits, touches the store and
@@ -3012,7 +4372,7 @@ mod handlers {
                 let Some(reply_rx) = queue_entry(&enter_tx, path.clone(), EnterMode::Load) else {
                     return entry_unavailable();
                 };
-                let Some(EnterReply { body }) = await_entry(reply_rx).await else {
+                let Some(EnterReply { body, epoch }) = await_entry(reply_rx).await else {
                     return entry_unavailable();
                 };
                 #[cfg(feature = "debugger")]
@@ -3027,20 +4387,59 @@ mod handlers {
                         labels.len(),
                         &web_base_path(),
                     );
-                    return page_response_with_overlay(&sid, &body, &overlay, &csrf_tok, &headers);
+                    return page_response_with_overlay(
+                        &sid, &body, &epoch, &overlay, &csrf_tok, &headers,
+                    );
                 }
                 #[cfg(not(feature = "debugger"))]
-                return page_response(&sid, &body, &csrf_tok, &headers);
+                return page_response(&sid, &body, &epoch, &csrf_tok, &headers);
             }
-            Some((sid, store::StoreHit::Cold(m))) => {
+            Some((_, store::Rejoin::Restored { claim, model, .. })) => {
                 // A returning user with a valid sid cookie → not new attack
-                // volume, so NOT rejected; but count its driver so the slot it
-                // gets below is paired (decremented on the driver's exit).
+                // volume, so NOT rejected; but count its driver. The slot is
+                // taken at once, so the count is given back on every exit,
+                // a cancelled request included.
+                let Some(scope) = claim_scope.take() else {
+                    return entry_unavailable();
+                };
                 st.session_count.fetch_add(1, Ordering::SeqCst);
-                let entered = pubsub::with_session_sid(sid.clone(), || (st.route_entry)(m, &path));
-                (sid, entered.model, entered.cmd)
+                let slot = SessionSlot {
+                    count: st.session_count.clone(),
+                };
+                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, &path);
+                (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
-            None => {
+            Some((
+                _,
+                store::Rejoin::Rebuilt {
+                    claim,
+                    model,
+                    init_cmd,
+                    ..
+                },
+            )) => {
+                // Returning user, same slot pairing as `Restored`; the rebuilt
+                // model's `init` Cmd runs first, exactly as on a new session.
+                let Some(scope) = claim_scope.take() else {
+                    return entry_unavailable();
+                };
+                st.session_count.fetch_add(1, Ordering::SeqCst);
+                let slot = SessionSlot {
+                    count: st.session_count.clone(),
+                };
+                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, &path);
+                (SessionOwner::Rejoined(claim), scope, slot, m, c)
+            }
+            Some((_, store::Rejoin::Miss)) | None => {
+                // Only a first-party arrival mints: a cross-site subresource or
+                // frame request is refused before any slot, `init` or cookie.
+                let proof = match mint_proof::MintProof::judge(
+                    &headers,
+                    mint_proof::Embedding::configured(),
+                ) {
+                    Ok(proof) => proof,
+                    Err(why) => return mint_proof::refused(why),
+                };
                 // Admission control (cookieless = brand-new session = the
                 // attack surface). Reserve a slot atomically: fetch_add-then-test
                 // avoids the load-then-add TOCTOU where N concurrent GETs all
@@ -3056,13 +4455,11 @@ mod handlers {
                 let reserved = st.session_count.fetch_add(1, Ordering::SeqCst);
                 if !unlimited && reserved >= cap {
                     st.session_count.fetch_sub(1, Ordering::SeqCst);
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        [(axum::http::header::RETRY_AFTER, "2")],
-                        "server at session capacity",
-                    )
-                        .into_response();
+                    return at_capacity();
                 }
+                let slot = SessionSlot {
+                    count: st.session_count.clone(),
+                };
                 // Build the request context (params from routing — empty when
                 // unrouted) and init a fresh model. The param_resolver is
                 // model-independent, breaking the init↔routing cycle.
@@ -3072,21 +4469,26 @@ mod handlers {
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
                 // Minted first so `init` and the entry run under it.
-                let s = new_sid();
-                let (m, c) = pubsub::with_session_sid(s.clone(), || {
-                    let (m, init_cmd) = (st.init)(req);
-                    let entered = (st.route_entry)(m, &path);
-                    (entered.model, IpeCmd::Batch(vec![init_cmd, entered.cmd]))
-                });
-                (s, m, c)
+                let scope = pubsub::SessionScope::new(minted_sid(proof));
+                let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
+                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, &path);
+                (
+                    SessionOwner::Minted(scope.sid().to_owned()),
+                    scope,
+                    slot,
+                    m,
+                    c,
+                )
             }
         };
+        let sid = owner.sid().to_owned();
 
-        let mut tree = (st.view)(model.clone());
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model.clone()));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let index = build_index(&tree);
         let body = render_html(&tree);
+        let rendered = Rendered::first(new_incarnation(), tree);
+        let epoch = rendered.epoch();
 
         // Bounded per-session Msg queue: cap at 1024 to prevent a fast
         // client from growing the queue without bound (per-session memory DoS).
@@ -3099,8 +4501,8 @@ mod handlers {
             crate::debugger::RecordBuffer::new(model.clone(), crate::debugger::DEFAULT_HISTORY_CAP);
         let entry = Arc::new(Mutex::new(SessionEntry {
             model,
-            last_view: tree,
-            index,
+            rendered,
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx: msg_tx.clone(),
@@ -3110,43 +4512,62 @@ mod handlers {
             history: history_init,
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: SessionLiveness::new(scope.clone()),
         }));
-        st.store.set(&sid, entry.clone()).await;
 
-        // The admission slot for this driver (reserved by the Cold/None arm
-        // above); its Drop decrements session_count when the driver exits.
-        let slot = SessionSlot {
-            count: st.session_count.clone(),
-        };
-        // Spawn the per-session driver with a WEAK entry ref (the store +
-        // any SSE connection are the strong holders) so the driver is mortal:
-        // it exits once the session is evicted and unconnected, releasing the
-        // slot. The local strong `entry` drops at this handler's return,
-        // leaving the store (+ future SSE) as the only strong holders.
-        tokio::spawn(drive_session(
-            Arc::downgrade(&entry),
-            msg_rx,
-            msg_tx.clone(),
-            enter_rx,
-            st.update.clone(),
-            st.view.clone(),
-            st.subs.clone(),
-            st.route_entry.clone(),
-            st.store.clone(),
-            sid.clone(),
-            slot,
-        ));
-        // Fire the entry Cmd into the loop (batched after init's on a miss).
-        pubsub::with_session_sid(sid.clone(), || run_cmd(cmd0, &msg_tx, &sid));
+        // Publishing the session is one task the request cannot cancel: the
+        // store write, the driver spawn and the seed Cmd all run, and only
+        // then is the claim released, so the next request for the sid finds
+        // the live session. The driver holds a WEAK entry ref (the store +
+        // any SSE connection are the strong holders) so it is mortal: it
+        // exits once the session is evicted and unconnected, releasing
+        // `slot`, which decrements `session_count`.
+        let store = st.store.clone();
+        let update = st.update.clone();
+        let view = st.view.clone();
+        let subs = st.subs.clone();
+        let route_entry = st.route_entry.clone();
+        let commit = tokio::spawn(async move {
+            let sid = owner.sid();
+            store.set(sid, entry.clone()).await;
+            tokio::spawn(drive_session(
+                Arc::downgrade(&entry),
+                msg_rx,
+                msg_tx.clone(),
+                enter_rx,
+                update,
+                view,
+                subs,
+                route_entry,
+                store.clone(),
+                scope.clone(),
+                revocation,
+                slot,
+            ));
+            // Fire the entry Cmd into the loop (batched after init's on a miss).
+            pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope));
+            drop(owner);
+        });
+        if let Err(failed) = commit.await {
+            return match failed.try_into_panic() {
+                Ok(payload) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    crate::core::panic_500_body(&*payload),
+                )
+                    .into_response(),
+                Err(_) => entry_unavailable(),
+            };
+        }
 
         #[cfg(feature = "debugger")]
         {
             let base = web_base_path();
             let overlay = crate::debugger::server::overlay_html(&[], 0, &base);
-            page_response_with_overlay(&sid, &body, &overlay, &csrf_tok, &headers)
+            page_response_with_overlay(&sid, &body, &epoch, &overlay, &csrf_tok, &headers)
         }
         #[cfg(not(feature = "debugger"))]
-        page_response(&sid, &body, &csrf_tok, &headers)
+        page_response(&sid, &body, &epoch, &csrf_tok, &headers)
     }
 
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
@@ -3180,27 +4601,15 @@ mod handlers {
             Ok(route) => route.flatten(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let sid = sid_from_cookie(&headers);
-        let entry = match &sid {
-            Some(s) => match st.store.get(s).await {
-                Some(store::StoreHit::Web(h)) => Some(h),
-                _ => None,
-            },
-            None => None,
-        };
-        let entry = match entry {
-            Some(e) => e,
-            // X-Ipê-Web: 1 lets the client distinguish a genuine session-lost
-            // 404 (reload to recover) from a wedged proxy (client.js probes for
-            // exactly this header — l1481/l1530).
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
+        // X-Ipê-Web: 1 on the session-lost 404 lets the client distinguish a
+        // genuine lost session (reload to recover) from a wedged proxy.
+        let LiveSession {
+            sid,
+            handle: entry,
+            scope: _,
+        } = match live_session(&st.store, &headers).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
 
         // Reconnect reconciliation: the client sends
@@ -3225,9 +4634,13 @@ mod handlers {
         let Ok((tx, rx)) = sse::channel() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
-        {
-            entry.lock().unwrap_or_else(|e| e.into_inner()).sse_tx = Some(tx.clone());
-        }
+        // Attached and subscribed under one lock: a close that lands after
+        // the lookup has already set the closer, so the stream ends at once.
+        let closer = {
+            let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+            e.sse_tx = Some(tx.clone());
+            e.liveness.closer.subscribe()
+        };
 
         // Bind this session's `Ipe.Ffi.Js` outbound port sink to THIS SSE
         // connection: every `js_send` whose origin is this sid is forwarded to
@@ -3240,7 +4653,7 @@ mod handlers {
         // drops the one frame rather than blocking the dispatch loop, the same
         // fire-and-forget contract the port carries client-side.
         #[cfg(all(feature = "json", feature = "tokio"))]
-        if let Some(port_sid) = sid.as_deref().and_then(crate::js_port::SessionId::parse) {
+        if let Some(port_sid) = crate::js_port::SessionId::parse(&sid) {
             let port_tx = tx.clone();
             crate::js_port::register_out_sink_for(
                 &port_sid,
@@ -3262,12 +4675,11 @@ mod handlers {
         let _ = tx
             .send(SsePatch(format!(": {}\n\n", " ".repeat(2048))))
             .await;
-        // Hello payload: `{"v":1,"sid":...,"ts":<ms>}`.
-        // Reaching here means `entry` exists ⇒ the cookie sid was a live session,
-        // so `sid` is Some; the impossible None degrades to an empty sid (the
-        // client already holds its sid via window.__IPE_SID — the body is
-        // confirmatory). The sid is hex (new_sid) ⇒ JSON-safe without escaping.
-        let hello_sid = sid.as_deref().unwrap_or("");
+        // Hello payload: `{"v":1,"sid":...,"ts":<ms>}`. The sid is the live
+        // session's (the client already holds it via window.__IPE_SID — the
+        // body is confirmatory). A live session is stored only under a minted
+        // or `SessionKey`-parsed hex sid ⇒ JSON-safe without escaping.
+        let hello_sid = sid.as_str();
         let hello_ts = chrono::Utc::now().timestamp_millis();
         let _ = tx
             .send(SsePatch(sse::frame(
@@ -3281,7 +4693,7 @@ mod handlers {
         // SSE open with a lightweight `swapped` frame. The client shows the
         // brief positive "updated ✓" toast only when it is a RECONNECT (it
         // already saw a prior `hello` this page-life), so a first page load is
-        // silent. A release / `ipe run` server never sets the env, so this
+        // silent. A release / `ipe dev run` server never sets the env, so this
         // frame is never emitted there.
         if crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
             .ok()
@@ -3293,7 +4705,7 @@ mod handlers {
 
         // Reconnect-resync.
         // A session restored from the store on a cold hit — or any process
-        // restart / `ipe watch` rebuild / redeploy paired with a persistent
+        // restart / `ipe dev watch` rebuild / redeploy paired with a persistent
         // store — has no live subscriptions from the previous process, so
         // nothing pushes until the next user Msg. Render the current view once
         // and ship it as a full-body `event: patch` frame; the client consumes
@@ -3308,14 +4720,21 @@ mod handlers {
         let resync = {
             let mut g = entry.lock().unwrap_or_else(|e| e.into_inner());
             g.seq += 1;
-            let html = render_html(&g.last_view);
-            serde_json::json!({ "seq": g.seq, "body": html }).to_string()
+            // The current render at its current epoch: a resync re-sends the
+            // view, it mints no epoch and changes no handler index.
+            let html = render_html(g.rendered.last_view());
+            serde_json::json!({
+                "seq": g.seq,
+                "epoch": g.rendered.epoch().to_token(),
+                "body": html,
+            })
+            .to_string()
         };
         let _ = tx.send(SsePatch(sse::frame("patch", &resync))).await;
 
         // Replay the latest build-status so a browser refresh during a failed
         // build immediately shows the sticky error banner without waiting for
-        // the next `ipe watch` status POST. A `None` status (no build has run
+        // the next `ipe dev watch` status POST. A `None` status (no build has run
         // yet, or production) sends nothing. Best-effort: a full channel is
         // fine — the next reload or real status event will catch up.
         {
@@ -3334,9 +4753,15 @@ mod handlers {
 
         {
             let tx = tx.clone();
+            let mut closer = closer.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    // A closed session stops its heartbeat: the sender clone
+                    // held here must not outlive the session it keeps alive.
+                    tokio::select! {
+                        () = session_closed(&mut closer) => break,
+                        () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    }
                     if tx
                         .send(SsePatch(sse::frame("heartbeat", "{}")))
                         .await
@@ -3367,13 +4792,20 @@ mod handlers {
         // would exit mid-stream. Holding the strong Arc here keeps it (and its
         // driver) alive exactly as long as the client stays connected; on
         // disconnect axum drops the body → this Arc releases.
+        // The closer ends the stream when the session is closed, although
+        // the driver, Cmd tasks and the heartbeat may still hold senders.
         let body_stream = futures_util::stream::unfold(
-            (rx, SessionGauge, entry),
-            |(mut rx, guard, entry)| async move {
-                rx.recv().await.map(|SsePatch(s)| {
+            (rx, SessionGauge, entry, closer),
+            |(mut rx, guard, entry, mut closer)| async move {
+                let frame = tokio::select! {
+                    biased;
+                    () = session_closed(&mut closer) => None,
+                    frame = rx.recv() => frame,
+                };
+                frame.map(|SsePatch(s)| {
                     (
                         Ok::<_, std::io::Error>(axum::body::Bytes::from(s)),
-                        (rx, guard, entry),
+                        (rx, guard, entry, closer),
                     )
                 })
             },
@@ -3415,36 +4847,16 @@ mod handlers {
         // ANY session by naming it (an auth-bypass that, paired with a
         // guessable sid, was a hijack path). A legitimate browser always has
         // the HttpOnly session cookie by the time an event fires (the page
-        // GET set it). No cookie → no session.
+        // GET set it). No cookie → no session. A session whose credentials
+        // no longer stand is closed by the lookup and answers session-lost.
         let _ = &parsed.session_id; // body field retained for wire-compat; not trusted for auth
-        let sid = match sid_from_cookie(&headers) {
-            Some(s) => s,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
-        };
-        let entry = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => Some(h),
-            _ => None,
-        };
-        let entry = match entry {
-            Some(e) => e,
-            // X-Ipê-Web: 1 lets the client distinguish a genuine session-lost
-            // 404 (reload to recover) from a wedged proxy (client.js probes for
-            // exactly this header — l1481/l1530).
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
+        let LiveSession {
+            handle: entry,
+            scope,
+            ..
+        } = match live_session(&st.store, &headers).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
 
         let hid = if !parsed.handler_id.is_empty() {
@@ -3462,64 +4874,75 @@ mod handlers {
             "click".to_string()
         };
 
-        let (msg, seq) = {
-            let e = entry.lock().unwrap_or_else(|e| e.into_inner());
-            if event == "submit" {
-                // args[0] is the form-data object {name: value, …}.
-                let fd: FormData = parsed
-                    .args
-                    .first()
-                    .and_then(|v| v.as_object())
-                    .map(|o| {
-                        o.iter()
-                            .map(|(k, v)| (k.clone(), value_to_string(v)))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (e.index.resolve_form(&hid, &event, fd), e.seq)
-            } else {
-                let args: Vec<String> = parsed.args.iter().map(value_to_string).collect();
-                (e.index.resolve(&hid, &event, &args), e.seq)
+        let at = parsed
+            .epoch
+            .as_deref()
+            .map_or(Err(EventRefusal::Missing), |token| {
+                RenderEpoch::parse(token).map_err(EventRefusal::Malformed)
+            });
+        let tab = parsed
+            .tab
+            .as_deref()
+            .map(|token| TabId::parse(token).ok_or(EventRefusal::MalformedTab))
+            .transpose();
+
+        // One lock covers resolve, the duplicate check, the enqueue and the
+        // seq record, so two copies of one event cannot both dispatch.
+        let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+        let (at, tab) = match (at, tab) {
+            (Ok(at), Ok(tab)) => (at, tab),
+            (Err(refusal), _) | (Ok(_), Err(refusal)) => {
+                return event_refusal_response(refusal, &e);
             }
         };
-        if let Some(m) = msg {
-            let tx = {
-                entry
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .msg_tx
-                    .clone()
-            };
-            // try_send is non-blocking; on a full queue drop the event and
-            // return 429 so the client can back off (choosing 429 over silent
-            // drop so the browser retry loop fires).
-            if let Err(e) = tx.try_send(m) {
-                crate::system::emit_runtime_log(
-                    "live",
-                    &format!(
-                        "event_handler: session msg queue full or closed; dropping event ({e})"
-                    ),
-                );
-                return (StatusCode::TOO_MANY_REQUESTS, "event queue full").into_response();
-            }
+        let resolved = if event == "submit" {
+            // args[0] is the form-data object {name: value, …}.
+            let fd: FormData = parsed
+                .args
+                .first()
+                .and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), value_to_string(v)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            pubsub::with_session(&scope, || e.rendered.resolve_form(&at, &hid, &event, fd))
+        } else {
+            let args: Vec<String> = parsed.args.iter().map(value_to_string).collect();
+            pubsub::with_session(&scope, || e.rendered.resolve(&at, &hid, &event, &args))
+        };
+        let msg = match resolved {
+            Ok(msg) => msg,
+            Err(why) => return event_refusal_response(EventRefusal::Stale(why), &e),
+        };
+        let replay_key = tab.zip(parsed.seq);
+        if let Some((tab, seq)) = replay_key
+            && e.tabs.is_duplicate(tab, seq)
+        {
+            return event_ack(e.seq, true);
         }
-        // Real patches flow over SSE from the driver; ack with an empty list.
-        // X-Ipê-Web: 1 marks this as a genuine Ipe.Web response (the client
-        // treats a 200 WITHOUT it as a wedged-proxy signal).
-        (
-            StatusCode::OK,
-            [
-                (axum::http::header::CONTENT_TYPE, "application/json"),
-                (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
-            ],
-            format!("{{\"seq\":{seq},\"patches\":[]}}"),
-        )
-            .into_response()
+        // try_send is non-blocking; on a full queue drop the event and return
+        // 429 so the client can back off. The seq is not recorded, so the
+        // client's retry of the same event is not mistaken for a duplicate.
+        if let Some(m) = msg
+            && let Err(err) = e.msg_tx.try_send(m)
+        {
+            crate::system::emit_runtime_log(
+                "live",
+                &format!("event_handler: session msg queue full or closed; dropping event ({err})"),
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, "event queue full").into_response();
+        }
+        if let Some((tab, seq)) = replay_key {
+            e.tabs.record(tab, seq);
+        }
+        event_ack(e.seq, false)
     }
 
     // ── POST /_ipe/hot-appearance (dev-only) ──────────────────────────
     // The running server's inbound leg of the appearance-hot-swap live socket.
-    // The `ipe watch` process (a SEPARATE process from the running app) computes
+    // The `ipe dev watch` process (a SEPARATE process from the running app) computes
     // an appearance-only table patch for an edited `view` and POSTs it here; the
     // handler registers it and re-renders every live session's `view(currentModel)`,
     // pushing the resulting VDOM diff over the existing SSE `patches` channel —
@@ -3585,7 +5008,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-transition (dev-only) ──────────────────────────
     // The running server's inbound leg of the `update`-arm transition-hot-swap
-    // live socket. The `ipe watch` process computes a transition patch for an
+    // live socket. The `ipe dev watch` process computes a transition patch for an
     // edited data-describable arm and POSTs it here; the handler registers the
     // replacement `Transition` under the arm's baked-datum signature, so the next
     // dispatch of that arm applies the edited transition through the SAME compiled
@@ -3663,7 +5086,7 @@ mod handlers {
     // ── POST /_ipe/hot-msg (dev-only) ─────────────────────────────────
     // The running server's inbound leg of the additive-`Msg`-variant hot-swap
     // live socket. When a source edit adds a `Msg` variant (plus its arm and a
-    // button firing it), `ipe watch` computes the edited program's `MsgSet`
+    // button firing it), `ipe dev watch` computes the edited program's `MsgSet`
     // descriptor and POSTs it here alongside the live baked descriptor. The
     // handler accepts it ONLY when it is a proven additive superset of the live
     // set (every live variant present, unchanged), so a returning session's live
@@ -3750,7 +5173,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-subs (dev-only) ────────────────────────────────
     // The running server's inbound leg of the `subscriptions`-entry hot-swap live
-    // socket. The `ipe watch` process computes a sub patch for an edited
+    // socket. The `ipe dev watch` process computes a sub patch for an edited
     // data-describable subscription (an interval or tick-message change) and POSTs
     // it here; the handler registers the replacement `SubDescription` under the
     // entry's baked-datum signature, so the next re-subscribe of that entry builds
@@ -3830,7 +5253,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-init (dev-only) ────────────────────────────────
     // The running server's inbound leg of the session-`init` hot-swap live
-    // socket. The `ipe watch` process computes an init patch for an edited
+    // socket. The `ipe dev watch` process computes an init patch for an edited
     // data-describable `init` and POSTs it here; the handler registers the
     // replacement `InitDatum` under the app's baked-datum signature, so the NEXT
     // NEW session decodes the edited init through the SAME compiled
@@ -3908,7 +5331,7 @@ mod handlers {
 
     // ── POST /_ipe/hot-wiring (dev-only) ──────────────────────────────
     // The running server's inbound leg of the `update`-arm Cmd-WIRING hot-swap
-    // live socket. The `ipe watch` process computes a wiring patch for an edited
+    // live socket. The `ipe dev watch` process computes a wiring patch for an edited
     // arm (which compiled effect it fires) and POSTs it here; the handler
     // registers the replacement `CmdWiring` under the arm's baked-datum signature,
     // so the next dispatch of that arm fires the edited (already-compiled) effect
@@ -3986,12 +5409,12 @@ mod handlers {
     }
 
     // ── POST /_ipe/watch/status (dev-only) ───────────────────────────
-    // Inbound build-status notification from `ipe watch`. Guarded two ways
+    // Inbound build-status notification from `ipe dev watch`. Guarded two ways
     // so it is inert in production:
     //   1. The route is MOUNTED only when the dev banner is active (non-
     //      production + `IPE_WEB_BANNER` not disabled + root-mounted).
     //   2. The `X-Ipe-Hot-Token` header MUST match the per-process token
-    //      set by `ipe watch` (the same mechanism as `/_ipe/hot-appearance`).
+    //      set by `ipe dev watch` (the same mechanism as `/_ipe/hot-appearance`).
     //      A web page cannot obtain this token, so the token alone is the
     //      trust boundary (same model as `/_ipe/hot-appearance`).
     //
@@ -4128,19 +5551,11 @@ mod handlers {
                     .into_response();
             }
         };
-        // The session must exist (a live Web session) for the frame to have a
-        // destination; an unknown sid is the same session-lost 404 the event
-        // path returns.
-        match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(_)) => {}
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    [(axum::http::HeaderName::from_static("x-ipe-web"), "1")],
-                    SESSION_LOST_BODY,
-                )
-                    .into_response();
-            }
+        // The session must be live with its credentials standing for the
+        // frame to have a destination; anything else is the same session-lost
+        // 404 the event path returns.
+        if let Err(lost) = live_session_for(&st.store, &sid).await {
+            return lost.into_response();
         }
         // Fail-closed boundary gate: reject an oversized / malformed /
         // over-nested frame BEFORE delivering it. A rejected frame is dropped
@@ -4166,6 +5581,17 @@ mod handlers {
             "{\"ok\":true}",
         )
             .into_response()
+    }
+
+    /// Install the render a debugger endpoint shows as the session's current
+    /// render, minting its epoch; `None` when no epoch is left to mint.
+    #[cfg(feature = "debugger")]
+    fn commit_debug_render<Model, Msg: Clone>(
+        handle: &store::SessionHandle<Model, Msg>,
+        tree: Html<Msg>,
+    ) -> Option<RenderEpoch> {
+        let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
+        e.rendered.commit(tree).ok().map(|step| step.to)
     }
 
     // ── POST /_ipe/debug/scrub ────────────────────────────────────────
@@ -4199,11 +5625,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let requested_n = body
             .get("index")
@@ -4214,7 +5638,9 @@ mod handlers {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
             let total = e.history.len();
             let n = requested_n.min(total.saturating_sub(1));
-            e.history.reconstruct(n, &|m, mdl| (*st.update)(m, mdl))
+            e.history.reconstruct(n, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            })
         };
         let model = match model_at_n {
             Some(m) => m,
@@ -4222,11 +5648,18 @@ mod handlers {
                 return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
             }
         };
-        let mut tree = (st.view)(model);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
-        let resp_json = serde_json::json!({ "body": html_body });
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
+        let resp_json = serde_json::json!({ "body": html_body, "epoch": epoch.to_token() });
         (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -4266,22 +5699,20 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         // Build a fresh init model from the current request context — the same
         // path the clean-reinit miss takes — so the reset session holds exactly
         // what a cold-start visit would have produced.
         let path = match crate::server::strict_url(&uri) {
-            Ok(url) => url.path,
+            Ok(path) => path,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         let params = (st.param_resolver)(&path);
         let req = req::web_req(&method, &uri, &headers, params);
-        let (init_model, _cmd) = (st.init)(req);
+        let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
         {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
             e.model = init_model.clone();
@@ -4328,11 +5759,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
-            }
+        let LiveSession { handle, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let json_bytes = {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -4399,30 +5828,29 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         // Derive the init model the same way reset_handler does: build a
         // WebReq from the current request context so route-aware apps get the
         // correct initial state.
         let path = match crate::server::strict_url(&uri) {
-            Ok(url) => url.path,
+            Ok(path) => path,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         let params = (st.param_resolver)(&path);
         let req = req::web_req(&method, &uri, &headers, params);
-        let (init_model, _cmd) = (st.init)(req);
+        let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
 
         // Replay the imported log from the init model. Fail-closed: any
         // malformed, oversized, or type-mismatched blob yields None.
         let update = st.update.clone();
+        let replay_scope = scope.clone();
         let imported = crate::debugger::import_msgs::<Msg, Model, _>(
             &body,
             init_model,
-            move |msg, model| (*update)(msg, model),
+            move |msg, model| pubsub::with_session(&replay_scope, || (*update)(msg, model)),
             crate::debugger::DEFAULT_HISTORY_CAP,
         );
 
@@ -4444,7 +5872,7 @@ mod handlers {
             let update = st.update.clone();
             imported_buf
                 .reconstruct(imported_buf.len() - 1, &move |msg, model| {
-                    (*update)(msg, model)
+                    pubsub::with_session(&scope, || (*update)(msg, model))
                 })
                 .unwrap_or_else(|| imported_buf.base().clone())
         };
@@ -4489,11 +5917,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let requested_n = match body.get("index").and_then(|v| v.as_u64()) {
             Some(n) => n as usize,
@@ -4504,9 +5930,9 @@ mod handlers {
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
             let total = e.history.len();
-            let stepped = e
-                .history
-                .step_to(requested_n, &|m, mdl| (*st.update)(m, mdl));
+            let stepped = e.history.step_to(requested_n, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            });
             match stepped {
                 Some(m) => {
                     e.model = m.clone();
@@ -4519,12 +5945,20 @@ mod handlers {
                 }
             }
         };
-        let mut tree = (st.view)(model_at_n);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
         let resp_json = serde_json::json!({
             "body":   html_body,
+            "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
@@ -4561,11 +5995,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -4576,7 +6008,9 @@ mod handlers {
             // Cursor starts at the last retained step when not yet set.
             let current = e.debug_cursor.unwrap_or(len - 1);
             let target = current.saturating_sub(1);
-            match e.history.step_to(target, &|m, mdl| (*st.update)(m, mdl)) {
+            match e.history.step_to(target, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            }) {
                 Some(m) => {
                     e.model = m.clone();
                     e.debug_cursor = Some(target);
@@ -4588,12 +6022,20 @@ mod handlers {
                 }
             }
         };
-        let mut tree = (st.view)(model_at_n);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
         let resp_json = serde_json::json!({
             "body":   html_body,
+            "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
@@ -4634,11 +6076,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
-            }
+        let LiveSession { handle, scope, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -4649,7 +6089,9 @@ mod handlers {
             let current = e.debug_cursor.unwrap_or(len - 1);
             // Clamp: cannot go past the last retained step.
             let target = (current + 1).min(len - 1);
-            match e.history.step_to(target, &|m, mdl| (*st.update)(m, mdl)) {
+            match e.history.step_to(target, &|m, mdl| {
+                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            }) {
                 Some(m) => {
                     e.model = m.clone();
                     e.debug_cursor = Some(target);
@@ -4661,12 +6103,20 @@ mod handlers {
                 }
             }
         };
-        let mut tree = (st.view)(model_at_n);
+        let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
         let html_body = render_html(&tree);
+        // The debugger shows this render, so it becomes the session's current
+        // render under a new epoch: the ids in the DOM it shows resolve against
+        // its own handler index, never the one it replaced.
+        let Some(epoch) = commit_debug_render(&handle, tree) else {
+            st.store.delete(&sid).await;
+            return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
+        };
         let resp_json = serde_json::json!({
             "body":   html_body,
+            "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
@@ -4709,11 +6159,9 @@ mod handlers {
                 return (axum::http::StatusCode::UNAUTHORIZED, "no session").into_response();
             }
         };
-        let handle = match st.store.get(&sid).await {
-            Some(store::StoreHit::Web(h)) => h,
-            _ => {
-                return (axum::http::StatusCode::NOT_FOUND, SESSION_LOST_BODY).into_response();
-            }
+        let LiveSession { handle, .. } = match live_session_for(&st.store, &sid).await {
+            Ok(live) => live,
+            Err(lost) => return lost.into_response(),
         };
         let rendered = {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -4729,9 +6177,17 @@ mod handlers {
     }
 }
 
-/// The documented operator var naming `Ipe.Web`'s listen port.
+/// The address a standalone web app binds, under `IPE_HTTP_BIND` > `Host.bind`
+/// > `127.0.0.1`.
+///
+/// # Errors
+///
+/// [`StartupRefusal::Bind`] when `IPE_HTTP_BIND` is present but not an IP
+/// address.
 #[cfg(feature = "server")]
-const WEB_PORT_ENV: &str = "IPE_WEB_PORT";
+fn web_bind_host() -> Result<crate::app_config::ListenHost, StartupRefusal> {
+    crate::app_config::resolve_host_bind().map_err(StartupRefusal::Bind)
+}
 
 /// Shared server setup for `web_app` / `web_app_routed`: nested HTTP
 /// handlers (`page` / `sse_handler` / `event_handler`), router + bind/serve.
@@ -4741,7 +6197,7 @@ async fn serve_web<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
 ) -> IpeResult<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: crate::FromIpeError + Send + 'static,
     // IpeStringify: required by inspect_handler for the live-datum GET
     // (`/_ipe/debug/inspect`). Generated Model types always satisfy this bound.
     Model: Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
@@ -4787,9 +6243,9 @@ where
     // (IPE_PARENT_URL) and remote-hub OTLP push (IPE_CONSOLE_HUB).
     // Both env-gated + inert by default. Only available when `http_client`
     // is active: these pipelines make outbound HTTP calls via reqwest.
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     push_exporter::enable_from_env().await;
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     hub_exporter::enable_from_env().await;
 
     // Console precedence: try the pre-built console child +
@@ -4801,21 +6257,23 @@ where
     // Only when `http_client` is active: the console proxy uses reqwest for
     // the reverse-proxy path. Without it, always use the in-process console.
     //
-    // The bind host is resolved once, here, and its listen scope installed
-    // before any console gate reads it: the console default opens only for a
-    // dev posture on a loopback listener.
-    let host = crate::app_config::resolve_host_bind();
-    crate::telemetry::ListenScope::install(&host);
-    #[cfg(feature = "http_client")]
+    // The bind host is resolved once, here, and its listen scope recorded
+    // before any console gate reads it: a dev surface exists only while every
+    // app listener is loopback.
+    let host = match web_bind_host() {
+        Ok(host) => crate::server::RecordedHost::record(host),
+        Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
+    };
+    #[cfg(all(feature = "web", feature = "http_client"))]
     let use_console_proxy = console_proxy::ensure_console_proxy().await;
 
     // Cloned for the shutdown path's dev-only reload push — the router's
     // `.with_state(state)` takes ownership of `state` below.
     let shutdown_store = state.store.clone();
 
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     let console_proxy_flag = use_console_proxy;
-    #[cfg(not(feature = "http_client"))]
+    #[cfg(not(all(feature = "web", feature = "http_client")))]
     let console_proxy_flag = false;
 
     let app = match build_web_router::<Model, Msg, FInit, FUpdate, FView, FSubs>(
@@ -4823,47 +6281,63 @@ where
         console_proxy_flag,
     ) {
         Ok(app) => app,
-        Err(cause) => return IpeResult::Err(cause.to_string().into()),
+        Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
     let grace = match shutdown_grace() {
         Ok(grace) => grace,
-        Err(refusal) => return IpeResult::Err(format!("Web.tea: {refusal}").into()),
+        Err(refusal) => {
+            return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                format!("Web.tea: {refusal}"),
+            )));
+        }
     };
 
     // Port precedence (shared with `Ipe.Http.Server`): the supervisor's
-    // relocation var > `IPE_WEB_PORT` (operator) > 8000. A malformed env layer
-    // falls through, never to `0`.
-    let resolved = crate::system::listen_port_from_env(
-        (WEB_PORT_ENV, crate::system::read_env_var(WEB_PORT_ENV).ok()),
-        8000,
-    );
-    let port = resolved.port;
-    // Honour the same host-bind precedence as the Ipe.Http.Server path
-    // (`IPE_HTTP_BIND` > `Host.bind` setting > loopback-unless-production), so
-    // an explicit loopback setting is never overridden into all-interfaces.
-    // `host` is the value resolved above, before the console gates.
-    let addr = format!("{host}:{port}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            return IpeResult::Err(resolved.addr_in_use_message().into());
-        }
-        Err(e) => return IpeResult::Err(format!("Web.tea: bind {addr}: {e}").into()),
+    // relocation var > `IPE_WEB_PORT` (operator) > 8000. A set env layer that
+    // is not a port refuses the listen, naming its variable; no layer can
+    // yield `0`.
+    let default_port = crate::env_registry::web::WEB_DEFAULT_PORT;
+    let Some(source) = crate::system::SourcePort::parse(i64::from(default_port)) else {
+        return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+            format!("Web.tea: port {default_port} is not a TCP port in 1..=65535"),
+        )));
     };
-    // Bind-address line (stderr) — carries the resolved host:port.
-    crate::system::emit_runtime_log("web", &format!("listening on http://{addr}"));
+    let resolved =
+        match crate::system::listen_port_from_env(crate::env_registry::web::WEB_PORT, source) {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                    format!("Web.tea: {refusal}"),
+                )));
+            }
+        };
+    // The same host-bind precedence and bind site as the Ipe.Http.Server path
+    // (`IPE_HTTP_BIND` > `Host.bind` setting > `127.0.0.1`). `host` is the
+    // value resolved and recorded above, before the console gates.
+    let port = resolved.port.get();
+    let addr = host.addr(port);
+    // Logs the bind-address line (stderr), and the exposure warning if any.
+    let listener = match crate::server::bind_app_listener("web", host, port).await {
+        Ok(l) => l,
+        Err(e) => {
+            return IpeResult::Err(E::from_ipe_error(
+                resolved.bind_refusal("Web.tea", addr, &e),
+            ));
+        }
+    };
     // User-facing line on stdout.
     crate::system::write_stdout_line(&format!("Ipe.Web listening on :{port}"));
     // Graceful shutdown: trap SIGINT/SIGTERM,
     // print the shutdown line, drain in-flight requests, and return cleanly so
     // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
     // SECOND signal force-exits 130 via the watchdog inside web_shutdown_signal.
-    match axum::serve(listener, app)
-        .with_graceful_shutdown(web_shutdown_signal(shutdown_store, grace))
-        .await
+    match crate::server::serve_app(listener, app, web_shutdown_signal(shutdown_store, grace)).await
     {
         Ok(()) => ok_res(()),
-        Err(e) => IpeResult::Err(format!("Web.tea: serve: {e}").into()),
+        Err(e) => IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
+            "Web.tea: serve: {}",
+            crate::system::scrub_log_controls(&e.to_string())
+        )))),
     }
 }
 
@@ -4878,7 +6352,11 @@ pub(crate) fn build_web_router<Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
     // Read only when `http_client` is active (the console-proxy arm); the
     // in-process console path ignores it, so it is unused without that feature.
-    #[cfg_attr(not(feature = "http_client"), allow(unused_variables))] use_console_proxy: bool,
+    #[cfg_attr(
+        not(all(feature = "web", feature = "http_client")),
+        allow(unused_variables)
+    )]
+    use_console_proxy: bool,
 ) -> Result<axum::Router, StartupRefusal>
 where
     // IpeStringify: required by inspect_handler for the live-datum GET.
@@ -4908,17 +6386,28 @@ where
     // a malformed base refuses the router rather than a per-request re-parse
     // that silently matches the unstripped path.
     let sse_base = Arc::new(parse_route_base(&web_base_path())?);
+    let mount_base = web_mount_base()?;
     // Every environment ceiling the app applies resolves here, so a malformed
     // one refuses the router instead of a request; the per-request sites
     // re-read and refuse that request on their own.
     let body_limit: usize = WEB_MAX_BODY_CEILING
         .read()
         .map_err(StartupRefusal::Ceiling)?;
+    let session_ttl = web_ttl().map_err(StartupRefusal::Ceiling)?;
+    #[cfg(feature = "jwt")]
+    crate::app_config::auth_ceilings().map_err(StartupRefusal::Ceiling)?;
+    // A requested revocation gate arms every session; a build without the
+    // token verifier could bind nothing to it, so it refuses the router.
+    crate::app_config::refuse_unbound_web_revocation(cfg!(feature = "jwt"))
+        .map_err(StartupRefusal::Auth)?;
     max_sessions().map_err(StartupRefusal::Ceiling)?;
     sse::buffer_capacity().map_err(StartupRefusal::Ceiling)?;
-    if let Err(refusal) = client_tuning_js() {
+    if let Err(refusal) = client_tuning() {
         return Err(StartupRefusal::Ceiling(refusal.clone()));
     }
+    // The framing policy every page carries is parsed here, so a value with no
+    // header representation refuses the router; the page path re-checks it.
+    crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
     let sse_route = get(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
               uri: axum::http::Uri,
@@ -5160,7 +6649,7 @@ where
     // spawned and all `/_ipe/console/*` traffic is forwarded to it via
     // reqwest. The child logs its own `session store: …` + `reverse-proxy
     // ready` lines, so the parent does not duplicate the inline-mount log.
-    #[cfg(feature = "http_client")]
+    #[cfg(all(feature = "web", feature = "http_client"))]
     if use_console_proxy {
         router = console_proxy::proxy_routes(router);
     }
@@ -5172,17 +6661,17 @@ where
     // the proxy is live (`use_console_proxy` true) it owns `/_ipe/console`,
     // so we skip this block to avoid duplicate route registration.
     let proxy_active = {
-        #[cfg(feature = "http_client")]
+        #[cfg(all(feature = "web", feature = "http_client"))]
         {
             use_console_proxy
         }
-        #[cfg(not(feature = "http_client"))]
+        #[cfg(not(all(feature = "web", feature = "http_client")))]
         {
             false
         }
     };
     if !proxy_active && console::gate_allows() {
-        store::emit_memory_store_log(web_ttl());
+        store::emit_memory_store_log(session_ttl);
         crate::system::emit_runtime_log(
             "console",
             &format!(
@@ -5216,19 +6705,26 @@ where
     // the page's SRI pins, so a tampered asset makes the browser refuse the
     // module. A widget-free program registers nothing here (no extra routes).
     if widget_assets::has_widgets() {
-        let base = web_base_path();
+        // The child router is root-relative: a parent proxy strips the base
+        // before forwarding, so routes sit at the root and only the URLs the
+        // page and glue carry are built from `mount_base`.
+        let route_root = crate::encoding::MountBase::root();
         for asset in widget_assets::registered() {
-            let path = widget_assets::widget_asset_path(&asset.content);
+            let path = route_root.url_of(&widget_assets::widget_asset_path(&asset.content));
             let content: &'static str = &asset.content;
             router = router.route(&path, get(move || async move { serve_widget_js(content) }));
         }
-        let glue_path = widget_assets::glue_path(&base, widget_assets::WidgetTransport::Server);
+        let glue_path = route_root.url_of(&widget_assets::glue_path(
+            &mount_base,
+            widget_assets::WidgetTransport::Server,
+        ));
         // The glue body folds in the base-prefixed author URLs, so it is
         // computed once here for the process (base is stable at startup) and
         // leaked to `'static` for the handler — a one-time, bounded allocation
         // sized by the program's widget count, never per-request.
         let glue_body: &'static str = Box::leak(
-            widget_assets::glue_js(&base, widget_assets::WidgetTransport::Server).into_boxed_str(),
+            widget_assets::glue_js(&mount_base, widget_assets::WidgetTransport::Server)
+                .into_boxed_str(),
         );
         router = router.route(
             &glue_path,
@@ -5305,7 +6801,22 @@ where
         .with_state(state);
 
     pubsub::mark_web_running();
+    WEB_SERVING.store(true, std::sync::atomic::Ordering::Release);
     Ok(app)
+}
+
+/// Set once a `Web` router passed its startup checks in this process; never cleared.
+#[cfg(feature = "server")]
+static WEB_SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `Web` app serves in this process.
+///
+/// While it does, an armed `Auth.verifyToken` that no session or request owns
+/// is refused: the credential would bind to nothing a revocation could close.
+#[cfg(feature = "server")]
+#[must_use]
+pub fn web_serving() -> bool {
+    WEB_SERVING.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Read the session cookie from request headers. Uses the base-path-aware
@@ -5313,17 +6824,7 @@ where
 /// never the parent's `ipe_sid`.
 #[cfg(feature = "server")]
 fn sid_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    let name = session_cookie_name();
-    let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    for c in raw.split(';') {
-        let c = c.trim();
-        if let Some((k, v)) = c.split_once('=')
-            && k.trim() == name
-        {
-            return Some(v.trim().to_string());
-        }
-    }
-    None
+    crate::server::request_cookie(headers, &session_cookie_name())
 }
 
 // The Ipe.Html `Ffi.callPure "htmlXxx"` kernel wrappers (html_render_,
@@ -5342,11 +6843,10 @@ mod reload_push_tests {
     fn handle_with(sse_tx: Option<SseTx>) -> SessionHandle<(), ()> {
         let (tx, _rx) = channel::<()>(1);
         let tree: Html<()> = Html::HText(String::new());
-        let index = build_index(&tree);
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            last_view: tree,
-            index,
+            rendered: Rendered::first(new_incarnation(), tree),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
             msg_tx: tx,
@@ -5356,6 +6856,7 @@ mod reload_push_tests {
             history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -5381,44 +6882,39 @@ mod reload_push_tests {
         );
     }
 
-    /// H23: with `ENV=production` the reload push is UNREACHABLE — the
-    /// gated path pushes nothing; in dev it pushes. (The gate is tested via
-    /// `maybe_push_reload_to_web_sessions`, the exact call
-    /// `web_shutdown_signal` makes right after `mark_draining` — split out
-    /// so no real OS signal is needed here.)
+    /// Without a dev intent the reload push is unreachable; with one it
+    /// pushes. The env-driven gate under `ENV=dev` on the release test binary
+    /// pushes nothing. (`maybe_push_reload_to_web_sessions` is the exact call
+    /// `web_shutdown_signal` makes right after `mark_draining`, split out so no
+    /// real OS signal is needed here.)
     #[tokio::test]
-    async fn web_shutdown_signal_skips_the_reload_push_in_production() {
-        use crate::system::{locked_remove_var, locked_set_var};
-        let prior_env = crate::system::read_env_var("ENV").ok();
-        let prior_ipe_env = crate::system::read_env_var("IPE_ENV").ok();
-
+    async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
         store_impl.set("s", handle_with(Some(sse_tx))).await;
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
-        locked_set_var("ENV", "production");
-        maybe_push_reload_to_web_sessions(&store).await;
+        maybe_push_reload_with(&store, None).await;
         assert!(
             sse_rx.try_recv().is_err(),
-            "production must have NO reachable path that pushes the reload frame"
+            "no dev intent: NO reachable path pushes the reload frame"
         );
+        if !cfg!(feature = "dev-posture") {
+            crate::system::locked_set_var("ENV", "dev");
+            maybe_push_reload_to_web_sessions(&store).await;
+            assert!(
+                sse_rx.try_recv().is_err(),
+                "ENV=dev on a release build must not push the reload frame"
+            );
+            crate::system::locked_remove_var("ENV");
+        }
 
-        locked_set_var("ENV", "dev");
-        maybe_push_reload_to_web_sessions(&store).await;
+        let dev = crate::telemetry::test_dev_intent();
+        maybe_push_reload_with(&store, Some(&dev)).await;
         assert!(
             sse_rx.try_recv().is_ok(),
-            "dev mode must push the reload frame"
+            "a dev intent pushes the reload frame"
         );
-
-        match prior_env {
-            Some(v) => locked_set_var("ENV", &v),
-            None => locked_remove_var("ENV"),
-        }
-        match prior_ipe_env {
-            Some(v) => locked_set_var("IPE_ENV", &v),
-            None => locked_remove_var("IPE_ENV"),
-        }
     }
 }
 
@@ -5452,12 +6948,11 @@ mod hot_appearance_push_tests {
         let mut tree = app_view(count);
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let index = build_index(&tree);
         let (msg_tx, _rx) = mpsc::channel::<()>(1);
         Arc::new(Mutex::new(SessionEntry {
             model: count,
-            last_view: tree,
-            index,
+            rendered: Rendered::first(new_incarnation(), tree),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
             msg_tx,
@@ -5470,6 +6965,7 @@ mod hot_appearance_push_tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -5551,14 +7047,65 @@ mod hot_appearance_push_tests {
             let model_after = store
                 .get("live")
                 .await
-                .and_then(|hit| match hit {
-                    store::StoreHit::Web(h) => {
-                        Some(h.lock().unwrap_or_else(|e| e.into_inner()).model)
-                    }
-                    _ => None,
-                })
+                .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).model)
                 .expect("session still present");
             assert_eq!(model_after, 7, "a hot-swap must not advance the Model");
+        });
+    }
+
+    /// An appearance re-render commits like any other render: it mints a new
+    /// epoch, its frame names the epochs it moved between, and the epoch the
+    /// client held stays resolvable in the history.
+    #[test]
+    #[allow(clippy::expect_used)] // the session and the frame are fixtures
+    fn patch_commit_mints_an_epoch_and_keeps_the_previous_one() {
+        with_overlay_serialised(|| async {
+            literal_table::set_dev_overlay_active_for_test(Some(true));
+            literal_table::clear_dev_overlay_for_test();
+
+            let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
+            let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
+            let handle = session_with_current_view(7, Some(sse_tx));
+            let before = handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .epoch();
+            store_impl.set("live", handle.clone()).await;
+            let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
+            let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
+
+            let defaults: Vec<String> = PADDING_DEFAULTS.iter().map(|s| (*s).to_string()).collect();
+            apply_literal_patch_to_web_sessions(
+                &store,
+                &view,
+                &defaults,
+                vec![(0, "padding: 16px".to_string())],
+            )
+            .await;
+
+            let frame = sse_rx
+                .try_recv()
+                .expect("an SSE-attached session must receive a patches frame");
+            let json = parse_patch_frame(&frame.0);
+            let e = handle.lock().unwrap_or_else(|e| e.into_inner());
+            let after = e.rendered.epoch();
+            assert_ne!(after, before, "an appearance commit must mint a new epoch");
+            let from = before.to_token();
+            let to = after.to_token();
+            assert_eq!(
+                json.get("from").and_then(serde_json::Value::as_str),
+                Some(from.as_str())
+            );
+            assert_eq!(
+                json.get("to").and_then(serde_json::Value::as_str),
+                Some(to.as_str())
+            );
+            assert_eq!(
+                e.rendered.resolve(&before, "r", "click", &[]),
+                Ok(None),
+                "the previous epoch stays in the history"
+            );
         });
     }
 
@@ -5602,9 +7149,9 @@ mod dev_banner_tests {
     #[test]
     fn banner_byte_matches_go_dev_banner_markup() {
         // Same id, target/rel/title, monospace blue style, `&#128269;` ENTITY
-        // (not a literal emoji). The banner renders only under a dev posture.
-        crate::system::locked_set_var("ENV", "dev");
-        let b = dev_console_banner("");
+        // (not a literal emoji). The banner renders only under a dev surface.
+        let surface = crate::telemetry::test_dev_surface();
+        let b = crate::telemetry::dev_console_banner_with("", Some(&surface));
         let expected = "<a id=\"__ipe-dev-console\" href=\"/_ipe/console\" target=\"_blank\" \
             rel=\"noopener\" title=\"Ipe Console (dev only)\" \
             style=\"position:fixed;right:12px;bottom:12px;z-index:2147483646;\
@@ -5630,28 +7177,70 @@ mod dev_banner_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod duration_parse_tests {
-    use super::parse_duration_secs;
+    use super::{WEB_TTL, web_ttl};
+    use crate::system::{locked_remove_var, locked_set_var};
+    use std::time::Duration;
 
-    #[test]
-    fn duration_formats_and_bare_seconds() {
-        assert_eq!(parse_duration_secs("1800"), Some(1800)); // bare seconds (legacy)
-        assert_eq!(parse_duration_secs("30m"), Some(1800));
-        assert_eq!(parse_duration_secs("1h"), Some(3600));
-        assert_eq!(parse_duration_secs("24h"), Some(86400));
-        assert_eq!(parse_duration_secs("90s"), Some(90));
-        assert_eq!(parse_duration_secs("1h30m"), Some(5400));
-        assert_eq!(parse_duration_secs("45m"), Some(2700)); // the e2e check (IPE_WEB_TTL=45m)
-        assert_eq!(parse_duration_secs("  1h  "), Some(3600));
+    fn ttl_with(raw: &str) -> Result<Duration, crate::system::EnvCeilingRefusal> {
+        locked_set_var("IPE_WEB_TTL", raw);
+        let resolved = web_ttl();
+        locked_remove_var("IPE_WEB_TTL");
+        resolved
     }
 
     #[test]
-    fn malformed_is_none_never_panics() {
-        assert_eq!(parse_duration_secs(""), None);
-        assert_eq!(parse_duration_secs("abc"), None);
-        assert_eq!(parse_duration_secs("1d"), None); // unsupported unit
-        assert_eq!(parse_duration_secs("1h30"), None); // trailing unit-less number
-        assert_eq!(parse_duration_secs("m"), None); // unit with no number
-        assert_eq!(parse_duration_secs("-5m"), None);
+    fn the_web_ttl_honours_the_duration_contract() {
+        crate::system::assert_env_duration_contract(WEB_TTL);
+    }
+
+    #[test]
+    fn duration_formats_and_bare_seconds() {
+        for (raw, secs) in [
+            ("1800", 1800),
+            ("30m", 1800),
+            ("1h", 3600),
+            ("24h", 86_400),
+            ("90s", 90),
+            ("1h30m", 5400),
+            ("45m", 2700),
+            ("34560000", 34_560_000),
+            ("9600h", 34_560_000),
+        ] {
+            assert_eq!(ttl_with(raw), Ok(Duration::from_secs(secs)), "{raw:?}");
+        }
+        assert_eq!(
+            web_ttl(),
+            Ok(Duration::from_secs(1800)),
+            "absent is the default"
+        );
+    }
+
+    #[test]
+    fn a_malformed_ttl_is_refused_never_defaulted() {
+        for raw in [
+            "",
+            "abc",
+            "1d",
+            "1h30",
+            "m",
+            "-5m",
+            "0",
+            "0s",
+            "0h0m",
+            " 1h",
+            "1h ",
+            "30m1h",
+            "1m1m",
+            "34560001",
+            "9601h",
+            "99999999999999999999",
+        ] {
+            let outcome = ttl_with(raw);
+            assert!(
+                outcome.as_ref().is_err_and(|r| r.name() == "IPE_WEB_TTL"),
+                "{raw:?} must be refused naming IPE_WEB_TTL, got {outcome:?}"
+            );
+        }
     }
 }
 
@@ -5878,7 +7467,8 @@ mod canonical_redirect_handler_tests {
 #[cfg(all(test, feature = "server"))]
 mod base_path_tests {
     use super::{
-        client_js_path, cookie_name_for, cookie_path_for, normalise_base_path, render_page_full,
+        Html, RenderEpoch, Rendered, client_js_path, cookie_name_for, cookie_name_with,
+        cookie_path_for, new_incarnation, normalise_base_path, render_page_full,
     };
 
     #[test]
@@ -5898,12 +7488,31 @@ mod base_path_tests {
 
     #[test]
     fn cookie_name_is_ipe_sid_at_root_distinct_under_base() {
-        // Dev posture: the root cookie keeps its plain-http name.
-        crate::system::locked_set_var("ENV", "dev");
-        assert_eq!(cookie_name_for(""), "ipe_sid");
+        // Plain-http dev: the root cookie keeps its plain name.
+        assert_eq!(cookie_name_with("", false).text(), "ipe_sid");
+        assert_eq!(cookie_name_with("", true).text(), "__Host-ipe_sid");
         // Distinct from the parent's `ipe_sid` so the proxied child can't clobber it.
-        assert_eq!(cookie_name_for("/_ipe/console"), "ipe_sid__ipe_console");
-        assert_ne!(cookie_name_for("/_ipe/console"), "ipe_sid");
+        for secure in [false, true] {
+            assert_eq!(
+                cookie_name_with("/_ipe/console", secure).text(),
+                "ipe_sid__ipe_console"
+            );
+        }
+        assert_eq!(
+            cookie_name_for("/_ipe/console").text(),
+            "ipe_sid__ipe_console"
+        );
+    }
+
+    // A release binary under `ENV=dev` still names its root session cookie
+    // `__Host-`: it is always `Secure`.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn session_cookie_host_prefixed_on_release_under_env_dev() {
+        crate::system::locked_set_var("ENV", "dev");
+        assert!(super::csrf::cookies_secure());
+        assert_eq!(cookie_name_for("").text(), "__Host-ipe_sid");
+        crate::system::locked_remove_var("ENV");
     }
 
     #[test]
@@ -5913,25 +7522,61 @@ mod base_path_tests {
         assert_eq!(cookie_path_for("/_ipe/console"), "/_ipe/console");
     }
 
+    /// The typed session line keeps the exact bytes of the hand-formatted one,
+    /// so an existing browser session cookie is replaced, never duplicated.
     #[test]
-    fn render_page_threads_base_into_meta_and_window_global() {
-        let root = render_page_full("sid1", "", "<b>x</b>", "deadbeef");
-        assert!(root.contains("<meta name=\"ipe-base\" content=\"\">"));
-        assert!(root.contains("window.__IPE_BASE=\"\""));
+    fn session_set_cookie_keeps_the_session_line_bytes() {
+        let headers = axum::http::HeaderMap::new();
+        let ttl = std::time::Duration::from_secs(1800);
+        let secure = if super::csrf::cookies_secure() {
+            "; Secure"
+        } else {
+            ""
+        };
+        let same_site = if super::csrf::frame_ancestors().is_some() {
+            "None"
+        } else {
+            "Lax"
+        };
+        let expected = format!(
+            "{}=0f3a-sid; Path={}; HttpOnly; SameSite={same_site}{secure}; Max-Age={}",
+            super::session_cookie_name(),
+            super::cookie_path(),
+            ttl.as_secs()
+        );
+        assert_eq!(
+            super::session_set_cookie("0f3a-sid", &headers, ttl).as_str(),
+            expected
+        );
+    }
 
-        let sub = render_page_full("sid1", "/_ipe/console", "<b>x</b>", "deadbeef");
+    #[test]
+    fn render_page_threads_base_into_meta_and_boot_block() {
+        let root = page(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            &page_epoch(),
+            "deadbeef",
+        );
+        assert!(root.contains("<meta name=\"ipe-base\" content=\"\">"));
+        assert_eq!(boot_str(&root, "/base").as_deref(), Some(""));
+
+        let sub = page("sid1", &console_base(), &page_epoch(), "deadbeef");
         assert!(sub.contains("<meta name=\"ipe-base\" content=\"/_ipe/console\">"));
-        assert!(sub.contains("window.__IPE_BASE=\"/_ipe/console\""));
+        assert_eq!(boot_str(&sub, "/base").as_deref(), Some("/_ipe/console"));
     }
 
     #[test]
     fn render_page_emits_external_client_script_with_sri() {
-        let root = render_page_full("sid1", "", "<b>x</b>", "tok1");
-        // Per-session values stay inline.
-        assert!(root.contains("window.__IPE_SID=\"sid1\""));
-        assert!(root.contains("window.__IPE_CSRF_TOKEN=\"tok1\""));
+        let epoch = page_epoch();
+        let root = page("sid1", &crate::encoding::MountBase::root(), &epoch, "tok1");
+        // Per-session values ride the boot data block, never a script literal.
+        assert_eq!(boot_str(&root, "/sid").as_deref(), Some("sid1"));
+        assert_eq!(boot_str(&root, "/epoch"), Some(epoch.to_token()));
+        assert_eq!(boot_str(&root, "/csrf").as_deref(), Some("tok1"));
+        assert!(!root.contains("window.__IPE_"), "{root}");
         // CLIENT_JS body must NOT be inlined.
-        assert!(!root.contains("var __ipeSid = window.__IPE_SID"));
+        assert!(!root.contains("var __ipeSid"));
         // External script tag with content-addressed src.
         assert!(root.contains("<script src=\"/_ipe/client."));
         assert!(root.contains(".js\" integrity=\"sha256-"));
@@ -5942,9 +7587,328 @@ mod base_path_tests {
 
     #[test]
     fn render_page_sub_app_prefixes_client_src() {
-        let sub = render_page_full("sid1", "/_ipe/console", "<b>x</b>", "tok1");
+        let sub = page("sid1", &console_base(), &page_epoch(), "tok1");
         // External script src must carry the base prefix.
         assert!(root_or_sub_has_prefixed_client_src(&sub, "/_ipe/console"));
+    }
+
+    /// Every `<script>` the live shell emits is external or an inert JSON block.
+    #[test]
+    fn page_has_no_inline_executable_script() {
+        for base in [crate::encoding::MountBase::root(), console_base()] {
+            let html = page("sid1", &base, &page_epoch(), "tok1");
+            assert_eq!(inline_executable_scripts(&html), Vec::<String>::new());
+            assert_eq!(html.matches("type=\"application/json\"").count(), 1);
+        }
+    }
+
+    /// The debugger shell renders through the same builder: no inline script.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn page_with_overlay_has_no_inline_executable_script() {
+        let html = super::render_page_full_with_overlay(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            "<b>x</b>",
+            &page_epoch(),
+            "tok1",
+            "<div data-ipe-debugger></div>",
+        )
+        .expect("the page builds");
+        assert!(html.contains("<div data-ipe-debugger></div>"));
+        assert_eq!(inline_executable_scripts(&html), Vec::<String>::new());
+        assert_eq!(boot_str(&html, "/sid").as_deref(), Some("sid1"));
+    }
+
+    /// Text that ends a script element, opens a comment, closes a CDATA section
+    /// or terminates a JavaScript line, if it reached the page unescaped.
+    const HOSTILE: &str =
+        "</script><script>alert(1)</script><!-- ]]> --> \u{2028}\u{2029} &amp; </SCRIPT >";
+
+    /// Hostile boot values neither break out of the block nor change its value.
+    #[test]
+    #[allow(clippy::expect_used)] // a serializable struct of strings and integers
+    fn boot_block_escapes_breakout() {
+        let tuning = super::ClientTuning::from([("RETRY_BASE_MS", 1)]);
+        let block = super::boot_block(&super::BootConfig {
+            sid: HOSTILE,
+            epoch: HOSTILE.to_string(),
+            base: HOSTILE,
+            csrf: HOSTILE,
+            cfg: super::ClientConfig {
+                banner_enabled: true,
+                swap_toast: false,
+                tuning: &tuning,
+                msg_reconnecting: HOSTILE,
+                msg_updated: HOSTILE,
+                msg_offline: HOSTILE,
+            },
+        })
+        .expect("the block serializes");
+        let body = block
+            .strip_prefix(boot_open_tag().as_str())
+            .and_then(|rest| rest.strip_suffix("</script>"));
+        assert!(body.is_some(), "the block is one element: {block}");
+        let Some(body) = body else { return };
+        for raw in ["<", ">", "&", "\u{2028}", "\u{2029}"] {
+            assert!(!body.contains(raw), "{raw:?} reached the block raw: {body}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("the block is JSON");
+        for path in [
+            "/sid",
+            "/epoch",
+            "/base",
+            "/csrf",
+            "/cfg/msgReconnecting",
+            "/cfg/msgUpdated",
+            "/cfg/msgOffline",
+        ] {
+            assert_eq!(
+                parsed.pointer(path).and_then(serde_json::Value::as_str),
+                Some(HOSTILE),
+                "{path} must round-trip"
+            );
+        }
+    }
+
+    /// A refused tuning value refuses the page; it never boots on defaults.
+    #[test]
+    fn refused_tuning_refuses_the_page() {
+        let [(_, ceiling), ..] = super::CLIENT_TUNING_CEILINGS;
+        let refused = ceiling.parse(Ok("not-a-count".to_string()));
+        assert!(refused.is_err(), "a non-decimal value is refused");
+        let Err(refusal) = refused else { return };
+        let page = super::render_live_page(
+            Err(&refusal),
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            "<b>x</b>",
+            &page_epoch(),
+            "tok1",
+            "",
+        );
+        assert_eq!(page, Err(super::BootRefusal::TuningRefused));
+    }
+
+    /// A hostile sid and CSRF token leave the whole page's script set unchanged.
+    #[test]
+    fn hostile_session_values_do_not_change_page_parse() {
+        let html = page(
+            HOSTILE,
+            &crate::encoding::MountBase::root(),
+            &page_epoch(),
+            HOSTILE,
+        );
+        assert_eq!(inline_executable_scripts(&html), Vec::<String>::new());
+        assert_eq!(
+            html.matches("</script>").count(),
+            html.matches("<script").count()
+        );
+        assert_eq!(boot_str(&html, "/sid").as_deref(), Some(HOSTILE));
+        assert_eq!(boot_str(&html, "/csrf").as_deref(), Some(HOSTILE));
+    }
+
+    /// The keys `client.js` requires at each level of the boot block are exactly
+    /// the keys the server writes there.
+    ///
+    /// The client refuses to boot on a missing key, so a key the server drops
+    /// or renames while the client still requires it would refuse every page;
+    /// a key the server adds that the client never reads is dead data. Each
+    /// level is compared as a set, in both directions.
+    #[test]
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn client_requires_exactly_the_boot_fields() {
+        let js = super::CLIENT_JS;
+        let required = |name: &str| -> std::collections::BTreeSet<String> {
+            let list = js_string_array(js, name);
+            assert!(list.is_some(), "client.js declares `{name}`");
+            list.unwrap_or_default().into_iter().collect()
+        };
+        let html = page(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            &page_epoch(),
+            "t",
+        );
+        let boot = boot_of(&html).expect("the page carries a boot block");
+        let keys_at = |pointer: &str| -> std::collections::BTreeSet<String> {
+            let object = boot.pointer(pointer).and_then(serde_json::Value::as_object);
+            assert!(object.is_some(), "{pointer:?} is an object");
+            object.into_iter().flat_map(|o| o.keys().cloned()).collect()
+        };
+        let with = |mut set: std::collections::BTreeSet<String>, nested: &str| {
+            set.insert(nested.to_string());
+            set
+        };
+        assert_eq!(keys_at(""), with(required("__IPE_BOOT_STRINGS"), "cfg"));
+        let cfg_required: std::collections::BTreeSet<String> = required("__IPE_CFG_BOOLEANS")
+            .into_iter()
+            .chain(required("__IPE_CFG_STRINGS"))
+            .collect();
+        assert_eq!(keys_at("/cfg"), with(cfg_required, "tuning"));
+        let tuning_keys: std::collections::BTreeSet<String> = super::CLIENT_TUNING_CEILINGS
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
+        assert_eq!(keys_at("/cfg/tuning"), tuning_keys);
+        assert_eq!(required("__IPE_TUNING_KEYS"), tuning_keys);
+    }
+
+    /// The client takes the element right before its own tag as the boot
+    /// block, so every live shell places the block immediately before it.
+    #[test]
+    fn boot_block_immediately_precedes_the_client_script() {
+        for base in [crate::encoding::MountBase::root(), console_base()] {
+            let html = page("sid1", &base, &page_epoch(), "tok1");
+            let client = format!("<script src=\"{}/_ipe/client.", base.prefix());
+            let adjacent = boot_block_end(&html)
+                .and_then(|end| html.get(end..))
+                .is_some_and(|rest| rest.starts_with(&client));
+            assert!(adjacent, "the client tag follows the boot block: {html}");
+        }
+        let js = super::CLIENT_JS;
+        assert!(
+            js.contains(&format!("node.id !== \"{}\"", super::BOOT_BLOCK_ID)),
+            "client.js checks the block's id"
+        );
+        assert!(
+            js.contains("own.previousElementSibling")
+                && !js.contains("getElementById(\"ipe-boot\")"),
+            "client.js binds the block to its own tag, never by an id lookup"
+        );
+        // `<img name="currentScript">` in page content shadows the document's
+        // own property with itself; only the prototype getter answers for the
+        // browser.
+        assert!(
+            js.contains("script: prop(\"currentScript\")")
+                && js.contains("var own = __ipeDoc.script();"),
+            "client.js reads its own tag through the `Document.prototype` getter"
+        );
+        assert!(
+            !js.contains("getElementById(\"__ipe-status\")"),
+            "the boot-failure banner never defers to an element page content can carry"
+        );
+    }
+
+    /// The client reads no document member through the document's own lookup.
+    ///
+    /// Page content names a document property with an `img`, `form`, `embed`,
+    /// `object` or `iframe`, and that element then answers `document.body`,
+    /// `document.activeElement` or `document.addEventListener`; only the
+    /// prototype-bound table answers for the browser.
+    #[test]
+    fn client_reads_the_document_only_through_the_bound_table() {
+        let js = super::CLIENT_JS;
+        assert_eq!(
+            crate::js_document_scan::unbound_document_reads(js),
+            Vec::<String>::new(),
+            "client.js names `document` only in the `__ipeDoc` table"
+        );
+        assert_eq!(
+            js.matches("})(document);").count(),
+            1,
+            "client.js binds one document table"
+        );
+    }
+
+    /// A fetched page reaches `#ipe-root` through one parse by the document's
+    /// own parser. A `DOMParser` document has no scripting, so it reads a
+    /// `<noscript>` body as markup; re-serializing that and parsing it again
+    /// with scripting reads the body as text, and an attribute value holding
+    /// `</noscript><img onerror=…>` then closes the element and runs.
+    #[test]
+    fn client_parses_a_fetched_page_once_with_scripting() {
+        let js = super::CLIENT_JS;
+        assert!(
+            !js.contains("DOMParser") && !js.contains("parseFromString"),
+            "client.js never parses server markup in a scripting-free document"
+        );
+        assert!(
+            js.contains("__ipeSwapPreservingFocus(root, parsed)")
+                && js.contains("var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);"),
+            "__ipePatch splices the nodes of its one parse, never a re-serialized copy"
+        );
+    }
+
+    /// The string items of `var {name} = [ … ];` in `js`.
+    fn js_string_array(js: &str, name: &str) -> Option<Vec<String>> {
+        let open = format!("var {name} = [");
+        let rest = js.get(js.find(&open)? + open.len()..)?;
+        let body = rest.get(..rest.find("];")?)?;
+        body.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(|item| {
+                item.strip_prefix('"')
+                    .and_then(|i| i.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// The byte offset just past the boot block's closing `</script>`.
+    fn boot_block_end(html: &str) -> Option<usize> {
+        let open = boot_open_tag();
+        let at = html.find(&open)? + open.len();
+        let close = html.get(at..)?.find("</script>")?;
+        Some(at + close + "</script>".len())
+    }
+
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn page(
+        sid: &str,
+        base: &crate::encoding::MountBase,
+        epoch: &RenderEpoch,
+        csrf: &str,
+    ) -> String {
+        render_page_full(sid, base, "<b>x</b>", epoch, csrf).expect("the page builds")
+    }
+
+    fn boot_open_tag() -> String {
+        format!(
+            "<script type=\"application/json\" id=\"{}\">",
+            super::BOOT_BLOCK_ID
+        )
+    }
+
+    /// The page's boot data block, parsed as JSON.
+    fn boot_of(html: &str) -> Option<serde_json::Value> {
+        super::boot_json_of(html)
+    }
+
+    /// The string at JSON `pointer` in the page's boot data block.
+    fn boot_str(html: &str, pointer: &str) -> Option<String> {
+        boot_of(html)?
+            .pointer(pointer)?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Every `<script>` open tag with neither a `src` nor a JSON `type`.
+    fn inline_executable_scripts(html: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut rest = html;
+        while let Some(at) = rest.find("<script") {
+            let tail = rest.get(at..).unwrap_or_default();
+            let end = tail.find('>').unwrap_or(tail.len());
+            let open = tail.get(..end).unwrap_or_default();
+            if !open.contains(" src=\"") && !open.contains(" type=\"application/json\"") {
+                found.push(open.to_string());
+            }
+            rest = tail.get(end..).unwrap_or_default();
+        }
+        found
+    }
+
+    /// The first epoch of a fresh render history, as a page GET serves it.
+    fn page_epoch() -> RenderEpoch {
+        Rendered::first(new_incarnation(), Html::<()>::HText(String::new())).epoch()
+    }
+
+    #[allow(clippy::expect_used)] // a fixed literal inside the mount-base grammar
+    fn console_base() -> crate::encoding::MountBase {
+        crate::encoding::MountBase::parse("/_ipe/console").expect("a well-formed base")
     }
 
     fn root_or_sub_has_prefixed_client_src(html: &str, base: &str) -> bool {
@@ -6236,13 +8200,12 @@ mod sse_reconnect_reconcile_tests {
         let route_matched = routed_lookup(routes_for_match, render);
         let model = page.clone();
         let last_view = (view)(model.clone());
-        let index = build_index(&last_view);
         let (msg_tx, _rx) = channel::<()>(1);
         let (enter_tx, enter_rx) = channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model,
-            last_view,
-            index,
+            rendered: Rendered::first(new_incarnation(), last_view),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx,
@@ -6252,6 +8215,7 @@ mod sse_reconnect_reconcile_tests {
             history: crate::debugger::RecordBuffer::new(page, crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }));
         Fixture {
             entry,
@@ -6272,7 +8236,7 @@ mod sse_reconnect_reconcile_tests {
             &fx.route_entry,
             &*fx.view,
             &fx.store,
-            "sid-test",
+            &pubsub::SessionScope::new("sid-test".to_owned()),
         )
         .await;
         assert!(
@@ -6376,7 +8340,13 @@ mod sse_reconnect_reconcile_tests {
 
     /// Helper: read the current rendered text from the session's `last_view`.
     fn rendered_text(entry: &SessionHandle<TestPage, ()>) -> String {
-        render_html(&entry.lock().unwrap_or_else(|e| e.into_inner()).last_view)
+        render_html(
+            entry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .last_view(),
+        )
     }
 
     fn model_of(entry: &SessionHandle<TestPage, ()>) -> TestPage {
@@ -6427,7 +8397,7 @@ mod sse_reconnect_reconcile_tests {
         assert_eq!(entered, 1);
 
         let g = fx.entry.lock().unwrap_or_else(|e| e.into_inner());
-        let body = render_html(&g.last_view);
+        let body = render_html(g.rendered.last_view());
         assert!(
             body.contains("data-ipe-hid=\"r\""),
             "entered resync body must stamp data-ipe-hid: {body}"
@@ -6437,8 +8407,8 @@ mod sse_reconnect_reconcile_tests {
             "entered resync body must stamp ipe-id: {body}"
         );
         assert_eq!(
-            g.index.resolve("r", "click", &[]),
-            Some(()),
+            g.rendered.resolve(&g.rendered.epoch(), "r", "click", &[]),
+            Ok(Some(())),
             "entered handler index must resolve the stamped ipe-id"
         );
         assert_eq!(g.entered_path, Some(dp("/")));
@@ -6615,6 +8585,52 @@ mod sse_reconnect_reconcile_tests {
             assert!(
                 matches!(route_path(skip, ""), Ok(None)),
                 "{skip} names no route path"
+            );
+        }
+    }
+
+    /// A base path outside the mount-base grammar is refused when the router
+    /// is built, as the typed `StartupRefusal::MountBase` naming the base; a
+    /// well-formed base and the empty root are admitted.
+    #[test]
+    fn non_mount_base_path_is_refused_at_build() {
+        for bad in ["/a b", "/app/x%41", "/a\"b", "/a//b", "/app/.."] {
+            assert!(
+                matches!(
+                    parse_mount_base(bad),
+                    Err(StartupRefusal::MountBase { ref base, .. }) if base == bad
+                ),
+                "base {bad} must be refused"
+            );
+        }
+        assert_eq!(parse_mount_base(""), Ok(crate::encoding::MountBase::root()));
+        assert!(parse_mount_base("/_ipe/console").is_ok_and(|b| b.prefix() == "/_ipe/console"));
+    }
+
+    /// A refused base path renders bidi overrides and control characters as
+    /// visible escapes, never raw into the startup log.
+    #[test]
+    fn startup_refusal_scrubs_bidi_and_controls() {
+        let hostile = "/%zz\u{202e}\n\u{1b}[31m";
+        let refusals = [
+            parse_route_base(hostile).err(),
+            parse_mount_base(hostile).err(),
+        ];
+        for refusal in refusals {
+            assert!(
+                matches!(
+                    &refusal,
+                    Some(StartupRefusal::BasePath { base, .. } | StartupRefusal::MountBase { base, .. })
+                        if base == hostile
+                ),
+                "{refusal:?}"
+            );
+            let rendered = refusal.map(|r| r.to_string()).unwrap_or_default();
+            assert!(
+                !rendered.contains('\u{202e}')
+                    && !rendered.contains('\n')
+                    && !rendered.contains('\u{1b}'),
+                "a startup refusal must scrub the base it names: {rendered:?}"
             );
         }
     }
@@ -6954,11 +8970,10 @@ mod watch_status_handler_tests {
     fn make_session_handle(sse_tx: Option<SseTx>) -> store::SessionHandle<TestModel, TestMsg> {
         let (msg_tx, _rx) = mpsc::channel::<TestMsg>(1);
         let tree: Html<TestMsg> = Html::HText(String::new());
-        let index = build_index(&tree);
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            last_view: tree,
-            index,
+            rendered: Rendered::first(new_incarnation(), tree),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
             msg_tx,
@@ -6968,6 +8983,7 @@ mod watch_status_handler_tests {
             history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }))
     }
 
@@ -7084,27 +9100,35 @@ mod watch_status_handler_tests {
 
     // ── 2. Production inertness ───────────────────────────────────────────────
 
-    /// Under `ENV=production` `watch_banner_active` returns false regardless of
-    /// banner and base settings — the gate function is the single source of truth
-    /// for whether the route is mounted.
+    /// Without a dev intent `watch_banner_active_with` is false regardless of
+    /// banner and base settings, and the env-driven gate under `ENV=dev` on
+    /// the release test binary is false too: the gate function is the single
+    /// source of truth for whether the route is mounted.
     #[test]
-    fn watch_banner_active_false_in_production() {
+    fn watch_status_unmounted_on_release_under_env_dev() {
+        locked_remove_var("IPE_WEB_BANNER");
+        assert!(!watch_banner_active_with("", None));
         locked_set_var("ENV", "production");
-        assert!(
-            !watch_banner_active(""),
-            "watch_banner_active must be false in production"
-        );
+        assert!(!watch_banner_active(""), "production: never mounted");
+        if !cfg!(feature = "dev-posture") {
+            locked_set_var("ENV", "dev");
+            locked_set_var("IPE_ENV", "dev");
+            assert!(
+                !watch_banner_active(""),
+                "ENV=dev on a release build must not mount the route"
+            );
+            locked_remove_var("IPE_ENV");
+        }
         locked_remove_var("ENV");
     }
 
-    /// In dev mode (`ENV=dev`) with banner on, `watch_banner_active` is true.
+    /// Under a dev intent with banner on, `watch_banner_active_with` is true.
     #[test]
     fn watch_banner_active_true_in_dev() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
         locked_remove_var("IPE_WEB_BANNER");
+        let dev = crate::telemetry::test_dev_intent();
         assert!(
-            watch_banner_active(""),
+            watch_banner_active_with("", Some(&dev)),
             "watch_banner_active must be true in dev with no overrides"
         );
     }
@@ -7112,12 +9136,11 @@ mod watch_status_handler_tests {
     /// With banner explicitly disabled, `watch_banner_active` is false even in dev.
     #[test]
     fn watch_banner_active_false_when_banner_disabled() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
+        let dev = crate::telemetry::test_dev_intent();
         for v in ["off", "0", "false"] {
             locked_set_var("IPE_WEB_BANNER", v);
             assert!(
-                !watch_banner_active(""),
+                !watch_banner_active_with("", Some(&dev)),
                 "watch_banner_active must be false when IPE_WEB_BANNER={v}"
             );
         }
@@ -7127,11 +9150,10 @@ mod watch_status_handler_tests {
     /// A non-root base (sub-app) → `watch_banner_active` is false.
     #[test]
     fn watch_banner_active_false_for_subapp() {
-        locked_set_var("ENV", "dev");
-        locked_remove_var("IPE_ENV");
         locked_remove_var("IPE_WEB_BANNER");
+        let dev = crate::telemetry::test_dev_intent();
         assert!(
-            !watch_banner_active("/sub"),
+            !watch_banner_active_with("/sub", Some(&dev)),
             "watch_banner_active must be false for a sub-app base"
         );
     }
@@ -7742,7 +9764,7 @@ mod hot_init_session_scoping_tests {
     use crate::web::init_datum::{InitDatum, apply_init_hot, clear_dev_init_for_test};
     use crate::web::literal_table::{overlay_test_lock, set_dev_overlay_active_for_test};
     use crate::web::req::WebReq;
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -7869,14 +9891,14 @@ mod hot_init_session_scoping_tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Extract the `ipe_sid` value from a `Set-Cookie` response header.
+    /// Extract the session-cookie value from a `Set-Cookie` response header.
     fn extract_sid(resp: &axum::response::Response) -> String {
         for val in resp.headers().get_all(header::SET_COOKIE) {
             let s = val.to_str().unwrap_or("");
             for part in s.split(';') {
                 let part = part.trim();
                 if let Some((k, v)) = part.split_once('=')
-                    && k.trim() == "ipe_sid"
+                    && k.trim() == cookie_name_for("").as_str()
                 {
                     return v.trim().to_string();
                 }
@@ -7921,8 +9943,6 @@ mod hot_init_session_scoping_tests {
         set_dev_overlay_active_for_test(Some(true));
         clear_dev_init_for_test();
         locked_set_var("IPE_WATCH_HOT_TOKEN", "seal-token");
-        // Dev posture: the session cookie keeps its plain-http name `ipe_sid`.
-        locked_set_var("ENV", "dev");
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7948,14 +9968,14 @@ mod hot_init_session_scoping_tests {
             let live_sid = extract_sid(&resp1);
 
             // Confirm the store holds the live session at count = 0.
-            let live_model_before = match store.get(&live_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected live Web session in store"),
-            };
+            let live_model_before = store
+                .get(&live_sid)
+                .await
+                .expect("expected live Web session in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 live_model_before.count, 0,
                 "live session must start at count = 0 (compiled baked datum)"
@@ -7980,14 +10000,14 @@ mod hot_init_session_scoping_tests {
             );
 
             // Step 3: live session Model in the store is UNCHANGED (count = 0).
-            let live_model_after = match store.get(&live_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected live Web session still in store"),
-            };
+            let live_model_after = store
+                .get(&live_sid)
+                .await
+                .expect("expected live Web session still in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 live_model_after.count, 0,
                 "hot-init must not touch a live session's Model"
@@ -8008,14 +10028,14 @@ mod hot_init_session_scoping_tests {
             let fresh_sid = extract_sid(&resp2);
             assert_ne!(fresh_sid, live_sid, "fresh GET must mint a new session id");
 
-            let fresh_model = match store.get(&fresh_sid).await {
-                Some(StoreHit::Web(handle)) => handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .model
-                    .clone(),
-                _ => panic!("expected fresh Web session in store"),
-            };
+            let fresh_model = store
+                .get(&fresh_sid)
+                .await
+                .expect("expected fresh Web session in store")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
             assert_eq!(
                 fresh_model.count, 99,
                 "fresh session must decode the replacement init datum (count = 99)"
@@ -8695,27 +10715,120 @@ fn utf8_prefix(bytes: &[u8]) -> &str {
 
 #[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
 mod bind_error_tests {
-    /// The port-taken refusal names `IPE_WEB_PORT` when the operator or the
-    /// default chose the port, and names no operator var when a supervisor did.
-    #[test]
-    fn addr_in_use_message_is_keyed_on_the_port_origin() {
-        let resolve = |relocation: Option<&str>, operator: Option<&str>| {
-            crate::system::resolve_listen_port(
-                relocation.map(str::to_owned),
-                (super::WEB_PORT_ENV, operator.map(str::to_owned)),
-                8000,
-            )
+    use crate::telemetry::BuildPosture;
+
+    /// `Web.tea`'s port resolution: `relocation` over the operator's
+    /// `IPE_WEB_PORT` over the default port, each layer parsed by its key.
+    fn try_resolve(
+        relocation: Option<&str>,
+        operator: Option<&str>,
+    ) -> Result<crate::system::ResolvedPort, crate::env_grammar::EnvRefusal> {
+        let lookup = |value: Option<&str>| {
+            value.map_or(Err(std::env::VarError::NotPresent), |v| Ok(v.to_owned()))
         };
+        let key = crate::env_registry::web::WEB_PORT;
+        #[allow(clippy::expect_used)] // the default port is a TCP port
+        let source =
+            crate::system::SourcePort::parse(i64::from(crate::env_registry::web::WEB_DEFAULT_PORT))
+                .expect("the default port is a TCP port");
+        crate::system::resolve_listen_port(
+            crate::env_registry::listen::LISTEN_PORT_RELOCATION.parse(lookup(relocation)),
+            (key.name(), key.parse(lookup(operator))),
+            source,
+        )
+    }
+
+    /// [`try_resolve`] over layers that all parse.
+    #[allow(clippy::expect_used)] // every caller passes well-formed layers
+    fn resolve(relocation: Option<&str>, operator: Option<&str>) -> crate::system::ResolvedPort {
+        try_resolve(relocation, operator).expect("well-formed layers resolve")
+    }
+
+    /// A set `IPE_WEB_PORT` that is not a port refuses, naming the variable,
+    /// rather than serving on the default.
+    #[test]
+    fn malformed_web_port_refuses_rather_than_defaulting() {
+        for raw in ["abc", "0", "65536", "", "+8080"] {
+            let outcome = try_resolve(None, Some(raw));
+            assert!(
+                outcome.as_ref().is_err_and(
+                    |r| r.name() == "IPE_WEB_PORT" && r.to_string().contains("1..=65535")
+                ),
+                "IPE_WEB_PORT={raw:?} must refuse, got {outcome:?}"
+            );
+        }
+        assert_eq!(resolve(None, None).port.get(), 8000);
+    }
+
+    /// The `Web.tea` refusal of a bind that failed with `kind` under `posture`,
+    /// as the `String` sink renders it.
+    fn refusal(
+        r: crate::system::ResolvedPort,
+        posture: BuildPosture,
+        kind: std::io::ErrorKind,
+    ) -> (crate::IpeErrorKind, String) {
+        let error = r.bind_refusal_for(
+            posture,
+            "Web.tea",
+            std::net::SocketAddr::from(([127, 0, 0, 1], 8000)),
+            &std::io::Error::from(kind),
+        );
+        (
+            crate::ipe_error_kind(error.clone()),
+            <String as crate::FromIpeError>::from_ipe_error(error),
+        )
+    }
+
+    /// A port another socket holds refuses `Web.tea` as a typed `Conflict`,
+    /// never the `Unexpected` catch-all; the fix line names `IPE_WEB_PORT` and
+    /// how this build starts, and a release binary names no `ipe` verb.
+    #[test]
+    fn web_port_in_use_is_a_typed_conflict_with_a_posture_fix_line() {
+        use std::io::ErrorKind;
         for r in [resolve(None, None), resolve(None, Some("9200"))] {
-            let msg = r.addr_in_use_message();
-            assert!(msg.contains("IPE_WEB_PORT=8123 ipe run"), "{msg}");
+            for (posture, launch) in [
+                (BuildPosture::Development, "ipe dev run"),
+                (BuildPosture::Release, "./<program>"),
+            ] {
+                let (kind, text) = refusal(r, posture, ErrorKind::AddrInUse);
+                assert_eq!(kind, crate::IpeErrorKind::Conflict, "{text}");
+                assert!(text.starts_with("Conflict: port "), "{text}");
+                assert!(!text.contains("Unexpected"), "{text}");
+                assert!(
+                    text.contains(&format!("IPE_WEB_PORT=8123 {launch}"))
+                        && !text.contains("IPE_SERVER_PORT"),
+                    "{posture:?}: {text}"
+                );
+                assert!(
+                    text.contains("IPE_WEB_PORT=8123 ./<program>"),
+                    "a {posture:?} build may run as a built binary: {text}"
+                );
+            }
+            let (_, release) = refusal(r, BuildPosture::Release, ErrorKind::AddrInUse);
+            assert!(
+                !release.contains("ipe dev"),
+                "a built binary is not started by `ipe dev run`: {release}"
+            );
         }
         let relocated = resolve(Some("9100"), Some("9200"));
-        assert_eq!(relocated.port, 9100);
-        let msg = relocated.addr_in_use_message();
+        assert_eq!(relocated.port.get(), 9100);
+        for posture in [BuildPosture::Development, BuildPosture::Release] {
+            let (kind, text) = refusal(relocated, posture, ErrorKind::AddrInUse);
+            assert_eq!(kind, crate::IpeErrorKind::Conflict, "{text}");
+            assert!(
+                !text.contains("IPE_WEB_PORT") && !text.contains("IPE_SERVER_PORT"),
+                "a supervisor-chosen port must not advise an operator var: {text}"
+            );
+        }
+        let (other_kind, other) = refusal(
+            resolve(None, None),
+            BuildPosture::Release,
+            ErrorKind::ConnectionReset,
+        );
+        assert_eq!(other_kind, crate::IpeErrorKind::Io, "{other}");
         assert!(
-            !msg.contains("IPE_WEB_PORT") && !msg.contains("IPE_SERVER_PORT"),
-            "{msg}"
+            other.starts_with("Io: Web.tea: bind 127.0.0.1:8000: "),
+            "{other}"
         );
     }
 }
@@ -8796,7 +10909,7 @@ mod emitted_router_behavior_tests {
 
     use super::*;
     use crate::web::req::WebReq;
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde::{Deserialize, Serialize};
@@ -8999,15 +11112,15 @@ mod emitted_router_behavior_tests {
         Some(after[..after.find('"')?].to_string())
     }
 
-    /// GET `path` (optionally with an `ipe_sid` cookie) and return
-    /// `(minted_sid, body)`. `minted_sid` is the `ipe_sid` from any `Set-Cookie`
+    /// GET `path` (optionally with a session cookie) and return
+    /// `(minted_sid, body)`. `minted_sid` is the session cookie from any `Set-Cookie`
     /// header (the response also sets a CSRF cookie, so scan ALL of them), or
     /// empty when none was set.
     #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
     async fn get(router: axum::Router, path: &str, cookie: Option<&str>) -> (String, String) {
         let mut b = Request::builder().method("GET").uri(path);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("ipe_sid={c}"));
+            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))
@@ -9016,7 +11129,7 @@ mod emitted_router_behavior_tests {
         let mut sid = String::new();
         for val in resp.headers().get_all(header::SET_COOKIE) {
             let s = val.to_str().unwrap_or("");
-            if let Some(rest) = s.strip_prefix("ipe_sid=") {
+            if let Some(rest) = s.strip_prefix(&format!("{}=", cookie_name_for(""))) {
                 sid = rest.split(';').next().unwrap_or("").trim().to_string();
                 break;
             }
@@ -9038,7 +11151,7 @@ mod emitted_router_behavior_tests {
                     .method("POST")
                     .uri("/_ipe/event")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::COOKIE, format!("ipe_sid={cookie}"))
+                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
                     .body(Body::from(body.to_owned()))
                     .expect("build POST"),
             )
@@ -9051,12 +11164,10 @@ mod emitted_router_behavior_tests {
     /// here; polling it avoids a fixed sleep — the same commit the second socket
     /// GET observes).
     async fn model_of(store: &Arc<Store>, sid: &str) -> Option<Model> {
-        match store.get(sid).await {
-            Some(StoreHit::Web(h)) => {
-                Some(h.lock().unwrap_or_else(|e| e.into_inner()).model.clone())
-            }
-            _ => None,
-        }
+        store
+            .get(sid)
+            .await
+            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).model.clone())
     }
 
     /// Wait (bounded) for the async `drive_session` task to commit a model
@@ -9079,8 +11190,6 @@ mod emitted_router_behavior_tests {
         // Serialize env mutation across these tests; `IPE_CSRF` is process-global.
         let _g = crate::web::literal_table::overlay_test_lock();
         crate::system::locked_set_var("IPE_CSRF", "off");
-        // Dev posture: plain-http cookie names (`ipe_sid`).
-        crate::system::locked_set_var("ENV", "dev");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -9088,6 +11197,305 @@ mod emitted_router_behavior_tests {
             .expect("multi-thread runtime");
         rt.block_on(body());
         crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// A malformed session TTL or auth ceiling refuses the router at startup,
+    /// naming the variable, instead of answering requests under a default.
+    #[tokio::test]
+    async fn a_malformed_ttl_or_auth_ceiling_refuses_the_router() {
+        let mut cases = vec![("IPE_WEB_TTL", "1h30")];
+        if cfg!(feature = "jwt") {
+            cases.extend([
+                ("IPE_AUTH_MAX_LIFETIME", "8h"),
+                ("IPE_AUTH_SLIDE_WINDOW", "0"),
+                ("IPE_REVOCATION_CAPACITY", " 1024"),
+            ]);
+        }
+        for (name, raw) in cases {
+            crate::system::locked_set_var(name, raw);
+            let refused = build_web_router::<
+                Model,
+                Msg,
+                fn(WebReq) -> (Model, IpeCmd<Msg>),
+                fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                fn(Model) -> Html<Msg>,
+                fn(Model) -> IpeSub<Msg>,
+            >(
+                make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+                false,
+            )
+            .err();
+            crate::system::locked_remove_var(name);
+            assert!(
+                matches!(&refused, Some(StartupRefusal::Ceiling(r)) if r.name() == name),
+                "{name}={raw:?} must refuse the router, got {refused:?}"
+            );
+        }
+    }
+
+    /// A base path that decodes but is outside the mount-base grammar refuses
+    /// the router at startup, so no page or widget URL is built from it.
+    #[tokio::test]
+    async fn a_non_mount_base_path_refuses_the_router() {
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/app/x%41");
+        let refused = build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+            false,
+        )
+        .err();
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert!(
+            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base == "/app/x%41"),
+            "a non-mount base must refuse the router, got {refused:?}"
+        );
+    }
+
+    /// The router built with the current environment and installed config.
+    fn router_refusal() -> Option<StartupRefusal> {
+        build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+            false,
+        )
+        .err()
+    }
+
+    /// Whether the process-wide revocation gate resolves armed right now.
+    #[cfg(feature = "jwt")]
+    fn gate_armed() -> bool {
+        crate::revocation::ArmedGate::resolve(crate::revocation::process_mode()).is_some()
+    }
+
+    /// Without `jwt` no gate type is compiled, so nothing is ever armed.
+    #[cfg(not(feature = "jwt"))]
+    const fn gate_armed() -> bool {
+        false
+    }
+
+    /// Assert an armed request's router outcome in this build.
+    ///
+    /// With the token verifier the router starts and the gate is `armed`;
+    /// without it nothing could bind, so the router refuses.
+    fn assert_starts_armed(refused: Option<&StartupRefusal>, armed: bool, what: &str) {
+        #[cfg(feature = "jwt")]
+        {
+            assert!(
+                refused.is_none(),
+                "{what} must start the router, got {refused:?}"
+            );
+            assert!(armed, "{what} must arm the process gate");
+        }
+        #[cfg(not(feature = "jwt"))]
+        assert!(
+            !armed
+                && matches!(
+                    refused,
+                    Some(StartupRefusal::Auth(
+                        crate::app_config::AuthStartupRefusal::RevocationUnbound
+                    ))
+                ),
+            "{what} has nothing to bind without a verifier, got {refused:?}"
+        );
+    }
+
+    /// A requested gate starts the router armed; a malformed mode refuses it.
+    #[tokio::test]
+    async fn web_revocation_store_starts_armed() {
+        for requested in ["store", "STORE", "1"] {
+            crate::system::locked_set_var("IPE_AUTH_REVOCATION", requested);
+            let refused = router_refusal();
+            let armed = gate_armed();
+            crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+            assert_starts_armed(
+                refused.as_ref(),
+                armed,
+                &format!("IPE_AUTH_REVOCATION={requested:?}"),
+            );
+        }
+        crate::system::locked_set_var("IPE_AUTH_REVOCATION", "stroe");
+        let malformed = router_refusal();
+        crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+        assert!(
+            matches!(
+                &malformed,
+                Some(StartupRefusal::Auth(
+                    crate::app_config::AuthStartupRefusal::Revocation(r)
+                )) if r.name() == "IPE_AUTH_REVOCATION"
+            ),
+            "an unparseable mode must refuse the router naming its variable, got {malformed:?}"
+        );
+    }
+
+    /// Set on the child process [`web_revocation_installed_store_starts_armed`]
+    /// spawns; its child half is a no-op without it.
+    const INSTALL_CHILD_MARKER: &str = "IPE_REVOCATION_INSTALL_CHILD";
+
+    /// Printed by the child half once it has observed both armed starts.
+    const INSTALL_CHILD_ARMED: &str = "installed revocation store armed start observed";
+
+    /// `Web.withRevocation` `Store` installed in code starts the router armed too.
+    ///
+    /// `install_web` fills a process-wide `OnceLock` that the first install
+    /// wins, so the install runs in a child process: here it would arm every
+    /// other router test of the binary, and an earlier install would mask it.
+    #[test]
+    fn web_revocation_installed_store_starts_armed() {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let filter = format!("{module}::web_revocation_installed_store_child");
+        let out = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    filter.as_str(),
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(INSTALL_CHILD_MARKER, "1")
+                .env_remove("IPE_AUTH_REVOCATION")
+                .stdin(std::process::Stdio::null())
+                .output()
+        });
+        let observed = out.as_ref().is_ok_and(|out| {
+            out.status.success()
+                && std::str::from_utf8(&out.stdout)
+                    .is_ok_and(|text| text.contains(INSTALL_CHILD_ARMED))
+        });
+        assert!(observed, "the child must observe the armed start: {out:?}");
+    }
+
+    /// The child half of [`web_revocation_installed_store_starts_armed`].
+    #[tokio::test]
+    #[ignore = "run as a child process by web_revocation_installed_store_starts_armed"]
+    async fn web_revocation_installed_store_child() {
+        if crate::system::read_env_var(INSTALL_CHILD_MARKER).as_deref() != Ok("1") {
+            return;
+        }
+        crate::app_config::install_web(vec![
+            crate::app_config::ipe_setting_web_auth_revocation_mode(1),
+        ]);
+        let refused = router_refusal();
+        assert_starts_armed(refused.as_ref(), gate_armed(), "an installed Store mode");
+        crate::system::locked_set_var("IPE_AUTH_REVOCATION", "off");
+        let env_off = router_refusal();
+        let armed = gate_armed();
+        crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+        assert_starts_armed(
+            env_off.as_ref(),
+            armed,
+            "an installed Store mode under IPE_AUTH_REVOCATION=off (the env cannot disarm it)",
+        );
+        println!("\n{INSTALL_CHILD_ARMED}");
+    }
+
+    /// An `Off` or absent mode asks for no gate, so the router starts.
+    #[tokio::test]
+    async fn web_revocation_off_starts() {
+        assert!(router_refusal().is_none(), "no mode must start the router");
+        for off in ["off", "0", ""] {
+            crate::system::locked_set_var("IPE_AUTH_REVOCATION", off);
+            let refused = router_refusal();
+            crate::system::locked_remove_var("IPE_AUTH_REVOCATION");
+            assert!(
+                refused.is_none(),
+                "IPE_AUTH_REVOCATION={off:?} asks for no gate, got {refused:?}"
+            );
+        }
+    }
+
+    /// A present `IPE_HTTP_BIND` that is not an IP address refuses the app
+    /// before it binds; an IP address is bound as given.
+    #[test]
+    fn a_bind_that_is_not_an_ip_address_refuses_the_app() {
+        for raw in ["localhost", "127.0.0.1:8080", "[::1]", ""] {
+            crate::system::locked_set_var("IPE_HTTP_BIND", raw);
+            let refused = web_bind_host();
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+            assert!(
+                matches!(&refused, Err(StartupRefusal::Bind(r)) if r.name() == "IPE_HTTP_BIND"),
+                "IPE_HTTP_BIND={raw:?} must refuse the app, got {refused:?}"
+            );
+            let Err(cause) = refused else {
+                panic!("IPE_HTTP_BIND={raw:?} must refuse the app");
+            };
+            let shown = cause.to_string();
+            let error = crate::error::IpeError::from(cause);
+            assert_eq!(
+                crate::ipe_error_kind(error.clone()),
+                crate::IpeErrorKind::InvalidInput,
+                "an operator's malformed setting is invalid input: {error:?}"
+            );
+            assert_eq!(crate::ipe_error_message(error), shown);
+        }
+        crate::system::locked_set_var("IPE_HTTP_BIND", "::1");
+        let bound = web_bind_host();
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+        assert!(
+            matches!(bound, Ok(host @ crate::app_config::ListenHost::Loopback(_))
+                if host.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            "a bare IPv6 loopback address is bound as given, got {bound:?}"
+        );
+    }
+
+    /// The router refuses an `IPE_WEB_FRAME_ANCESTORS` with no
+    /// `frame-ancestors` representation at startup. The value is read once per
+    /// process, so the check runs in a child holding it.
+    #[test]
+    fn an_unrepresentable_frame_ancestors_refuses_the_router() {
+        let (refused, out) = crate::telemetry::frame_ancestors_child::refused(
+            module_path!(),
+            "router_frame_ancestors_child",
+            "a;b",
+        );
+        assert!(refused, "the child must observe the refusal:\n{out}");
+    }
+
+    /// The child half of `an_unrepresentable_frame_ancestors_refuses_the_router`;
+    /// a no-op unless it runs with `IPE_WEB_FRAME_ANCESTORS=a;b`.
+    #[tokio::test]
+    #[ignore = "run as a child process by an_unrepresentable_frame_ancestors_refuses_the_router"]
+    async fn router_frame_ancestors_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok("a;b")
+        {
+            return;
+        }
+        let refused = build_web_router::<
+            Model,
+            Msg,
+            fn(WebReq) -> (Model, IpeCmd<Msg>),
+            fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+            fn(Model) -> Html<Msg>,
+            fn(Model) -> IpeSub<Msg>,
+        >(
+            make_state(Arc::new(Store::new(Duration::from_secs(60)))),
+            false,
+        )
+        .err();
+        assert!(
+            matches!(
+                refused,
+                Some(StartupRefusal::FrameAncestors(
+                    crate::telemetry::FrameAncestorsRefusal::DirectiveSeparator
+                ))
+            ),
+            "a `;` must refuse the router, got {refused:?}"
+        );
+        println!("\n{}", crate::telemetry::frame_ancestors_child::REFUSED);
     }
 
     // ── (ii) In-process behavior — ported from the socket `live_e2e` tests ────
@@ -9122,8 +11530,11 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             assert!(!sid.is_empty(), "GET / must set an ipe_sid cookie");
             let hid = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let epoch = epoch_of(&body).expect("the page carries its render epoch");
 
-            let event = format!(r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":""}}"#);
+            let event = format!(
+                r#"{{"id":"{hid}","msg":"click","args":[],"sessionId":"","epoch":"{epoch}"}}"#
+            );
             let status = post_event(make_router(store.clone()), &sid, &event).await;
             assert_eq!(status, StatusCode::OK, "click event must be accepted");
 
@@ -9157,7 +11568,7 @@ mod emitted_router_behavior_tests {
                         .method("GET")
                         .uri("/_ipe/sse?path=%2F")
                         .header(header::ACCEPT, "text/event-stream")
-                        .header(header::COOKIE, format!("ipe_sid={sid}"))
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
                         .body(Body::empty())
                         .expect("build SSE GET"),
                 )
@@ -9211,9 +11622,10 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             assert!(!sid.is_empty(), "GET / must set an ipe_sid cookie");
             let hid = hid_for_open_tag(&body, "form").expect("data-ipe-hid on <form>");
+            let epoch = epoch_of(&body).expect("the page carries its render epoch");
 
             let event = format!(
-                r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":""}}"#
+                r#"{{"id":"{hid}","event":"submit","args":[{{"username":"alice","password":"s3cr3t"}}],"sessionId":"","epoch":"{epoch}"}}"#
             );
             let status = post_event(make_router(store.clone()), &sid, &event).await;
             assert_eq!(status, StatusCode::OK, "submit event must be accepted");
@@ -9229,6 +11641,813 @@ mod emitted_router_behavior_tests {
                 body2.contains(">alice<"),
                 "re-render after submit must show the decoded username:\n{}",
                 &body2[..body2.len().min(1500)]
+            );
+        });
+    }
+
+    // ── Render epochs and per-tab replay through the production router ──────
+
+    /// A well-formed tab id, as a browser tab mints once per page load.
+    const TAB: &str = "00112233445566778899aabbccddeeff";
+
+    /// The render epoch the page carries in its boot data block.
+    fn epoch_of(page: &str) -> Option<String> {
+        super::boot_json_of(page)?
+            .get("epoch")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// `token` one render ahead of its own counter: an epoch never committed.
+    fn future_of(token: &str) -> Option<String> {
+        let (hex, n) = token.split_once('.')?;
+        let n: u64 = n.parse().ok()?;
+        Some(format!("{hex}.{}", n.checked_add(1)?))
+    }
+
+    /// `token` with its incarnation's first hex digit changed: another history.
+    fn foreign_of(token: &str) -> Option<String> {
+        let (hex, n) = token.split_once('.')?;
+        let first = if hex.starts_with('0') { '1' } else { '0' };
+        Some(format!("{first}{}.{n}", hex.get(1..)?))
+    }
+
+    /// A click event body on `hid`, with an optional epoch and `(tab, seq)`.
+    fn click_body(hid: &str, epoch: Option<&str>, tab: Option<(&str, u64)>) -> String {
+        let mut body = serde_json::Map::new();
+        body.insert("id".to_string(), hid.into());
+        body.insert("msg".to_string(), "click".into());
+        body.insert("args".to_string(), serde_json::Value::Array(Vec::new()));
+        if let Some(epoch) = epoch {
+            body.insert("epoch".to_string(), epoch.into());
+        }
+        if let Some((tab, seq)) = tab {
+            body.insert("tab".to_string(), tab.into());
+            body.insert("seq".to_string(), seq.into());
+        }
+        serde_json::Value::Object(body).to_string()
+    }
+
+    /// POST an event and return its status, its `X-Ipe-Web` marker and its body.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn post_event_full(
+        router: axum::Router,
+        cookie: &str,
+        body: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_ipe/event")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
+                    .body(Body::from(body.to_owned()))
+                    .expect("build POST"),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let marker = resp
+            .headers()
+            .get("x-ipe-web")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (
+            status,
+            marker,
+            String::from_utf8(bytes.to_vec()).expect("a UTF-8 body"),
+        )
+    }
+
+    /// GET `path` with the session cookie; return the `X-Ipe-Epoch` header and the body.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_with_epoch(
+        router: axum::Router,
+        path: &str,
+        cookie: &str,
+    ) -> (Option<String>, String) {
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::COOKIE, format!("{}={cookie}", cookie_name_for("")))
+                    .body(Body::empty())
+                    .expect("build GET"),
+            )
+            .await
+            .expect("router responds");
+        let epoch = resp
+            .headers()
+            .get("x-ipe-epoch")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (
+            epoch,
+            String::from_utf8(bytes.to_vec()).expect("a UTF-8 body"),
+        )
+    }
+
+    /// The session's live entry.
+    #[allow(clippy::expect_used)] // test helper — the session was just created by a GET
+    async fn session_of(store: &Arc<Store>, sid: &str) -> SessionHandle<Model, Msg> {
+        store.get(sid).await.expect("the session is live")
+    }
+
+    /// The token of the session's current render epoch.
+    async fn current_epoch(store: &Arc<Store>, sid: &str) -> String {
+        session_of(store, sid)
+            .await
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rendered
+            .epoch()
+            .to_token()
+    }
+
+    /// Route the session's dispatches into `tx`, so a test reads exactly what
+    /// `event_handler` enqueued.
+    async fn capture_dispatches(store: &Arc<Store>, sid: &str, tx: Sender<Msg>) {
+        session_of(store, sid)
+            .await
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .msg_tx = tx;
+    }
+
+    /// `view(model)` stamped exactly as the driver stamps a committed render.
+    fn stamped(mut tree: Html<Msg>) -> Html<Msg> {
+        assign_ipe_ids(&mut tree, "r");
+        style_inject::apply_style_injections(&mut tree);
+        tree
+    }
+
+    /// The counter view with its two buttons swapped: the `-` button now sits
+    /// where `+` was, so it inherits the `+` button's positional hid.
+    fn swapped_view() -> Html<Msg> {
+        use crate::html::{Attribute, Event};
+        let button = |label: &str, msg: Msg| {
+            Html::HElement(
+                "div".to_string(),
+                vec![Attribute::EventAttr(Event::OnMsg("click".to_string(), msg))],
+                vec![Html::HText(label.to_string())],
+            )
+        };
+        stamped(Html::HElement(
+            "div".to_string(),
+            vec![],
+            vec![
+                button("-", Msg::Decrement),
+                Html::HText("0".to_string()),
+                button("+", Msg::Increment),
+            ],
+        ))
+    }
+
+    /// Commit `tree` as the session's next render, as a driver commit would.
+    async fn commit_view(store: &Arc<Store>, sid: &str, tree: Html<Msg>) {
+        let step = session_of(store, sid)
+            .await
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rendered
+            .commit(tree);
+        assert!(step.is_ok(), "a fresh history mints another epoch");
+    }
+
+    /// A replayed event resolves against the render it came from: after the
+    /// `+` button's position passes to `-`, the old-epoch click still
+    /// dispatches `Increment`, while a current-epoch click on the same hid
+    /// dispatches `Decrement`.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the swapped view are fixtures
+    fn an_old_epoch_click_dispatches_the_handler_it_was_rendered_with() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let swapped = swapped_view();
+            assert_eq!(
+                hid_near_text(&render_html(&swapped), "-").as_deref(),
+                Some(plus.as_str()),
+                "the swap must hand the `+` hid to the `-` button"
+            );
+            commit_view(&store, &sid, swapped).await;
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let old = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &old).await;
+            assert_eq!(status, StatusCode::OK, "a retained epoch resolves");
+            assert!(
+                matches!(rx.try_recv(), Ok(Msg::Increment)),
+                "the old-epoch click must dispatch the handler it was rendered with"
+            );
+
+            let current = current_epoch(&store, &sid).await;
+            let now = click_body(&plus, Some(&current), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &now).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(matches!(rx.try_recv(), Ok(Msg::Decrement)));
+        });
+    }
+
+    /// An epoch evicted from the render history refuses with `409`, the
+    /// `X-Ipe-Web` marker and the current render, and dispatches nothing.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the refusal JSON are fixtures
+    fn an_evicted_epoch_refuses_with_the_current_render_and_no_dispatch() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            for _ in 0..RENDER_HISTORY_DEPTH.get() {
+                let model = Model {
+                    count: 0,
+                    last_username: String::new(),
+                };
+                commit_view(&store, &sid, stamped(view(model))).await;
+            }
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let stale = click_body(&plus, Some(&first), None);
+            let (status, marker, reply) =
+                post_event_full(make_router(store.clone()), &sid, &stale).await;
+            assert_eq!(status, StatusCode::CONFLICT, "an evicted epoch must refuse");
+            assert_eq!(
+                marker.as_deref(),
+                Some("1"),
+                "the refusal is a genuine Ipe.Web reply"
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(&reply).expect("the refusal body is JSON");
+            assert_eq!(
+                json.get("refused").and_then(serde_json::Value::as_str),
+                Some("stale-render")
+            );
+            let current = current_epoch(&store, &sid).await;
+            assert_eq!(
+                json.get("epoch").and_then(serde_json::Value::as_str),
+                Some(current.as_str())
+            );
+            assert!(json.get("seq").is_some_and(serde_json::Value::is_u64));
+            assert!(
+                json.get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|b| b.contains("data-ipe-hid")),
+                "the refusal carries the current render: {reply}"
+            );
+            assert!(rx.try_recv().is_err(), "a refused event must not dispatch");
+        });
+    }
+
+    /// An event without an epoch refuses with `409` and dispatches nothing: an
+    /// absent epoch never means the current render.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_missing_epoch_refuses_and_dispatches_nothing() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let unstamped = click_body(&plus, None, None);
+            let (status, marker, _) =
+                post_event_full(make_router(store.clone()), &sid, &unstamped).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(marker.as_deref(), Some("1"));
+            assert!(
+                rx.try_recv().is_err(),
+                "an unstamped event must not dispatch"
+            );
+        });
+    }
+
+    /// A malformed epoch or tab id is a malformed body: `400 bad body`, no dispatch.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_malformed_epoch_or_tab_is_a_bad_body_and_dispatches_nothing() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let bad_epoch = click_body(&plus, Some("not-an-epoch"), None);
+            let bad_tab = click_body(&plus, Some(&first), Some(("NOT-A-TAB", 1)));
+            for event in [bad_epoch, bad_tab] {
+                let (status, _, reply) =
+                    post_event_full(make_router(store.clone()), &sid, &event).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{event}");
+                assert_eq!(reply, "bad body");
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "a malformed event must not dispatch"
+            );
+        });
+    }
+
+    /// An epoch from the future of this history, or from another history,
+    /// refuses with `409` and dispatches nothing.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the token mutations are fixtures
+    fn a_future_or_foreign_epoch_refuses() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let future = future_of(&first).expect("a well-formed token");
+            let foreign = foreign_of(&first).expect("a well-formed token");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            for epoch in [future, foreign] {
+                let event = click_body(&plus, Some(&epoch), None);
+                let (status, marker, _) =
+                    post_event_full(make_router(store.clone()), &sid, &event).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{epoch}");
+                assert_eq!(marker.as_deref(), Some("1"));
+            }
+            assert!(rx.try_recv().is_err(), "a refused event must not dispatch");
+        });
+    }
+
+    /// A replay of a tab's recorded seq is acked as a duplicate and dispatched
+    /// once; the tab's next seq dispatches again.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_replayed_tab_seq_is_acked_as_a_duplicate_and_dispatched_once() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let event = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                !reply.contains("duplicate"),
+                "the first send is no duplicate: {reply}"
+            );
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                reply.contains("\"duplicate\":true"),
+                "the replay is a duplicate: {reply}"
+            );
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+            assert!(rx.try_recv().is_err(), "the replay must not dispatch again");
+
+            let next = click_body(&plus, Some(&first), Some((TAB, 2)));
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &next).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+        });
+    }
+
+    /// A tab's earlier seq that reaches the server after a later one (a retried
+    /// event, or two posts racing for the lock) is no duplicate: it dispatches,
+    /// and only its own replay is acked as a duplicate.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn an_earlier_tab_seq_arriving_late_still_dispatches_once() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            capture_dispatches(&store, &sid, tx).await;
+
+            let later = click_body(&plus, Some(&first), Some((TAB, 2)));
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &later).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+
+            let earlier = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &earlier).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                !reply.contains("duplicate"),
+                "a late earlier seq is no duplicate: {reply}"
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(Msg::Increment)),
+                "a late earlier seq must dispatch"
+            );
+
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &earlier).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                reply.contains("\"duplicate\":true"),
+                "its replay is a duplicate: {reply}"
+            );
+            assert!(rx.try_recv().is_err(), "the replay must not dispatch again");
+        });
+    }
+
+    /// A debugger step commits the render it shows: its reply names a fresh
+    /// current epoch whose handler index is the shown DOM's, so a click on the
+    /// stepped DOM resolves against that render, never the one it replaced.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the step reply are fixtures
+    fn a_debugger_step_commits_the_render_it_shows() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let event = click_body(&plus, Some(&first), None);
+            assert_eq!(
+                post_event(make_router(store.clone()), &sid, &event).await,
+                StatusCode::OK
+            );
+            await_model(&store, &sid, |m| m.count == 1).await;
+            let before = current_epoch(&store, &sid).await;
+
+            let resp = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_ipe/debug/step-to")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .body(Body::from(r#"{"index":0}"#))
+                        .expect("build POST"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let reply: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("the step reply is JSON");
+            let after = current_epoch(&store, &sid).await;
+            assert_ne!(after, before, "the step must commit a new render");
+            assert_eq!(
+                reply.get("epoch").and_then(serde_json::Value::as_str),
+                Some(after.as_str()),
+                "the reply names the committed epoch"
+            );
+            let shown = render_html(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .rendered
+                    .last_view(),
+            );
+            assert_eq!(
+                reply.get("body").and_then(serde_json::Value::as_str),
+                Some(shown.as_str()),
+                "the committed render is the one the debugger shows"
+            );
+        });
+    }
+
+    /// A `429` leaves the tab's seq unrecorded, so the client's retry of the
+    /// same event dispatches once the queue drains.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the one-slot channel are fixtures
+    fn a_full_queue_does_not_record_the_seq() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<Msg>(1);
+            tx.try_send(Msg::Decrement).expect("the one slot is free");
+            capture_dispatches(&store, &sid, tx).await;
+
+            let event = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "a full queue answers 429"
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(Msg::Decrement)),
+                "drain the filler"
+            );
+
+            let (status, _, reply) =
+                post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                !reply.contains("duplicate"),
+                "a 429 must not burn the seq: {reply}"
+            );
+            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+        });
+    }
+
+    /// A driver commit and a route entry each mint a new epoch, which the page
+    /// serves in its boot data block and `X-Ipe-Epoch`; an SSE resync carries
+    /// the current epoch without minting one.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the SSE request are fixtures
+    fn every_commit_advances_the_epoch_and_a_resync_does_not() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            assert_eq!(current_epoch(&store, &sid).await, first);
+
+            let event = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            await_model(&store, &sid, |m| m.count == 1).await;
+            let driven = current_epoch(&store, &sid).await;
+            assert_ne!(driven, first, "a driver commit must mint a new epoch");
+
+            let (header_epoch, page) = get_with_epoch(make_router(store.clone()), "/", &sid).await;
+            let entered = epoch_of(&page).expect("the page carries its render epoch");
+            assert_ne!(entered, driven, "a route entry must mint a new epoch");
+            assert_eq!(header_epoch.as_deref(), Some(entered.as_str()));
+            assert_eq!(current_epoch(&store, &sid).await, entered);
+
+            let resp = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), StatusCode::OK);
+            use futures_util::StreamExt;
+            let mut stream = resp.into_body().into_data_stream();
+            let mut bytes = Vec::new();
+            let want = format!("\"epoch\":\"{entered}\"");
+            let read = tokio::time::timeout(Duration::from_secs(5), async {
+                while bytes.len() < 256 * 1024 {
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            bytes.extend_from_slice(&chunk);
+                            if utf8_prefix(&bytes).contains(&want) {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            })
+            .await;
+            assert!(read.is_ok(), "SSE read timed out before the resync frame");
+            let acc = utf8_prefix(&bytes);
+            assert!(
+                acc.contains(&want),
+                "the resync names the current epoch:\n{acc}"
+            );
+            assert_eq!(
+                current_epoch(&store, &sid).await,
+                entered,
+                "a resync must not mint an epoch"
+            );
+        });
+    }
+
+    /// Every driver commit pushes a `patches` frame naming the epochs it moved
+    /// between, an update that changes nothing included.
+    #[test]
+    #[allow(clippy::expect_used)] // the page, the SSE channel and the frames are fixtures
+    fn a_patches_frame_names_its_epochs_even_with_no_patches() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let form = hid_for_open_tag(&body, "form").expect("data-ipe-hid on <form>");
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
+            session_of(&store, &sid)
+                .await
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .sse_tx = Some(sse_tx);
+
+            // An empty sign-in leaves the model, and so the view, unchanged.
+            let unchanged = format!(
+                r#"{{"id":"{form}","event":"submit","args":[{{"username":"","password":""}}],"epoch":"{first}"}}"#
+            );
+            let (status, _, _) =
+                post_event_full(make_router(store.clone()), &sid, &unchanged).await;
+            assert_eq!(status, StatusCode::OK);
+            let frame = tokio::time::timeout(Duration::from_secs(5), sse_rx.recv())
+                .await
+                .expect("the commit pushes a frame")
+                .expect("the SSE channel is open");
+            let data = frame
+                .0
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("a frame carries a data line");
+            let json: serde_json::Value = serde_json::from_str(data).expect("the frame is JSON");
+            assert!(frame.0.starts_with("event: patches"), "{}", frame.0);
+            assert_eq!(
+                json.get("from").and_then(serde_json::Value::as_str),
+                Some(first.as_str())
+            );
+            let second = current_epoch(&store, &sid).await;
+            assert_ne!(second, first);
+            assert_eq!(
+                json.get("to").and_then(serde_json::Value::as_str),
+                Some(second.as_str())
+            );
+            assert!(
+                json.get("patches")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty),
+                "an unchanged view still pushes its epoch-only frame: {json}"
+            );
+
+            let event = click_body(&plus, Some(&second), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
+            assert_eq!(status, StatusCode::OK);
+            let frame = tokio::time::timeout(Duration::from_secs(5), sse_rx.recv())
+                .await
+                .expect("the commit pushes a frame")
+                .expect("the SSE channel is open");
+            let data = frame
+                .0
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("a frame carries a data line");
+            let json: serde_json::Value = serde_json::from_str(data).expect("the frame is JSON");
+            assert_eq!(
+                json.get("from").and_then(serde_json::Value::as_str),
+                Some(second.as_str())
+            );
+            let third = current_epoch(&store, &sid).await;
+            assert_eq!(
+                json.get("to").and_then(serde_json::Value::as_str),
+                Some(third.as_str())
+            );
+            assert!(
+                json.get("patches")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|p| !p.is_empty()),
+                "a changed view pushes its patches: {json}"
+            );
+        });
+    }
+
+    /// `init` runs counted by [`counted_init`]; only the mint-gate test reads it.
+    static MINT_GATE_INITS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted_init(req: WebReq) -> (Model, IpeCmd<Msg>) {
+        MINT_GATE_INITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        init(req)
+    }
+
+    /// One cookieless `GET /` carrying `fetch_metadata`, bounded by a timeout.
+    #[allow(clippy::expect_used)] // test helper: request build / router failure / a hung handler is a test environment issue
+    async fn cookieless_get(
+        router: axum::Router,
+        fetch_metadata: [(&str, &str); 3],
+    ) -> axum::response::Response {
+        let mut b = Request::builder().method("GET").uri("/");
+        for (name, value) in fetch_metadata {
+            b = b.header(name, value);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            router.oneshot(b.body(Body::empty()).expect("build GET")),
+        )
+        .await
+        .expect("the page handler answers in time")
+        .expect("router responds")
+    }
+
+    fn vary_names(resp: &axum::response::Response) -> Vec<String> {
+        resp.headers()
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+            .collect()
+    }
+
+    /// Prove the refusal through the production page handler: a cross-site
+    /// subresource GET mints no session, runs no `init` and sets no cookie,
+    /// while the same request as a top-level navigation mints one; both vary on
+    /// the mint inputs.
+    #[test]
+    fn cross_site_subresource_get_mints_no_session() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let mut state = make_state(store.clone());
+            state.init = Arc::new(counted_init as fn(WebReq) -> (Model, IpeCmd<Msg>));
+            let sessions = state.session_count.clone();
+            #[allow(clippy::expect_used)] // test fixture: the test process sets no base path
+            let router = build_web_router::<
+                Model,
+                Msg,
+                fn(WebReq) -> (Model, IpeCmd<Msg>),
+                fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                fn(Model) -> Html<Msg>,
+                fn(Model) -> IpeSub<Msg>,
+            >(state, false)
+            .expect("the unset test base parses");
+            let ord = std::sync::atomic::Ordering::SeqCst;
+            let expected_vary = [
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-dest",
+                "x-ipe-nav",
+            ];
+
+            let refused = cookieless_get(
+                router.clone(),
+                [
+                    ("sec-fetch-site", "cross-site"),
+                    ("sec-fetch-mode", "no-cors"),
+                    ("sec-fetch-dest", "image"),
+                ],
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+            assert!(refused.headers().get(header::SET_COOKIE).is_none());
+            let names = vary_names(&refused);
+            for name in expected_vary {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "refusal Vary lacks {name}: {names:?}"
+                );
+            }
+            assert_eq!(
+                sessions.load(ord),
+                0,
+                "a refused mint reserves no session slot"
+            );
+            assert_eq!(MINT_GATE_INITS.load(ord), 0, "a refused mint runs no init");
+
+            let admitted = cookieless_get(
+                router,
+                [
+                    ("sec-fetch-site", "cross-site"),
+                    ("sec-fetch-mode", "navigate"),
+                    ("sec-fetch-dest", "document"),
+                ],
+            )
+            .await;
+            assert_eq!(admitted.status(), StatusCode::OK);
+            let session_prefix = format!("{}=", cookie_name_for(""));
+            assert!(
+                admitted
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .any(|v| v.starts_with(&session_prefix)),
+                "a top-level navigation mints a session cookie"
+            );
+            let names = vary_names(&admitted);
+            for name in expected_vary {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "page Vary lacks {name}: {names:?}"
+                );
+            }
+            assert_eq!(
+                MINT_GATE_INITS.load(ord),
+                1,
+                "the admitted mint runs init once"
+            );
+            assert_eq!(
+                sessions.load(ord),
+                1,
+                "the admitted mint holds one session slot"
             );
         });
     }
@@ -9262,7 +12481,7 @@ mod emitted_router_behavior_tests {
     ) -> (StatusCode, String) {
         let mut b = Request::builder().method("GET").uri(uri);
         if let Some(c) = cookie {
-            b = b.header(header::COOKIE, format!("ipe_sid={c}"));
+            b = b.header(header::COOKIE, format!("{}={c}", cookie_name_for("")));
         }
         let resp = router
             .oneshot(b.body(Body::empty()).expect("build GET"))
@@ -9380,6 +12599,77 @@ mod emitted_router_behavior_tests {
         );
     }
 
+    /// A standalone app whose store config a policy gate refuses resolves to a
+    /// typed `InvalidInput` startup error naming the store, never the
+    /// `Unexpected` catch-all a stringified error lands in.
+    #[cfg(feature = "db")]
+    #[test]
+    fn standalone_app_store_refusal_is_typed() {
+        let plain = block_on(web_app::<crate::error::IpeError, Model, Msg, _, _, _, _>(
+            init,
+            update,
+            view,
+            subs,
+            "postgres".to_string(),
+            "mysql://db.example/app".to_string(),
+            [0u8; 32],
+        ));
+        let routed = block_on(web_app_routed::<
+            crate::error::IpeError,
+            Model,
+            Msg,
+            (),
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        >(
+            init,
+            update,
+            view,
+            subs,
+            vec![crate::web::route::Route::new("/", |_| Some(()))],
+            (),
+            |_page: (), model: Model| (model, IpeCmd::None),
+            |_page: &()| Err(crate::web::route::RenderRefusal::NoRoute),
+            "postgres".to_string(),
+            "mysql://db.example/app".to_string(),
+            [0u8; 32],
+        ));
+        for (what, result) in [("web_app", plain), ("web_app_routed", routed)] {
+            let IpeResult::Err(error) = result else {
+                panic!("{what}: a refused store must not start");
+            };
+            assert_eq!(
+                crate::error::ipe_error_kind(error.clone()),
+                crate::error::IpeErrorKind::InvalidInput,
+                "{what}: {error:?}"
+            );
+            let message = crate::error::ipe_error_message(error);
+            assert!(
+                message.starts_with("session store misconfigured: "),
+                "{what}: {message}"
+            );
+        }
+    }
+
+    /// A store refusal's operator text is scrubbed of controls before it
+    /// reaches the startup error or the log.
+    #[test]
+    fn store_refusal_display_is_scrubbed() {
+        let cause = StartupRefusal::SessionStore(store::StoreConfigError(
+            "bad\n[ipe.live] forged\u{1b}[31m\u{202e}".to_string(),
+        ));
+        let shown = cause.to_string();
+        assert!(
+            !shown.chars().any(crate::system::is_log_hazard),
+            "a raw control survived: {shown:?}"
+        );
+        assert_eq!(shown.lines().count(), 1, "{shown:?}");
+    }
+
     /// A mounted routed app whose table holds a malformed pattern answers every
     /// path with the fixed 503 body; the pattern stays in the server log.
     #[test]
@@ -9442,6 +12732,10 @@ mod emitted_router_behavior_tests {
                     .to_string(),
             )),
             parse_route_base("/%zz").expect_err("the base is malformed"),
+            StartupRefusal::FrameAncestors(
+                crate::telemetry::FrameAncestors::parse("https://a.example\r\n")
+                    .expect_err("a CR/LF source list is refused"),
+            ),
         ];
         for cause in causes {
             let detail = cause.to_string();
@@ -9476,6 +12770,47 @@ mod emitted_router_behavior_tests {
 }
 
 #[cfg(all(test, feature = "server"))]
+mod page_mount_base_tests {
+    use axum::http::{HeaderMap, StatusCode};
+
+    /// The first epoch of a fresh render history.
+    fn page_epoch() -> super::RenderEpoch {
+        super::Rendered::first(
+            super::new_incarnation(),
+            super::Html::<()>::HText(String::new()),
+        )
+        .epoch()
+    }
+
+    /// The page under the current `IPE_WEB_BASE_PATH`.
+    #[cfg(not(feature = "debugger"))]
+    fn page(headers: &HeaderMap) -> axum::response::Response {
+        super::page_response("sid", "<p>x</p>", &page_epoch(), "tok", headers)
+    }
+
+    /// The page under the current `IPE_WEB_BASE_PATH`.
+    #[cfg(feature = "debugger")]
+    fn page(headers: &HeaderMap) -> axum::response::Response {
+        super::page_response_with_overlay("sid", "<p>x</p>", &page_epoch(), "", "tok", headers)
+    }
+
+    /// A page asked for under a base outside the mount-base grammar answers the
+    /// fixed 503, never a page whose URLs and `ipe-base` meta carry that base; a
+    /// grammar base renders the page.
+    #[test]
+    fn a_non_mount_base_path_refuses_the_page() {
+        let headers = HeaderMap::new();
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/a\"b");
+        let refused = page(&headers).status();
+        crate::system::locked_set_var("IPE_WEB_BASE_PATH", "/app");
+        let admitted = page(&headers).status();
+        crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
+        assert_eq!(refused, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(admitted, StatusCode::OK);
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
 mod route_entry_cmd_tests {
     //! Every server path that commits a routed page from a URL runs that
     //! page's entry Cmd: the first GET (after `init`'s Cmd), a reload of a live
@@ -9486,7 +12821,7 @@ mod route_entry_cmd_tests {
     use super::*;
     use crate::web::req::WebReq;
     use crate::web::route::{RenderArg, RenderRefusal, Route, RoutePath, render_route};
-    use crate::web::store::{MemoryStore, SessionStore, StoreHit};
+    use crate::web::store::{MemoryStore, SessionStore};
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde::{Deserialize, Serialize};
@@ -9530,7 +12865,20 @@ mod route_entry_cmd_tests {
         }))
     }
 
+    thread_local! {
+        /// The session sid each fixture `init` call ran under, in call order.
+        static INIT_SIDS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Drain the sids `init` ran under on this thread since the last drain.
+    fn take_init_sids() -> Vec<String> {
+        INIT_SIDS.with(|sids| std::mem::take(&mut *sids.borrow_mut()))
+    }
+
+    /// Records the sid it runs under (where a js port binds its session), then inits.
     fn init(_req: WebReq) -> (Model, IpeCmd<Msg>) {
+        INIT_SIDS.with(|sids| sids.borrow_mut().push(pubsub::current_session_sid()));
         (
             Model {
                 page: Page::Home,
@@ -9600,11 +12948,22 @@ mod route_entry_cmd_tests {
         route::DecodedPath::parse("/").expect("`/` decodes")
     }
 
-    #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
     fn router(store: Store) -> axum::Router {
+        router_counted(store, Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// The fixture router over `store`, counting its session drivers in `session_count`.
+    #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
+    fn router_counted(store: Store, session_count: Arc<AtomicUsize>) -> axum::Router {
+        build_web_router(fixture_state(store, session_count), false)
+            .expect("the fixture route table and base are well-formed")
+    }
+
+    /// The fixture app's state over `store`, counting its session drivers in `session_count`.
+    fn fixture_state(store: Store, session_count: Arc<AtomicUsize>) -> FixtureState {
         let (route_entry, _, route_matched) =
             routed_resolvers(routes(), Page::Home, set_page, render);
-        let state: FixtureState = WebState {
+        WebState {
             store,
             init: Arc::new(init),
             update: Arc::new(update),
@@ -9613,14 +12972,65 @@ mod route_entry_cmd_tests {
             route_entry,
             param_resolver: Arc::new(|_path| crate::dict::dict_empty()),
             route_matched,
-            session_count: Arc::new(AtomicUsize::new(0)),
+            session_count,
             watch_build_status: Arc::new(Mutex::new(None)),
-        };
-        build_web_router(state, false).expect("the fixture route table and base are well-formed")
+        }
     }
 
     fn memory() -> Store {
         Arc::new(MemoryStore::<Model, Msg>::new(Duration::from_secs(60)))
+    }
+
+    /// A rebound name reaches no route of a real `serve_web`: the page GET
+    /// and the event POST both answer 421, no session driver starts and
+    /// `init` never runs; the same listener addressed by its IP literal
+    /// serves the page.
+    #[test]
+    fn dev_posture_pin_web_refuses_a_rebound_host() {
+        run(false, || async {
+            let port = crate::server::free_loopback_port().unwrap();
+            crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+            crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
+            crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+            crate::system::locked_set_var(
+                crate::env_registry::web::WEB_PORT.name(),
+                &port.to_string(),
+            );
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let served = serve_web::<crate::IpeError, _, _, _, _, _, _>(fixture_state(
+                memory(),
+                sessions.clone(),
+            ));
+            let checks = async {
+                let evil = format!("evil.example:{port}");
+                let page = format!("GET / HTTP/1.1\r\nHost: {evil}\r\nConnection: close\r\n\r\n");
+                let event = format!(
+                    "POST /_ipe/event HTTP/1.1\r\nHost: {evil}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+                for request in [page, event] {
+                    let resp = crate::server::raw_exchange(port, &request).await.unwrap();
+                    assert_eq!(crate::server::raw_status(&resp), 421, "{request}: {resp}");
+                    assert!(resp.contains("host_not_admitted"), "{resp}");
+                    assert!(!resp.to_ascii_lowercase().contains("set-cookie"), "{resp}");
+                }
+                assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(take_init_sids().is_empty());
+                let control = format!(
+                    "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                );
+                let resp = crate::server::raw_exchange(port, &control).await.unwrap();
+                assert_eq!(crate::server::raw_status(&resp), 200, "{resp}");
+            };
+            // The listener serves until shutdown; the checks finishing first is the pass.
+            let checked = tokio::select! {
+                _ = served => false,
+                () = checks => true,
+            };
+            assert!(checked, "serve_web returned before the checks ran");
+            crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
     }
 
     /// Run `body` on a current-thread runtime (deterministic task order); `paused` starts tokio's clock paused.
@@ -9641,9 +13051,18 @@ mod route_entry_cmd_tests {
     ///
     /// The cookie name comes from `cookie_name_for`, so the helper follows the
     /// posture's name (`ipe_sid` or `__Host-ipe_sid`) instead of pinning one.
-    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
     async fn get(
         store: &Store,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, Option<String>, String, String) {
+        get_via(router(store.clone()), path, cookie).await
+    }
+
+    /// GET `path` through `app`, answering as [`get`] does.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_via(
+        app: axum::Router,
         path: &str,
         cookie: Option<&str>,
     ) -> (StatusCode, Option<String>, String, String) {
@@ -9653,7 +13072,7 @@ mod route_entry_cmd_tests {
         if let Some(c) = cookie {
             b = b.header(header::COOKIE, format!("{name}={c}"));
         }
-        let resp = router(store.clone())
+        let resp = app
             .oneshot(b.body(Body::empty()).expect("build GET"))
             .await
             .expect("router responds");
@@ -9681,10 +13100,7 @@ mod route_entry_cmd_tests {
     }
 
     async fn handle_of(store: &Store, sid: &str) -> Option<SessionHandle<Model, Msg>> {
-        match store.get(sid).await {
-            Some(StoreHit::Web(h)) => Some(h),
-            _ => None,
-        }
+        store.get(sid).await
     }
 
     async fn model_of(store: &Store, sid: &str) -> Option<Model> {
@@ -9762,14 +13178,34 @@ mod route_entry_cmd_tests {
 
     #[async_trait::async_trait]
     impl SessionStore<Model, Msg> for ColdStore {
-        async fn get(&self, sid: &str) -> Option<StoreHit<Model, Msg>> {
-            match self.live.get(sid).await {
-                Some(hit) => Some(hit),
-                None if sid == self.cold_sid => Some(StoreHit::Cold(Model {
-                    page: Page::Home,
-                    log: vec!["persisted".to_owned()],
-                })),
-                None => None,
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.live.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.live.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            _make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            if !self.admission().admits(&claim) {
+                return store::Rejoin::Miss;
+            }
+            if let Some(h) = self.live.get(claim.key().as_str()).await {
+                return store::Rejoin::Live(h);
+            }
+            if claim.key().as_str() == self.cold_sid {
+                store::Rejoin::Restored {
+                    claim,
+                    section: store::CredSection::Absent,
+                    model: Model {
+                        page: Page::Home,
+                        log: vec!["persisted".to_owned()],
+                    },
+                }
+            } else {
+                store::Rejoin::Miss
             }
         }
         async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
@@ -9803,6 +13239,535 @@ mod route_entry_cmd_tests {
         });
     }
 
+    /// The live binary's Model schema tag in the file-store fixtures.
+    #[cfg(feature = "web")]
+    const LIVE_TAG: [u8; 32] = [0x11; 32];
+    /// A previous binary's tag: a row under it was written before a Model change.
+    #[cfg(feature = "web")]
+    const OLD_TAG: [u8; 32] = [0x22; 32];
+
+    /// One checkpoint blob framed as the store writes it: `base64(tag ++ json)`.
+    #[cfg(feature = "web")]
+    fn checkpoint(tag: [u8; 32], json: &str) -> String {
+        use base64::Engine as _;
+        let mut framed = tag.to_vec();
+        framed.extend_from_slice(json.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(framed)
+    }
+
+    /// A file store under `LIVE_TAG` whose one persisted row maps `sid` to `blob`.
+    ///
+    /// The map lives in a private scratch directory the returned guard removes
+    /// on drop, so no fixture writes through a name another local user can plant.
+    #[cfg(feature = "web")]
+    #[allow(clippy::expect_used)] // test helper — a temp-file write failure is a test environment issue
+    fn file_store_with(
+        name: &str,
+        sid: &str,
+        blob: String,
+    ) -> (Store, crate::scratch_core::ScratchDir) {
+        let dir = crate::scratch_core::ScratchDir::new(&format!("ipetest-rejoin-{name}"))
+            .expect("a private scratch dir");
+        let path = dir.path().join("sessions.json");
+        let last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let mut map: std::collections::HashMap<String, (String, i64)> =
+            std::collections::HashMap::new();
+        map.insert(sid.to_owned(), (blob, last_seen));
+        std::fs::write(
+            &path,
+            serde_json::to_string(&map).expect("encode the seed map"),
+        )
+        .expect("write the seed map");
+        let store: Store = Arc::new(store::FileStore::<Model, Msg>::new(
+            path.to_str().expect("a UTF-8 temp path"),
+            Duration::from_secs(60),
+            LIVE_TAG,
+        ));
+        (store, dir)
+    }
+
+    /// A session rebuilt across an additive Model change runs init's Cmd, then the entry Cmd, under its kept sid.
+    #[cfg(feature = "web")]
+    #[test]
+    fn schema_rebuilt_session_runs_init_cmd_then_entry_cmd() {
+        run(false, || async {
+            let sid = new_sid();
+            // The old Model had no `log`: an additive change, so the row is rebuilt.
+            let (store, _dir) =
+                file_store_with("rebuilt", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(cookie_sid, sid, "a rebuilt session keeps the cookie's sid");
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "a rebuilt session runs init's Cmd, then the entry Cmd, each once"
+            );
+        });
+    }
+
+    /// The `init` a rebuild evaluates runs under the session's sid, never the empty default.
+    #[cfg(feature = "web")]
+    #[test]
+    fn rebuilt_init_cmd_binds_session_sid() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) =
+                file_store_with("bindsid", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            take_init_sids();
+            let (status, _, _, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                take_init_sids(),
+                vec![sid],
+                "init runs once, scoped to the rebuilt session's sid"
+            );
+        });
+    }
+
+    /// A same-tag checkpoint restores verbatim and never evaluates `init`.
+    #[cfg(feature = "web")]
+    #[test]
+    fn exact_tag_restore_never_calls_init() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) = file_store_with(
+                "exact",
+                &sid,
+                checkpoint(LIVE_TAG, r#"{"page":"Home","log":["persisted"]}"#),
+            );
+            take_init_sids();
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(cookie_sid, sid, "a restored session keeps the cookie's sid");
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["persisted".to_owned(), "enter:home".to_owned()]),
+                "a verbatim restore runs the entry Cmd and never init's"
+            );
+            assert!(
+                take_init_sids().is_empty(),
+                "a verbatim restore never evaluates init"
+            );
+        });
+    }
+
+    /// An undecodable row is a miss: a fresh sid, `init` evaluated exactly once under it.
+    #[cfg(feature = "web")]
+    #[test]
+    fn failed_rebuild_runs_init_once_under_new_sid() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) = file_store_with("undecodable", &sid, "!! not base64 !!".to_owned());
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(minted, sid, "a miss never adopts the client's sid");
+            assert_eq!(
+                take_init_sids(),
+                vec![minted.clone()],
+                "init runs exactly once, under the minted sid"
+            );
+            let m = settled(&store, &minted, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "the new session runs init's Cmd, then the entry Cmd"
+            );
+        });
+    }
+
+    /// A non-additive old row evaluates `init` for the rebuild attempt, drops that Cmd unrun, and re-inits once.
+    #[cfg(feature = "web")]
+    #[test]
+    fn non_additive_rebuild_discards_its_init_cmd() {
+        run(false, || async {
+            let sid = new_sid();
+            // `log` retyped (a number where the live Model holds a list): not additive.
+            let (store, _dir) = file_store_with(
+                "retyped",
+                &sid,
+                checkpoint(OLD_TAG, r#"{"page":"Home","log":5}"#),
+            );
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(
+                minted, sid,
+                "a failed rebuild never adopts the client's sid"
+            );
+            assert_eq!(
+                take_init_sids(),
+                vec![sid, minted.clone()],
+                "the rebuild attempt evaluates init under the cookie's sid, the re-init under the minted one"
+            );
+            // Wait past the expected length: a leaked rebuild Cmd would land a second "init".
+            let m = settled(&store, &minted, 3).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "only the re-init's Cmd runs; the discarded rebuild's Cmd never does"
+            );
+        });
+    }
+
+    /// A store that yields between its claimed lookup and the caller's publish, as a networked store's I/O does.
+    ///
+    /// Without the yield every fixture lookup completes in one poll, so two
+    /// concurrent GETs never interleave between lookup and `set` and a race
+    /// test passes with or without the claim.
+    #[cfg(feature = "web")]
+    struct YieldingStore {
+        inner: Store,
+    }
+
+    #[cfg(feature = "web")]
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for YieldingStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            let rejoin = self.inner.get_reconstructing(claim, make_init).await;
+            tokio::task::yield_now().await;
+            rejoin
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// Two concurrent GETs rejoining one schema-rebuilt sid evaluate `init` once; the second joins live.
+    #[cfg(feature = "web")]
+    #[test]
+    fn two_concurrent_rebuilt_gets_run_init_once() {
+        run(false, || async {
+            let sid = new_sid();
+            let (file, _dir) =
+                file_store_with("racedinit", &sid, checkpoint(OLD_TAG, r#"{"page":"Home"}"#));
+            let store: Store = Arc::new(YieldingStore { inner: file });
+            take_init_sids();
+            let ((first, ..), (second, ..)) =
+                tokio::join!(get(&store, "/", Some(&sid)), get(&store, "/", Some(&sid)));
+            assert_eq!((first, second), (StatusCode::OK, StatusCode::OK));
+            assert_eq!(
+                take_init_sids(),
+                vec![sid.clone()],
+                "one cold rejoin per sid: init runs once"
+            );
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(
+                m.map(|m| count(&m, "init")),
+                Some(1),
+                "init's Cmd lands once"
+            );
+        });
+    }
+
+    /// Two concurrent GETs restoring one sid verbatim spawn one session driver.
+    #[cfg(feature = "web")]
+    #[test]
+    fn restored_concurrent_gets_spawn_one_driver() {
+        run(false, || async {
+            let sid = new_sid();
+            let (file, _dir) = file_store_with(
+                "raceddriver",
+                &sid,
+                checkpoint(LIVE_TAG, r#"{"page":"Home","log":["persisted"]}"#),
+            );
+            let store: Store = Arc::new(YieldingStore { inner: file });
+            let drivers = Arc::new(AtomicUsize::new(0));
+            let ((first, ..), (second, ..)) = tokio::join!(
+                get_via(
+                    router_counted(store.clone(), drivers.clone()),
+                    "/",
+                    Some(&sid)
+                ),
+                get_via(
+                    router_counted(store.clone(), drivers.clone()),
+                    "/",
+                    Some(&sid)
+                )
+            );
+            assert_eq!((first, second), (StatusCode::OK, StatusCode::OK));
+            assert_eq!(
+                drivers.load(Ordering::SeqCst),
+                1,
+                "the second rejoin joins the first's live session"
+            );
+        });
+    }
+
+    /// A cold store whose `set` waits for the test's release, so a test cancels a handler mid-commit.
+    struct GatedStore {
+        inner: ColdStore,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for GatedStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            self.inner.get_reconstructing(claim, make_init).await
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            self.entered.notify_one();
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// A handler cancelled while its rejoin is being stored still commits the session, its Cmd and its claim release.
+    #[test]
+    fn cancelled_handler_mid_set_still_commits() {
+        run(false, || async {
+            let cold_sid = new_sid();
+            let gated = Arc::new(GatedStore {
+                inner: ColdStore {
+                    live: MemoryStore::new(Duration::from_secs(60)),
+                    cold_sid: cold_sid.clone(),
+                },
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            let store: Store = gated.clone();
+            let app = router(store.clone());
+            let cookie = cold_sid.clone();
+            let request =
+                tokio::spawn(async move { get_via(app, "/", Some(cookie.as_str())).await });
+            gated.entered.notified().await;
+            request.abort();
+            assert!(
+                request.await.is_err(),
+                "the handler is cancelled mid-commit"
+            );
+            gated.release.add_permits(1);
+            let m = settled(&store, &cold_sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["persisted".to_owned(), "enter:home".to_owned()]),
+                "the cancelled handler's session is stored and its entry Cmd runs"
+            );
+            gated.release.add_permits(1);
+            let (status, ..) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(status, StatusCode::OK, "the committed claim was released");
+        });
+    }
+
+    /// A cold store whose first `set` panics, so a test drives a commit that unwinds mid-publish.
+    struct PanicOnceStore {
+        inner: ColdStore,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for PanicOnceStore {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn get_reconstructing(
+            &self,
+            claim: store::SidClaim,
+            make_init: &(dyn Fn() -> (Model, IpeCmd<Msg>) + Sync),
+        ) -> store::Rejoin<Model, Msg> {
+            self.inner.get_reconstructing(claim, make_init).await
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                panic!("the first commit unwinds mid-publish");
+            }
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// A commit that panics answers the panic 500 and releases its claim, so a retry restores the session.
+    #[test]
+    fn panicking_commit_is_500_and_releases_claim() {
+        run(false, || async {
+            let cold_sid = new_sid();
+            let store: Store = Arc::new(PanicOnceStore {
+                inner: ColdStore {
+                    live: MemoryStore::new(Duration::from_secs(60)),
+                    cold_sid: cold_sid.clone(),
+                },
+                armed: std::sync::atomic::AtomicBool::new(true),
+            });
+            let (status, _, _, body) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a panicked commit is the panic 500"
+            );
+            assert!(
+                !body.contains(&cold_sid),
+                "the panic body never carries the sid: {body}"
+            );
+            let (status, _, cookie_sid, _) = get(&store, "/", Some(&cold_sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the unwound commit released its claim"
+            );
+            assert_eq!(cookie_sid, cold_sid, "the retry restores the cold session");
+        });
+    }
+
+    /// A claim held past the wait, or a sid with too many waiters, is the busy 503; a full claim table is the capacity 503.
+    #[test]
+    fn claim_refusals_map_to_existing_503s() {
+        run(true, || async {
+            let store = memory();
+            let sid = new_sid();
+            let key = || store::SessionKey::parse(&sid).expect("a minted sid is a session key");
+            let held = store
+                .claim(key())
+                .await
+                .expect("an idle sid is claimed at once");
+
+            let (status, retry_after, ..) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a wait past CLAIM_WAIT"
+            );
+            assert_eq!(retry_after.as_deref(), Some("1"));
+
+            let mut waiters: Vec<_> = (0..store::MAX_CLAIM_WAITERS.get())
+                .map(|_| store.claim(key()))
+                .collect();
+            for waiter in &mut waiters {
+                assert!(
+                    futures_util::FutureExt::now_or_never(waiter).is_none(),
+                    "a waiter up to the limit queues"
+                );
+            }
+            let (status, retry_after, ..) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a crowded sid");
+            assert_eq!(retry_after.as_deref(), Some("1"));
+            drop(waiters);
+            drop(held);
+
+            let mut table = Vec::with_capacity(store::MAX_CLAIMS_IN_FLIGHT);
+            for i in 0..store::MAX_CLAIMS_IN_FLIGHT {
+                let k = store::SessionKey::parse(&format!("{i:032x}")).expect("a 32-hex sid");
+                table.push(
+                    store
+                        .claim(k)
+                        .await
+                        .expect("a sid under the cap is claimed"),
+                );
+            }
+            let (status, retry_after, ..) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a full claim table"
+            );
+            assert_eq!(retry_after.as_deref(), Some("2"));
+        });
+    }
+
+    /// A live session's GET never touches the claim table, so a full table cannot refuse it.
+    #[test]
+    fn live_session_bypasses_a_full_claim_table() {
+        run(false, || async {
+            let store = memory();
+            let (status, _, sid, _) = get(&store, "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                settled(&store, &sid, 2).await.is_some(),
+                "the session is live"
+            );
+            let mut table = Vec::with_capacity(store::MAX_CLAIMS_IN_FLIGHT);
+            for i in 0..store::MAX_CLAIMS_IN_FLIGHT {
+                let k = store::SessionKey::parse(&format!("{i:032x}")).expect("a 32-hex sid");
+                table.push(
+                    store
+                        .claim(k)
+                        .await
+                        .expect("a sid under the cap is claimed"),
+                );
+            }
+            let cold = store::SessionKey::parse(&new_sid()).expect("a minted sid is a session key");
+            assert_eq!(
+                store.claim(cold).await.err(),
+                Some(store::ClaimRefusal::Saturated),
+                "the claim table is full"
+            );
+            let (status, retry_after, cookie_sid, _) = get(&store, "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK, "a live session is never refused");
+            assert_eq!(retry_after, None);
+            assert_eq!(cookie_sid, sid, "the GET joins the live session");
+        });
+    }
+
+    /// A cookie that is not a well-formed sid is never looked up: the GET mints a fresh session.
+    #[test]
+    fn malformed_cookie_mints_without_lookup() {
+        run(false, || async {
+            let malformed = "persisted-session".to_owned();
+            let store: Store = Arc::new(ColdStore {
+                live: MemoryStore::new(Duration::from_secs(60)),
+                cold_sid: malformed.clone(),
+            });
+            take_init_sids();
+            let (status, _, minted, _) = get(&store, "/", Some(&malformed)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(minted, malformed, "a malformed sid is never adopted");
+            assert_eq!(take_init_sids(), vec![minted.clone()]);
+            let m = settled(&store, &minted, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["init".to_owned(), "enter:home".to_owned()]),
+                "the store's row under the malformed sid is never restored"
+            );
+        });
+    }
+
     /// A live session whose driver does not drain its enter queue, so a test holds the queue's far end.
     async fn stalled_session(store: &Store) -> (String, Receiver<EnterRequest>) {
         let sid = new_sid();
@@ -9811,13 +13776,12 @@ mod route_entry_cmd_tests {
             log: Vec::new(),
         };
         let last_view = view(model.clone());
-        let index = build_index(&last_view);
         let (msg_tx, _msg_rx) = mpsc::channel::<Msg>(1);
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model: model.clone(),
-            last_view,
-            index,
+            rendered: Rendered::first(new_incarnation(), last_view),
+            tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx,
@@ -9830,6 +13794,7 @@ mod route_entry_cmd_tests {
             ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
+            liveness: crate::web::SessionLiveness::default(),
         }));
         store.set(&sid, entry).await;
         (sid, enter_rx)
@@ -9969,6 +13934,1930 @@ mod route_entry_cmd_tests {
             );
             let m = settled(&store, &sid, 3).await;
             assert_eq!(m.map(|m| count(&m, "enter:home")), Some(1));
+        });
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tab_seq_window_tests {
+    use super::{TAB_SEQ_CAP, TAB_SEQ_WINDOW, TabId, TabSeqs};
+
+    const TAB: TabId = TabId(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+
+    #[test]
+    fn only_a_dispatched_seq_is_a_duplicate_inside_the_window() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 500);
+        let oldest_tracked = 500 - u64::from(TAB_SEQ_WINDOW) + 1;
+        assert!(seqs.is_duplicate(TAB, 500));
+        assert!(!seqs.is_duplicate(TAB, 501));
+        assert!(!seqs.is_duplicate(TAB, 499));
+        assert!(!seqs.is_duplicate(TAB, oldest_tracked));
+        seqs.record(TAB, oldest_tracked);
+        assert!(seqs.is_duplicate(TAB, oldest_tracked));
+        assert!(!seqs.is_duplicate(TAB, oldest_tracked + 1));
+    }
+
+    #[test]
+    fn a_seq_older_than_the_window_counts_as_dispatched() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 500);
+        let past = 500 - u64::from(TAB_SEQ_WINDOW);
+        assert!(seqs.is_duplicate(TAB, past));
+        assert!(seqs.is_duplicate(TAB, 0));
+        seqs.record(TAB, u64::MAX);
+        assert!(seqs.is_duplicate(TAB, 0));
+        assert!(!seqs.is_duplicate(TAB, u64::MAX - 1));
+    }
+
+    #[test]
+    fn advancing_slides_the_window_and_keeps_the_marks_inside_it() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 10);
+        seqs.record(TAB, 12);
+        assert!(seqs.is_duplicate(TAB, 10));
+        assert!(!seqs.is_duplicate(TAB, 11));
+        seqs.record(TAB, 10 + u64::from(TAB_SEQ_WINDOW));
+        assert!(seqs.is_duplicate(TAB, 10), "10 slid out of the window");
+        assert!(!seqs.is_duplicate(TAB, 11));
+        assert!(seqs.is_duplicate(TAB, 12));
+    }
+
+    #[test]
+    fn the_least_recent_tab_is_forgotten_past_the_cap() {
+        let mut seqs = TabSeqs::default();
+        seqs.record(TAB, 1);
+        for k in 1..=TAB_SEQ_CAP.get() {
+            seqs.record(TabId(u128::try_from(k).unwrap_or(u128::MAX)), 1);
+        }
+        assert!(!seqs.is_duplicate(TAB, 1), "the oldest tab was evicted");
+    }
+}
+
+#[cfg(all(test, feature = "web", feature = "jwt"))]
+mod web_revocation_tests {
+    //! A revoked or expired credential ends the `Web` session it is bound to.
+    //!
+    //! A test arms the process through the `Server` floor
+    //! ([`crate::revocation::arm_process`]), which resolves the same gate the
+    //! installed and environment arming do and leaves no setting installed
+    //! for the next router. Neither the arming nor the serving flag the router
+    //! sets is ever cleared, as in production, so the suite runs one process
+    //! per test (nextest).
+    //!
+    //! A test that covers a request-side or driver-side check revokes through
+    //! [`crate::revocation::revoke_subject_unannounced`]: no generation bump
+    //! wakes the driver, so only the check under test can see the revocation.
+
+    use super::*;
+    use crate::web::req::WebReq;
+    use crate::web::store::{MemoryStore, SessionStore};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::response::Response;
+    use serde::{Deserialize, Serialize};
+    use std::time::Duration;
+    use tower::ServiceExt; // oneshot
+
+    const SECRET: &str = "a-web-revocation-test-secret-of-32-bytes";
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct Model {
+        sub: String,
+        authed: bool,
+        n: i64,
+        revoked: bool,
+        view_token: String,
+        task_token: String,
+        task_ok: Option<bool>,
+    }
+
+    impl crate::stringify::IpeStringify for Model {
+        fn ipe_show(&self) -> String {
+            format!("{self:?}")
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    enum Msg {
+        RevokeSelf,
+        Bump,
+        RunTask,
+        TaskDone(bool),
+        /// Counts one step and returns [`revoked_cmd`], revoking nothing itself.
+        Effect,
+    }
+
+    impl crate::stringify::IpeStringify for Msg {
+        fn ipe_show(&self) -> String {
+            format!("{self:?}")
+        }
+    }
+
+    /// Whether `Auth.verifyToken` admits `token` where it is called.
+    fn verifies(token: &str) -> bool {
+        matches!(
+            crate::auth::auth_verify_token(SECRET.to_owned(), token.to_owned()),
+            crate::IpeResult::Ok(_)
+        )
+    }
+
+    fn init(req: WebReq) -> (Model, IpeCmd<Msg>) {
+        let cookie = |name: &str| req.cookies.get(name).cloned().unwrap_or_default();
+        let token = cookie("tok");
+        let model = Model {
+            sub: cookie("sub"),
+            authed: !token.is_empty() && verifies(&token),
+            n: 0,
+            revoked: false,
+            view_token: cookie("vtok"),
+            task_token: cookie("ttok"),
+            task_ok: None,
+        };
+        (model, IpeCmd::None)
+    }
+
+    /// Times `update` ran a `Msg::Bump`, read as a before and after delta.
+    static BUMPS: AtomicUsize = AtomicUsize::new(0);
+    /// Times a Cmd a revoked session must never dispatch ran.
+    static REVOKED_CMDS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A Cmd that counts its own dispatch in [`REVOKED_CMDS`].
+    fn revoked_cmd() -> IpeCmd<Msg> {
+        IpeCmd::Perform(Box::new(|| {
+            Box::pin(async {
+                REVOKED_CMDS.fetch_add(1, Ordering::Relaxed);
+                Msg::Bump
+            })
+        }))
+    }
+
+    fn update(msg: Msg, model: Model) -> (Model, IpeCmd<Msg>) {
+        match msg {
+            Msg::RevokeSelf => {
+                let revoked =
+                    crate::revocation::revoke_subject_unannounced(model.sub.clone()).is_ok();
+                let n = model.n + 1;
+                (
+                    Model {
+                        n,
+                        revoked,
+                        ..model
+                    },
+                    revoked_cmd(),
+                )
+            }
+            Msg::Bump => {
+                BUMPS.fetch_add(1, Ordering::Relaxed);
+                let n = model.n + 1;
+                (Model { n, ..model }, IpeCmd::None)
+            }
+            Msg::RunTask => {
+                let token = model.task_token.clone();
+                let task: IpeCmd<Msg> = IpeCmd::Perform(Box::new(move || {
+                    Box::pin(async move { Msg::TaskDone(verifies(&token)) })
+                }));
+                (model, task)
+            }
+            Msg::TaskDone(ok) => (
+                Model {
+                    task_ok: Some(ok),
+                    ..model
+                },
+                IpeCmd::None,
+            ),
+            Msg::Effect => {
+                let n = model.n + 1;
+                (Model { n, ..model }, revoked_cmd())
+            }
+        }
+    }
+
+    fn view(model: Model) -> Html<Msg> {
+        let verdict = if model.view_token.is_empty() {
+            "view-none"
+        } else if verifies(&model.view_token) {
+            "view-authed"
+        } else {
+            "view-refused"
+        };
+        Html::HElement(
+            "div".to_owned(),
+            vec![],
+            vec![Html::HText(format!(
+                "authed={} n={} {verdict}",
+                model.authed, model.n
+            ))],
+        )
+    }
+
+    fn subs(_model: Model) -> IpeSub<Msg> {
+        IpeSub::None
+    }
+
+    type Store = MemoryStore<Model, Msg>;
+    type RouterState = WebState<
+        Model,
+        Msg,
+        fn(WebReq) -> (Model, IpeCmd<Msg>),
+        fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+        fn(Model) -> Html<Msg>,
+        fn(Model) -> IpeSub<Msg>,
+    >;
+
+    fn param_resolver(_path: &crate::web::route::DecodedPath) -> crate::dict::IpeDict<String> {
+        crate::dict::dict_empty()
+    }
+
+    fn route_matched(p: &crate::web::route::DecodedPath) -> crate::web::RouteLookup {
+        crate::web::RouteLookup::single_page(p)
+    }
+
+    /// The production router over `store`.
+    fn make_router(store: &Arc<Store>) -> axum::Router {
+        router_over(Arc::clone(store) as Arc<dyn store::SessionStore<Model, Msg>>)
+    }
+
+    /// The production router over any session `store`.
+    #[allow(clippy::expect_used)] // test helper: an armed router with `jwt` compiled always builds
+    fn router_over(store: Arc<dyn store::SessionStore<Model, Msg>>) -> axum::Router {
+        let state: RouterState = WebState {
+            store,
+            init: Arc::new(init),
+            update: Arc::new(update),
+            view: Arc::new(view),
+            subs: Arc::new(subs),
+            route_entry: Arc::new(|model, _path| route::Entered {
+                model,
+                cmd: IpeCmd::None,
+            }),
+            param_resolver: Arc::new(param_resolver),
+            route_matched: Arc::new(route_matched),
+            session_count: Arc::new(AtomicUsize::new(0)),
+            watch_build_status: Arc::new(Mutex::new(None)),
+        };
+        build_web_router(state, false).expect("a router armed through the Server floor builds")
+    }
+
+    /// Arm the process through the `Server` floor, then run `body` on a
+    /// current-thread runtime, its clock paused when `paused`, with CSRF off.
+    fn run<F: std::future::Future<Output = ()>>(paused: bool, body: impl FnOnce() -> F) {
+        run_with(true, paused, body);
+    }
+
+    /// [`run`], arming the process first only when `armed`.
+    #[allow(clippy::expect_used)] // test helper: runtime build failure is a test environment issue
+    fn run_with<F: std::future::Future<Output = ()>>(
+        armed: bool,
+        paused: bool,
+        body: impl FnOnce() -> F,
+    ) {
+        let _g = crate::web::literal_table::overlay_test_lock();
+        crate::system::locked_set_var("IPE_CSRF", "off");
+        if armed {
+            crate::revocation::arm_process();
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(paused)
+            .build()
+            .expect("current-thread runtime")
+            .block_on(body());
+        crate::system::locked_remove_var("IPE_CSRF");
+    }
+
+    /// An `HS256` token for `sub`, live for an hour, capped `cap_in` seconds from now.
+    #[allow(clippy::expect_used)] // test helper: encoding a fixed claim set cannot fail
+    fn token(sub: &str, jti: Option<&str>, cap_in: i64) -> String {
+        let now = crate::jwt::now_unix_seconds();
+        let mut claims = serde_json::json!({
+            "sub": sub,
+            "iat": now,
+            "exp": now + 3600,
+            "cap": now + cap_in,
+        });
+        if let (Some(jti), Some(map)) = (jti, claims.as_object_mut()) {
+            map.insert("jti".to_owned(), serde_json::Value::from(jti));
+        }
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let key = jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes());
+        jsonwebtoken::encode(&header, &claims, &key).expect("encode a test token")
+    }
+
+    /// The session cookie pair for `sid`.
+    fn sid_cookie(sid: &str) -> String {
+        format!("{}={sid}", cookie_name_for(""))
+    }
+
+    /// Send one request through `router`.
+    #[allow(clippy::expect_used)] // test helper: a fixed request always builds and the router always answers
+    async fn send(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        cookies: &str,
+        body: &str,
+    ) -> Response {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::COOKIE, cookies)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("build a request");
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers")
+    }
+
+    /// The session sid a response sets, or empty when it sets none.
+    fn minted_sid(resp: &Response) -> String {
+        let prefix = format!("{}=", cookie_name_for(""));
+        resp.headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| value.strip_prefix(prefix.as_str()))
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    /// The whole body of `resp`, empty when it is not UTF-8.
+    async fn text(resp: Response) -> String {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Whether `resp` is the session-lost answer the client reloads on.
+    async fn is_session_lost(resp: Response) -> bool {
+        let shape = resp.status() == StatusCode::NOT_FOUND
+            && resp
+                .headers()
+                .get("x-ipe-web")
+                .is_some_and(|value| value == "1");
+        shape && text(resp).await.contains(SESSION_LOST_BODY)
+    }
+
+    /// A session opened by a page load.
+    struct Opened {
+        sid: String,
+        /// The credential cookies the page load carried, without the sid.
+        cookies: String,
+        body: String,
+    }
+
+    /// Load the page with a token for `sub` capped `cap_in` seconds from now,
+    /// plus the cookies in `extra`.
+    async fn open_session(router: &axum::Router, sub: &str, cap_in: i64, extra: &str) -> Opened {
+        let jti = format!("{sub}-jti");
+        let cookies = format!("sub={sub}; tok={}{extra}", token(sub, Some(&jti), cap_in));
+        let resp = send(router, "GET", "/", &cookies, "").await;
+        let sid = minted_sid(&resp);
+        let body = text(resp).await;
+        Opened { sid, cookies, body }
+    }
+
+    /// The live entry of `sid` in `store`.
+    async fn entry_of(store: &Arc<Store>, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+        store.get(sid).await
+    }
+
+    /// Whether the session `handle` closes within `within`.
+    async fn closes_within(handle: &store::SessionHandle<Model, Msg>, within: Duration) -> bool {
+        let mut closer = handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .liveness
+            .closer
+            .subscribe();
+        tokio::time::timeout(within, closer.wait_for(|closed| *closed))
+            .await
+            .is_ok_and(|seen| seen.is_ok())
+    }
+
+    /// An event for a session whose subject is revoked gets the session-lost answer.
+    #[test]
+    fn event_after_revoke_is_session_lost() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w1-subject", 7200, "").await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            let before = send(
+                &router,
+                "POST",
+                "/_ipe/event",
+                &sid_cookie(&opened.sid),
+                "{}",
+            )
+            .await;
+            assert_ne!(
+                before.status(),
+                StatusCode::NOT_FOUND,
+                "a live session is found"
+            );
+            assert!(crate::revocation::revoke_subject_unannounced("w1-subject".to_owned()).is_ok());
+            let after = send(
+                &router,
+                "POST",
+                "/_ipe/event",
+                &sid_cookie(&opened.sid),
+                "{}",
+            )
+            .await;
+            assert!(is_session_lost(after).await, "a revoked session is lost");
+        });
+    }
+
+    /// The message sender of the live session `handle`.
+    fn msg_tx_of(handle: &store::SessionHandle<Model, Msg>) -> tokio::sync::mpsc::Sender<Msg> {
+        handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .msg_tx
+            .clone()
+    }
+
+    /// Let every ready task run.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The schema tag the persistent test stores write under.
+    const TAG: [u8; 32] = [3; 32];
+
+    /// A schema tag of an earlier build of the Model.
+    const OLD_TAG: [u8; 32] = [4; 32];
+
+    /// A file session store at `path`, as a fresh process opens it.
+    fn file_store(path: &std::path::Path) -> Arc<store::FileStore<Model, Msg>> {
+        Arc::new(store::FileStore::new(
+            path.to_str().unwrap_or_default(),
+            Duration::from_secs(60),
+            TAG,
+        ))
+    }
+
+    /// A per-test scratch path for a store file named `name`.
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_webrev_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// A persisted row's Model, counting `n`.
+    fn row_model(n: i64) -> Model {
+        Model {
+            sub: String::new(),
+            authed: false,
+            n,
+            revoked: false,
+            view_token: String::new(),
+            task_token: String::new(),
+            task_ok: None,
+        }
+    }
+
+    /// A checkpoint blob under `tag`, with the credential `section` when given.
+    ///
+    /// Framed by hand, so a reader drift from the writer shows here.
+    fn blob(tag: [u8; 32], section: Option<&[u8]>, body: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let mut framed = tag.to_vec();
+        if let Some(section) = section {
+            framed.push(0x00);
+            framed.extend_from_slice(
+                &u16::try_from(section.len())
+                    .unwrap_or(u16::MAX)
+                    .to_be_bytes(),
+            );
+            framed.extend_from_slice(section);
+        }
+        framed.extend_from_slice(body);
+        B64.encode(framed)
+    }
+
+    /// The JSON body of `model`.
+    fn body_of(model: &Model) -> Vec<u8> {
+        serde_json::to_vec(model).unwrap_or_default()
+    }
+
+    /// The JSON body of `model` as an earlier build wrote it, without `task_ok`.
+    fn old_body_of(model: &Model) -> Vec<u8> {
+        let mut value = serde_json::to_value(model).unwrap_or_default();
+        if let Some(map) = value.as_object_mut() {
+            map.remove("task_ok");
+        }
+        serde_json::to_vec(&value).unwrap_or_default()
+    }
+
+    /// A persisted credential section binding one live credential per subject.
+    fn section_of(subjects: &[String]) -> Vec<u8> {
+        let deadline = crate::jwt::now_unix_seconds() + 3600;
+        let credentials: Vec<serde_json::Value> = subjects
+            .iter()
+            .map(|sub| serde_json::json!({ "sub": sub, "jti": format!("{sub}-jti"), "deadline": deadline }))
+            .collect();
+        serde_json::to_vec(&credentials).unwrap_or_default()
+    }
+
+    /// Write the file-store map at `path` holding `rows`.
+    fn seed_rows(path: &std::path::Path, rows: &[(&str, String)]) -> bool {
+        let seen = crate::jwt::now_unix_seconds();
+        let map: std::collections::HashMap<&str, (&str, i64)> = rows
+            .iter()
+            .map(|(sid, blob)| (*sid, (blob.as_str(), seen)))
+            .collect();
+        serde_json::to_string(&map).is_ok_and(|json| std::fs::write(path, json).is_ok())
+    }
+
+    /// The bytes after the schema tag of `sid`'s row in the file map at `path`.
+    fn row_after_tag(path: &std::path::Path, sid: &str) -> Option<Vec<u8>> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let json = std::fs::read_to_string(path).ok()?;
+        let map: std::collections::HashMap<String, (String, i64)> =
+            serde_json::from_str(&json).ok()?;
+        let (blob, _) = map.get(sid)?;
+        B64.decode(blob.as_bytes())
+            .ok()?
+            .get(32..)
+            .map(<[u8]>::to_vec)
+    }
+
+    /// Whether a fresh `store` still holds a cold row for `sid` that restores.
+    async fn cold_row_restores(store: &dyn store::SessionStore<Model, Msg>, sid: &str) -> bool {
+        let Some(key) = store::SessionKey::parse(sid) else {
+            return false;
+        };
+        let Ok(claim) = store.claim(key).await else {
+            return false;
+        };
+        let init = || (row_model(0), IpeCmd::None);
+        matches!(
+            store.get_reconstructing(claim, &init).await,
+            store::Rejoin::Restored { .. } | store::Rejoin::Rebuilt { .. }
+        )
+    }
+
+    /// A page load of `sid` with the extra `cookies`: the sid it answers with and its body.
+    async fn reload(router: &axum::Router, sid: &str, cookies: &str) -> (String, String) {
+        let resp = send(
+            router,
+            "GET",
+            "/",
+            &format!("{}; {cookies}", sid_cookie(sid)),
+            "",
+        )
+        .await;
+        let answered = minted_sid(&resp);
+        (answered, text(resp).await)
+    }
+
+    /// The number of credentials the live session `sid` in `store` holds.
+    async fn bound_count(store: &dyn store::SessionStore<Model, Msg>, sid: &str) -> Option<usize> {
+        let handle = store.get(sid).await?;
+        let bindings = Arc::clone(
+            handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .bindings(),
+        );
+        bindings.lock().ok().map(|held| held.len())
+    }
+
+    /// A restored row is rechecked against its persisted credentials: it
+    /// restores while they stand, and once revoked the row is deleted and the
+    /// page load mints a new sid and re-runs `init`.
+    #[cfg(feature = "db")]
+    #[test]
+    #[allow(clippy::expect_used)] // test: a scratch SQLite store that cannot open is a broken test environment, never a pass
+    fn restored_row_rechecks_persisted_bindings() {
+        run(false, || async {
+            let path = scratch_path("restore.db");
+            let p = path.to_str().expect("a UTF-8 scratch path");
+            let open = || async {
+                store::SqliteStore::<Model, Msg>::new(p, Duration::from_secs(60), TAG)
+                    .await
+                    .map(Arc::new)
+                    .expect("open the scratch SQLite store")
+            };
+            let first = open().await;
+            let opened = open_session(
+                &router_over(first as Arc<dyn store::SessionStore<Model, Msg>>),
+                "persist-subject",
+                7200,
+                "",
+            )
+            .await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            let second = open().await;
+            let (answered, _) = reload(
+                &router_over(second as Arc<dyn store::SessionStore<Model, Msg>>),
+                &opened.sid,
+                &opened.cookies,
+            )
+            .await;
+            assert_eq!(
+                answered, opened.sid,
+                "a standing credential restores the row"
+            );
+            assert!(
+                crate::revocation::revoke_subject_unannounced("persist-subject".to_owned()).is_ok()
+            );
+            let third = open().await;
+            let (answered, body) = reload(
+                &router_over(third as Arc<dyn store::SessionStore<Model, Msg>>),
+                &opened.sid,
+                &opened.cookies,
+            )
+            .await;
+            assert!(
+                !answered.is_empty() && answered != opened.sid,
+                "a revoked row is a miss with a new sid"
+            );
+            assert!(body.contains("authed=false"), "`init` re-ran: {body}");
+            let fourth = open().await;
+            assert!(
+                !cold_row_restores(fourth.as_ref(), &opened.sid).await,
+                "the revoked row is deleted"
+            );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// Armed, a row without a credential section is a miss with a new sid: a
+    /// row an earlier build wrote, and a row this build wrote unarmed.
+    #[test]
+    fn sectionless_row_when_armed_is_miss_with_new_sid() {
+        run_with(false, false, || async {
+            let unarmed_path = scratch_path("unarmed.json");
+            let opened = open_session(
+                &router_over(file_store(&unarmed_path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                "sectionless-subject",
+                7200,
+                "",
+            )
+            .await;
+            assert!(
+                row_after_tag(&unarmed_path, &opened.sid)
+                    .is_some_and(|rest| rest.first() != Some(&0x00)),
+                "an unarmed process writes no section"
+            );
+            let legacy_path = scratch_path("legacy.json");
+            let legacy_sid = new_sid();
+            assert!(seed_rows(
+                &legacy_path,
+                &[(
+                    legacy_sid.as_str(),
+                    blob(TAG, None, &body_of(&row_model(5)))
+                )]
+            ));
+            crate::revocation::arm_process();
+            for (path, sid, cookies) in [
+                (&unarmed_path, opened.sid.as_str(), opened.cookies.as_str()),
+                (&legacy_path, legacy_sid.as_str(), ""),
+            ] {
+                let (answered, body) = reload(
+                    &router_over(file_store(path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                    sid,
+                    cookies,
+                )
+                .await;
+                assert!(
+                    !answered.is_empty() && answered != sid,
+                    "a sectionless row is a miss with a new sid"
+                );
+                assert!(body.contains("n=0"), "`init` re-ran: {body}");
+                assert!(
+                    !cold_row_restores(file_store(path).as_ref(), sid).await,
+                    "the sectionless row is deleted"
+                );
+                let _ = std::fs::remove_file(path);
+            }
+        });
+    }
+
+    /// Unarmed, a row without a credential section restores as it always did.
+    #[test]
+    fn sectionless_row_when_off_restores() {
+        run_with(false, false, || async {
+            let path = scratch_path("off.json");
+            let sid = new_sid();
+            assert!(seed_rows(
+                &path,
+                &[(sid.as_str(), blob(TAG, None, &body_of(&row_model(5))))]
+            ));
+            let (answered, body) = reload(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                &sid,
+                "",
+            )
+            .await;
+            assert_eq!(answered, sid, "the row restores under its sid");
+            assert!(body.contains("n=5"), "the persisted model restores: {body}");
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// Unarmed, a sectioned row restores with its section skipped unread, and
+    /// the next checkpoint writes the row without one.
+    #[test]
+    fn sectioned_row_when_off_restores_and_skips_section() {
+        run_with(false, false, || async {
+            let path = scratch_path("offsection.json");
+            let sid = new_sid();
+            let unreadable = b"not a credential list";
+            assert!(seed_rows(
+                &path,
+                &[(
+                    sid.as_str(),
+                    blob(TAG, Some(unreadable), &body_of(&row_model(5)))
+                )]
+            ));
+            let (answered, body) = reload(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                &sid,
+                "",
+            )
+            .await;
+            assert_eq!(answered, sid, "the row restores under its sid");
+            assert!(body.contains("n=5"), "the persisted model restores: {body}");
+            assert!(
+                row_after_tag(&path, &sid).is_some_and(|rest| rest.first() != Some(&0x00)),
+                "the unarmed checkpoint rewrites the row without a section"
+            );
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// An armed session that bound nothing persists the empty set and restores.
+    #[test]
+    fn anonymous_armed_session_persists_empty_section() {
+        run(false, || async {
+            let path = scratch_path("anonymous.json");
+            let resp = send(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                "GET",
+                "/",
+                "",
+                "",
+            )
+            .await;
+            let sid = minted_sid(&resp);
+            assert!(!sid.is_empty(), "the page load minted a session");
+            let empty =
+                crate::revocation::encode_bindings(&crate::revocation::SessionBindings::default());
+            let mut framed = vec![0x00];
+            framed.extend_from_slice(&u16::try_from(empty.len()).unwrap_or(u16::MAX).to_be_bytes());
+            framed.extend_from_slice(&empty);
+            assert!(
+                row_after_tag(&path, &sid).is_some_and(|rest| rest.starts_with(&framed)),
+                "the row carries the empty set as a present section"
+            );
+            let (answered, _) = reload(
+                &router_over(file_store(&path) as Arc<dyn store::SessionStore<Model, Msg>>),
+                &sid,
+                "",
+            )
+            .await;
+            assert_eq!(answered, sid, "the anonymous row restores, never a miss");
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// A row rebuilt across an additive Model change keeps its persisted
+    /// credentials beside the ones `init` binds, and is a miss with a new sid
+    /// once one is revoked or the union passes the bound; a union exactly at
+    /// the bound restores.
+    #[test]
+    fn rebuilt_row_unions_persisted_and_init_bindings() {
+        run(false, || async {
+            let path = scratch_path("rebuilt.json");
+            let kept = new_sid();
+            let revoked = new_sid();
+            let full = new_sid();
+            let at_bound = new_sid();
+            let old = old_body_of(&row_model(5));
+            let persisted = ["union-persisted".to_owned()];
+            let eight: Vec<String> = (0..crate::revocation::MAX_SESSION_CREDENTIALS)
+                .map(|n| format!("union-full-{n}"))
+                .collect();
+            assert!(seed_rows(
+                &path,
+                &[
+                    (
+                        kept.as_str(),
+                        blob(OLD_TAG, Some(&section_of(&persisted)), &old)
+                    ),
+                    (
+                        revoked.as_str(),
+                        blob(
+                            OLD_TAG,
+                            Some(&section_of(&["union-revoked".to_owned()])),
+                            &old
+                        )
+                    ),
+                    (
+                        full.as_str(),
+                        blob(OLD_TAG, Some(&section_of(&eight)), &old)
+                    ),
+                    (
+                        at_bound.as_str(),
+                        blob(OLD_TAG, Some(&section_of(&eight)), &old)
+                    ),
+                ]
+            ));
+            assert!(
+                crate::revocation::revoke_subject_unannounced("union-revoked".to_owned()).is_ok()
+            );
+            let store = file_store(&path);
+            let router =
+                router_over(Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>);
+            let login = format!(
+                "sub=union-login; tok={}",
+                token("union-login", Some("union-login-jti"), 7200)
+            );
+            let (answered, body) = reload(&router, &kept, &login).await;
+            assert_eq!(answered, kept, "the rebuilt row restores under its sid");
+            assert!(
+                body.contains("n=5"),
+                "the persisted fields are kept: {body}"
+            );
+            assert_eq!(
+                bound_count(store.as_ref(), &kept).await,
+                Some(2),
+                "the persisted credential and the one `init` bound are both held"
+            );
+            let (answered, _) = reload(&router, &revoked, "").await;
+            assert!(
+                !answered.is_empty() && answered != revoked,
+                "a revoked persisted credential is a miss with a new sid"
+            );
+            let (answered, _) = reload(&router, &full, &login).await;
+            assert!(
+                !answered.is_empty() && answered != full,
+                "a union past the bound is a miss with a new sid"
+            );
+            let (answered, _) = reload(&router, &at_bound, "").await;
+            assert_eq!(answered, at_bound, "a union at the bound restores");
+            let fresh = file_store(&path);
+            assert!(!cold_row_restores(fresh.as_ref(), &revoked).await);
+            assert!(!cold_row_restores(fresh.as_ref(), &full).await);
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// A Msg whose `update` revokes its own session commits nothing and
+    /// dispatches no Cmd, and the Msg queued behind it never runs.
+    #[test]
+    fn revoking_msg_commits_nothing_and_queued_msg_never_runs() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w2-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let bumps = BUMPS.load(Ordering::Relaxed);
+            let cmds = REVOKED_CMDS.load(Ordering::Relaxed);
+            let msg_tx = msg_tx_of(&handle);
+            assert!(msg_tx.try_send(Msg::RevokeSelf).is_ok());
+            assert!(msg_tx.try_send(Msg::Bump).is_ok());
+            assert!(closes_within(&handle, Duration::from_secs(5)).await);
+            settle().await;
+            let model = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model
+                .clone();
+            assert_eq!(model.n, 0, "the revoking Msg's model is never committed");
+            assert_eq!(
+                REVOKED_CMDS.load(Ordering::Relaxed),
+                cmds,
+                "the revoking Msg's Cmd is never dispatched"
+            );
+            assert_eq!(
+                BUMPS.load(Ordering::Relaxed),
+                bumps,
+                "the Msg behind it never reaches `update`"
+            );
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// A Msg for a session whose subject was revoked never reaches `update`.
+    #[test]
+    fn msg_after_revoke_never_reaches_update() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w2b-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let bumps = BUMPS.load(Ordering::Relaxed);
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w2b-subject".to_owned()).is_ok()
+            );
+            assert!(msg_tx_of(&handle).try_send(Msg::Bump).is_ok());
+            assert!(closes_within(&handle, Duration::from_secs(5)).await);
+            assert_eq!(
+                BUMPS.load(Ordering::Relaxed),
+                bumps,
+                "`update` never runs for a revoked session"
+            );
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// A URL entry whose route code revokes its own session commits nothing
+    /// and dispatches no Cmd.
+    #[test]
+    fn revoking_entry_commits_nothing() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w2c-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let route_entry: RouteEntry<Model, Msg> =
+                Arc::new(|model: Model, _path: &route::DecodedPath| {
+                    let revoked =
+                        crate::revocation::revoke_subject_unannounced(model.sub.clone()).is_ok();
+                    route::Entered {
+                        model: Model { revoked, ..model },
+                        cmd: revoked_cmd(),
+                    }
+                });
+            let path = route::DecodedPath::parse("/other").ok();
+            assert!(path.is_some(), "`/other` decodes");
+            let Some(path) = path else { return };
+            let (reply, replied) = tokio::sync::oneshot::channel();
+            let request = EnterRequest {
+                path,
+                mode: EnterMode::Load,
+                reply,
+            };
+            let dyn_store = Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>;
+            let commit = commit_entry(
+                &Arc::downgrade(&handle),
+                request,
+                &route_entry,
+                &view,
+                &dyn_store,
+                &scope,
+            )
+            .await;
+            assert!(
+                matches!(commit, EntryCommit::SessionGone),
+                "the revoking entry ends its session"
+            );
+            assert!(replied.await.is_err(), "the entry is never answered");
+            let model = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model
+                .clone();
+            assert!(!model.revoked, "the entered model is never committed");
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// A checkpoint of a session closed meanwhile undoes its own write, and a
+    /// checkpoint of an open session stores it.
+    #[test]
+    fn checkpoint_never_stores_a_closed_session() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let dyn_store = Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>;
+            let closed = open_session(&router, "w17-closed-subject", 7200, "").await;
+            let handle = entry_of(&store, &closed.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .closer
+                .send_replace(true);
+            store.delete(&closed.sid).await;
+            assert_eq!(
+                checkpoint(&dyn_store, &closed.sid, &handle).await,
+                Checkpoint::Closed
+            );
+            assert!(
+                entry_of(&store, &closed.sid).await.is_none(),
+                "a closed session is never stored again"
+            );
+
+            let open = open_session(&router, "w17-open-subject", 7200, "").await;
+            let handle = entry_of(&store, &open.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            store.delete(&open.sid).await;
+            assert_eq!(
+                checkpoint(&dyn_store, &open.sid, &handle).await,
+                Checkpoint::Stored
+            );
+            assert!(entry_of(&store, &open.sid).await.is_some());
+        });
+    }
+
+    /// A memory store that records, at each delete, whether `watched` was already closed.
+    struct DeleteProbe {
+        inner: Store,
+        watched: store::SessionHandle<Model, Msg>,
+        closed_at_delete: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl store::SessionStore<Model, Msg> for DeleteProbe {
+        async fn get(&self, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(&self, sid: &str, handle: store::SessionHandle<Model, Msg>) {
+            self.inner.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            let closed = *self
+                .watched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .closer
+                .borrow();
+            self.closed_at_delete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(closed);
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// Closing a session flips its closer before the store delete runs, so a
+    /// racing checkpoint always sees one or the other.
+    #[test]
+    fn close_session_flips_closer_before_delete() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w18-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let probe = Arc::new(DeleteProbe {
+                inner: Store::new(Duration::from_secs(60)),
+                watched: Arc::clone(&handle),
+                closed_at_delete: Mutex::new(Vec::new()),
+            });
+            let dyn_probe = Arc::clone(&probe) as Arc<dyn store::SessionStore<Model, Msg>>;
+            close_session(&dyn_probe, &opened.sid, Some(&handle)).await;
+            let seen = probe
+                .closed_at_delete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert_eq!(seen, vec![true], "the closer is set when the delete runs");
+        });
+    }
+
+    /// A memory store whose next write revokes `subject`, as a revocation that
+    /// returns while a checkpoint write is in flight.
+    struct RevokeOnSet {
+        inner: Store,
+        subject: Mutex<Option<String>>,
+    }
+
+    impl RevokeOnSet {
+        /// Revoke `subject` at the next write.
+        fn arm(&self, subject: &str) {
+            *self
+                .subject
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(subject.to_owned());
+        }
+
+        /// Whether a write has revoked the armed subject.
+        fn fired(&self) -> bool {
+            self.subject
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl store::SessionStore<Model, Msg> for RevokeOnSet {
+        async fn get(&self, sid: &str) -> Option<store::SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(&self, sid: &str, handle: store::SessionHandle<Model, Msg>) {
+            self.inner.set(sid, handle).await;
+            let armed = self
+                .subject
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(subject) = armed {
+                assert!(crate::revocation::revoke_subject_unannounced(subject).is_ok());
+            }
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+    }
+
+    /// A revocation that returns while a Msg's checkpoint write is in flight
+    /// drops that Msg's Cmd: the commit is already stored, the effect never runs.
+    #[test]
+    fn revocation_during_checkpoint_dispatches_no_cmd() {
+        run(false, || async {
+            let store = Arc::new(RevokeOnSet {
+                inner: Store::new(Duration::from_secs(60)),
+                subject: Mutex::new(None),
+            });
+            let router =
+                router_over(Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>);
+            let opened = open_session(&router, "w19-subject", 7200, "").await;
+            let handle = store.get(&opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            settle().await;
+            let cmds = REVOKED_CMDS.load(Ordering::Relaxed);
+            store.arm("w19-subject");
+            assert!(msg_tx_of(&handle).try_send(Msg::Effect).is_ok());
+            for _ in 0..200 {
+                if store.fired() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            settle().await;
+            assert!(
+                store.fired(),
+                "the Msg's checkpoint write revoked the subject"
+            );
+            let n = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model
+                .n;
+            assert_eq!(n, 1, "the Msg committed before its checkpoint write");
+            assert_eq!(
+                REVOKED_CMDS.load(Ordering::Relaxed),
+                cmds,
+                "a Cmd whose session was revoked during its checkpoint is never dispatched"
+            );
+        });
+    }
+
+    /// A Cmd dispatched for a session whose subject is revoked runs nothing,
+    /// whichever path hands it over (a Msg, a URL entry, a page load's seed).
+    #[test]
+    fn run_cmd_for_revoked_session_dispatches_nothing() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w20-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let msg_tx = msg_tx_of(&handle);
+            let cmds = REVOKED_CMDS.load(Ordering::Relaxed);
+            run_cmd(revoked_cmd(), &msg_tx, &scope);
+            settle().await;
+            let live = REVOKED_CMDS.load(Ordering::Relaxed);
+            assert_eq!(live, cmds + 1, "a standing session dispatches its Cmd");
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w20-subject".to_owned()).is_ok()
+            );
+            run_cmd(
+                IpeCmd::Batch(vec![revoked_cmd(), revoked_cmd()]),
+                &msg_tx,
+                &scope,
+            );
+            settle().await;
+            assert_eq!(
+                REVOKED_CMDS.load(Ordering::Relaxed),
+                live,
+                "a revoked session dispatches no Cmd"
+            );
+        });
+    }
+
+    /// An idle SSE stream ends once its session's subject is revoked, with no
+    /// request arriving to notice.
+    #[test]
+    fn idle_sse_stream_ends_after_revoke() {
+        run(true, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w3-subject", 7200, "").await;
+            let stream = send(&router, "GET", "/_ipe/sse", &sid_cookie(&opened.sid), "").await;
+            assert_eq!(stream.status(), StatusCode::OK);
+            assert!(crate::revocation::revoke_subject("w3-subject".to_owned()).is_ok());
+            let ended = tokio::time::timeout(
+                RECHECK_COALESCE * 2,
+                axum::body::to_bytes(stream.into_body(), usize::MAX),
+            )
+            .await;
+            assert!(ended.is_ok(), "the stream of a revoked session ends");
+        });
+    }
+
+    /// A session ends when its bound credential's deadline passes, with no
+    /// revocation and no request.
+    #[test]
+    fn session_ends_at_credential_deadline() {
+        run(true, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w4-subject", 2, "").await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            assert!(closes_within(&handle, Duration::from_secs(10)).await);
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// The SSE and port routes answer a revoked session with session-lost.
+    #[test]
+    fn sse_and_port_after_revoke_are_session_lost() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let sse = open_session(&router, "w5-sse-subject", 7200, "").await;
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-sse-subject".to_owned()).is_ok()
+            );
+            let resp = send(&router, "GET", "/_ipe/sse", &sid_cookie(&sse.sid), "").await;
+            assert!(
+                is_session_lost(resp).await,
+                "SSE of a revoked session is lost"
+            );
+
+            let port = open_session(&router, "w5-port-subject", 7200, "").await;
+            let before = send(&router, "POST", "/_ipe/port", &sid_cookie(&port.sid), "{}").await;
+            assert_ne!(
+                before.status(),
+                StatusCode::NOT_FOUND,
+                "a live session is found"
+            );
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-port-subject".to_owned()).is_ok()
+            );
+            let after = send(&router, "POST", "/_ipe/port", &sid_cookie(&port.sid), "{}").await;
+            assert!(
+                is_session_lost(after).await,
+                "a port frame of a revoked session is lost"
+            );
+        });
+    }
+
+    /// The debugger routes answer a revoked session with session-lost.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn debugger_routes_after_revoke_are_session_lost() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let inspect = open_session(&router, "w5-inspect-subject", 7200, "").await;
+            let cookie = sid_cookie(&inspect.sid);
+            let before = send(&router, "GET", "/_ipe/debug/inspect", &cookie, "").await;
+            assert_eq!(before.status(), StatusCode::OK);
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-inspect-subject".to_owned())
+                    .is_ok()
+            );
+            let after = send(&router, "GET", "/_ipe/debug/inspect", &cookie, "").await;
+            assert!(
+                is_session_lost(after).await,
+                "inspect of a revoked session is lost"
+            );
+
+            let export = open_session(&router, "w5-export-subject", 7200, "").await;
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w5-export-subject".to_owned())
+                    .is_ok()
+            );
+            let resp = send(
+                &router,
+                "GET",
+                "/_ipe/debug/export",
+                &sid_cookie(&export.sid),
+                "",
+            )
+            .await;
+            assert!(
+                is_session_lost(resp).await,
+                "export of a revoked session is lost"
+            );
+        });
+    }
+
+    /// A page load naming a revoked session never rejoins it: it mints a fresh
+    /// sid, re-runs `init`, and the old session is gone.
+    #[test]
+    fn page_live_after_revoke_reinits_with_new_sid() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w6-subject", 7200, "").await;
+            assert!(!opened.sid.is_empty());
+            assert!(crate::revocation::revoke_subject_unannounced("w6-subject".to_owned()).is_ok());
+            let cookies = format!("{}; {}", sid_cookie(&opened.sid), opened.cookies);
+            let resp = send(&router, "GET", "/", &cookies, "").await;
+            let fresh = minted_sid(&resp);
+            let body = text(resp).await;
+            assert!(!fresh.is_empty(), "a fresh session is minted");
+            assert_ne!(fresh, opened.sid, "the revoked sid is never rejoined");
+            assert!(
+                body.contains("authed=false"),
+                "init re-ran and refused: {body}"
+            );
+            assert!(entry_of(&store, &opened.sid).await.is_none());
+        });
+    }
+
+    /// `s` with every comment and string or char literal blanked, newlines kept.
+    fn code_only(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(chars.len());
+        let mut i = 0;
+        while let Some(&c) = chars.get(i) {
+            if let Some(end) = literal_end(&chars, i) {
+                let span = chars.get(i..end).unwrap_or_default();
+                out.extend(span.iter().map(|&x| if x == '\n' { '\n' } else { ' ' }));
+                i = end;
+            } else {
+                out.push(if c.is_ascii() { c } else { ' ' });
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The end of the comment or literal starting at `i`, if one starts there.
+    fn literal_end(chars: &[char], i: usize) -> Option<usize> {
+        let at = |k: usize| chars.get(k).copied();
+        let len = chars.len();
+        let after_ident = i
+            .checked_sub(1)
+            .and_then(at)
+            .is_some_and(|p| p.is_alphanumeric() || p == '_');
+        match (at(i)?, at(i + 1)) {
+            ('/', Some('/')) => Some((i..len).find(|&k| at(k) == Some('\n')).unwrap_or(len)),
+            ('/', Some('*')) => {
+                let mut depth = 0_usize;
+                let mut k = i;
+                while k < len {
+                    match (at(k), at(k + 1)) {
+                        (Some('/'), Some('*')) => {
+                            depth += 1;
+                            k += 2;
+                        }
+                        (Some('*'), Some('/')) => {
+                            depth = depth.saturating_sub(1);
+                            k += 2;
+                            if depth == 0 {
+                                return Some(k);
+                            }
+                        }
+                        _ => k += 1,
+                    }
+                }
+                Some(len)
+            }
+            ('"', _) => {
+                let mut k = i + 1;
+                loop {
+                    match at(k) {
+                        None => return Some(len),
+                        Some('\\') => k += 2,
+                        Some('"') => return Some(k + 1),
+                        Some(_) => k += 1,
+                    }
+                }
+            }
+            ('r', Some('"' | '#')) if !after_ident => {
+                let hashes = (i + 1..len).take_while(|&k| at(k) == Some('#')).count();
+                let open = i + 1 + hashes;
+                if at(open) != Some('"') {
+                    return None;
+                }
+                let close = (open + 1..len)
+                    .find(|&k| at(k) == Some('"') && (1..=hashes).all(|h| at(k + h) == Some('#')));
+                Some(close.map_or(len, |k| k + 1 + hashes))
+            }
+            ('\'', Some('\\')) => (i + 3..len).find(|&k| at(k) == Some('\'')).map(|k| k + 1),
+            ('\'', Some(_)) if at(i + 2) == Some('\'') => Some(i + 3),
+            _ => None,
+        }
+    }
+
+    /// `code` with every test-only module, function and impl blanked.
+    fn production_only(code: &str) -> String {
+        let mut out = code.to_owned();
+        let mut from = 0;
+        while let Some(at) = code
+            .get(from..)
+            .and_then(|rest| rest.find("#[cfg("))
+            .map(|o| from + o)
+        {
+            from = at + 1;
+            let Some(close) = code
+                .get(at..)
+                .and_then(|rest| rest.find(")]"))
+                .map(|o| at + o)
+            else {
+                break;
+            };
+            let predicate = code.get(at + 6..close).unwrap_or_default();
+            if !test_only(predicate) {
+                continue;
+            }
+            let mut item = close + 2;
+            loop {
+                let rest = code.get(item..).unwrap_or_default();
+                let trimmed = rest.trim_start();
+                item += rest.len() - trimmed.len();
+                if !trimmed.starts_with("#[") {
+                    break;
+                }
+                item += trimmed.find(']').map_or(trimmed.len(), |o| o + 1);
+            }
+            let head = code.get(item..).unwrap_or_default();
+            let head = ["pub(crate) ", "pub(super) ", "pub ", "async "]
+                .iter()
+                .fold(head, |h, prefix| h.strip_prefix(prefix).unwrap_or(h));
+            if !["mod ", "fn ", "impl"]
+                .iter()
+                .any(|kw| head.starts_with(kw))
+            {
+                continue;
+            }
+            let Some(open) = code
+                .get(item..)
+                .and_then(|rest| rest.find('{'))
+                .map(|o| item + o)
+            else {
+                break;
+            };
+            let end = matching_brace(code, open);
+            let blanked: String = code
+                .get(at..end)
+                .unwrap_or_default()
+                .chars()
+                .map(|c| if c == '\n' { '\n' } else { ' ' })
+                .collect();
+            out.replace_range(at..end, &blanked);
+            from = end;
+        }
+        out
+    }
+
+    /// Whether a `cfg` predicate holds only under `test`: `test` itself, or an
+    /// `all(..)` with `test` among its top-level terms.
+    fn test_only(predicate: &str) -> bool {
+        let predicate = predicate.trim();
+        if predicate == "test" {
+            return true;
+        }
+        let Some(terms) = predicate
+            .strip_prefix("all(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            return false;
+        };
+        let mut depth = 0_usize;
+        let mut start = 0;
+        let mut found = false;
+        for (k, c) in terms.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    found |= terms.get(start..k).is_some_and(|t| t.trim() == "test");
+                    start = k + 1;
+                }
+                _ => {}
+            }
+        }
+        found || terms.get(start..).is_some_and(|t| t.trim() == "test")
+    }
+
+    /// Every position in `code` of a `receiver.method(` call, whitespace allowed
+    /// around the dot.
+    fn calls(code: &str, receiver: &str, method: &str) -> Vec<usize> {
+        let call = format!("{method}(");
+        code.match_indices(call.as_str())
+            .filter_map(|(pos, _)| {
+                let head = code
+                    .get(..pos)?
+                    .trim_end()
+                    .strip_suffix('.')?
+                    .trim_end()
+                    .strip_suffix(receiver)?;
+                let bounded = head
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                bounded.then_some(pos)
+            })
+            .collect()
+    }
+
+    /// The enclosing named function of every `receiver.method(` call in `code`.
+    fn call_owners(
+        code: &str,
+        bodies: &[(String, std::ops::Range<usize>)],
+        receiver: &str,
+        method: &str,
+    ) -> Vec<Option<String>> {
+        calls(code, receiver, method)
+            .into_iter()
+            .map(|pos| enclosing_fn(bodies, pos))
+            .collect()
+    }
+
+    /// The scan helpers find calls across line breaks and blank every
+    /// test-only `cfg` form.
+    #[test]
+    fn scan_helpers_see_through_layout() {
+        let code =
+            "fn a() { st.store\n    .get(x); store . set(y); restore.get(z); store.try_get(w); }";
+        assert_eq!(calls(code, "store", "get").len(), 1);
+        assert_eq!(calls(code, "store", "set").len(), 1);
+        assert!(test_only("test"));
+        assert!(test_only("all(test, feature = \"server\")"));
+        assert!(test_only("all(feature = \"server\", test)"));
+        assert!(!test_only("all(not(test), feature = \"server\")"));
+        assert!(!test_only("feature = \"server\""));
+        let blanked =
+            production_only("#[cfg(all(feature = \"web\", test))]\nmod t { fn x() {} }\nfn y() {}");
+        assert!(!blanked.contains("fn x"), "{blanked}");
+        assert!(blanked.contains("fn y"), "{blanked}");
+    }
+
+    /// The index just past the brace closing the one at `open`.
+    fn matching_brace(code: &str, open: usize) -> usize {
+        let mut depth = 0_usize;
+        for (k, b) in code.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return k + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        code.len()
+    }
+
+    /// Every named function in `code` with the span of its body.
+    fn fn_bodies(code: &str) -> Vec<(String, std::ops::Range<usize>)> {
+        let bytes = code.as_bytes();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut bodies = Vec::new();
+        let mut stack: Vec<Option<(String, usize)>> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut nest = 0_i64;
+        let mut i = 0;
+        while let Some(&b) = bytes.get(i) {
+            let word_start = i
+                .checked_sub(1)
+                .and_then(|p| bytes.get(p))
+                .is_none_or(|p| !ident(*p));
+            if word_start && code.get(i..).is_some_and(|rest| rest.starts_with("fn ")) {
+                let name: String = code
+                    .get(i + 3..)
+                    .unwrap_or_default()
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    pending = Some(name);
+                    nest = 0;
+                }
+                i += 3;
+                continue;
+            }
+            match b {
+                b'(' | b'[' => nest += 1,
+                b')' | b']' => nest -= 1,
+                b';' if nest == 0 => pending = None,
+                b'{' => stack.push(pending.take().map(|name| (name, i))),
+                b'}' => {
+                    if let Some(Some((name, start))) = stack.pop() {
+                        bodies.push((name, start..i + 1));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        bodies
+    }
+
+    /// The innermost named function whose body holds `pos`.
+    fn enclosing_fn(bodies: &[(String, std::ops::Range<usize>)], pos: usize) -> Option<String> {
+        bodies
+            .iter()
+            .filter(|(_, span)| span.contains(&pos))
+            .min_by_key(|(_, span)| span.len())
+            .map(|(name, _)| name.clone())
+    }
+
+    /// The whitespace-free body of the one production function named `name`.
+    fn sole_body(code: &str, bodies: &[(String, std::ops::Range<usize>)], name: &str) -> String {
+        let named: Vec<_> = bodies.iter().filter(|(n, _)| n == name).collect();
+        assert_eq!(named.len(), 1, "one `{name}` in production code");
+        named
+            .first()
+            .and_then(|(_, span)| code.get(span.clone()))
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect()
+    }
+
+    /// Every task a Cmd dispatch spawns runs in the session's scope, every
+    /// dispatch re-proves the session first, and a sid becomes a live entry
+    /// only through the resolver.
+    #[test]
+    fn cmd_dispatch_spawns_are_session_scoped() {
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        let bodies = fn_bodies(&code);
+        let body = sole_body(&code, &bodies, "dispatch_cmd");
+        let spawns = body.matches("spawn").count();
+        let scoped = body.matches("tokio::spawn(scope.clone().scoped(").count();
+        assert!(scoped >= 1, "`dispatch_cmd` spawns its Perform task");
+        assert_eq!(
+            spawns, scoped,
+            "every task `dispatch_cmd` spawns is session-scoped"
+        );
+        let gate = sole_body(&code, &bodies, "run_cmd");
+        let recheck = gate.find("ifrecheck_scope(scope,None)==Standing::Revoked{return;}");
+        let dispatch = gate.find("dispatch_cmd(cmd,tx,scope)");
+        assert!(
+            recheck.is_some_and(|r| dispatch.is_some_and(|d| r < d)) && !gate.contains("spawn"),
+            "`run_cmd` re-proves the session before it dispatches: {gate}"
+        );
+        let dispatchers: Vec<_> = code
+            .match_indices("dispatch_cmd(")
+            .filter(|(pos, _)| {
+                code.get(..*pos)
+                    .and_then(|head| head.chars().next_back())
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            })
+            .map(|(pos, _)| enclosing_fn(&bodies, pos))
+            .collect();
+        assert!(
+            dispatchers
+                .iter()
+                .all(|o| matches!(o.as_deref(), Some("run_cmd" | "dispatch_cmd"))),
+            "a Cmd is dispatched only through the re-proving `run_cmd`: {dispatchers:?}"
+        );
+
+        let owners = call_owners(&code, &bodies, "store", "get");
+        let resolver = owners
+            .iter()
+            .filter(|o| o.as_deref() == Some("lookup_session"))
+            .count();
+        assert_eq!(resolver, 1, "the resolver reads the store once");
+        assert!(
+            owners
+                .iter()
+                .all(|o| matches!(o.as_deref(), Some("lookup_session" | "serve_page"))),
+            "a live entry is read only by the resolver and the page rejoin it admits: {owners:?}"
+        );
+
+        let rejoins = call_owners(&code, &bodies, "store", "get_reconstructing");
+        assert!(
+            !rejoins.is_empty() && rejoins.iter().all(|o| o.as_deref() == Some("serve_page")),
+            "a session is reconstructed only by the page rejoin: {rejoins:?}"
+        );
+        let writes = call_owners(&code, &bodies, "store", "set");
+        let checkpoints = writes
+            .iter()
+            .filter(|o| o.as_deref() == Some("checkpoint"))
+            .count();
+        assert_eq!(checkpoints, 1, "one checkpoint writes a session back");
+        assert!(
+            writes
+                .iter()
+                .all(|o| matches!(o.as_deref(), Some("checkpoint" | "serve_page"))),
+            "an open session is written back only through the checkpoint: {writes:?}"
+        );
+        let sweeps = call_owners(&code, &bodies, "store", "web_sessions");
+        assert!(
+            sweeps.iter().all(|o| matches!(
+                o.as_deref(),
+                Some(
+                    "push_reload_to_web_sessions"
+                        | "watch_status_handler"
+                        | "apply_literal_patch_to_web_sessions"
+                )
+            )),
+            "a sweep over live sessions sends a fixed frame or re-proves first: {sweeps:?}"
+        );
+        let patch_sweep: String = bodies
+            .iter()
+            .filter(|(name, _)| name == "apply_literal_patch_to_web_sessions")
+            .filter_map(|(_, span)| code.get(span.clone()))
+            .collect();
+        assert!(
+            patch_sweep.contains("recheck_scope("),
+            "the sweep that runs `view` re-proves each session first"
+        );
+    }
+
+    /// A `Perform` task's `verifyToken` binds to the session that ran the Cmd.
+    #[test]
+    fn perform_task_verify_binds_to_its_session() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let task_token = token("w10-subject", Some("w10-task-jti"), 7200);
+            let extra = format!("; ttok={task_token}");
+            let opened = open_session(&router, "w10-subject", 7200, &extra).await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let msg_tx = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .msg_tx
+                .clone();
+            assert!(msg_tx.try_send(Msg::RunTask).is_ok());
+            let mut task_ok = None;
+            for _ in 0..200 {
+                task_ok = handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .model
+                    .task_ok;
+                if task_ok.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                task_ok,
+                Some(true),
+                "the task's verify ran in the session scope"
+            );
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let bound = scope
+                .bindings()
+                .lock()
+                .is_ok_and(|held| held.binds_session("w10-task-jti"));
+            assert!(bound, "the task's credential is bound to its session");
+        });
+    }
+
+    /// A burst of revocations costs an open session at most two rechecks.
+    #[test]
+    fn revocation_burst_is_coalesced() {
+        run(true, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "w12-subject", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let rechecks = Arc::clone(
+                &handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .liveness
+                    .rechecks,
+            );
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            for n in 0..512 {
+                assert!(crate::revocation::revoke_subject(format!("w12-other-{n}")).is_ok());
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(RECHECK_COALESCE * 3).await;
+            let ran = rechecks.load(Ordering::Relaxed);
+            assert!(
+                (1..=2).contains(&ran),
+                "a burst costs one or two rechecks, ran {ran}"
+            );
+            assert!(
+                entry_of(&store, &opened.sid).await.is_some(),
+                "other subjects' revocations leave the session live"
+            );
+        });
+    }
+
+    /// `verifyToken` in `view` binds to the session it renders for.
+    #[test]
+    fn verify_token_in_view_binds_not_unscoped() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let view_token = token("w13-subject", Some("w13-view-jti"), 7200);
+            let extra = format!("; vtok={view_token}");
+            let opened = open_session(&router, "w13-subject", 7200, &extra).await;
+            assert!(opened.body.contains("view-authed"), "{}", opened.body);
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let scope = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .scope
+                .clone();
+            let bound = scope
+                .bindings()
+                .lock()
+                .is_ok_and(|held| held.binds_session("w13-view-jti"));
+            assert!(bound, "the view's credential is bound to its session");
+        });
+    }
+
+    /// A `Web` app under an armed `Server` route enforces the gate: a token
+    /// with no session id is refused, a revoked session ends.
+    #[test]
+    fn mounted_web_under_armed_server_route_enforces() {
+        run(false, || async {
+            assert!(matches!(
+                crate::revocation::process_mode(),
+                crate::app_config::RevocationMode::Store
+            ));
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let no_jti = format!("sub=w16-subject; tok={}", token("w16-subject", None, 7200));
+            let refused = text(send(&router, "GET", "/", &no_jti, "").await).await;
+            assert!(
+                refused.contains("authed=false"),
+                "a token with no jti is refused: {refused}"
+            );
+            let opened = open_session(&router, "w16-subject", 7200, "").await;
+            assert!(opened.body.contains("authed=true"), "{}", opened.body);
+            assert!(
+                crate::revocation::revoke_subject_unannounced("w16-subject".to_owned()).is_ok()
+            );
+            let after = send(
+                &router,
+                "POST",
+                "/_ipe/event",
+                &sid_cookie(&opened.sid),
+                "{}",
+            )
+            .await;
+            assert!(is_session_lost(after).await, "a revoked session is lost");
         });
     }
 }

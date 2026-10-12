@@ -66,7 +66,7 @@ encipher n text =
     String.map (shiftChar n) text
 ```
 
-Running it (`ipe run`) shifts the letters by three, leaves the digits and
+Running it (`ipe dev run`) shifts the letters by three, leaves the digits and
 punctuation alone, and the inverse shift recovers the original:
 
 ```

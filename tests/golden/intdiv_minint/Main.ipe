@@ -2,17 +2,9 @@ module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.String
 
--- m2lex golden: integer division at the i64::MIN // -1 corner.
---
--- Genuine F6 regression: raw Rust `/` on i64 panics here ("attempt to divide
--- with overflow") even when overflow-checks are off — it is an unconditional
--- x86-64 hardware trap. Ipe-Go rt.IntDiv uses two's-complement Go integer
--- arithmetic and returns i64::MIN (wraps silently). The fix (BinOp::IntDiv
--- → ipe_runtime::math::ipe_int_div with wrapping_div) must reproduce this.
---
--- Construct i64::MIN as (-9223372036854775807 - 1) because the positive
--- magnitude 9223372036854775808 overflows i64 as a literal (Active Limitation
--- #4: negative literal arguments need parens).
+-- Integer division at the i64::MIN // -1 corner: the quotient wraps to
+-- i64::MIN instead of trapping. minInt is built by wrapping subtraction,
+-- (-9223372036854775807) - 1, so the program also pins that path.
 
 minInt : Int
 minInt =

@@ -9,8 +9,8 @@ Ipe.Basics — the implicit prelude (Tier-A auto-import, compiled source).
 Each binding routes to its runtime kernel via `Kernel.kernel`. Polymorphic
 members with ordering or numeric obligations (`clamp`, `min`, `max`,
 `negate`, `abs`, `compare`) carry the bound implicitly — the type-checker's
-`Comparable`/`Number` obligation rejects a function or record argument
-before it monomorphises. `sqrt` is monomorphically `Float -> Float`.
+`Comparable`/`Number` obligation rejects a function, record, list, or tuple
+argument before it monomorphises. `sqrt` is monomorphically `Float -> Float`.
 
 ## `identity`
 
@@ -93,7 +93,7 @@ clamp : a -> a -> a -> a
 `clamp lo hi x` — constrain `x` to the range `[lo, hi]`.
 
 Returns `lo` when `x < lo`, `hi` when `x > hi`, and `x` otherwise.
-Works on any comparable type: `Int`, `Float`, or `String`.
+Works on any comparable scalar: `Int`, `Float`, `String`, `Char`, or `Bool`.
 
 ```ipe
 clamp 0 100 42 --> 42
@@ -179,8 +179,9 @@ min : a -> a -> a
 
 `min a b` — the smaller of two comparable values.
 
-Works on any `Comparable` type: `Int`, `Float`, `String`, `Char`,
-or a `List`/tuple of comparables. Returns `a` when `a == b`.
+Works on any `Comparable` scalar: `Int`, `Float`, `String`, `Char`, or
+`Bool`. A list, tuple, or record is not comparable. Returns `a` when
+`a == b`.
 
 ```ipe
 min 3 5 --> 3
@@ -196,8 +197,9 @@ max : a -> a -> a
 
 `max a b` — the larger of two comparable values.
 
-Works on any `Comparable` type: `Int`, `Float`, `String`, `Char`,
-or a `List`/tuple of comparables. Returns `a` when `a == b`.
+Works on any `Comparable` scalar: `Int`, `Float`, `String`, `Char`, or
+`Bool`. A list, tuple, or record is not comparable. Returns `a` when
+`a == b`.
 
 ```ipe
 max 3 5 --> 5
@@ -212,6 +214,9 @@ compare : a -> a -> Order
 ```
 
 `compare a b` — the `Order` relation between two comparable values.
+
+Works on any comparable scalar: `Int`, `Float`, `String`, `Char`, or `Bool`.
+A list, tuple, or record is not comparable.
 
 Returns `LT` when `a < b`, `EQ` when `a == b`, and `GT` when `a > b`.
 `Order` is a built-in type with three constructors: `LT`, `EQ`, `GT`.

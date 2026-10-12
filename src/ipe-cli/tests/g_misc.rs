@@ -22,6 +22,8 @@ mod golden_any_ctor_payload;
 mod golden_attribute_home_disambiguation_179;
 #[path = "g_misc/golden_aud14_duplicate_qualifier.rs"]
 mod golden_aud14_duplicate_qualifier;
+#[path = "g_misc/golden_auth_error.rs"]
+mod golden_auth_error;
 #[path = "g_misc/golden_bare_ui_arity_fill.rs"]
 mod golden_bare_ui_arity_fill;
 #[path = "g_misc/golden_basics.rs"]
@@ -42,6 +44,8 @@ mod golden_cmd_sub_map;
 mod golden_core_stdlib;
 #[path = "g_misc/golden_cross_module_attr_field_access.rs"]
 mod golden_cross_module_attr_field_access;
+#[path = "g_misc/golden_cross_module_attr_field_mismatch.rs"]
+mod golden_cross_module_attr_field_mismatch;
 #[path = "g_misc/golden_cross_module_attr_lowering.rs"]
 mod golden_cross_module_attr_lowering;
 #[path = "g_misc/golden_cross_module_type_res.rs"]
@@ -70,6 +74,8 @@ mod golden_http_statuscode_imagesrc_seal;
 mod golden_if_expr;
 #[path = "g_misc/golden_l0105_refutable_gates.rs"]
 mod golden_l0105_refutable_gates;
+#[path = "g_misc/golden_lambda_field_access_seal.rs"]
+mod golden_lambda_field_access_seal;
 #[path = "g_misc/golden_lazy_emit_seal.rs"]
 mod golden_lazy_emit_seal;
 #[path = "g_misc/golden_local_type_shadows_dep.rs"]
@@ -92,6 +98,8 @@ mod golden_region_seal;
 mod golden_secret;
 #[path = "g_misc/golden_session_replay_seal.rs"]
 mod golden_session_replay_seal;
+#[path = "g_misc/golden_show_policy.rs"]
+mod golden_show_policy;
 #[path = "g_misc/golden_static_bound.rs"]
 mod golden_static_bound;
 #[path = "g_misc/golden_stdlib_module_seal.rs"]

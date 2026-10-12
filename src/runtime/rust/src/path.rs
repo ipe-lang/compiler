@@ -95,13 +95,8 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Path(String);
 
-impl super::stringify::IpeStringify for Path {
-    /// Backs Ipê's `toString` / interpolation on a `Path`: the cleaned path
-    /// string. Identical to [`path_to_string`].
-    fn ipe_show(&self) -> String {
-        self.0.clone()
-    }
-}
+// The cleaned path string, identical to [`path_to_string`].
+crate::stringify::show_row!("Path", Value, [] Path, |p| p.0.clone());
 
 /// `Ipe.Path.fromString : String -> Result Error Path` — THE seal.
 ///

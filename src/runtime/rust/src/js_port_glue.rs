@@ -37,6 +37,27 @@ pub const SHARE_SCHEMES: &[&str] = &["http", "https"];
 const PORT_GLUE_JS_HEAD: &str = r#"// Ipe.Ffi.Js browser port surface. Values cross as JSON strings only.
 (function () {
   var onReceive = null;
+  // The document members the sinks read, bound from the prototypes before any
+  // page content is consulted: an `img`, `form`, `embed`, `object` or `iframe`
+  // named after a document member shadows that member with the element. Null
+  // where the host has no document.
+  var doc = typeof document === "undefined" || typeof Document === "undefined" ? null : (function (d) {
+    function prop(name) {
+      var desc = Object.getOwnPropertyDescriptor(Document.prototype, name);
+      return function () { return desc && desc.get ? desc.get.call(d) : undefined; };
+    }
+    function method(proto, name) {
+      return typeof proto[name] === "function" ? proto[name].bind(d) : null;
+    }
+    return {
+      visibility: prop("visibilityState"),
+      root: prop("documentElement"),
+      fullscreenElement: prop("fullscreenElement"),
+      create: method(Document.prototype, "createElement"),
+      exitFullscreen: method(Document.prototype, "exitFullscreen"),
+      on: method(EventTarget.prototype, "addEventListener")
+    };
+  })(document);
   // Return an inbound typed frame to the Ipê program: a decoded intent, never a
   // thrown error, so a host permission denial is an ordinary case the program's
   // subscription decodes (parse-don't-validate at the trust boundary). Each frame
@@ -413,11 +434,11 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     var isPickImage = value === "PickImage" ||
       (value && typeof value === "object" && value.PickImage !== undefined);
     if (!isPickFile && !isPickImage) return false;
-    if (typeof File === "undefined" || typeof FileReader === "undefined") {
+    if (!doc || typeof File === "undefined" || typeof FileReader === "undefined") {
       reply({ tag: "file-picker", ok: false, error: "unavailable" }, corId);
       return true;
     }
-    var input = document.createElement("input");
+    var input = doc.create("input");
     input.type = "file";
     if (isPickImage) {
       input.accept = "image/*";
@@ -467,11 +488,11 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     var isCapture = value === "CapturePhoto" ||
       (value && typeof value === "object" && value.CapturePhoto !== undefined);
     if (!isCapture) return false;
-    if (typeof File === "undefined" || typeof FileReader === "undefined") {
+    if (!doc || typeof File === "undefined" || typeof FileReader === "undefined") {
       reply({ tag: "camera", ok: false, error: "unavailable" }, corId);
       return true;
     }
-    var input = document.createElement("input");
+    var input = doc.create("input");
     input.type = "file";
     input.accept = "image/*";
     input.capture = "environment";
@@ -924,7 +945,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     gamepadRafId = requestAnimationFrame(poll);
     return true;
   }
-  // Ipe.Browser.Visibility: `Query` / `Watch` -> document.visibilityState +
+  // Ipe.Browser.Visibility: `Query` / `Watch` -> the visibility state +
   // visibilitychange. A `Query` reads the current state once; a `Watch` also
   // attaches a `visibilitychange` listener that pushes fresh readings. An absent
   // Page Visibility API traps to `unavailable` — never a throw.
@@ -934,15 +955,15 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     var isWatch = value === "Watch" ||
       (value && typeof value === "object" && value.Watch !== undefined);
     if (!isQuery && !isWatch) return false;
-    if (typeof document === "undefined" || typeof document.visibilityState !== "string") {
+    if (!doc || typeof doc.visibility() !== "string") {
       reply({ tag: "visibility", ok: false, error: "unavailable" }, corId);
       return true;
     }
-    reply({ tag: "visibility", ok: true, visible: document.visibilityState === "visible" }, corId);
-    if (isWatch && typeof document.addEventListener === "function") {
+    reply({ tag: "visibility", ok: true, visible: doc.visibility() === "visible" }, corId);
+    if (isWatch && doc.on) {
       // Each change event delivers a fresh reading; no correlation id on broadcasts.
-      document.addEventListener("visibilitychange", function () {
-        reply({ tag: "visibility", ok: true, visible: document.visibilityState === "visible" }, null);
+      doc.on("visibilitychange", function () {
+        reply({ tag: "visibility", ok: true, visible: doc.visibility() === "visible" }, null);
       });
     }
     return true;
@@ -1143,7 +1164,7 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
     return true;
   }
   // Ipe.Browser.Fullscreen: `Request` / `Exit` / `Watch` ->
-  // document.documentElement.requestFullscreen / document.exitFullscreen /
+  // the root element's requestFullscreen / the document's exitFullscreen /
   // fullscreenchange. `Request` and `Exit` are correlated one-shot; `Watch`
   // attaches a `fullscreenchange` listener for broadcast state frames. An absent
   // or denied API traps to typed frames — never a throw.
@@ -1156,32 +1177,32 @@ const PORT_GLUE_JS_TAIL: &str = r#"    try {
       (value && typeof value === "object" && value.Watch !== undefined);
     if (!isRequest && !isExit && !isWatch) return false;
     if (isWatch) {
-      if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
-        document.addEventListener("fullscreenchange", function () {
-          var isFull = !!document.fullscreenElement;
+      if (doc && doc.on) {
+        doc.on("fullscreenchange", function () {
+          var isFull = !!doc.fullscreenElement();
           reply({ tag: "fullscreen", event: "changed", fullscreen: isFull }, null);
         });
       }
       return true;
     }
     if (isRequest) {
-      if (typeof document === "undefined" || !document.documentElement ||
-          typeof document.documentElement.requestFullscreen !== "function") {
+      var root = doc ? doc.root() : null;
+      if (!root || typeof root.requestFullscreen !== "function") {
         reply({ tag: "fullscreen", event: "unavailable" }, corId);
         return true;
       }
-      document.documentElement.requestFullscreen().then(
+      root.requestFullscreen().then(
         function () { reply({ tag: "fullscreen", event: "ok" }, corId); },
         function () { reply({ tag: "fullscreen", event: "denied" }, corId); }
       );
       return true;
     }
     // isExit
-    if (typeof document === "undefined" || typeof document.exitFullscreen !== "function") {
+    if (!doc || !doc.exitFullscreen) {
       reply({ tag: "fullscreen", event: "unavailable" }, corId);
       return true;
     }
-    document.exitFullscreen().then(
+    doc.exitFullscreen().then(
       function () { reply({ tag: "fullscreen", event: "ok" }, corId); },
       function () { reply({ tag: "fullscreen", event: "denied" }, corId); }
     );
@@ -1493,6 +1514,19 @@ pub fn port_glue_integrity() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The glue reads no document member through the document's own lookup.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn glue_reads_the_document_only_through_the_bound_table() {
+        let js = port_glue_js();
+        assert_eq!(
+            crate::js_document_scan::unbound_document_reads(js),
+            Vec::<String>::new(),
+            "the port glue names `document` only in its bound table"
+        );
+        assert_eq!(js.matches("})(document);").count(), 1);
+    }
 
     #[test]
     fn path_is_content_addressed_and_stable() {
@@ -1914,9 +1948,9 @@ mod tests {
     #[test]
     fn visibility_sink_reaches_the_web_api_and_traps_absence_to_a_typed_result() {
         let js = port_glue_js();
-        // The first-party Ipe.Browser.Visibility sink reads document.visibilityState…
+        // The first-party Ipe.Browser.Visibility sink reads the visibility state…
         assert!(js.contains("visibilitySink"));
-        assert!(js.contains("document.visibilityState"));
+        assert!(js.contains("visibility: prop(\"visibilityState\")"));
         assert!(js.contains("visibilitychange"));
         // …emits a typed reading with the `visible` boolean field…
         assert!(js.contains("tag: \"visibility\""));
