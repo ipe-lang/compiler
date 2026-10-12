@@ -434,18 +434,21 @@ mod tests {
 
     #[test]
     fn long_lived_reset_is_invisible() {
+        const MAIN: &str = "module Main exposing (main)\n\n\
+            import Lib exposing (answer, discard)\n\n\
+            main = discard answer\n";
         let desired: Desired = BTreeMap::from([
             (
                 vec!["Lib".to_owned()],
-                (module("Lib", "answer = 42"), ModuleOrigin::User),
+                (
+                    module("Lib", "answer = 42\n\ndiscard n = ()"),
+                    ModuleOrigin::User,
+                ),
             ),
             (
                 vec!["Main".to_owned()],
-                (
-                    "module Main exposing (main)\n\nimport Lib exposing (answer)\n\nmain = answer\n".to_owned(),
-                    ModuleOrigin::User,
-                ),
-                ),
+                (MAIN.to_owned(), ModuleOrigin::User),
+            ),
         ]);
         let entry = vec!["Main".to_owned()];
         let render = |owner: &LongLivedDb, root: SourceRoot| {
