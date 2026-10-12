@@ -510,7 +510,7 @@ pub enum NameError {
         found: usize,
     },
     /// A local module named in an `import` cannot be found under `source_root`.
-    /// `suggestions` lists close matches by Levenshtein distance. [IPE-N0020]
+    /// `suggestions` lists close matches in the shared ranker's order. [IPE-N0020]
     ModuleNotFound {
         name: Box<str>,
         suggestions: Candidates,
@@ -2258,7 +2258,7 @@ impl EditTarget {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Candidates {
     /// The region a sole candidate replaces, when provable.
-    pub region: Option<EditTarget>,
+    region: Option<EditTarget>,
     /// The ranked hits, best first.
     hits: Box<[Hit<Box<str>>]>,
 }
@@ -2279,7 +2279,7 @@ impl Candidates {
     /// The candidate names, best first.
     #[must_use]
     pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.hits.iter().map(|hit| &*hit.target)
+        self.hits.iter().map(|hit| &**hit.target())
     }
 }
 
@@ -3542,12 +3542,12 @@ fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
         ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
             span: target.span,
             replaces: target.replaces.clone(),
-            replacement: only.target.clone(),
-            applicability: sole_applicability(only.confidence),
+            replacement: only.target().clone(),
+            applicability: sole_applicability(only.confidence()),
         })],
         (many, _) => many
             .iter()
-            .map(|hit| HelpLine::DidYouMean(hit.target.clone()))
+            .map(|hit| HelpLine::DidYouMean(hit.target().clone()))
             .collect(),
     }
 }

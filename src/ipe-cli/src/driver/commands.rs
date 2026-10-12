@@ -3525,7 +3525,7 @@ fn ranked_names(
     suggest::rank(&query, spellings, policy)
         .hits
         .into_iter()
-        .map(|hit| hit.target)
+        .map(suggest::Hit::into_target)
         .collect()
 }
 

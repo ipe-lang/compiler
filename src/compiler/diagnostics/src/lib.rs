@@ -478,6 +478,7 @@ mod tests {
     }
 
     /// `Lsit.map` at `10..18`: the applicable edit overwrites only `Lsit`.
+    /// (`Set`, two edits away, would make the guess ambiguous.)
     #[test]
     fn unknown_module_suggestion_region_is_the_qualifier() {
         let token = Span::new(10, 18);
@@ -487,7 +488,7 @@ mod tests {
                 qualifier: "Lsit".into(),
                 suggestions: Candidates::at(
                     EditTarget::prefix(token, "Lsit"),
-                    ranked("Lsit", &["List", "Set"]),
+                    ranked("Lsit", &["List", "Maybe"]),
                 ),
             },
         };
@@ -499,6 +500,23 @@ mod tests {
                 replacement: "List".into(),
                 applicability: Applicability::MachineApplicable,
             })]
+        );
+    }
+
+    /// A sole shown guess with a rival two edits away that the threshold
+    /// hides is offered, never applied unprompted.
+    #[test]
+    fn a_sole_guess_with_a_hidden_rival_is_maybe_incorrect() {
+        let help = value_help("Lsit", &["List", "Set"]);
+        assert!(
+            matches!(
+                help.as_slice(),
+                [HelpLine::Suggest(Suggestion {
+                    applicability: Applicability::MaybeIncorrect,
+                    ..
+                })]
+            ),
+            "{help:?}"
         );
     }
 

@@ -14,7 +14,7 @@
 //! of a spelling read ([`SPELLING_CHARS`]), the characters one distance
 //! compares per side ([`DISTANCE_CHARS`]), and the hits returned ([`Cap`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU8;
 
 use crate::terminal::is_display_hazard;
@@ -174,6 +174,10 @@ pub struct Policy {
     pub threshold: Threshold,
 }
 
+/// The distance within which another target makes a one-edit guess
+/// ambiguous, whether or not the site's threshold shows that target.
+const RIVAL_EDITS: Distance = Distance(2);
+
 /// An edit distance, at most [`Distance::CEILING`] per compared pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Distance(u8);
@@ -193,10 +197,13 @@ impl Distance {
 /// How sure the ranker is that a hit is what the query meant, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
-    /// The query and a spelling differ only in letter case.
+    /// The query and a spelling differ only in letter case, no other target
+    /// sits at distance zero, and neither the scan nor the list was cut, so
+    /// no unseen spelling could compete.
     CaseOnly,
-    /// The one hit at one edit, with no other hit within two edits of it and
-    /// a complete scan, so no unseen spelling could compete.
+    /// The one hit at one edit, with no other target within [`RIVAL_EDITS`]
+    /// of the query (shown or kept out by the threshold) and a complete scan,
+    /// so no unseen spelling could compete.
     UniqueSingleEdit,
     /// Any other hit, including an exact spelling: the site's exact lookup
     /// answers that one before ranking.
@@ -204,14 +211,54 @@ pub enum Confidence {
 }
 
 /// One ranked target.
+///
+/// Only [`rank`] builds one, so a target always carries the distance and
+/// confidence the ranker gave it: no site can pair a name with a confidence
+/// it did not earn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit<T> {
     /// The target a spelling within the threshold opens.
-    pub target: T,
+    target: T,
     /// The best distance over the target's spellings.
-    pub distance: Distance,
+    distance: Distance,
     /// How sure the ranker is.
-    pub confidence: Confidence,
+    confidence: Confidence,
+}
+
+impl<T> Hit<T> {
+    /// The target a spelling within the threshold opens.
+    #[must_use]
+    pub const fn target(&self) -> &T {
+        &self.target
+    }
+
+    /// The best distance over the target's spellings.
+    #[must_use]
+    pub const fn distance(&self) -> Distance {
+        self.distance
+    }
+
+    /// How sure the ranker is.
+    #[must_use]
+    pub const fn confidence(&self) -> Confidence {
+        self.confidence
+    }
+
+    /// The target, dropping its score.
+    #[must_use]
+    pub fn into_target(self) -> T {
+        self.target
+    }
+
+    /// The same hit over another representation of its target.
+    #[must_use]
+    pub fn map_target<U>(self, f: impl FnOnce(T) -> U) -> Hit<U> {
+        Hit {
+            target: f(self.target),
+            distance: self.distance,
+            confidence: self.confidence,
+        }
+    }
 }
 
 /// The outcome of one ranking.
@@ -240,6 +287,9 @@ pub fn rank<'a, T: Ord + Clone>(
     let query_segments: Vec<Vec<char>> = query.segments.iter().map(|s| cut_chars(s)).collect();
     let mut work = Work::default();
     let mut best: BTreeMap<T, Best> = BTreeMap::new();
+    // Targets within `RIVAL_EDITS` of the query that the threshold kept out:
+    // never shown, yet each makes a one-edit guess ambiguous.
+    let mut rivals: BTreeSet<T> = BTreeSet::new();
 
     let mut scan = universe.into_iter();
     for spelling in scan.by_ref().take(MAX_UNIVERSE) {
@@ -251,6 +301,19 @@ pub fn rank<'a, T: Ord + Clone>(
             policy.threshold,
             &mut work,
         ) else {
+            let rival = Threshold::Nearest { max: RIVAL_EDITS };
+            if score(
+                query,
+                &query_whole,
+                &query_segments,
+                spelling.text,
+                rival,
+                &mut work,
+            )
+            .is_some()
+            {
+                rivals.insert(spelling.target);
+            }
             continue;
         };
         best.entry(spelling.target)
@@ -266,6 +329,13 @@ pub fn rank<'a, T: Ord + Clone>(
     let mut ordered: Vec<(T, Best)> = best.into_iter().collect();
     ordered.sort_by(|(at, a), (bt, b)| a.cmp(b).then_with(|| at.cmp(bt)));
     let runner_up = ordered.get(1).map(|(_, b)| b.distance);
+    // A case-only match is unambiguous only when no other target also sits at
+    // distance zero and every competitor is visible: a cut scan or a cut list
+    // could hide another spelling of the same letters.
+    let exact_ties = ordered
+        .iter()
+        .take_while(|(_, b)| b.distance == Distance(0))
+        .count();
     let mut hits: Vec<Hit<T>> = ordered
         .into_iter()
         .enumerate()
@@ -273,7 +343,8 @@ pub fn rank<'a, T: Ord + Clone>(
             let unique = at == 0
                 && !truncated
                 && found.distance == Distance(1)
-                && runner_up.is_none_or(|next| next.get() >= 3);
+                && runner_up.is_none_or(|next| next > RIVAL_EDITS)
+                && rivals.iter().all(|rival| *rival == target);
             let confidence = if found.case_only {
                 Confidence::CaseOnly
             } else if unique {
@@ -293,7 +364,15 @@ pub fn rank<'a, T: Ord + Clone>(
             .cmp(&(b.distance, b.confidence))
             .then_with(|| a.target.cmp(&b.target))
     });
+    let capped = hits.len() > policy.cap.get();
     hits.truncate(policy.cap.get());
+    if truncated || capped || exact_ties > 1 {
+        for hit in &mut hits {
+            if hit.confidence == Confidence::CaseOnly {
+                hit.confidence = Confidence::Plausible;
+            }
+        }
+    }
     Ranked { hits, truncated }
 }
 
@@ -673,6 +752,52 @@ mod tests {
         assert_eq!(first.confidence, Confidence::CaseOnly);
     }
 
+    /// A case-only guess that shares distance zero with another target, or
+    /// whose competitors a cut list or a cut scan hides, is never confident.
+    #[test]
+    fn a_case_only_match_with_a_hidden_or_tied_competitor_is_plausible() {
+        let confidence = |ranked: Ranked<&str>| ranked.hits.first().map(Hit::confidence);
+        let one = Policy {
+            cap: Cap::new(NonZeroU8::MIN),
+            threshold: Threshold::Relative,
+        };
+        assert_eq!(
+            confidence(rank(
+                &query("just", Shape::Flat),
+                spellings(&["Just", "JUST"]),
+                one
+            )),
+            Some(Confidence::Plausible),
+            "the cap hides a second case-only spelling"
+        );
+        assert_eq!(
+            confidence(rank(
+                &query("Just", Shape::Flat),
+                spellings(&["Just", "just"]),
+                RELATIVE
+            )),
+            Some(Confidence::Plausible),
+            "the typed name itself ties at distance zero"
+        );
+        let names: Vec<String> = (0..MAX_UNIVERSE).map(|n| format!("q{n}")).collect();
+        let universe = std::iter::once(Spelling {
+            text: "Just",
+            target: "Just",
+        })
+        .chain(names.iter().map(|n| Spelling {
+            text: n.as_str(),
+            target: n.as_str(),
+        }));
+        let ranked = rank(&query("just", Shape::Flat), universe, RELATIVE);
+        assert!(ranked.truncated);
+        assert_eq!(confidence(ranked), Some(Confidence::Plausible));
+        assert_eq!(
+            confidence(rank(&query("just", Shape::Flat), spellings(&["Just"]), one)),
+            Some(Confidence::CaseOnly),
+            "a lone, fully seen case-only match stays confident"
+        );
+    }
+
     #[test]
     fn an_empty_universe_has_no_hits() {
         let ranked = rank(&query("map", Shape::Flat), spellings(&[]), RELATIVE);
@@ -807,6 +932,35 @@ mod tests {
         assert_eq!(
             confidence(&["length", "lenghs"]),
             Some(Confidence::Plausible)
+        );
+    }
+
+    /// A target two edits away is a rival even when a short query's
+    /// threshold keeps it out of the shown list.
+    #[test]
+    fn a_rival_the_threshold_hides_still_blocks_a_unique_single_edit() {
+        assert_eq!(distance("lsit", "lost"), Some(2));
+        let confidence = |names: &[&str]| {
+            rank(&query("lsit", Shape::Flat), spellings(names), RELATIVE)
+                .hits
+                .first()
+                .map(Hit::confidence)
+        };
+        assert_eq!(confidence(&["list"]), Some(Confidence::UniqueSingleEdit));
+        assert_eq!(
+            targets("lsit", Shape::Flat, &["list", "lost"]),
+            ["list"],
+            "the rival is never shown"
+        );
+        assert_eq!(
+            confidence(&["list", "lost"]),
+            Some(Confidence::Plausible),
+            "yet the one shown guess is ambiguous"
+        );
+        assert_eq!(
+            confidence(&["list", "zzzz"]),
+            Some(Confidence::UniqueSingleEdit),
+            "a far name is no rival"
         );
     }
 

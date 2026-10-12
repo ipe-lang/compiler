@@ -7780,13 +7780,9 @@ fn ranked_names<'a>(
     rank(&query, universe, SUGGESTION_POLICY)
         .hits
         .into_iter()
-        .filter(|hit| hit.target != typo)
+        .filter(|hit| *hit.target() != typo)
         .take(usize::from(MAX_SUGGESTIONS.get()))
-        .map(|hit| Hit {
-            target: Box::from(hit.target),
-            distance: hit.distance,
-            confidence: hit.confidence,
-        })
+        .map(|hit| hit.map_target(Box::from))
         .collect()
 }
 
@@ -8422,12 +8418,12 @@ mod suggestion_ranking_tests {
     //! an unrelated import cannot dump every project module as a "did you mean").
 
     use super::{MAX_SUGGESTIONS, Shape, ranked_names};
-    use ipe_diagnostics::suggest::Confidence;
+    use ipe_diagnostics::suggest::{Confidence, Hit};
 
     fn names(typo: &str, shape: Shape, universe: &[&str]) -> Vec<String> {
         ranked_names(typo, shape, universe.iter().copied())
             .iter()
-            .map(|hit| hit.target.to_string())
+            .map(|hit| hit.target().to_string())
             .collect()
     }
 
@@ -8485,7 +8481,20 @@ mod suggestion_ranking_tests {
         let hits = ranked_names("lenght", Shape::Flat, ["lenght", "length"].into_iter());
         assert_eq!(hits.len(), 1);
         assert_eq!(
-            hits.first().map(|hit| hit.confidence),
+            hits.first().map(Hit::confidence),
+            Some(Confidence::Plausible)
+        );
+    }
+
+    /// The typed name's presence also blocks a case-only guess: after the
+    /// typed name is dropped the case variant stands alone, yet it was never
+    /// the one spelling of those letters.
+    #[test]
+    fn the_typed_name_in_the_universe_blocks_a_case_only_guess() {
+        let hits = ranked_names("Just", Shape::Flat, ["Just", "just"].into_iter());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits.first().map(Hit::confidence),
             Some(Confidence::Plausible)
         );
     }
