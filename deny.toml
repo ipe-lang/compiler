@@ -47,6 +47,13 @@ ignore = [
     # unreachable. Fix would require rust_decimal >= 0.8 (a semver-breaking
     # jump); accepted until that line is available and rust_decimal updates.
     "RUSTSEC-2026-0235",
+    # RUSTSEC-2024-0449 — unsafe-libyaml is unmaintained (an advisory about
+    # maintenance status, not a vulnerability). Reached only through
+    # `serde_yaml` 0.9 (also deprecated upstream), which backs the optional
+    # `config` feature's YAML decode (runtime/src/config_decode.rs) and the
+    # matching emitted-project dependency. Accepted until the YAML backend is
+    # replaced by a maintained, memory-safe parser.
+    "RUSTSEC-2024-0449",
 ]
 
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
