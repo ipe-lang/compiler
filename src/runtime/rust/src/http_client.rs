@@ -1729,12 +1729,12 @@ mod tests {
         /// redirect target, the next one spends the budget.
         #[test]
         fn redirect_budget_boundary_is_independent_of_the_dial_policy() {
-            let budget = RedirectBudget::new(3);
+            let budget = super::super::RedirectBudget::new(3);
             assert!((1..=3).all(|visited| !budget.spent_by(visited)));
             assert!(budget.refusal().is_none());
             assert!(budget.spent_by(4));
             assert_eq!(
-                budget.refusal().map(LimitRefusal::into_error),
+                budget.refusal().map(crate::LimitRefusal::into_error),
                 Some(crate::IpeError::limit_exceeded(
                     "http: too many redirects (max 3)"
                 ))
