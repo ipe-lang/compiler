@@ -16,8 +16,8 @@
 //!
 //! [`Arrival`] parses the metadata once; [`Arrival::mint`] is the one
 //! constructor of [`MintProof`] and [`Arrival::rejoin`] of [`RejoinProof`], so
-//! the page handler reaches neither a fresh session id nor a cookie's session
-//! except through a judged request.
+//! neither the page handler nor the SSE stream reaches a fresh session id or a
+//! cookie's session except through a judged request.
 
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, VARY};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -282,8 +282,8 @@ pub enum RejoinRefusal {
 
 /// Evidence that a request may act on the session its cookie names.
 ///
-/// It holds that session's key, the only one the page handler looks up; it
-/// derives no `Debug`.
+/// It holds that session's key, the only one the page handler or the SSE
+/// stream looks up; it derives no `Debug`.
 pub struct RejoinProof(crate::web::store::SessionKey);
 
 impl RejoinProof {
