@@ -557,7 +557,7 @@ fn installer_reads_home_once_at_the_boundary() -> io::Result<()> {
         .collect();
     assert_eq!(
         readers,
-        ["parse_home \"${HOME:-}\""],
+        [concat!("parse_home \"${", "HOME:-}\"")],
         "HOME must be read once, by `parse_home`; every later use derives from `USER_HOME`"
     );
     let writers: Vec<&str> = code
