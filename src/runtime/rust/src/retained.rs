@@ -429,6 +429,7 @@ mod tests {
     }
 
     /// The measure of `v`, which must not overflow.
+    #[allow(clippy::unwrap_used)] // a test helper: an unmeasurable value is the failure
     fn measure<T: RetainedBytes + ?Sized>(v: &T) -> u64 {
         v.retained_bytes().map(Bytes::get).unwrap()
     }

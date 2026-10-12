@@ -1405,28 +1405,11 @@ impl<M: RetainedBytes> RetainedBytes for Event<M> {
         let inline = Bytes::inline::<Self>()?;
         match self {
             Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
-            Self::OnString(name, handler) => {
-                inline.plus(name)?.checked_add(handler_bytes(handler)?)
-            }
-            Self::OnBool(name, handler) => inline.plus(name)?.checked_add(handler_bytes(handler)?),
-            Self::OnForm(name, handler) => inline.plus(name)?.checked_add(handler_bytes(handler)?),
-            Self::OnWidget(name, handler) => {
-                inline.plus(name)?.checked_add(handler_bytes(handler)?)
-            }
+            // A handler's captured heap is not reachable through `dyn Fn`, so
+            // its measure is unknown rather than an undercount.
+            Self::OnString(..) | Self::OnBool(..) | Self::OnForm(..) | Self::OnWidget(..) => None,
         }
     }
-}
-
-/// The bytes a shared event handler keeps alive, counted at every reference.
-///
-/// The pointer, the two reference counters and the closure's inline captures.
-/// Heap a capture owns (a captured `String`'s buffer) is not reachable through
-/// `dyn Fn` and is not counted, so this undercounts a closure capturing an
-/// allocation.
-fn handler_bytes<F: ?Sized>(handler: &std::sync::Arc<F>) -> Option<Bytes> {
-    Bytes::inline::<std::sync::Arc<F>>()?
-        .checked_add(Bytes::inline::<[usize; 2]>()?)?
-        .plus_count(std::mem::size_of_val::<F>(handler))
 }
 
 #[cfg(test)]
@@ -1450,6 +1433,13 @@ mod tests {
         let measured = tree.retained_bytes().map(Bytes::get);
         let floor = u64::try_from(64 + 3 * depth).unwrap();
         assert!(measured.is_some_and(|n| n >= floor), "{measured:?}");
+    }
+
+    // A handler's captured heap is unreachable, so a handler event is unmeasurable.
+    #[test]
+    fn a_handler_event_is_unmeasurable() {
+        let attr: Attribute<String> = html_on_string_("input".into(), std::sync::Arc::new(|s| s));
+        assert_eq!(attr.retained_bytes(), None);
     }
 
     // A message an event carries counts toward the attribute holding it.

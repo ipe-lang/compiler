@@ -675,7 +675,7 @@ where
     for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
 {
     let cols = row.columns();
-    let mut map = serde_json::Map::with_capacity(cols.len());
+    let mut map = serde_json::Map::new();
     for (i, col) in cols.iter().enumerate() {
         map.insert(col.name().to_string(), read_cell(row, i)?.into_json());
     }
