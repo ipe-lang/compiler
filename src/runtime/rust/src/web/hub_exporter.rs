@@ -502,7 +502,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(capture)).with_state(rec.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
 
         let base = format!("http://127.0.0.1:{port}");
@@ -580,7 +580,7 @@ mod tests {
             .fallback(any(leak))
             .with_state(leak_hits.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(leak_listener, leak_app).await;
+            let _ = crate::server::serve_fixture(leak_listener, leak_app).await;
         });
 
         // The hub: answers every push with a 307 redirect to the leak target.
@@ -601,7 +601,7 @@ mod tests {
             .fallback(any(redirect))
             .with_state(leak_base.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(hub_listener, hub_app).await;
+            let _ = crate::server::serve_fixture(hub_listener, hub_app).await;
         });
 
         let base = format!("http://127.0.0.1:{hub_port}");
@@ -661,7 +661,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(refuse)).with_state(hits.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = crate::server::serve_fixture(listener, app).await;
         });
         let base = format!("http://127.0.0.1:{port}");
         let target = HubTarget {

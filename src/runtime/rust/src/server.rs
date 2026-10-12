@@ -2038,8 +2038,20 @@ impl RecordedHost {
     }
 }
 
-/// Bind an app listener on `host` and `port`, then log where it listens and,
-/// for an exposed host, who exposed it.
+/// A bound app listener and the Host admission every request on it is judged
+/// by.
+///
+/// Built only by [`bind_app_listener`] and consumed only by [`serve_app`], so
+/// no app listener's socket can be served without its admission.
+#[derive(Debug)]
+pub(crate) struct AppListener {
+    listener: tokio::net::TcpListener,
+    admission: crate::inbound_authority::HostAdmission,
+    tag: &'static str,
+}
+
+/// Bind an app listener on `host` and `port`, then log where it listens, which
+/// hosts it admits and, for an exposed host, who exposed it.
 ///
 /// The one app bind site: `Server.listen` and `serve_web` both bind through
 /// it, so neither keeps a `TcpListener::bind` of its own.
@@ -2051,24 +2063,139 @@ pub(crate) async fn bind_app_listener(
     tag: &'static str,
     host: RecordedHost,
     port: u16,
-) -> std::io::Result<tokio::net::TcpListener> {
+) -> std::io::Result<AppListener> {
     let addr = host.addr(port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    for line in startup_lines(addr, host.0) {
+    let admission = crate::inbound_authority::HostAdmission::new(
+        crate::inbound_authority::DeclaredNames::none(),
+    );
+    for line in startup_lines(addr, host.0, admission.names()) {
         crate::system::emit_runtime_log(tag, &line);
     }
-    Ok(listener)
+    Ok(AppListener {
+        listener,
+        admission,
+        tag,
+    })
+}
+
+/// Serve `router` on `app`, judging every request's target authority against
+/// the listener's Host admission before routing, until `shutdown` resolves.
+///
+/// The one app serve site. The admission wraps the router as a service, never
+/// through `Router::layer` (which runs after routing), so an unrouted path and
+/// the fallback are refused alike and a refused request reaches no handler,
+/// session or concurrency permit.
+///
+/// # Errors
+///
+/// The serve loop's own error, for the caller to word.
+#[allow(clippy::disallowed_methods)] // the one app serve site; Host admission wraps the router
+pub(crate) async fn serve_app(
+    app: AppListener,
+    router: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    use axum::ServiceExt as _;
+    use tower::Layer as _;
+    let AppListener {
+        listener,
+        admission,
+        tag,
+    } = app;
+    let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag).layer(router);
+    axum::serve(
+        listener,
+        svc.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+}
+
+/// Serve a test upstream `router` on `listener` with no Host admission.
+///
+/// The test modules' one serve site: exporter and proxy upstreams stand in for
+/// a remote peer on `127.0.0.1:0`, never for an app listener.
+#[cfg(all(test, feature = "web", feature = "http_client"))]
+#[allow(clippy::disallowed_methods)] // test upstreams stand in for remote peers, never an app listener
+pub(crate) async fn serve_fixture(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+) -> std::io::Result<()> {
+    axum::serve(listener, router).await
+}
+
+/// One raw HTTP/1.1 exchange with the app listener on `127.0.0.1:port`: send
+/// `request` verbatim and return the whole response text, or `None` when no
+/// connection opens within five seconds or the response is not UTF-8.
+///
+/// Raw bytes, so a test can send the `Host` a rebinding browser sends.
+#[cfg(test)]
+pub(crate) async fn raw_exchange(port: u16, request: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = None;
+    for _ in 0..100 {
+        if let Ok(s) = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            stream = Some(s);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut stream = stream?;
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut out = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut out),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    String::from_utf8(out).ok()
+}
+
+/// The status code of a raw HTTP/1.1 `response`, `0` when it has none.
+#[cfg(test)]
+pub(crate) fn raw_status(response: &str) -> u16 {
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A free loopback port: bound once, then released for the listener under test.
+#[cfg(test)]
+pub(crate) fn free_loopback_port() -> Option<u16> {
+    let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+    held.local_addr().ok().map(|a| a.port())
 }
 
 /// The startup lines an app listener bound on `addr` prints, in order: where
-/// it listens, then, for an exposed host, the [`exposure_warning`].
+/// it listens, which hosts it admits, then, for an exposed host, the
+/// [`exposure_warning`].
 ///
 /// One list, so the warning cannot be dropped without the `listening on`
 /// readiness line every launcher waits for.
-fn startup_lines(addr: std::net::SocketAddr, host: crate::app_config::ListenHost) -> Vec<String> {
-    let mut lines = vec![format!("listening on http://{addr}")];
+fn startup_lines(
+    addr: std::net::SocketAddr,
+    host: crate::app_config::ListenHost,
+    names: &crate::inbound_authority::DeclaredNames,
+) -> Vec<String> {
+    let mut lines = vec![format!("listening on http://{addr}"), admission_line(names)];
     lines.extend(exposure_warning(host).into_iter().flatten());
     lines
+}
+
+/// The startup line naming which hosts an app listener admits; it counts the
+/// declared names and never echoes one.
+fn admission_line(names: &crate::inbound_authority::DeclaredNames) -> String {
+    const ADMITTED: &str = "host admission: IP literals and localhost";
+    if names.is_empty() {
+        ADMITTED.to_owned()
+    } else {
+        format!("{ADMITTED}, and {} declared name(s)", names.len())
+    }
 }
 
 /// The startup warning an exposed app listener prints, one message per line;
@@ -2290,12 +2417,14 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                 )));
             }
         };
-        // with_connect_info so each request carries the peer SocketAddr —
-        // populates ServerRequest.remoteAddr (also used by per-IP rate limiting).
-        let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-        match axum::serve(listener, svc).await {
+        // `serve_app` serves with connect-info, so each request carries the peer
+        // `SocketAddr` (`ServerRequest.remoteAddr`, per-IP rate limiting).
+        match serve_app(listener, app, std::future::pending()).await {
             Ok(()) => ok_res(()),
-            Err(e) => IpeResult::Err(format!("Server.listen: serve: {}", e).into()),
+            Err(e) => IpeResult::Err(E::from_ipe_error(IpeError::io(format!(
+                "Server.listen: serve: {}",
+                crate::system::scrub_log_controls(&e.to_string())
+            )))),
         }
     })
 }
@@ -4613,21 +4742,32 @@ mod tests {
     fn an_exposed_listener_prints_the_warning_after_its_readiness_line() {
         use crate::app_config::{ExposedBy, ListenHost, LoopbackIp};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let none = crate::inbound_authority::DeclaredNames::none();
+        let admission = "host admission: IP literals and localhost".to_owned();
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
         assert_eq!(
-            startup_lines(loopback, ListenHost::Loopback(LoopbackIp::DEFAULT)),
-            vec!["listening on http://127.0.0.1:8000".to_owned()]
+            startup_lines(loopback, ListenHost::Loopback(LoopbackIp::DEFAULT), &none),
+            vec![
+                "listening on http://127.0.0.1:8000".to_owned(),
+                admission.clone()
+            ]
         );
         let exposed = ListenHost::Exposed {
             ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             by: ExposedBy::EnvVar,
         };
-        let mut expected = vec!["listening on http://0.0.0.0:8000".to_owned()];
+        let mut expected = vec!["listening on http://0.0.0.0:8000".to_owned(), admission];
         expected.extend(exposure_warning(exposed).into_iter().flatten());
-        assert_eq!(expected.len(), 3, "an exposed host warns in two lines");
+        assert_eq!(expected.len(), 4, "an exposed host warns in two lines");
         assert_eq!(
-            startup_lines(SocketAddr::new(exposed.ip(), 8000), exposed),
+            startup_lines(SocketAddr::new(exposed.ip(), 8000), exposed, &none),
             expected
+        );
+        let declared =
+            crate::inbound_authority::DeclaredNames::parse("a.example, .b.example").unwrap();
+        assert_eq!(
+            admission_line(&declared),
+            "host admission: IP literals and localhost, and 2 declared name(s)"
         );
     }
 
@@ -7531,6 +7671,64 @@ mod tests {
             "X-Forwarded-Proto must be ignored without IPE_TRUSTED_PROXY opt-in: {:?}",
             r.cookies
         );
+    }
+
+    /// `Server.listen` on a free loopback port with one `GET /` route, spawned.
+    fn spawn_listen() -> Option<(u16, tokio::task::JoinHandle<IpeResult<String, ()>>)> {
+        let port = free_loopback_port()?;
+        crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+        crate::system::locked_remove_var(crate::env_registry::listen::SERVER_PORT.name());
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        let route = server_get::<String, _>("/".to_owned(), |_req: ServerRequest| {
+            Box::pin(ready(ok_res::<String, _>(server_text("ok".to_owned()))))
+                as IpeTask<String, ServerResponse>
+        });
+        let task = tokio::spawn(server_listen(i64::from(port), vec![route]));
+        Some((port, task))
+    }
+
+    /// A `GET path` request carrying `host` verbatim as its `Host` header.
+    fn get_with_host(path: &str, host: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+    }
+
+    /// A rebound name reaches no route of a real `Server.listen`: `GET /` and
+    /// an unknown path both answer 421 with no cookie, before routing; the same
+    /// listener addressed by its IP literal serves the route.
+    #[tokio::test]
+    async fn dev_posture_pin_listen_refuses_a_rebound_host() {
+        let (port, task) = spawn_listen().unwrap();
+        let evil = format!("evil.example:{port}");
+        for path in ["/", "/no/such/route"] {
+            let resp = raw_exchange(port, &get_with_host(path, &evil))
+                .await
+                .unwrap();
+            assert_eq!(raw_status(&resp), 421, "{path}: {resp}");
+            assert!(resp.contains("host_not_admitted"), "{path}: {resp}");
+            assert!(
+                !resp.to_ascii_lowercase().contains("set-cookie"),
+                "{path}: {resp}"
+            );
+        }
+        let ip = format!("127.0.0.1:{port}");
+        let resp = raw_exchange(port, &get_with_host("/", &ip)).await.unwrap();
+        assert_eq!(raw_status(&resp), 200, "{resp}");
+        task.abort();
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// An authority carrying userinfo is malformed and refused with 421 in
+    /// every build posture, though its host is the loopback literal.
+    #[tokio::test]
+    async fn malformed_authority_refuses_in_every_posture() {
+        let (port, task) = spawn_listen().unwrap();
+        let resp = raw_exchange(port, &get_with_host("/", "user@127.0.0.1"))
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&resp), 421, "{resp}");
+        assert!(resp.contains("host_not_admitted"), "{resp}");
+        task.abort();
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
     }
 
     // ── authenticated routes (fail-closed) ────────────────────────────

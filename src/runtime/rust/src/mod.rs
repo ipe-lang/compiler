@@ -561,6 +561,11 @@ pub use ws_client::*;
 pub mod env_grammar;
 pub mod env_registry;
 
+// The target authority of an inbound request and the Host admission every app
+// listener judges it by. Std-only and declared in every native module set; its
+// request judgement is gated on `server` inside the file.
+pub mod inbound_authority;
+
 // The one HTML escaper (text and attribute forms). Std-only and declared in
 // every module set (the emitted floor and the wasm set too): `html`, the
 // always-vendored `telemetry` dev banner, and the debugger overlay all call it,
