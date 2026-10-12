@@ -340,7 +340,7 @@ fn a_planted_working_tree_read_is_refused() -> Result<(), String> {
         "fn run_audit_over() { PackageSourceSet::read(p); }\n",
         "fn run_audit_over() { crate::lockfile::Lockfile::read(root); }\n",
         "fn run_audit_over() { let _ = vec![Lockfile::read(root)]; }\n",
-        "fn run_audit_over() { let _ = format!(\"{:?}\", discover_modules(src)); }\n",
+        "fn run_audit_over() { let _ = dbg!(discover_modules(src)); }\n",
         "use crate::diff::extract_tree as walk;\nfn run_audit_over() { walk(p); }\n",
         "fn run_audit_over() { include!(\"r.rs\"); }\n",
         "mod reader;\nfn run_audit_over() { reader::r(); }\n",

@@ -1072,7 +1072,7 @@ fn audit_version(
     // Display names the failing check; the version context is clear from
     // the chatter below and the structured error kind.
     audit::run_audit_as(&audit_args, blessing)
-        .and_then(|audited| admit_against_audit(version, &submitted.name, &audited))
+        .and_then(|audited| admit_against_audit(version, submitted.name.as_str(), &audited))
         .inspect_err(|_| {
             crate::screen::chatter(
                 crate::screen::Stream::Stderr,

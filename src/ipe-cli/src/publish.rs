@@ -2208,9 +2208,9 @@ mod tests {
             caps(&[Capability::Network]),
         );
         let draft = EntryDraft {
-            version: template.version.clone(),
-            source: template.source.clone(),
-            rev: template.rev.clone(),
+            version: template.version,
+            source: template.source,
+            rev: template.rev,
         };
         let entry = entry_version_from(draft, &audited);
         assert_eq!(

@@ -1030,7 +1030,7 @@ pub fn compile_modules_observed(
 ///
 /// # Errors
 /// [`CliError::Usage`] for a debugger build under the vendored runtime.
-fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(), CliError> {
+const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(), CliError> {
     if options.debugger && !options.runtime_dep {
         return Err(CliError::Usage(text::msg::debugger_needs_runtime_dep()));
     }

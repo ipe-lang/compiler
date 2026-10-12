@@ -303,6 +303,7 @@ impl AuditedPackage {
 
     /// An audited package with the given digest and capabilities, for a consumer's unit test.
     #[cfg(test)]
+    #[must_use]
     pub const fn for_test(digest: Sha256Hex, capabilities: BTreeSet<Capability>) -> Self {
         Self {
             digest,
@@ -333,7 +334,7 @@ pub struct AuditOptions {
 impl AuditOptions {
     /// The defaults under a claimed publisher: the resolver's index, the default advisory database, human output.
     #[must_use]
-    pub fn for_publisher(claimed: SelfDeclaredPublisher) -> Self {
+    pub const fn for_publisher(claimed: SelfDeclaredPublisher) -> Self {
         Self {
             index_root: None,
             advisory_db_override: None,
