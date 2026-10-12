@@ -47,8 +47,6 @@
 //! [`emit_expr_at`] survives as the leaf builder the structured arms delegate to
 //! (and as the SEAL / byte-golden test oracle), not as the body formatter.
 
-use std::borrow::Cow;
-
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
 use ipe_intern::{Interner, Symbol, rust_str_lit};
 use ipe_ir::{BinOp, Callee, Expr, IrType, KernelFn, MAX_IR_RENDER_DEPTH, ModPath};
@@ -615,7 +613,6 @@ fn build_binop_chain(
             detail: format!("{op:?} reached build_binop_chain but `infix` returned None"),
         });
     };
-    let opstr = sym.spelling();
 
     // Walk down the left spine while it is the SAME operator, collecting the
     // right operands. `spine` ends up outermost..innermost; reverse to source
@@ -669,7 +666,7 @@ fn build_binop_chain(
     for rhs_expr in spine {
         let rhs_doc = build_doc(ctx, rhs_expr, indent, depth, generics)?;
         operands.push(ChainOperand {
-            leading_op: Some(Cow::Borrowed(opstr)),
+            leading_op: Some(sym),
             doc: Doc::concat(vec![rhs_doc, Doc::text(leaf!(")"))]),
         });
     }
@@ -2123,8 +2120,6 @@ mod tests {
     //! renderer. The goldens are captured from `rustfmt --edition 2024
     //! --style-edition 2024`; the renderer is fixed to match, never the reverse.
 
-    use std::borrow::Cow;
-
     use ipe_intern::Interner;
     use ipe_ir::{
         Arm, BinOp, CallPin, Callee, EnumDef, Expr, Func, FuncId, IrType, KernelFn, Match, ModPath,
@@ -2136,7 +2131,7 @@ mod tests {
 
     use super::build_doc;
     use crate::doc::{ChainOperand, Doc, whitespace_normalize};
-    use crate::emit_expr::emit_expr_at;
+    use crate::emit_expr::{InfixOp, emit_expr_at};
     use crate::emit_types::GenericScope;
     use crate::render::{RenderConfig, render};
     use crate::{DbDriver, EmitCtx};
@@ -2945,19 +2940,19 @@ mod tests {
                 .expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
+                leading_op: Some(InfixOp::FloatAdd),
                 doc: Doc::owned("bbbbbbbbbbb)".to_owned()).expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
+                leading_op: Some(InfixOp::FloatAdd),
                 doc: Doc::owned("cc)".to_owned()).expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
+                leading_op: Some(InfixOp::FloatAdd),
                 doc: Doc::owned("dd)".to_owned()).expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
+                leading_op: Some(InfixOp::FloatAdd),
                 doc: Doc::owned("ee)".to_owned()).expect("a test leaf is code only"),
             },
         ];

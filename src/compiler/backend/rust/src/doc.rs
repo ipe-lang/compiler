@@ -31,6 +31,8 @@ use std::borrow::Cow;
 
 use ipe_diagnostics::Diagnostic;
 
+use crate::emit_expr::InfixOp;
+
 /// A layout document. Rendered by [`crate::render::render`].
 ///
 /// Downstream builders compose these variants. A soft break candidate is
@@ -374,9 +376,9 @@ pub enum Doc {
 /// One operand of a [`Doc::Chain`], with the operator that precedes it (if any).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainOperand {
-    /// The infix operator immediately before this operand, e.g. `"+"`. `None`
+    /// The infix operator immediately before this operand, e.g. `+`. `None`
     /// for the first operand.
-    pub leading_op: Option<Cow<'static, str>>,
+    pub leading_op: Option<InfixOp>,
     /// The operand's own document. May itself render multiline (a block, a
     /// forced-break call), which drives the chain's last-line-glue decision.
     pub doc: Doc,
@@ -515,6 +517,12 @@ impl Leaf {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The leaf's text, owned.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0.into_owned()
     }
 }
 
@@ -844,11 +852,11 @@ impl Doc {
             }
             Self::Chain { operands } => {
                 for (i, op) in operands.iter().enumerate() {
-                    if let Some(o) = &op.leading_op {
+                    if let Some(o) = op.leading_op {
                         if i > 0 {
                             sink.layout(" ");
                         }
-                        sink.layout(o);
+                        sink.layout(o.spelling());
                         sink.layout(" ");
                     }
                     sink.child(&op.doc);

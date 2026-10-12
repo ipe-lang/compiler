@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::doc::{ChainOperand, Doc, LeafNorm};
+use crate::emit_expr::InfixOp;
 
 mod buf;
 #[cfg(test)]
@@ -2968,7 +2969,7 @@ fn chain_flat_fits_single_line(
     let run = flat_run(
         operands.iter().enumerate().map(|(i, o)| {
             let op = if i > 0 {
-                o.leading_op.as_deref().unwrap_or("").len() + 2
+                o.leading_op.map_or("", InfixOp::spelling).len() + 2
             } else {
                 0
             };
@@ -3064,7 +3065,7 @@ fn render_chain(
         }
         // Non-first operands always carry a leading operator (the builder
         // invariant); an absent one degrades to no operator rather than panicking.
-        let op = operand.leading_op.as_deref().unwrap_or("");
+        let op = operand.leading_op.map_or("", InfixOp::spelling);
 
         if !broken {
             let cur = current_col(out);
@@ -4006,7 +4007,7 @@ fn render_chain_flat(operands: &[ChainOperand], cfg: RenderConfig, indent: usize
     for (i, operand) in operands.iter().enumerate() {
         if i > 0 {
             out.push(' ');
-            out.push_str(operand.leading_op.as_deref().unwrap_or(""));
+            out.push_str(operand.leading_op.map_or("", InfixOp::spelling));
             out.push(' ');
         }
         let c = current_col(out);
@@ -4024,7 +4025,6 @@ mod p0_tests {
 
     use super::*;
     use crate::doc::{ChainOperand, Doc, Leaf};
-    use std::borrow::Cow;
 
     /// The leaf of a test text.
     #[allow(clippy::expect_used)] // every test text is code only; a refusal fails the test
@@ -4038,9 +4038,9 @@ mod p0_tests {
     }
 
     /// A chain operand from a plain text leaf.
-    fn op(leading: Option<&'static str>, text: String) -> ChainOperand {
+    fn op(leading: Option<InfixOp>, text: String) -> ChainOperand {
         ChainOperand {
-            leading_op: leading.map(Cow::Borrowed),
+            leading_op: leading,
             doc: owned(text),
         }
     }
@@ -4069,10 +4069,10 @@ mod p0_tests {
         // `+ f` each break to col 8 (block indent 4 + 4). Captured from rustfmt.
         let operands = vec![
             op(None, "(((((longfunctioncallnamehere_aaaa(x)".into()),
-            op(Some("+"), "bbbbbbbbbbb)".into()),
-            op(Some("+"), "ccccccccccc)".into()),
-            op(Some("+"), "ddddddddddd)".into()),
-            op(Some("+"), "eeeeeeeeeee)".into()),
+            op(Some(InfixOp::FloatAdd), "bbbbbbbbbbb)".into()),
+            op(Some(InfixOp::FloatAdd), "ccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "ddddddddddd)".into()),
+            op(Some(InfixOp::FloatAdd), "eeeeeeeeeee)".into()),
             op(
                 Some("+"),
                 "ffffffffffffffffffffffffffffffffffffffffffffff)".into(),
@@ -4095,11 +4095,11 @@ mod p0_tests {
                 None,
                 "(((((longfunctioncallnamehere_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa(x)".into(),
             ),
-            op(Some("+"), "bbbbbbbbbbb)".into()),
-            op(Some("+"), "ccccccccccc)".into()),
-            op(Some("+"), "ddddddddddd)".into()),
-            op(Some("+"), "eeeeeeeeeee)".into()),
-            op(Some("+"), "ff)".into()),
+            op(Some(InfixOp::FloatAdd), "bbbbbbbbbbb)".into()),
+            op(Some(InfixOp::FloatAdd), "ccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "ddddddddddd)".into()),
+            op(Some(InfixOp::FloatAdd), "eeeeeeeeeee)".into()),
+            op(Some(InfixOp::FloatAdd), "ff)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         let expected = "    let z = (((((longfunctioncallnamehere_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa(x) + bbbbbbbbbbb)\n        + ccccccccccc)\n        + ddddddddddd)\n        + eeeeeeeeeee)\n        + ff)";
@@ -4167,7 +4167,7 @@ mod p0_tests {
                     ),
                 ]),
             },
-            op(Some("+"), "cccccccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "cccccccccccccccc)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         let expected = "    let z = (bcall(\n        argument_number_one_long,\n        argument_number_two_long,\n        argument_number_three_verylong,\n    ) + cccccccccccccccc)";
@@ -4194,16 +4194,16 @@ mod p0_tests {
                     Doc::text(leaf!(")")),
                 ]),
             },
-            op(Some("+"), "slshort)".into()),
+            op(Some(InfixOp::FloatAdd), "slshort)".into()),
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
+                leading_op: Some(InfixOp::FloatAdd),
                 doc: Doc::concat(vec![
                     Doc::text(leaf!("mlcall_two(")),
                     block("let b = another_thing_long_enough_to_break_it;", "b"),
                     Doc::text(leaf!("))")),
                 ]),
             },
-            op(Some("+"), "tail_operand_x)".into()),
+            op(Some(InfixOp::FloatAdd), "tail_operand_x)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         let expected = "    let z = (((mlcall_one({\n        let a = something_long_enough_to_force_break_here_now;\n        a\n    }) + slshort)\n        + mlcall_two({\n            let b = another_thing_long_enough_to_break_it;\n            b\n        }))\n        + tail_operand_x)";
@@ -4218,8 +4218,8 @@ mod p0_tests {
         // A short chain that fits entirely on the line: no operator breaks.
         let operands = vec![
             op(None, "((a".into()),
-            op(Some("+"), "b)".into()),
-            op(Some("+"), "c)".into()),
+            op(Some(InfixOp::FloatAdd), "b)".into()),
+            op(Some(InfixOp::FloatAdd), "c)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         assert_eq!(got, "    let z = ((a + b) + c)");
@@ -4279,11 +4279,11 @@ mod p0_tests {
         // A chain doc's normalized leaves must equal its normalized rendered bytes.
         let operands = vec![
             op(None, "(((((longfunctioncallnamehere_aaaa(x)".into()),
-            op(Some("+"), "bbbbbbbbbbb)".into()),
-            op(Some("+"), "ccccccccccc)".into()),
-            op(Some("+"), "ddddddddddd)".into()),
-            op(Some("+"), "eeeeeeeeeee)".into()),
-            op(Some("+"), "ff)".into()),
+            op(Some(InfixOp::FloatAdd), "bbbbbbbbbbb)".into()),
+            op(Some(InfixOp::FloatAdd), "ccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "ddddddddddd)".into()),
+            op(Some(InfixOp::FloatAdd), "eeeeeeeeeee)".into()),
+            op(Some(InfixOp::FloatAdd), "ff)".into()),
         ];
         let chain = Doc::Chain { operands };
         let rendered = render(&chain, RenderConfig::default());
@@ -4383,7 +4383,7 @@ mod p0_tests {
                     doc: op0,
                 },
                 ChainOperand {
-                    leading_op: Some(Cow::Borrowed("+")),
+                    leading_op: Some(InfixOp::FloatAdd),
                     doc: Doc::text(leaf!("crate::main_apply_p(1))")),
                 },
             ],

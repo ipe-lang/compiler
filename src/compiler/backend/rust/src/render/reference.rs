@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::doc::{ChainOperand, Doc, LeafNorm};
+use crate::emit_expr::InfixOp;
 
 use super::RenderConfig;
 
@@ -2995,7 +2996,7 @@ fn chain_flat_fits_single_line(
     let run = flat_run(
         operands.iter().enumerate().map(|(i, o)| {
             let op = if i > 0 {
-                o.leading_op.as_deref().unwrap_or("").len() + 2
+                o.leading_op.map_or("", InfixOp::spelling).len() + 2
             } else {
                 0
             };
@@ -3091,7 +3092,7 @@ fn render_chain(
         }
         // Non-first operands always carry a leading operator (the builder
         // invariant); an absent one degrades to no operator rather than panicking.
-        let op = operand.leading_op.as_deref().unwrap_or("");
+        let op = operand.leading_op.map_or("", InfixOp::spelling);
 
         if !broken {
             let cur = current_col(out);
@@ -4054,7 +4055,7 @@ fn render_chain_flat(
     for (i, operand) in operands.iter().enumerate() {
         if i > 0 {
             out.push(' ');
-            out.push_str(operand.leading_op.as_deref().unwrap_or(""));
+            out.push_str(operand.leading_op.map_or("", InfixOp::spelling));
             out.push(' ');
         }
         let c = current_col(out);
