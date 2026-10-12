@@ -387,7 +387,9 @@ pub fn rank<'a, T: Ord + Clone>(
 
 /// A spelling's score: its distance, and whether it is a case-only match.
 ///
-/// Ordered best first: a smaller distance, then a case-only match.
+/// Ordered best first: a smaller distance, then an exact spelling before a
+/// case-only one. A target with a spelling equal to the query is the query
+/// itself, so another of its spellings never makes it a case-only guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Best {
     distance: Distance,
@@ -404,7 +406,7 @@ impl Ord for Best {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.distance
             .cmp(&other.distance)
-            .then_with(|| other.case_only.cmp(&self.case_only))
+            .then_with(|| self.case_only.cmp(&other.case_only))
     }
 }
 
@@ -1117,5 +1119,225 @@ mod tests {
         let first = rank(&query("maq", Shape::Flat), spellings(&names), RELATIVE);
         let again = rank(&query("maq", Shape::Flat), spellings(&reversed), RELATIVE);
         assert_eq!(first, again);
+    }
+
+    /// A target one of whose spellings is the query itself is the query, not
+    /// a case-only guess, whichever of its spellings the scan meets first.
+    #[test]
+    fn a_target_spelling_the_query_is_never_a_case_only_guess() {
+        for names in [["B", "b"], ["b", "B"]] {
+            let universe = names.into_iter().map(|text| Spelling { text, target: 0 });
+            let ranked = rank(&query("B", Shape::Flat), universe, RELATIVE);
+            assert_eq!(
+                ranked.hits.first().map(|h| (h.distance, h.confidence)),
+                Some((Distance(0), Confidence::Plausible)),
+                "{names:?}"
+            );
+        }
+    }
+
+    // -- Oracle ---------------------------------------------------------------
+
+    /// A fixed-seed xorshift stream, so the oracle sees the same cases every run.
+    struct Stream(u64);
+
+    impl Stream {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            let n = u64::try_from(n.max(1)).unwrap_or(1);
+            usize::try_from(self.0 % n).unwrap_or(0)
+        }
+
+        fn letter(&mut self) -> char {
+            const ALPHABET: [char; 13] = [
+                'a', 'b', 'A', 'B', '.', 'İ', 'i', '\u{307}', 'ß', 'ẞ', 'K', '\u{212a}', 'k',
+            ];
+            ALPHABET
+                .get(self.below(ALPHABET.len()))
+                .copied()
+                .unwrap_or('a')
+        }
+
+        /// `text` after `edits` random inserts, deletes, substitutions,
+        /// adjacent swaps, or case flips.
+        fn mutate(&mut self, text: &str, edits: usize) -> String {
+            let mut chars: Vec<char> = text.chars().collect();
+            for _ in 0..edits {
+                let at = self.below(chars.len());
+                match self.below(5) {
+                    0 => {
+                        if at < chars.len() {
+                            chars.remove(at);
+                        }
+                    }
+                    1 => {
+                        let letter = self.letter();
+                        chars.insert(at.min(chars.len()), letter);
+                    }
+                    2 => {
+                        let letter = self.letter();
+                        if let Some(slot) = chars.get_mut(at) {
+                            *slot = letter;
+                        }
+                    }
+                    3 => {
+                        if let Some(pair) = chars.get_mut(at..at.saturating_add(2)) {
+                            pair.reverse();
+                        }
+                    }
+                    _ => {
+                        if let Some(slot) = chars.get_mut(at) {
+                            let flipped = if slot.is_lowercase() {
+                                slot.to_uppercase().next()
+                            } else {
+                                slot.to_lowercase().next()
+                            };
+                            *slot = flipped.unwrap_or(*slot);
+                        }
+                    }
+                }
+            }
+            chars.into_iter().collect()
+        }
+    }
+
+    /// The optimal-string-alignment distance by plain memoised recursion,
+    /// independent of [`osa`]'s rows, limits, and early exit.
+    fn reference_distance(left: &[char], right: &[char]) -> usize {
+        fn go(left: &[char], right: &[char], memo: &mut BTreeMap<(usize, usize), usize>) -> usize {
+            let key = (left.len(), right.len());
+            if let Some(&known) = memo.get(&key) {
+                return known;
+            }
+            let found = match (left.split_last(), right.split_last()) {
+                (None, _) => right.len(),
+                (_, None) => left.len(),
+                (Some((last_l, init_l)), Some((last_r, init_r))) => {
+                    let mut best = go(init_l, right, memo)
+                        .saturating_add(1)
+                        .min(go(left, init_r, memo).saturating_add(1))
+                        .min(
+                            go(init_l, init_r, memo).saturating_add(usize::from(last_l != last_r)),
+                        );
+                    if let (Some((prev_l, rest_l)), Some((prev_r, rest_r))) =
+                        (init_l.split_last(), init_r.split_last())
+                        && last_l == prev_r
+                        && prev_l == last_r
+                    {
+                        best = best.min(go(rest_l, rest_r, memo).saturating_add(1));
+                    }
+                    best
+                }
+            };
+            memo.insert(key, found);
+            found
+        }
+        go(left, right, &mut BTreeMap::new())
+    }
+
+    /// The ranker's measure, uncut: the whole folded strings, and for a
+    /// dotted query the trailing segments too when the spelling has enough.
+    fn reference_measure(typed: &str, spelling: &str, shape: Shape) -> usize {
+        let (typed, spelling) = (fold(typed.trim()), fold(spelling));
+        let chars = |s: &str| s.chars().collect::<Vec<char>>();
+        let whole = reference_distance(&chars(&typed), &chars(&spelling));
+        let (wanted, have) = (typed.split('.').count(), spelling.split('.').count());
+        if shape == Shape::Flat || have < wanted {
+            return whole;
+        }
+        let aligned = typed
+            .rsplit('.')
+            .zip(spelling.rsplit('.'))
+            .map(|(want, got)| reference_distance(&chars(want), &chars(got)))
+            .fold(0, usize::saturating_add);
+        whole.min(aligned)
+    }
+
+    /// Why a confident hit is wrong, measured against every spelling.
+    fn oracle_refutes(
+        typed: &str,
+        shape: Shape,
+        universe: &[(String, u8)],
+        policy: Policy,
+    ) -> Option<String> {
+        let parsed = Query::parse(typed, shape).ok()?;
+        let ranked = rank(
+            &parsed,
+            universe.iter().map(|(text, target)| Spelling {
+                text: text.as_str(),
+                target: *target,
+            }),
+            policy,
+        );
+        if let Some(late) = ranked
+            .hits
+            .iter()
+            .skip(1)
+            .find(|h| h.confidence != Confidence::Plausible)
+        {
+            return Some(format!("a confident hit past the first: {late:?}"));
+        }
+        let first = ranked.hits.first()?;
+        let typed = parsed.text();
+        let own = || universe.iter().filter(|(_, t)| *t == first.target);
+        let earned = match first.confidence {
+            Confidence::Plausible => return None,
+            Confidence::CaseOnly => own().any(|(s, _)| fold(s) == parsed.folded() && s != typed),
+            Confidence::UniqueSingleEdit => {
+                own().any(|(s, _)| reference_measure(typed, s, shape) == 1)
+            }
+        };
+        if !earned || own().any(|(s, _)| s == typed) {
+            return Some(format!("{first:?} unearned"));
+        }
+        universe
+            .iter()
+            .filter(|(_, t)| *t != first.target)
+            .find(|(s, _)| reference_measure(typed, s, shape) <= usize::from(RIVAL_EDITS.get()))
+            .map(|rival| format!("{first:?} beside rival {rival:?}"))
+    }
+
+    /// A confident verdict holds against a brute-force measure of every
+    /// spelling: the guess earned it, and no other target sits within
+    /// [`RIVAL_EDITS`] of the query, over small universes of near spellings
+    /// with aliases, duplicates, dots, and multi-char case folds.
+    #[test]
+    fn every_confident_verdict_survives_the_brute_force_oracle() {
+        let nearest = Policy {
+            cap: Cap::MAX,
+            threshold: Threshold::Nearest {
+                max: Distance::CEILING,
+            },
+        };
+        let one = Policy {
+            cap: Cap::new(NonZeroU8::MIN),
+            threshold: Threshold::Relative,
+        };
+        let mut stream = Stream(0x9e37_79b9_7f4a_7c15);
+        let mut refuted = Vec::new();
+        for _ in 0..1500 {
+            let len = stream.below(7);
+            let base: String = (0..len).map(|_| stream.letter()).collect();
+            let edits = stream.below(3);
+            let typed = stream.mutate(&base, edits);
+            let count = stream.below(6).saturating_add(1);
+            let universe: Vec<(String, u8)> = (0..count)
+                .map(|_| {
+                    let edits = stream.below(4);
+                    let text = stream.mutate(&base, edits);
+                    (text, u8::try_from(stream.below(4)).unwrap_or(0))
+                })
+                .collect();
+            for shape in [Shape::Flat, Shape::Dotted] {
+                for policy in [RELATIVE, one, nearest] {
+                    if let Some(why) = oracle_refutes(&typed, shape, &universe, policy) {
+                        refuted.push(format!("{typed:?} {shape:?}: {why} in {universe:?}"));
+                    }
+                }
+            }
+        }
+        assert!(refuted.is_empty(), "{refuted:#?}");
     }
 }
