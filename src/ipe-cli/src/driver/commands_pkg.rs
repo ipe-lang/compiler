@@ -2591,52 +2591,118 @@ pub fn infer_package_capabilities(
     infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &package)
 }
 
-/// Every source a package's capability inference sees, plus its entry modules.
+/// Every source a package's build and capability inference see, plus its entry modules.
 ///
 /// Sources are the package's own modules plus the compiled-source stdlib closure
-/// and FFI interface modules the build injects.
+/// and FFI interface modules the build injects; the FFI emission inputs (the
+/// `src/ffi.rs` bindings text among them) are computed in the same step. The
+/// build ([`super::build_from_sources`]) and capability inference
+/// ([`infer_package_capabilities_in`]) consume one value of this type, so the
+/// bytes a capability verdict judges are the bytes that are emitted.
 #[derive(Clone, Debug)]
 pub struct PackageSourceSet {
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
     entries: Vec<project::DiscoveredModule>,
     injected: std::collections::BTreeSet<Vec<String>>,
     ffi_injected: std::collections::BTreeSet<Vec<String>>,
+    ffi_emit: Option<ipe_backend_rust::FfiEmit>,
 }
 
+/// The parts of a [`PackageSourceSet`] the compile core consumes.
+pub struct SourceSetParts {
+    /// Every module source, injected ones included.
+    pub sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+    /// The compiled-source stdlib module paths the driver injected.
+    pub injected: std::collections::BTreeSet<Vec<String>>,
+    /// The FFI interface module paths the driver injected.
+    pub ffi_injected: std::collections::BTreeSet<Vec<String>>,
+    /// The FFI emission inputs, when any crate is installed.
+    pub ffi_emit: Option<ipe_backend_rust::FfiEmit>,
+}
+
+/// A module-source map with the modules discovered for it.
+pub type ReadModules = (
+    BTreeMap<Vec<String>, (PathBuf, String)>,
+    Vec<project::DiscoveredModule>,
+);
+
 impl PackageSourceSet {
-    /// Read the package rooted at `manifest_path`: every discovered module's
-    /// source (read once, bounded), then the same compiled-source stdlib closure
-    /// and FFI interface injection the build performs.
+    /// Read the package rooted at `manifest_path` from disk, one bounded read per module.
+    ///
+    /// The working-tree reader for a single-shot command; a gate judges a
+    /// [`project::PackageSnapshot`] through [`PackageSourceSet::from_snapshot`].
     ///
     /// # Errors
     /// [`CliError::Io`] / manifest errors when the package cannot be read.
     pub fn read(manifest_path: &Path) -> Result<Self, CliError> {
         let manifest = project::parse_manifest(manifest_path)?;
-        let mut entries = project::discover_modules(&manifest.src_root)?;
+        let (sources, entries) = read_package_modules(&manifest)?;
+        Self::assemble(sources, entries, manifest_path)
+    }
 
-        let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-        for m in &entries {
-            let src = crate::io_bounded::read_walked_source(m.path())?;
-            sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
-        }
+    /// The source set of a captured package: its modules as the snapshot holds them, never re-read.
+    ///
+    /// # Errors
+    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    pub fn from_snapshot(snapshot: &project::PackageSnapshot) -> Result<Self, CliError> {
+        Self::assemble(
+            snapshot.sources().clone(),
+            snapshot.modules().to_vec(),
+            &snapshot_manifest_path(snapshot),
+        )
+    }
 
-        // Inject the compiled-source stdlib closure (e.g. `Ipe.Css`) just like
-        // the real build path, so a module that imports a compiled-source stdlib
-        // module lowers standalone here instead of failing name resolution
-        // (which, since a failing entry surfaces its real diagnostic, would
-        // otherwise abort build).
+    /// Inject the compiled-source stdlib closure and the FFI interface modules into `sources`.
+    ///
+    /// `blame_path` is the project manifest or entry file the FFI catalog
+    /// search walks up from.
+    ///
+    /// # Errors
+    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    pub fn assemble(
+        mut sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+        mut entries: Vec<project::DiscoveredModule>,
+        blame_path: &Path,
+    ) -> Result<Self, CliError> {
+        // `injected` is the driver's unforgeable record of which module paths
+        // are trusted stdlib source, the only inputs that earn
+        // `ModuleOrigin::EmbeddedStdlib`.
         let injected = project::inject_compiled_std_closure(&mut sources, &mut entries);
-        // Inject the FFI interface modules (installed crates + the asserted-call
-        // `Rust.Ffi` module) exactly as the build does, so an FFI-using module
-        // lowers here and its `native-ffi`/`ffi-raw` capabilities are inferred
-        // instead of the package being refused on a resolve failure.
-        let ffi_injected = ffi::prepare_ffi(&mut sources, manifest_path)?.injected;
+        // The catalog-load, nominal-unification, interface-inject and
+        // emit-assemble sequence `watch` and `lsp` share.
+        let ffi = ffi::prepare_ffi(&mut sources, blame_path)?;
         Ok(Self {
             sources,
             entries,
             injected,
-            ffi_injected,
+            ffi_injected: ffi.injected,
+            ffi_emit: ffi.emit,
         })
+    }
+
+    /// The `src/ffi.rs` text the build writes, when the package binds any crate.
+    #[must_use]
+    pub fn bindings_source(&self) -> Option<&str> {
+        self.ffi_emit
+            .as_ref()
+            .map(|emit| emit.bindings_source.as_str())
+    }
+
+    /// Whether `module_path` is one of the module sources.
+    #[must_use]
+    pub fn has_module(&self, module_path: &[String]) -> bool {
+        self.sources.contains_key(module_path)
+    }
+
+    /// The parts the compile core consumes.
+    #[must_use]
+    pub fn into_parts(self) -> SourceSetParts {
+        SourceSetParts {
+            sources: self.sources,
+            injected: self.injected,
+            ffi_injected: self.ffi_injected,
+            ffi_emit: self.ffi_emit,
+        }
     }
 
     /// The module path of every module lowered as an inference entry.
@@ -2667,8 +2733,32 @@ impl PackageSourceSet {
                 .collect(),
             injected: self.injected.clone(),
             ffi_injected: self.ffi_injected.clone(),
+            ffi_emit: self.ffi_emit.clone(),
         }
     }
+}
+
+/// The `package.ipe` path of a captured package, the FFI catalog search's start.
+#[must_use]
+pub fn snapshot_manifest_path(snapshot: &project::PackageSnapshot) -> PathBuf {
+    snapshot
+        .manifest()
+        .root
+        .join(crate::package_manifest::PACKAGE_IPE)
+}
+
+/// Read every module under `manifest`'s source root, one bounded read each.
+///
+/// # Errors
+/// [`CliError::Io`] when the source root cannot be walked or a module read.
+pub fn read_package_modules(manifest: &project::ProjectManifest) -> Result<ReadModules, CliError> {
+    let entries = project::discover_modules(&manifest.src_root)?;
+    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
+    for m in &entries {
+        let src = crate::io_bounded::read_walked_source(m.path())?;
+        sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
+    }
+    Ok((sources, entries))
 }
 
 /// [`infer_package_capabilities`] over one caller-supplied database.
