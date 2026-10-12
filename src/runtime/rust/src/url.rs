@@ -115,16 +115,17 @@ impl Url {
         if self.0.host_str().is_none() || self.spilled() {
             return self.shown();
         }
-        if self.0.password().is_none() {
+        let Some(password) = self.0.password() else {
             return self.0.as_str().to_owned();
-        }
-        let mut bare = self.0.clone();
-        let _ = bare.set_password(None);
-        let prefix = format!("{}://{}", bare.scheme(), bare.username());
-        bare.as_str().strip_prefix(prefix.as_str()).map_or_else(
-            || self.shown(),
-            |rest| format!("{prefix}:{REDACTED_SHOW}{rest}"),
-        )
+        };
+        let user = format!("{}://{}", self.0.scheme(), self.0.username());
+        self.0
+            .as_str()
+            .strip_prefix(format!("{user}:{password}@").as_str())
+            .map_or_else(
+                || self.shown(),
+                |rest| format!("{user}:{REDACTED_SHOW}@{rest}"),
+            )
     }
 }
 

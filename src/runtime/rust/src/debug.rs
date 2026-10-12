@@ -141,6 +141,10 @@ mod tests {
         let spilled = parse_url("https://S3CR3TUSER:1/S3CR3TPW@example.com/x")
             .expect("a literal absolute URL");
         assert!(!dev(&spilled).contains("S3CR3T"), "{}", dev(&spilled));
+        // A password under an empty user name keeps the `@` that ends the userinfo.
+        #[allow(clippy::expect_used)] // fixture: a literal absolute URL always parses
+        let no_user = parse_url("https://:S3CR3TPW@example.com/p").expect("a literal absolute URL");
+        assert_eq!(dev(&no_user), "https://:<redacted>@example.com/p");
     }
 
     /// One value per `Reveal` row, rendered `(leaf, dev, shown)`.
