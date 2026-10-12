@@ -1706,10 +1706,9 @@ mod script_node_tests {
             neutralise_script_close("a</script><img src=x onerror=alert(1)>"),
             "a<\\/script><img src=x onerror=alert(1)>"
         );
-        // Case-insensitive match; the neutralised run is emitted as the fixed
-        // lowercase literal (the exact casing of the code text is irrelevant —
-        // only that no `</script` byte run of ANY case survives).
-        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/script >");
+        // Case-insensitive match; the tag name keeps its original case so a
+        // data string value is unchanged — only the `</` pair is split.
+        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/SCRIPT >");
         // No surviving `</script` (any case) after neutralisation.
         let out = neutralise_script_close("x</script>y</ScRiPt>z");
         assert!(!out.to_ascii_lowercase().contains("</script"));

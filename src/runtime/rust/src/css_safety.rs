@@ -1024,20 +1024,28 @@ pub(crate) fn neutralise_style_body(css: &str) -> String {
 /// Total (never panics; only ASCII single-byte characters are ever compared or
 /// emitted specially, and every multi-byte `char` is copied whole).
 pub(crate) fn neutralise_script_close(body: &str) -> String {
-    /// Each byte run that leaves script-data state, and its split form.
-    const SPLITS: [(&[u8], &str); 2] = [(b"</script", "<\\/script"), (b"<!--", "<\\u0021--")];
+    /// Each byte run that leaves script-data state: the run, how many leading
+    /// bytes the split form replaces, and that split form. The remaining bytes
+    /// of the run are copied in their original case so a data string keeps its
+    /// value.
+    const SPLITS: [(&[u8], usize, &str); 2] =
+        [(b"</script", 2, "<\\/"), (b"<!--", 4, "<\\u0021--")];
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i < bytes.len() {
-        let split_here = SPLITS.iter().find(|(needle, _)| {
+        let split_here = SPLITS.iter().find(|(needle, _, _)| {
             bytes
                 .get(i..i.saturating_add(needle.len()))
                 .is_some_and(|w| w.eq_ignore_ascii_case(needle))
         });
-        if let Some((needle, split)) = split_here {
+        if let Some((needle, keep, split)) = split_here {
             out.push_str(split);
-            i = i.saturating_add(needle.len());
+            let end = i.saturating_add(needle.len());
+            if let Some(rest) = body.get(i.saturating_add(*keep)..end) {
+                out.push_str(rest);
+            }
+            i = end;
         } else {
             // A multi-byte UTF-8 char never starts with `<`, so the needle branch
             // only fires on single-byte ASCII; here we copy the next whole char
@@ -1451,7 +1459,7 @@ mod tests {
             neutralise_script_close("a</script><img src=x onerror=alert(1)>"),
             "a<\\/script><img src=x onerror=alert(1)>"
         );
-        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/script >");
+        assert_eq!(neutralise_script_close("b</SCRIPT >"), "b<\\/SCRIPT >");
         let out = neutralise_script_close("x</script>y</ScRiPt>z");
         assert!(!out.to_ascii_lowercase().contains("</script"));
         // Non-breakout text (incl. multibyte UTF-8) is untouched.
