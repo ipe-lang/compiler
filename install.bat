@@ -18,7 +18,7 @@ exit /b %IPE_RC%
 #PS-BODY
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocol]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $artifact = 'ipe-windows-x64.zip'
 $base = 'https://github.com/ipe-lang/compiler/releases/latest/download'
 $dir = if ($env:IPE_INSTALL_DIR) { $env:IPE_INSTALL_DIR } else { Join-Path $env:USERPROFILE '.ipe\bin' }
