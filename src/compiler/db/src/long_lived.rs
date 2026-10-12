@@ -47,7 +47,7 @@ pub enum Generation {
 }
 
 /// The outcome of [`LongLivedDb::sync`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Synced {
     /// The current generation's root over the desired inputs.
     pub root: SourceRoot,
@@ -254,9 +254,12 @@ mod tests {
     }
 
     fn intern_fresh(owner: &LongLivedDb, round: usize, count: usize) {
-        let mut interner = owner.db().interner().lock();
         for n in 0..count {
-            let fresh = interner.intern(&format!("churn_{round}_{n}"));
+            let fresh = owner
+                .db()
+                .interner()
+                .lock()
+                .intern(&format!("churn_{round}_{n}"));
             assert!(fresh.is_ok());
         }
     }
@@ -317,7 +320,8 @@ mod tests {
                 let lowered = crate::lower_program(owner.db(), root, file);
                 let interner = owner.db().interner().lock();
                 lowered
-                    .map(|program| ipe_ir::pretty(&program, &interner))
+                    .as_ref()
+                    .map(|program| ipe_ir::pretty(program, &interner))
                     .map_err(|err| format!("{err:?}"))
                     .map(|text| (linked, text))
             })
@@ -401,7 +405,7 @@ mod tests {
                 false,
             )
         });
-        assert_eq!(owner.config(), Some(installed));
+        assert!(owner.config() == Some(installed));
         let mut generations = (0..=SMALL.inputs.saturating_mul(2))
             .map(|round| owner.sync(&one(&format!("M{round}"), "x = 1")).generation);
         assert!(generations.any(|generation| generation == Generation::Reset));
