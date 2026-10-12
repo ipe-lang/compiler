@@ -172,7 +172,6 @@ crate::stringify::show_row!(
     [] HttpRequest,
     shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
     dev: |r, view| {
-        use crate::stringify::IpeStringify;
         crate::stringify::dev_record(
             "HttpRequest",
             &[

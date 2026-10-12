@@ -24,7 +24,7 @@ crate::stringify::show_row!(
     [] WebReq,
     shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
     dev: |r, view| {
-        use crate::stringify::{IpeStringify, dev_cookie_names, dev_header_map, dev_record};
+        use crate::stringify::{dev_cookie_names, dev_header_map, dev_record};
         dev_record(
             "WebReq",
             &[

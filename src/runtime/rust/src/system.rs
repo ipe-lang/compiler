@@ -2661,7 +2661,6 @@ crate::stringify::show_row!(
     [] ProcessRunWithCfg,
     shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
     dev: |c, view| {
-        use crate::stringify::IpeStringify;
         crate::stringify::dev_record(
             "ProcessRunWithCfg",
             &[
@@ -2720,7 +2719,6 @@ crate::stringify::show_row!(
     [] ProcessRunInPtyCfg,
     shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
     dev: |c, view| {
-        use crate::stringify::IpeStringify;
         crate::stringify::dev_record(
             "ProcessRunInPtyCfg",
             &[
