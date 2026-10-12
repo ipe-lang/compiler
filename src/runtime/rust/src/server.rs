@@ -2192,7 +2192,7 @@ fn startup_lines(
 fn admission_line(names: &crate::inbound_authority::DeclaredNames) -> String {
     const ADMITTED: &str = "host admission: IP literals and localhost";
     if names.is_empty() {
-        format!("{ADMITTED}; set IPE_HTTP_ALLOWED_HOSTS=<name> to serve a DNS name")
+        ADMITTED.to_owned()
     } else {
         format!("{ADMITTED}, and {} declared name(s)", names.len())
     }
@@ -4743,9 +4743,7 @@ mod tests {
         use crate::app_config::{ExposedBy, ListenHost, LoopbackIp};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let none = crate::inbound_authority::DeclaredNames::none();
-        let admission = "host admission: IP literals and localhost; set \
-                         IPE_HTTP_ALLOWED_HOSTS=<name> to serve a DNS name"
-            .to_owned();
+        let admission = "host admission: IP literals and localhost".to_owned();
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
         assert_eq!(
             startup_lines(loopback, ListenHost::Loopback(LoopbackIp::DEFAULT), &none),
