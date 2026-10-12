@@ -640,12 +640,13 @@ pub fn html_style_node_<M>(attrs: Vec<crate::html::Attribute<M>>, css: String) -
 /// named `unsafe*` — never on the safe `Ipe.Html` surface. There is no escaping a
 /// script body admits: HTML-escaping it would corrupt the JavaScript, and the
 /// body is executable code regardless of value-escaping, so the caller owns the
-/// invariant that the body is trusted, author-controlled code. The one structural
-/// breakout — a literal `</script` closing the element early — is neutralised
-/// here at construction (parse, don't validate) by splitting the ASCII-case-
-/// insensitive `</script` sequence with a backslash, exactly the belt-and-braces
-/// shape `html_style_node_` uses for `</style`; the `<script>` render sink emits
-/// the resulting `HRaw` child verbatim.
+/// invariant that the body is trusted, author-controlled code. The structural
+/// breakouts — a literal `</script` closing the element early, and a `<!--`
+/// that lets a later `<script` swallow the close tag — are neutralised here at
+/// construction (parse, don't validate) by `neutralise_script_close`, exactly
+/// the belt-and-braces shape `html_style_node_` uses for `</style`; the render
+/// sink neutralises the `HRaw` child again and admits the `<script>` only where
+/// its start tag enters script-data state.
 #[must_use]
 pub fn html_script_node_<M>(body: String) -> Html<M> {
     Html::HElement(

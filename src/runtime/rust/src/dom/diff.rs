@@ -758,7 +758,13 @@ mod tests {
                 vec![Html::HRaw("<img src=x onerror=alert(1)>".into())],
             )
         };
-        for (parent, admitted) in [("svg", false), ("math", false), ("div", true)] {
+        for (parent, admitted) in [
+            ("svg", false),
+            ("math", false),
+            ("textarea", false),
+            ("noscript", false),
+            ("div", true),
+        ] {
             let mut old: Html<()> = Html::HElement(parent.into(), vec![], vec![]);
             let mut new: Html<()> = Html::HElement(parent.into(), vec![], vec![script()]);
             ids(&mut old);
@@ -774,6 +780,33 @@ mod tests {
             let first_paint = crate::html::render_html(&new);
             assert_eq!(first_paint.contains("<script"), admitted, "{first_paint}");
         }
+    }
+
+    /// A patch two levels below `svg`, under its `foreignObject`, still treats
+    /// the subtree as foreign content: no script is patched in.
+    #[test]
+    fn diff_patch_under_foreign_object_refuses_script() {
+        let page = |kids: Vec<Html<()>>| -> Html<()> {
+            let fo = Html::HElement("foreignObject".into(), vec![], kids);
+            Html::HElement("svg".into(), vec![], vec![fo])
+        };
+        let script = Html::HElement(
+            "script".into(),
+            vec![],
+            vec![Html::HRaw("<img src=x onerror=alert(1)>".into())],
+        );
+        let mut old = page(vec![]);
+        let mut new = page(vec![script]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new);
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        for p in &patches {
+            let html = p.html.as_deref().unwrap_or_default();
+            assert!(!html.contains("<script"), "{html}");
+            assert!(!html.contains("<img"), "{html}");
+        }
+        assert!(!crate::html::render_html(&new).contains("<script"));
     }
 
     /// A trusted script body that changes under an `svg` parent is not on the

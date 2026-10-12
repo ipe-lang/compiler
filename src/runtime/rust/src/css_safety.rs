@@ -1001,12 +1001,16 @@ pub(crate) fn neutralise_style_body(css: &str) -> String {
 /// The browser's HTML parser ends a script element at a literal
 /// ASCII-case-insensitive `</script` byte run, and a `<!--` followed later by
 /// `<script` puts it in the double-escaped state, where the renderer's own
-/// `</script>` no longer closes the element. Inserting a `\` after the `<`
-/// (`<\/script`, `<\!--`) removes both byte runs the parser scans for. Inside a
-/// JavaScript string, template literal or ordinary regex the escape is
-/// redundant and the program is unchanged; inside a `/u` regex `\!` is a
-/// `SyntaxError`, which fails closed with no markup. Other text is untouched, so
-/// ordinary script bodies pass through unchanged.
+/// `</script>` no longer closes the element. `</script` becomes `<\/script` and
+/// `<!--` becomes `<!--`: each spells the same characters as a JavaScript
+/// or JSON escape, and neither holds a byte run the parser scans for. Inside a
+/// JavaScript string, the cooked value of a template literal, a regex (with or
+/// without the `u` or `v` flag) or a JSON string the escape decodes to the
+/// original character, so the program and the data are unchanged; only a
+/// template literal's raw value (`String.raw`) sees the escape spelled out. A
+/// `<!--` in code position (a legacy HTML-like comment, or `a<!--b`) becomes a
+/// `SyntaxError`, which fails closed with no markup. Other text is untouched,
+/// so ordinary script bodies pass through unchanged.
 ///
 /// Total and a fixpoint: every `<` it writes specially is followed by `\`, so
 /// its output holds neither byte run and a second pass changes nothing.
@@ -1021,7 +1025,7 @@ pub(crate) fn neutralise_style_body(css: &str) -> String {
 /// emitted specially, and every multi-byte `char` is copied whole).
 pub(crate) fn neutralise_script_close(body: &str) -> String {
     /// Each byte run that leaves script-data state, and its split form.
-    const SPLITS: [(&[u8], &str); 2] = [(b"</script", "<\\/script"), (b"<!--", "<\\!--")];
+    const SPLITS: [(&[u8], &str); 2] = [(b"</script", "<\\/script"), (b"<!--", "<\\u0021--")];
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
@@ -1467,7 +1471,10 @@ mod tests {
     /// output holds neither byte run on any later pass.
     #[test]
     fn neutralise_script_close_splits_comment_open() {
-        assert_eq!(neutralise_script_close("a<!--<script>"), "a<\\!--<script>");
+        assert_eq!(
+            neutralise_script_close("a<!--<script>"),
+            "a<\\u0021--<script>"
+        );
         for body in [
             "<!--<script>",
             "<<!--",
@@ -1481,6 +1488,19 @@ mod tests {
             assert!(!once.to_ascii_lowercase().contains("</script"), "{once}");
             assert_eq!(neutralise_script_close(&once), once);
         }
+    }
+
+    /// A JSON data block (`application/json`, an import map) keeps its value
+    /// after both splits: each one is a valid JSON string escape of the
+    /// characters it replaces.
+    #[test]
+    fn neutralise_script_close_keeps_json_strings_valid() {
+        let body = r#"{"a":"<!--<script>","b":"</SCRIPT>"}"#;
+        let out = neutralise_script_close(body);
+        assert!(!out.contains("<!--"), "{out}");
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&out);
+        let expected = serde_json::json!({"a": "<!--<script>", "b": "</SCRIPT>"});
+        assert_eq!(parsed.ok(), Some(expected), "{out}");
     }
 
     /// Legacy script-execution CSS properties are blocked in both the value
