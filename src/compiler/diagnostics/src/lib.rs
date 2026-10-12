@@ -385,44 +385,122 @@ mod tests {
         );
     }
 
+    /// The hits a resolver site gets for `typo` over `names`.
+    fn ranked(typo: &str, names: &[&str]) -> Box<[suggest::Hit<Box<str>>]> {
+        let Ok(query) = suggest::Query::parse(typo, suggest::Shape::Flat) else {
+            return Box::new([]);
+        };
+        let universe = names.iter().map(|name| suggest::Spelling {
+            text: name,
+            target: Box::<str>::from(*name),
+        });
+        let policy = suggest::Policy {
+            cap: suggest::Cap::MAX,
+            threshold: suggest::Threshold::Relative,
+        };
+        suggest::rank(&query, universe, policy)
+            .hits
+            .into_boxed_slice()
+    }
+
+    /// The help a `ValueNotFound` for `typo` at `0..len` gets over `names`.
+    fn value_help(typo: &str, names: &[&str]) -> Vec<HelpLine> {
+        let span = Span::new(0, u32::try_from(typo.len()).unwrap_or(u32::MAX));
+        Diagnostic::Name {
+            span,
+            msg: NameError::ValueNotFound {
+                name: typo.into(),
+                suggestions: Candidates::at(EditTarget::whole(span, typo), ranked(typo, names)),
+            },
+        }
+        .help()
+    }
+
     #[test]
     fn did_you_mean_preserves_producer_order() {
         let d = Diagnostic::Name {
             span: Span::DUMMY,
             msg: NameError::ValueNotFound {
-                name: "lenght".into(),
-                suggestions: Candidates::hints(Box::new(["length".into(), "list".into()])),
+                name: "mab".into(),
+                suggestions: Candidates::hints(ranked("mab", &["map", "mad"])),
             },
         };
         assert_eq!(
             d.help(),
             vec![
-                HelpLine::DidYouMean("length".into()),
-                HelpLine::DidYouMean("list".into()),
+                HelpLine::DidYouMean("mad".into()),
+                HelpLine::DidYouMean("map".into()),
             ]
         );
     }
 
     #[test]
-    fn single_candidate_becomes_machine_applicable_suggestion() {
-        let d = Diagnostic::Name {
-            span: Span::new(0, 6),
-            msg: NameError::ValueNotFound {
-                name: "lenght".into(),
-                suggestions: Candidates::at(
-                    EditTarget::whole(Span::new(0, 6), "lenght"),
-                    Box::new(["length".into()]),
-                ),
-            },
-        };
+    fn a_unique_single_edit_becomes_a_machine_applicable_suggestion() {
         assert_eq!(
-            d.help(),
+            value_help("lenght", &["length", "map"]),
             vec![HelpLine::Suggest(Suggestion {
                 span: Span::new(0, 6),
                 replaces: "lenght".into(),
                 replacement: "length".into(),
                 applicability: Applicability::MachineApplicable,
             })]
+        );
+    }
+
+    #[test]
+    fn a_case_only_match_becomes_a_machine_applicable_suggestion() {
+        let help = value_help("just", &["Just"]);
+        assert!(
+            matches!(
+                help.as_slice(),
+                [HelpLine::Suggest(Suggestion {
+                    applicability: Applicability::MachineApplicable,
+                    ..
+                })]
+            ),
+            "{help:?}"
+        );
+    }
+
+    /// A sole guess two edits away could name another binding that still
+    /// type-checks: it is offered, never applied unprompted.
+    #[test]
+    fn a_plausible_sole_candidate_is_maybe_incorrect() {
+        assert_eq!(
+            value_help("lenght", &["lengths"]),
+            vec![HelpLine::Suggest(Suggestion {
+                span: Span::new(0, 6),
+                replaces: "lenght".into(),
+                replacement: "lengths".into(),
+                applicability: Applicability::MaybeIncorrect,
+            })]
+        );
+    }
+
+    /// Candidates built with no ranked hit carry no confidence, so no edit
+    /// they could ever hold is applicable unprompted.
+    #[test]
+    fn candidates_without_a_ranked_best_are_never_machine_applicable() {
+        let mut candidates =
+            Candidates::at(EditTarget::whole(Span::new(0, 6), "lenght"), Box::new([]));
+        candidates.names = Box::new(["length".into()]);
+        let help = Diagnostic::Name {
+            span: Span::new(0, 6),
+            msg: NameError::ValueNotFound {
+                name: "lenght".into(),
+                suggestions: candidates,
+            },
+        }
+        .help();
+        assert!(
+            matches!(
+                help.as_slice(),
+                [HelpLine::Suggest(Suggestion {
+                    applicability: Applicability::MaybeIncorrect,
+                    ..
+                })]
+            ),
+            "{help:?}"
         );
     }
 
@@ -436,7 +514,7 @@ mod tests {
                 qualifier: "Lsit".into(),
                 suggestions: Candidates::at(
                     EditTarget::prefix(token, "Lsit"),
-                    Box::new(["List".into()]),
+                    ranked("Lsit", &["List", "Set"]),
                 ),
             },
         };
@@ -462,7 +540,7 @@ mod tests {
                 member: "mpa".into(),
                 suggestions: Candidates::at(
                     EditTarget::suffix(token, "mpa"),
-                    Box::new(["map".into()]),
+                    ranked("mpa", &["map", "foldl"]),
                 ),
             },
         };
@@ -484,7 +562,7 @@ mod tests {
             span: Span::new(0, 30),
             msg: NameError::TypeNotFound {
                 name: "Strng".into(),
-                suggestions: Candidates::hints(Box::new(["String".into()])),
+                suggestions: Candidates::hints(ranked("Strng", &["String"])),
             },
         };
         assert_eq!(d.help(), vec![HelpLine::DidYouMean("String".into())]);

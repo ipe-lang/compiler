@@ -34,6 +34,7 @@ use crate::code::{
     IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
+use crate::suggest::{Confidence, Hit};
 use crate::terminal::TerminalSafe;
 
 // ===========================================================================
@@ -2248,31 +2249,52 @@ impl EditTarget {
 
 /// Ranked did-you-mean names for an unresolved name, plus where a fix may land.
 ///
+/// Built only from the hits of [`crate::suggest::rank`], so the names keep the
+/// ranker's order and the sole name's edit carries the ranker's confidence.
 /// `region` is `None` when the producer cannot prove the exact sub-span the
 /// replacement would overwrite (a type annotation carries one span for the
 /// whole annotation); such candidates only ever render as "did you mean"
-/// lines, never as an applicable edit.
+/// lines, never as an edit.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Candidates {
     /// The region a sole candidate replaces, when provable.
     pub region: Option<EditTarget>,
     /// The candidate names, best first.
     pub names: Box<[Box<str>]>,
+    /// The ranker's confidence in the best name; `None` when there is none.
+    best: Option<Confidence>,
 }
 
 impl Candidates {
-    /// Candidates with a proven (or absent) replace region.
+    /// Ranked hits with a proven (or absent) replace region.
     #[must_use]
-    pub const fn at(region: Option<EditTarget>, names: Box<[Box<str>]>) -> Self {
-        Self { region, names }
+    pub fn at(region: Option<EditTarget>, hits: Box<[Hit<Box<str>>]>) -> Self {
+        let best = hits.first().map(|hit| hit.confidence);
+        let names = hits.into_iter().map(|hit| hit.target).collect();
+        Self {
+            region,
+            names,
+            best,
+        }
     }
 
-    /// Candidates that are hints only: no region, so never machine-applicable.
+    /// Ranked hits that are hints only: no region, so never an edit.
     #[must_use]
-    pub const fn hints(names: Box<[Box<str>]>) -> Self {
-        Self {
-            region: None,
-            names,
+    pub fn hints(hits: Box<[Hit<Box<str>>]>) -> Self {
+        Self::at(None, hits)
+    }
+
+    /// How sure an edit to the sole name may be.
+    ///
+    /// Only a case-only match or a unique single edit is unambiguous enough to
+    /// apply unprompted; any other guess could rewrite the code to a different
+    /// binding that still type-checks, so it needs the author's confirmation.
+    const fn sole_applicability(&self) -> Applicability {
+        match self.best {
+            Some(Confidence::CaseOnly | Confidence::UniqueSingleEdit) => {
+                Applicability::MachineApplicable
+            }
+            Some(Confidence::Plausible) | None => Applicability::MaybeIncorrect,
         }
     }
 }
@@ -3512,20 +3534,20 @@ const fn consent_code(msg: &ConsentError) -> Code {
 
 // --- did_you_mean ------------------------------------------------------------
 
-/// Turns already-sorted candidates into help lines.
+/// Turns ranked candidates into help lines.
 ///
-/// A single candidate with a proven [`EditTarget`] is confident enough to offer
-/// as a [`Applicability::MachineApplicable`] suggestion over exactly that
-/// region; any other shape (several candidates, or no provable region) stays a
-/// non-committal "did you mean" line per name. The producer is responsible for
-/// the stable `(Levenshtein, name)` ordering.
+/// A single candidate with a proven [`EditTarget`] becomes a [`Suggestion`]
+/// over exactly that region, applicable unprompted only when the ranker found
+/// it unambiguous ([`Candidates::sole_applicability`]); any other shape
+/// (several candidates, or no provable region) stays a non-committal "did you
+/// mean" line per name, in the ranker's order.
 fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
     match (&*candidates.names, &candidates.region) {
         ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
             span: target.span,
             replaces: target.replaces.clone(),
             replacement: only.clone(),
-            applicability: Applicability::MachineApplicable,
+            applicability: candidates.sole_applicability(),
         })],
         (many, _) => many
             .iter()
