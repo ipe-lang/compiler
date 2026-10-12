@@ -2,10 +2,12 @@
 //!
 //! A browser stamps every request with Fetch Metadata (`Sec-Fetch-Site`,
 //! `Sec-Fetch-Mode`, `Sec-Fetch-Dest`). A session is minted only when that
-//! metadata proves a top-level navigation, an embeddable frame navigation, or a
-//! same-origin client-router navigation (`X-Ipe-Nav: 1`), or when the client
-//! sends no Fetch Metadata at all. A cross-site subresource or frame request
-//! never mints: no `init`, no session slot, no cookie.
+//! metadata proves a top-level navigation, a same-origin frame navigation (the
+//! framing every page response's `X-Frame-Options: SAMEORIGIN` admits), a frame
+//! navigation while the app is embeddable, or a same-origin client-router
+//! navigation (`X-Ipe-Nav: 1`), or when the client sends no Fetch Metadata at
+//! all. A cross-site subresource or frame request never mints: no `init`, no
+//! session slot, no cookie.
 //!
 //! [`MintProof`] has one constructor, [`MintProof::judge`], so the only way the
 //! page handler reaches a fresh session id is through a judged request.
@@ -52,7 +54,7 @@ impl Embedding {
 pub enum MintRefusal {
     /// A cross-site or same-site request that is not a navigation.
     CrossSiteSubresource,
-    /// A frame navigation while the app is not embeddable.
+    /// A same-site or cross-site frame navigation while the app is not embeddable.
     FrameNotEmbeddable,
     /// A same-origin request that is neither a navigation nor the client router.
     UnprovenSameOrigin,
@@ -208,7 +210,8 @@ impl MintProof {
             return Err(MintRefusal::Malformed);
         }
         match (site, mode, dest) {
-            (_, Mode::Navigate, Dest::Document) => Ok(Self(())),
+            (_, Mode::Navigate, Dest::Document)
+            | (Initiator::SameOrigin, Mode::Navigate, Dest::Iframe | Dest::Frame) => Ok(Self(())),
             (_, Mode::Navigate, Dest::Iframe | Dest::Frame) => match embedding {
                 Embedding::Embeddable => Ok(Self(())),
                 Embedding::NotEmbeddable => Err(MintRefusal::FrameNotEmbeddable),
@@ -339,7 +342,7 @@ mod tests {
 
     /// Prove the refusals: every subresource, unembeddable frame, unproven
     /// same-origin, and malformed shape is refused with its exact reason, and
-    /// the four first-party shapes are admitted.
+    /// every first-party shape is admitted.
     #[test]
     fn mint_refusals() {
         use MintRefusal::{
@@ -368,6 +371,12 @@ mod tests {
                 Err(FrameNotEmbeddable),
             ),
             row(cs, Some("navigate"), Some("frame"), Err(FrameNotEmbeddable)),
+            row(
+                Some("same-site"),
+                Some("navigate"),
+                Some("iframe"),
+                Err(FrameNotEmbeddable),
+            ),
             row(so, Some("cors"), Some("empty"), Err(UnprovenSameOrigin)),
             Row {
                 ipe_nav: true,
@@ -390,6 +399,10 @@ mod tests {
             row(None, None, None, Ok(())),
             // Admitted: a top-level navigation from any site.
             row(cs, Some("navigate"), Some("document"), Ok(())),
+            // Admitted: a same-origin frame navigation, the framing the page's
+            // `X-Frame-Options: SAMEORIGIN` already allows.
+            row(so, Some("navigate"), Some("iframe"), Ok(())),
+            row(so, Some("navigate"), Some("frame"), Ok(())),
             // Admitted: a frame navigation while embeddable.
             Row {
                 embedding: Embedding::Embeddable,
