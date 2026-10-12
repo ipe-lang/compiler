@@ -5233,17 +5233,22 @@ fn serve(path: &Path, port: Option<u16>) -> Result<(), CliError> {
         let _ = crate::browser::open_url(&url);
     }
 
-    serve_site(&listener, &site);
+    serve_site(&listener, &site, DOC_SERVE_IO_BUDGET);
     Ok(())
 }
 
 /// Serve `site` on `listener`, one connection at a time, until the process ends.
 ///
 /// A single dropped connection must not take the server down; `flatten` skips
-/// the `Err`s and serves each accepted stream.
-fn serve_site(listener: &std::net::TcpListener, site: &BTreeMap<String, String>) {
-    for mut conn in listener.incoming().flatten() {
-        serve_one(&mut conn, site);
+/// the `Err`s and serves each accepted stream. `budget` bounds each
+/// connection's head read and response write, each in wall-clock.
+fn serve_site(
+    listener: &std::net::TcpListener,
+    site: &BTreeMap<String, String>,
+    budget: std::time::Duration,
+) {
+    for conn in listener.incoming().flatten() {
+        serve_one(&conn, site, budget);
     }
 }
 
@@ -5255,10 +5260,59 @@ fn serve_site(listener: &std::net::TcpListener, site: &BTreeMap<String, String>)
 /// growth.
 const DOC_SERVE_REQUEST_HEAD_CAP: usize = 16 * 1024;
 
-/// The wall-clock a single read may block before the doc server abandons the
-/// connection, so a client that opens a socket and never sends stalls one
-/// connection briefly instead of pinning the accept loop forever.
-const DOC_SERVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The wall-clock the doc server spends reading one request head, and again
+/// writing one response, before it abandons the connection.
+///
+/// The bound is on the whole head and the whole response, not on each read or
+/// write: a peer that never sends, drips a byte at a time, or never reads its
+/// response stalls the one-connection-at-a-time loop briefly, never forever.
+const DOC_SERVE_IO_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One connection's socket under a wall-clock deadline: each read or write
+/// waits at most the time left, and none starts once the deadline has passed.
+struct DeadlineConn<'a> {
+    conn: &'a std::net::TcpStream,
+    deadline: std::time::Instant,
+}
+
+impl DeadlineConn<'_> {
+    /// The time left before the deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::ErrorKind::TimedOut`] once the deadline has passed.
+    fn time_left(&self) -> std::io::Result<std::time::Duration> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            Err(std::io::ErrorKind::TimedOut.into())
+        } else {
+            Ok(left)
+        }
+    }
+}
+
+impl std::io::Read for DeadlineConn<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.conn.set_read_timeout(Some(self.time_left()?))?;
+        let mut conn = self.conn;
+        std::io::Read::read(&mut conn, buf)
+    }
+}
+
+impl std::io::Write for DeadlineConn<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.conn.set_write_timeout(Some(self.time_left()?))?;
+        let mut conn = self.conn;
+        std::io::Write::write(&mut conn, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut conn = self.conn;
+        std::io::Write::flush(&mut conn)
+    }
+}
 
 /// The fixed body of a `421` answered to a request whose host is not admitted.
 const DOC_SERVE_REFUSED_HOST_BODY: &str = r#"{"status":"host_not_admitted"}"#;
@@ -5377,14 +5431,19 @@ fn request_authority(
 /// # Errors
 ///
 /// [`HeadRefusal::TooLarge`] when the cap runs out first,
-/// [`HeadRefusal::Malformed`] for a line that is not a header field, and
+/// [`HeadRefusal::Malformed`] for a request line with no target or a line
+/// that is not a header field, and
 /// [`HeadRefusal::Abandoned`] when the peer stops sending.
 fn read_head<R: std::io::Read>(
     reader: &mut std::io::BufReader<std::io::Take<R>>,
 ) -> Result<RequestHead, HeadRefusal> {
     let mut line = String::new();
     read_head_line(reader, &mut line)?;
-    let target = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+    let target = line
+        .split_whitespace()
+        .nth(1)
+        .ok_or(HeadRefusal::Malformed)?
+        .to_owned();
     let mut host = HostHeader::Absent;
     loop {
         read_head_line(reader, &mut line)?;
@@ -5440,24 +5499,25 @@ fn header_field(line: &str) -> Option<(&str, &str)> {
 
 /// Serve one HTTP/1.1 request from the in-memory `site`, read-only.
 ///
-/// Reads the request head under a byte cap and a read timeout, judges the
+/// Reads the request head under a byte cap and a `budget` deadline, judges the
 /// request's target authority, maps its path to a built file (`/` →
-/// `index.html`), and writes the file with its content type, a `404` when the
-/// path names no built file, or a `421` when the host is not admitted. The body,
-/// if any, is ignored (nothing here writes or executes).
-fn serve_one(conn: &mut std::net::TcpStream, site: &BTreeMap<String, String>) {
+/// `index.html`), and writes, under a fresh `budget` deadline, the file with its
+/// content type, a `404` when the path names no built file, or a `421` when the
+/// host is not admitted. The body, if any, is ignored (nothing here writes or
+/// executes).
+fn serve_one(
+    conn: &std::net::TcpStream,
+    site: &BTreeMap<String, String>,
+    budget: std::time::Duration,
+) {
     use std::io::{BufReader, Read, Write};
+    use std::time::Instant;
 
-    // Bound the wait: a peer that connects and never writes stalls this one
-    // connection for at most the timeout, never the whole loop (a remote
-    // exhaustion vector otherwise).
-    if conn.set_read_timeout(Some(DOC_SERVE_READ_TIMEOUT)).is_err() {
-        return;
-    }
-    let Ok(clone) = conn.try_clone() else {
+    let Some(deadline) = Instant::now().checked_add(budget) else {
         return;
     };
-    let mut reader = BufReader::new(clone.take(DOC_SERVE_REQUEST_HEAD_CAP as u64));
+    let mut reader =
+        BufReader::new(DeadlineConn { conn, deadline }.take(DOC_SERVE_REQUEST_HEAD_CAP as u64));
     let response = match read_head(&mut reader) {
         Err(HeadRefusal::Abandoned) => return,
         Err(HeadRefusal::TooLarge) => http_response(
@@ -5485,8 +5545,12 @@ fn serve_one(conn: &mut std::net::TcpStream, site: &BTreeMap<String, String>) {
             ),
         },
     };
-    let _ = conn.write_all(response.as_bytes());
-    let _ = conn.flush();
+    let Some(deadline) = Instant::now().checked_add(budget) else {
+        return;
+    };
+    let mut writer = DeadlineConn { conn, deadline };
+    let _ = writer.write_all(response.as_bytes());
+    let _ = writer.flush();
 }
 
 /// Map a request path to a built-file key: `/` (or empty) → `index.html`,
@@ -7897,18 +7961,106 @@ withBaseMs = something
     }
 
     /// Run the real doc serve loop over a one-page site on an ephemeral loopback
-    /// port; the server thread lives until the test process ends.
+    /// port under the production I/O budget; the server thread lives until the
+    /// test process ends.
     fn doc_serve_fixture() -> std::net::SocketAddr {
+        doc_serve_fixture_with(BTreeMap::new(), DOC_SERVE_IO_BUDGET)
+    }
+
+    /// Run the real doc serve loop over `extra` pages plus the one-page site,
+    /// under `budget`, on an ephemeral loopback port.
+    fn doc_serve_fixture_with(
+        extra: BTreeMap<String, String>,
+        budget: std::time::Duration,
+    ) -> std::net::SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("addr");
         std::thread::Builder::new()
             .spawn(move || {
-                let mut site: BTreeMap<String, String> = BTreeMap::new();
+                let mut site = extra;
                 site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
-                serve_site(&listener, &site);
+                serve_site(&listener, &site, budget);
             })
             .expect("spawn doc server");
         addr
+    }
+
+    /// Whether a well-formed admitted request on a fresh connection to `addr`
+    /// is served within `wait`, the loop being free to accept it.
+    fn doc_serve_answers_within(addr: std::net::SocketAddr, wait: std::time::Duration) -> bool {
+        use std::io::{Read, Write};
+
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        client.set_read_timeout(Some(wait)).expect("read timeout");
+        let head = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", addr.port());
+        client.write_all(head.as_bytes()).expect("write request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).is_ok() && resp.starts_with("HTTP/1.1 200 OK\r\n")
+    }
+
+    #[test]
+    fn doc_serve_bounds_a_dripped_head_by_wall_clock() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let addr = doc_serve_fixture_with(BTreeMap::new(), Duration::from_millis(500));
+        let port = addr.port();
+        // A peer drips its head a byte at a time, every byte well inside the
+        // budget, for longer than the budget: each read alone is quick, so only
+        // a deadline on the whole head frees the one-at-a-time loop.
+        let (connected, ready) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut slow = std::net::TcpStream::connect(addr).expect("connect");
+                let _ = slow.write_all(
+                    format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Drip: ").as_bytes(),
+                );
+                let _ = connected.send(());
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_secs(6) && slow.write_all(b"a").is_ok() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+            .expect("spawn dripping peer");
+        ready.recv().expect("dripping peer connected");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            doc_serve_answers_within(addr, Duration::from_secs(4)),
+            "a dripped head must be abandoned at the budget, freeing the loop"
+        );
+    }
+
+    #[test]
+    fn doc_serve_bounds_an_unread_response_by_wall_clock() {
+        use std::io::Write;
+        use std::time::Duration;
+
+        let mut extra = BTreeMap::new();
+        extra.insert("big.html".to_owned(), "x".repeat(32 << 20));
+        let addr = doc_serve_fixture_with(extra, Duration::from_millis(500));
+        let port = addr.port();
+        // A peer asks for a page far larger than the socket buffers and never
+        // reads it: only a deadline on the write frees the one-at-a-time loop.
+        let (connected, ready) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let mut stalled = std::net::TcpStream::connect(addr).expect("connect");
+                let _ = stalled.write_all(
+                    format!("GET /big.html HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes(),
+                );
+                let _ = connected.send(());
+                std::thread::sleep(Duration::from_secs(6));
+            })
+            .expect("spawn stalled peer");
+        ready.recv().expect("stalled peer connected");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            doc_serve_answers_within(addr, Duration::from_secs(4)),
+            "an unread response must be abandoned at the budget, freeing the loop"
+        );
     }
 
     /// Send `head` on a fresh connection to `addr` and read the whole response.
@@ -7951,6 +8103,12 @@ withBaseMs = something
                 "Host `{host}` must be served: {resp}"
             );
         }
+        let bare_lf =
+            doc_serve_exchange(addr, &format!("GET / HTTP/1.1\nhOsT: 127.0.0.1:{port}\n\n"));
+        assert!(
+            bare_lf.starts_with("HTTP/1.1 200 OK\r\n") && bare_lf.contains("<h1>hi</h1>"),
+            "bare-LF lines and any-case `Host` name must be served: {bare_lf}"
+        );
         let missing = doc_serve_exchange(
             addr,
             &format!("GET /no-such.html HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
@@ -7995,6 +8153,8 @@ withBaseMs = something
             "::1".to_owned(),
             "localhost.".to_owned(),
             "127.1".to_owned(),
+            "127.0.0.1\0".to_owned(),
+            format!("127.0.0.1:{port}\r"),
             String::new(),
         ] {
             let resp = doc_serve_exchange(addr, &format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"));
@@ -8046,6 +8206,9 @@ withBaseMs = something
             format!("GET / HTTP/1.1\r\nHost: evil.example\r\n 127.0.0.1:{port}\r\n\r\n"),
             format!("GET / HTTP/1.1\r\nHost : 127.0.0.1:{port}\r\n\r\n"),
             format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nno colon here\r\n\r\n"),
+            format!("GET\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+            format!("\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+            format!("GET / HTTP/1.1\r\nHo\0st: 127.0.0.1:{port}\r\n\r\n"),
         ] {
             let resp = doc_serve_exchange(addr, &head);
             assert!(
@@ -8136,9 +8299,9 @@ withBaseMs = something
         let handle = std::thread::Builder::new()
             .spawn(move || {
                 let site: BTreeMap<String, String> = BTreeMap::new();
-                let (mut conn, _) = listener.accept().expect("accept");
+                let (conn, _) = listener.accept().expect("accept");
                 let started = Instant::now();
-                serve_one(&mut conn, &site);
+                serve_one(&conn, &site, DOC_SERVE_IO_BUDGET);
                 started.elapsed()
             })
             .expect("spawn test thread");
@@ -8155,11 +8318,11 @@ withBaseMs = something
         }
         drop(client);
         let elapsed = handle.join().expect("server thread");
-        // The read timeout is 10s; a bounded server returns well within it. A
+        // The head budget is 10s; a bounded server returns well within it. A
         // regression that reverted to an unbounded `read_line` would block until
         // the client closed (here) or forever (a real slow-loris).
         assert!(
-            elapsed < DOC_SERVE_READ_TIMEOUT * 3,
+            elapsed < DOC_SERVE_IO_BUDGET * 3,
             "serve_one must return promptly, took {elapsed:?}"
         );
     }
@@ -8180,8 +8343,8 @@ withBaseMs = something
             .spawn(move || {
                 let mut site: BTreeMap<String, String> = BTreeMap::new();
                 site.insert("index.html".to_owned(), "<h1>hi</h1>".to_owned());
-                let (mut conn, _) = listener.accept().expect("accept");
-                serve_one(&mut conn, &site);
+                let (conn, _) = listener.accept().expect("accept");
+                serve_one(&conn, &site, DOC_SERVE_IO_BUDGET);
             })
             .expect("spawn test thread");
 
