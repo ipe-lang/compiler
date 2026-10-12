@@ -825,13 +825,16 @@ fn an_excluded_name_that_is_registered_is_still_refused() {
         kinds(FIXTURE_PATH, &named("IPE_INTERNAL_LISTEN_PORT")),
         [Kind::Literal]
     );
-    assert_eq!(kinds(FIXTURE_PATH, &named("IPE_E2E")), Vec::<Kind>::new());
+    assert_eq!(
+        kinds(FIXTURE_PATH, &named(e2e_support::bin::E2E_VAR)),
+        Vec::<Kind>::new()
+    );
     let harness = harness_names();
     assert!(
         !harness.contains(&"IPE_INTERNAL_LISTEN_PORT"),
         "{harness:?}"
     );
-    assert!(harness.contains(&"IPE_E2E"), "{harness:?}");
+    assert!(harness.contains(&e2e_support::bin::E2E_VAR), "{harness:?}");
 }
 
 /// A fresh tree holding `files` (path relative to the tree, contents).
